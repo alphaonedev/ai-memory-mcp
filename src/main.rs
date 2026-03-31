@@ -1,6 +1,7 @@
 mod db;
 mod handlers;
 mod models;
+mod validate;
 
 use anyhow::Result;
 use axum::{routing::{delete, get, post, put}, Router};
@@ -13,7 +14,7 @@ use tokio::sync::Mutex;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
-use crate::models::{Tier, MAX_CONTENT_SIZE};
+use crate::models::Tier;
 
 const DEFAULT_DB: &str = "claude-memory.db";
 const DEFAULT_PORT: u16 = 9077;
@@ -340,13 +341,22 @@ async fn serve(db_path: PathBuf, args: ServeArgs) -> Result<()> {
 
 fn cmd_store(db_path: PathBuf, args: StoreArgs, json_out: bool) -> Result<()> {
     let conn = db::open(&db_path)?;
-    let tier = Tier::from_str(&args.tier).ok_or_else(|| anyhow::anyhow!("invalid tier: {}", args.tier))?;
+    let tier = Tier::from_str(&args.tier).ok_or_else(|| anyhow::anyhow!("invalid tier: {} (use short, mid, long)", args.tier))?;
     let namespace = args.namespace.unwrap_or_else(auto_namespace);
     let content = if args.content == "-" {
         use std::io::Read; let mut buf = String::new(); std::io::stdin().read_to_string(&mut buf)?; buf
     } else { args.content };
-    if content.len() > MAX_CONTENT_SIZE { anyhow::bail!("content exceeds {} bytes", MAX_CONTENT_SIZE); }
     let tags: Vec<String> = args.tags.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+
+    // Validate all fields before touching the DB
+    validate::validate_title(&args.title)?;
+    validate::validate_content(&content)?;
+    validate::validate_namespace(&namespace)?;
+    validate::validate_source(&args.source)?;
+    validate::validate_tags(&tags)?;
+    validate::validate_priority(args.priority)?;
+    validate::validate_confidence(args.confidence)?;
+
     let now = Utc::now();
     let expires_at = tier.default_ttl_secs().map(|s| (now + Duration::seconds(s)).to_rfc3339());
     let mem = models::Memory {
@@ -378,7 +388,13 @@ fn cmd_update(db_path: PathBuf, args: UpdateArgs, json_out: bool) -> Result<()> 
     let conn = db::open(&db_path)?;
     let tier = args.tier.as_deref().and_then(Tier::from_str);
     let tags: Option<Vec<String>> = args.tags.as_ref().map(|t| t.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect());
-    if let Some(ref c) = args.content { if c.len() > MAX_CONTENT_SIZE { anyhow::bail!("content exceeds {} bytes", MAX_CONTENT_SIZE); } }
+    // Validate present fields
+    if let Some(ref t) = args.title { validate::validate_title(t)?; }
+    if let Some(ref c) = args.content { validate::validate_content(c)?; }
+    if let Some(ref ns) = args.namespace { validate::validate_namespace(ns)?; }
+    if let Some(ref tags) = tags { validate::validate_tags(tags)?; }
+    if let Some(p) = args.priority { validate::validate_priority(p)?; }
+    if let Some(c) = args.confidence { validate::validate_confidence(c)?; }
     let updated = db::update(&conn, &args.id, args.title.as_deref(), args.content.as_deref(),
         tier.as_ref(), args.namespace.as_deref(), tags.as_ref(), args.priority, args.confidence, None)?;
     if !updated { eprintln!("not found: {}", args.id); std::process::exit(1); }
@@ -499,6 +515,7 @@ fn cmd_forget(db_path: PathBuf, args: ForgetArgs, json_out: bool) -> Result<()> 
 }
 
 fn cmd_link(db_path: PathBuf, args: LinkArgs, json_out: bool) -> Result<()> {
+    validate::validate_link(&args.source_id, &args.target_id, &args.relation)?;
     let conn = db::open(&db_path)?;
     db::create_link(&conn, &args.source_id, &args.target_id, &args.relation)?;
     if json_out { println!("{}", serde_json::json!({"linked": true})); }
@@ -508,8 +525,8 @@ fn cmd_link(db_path: PathBuf, args: LinkArgs, json_out: bool) -> Result<()> {
 
 fn cmd_consolidate(db_path: PathBuf, args: ConsolidateArgs, json_out: bool) -> Result<()> {
     let ids: Vec<String> = args.ids.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-    if ids.len() < 2 { anyhow::bail!("need at least 2 IDs"); }
     let namespace = args.namespace.unwrap_or_else(auto_namespace);
+    validate::validate_consolidate(&ids, &args.title, &args.summary, &namespace)?;
     let conn = db::open(&db_path)?;
     let new_id = db::consolidate(&conn, &ids, &args.title, &args.summary, &namespace, &Tier::Long, "cli")?;
     if json_out { println!("{}", serde_json::json!({"id": new_id, "consolidated": ids.len()})); }
@@ -571,9 +588,14 @@ fn cmd_import(db_path: PathBuf, json_out: bool) -> Result<()> {
     let mut imported = 0usize;
     let mut errors = Vec::new();
     for mem in memories {
+        if let Err(e) = validate::validate_memory(&mem) {
+            errors.push(format!("{}: {}", mem.id, e));
+            continue;
+        }
         match db::insert(&conn, &mem) { Ok(_) => imported += 1, Err(e) => errors.push(format!("{}: {}", mem.id, e)) }
     }
     for link in links {
+        if validate::validate_link(&link.source_id, &link.target_id, &link.relation).is_err() { continue; }
         let _ = db::create_link(&conn, &link.source_id, &link.target_id, &link.relation);
     }
     if json_out { println!("{}", serde_json::json!({"imported": imported, "errors": errors})); }
