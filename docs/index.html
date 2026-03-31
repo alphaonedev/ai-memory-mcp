@@ -686,7 +686,8 @@
         <pre><code># Install
 cargo install --path .
 
-# Add to Claude Code settings.json:
+# Add to ~/.claude/.mcp.json (global) or .mcp.json (project root):
+# NOTE: Does NOT go in settings.json -- that file doesn't support mcpServers.
 {
   "mcpServers": {
     "memory": {

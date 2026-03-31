@@ -17,7 +17,7 @@ The easiest way to use claude-memory is as an **MCP tool server**. Once configur
 
 ### Setup
 
-Add to your Claude Code `settings.json`:
+Add to `~/.claude/.mcp.json` (global -- applies to all projects) or `.mcp.json` in your project root (project-level):
 
 ```json
 {
@@ -29,6 +29,8 @@ Add to your Claude Code `settings.json`:
   }
 }
 ```
+
+> MCP server configuration does **not** go in `settings.json` or `settings.local.json` -- those files do not support `mcpServers`.
 
 ### How It Works
 

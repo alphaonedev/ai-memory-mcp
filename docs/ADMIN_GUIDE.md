@@ -6,7 +6,7 @@
 
 The simplest deployment is as an MCP tool server. No daemon process to manage -- Claude Code spawns the process on demand.
 
-Configure in Claude Code `settings.json`:
+Configure in `~/.claude/.mcp.json` (global -- applies to all projects) or `.mcp.json` in the project root (project-level):
 
 ```json
 {
@@ -18,6 +18,8 @@ Configure in Claude Code `settings.json`:
   }
 }
 ```
+
+> MCP server configuration does **not** go in `settings.json` or `settings.local.json` -- those files do not support `mcpServers`.
 
 The MCP server:
 - Starts when Claude Code opens a session
@@ -446,7 +448,7 @@ ls -la /path/to/claude-memory.db
 ### MCP server not connecting
 
 **Binary not found:**
-Check that the path in `settings.json` is correct and the binary is executable.
+Check that the path in `.mcp.json` is correct and the binary is executable.
 
 **Database path issues:**
 The MCP server opens the database at the path specified by `--db`. Ensure the directory exists and is writable.

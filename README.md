@@ -26,7 +26,7 @@
 
 The recommended way to use claude-memory with Claude Code is as an **MCP (Model Context Protocol) tool server**. This makes memory operations available as native tools that Claude can call directly.
 
-Add to your Claude Code `settings.json`:
+Add to your MCP configuration file (`~/.claude/.mcp.json` for global, or `.mcp.json` in your project root):
 
 ```json
 {
@@ -38,6 +38,8 @@ Add to your Claude Code `settings.json`:
   }
 }
 ```
+
+> **Global vs project-level:** `~/.claude/.mcp.json` applies to all projects. `.mcp.json` in a repo root applies only to that project. MCP server configuration does **not** go in `settings.json` or `settings.local.json` -- those files do not support `mcpServers`.
 
 This exposes **8 tools** to Claude Code:
 
@@ -139,7 +141,7 @@ This exposes **8 tools** to Claude Code:
 # 1. Build and install
 cargo install --path .
 
-# 2. Add to Claude Code settings.json
+# 2. Add to ~/.claude/.mcp.json (global) or .mcp.json (project root)
 # See MCP Integration section above
 
 # 3. Claude Code now has memory tools natively

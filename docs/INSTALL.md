@@ -37,9 +37,9 @@ sudo mv claude-memory /usr/local/bin/
 
 The primary integration path is the **MCP tool server**. This makes memory operations available as native tools inside Claude Code.
 
-### Step 1: Add to Claude Code settings
+### Step 1: Add MCP configuration
 
-Edit your Claude Code `settings.json` and add:
+Create or edit `~/.claude/.mcp.json` (global -- applies to all projects) or `.mcp.json` in your project root (project-level):
 
 ```json
 {
@@ -64,6 +64,8 @@ If `claude-memory` is not in your PATH, use the full path to the binary:
   }
 }
 ```
+
+> **Important:** MCP server configuration does **not** go in `settings.json` or `settings.local.json` -- those files do not support `mcpServers`.
 
 ### Step 2: Verify
 
@@ -218,7 +220,7 @@ sudo systemctl disable claude-memory
 sudo rm /etc/systemd/system/claude-memory.service
 sudo systemctl daemon-reload
 
-# Remove MCP configuration from Claude Code settings.json
+# Remove MCP configuration from ~/.claude/.mcp.json or .mcp.json
 
 # Remove the binary
 cargo uninstall claude-memory

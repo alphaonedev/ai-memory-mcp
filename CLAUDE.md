@@ -4,7 +4,7 @@ This project is `claude-memory` -- a persistent memory daemon for Claude Code.
 
 ## Primary Integration: MCP Server
 
-The recommended integration path is the **MCP tool server**. Configure in Claude Code `settings.json`:
+The recommended integration path is the **MCP tool server**. Configure in `~/.claude/.mcp.json` (global) or `.mcp.json` (project root):
 
 ```json
 {
@@ -16,6 +16,8 @@ The recommended integration path is the **MCP tool server**. Configure in Claude
   }
 }
 ```
+
+> MCP server configuration does **not** go in `settings.json` or `settings.local.json` -- those files do not support `mcpServers`. Use `~/.claude/.mcp.json` for all projects, or `.mcp.json` in a repo root for project-level config.
 
 This gives Claude Code 8 native tools: `memory_store`, `memory_recall`, `memory_search`, `memory_list`, `memory_delete`, `memory_promote`, `memory_forget`, `memory_stats`.
 
