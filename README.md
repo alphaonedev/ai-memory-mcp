@@ -59,6 +59,12 @@ This exposes **8 tools** to Claude Code:
 - **Full-text search** -- SQLite FTS5 with ranked retrieval
 - **Recency decay** -- `1/(1 + days_old * 0.1)` factor so recent memories rank higher
 - **Smart recall** -- 6-factor scoring: FTS relevance + priority + access frequency + confidence + tier boost + recency decay
+- **Interactive REPL shell** -- `claude-memory shell` with recall, search, list, get, stats, namespaces, delete, and color output
+- **Color CLI output** -- ANSI colors: tier labels (red=short, yellow=mid, green=long), priority bars, bold titles, dim previews, cyan namespaces (auto-detects terminal)
+- **Multi-node sync** -- `claude-memory sync <remote.db> --direction pull|push|merge` with dedup-safe upsert
+- **Auto-consolidation** -- `claude-memory auto-consolidate` groups memories by namespace+primary tag, merges groups into long-term summaries
+- **Contradiction resolution** -- `claude-memory resolve <winner> <loser>` creates "supersedes" link, demotes loser
+- **Man page** -- `claude-memory man` generates roff man page to stdout
 - **Schema validation** -- full input validation on every write path (title, content, namespace, source, tags, priority, confidence, expires_at, ttl_secs, relation, id)
 - **Structured error types** -- typed errors: NOT_FOUND, VALIDATION_FAILED, DATABASE_ERROR, CONFLICT
 - **Auto-promotion** -- memories accessed 5+ times automatically promote from mid to long
@@ -81,7 +87,7 @@ This exposes **8 tools** to Claude Code:
 - **Human-readable ages** -- "2h ago", "3d ago" in CLI output
 - **Garbage collection** -- automatic background expiry every 30 minutes
 - **20 API endpoints** -- full REST API on port 9077
-- **19 CLI commands** -- complete CLI with identical capabilities
+- **22 CLI commands** -- complete CLI with identical capabilities
 - **41 tests** -- 8 unit + 33 integration
 - **Criterion benchmarks** -- insert, recall, search at 1K scale
 - **GitHub Actions CI/CD** -- fmt, clippy, test, build on Ubuntu + macOS, release on tag
@@ -99,7 +105,7 @@ This exposes **8 tools** to Claude Code:
         +-----v------+    +-------v--------+    +-------v-------+
         |    CLI      |    | MCP Server     |    |  HTTP API     |
         | claude-     |    | stdio JSON-RPC |    | 127.0.0.1:9077|
-        | memory      |    | 8 tools        |    | /api/v1/*     |
+        | memory 22cmd|    | 8 tools        |    | /api/v1/*     |
         +-----+-------+    +-------+--------+    +-------+-------+
               |                     |                     |
               +----------+----------+----------+----------+

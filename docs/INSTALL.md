@@ -163,6 +163,20 @@ claude-memory store -T "Installation test" -c "It works." --tier short
 claude-memory recall "installation"
 ```
 
+## Man Page
+
+Generate and install the man page:
+
+```bash
+# View immediately
+claude-memory man | man -l -
+
+# Install system-wide
+claude-memory man | sudo tee /usr/local/share/man/man1/claude-memory.1 > /dev/null
+sudo mandb
+man claude-memory
+```
+
 ## Shell Completions
 
 Generate completions for your shell:
@@ -177,6 +191,23 @@ claude-memory completions zsh > ~/.zfunc/_claude-memory
 # Fish
 claude-memory completions fish > ~/.config/fish/completions/claude-memory.fish
 ```
+
+## Multi-Node Sync Setup
+
+If you use claude-memory on multiple machines (e.g., laptop and server), you can sync databases:
+
+```bash
+# Pull memories from a remote database (e.g., over NFS, sshfs, or rsync'd copy)
+claude-memory sync /mnt/server/claude-memory.db --direction pull
+
+# Push local memories to remote
+claude-memory sync /mnt/server/claude-memory.db --direction push
+
+# Bidirectional merge (both sides get all memories, dedup-safe)
+claude-memory sync /mnt/server/claude-memory.db --direction merge
+```
+
+The sync operation uses the same dedup-safe upsert as regular stores -- title+namespace conflicts are resolved by keeping the higher priority and never downgrading tier.
 
 ## Uninstall
 

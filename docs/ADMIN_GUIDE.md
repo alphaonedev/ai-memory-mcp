@@ -329,6 +329,86 @@ cargo test
 cargo build --release
 ```
 
+## Multi-Node Sync
+
+For multi-machine deployments (e.g., laptop + server, or multiple workstations), use the `sync` command to keep databases in sync.
+
+### Manual Sync
+
+```bash
+# Pull remote changes to local
+claude-memory sync /mnt/shared/claude-memory.db --direction pull
+
+# Push local changes to remote
+claude-memory sync /mnt/shared/claude-memory.db --direction push
+
+# Bidirectional merge (recommended)
+claude-memory sync /mnt/shared/claude-memory.db --direction merge
+```
+
+### Automated Sync via Cron
+
+```bash
+# Sync every 15 minutes (bidirectional merge)
+*/15 * * * * /usr/local/bin/claude-memory --db /var/lib/claude-memory/claude-memory.db sync /mnt/shared/remote-memory.db --direction merge --json >> /var/log/claude-memory-sync.log 2>&1
+```
+
+Sync uses the same dedup-safe upsert as regular stores:
+- Title+namespace conflicts are resolved by keeping the higher priority
+- Tier never downgrades
+- Links are synced alongside memories
+- Safe to run concurrently from multiple machines (SQLite WAL mode handles locking)
+
+### Sync via sshfs or rsync
+
+If the remote database is on another machine, mount it or copy it first:
+
+```bash
+# Option 1: sshfs mount
+mkdir -p /mnt/remote-memory
+sshfs user@server:/var/lib/claude-memory /mnt/remote-memory
+claude-memory sync /mnt/remote-memory/claude-memory.db --direction merge
+
+# Option 2: rsync + sync + rsync
+rsync -a server:/var/lib/claude-memory/claude-memory.db /tmp/remote.db
+claude-memory sync /tmp/remote.db --direction merge
+rsync -a /tmp/remote.db server:/var/lib/claude-memory/claude-memory.db
+```
+
+## Auto-Consolidation (Maintenance)
+
+Auto-consolidation groups memories by namespace and primary tag, then merges groups with enough members into a single long-term summary. This reduces memory count and improves recall relevance.
+
+### Manual Run
+
+```bash
+# Preview what would be consolidated
+claude-memory auto-consolidate --dry-run
+
+# Consolidate all namespaces (groups of 3+)
+claude-memory auto-consolidate
+
+# Only short-term memories, minimum 5 per group
+claude-memory auto-consolidate --short-only --min-count 5
+```
+
+### Cron Schedule
+
+```bash
+# Run auto-consolidation daily at 3am, short-term memories only
+0 3 * * * /usr/local/bin/claude-memory --db /var/lib/claude-memory/claude-memory.db auto-consolidate --short-only --json >> /var/log/claude-memory-consolidate.log 2>&1
+```
+
+## Man Page
+
+Install the man page for system-wide documentation:
+
+```bash
+claude-memory man | sudo tee /usr/local/share/man/man1/claude-memory.1 > /dev/null
+sudo mandb
+man claude-memory
+```
+
 ## Scaling Considerations
 
 `claude-memory` is designed for single-machine use. It is not a distributed system.

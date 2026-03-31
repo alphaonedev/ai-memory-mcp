@@ -11,13 +11,14 @@
 All three interfaces share the same database layer (`db.rs`) and validation layer (`validate.rs`). The daemon adds automatic garbage collection (every 30 minutes) and graceful shutdown with WAL checkpointing.
 
 ```
-main.rs          -- CLI parsing (clap), daemon setup (axum), command dispatch
+main.rs          -- CLI parsing (clap), daemon setup (axum), command dispatch (22 commands)
 models.rs        -- Data structures: Memory, MemoryLink, query types, constants
 handlers.rs      -- HTTP request handlers (Axum extractors + JSON responses)
 db.rs            -- All SQLite operations: CRUD, FTS5, recall scoring, GC, migration
 mcp.rs           -- MCP (Model Context Protocol) server over stdio JSON-RPC
 validate.rs      -- Input validation for all write paths
 errors.rs        -- Structured error types (ApiError, MemoryError)
+color.rs         -- ANSI color output for CLI (zero dependencies, auto-detects terminal)
 ```
 
 ## Code Structure
@@ -25,7 +26,7 @@ errors.rs        -- Structured error types (ApiError, MemoryError)
 ### `src/main.rs`
 
 - `Cli` struct with `clap` derive -- defines all CLI commands and global flags (`--db`, `--json`)
-- `Command` enum -- `Serve`, `Mcp`, `Store`, `Update`, `Recall`, `Search`, `Get`, `List`, `Delete`, `Promote`, `Forget`, `Link`, `Consolidate`, `Gc`, `Stats`, `Namespaces`, `Export`, `Import`, `Completions`
+- `Command` enum -- `Serve`, `Mcp`, `Store`, `Update`, `Recall`, `Search`, `Get`, `List`, `Delete`, `Promote`, `Forget`, `Link`, `Consolidate`, `Resolve`, `Shell`, `Sync`, `AutoConsolidate`, `Gc`, `Stats`, `Namespaces`, `Export`, `Import`, `Completions`, `Man` (22 commands)
 - `auto_namespace()` -- detects namespace from git remote URL or directory name
 - `human_age()` -- formats ISO timestamps as "2h ago", "3d ago" for CLI output
 - `serve()` -- starts the Axum server with all routes, spawns GC task, handles graceful shutdown via SIGINT with WAL checkpoint
@@ -74,6 +75,18 @@ Input validation for every write path. Called by CLI, HTTP handlers, and MCP han
 | `validate_update()` | Validates only present fields |
 | `validate_link()` | Validates both IDs, relation, and rejects self-links |
 | `validate_consolidate()` | 2-100 IDs, validates title, summary, namespace |
+
+### `src/color.rs`
+
+ANSI color output for CLI -- zero external dependencies. Auto-detects terminal via `std::io::IsTerminal`.
+
+- `init()` -- sets global color flag based on terminal detection
+- `short()`, `mid()`, `long()` -- tier-specific colors (red, yellow, green)
+- `dim()`, `bold()`, `cyan()` -- semantic colors
+- `tier_color()` -- dispatches to tier color by string name
+- `priority_bar()` -- renders a 10-character bar (`█████░░░░░`) colored by priority level (green for 8+, yellow for 5-7, red for 1-4)
+
+Colors are suppressed when stdout is not a terminal (e.g., piping to file). The `--json` flag bypasses color output entirely.
 
 ### `src/errors.rs`
 
@@ -568,6 +581,59 @@ claude-memory import < backup.json
 
 Export includes memories and links. Import validates each memory and skips invalid ones.
 
+### `resolve`
+
+Resolve a contradiction by marking one memory as superseding another.
+
+```bash
+claude-memory resolve <winner_id> <loser_id>
+```
+
+Creates a "supersedes" link from winner to loser. Demotes the loser (priority=1, confidence=0.1). Touches the winner (bumps access count).
+
+### `shell`
+
+Interactive REPL for browsing and managing memories.
+
+```bash
+claude-memory shell
+```
+
+REPL commands: `recall <ctx>`, `search <q>`, `list [ns]`, `get <id>`, `stats`, `namespaces`, `delete <id>`, `help`, `quit`. Color output with tier labels and priority bars.
+
+### `sync`
+
+Sync memories between two database files.
+
+```bash
+claude-memory sync <remote.db> --direction pull|push|merge
+```
+
+- `pull` -- import all memories from remote into local
+- `push` -- export all local memories to remote
+- `merge` -- bidirectional sync (both databases get all memories)
+
+Uses dedup-safe upsert (title+namespace). Links are synced alongside memories.
+
+### `auto-consolidate`
+
+Automatically group and consolidate memories.
+
+```bash
+claude-memory auto-consolidate [--namespace <ns>] [--short-only] [--min-count 3] [--dry-run]
+```
+
+Groups memories by namespace+primary tag. Groups with >= min_count members are consolidated into one long-term memory. Use `--dry-run` to preview.
+
+### `man`
+
+Generate roff man page to stdout.
+
+```bash
+claude-memory man           # print roff to stdout
+claude-memory man | man -l -  # view immediately
+```
+
 ### `completions`
 
 ```bash
@@ -640,7 +706,7 @@ Runs on both `ubuntu-latest` and `macos-latest`.
 
 ### Release Pipeline
 
-On tag push (e.g., `v0.1.0`):
+On tag push (e.g., `v0.2.0`):
 
 1. Builds release binaries for `x86_64-unknown-linux-gnu` and `aarch64-apple-darwin`
 2. Packages as `.tar.gz`

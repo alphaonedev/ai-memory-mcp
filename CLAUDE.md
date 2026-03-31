@@ -55,7 +55,7 @@ claude-memory --db /opt/cybercommand/claude-memory.db store \
 ### Namespace auto-detection:
 If you omit `--namespace`, it auto-detects from the git remote or directory name.
 
-### All commands:
+### All 22 commands:
 - `mcp` -- run as MCP tool server over stdio (primary integration path)
 - `serve` -- start the HTTP daemon on port 9077
 - `store` -- store a new memory (deduplicates by title+namespace)
@@ -69,12 +69,17 @@ If you omit `--namespace`, it auto-detects from the git remote or directory name
 - `forget` -- bulk delete by pattern + namespace + tier
 - `link` -- link two memories (related_to, supersedes, contradicts, derived_from)
 - `consolidate` -- merge multiple memories into one long-term summary
+- `resolve` -- resolve a contradiction: mark one memory as superseding another (creates "supersedes" link, demotes loser to priority=1, confidence=0.1)
+- `shell` -- interactive REPL with recall, search, list, get, stats, namespaces, delete (color output)
+- `sync` -- sync memories between two database files (pull, push, or bidirectional merge with dedup-safe upsert)
+- `auto-consolidate` -- automatically group memories by namespace+primary tag and consolidate groups >= min_count into long-term summaries (supports --dry-run, --short-only, --min-count, --namespace)
 - `gc` -- run garbage collection on expired memories
 - `stats` -- overview of memory state (counts, tiers, namespaces, links, DB size)
 - `namespaces` -- list all namespaces with memory counts
 - `export` -- export all memories and links as JSON
 - `import` -- import memories and links from JSON (stdin)
 - `completions` -- generate shell completions (bash, zsh, fish)
+- `man` -- generate roff man page to stdout (pipe to `man -l -` to view)
 
 ### Recall scoring (6 factors):
 Memories are ranked by: FTS relevance + priority weight + access frequency + confidence + tier boost (long=3.0, mid=1.0) + recency decay (1/(1 + days_old * 0.1)).

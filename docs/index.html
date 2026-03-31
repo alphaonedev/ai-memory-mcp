@@ -198,6 +198,10 @@
             <a href="#quickstart">Quick Start</a>
             <a href="#api">API</a>
             <a href="#cli">CLI</a>
+            <a href="#shell">Shell</a>
+            <a href="#sync">Sync</a>
+            <a href="#auto-consolidate">Consolidate</a>
+            <a href="#resolve">Resolve</a>
             <a href="#ci">CI/CD</a>
         </div>
     </div>
@@ -214,7 +218,7 @@
         <div class="stats-row">
             <div class="stat"><span class="num">41</span><span class="label">Tests</span></div>
             <div class="stat"><span class="num">20</span><span class="label">API Endpoints</span></div>
-            <div class="stat"><span class="num">19</span><span class="label">CLI Commands</span></div>
+            <div class="stat"><span class="num">22</span><span class="label">CLI Commands</span></div>
             <div class="stat"><span class="num">8</span><span class="label">MCP Tools</span></div>
             <div class="stat"><span class="num">6</span><span class="label">Ranking Factors</span></div>
         </div>
@@ -631,7 +635,7 @@
                 <!-- CLI -->
                 <rect x="30" y="90" width="140" height="45" rx="8" fill="#161b22" stroke="#3fb950" stroke-width="1.5"/>
                 <text x="100" y="110" text-anchor="middle" fill="#3fb950" font-family="system-ui" font-size="12" font-weight="700">CLI</text>
-                <text x="100" y="126" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="10">19 commands</text>
+                <text x="100" y="126" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="10">22 commands</text>
 
                 <!-- MCP -->
                 <rect x="280" y="90" width="140" height="45" rx="8" fill="#161b22" stroke="#bc8cff" stroke-width="1.5"/>
@@ -787,9 +791,293 @@ curl "http://127.0.0.1:9077/api/v1/recall?context=test"</code></pre>
                 <tr><td><code>namespaces</code></td><td>List namespaces</td></tr>
                 <tr><td><code>export</code></td><td>Export to JSON (stdout)</td></tr>
                 <tr><td><code>import</code></td><td>Import from JSON (stdin)</td></tr>
+                <tr><td><code>resolve</code></td><td>Resolve contradiction (winner supersedes loser, demotes loser)</td></tr>
+                <tr><td><code>shell</code></td><td>Interactive REPL with color output (recall, search, list, get, stats, delete)</td></tr>
+                <tr><td><code>sync</code></td><td>Sync databases (--direction pull|push|merge, dedup-safe)</td></tr>
+                <tr><td><code>auto-consolidate</code></td><td>Auto-group by tag and consolidate (--dry-run, --short-only, --min-count)</td></tr>
                 <tr><td><code>completions</code></td><td>Generate shell completions (bash, zsh, fish)</td></tr>
+                <tr><td><code>man</code></td><td>Generate roff man page to stdout</td></tr>
             </tbody>
         </table>
+    </div>
+</section>
+
+<!-- ===================== INTERACTIVE SHELL ===================== -->
+<section id="shell" style="background: rgba(88,166,255,0.03);">
+    <div class="container">
+        <h2>Interactive Shell <span class="badge">v0.2.0</span></h2>
+        <p>
+            <code>claude-memory shell</code> opens a REPL with color-coded output. Tier labels use red (short), yellow (mid), green (long).
+            Priority is visualized as filled bars. Namespaces appear in cyan.
+        </p>
+
+        <div class="diagram-wrap">
+            <svg viewBox="0 0 700 340" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Interactive shell mockup">
+                <!-- Terminal frame -->
+                <rect x="20" y="10" width="660" height="320" rx="10" fill="#0d1117" stroke="#30363d" stroke-width="2"/>
+                <!-- Title bar -->
+                <rect x="20" y="10" width="660" height="30" rx="10" fill="#161b22"/>
+                <rect x="20" y="30" width="660" height="10" fill="#161b22"/>
+                <circle cx="42" cy="25" r="6" fill="#f85149"/>
+                <circle cx="62" cy="25" r="6" fill="#d29922"/>
+                <circle cx="82" cy="25" r="6" fill="#3fb950"/>
+                <text x="350" y="28" text-anchor="middle" fill="#8b949e" font-family="monospace" font-size="11">claude-memory shell</text>
+
+                <!-- Shell content -->
+                <text x="35" y="60" fill="#e6edf3" font-family="monospace" font-size="11" font-weight="700">claude-memory shell -- type 'help' for commands, 'quit' to exit</text>
+
+                <!-- Prompt 1 -->
+                <text x="35" y="85" fill="#39d2c0" font-family="monospace" font-size="11">memory&gt;</text>
+                <text x="100" y="85" fill="#e6edf3" font-family="monospace" font-size="11">recall database setup</text>
+
+                <!-- Result 1 -->
+                <text x="45" y="110" fill="#3fb950" font-family="monospace" font-size="11">[long]</text>
+                <text x="100" y="110" fill="#e6edf3" font-family="monospace" font-size="11" font-weight="700">Project uses PostgreSQL 15</text>
+                <text x="360" y="110" fill="#3fb950" font-family="monospace" font-size="11">████████░░</text>
+                <text x="55" y="128" fill="#8b949e" font-family="monospace" font-size="10">Main database is PostgreSQL 15 with pgvector for embeddings...</text>
+
+                <!-- Result 2 -->
+                <text x="45" y="153" fill="#d29922" font-family="monospace" font-size="11">[mid]</text>
+                <text x="95" y="153" fill="#e6edf3" font-family="monospace" font-size="11" font-weight="700">Database migration to v3</text>
+                <text x="340" y="153" fill="#d29922" font-family="monospace" font-size="11">██████░░░░</text>
+                <text x="55" y="171" fill="#8b949e" font-family="monospace" font-size="10">Sprint goal: migrate schema from v2 to v3 by end of week...</text>
+
+                <!-- Result 3 -->
+                <text x="45" y="196" fill="#f85149" font-family="monospace" font-size="11">[short]</text>
+                <text x="108" y="196" fill="#e6edf3" font-family="monospace" font-size="11" font-weight="700">Debug: connection pool exhausted</text>
+                <text x="415" y="196" fill="#f85149" font-family="monospace" font-size="11">███░░░░░░░</text>
+                <text x="55" y="214" fill="#8b949e" font-family="monospace" font-size="10">Seeing connection pool exhaustion under load in staging env...</text>
+
+                <text x="45" y="239" fill="#e6edf3" font-family="monospace" font-size="11">3 memory(ies) recalled</text>
+
+                <!-- Prompt 2 -->
+                <text x="35" y="264" fill="#39d2c0" font-family="monospace" font-size="11">memory&gt;</text>
+                <text x="100" y="264" fill="#e6edf3" font-family="monospace" font-size="11">stats</text>
+                <text x="45" y="284" fill="#e6edf3" font-family="monospace" font-size="11">total: 47, links: 12</text>
+                <text x="55" y="302" fill="#3fb950" font-family="monospace" font-size="10">long: 18</text>
+                <text x="140" y="302" fill="#d29922" font-family="monospace" font-size="10">mid: 21</text>
+                <text x="220" y="302" fill="#f85149" font-family="monospace" font-size="10">short: 8</text>
+
+                <!-- Prompt 3 -->
+                <text x="35" y="325" fill="#39d2c0" font-family="monospace" font-size="11">memory&gt;</text>
+                <text x="100" y="325" fill="#8b949e" font-family="monospace" font-size="11" font-style="italic">_</text>
+            </svg>
+        </div>
+    </div>
+</section>
+
+<!-- ===================== MULTI-NODE SYNC ===================== -->
+<section id="sync">
+    <div class="container">
+        <h2>Multi-Node Sync <span class="badge">v0.2.0</span></h2>
+        <p>
+            Sync memories between database files with <code>claude-memory sync</code>. Supports pull, push, and bidirectional merge.
+            All operations use dedup-safe upsert -- title+namespace conflicts are resolved safely.
+        </p>
+
+        <div class="diagram-wrap">
+            <svg viewBox="0 0 800 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Multi-node sync diagram">
+                <!-- Local DB -->
+                <rect x="40" y="60" width="200" height="160" rx="12" fill="#161b22" stroke="#58a6ff" stroke-width="2"/>
+                <text x="140" y="90" text-anchor="middle" fill="#58a6ff" font-family="system-ui" font-size="14" font-weight="700">Local DB</text>
+                <text x="140" y="108" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="10">laptop / workstation</text>
+
+                <!-- Local memories -->
+                <rect x="60" y="120" width="160" height="22" rx="4" fill="rgba(63,185,80,0.15)" stroke="#3fb950" stroke-width="1"/>
+                <text x="140" y="135" text-anchor="middle" fill="#3fb950" font-family="monospace" font-size="10">Auth architecture [long]</text>
+                <rect x="60" y="148" width="160" height="22" rx="4" fill="rgba(210,153,34,0.15)" stroke="#d29922" stroke-width="1"/>
+                <text x="140" y="163" text-anchor="middle" fill="#d29922" font-family="monospace" font-size="10">Sprint goals [mid]</text>
+                <rect x="60" y="176" width="160" height="22" rx="4" fill="rgba(248,81,73,0.15)" stroke="#f85149" stroke-width="1"/>
+                <text x="140" y="191" text-anchor="middle" fill="#f85149" font-family="monospace" font-size="10">Debug session [short]</text>
+
+                <!-- Remote DB -->
+                <rect x="560" y="60" width="200" height="160" rx="12" fill="#161b22" stroke="#bc8cff" stroke-width="2"/>
+                <text x="660" y="90" text-anchor="middle" fill="#bc8cff" font-family="system-ui" font-size="14" font-weight="700">Remote DB</text>
+                <text x="660" y="108" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="10">server / shared</text>
+
+                <!-- Remote memories -->
+                <rect x="580" y="120" width="160" height="22" rx="4" fill="rgba(63,185,80,0.15)" stroke="#3fb950" stroke-width="1"/>
+                <text x="660" y="135" text-anchor="middle" fill="#3fb950" font-family="monospace" font-size="10">Auth architecture [long]</text>
+                <rect x="580" y="148" width="160" height="22" rx="4" fill="rgba(57,210,192,0.15)" stroke="#39d2c0" stroke-width="1"/>
+                <text x="660" y="163" text-anchor="middle" fill="#39d2c0" font-family="monospace" font-size="10">Deploy process [long]</text>
+                <rect x="580" y="176" width="160" height="22" rx="4" fill="rgba(210,153,34,0.15)" stroke="#d29922" stroke-width="1"/>
+                <text x="660" y="191" text-anchor="middle" fill="#d29922" font-family="monospace" font-size="10">API v2 notes [mid]</text>
+
+                <!-- Sync arrows (bidirectional) -->
+                <!-- Pull arrow (top) -->
+                <line x1="560" y1="120" x2="250" y2="120" stroke="#bc8cff" stroke-width="2" stroke-dasharray="6 3">
+                    <animate attributeName="stroke-dashoffset" from="30" to="0" dur="2s" repeatCount="indefinite"/>
+                </line>
+                <polygon points="250,116 240,120 250,124" fill="#bc8cff"/>
+                <text x="400" y="112" text-anchor="middle" fill="#bc8cff" font-family="monospace" font-size="10">pull</text>
+
+                <!-- Push arrow (bottom) -->
+                <line x1="240" y1="190" x2="560" y2="190" stroke="#58a6ff" stroke-width="2" stroke-dasharray="6 3">
+                    <animate attributeName="stroke-dashoffset" from="30" to="0" dur="2s" repeatCount="indefinite"/>
+                </line>
+                <polygon points="560,186 570,190 560,194" fill="#58a6ff"/>
+                <text x="400" y="206" text-anchor="middle" fill="#58a6ff" font-family="monospace" font-size="10">push</text>
+
+                <!-- Merge label -->
+                <rect x="340" y="145" width="120" height="28" rx="6" fill="#161b22" stroke="#3fb950" stroke-width="1.5"/>
+                <text x="400" y="163" text-anchor="middle" fill="#3fb950" font-family="system-ui" font-size="11" font-weight="700">merge = both</text>
+
+                <!-- Dedup note -->
+                <text x="400" y="250" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="11">Dedup-safe upsert: title+namespace conflicts resolved, tier never downgrades</text>
+
+                <!-- Direction labels -->
+                <text x="400" y="40" text-anchor="middle" fill="#e6edf3" font-family="system-ui" font-size="12" font-weight="600">claude-memory sync remote.db --direction merge</text>
+            </svg>
+        </div>
+    </div>
+</section>
+
+<!-- ===================== AUTO-CONSOLIDATION ===================== -->
+<section id="auto-consolidate" style="background: rgba(88,166,255,0.03);">
+    <div class="container">
+        <h2>Auto-Consolidation <span class="badge">v0.2.0</span></h2>
+        <p>
+            <code>claude-memory auto-consolidate</code> groups memories by namespace and primary tag, then merges groups
+            with enough members into a single long-term summary. Reduces clutter, improves recall relevance.
+        </p>
+
+        <div class="diagram-wrap">
+            <svg viewBox="0 0 800 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Auto-consolidation process">
+                <!-- Phase 1: Scattered memories -->
+                <text x="130" y="25" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="12" font-weight="600">Before: Scattered memories</text>
+
+                <!-- Namespace box -->
+                <rect x="20" y="35" width="220" height="240" rx="8" fill="rgba(57,210,192,0.05)" stroke="#30363d" stroke-width="1" stroke-dasharray="4"/>
+                <text x="130" y="55" text-anchor="middle" fill="#39d2c0" font-family="monospace" font-size="10">namespace: my-project</text>
+
+                <!-- Tag group 1: "auth" -->
+                <rect x="35" y="68" width="190" height="18" rx="3" fill="rgba(248,81,73,0.15)" stroke="#f85149" stroke-width="1"/>
+                <text x="130" y="81" text-anchor="middle" fill="#f85149" font-family="monospace" font-size="9">[short] JWT token rotation</text>
+                <rect x="35" y="90" width="190" height="18" rx="3" fill="rgba(210,153,34,0.15)" stroke="#d29922" stroke-width="1"/>
+                <text x="130" y="103" text-anchor="middle" fill="#d29922" font-family="monospace" font-size="9">[mid] RBAC middleware setup</text>
+                <rect x="35" y="112" width="190" height="18" rx="3" fill="rgba(248,81,73,0.15)" stroke="#f85149" stroke-width="1"/>
+                <text x="130" y="125" text-anchor="middle" fill="#f85149" font-family="monospace" font-size="9">[short] Session in Redis</text>
+                <rect x="35" y="134" width="190" height="18" rx="3" fill="rgba(210,153,34,0.15)" stroke="#d29922" stroke-width="1"/>
+                <text x="130" y="147" text-anchor="middle" fill="#d29922" font-family="monospace" font-size="9">[mid] OAuth2 flow notes</text>
+                <!-- Tag label -->
+                <text x="40" y="170" fill="#58a6ff" font-family="monospace" font-size="9">tag: auth (4 memories)</text>
+
+                <!-- Tag group 2: "deploy" -->
+                <rect x="35" y="185" width="190" height="18" rx="3" fill="rgba(210,153,34,0.15)" stroke="#d29922" stroke-width="1"/>
+                <text x="130" y="198" text-anchor="middle" fill="#d29922" font-family="monospace" font-size="9">[mid] Docker compose setup</text>
+                <rect x="35" y="207" width="190" height="18" rx="3" fill="rgba(248,81,73,0.15)" stroke="#f85149" stroke-width="1"/>
+                <text x="130" y="220" text-anchor="middle" fill="#f85149" font-family="monospace" font-size="9">[short] CI pipeline fix</text>
+                <rect x="35" y="229" width="190" height="18" rx="3" fill="rgba(210,153,34,0.15)" stroke="#d29922" stroke-width="1"/>
+                <text x="130" y="242" text-anchor="middle" fill="#d29922" font-family="monospace" font-size="9">[mid] Nginx config notes</text>
+                <text x="40" y="265" fill="#58a6ff" font-family="monospace" font-size="9">tag: deploy (3 memories)</text>
+
+                <!-- Arrow -->
+                <line x1="260" y1="155" x2="350" y2="155" stroke="#3fb950" stroke-width="2.5">
+                    <animate attributeName="stroke-dashoffset" from="20" to="0" dur="1s" repeatCount="indefinite"/>
+                </line>
+                <polygon points="350,150 362,155 350,160" fill="#3fb950"/>
+                <text x="306" y="145" text-anchor="middle" fill="#3fb950" font-family="system-ui" font-size="10" font-weight="600">auto-consolidate</text>
+                <text x="306" y="170" text-anchor="middle" fill="#8b949e" font-family="monospace" font-size="9">--min-count 3</text>
+
+                <!-- Phase 2: Consolidated -->
+                <text x="560" y="25" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="12" font-weight="600">After: Consolidated long-term</text>
+
+                <rect x="380" y="35" width="360" height="240" rx="8" fill="rgba(63,185,80,0.05)" stroke="#30363d" stroke-width="1" stroke-dasharray="4"/>
+                <text x="560" y="55" text-anchor="middle" fill="#39d2c0" font-family="monospace" font-size="10">namespace: my-project</text>
+
+                <!-- Consolidated memory 1 -->
+                <rect x="400" y="70" width="320" height="80" rx="6" fill="#161b22" stroke="#3fb950" stroke-width="2"/>
+                <text x="560" y="92" text-anchor="middle" fill="#3fb950" font-family="system-ui" font-size="12" font-weight="700">[long] Consolidated: auth (4 memories)</text>
+                <text x="415" y="110" fill="#8b949e" font-family="monospace" font-size="9">- JWT token rotation: ...</text>
+                <text x="415" y="123" fill="#8b949e" font-family="monospace" font-size="9">- RBAC middleware setup: ...</text>
+                <text x="415" y="136" fill="#8b949e" font-family="monospace" font-size="9">- Session in Redis: ... + OAuth2 flow...</text>
+
+                <!-- Consolidated memory 2 -->
+                <rect x="400" y="165" width="320" height="80" rx="6" fill="#161b22" stroke="#3fb950" stroke-width="2"/>
+                <text x="560" y="187" text-anchor="middle" fill="#3fb950" font-family="system-ui" font-size="12" font-weight="700">[long] Consolidated: deploy (3 memories)</text>
+                <text x="415" y="205" fill="#8b949e" font-family="monospace" font-size="9">- Docker compose setup: ...</text>
+                <text x="415" y="218" fill="#8b949e" font-family="monospace" font-size="9">- CI pipeline fix: ...</text>
+                <text x="415" y="231" fill="#8b949e" font-family="monospace" font-size="9">- Nginx config notes: ...</text>
+
+                <!-- Summary -->
+                <text x="400" y="290" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="11">7 scattered memories consolidated into 2 long-term summaries</text>
+            </svg>
+        </div>
+    </div>
+</section>
+
+<!-- ===================== CONTRADICTION RESOLUTION ===================== -->
+<section id="resolve">
+    <div class="container">
+        <h2>Contradiction Resolution <span class="badge">v0.2.0</span></h2>
+        <p>
+            When two memories conflict, <code>claude-memory resolve &lt;winner&gt; &lt;loser&gt;</code> declares the winner.
+            The loser is demoted (priority=1, confidence=0.1) and linked with a "supersedes" relation.
+        </p>
+
+        <div class="diagram-wrap">
+            <svg viewBox="0 0 800 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Contradiction resolution">
+                <!-- Phase 1: Before -->
+                <text x="200" y="25" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="12" font-weight="600">Before: Conflicting memories</text>
+
+                <!-- Memory A (will win) -->
+                <rect x="40" y="40" width="300" height="80" rx="8" fill="#161b22" stroke="#d29922" stroke-width="2"/>
+                <text x="190" y="62" text-anchor="middle" fill="#d29922" font-family="system-ui" font-size="12" font-weight="700">API uses REST with JSON</text>
+                <text x="60" y="82" fill="#8b949e" font-family="monospace" font-size="10">priority: 7</text>
+                <text x="180" y="82" fill="#8b949e" font-family="monospace" font-size="10">confidence: 1.0</text>
+                <text x="60" y="100" fill="#d29922" font-family="monospace" font-size="10">████████░░</text>
+                <text x="170" y="100" fill="#d29922" font-family="monospace" font-size="10">[mid]</text>
+                <text x="220" y="100" fill="#8b949e" font-family="monospace" font-size="10">ns=my-api</text>
+
+                <!-- Memory B (will lose) -->
+                <rect x="40" y="140" width="300" height="80" rx="8" fill="#161b22" stroke="#d29922" stroke-width="2"/>
+                <text x="190" y="162" text-anchor="middle" fill="#d29922" font-family="system-ui" font-size="12" font-weight="700">API uses GraphQL</text>
+                <text x="60" y="182" fill="#8b949e" font-family="monospace" font-size="10">priority: 6</text>
+                <text x="180" y="182" fill="#8b949e" font-family="monospace" font-size="10">confidence: 0.8</text>
+                <text x="60" y="200" fill="#d29922" font-family="monospace" font-size="10">██████░░░░</text>
+                <text x="170" y="200" fill="#d29922" font-family="monospace" font-size="10">[mid]</text>
+                <text x="220" y="200" fill="#8b949e" font-family="monospace" font-size="10">ns=my-api</text>
+
+                <!-- Conflict indicator -->
+                <text x="190" y="133" text-anchor="middle" fill="#f85149" font-family="system-ui" font-size="11" font-weight="700">CONFLICT</text>
+                <line x1="148" y1="128" x2="235" y2="128" stroke="#f85149" stroke-width="1" stroke-dasharray="3"/>
+
+                <!-- Arrow to resolved state -->
+                <line x1="360" y1="140" x2="430" y2="140" stroke="#3fb950" stroke-width="2.5">
+                    <animate attributeName="stroke-dashoffset" from="20" to="0" dur="1s" repeatCount="indefinite"/>
+                </line>
+                <polygon points="430,135 442,140 430,145" fill="#3fb950"/>
+                <text x="396" y="128" text-anchor="middle" fill="#3fb950" font-family="monospace" font-size="10">resolve</text>
+
+                <!-- Phase 2: After -->
+                <text x="610" y="25" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="12" font-weight="600">After: Winner bright, loser dimmed</text>
+
+                <!-- Winner (bright) -->
+                <rect x="450" y="40" width="300" height="80" rx="8" fill="#161b22" stroke="#3fb950" stroke-width="2.5"/>
+                <text x="600" y="62" text-anchor="middle" fill="#3fb950" font-family="system-ui" font-size="12" font-weight="700">API uses REST with JSON</text>
+                <text x="470" y="82" fill="#3fb950" font-family="monospace" font-size="10">priority: 7</text>
+                <text x="590" y="82" fill="#3fb950" font-family="monospace" font-size="10">confidence: 1.0</text>
+                <text x="470" y="100" fill="#3fb950" font-family="monospace" font-size="10">████████░░</text>
+                <text x="570" y="100" fill="#3fb950" font-family="monospace" font-size="10">WINNER</text>
+                <text x="640" y="100" fill="#3fb950" font-family="monospace" font-size="10">touched +1</text>
+
+                <!-- Supersedes arrow -->
+                <line x1="600" y1="120" x2="600" y2="145" stroke="#58a6ff" stroke-width="2"/>
+                <polygon points="596,145 600,155 604,145" fill="#58a6ff"/>
+                <text x="640" y="140" fill="#58a6ff" font-family="monospace" font-size="9">supersedes</text>
+
+                <!-- Loser (dimmed) -->
+                <rect x="450" y="155" width="300" height="80" rx="8" fill="#0d1117" stroke="#30363d" stroke-width="1" opacity="0.6"/>
+                <text x="600" y="177" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="12" opacity="0.5">API uses GraphQL</text>
+                <text x="470" y="197" fill="#f85149" font-family="monospace" font-size="10" opacity="0.6">priority: 1</text>
+                <text x="590" y="197" fill="#f85149" font-family="monospace" font-size="10" opacity="0.6">confidence: 0.1</text>
+                <text x="470" y="215" fill="#8b949e" font-family="monospace" font-size="10" opacity="0.4">█░░░░░░░░░</text>
+                <text x="570" y="215" fill="#8b949e" font-family="monospace" font-size="10" opacity="0.5">DEMOTED</text>
+
+                <!-- Summary -->
+                <text x="400" y="268" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="11">Loser remains searchable but ranks far lower due to reduced priority and confidence</text>
+            </svg>
+        </div>
     </div>
 </section>
 
@@ -859,7 +1147,7 @@ curl "http://127.0.0.1:9077/api/v1/recall?context=test"</code></pre>
             <a href="https://github.com/alphaonedev/claude-memory/blob/main/docs/DEVELOPER_GUIDE.md">Developer Guide</a> &middot;
             <a href="https://github.com/alphaonedev/claude-memory/blob/main/docs/ADMIN_GUIDE.md">Admin Guide</a>
         </p>
-        <p style="margin-top: 0.75rem;">MIT License</p>
+        <p style="margin-top: 0.75rem;">v0.2.0 &middot; MIT License</p>
     </div>
 </footer>
 
