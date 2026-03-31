@@ -1,3 +1,4 @@
+mod color;
 mod db;
 mod errors;
 mod handlers;
@@ -78,8 +79,18 @@ enum Command {
     Export,
     /// Import memories from JSON (stdin)
     Import,
+    /// Resolve a contradiction — mark one memory as superseding another
+    Resolve(ResolveArgs),
+    /// Interactive memory shell (REPL)
+    Shell,
+    /// Sync memories between two database files
+    Sync(SyncArgs),
+    /// Auto-consolidate short-term memories by namespace
+    AutoConsolidate(AutoConsolidateArgs),
     /// Generate shell completions
     Completions(CompletionsArgs),
+    /// Generate man page
+    Man,
 }
 
 #[derive(Args)]
@@ -224,6 +235,39 @@ struct ConsolidateArgs {
 }
 
 #[derive(Args)]
+struct ResolveArgs {
+    /// ID of the memory that wins (supersedes)
+    winner_id: String,
+    /// ID of the memory that loses (superseded)
+    loser_id: String,
+}
+
+#[derive(Args)]
+struct SyncArgs {
+    /// Path to the remote database to sync with
+    remote_db: PathBuf,
+    /// Direction: pull, push, or merge
+    #[arg(long, short, default_value = "merge")]
+    direction: String,
+}
+
+#[derive(Args)]
+struct AutoConsolidateArgs {
+    /// Namespace to consolidate
+    #[arg(long, short)]
+    namespace: Option<String>,
+    /// Only consolidate short-term memories
+    #[arg(long, default_value_t = false)]
+    short_only: bool,
+    /// Minimum number of memories to trigger consolidation
+    #[arg(long, default_value_t = 3)]
+    min_count: usize,
+    /// Dry run — show what would be consolidated without doing it
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
+}
+
+#[derive(Args)]
 struct CompletionsArgs {
     shell: Shell,
 }
@@ -275,6 +319,7 @@ fn human_age(iso: &str) -> String {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    color::init();
     let cli = Cli::parse();
     let j = cli.json;
     match cli.command {
@@ -294,6 +339,10 @@ async fn main() -> Result<()> {
         Command::Forget(a) => cmd_forget(cli.db, a, j),
         Command::Link(a) => cmd_link(cli.db, a, j),
         Command::Consolidate(a) => cmd_consolidate(cli.db, a, j),
+        Command::Resolve(a) => cmd_resolve(cli.db, a, j),
+        Command::Shell => cmd_shell(cli.db),
+        Command::Sync(a) => cmd_sync(cli.db, a, j),
+        Command::AutoConsolidate(a) => cmd_auto_consolidate(cli.db, a, j),
         Command::Gc => cmd_gc(cli.db, j),
         Command::Stats => cmd_stats(cli.db, j),
         Command::Namespaces => cmd_namespaces(cli.db, j),
@@ -306,6 +355,12 @@ async fn main() -> Result<()> {
                 "claude-memory",
                 &mut std::io::stdout(),
             );
+            Ok(())
+        }
+        Command::Man => {
+            let cmd = Cli::command();
+            let man = clap_mangen::Man::new(cmd);
+            man.render(&mut std::io::stdout())?;
             Ok(())
         }
     }
@@ -541,18 +596,17 @@ fn cmd_recall(db_path: PathBuf, args: RecallArgs, json_out: bool) -> Result<()> 
             String::new()
         };
         println!(
-            "[{}/{}] {} (p={}, ns={}, {}x, {}{})",
-            mem.tier,
-            &mem.id[..8],
-            mem.title,
-            mem.priority,
-            mem.namespace,
+            "[{}] {} {} (ns={}, {}x, {}{})",
+            color::tier_color(mem.tier.as_str(), &format!("{}/{}", mem.tier, &mem.id[..8])),
+            color::bold(&mem.title),
+            color::priority_bar(mem.priority),
+            color::cyan(&mem.namespace),
             mem.access_count,
-            age,
+            color::dim(&age),
             conf
         );
         let preview: String = mem.content.chars().take(200).collect();
-        println!("  {}\n", preview);
+        println!("  {}\n", color::dim(&preview));
     }
     println!("{} memory(ies) recalled", results.len());
     Ok(())
@@ -897,6 +951,388 @@ fn cmd_import(db_path: PathBuf, json_out: bool) -> Result<()> {
                 eprintln!("  {}", e);
             }
         }
+    }
+    Ok(())
+}
+
+fn cmd_resolve(db_path: PathBuf, args: ResolveArgs, json_out: bool) -> Result<()> {
+    let conn = db::open(&db_path)?;
+    db::create_link(&conn, &args.winner_id, &args.loser_id, "supersedes")?;
+    db::update(
+        &conn,
+        &args.loser_id,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(1),
+        Some(0.1),
+        None,
+    )?;
+    db::touch(&conn, &args.winner_id)?;
+    if json_out {
+        println!(
+            "{}",
+            serde_json::json!({"resolved": true, "winner": args.winner_id, "loser": args.loser_id})
+        );
+    } else {
+        println!(
+            "resolved: {} supersedes {}",
+            color::long(&args.winner_id),
+            color::dim(&args.loser_id)
+        );
+    }
+    Ok(())
+}
+
+fn cmd_shell(db_path: PathBuf) -> Result<()> {
+    let conn = db::open(&db_path)?;
+    println!(
+        "{}",
+        color::bold("claude-memory shell — type 'help' for commands, 'quit' to exit")
+    );
+    let stdin = std::io::stdin();
+    loop {
+        eprint!("{} ", color::cyan("memory>"));
+        let mut line = String::new();
+        if stdin.read_line(&mut line)? == 0 {
+            break;
+        }
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.is_empty() {
+            continue;
+        }
+        match parts[0] {
+            "quit" | "exit" | "q" => break,
+            "help" | "h" => {
+                println!("  recall <context>    — fuzzy recall");
+                println!("  search <query>      — keyword search");
+                println!("  list [namespace]    — list memories");
+                println!("  get <id>            — show memory details");
+                println!("  stats               — show statistics");
+                println!("  namespaces          — list namespaces");
+                println!("  delete <id>         — delete a memory");
+                println!("  quit                — exit shell");
+            }
+            "recall" | "r" => {
+                let ctx = parts[1..].join(" ");
+                if ctx.is_empty() {
+                    eprintln!("usage: recall <context>");
+                    continue;
+                }
+                match db::recall(&conn, &ctx, None, 10, None, None) {
+                    Ok(results) => {
+                        for mem in &results {
+                            println!(
+                                "  [{}] {} {}",
+                                color::tier_color(mem.tier.as_str(), mem.tier.as_str()),
+                                color::bold(&mem.title),
+                                color::priority_bar(mem.priority)
+                            );
+                            let preview: String = mem.content.chars().take(100).collect();
+                            println!("    {}", color::dim(&preview));
+                        }
+                        println!("  {} result(s)", results.len());
+                    }
+                    Err(e) => eprintln!("error: {e}"),
+                }
+            }
+            "search" | "s" => {
+                let q = parts[1..].join(" ");
+                if q.is_empty() {
+                    eprintln!("usage: search <query>");
+                    continue;
+                }
+                match db::search(&conn, &q, None, None, 20, None, None, None, None) {
+                    Ok(results) => {
+                        for mem in &results {
+                            println!(
+                                "  [{}] {} (p={})",
+                                color::tier_color(mem.tier.as_str(), mem.tier.as_str()),
+                                mem.title,
+                                mem.priority
+                            );
+                        }
+                        println!("  {} result(s)", results.len());
+                    }
+                    Err(e) => eprintln!("error: {e}"),
+                }
+            }
+            "list" | "ls" => {
+                let ns = parts.get(1).copied();
+                match db::list(&conn, ns, None, 20, 0, None, None, None, None) {
+                    Ok(results) => {
+                        for mem in &results {
+                            let age = human_age(&mem.updated_at);
+                            println!(
+                                "  [{}] {} (ns={}, {})",
+                                color::tier_color(mem.tier.as_str(), mem.tier.as_str()),
+                                mem.title,
+                                mem.namespace,
+                                color::dim(&age)
+                            );
+                        }
+                        println!("  {} memory(ies)", results.len());
+                    }
+                    Err(e) => eprintln!("error: {e}"),
+                }
+            }
+            "get" => {
+                let id = parts.get(1).unwrap_or(&"");
+                if id.is_empty() {
+                    eprintln!("usage: get <id>");
+                    continue;
+                }
+                match db::get(&conn, id) {
+                    Ok(Some(mem)) => {
+                        println!("{}", serde_json::to_string_pretty(&mem).unwrap_or_default())
+                    }
+                    Ok(None) => eprintln!("not found"),
+                    Err(e) => eprintln!("error: {e}"),
+                }
+            }
+            "stats" => match db::stats(&conn, &db_path) {
+                Ok(s) => {
+                    println!("  total: {}, links: {}", s.total, s.links_count);
+                    for t in &s.by_tier {
+                        println!("    {}: {}", color::tier_color(&t.tier, &t.tier), t.count);
+                    }
+                }
+                Err(e) => eprintln!("error: {e}"),
+            },
+            "namespaces" | "ns" => match db::list_namespaces(&conn) {
+                Ok(ns) => {
+                    for n in &ns {
+                        println!("  {}: {}", color::cyan(&n.namespace), n.count);
+                    }
+                }
+                Err(e) => eprintln!("error: {e}"),
+            },
+            "delete" | "del" | "rm" => {
+                let id = parts.get(1).unwrap_or(&"");
+                if id.is_empty() {
+                    eprintln!("usage: delete <id>");
+                    continue;
+                }
+                match db::delete(&conn, id) {
+                    Ok(true) => println!("  deleted"),
+                    Ok(false) => eprintln!("  not found"),
+                    Err(e) => eprintln!("error: {e}"),
+                }
+            }
+            _ => eprintln!("unknown command: {}. Type 'help' for commands.", parts[0]),
+        }
+    }
+    println!("goodbye");
+    Ok(())
+}
+
+fn cmd_sync(db_path: PathBuf, args: SyncArgs, json_out: bool) -> Result<()> {
+    let local_conn = db::open(&db_path)?;
+    let remote_conn = db::open(&args.remote_db)?;
+    match args.direction.as_str() {
+        "pull" => {
+            let mems = db::export_all(&remote_conn)?;
+            let links = db::export_links(&remote_conn)?;
+            let mut n = 0;
+            for mem in &mems {
+                if db::insert(&local_conn, mem).is_ok() {
+                    n += 1;
+                }
+            }
+            for link in &links {
+                let _ = db::create_link(
+                    &local_conn,
+                    &link.source_id,
+                    &link.target_id,
+                    &link.relation,
+                );
+            }
+            if json_out {
+                println!(
+                    "{}",
+                    serde_json::json!({"direction": "pull", "imported": n})
+                );
+            } else {
+                println!("pulled {} memories from remote", n);
+            }
+        }
+        "push" => {
+            let mems = db::export_all(&local_conn)?;
+            let links = db::export_links(&local_conn)?;
+            let mut n = 0;
+            for mem in &mems {
+                if db::insert(&remote_conn, mem).is_ok() {
+                    n += 1;
+                }
+            }
+            for link in &links {
+                let _ = db::create_link(
+                    &remote_conn,
+                    &link.source_id,
+                    &link.target_id,
+                    &link.relation,
+                );
+            }
+            if json_out {
+                println!(
+                    "{}",
+                    serde_json::json!({"direction": "push", "exported": n})
+                );
+            } else {
+                println!("pushed {} memories to remote", n);
+            }
+        }
+        "merge" => {
+            let r_mems = db::export_all(&remote_conn)?;
+            let r_links = db::export_links(&remote_conn)?;
+            let l_mems = db::export_all(&local_conn)?;
+            let l_links = db::export_links(&local_conn)?;
+            let (mut pulled, mut pushed) = (0, 0);
+            for mem in &r_mems {
+                if db::insert(&local_conn, mem).is_ok() {
+                    pulled += 1;
+                }
+            }
+            for link in &r_links {
+                let _ = db::create_link(
+                    &local_conn,
+                    &link.source_id,
+                    &link.target_id,
+                    &link.relation,
+                );
+            }
+            for mem in &l_mems {
+                if db::insert(&remote_conn, mem).is_ok() {
+                    pushed += 1;
+                }
+            }
+            for link in &l_links {
+                let _ = db::create_link(
+                    &remote_conn,
+                    &link.source_id,
+                    &link.target_id,
+                    &link.relation,
+                );
+            }
+            if json_out {
+                println!(
+                    "{}",
+                    serde_json::json!({"direction": "merge", "pulled": pulled, "pushed": pushed})
+                );
+            } else {
+                println!("merged: pulled {}, pushed {}", pulled, pushed);
+            }
+        }
+        _ => anyhow::bail!(
+            "invalid direction: {} (use pull, push, merge)",
+            args.direction
+        ),
+    }
+    Ok(())
+}
+
+fn cmd_auto_consolidate(db_path: PathBuf, args: AutoConsolidateArgs, json_out: bool) -> Result<()> {
+    let conn = db::open(&db_path)?;
+    let tier_filter = if args.short_only {
+        Some(Tier::Short)
+    } else {
+        None
+    };
+    let namespaces = if let Some(ref ns) = args.namespace {
+        vec![models::NamespaceCount {
+            namespace: ns.clone(),
+            count: 0,
+        }]
+    } else {
+        db::list_namespaces(&conn)?
+    };
+
+    let mut total = 0;
+    let mut groups = Vec::new();
+
+    for ns in &namespaces {
+        let memories = db::list(
+            &conn,
+            Some(&ns.namespace),
+            tier_filter.as_ref(),
+            200,
+            0,
+            None,
+            None,
+            None,
+            None,
+        )?;
+        if memories.len() < args.min_count {
+            continue;
+        }
+
+        // Group by primary tag
+        let mut tag_groups: std::collections::HashMap<String, Vec<&models::Memory>> =
+            std::collections::HashMap::new();
+        for mem in &memories {
+            let key = mem
+                .tags
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "_untagged".to_string());
+            tag_groups.entry(key).or_default().push(mem);
+        }
+
+        for (tag, group) in &tag_groups {
+            if group.len() < args.min_count {
+                continue;
+            }
+            let ids: Vec<String> = group.iter().map(|m| m.id.clone()).collect();
+            if args.dry_run {
+                let titles: Vec<&str> = group.iter().map(|m| m.title.as_str()).collect();
+                groups.push(serde_json::json!({"namespace": ns.namespace, "tag": tag, "count": group.len(), "titles": titles}));
+            } else {
+                let title = format!(
+                    "Consolidated: {} ({} memories)",
+                    if tag == "_untagged" {
+                        &ns.namespace
+                    } else {
+                        tag
+                    },
+                    group.len()
+                );
+                let content: String = group
+                    .iter()
+                    .map(|m| format!("- {}: {}", m.title, &m.content[..m.content.len().min(200)]))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                db::consolidate(
+                    &conn,
+                    &ids,
+                    &title,
+                    &content,
+                    &ns.namespace,
+                    &Tier::Long,
+                    "auto-consolidate",
+                )?;
+                total += group.len();
+            }
+        }
+    }
+
+    if json_out {
+        if args.dry_run {
+            println!("{}", serde_json::json!({"dry_run": true, "groups": groups}));
+        } else {
+            println!("{}", serde_json::json!({"consolidated": total}));
+        }
+    } else if args.dry_run {
+        println!("dry run — would consolidate:");
+        for g in &groups {
+            println!(
+                "  {} [{}]: {} memories",
+                g["namespace"], g["tag"], g["count"]
+            );
+        }
+    } else {
+        println!("auto-consolidated {} memories", total);
     }
     Ok(())
 }
