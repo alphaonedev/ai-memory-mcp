@@ -298,6 +298,129 @@ claude-memory store -T "Deploy process" -c "..." --tags "devops,ci,deploy"
 claude-memory recall "deployment" --tags "devops"
 ```
 
+## Interactive Shell
+
+The `shell` command opens a REPL (read-eval-print loop) for browsing and managing memories interactively. Output uses color-coded tier labels and priority bars.
+
+```bash
+claude-memory shell
+```
+
+Available REPL commands:
+
+| Command | Description |
+|---------|-------------|
+| `recall <context>` (or `r`) | Fuzzy recall with colored output |
+| `search <query>` (or `s`) | Keyword search |
+| `list [namespace]` (or `ls`) | List memories, optionally filtered by namespace |
+| `get <id>` | Show full memory details as JSON |
+| `stats` | Show memory statistics with tier breakdown |
+| `namespaces` (or `ns`) | List all namespaces with counts |
+| `delete <id>` (or `del`, `rm`) | Delete a memory |
+| `help` (or `h`) | Show command help |
+| `quit` (or `exit`, `q`) | Exit the shell |
+
+In the shell, tier labels are color-coded: red for short, yellow for mid, green for long. Priority is shown as a visual bar (`████░░░░░░`).
+
+## Color Output
+
+CLI output uses ANSI colors when connected to a terminal (auto-detected). Colors are suppressed when piping to a file or another command. Use `--json` for machine-parseable output.
+
+Color scheme:
+- **Tier labels**: red = short, yellow = mid, green = long
+- **Priority bars**: `█████░░░░░` (green for 8+, yellow for 5-7, red for 1-4)
+- **Titles**: bold
+- **Content previews**: dim
+- **Namespaces**: cyan
+- **Memory IDs**: colored by tier
+
+## Multi-Node Sync
+
+Sync memories between two SQLite database files. Useful for keeping laptop and server in sync, or merging memories from different machines.
+
+```bash
+# Pull all memories from remote database into local
+claude-memory sync /path/to/remote.db --direction pull
+
+# Push local memories to remote database
+claude-memory sync /path/to/remote.db --direction push
+
+# Bidirectional merge -- both databases end up with all memories
+claude-memory sync /path/to/remote.db --direction merge
+```
+
+Sync uses the same dedup-safe upsert as regular stores:
+- Title+namespace conflicts are resolved by keeping the higher priority
+- Tier never downgrades (a long memory stays long)
+- Links are synced alongside memories
+
+**Typical workflow** (laptop and server):
+
+```bash
+# On laptop, mount remote DB (e.g., via sshfs or rsync'd copy)
+scp server:/var/lib/claude-memory/claude-memory.db /tmp/remote-memory.db
+
+# Merge both ways
+claude-memory sync /tmp/remote-memory.db --direction merge
+
+# Copy merged remote back
+scp /tmp/remote-memory.db server:/var/lib/claude-memory/claude-memory.db
+```
+
+## Auto-Consolidation
+
+Automatically group memories by namespace and primary tag, then consolidate groups with enough members into a single long-term summary:
+
+```bash
+# Dry run -- see what would be consolidated
+claude-memory auto-consolidate --dry-run
+
+# Consolidate all namespaces (groups of 3+ memories)
+claude-memory auto-consolidate
+
+# Only short-term memories, minimum 5 per group
+claude-memory auto-consolidate --short-only --min-count 5
+
+# Only a specific namespace
+claude-memory auto-consolidate --namespace my-project
+```
+
+How it works:
+1. Lists all namespaces (or the specified one)
+2. For each namespace, groups memories by their primary tag (first tag)
+3. Groups with >= `min_count` members are consolidated into one long-term memory
+4. The consolidated memory gets the title "Consolidated: tag (N memories)" and combines the content from all source memories
+5. Source memories are deleted; the new memory inherits the highest priority and all tags
+
+Use `--dry-run` first to preview what would be consolidated.
+
+## Contradiction Resolution
+
+When two memories conflict, resolve the contradiction by declaring a winner:
+
+```bash
+claude-memory resolve <winner_id> <loser_id>
+```
+
+This command:
+1. Creates a "supersedes" link from the winner to the loser
+2. Demotes the loser (priority set to 1, confidence set to 0.1)
+3. Touches the winner (bumps access count, extends TTL)
+
+The loser memory is not deleted -- it remains searchable but ranks much lower due to its reduced priority and confidence.
+
+## Man Page
+
+Generate and view the built-in man page:
+
+```bash
+# View immediately
+claude-memory man | man -l -
+
+# Install system-wide
+claude-memory man | sudo tee /usr/local/share/man/man1/claude-memory.1 > /dev/null
+```
+
 ## FAQ
 
 **Q: Where is the database stored?**
