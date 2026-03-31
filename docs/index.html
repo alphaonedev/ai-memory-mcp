@@ -3,8 +3,8 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>claude-memory — Persistent Memory for Claude Code</title>
-    <meta name="description" content="A lightweight Rust daemon that gives Claude Code persistent memory across sessions. SQLite + FTS5, three memory tiers, HTTP API, CLI access.">
+    <title>claude-memory -- Persistent Memory for Claude Code</title>
+    <meta name="description" content="A Rust daemon that gives Claude Code persistent memory across sessions. Three-tier recall, SQLite FTS5, HTTP API, CLI.">
     <style>
         :root {
             --bg: #0d1117;
@@ -19,12 +19,12 @@
             --orange: #d29922;
             --purple: #bc8cff;
             --red: #f85149;
+            --cyan: #39d2c0;
             --font-mono: 'SF Mono', 'Cascadia Code', 'Fira Code', 'JetBrains Mono', Consolas, monospace;
             --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
         }
 
         * { margin: 0; padding: 0; box-sizing: border-box; }
-
         html { scroll-behavior: smooth; }
 
         body {
@@ -33,21 +33,14 @@
             color: var(--text);
             line-height: 1.6;
             -webkit-font-smoothing: antialiased;
+            overflow-x: hidden;
         }
 
         a { color: var(--accent); text-decoration: none; }
         a:hover { text-decoration: underline; }
 
-        code, pre {
-            font-family: var(--font-mono);
-            font-size: 0.875rem;
-        }
-
-        code {
-            background: var(--bg-code);
-            padding: 0.15em 0.4em;
-            border-radius: 4px;
-        }
+        code, pre { font-family: var(--font-mono); font-size: 0.875rem; }
+        code { background: var(--bg-code); padding: 0.15em 0.4em; border-radius: 4px; }
 
         pre {
             background: var(--bg-code);
@@ -56,654 +49,916 @@
             padding: 1.25rem;
             overflow-x: auto;
             line-height: 1.5;
+            position: relative;
         }
+        pre code { background: none; padding: 0; }
 
-        pre code {
-            background: none;
-            padding: 0;
-        }
+        .container { max-width: 1000px; margin: 0 auto; padding: 0 1.5rem; }
 
-        .container {
-            max-width: 960px;
-            margin: 0 auto;
-            padding: 0 1.5rem;
-        }
-
-        /* Nav */
+        /* ---- Nav ---- */
         nav {
-            position: sticky;
-            top: 0;
-            z-index: 100;
-            background: rgba(13, 17, 23, 0.85);
-            backdrop-filter: blur(12px);
+            position: sticky; top: 0; z-index: 100;
+            background: rgba(13, 17, 23, 0.88);
+            backdrop-filter: blur(14px);
+            -webkit-backdrop-filter: blur(14px);
             border-bottom: 1px solid var(--border);
             padding: 0.75rem 0;
         }
-
-        nav .container {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-
-        nav .logo {
-            font-family: var(--font-mono);
-            font-weight: 700;
-            font-size: 1rem;
-            color: var(--text);
-        }
-
-        nav .links { display: flex; gap: 1.5rem; }
-
-        nav .links a {
-            color: var(--text-muted);
-            font-size: 0.875rem;
-            transition: color 0.15s;
-        }
-
+        nav .container { display: flex; justify-content: space-between; align-items: center; }
+        nav .logo { font-family: var(--font-mono); font-weight: 700; font-size: 1rem; color: var(--text); }
+        nav .logo .accent { color: var(--accent); }
+        nav .links { display: flex; gap: 1.5rem; flex-wrap: wrap; }
+        nav .links a { color: var(--text-muted); font-size: 0.85rem; transition: color 0.15s; }
         nav .links a:hover { color: var(--text); text-decoration: none; }
 
-        /* Hero */
-        .hero {
-            padding: 6rem 0 4rem;
-            text-align: center;
-        }
+        /* ---- Sections ---- */
+        section { padding: 5rem 0; }
+        section + section { border-top: 1px solid var(--border); }
+        h2 { font-size: 1.85rem; font-weight: 700; margin-bottom: 0.5rem; letter-spacing: -0.01em; }
+        h3 { font-size: 1.15rem; font-weight: 600; margin-bottom: 0.75rem; }
+        .section-sub { color: var(--text-muted); margin-bottom: 2rem; font-size: 1rem; max-width: 700px; }
 
+        /* ---- Hero ---- */
+        .hero {
+            padding: 7rem 0 5rem;
+            text-align: center;
+            position: relative;
+            overflow: hidden;
+        }
+        .hero::before {
+            content: '';
+            position: absolute;
+            top: -40%; left: 50%; transform: translateX(-50%);
+            width: 900px; height: 900px;
+            background: radial-gradient(circle, rgba(88,166,255,0.06) 0%, transparent 70%);
+            pointer-events: none;
+        }
         .hero h1 {
             font-family: var(--font-mono);
-            font-size: 3rem;
-            font-weight: 800;
-            margin-bottom: 1rem;
-            letter-spacing: -0.02em;
+            font-size: 3.5rem; font-weight: 800;
+            margin-bottom: 1rem; letter-spacing: -0.03em;
+            position: relative;
         }
-
         .hero h1 .accent { color: var(--accent); }
-
         .hero .tagline {
-            font-size: 1.25rem;
-            color: var(--text-muted);
-            max-width: 600px;
-            margin: 0 auto 2rem;
+            font-size: 1.3rem; color: var(--text-muted);
+            max-width: 550px; margin: 0 auto 2.5rem;
+            position: relative;
         }
 
         .hero .stats {
-            display: flex;
-            justify-content: center;
-            gap: 2.5rem;
-            margin-bottom: 2.5rem;
-            flex-wrap: wrap;
+            display: flex; justify-content: center; gap: 3rem;
+            margin-bottom: 2.5rem; flex-wrap: wrap;
+            position: relative;
         }
-
-        .hero .stat {
-            text-align: center;
-        }
-
+        .hero .stat { text-align: center; }
         .hero .stat .value {
-            font-family: var(--font-mono);
-            font-size: 1.5rem;
-            font-weight: 700;
-            color: var(--green);
+            font-family: var(--font-mono); font-size: 1.6rem; font-weight: 700;
+        }
+        .hero .stat:nth-child(1) .value { color: var(--green); }
+        .hero .stat:nth-child(2) .value { color: var(--accent); }
+        .hero .stat:nth-child(3) .value { color: var(--purple); }
+        .hero .stat:nth-child(4) .value { color: var(--orange); }
+        .hero .stat .label {
+            font-size: 0.78rem; color: var(--text-muted);
+            text-transform: uppercase; letter-spacing: 0.06em;
         }
 
-        .hero .stat .label {
-            font-size: 0.8rem;
-            color: var(--text-muted);
-            text-transform: uppercase;
-            letter-spacing: 0.05em;
+        /* Stat count-up animation */
+        @keyframes fadeSlideUp {
+            from { opacity: 0; transform: translateY(16px); }
+            to { opacity: 1; transform: translateY(0); }
         }
+        .hero .stat { animation: fadeSlideUp 0.6s ease-out both; }
+        .hero .stat:nth-child(1) { animation-delay: 0.1s; }
+        .hero .stat:nth-child(2) { animation-delay: 0.25s; }
+        .hero .stat:nth-child(3) { animation-delay: 0.4s; }
+        .hero .stat:nth-child(4) { animation-delay: 0.55s; }
 
         .hero .cta {
-            display: inline-flex;
-            gap: 1rem;
-            flex-wrap: wrap;
-            justify-content: center;
+            display: inline-flex; gap: 1rem; flex-wrap: wrap;
+            justify-content: center; position: relative;
         }
-
         .btn {
-            display: inline-block;
-            padding: 0.65rem 1.5rem;
-            border-radius: 6px;
-            font-size: 0.9rem;
-            font-weight: 600;
-            transition: all 0.15s;
+            display: inline-block; padding: 0.7rem 1.6rem; border-radius: 6px;
+            font-size: 0.9rem; font-weight: 600; transition: all 0.15s;
             border: 1px solid transparent;
         }
-
         .btn-primary {
-            background: var(--accent-dim);
-            color: #fff;
-            border-color: var(--accent-dim);
+            background: var(--accent-dim); color: #fff; border-color: var(--accent-dim);
         }
-
-        .btn-primary:hover {
-            background: var(--accent);
-            text-decoration: none;
-        }
-
+        .btn-primary:hover { background: var(--accent); text-decoration: none; }
         .btn-secondary {
-            background: transparent;
-            color: var(--text);
-            border-color: var(--border);
+            background: transparent; color: var(--text); border-color: var(--border);
+        }
+        .btn-secondary:hover { border-color: var(--text-muted); text-decoration: none; }
+
+        /* ---- SVG Diagrams Shared ---- */
+        .svg-container {
+            display: flex; justify-content: center; margin: 2rem 0;
+            overflow-x: auto;
+        }
+        .svg-container svg { max-width: 100%; height: auto; }
+
+        /* ---- Pulse animation for nodes ---- */
+        @keyframes pulse {
+            0%, 100% { r: 6; opacity: 1; }
+            50% { r: 9; opacity: 0.7; }
+        }
+        @keyframes pulse-ring {
+            0% { r: 6; opacity: 0.6; }
+            100% { r: 20; opacity: 0; }
+        }
+        @keyframes dash-flow {
+            to { stroke-dashoffset: -20; }
+        }
+        @keyframes fade-in-grow {
+            from { opacity: 0; transform: scale(0.85); }
+            to { opacity: 1; transform: scale(1); }
+        }
+        @keyframes glow {
+            0%, 100% { filter: drop-shadow(0 0 2px currentColor); }
+            50% { filter: drop-shadow(0 0 8px currentColor); }
+        }
+        @keyframes bar-grow {
+            from { width: 0; }
         }
 
-        .btn-secondary:hover {
-            border-color: var(--text-muted);
-            text-decoration: none;
+        /* ---- How It Works: Three-Tier Flow ---- */
+        .tier-flow-arrow {
+            stroke-dasharray: 6 4;
+            animation: dash-flow 1s linear infinite;
+        }
+        .tier-node-pulse {
+            animation: pulse 2s ease-in-out infinite;
+        }
+        .tier-ring {
+            animation: pulse-ring 2s ease-out infinite;
+            fill: none;
+        }
+        .tier-promote-arrow {
+            stroke-dasharray: 4 3;
+            animation: dash-flow 1.5s linear infinite;
         }
 
-        /* Sections */
-        section {
-            padding: 4rem 0;
+        /* ---- Memory Lifecycle Timeline ---- */
+        @keyframes timeline-dot-pop {
+            0% { r: 0; opacity: 0; }
+            60% { r: 7; opacity: 1; }
+            100% { r: 5; opacity: 1; }
+        }
+        .timeline-dot { animation: timeline-dot-pop 0.5s ease-out both; }
+        .timeline-dot:nth-child(2) { animation-delay: 0.3s; }
+        .timeline-dot:nth-child(3) { animation-delay: 0.6s; }
+
+        @keyframes ttl-extend {
+            from { width: 0; }
         }
 
-        section + section {
-            border-top: 1px solid var(--border);
+        /* ---- Scoring Bars ---- */
+        .score-bar-fill {
+            animation: bar-grow 1.2s ease-out both;
+            transform-origin: left;
         }
+        .score-bar-fill:nth-child(1) { animation-delay: 0.1s; }
+        .score-bar-fill:nth-child(2) { animation-delay: 0.3s; }
+        .score-bar-fill:nth-child(3) { animation-delay: 0.5s; }
+        .score-bar-fill:nth-child(4) { animation-delay: 0.7s; }
+        .score-bar-fill:nth-child(5) { animation-delay: 0.9s; }
 
-        h2 {
-            font-size: 1.75rem;
-            font-weight: 700;
-            margin-bottom: 1.5rem;
-            letter-spacing: -0.01em;
-        }
-
-        h3 {
-            font-size: 1.15rem;
-            font-weight: 600;
-            margin-bottom: 0.75rem;
-        }
-
-        p + p { margin-top: 0.75rem; }
-
-        /* Feature grid */
+        /* ---- Feature Grid ---- */
         .feature-grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
             gap: 1.25rem;
         }
-
         .feature-card {
             background: var(--bg-card);
             border: 1px solid var(--border);
             border-radius: 8px;
             padding: 1.5rem;
+            transition: border-color 0.2s;
         }
-
-        .feature-card .icon {
-            font-size: 1.5rem;
-            margin-bottom: 0.5rem;
-            display: block;
+        .feature-card:hover { border-color: var(--accent); }
+        .feature-card .fc-icon {
+            width: 36px; height: 36px;
+            margin-bottom: 0.75rem;
         }
+        .feature-card h3 { margin-bottom: 0.4rem; font-size: 1.05rem; }
+        .feature-card p { font-size: 0.88rem; color: var(--text-muted); line-height: 1.55; }
 
-        .feature-card h3 { margin-bottom: 0.5rem; }
-
-        .feature-card p {
-            font-size: 0.9rem;
-            color: var(--text-muted);
-            line-height: 1.5;
-        }
-
-        /* Tier diagram */
+        /* ---- Tier Cards ---- */
         .tiers {
-            display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 1.25rem;
-            margin-top: 1.5rem;
+            display: grid; grid-template-columns: repeat(3, 1fr);
+            gap: 1.25rem; margin-top: 1.5rem;
         }
-
         .tier-card {
             background: var(--bg-card);
             border: 1px solid var(--border);
             border-radius: 8px;
             padding: 1.5rem;
             text-align: center;
-            position: relative;
-            overflow: hidden;
+            position: relative; overflow: hidden;
         }
-
         .tier-card::before {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: 0;
-            right: 0;
-            height: 3px;
+            content: ''; position: absolute;
+            top: 0; left: 0; right: 0; height: 3px;
         }
-
         .tier-card.short::before { background: var(--orange); }
         .tier-card.mid::before { background: var(--accent); }
         .tier-card.long::before { background: var(--green); }
-
         .tier-card .tier-name {
-            font-family: var(--font-mono);
-            font-weight: 700;
-            font-size: 1.1rem;
+            font-family: var(--font-mono); font-weight: 700; font-size: 1.1rem;
             margin-bottom: 0.25rem;
         }
-
         .tier-card.short .tier-name { color: var(--orange); }
         .tier-card.mid .tier-name { color: var(--accent); }
         .tier-card.long .tier-name { color: var(--green); }
-
         .tier-card .ttl {
-            font-family: var(--font-mono);
-            font-size: 0.85rem;
-            color: var(--text-muted);
-            margin-bottom: 0.75rem;
+            font-family: var(--font-mono); font-size: 0.85rem;
+            color: var(--text-muted); margin-bottom: 0.75rem;
         }
+        .tier-card p { font-size: 0.85rem; color: var(--text-muted); }
 
-        .tier-card p {
-            font-size: 0.85rem;
-            color: var(--text-muted);
-        }
-
-        /* Tables */
-        .table-wrap {
-            overflow-x: auto;
-            margin-top: 1rem;
-        }
-
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            font-size: 0.875rem;
-        }
-
-        th, td {
-            text-align: left;
-            padding: 0.65rem 1rem;
-            border-bottom: 1px solid var(--border);
-        }
-
+        /* ---- Tables ---- */
+        .table-wrap { overflow-x: auto; margin-top: 1rem; }
+        table { width: 100%; border-collapse: collapse; font-size: 0.875rem; }
+        th, td { text-align: left; padding: 0.65rem 1rem; border-bottom: 1px solid var(--border); }
         th {
-            background: var(--bg-card);
-            color: var(--text-muted);
-            font-weight: 600;
-            font-size: 0.8rem;
-            text-transform: uppercase;
-            letter-spacing: 0.04em;
+            background: var(--bg-card); color: var(--text-muted);
+            font-weight: 600; font-size: 0.78rem;
+            text-transform: uppercase; letter-spacing: 0.04em;
         }
-
-        td code {
-            white-space: nowrap;
-        }
-
+        td code { white-space: nowrap; }
         tr:hover td { background: rgba(88, 166, 255, 0.04); }
 
         .method {
-            font-family: var(--font-mono);
-            font-weight: 700;
-            font-size: 0.8rem;
-            padding: 0.15rem 0.5rem;
-            border-radius: 4px;
-            display: inline-block;
+            font-family: var(--font-mono); font-weight: 700; font-size: 0.78rem;
+            padding: 0.15rem 0.5rem; border-radius: 4px; display: inline-block;
         }
-
         .method.get { color: var(--green); background: rgba(63, 185, 80, 0.12); }
         .method.post { color: var(--accent); background: rgba(88, 166, 255, 0.12); }
         .method.put { color: var(--orange); background: rgba(210, 153, 34, 0.12); }
         .method.delete { color: var(--red); background: rgba(248, 81, 73, 0.12); }
 
-        /* Quick start */
-        .steps {
-            counter-reset: step;
-        }
-
-        .step {
-            margin-bottom: 2rem;
-        }
-
+        /* ---- Quick Start Steps ---- */
+        .steps { counter-reset: step; }
+        .step { margin-bottom: 2rem; }
         .step h3::before {
             counter-increment: step;
             content: counter(step) ". ";
             color: var(--accent);
             font-family: var(--font-mono);
         }
+        .step p { color: var(--text-muted); font-size: 0.9rem; margin-bottom: 0.75rem; }
 
-        .step p {
-            color: var(--text-muted);
-            font-size: 0.9rem;
-            margin-bottom: 0.75rem;
+        /* ---- Code Highlighting (CSS-only) ---- */
+        .kw { color: var(--purple); }    /* keyword */
+        .str { color: var(--green); }    /* string */
+        .cm { color: #6e7681; }          /* comment */
+        .fn { color: var(--accent); }    /* function/command */
+        .num { color: var(--orange); }   /* number */
+        .flag { color: var(--cyan); }    /* flags */
+        .op { color: var(--text-muted); }
+
+        /* ---- CLI Reference ---- */
+        .cli-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 1rem;
         }
-
-        /* CLI reference */
         .cli-cmd {
             background: var(--bg-card);
             border: 1px solid var(--border);
             border-radius: 8px;
             padding: 1.25rem;
-            margin-bottom: 1rem;
         }
-
         .cli-cmd h4 {
-            font-family: var(--font-mono);
-            font-size: 0.9rem;
-            color: var(--accent);
-            margin-bottom: 0.25rem;
+            font-family: var(--font-mono); font-size: 0.9rem;
+            color: var(--accent); margin-bottom: 0.25rem;
         }
-
         .cli-cmd p {
-            font-size: 0.85rem;
-            color: var(--text-muted);
-            margin-bottom: 0.5rem;
+            font-size: 0.82rem; color: var(--text-muted); margin-bottom: 0.5rem;
+        }
+        .cli-cmd pre { margin: 0; border: none; background: var(--bg); padding: 0.75rem; font-size: 0.8rem; }
+
+        /* ---- Scoring Visual ---- */
+        .scoring-breakdown {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 2rem;
+            align-items: start;
+            margin-top: 2rem;
         }
 
-        .cli-cmd pre {
-            margin: 0;
-            border: none;
-            background: var(--bg);
-        }
-
-        /* Scoring section */
-        .formula {
+        .score-formula {
             background: var(--bg-card);
             border: 1px solid var(--border);
             border-radius: 8px;
             padding: 1.5rem;
-            margin-top: 1rem;
-            text-align: center;
+        }
+        .score-formula code {
+            font-size: 0.95rem; background: none; color: var(--purple);
+        }
+        .score-formula .formula-line {
+            display: block; padding: 0.15rem 0;
+        }
+        .score-formula .note {
+            font-size: 0.82rem; color: var(--text-muted); margin-top: 1rem;
         }
 
-        .formula code {
-            font-size: 1rem;
-            background: none;
-            color: var(--purple);
-        }
-
-        .formula p {
-            font-size: 0.85rem;
-            color: var(--text-muted);
-            margin-top: 0.75rem;
-        }
-
-        /* Footer */
+        /* ---- Footer ---- */
         footer {
             border-top: 1px solid var(--border);
-            padding: 2.5rem 0;
+            padding: 3rem 0;
             text-align: center;
         }
-
-        footer p {
-            color: var(--text-muted);
-            font-size: 0.85rem;
+        footer p { color: var(--text-muted); font-size: 0.85rem; }
+        footer .footer-links {
+            display: flex; justify-content: center; gap: 2rem;
+            margin-bottom: 1rem; flex-wrap: wrap;
+        }
+        footer .footer-links a { color: var(--text-muted); font-size: 0.85rem; }
+        footer .footer-links a:hover { color: var(--accent); }
+        footer .built-with {
+            font-family: var(--font-mono); font-size: 0.78rem;
+            color: var(--text-muted); margin-top: 0.5rem;
         }
 
-        footer a {
-            color: var(--accent);
-        }
-
-        /* Responsive */
-        @media (max-width: 640px) {
-            .hero h1 { font-size: 2rem; }
+        /* ---- Responsive ---- */
+        @media (max-width: 768px) {
+            .hero h1 { font-size: 2.2rem; }
             .hero .tagline { font-size: 1rem; }
             .tiers { grid-template-columns: 1fr; }
             .hero .stats { gap: 1.5rem; }
-            nav .links { gap: 1rem; }
+            nav .links { gap: 1rem; font-size: 0.8rem; }
+            .scoring-breakdown { grid-template-columns: 1fr; }
+            .cli-grid { grid-template-columns: 1fr; }
+            section { padding: 3rem 0; }
         }
-
-        /* Comment color in code blocks */
-        .comment { color: var(--text-muted); }
-        .str { color: var(--green); }
-        .cmd { color: var(--accent); }
+        @media (max-width: 480px) {
+            .hero h1 { font-size: 1.8rem; }
+            nav .links { display: none; }
+        }
     </style>
 </head>
 <body>
 
 <nav>
     <div class="container">
-        <span class="logo">claude-memory</span>
+        <span class="logo"><span class="accent">claude</span>-memory</span>
         <div class="links">
-            <a href="#features">Features</a>
+            <a href="#how-it-works">How It Works</a>
+            <a href="#architecture">Architecture</a>
+            <a href="#lifecycle">Lifecycle</a>
+            <a href="#scoring">Scoring</a>
             <a href="#quickstart">Quick Start</a>
             <a href="#api">API</a>
             <a href="#cli">CLI</a>
-            <a href="#architecture">Architecture</a>
             <a href="https://github.com/alphaonedev/claude-memory">GitHub</a>
         </div>
     </div>
 </nav>
 
-<!-- Hero -->
+<!-- ============ HERO ============ -->
 <header class="hero">
     <div class="container">
         <h1><span class="accent">claude</span>-memory</h1>
-        <p class="tagline">
-            Persistent memory for Claude Code. Three tiers of recall &mdash; short, mid, and long-term &mdash; backed by SQLite&nbsp;+&nbsp;FTS5. Remembers so you don't have to.
-        </p>
+        <p class="tagline">Memory for machines. Three-tier persistent recall for Claude Code, backed by SQLite&nbsp;+&nbsp;FTS5.</p>
+
         <div class="stats">
             <div class="stat">
-                <div class="value">~2 MB</div>
-                <div class="label">Memory footprint</div>
+                <div class="value">3 tiers</div>
+                <div class="label">Short / Mid / Long</div>
             </div>
             <div class="stat">
-                <div class="value">4 ms</div>
+                <div class="value">&lt;4 ms</div>
                 <div class="label">Startup time</div>
             </div>
             <div class="stat">
-                <div class="value">0</div>
-                <div class="label">Dependencies at runtime</div>
+                <div class="value">0 deps</div>
+                <div class="label">Runtime dependencies</div>
             </div>
             <div class="stat">
                 <div class="value">1 file</div>
                 <div class="label">SQLite database</div>
             </div>
         </div>
+
         <div class="cta">
             <a href="#quickstart" class="btn btn-primary">Get Started</a>
-            <a href="https://github.com/alphaonedev/claude-memory" class="btn btn-secondary">View on GitHub</a>
+            <a href="https://github.com/alphaonedev/claude-memory" class="btn btn-secondary">View Source</a>
         </div>
     </div>
 </header>
 
-<!-- Features -->
-<section id="features">
+<!-- ============ HOW IT WORKS: THREE-TIER MEMORY FLOW ============ -->
+<section id="how-it-works">
     <div class="container">
-        <h2>Features</h2>
-        <div class="feature-grid">
-            <div class="feature-card">
-                <span class="icon">&#x1f9e0;</span>
-                <h3>Three Memory Tiers</h3>
-                <p>Short-term (6h), mid-term (7d), and long-term (permanent) &mdash; mimicking how human memory works. Expired memories are automatically garbage collected.</p>
-            </div>
-            <div class="feature-card">
-                <span class="icon">&#x1f50d;</span>
-                <h3>Full-Text Search</h3>
-                <p>SQLite FTS5 with BM25 ranking, priority boosting, and access frequency weighting. Find what matters fast.</p>
-            </div>
-            <div class="feature-card">
-                <span class="icon">&#x1f4e1;</span>
-                <h3>HTTP API + CLI</h3>
-                <p>Axum-powered REST API on <code>localhost:9077</code> plus a full CLI for direct terminal access. Both interfaces, same database.</p>
-            </div>
-            <div class="feature-card">
-                <span class="icon">&#x1f3af;</span>
-                <h3>/recall Endpoint</h3>
-                <p>The primary "what do I know about X?" interface. Searches across all tiers, boosts long-term and frequently-accessed memories.</p>
-            </div>
-            <div class="feature-card">
-                <span class="icon">&#x1f4c1;</span>
-                <h3>Free-form Namespaces</h3>
-                <p>Organize memories by project, repo, topic &mdash; any string works. Filter queries by namespace to scope results.</p>
-            </div>
-            <div class="feature-card">
-                <span class="icon">&#x26a1;</span>
-                <h3>Zero-Dependency Runtime</h3>
-                <p>Single static binary. SQLite bundled and compiled in. WAL mode for concurrent reads. One file is the entire database.</p>
-            </div>
+        <h2>How It Works</h2>
+        <p class="section-sub">Memories flow through three tiers, from ephemeral to permanent. TTLs decay over time, but each access extends the expiry. Frequently recalled memories auto-promote upward.</p>
+
+        <div class="svg-container">
+            <svg viewBox="0 0 820 320" width="820" height="320" xmlns="http://www.w3.org/2000/svg">
+                <!-- Background grid (subtle) -->
+                <defs>
+                    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+                        <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#21262d" stroke-width="0.5"/>
+                    </pattern>
+                    <filter id="glow-orange">
+                        <feGaussianBlur stdDeviation="3" result="blur"/>
+                        <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+                    </filter>
+                    <filter id="glow-blue">
+                        <feGaussianBlur stdDeviation="3" result="blur"/>
+                        <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+                    </filter>
+                    <filter id="glow-green">
+                        <feGaussianBlur stdDeviation="3" result="blur"/>
+                        <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+                    </filter>
+                </defs>
+                <rect width="820" height="320" fill="#0d1117" rx="12"/>
+                <rect width="820" height="320" fill="url(#grid)" rx="12"/>
+
+                <!-- SHORT tier -->
+                <rect x="40" y="100" width="200" height="120" rx="10" fill="#161b22" stroke="#d29922" stroke-width="1.5"/>
+                <text x="140" y="135" text-anchor="middle" fill="#d29922" font-family="SF Mono, Consolas, monospace" font-size="16" font-weight="700">SHORT</text>
+                <text x="140" y="158" text-anchor="middle" fill="#8b949e" font-family="SF Mono, Consolas, monospace" font-size="11">TTL: 6 hours</text>
+                <text x="140" y="178" text-anchor="middle" fill="#6e7681" font-size="11" font-family="-apple-system, sans-serif">Ephemeral context</text>
+                <text x="140" y="198" text-anchor="middle" fill="#6e7681" font-size="11" font-family="-apple-system, sans-serif">+1h per access</text>
+                <!-- Pulse node -->
+                <circle cx="140" cy="92" fill="none" stroke="#d29922" stroke-width="1" opacity="0.4" class="tier-ring" style="animation-delay: 0s;">
+                    <animate attributeName="r" from="4" to="16" dur="2.5s" repeatCount="indefinite"/>
+                    <animate attributeName="opacity" from="0.5" to="0" dur="2.5s" repeatCount="indefinite"/>
+                </circle>
+                <circle cx="140" cy="92" r="5" fill="#d29922" class="tier-node-pulse"/>
+
+                <!-- Arrow: SHORT -> MID -->
+                <line x1="250" y1="160" x2="298" y2="160" stroke="#8b949e" stroke-width="1.5" class="tier-flow-arrow"/>
+                <polygon points="300,160 292,155 292,165" fill="#8b949e"/>
+
+                <!-- MID tier -->
+                <rect x="310" y="100" width="200" height="120" rx="10" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
+                <text x="410" y="135" text-anchor="middle" fill="#58a6ff" font-family="SF Mono, Consolas, monospace" font-size="16" font-weight="700">MID</text>
+                <text x="410" y="158" text-anchor="middle" fill="#8b949e" font-family="SF Mono, Consolas, monospace" font-size="11">TTL: 7 days</text>
+                <text x="410" y="178" text-anchor="middle" fill="#6e7681" font-size="11" font-family="-apple-system, sans-serif">Working knowledge</text>
+                <text x="410" y="198" text-anchor="middle" fill="#6e7681" font-size="11" font-family="-apple-system, sans-serif">+1d per access</text>
+                <!-- Pulse node -->
+                <circle cx="410" cy="92" fill="none" stroke="#58a6ff" stroke-width="1" class="tier-ring" style="animation-delay: 0.8s;">
+                    <animate attributeName="r" from="4" to="16" dur="2.5s" repeatCount="indefinite" begin="0.8s"/>
+                    <animate attributeName="opacity" from="0.5" to="0" dur="2.5s" repeatCount="indefinite" begin="0.8s"/>
+                </circle>
+                <circle cx="410" cy="92" r="5" fill="#58a6ff" class="tier-node-pulse" style="animation-delay: 0.8s;"/>
+
+                <!-- Arrow: MID -> LONG -->
+                <line x1="520" y1="160" x2="568" y2="160" stroke="#8b949e" stroke-width="1.5" class="tier-flow-arrow"/>
+                <polygon points="570,160 562,155 562,165" fill="#8b949e"/>
+
+                <!-- LONG tier -->
+                <rect x="580" y="100" width="200" height="120" rx="10" fill="#161b22" stroke="#3fb950" stroke-width="1.5"/>
+                <text x="680" y="135" text-anchor="middle" fill="#3fb950" font-family="SF Mono, Consolas, monospace" font-size="16" font-weight="700">LONG</text>
+                <text x="680" y="158" text-anchor="middle" fill="#8b949e" font-family="SF Mono, Consolas, monospace" font-size="11">TTL: permanent</text>
+                <text x="680" y="178" text-anchor="middle" fill="#6e7681" font-size="11" font-family="-apple-system, sans-serif">Permanent knowledge</text>
+                <text x="680" y="198" text-anchor="middle" fill="#6e7681" font-size="11" font-family="-apple-system, sans-serif">Never expires</text>
+                <!-- Pulse node -->
+                <circle cx="680" cy="92" fill="none" stroke="#3fb950" stroke-width="1" class="tier-ring" style="animation-delay: 1.6s;">
+                    <animate attributeName="r" from="4" to="16" dur="2.5s" repeatCount="indefinite" begin="1.6s"/>
+                    <animate attributeName="opacity" from="0.5" to="0" dur="2.5s" repeatCount="indefinite" begin="1.6s"/>
+                </circle>
+                <circle cx="680" cy="92" r="5" fill="#3fb950" class="tier-node-pulse" style="animation-delay: 1.6s;"/>
+
+                <!-- Auto-promote arrow (curved, MID -> LONG, below) -->
+                <path d="M 410 230 Q 410 275 540 275 Q 680 275 680 230"
+                      fill="none" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="5 3" class="tier-promote-arrow"/>
+                <polygon points="680,228 675,236 685,236" fill="#3fb950"/>
+                <text x="545" y="295" text-anchor="middle" fill="#3fb950" font-size="11" font-family="SF Mono, Consolas, monospace">auto-promote at 5+ accesses</text>
+
+                <!-- TTL decay indicators -->
+                <g opacity="0.6">
+                    <text x="80" y="55" fill="#d29922" font-size="10" font-family="SF Mono, Consolas, monospace">TTL decaying...</text>
+                    <rect x="80" y="62" width="120" height="3" rx="1.5" fill="#30363d"/>
+                    <rect x="80" y="62" rx="1.5" height="3" fill="#d29922" opacity="0.8">
+                        <animate attributeName="width" from="120" to="0" dur="6s" repeatCount="indefinite"/>
+                    </rect>
+                </g>
+                <g opacity="0.6">
+                    <text x="350" y="55" fill="#58a6ff" font-size="10" font-family="SF Mono, Consolas, monospace">TTL decaying...</text>
+                    <rect x="350" y="62" width="120" height="3" rx="1.5" fill="#30363d"/>
+                    <rect x="350" y="62" rx="1.5" height="3" fill="#58a6ff" opacity="0.8">
+                        <animate attributeName="width" from="120" to="0" dur="14s" repeatCount="indefinite"/>
+                    </rect>
+                </g>
+                <g opacity="0.6">
+                    <text x="640" y="55" fill="#3fb950" font-size="10" font-family="SF Mono, Consolas, monospace">No expiry</text>
+                    <rect x="640" y="62" width="100" height="3" rx="1.5" fill="#3fb950" opacity="0.5"/>
+                </g>
+            </svg>
         </div>
     </div>
 </section>
 
-<!-- Architecture -->
+<!-- ============ ARCHITECTURE ============ -->
 <section id="architecture">
     <div class="container">
         <h2>Architecture</h2>
-        <p style="color: var(--text-muted); margin-bottom: 1rem;">
-            claude-memory models its storage after human memory systems. Each memory has a tier that determines its lifetime, plus metadata for intelligent ranking.
-        </p>
+        <p class="section-sub">A single Rust binary exposing both CLI and HTTP API. SQLite with FTS5 handles storage and full-text search. Garbage collection runs automatically.</p>
 
-        <div class="tiers">
-            <div class="tier-card short">
-                <div class="tier-name">short</div>
-                <div class="ttl">TTL: 6 hours</div>
-                <p>Ephemeral session context. Current task details, scratch notes, temporary state. Auto-expires.</p>
-            </div>
-            <div class="tier-card mid">
-                <div class="tier-name">mid</div>
-                <div class="ttl">TTL: 7 days</div>
-                <p>Working knowledge. Sprint context, recent decisions, active investigation notes. Default tier.</p>
-            </div>
-            <div class="tier-card long">
-                <div class="tier-name">long</div>
-                <div class="ttl">TTL: permanent</div>
-                <p>Durable knowledge. Architecture decisions, project conventions, hard-won lessons. Never expires.</p>
-            </div>
+        <div class="svg-container">
+            <svg viewBox="0 0 820 440" width="820" height="440" xmlns="http://www.w3.org/2000/svg">
+                <rect width="820" height="440" fill="#0d1117" rx="12"/>
+
+                <!-- Client -->
+                <rect x="310" y="20" width="200" height="48" rx="8" fill="#161b22" stroke="#bc8cff" stroke-width="1.5"/>
+                <text x="410" y="49" text-anchor="middle" fill="#bc8cff" font-family="SF Mono, Consolas, monospace" font-size="13" font-weight="600">Claude Code / Client</text>
+
+                <!-- Arrows down -->
+                <line x1="350" y1="68" x2="200" y2="115" stroke="#8b949e" stroke-width="1" stroke-dasharray="4 3">
+                    <animate attributeName="stroke-dashoffset" from="0" to="-14" dur="1.5s" repeatCount="indefinite"/>
+                </line>
+                <line x1="470" y1="68" x2="620" y2="115" stroke="#8b949e" stroke-width="1" stroke-dasharray="4 3">
+                    <animate attributeName="stroke-dashoffset" from="0" to="-14" dur="1.5s" repeatCount="indefinite"/>
+                </line>
+
+                <!-- CLI Box -->
+                <rect x="100" y="120" width="200" height="55" rx="8" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
+                <text x="200" y="143" text-anchor="middle" fill="#58a6ff" font-family="SF Mono, Consolas, monospace" font-size="12" font-weight="600">CLI</text>
+                <text x="200" y="161" text-anchor="middle" fill="#6e7681" font-size="10" font-family="-apple-system, sans-serif">claude-memory &lt;cmd&gt;</text>
+
+                <!-- HTTP API Box -->
+                <rect x="520" y="120" width="200" height="55" rx="8" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
+                <text x="620" y="143" text-anchor="middle" fill="#58a6ff" font-family="SF Mono, Consolas, monospace" font-size="12" font-weight="600">HTTP API</text>
+                <text x="620" y="161" text-anchor="middle" fill="#6e7681" font-size="10" font-family="-apple-system, sans-serif">127.0.0.1:9077/api/v1</text>
+
+                <!-- Arrows to DB -->
+                <line x1="200" y1="175" x2="340" y2="225" stroke="#8b949e" stroke-width="1" stroke-dasharray="4 3">
+                    <animate attributeName="stroke-dashoffset" from="0" to="-14" dur="1.5s" repeatCount="indefinite"/>
+                </line>
+                <line x1="620" y1="175" x2="480" y2="225" stroke="#8b949e" stroke-width="1" stroke-dasharray="4 3">
+                    <animate attributeName="stroke-dashoffset" from="0" to="-14" dur="1.5s" repeatCount="indefinite"/>
+                </line>
+
+                <!-- SQLite + FTS5 Engine -->
+                <rect x="290" y="220" width="240" height="70" rx="10" fill="#161b22" stroke="#d29922" stroke-width="1.5"/>
+                <text x="410" y="250" text-anchor="middle" fill="#d29922" font-family="SF Mono, Consolas, monospace" font-size="14" font-weight="700">SQLite + FTS5</text>
+                <text x="410" y="270" text-anchor="middle" fill="#6e7681" font-size="10" font-family="-apple-system, sans-serif">WAL mode | bundled | single file</text>
+
+                <!-- Arrows to tiers -->
+                <line x1="340" y1="290" x2="160" y2="345" stroke="#d29922" stroke-width="1" opacity="0.5"/>
+                <line x1="410" y1="290" x2="410" y2="345" stroke="#58a6ff" stroke-width="1" opacity="0.5"/>
+                <line x1="480" y1="290" x2="660" y2="345" stroke="#3fb950" stroke-width="1" opacity="0.5"/>
+
+                <!-- Tier boxes at bottom -->
+                <rect x="100" y="350" width="120" height="40" rx="6" fill="#161b22" stroke="#d29922" stroke-width="1"/>
+                <text x="160" y="375" text-anchor="middle" fill="#d29922" font-family="SF Mono, Consolas, monospace" font-size="11" font-weight="600">short (6h)</text>
+
+                <rect x="350" y="350" width="120" height="40" rx="6" fill="#161b22" stroke="#58a6ff" stroke-width="1"/>
+                <text x="410" y="375" text-anchor="middle" fill="#58a6ff" font-family="SF Mono, Consolas, monospace" font-size="11" font-weight="600">mid (7d)</text>
+
+                <rect x="600" y="350" width="120" height="40" rx="6" fill="#161b22" stroke="#3fb950" stroke-width="1"/>
+                <text x="660" y="375" text-anchor="middle" fill="#3fb950" font-family="SF Mono, Consolas, monospace" font-size="11" font-weight="600">long (inf)</text>
+
+                <!-- GC cycle indicator -->
+                <rect x="610" y="225" width="150" height="42" rx="6" fill="#161b22" stroke="#f85149" stroke-width="1" stroke-dasharray="3 2"/>
+                <text x="685" y="244" text-anchor="middle" fill="#f85149" font-family="SF Mono, Consolas, monospace" font-size="10" font-weight="600">GC cycle</text>
+                <text x="685" y="258" text-anchor="middle" fill="#6e7681" font-size="9" font-family="-apple-system, sans-serif">every 30 min</text>
+                <!-- Rotating arrow for GC -->
+                <g transform="translate(633, 246)">
+                    <circle cx="0" cy="0" r="6" fill="none" stroke="#f85149" stroke-width="1" stroke-dasharray="12 6" opacity="0.6">
+                        <animateTransform attributeName="transform" type="rotate" from="0" to="360" dur="3s" repeatCount="indefinite"/>
+                    </circle>
+                </g>
+
+                <!-- Ranking formula callout -->
+                <rect x="60" y="225" width="180" height="55" rx="6" fill="#161b22" stroke="#bc8cff" stroke-width="1" stroke-dasharray="3 2"/>
+                <text x="150" y="244" text-anchor="middle" fill="#bc8cff" font-family="SF Mono, Consolas, monospace" font-size="9" font-weight="600">Ranking Formula</text>
+                <text x="150" y="258" text-anchor="middle" fill="#6e7681" font-size="8.5" font-family="SF Mono, Consolas, monospace">FTS + priority + freq</text>
+                <text x="150" y="270" text-anchor="middle" fill="#6e7681" font-size="8.5" font-family="SF Mono, Consolas, monospace">+ confidence + tier</text>
+
+                <!-- Legend -->
+                <text x="410" y="420" text-anchor="middle" fill="#6e7681" font-size="10" font-family="-apple-system, sans-serif">Both CLI and HTTP share the same SQLite database -- no daemon required for CLI usage</text>
+            </svg>
         </div>
-
-        <h3 style="margin-top: 2.5rem;">Recall Scoring</h3>
-        <p style="color: var(--text-muted);">
-            The <code>/recall</code> endpoint combines multiple signals to surface the most relevant memories:
-        </p>
-        <div class="formula">
-            <code>score = BM25(query) + (priority * 0.5) + (access_count * 0.1) + tier_boost</code>
-            <p>
-                Where <code>tier_boost</code> is: long = 3.0, mid = 1.0, short = 0.0<br>
-                Frequently accessed, high-priority, long-term memories float to the top.
-            </p>
-        </div>
-
-        <h3 style="margin-top: 2.5rem;">Storage</h3>
-        <p style="color: var(--text-muted);">
-            SQLite in WAL mode with bundled compilation &mdash; no system SQLite dependency. The database is a single portable file. FTS5 virtual table with triggers keeps the full-text index in sync automatically. Access counts and recency are tracked on every read.
-        </p>
     </div>
 </section>
 
-<!-- Quick Start -->
+<!-- ============ MEMORY LIFECYCLE ============ -->
+<section id="lifecycle">
+    <div class="container">
+        <h2>Memory Lifecycle</h2>
+        <p class="section-sub">Watch a memory evolve from creation to permanent storage. Each recall extends the TTL and increments the access count. At 5 accesses, mid-tier memories auto-promote to long-term.</p>
+
+        <div class="svg-container">
+            <svg viewBox="0 0 820 340" width="820" height="340" xmlns="http://www.w3.org/2000/svg">
+                <rect width="820" height="340" fill="#0d1117" rx="12"/>
+
+                <!-- Timeline axis -->
+                <line x1="60" y1="160" x2="760" y2="160" stroke="#30363d" stroke-width="2"/>
+                <polygon points="760,160 752,155 752,165" fill="#30363d"/>
+
+                <!-- Event 1: Created (short) -->
+                <circle cx="100" cy="160" r="6" fill="#d29922">
+                    <animate attributeName="r" from="0" to="6" dur="0.4s" begin="0.2s" fill="freeze"/>
+                </circle>
+                <line x1="100" y1="152" x2="100" y2="65" stroke="#d29922" stroke-width="1" stroke-dasharray="3 2"/>
+                <rect x="50" y="30" width="100" height="35" rx="5" fill="#161b22" stroke="#d29922" stroke-width="1"/>
+                <text x="100" y="47" text-anchor="middle" fill="#d29922" font-family="SF Mono, Consolas, monospace" font-size="10" font-weight="600">CREATED</text>
+                <text x="100" y="60" text-anchor="middle" fill="#6e7681" font-size="9" font-family="SF Mono, Consolas, monospace">tier: short</text>
+                <text x="100" y="190" text-anchor="middle" fill="#6e7681" font-size="9">access: 0</text>
+
+                <!-- Event 2: Recalled x3 -->
+                <circle cx="230" cy="160" r="6" fill="#58a6ff">
+                    <animate attributeName="r" from="0" to="6" dur="0.4s" begin="0.6s" fill="freeze"/>
+                </circle>
+                <line x1="230" y1="168" x2="230" y2="230" stroke="#58a6ff" stroke-width="1" stroke-dasharray="3 2"/>
+                <rect x="165" y="235" width="130" height="45" rx="5" fill="#161b22" stroke="#58a6ff" stroke-width="1"/>
+                <text x="230" y="252" text-anchor="middle" fill="#58a6ff" font-family="SF Mono, Consolas, monospace" font-size="10" font-weight="600">RECALLED x3</text>
+                <text x="230" y="265" text-anchor="middle" fill="#6e7681" font-size="9" font-family="SF Mono, Consolas, monospace">TTL extended</text>
+                <text x="230" y="276" text-anchor="middle" fill="#6e7681" font-size="9" font-family="SF Mono, Consolas, monospace">promoted: mid</text>
+                <text x="230" y="190" text-anchor="middle" fill="#6e7681" font-size="9">access: 3</text>
+
+                <!-- TTL bar between 1 and 2 -->
+                <rect x="106" y="140" width="118" height="4" rx="2" fill="#d29922" opacity="0.3"/>
+                <rect x="106" y="140" width="118" height="4" rx="2" fill="#d29922" opacity="0.7">
+                    <animate attributeName="width" from="118" to="80" dur="3s" repeatCount="indefinite"/>
+                </rect>
+
+                <!-- Event 3: Recalled x5 more -->
+                <circle cx="400" cy="160" r="6" fill="#58a6ff">
+                    <animate attributeName="r" from="0" to="6" dur="0.4s" begin="1.0s" fill="freeze"/>
+                </circle>
+                <line x1="400" y1="152" x2="400" y2="65" stroke="#58a6ff" stroke-width="1" stroke-dasharray="3 2"/>
+                <rect x="335" y="30" width="130" height="35" rx="5" fill="#161b22" stroke="#58a6ff" stroke-width="1"/>
+                <text x="400" y="47" text-anchor="middle" fill="#58a6ff" font-family="SF Mono, Consolas, monospace" font-size="10" font-weight="600">RECALLED x5</text>
+                <text x="400" y="60" text-anchor="middle" fill="#6e7681" font-size="9" font-family="SF Mono, Consolas, monospace">TTL extended 5x</text>
+                <text x="400" y="190" text-anchor="middle" fill="#6e7681" font-size="9">access: 8</text>
+
+                <!-- TTL bar between 2 and 3 -->
+                <rect x="236" y="140" width="158" height="4" rx="2" fill="#58a6ff" opacity="0.3"/>
+                <rect x="236" y="140" rx="2" height="4" fill="#58a6ff" opacity="0.6">
+                    <animate attributeName="width" from="158" to="100" dur="5s" repeatCount="indefinite"/>
+                </rect>
+
+                <!-- Event 4: Auto-promoted to long -->
+                <circle cx="560" cy="160" r="8" fill="#3fb950">
+                    <animate attributeName="r" from="0" to="8" dur="0.4s" begin="1.4s" fill="freeze"/>
+                </circle>
+                <circle cx="560" cy="160" fill="none" stroke="#3fb950" stroke-width="1">
+                    <animate attributeName="r" from="8" to="22" dur="2s" repeatCount="indefinite"/>
+                    <animate attributeName="opacity" from="0.6" to="0" dur="2s" repeatCount="indefinite"/>
+                </circle>
+                <line x1="560" y1="168" x2="560" y2="230" stroke="#3fb950" stroke-width="1" stroke-dasharray="3 2"/>
+                <rect x="485" y="235" width="150" height="50" rx="5" fill="#161b22" stroke="#3fb950" stroke-width="1.5"/>
+                <text x="560" y="253" text-anchor="middle" fill="#3fb950" font-family="SF Mono, Consolas, monospace" font-size="11" font-weight="700">AUTO-PROMOTED</text>
+                <text x="560" y="268" text-anchor="middle" fill="#6e7681" font-size="9" font-family="SF Mono, Consolas, monospace">tier: long</text>
+                <text x="560" y="280" text-anchor="middle" fill="#6e7681" font-size="9" font-family="SF Mono, Consolas, monospace">expires: never</text>
+                <text x="560" y="190" text-anchor="middle" fill="#6e7681" font-size="9">access: 8+</text>
+
+                <!-- No TTL bar after promotion (permanent) -->
+                <rect x="566" y="140" width="160" height="4" rx="2" fill="#3fb950" opacity="0.4"/>
+                <text x="646" y="136" fill="#3fb950" font-size="8" font-family="SF Mono, Consolas, monospace" opacity="0.6">permanent</text>
+
+                <!-- Event 5: Priority reinforcement -->
+                <circle cx="710" cy="160" r="5" fill="#bc8cff">
+                    <animate attributeName="r" from="0" to="5" dur="0.4s" begin="1.8s" fill="freeze"/>
+                </circle>
+                <line x1="710" y1="152" x2="710" y2="90" stroke="#bc8cff" stroke-width="1" stroke-dasharray="3 2"/>
+                <rect x="650" y="70" width="120" height="25" rx="5" fill="#161b22" stroke="#bc8cff" stroke-width="1"/>
+                <text x="710" y="87" text-anchor="middle" fill="#bc8cff" font-family="SF Mono, Consolas, monospace" font-size="9" font-weight="600">priority +1 at 10x</text>
+
+                <!-- Time labels -->
+                <text x="100" y="210" text-anchor="middle" fill="#30363d" font-size="9" font-family="SF Mono, Consolas, monospace">t=0</text>
+                <text x="230" y="210" text-anchor="middle" fill="#30363d" font-size="9" font-family="SF Mono, Consolas, monospace">t=3h</text>
+                <text x="400" y="210" text-anchor="middle" fill="#30363d" font-size="9" font-family="SF Mono, Consolas, monospace">t=2d</text>
+                <text x="560" y="210" text-anchor="middle" fill="#30363d" font-size="9" font-family="SF Mono, Consolas, monospace">t=5d</text>
+                <text x="710" y="210" text-anchor="middle" fill="#30363d" font-size="9" font-family="SF Mono, Consolas, monospace">t=10d</text>
+            </svg>
+        </div>
+    </div>
+</section>
+
+<!-- ============ RECALL SCORING ============ -->
+<section id="scoring">
+    <div class="container">
+        <h2>Recall Scoring</h2>
+        <p class="section-sub">When you recall memories, a composite score determines which ones surface. Five signals combine to rank results.</p>
+
+        <div class="scoring-breakdown">
+            <!-- Visual bars -->
+            <div>
+                <svg viewBox="0 0 380 280" width="380" height="280" xmlns="http://www.w3.org/2000/svg">
+                    <rect width="380" height="280" fill="#0d1117" rx="10"/>
+
+                    <!-- FTS Relevance -->
+                    <text x="20" y="38" fill="#e6edf3" font-size="12" font-family="-apple-system, sans-serif">FTS Relevance</text>
+                    <rect x="150" y="24" width="200" height="20" rx="4" fill="#21262d"/>
+                    <rect x="150" y="24" width="170" height="20" rx="4" fill="#58a6ff" opacity="0.85">
+                        <animate attributeName="width" from="0" to="170" dur="1s" begin="0.2s" fill="freeze"/>
+                    </rect>
+                    <text x="355" y="38" fill="#8b949e" font-size="10" font-family="SF Mono, Consolas, monospace">BM25</text>
+
+                    <!-- Priority -->
+                    <text x="20" y="83" fill="#e6edf3" font-size="12" font-family="-apple-system, sans-serif">Priority</text>
+                    <rect x="150" y="69" width="200" height="20" rx="4" fill="#21262d"/>
+                    <rect x="150" y="69" width="100" height="20" rx="4" fill="#d29922" opacity="0.85">
+                        <animate attributeName="width" from="0" to="100" dur="1s" begin="0.4s" fill="freeze"/>
+                    </rect>
+                    <text x="355" y="83" fill="#8b949e" font-size="10" font-family="SF Mono, Consolas, monospace">x0.5</text>
+
+                    <!-- Access Frequency -->
+                    <text x="20" y="128" fill="#e6edf3" font-size="12" font-family="-apple-system, sans-serif">Access Count</text>
+                    <rect x="150" y="114" width="200" height="20" rx="4" fill="#21262d"/>
+                    <rect x="150" y="114" width="60" height="20" rx="4" fill="#bc8cff" opacity="0.85">
+                        <animate attributeName="width" from="0" to="60" dur="1s" begin="0.6s" fill="freeze"/>
+                    </rect>
+                    <text x="355" y="128" fill="#8b949e" font-size="10" font-family="SF Mono, Consolas, monospace">x0.1</text>
+
+                    <!-- Confidence -->
+                    <text x="20" y="173" fill="#e6edf3" font-size="12" font-family="-apple-system, sans-serif">Confidence</text>
+                    <rect x="150" y="159" width="200" height="20" rx="4" fill="#21262d"/>
+                    <rect x="150" y="159" width="140" height="20" rx="4" fill="#39d2c0" opacity="0.85">
+                        <animate attributeName="width" from="0" to="140" dur="1s" begin="0.8s" fill="freeze"/>
+                    </rect>
+                    <text x="355" y="173" fill="#8b949e" font-size="10" font-family="SF Mono, Consolas, monospace">x2.0</text>
+
+                    <!-- Tier Boost -->
+                    <text x="20" y="218" fill="#e6edf3" font-size="12" font-family="-apple-system, sans-serif">Tier Boost</text>
+                    <rect x="150" y="204" width="200" height="20" rx="4" fill="#21262d"/>
+                    <rect x="150" y="204" width="120" height="20" rx="4" fill="#3fb950" opacity="0.85">
+                        <animate attributeName="width" from="0" to="120" dur="1s" begin="1.0s" fill="freeze"/>
+                    </rect>
+                    <text x="355" y="218" fill="#8b949e" font-size="10" font-family="SF Mono, Consolas, monospace">0-3</text>
+
+                    <!-- Combined Score -->
+                    <line x1="20" y1="242" x2="360" y2="242" stroke="#30363d" stroke-width="1"/>
+                    <text x="20" y="265" fill="#e6edf3" font-size="13" font-weight="600" font-family="-apple-system, sans-serif">Combined</text>
+                    <rect x="150" y="251" width="200" height="20" rx="4" fill="#21262d"/>
+                    <rect x="150" y="251" width="190" height="20" rx="4" opacity="0.9">
+                        <animate attributeName="width" from="0" to="190" dur="1.2s" begin="1.3s" fill="freeze"/>
+                        <animate attributeName="fill" values="#58a6ff;#3fb950;#58a6ff" dur="3s" repeatCount="indefinite"/>
+                    </rect>
+                </svg>
+            </div>
+
+            <!-- Formula text -->
+            <div class="score-formula">
+                <h3>The Formula</h3>
+                <pre style="border: none; background: var(--bg); padding: 1rem; margin-top: 0.75rem; font-size: 0.85rem;"><code><span class="kw">score</span> <span class="op">=</span>
+  (<span class="fn">fts_rank</span> <span class="op">*</span> <span class="num">-1</span>)         <span class="cm">-- BM25 relevance</span>
+  <span class="op">+</span> (<span class="fn">priority</span> <span class="op">*</span> <span class="num">0.5</span>)       <span class="cm">-- 1-10 scale</span>
+  <span class="op">+</span> (<span class="fn">access_count</span> <span class="op">*</span> <span class="num">0.1</span>)  <span class="cm">-- frequency</span>
+  <span class="op">+</span> (<span class="fn">confidence</span> <span class="op">*</span> <span class="num">2.0</span>)    <span class="cm">-- 0.0-1.0</span>
+  <span class="op">+</span> <span class="fn">tier_boost</span>             <span class="cm">-- long=3 mid=1 short=0</span></code></pre>
+                <p class="note">
+                    FTS5's BM25 algorithm measures text relevance. Priority and confidence are author-set weights. Access count rewards frequently recalled knowledge. The tier boost ensures long-term memories -- which have proven their value -- always surface first.
+                </p>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- ============ QUICK START ============ -->
 <section id="quickstart">
     <div class="container">
         <h2>Quick Start</h2>
+        <p class="section-sub">Three steps. Under a minute.</p>
+
         <div class="steps">
             <div class="step">
-                <h3>Build from source</h3>
-                <p>Requires Rust 1.70+. Clone the repo and build in release mode:</p>
-<pre><code>git clone https://github.com/alphaonedev/claude-memory.git
-cd claude-memory
-cargo build --release</code></pre>
+                <h3>Install</h3>
+                <p>Requires Rust 1.75+. Install directly from the repository:</p>
+<pre><code><span class="fn">cargo install</span> <span class="flag">--git</span> <span class="str">https://github.com/alphaonedev/claude-memory.git</span></code></pre>
             </div>
 
             <div class="step">
                 <h3>Start the daemon</h3>
-                <p>Launch the HTTP server on <code>127.0.0.1:9077</code>:</p>
-<pre><code>./target/release/claude-memory serve</code></pre>
-                <p>Custom host/port and database path:</p>
-<pre><code>./target/release/claude-memory --db ~/my-memories.db serve --port 8080</code></pre>
-            </div>
-
-            <div class="step">
-                <h3>Store a memory</h3>
-                <p>Via the HTTP API:</p>
-<pre><code>curl -X POST http://127.0.0.1:9077/api/v1/memories \
-  -H "Content-Type: application/json" \
-  -d '{
-    "tier": "long",
-    "namespace": "my-project",
-    "title": "Database schema uses UUID primary keys",
-    "content": "All tables use UUIDv4 as primary keys. Never use auto-increment.",
-    "tags": ["architecture", "database"],
-    "priority": 8
-  }'</code></pre>
-                <p>Or via the CLI:</p>
-<pre><code>claude-memory store \
-  -t long -n my-project -T "UUID primary keys" \
-  -c "All tables use UUIDv4 as primary keys." \
-  --tags architecture,database -p 8</code></pre>
+                <p>Launch on <code>127.0.0.1:9077</code>:</p>
+<pre><code><span class="fn">claude-memory</span> serve</code></pre>
+                <p>Or use the CLI directly (no daemon needed):</p>
+<pre><code><span class="fn">claude-memory</span> store <span class="flag">-T</span> <span class="str">"Project uses Axum 0.8"</span> \
+  <span class="flag">-c</span> <span class="str">"HTTP layer is Axum 0.8 with tower-http middleware."</span> \
+  <span class="flag">--tier</span> long <span class="flag">--priority</span> <span class="num">7</span></code></pre>
             </div>
 
             <div class="step">
                 <h3>Recall what you know</h3>
-                <p>Ask the memory system what it knows about a topic:</p>
-<pre><code><span class="comment"># HTTP</span>
-curl "http://127.0.0.1:9077/api/v1/recall?context=database+primary+keys&namespace=my-project"
+                <p>Ask the memory system about any topic:</p>
+<pre><code><span class="cm"># CLI</span>
+<span class="fn">claude-memory</span> recall <span class="str">"HTTP framework choice"</span>
 
-<span class="comment"># CLI</span>
-claude-memory recall "database primary keys" -n my-project</code></pre>
+<span class="cm"># HTTP API</span>
+<span class="fn">curl</span> <span class="str">"http://127.0.0.1:9077/api/v1/recall?context=HTTP+framework"</span></code></pre>
             </div>
         </div>
     </div>
 </section>
 
-<!-- API Reference -->
+<!-- ============ API REFERENCE ============ -->
 <section id="api">
     <div class="container">
         <h2>API Reference</h2>
-        <p style="color: var(--text-muted); margin-bottom: 1rem;">
-            All endpoints are prefixed with <code>/api/v1</code>. The daemon listens on <code>127.0.0.1:9077</code> by default.
-        </p>
+        <p class="section-sub">All endpoints prefixed with <code>/api/v1</code>. Default: <code>127.0.0.1:9077</code>. All responses are JSON.</p>
+
         <div class="table-wrap">
             <table>
                 <thead>
-                    <tr>
-                        <th>Method</th>
-                        <th>Endpoint</th>
-                        <th>Description</th>
-                    </tr>
+                    <tr><th>Method</th><th>Endpoint</th><th>Description</th></tr>
                 </thead>
                 <tbody>
                     <tr>
                         <td><span class="method get">GET</span></td>
-                        <td><code>/api/v1/health</code></td>
-                        <td>Health check. Returns <code>{"status": "ok"}</code></td>
-                    </tr>
-                    <tr>
-                        <td><span class="method get">GET</span></td>
-                        <td><code>/api/v1/recall</code></td>
-                        <td>Recall memories by context. Params: <code>context</code> (required), <code>namespace</code>, <code>limit</code></td>
-                    </tr>
-                    <tr>
-                        <td><span class="method get">GET</span></td>
-                        <td><code>/api/v1/search</code></td>
-                        <td>Full-text search. Params: <code>q</code> (required), <code>namespace</code>, <code>tier</code>, <code>limit</code>, <code>min_priority</code></td>
-                    </tr>
-                    <tr>
-                        <td><span class="method get">GET</span></td>
-                        <td><code>/api/v1/memories</code></td>
-                        <td>List memories. Params: <code>namespace</code>, <code>tier</code>, <code>limit</code>, <code>offset</code>, <code>min_priority</code></td>
+                        <td><code>/health</code></td>
+                        <td>Health check -- DB accessibility + FTS integrity</td>
                     </tr>
                     <tr>
                         <td><span class="method post">POST</span></td>
-                        <td><code>/api/v1/memories</code></td>
-                        <td>Create a memory. Body: <code>title</code>, <code>content</code> (required); <code>tier</code>, <code>namespace</code>, <code>tags</code>, <code>priority</code>, <code>ttl_secs</code></td>
+                        <td><code>/memories</code></td>
+                        <td>Create a memory. Body: <code>title</code>, <code>content</code> (required); <code>tier</code>, <code>namespace</code>, <code>tags</code>, <code>priority</code>, <code>confidence</code>, <code>ttl_secs</code></td>
                     </tr>
                     <tr>
                         <td><span class="method post">POST</span></td>
-                        <td><code>/api/v1/memories/bulk</code></td>
+                        <td><code>/memories/bulk</code></td>
                         <td>Bulk create. Body: array of memory objects</td>
                     </tr>
                     <tr>
                         <td><span class="method get">GET</span></td>
-                        <td><code>/api/v1/memories/{id}</code></td>
-                        <td>Get a single memory by ID. Bumps access count.</td>
+                        <td><code>/memories</code></td>
+                        <td>List memories. Params: <code>namespace</code>, <code>tier</code>, <code>limit</code>, <code>offset</code>, <code>min_priority</code>, <code>since</code>, <code>until</code>, <code>tags</code></td>
+                    </tr>
+                    <tr>
+                        <td><span class="method get">GET</span></td>
+                        <td><code>/memories/{id}</code></td>
+                        <td>Get a memory by ID (returns memory + links)</td>
                     </tr>
                     <tr>
                         <td><span class="method put">PUT</span></td>
-                        <td><code>/api/v1/memories/{id}</code></td>
+                        <td><code>/memories/{id}</code></td>
                         <td>Update a memory. Body: any subset of fields</td>
                     </tr>
                     <tr>
                         <td><span class="method delete">DELETE</span></td>
-                        <td><code>/api/v1/memories/{id}</code></td>
+                        <td><code>/memories/{id}</code></td>
                         <td>Delete a memory by ID</td>
                     </tr>
                     <tr>
                         <td><span class="method get">GET</span></td>
-                        <td><code>/api/v1/stats</code></td>
-                        <td>Database statistics: counts by tier and namespace, DB size</td>
+                        <td><code>/search</code></td>
+                        <td>FTS search (AND). Params: <code>q</code> (required), <code>namespace</code>, <code>tier</code>, <code>limit</code>, <code>min_priority</code>, <code>since</code>, <code>until</code>, <code>tags</code></td>
+                    </tr>
+                    <tr>
+                        <td><span class="method get">GET</span></td>
+                        <td><code>/recall</code></td>
+                        <td>Recall (OR + touch). Params: <code>context</code> (required), <code>namespace</code>, <code>limit</code>, <code>tags</code>, <code>since</code></td>
                     </tr>
                     <tr>
                         <td><span class="method post">POST</span></td>
-                        <td><code>/api/v1/gc</code></td>
+                        <td><code>/recall</code></td>
+                        <td>Recall via POST body: <code>context</code>, <code>namespace</code>, <code>limit</code>, <code>tags</code>, <code>since</code></td>
+                    </tr>
+                    <tr>
+                        <td><span class="method post">POST</span></td>
+                        <td><code>/forget</code></td>
+                        <td>Bulk delete. Body: <code>namespace</code>, <code>pattern</code>, <code>tier</code> (at least one required)</td>
+                    </tr>
+                    <tr>
+                        <td><span class="method post">POST</span></td>
+                        <td><code>/consolidate</code></td>
+                        <td>Merge memories. Body: <code>ids</code> (2+ required), <code>title</code>, <code>summary</code>, <code>namespace</code>, <code>tier</code></td>
+                    </tr>
+                    <tr>
+                        <td><span class="method post">POST</span></td>
+                        <td><code>/links</code></td>
+                        <td>Link two memories. Body: <code>source_id</code>, <code>target_id</code>, <code>relation</code></td>
+                    </tr>
+                    <tr>
+                        <td><span class="method get">GET</span></td>
+                        <td><code>/links/{id}</code></td>
+                        <td>Get all links for a memory</td>
+                    </tr>
+                    <tr>
+                        <td><span class="method get">GET</span></td>
+                        <td><code>/namespaces</code></td>
+                        <td>List all namespaces with memory counts</td>
+                    </tr>
+                    <tr>
+                        <td><span class="method get">GET</span></td>
+                        <td><code>/stats</code></td>
+                        <td>Database statistics: counts by tier/namespace, DB size, expiring soon</td>
+                    </tr>
+                    <tr>
+                        <td><span class="method post">POST</span></td>
+                        <td><code>/gc</code></td>
                         <td>Trigger garbage collection of expired memories</td>
+                    </tr>
+                    <tr>
+                        <td><span class="method get">GET</span></td>
+                        <td><code>/export</code></td>
+                        <td>Export all memories and links as JSON</td>
+                    </tr>
+                    <tr>
+                        <td><span class="method post">POST</span></td>
+                        <td><code>/import</code></td>
+                        <td>Import memories and links from JSON</td>
                     </tr>
                 </tbody>
             </table>
@@ -711,96 +966,117 @@ claude-memory recall "database primary keys" -n my-project</code></pre>
 
         <h3 style="margin-top: 2.5rem;">Memory Object</h3>
 <pre><code>{
-  "id": "550e8400-e29b-41d4-a716-446655440000",
-  "tier": "long",
-  "namespace": "my-project",
-  "title": "Database uses UUID primary keys",
-  "content": "All tables use UUIDv4. Never use auto-increment.",
-  "tags": ["architecture", "database"],
-  "priority": 8,
-  "access_count": 5,
-  "created_at": "2025-01-15T10:30:00+00:00",
-  "updated_at": "2025-01-15T10:30:00+00:00",
-  "last_accessed_at": "2025-01-16T14:22:00+00:00",
-  "expires_at": null
+  <span class="str">"id"</span>: <span class="str">"550e8400-e29b-41d4-a716-446655440000"</span>,
+  <span class="str">"tier"</span>: <span class="str">"long"</span>,
+  <span class="str">"namespace"</span>: <span class="str">"my-project"</span>,
+  <span class="str">"title"</span>: <span class="str">"Database uses UUID primary keys"</span>,
+  <span class="str">"content"</span>: <span class="str">"All tables use UUIDv4. Never auto-increment."</span>,
+  <span class="str">"tags"</span>: [<span class="str">"architecture"</span>, <span class="str">"database"</span>],
+  <span class="str">"priority"</span>: <span class="num">8</span>,
+  <span class="str">"confidence"</span>: <span class="num">1.0</span>,
+  <span class="str">"source"</span>: <span class="str">"api"</span>,
+  <span class="str">"access_count"</span>: <span class="num">12</span>,
+  <span class="str">"created_at"</span>: <span class="str">"2025-06-15T10:30:00+00:00"</span>,
+  <span class="str">"updated_at"</span>: <span class="str">"2025-06-18T14:22:00+00:00"</span>,
+  <span class="str">"last_accessed_at"</span>: <span class="str">"2025-06-18T14:22:00+00:00"</span>,
+  <span class="str">"expires_at"</span>: <span class="kw">null</span>
 }</code></pre>
     </div>
 </section>
 
-<!-- CLI Reference -->
+<!-- ============ CLI REFERENCE ============ -->
 <section id="cli">
     <div class="container">
         <h2>CLI Reference</h2>
-        <p style="color: var(--text-muted); margin-bottom: 1.5rem;">
-            Every operation available via the API is also accessible from the command line. Global flag: <code>--db &lt;path&gt;</code> (default: <code>claude-memory.db</code>, env: <code>CLAUDE_MEMORY_DB</code>).
-        </p>
+        <p class="section-sub">Every API operation has a CLI equivalent. Global flags: <code>--db &lt;path&gt;</code> and <code>--json</code>.</p>
 
-        <div class="cli-cmd">
-            <h4>serve</h4>
-            <p>Start the HTTP daemon.</p>
-<pre><code>claude-memory serve [--host 127.0.0.1] [--port 9077]</code></pre>
-        </div>
-
-        <div class="cli-cmd">
-            <h4>store</h4>
-            <p>Store a new memory.</p>
-<pre><code>claude-memory store -T "Title" -c "Content body" \
-  [-t short|mid|long] [-n namespace] [--tags a,b,c] [-p 1-10]</code></pre>
-        </div>
-
-        <div class="cli-cmd">
-            <h4>recall</h4>
-            <p>Recall memories relevant to a context string. The primary retrieval interface.</p>
-<pre><code>claude-memory recall "what are the database conventions" \
-  [-n namespace] [--limit 10]</code></pre>
-        </div>
-
-        <div class="cli-cmd">
-            <h4>search</h4>
-            <p>Full-text search across all memories.</p>
-<pre><code>claude-memory search "UUID primary key" \
-  [-n namespace] [-t tier] [--limit 20]</code></pre>
-        </div>
-
-        <div class="cli-cmd">
-            <h4>get</h4>
-            <p>Retrieve a single memory by ID.</p>
-<pre><code>claude-memory get &lt;uuid&gt;</code></pre>
-        </div>
-
-        <div class="cli-cmd">
-            <h4>list</h4>
-            <p>List stored memories with optional filters.</p>
-<pre><code>claude-memory list [-n namespace] [-t tier] [--limit 20]</code></pre>
-        </div>
-
-        <div class="cli-cmd">
-            <h4>delete</h4>
-            <p>Delete a memory by ID.</p>
-<pre><code>claude-memory delete &lt;uuid&gt;</code></pre>
-        </div>
-
-        <div class="cli-cmd">
-            <h4>gc</h4>
-            <p>Run garbage collection &mdash; removes all expired short-term and mid-term memories.</p>
-<pre><code>claude-memory gc</code></pre>
-        </div>
-
-        <div class="cli-cmd">
-            <h4>stats</h4>
-            <p>Show database statistics: total count, breakdown by tier and namespace, database file size.</p>
-<pre><code>claude-memory stats</code></pre>
+        <div class="cli-grid">
+            <div class="cli-cmd">
+                <h4>serve</h4>
+                <p>Start the HTTP daemon</p>
+<pre><code><span class="fn">claude-memory</span> serve <span class="flag">--port</span> <span class="num">9077</span></code></pre>
+            </div>
+            <div class="cli-cmd">
+                <h4>store</h4>
+                <p>Store a new memory</p>
+<pre><code><span class="fn">claude-memory</span> store <span class="flag">-T</span> <span class="str">"Title"</span> <span class="flag">-c</span> <span class="str">"Content"</span> \
+  <span class="flag">--tier</span> mid <span class="flag">-p</span> <span class="num">7</span> <span class="flag">--tags</span> <span class="str">a,b</span></code></pre>
+            </div>
+            <div class="cli-cmd">
+                <h4>recall</h4>
+                <p>Fuzzy OR search with touch + auto-promote</p>
+<pre><code><span class="fn">claude-memory</span> recall <span class="str">"search context"</span> \
+  <span class="flag">-n</span> my-app <span class="flag">--limit</span> <span class="num">10</span></code></pre>
+            </div>
+            <div class="cli-cmd">
+                <h4>search</h4>
+                <p>Exact AND full-text search</p>
+<pre><code><span class="fn">claude-memory</span> search <span class="str">"exact terms"</span> \
+  <span class="flag">--tier</span> long <span class="flag">--limit</span> <span class="num">20</span></code></pre>
+            </div>
+            <div class="cli-cmd">
+                <h4>list</h4>
+                <p>List memories with optional filters</p>
+<pre><code><span class="fn">claude-memory</span> list <span class="flag">-n</span> my-app <span class="flag">-t</span> long</code></pre>
+            </div>
+            <div class="cli-cmd">
+                <h4>get / delete</h4>
+                <p>Retrieve or delete by ID</p>
+<pre><code><span class="fn">claude-memory</span> get <span class="str">&lt;uuid&gt;</span>
+<span class="fn">claude-memory</span> delete <span class="str">&lt;uuid&gt;</span></code></pre>
+            </div>
+            <div class="cli-cmd">
+                <h4>promote</h4>
+                <p>Promote a memory to long-term (permanent)</p>
+<pre><code><span class="fn">claude-memory</span> promote <span class="str">&lt;uuid&gt;</span></code></pre>
+            </div>
+            <div class="cli-cmd">
+                <h4>forget</h4>
+                <p>Bulk delete by namespace, pattern, or tier</p>
+<pre><code><span class="fn">claude-memory</span> forget <span class="flag">-n</span> my-app \
+  <span class="flag">--pattern</span> <span class="str">"deprecated"</span> <span class="flag">-t</span> short</code></pre>
+            </div>
+            <div class="cli-cmd">
+                <h4>link</h4>
+                <p>Link two memories with a relation type</p>
+<pre><code><span class="fn">claude-memory</span> link <span class="str">&lt;src-id&gt;</span> <span class="str">&lt;tgt-id&gt;</span> \
+  <span class="flag">-r</span> supersedes</code></pre>
+            </div>
+            <div class="cli-cmd">
+                <h4>consolidate</h4>
+                <p>Merge multiple memories into one</p>
+<pre><code><span class="fn">claude-memory</span> consolidate <span class="str">"id1,id2,id3"</span> \
+  <span class="flag">-T</span> <span class="str">"Summary"</span> <span class="flag">-s</span> <span class="str">"Combined..."</span></code></pre>
+            </div>
+            <div class="cli-cmd">
+                <h4>stats / gc / namespaces</h4>
+                <p>Monitoring and maintenance</p>
+<pre><code><span class="fn">claude-memory</span> stats
+<span class="fn">claude-memory</span> gc
+<span class="fn">claude-memory</span> namespaces</code></pre>
+            </div>
+            <div class="cli-cmd">
+                <h4>export / import</h4>
+                <p>Full JSON backup and restore</p>
+<pre><code><span class="fn">claude-memory</span> export > <span class="str">backup.json</span>
+<span class="fn">claude-memory</span> import < <span class="str">backup.json</span></code></pre>
+            </div>
         </div>
     </div>
 </section>
 
-<!-- Footer -->
+<!-- ============ FOOTER ============ -->
 <footer>
     <div class="container">
-        <p>
-            <strong>claude-memory</strong> &mdash; open source, MIT licensed<br>
-            <a href="https://github.com/alphaonedev/claude-memory">github.com/alphaonedev/claude-memory</a>
-        </p>
+        <div class="footer-links">
+            <a href="https://github.com/alphaonedev/claude-memory">GitHub</a>
+            <a href="https://github.com/alphaonedev/claude-memory/blob/main/docs/INSTALL.md">Installation</a>
+            <a href="https://github.com/alphaonedev/claude-memory/blob/main/docs/USER_GUIDE.md">User Guide</a>
+            <a href="https://github.com/alphaonedev/claude-memory/blob/main/docs/DEVELOPER_GUIDE.md">Developer Guide</a>
+            <a href="https://github.com/alphaonedev/claude-memory/blob/main/docs/ADMIN_GUIDE.md">Admin Guide</a>
+        </div>
+        <p>MIT Licensed</p>
+        <p class="built-with">Built with Rust + SQLite + FTS5</p>
     </div>
 </footer>
 
