@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 use crate::db;
 use crate::models::*;
+use crate::validate;
 
 pub type Db = Arc<Mutex<(rusqlite::Connection, std::path::PathBuf)>>;
 
@@ -23,8 +24,8 @@ pub async fn health(State(state): State<Db>) -> impl IntoResponse {
 }
 
 pub async fn create_memory(State(state): State<Db>, Json(body): Json<CreateMemory>) -> impl IntoResponse {
-    if body.content.len() > MAX_CONTENT_SIZE {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": format!("content exceeds {} bytes", MAX_CONTENT_SIZE)}))).into_response();
+    if let Err(e) = validate::validate_create(&body) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
     }
     let now = Utc::now();
     let expires_at = body.expires_at.or_else(|| {
@@ -72,10 +73,8 @@ pub async fn get_memory(State(state): State<Db>, Path(id): Path<String>) -> impl
 }
 
 pub async fn update_memory(State(state): State<Db>, Path(id): Path<String>, Json(body): Json<UpdateMemory>) -> impl IntoResponse {
-    if let Some(ref c) = body.content {
-        if c.len() > MAX_CONTENT_SIZE {
-            return (StatusCode::BAD_REQUEST, Json(json!({"error": format!("content exceeds {} bytes", MAX_CONTENT_SIZE)}))).into_response();
-        }
+    if let Err(e) = validate::validate_update(&body) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
     }
     let lock = state.lock().await;
     match db::update(&lock.0, &id, body.title.as_deref(), body.content.as_deref(),
@@ -161,6 +160,9 @@ pub async fn list_namespaces(State(state): State<Db>) -> impl IntoResponse {
 }
 
 pub async fn create_link(State(state): State<Db>, Json(body): Json<LinkBody>) -> impl IntoResponse {
+    if let Err(e) = validate::validate_link(&body.source_id, &body.target_id, &body.relation) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
+    }
     let lock = state.lock().await;
     match db::create_link(&lock.0, &body.source_id, &body.target_id, &body.relation) {
         Ok(()) => (StatusCode::CREATED, Json(json!({"linked": true}))).into_response(),
@@ -204,12 +206,17 @@ pub async fn import_memories(State(state): State<Db>, Json(body): Json<ImportBod
     let mut imported = 0usize;
     let mut errors = Vec::new();
     for mem in body.memories {
+        if let Err(e) = validate::validate_memory(&mem) {
+            errors.push(format!("{}: {}", mem.id, e));
+            continue;
+        }
         match db::insert(&lock.0, &mem) {
             Ok(_) => imported += 1,
             Err(e) => errors.push(format!("{}: {}", mem.id, e)),
         }
     }
     for link in body.links.unwrap_or_default() {
+        if validate::validate_link(&link.source_id, &link.target_id, &link.relation).is_err() { continue; }
         let _ = db::create_link(&lock.0, &link.source_id, &link.target_id, &link.relation);
     }
     Json(json!({"imported": imported, "errors": errors})).into_response()
@@ -235,8 +242,8 @@ pub struct ConsolidateBody {
 fn default_ns() -> String { "global".to_string() }
 
 pub async fn consolidate_memories(State(state): State<Db>, Json(body): Json<ConsolidateBody>) -> impl IntoResponse {
-    if body.ids.len() < 2 {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "need at least 2 memory IDs to consolidate"}))).into_response();
+    if let Err(e) = validate::validate_consolidate(&body.ids, &body.title, &body.summary, &body.namespace) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
     }
     let lock = state.lock().await;
     let tier = body.tier.unwrap_or(Tier::Long);
@@ -252,7 +259,7 @@ pub async fn bulk_create(State(state): State<Db>, Json(bodies): Json<Vec<CreateM
     let mut created = 0usize;
     let mut errors = Vec::new();
     for body in bodies {
-        if body.content.len() > MAX_CONTENT_SIZE { errors.push(format!("{}: too large", body.title)); continue; }
+        if let Err(e) = validate::validate_create(&body) { errors.push(format!("{}: {}", body.title, e)); continue; }
         let expires_at = body.expires_at.or_else(|| {
             body.ttl_secs.or(body.tier.default_ttl_secs()).map(|s| (now + Duration::seconds(s)).to_rfc3339())
         });
