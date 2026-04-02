@@ -1,3 +1,6 @@
+// Copyright (c) 2026 AlphaOne LLC. All rights reserved.
+// Licensed under the MIT License. See LICENSE file in the project root.
+
 use serde::{Deserialize, Serialize};
 
 /// Memory tier — mirrors human memory systems.
