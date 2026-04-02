@@ -1,5 +1,36 @@
 # Installation Guide
 
+> **BLUF (Bottom Line Up Front):** Install the binary, add 4 lines to `~/.claude/.mcp.json`, restart Claude Code. You get 13 memory tools instantly. Total time: ~60 seconds.
+
+## Install in 60 Seconds
+
+1. **Install the binary:**
+   ```bash
+   cargo install --git https://github.com/alphaonedev/claude-memory.git
+   ```
+
+2. **Configure MCP** (create or edit `~/.claude/.mcp.json`):
+   ```json
+   {
+     "mcpServers": {
+       "memory": {
+         "command": "claude-memory",
+         "args": ["--db", "~/.claude/claude-memory.db", "mcp"]
+       }
+     }
+   }
+   ```
+
+3. **Restart Claude Code.**
+
+4. **Verify** -- you should see 13 new tools: `memory_store`, `memory_recall`, `memory_search`, `memory_list`, `memory_delete`, `memory_promote`, `memory_forget`, `memory_stats`, `memory_update`, `memory_get`, `memory_link`, `memory_get_links`, `memory_consolidate`.
+
+5. **Test** -- ask Claude to store a memory. It should use `memory_store` automatically.
+
+That's it. Everything below is optional detail.
+
+---
+
 ## Prerequisites
 
 - **Rust toolchain** (1.75+): Install via [rustup](https://rustup.rs/)
@@ -39,14 +70,14 @@ The primary integration path is the **MCP tool server**. This makes memory opera
 
 ### Step 1: Add MCP configuration
 
-Create or edit `~/.claude/.mcp.json` (global -- applies to all projects) or `.mcp.json` in your project root (project-level):
+Create or edit `~/.claude/.mcp.json` (global -- applies to all projects):
 
 ```json
 {
   "mcpServers": {
     "memory": {
       "command": "claude-memory",
-      "args": ["--db", "/path/to/claude-memory.db", "mcp"]
+      "args": ["--db", "~/.claude/claude-memory.db", "mcp"]
     }
   }
 }
@@ -69,7 +100,7 @@ If `claude-memory` is not in your PATH, use the full path to the binary:
 
 ### Step 2: Verify
 
-Restart Claude Code. You should see 8 new tools available: `memory_store`, `memory_recall`, `memory_search`, `memory_list`, `memory_delete`, `memory_promote`, `memory_forget`, `memory_stats`.
+Restart Claude Code. You should see 13 new tools available: `memory_store`, `memory_recall`, `memory_search`, `memory_list`, `memory_delete`, `memory_promote`, `memory_forget`, `memory_stats`, `memory_update`, `memory_get`, `memory_link`, `memory_get_links`, `memory_consolidate`.
 
 ### Step 3: Test
 
@@ -220,7 +251,7 @@ sudo systemctl disable claude-memory
 sudo rm /etc/systemd/system/claude-memory.service
 sudo systemctl daemon-reload
 
-# Remove MCP configuration from ~/.claude/.mcp.json or .mcp.json
+# Remove MCP configuration from ~/.claude/.mcp.json
 
 # Remove the binary
 cargo uninstall claude-memory

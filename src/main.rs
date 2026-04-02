@@ -122,6 +122,12 @@ struct StoreArgs {
     /// Source: user, claude, hook, api
     #[arg(long, short = 'S', default_value = "cli")]
     source: String,
+    /// Explicit expiry timestamp (RFC3339). Overrides tier default.
+    #[arg(long)]
+    expires_at: Option<String>,
+    /// TTL in seconds. Overrides tier default.
+    #[arg(long)]
+    ttl_secs: Option<i64>,
 }
 
 #[derive(Args)]
@@ -141,6 +147,9 @@ struct UpdateArgs {
     priority: Option<i32>,
     #[arg(long)]
     confidence: Option<f64>,
+    /// Expiry timestamp (RFC3339), or empty string to clear
+    #[arg(long)]
+    expires_at: Option<String>,
 }
 
 #[derive(Args)]
@@ -154,6 +163,8 @@ struct RecallArgs {
     tags: Option<String>,
     #[arg(long)]
     since: Option<String>,
+    #[arg(long)]
+    until: Option<String>,
 }
 
 #[derive(Args)]
@@ -192,6 +203,8 @@ struct ListArgs {
     until: Option<String>,
     #[arg(long)]
     tags: Option<String>,
+    #[arg(long, default_value_t = 0)]
+    offset: usize,
 }
 
 #[derive(Args)]
@@ -408,6 +421,7 @@ async fn serve(db_path: PathBuf, args: ServeArgs) -> Result<()> {
         .route("/api/v1/memories/{id}", get(handlers::get_memory))
         .route("/api/v1/memories/{id}", put(handlers::update_memory))
         .route("/api/v1/memories/{id}", delete(handlers::delete_memory))
+        .route("/api/v1/memories/{id}/promote", post(handlers::promote_memory))
         .route("/api/v1/search", get(handlers::search_memories))
         .route("/api/v1/recall", get(handlers::recall_memories_get))
         .route("/api/v1/recall", post(handlers::recall_memories_post))
@@ -438,6 +452,7 @@ async fn serve(db_path: PathBuf, args: ServeArgs) -> Result<()> {
 
 fn cmd_store(db_path: PathBuf, args: StoreArgs, json_out: bool) -> Result<()> {
     let conn = db::open(&db_path)?;
+    let _ = db::gc_if_needed(&conn);
     let tier = Tier::from_str(&args.tier)
         .ok_or_else(|| anyhow::anyhow!("invalid tier: {} (use short, mid, long)", args.tier))?;
     let namespace = args.namespace.unwrap_or_else(auto_namespace);
@@ -464,11 +479,15 @@ fn cmd_store(db_path: PathBuf, args: StoreArgs, json_out: bool) -> Result<()> {
     validate::validate_tags(&tags)?;
     validate::validate_priority(args.priority)?;
     validate::validate_confidence(args.confidence)?;
+    validate::validate_expires_at(args.expires_at.as_deref())?;
+    validate::validate_ttl_secs(args.ttl_secs)?;
 
     let now = Utc::now();
-    let expires_at = tier
-        .default_ttl_secs()
-        .map(|s| (now + Duration::seconds(s)).to_rfc3339());
+    let expires_at = args.expires_at.or_else(|| {
+        args.ttl_secs
+            .or(tier.default_ttl_secs())
+            .map(|s| (now + Duration::seconds(s)).to_rfc3339())
+    });
     let mem = models::Memory {
         id: uuid::Uuid::new_v4().to_string(),
         tier,
@@ -539,6 +558,11 @@ fn cmd_update(db_path: PathBuf, args: UpdateArgs, json_out: bool) -> Result<()> 
     if let Some(c) = args.confidence {
         validate::validate_confidence(c)?;
     }
+    if let Some(ref ts) = args.expires_at {
+        if !ts.is_empty() {
+            validate::validate_expires_at(Some(ts))?;
+        }
+    }
     let updated = db::update(
         &conn,
         &args.id,
@@ -549,7 +573,7 @@ fn cmd_update(db_path: PathBuf, args: UpdateArgs, json_out: bool) -> Result<()> 
         tags.as_ref(),
         args.priority,
         args.confidence,
-        None,
+        args.expires_at.as_deref(),
     )?;
     if !updated {
         eprintln!("not found: {}", args.id);
@@ -567,6 +591,7 @@ fn cmd_update(db_path: PathBuf, args: UpdateArgs, json_out: bool) -> Result<()> 
 
 fn cmd_recall(db_path: PathBuf, args: RecallArgs, json_out: bool) -> Result<()> {
     let conn = db::open(&db_path)?;
+    let _ = db::gc_if_needed(&conn);
     let results = db::recall(
         &conn,
         &args.context,
@@ -574,6 +599,7 @@ fn cmd_recall(db_path: PathBuf, args: RecallArgs, json_out: bool) -> Result<()> 
         args.limit,
         args.tags.as_deref(),
         args.since.as_deref(),
+        args.until.as_deref(),
     )?;
     if json_out {
         println!(
@@ -614,6 +640,7 @@ fn cmd_recall(db_path: PathBuf, args: RecallArgs, json_out: bool) -> Result<()> 
 
 fn cmd_search(db_path: PathBuf, args: SearchArgs, json_out: bool) -> Result<()> {
     let conn = db::open(&db_path)?;
+    let _ = db::gc_if_needed(&conn);
     let tier = args.tier.as_deref().and_then(Tier::from_str);
     let results = db::search(
         &conn,
@@ -685,13 +712,14 @@ fn cmd_get(db_path: PathBuf, args: GetArgs, json_out: bool) -> Result<()> {
 
 fn cmd_list(db_path: PathBuf, args: ListArgs, json_out: bool) -> Result<()> {
     let conn = db::open(&db_path)?;
+    let _ = db::gc_if_needed(&conn);
     let tier = args.tier.as_deref().and_then(Tier::from_str);
     let results = db::list(
         &conn,
         args.namespace.as_deref(),
         tier.as_ref(),
         args.limit,
-        0,
+        args.offset,
         None,
         args.since.as_deref(),
         args.until.as_deref(),
@@ -1021,7 +1049,7 @@ fn cmd_shell(db_path: PathBuf) -> Result<()> {
                     eprintln!("usage: recall <context>");
                     continue;
                 }
-                match db::recall(&conn, &ctx, None, 10, None, None) {
+                match db::recall(&conn, &ctx, None, 10, None, None, None) {
                     Ok(results) => {
                         for mem in &results {
                             println!(
@@ -1190,8 +1218,9 @@ fn cmd_sync(db_path: PathBuf, args: SyncArgs, json_out: bool) -> Result<()> {
             let l_mems = db::export_all(&local_conn)?;
             let l_links = db::export_links(&local_conn)?;
             let (mut pulled, mut pushed) = (0, 0);
+            // Use timestamp-aware insert so newer version wins on conflict
             for mem in &r_mems {
-                if db::insert(&local_conn, mem).is_ok() {
+                if db::insert_if_newer(&local_conn, mem).is_ok() {
                     pulled += 1;
                 }
             }
@@ -1204,7 +1233,7 @@ fn cmd_sync(db_path: PathBuf, args: SyncArgs, json_out: bool) -> Result<()> {
                 );
             }
             for mem in &l_mems {
-                if db::insert(&remote_conn, mem).is_ok() {
+                if db::insert_if_newer(&remote_conn, mem).is_ok() {
                     pushed += 1;
                 }
             }
@@ -1268,19 +1297,23 @@ fn cmd_auto_consolidate(db_path: PathBuf, args: AutoConsolidateArgs, json_out: b
             continue;
         }
 
-        // Group by primary tag
+        // Group by all tags (each memory appears in every tag group it belongs to)
         let mut tag_groups: std::collections::HashMap<String, Vec<&models::Memory>> =
             std::collections::HashMap::new();
         for mem in &memories {
-            let key = mem
-                .tags
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "_untagged".to_string());
-            tag_groups.entry(key).or_default().push(mem);
+            if mem.tags.is_empty() {
+                tag_groups.entry("_untagged".to_string()).or_default().push(mem);
+            } else {
+                for tag in &mem.tags {
+                    tag_groups.entry(tag.clone()).or_default().push(mem);
+                }
+            }
         }
 
+        let mut consolidated_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (tag, group) in &tag_groups {
+            // Skip memories already consolidated in another tag group
+            let group: Vec<&&models::Memory> = group.iter().filter(|m| !consolidated_ids.contains(&m.id)).collect();
             if group.len() < args.min_count {
                 continue;
             }
@@ -1312,6 +1345,7 @@ fn cmd_auto_consolidate(db_path: PathBuf, args: AutoConsolidateArgs, json_out: b
                     &Tier::Long,
                     "auto-consolidate",
                 )?;
+                consolidated_ids.extend(ids);
                 total += group.len();
             }
         }

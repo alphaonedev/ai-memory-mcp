@@ -4,35 +4,35 @@ This project is `claude-memory` -- a persistent memory daemon for Claude Code.
 
 ## Primary Integration: MCP Server
 
-The recommended integration path is the **MCP tool server**. Configure in `~/.claude/.mcp.json` (global) or `.mcp.json` (project root):
+The recommended integration path is the **MCP tool server**. Configure in `~/.claude/.mcp.json` (global config -- applies to all projects):
 
 ```json
 {
   "mcpServers": {
     "memory": {
       "command": "claude-memory",
-      "args": ["--db", "/path/to/claude-memory.db", "mcp"]
+      "args": ["--db", "~/.claude/claude-memory.db", "mcp"]
     }
   }
 }
 ```
 
-> MCP server configuration does **not** go in `settings.json` or `settings.local.json` -- those files do not support `mcpServers`. Use `~/.claude/.mcp.json` for all projects, or `.mcp.json` in a repo root for project-level config.
+> MCP server configuration does **not** go in `settings.json`, `settings.local.json`, or project-level `.mcp.json` files. Memory is a global service -- always configure it in `~/.claude/.mcp.json`.
 
-This gives Claude Code 8 native tools: `memory_store`, `memory_recall`, `memory_search`, `memory_list`, `memory_delete`, `memory_promote`, `memory_forget`, `memory_stats`.
+This gives Claude Code 13 native tools: `memory_store`, `memory_recall`, `memory_search`, `memory_list`, `memory_delete`, `memory_promote`, `memory_forget`, `memory_stats`, `memory_update`, `memory_get`, `memory_link`, `memory_get_links`, `memory_consolidate`.
 
 ## Alternative: CLI Integration
 
-The CLI binary is at `/opt/cybercommand/bin/claude-memory` (or `claude-memory` if in PATH).
+The CLI binary is at `claude-memory` (or `claude-memory` if in PATH).
 
 ### At session start -- recall relevant context:
 ```bash
-claude-memory --db /opt/cybercommand/claude-memory.db recall "<current project or task context>"
+claude-memory --db /root/.claude/claude-memory.db recall "<current project or task context>"
 ```
 
 ### When you learn something important -- store it:
 ```bash
-claude-memory --db /opt/cybercommand/claude-memory.db store \
+claude-memory --db /root/.claude/claude-memory.db store \
   --tier long \
   --namespace "<project-name>" \
   --title "What you learned" \
@@ -48,7 +48,7 @@ claude-memory --db /opt/cybercommand/claude-memory.db store \
 
 ### When the user corrects you -- store as high-priority long-term:
 ```bash
-claude-memory --db /opt/cybercommand/claude-memory.db store \
+claude-memory --db /root/.claude/claude-memory.db store \
   --tier long --priority 9 --source user \
   --title "User correction: <what>" \
   --content "<the correction and why>"
@@ -57,7 +57,7 @@ claude-memory --db /opt/cybercommand/claude-memory.db store \
 ### Namespace auto-detection:
 If you omit `--namespace`, it auto-detects from the git remote or directory name.
 
-### All 22 commands:
+### All 24 commands:
 - `mcp` -- run as MCP tool server over stdio (primary integration path)
 - `serve` -- start the HTTP daemon on port 9077
 - `store` -- store a new memory (deduplicates by title+namespace)

@@ -16,6 +16,8 @@ use crate::validate;
 
 pub type Db = Arc<Mutex<(rusqlite::Connection, std::path::PathBuf)>>;
 
+const MAX_BULK_SIZE: usize = 1000;
+
 pub async fn health(State(state): State<Db>) -> impl IntoResponse {
     let lock = state.lock().await;
     let ok = db::health_check(&lock.0).unwrap_or(false);
@@ -83,15 +85,25 @@ pub async fn create_memory(
             }
             (StatusCode::CREATED, Json(response)).into_response()
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        Err(e) => {
+            tracing::error!("handler error: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "internal server error"})),
+            )
+                .into_response()
+        }
     }
 }
 
 pub async fn get_memory(State(state): State<Db>, Path(id): Path<String>) -> impl IntoResponse {
+    if let Err(e) = validate::validate_id(&id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
     let lock = state.lock().await;
     match db::get(&lock.0, &id) {
         Ok(Some(mem)) => {
@@ -99,11 +111,14 @@ pub async fn get_memory(State(state): State<Db>, Path(id): Path<String>) -> impl
             Json(json!({"memory": mem, "links": links})).into_response()
         }
         Ok(None) => (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        Err(e) => {
+            tracing::error!("handler error: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "internal server error"})),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -112,6 +127,13 @@ pub async fn update_memory(
     Path(id): Path<String>,
     Json(body): Json<UpdateMemory>,
 ) -> impl IntoResponse {
+    if let Err(e) = validate::validate_id(&id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
     if let Err(e) = validate::validate_update(&body) {
         return (
             StatusCode::BAD_REQUEST,
@@ -137,22 +159,59 @@ pub async fn update_memory(
             Json(json!(mem)).into_response()
         }
         Ok(false) => (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        Err(e) => {
+            tracing::error!("handler error: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "internal server error"})),
+            )
+                .into_response()
+        }
     }
 }
 
 pub async fn delete_memory(State(state): State<Db>, Path(id): Path<String>) -> impl IntoResponse {
+    if let Err(e) = validate::validate_id(&id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
     let lock = state.lock().await;
     match db::delete(&lock.0, &id) {
         Ok(true) => Json(json!({"deleted": true})).into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response(),
-        Err(e) => (
+        Err(e) => {
+            tracing::error!("handler error: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "internal server error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+pub async fn promote_memory(
+    State(state): State<Db>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let lock = state.lock().await;
+    match db::update(
+        &lock.0, &id, None, None, Some(&Tier::Long), None, None, None, None, None,
+    ) {
+        Ok(true) => {
+            let _ = lock.0.execute(
+                "UPDATE memories SET expires_at = NULL WHERE id = ?1",
+                rusqlite::params![id],
+            );
+            Json(json!({"promoted": true, "id": id, "tier": "long"})).into_response()
+        }
+        Ok(false) => (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response(),
+        Err(_e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": e.to_string()})),
+            Json(json!({"error": "database error"})),
         )
             .into_response(),
     }
@@ -176,11 +235,14 @@ pub async fn list_memories(
         p.tags.as_deref(),
     ) {
         Ok(mems) => Json(json!({"memories": mems, "count": mems.len()})).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        Err(e) => {
+            tracing::error!("handler error: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "internal server error"})),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -209,11 +271,14 @@ pub async fn search_memories(
         p.tags.as_deref(),
     ) {
         Ok(r) => Json(json!({"results": r, "count": r.len(), "query": p.q})).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        Err(e) => {
+            tracing::error!("handler error: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "internal server error"})),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -238,13 +303,17 @@ pub async fn recall_memories_get(
         limit,
         p.tags.as_deref(),
         p.since.as_deref(),
+        p.until.as_deref(),
     ) {
         Ok(r) => Json(json!({"memories": r, "count": r.len()})).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        Err(e) => {
+            tracing::error!("handler error: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "internal server error"})),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -268,13 +337,17 @@ pub async fn recall_memories_post(
         limit,
         body.tags.as_deref(),
         body.since.as_deref(),
+        body.until.as_deref(),
     ) {
         Ok(r) => Json(json!({"memories": r, "count": r.len()})).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        Err(e) => {
+            tracing::error!("handler error: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "internal server error"})),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -302,11 +375,14 @@ pub async fn list_namespaces(State(state): State<Db>) -> impl IntoResponse {
     let lock = state.lock().await;
     match db::list_namespaces(&lock.0) {
         Ok(ns) => Json(json!({"namespaces": ns})).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        Err(e) => {
+            tracing::error!("handler error: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "internal server error"})),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -321,23 +397,36 @@ pub async fn create_link(State(state): State<Db>, Json(body): Json<LinkBody>) ->
     let lock = state.lock().await;
     match db::create_link(&lock.0, &body.source_id, &body.target_id, &body.relation) {
         Ok(()) => (StatusCode::CREATED, Json(json!({"linked": true}))).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        Err(e) => {
+            tracing::error!("handler error: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "internal server error"})),
+            )
+                .into_response()
+        }
     }
 }
 
 pub async fn get_links(State(state): State<Db>, Path(id): Path<String>) -> impl IntoResponse {
+    if let Err(e) = validate::validate_id(&id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
     let lock = state.lock().await;
     match db::get_links(&lock.0, &id) {
         Ok(links) => Json(json!({"links": links})).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        Err(e) => {
+            tracing::error!("handler error: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "internal server error"})),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -345,11 +434,14 @@ pub async fn get_stats(State(state): State<Db>) -> impl IntoResponse {
     let lock = state.lock().await;
     match db::stats(&lock.0, &lock.1) {
         Ok(s) => Json(json!(s)).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        Err(e) => {
+            tracing::error!("handler error: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "internal server error"})),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -357,11 +449,14 @@ pub async fn run_gc(State(state): State<Db>) -> impl IntoResponse {
     let lock = state.lock().await;
     match db::gc(&lock.0) {
         Ok(n) => Json(json!({"expired_deleted": n})).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        Err(e) => {
+            tracing::error!("handler error: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "internal server error"})),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -376,6 +471,13 @@ pub async fn import_memories(
     State(state): State<Db>,
     Json(body): Json<ImportBody>,
 ) -> impl IntoResponse {
+    if body.memories.len() > MAX_BULK_SIZE {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("import limited to {} memories", MAX_BULK_SIZE)})),
+        )
+            .into_response();
+    }
     let lock = state.lock().await;
     let mut imported = 0usize;
     let mut errors = Vec::new();
@@ -448,11 +550,14 @@ pub async fn consolidate_memories(
             Json(json!({"id": new_id, "consolidated": body.ids.len()})),
         )
             .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        Err(e) => {
+            tracing::error!("handler error: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "internal server error"})),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -460,6 +565,13 @@ pub async fn bulk_create(
     State(state): State<Db>,
     Json(bodies): Json<Vec<CreateMemory>>,
 ) -> impl IntoResponse {
+    if bodies.len() > MAX_BULK_SIZE {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("bulk operations limited to {} items", MAX_BULK_SIZE)})),
+        )
+            .into_response();
+    }
     let now = Utc::now();
     let lock = state.lock().await;
     let mut created = 0usize;
