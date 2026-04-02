@@ -1,5 +1,8 @@
+// Copyright (c) 2026 AlphaOne LLC. All rights reserved.
+// Licensed under the MIT License. See LICENSE file in the project root.
+
 //! MCP (Model Context Protocol) server for claude-memory.
-//! Exposes memory operations as native Claude Code tools over stdio JSON-RPC.
+//! Exposes memory operations as tools for any MCP-compatible AI client over stdio JSON-RPC.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};

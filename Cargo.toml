@@ -1,10 +1,14 @@
 [package]
 name = "claude-memory"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
-description = "Persistent memory daemon for Claude Code — short, mid, and long-term recall"
+authors = ["AlphaOne LLC"]
+description = "AI-agnostic persistent memory system — MCP server, HTTP API, and CLI for any AI platform"
 license = "MIT"
 repository = "https://github.com/alphaonedev/ai-memory-mcp"
+homepage = "https://alphaonedev.github.io/ai-memory-mcp/"
+keywords = ["mcp", "ai", "memory", "sqlite", "llm"]
+categories = ["command-line-utilities", "database"]
 
 [dependencies]
 anyhow = "1"
