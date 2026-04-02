@@ -88,30 +88,44 @@ Each AI platform has its own MCP configuration location. The server command and 
 
 > **Note for Claude Code:** MCP server configuration does **not** go in `settings.json` or `settings.local.json` -- those files do not support `mcpServers`.
 
-**OpenAI Codex CLI** -- create or edit `~/.codex/config.toml` (TOML format, not JSON):
+**OpenAI Codex CLI** -- create or edit `~/.codex/config.toml` (global) or `.codex/config.toml` (project):
 
 ```toml
 [mcp_servers.memory]
 command = "ai-memory"
 args = ["--db", "~/.local/share/ai-memory/memories.db", "mcp"]
+enabled = true
 ```
 
-> **Note for Codex CLI:** Codex uses TOML format with underscored key `mcp_servers`, not camelCase.
+Or add via CLI:
 
-**Google Gemini CLI** -- create or edit `~/.gemini/settings.json`:
+```bash
+codex mcp add memory -- ai-memory --db ~/.local/share/ai-memory/memories.db mcp
+```
+
+> **Notes for Codex CLI:** Codex uses TOML format with underscored key `mcp_servers`, not camelCase. Additional supported options include `env`, `cwd`, `startup_timeout_sec`, `tool_timeout_sec`, `enabled_tools` (restrict which memory tools are exposed), and `disabled_tools`. Use `/mcp` in the TUI to view server status. Codex also supports HTTP-based MCP servers via `url` and `bearer_token_env_var`. See [Codex MCP docs](https://developers.openai.com/codex/mcp).
+
+**Google Gemini CLI** -- create or edit `~/.gemini/settings.json` (user) or `.gemini/settings.json` (project):
 
 ```json
 {
   "mcpServers": {
     "memory": {
       "command": "ai-memory",
-      "args": ["--db", "~/.local/share/ai-memory/memories.db", "mcp"]
+      "args": ["--db", "~/.local/share/ai-memory/memories.db", "mcp"],
+      "timeout": 30000
     }
   }
 }
 ```
 
-> **Note for Gemini CLI:** Gemini CLI sanitizes environment variables. Declare needed vars in the `env` field.
+Or add via CLI:
+
+```bash
+gemini mcp add memory ai-memory -- --db ~/.local/share/ai-memory/memories.db mcp
+```
+
+> **Notes for Gemini CLI:** Avoid underscores in server names (use hyphens). Tool names are auto-prefixed as `mcp_<serverName>_<toolName>`. Gemini sanitizes environment variables -- explicitly declare needed vars in the `env` field (supports `$VAR` expansion). Add `"trust": true` to skip tool confirmation prompts. Additional supported options include `cwd`, `includeTools`, `excludeTools`, `url` (SSE), and `httpUrl` (HTTP). See [Gemini CLI MCP docs](https://geminicli.com/docs/tools/mcp-server/).
 
 **Cursor IDE** -- create or edit `~/.cursor/mcp.json` (global) or `.cursor/mcp.json` (project-level):
 

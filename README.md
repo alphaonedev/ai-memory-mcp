@@ -11,7 +11,7 @@
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange?logo=rust)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![SQLite](https://img.shields.io/badge/sqlite-FTS5-003B57?logo=sqlite)](https://www.sqlite.org/)
-[![Tests](https://img.shields.io/badge/tests-41-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-48-brightgreen)]()
 [![MCP](https://img.shields.io/badge/MCP-13_tools-blueviolet)]()
 
 **ai-memory is a persistent memory system for AI assistants.** It works with **any AI that supports MCP** -- Claude, ChatGPT, Grok, Llama, and more. It stores what your AI learns in a local SQLite database, ranks memories by relevance when recalling, and auto-promotes important knowledge to permanent storage. Install it once, and every AI assistant you use remembers your architecture, your preferences, your corrections -- forever.
@@ -83,31 +83,41 @@ Add to `~/.claude/.mcp.json`:
 <details>
 <summary><strong>OpenAI Codex CLI</strong></summary>
 
-Add to `~/.codex/config.toml`:
+Add to `~/.codex/config.toml` (global) or `.codex/config.toml` (project):
 
 ```toml
 [mcp_servers.memory]
 command = "ai-memory"
 args = ["--db", "~/.local/share/ai-memory/memories.db", "mcp"]
+enabled = true
 ```
+
+Or add via CLI: `codex mcp add memory -- ai-memory --db ~/.local/share/ai-memory/memories.db mcp`
+
+> **Notes:** Codex uses TOML format with underscored key `mcp_servers`. Use `enabled_tools` to restrict which memory tools are exposed. Use `/mcp` in the TUI to view server status. See [Codex MCP docs](https://developers.openai.com/codex/mcp).
 
 </details>
 
 <details>
 <summary><strong>Google Gemini CLI</strong></summary>
 
-Add to `~/.gemini/settings.json`:
+Add to `~/.gemini/settings.json` (user) or `.gemini/settings.json` (project):
 
 ```json
 {
   "mcpServers": {
     "memory": {
       "command": "ai-memory",
-      "args": ["--db", "~/.local/share/ai-memory/memories.db", "mcp"]
+      "args": ["--db", "~/.local/share/ai-memory/memories.db", "mcp"],
+      "timeout": 30000
     }
   }
 }
 ```
+
+Or add via CLI: `gemini mcp add memory ai-memory -- --db ~/.local/share/ai-memory/memories.db mcp`
+
+> **Notes:** Avoid underscores in server names (use hyphens). Tool names are auto-prefixed as `mcp_memory_<toolName>`. Gemini sanitizes environment variables -- explicitly declare needed vars in the `env` field. Add `"trust": true` to skip confirmation prompts. See [Gemini CLI MCP docs](https://geminicli.com/docs/tools/mcp-server/).
 
 </details>
 
@@ -302,7 +312,7 @@ Beyond MCP, ai-memory also exposes a full HTTP REST API (20 endpoints on port 90
 - **Color CLI output** -- ANSI tier labels (red/yellow/green), priority bars, bold titles, cyan namespaces
 
 ### Quality
-- **41 tests** -- 8 unit + 33 integration
+- **48 tests** -- 8 unit + 40 integration
 - **Criterion benchmarks** -- insert, recall, search at 1K scale
 - **GitHub Actions CI/CD** -- fmt, clippy, test, build on Ubuntu + macOS, release on tag
 
