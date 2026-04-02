@@ -1,15 +1,15 @@
 # Installation Guide
 
-> **BLUF (Bottom Line Up Front):** Install the binary, add 4 lines to `~/.claude/.mcp.json`, restart Claude Code. You get 13 memory tools instantly. Total time: ~60 seconds.
+> **BLUF (Bottom Line Up Front):** `claude-memory` is an AI-agnostic memory management system that works with **any MCP-compatible AI client** -- including Claude AI, OpenAI ChatGPT, xAI Grok, META Llama, and others. Install the binary, configure your AI client's MCP settings, and you get 13 memory tools instantly. Total time: ~60 seconds.
 
 ## Install in 60 Seconds
 
 1. **Install the binary:**
    ```bash
-   cargo install --git https://github.com/alphaonedev/claude-memory.git
+   cargo install --git https://github.com/alphaonedev/ai-memory-mcp.git
    ```
 
-2. **Configure MCP** (create or edit `~/.claude/.mcp.json`):
+2. **Configure MCP in your AI client.** The example below is for **Claude Code** (`~/.claude/.mcp.json`):
    ```json
    {
      "mcpServers": {
@@ -20,12 +20,13 @@
      }
    }
    ```
+   > **Other AI platforms** (OpenAI ChatGPT, xAI Grok, META Llama, etc.) have their own MCP configuration locations. Consult your platform's documentation for where to add MCP server entries. The server command and args are the same -- only the config file location differs.
 
-3. **Restart Claude Code.**
+3. **Restart your AI client.**
 
 4. **Verify** -- you should see 13 new tools: `memory_store`, `memory_recall`, `memory_search`, `memory_list`, `memory_delete`, `memory_promote`, `memory_forget`, `memory_stats`, `memory_update`, `memory_get`, `memory_link`, `memory_get_links`, `memory_consolidate`.
 
-5. **Test** -- ask Claude to store a memory. It should use `memory_store` automatically.
+5. **Test** -- ask your AI assistant to store a memory. It should use `memory_store` automatically.
 
 That's it. Everything below is optional detail.
 
@@ -41,7 +42,7 @@ That's it. Everything below is optional detail.
 ## Install from Source (One-Liner)
 
 ```bash
-cargo install --git https://github.com/alphaonedev/claude-memory.git
+cargo install --git https://github.com/alphaonedev/ai-memory-mcp.git
 ```
 
 This builds a release binary and places it in `~/.cargo/bin/claude-memory`.
@@ -49,14 +50,14 @@ This builds a release binary and places it in `~/.cargo/bin/claude-memory`.
 Or clone and build locally:
 
 ```bash
-git clone https://github.com/alphaonedev/claude-memory.git
+git clone https://github.com/alphaonedev/ai-memory-mcp.git
 cd claude-memory
 cargo install --path .
 ```
 
 ## Binary Download
 
-Pre-built binaries are available on the [Releases](https://github.com/alphaonedev/claude-memory/releases) page for Linux (x86_64) and macOS (aarch64). Download the tarball for your platform:
+Pre-built binaries are available on the [Releases](https://github.com/alphaonedev/ai-memory-mcp/releases) page for Linux (x86_64) and macOS (aarch64). Download the tarball for your platform:
 
 ```bash
 tar xzf claude-memory-x86_64-unknown-linux-gnu.tar.gz
@@ -66,11 +67,13 @@ sudo mv claude-memory /usr/local/bin/
 
 ## MCP Server Setup (Recommended)
 
-The primary integration path is the **MCP tool server**. This makes memory operations available as native tools inside Claude Code.
+The primary integration path is the **MCP tool server**. MCP (Model Context Protocol) is an open standard -- `claude-memory` works with **any MCP-compatible AI client**, including Claude AI, OpenAI ChatGPT, xAI Grok, META Llama, and others.
 
 ### Step 1: Add MCP configuration
 
-Create or edit `~/.claude/.mcp.json` (global -- applies to all projects):
+Each AI platform has its own MCP configuration location. The server command and arguments are identical across all platforms.
+
+**Claude Code** -- create or edit `~/.claude/.mcp.json` (global -- applies to all projects):
 
 ```json
 {
@@ -82,6 +85,12 @@ Create or edit `~/.claude/.mcp.json` (global -- applies to all projects):
   }
 }
 ```
+
+> **Note for Claude Code:** MCP server configuration does **not** go in `settings.json` or `settings.local.json` -- those files do not support `mcpServers`.
+
+**Other MCP-compatible clients** -- consult your platform's documentation for where to register MCP servers. The server entry is the same:
+- **Command:** `claude-memory` (or full path if not in PATH)
+- **Args:** `["--db", "/path/to/memory.db", "mcp"]`
 
 If `claude-memory` is not in your PATH, use the full path to the binary:
 
@@ -96,19 +105,17 @@ If `claude-memory` is not in your PATH, use the full path to the binary:
 }
 ```
 
-> **Important:** MCP server configuration does **not** go in `settings.json` or `settings.local.json` -- those files do not support `mcpServers`.
-
 ### Step 2: Verify
 
-Restart Claude Code. You should see 13 new tools available: `memory_store`, `memory_recall`, `memory_search`, `memory_list`, `memory_delete`, `memory_promote`, `memory_forget`, `memory_stats`, `memory_update`, `memory_get`, `memory_link`, `memory_get_links`, `memory_consolidate`.
+Restart your AI client. You should see 13 new tools available: `memory_store`, `memory_recall`, `memory_search`, `memory_list`, `memory_delete`, `memory_promote`, `memory_forget`, `memory_stats`, `memory_update`, `memory_get`, `memory_link`, `memory_get_links`, `memory_consolidate`.
 
 ### Step 3: Test
 
-Ask Claude to store a memory. It should use the `memory_store` tool automatically.
+Ask your AI assistant to store a memory. It should use the `memory_store` tool automatically.
 
-## Hook Installation (Optional)
+## Hook Installation (Optional, Claude Code-Specific)
 
-The `hooks/session-start.sh` script auto-recalls relevant memories at the start of each Claude Code session.
+The `hooks/session-start.sh` script auto-recalls relevant memories at the start of each Claude Code session. Other AI platforms may have their own hook/plugin mechanisms -- the CLI commands used in this hook work with any platform.
 
 ### Install the hook
 
@@ -143,7 +150,7 @@ chmod +x ~/.claude/hooks/session-start.sh
 
 ## Systemd Service Setup (HTTP Daemon)
 
-If you want to run the HTTP daemon as a background service (alternative to MCP):
+If you want to run the HTTP daemon as a background service (alternative to MCP). The HTTP API at `localhost:9077` works with **any AI platform, framework, or tool** -- no MCP required:
 
 ```bash
 sudo tee /etc/systemd/system/claude-memory.service > /dev/null << 'EOF'

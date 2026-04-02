@@ -2,11 +2,11 @@
 
 ## Architecture Overview
 
-`claude-memory` is a single Rust binary that serves three roles:
+`claude-memory` is an AI-agnostic memory management system built as a single Rust binary that serves three roles:
 
-1. **MCP tool server** -- stdio JSON-RPC server exposing 13 memory tools for Claude Code
-2. **CLI tool** -- direct SQLite operations for store, recall, search, list, etc.
-3. **HTTP daemon** -- an Axum web server exposing the same operations as a REST API with 20 endpoints
+1. **MCP tool server** -- stdio JSON-RPC server exposing 13 memory tools for any MCP-compatible AI client (Claude AI, OpenAI ChatGPT, xAI Grok, META Llama, and others)
+2. **CLI tool** -- direct SQLite operations for store, recall, search, list, etc. (completely AI-agnostic)
+3. **HTTP daemon** -- an Axum web server exposing the same operations as a REST API with 20 endpoints (completely AI-agnostic)
 
 All three interfaces share the same database layer (`db.rs`) and validation layer (`validate.rs`). The daemon adds automatic garbage collection (every 30 minutes) and graceful shutdown with WAL checkpointing.
 
@@ -46,7 +46,7 @@ color.rs         -- ANSI color output for CLI (zero dependencies, auto-detects t
 
 ### `src/mcp.rs`
 
-The MCP (Model Context Protocol) server implementation. Runs over stdio, processing one JSON-RPC message per line. Exposes **13 tools**.
+The MCP (Model Context Protocol) server implementation. MCP is an open standard -- this server works with any MCP-compatible AI client. Runs over stdio, processing one JSON-RPC message per line. Exposes **13 tools**.
 
 - `RpcRequest` / `RpcResponse` / `RpcError` -- JSON-RPC 2.0 types
 - `tool_definitions()` -- returns the 13 tool schemas for `tools/list`
@@ -59,7 +59,7 @@ The MCP (Model Context Protocol) server implementation. Runs over stdio, process
 - Notification handling: all JSON-RPC notifications (requests without an `id` field) are correctly skipped without sending a response, per the JSON-RPC 2.0 specification
 - `run_mcp_server()` -- main loop: reads lines from stdin, parses JSON-RPC, dispatches, writes responses to stdout
 
-Protocol version: `2024-11-05`. All tool responses are wrapped in MCP content blocks (`{"content": [{"type": "text", "text": "..."}]}`).
+Protocol version: `2024-11-05`. All tool responses are wrapped in MCP content blocks (`{"content": [{"type": "text", "text": "..."}]}`). The protocol is AI-agnostic -- any MCP client can connect.
 
 ### `src/validate.rs`
 
@@ -502,13 +502,13 @@ claude-memory serve --host 127.0.0.1 --port 9077
 
 ### `mcp`
 
-Run as an MCP tool server over stdio. This is the primary integration path for Claude Code. Exposes 13 tools.
+Run as an MCP tool server over stdio. This is the primary integration path for any MCP-compatible AI client. Exposes 13 tools.
 
 ```bash
 claude-memory mcp
 ```
 
-Reads JSON-RPC from stdin, writes responses to stdout. Logs to stderr. Correctly handles notifications (no response sent).
+Reads JSON-RPC from stdin, writes responses to stdout. Logs to stderr. Correctly handles notifications (no response sent). Works with any MCP-compatible client (Claude AI, OpenAI ChatGPT, xAI Grok, META Llama, etc.).
 
 ### `store`
 
@@ -761,7 +761,7 @@ On tag push (e.g., `v0.2.0`):
 ## Building from Source
 
 ```bash
-git clone https://github.com/alphaonedev/claude-memory.git
+git clone https://github.com/alphaonedev/ai-memory-mcp.git
 cd claude-memory
 
 # Debug build

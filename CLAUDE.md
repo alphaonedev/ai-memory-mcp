@@ -1,6 +1,8 @@
 # Claude Memory Integration
 
-This project is `claude-memory` -- a persistent memory daemon for Claude Code.
+> **Note:** `claude-memory` is AI-agnostic and works with any MCP-compatible AI client (Claude AI, OpenAI ChatGPT, xAI Grok, META Llama, and others). This file contains **Claude Code-specific** integration instructions.
+
+This project is `claude-memory` -- a persistent memory daemon. While it works with any MCP client, this file provides instructions specific to Claude Code.
 
 ## Primary Integration: MCP Server
 

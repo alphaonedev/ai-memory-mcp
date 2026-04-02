@@ -1,12 +1,14 @@
 # Admin Guide
 
+`claude-memory` is an AI-agnostic memory management system. It works with **any MCP-compatible AI client** -- including Claude AI, OpenAI ChatGPT, xAI Grok, META Llama, and others. The HTTP API and CLI are completely platform-independent.
+
 ## Deployment Options
 
 ### MCP Server (Recommended)
 
-The simplest deployment is as an MCP tool server. No daemon process to manage -- Claude Code spawns the process on demand.
+The simplest deployment is as an MCP tool server. No daemon process to manage -- your AI client spawns the process on demand. MCP (Model Context Protocol) is an open standard supported by multiple AI platforms.
 
-Configure in `~/.claude/.mcp.json` (global -- applies to all projects):
+Below is an example for **Claude Code** (`~/.claude/.mcp.json`). Other MCP-compatible clients have their own configuration locations -- consult your platform's documentation.
 
 ```json
 {
@@ -19,14 +21,15 @@ Configure in `~/.claude/.mcp.json` (global -- applies to all projects):
 }
 ```
 
-> MCP server configuration does **not** go in `settings.json` or `settings.local.json` -- those files do not support `mcpServers`.
+> **Claude Code note:** MCP server configuration does **not** go in `settings.json` or `settings.local.json` -- those files do not support `mcpServers`.
 
 The MCP server:
-- Starts when Claude Code opens a session
-- Communicates over stdio (JSON-RPC)
+- Starts when your AI client opens a session
+- Communicates over stdio (JSON-RPC) -- the standard MCP transport
 - Stops when the session ends
 - Uses the same SQLite database as the CLI and HTTP daemon
 - Correctly skips all JSON-RPC notifications (no response sent)
+- Works with any MCP-compatible client, not just Claude Code
 
 ### Standalone (Development)
 
@@ -139,7 +142,7 @@ The HTTP daemon handles SIGINT (Ctrl+C) gracefully:
 
 For systemd, use `KillSignal=SIGINT` and `TimeoutStopSec=10` to ensure the checkpoint completes.
 
-The MCP server exits cleanly when stdin closes (Claude Code session ends).
+The MCP server exits cleanly when stdin closes (AI client session ends).
 
 ## Database Management
 
@@ -281,7 +284,7 @@ The MCP server communicates over stdio only -- no network exposure.
 
 ### No Authentication
 
-There is no authentication mechanism. This is by design -- the daemon is intended for localhost access only. If you expose it to a network, you are responsible for adding a reverse proxy with authentication.
+There is no authentication mechanism. This is by design -- the daemon is intended for localhost access only by your AI client (Claude AI, ChatGPT, Grok, Llama, or any other). If you expose it to a network, you are responsible for adding a reverse proxy with authentication.
 
 ### Data at Rest
 
@@ -289,7 +292,7 @@ The SQLite database is stored as a regular file. It is not encrypted. If you nee
 
 ### MCP Notification Handling
 
-The MCP server correctly handles all JSON-RPC notifications (requests without an `id` field). Notifications are processed but no response is sent, per the JSON-RPC 2.0 specification. This prevents protocol errors when Claude Code sends `notifications/initialized` or other notification messages.
+The MCP server correctly handles all JSON-RPC notifications (requests without an `id` field). Notifications are processed but no response is sent, per the JSON-RPC 2.0 specification. This prevents protocol errors when any MCP client sends `notifications/initialized` or other notification messages.
 
 ### WAL Files
 
@@ -360,14 +363,14 @@ Returns:
 The MCP server logs to stderr. Monitor via:
 
 ```bash
-# If running via Claude Code, check Claude Code's MCP logs
+# If running via an AI client, check your client's MCP logs
 # If running manually:
 claude-memory mcp 2>mcp-server.log
 ```
 
 Key log messages:
 - `claude-memory MCP server started (stdio)` -- server is ready
-- `claude-memory MCP server stopped` -- stdin closed, server exiting
+- `claude-memory MCP server stopped` -- stdin closed (AI client session ended), server exiting
 
 ### Logs
 
@@ -522,7 +525,7 @@ man claude-memory
 `claude-memory` is designed for single-machine use. It is not a distributed system.
 
 - **Concurrency**: The daemon uses `Arc<Mutex<Connection>>` -- one write at a time, but this is fine for a single-user tool. SQLite WAL mode allows concurrent reads.
-- **MCP concurrency**: The MCP server is single-threaded (synchronous stdio loop), one request at a time. This is by design -- Claude Code sends one request at a time.
+- **MCP concurrency**: The MCP server is single-threaded (synchronous stdio loop), one request at a time. This is by design -- MCP clients typically send one request at a time.
 - **Database size**: SQLite handles databases up to 281 TB. Practically, performance stays excellent up to millions of rows.
 - **Memory usage**: Minimal. The daemon holds only the connection and a path in memory. All data is on disk.
 - **Multiple instances**: You can run multiple daemons on different ports with different databases. Do not point two daemons at the same database file. The MCP server and CLI can share a database (both use WAL mode).
@@ -554,7 +557,7 @@ ls -la /path/to/claude-memory.db
 ### MCP server not connecting
 
 **Binary not found:**
-Check that the path in `~/.claude/.mcp.json` is correct and the binary is executable.
+Check that the path in your MCP configuration (e.g., `~/.claude/.mcp.json` for Claude Code) is correct and the binary is executable.
 
 **Database path issues:**
 The MCP server opens the database at the path specified by `--db`. Ensure the directory exists and is writable.

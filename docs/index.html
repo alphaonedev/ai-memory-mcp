@@ -3,10 +3,10 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>claude-memory -- Persistent Memory for Claude Code</title>
-    <meta name="description" content="Give Claude Code persistent memory across sessions. A single Rust binary with three interfaces (MCP, HTTP, CLI), three-tier recall, SQLite FTS5, and 6-factor ranking.">
+    <title>claude-memory -- Persistent Memory for Any AI</title>
+    <meta name="description" content="Give any AI persistent memory across sessions. MCP-based memory management for Claude, ChatGPT, Grok, Llama, and any MCP-compatible platform. A single Rust binary with three interfaces (MCP, HTTP, CLI), three-tier recall, SQLite FTS5, and 6-factor ranking.">
     <meta name="theme-color" content="#0d1117">
-    <link rel="canonical" href="https://alphaonedev.github.io/claude-memory/">
+    <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/">
     <style>
         /* ============================================================
            DESIGN TOKENS
@@ -79,7 +79,7 @@
         .hero{padding:8.5rem 0 4rem;text-align:center;background:linear-gradient(180deg,rgba(88,166,255,.07) 0%,transparent 55%)}
         .hero h1{font-size:clamp(2rem,5vw,3.4rem);font-weight:800;margin-bottom:1rem;letter-spacing:-.025em;line-height:1.15}
         .hero h1 span{color:var(--accent)}
-        .hero .bluf{color:var(--text-muted);font-size:1.2rem;max-width:680px;margin:0 auto 2.5rem;line-height:1.6}
+        .hero .bluf{color:var(--text-muted);font-size:1.2rem;max-width:720px;margin:0 auto 2.5rem;line-height:1.6}
 
         .stats-row{display:flex;justify-content:center;gap:2rem;flex-wrap:wrap;margin-bottom:2.5rem}
         .stat{text-align:center}
@@ -88,6 +88,20 @@
 
         .hero-cta{display:inline-flex;align-items:center;gap:.5rem;background:var(--accent-dim);color:#fff;font-weight:700;font-size:1rem;padding:.75rem 1.75rem;border-radius:8px;transition:background .2s,transform .15s;border:none;cursor:pointer}
         .hero-cta:hover{background:var(--accent);text-decoration:none;transform:translateY(-1px)}
+
+        /* ============================================================
+           PLATFORM CARDS (Works With)
+           ============================================================ */
+        .platform-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:1rem;margin:1.5rem 0}
+        .platform-card{background:var(--bg-card);border:1px solid var(--border);border-radius:10px;padding:1.35rem 1rem;text-align:center;transition:border-color .2s,transform .2s,box-shadow .2s}
+        .platform-card:hover{border-color:var(--accent-dim);transform:translateY(-3px);box-shadow:0 6px 28px rgba(0,0,0,.3)}
+        .platform-card .platform-icon{font-size:2rem;margin-bottom:.6rem;display:block}
+        .platform-card h4{font-size:.95rem;margin-bottom:.3rem}
+        .platform-card p{font-size:.78rem;color:var(--text-muted);margin:0}
+        .platform-card .platform-tag{display:inline-block;font-size:.65rem;font-weight:600;text-transform:uppercase;letter-spacing:.04em;padding:.15em .5em;border-radius:3px;margin-top:.5rem}
+        .tag-mcp{color:var(--purple);background:rgba(188,140,255,.12)}
+        .tag-http{color:var(--orange);background:rgba(210,153,34,.12)}
+        .tag-universal{color:var(--cyan);background:rgba(57,210,192,.12)}
 
         /* ============================================================
            SECTIONS
@@ -216,6 +230,15 @@
         .steps li p{color:var(--text-muted);font-size:.9rem;margin-bottom:.75rem}
 
         /* ============================================================
+           INTEGRATION TABS
+           ============================================================ */
+        .integration-tabs{display:flex;gap:.5rem;flex-wrap:wrap;margin-bottom:1.25rem}
+        .integration-tab{background:var(--bg-card);border:1px solid var(--border);border-radius:6px;padding:.5rem 1rem;font-size:.82rem;font-weight:600;color:var(--text-muted);cursor:pointer;transition:all .2s}
+        .integration-tab:hover,.integration-tab.active{color:var(--accent);border-color:var(--accent-dim);background:rgba(88,166,255,.06)}
+        .integration-panel{display:none}
+        .integration-panel.active{display:block}
+
+        /* ============================================================
            ANIMATIONS
            ============================================================ */
         @keyframes flow{0%{stroke-dashoffset:20}100%{stroke-dashoffset:0}}
@@ -251,9 +274,13 @@
             .card-grid,.feature-grid{grid-template-columns:1fr}
             .tier-cards{grid-template-columns:1fr}
             .security-grid{grid-template-columns:1fr}
+            .platform-grid{grid-template-columns:repeat(2,1fr)}
             nav .links{gap:.5rem}
             nav .links a{font-size:.75rem}
             .steps li{padding-left:3rem}
+        }
+        @media(max-width:420px){
+            .platform-grid{grid-template-columns:1fr}
         }
     </style>
 </head>
@@ -266,6 +293,7 @@
     <div class="container">
         <span class="logo">claude-memory</span>
         <div class="links">
+            <a href="#platforms">Platforms</a>
             <a href="#install">Install</a>
             <a href="#features">Features</a>
             <a href="#mcp">MCP Tools</a>
@@ -276,7 +304,7 @@
             <a href="#security">Security</a>
             <a href="#architecture">Architecture</a>
             <a href="#matrix">Matrix</a>
-            <a href="https://github.com/alphaonedev/claude-memory">GitHub</a>
+            <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub</a>
         </div>
     </div>
 </nav>
@@ -286,43 +314,114 @@
      ================================================================ -->
 <section class="hero">
     <div class="container">
-        <h1>Persistent Memory for <span>Claude Code</span></h1>
+        <h1>Persistent Memory for <span>Any AI</span></h1>
         <p class="bluf">
-            Claude Code forgets everything between sessions. This fixes that.
-            A single Rust binary gives Claude real memory -- short-term, mid-term, and permanent -- so it
+            Give any AI a memory that persists. Works with Claude, ChatGPT, Grok, Llama, and any MCP-compatible platform.
+            A single Rust binary gives your AI real memory -- short-term, mid-term, and permanent -- so it
             remembers your projects, preferences, and past decisions across every conversation.
         </p>
         <div class="stats-row">
             <div class="stat"><span class="num">13</span><span class="label">MCP Tools</span></div>
             <div class="stat"><span class="num">20</span><span class="label">HTTP Endpoints</span></div>
-            <div class="stat"><span class="num">25</span><span class="label">CLI Commands</span></div>
+            <div class="stat"><span class="num">24</span><span class="label">CLI Commands</span></div>
             <div class="stat"><span class="num">41</span><span class="label">Tests</span></div>
             <div class="stat"><span class="num">6</span><span class="label">Ranking Factors</span></div>
         </div>
-        <a href="#install" class="hero-cta">Install in 60 Seconds</a>
+        <a href="#install" class="hero-cta">Get Started in 60 Seconds</a>
     </div>
 </section>
 
 <!-- ================================================================
-     INSTALL IN 60 SECONDS
+     WORKS WITH (Platform Cards)
      ================================================================ -->
-<section id="install" class="alt">
+<section id="platforms" class="alt">
+    <div class="container">
+        <h2>Works With Any AI Platform</h2>
+        <p class="section-subtitle">MCP is the universal integration layer. The HTTP API works with literally anything that can make a request. No vendor lock-in.</p>
+
+        <div class="platform-grid">
+            <div class="platform-card">
+                <span class="platform-icon">C</span>
+                <h4>Claude AI</h4>
+                <p>Anthropic's Claude Code, Claude Desktop, and any Claude-based tool</p>
+                <span class="platform-tag tag-mcp">MCP Native</span>
+            </div>
+            <div class="platform-card">
+                <span class="platform-icon">G</span>
+                <h4>OpenAI ChatGPT</h4>
+                <p>ChatGPT, GPT-4, GPT-4o, and OpenAI-compatible APIs</p>
+                <span class="platform-tag tag-http">HTTP / MCP</span>
+            </div>
+            <div class="platform-card">
+                <span class="platform-icon">X</span>
+                <h4>xAI Grok</h4>
+                <p>Grok and any xAI-based applications</p>
+                <span class="platform-tag tag-http">HTTP / MCP</span>
+            </div>
+            <div class="platform-card">
+                <span class="platform-icon">L</span>
+                <h4>META Llama</h4>
+                <p>Llama 3, Llama 4, and all Meta open-source models</p>
+                <span class="platform-tag tag-http">HTTP / MCP</span>
+            </div>
+            <div class="platform-card">
+                <span class="platform-icon">*</span>
+                <h4>Any MCP Client</h4>
+                <p>Any tool that speaks the Model Context Protocol -- present or future</p>
+                <span class="platform-tag tag-universal">Universal</span>
+            </div>
+        </div>
+
+        <p style="text-align:center;margin-top:1.5rem;font-size:.9rem;color:var(--text-muted)">
+            <strong style="color:var(--accent)">MCP</strong> = native tool integration (stdio JSON-RPC) &nbsp;|&nbsp;
+            <strong style="color:var(--orange)">HTTP</strong> = REST API on localhost:9077 (works with anything) &nbsp;|&nbsp;
+            <strong style="color:var(--green)">CLI</strong> = shell commands (scriptable, pipeable)
+        </p>
+    </div>
+</section>
+
+<!-- ================================================================
+     INSTALL
+     ================================================================ -->
+<section id="install">
     <div class="container">
         <h2>Install in 60 Seconds</h2>
-        <p class="section-subtitle">Three steps. Copy, paste, done.</p>
+        <p class="section-subtitle">Three steps. Build, configure your AI platform, and go.</p>
 
         <ol class="steps">
             <li>
                 <h4>Build the binary</h4>
                 <p>Clone the repo and compile. You need Rust installed (<a href="https://rustup.rs">rustup.rs</a> if you don't have it).</p>
-                <pre><code><span class="tok-cmd">git clone</span> <span class="tok-url">https://github.com/alphaonedev/claude-memory.git</span>
+                <pre><code><span class="tok-cmd">git clone</span> <span class="tok-url">https://github.com/alphaonedev/ai-memory-mcp.git</span>
 <span class="tok-cmd">cd</span> claude-memory
 <span class="tok-cmd">cargo install</span> <span class="tok-flag">--path</span> .<span class="lang-label">bash</span></code></pre>
             </li>
             <li>
-                <h4>Tell Claude Code about it</h4>
-                <p>Add this to <code>~/.claude/.mcp.json</code> (create the file if it doesn't exist). This is the global config -- memory works across all projects.</p>
-                <pre><code>{
+                <h4>Configure your AI platform</h4>
+                <p>Choose the integration method that fits your setup.</p>
+
+                <div class="integration-tabs">
+                    <span class="integration-tab active" onclick="switchTab('tab-mcp-generic')">MCP (Generic)</span>
+                    <span class="integration-tab" onclick="switchTab('tab-claude')">Claude Code</span>
+                    <span class="integration-tab" onclick="switchTab('tab-http')">HTTP API (Any AI)</span>
+                </div>
+
+                <div id="tab-mcp-generic" class="integration-panel active">
+                    <p>For any MCP-compatible client, point it to the claude-memory binary with the <code>mcp</code> subcommand:</p>
+                    <pre><code>{
+  <span class="tok-str">"mcpServers"</span>: {
+    <span class="tok-str">"memory"</span>: {
+      <span class="tok-str">"command"</span>: <span class="tok-str">"claude-memory"</span>,
+      <span class="tok-str">"args"</span>: [<span class="tok-str">"--db"</span>, <span class="tok-str">"path/to/memory.db"</span>, <span class="tok-str">"mcp"</span>]
+    }
+  }
+}<span class="lang-label">json</span></code></pre>
+                    <p style="font-size:.85rem">The MCP server exposes 13 tools over stdio using JSON-RPC. Your AI client will discover them automatically.</p>
+                </div>
+
+                <div id="tab-claude" class="integration-panel">
+                    <p>Add this to <code>~/.claude/.mcp.json</code> (global config -- memory works across all projects):</p>
+                    <pre><code>{
   <span class="tok-str">"mcpServers"</span>: {
     <span class="tok-str">"memory"</span>: {
       <span class="tok-str">"command"</span>: <span class="tok-str">"claude-memory"</span>,
@@ -330,13 +429,28 @@
     }
   }
 }<span class="lang-label">json</span></code></pre>
+                    <p style="font-size:.85rem">Restart Claude Code. It will discover all 13 memory tools natively. No daemon, no ports.</p>
+                </div>
+
+                <div id="tab-http" class="integration-panel">
+                    <p>For ChatGPT, Grok, Llama, or any AI that supports function calling via HTTP:</p>
+                    <pre><code><span class="tok-cm"># Start the memory server (background)</span>
+<span class="tok-cmd">claude-memory</span> serve <span class="tok-flag">--host</span> <span class="tok-num">127.0.0.1</span> <span class="tok-flag">--port</span> <span class="tok-num">9077</span> &amp;
+
+<span class="tok-cm"># Your AI can now call the REST API:</span>
+<span class="tok-cm"># POST http://127.0.0.1:9077/api/v1/memories   (store)</span>
+<span class="tok-cm"># GET  http://127.0.0.1:9077/api/v1/recall      (recall)</span>
+<span class="tok-cm"># GET  http://127.0.0.1:9077/api/v1/search      (search)</span>
+<span class="tok-cm"># ... 20 endpoints total</span><span class="lang-label">bash</span></code></pre>
+                    <p style="font-size:.85rem">The HTTP API works with any language, any framework, any AI. Wrap calls in your tool/function definitions and your AI gets persistent memory.</p>
+                </div>
             </li>
             <li>
-                <h4>Restart Claude Code</h4>
-                <p>That's it. Claude now has 13 memory tools available natively. No daemon to run, no ports to open. It just works.</p>
-                <pre><code><span class="tok-cm"># Verify it's working -- ask Claude:</span>
-<span class="tok-str">"What memory tools do you have available?"</span>
-<span class="tok-cm"># It should list: memory_store, memory_recall, memory_search, ...</span><span class="lang-label">text</span></code></pre>
+                <h4>Verify it works</h4>
+                <p>Check that your AI has access to memory tools.</p>
+                <pre><code><span class="tok-cm"># MCP: Ask your AI "What memory tools do you have?"</span>
+<span class="tok-cm"># HTTP: curl http://127.0.0.1:9077/api/v1/health</span>
+<span class="tok-cm"># CLI:  claude-memory stats</span><span class="lang-label">text</span></code></pre>
             </li>
         </ol>
     </div>
@@ -345,10 +459,10 @@
 <!-- ================================================================
      WHAT IT DOES
      ================================================================ -->
-<section id="features">
+<section id="features" class="alt">
     <div class="container">
         <h2>What It Does</h2>
-        <p class="section-subtitle">Every capability at a glance. Three interfaces, one shared database, zero configuration drift.</p>
+        <p class="section-subtitle">Every capability at a glance. Three interfaces, one shared database, zero configuration drift. Works with any AI that supports MCP or HTTP.</p>
 
         <div class="feature-grid">
             <div class="feature-card">
@@ -388,37 +502,60 @@
 <!-- ================================================================
      13 MCP TOOLS
      ================================================================ -->
-<section id="mcp" class="alt">
+<section id="mcp">
     <div class="container">
-        <h2>13 MCP Tools <span class="badge">Primary Integration</span></h2>
+        <h2>13 MCP Tools <span class="badge">Universal Integration</span></h2>
         <p class="section-subtitle">
             claude-memory runs as a Model Context Protocol (MCP) tool server over stdio.
-            Configure it once and memory operations become native Claude Code tools -- no HTTP daemon needed.
+            Any MCP-compatible AI client -- Claude, ChatGPT, Grok, Llama, or custom agents -- discovers these tools automatically.
         </p>
 
         <div class="diagram-wrap">
-            <svg viewBox="0 0 800 130" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="MCP integration flow">
-                <rect x="20" y="35" width="170" height="60" rx="8" fill="#161b22" stroke="#58a6ff" stroke-width="2"/>
-                <text x="105" y="62" text-anchor="middle" fill="#e6edf3" font-family="system-ui" font-size="13" font-weight="700">Claude Code</text>
-                <text x="105" y="80" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="11">AI Assistant</text>
+            <svg viewBox="0 0 800 220" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="MCP integration flow with multiple AI clients">
+                <!-- AI Client 1: Claude -->
+                <rect x="10" y="10" width="130" height="40" rx="6" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
+                <text x="75" y="28" text-anchor="middle" fill="#58a6ff" font-family="system-ui" font-size="11" font-weight="700">Claude</text>
+                <text x="75" y="42" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="9">MCP native</text>
 
-                <line x1="190" y1="65" x2="280" y2="65" stroke="#58a6ff" stroke-width="2" class="animate-flow"/>
-                <polygon points="280,60 290,65 280,70" fill="#58a6ff"/>
-                <text x="235" y="55" text-anchor="middle" fill="#8b949e" font-family="monospace" font-size="10">stdio</text>
+                <!-- AI Client 2: ChatGPT -->
+                <rect x="10" y="60" width="130" height="40" rx="6" fill="#161b22" stroke="#3fb950" stroke-width="1.5"/>
+                <text x="75" y="78" text-anchor="middle" fill="#3fb950" font-family="system-ui" font-size="11" font-weight="700">ChatGPT</text>
+                <text x="75" y="92" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="9">MCP / HTTP</text>
 
-                <rect x="290" y="35" width="190" height="60" rx="8" fill="#161b22" stroke="#bc8cff" stroke-width="2"/>
-                <text x="385" y="62" text-anchor="middle" fill="#e6edf3" font-family="system-ui" font-size="13" font-weight="700">MCP Server</text>
-                <text x="385" y="80" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="11">JSON-RPC / 13 tools</text>
+                <!-- AI Client 3: Grok -->
+                <rect x="10" y="110" width="130" height="40" rx="6" fill="#161b22" stroke="#d29922" stroke-width="1.5"/>
+                <text x="75" y="128" text-anchor="middle" fill="#d29922" font-family="system-ui" font-size="11" font-weight="700">Grok</text>
+                <text x="75" y="142" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="9">MCP / HTTP</text>
 
-                <line x1="480" y1="65" x2="540" y2="65" stroke="#bc8cff" stroke-width="2" class="animate-flow"/>
-                <polygon points="540,60 550,65 540,70" fill="#bc8cff"/>
-                <text x="510" y="55" text-anchor="middle" fill="#8b949e" font-family="monospace" font-size="10">rusqlite</text>
+                <!-- AI Client 4: Llama -->
+                <rect x="10" y="160" width="130" height="40" rx="6" fill="#161b22" stroke="#bc8cff" stroke-width="1.5"/>
+                <text x="75" y="178" text-anchor="middle" fill="#bc8cff" font-family="system-ui" font-size="11" font-weight="700">Llama</text>
+                <text x="75" y="192" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="9">MCP / HTTP</text>
 
-                <rect x="550" y="35" width="190" height="60" rx="8" fill="#161b22" stroke="#3fb950" stroke-width="2"/>
-                <text x="645" y="62" text-anchor="middle" fill="#e6edf3" font-family="system-ui" font-size="13" font-weight="700">SQLite + FTS5</text>
-                <text x="645" y="80" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="11">WAL mode</text>
+                <!-- Converging arrows -->
+                <line x1="140" y1="30" x2="270" y2="100" stroke="#58a6ff" stroke-width="1.5" class="animate-flow"/>
+                <line x1="140" y1="80" x2="270" y2="100" stroke="#3fb950" stroke-width="1.5" class="animate-flow"/>
+                <line x1="140" y1="130" x2="270" y2="110" stroke="#d29922" stroke-width="1.5" class="animate-flow"/>
+                <line x1="140" y1="180" x2="270" y2="115" stroke="#bc8cff" stroke-width="1.5" class="animate-flow"/>
 
-                <text x="400" y="118" text-anchor="middle" fill="#58a6ff" font-family="system-ui" font-size="11" font-weight="600">claude-memory --db ~/.claude/claude-memory.db mcp</text>
+                <text x="210" y="75" text-anchor="middle" fill="#8b949e" font-family="monospace" font-size="9">stdio /</text>
+                <text x="210" y="86" text-anchor="middle" fill="#8b949e" font-family="monospace" font-size="9">HTTP</text>
+
+                <!-- MCP Server -->
+                <rect x="275" y="80" width="190" height="60" rx="8" fill="#161b22" stroke="#bc8cff" stroke-width="2"/>
+                <text x="370" y="105" text-anchor="middle" fill="#e6edf3" font-family="system-ui" font-size="13" font-weight="700">MCP Server</text>
+                <text x="370" y="125" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="11">JSON-RPC / 13 tools</text>
+
+                <line x1="465" y1="110" x2="530" y2="110" stroke="#bc8cff" stroke-width="2" class="animate-flow"/>
+                <polygon points="530,105 540,110 530,115" fill="#bc8cff"/>
+                <text x="497" y="100" text-anchor="middle" fill="#8b949e" font-family="monospace" font-size="10">rusqlite</text>
+
+                <!-- SQLite -->
+                <rect x="545" y="80" width="190" height="60" rx="8" fill="#161b22" stroke="#3fb950" stroke-width="2"/>
+                <text x="640" y="105" text-anchor="middle" fill="#e6edf3" font-family="system-ui" font-size="13" font-weight="700">SQLite + FTS5</text>
+                <text x="640" y="125" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="11">WAL mode</text>
+
+                <text x="400" y="210" text-anchor="middle" fill="#58a6ff" font-family="system-ui" font-size="11" font-weight="600">claude-memory --db path/to/memory.db mcp</text>
             </svg>
         </div>
 
@@ -482,12 +619,12 @@
 <!-- ================================================================
      20 HTTP API ENDPOINTS
      ================================================================ -->
-<section id="api">
+<section id="api" class="alt">
     <div class="container">
-        <h2>20 HTTP API Endpoints</h2>
+        <h2>20 HTTP API Endpoints <span class="badge">Universal Fallback</span></h2>
         <p class="section-subtitle">
             Start with <code>claude-memory serve</code> (default: <code>http://127.0.0.1:9077</code>).
-            All endpoints are under <code>/api/v1</code>.
+            The HTTP API works with any AI platform, any programming language, any framework. If it can make an HTTP request, it can use claude-memory.
         </p>
 
         <div class="table-wrap">
@@ -519,18 +656,34 @@
                 </tbody>
             </table>
         </div>
+
+        <h3>Integration Examples</h3>
+        <pre><code><span class="tok-cm"># Python (works with any AI backend: OpenAI, Anthropic, local Llama, etc.)</span>
+<span class="tok-kw">import</span> requests
+
+<span class="tok-kw">def</span> <span class="tok-fn">ai_store_memory</span>(title, content, tier=<span class="tok-str">"mid"</span>):
+    requests.post(<span class="tok-str">"http://127.0.0.1:9077/api/v1/memories"</span>, json={
+        <span class="tok-str">"title"</span>: title, <span class="tok-str">"content"</span>: content, <span class="tok-str">"tier"</span>: tier
+    })
+
+<span class="tok-kw">def</span> <span class="tok-fn">ai_recall</span>(context):
+    r = requests.get(<span class="tok-str">"http://127.0.0.1:9077/api/v1/recall"</span>, params={<span class="tok-str">"context"</span>: context})
+    <span class="tok-kw">return</span> r.json()
+
+<span class="tok-cm"># Use in your AI's tool/function definitions</span>
+<span class="tok-cm"># Works with OpenAI function calling, Anthropic tool use, etc.</span><span class="lang-label">python</span></code></pre>
     </div>
 </section>
 
 <!-- ================================================================
      24 CLI COMMANDS
      ================================================================ -->
-<section id="cli" class="alt">
+<section id="cli">
     <div class="container">
-        <h2>24 CLI Commands</h2>
+        <h2>24 CLI Commands <span class="badge">Universal</span></h2>
         <p class="section-subtitle">
             Global flags: <code>--db &lt;path&gt;</code> and <code>--json</code>.
-            Organized by category.
+            Scriptable, pipeable, works in any shell. Use directly or wrap in your AI's tool layer.
         </p>
 
         <div class="table-wrap">
@@ -539,8 +692,8 @@
                     <tr><th>Category</th><th>Command</th><th>Description</th></tr>
                 </thead>
                 <tbody>
-                    <tr><td><span class="cat-label cat-server">Server</span></td><td><code>mcp</code></td><td>Run as MCP tool server over stdio (primary integration path)</td></tr>
-                    <tr><td><span class="cat-label cat-server">Server</span></td><td><code>serve</code></td><td>Start HTTP daemon (--host, --port, default 9077)</td></tr>
+                    <tr><td><span class="cat-label cat-server">Server</span></td><td><code>mcp</code></td><td>Run as MCP tool server over stdio (primary integration for MCP clients)</td></tr>
+                    <tr><td><span class="cat-label cat-server">Server</span></td><td><code>serve</code></td><td>Start HTTP daemon (--host, --port, default 9077) -- universal API for any AI</td></tr>
 
                     <tr><td><span class="cat-label cat-core">Core</span></td><td><code>store</code></td><td>Store memory (-T title, -c content, --tier, --namespace, --tags, --priority, --confidence, --source)</td></tr>
                     <tr><td><span class="cat-label cat-core">Core</span></td><td><code>update</code></td><td>Update memory by ID (partial fields)</td></tr>
@@ -578,7 +731,7 @@
 <!-- ================================================================
      THREE-TIER MEMORY
      ================================================================ -->
-<section id="tiers">
+<section id="tiers" class="alt">
     <div class="container">
         <h2>Three-Tier Memory</h2>
         <p class="section-subtitle">Memories are organized into three tiers that mirror human memory systems. Each tier has automatic TTL management, and memories flow upward through access patterns.</p>
@@ -664,7 +817,7 @@
 <!-- ================================================================
      RECALL SCORING
      ================================================================ -->
-<section id="ranking" class="alt">
+<section id="ranking">
     <div class="container">
         <h2>6-Factor Recall Scoring</h2>
         <p class="section-subtitle">Every recall query computes a composite score entirely in SQLite. Higher scores rank first. No external ML or embedding service required.</p>
@@ -732,7 +885,7 @@
 <!-- ================================================================
      SECURITY
      ================================================================ -->
-<section id="security">
+<section id="security" class="alt">
     <div class="container">
         <h2>Security</h2>
         <p class="section-subtitle">Defense in depth, even for a local tool. Every input is validated, every error is sanitized, every write is transactional.</p>
@@ -769,63 +922,84 @@
 <!-- ================================================================
      ARCHITECTURE
      ================================================================ -->
-<section id="architecture" class="alt">
+<section id="architecture">
     <div class="container">
         <h2>Architecture</h2>
-        <p class="section-subtitle">Single Rust binary. Three interfaces. One shared database layer. Zero runtime dependencies.</p>
+        <p class="section-subtitle">Single Rust binary. Three universal interfaces. One shared database layer. Zero runtime dependencies.</p>
 
         <div class="diagram-wrap">
-            <svg viewBox="0 0 700 340" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Architecture diagram">
-                <!-- Client -->
-                <rect x="240" y="10" width="220" height="45" rx="8" fill="#161b22" stroke="#58a6ff" stroke-width="2"/>
-                <text x="350" y="30" text-anchor="middle" fill="#e6edf3" font-family="system-ui" font-size="13" font-weight="700">Claude Code / Client</text>
-                <text x="350" y="46" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="10">or any MCP/HTTP/CLI consumer</text>
+            <svg viewBox="0 0 760 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Architecture diagram showing multiple AI clients">
+                <!-- Multiple AI Clients -->
+                <rect x="40" y="10" width="100" height="35" rx="6" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
+                <text x="90" y="32" text-anchor="middle" fill="#58a6ff" font-family="system-ui" font-size="10" font-weight="700">Claude</text>
 
-                <!-- Three branches -->
-                <line x1="250" y1="55" x2="100" y2="90" stroke="#30363d" stroke-width="1.5"/>
-                <line x1="350" y1="55" x2="350" y2="90" stroke="#30363d" stroke-width="1.5"/>
-                <line x1="450" y1="55" x2="600" y2="90" stroke="#30363d" stroke-width="1.5"/>
+                <rect x="160" y="10" width="100" height="35" rx="6" fill="#161b22" stroke="#3fb950" stroke-width="1.5"/>
+                <text x="210" y="32" text-anchor="middle" fill="#3fb950" font-family="system-ui" font-size="10" font-weight="700">ChatGPT</text>
 
+                <rect x="280" y="10" width="100" height="35" rx="6" fill="#161b22" stroke="#d29922" stroke-width="1.5"/>
+                <text x="330" y="32" text-anchor="middle" fill="#d29922" font-family="system-ui" font-size="10" font-weight="700">Grok</text>
+
+                <rect x="400" y="10" width="100" height="35" rx="6" fill="#161b22" stroke="#bc8cff" stroke-width="1.5"/>
+                <text x="450" y="32" text-anchor="middle" fill="#bc8cff" font-family="system-ui" font-size="10" font-weight="700">Llama</text>
+
+                <rect x="520" y="10" width="130" height="35" rx="6" fill="#161b22" stroke="#39d2c0" stroke-width="1.5"/>
+                <text x="585" y="32" text-anchor="middle" fill="#39d2c0" font-family="system-ui" font-size="10" font-weight="700">Any MCP Client</text>
+
+                <!-- Connecting lines down to interfaces -->
+                <line x1="90" y1="45" x2="90" y2="80" stroke="#58a6ff" stroke-width="1" opacity=".5"/>
+                <line x1="210" y1="45" x2="350" y2="80" stroke="#3fb950" stroke-width="1" opacity=".5"/>
+                <line x1="330" y1="45" x2="350" y2="80" stroke="#d29922" stroke-width="1" opacity=".5"/>
+                <line x1="450" y1="45" x2="350" y2="80" stroke="#bc8cff" stroke-width="1" opacity=".5"/>
+                <line x1="585" y1="45" x2="350" y2="80" stroke="#39d2c0" stroke-width="1" opacity=".5"/>
+                <line x1="90" y1="45" x2="350" y2="80" stroke="#58a6ff" stroke-width="1" opacity=".3"/>
+                <line x1="210" y1="45" x2="600" y2="80" stroke="#3fb950" stroke-width="1" opacity=".3"/>
+
+                <!-- Three interfaces -->
                 <!-- CLI -->
-                <rect x="30" y="90" width="140" height="48" rx="8" fill="#161b22" stroke="#3fb950" stroke-width="1.5"/>
-                <text x="100" y="112" text-anchor="middle" fill="#3fb950" font-family="system-ui" font-size="12" font-weight="700">CLI</text>
-                <text x="100" y="128" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="10">24 commands</text>
+                <rect x="30" y="80" width="140" height="48" rx="8" fill="#161b22" stroke="#3fb950" stroke-width="1.5"/>
+                <text x="100" y="102" text-anchor="middle" fill="#3fb950" font-family="system-ui" font-size="12" font-weight="700">CLI</text>
+                <text x="100" y="118" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="10">24 commands</text>
 
                 <!-- MCP -->
-                <rect x="280" y="90" width="140" height="48" rx="8" fill="#161b22" stroke="#bc8cff" stroke-width="1.5"/>
-                <text x="350" y="112" text-anchor="middle" fill="#bc8cff" font-family="system-ui" font-size="12" font-weight="700">MCP Server</text>
-                <text x="350" y="128" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="10">13 tools / stdio</text>
+                <rect x="280" y="80" width="140" height="48" rx="8" fill="#161b22" stroke="#bc8cff" stroke-width="1.5"/>
+                <text x="350" y="102" text-anchor="middle" fill="#bc8cff" font-family="system-ui" font-size="12" font-weight="700">MCP Server</text>
+                <text x="350" y="118" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="10">13 tools / stdio</text>
 
                 <!-- HTTP -->
-                <rect x="530" y="90" width="140" height="48" rx="8" fill="#161b22" stroke="#d29922" stroke-width="1.5"/>
-                <text x="600" y="112" text-anchor="middle" fill="#d29922" font-family="system-ui" font-size="12" font-weight="700">HTTP API</text>
-                <text x="600" y="128" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="10">20 endpoints / Axum</text>
+                <rect x="530" y="80" width="140" height="48" rx="8" fill="#161b22" stroke="#d29922" stroke-width="1.5"/>
+                <text x="600" y="102" text-anchor="middle" fill="#d29922" font-family="system-ui" font-size="12" font-weight="700">HTTP API</text>
+                <text x="600" y="118" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="10">20 endpoints / Axum</text>
+
+                <!-- Labels under interfaces -->
+                <text x="100" y="146" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="8">Universal</text>
+                <text x="350" y="146" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="8">Universal</text>
+                <text x="600" y="146" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="8">Universal</text>
 
                 <!-- Down to validation -->
-                <line x1="100" y1="138" x2="100" y2="175" stroke="#30363d" stroke-width="1"/>
-                <line x1="350" y1="138" x2="350" y2="175" stroke="#30363d" stroke-width="1"/>
-                <line x1="600" y1="138" x2="600" y2="175" stroke="#30363d" stroke-width="1"/>
+                <line x1="100" y1="150" x2="100" y2="185" stroke="#30363d" stroke-width="1"/>
+                <line x1="350" y1="150" x2="350" y2="185" stroke="#30363d" stroke-width="1"/>
+                <line x1="600" y1="150" x2="600" y2="185" stroke="#30363d" stroke-width="1"/>
 
                 <!-- Validation layer -->
-                <rect x="50" y="175" width="600" height="35" rx="6" fill="#161b22" stroke="#f85149" stroke-width="1"/>
-                <text x="350" y="197" text-anchor="middle" fill="#f85149" font-family="system-ui" font-size="12" font-weight="600">Validation Layer (validate.rs) + Structured Errors (errors.rs)</text>
+                <rect x="50" y="185" width="600" height="35" rx="6" fill="#161b22" stroke="#f85149" stroke-width="1"/>
+                <text x="350" y="207" text-anchor="middle" fill="#f85149" font-family="system-ui" font-size="12" font-weight="600">Validation Layer (validate.rs) + Structured Errors (errors.rs)</text>
 
                 <!-- Down to DB -->
-                <line x1="350" y1="210" x2="350" y2="240" stroke="#30363d" stroke-width="1.5"/>
-                <polygon points="346,240 350,247 354,240" fill="#30363d"/>
+                <line x1="350" y1="220" x2="350" y2="250" stroke="#30363d" stroke-width="1.5"/>
+                <polygon points="346,250 350,257 354,250" fill="#30363d"/>
 
                 <!-- DB layer -->
-                <rect x="170" y="247" width="360" height="55" rx="8" fill="#161b22" stroke="#39d2c0" stroke-width="2"/>
-                <text x="350" y="270" text-anchor="middle" fill="#39d2c0" font-family="system-ui" font-size="13" font-weight="700">SQLite + FTS5 (db.rs)</text>
-                <text x="350" y="290" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="10">WAL mode | schema v2 | 5 indexes | 41 tests</text>
+                <rect x="170" y="257" width="360" height="55" rx="8" fill="#161b22" stroke="#39d2c0" stroke-width="2"/>
+                <text x="350" y="280" text-anchor="middle" fill="#39d2c0" font-family="system-ui" font-size="13" font-weight="700">SQLite + FTS5 (db.rs)</text>
+                <text x="350" y="300" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="10">WAL mode | schema v2 | 5 indexes | 41 tests</text>
 
                 <!-- Tiers -->
-                <rect x="200" y="315" width="70" height="22" rx="4" fill="rgba(248,81,73,.15)" stroke="#f85149" stroke-width="1"/>
-                <text x="235" y="330" text-anchor="middle" fill="#f85149" font-family="monospace" font-size="10">short 6h</text>
-                <rect x="305" y="315" width="70" height="22" rx="4" fill="rgba(210,153,34,.15)" stroke="#d29922" stroke-width="1"/>
-                <text x="340" y="330" text-anchor="middle" fill="#d29922" font-family="monospace" font-size="10">mid 7d</text>
-                <rect x="410" y="315" width="90" height="22" rx="4" fill="rgba(63,185,80,.15)" stroke="#3fb950" stroke-width="1"/>
-                <text x="455" y="330" text-anchor="middle" fill="#3fb950" font-family="monospace" font-size="10">long forever</text>
+                <rect x="200" y="325" width="70" height="22" rx="4" fill="rgba(248,81,73,.15)" stroke="#f85149" stroke-width="1"/>
+                <text x="235" y="340" text-anchor="middle" fill="#f85149" font-family="monospace" font-size="10">short 6h</text>
+                <rect x="305" y="325" width="70" height="22" rx="4" fill="rgba(210,153,34,.15)" stroke="#d29922" stroke-width="1"/>
+                <text x="340" y="340" text-anchor="middle" fill="#d29922" font-family="monospace" font-size="10">mid 7d</text>
+                <rect x="410" y="325" width="90" height="22" rx="4" fill="rgba(63,185,80,.15)" stroke="#3fb950" stroke-width="1"/>
+                <text x="455" y="340" text-anchor="middle" fill="#3fb950" font-family="monospace" font-size="10">long forever</text>
             </svg>
         </div>
     </div>
@@ -834,15 +1008,15 @@
 <!-- ================================================================
      FEATURE MATRIX
      ================================================================ -->
-<section id="matrix">
+<section id="matrix" class="alt">
     <div class="container">
         <h2>Feature Matrix</h2>
-        <p class="section-subtitle">CLI, HTTP, and MCP interface parity. All three interfaces share the same validation layer and database.</p>
+        <p class="section-subtitle">All three interfaces are universal -- any AI platform can use any of them. They share the same validation layer and database.</p>
 
         <div class="table-wrap">
             <table class="api-table">
                 <thead>
-                    <tr><th>Capability</th><th>CLI</th><th>HTTP API</th><th>MCP</th></tr>
+                    <tr><th>Capability</th><th>CLI (Universal)</th><th>HTTP API (Universal)</th><th>MCP (Universal)</th></tr>
                 </thead>
                 <tbody>
                     <tr><td>Store memory</td><td class="matrix-check">Yes</td><td class="matrix-check">Yes</td><td class="matrix-check">Yes</td></tr>
@@ -877,7 +1051,7 @@
 <!-- ================================================================
      INTERACTIVE SHELL
      ================================================================ -->
-<section id="shell" class="alt">
+<section id="shell">
     <div class="container">
         <h2>Interactive Shell</h2>
         <p class="section-subtitle"><code>claude-memory shell</code> opens a REPL with color-coded output. Tiers are red/yellow/green, priority is visualized as bars, namespaces appear in cyan.</p>
@@ -929,10 +1103,10 @@
 <!-- ================================================================
      QUICK START ALTERNATIVES
      ================================================================ -->
-<section id="quickstart">
+<section id="quickstart" class="alt">
     <div class="container">
-        <h2>Alternative Interfaces</h2>
-        <p class="section-subtitle">MCP is the recommended path, but the CLI and HTTP API work just as well.</p>
+        <h2>Usage Examples</h2>
+        <p class="section-subtitle">All interfaces work with any AI platform. Choose the one that fits your setup.</p>
 
         <h3>CLI Usage</h3>
         <pre><code><span class="tok-cm"># Store a memory</span>
@@ -953,7 +1127,7 @@
         <pre><code><span class="tok-cm"># Start the daemon</span>
 <span class="tok-cmd">claude-memory</span> serve &amp;
 
-<span class="tok-cm"># Store via API</span>
+<span class="tok-cm"># Store via API (works from any language, any AI backend)</span>
 <span class="tok-cmd">curl</span> <span class="tok-flag">-X POST</span> <span class="tok-url">http://127.0.0.1:9077/api/v1/memories</span> \
   <span class="tok-flag">-H</span> <span class="tok-str">'Content-Type: application/json'</span> \
   <span class="tok-flag">-d</span> <span class="tok-str">'{"title":"Test","content":"It works.","tier":"short"}'</span>
@@ -966,7 +1140,7 @@
 <!-- ================================================================
      CI/CD
      ================================================================ -->
-<section id="ci" class="alt">
+<section id="ci">
     <div class="container">
         <h2>CI/CD Pipeline</h2>
         <p class="section-subtitle">GitHub Actions runs on every push and PR. Releases are automated on tag push with cross-platform binaries.</p>
@@ -1020,20 +1194,29 @@
 <footer>
     <div class="container">
         <div class="footer-links">
-            <a href="https://github.com/alphaonedev/claude-memory">GitHub</a>
-            <a href="https://github.com/alphaonedev/claude-memory/blob/main/docs/INSTALL.md">Install Guide</a>
-            <a href="https://github.com/alphaonedev/claude-memory/blob/main/docs/USER_GUIDE.md">User Guide</a>
-            <a href="https://github.com/alphaonedev/claude-memory/blob/main/docs/DEVELOPER_GUIDE.md">Developer Guide</a>
-            <a href="https://github.com/alphaonedev/claude-memory/blob/main/docs/ADMIN_GUIDE.md">Admin Guide</a>
+            <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub</a>
+            <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/INSTALL.md">Install Guide</a>
+            <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/USER_GUIDE.md">User Guide</a>
+            <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/DEVELOPER_GUIDE.md">Developer Guide</a>
+            <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/ADMIN_GUIDE.md">Admin Guide</a>
         </div>
         <p>
-            <strong>claude-memory</strong> v0.2.0 -- MIT License
+            <strong>claude-memory</strong> v0.2.0 -- MIT License -- AI-Agnostic MCP Memory Server
         </p>
         <p style="margin-top:.5rem;font-size:.78rem">
-            Built with Rust, SQLite, FTS5, and Axum. No runtime dependencies.
+            Built with Rust, SQLite, FTS5, and Axum. Works with Claude, ChatGPT, Grok, Llama, and any MCP-compatible AI. No runtime dependencies.
         </p>
     </div>
 </footer>
+
+<script>
+    function switchTab(id) {
+        document.querySelectorAll('.integration-panel').forEach(p => p.classList.remove('active'));
+        document.querySelectorAll('.integration-tab').forEach(t => t.classList.remove('active'));
+        document.getElementById(id).classList.add('active');
+        event.target.classList.add('active');
+    }
+</script>
 
 </body>
 </html>
