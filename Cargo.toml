@@ -4,7 +4,7 @@ version = "0.2.0"
 edition = "2021"
 description = "Persistent memory daemon for Claude Code — short, mid, and long-term recall"
 license = "MIT"
-repository = "https://github.com/alphaonedev/claude-memory"
+repository = "https://github.com/alphaonedev/ai-memory-mcp"
 
 [dependencies]
 anyhow = "1"

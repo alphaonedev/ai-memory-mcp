@@ -4,17 +4,34 @@
  / __| |/ _` | | | |/ _` |/ _ \___  | '_ ` _ \ / _ \ '_ ` _ \ / _ \| '__| | | |
 | (__| | (_| | |_| | (_| |  __/___| | | | | | |  __/ | | | | | (_) | |  | |_| |
  \___|_|\__,_|\__,_|\__,_|\___|     |_| |_| |_|\___|_| |_| |_|\___/|_|   \__, |
-                                                                          |___/
+               universal AI memory                                        |___/
 ```
 
-[![CI](https://github.com/alphaonedev/claude-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/alphaonedev/claude-memory/actions/workflows/ci.yml)
+[![CI](https://github.com/alphaonedev/ai-memory-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/alphaonedev/ai-memory-mcp/actions/workflows/ci.yml)
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange?logo=rust)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![SQLite](https://img.shields.io/badge/sqlite-FTS5-003B57?logo=sqlite)](https://www.sqlite.org/)
 [![Tests](https://img.shields.io/badge/tests-41-brightgreen)]()
 [![MCP](https://img.shields.io/badge/MCP-13_tools-blueviolet)]()
 
-**claude-memory gives Claude Code a brain that persists between conversations.** It stores what Claude learns in a local SQLite database, ranks memories by relevance when recalling, and auto-promotes important knowledge to permanent storage. Install it once, and Claude remembers everything -- your architecture, your preferences, your corrections -- forever.
+**claude-memory is a persistent memory system for AI assistants.** It works with **any AI that supports MCP** -- Claude, ChatGPT, Grok, Llama, and more. It stores what your AI learns in a local SQLite database, ranks memories by relevance when recalling, and auto-promotes important knowledge to permanent storage. Install it once, and every AI assistant you use remembers your architecture, your preferences, your corrections -- forever.
+
+---
+
+## Compatible AI Platforms
+
+claude-memory integrates with any AI platform that supports the **Model Context Protocol (MCP)**. MCP is the universal standard for connecting AI assistants to external tools and data sources.
+
+| Platform | Integration Method | Status |
+|----------|-------------------|--------|
+| **Claude AI** (Anthropic) | MCP native | Fully supported |
+| **ChatGPT** (OpenAI) | MCP via tool use | Fully supported |
+| **Grok** (xAI) | MCP via tool use | Fully supported |
+| **Llama** (META) | MCP via compatible hosts | Fully supported |
+| **Any MCP-compatible AI** | MCP stdio JSON-RPC | Fully supported |
+| **Any AI or tool** | HTTP REST API / CLI | Universal fallback |
+
+MCP is the primary integration layer. For AI platforms that do not yet support MCP natively, the **HTTP API** (20 endpoints on localhost) and the **CLI** (24 commands) provide universal access -- any AI, script, or automation that can make HTTP calls or run shell commands can use claude-memory.
 
 ---
 
@@ -33,14 +50,14 @@ Follow the prompts, then restart your terminal (or run `source ~/.cargo/env`).
 **Step 2: Install claude-memory**
 
 ```bash
-cargo install --git https://github.com/alphaonedev/claude-memory.git
+cargo install --git https://github.com/alphaonedev/ai-memory-mcp.git
 ```
 
 This compiles the binary and puts it in your PATH. It takes a minute or two.
 
-**Step 3: Tell Claude Code about it**
+**Step 3: Connect your AI**
 
-Open (or create) the file `~/.claude/.mcp.json` and paste this in:
+**For MCP-compatible AI platforms** -- add claude-memory as an MCP server in your AI's configuration. The exact location varies by platform, but the server definition is the same:
 
 ```json
 {
@@ -53,19 +70,26 @@ Open (or create) the file `~/.claude/.mcp.json` and paste this in:
 }
 ```
 
-That file must be at `~/.claude/.mcp.json`. Not `settings.json`. Not `.mcp.json` in your project. The global one.
+For Claude Code, this file goes at `~/.claude/.mcp.json` (global config). Other AI platforms may use different config paths -- consult your platform's MCP documentation.
+
+**For non-MCP platforms** -- start the HTTP server and point your AI at the REST API:
+
+```bash
+claude-memory serve
+# API available at http://127.0.0.1:9077/api/v1/
+```
 
 **Step 4: Done. Test it.**
 
-Restart Claude Code. It now has 13 memory tools. Ask it: "Store a memory that my favorite language is Rust." Then in a new conversation, ask: "What is my favorite language?" It will remember.
+Restart your AI assistant. If using MCP, it now has 13 memory tools. Ask it: "Store a memory that my favorite language is Rust." Then in a new conversation, ask: "What is my favorite language?" It will remember.
 
 ---
 
 ## What Does It Do?
 
-Claude Code forgets everything between conversations. claude-memory fixes that.
+AI assistants forget everything between conversations. claude-memory fixes that.
 
-It runs as an MCP (Model Context Protocol) tool server -- a background process that Claude Code talks to natively. When Claude learns something important, it stores it. When it needs context, it recalls relevant memories ranked by a 6-factor scoring algorithm. Memories live in three tiers:
+It runs as an MCP (Model Context Protocol) tool server -- a background process that your AI talks to natively. When your AI learns something important, it stores it. When it needs context, it recalls relevant memories ranked by a 6-factor scoring algorithm. Memories live in three tiers:
 
 - **Short-term** (6 hours) -- throwaway context like current debugging state
 - **Mid-term** (7 days) -- working knowledge like sprint goals and recent decisions
@@ -73,14 +97,14 @@ It runs as an MCP (Model Context Protocol) tool server -- a background process t
 
 Memories that keep getting accessed automatically promote from mid to long-term. Each recall extends the TTL. Priority increases with usage. The system is self-curating.
 
-Beyond MCP, claude-memory also exposes a full HTTP REST API (20 endpoints on port 9077) and a complete CLI (24 commands) for direct interaction, scripting, and integration with other tools.
+Beyond MCP, claude-memory also exposes a full HTTP REST API (20 endpoints on port 9077) and a complete CLI (24 commands) for direct interaction, scripting, and integration with any AI platform or tool.
 
 ---
 
 ## Features
 
 ### Core
-- **MCP tool server** -- 13 native Claude Code tools over stdio JSON-RPC
+- **MCP tool server** -- 13 tools over stdio JSON-RPC, compatible with any MCP client
 - **Three-tier memory** -- short (6h TTL), mid (7d TTL), long (permanent)
 - **Full-text search** -- SQLite FTS5 with ranked retrieval
 - **6-factor recall scoring** -- FTS relevance + priority + access frequency + confidence + tier boost + recency decay
@@ -102,9 +126,9 @@ Beyond MCP, claude-memory also exposes a full HTTP REST API (20 endpoints on por
 - **Tagging** -- comma-separated tags with filter support
 
 ### Interfaces
-- **20 HTTP endpoints** -- full REST API on 127.0.0.1:9077
+- **20 HTTP endpoints** -- full REST API on 127.0.0.1:9077 (works with any AI or tool)
 - **24 CLI commands** -- complete CLI with identical capabilities
-- **13 MCP tools** -- native Claude Code integration
+- **13 MCP tools** -- native integration for any MCP-compatible AI
 - **Interactive REPL shell** -- recall, search, list, get, stats, namespaces, delete with color output
 - **JSON output** -- `--json` flag on all CLI commands
 
@@ -130,46 +154,84 @@ Beyond MCP, claude-memory also exposes a full HTTP REST API (20 endpoints on por
 ## Architecture
 
 ```
-                        +---------------------+
-                        |    Claude Code       |
-                        |  (or any client)     |
-                        +----+-----+-----+----+
-                             |     |     |
-              +--------------+     |     +--------------+
-              |                    |                     |
-        +-----v------+    +-------v--------+    +-------v-------+
-        |    CLI      |    | MCP Server     |    |  HTTP API     |
-        | 24 commands |    | stdio JSON-RPC |    | 127.0.0.1:9077|
-        +-----+-------+    +-------+--------+    +-------+-------+
-              |                     |                     |
-              +----------+----------+----------+----------+
-                         |                     |
-                   +-----v------+        +-----v------+
-                   | Validation |        |   Errors   |
-                   | validate.rs|        |  errors.rs |
-                   +-----+------+        +-----+------+
-                         |                     |
-                         +----------+----------+
-                                    |
-                          +---------v---------+
-                          |   SQLite + FTS5   |
-                          |   WAL mode        |
-                          +---+-----+-----+---+
-                              |     |     |
-                         +----+  +--+--+  +----+
-                         |short| | mid | | long|
-                         |6h   | | 7d  | | inf |
-                         +-----+ +-----+ +-----+
-                              |     ^
-                              |     | auto-promote
-                              +-----+ (5+ accesses)
+    +-------------+   +-------------+   +-------------+   +-------------+
+    | Claude Code |   |   ChatGPT   |   |    Grok     |   |   Llama     |
+    |  (Anthropic)|   |   (OpenAI)  |   |    (xAI)    |   |   (META)    |
+    +------+------+   +------+------+   +------+------+   +------+------+
+           |                 |                 |                 |
+           +--------+--------+--------+--------+--------+--------+
+                    |                 |                 |
+              +-----v------+  +------v--------+  +----v----------+
+              |    CLI      |  | MCP Server    |  |  HTTP API     |
+              | 24 commands |  | stdio JSON-RPC|  | 127.0.0.1:9077|
+              +-----+------+  +------+--------+  +----+----------+
+                    |                 |                 |
+                    +--------+--------+--------+--------+
+                             |                 |
+                       +-----v------+    +-----v------+
+                       | Validation |    |   Errors   |
+                       | validate.rs|    |  errors.rs |
+                       +-----+------+    +-----+------+
+                             |                 |
+                             +--------+--------+
+                                      |
+                            +---------v---------+
+                            |   SQLite + FTS5   |
+                            |   WAL mode        |
+                            +---+-----+-----+---+
+                                |     |     |
+                           +----+  +--+--+  +----+
+                           |short| | mid | | long|
+                           |6h   | | 7d  | | inf |
+                           +-----+ +-----+ +-----+
+                                |     ^
+                                |     | auto-promote
+                                +-----+ (5+ accesses)
+```
+
+---
+
+## Integration Methods
+
+### MCP (Primary -- for MCP-compatible AI platforms)
+
+MCP is the recommended integration. Your AI gets 13 native memory tools with zero glue code. Configure the MCP server in your AI platform's config:
+
+```json
+{
+  "mcpServers": {
+    "memory": {
+      "command": "claude-memory",
+      "args": ["--db", "~/.claude/claude-memory.db", "mcp"]
+    }
+  }
+}
+```
+
+### HTTP API (Universal -- for any AI or tool)
+
+Start the HTTP server for REST API access. Any AI, script, or automation that can make HTTP calls can use this:
+
+```bash
+claude-memory serve
+# 20 endpoints at http://127.0.0.1:9077/api/v1/
+```
+
+### CLI (Universal -- for scripting and direct use)
+
+The CLI works standalone or as a building block for AI integrations that run shell commands:
+
+```bash
+claude-memory store --tier long --title "Architecture decision" --content "We use PostgreSQL"
+claude-memory recall "database choice"
+claude-memory search "PostgreSQL"
 ```
 
 ---
 
 ## MCP Tools
 
-These 13 tools are available to Claude Code when configured as an MCP server:
+These 13 tools are available to any MCP-compatible AI when configured as an MCP server:
 
 | Tool | Description |
 |------|-------------|
@@ -318,11 +380,11 @@ claude-memory includes hardening across all input paths:
 
 | Guide | Audience |
 |-------|----------|
-| [Installation Guide](docs/INSTALL.md) | Getting it running (includes MCP setup) |
-| [User Guide](docs/USER_GUIDE.md) | Claude Code users who want memory to work |
+| [Installation Guide](docs/INSTALL.md) | Getting it running (includes MCP setup for multiple AI platforms) |
+| [User Guide](docs/USER_GUIDE.md) | AI assistant users who want persistent memory |
 | [Developer Guide](docs/DEVELOPER_GUIDE.md) | Building on or contributing to claude-memory |
 | [Admin Guide](docs/ADMIN_GUIDE.md) | Deploying, monitoring, and troubleshooting |
-| [GitHub Pages](https://alphaonedev.github.io/claude-memory/) | Visual overview with animated diagrams |
+| [GitHub Pages](https://alphaonedev.github.io/ai-memory-mcp/) | Visual overview with animated diagrams |
 
 ---
 

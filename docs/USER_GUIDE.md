@@ -1,10 +1,10 @@
 # User Guide
 
-> **BLUF (Bottom Line Up Front):** `claude-memory` gives Claude Code persistent memory across sessions. Configure the MCP server once, and Claude automatically stores and recalls knowledge -- your project architecture, preferences, past decisions, and hard-won lessons.
+> **BLUF (Bottom Line Up Front):** `claude-memory` gives any AI assistant persistent memory across sessions. It works with **any MCP-compatible AI client** -- including Claude AI, OpenAI ChatGPT, xAI Grok, META Llama, and others. Configure the MCP server once, and your AI automatically stores and recalls knowledge -- your project architecture, preferences, past decisions, and hard-won lessons.
 
 ## What Is This and Why Do I Need It?
 
-`claude-memory` gives Claude Code persistent memory across sessions. Without it, every conversation starts from zero. With it, Claude can:
+`claude-memory` gives any AI assistant persistent memory across sessions. Without it, every conversation starts from zero. With it, your AI can:
 
 - Remember your project architecture, preferences, and past decisions
 - Recall debugging context from yesterday
@@ -15,11 +15,11 @@ Think of it as a brain for your AI assistant -- short-term for what you're doing
 
 ## MCP Integration (Recommended)
 
-The easiest way to use claude-memory is as an **MCP tool server**. Once configured, Claude Code can store and recall memories natively without any manual CLI usage.
+The easiest way to use claude-memory is as an **MCP tool server**. MCP (Model Context Protocol) is an open standard supported by multiple AI platforms. Once configured, your AI client can store and recall memories natively without any manual CLI usage.
 
 ### Setup
 
-Add to `~/.claude/.mcp.json` (global -- applies to all projects):
+Each AI platform has its own MCP configuration location. Below is an example for **Claude Code** (`~/.claude/.mcp.json`):
 
 ```json
 {
@@ -32,11 +32,13 @@ Add to `~/.claude/.mcp.json` (global -- applies to all projects):
 }
 ```
 
-> MCP server configuration does **not** go in `settings.json` or `settings.local.json` -- those files do not support `mcpServers`.
+> **Claude Code note:** MCP server configuration does **not** go in `settings.json` or `settings.local.json` -- those files do not support `mcpServers`.
+
+> **Other platforms** (OpenAI ChatGPT, xAI Grok, META Llama, etc.): consult your platform's documentation for where to register MCP servers. The command and args are identical.
 
 ### How It Works
 
-With MCP configured, Claude Code gains 13 memory tools:
+With MCP configured, your AI client gains 13 memory tools:
 
 - **memory_store** -- Store new knowledge (auto-deduplicates by title+namespace, reports contradictions)
 - **memory_recall** -- Recall relevant memories for the current context (supports `until` date filter)
@@ -52,7 +54,7 @@ With MCP configured, Claude Code gains 13 memory tools:
 - **memory_get_links** -- Get all links for a memory
 - **memory_consolidate** -- Consolidate multiple memories into one long-term summary (2-100 memories)
 
-Claude uses these tools automatically during conversations. You can also ask Claude directly: "Remember that we use PostgreSQL 15" or "What do you remember about our auth system?"
+Your AI assistant uses these tools automatically during conversations. You can also ask directly: "Remember that we use PostgreSQL 15" or "What do you remember about our auth system?"
 
 ## Getting Started (CLI)
 
@@ -493,8 +495,8 @@ A: Content is limited to 65,536 bytes (64 KB).
 **Q: What is recency decay?**
 A: A factor of `1/(1 + days_old * 0.1)` applied during recall ranking. A memory updated today gets a boost of 1.0, a memory from 10 days ago gets 0.5, and a memory from 100 days ago gets 0.09. This ensures recent memories are preferred when relevance is similar.
 
-**Q: Can I use this with tools other than Claude Code?**
-A: Yes. The MCP server speaks standard JSON-RPC over stdio. The HTTP API at `http://127.0.0.1:9077/api/v1/` is language-agnostic. Any tool that can make HTTP requests or speak JSON-RPC can store and recall memories.
+**Q: Can I use this with AI tools other than Claude Code?**
+A: Absolutely. `claude-memory` is AI-agnostic. The MCP server speaks standard JSON-RPC over stdio and works with any MCP-compatible client -- Claude AI, OpenAI ChatGPT, xAI Grok, META Llama, and others. The HTTP API at `http://127.0.0.1:9077/api/v1/` is completely platform-independent -- any tool, framework, or script that can make HTTP requests can store and recall memories.
 
 **Q: Are there limits on bulk operations?**
 A: Yes. Bulk create (`POST /memories/bulk`) and import (`POST /import`) are limited to 1,000 items per request to prevent abuse and memory exhaustion.
