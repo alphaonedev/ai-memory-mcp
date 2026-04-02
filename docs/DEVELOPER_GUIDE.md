@@ -4,20 +4,20 @@
 
 `claude-memory` is a single Rust binary that serves three roles:
 
-1. **MCP tool server** -- stdio JSON-RPC server exposing 8 memory tools for Claude Code
+1. **MCP tool server** -- stdio JSON-RPC server exposing 13 memory tools for Claude Code
 2. **CLI tool** -- direct SQLite operations for store, recall, search, list, etc.
-3. **HTTP daemon** -- an Axum web server exposing the same operations as a REST API
+3. **HTTP daemon** -- an Axum web server exposing the same operations as a REST API with 20 endpoints
 
 All three interfaces share the same database layer (`db.rs`) and validation layer (`validate.rs`). The daemon adds automatic garbage collection (every 30 minutes) and graceful shutdown with WAL checkpointing.
 
 ```
-main.rs          -- CLI parsing (clap), daemon setup (axum), command dispatch (22 commands)
+main.rs          -- CLI parsing (clap), daemon setup (axum), command dispatch (24 commands)
 models.rs        -- Data structures: Memory, MemoryLink, query types, constants
-handlers.rs      -- HTTP request handlers (Axum extractors + JSON responses)
-db.rs            -- All SQLite operations: CRUD, FTS5, recall scoring, GC, migration
-mcp.rs           -- MCP (Model Context Protocol) server over stdio JSON-RPC
+handlers.rs      -- HTTP request handlers (Axum extractors + JSON responses), error sanitization
+db.rs            -- All SQLite operations: CRUD, FTS5, recall scoring, GC, migration, FTS query sanitization, transactional touch/consolidate
+mcp.rs           -- MCP (Model Context Protocol) server over stdio JSON-RPC, 13 tools, notification handling
 validate.rs      -- Input validation for all write paths
-errors.rs        -- Structured error types (ApiError, MemoryError)
+errors.rs        -- Structured error types (ApiError, MemoryError), error sanitization for HTTP responses
 color.rs         -- ANSI color output for CLI (zero dependencies, auto-detects terminal)
 ```
 
@@ -26,10 +26,13 @@ color.rs         -- ANSI color output for CLI (zero dependencies, auto-detects t
 ### `src/main.rs`
 
 - `Cli` struct with `clap` derive -- defines all CLI commands and global flags (`--db`, `--json`)
-- `Command` enum -- `Serve`, `Mcp`, `Store`, `Update`, `Recall`, `Search`, `Get`, `List`, `Delete`, `Promote`, `Forget`, `Link`, `Consolidate`, `Resolve`, `Shell`, `Sync`, `AutoConsolidate`, `Gc`, `Stats`, `Namespaces`, `Export`, `Import`, `Completions`, `Man` (22 commands)
+- `Command` enum -- `Serve`, `Mcp`, `Store`, `Update`, `Recall`, `Search`, `Get`, `List`, `Delete`, `Promote`, `Forget`, `Link`, `Consolidate`, `Resolve`, `Shell`, `Sync`, `AutoConsolidate`, `Gc`, `Stats`, `Namespaces`, `Export`, `Import`, `Completions`, `Man` (24 commands)
+- `StoreArgs` includes `--expires-at` and `--ttl-secs` flags for custom expiration
+- `UpdateArgs` includes `--expires-at` flag for setting expiration on existing memories
+- `ListArgs` includes `--offset` flag for pagination
 - `auto_namespace()` -- detects namespace from git remote URL or directory name
 - `human_age()` -- formats ISO timestamps as "2h ago", "3d ago" for CLI output
-- `serve()` -- starts the Axum server with all routes, spawns GC task, handles graceful shutdown via SIGINT with WAL checkpoint
+- `serve()` -- starts the Axum server with all routes (20 endpoints including `POST /memories/{id}/promote`), spawns GC task, handles graceful shutdown via SIGINT with WAL checkpoint
 - `cmd_*()` functions -- one per CLI command, each opens the DB directly
 
 ### `src/models.rs`
@@ -43,12 +46,17 @@ color.rs         -- ANSI color output for CLI (zero dependencies, auto-detects t
 
 ### `src/mcp.rs`
 
-The MCP (Model Context Protocol) server implementation. Runs over stdio, processing one JSON-RPC message per line.
+The MCP (Model Context Protocol) server implementation. Runs over stdio, processing one JSON-RPC message per line. Exposes **13 tools**.
 
 - `RpcRequest` / `RpcResponse` / `RpcError` -- JSON-RPC 2.0 types
-- `tool_definitions()` -- returns the 8 tool schemas for `tools/list`
-- `handle_store()`, `handle_recall()`, `handle_search()`, `handle_list()`, `handle_delete()`, `handle_promote()`, `handle_forget()`, `handle_stats()` -- one handler per tool
+- `tool_definitions()` -- returns the 13 tool schemas for `tools/list`
+  - `memory_recall` schema includes `until` parameter
+  - `memory_search` and `memory_list` schemas enforce `maximum: 200` on limit
+  - `memory_consolidate` schema enforces `minItems: 2, maxItems: 100` on IDs
+  - `memory_update` schema includes `expires_at` parameter
+- `handle_store()`, `handle_recall()`, `handle_search()`, `handle_list()`, `handle_delete()`, `handle_promote()`, `handle_forget()`, `handle_stats()`, `handle_update()`, `handle_get()`, `handle_link()`, `handle_get_links()`, `handle_consolidate()` -- one handler per tool
 - `handle_request()` -- routes JSON-RPC methods: `initialize`, `notifications/initialized`, `tools/list`, `tools/call`, `ping`
+- Notification handling: all JSON-RPC notifications (requests without an `id` field) are correctly skipped without sending a response, per the JSON-RPC 2.0 specification
 - `run_mcp_server()` -- main loop: reads lines from stdin, parses JSON-RPC, dispatches, writes responses to stdout
 
 Protocol version: `2024-11-05`. All tool responses are wrapped in MCP content blocks (`{"content": [{"type": "text", "text": "..."}]}`).
@@ -96,10 +104,20 @@ Structured error types for the HTTP API:
 - `MemoryError` enum -- `NotFound`, `ValidationFailed`, `DatabaseError`, `Conflict`
 - Implements `IntoResponse` for Axum, mapping to appropriate HTTP status codes
 - Implements `From<anyhow::Error>` and `From<rusqlite::Error>`
+- **Error sanitization**: `DatabaseError` responses return a generic `"Internal server error"` message to clients, never leaking internal database error details. Detailed errors are logged server-side.
 
 ### `src/handlers.rs`
 
-All HTTP handlers. State is `Arc<Mutex<(Connection, PathBuf)>>`. Each handler acquires the lock, validates input, performs DB operations, returns JSON.
+All HTTP handlers for the 20-endpoint REST API. State is `Arc<Mutex<(Connection, PathBuf)>>`. Each handler acquires the lock, validates input, performs DB operations, returns JSON.
+
+Key handlers:
+- `create_memory` / `bulk_create` -- memory creation with deduplication (bulk limited to 1,000 items)
+- `get_memory` / `list_memories` / `update_memory` / `delete_memory` -- standard CRUD
+- `promote_memory` -- `POST /memories/{id}/promote` endpoint for promoting to long-term
+- `search` / `recall` -- FTS-powered search with sanitized queries
+- `forget` / `consolidate` -- bulk operations
+- `import_memories` -- import with 1,000 item limit
+- All ID path parameters are validated before database access
 
 ### `src/db.rs`
 
@@ -110,15 +128,16 @@ The database layer. Key functions:
 | `open()` | Opens DB, sets WAL mode, creates schema, runs migrations |
 | `insert()` | Upsert on `(title, namespace)` -- never downgrades tier, keeps max priority |
 | `get()` | Fetch by ID |
-| `touch()` | Bump access count, extend TTL, auto-promote mid->long at 5 accesses, reinforce priority every 10 accesses |
+| `touch()` | Bump access count, extend TTL, auto-promote mid->long at 5 accesses, reinforce priority every 10 accesses. **Uses BEGIN IMMEDIATE/COMMIT transaction** for atomicity. |
 | `update()` | Partial update of any fields |
 | `delete()` | Delete by ID (links cascade) |
 | `forget()` | Bulk delete by namespace + FTS pattern + tier |
-| `list()` | List with filters: namespace, tier, priority, date range, tags |
+| `list()` | List with filters: namespace, tier, priority, date range, tags, offset |
 | `search()` | FTS5 AND search with 6-factor composite scoring |
 | `recall()` | FTS5 OR search + touch + auto-promote + TTL extension |
 | `find_contradictions()` | Find memories in same namespace with similar titles |
-| `consolidate()` | Merge multiple memories, delete originals, aggregate tags and max priority |
+| `consolidate()` | Merge multiple memories, delete originals, aggregate tags and max priority. **Uses BEGIN IMMEDIATE/COMMIT transaction** for atomicity. |
+| `sanitize_fts_query()` | Strips special characters and quotes tokens to prevent FTS injection |
 | `create_link()` / `get_links()` / `delete_link()` | Memory linking (ON DELETE CASCADE) |
 | `gc()` | Delete expired memories |
 | `stats()` | Aggregate statistics (totals, by tier, by namespace, expiring soon, links, DB size) |
@@ -126,6 +145,12 @@ The database layer. Key functions:
 | `export_all()` / `export_links()` | Full data export |
 | `checkpoint()` | WAL checkpoint (TRUNCATE) for clean shutdown |
 | `health_check()` | Verifies DB accessibility and FTS5 integrity |
+
+**Transaction safety**: `touch()` and `consolidate()` use `BEGIN IMMEDIATE` to acquire a write lock upfront, preventing deadlocks and ensuring the entire read-modify-write cycle is atomic. This is critical for `touch()` because it reads the current access count, computes promotion/reinforcement logic, and writes back -- all of which must be atomic under concurrent access.
+
+**FTS query sanitization**: The `sanitize_fts_query()` function strips all FTS5 special characters (`*`, `"`, `(`, `)`, `:`, `+`, `-`, `~`, `^`, `{`, `}`, `[`, `]`, `|`, `\`) from user input and wraps each remaining token in double quotes. This prevents injection of FTS query syntax that could cause unexpected results or errors.
+
+**Migration error handling**: The migration logic only ignores "duplicate column" errors (indicating the migration already ran). All other errors are propagated, ensuring real failures are caught early.
 
 ## Database Schema
 
@@ -209,7 +234,9 @@ The recency decay factor ensures that recent memories rank higher when other fac
 
 Base URL: `http://127.0.0.1:9077/api/v1`
 
-All responses are JSON. Error responses include `{"error": "message"}`.
+All responses are JSON. Error responses include `{"error": "message"}`. Database errors are sanitized -- clients receive `"Internal server error"` instead of raw SQLite error details.
+
+The HTTP API exposes **20 endpoints**.
 
 ### Health Check
 
@@ -271,6 +298,8 @@ Content-Type: application/json
 
 Response: `{"created": 2, "errors": []}`
 
+Limited to **1,000 items per request**.
+
 ### Get Memory
 
 ```
@@ -293,7 +322,8 @@ Content-Type: application/json
 
 {
   "content": "Updated content",
-  "priority": 8
+  "priority": 8,
+  "expires_at": "2026-06-01T00:00:00Z"
 }
 ```
 
@@ -306,6 +336,16 @@ DELETE /memories/{id}
 ```
 
 Response: `{"deleted": true}`. Links are cascade-deleted.
+
+### Promote Memory
+
+```
+POST /memories/{id}/promote
+```
+
+Promotes a memory to long-term tier and clears its expiry.
+
+Response: `{"promoted": true}`
 
 ### List Memories
 
@@ -325,12 +365,12 @@ GET /search?q=database+migration&namespace=my-app&tier=mid&limit=10&since=...&un
 
 Response: `{"results": [...], "count": 3, "query": "database migration"}`
 
-Uses 6-factor scoring (without tier boost).
+Uses 6-factor scoring (without tier boost). Queries are sanitized to prevent FTS injection.
 
 ### Recall (OR semantics + touch)
 
 ```
-GET /recall?context=auth+flow+jwt&namespace=my-app&limit=10&tags=auth&since=2026-01-01T00:00:00Z
+GET /recall?context=auth+flow+jwt&namespace=my-app&limit=10&tags=auth&since=2026-01-01T00:00:00Z&until=2026-12-31T23:59:59Z
 ```
 
 Or via POST:
@@ -344,7 +384,7 @@ Content-Type: application/json
 
 Response: `{"memories": [...], "count": 5}`
 
-Recall automatically: bumps `access_count`, extends TTL, and auto-promotes mid-tier memories with 5+ accesses to long-term.
+Recall automatically: bumps `access_count`, extends TTL, and auto-promotes mid-tier memories with 5+ accesses to long-term. The touch operation is transactional.
 
 ### Forget (Bulk Delete)
 
@@ -355,7 +395,7 @@ Content-Type: application/json
 {"namespace": "my-app", "pattern": "deprecated API", "tier": "short"}
 ```
 
-At least one field is required. Pattern uses FTS matching. Response: `{"deleted": 3}`
+At least one field is required. Pattern uses FTS matching (sanitized). Response: `{"deleted": 3}`
 
 ### Consolidate
 
@@ -372,7 +412,7 @@ Content-Type: application/json
 }
 ```
 
-Requires 2-100 IDs. Deletes source memories, creates new with aggregated tags and max priority. Response (201): `{"id": "new-id", "consolidated": 3}`
+Requires 2-100 IDs. Deletes source memories, creates new with aggregated tags and max priority. The entire operation is transactional. Response (201): `{"id": "new-id", "consolidated": 3}`
 
 ### Create Link
 
@@ -444,7 +484,7 @@ Content-Type: application/json
 {"memories": [...], "links": [...]}
 ```
 
-Validates each memory before import. Response: `{"imported": 50, "errors": []}`
+Validates each memory before import. Limited to **1,000 memories per request**. Response: `{"imported": 50, "errors": []}`
 
 ## CLI Reference
 
@@ -454,7 +494,7 @@ Global flags:
 
 ### `serve`
 
-Start the HTTP daemon.
+Start the HTTP daemon (20 endpoints).
 
 ```bash
 claude-memory serve --host 127.0.0.1 --port 9077
@@ -462,13 +502,13 @@ claude-memory serve --host 127.0.0.1 --port 9077
 
 ### `mcp`
 
-Run as an MCP tool server over stdio. This is the primary integration path for Claude Code.
+Run as an MCP tool server over stdio. This is the primary integration path for Claude Code. Exposes 13 tools.
 
 ```bash
 claude-memory mcp
 ```
 
-Reads JSON-RPC from stdin, writes responses to stdout. Logs to stderr.
+Reads JSON-RPC from stdin, writes responses to stdout. Logs to stderr. Correctly handles notifications (no response sent).
 
 ### `store`
 
@@ -481,16 +521,20 @@ claude-memory store \
   --tags "tag1,tag2" \
   --priority 7 \
   --confidence 0.9 \
-  --source claude
+  --source claude \
+  --expires-at "2026-04-15T00:00:00Z" \
+  --ttl-secs 86400
 ```
 
-Use `-c -` to read content from stdin. Validates all fields before writing.
+Use `-c -` to read content from stdin. Validates all fields before writing. `--expires-at` sets an explicit expiration timestamp (RFC3339). `--ttl-secs` sets a TTL in seconds (overrides tier default).
 
 ### `update`
 
 ```bash
-claude-memory update <id> -T "New title" -c "New content" --priority 8
+claude-memory update <id> -T "New title" -c "New content" --priority 8 --expires-at "2026-06-01T00:00:00Z"
 ```
+
+The `--expires-at` flag sets or changes the expiration on an existing memory.
 
 ### `recall`
 
@@ -515,8 +559,10 @@ Shows the memory plus all its links.
 ### `list`
 
 ```bash
-claude-memory list --namespace my-app --tier mid --limit 50 --since 2026-01-01 --until 2026-12-31 --tags devops
+claude-memory list --namespace my-app --tier mid --limit 50 --offset 0 --since 2026-01-01 --until 2026-12-31 --tags devops
 ```
+
+The `--offset` flag enables pagination. Use with `--limit` to page through results.
 
 ### `delete`
 

@@ -176,6 +176,8 @@ pub struct RecallQuery {
     pub tags: Option<String>,
     #[serde(default)]
     pub since: Option<String>,
+    #[serde(default)]
+    pub until: Option<String>,
 }
 
 fn default_recall_limit() -> Option<usize> {
@@ -193,6 +195,8 @@ pub struct RecallBody {
     pub tags: Option<String>,
     #[serde(default)]
     pub since: Option<String>,
+    #[serde(default)]
+    pub until: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

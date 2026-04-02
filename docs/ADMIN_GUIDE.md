@@ -6,14 +6,14 @@
 
 The simplest deployment is as an MCP tool server. No daemon process to manage -- Claude Code spawns the process on demand.
 
-Configure in `~/.claude/.mcp.json` (global -- applies to all projects) or `.mcp.json` in the project root (project-level):
+Configure in `~/.claude/.mcp.json` (global -- applies to all projects):
 
 ```json
 {
   "mcpServers": {
     "memory": {
-      "command": "/usr/local/bin/claude-memory",
-      "args": ["--db", "/var/lib/claude-memory/claude-memory.db", "mcp"]
+      "command": "claude-memory",
+      "args": ["--db", "~/.claude/claude-memory.db", "mcp"]
     }
   }
 }
@@ -26,6 +26,7 @@ The MCP server:
 - Communicates over stdio (JSON-RPC)
 - Stops when the session ends
 - Uses the same SQLite database as the CLI and HTTP daemon
+- Correctly skips all JSON-RPC notifications (no response sent)
 
 ### Standalone (Development)
 
@@ -35,7 +36,7 @@ Run the HTTP daemon directly in the foreground:
 claude-memory --db /path/to/claude-memory.db serve
 ```
 
-The daemon listens on `127.0.0.1:9077` by default.
+The daemon listens on `127.0.0.1:9077` by default and exposes 20 HTTP endpoints.
 
 ### Systemd (Production HTTP Daemon)
 
@@ -196,6 +197,8 @@ The schema is auto-migrated on startup. The `schema_version` table tracks the cu
 
 - v1 -> v2: Added `confidence` (REAL) and `source` (TEXT) columns
 
+Migration error handling: only expected errors (e.g., "duplicate column" when re-running a migration) are silently ignored. Real failures are propagated and will prevent startup, ensuring data integrity.
+
 ### Database Maintenance
 
 Manually trigger garbage collection:
@@ -219,6 +222,109 @@ Rebuild the FTS index (if it becomes corrupt):
 ```bash
 sqlite3 /path/to/claude-memory.db "INSERT INTO memories_fts(memories_fts) VALUES('rebuild')"
 ```
+
+## Security Hardening
+
+### Transaction Safety
+
+Critical operations use `BEGIN IMMEDIATE` / `COMMIT` transactions to prevent data corruption under concurrent access:
+- **`touch()`** -- the read-modify-write cycle for access count, TTL extension, auto-promotion, and priority reinforcement is fully atomic
+- **`consolidate()`** -- the multi-step merge (create new memory, delete originals, aggregate tags) is fully atomic
+
+This prevents race conditions where two concurrent recalls could cause incorrect access counts or missed auto-promotions.
+
+### FTS Query Injection Protection
+
+All full-text search queries are sanitized before being passed to SQLite FTS5:
+- Special characters (`*`, `"`, `(`, `)`, `:`, `+`, `-`, `^`, etc.) are stripped
+- Remaining tokens are individually double-quoted (e.g., `auth flow` becomes `"auth" "flow"`)
+- This prevents FTS query syntax injection that could cause errors or unexpected results
+
+The sanitization is applied in `recall()`, `search()`, and `forget()` operations.
+
+### Error Sanitization
+
+The HTTP API never leaks internal database error details to clients. All `rusqlite::Error` and `anyhow::Error` responses are replaced with a generic `"Internal server error"` message. Detailed errors are logged server-side for debugging.
+
+### Bulk Input Limits
+
+To prevent memory exhaustion and abuse:
+- **Bulk create** (`POST /memories/bulk`): Limited to 1,000 items per request
+- **Import** (`POST /import`): Limited to 1,000 memories per request
+
+Requests exceeding these limits receive a `400 Bad Request` response.
+
+### Path Parameter Validation
+
+All ID path parameters (e.g., `/memories/{id}`, `/links/{id}`) are validated before database queries are executed. Invalid IDs (empty, too long, containing null bytes) are rejected with a `400 Bad Request` response before any database access occurs.
+
+### Input Validation
+
+All write paths go through the validation layer (`validate.rs`):
+- Title: max 512 bytes, no null bytes
+- Content: max 64KB, no null bytes
+- Namespace: max 128 bytes, no slashes/spaces/nulls
+- Source: whitelist (user, claude, hook, api, cli, import, consolidation, system)
+- Tags: max 50 tags, each max 128 bytes
+- Priority: 1-10
+- Confidence: 0.0-1.0, finite
+- Relations: whitelist (related_to, supersedes, contradicts, derived_from)
+- IDs: max 128 bytes, no null bytes
+- Timestamps: valid RFC3339
+- TTL: positive, max 1 year
+
+### Localhost Binding
+
+By default, the HTTP daemon binds to `127.0.0.1` only. It is **not accessible from the network**. This is intentional -- `claude-memory` is a local-machine tool.
+
+The MCP server communicates over stdio only -- no network exposure.
+
+### No Authentication
+
+There is no authentication mechanism. This is by design -- the daemon is intended for localhost access only. If you expose it to a network, you are responsible for adding a reverse proxy with authentication.
+
+### Data at Rest
+
+The SQLite database is stored as a regular file. It is not encrypted. If you need encryption at rest, use filesystem-level encryption (LUKS, FileVault, BitLocker).
+
+### MCP Notification Handling
+
+The MCP server correctly handles all JSON-RPC notifications (requests without an `id` field). Notifications are processed but no response is sent, per the JSON-RPC 2.0 specification. This prevents protocol errors when Claude Code sends `notifications/initialized` or other notification messages.
+
+### WAL Files
+
+SQLite WAL mode creates two additional files alongside the database:
+- `claude-memory.db-wal` -- write-ahead log
+- `claude-memory.db-shm` -- shared memory file
+
+Both are cleaned up on graceful shutdown (the daemon runs `PRAGMA wal_checkpoint(TRUNCATE)` on SIGINT). If the daemon crashes, these files persist but are automatically recovered on next open.
+
+## HTTP API Endpoints
+
+The HTTP daemon exposes **20 endpoints** under `/api/v1`:
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/health` | Deep health check (DB + FTS integrity) |
+| `POST` | `/memories` | Create a memory |
+| `POST` | `/memories/bulk` | Bulk create (max 1,000) |
+| `GET` | `/memories/{id}` | Get a memory by ID (includes links) |
+| `PUT` | `/memories/{id}` | Update a memory |
+| `DELETE` | `/memories/{id}` | Delete a memory |
+| `POST` | `/memories/{id}/promote` | Promote a memory to long-term |
+| `GET` | `/memories` | List memories with filters |
+| `GET` | `/search` | AND search with 6-factor scoring |
+| `GET` | `/recall` | OR recall with touch + auto-promote |
+| `POST` | `/recall` | OR recall (POST body) |
+| `POST` | `/forget` | Bulk delete by pattern/namespace/tier |
+| `POST` | `/consolidate` | Consolidate 2-100 memories |
+| `POST` | `/links` | Create a link between memories |
+| `GET` | `/links/{id}` | Get links for a memory |
+| `GET` | `/namespaces` | List namespaces with counts |
+| `GET` | `/stats` | Aggregate statistics |
+| `POST` | `/gc` | Trigger garbage collection |
+| `GET` | `/export` | Export all memories and links |
+| `POST` | `/import` | Import memories and links (max 1,000) |
 
 ## Monitoring
 
@@ -448,7 +554,7 @@ ls -la /path/to/claude-memory.db
 ### MCP server not connecting
 
 **Binary not found:**
-Check that the path in `.mcp.json` is correct and the binary is executable.
+Check that the path in `~/.claude/.mcp.json` is correct and the binary is executable.
 
 **Database path issues:**
 The MCP server opens the database at the path specified by `--db`. Ensure the directory exists and is writable.
@@ -495,42 +601,3 @@ claude-memory forget --tier short --namespace my-app
 # Compact after deletion
 sqlite3 /path/to/claude-memory.db "VACUUM"
 ```
-
-## Security
-
-### Localhost Binding
-
-By default, the HTTP daemon binds to `127.0.0.1` only. It is **not accessible from the network**. This is intentional -- `claude-memory` is a local-machine tool.
-
-The MCP server communicates over stdio only -- no network exposure.
-
-### No Authentication
-
-There is no authentication mechanism. This is by design -- the daemon is intended for localhost access only. If you expose it to a network, you are responsible for adding a reverse proxy with authentication.
-
-### Data at Rest
-
-The SQLite database is stored as a regular file. It is not encrypted. If you need encryption at rest, use filesystem-level encryption (LUKS, FileVault, BitLocker).
-
-### Input Validation
-
-All write paths go through the validation layer (`validate.rs`):
-- Title: max 512 bytes, no null bytes
-- Content: max 64KB, no null bytes
-- Namespace: max 128 bytes, no slashes/spaces/nulls
-- Source: whitelist (user, claude, hook, api, cli, import, consolidation, system)
-- Tags: max 50 tags, each max 128 bytes
-- Priority: 1-10
-- Confidence: 0.0-1.0, finite
-- Relations: whitelist (related_to, supersedes, contradicts, derived_from)
-- IDs: max 128 bytes, no null bytes
-- Timestamps: valid RFC3339
-- TTL: positive, max 1 year
-
-### WAL Files
-
-SQLite WAL mode creates two additional files alongside the database:
-- `claude-memory.db-wal` -- write-ahead log
-- `claude-memory.db-shm` -- shared memory file
-
-Both are cleaned up on graceful shutdown (the daemon runs `PRAGMA wal_checkpoint(TRUNCATE)` on SIGINT). If the daemon crashes, these files persist but are automatically recovered on next open.

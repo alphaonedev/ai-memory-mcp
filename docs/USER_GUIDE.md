@@ -1,5 +1,7 @@
 # User Guide
 
+> **BLUF (Bottom Line Up Front):** `claude-memory` gives Claude Code persistent memory across sessions. Configure the MCP server once, and Claude automatically stores and recalls knowledge -- your project architecture, preferences, past decisions, and hard-won lessons.
+
 ## What Is This and Why Do I Need It?
 
 `claude-memory` gives Claude Code persistent memory across sessions. Without it, every conversation starts from zero. With it, Claude can:
@@ -17,14 +19,14 @@ The easiest way to use claude-memory is as an **MCP tool server**. Once configur
 
 ### Setup
 
-Add to `~/.claude/.mcp.json` (global -- applies to all projects) or `.mcp.json` in your project root (project-level):
+Add to `~/.claude/.mcp.json` (global -- applies to all projects):
 
 ```json
 {
   "mcpServers": {
     "memory": {
       "command": "claude-memory",
-      "args": ["--db", "/path/to/claude-memory.db", "mcp"]
+      "args": ["--db", "~/.claude/claude-memory.db", "mcp"]
     }
   }
 }
@@ -34,16 +36,21 @@ Add to `~/.claude/.mcp.json` (global -- applies to all projects) or `.mcp.json` 
 
 ### How It Works
 
-With MCP configured, Claude Code gains 8 memory tools:
+With MCP configured, Claude Code gains 13 memory tools:
 
-- **memory_store** -- Store new knowledge (auto-deduplicates by title+namespace)
-- **memory_recall** -- Recall relevant memories for the current context
-- **memory_search** -- Search for specific memories by keyword
-- **memory_list** -- Browse memories with filters
+- **memory_store** -- Store new knowledge (auto-deduplicates by title+namespace, reports contradictions)
+- **memory_recall** -- Recall relevant memories for the current context (supports `until` date filter)
+- **memory_search** -- Search for specific memories by keyword (max 200 results)
+- **memory_list** -- Browse memories with filters (max 200 results)
 - **memory_delete** -- Remove a specific memory
 - **memory_promote** -- Make a memory permanent (long-term)
 - **memory_forget** -- Bulk delete memories by pattern
 - **memory_stats** -- View memory statistics
+- **memory_update** -- Update an existing memory by ID (partial update, supports `expires_at`)
+- **memory_get** -- Get a specific memory by ID with its links
+- **memory_link** -- Create a link between two memories
+- **memory_get_links** -- Get all links for a memory
+- **memory_consolidate** -- Consolidate multiple memories into one long-term summary (2-100 memories)
 
 Claude uses these tools automatically during conversations. You can also ask Claude directly: "Remember that we use PostgreSQL 15" or "What do you remember about our auth system?"
 
@@ -60,6 +67,26 @@ claude-memory store \
 ```
 
 That's it. The memory is now stored permanently (long tier) with priority 7/10.
+
+#### Custom Expiration
+
+You can set a custom expiration on any memory:
+
+```bash
+# Set an explicit expiration timestamp
+claude-memory store \
+  -T "Sprint 42 goals" \
+  -c "Finish migration, deploy v2 API." \
+  --tier mid \
+  --expires-at "2026-04-15T00:00:00Z"
+
+# Or set a TTL in seconds (e.g., 2 hours)
+claude-memory store \
+  -T "Current debugging session" \
+  -c "Investigating auth timeout in login.rs" \
+  --tier short \
+  --ttl-secs 7200
+```
 
 ### Recall Memories
 
@@ -173,6 +200,32 @@ Consolidation:
 - Creates a new long-term memory with the combined tags and highest priority
 - Deletes the source memories
 - Requires at least 2 IDs (max 100)
+
+## Updating Memories
+
+Update an existing memory by ID. Only the fields you provide are changed:
+
+```bash
+claude-memory update <id> -T "New title" -c "New content" --priority 8
+
+# Set a custom expiration on an existing memory
+claude-memory update <id> --expires-at "2026-06-01T00:00:00Z"
+```
+
+## Listing with Pagination
+
+Browse memories with filters and pagination using `--offset`:
+
+```bash
+# First page (default)
+claude-memory list --namespace my-app --limit 20
+
+# Second page
+claude-memory list --namespace my-app --limit 20 --offset 20
+
+# Third page
+claude-memory list --namespace my-app --limit 20 --offset 40
+```
 
 ## Common Workflows
 
@@ -442,3 +495,9 @@ A: A factor of `1/(1 + days_old * 0.1)` applied during recall ranking. A memory 
 
 **Q: Can I use this with tools other than Claude Code?**
 A: Yes. The MCP server speaks standard JSON-RPC over stdio. The HTTP API at `http://127.0.0.1:9077/api/v1/` is language-agnostic. Any tool that can make HTTP requests or speak JSON-RPC can store and recall memories.
+
+**Q: Are there limits on bulk operations?**
+A: Yes. Bulk create (`POST /memories/bulk`) and import (`POST /import`) are limited to 1,000 items per request to prevent abuse and memory exhaustion.
+
+**Q: Is the HTTP API safe from injection attacks?**
+A: Yes. All FTS queries are sanitized -- special characters are stripped and tokens are individually quoted before being passed to SQLite FTS5. The API also sanitizes error responses to avoid leaking internal database details to clients.

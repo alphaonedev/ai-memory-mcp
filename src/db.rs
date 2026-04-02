@@ -91,14 +91,17 @@ fn migrate(conn: &Connection) -> Result<()> {
         .unwrap_or(0);
     if version < 2 {
         // Add confidence and source columns if missing (v1 -> v2)
-        let _ = conn.execute(
+        // Ignore "duplicate column" errors but propagate real failures
+        for col_sql in &[
             "ALTER TABLE memories ADD COLUMN confidence REAL NOT NULL DEFAULT 1.0",
-            [],
-        );
-        let _ = conn.execute(
             "ALTER TABLE memories ADD COLUMN source TEXT NOT NULL DEFAULT 'api'",
-            [],
-        );
+        ] {
+            match conn.execute(col_sql, []) {
+                Ok(_) => {}
+                Err(e) if e.to_string().contains("duplicate column") => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
     }
     if version < CURRENT_SCHEMA_VERSION {
         conn.execute("DELETE FROM schema_version", [])?;
@@ -143,7 +146,7 @@ pub fn insert(conn: &Connection, mem: &Memory) -> Result<String> {
             content = excluded.content,
             tags = excluded.tags,
             priority = MAX(memories.priority, excluded.priority),
-            confidence = excluded.confidence,
+            confidence = MAX(memories.confidence, excluded.confidence),
             source = excluded.source,
             tier = CASE WHEN excluded.tier = 'long' THEN 'long'
                         WHEN memories.tier = 'long' THEN 'long'
@@ -159,13 +162,11 @@ pub fn insert(conn: &Connection, mem: &Memory) -> Result<String> {
         ],
     )?;
     // Return the actual ID (could be the existing one on conflict)
-    let actual_id: String = conn
-        .query_row(
-            "SELECT id FROM memories WHERE title = ?1 AND namespace = ?2",
-            params![mem.title, mem.namespace],
-            |r| r.get(0),
-        )
-        .unwrap_or_else(|_| mem.id.clone());
+    let actual_id: String = conn.query_row(
+        "SELECT id FROM memories WHERE title = ?1 AND namespace = ?2",
+        params![mem.title, mem.namespace],
+        |r| r.get(0),
+    )?;
     Ok(actual_id)
 }
 
@@ -179,46 +180,49 @@ pub fn get(conn: &Connection, id: &str) -> Result<Option<Memory>> {
     }
 }
 
-/// Bump access count, extend TTL, auto-promote.
+/// Bump access count, extend TTL, auto-promote — atomic via transaction.
 pub fn touch(conn: &Connection, id: &str) -> Result<()> {
-    let mem = get(conn, id)?;
-    let Some(mem) = mem else { return Ok(()) };
     let now = Utc::now();
     let now_str = now.to_rfc3339();
-    let new_count = mem.access_count + 1;
+    let short_expires = (now + chrono::Duration::seconds(SHORT_TTL_EXTEND_SECS)).to_rfc3339();
+    let mid_expires = (now + chrono::Duration::seconds(MID_TTL_EXTEND_SECS)).to_rfc3339();
 
-    // Extend TTL on access
-    let new_expires = match mem.tier {
-        Tier::Short => mem
-            .expires_at
-            .map(|_| (now + chrono::Duration::seconds(SHORT_TTL_EXTEND_SECS)).to_rfc3339()),
-        Tier::Mid => mem
-            .expires_at
-            .map(|_| (now + chrono::Duration::seconds(MID_TTL_EXTEND_SECS)).to_rfc3339()),
-        Tier::Long => None,
-    };
+    conn.execute_batch("BEGIN IMMEDIATE")?;
 
-    conn.execute(
-        "UPDATE memories SET access_count = ?1, last_accessed_at = ?2, expires_at = COALESCE(?3, expires_at) WHERE id = ?4",
-        params![new_count, now_str, new_expires, id],
-    )?;
-
-    // Auto-promote mid → long
-    if mem.tier == Tier::Mid && new_count >= PROMOTION_THRESHOLD {
+    let result = (|| -> Result<()> {
         conn.execute(
-            "UPDATE memories SET tier = 'long', expires_at = NULL, updated_at = ?1 WHERE id = ?2 AND tier = 'mid'",
-            params![now_str, id],
+            "UPDATE memories SET
+                access_count = access_count + 1,
+                last_accessed_at = ?1,
+                expires_at = CASE
+                    WHEN tier = 'long' THEN expires_at
+                    WHEN tier = 'short' AND expires_at IS NOT NULL THEN ?2
+                    WHEN tier = 'mid' AND expires_at IS NOT NULL THEN ?3
+                    ELSE expires_at
+                END
+             WHERE id = ?4",
+            params![now_str, short_expires, mid_expires, id],
         )?;
-    }
 
-    // Reinforce priority every 10 accesses
-    if new_count > 0 && new_count % 10 == 0 && mem.priority < 10 {
         conn.execute(
-            "UPDATE memories SET priority = MIN(priority + 1, 10) WHERE id = ?1",
+            "UPDATE memories SET tier = 'long', expires_at = NULL, updated_at = ?1
+             WHERE id = ?2 AND tier = 'mid' AND access_count >= ?3",
+            params![now_str, id, PROMOTION_THRESHOLD],
+        )?;
+
+        conn.execute(
+            "UPDATE memories SET priority = MIN(priority + 1, 10)
+             WHERE id = ?1 AND access_count > 0 AND access_count % 10 = 0 AND priority < 10",
             params![id],
         )?;
+
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => { conn.execute_batch("COMMIT")?; Ok(()) }
+        Err(e) => { let _ = conn.execute_batch("ROLLBACK"); Err(e) }
     }
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -325,7 +329,7 @@ pub fn list(
            AND (expires_at IS NULL OR expires_at > ?4)
            AND (?5 IS NULL OR created_at >= ?5)
            AND (?6 IS NULL OR created_at <= ?6)
-           AND (?7 IS NULL OR tags LIKE '%' || ?7 || '%')
+           AND (?7 IS NULL OR EXISTS (SELECT 1 FROM json_each(memories.tags) WHERE json_each.value = ?7))
          ORDER BY priority DESC, updated_at DESC
          LIMIT ?8 OFFSET ?9",
     )?;
@@ -376,10 +380,10 @@ pub fn search(
            AND (m.expires_at IS NULL OR m.expires_at > ?5)
            AND (?6 IS NULL OR m.created_at >= ?6)
            AND (?7 IS NULL OR m.created_at <= ?7)
-           AND (?8 IS NULL OR m.tags LIKE '%' || ?8 || '%')
+           AND (?8 IS NULL OR EXISTS (SELECT 1 FROM json_each(m.tags) WHERE json_each.value = ?8))
          ORDER BY (fts.rank * -1)
            + (m.priority * 0.5)
-           + (m.access_count * 0.1)
+           + (MIN(m.access_count, 50) * 0.1)
            + (m.confidence * 2.0)
            + (1.0 / (1.0 + (julianday('now') - julianday(m.updated_at)) * 0.1))
            DESC
@@ -411,6 +415,7 @@ pub fn recall(
     limit: usize,
     tags_filter: Option<&str>,
     since: Option<&str>,
+    until: Option<&str>,
 ) -> Result<Vec<Memory>> {
     let now = Utc::now().to_rfc3339();
     let fts_query = sanitize_fts_query(context, true);
@@ -424,20 +429,21 @@ pub fn recall(
          WHERE memories_fts MATCH ?1
            AND (?2 IS NULL OR m.namespace = ?2)
            AND (m.expires_at IS NULL OR m.expires_at > ?3)
-           AND (?4 IS NULL OR m.tags LIKE '%' || ?4 || '%')
+           AND (?4 IS NULL OR EXISTS (SELECT 1 FROM json_each(m.tags) WHERE json_each.value = ?4))
            AND (?5 IS NULL OR m.created_at >= ?5)
+           AND (?6 IS NULL OR m.created_at <= ?6)
          ORDER BY
            (fts.rank * -1)
            + (m.priority * 0.5)
-           + (m.access_count * 0.1)
+           + (MIN(m.access_count, 50) * 0.1)
            + (m.confidence * 2.0)
            + (CASE m.tier WHEN 'long' THEN 3.0 WHEN 'mid' THEN 1.0 ELSE 0.0 END)
            + (1.0 / (1.0 + (julianday('now') - julianday(m.updated_at)) * 0.1))
            DESC
-         LIMIT ?6",
+         LIMIT ?7",
     )?;
     let rows = stmt.query_map(
-        params![fts_query, namespace, now, tags_filter, since, limit as i64],
+        params![fts_query, namespace, now, tags_filter, since, until, limit as i64],
         row_to_memory,
     )?;
     let results: Vec<Memory> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -525,51 +531,66 @@ pub fn consolidate(
     let now = Utc::now().to_rfc3339();
     let new_id = uuid::Uuid::new_v4().to_string();
 
-    // Collect max priority and all tags from source memories
-    let mut max_priority = 5i32;
-    let mut all_tags: Vec<String> = Vec::new();
-    let mut total_access = 0i64;
-    for id in ids {
-        if let Some(mem) = get(conn, id)? {
-            max_priority = max_priority.max(mem.priority);
-            all_tags.extend(mem.tags);
-            total_access += mem.access_count;
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+
+    let result = (|| -> Result<String> {
+        // Collect max priority and all tags from source memories
+        let mut max_priority = 5i32;
+        let mut all_tags: Vec<String> = Vec::new();
+        let mut total_access = 0i64;
+        for id in ids {
+            if let Some(mem) = get(conn, id)? {
+                max_priority = max_priority.max(mem.priority);
+                all_tags.extend(mem.tags);
+                total_access += mem.access_count;
+            }
         }
+        all_tags.sort();
+        all_tags.dedup();
+        let tags_json = serde_json::to_string(&all_tags)?;
+
+        conn.execute(
+            "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1.0, ?8, ?9, ?10, ?10)",
+            params![new_id, tier.as_str(), namespace, title, summary, tags_json, max_priority, source, total_access, now],
+        )?;
+
+        for id in ids {
+            create_link(conn, &new_id, id, "derived_from")?;
+        }
+
+        for id in ids {
+            delete(conn, id)?;
+        }
+
+        Ok(new_id.clone())
+    })();
+
+    match result {
+        Ok(id) => { conn.execute_batch("COMMIT")?; Ok(id) }
+        Err(e) => { let _ = conn.execute_batch("ROLLBACK"); Err(e) }
     }
-    all_tags.sort();
-    all_tags.dedup();
-    let tags_json = serde_json::to_string(&all_tags)?;
-
-    conn.execute(
-        "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1.0, ?8, ?9, ?10, ?10)",
-        params![new_id, tier.as_str(), namespace, title, summary, tags_json, max_priority, source, total_access, now],
-    )?;
-
-    // Delete source memories (links cascade)
-    for id in ids {
-        let _ = delete(conn, id);
-    }
-
-    Ok(new_id)
 }
 
 fn sanitize_fts_query(input: &str, use_or: bool) -> String {
-    let has_operators = input.contains('"')
-        || input.contains(" OR ")
-        || input.contains(" AND ")
-        || input.contains(" NOT ")
-        || input.contains('*');
-    if has_operators {
-        return input.to_string();
-    }
     let joiner = if use_or { " OR " } else { " " };
-    input
+    let tokens: Vec<String> = input
         .split_whitespace()
-        .filter(|t| t.len() > 1) // skip single chars
-        .map(|token| format!("\"{}\"", token.replace('"', "")))
-        .collect::<Vec<_>>()
-        .join(joiner)
+        .filter(|t| !t.is_empty())
+        .map(|token| {
+            // Strip all FTS5 special characters to prevent injection
+            let clean: String = token.chars().filter(|c| *c != '"' && *c != '*' && *c != '^' && *c != '{' && *c != '}').collect();
+            if clean.is_empty() {
+                return String::new();
+            }
+            format!("\"{}\"", clean)
+        })
+        .filter(|t| !t.is_empty())
+        .collect();
+    if tokens.is_empty() {
+        return "\"\"".to_string();
+    }
+    tokens.join(joiner)
 }
 
 pub fn list_namespaces(conn: &Connection) -> Result<Vec<NamespaceCount>> {
@@ -635,6 +656,19 @@ pub fn stats(conn: &Connection, db_path: &Path) -> Result<Stats> {
     })
 }
 
+/// Run GC if there are any expired memories. Lightweight check first.
+pub fn gc_if_needed(conn: &Connection) -> Result<usize> {
+    let now = Utc::now().to_rfc3339();
+    let has_expired: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM memories WHERE expires_at IS NOT NULL AND expires_at < ?1)",
+            params![now],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
+    if has_expired { gc(conn) } else { Ok(0) }
+}
+
 pub fn gc(conn: &Connection) -> Result<usize> {
     let now = Utc::now().to_rfc3339();
     let deleted = conn.execute(
@@ -664,6 +698,41 @@ pub fn export_links(conn: &Connection) -> Result<Vec<MemoryLink>> {
     })?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .map_err(Into::into)
+}
+
+/// Insert with timestamp-aware conflict resolution for sync.
+/// Only overwrites if the incoming memory is newer (by updated_at).
+pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
+    let tags_json = serde_json::to_string(&mem.tags)?;
+    conn.execute(
+        "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+         ON CONFLICT(title, namespace) DO UPDATE SET
+            content = CASE WHEN excluded.updated_at > memories.updated_at THEN excluded.content ELSE memories.content END,
+            tags = CASE WHEN excluded.updated_at > memories.updated_at THEN excluded.tags ELSE memories.tags END,
+            priority = MAX(memories.priority, excluded.priority),
+            confidence = MAX(memories.confidence, excluded.confidence),
+            source = CASE WHEN excluded.updated_at > memories.updated_at THEN excluded.source ELSE memories.source END,
+            tier = CASE WHEN excluded.tier = 'long' THEN 'long'
+                        WHEN memories.tier = 'long' THEN 'long'
+                        WHEN excluded.tier = 'mid' THEN 'mid'
+                        ELSE memories.tier END,
+            updated_at = MAX(memories.updated_at, excluded.updated_at),
+            access_count = MAX(memories.access_count, excluded.access_count),
+            expires_at = CASE WHEN excluded.tier = 'long' OR memories.tier = 'long' THEN NULL
+                              ELSE COALESCE(excluded.expires_at, memories.expires_at) END",
+        params![
+            mem.id, mem.tier.as_str(), mem.namespace, mem.title, mem.content,
+            tags_json, mem.priority, mem.confidence, mem.source, mem.access_count,
+            mem.created_at, mem.updated_at, mem.last_accessed_at, mem.expires_at,
+        ],
+    )?;
+    let actual_id: String = conn.query_row(
+        "SELECT id FROM memories WHERE title = ?1 AND namespace = ?2",
+        params![mem.title, mem.namespace],
+        |r| r.get(0),
+    )?;
+    Ok(actual_id)
 }
 
 /// Checkpoint WAL for clean shutdown.
