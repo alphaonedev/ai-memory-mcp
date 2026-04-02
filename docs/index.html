@@ -454,25 +454,29 @@
                 </div>
 
                 <div id="tab-codex" class="integration-panel">
-                    <p>Config: <code>~/.codex/config.toml</code></p>
+                    <p>Config: <code>~/.codex/config.toml</code> (global) or <code>.codex/config.toml</code> (project)</p>
                     <pre><code><span class="tok-cm"># OpenAI Codex CLI MCP configuration</span>
 <span class="tok-flag">[mcp_servers.memory]</span>
 <span class="tok-str">command</span> = <span class="tok-str">"ai-memory"</span>
-<span class="tok-str">args</span> = [<span class="tok-str">"--db"</span>, <span class="tok-str">"~/.codex/ai-memory.db"</span>, <span class="tok-str">"mcp"</span>]<span class="lang-label">toml</span></code></pre>
-                    <p style="font-size:.85rem">Codex CLI uses TOML for configuration. Restart codex after editing. The MCP tools appear as native function calls.</p>
+<span class="tok-str">args</span> = [<span class="tok-str">"--db"</span>, <span class="tok-str">"~/.local/share/ai-memory/memories.db"</span>, <span class="tok-str">"mcp"</span>]
+<span class="tok-str">enabled</span> = <span class="tok-str">true</span><span class="lang-label">toml</span></code></pre>
+                    <p style="font-size:.85rem">CLI shortcut: <code>codex mcp add memory -- ai-memory --db ~/.local/share/ai-memory/memories.db mcp</code></p>
+                    <p style="font-size:.85rem">Codex CLI uses TOML config. Use <code>enabled_tools</code> to restrict which memory tools are exposed. Use <code>/mcp</code> in the TUI to view server status. Supports <code>startup_timeout_sec</code>, <code>tool_timeout_sec</code>, and HTTP servers via <code>url</code>. See <a href="https://developers.openai.com/codex/mcp">Codex MCP docs</a>.</p>
                 </div>
 
                 <div id="tab-gemini" class="integration-panel">
-                    <p>Config: <code>~/.gemini/settings.json</code></p>
+                    <p>Config: <code>~/.gemini/settings.json</code> (user) or <code>.gemini/settings.json</code> (project)</p>
                     <pre><code>{
   <span class="tok-str">"mcpServers"</span>: {
     <span class="tok-str">"memory"</span>: {
       <span class="tok-str">"command"</span>: <span class="tok-str">"ai-memory"</span>,
-      <span class="tok-str">"args"</span>: [<span class="tok-str">"--db"</span>, <span class="tok-str">"~/.gemini/ai-memory.db"</span>, <span class="tok-str">"mcp"</span>]
+      <span class="tok-str">"args"</span>: [<span class="tok-str">"--db"</span>, <span class="tok-str">"~/.local/share/ai-memory/memories.db"</span>, <span class="tok-str">"mcp"</span>],
+      <span class="tok-str">"timeout"</span>: <span class="tok-num">30000</span>
     }
   }
 }<span class="lang-label">json</span></code></pre>
-                    <p style="font-size:.85rem">Google Gemini CLI discovers MCP tools on startup. Restart the CLI after adding the config.</p>
+                    <p style="font-size:.85rem">CLI shortcut: <code>gemini mcp add memory ai-memory -- --db ~/.local/share/ai-memory/memories.db mcp</code></p>
+                    <p style="font-size:.85rem">Avoid underscores in server names (use hyphens). Tool names are auto-prefixed as <code>mcp_memory_&lt;toolName&gt;</code>. Gemini sanitizes env vars -- declare needed vars in <code>env</code> field. Add <code>"trust": true</code> to skip confirmation prompts. See <a href="https://geminicli.com/docs/tools/mcp-server/">Gemini CLI MCP docs</a>.</p>
                 </div>
 
                 <div id="tab-cursor" class="integration-panel">
@@ -1136,7 +1140,7 @@
                 <!-- DB layer -->
                 <rect x="170" y="257" width="360" height="55" rx="8" fill="#161b22" stroke="#39d2c0" stroke-width="2"/>
                 <text x="350" y="280" text-anchor="middle" fill="#39d2c0" font-family="system-ui" font-size="13" font-weight="700">SQLite + FTS5 (db.rs)</text>
-                <text x="350" y="300" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="10">WAL mode | schema v2 | 5 indexes | 41 tests</text>
+                <text x="350" y="300" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="10">WAL mode | schema v2 | 5 indexes | 48 tests</text>
 
                 <!-- Tiers -->
                 <rect x="200" y="325" width="70" height="22" rx="4" fill="rgba(248,81,73,.15)" stroke="#f85149" stroke-width="1"/>
@@ -1312,7 +1316,7 @@
 
                 <rect x="327" y="30" width="80" height="40" rx="6" fill="#161b22" stroke="#bc8cff" stroke-width="1"/>
                 <text x="367" y="48" text-anchor="middle" fill="#bc8cff" font-family="monospace" font-size="10">test</text>
-                <text x="367" y="62" text-anchor="middle" fill="#8b949e" font-family="monospace" font-size="9">41 tests</text>
+                <text x="367" y="62" text-anchor="middle" fill="#8b949e" font-family="monospace" font-size="9">48 tests</text>
 
                 <line x1="407" y1="50" x2="427" y2="50" stroke="#30363d" stroke-width="1.5" class="animate-flow"/>
 

@@ -1723,3 +1723,281 @@ fn test_health_endpoint() {
 
     let _ = std::fs::remove_file(&db_path);
 }
+
+// === MCP Protocol Tests ===
+
+#[test]
+fn test_mcp_initialize() {
+    let binary = env!("CARGO_BIN_EXE_ai-memory");
+    let dir = std::env::temp_dir();
+    let db_path = dir.join(format!("ai-memory-mcp-init-{}.db", uuid::Uuid::new_v4()));
+
+    let output = std::process::Command::new(binary)
+        .args(["--db", db_path.to_str().unwrap(), "mcp"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            if let Some(ref mut stdin) = child.stdin {
+                writeln!(
+                    stdin,
+                    r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{}}}}"#
+                )
+                .ok();
+            }
+            drop(child.stdin.take());
+            child.wait_with_output()
+        })
+        .expect("failed to run mcp");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let resp: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("invalid JSON response");
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["id"], 1);
+    assert_eq!(resp["result"]["serverInfo"]["name"], "ai-memory");
+    assert_eq!(resp["result"]["protocolVersion"], "2024-11-05");
+    assert!(resp["result"]["capabilities"]["tools"].is_object());
+
+    let _ = std::fs::remove_file(&db_path);
+}
+
+#[test]
+fn test_mcp_tools_list() {
+    let binary = env!("CARGO_BIN_EXE_ai-memory");
+    let dir = std::env::temp_dir();
+    let db_path = dir.join(format!("ai-memory-mcp-tools-{}.db", uuid::Uuid::new_v4()));
+
+    let output = std::process::Command::new(binary)
+        .args(["--db", db_path.to_str().unwrap(), "mcp"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            if let Some(ref mut stdin) = child.stdin {
+                writeln!(
+                    stdin,
+                    r#"{{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{{}}}}"#
+                )
+                .ok();
+            }
+            drop(child.stdin.take());
+            child.wait_with_output()
+        })
+        .expect("failed to run mcp");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let resp: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("invalid JSON response");
+    let tools = resp["result"]["tools"]
+        .as_array()
+        .expect("tools should be array");
+    assert_eq!(tools.len(), 13, "expected 13 MCP tools");
+
+    let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+    assert!(tool_names.contains(&"memory_store"));
+    assert!(tool_names.contains(&"memory_recall"));
+    assert!(tool_names.contains(&"memory_search"));
+    assert!(tool_names.contains(&"memory_list"));
+    assert!(tool_names.contains(&"memory_delete"));
+    assert!(tool_names.contains(&"memory_promote"));
+    assert!(tool_names.contains(&"memory_forget"));
+    assert!(tool_names.contains(&"memory_stats"));
+    assert!(tool_names.contains(&"memory_update"));
+    assert!(tool_names.contains(&"memory_get"));
+    assert!(tool_names.contains(&"memory_link"));
+    assert!(tool_names.contains(&"memory_get_links"));
+    assert!(tool_names.contains(&"memory_consolidate"));
+
+    let _ = std::fs::remove_file(&db_path);
+}
+
+#[test]
+fn test_mcp_store_and_recall() {
+    let binary = env!("CARGO_BIN_EXE_ai-memory");
+    let dir = std::env::temp_dir();
+    let db_path = dir.join(format!("ai-memory-mcp-store-{}.db", uuid::Uuid::new_v4()));
+
+    // Send store then recall in sequence
+    let output = std::process::Command::new(binary)
+        .args(["--db", db_path.to_str().unwrap(), "mcp"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            if let Some(ref mut stdin) = child.stdin {
+                writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"memory_store","arguments":{{"title":"MCP test memory","content":"This was stored via MCP protocol","tier":"long","priority":8}}}}}}"#).ok();
+                writeln!(stdin, r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"memory_recall","arguments":{{"context":"MCP test"}}}}}}"#).ok();
+            }
+            drop(child.stdin.take());
+            child.wait_with_output()
+        })
+        .expect("failed to run mcp");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(lines.len(), 2, "expected 2 responses");
+
+    // Verify store response
+    let store_resp: serde_json::Value =
+        serde_json::from_str(lines[0]).expect("invalid store response");
+    assert_eq!(store_resp["id"], 1);
+    assert!(store_resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("\"id\""));
+
+    // Verify recall response
+    let recall_resp: serde_json::Value =
+        serde_json::from_str(lines[1]).expect("invalid recall response");
+    assert_eq!(recall_resp["id"], 2);
+    let recall_text = recall_resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(recall_text.contains("MCP test memory"));
+
+    let _ = std::fs::remove_file(&db_path);
+}
+
+#[test]
+fn test_mcp_invalid_jsonrpc_version() {
+    let binary = env!("CARGO_BIN_EXE_ai-memory");
+    let dir = std::env::temp_dir();
+    let db_path = dir.join(format!("ai-memory-mcp-ver-{}.db", uuid::Uuid::new_v4()));
+
+    let output = std::process::Command::new(binary)
+        .args(["--db", db_path.to_str().unwrap(), "mcp"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            if let Some(ref mut stdin) = child.stdin {
+                writeln!(
+                    stdin,
+                    r#"{{"jsonrpc":"1.0","id":1,"method":"initialize","params":{{}}}}"#
+                )
+                .ok();
+            }
+            drop(child.stdin.take());
+            child.wait_with_output()
+        })
+        .expect("failed to run mcp");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let resp: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("invalid JSON response");
+    assert!(
+        resp["error"].is_object(),
+        "expected error for invalid jsonrpc version"
+    );
+    assert_eq!(resp["error"]["code"], -32600);
+
+    let _ = std::fs::remove_file(&db_path);
+}
+
+#[test]
+fn test_mcp_unknown_tool() {
+    let binary = env!("CARGO_BIN_EXE_ai-memory");
+    let dir = std::env::temp_dir();
+    let db_path = dir.join(format!("ai-memory-mcp-unk-{}.db", uuid::Uuid::new_v4()));
+
+    let output = std::process::Command::new(binary)
+        .args(["--db", db_path.to_str().unwrap(), "mcp"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            if let Some(ref mut stdin) = child.stdin {
+                writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"nonexistent_tool","arguments":{{}}}}}}"#).ok();
+            }
+            drop(child.stdin.take());
+            child.wait_with_output()
+        })
+        .expect("failed to run mcp");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let resp: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("invalid JSON response");
+    // Tool errors come back as isError in MCP spec
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
+    assert!(text.contains("unknown tool"), "expected unknown tool error");
+    assert_eq!(resp["result"]["isError"], true);
+
+    let _ = std::fs::remove_file(&db_path);
+}
+
+#[test]
+fn test_mcp_missing_tool_name() {
+    let binary = env!("CARGO_BIN_EXE_ai-memory");
+    let dir = std::env::temp_dir();
+    let db_path = dir.join(format!("ai-memory-mcp-noname-{}.db", uuid::Uuid::new_v4()));
+
+    let output = std::process::Command::new(binary)
+        .args(["--db", db_path.to_str().unwrap(), "mcp"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            if let Some(ref mut stdin) = child.stdin {
+                writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"arguments":{{}}}}}}"#).ok();
+            }
+            drop(child.stdin.take());
+            child.wait_with_output()
+        })
+        .expect("failed to run mcp");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let resp: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("invalid JSON response");
+    assert!(
+        resp["error"].is_object(),
+        "expected error for missing tool name"
+    );
+    assert_eq!(resp["error"]["code"], -32602);
+
+    let _ = std::fs::remove_file(&db_path);
+}
+
+#[test]
+fn test_mcp_stats() {
+    let binary = env!("CARGO_BIN_EXE_ai-memory");
+    let dir = std::env::temp_dir();
+    let db_path = dir.join(format!("ai-memory-mcp-stats-{}.db", uuid::Uuid::new_v4()));
+
+    let output = std::process::Command::new(binary)
+        .args(["--db", db_path.to_str().unwrap(), "mcp"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            if let Some(ref mut stdin) = child.stdin {
+                writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"memory_stats","arguments":{{}}}}}}"#).ok();
+            }
+            drop(child.stdin.take());
+            child.wait_with_output()
+        })
+        .expect("failed to run mcp");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let resp: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("invalid JSON response");
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("total"));
+    assert!(text.contains("by_tier"));
+
+    let _ = std::fs::remove_file(&db_path);
+}
