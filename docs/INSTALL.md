@@ -153,13 +153,32 @@ mcpServers:
 
 > **Note for Continue.dev:** Uses YAML list format. MCP tools only work in agent mode.
 
-**xAI Grok (API-level)** -- Grok uses remote MCP over HTTP. Start the ai-memory HTTP server:
+**xAI Grok (API-level, remote MCP)** -- Grok connects to MCP servers over HTTPS (remote only, no stdio). Start ai-memory as an HTTP server behind HTTPS:
 
 ```bash
 ai-memory serve --host 127.0.0.1 --port 9077
+# Expose via HTTPS reverse proxy (nginx, caddy, cloudflare tunnel, etc.)
 ```
 
-Then pass the server URL in your Grok API call. See [xAI docs](https://docs.x.ai/docs/guides/tools/remote-mcp-tools).
+Then add the MCP server to your Grok API call:
+
+```bash
+curl https://api.x.ai/v1/responses \
+  -H "Authorization: Bearer $XAI_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "grok-3",
+    "tools": [{
+      "type": "mcp",
+      "server_url": "https://your-server.example.com/mcp",
+      "server_label": "memory",
+      "server_description": "Persistent AI memory with recall and search"
+    }],
+    "input": "What do you remember about our project?"
+  }'
+```
+
+**Requirements:** HTTPS required. `server_label` is required. Supports Streamable HTTP and SSE transports. See [xAI Remote MCP docs](https://docs.x.ai/developers/tools/remote-mcp).
 
 **META Llama (via Llama Stack)** -- Start the HTTP server, then register as a toolgroup:
 
