@@ -22,14 +22,17 @@
 
 ai-memory integrates with any AI platform that supports the **Model Context Protocol (MCP)**. MCP is the universal standard for connecting AI assistants to external tools and data sources.
 
-| Platform | Integration Method | Status |
-|----------|-------------------|--------|
-| **Claude AI** (Anthropic) | MCP native | Fully supported |
-| **ChatGPT** (OpenAI) | MCP via tool use | Fully supported |
-| **Grok** (xAI) | MCP via tool use | Fully supported |
-| **Llama** (META) | MCP via compatible hosts | Fully supported |
-| **Any MCP-compatible AI** | MCP stdio JSON-RPC | Fully supported |
-| **Any AI or tool** | HTTP REST API / CLI | Universal fallback |
+| Platform | Integration Method | Config Format | Status |
+|----------|-------------------|---------------|--------|
+| **Claude Code** (Anthropic) | MCP stdio | JSON (`~/.claude/.mcp.json`) | Fully supported |
+| **Codex CLI** (OpenAI) | MCP stdio | TOML (`~/.codex/config.toml`) | Fully supported |
+| **Gemini CLI** (Google) | MCP stdio | JSON (`~/.gemini/settings.json`) | Fully supported |
+| **Grok** (xAI) | MCP remote HTTP | API-level | Fully supported |
+| **Cursor IDE** | MCP stdio | JSON (`~/.cursor/mcp.json`) | Fully supported |
+| **Windsurf** (Codeium) | MCP stdio | JSON (`~/.codeium/windsurf/mcp_config.json`) | Fully supported |
+| **Continue.dev** | MCP stdio | YAML (`~/.continue/config.yaml`) | Fully supported |
+| **Llama Stack** (META) | MCP remote HTTP | YAML / Python SDK | Fully supported |
+| **Any MCP client** | MCP stdio or HTTP | Varies | Universal |
 
 MCP is the primary integration layer. For AI platforms that do not yet support MCP natively, the **HTTP API** (20 endpoints on localhost) and the **CLI** (24 commands) provide universal access -- any AI, script, or automation that can make HTTP calls or run shell commands can use ai-memory.
 
@@ -57,7 +60,12 @@ This compiles the binary and puts it in your PATH. It takes a minute or two.
 
 **Step 3: Connect your AI**
 
-**For MCP-compatible AI platforms** -- add ai-memory as an MCP server in your AI's configuration. The exact location varies by platform, but the server definition is the same:
+Configuration varies by platform. Find yours below:
+
+<details>
+<summary><strong>Claude Code</strong> (Anthropic)</summary>
+
+Add to `~/.claude/.mcp.json`:
 
 ```json
 {
@@ -70,14 +78,152 @@ This compiles the binary and puts it in your PATH. It takes a minute or two.
 }
 ```
 
-For Claude Code, this file goes at `~/.claude/.mcp.json` (global config). Other AI platforms may use different config paths -- consult your platform's MCP documentation.
+</details>
 
-**For non-MCP platforms** -- start the HTTP server and point your AI at the REST API:
+<details>
+<summary><strong>OpenAI Codex CLI</strong></summary>
+
+Add to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.memory]
+command = "ai-memory"
+args = ["--db", "~/.local/share/ai-memory/memories.db", "mcp"]
+```
+
+</details>
+
+<details>
+<summary><strong>Google Gemini CLI</strong></summary>
+
+Add to `~/.gemini/settings.json`:
+
+```json
+{
+  "mcpServers": {
+    "memory": {
+      "command": "ai-memory",
+      "args": ["--db", "~/.local/share/ai-memory/memories.db", "mcp"]
+    }
+  }
+}
+```
+
+</details>
+
+<details>
+<summary><strong>Cursor IDE</strong></summary>
+
+Add to `~/.cursor/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "memory": {
+      "command": "ai-memory",
+      "args": ["--db", "~/.local/share/ai-memory/memories.db", "mcp"]
+    }
+  }
+}
+```
+
+</details>
+
+<details>
+<summary><strong>Windsurf</strong> (Codeium)</summary>
+
+Add to `~/.codeium/windsurf/mcp_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "memory": {
+      "command": "ai-memory",
+      "args": ["--db", "~/.local/share/ai-memory/memories.db", "mcp"]
+    }
+  }
+}
+```
+
+</details>
+
+<details>
+<summary><strong>Continue.dev</strong></summary>
+
+Add to `~/.continue/config.yaml`:
+
+```yaml
+mcpServers:
+  - name: memory
+    command: ai-memory
+    args:
+      - "--db"
+      - "~/.local/share/ai-memory/memories.db"
+      - "mcp"
+```
+
+</details>
+
+<details>
+<summary><strong>xAI Grok</strong> (API-level)</summary>
+
+Grok uses remote MCP over HTTP. Start the ai-memory HTTP server, then pass it in your API call:
+
+```bash
+ai-memory serve --host 127.0.0.1 --port 9077
+```
+
+```python
+from xai_sdk import Client
+client = Client()
+response = client.chat.create(
+    model="grok-4",
+    tools=[mcp(server_url="http://localhost:9077/mcp")],
+    messages=[...]
+)
+```
+
+</details>
+
+<details>
+<summary><strong>META Llama</strong> (via Llama Stack)</summary>
+
+Llama Stack registers MCP servers as toolgroups. Start the HTTP server first:
+
+```bash
+ai-memory serve --host 127.0.0.1 --port 9077
+```
+
+Then register via the Python SDK:
+
+```python
+client.toolgroups.register(
+    provider_id="model-context-protocol",
+    toolgroup_id="mcp::memory",
+    mcp_endpoint={"uri": "http://localhost:9077/sse"}
+)
+```
+
+</details>
+
+<details>
+<summary><strong>Any other MCP client</strong></summary>
+
+ai-memory speaks MCP over stdio (JSON-RPC 2.0). Point your client at:
+
+```
+command: ai-memory
+args: ["--db", "/path/to/ai-memory.db", "mcp"]
+```
+
+For HTTP-only clients, start the REST API:
 
 ```bash
 ai-memory serve
-# API available at http://127.0.0.1:9077/api/v1/
+# 20 endpoints at http://127.0.0.1:9077/api/v1/
 ```
+
+</details>
 
 **Step 4: Done. Test it.**
 

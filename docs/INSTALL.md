@@ -88,11 +88,94 @@ Each AI platform has its own MCP configuration location. The server command and 
 
 > **Note for Claude Code:** MCP server configuration does **not** go in `settings.json` or `settings.local.json` -- those files do not support `mcpServers`.
 
-**Other MCP-compatible clients** -- consult your platform's documentation for where to register MCP servers. The server entry is the same:
-- **Command:** `ai-memory` (or full path if not in PATH)
-- **Args:** `["--db", "/path/to/memory.db", "mcp"]`
+**OpenAI Codex CLI** -- create or edit `~/.codex/config.toml` (TOML format, not JSON):
 
-If `ai-memory` is not in your PATH, use the full path to the binary:
+```toml
+[mcp_servers.memory]
+command = "ai-memory"
+args = ["--db", "~/.local/share/ai-memory/memories.db", "mcp"]
+```
+
+> **Note for Codex CLI:** Codex uses TOML format with underscored key `mcp_servers`, not camelCase.
+
+**Google Gemini CLI** -- create or edit `~/.gemini/settings.json`:
+
+```json
+{
+  "mcpServers": {
+    "memory": {
+      "command": "ai-memory",
+      "args": ["--db", "~/.local/share/ai-memory/memories.db", "mcp"]
+    }
+  }
+}
+```
+
+> **Note for Gemini CLI:** Gemini CLI sanitizes environment variables. Declare needed vars in the `env` field.
+
+**Cursor IDE** -- create or edit `~/.cursor/mcp.json` (global) or `.cursor/mcp.json` (project-level):
+
+```json
+{
+  "mcpServers": {
+    "memory": {
+      "command": "ai-memory",
+      "args": ["--db", "~/.local/share/ai-memory/memories.db", "mcp"]
+    }
+  }
+}
+```
+
+**Windsurf (Codeium)** -- create or edit `~/.codeium/windsurf/mcp_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "memory": {
+      "command": "ai-memory",
+      "args": ["--db", "~/.local/share/ai-memory/memories.db", "mcp"]
+    }
+  }
+}
+```
+
+**Continue.dev** -- create or edit `~/.continue/config.yaml` (YAML format):
+
+```yaml
+mcpServers:
+  - name: memory
+    command: ai-memory
+    args:
+      - "--db"
+      - "~/.local/share/ai-memory/memories.db"
+      - "mcp"
+```
+
+> **Note for Continue.dev:** Uses YAML list format. MCP tools only work in agent mode.
+
+**xAI Grok (API-level)** -- Grok uses remote MCP over HTTP. Start the ai-memory HTTP server:
+
+```bash
+ai-memory serve --host 127.0.0.1 --port 9077
+```
+
+Then pass the server URL in your Grok API call. See [xAI docs](https://docs.x.ai/docs/guides/tools/remote-mcp-tools).
+
+**META Llama (via Llama Stack)** -- Start the HTTP server, then register as a toolgroup:
+
+```bash
+ai-memory serve --host 127.0.0.1 --port 9077
+```
+
+```python
+client.toolgroups.register(
+    provider_id="model-context-protocol",
+    toolgroup_id="mcp::memory",
+    mcp_endpoint={"uri": "http://localhost:9077/sse"}
+)
+```
+
+If `ai-memory` is not in your PATH, use the full path to the binary in any of the configurations above:
 
 ```json
 {
