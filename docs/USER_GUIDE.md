@@ -38,7 +38,9 @@ Below is an example for **Claude Code** (`~/.claude/.mcp.json`) -- one of many s
 
 > **Other platforms** (Codex, Gemini, Cursor, Windsurf, Continue.dev, etc.): config paths vary by platform. The command and args are the same -- only the config file location differs. Refer to the [Installation Guide](INSTALL.md) for exact paths.
 
-> **Grok and Llama note:** These platforms connect over HTTP rather than stdio MCP. Run `ai-memory serve` to start the HTTP daemon, then point your client at `http://localhost:9077`. See the [Installation Guide](INSTALL.md) for details.
+> **Grok note:** Grok connects via remote MCP over HTTPS only (no stdio). Run `ai-memory serve` and expose it behind an HTTPS reverse proxy. `server_label` is required. See the [Installation Guide](INSTALL.md) for details.
+
+> **Llama note:** Llama Stack connects over HTTP rather than stdio MCP. Run `ai-memory serve` to start the HTTP daemon, then point your client at `http://localhost:9077`. See the [Installation Guide](INSTALL.md) for details.
 
 ### How It Works
 

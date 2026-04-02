@@ -384,7 +384,7 @@
                 <span class="platform-icon">X</span>
                 <h4>xAI Grok</h4>
                 <p>Grok and any xAI-based applications via remote MCP</p>
-                <span class="platform-tag tag-http">HTTP / MCP</span>
+                <span class="platform-tag tag-http">Remote MCP (HTTPS)</span>
             </div>
             <div class="platform-card">
                 <span class="platform-icon">L</span>
@@ -515,17 +515,26 @@
                 </div>
 
                 <div id="tab-grok" class="integration-panel">
-                    <p>Grok uses API-level remote MCP. You must run the HTTP server.</p>
+                    <p>Grok connects to MCP servers over HTTPS (remote only, no stdio). Start ai-memory behind an HTTPS reverse proxy.</p>
                     <pre><code><span class="tok-cm"># Step 1: Start the ai-memory HTTP server</span>
 <span class="tok-cmd">ai-memory</span> serve <span class="tok-flag">--host</span> <span class="tok-num">127.0.0.1</span> <span class="tok-flag">--port</span> <span class="tok-num">9077</span> &amp;
+<span class="tok-cm"># Expose via HTTPS reverse proxy (nginx, caddy, cloudflare tunnel, etc.)</span>
 
-<span class="tok-cm"># Step 2: Register memory endpoints as Grok function tools</span>
-<span class="tok-cm"># In your xAI API tool definitions:</span>
-<span class="tok-cm">#   POST http://127.0.0.1:9077/api/v1/memories   (store)</span>
-<span class="tok-cm">#   GET  http://127.0.0.1:9077/api/v1/recall      (recall)</span>
-<span class="tok-cm">#   GET  http://127.0.0.1:9077/api/v1/search      (search)</span>
-<span class="tok-cm">#   ... 20 endpoints total</span><span class="lang-label">bash</span></code></pre>
-                    <p style="font-size:.85rem">xAI Grok does not support local stdio MCP. Run <code>ai-memory serve</code> and expose the HTTP endpoints as function-calling tools in your Grok integration. Suitable for any API-level integration.</p>
+<span class="tok-cm"># Step 2: Add the MCP server to your Grok API call</span>
+<span class="tok-cmd">curl</span> https://api.x.ai/v1/responses \
+  <span class="tok-flag">-H</span> <span class="tok-str">"Authorization: Bearer $XAI_API_KEY"</span> \
+  <span class="tok-flag">-H</span> <span class="tok-str">"Content-Type: application/json"</span> \
+  <span class="tok-flag">-d</span> <span class="tok-str">'{
+    "model": "grok-3",
+    "tools": [{
+      "type": "mcp",
+      "server_url": "https://your-server.example.com/mcp",
+      "server_label": "memory",
+      "server_description": "Persistent AI memory with recall and search"
+    }],
+    "input": "What do you remember about our project?"
+  }'</span><span class="lang-label">bash</span></code></pre>
+                    <p style="font-size:.85rem"><strong>HTTPS required.</strong> <code>server_label</code> is required. Supports Streamable HTTP and SSE transports. See <a href="https://docs.x.ai/developers/tools/remote-mcp">xAI Remote MCP docs</a>.</p>
                 </div>
 
                 <div id="tab-llama" class="integration-panel">

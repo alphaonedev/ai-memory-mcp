@@ -27,7 +27,7 @@ ai-memory integrates with any AI platform that supports the **Model Context Prot
 | **Claude Code** (Anthropic) | MCP stdio | JSON (`~/.claude/.mcp.json`) | Fully supported |
 | **Codex CLI** (OpenAI) | MCP stdio | TOML (`~/.codex/config.toml`) | Fully supported |
 | **Gemini CLI** (Google) | MCP stdio | JSON (`~/.gemini/settings.json`) | Fully supported |
-| **Grok** (xAI) | MCP remote HTTP | API-level | Fully supported |
+| **Grok** (xAI) | MCP remote HTTPS | API-level | Fully supported |
 | **Cursor IDE** | MCP stdio | JSON (`~/.cursor/mcp.json`) | Fully supported |
 | **Windsurf** (Codeium) | MCP stdio | JSON (`~/.codeium/windsurf/mcp_config.json`) | Fully supported |
 | **Continue.dev** | MCP stdio | YAML (`~/.continue/config.yaml`) | Fully supported |
@@ -165,23 +165,34 @@ mcpServers:
 </details>
 
 <details>
-<summary><strong>xAI Grok</strong> (API-level)</summary>
+<summary><strong>xAI Grok</strong> (API-level, remote MCP)</summary>
 
-Grok uses remote MCP over HTTP. Start the ai-memory HTTP server, then pass it in your API call:
+Grok connects to MCP servers over HTTPS (remote only, no stdio). Start ai-memory as an HTTP server behind HTTPS:
 
 ```bash
 ai-memory serve --host 127.0.0.1 --port 9077
+# Expose via HTTPS reverse proxy (nginx, caddy, cloudflare tunnel, etc.)
 ```
 
-```python
-from xai_sdk import Client
-client = Client()
-response = client.chat.create(
-    model="grok-4",
-    tools=[mcp(server_url="http://localhost:9077/mcp")],
-    messages=[...]
-)
+Then add the MCP server to your Grok API call:
+
+```bash
+curl https://api.x.ai/v1/responses \
+  -H "Authorization: Bearer $XAI_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "grok-3",
+    "tools": [{
+      "type": "mcp",
+      "server_url": "https://your-server.example.com/mcp",
+      "server_label": "memory",
+      "server_description": "Persistent AI memory with recall and search"
+    }],
+    "input": "What do you remember about our project?"
+  }'
 ```
+
+**Requirements:** HTTPS required. Supports Streamable HTTP and SSE transports. See [xAI Remote MCP docs](https://docs.x.ai/developers/tools/remote-mcp).
 
 </details>
 
