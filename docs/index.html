@@ -896,28 +896,52 @@
 
         <div class="security-grid">
             <div class="security-card">
-                <h4>Localhost-Only Binding</h4>
-                <p>The HTTP server binds to 127.0.0.1 by default. Your memories never leave your machine unless you explicitly configure otherwise.</p>
+                <h4>Transaction Safety</h4>
+                <p>Every write operation is wrapped in a SQLite transaction. WAL mode enables concurrent reads without blocking. Schema migrations are atomic.</p>
+            </div>
+            <div class="security-card">
+                <h4>FTS5 Injection Prevention</h4>
+                <p>Search queries are sanitized before reaching FTS5. All special characters including <code>|</code> (pipe/OR operator), <code>"</code>, <code>*</code>, <code>^</code>, <code>:</code>, <code>-</code>, braces, and parentheses are stripped. Boolean operators (AND, OR, NOT, NEAR) are filtered as standalone tokens. Every term is double-quoted.</p>
+            </div>
+            <div class="security-card">
+                <h4>Body Size Limits</h4>
+                <p>HTTP request bodies are capped at 50MB via <code>DefaultBodyLimit</code>. Prevents memory exhaustion from oversized payloads at the transport layer.</p>
+            </div>
+            <div class="security-card">
+                <h4>CORS (Permissive for Localhost)</h4>
+                <p>The HTTP server applies <code>CorsLayer::permissive()</code> -- open CORS policy appropriate for localhost-bound services. Safe because the server defaults to 127.0.0.1 binding.</p>
+            </div>
+            <div class="security-card">
+                <h4>Sanitized Error Responses</h4>
+                <p>Error messages never leak database internals, file paths, or stack traces. Handlers return generic "internal server error" strings; details go to <code>tracing::error!</code> only.</p>
+            </div>
+            <div class="security-card">
+                <h4>Bulk Limits (1000)</h4>
+                <p>Bulk create and import operations cap at 1000 items per request (<code>MAX_BULK_SIZE</code>). Prevents memory exhaustion and denial-of-service from oversized batches.</p>
+            </div>
+            <div class="security-card">
+                <h4>AtomicBool Thread Safety</h4>
+                <p>Color output uses <code>AtomicBool</code> with atomic ordering for thread-safe global state. No mutexes needed for the color-enabled flag across threads.</p>
+            </div>
+            <div class="security-card">
+                <h4>Link Validation in Sync</h4>
+                <p>During database sync (pull, push, merge), every imported link is validated via <code>validate::validate_link()</code> before insertion. Invalid links are silently skipped to prevent corrupt cross-references.</p>
+            </div>
+            <div class="security-card">
+                <h4>JSON-RPC Version Validation</h4>
+                <p>The MCP server validates that every incoming request has <code>jsonrpc: "2.0"</code>. Non-conformant requests are rejected before any tool dispatch occurs.</p>
+            </div>
+            <div class="security-card">
+                <h4>Arguments Validation</h4>
+                <p>MCP tool calls extract <code>arguments</code> from the request params object. Non-object arguments default to an empty object, preventing type-confusion attacks on tool handlers.</p>
             </div>
             <div class="security-card">
                 <h4>Input Validation</h4>
                 <p>Shared validation layer across CLI, HTTP, and MCP. Title max 512B, content max 64KB, namespace alphanumeric, source whitelisted, priority 1-10, confidence 0.0-1.0.</p>
             </div>
             <div class="security-card">
-                <h4>FTS5 Injection Protection</h4>
-                <p>Search queries are sanitized before reaching the FTS5 engine. Special characters are escaped to prevent query syntax injection.</p>
-            </div>
-            <div class="security-card">
-                <h4>Transaction Safety</h4>
-                <p>Every write operation is wrapped in a SQLite transaction. WAL mode enables concurrent reads without blocking. Schema migrations are atomic.</p>
-            </div>
-            <div class="security-card">
-                <h4>Sanitized Error Responses</h4>
-                <p>Error messages never leak database internals, file paths, or stack traces. Structured error codes (e.g., VALIDATION_FAILED) for programmatic handling.</p>
-            </div>
-            <div class="security-card">
-                <h4>Bulk Input Limits</h4>
-                <p>Bulk operations cap at 1000 items per request. Prevents memory exhaustion and denial-of-service from oversized payloads.</p>
+                <h4>Localhost-Only Binding</h4>
+                <p>The HTTP server binds to 127.0.0.1 by default. Your memories never leave your machine unless you explicitly configure otherwise.</p>
             </div>
         </div>
     </div>
