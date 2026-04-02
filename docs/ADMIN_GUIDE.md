@@ -46,7 +46,7 @@ The daemon listens on `127.0.0.1:9077` by default and exposes 20 HTTP endpoints.
 ```bash
 sudo tee /etc/systemd/system/ai-memory.service > /dev/null << 'EOF'
 [Unit]
-Description=Claude Memory Daemon
+Description=AI Memory Daemon
 After=network.target
 
 [Service]

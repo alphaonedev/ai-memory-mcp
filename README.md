@@ -315,7 +315,7 @@ The top-level `ai-memory` binary also accepts global flags:
 
 | Flag | Description |
 |------|-------------|
-| `--db <path>` | Database path (default: `~/.local/share/ai-memory/memories.db`, or `$AI_MEMORY_DB`) |
+| `--db <path>` | Database path (default: `ai-memory.db`, or `$AI_MEMORY_DB`) |
 | `--json` | JSON output on all commands |
 
 ---
@@ -369,8 +369,12 @@ ai-memory includes hardening across all input paths:
 - **Transaction safety** -- all multi-step database operations use transactions; no partial writes on failure
 - **FTS injection prevention** -- user input is sanitized before reaching FTS5 queries; special characters are escaped
 - **Error sanitization** -- internal database paths and system details are stripped from error responses; clients see structured error types (NOT_FOUND, VALIDATION_FAILED, DATABASE_ERROR, CONFLICT)
+- **Body size limits** -- HTTP request bodies are capped at 50 MB via Axum's DefaultBodyLimit
 - **Bulk operation limits** -- bulk create endpoints enforce maximum batch sizes to prevent resource exhaustion
+- **CORS** -- permissive CORS layer enabled for localhost development workflows
 - **Input validation** -- every write path validates title length, content length, namespace format, source values, priority range (1-10), confidence range (0.0-1.0), tag format, tier values, relation types, and ID format
+- **Link validation in sync** -- all links are validated (both IDs, relation type, no self-links) before import during sync operations
+- **Thread-safe color** -- terminal color detection uses `AtomicBool` for safe concurrent access
 - **Local-only HTTP** -- the HTTP server binds to 127.0.0.1 by default; not exposed to the network
 - **WAL mode** -- SQLite Write-Ahead Logging for safe concurrent reads during writes
 

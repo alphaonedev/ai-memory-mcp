@@ -774,6 +774,6 @@ cargo build --release
 ```
 
 Release profile settings (from `Cargo.toml`):
-- `opt-level = 2`
+- `opt-level = 3`
 - `strip = true` (removes debug symbols)
 - `lto = "thin"` (link-time optimization)

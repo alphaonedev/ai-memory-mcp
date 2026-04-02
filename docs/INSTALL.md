@@ -155,7 +155,7 @@ If you want to run the HTTP daemon as a background service (alternative to MCP).
 ```bash
 sudo tee /etc/systemd/system/ai-memory.service > /dev/null << 'EOF'
 [Unit]
-Description=Claude Memory Daemon
+Description=AI Memory Daemon
 After=network.target
 
 [Service]
