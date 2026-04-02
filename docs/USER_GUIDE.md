@@ -15,11 +15,13 @@ Think of it as a brain for your AI assistant -- short-term for what you're doing
 
 ## MCP Integration (Recommended)
 
-The easiest way to use ai-memory is as an **MCP tool server**. MCP (Model Context Protocol) is an open standard supported by multiple AI platforms. Once configured, your AI client can store and recall memories natively without any manual CLI usage.
+The easiest way to use ai-memory is as an **MCP tool server**. MCP (Model Context Protocol) is an open standard supported by multiple AI platforms. ai-memory works with **Claude Code, Codex, Gemini, Cursor, Windsurf, Continue.dev, Grok, Llama**, and any other MCP-compatible client. Once configured, your AI client can store and recall memories natively without any manual CLI usage.
 
 ### Setup
 
-Each AI platform has its own MCP configuration location. Below is an example for **Claude Code** (`~/.claude/.mcp.json`):
+Each AI platform has its own MCP configuration path and format. See the [Installation Guide](INSTALL.md) for platform-specific setup instructions.
+
+Below is an example for **Claude Code** (`~/.claude/.mcp.json`) -- one of many supported platforms:
 
 ```json
 {
@@ -34,7 +36,9 @@ Each AI platform has its own MCP configuration location. Below is an example for
 
 > **Claude Code note:** MCP server configuration does **not** go in `settings.json` or `settings.local.json` -- those files do not support `mcpServers`.
 
-> **Other platforms** (OpenAI ChatGPT, xAI Grok, META Llama, etc.): consult your platform's documentation for where to register MCP servers. The command and args are identical.
+> **Other platforms** (Codex, Gemini, Cursor, Windsurf, Continue.dev, etc.): config paths vary by platform. The command and args are the same -- only the config file location differs. Refer to the [Installation Guide](INSTALL.md) for exact paths.
+
+> **Grok and Llama note:** These platforms connect over HTTP rather than stdio MCP. Run `ai-memory serve` to start the HTTP daemon, then point your client at `http://localhost:9077`. See the [Installation Guide](INSTALL.md) for details.
 
 ### How It Works
 
