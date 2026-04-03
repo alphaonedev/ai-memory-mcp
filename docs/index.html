@@ -335,6 +335,7 @@
             Give any AI a memory that persists -- <strong style="color:var(--green)">without burning tokens on every message.</strong>
             Built-in memory systems (Claude auto-memory, ChatGPT memory) load your entire memory into every conversation, costing tokens and money whether used or not.
             ai-memory uses <strong>zero context tokens until recalled</strong> -- only relevant memories come back, ranked by a 6-factor algorithm.
+            <strong>TOON format</strong> (Token-Oriented Object Notation) cuts recall response tokens by another 61-79%, saving even more.
             Four feature tiers from zero-dependency keyword search to autonomous recall with local LLMs via Ollama.
         </p>
         <div class="stats-row">
@@ -342,7 +343,7 @@
             <div class="stat"><span class="num">17</span><span class="label">MCP Tools</span></div>
             <div class="stat"><span class="num">20</span><span class="label">HTTP Endpoints</span></div>
             <div class="stat"><span class="num">24</span><span class="label">CLI Commands</span></div>
-            <div class="stat"><span class="num">75</span><span class="label">Tests</span></div>
+            <div class="stat"><span class="num">81</span><span class="label">Tests</span></div>
             <div class="stat"><span class="num">6</span><span class="label">Ranking Factors</span></div>
         </div>
         <a href="#install" class="hero-cta">Get Started in 60 Seconds</a>
@@ -702,6 +703,11 @@
                 <div class="icon-box icon-secure">LLM</div>
                 <h4>LLM-Powered Features</h4>
                 <p>Smart and autonomous tiers use Ollama (Gemma 4) for query expansion, auto-tagging, auto-consolidation, cross-encoder reranking, and contradiction analysis.</p>
+            </div>
+            <div class="feature-card" style="border:1px solid var(--orange);background:rgba(210,153,34,.04)">
+                <div class="icon-box icon-fast">T</div>
+                <h4 style="color:var(--orange)">TOON Format</h4>
+                <p>Token-Oriented Object Notation eliminates repeated field names in recall responses. Pass <code>format: "toon"</code> for 61% fewer bytes or <code>"toon_compact"</code> for 79% fewer. Field names declared once as a header, values as pipe-delimited rows. LLMs parse it natively.</p>
             </div>
         </div>
     </div>
@@ -1461,7 +1467,7 @@
                 <!-- DB layer -->
                 <rect x="120" y="352" width="360" height="55" rx="8" fill="#161b22" stroke="#39d2c0" stroke-width="2"/>
                 <text x="300" y="375" text-anchor="middle" fill="#39d2c0" font-family="system-ui" font-size="13" font-weight="700">SQLite + FTS5 + HNSW (db.rs)</text>
-                <text x="300" y="395" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="10">WAL mode | schema v3 | embeddings | 75 tests</text>
+                <text x="300" y="395" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="10">WAL mode | schema v3 | embeddings | 81 tests</text>
 
                 <!-- Memory tiers -->
                 <rect x="145" y="420" width="70" height="22" rx="4" fill="rgba(248,81,73,.15)" stroke="#f85149" stroke-width="1"/>
@@ -1640,7 +1646,7 @@
 
                 <rect x="327" y="30" width="80" height="40" rx="6" fill="#161b22" stroke="#bc8cff" stroke-width="1"/>
                 <text x="367" y="48" text-anchor="middle" fill="#bc8cff" font-family="monospace" font-size="10">test</text>
-                <text x="367" y="62" text-anchor="middle" fill="#8b949e" font-family="monospace" font-size="9">75 tests</text>
+                <text x="367" y="62" text-anchor="middle" fill="#8b949e" font-family="monospace" font-size="9">81 tests</text>
 
                 <line x1="407" y1="50" x2="427" y2="50" stroke="#30363d" stroke-width="1.5" class="animate-flow"/>
 

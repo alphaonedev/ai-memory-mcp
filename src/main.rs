@@ -12,6 +12,7 @@ mod llm;
 mod mcp;
 mod models;
 mod reranker;
+mod toon;
 mod validate;
 
 use anyhow::Result;
