@@ -664,3 +664,97 @@ pub async fn bulk_create(
     }
     Json(json!({"created": created, "errors": errors})).into_response()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_state() -> Db {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let path = std::path::PathBuf::from(":memory:");
+        Arc::new(Mutex::new((conn, path)))
+    }
+
+    #[tokio::test]
+    async fn health_returns_ok() {
+        let state = test_state();
+        let lock = state.lock().await;
+        let ok = db::health_check(&lock.0).unwrap_or(false);
+        assert!(ok);
+    }
+
+    #[tokio::test]
+    async fn store_and_retrieve_via_state() {
+        let state = test_state();
+        let lock = state.lock().await;
+        let now = Utc::now();
+        let mem = Memory {
+            id: Uuid::new_v4().to_string(),
+            tier: Tier::Long,
+            namespace: "test".into(),
+            title: "Handler test".into(),
+            content: "Testing handlers.".into(),
+            tags: vec!["test".into()],
+            priority: 7,
+            confidence: 1.0,
+            source: "test".into(),
+            access_count: 0,
+            created_at: now.to_rfc3339(),
+            updated_at: now.to_rfc3339(),
+            last_accessed_at: None,
+            expires_at: None,
+        };
+        let id = db::insert(&lock.0, &mem).unwrap();
+        let got = db::get(&lock.0, &id).unwrap().unwrap();
+        assert_eq!(got.title, "Handler test");
+    }
+
+    #[tokio::test]
+    async fn recall_via_state() {
+        let state = test_state();
+        let lock = state.lock().await;
+        let now = Utc::now();
+        let mem = Memory {
+            id: Uuid::new_v4().to_string(),
+            tier: Tier::Long,
+            namespace: "test".into(),
+            title: "Recall handler test".into(),
+            content: "Content for recall.".into(),
+            tags: vec![],
+            priority: 8,
+            confidence: 1.0,
+            source: "test".into(),
+            access_count: 0,
+            created_at: now.to_rfc3339(),
+            updated_at: now.to_rfc3339(),
+            last_accessed_at: None,
+            expires_at: None,
+        };
+        db::insert(&lock.0, &mem).unwrap();
+        let results = db::recall(&lock.0, "recall handler", Some("test"), 10, None, None, None).unwrap();
+        assert!(!results.is_empty());
+        assert!(results[0].1 > 0.0); // has score
+    }
+
+    #[tokio::test]
+    async fn stats_via_state() {
+        let state = test_state();
+        let lock = state.lock().await;
+        let path = std::path::Path::new(":memory:");
+        let s = db::stats(&lock.0, path).unwrap();
+        assert_eq!(s.total, 0);
+    }
+
+    #[tokio::test]
+    async fn bulk_size_limit() {
+        assert_eq!(MAX_BULK_SIZE, 1000);
+    }
+
+    #[tokio::test]
+    async fn list_empty_namespace() {
+        let state = test_state();
+        let lock = state.lock().await;
+        let results = db::list(&lock.0, Some("nonexistent"), None, 10, 0, None, None, None, None).unwrap();
+        assert!(results.is_empty());
+    }
+}

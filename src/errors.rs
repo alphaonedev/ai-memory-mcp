@@ -78,3 +78,53 @@ impl From<rusqlite::Error> for MemoryError {
         Self::DatabaseError(e.to_string())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_codes() {
+        assert_eq!(MemoryError::NotFound("x".into()).code(), "NOT_FOUND");
+        assert_eq!(MemoryError::ValidationFailed("x".into()).code(), "VALIDATION_FAILED");
+        assert_eq!(MemoryError::DatabaseError("x".into()).code(), "DATABASE_ERROR");
+        assert_eq!(MemoryError::Conflict("x".into()).code(), "CONFLICT");
+    }
+
+    #[test]
+    fn error_status_codes() {
+        assert_eq!(MemoryError::NotFound("x".into()).status(), StatusCode::NOT_FOUND);
+        assert_eq!(MemoryError::ValidationFailed("x".into()).status(), StatusCode::BAD_REQUEST);
+        assert_eq!(MemoryError::DatabaseError("x".into()).status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(MemoryError::Conflict("x".into()).status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn error_messages() {
+        assert_eq!(MemoryError::NotFound("not here".into()).message(), "not here");
+        assert_eq!(MemoryError::ValidationFailed("bad input".into()).message(), "bad input");
+    }
+
+    #[test]
+    fn error_display() {
+        let err = MemoryError::NotFound("memory xyz".into());
+        let display = format!("{err}");
+        assert!(display.contains("NOT_FOUND"));
+        assert!(display.contains("memory xyz"));
+    }
+
+    #[test]
+    fn from_anyhow() {
+        let err: MemoryError = anyhow::anyhow!("db broke").into();
+        assert_eq!(err.code(), "DATABASE_ERROR");
+        assert!(err.message().contains("db broke"));
+    }
+
+    #[test]
+    fn api_error_serializes() {
+        let api_err = ApiError { code: "TEST", message: "test msg".into() };
+        let json = serde_json::to_value(&api_err).unwrap();
+        assert_eq!(json["code"], "TEST");
+        assert_eq!(json["message"], "test msg");
+    }
+}

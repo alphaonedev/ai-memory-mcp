@@ -492,7 +492,7 @@ Runs on `ubuntu-latest` and `macos-latest`:
 
 1. **Formatting** -- `cargo fmt --check`
 2. **Linting** -- `cargo clippy -- -D warnings`
-3. **Tests** -- `cargo test` (131 tests: 88 unit + 43 integration)
+3. **Tests** -- `cargo test` (158 tests: 115 unit + 43 integration, 14/14 modules)
 4. **Build** -- `cargo build --release`
 
 Uses `Swatinem/rust-cache@v2` for build caching.

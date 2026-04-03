@@ -1459,3 +1459,61 @@ fn cmd_auto_consolidate(db_path: PathBuf, args: AutoConsolidateArgs, json_out: b
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn id_short_truncates() {
+        assert_eq!(id_short("abcdefghijklmnop"), "abcdefgh");
+    }
+
+    #[test]
+    fn id_short_short_input() {
+        assert_eq!(id_short("abc"), "abc");
+    }
+
+    #[test]
+    fn id_short_empty() {
+        assert_eq!(id_short(""), "");
+    }
+
+    #[test]
+    fn human_age_just_now() {
+        let now = chrono::Utc::now().to_rfc3339();
+        assert_eq!(human_age(&now), "just now");
+    }
+
+    #[test]
+    fn human_age_minutes() {
+        let past = (chrono::Utc::now() - chrono::Duration::minutes(5)).to_rfc3339();
+        let age = human_age(&past);
+        assert!(age.contains("m ago"), "got: {age}");
+    }
+
+    #[test]
+    fn human_age_hours() {
+        let past = (chrono::Utc::now() - chrono::Duration::hours(3)).to_rfc3339();
+        let age = human_age(&past);
+        assert!(age.contains("h ago"), "got: {age}");
+    }
+
+    #[test]
+    fn human_age_days() {
+        let past = (chrono::Utc::now() - chrono::Duration::days(5)).to_rfc3339();
+        let age = human_age(&past);
+        assert!(age.contains("d ago"), "got: {age}");
+    }
+
+    #[test]
+    fn human_age_invalid_returns_input() {
+        assert_eq!(human_age("not-a-date"), "not-a-date");
+    }
+
+    #[test]
+    fn auto_namespace_returns_nonempty() {
+        let ns = auto_namespace();
+        assert!(!ns.is_empty());
+    }
+}
