@@ -739,7 +739,7 @@ ai-memory completions fish
 
 ## Testing
 
-The project has **84 tests** total: 41 unit tests across 7 modules (`src/config.rs` 9, `src/validate.rs` 8, `src/reranker.rs` 7, `src/toon.rs` 6, `src/embeddings.rs` 5, `src/hnsw.rs` 4, `src/llm.rs` 2) and 43 integration tests in `tests/integration.rs` (including MCP prompts and TOON-default tests).
+The project has **131 tests** total: 88 unit tests across 10 modules (`src/db.rs` 29, `src/mcp.rs` 12, `src/config.rs` 9, `src/validate.rs` 8, `src/reranker.rs` 7, `src/toon.rs` 6, `src/models.rs` 6, `src/embeddings.rs` 5, `src/hnsw.rs` 4, `src/llm.rs` 2) and 43 integration tests in `tests/integration.rs`. Coverage: 10/14 modules have unit tests; remaining 4 (handlers, main, errors, color) are covered by integration tests or are trivial.
 
 ```bash
 # Run all tests

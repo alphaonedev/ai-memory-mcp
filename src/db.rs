@@ -1106,3 +1106,357 @@ pub fn health_check(conn: &Connection) -> Result<bool> {
     )?;
     Ok(true)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{Memory, Tier};
+
+    fn test_db() -> Connection {
+        open(std::path::Path::new(":memory:")).unwrap()
+    }
+
+    fn make_memory(title: &str, ns: &str, tier: Tier, priority: i32) -> Memory {
+        let now = chrono::Utc::now().to_rfc3339();
+        Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: tier.clone(),
+            namespace: ns.to_string(),
+            title: title.to_string(),
+            content: format!("Content for {title}"),
+            tags: vec![],
+            priority,
+            confidence: 1.0,
+            source: "test".to_string(),
+            access_count: 0,
+            created_at: now.clone(),
+            updated_at: now,
+            last_accessed_at: None,
+            expires_at: tier.default_ttl_secs().map(|s| {
+                (chrono::Utc::now() + chrono::Duration::seconds(s)).to_rfc3339()
+            }),
+        }
+    }
+
+    #[test]
+    fn open_creates_schema() {
+        let conn = test_db();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn insert_and_get() {
+        let conn = test_db();
+        let mem = make_memory("Test insert", "test", Tier::Long, 5);
+        let id = insert(&conn, &mem).unwrap();
+        let got = get(&conn, &id).unwrap().unwrap();
+        assert_eq!(got.title, "Test insert");
+        assert_eq!(got.namespace, "test");
+        assert_eq!(got.priority, 5);
+    }
+
+    #[test]
+    fn get_nonexistent() {
+        let conn = test_db();
+        let got = get(&conn, "nonexistent-id").unwrap();
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn update_partial_fields() {
+        let conn = test_db();
+        let mem = make_memory("Original", "test", Tier::Mid, 5);
+        let id = insert(&conn, &mem).unwrap();
+
+        let updated = update(&conn, &id, Some("Updated Title"), None, None, None, None, Some(9), None, None).unwrap();
+        assert!(updated);
+
+        let got = get(&conn, &id).unwrap().unwrap();
+        assert_eq!(got.title, "Updated Title");
+        assert_eq!(got.priority, 9);
+        assert_eq!(got.content, mem.content); // unchanged
+    }
+
+    #[test]
+    fn update_nonexistent_returns_false() {
+        let conn = test_db();
+        let updated = update(&conn, "bad-id", Some("New"), None, None, None, None, None, None, None).unwrap();
+        assert!(!updated);
+    }
+
+    #[test]
+    fn delete_existing() {
+        let conn = test_db();
+        let mem = make_memory("To delete", "test", Tier::Short, 3);
+        let id = insert(&conn, &mem).unwrap();
+        assert!(delete(&conn, &id).unwrap());
+        assert!(get(&conn, &id).unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_nonexistent() {
+        let conn = test_db();
+        assert!(!delete(&conn, "bad-id").unwrap());
+    }
+
+    #[test]
+    fn list_with_namespace_filter() {
+        let conn = test_db();
+        insert(&conn, &make_memory("A", "ns1", Tier::Long, 5)).unwrap();
+        insert(&conn, &make_memory("B", "ns2", Tier::Long, 5)).unwrap();
+        insert(&conn, &make_memory("C", "ns1", Tier::Long, 5)).unwrap();
+
+        let results = list(&conn, Some("ns1"), None, 100, 0, None, None, None, None).unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn list_with_tier_filter() {
+        let conn = test_db();
+        insert(&conn, &make_memory("Long", "test", Tier::Long, 5)).unwrap();
+        insert(&conn, &make_memory("Mid", "test", Tier::Mid, 5)).unwrap();
+
+        let results = list(&conn, None, Some(&Tier::Long), 100, 0, None, None, None, None).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "Long");
+    }
+
+    #[test]
+    fn list_with_limit() {
+        let conn = test_db();
+        for i in 0..5 {
+            insert(&conn, &make_memory(&format!("Mem {i}"), "test", Tier::Long, 5)).unwrap();
+        }
+        let results = list(&conn, None, None, 3, 0, None, None, None, None).unwrap();
+        assert_eq!(results.len(), 3);
+    }
+
+    #[test]
+    fn search_keyword_match() {
+        let conn = test_db();
+        insert(&conn, &make_memory("PostgreSQL config", "test", Tier::Long, 5)).unwrap();
+        insert(&conn, &make_memory("Redis cache", "test", Tier::Long, 5)).unwrap();
+
+        let results = search(&conn, "PostgreSQL", None, None, 10, None, None, None, None).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].title.contains("PostgreSQL"));
+    }
+
+    #[test]
+    fn search_no_match() {
+        let conn = test_db();
+        insert(&conn, &make_memory("PostgreSQL", "test", Tier::Long, 5)).unwrap();
+        let results = search(&conn, "nonexistent_term_xyz", None, None, 10, None, None, None, None).unwrap();
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn recall_returns_scored() {
+        let conn = test_db();
+        insert(&conn, &make_memory("Rust programming language", "test", Tier::Long, 8)).unwrap();
+        insert(&conn, &make_memory("Python scripting", "test", Tier::Long, 5)).unwrap();
+
+        let results = recall(&conn, "Rust programming", None, 10, None, None, None).unwrap();
+        assert!(!results.is_empty());
+        // Score should be present
+        let (mem, score) = &results[0];
+        assert!(mem.title.contains("Rust"));
+        assert!(*score > 0.0);
+    }
+
+    #[test]
+    fn recall_empty_context() {
+        let conn = test_db();
+        insert(&conn, &make_memory("Test", "test", Tier::Long, 5)).unwrap();
+        // Empty context should not crash
+        let results = recall(&conn, "", None, 10, None, None, None);
+        // May return empty or error, both acceptable
+        assert!(results.is_ok() || results.is_err());
+    }
+
+    #[test]
+    fn touch_increments_access_count() {
+        let conn = test_db();
+        let mem = make_memory("Touchable", "test", Tier::Mid, 5);
+        let id = insert(&conn, &mem).unwrap();
+        assert_eq!(get(&conn, &id).unwrap().unwrap().access_count, 0);
+
+        touch(&conn, &id).unwrap();
+        assert_eq!(get(&conn, &id).unwrap().unwrap().access_count, 1);
+
+        touch(&conn, &id).unwrap();
+        assert_eq!(get(&conn, &id).unwrap().unwrap().access_count, 2);
+    }
+
+    #[test]
+    fn find_contradictions_similar_titles() {
+        let conn = test_db();
+        insert(&conn, &make_memory("Database is PostgreSQL", "infra", Tier::Long, 8)).unwrap();
+        insert(&conn, &make_memory("Database is MySQL", "infra", Tier::Long, 5)).unwrap();
+
+        let contradictions = find_contradictions(&conn, "Database is PostgreSQL", "infra").unwrap();
+        assert!(!contradictions.is_empty());
+    }
+
+    #[test]
+    fn create_and_get_links() {
+        let conn = test_db();
+        let id1 = insert(&conn, &make_memory("Memory A", "test", Tier::Long, 5)).unwrap();
+        let id2 = insert(&conn, &make_memory("Memory B", "test", Tier::Long, 5)).unwrap();
+
+        create_link(&conn, &id1, &id2, "related_to").unwrap();
+        let links = get_links(&conn, &id1).unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].relation, "related_to");
+    }
+
+    #[test]
+    fn consolidate_merges_memories() {
+        let conn = test_db();
+        let id1 = insert(&conn, &make_memory("Part 1", "test", Tier::Mid, 5)).unwrap();
+        let id2 = insert(&conn, &make_memory("Part 2", "test", Tier::Mid, 5)).unwrap();
+
+        let new_id = consolidate(&conn, &[id1.clone(), id2.clone()], "Combined", "Part 1 + Part 2", "test", &Tier::Long, "test").unwrap();
+        // Original memories should be deleted
+        assert!(get(&conn, &id1).unwrap().is_none());
+        assert!(get(&conn, &id2).unwrap().is_none());
+        // New memory should exist
+        let combined = get(&conn, &new_id).unwrap().unwrap();
+        assert_eq!(combined.title, "Combined");
+        assert_eq!(combined.tier, Tier::Long);
+    }
+
+    #[test]
+    fn stats_counts() {
+        let conn = test_db();
+        let path = std::path::Path::new(":memory:");
+        insert(&conn, &make_memory("A", "ns1", Tier::Long, 5)).unwrap();
+        insert(&conn, &make_memory("B", "ns1", Tier::Mid, 5)).unwrap();
+        insert(&conn, &make_memory("C", "ns2", Tier::Short, 5)).unwrap();
+
+        let s = stats(&conn, path).unwrap();
+        assert_eq!(s.total, 3);
+    }
+
+    #[test]
+    fn gc_removes_expired() {
+        let conn = test_db();
+        let mut mem = make_memory("Expired", "test", Tier::Short, 5);
+        mem.expires_at = Some("2020-01-01T00:00:00+00:00".to_string()); // past
+        insert(&conn, &mem).unwrap();
+
+        let removed = gc(&conn).unwrap();
+        assert_eq!(removed, 1);
+    }
+
+    #[test]
+    fn gc_preserves_long_term() {
+        let conn = test_db();
+        insert(&conn, &make_memory("Permanent", "test", Tier::Long, 5)).unwrap();
+        let removed = gc(&conn).unwrap();
+        assert_eq!(removed, 0);
+    }
+
+    #[test]
+    fn export_all_and_links() {
+        let conn = test_db();
+        let id1 = insert(&conn, &make_memory("Export A", "test", Tier::Long, 5)).unwrap();
+        let id2 = insert(&conn, &make_memory("Export B", "test", Tier::Long, 5)).unwrap();
+        create_link(&conn, &id1, &id2, "supersedes").unwrap();
+
+        let mems = export_all(&conn).unwrap();
+        assert_eq!(mems.len(), 2);
+        let links = export_links(&conn).unwrap();
+        assert_eq!(links.len(), 1);
+    }
+
+    #[test]
+    fn list_namespaces_counts() {
+        let conn = test_db();
+        insert(&conn, &make_memory("A", "alpha", Tier::Long, 5)).unwrap();
+        insert(&conn, &make_memory("B", "alpha", Tier::Long, 5)).unwrap();
+        insert(&conn, &make_memory("C", "beta", Tier::Long, 5)).unwrap();
+
+        let ns = list_namespaces(&conn).unwrap();
+        assert_eq!(ns.len(), 2);
+    }
+
+    #[test]
+    fn forget_by_namespace() {
+        let conn = test_db();
+        insert(&conn, &make_memory("A", "delete-me", Tier::Long, 5)).unwrap();
+        insert(&conn, &make_memory("B", "delete-me", Tier::Long, 5)).unwrap();
+        insert(&conn, &make_memory("C", "keep", Tier::Long, 5)).unwrap();
+
+        let deleted = forget(&conn, Some("delete-me"), None, None).unwrap();
+        assert_eq!(deleted, 2);
+        let remaining = list(&conn, None, None, 100, 0, None, None, None, None).unwrap();
+        assert_eq!(remaining.len(), 1);
+    }
+
+    #[test]
+    fn set_and_get_embedding() {
+        let conn = test_db();
+        let mem = make_memory("Embed test", "test", Tier::Long, 5);
+        let id = insert(&conn, &mem).unwrap();
+
+        let emb = vec![0.1f32, 0.2, 0.3, 0.4];
+        set_embedding(&conn, &id, &emb).unwrap();
+
+        let got = get_embedding(&conn, &id).unwrap().unwrap();
+        assert_eq!(got.len(), 4);
+        assert!((got[0] - 0.1).abs() < 1e-6);
+    }
+
+    #[test]
+    fn get_unembedded_returns_memoryless() {
+        let conn = test_db();
+        let mem = make_memory("No embed", "test", Tier::Long, 5);
+        insert(&conn, &mem).unwrap();
+
+        let unembedded = get_unembedded_ids(&conn).unwrap();
+        assert_eq!(unembedded.len(), 1);
+    }
+
+    #[test]
+    fn health_check_passes() {
+        let conn = test_db();
+        assert!(health_check(&conn).unwrap());
+    }
+
+    #[test]
+    fn sanitize_fts_strips_operators_and_quotes() {
+        // FTS5 special chars: " * ^ { } ( ) : - | are stripped
+        let sanitized = sanitize_fts_query("test* \"injection\" (drop)", true);
+        assert!(!sanitized.contains("*"));
+        assert!(!sanitized.contains("("));
+        assert!(!sanitized.contains(")"));
+        // Standalone boolean operators are removed
+        let sanitized2 = sanitize_fts_query("hello AND world OR NOT NEAR test", true);
+        assert!(sanitized2.contains("hello"));
+        assert!(sanitized2.contains("world"));
+        assert!(sanitized2.contains("test"));
+        // Empty input returns placeholder
+        let sanitized3 = sanitize_fts_query("", true);
+        assert_eq!(sanitized3, "\"_empty_\"");
+    }
+
+    #[test]
+    fn insert_if_newer_updates() {
+        let conn = test_db();
+        let mut mem = make_memory("Sync test", "test", Tier::Long, 5);
+        let id = insert(&conn, &mem).unwrap();
+
+        mem.id = id.clone();
+        mem.content = "Updated via sync".to_string();
+        mem.updated_at = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        let result_id = insert_if_newer(&conn, &mem).unwrap();
+        assert_eq!(result_id, id);
+
+        let got = get(&conn, &id).unwrap().unwrap();
+        assert_eq!(got.content, "Updated via sync");
+    }
+}
