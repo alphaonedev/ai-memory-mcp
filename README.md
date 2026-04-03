@@ -72,11 +72,13 @@ Add to `~/.claude/.mcp.json`:
   "mcpServers": {
     "memory": {
       "command": "ai-memory",
-      "args": ["--db", "~/.claude/ai-memory.db", "mcp"]
+      "args": ["--db", "~/.claude/ai-memory.db", "mcp", "--tier", "semantic"]
     }
   }
 }
 ```
+
+> **Tier flag:** The `--tier` flag selects the feature tier: `keyword`, `semantic` (default), `smart`, or `autonomous`. Smart and autonomous tiers require [Ollama](https://ollama.com) running locally. The `--tier` flag **must** be passed in the args -- the `config.toml` tier setting is not used when the MCP server is launched by an AI client.
 
 </details>
 
@@ -88,11 +90,11 @@ Add to `~/.codex/config.toml` (global) or `.codex/config.toml` (project):
 ```toml
 [mcp_servers.memory]
 command = "ai-memory"
-args = ["--db", "~/.local/share/ai-memory/memories.db", "mcp"]
+args = ["--db", "~/.local/share/ai-memory/memories.db", "mcp", "--tier", "semantic"]
 enabled = true
 ```
 
-Or add via CLI: `codex mcp add memory -- ai-memory --db ~/.local/share/ai-memory/memories.db mcp`
+Or add via CLI: `codex mcp add memory -- ai-memory --db ~/.local/share/ai-memory/memories.db mcp --tier semantic`
 
 > **Notes:** Codex uses TOML format with underscored key `mcp_servers`. Use `enabled_tools` to restrict which memory tools are exposed. Use `/mcp` in the TUI to view server status. See [Codex MCP docs](https://developers.openai.com/codex/mcp).
 
@@ -108,14 +110,14 @@ Add to `~/.gemini/settings.json` (user) or `.gemini/settings.json` (project):
   "mcpServers": {
     "memory": {
       "command": "ai-memory",
-      "args": ["--db", "~/.local/share/ai-memory/memories.db", "mcp"],
+      "args": ["--db", "~/.local/share/ai-memory/memories.db", "mcp", "--tier", "semantic"],
       "timeout": 30000
     }
   }
 }
 ```
 
-Or add via CLI: `gemini mcp add memory ai-memory -- --db ~/.local/share/ai-memory/memories.db mcp`
+Or add via CLI: `gemini mcp add memory ai-memory -- --db ~/.local/share/ai-memory/memories.db mcp --tier semantic`
 
 > **Notes:** Avoid underscores in server names (use hyphens). Tool names are auto-prefixed as `mcp_memory_<toolName>`. Gemini sanitizes environment variables -- explicitly declare needed vars in the `env` field. Add `"trust": true` to skip confirmation prompts. See [Gemini CLI MCP docs](https://geminicli.com/docs/tools/mcp-server/).
 
@@ -131,7 +133,7 @@ Add to `~/.cursor/mcp.json` (global) or `.cursor/mcp.json` (project-level):
   "mcpServers": {
     "memory": {
       "command": "ai-memory",
-      "args": ["--db", "~/.local/share/ai-memory/memories.db", "mcp"]
+      "args": ["--db", "~/.local/share/ai-memory/memories.db", "mcp", "--tier", "semantic"]
     }
   }
 }
@@ -151,7 +153,7 @@ Add to `~/.codeium/windsurf/mcp_config.json`:
   "mcpServers": {
     "memory": {
       "command": "ai-memory",
-      "args": ["--db", "~/.local/share/ai-memory/memories.db", "mcp"]
+      "args": ["--db", "~/.local/share/ai-memory/memories.db", "mcp", "--tier", "semantic"]
     }
   }
 }
@@ -172,6 +174,8 @@ mcpServers:
       - "--db"
       - "~/.local/share/ai-memory/memories.db"
       - "mcp"
+      - "--tier"
+      - "semantic"
 ```
 
 </details>

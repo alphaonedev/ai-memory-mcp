@@ -28,13 +28,15 @@ Below is an example for **Claude Code** (`~/.claude/.mcp.json`) -- one of many s
   "mcpServers": {
     "memory": {
       "command": "ai-memory",
-      "args": ["--db", "~/.claude/ai-memory.db", "mcp"]
+      "args": ["--db", "~/.claude/ai-memory.db", "mcp", "--tier", "semantic"]
     }
   }
 }
 ```
 
 > **Claude Code note:** MCP server configuration does **not** go in `settings.json` or `settings.local.json` -- those files do not support `mcpServers`.
+
+> **Tier flag:** The `--tier` flag must be passed in the args: `keyword`, `semantic` (default), `smart`, or `autonomous`. The `config.toml` tier setting is not used when launched by an AI client. Smart/autonomous tiers require [Ollama](https://ollama.com).
 
 > **Other platforms** (Codex, Gemini, Cursor, Windsurf, Continue.dev, etc.): config paths vary by platform. The command and args are the same -- only the config file location differs. Refer to the [Installation Guide](INSTALL.md) for exact paths.
 

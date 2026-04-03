@@ -521,11 +521,11 @@
   <span class="tok-str">"mcpServers"</span>: {
     <span class="tok-str">"memory"</span>: {
       <span class="tok-str">"command"</span>: <span class="tok-str">"ai-memory"</span>,
-      <span class="tok-str">"args"</span>: [<span class="tok-str">"--db"</span>, <span class="tok-str">"~/.claude/ai-memory.db"</span>, <span class="tok-str">"mcp"</span>]
+      <span class="tok-str">"args"</span>: [<span class="tok-str">"--db"</span>, <span class="tok-str">"~/.claude/ai-memory.db"</span>, <span class="tok-str">"mcp"</span>, <span class="tok-str">"--tier"</span>, <span class="tok-str">"semantic"</span>]
     }
   }
 }<span class="lang-label">json</span></code></pre>
-                    <p style="font-size:.85rem">Restart Claude Code. It will discover all 17 memory tools natively. No daemon, no ports. Do not place this in <code>settings.json</code> or project-level <code>.mcp.json</code> -- memory is a global service.</p>
+                    <p style="font-size:.85rem">Restart Claude Code. It will discover all 17 memory tools natively. No daemon, no ports. Do not place this in <code>settings.json</code> or project-level <code>.mcp.json</code> -- memory is a global service. The <code>--tier</code> flag is required -- options: <code>keyword</code>, <code>semantic</code> (default), <code>smart</code>, <code>autonomous</code>. Smart/autonomous require <a href="https://ollama.com">Ollama</a>.</p>
                 </div>
 
                 <div id="tab-codex" class="integration-panel">
@@ -533,9 +533,9 @@
                     <pre><code><span class="tok-cm"># OpenAI Codex CLI MCP configuration</span>
 <span class="tok-flag">[mcp_servers.memory]</span>
 <span class="tok-str">command</span> = <span class="tok-str">"ai-memory"</span>
-<span class="tok-str">args</span> = [<span class="tok-str">"--db"</span>, <span class="tok-str">"~/.local/share/ai-memory/memories.db"</span>, <span class="tok-str">"mcp"</span>]
+<span class="tok-str">args</span> = [<span class="tok-str">"--db"</span>, <span class="tok-str">"~/.local/share/ai-memory/memories.db"</span>, <span class="tok-str">"mcp"</span>, <span class="tok-str">"--tier"</span>, <span class="tok-str">"semantic"</span>]
 <span class="tok-str">enabled</span> = <span class="tok-str">true</span><span class="lang-label">toml</span></code></pre>
-                    <p style="font-size:.85rem">CLI shortcut: <code>codex mcp add memory -- ai-memory --db ~/.local/share/ai-memory/memories.db mcp</code></p>
+                    <p style="font-size:.85rem">CLI shortcut: <code>codex mcp add memory -- ai-memory --db ~/.local/share/ai-memory/memories.db mcp --tier semantic</code></p>
                     <p style="font-size:.85rem">Codex CLI uses TOML config. Use <code>enabled_tools</code> to restrict which memory tools are exposed. Use <code>/mcp</code> in the TUI to view server status. Supports <code>startup_timeout_sec</code>, <code>tool_timeout_sec</code>, and HTTP servers via <code>url</code>. See <a href="https://developers.openai.com/codex/mcp">Codex MCP docs</a>.</p>
                 </div>
 
@@ -545,12 +545,12 @@
   <span class="tok-str">"mcpServers"</span>: {
     <span class="tok-str">"memory"</span>: {
       <span class="tok-str">"command"</span>: <span class="tok-str">"ai-memory"</span>,
-      <span class="tok-str">"args"</span>: [<span class="tok-str">"--db"</span>, <span class="tok-str">"~/.local/share/ai-memory/memories.db"</span>, <span class="tok-str">"mcp"</span>],
+      <span class="tok-str">"args"</span>: [<span class="tok-str">"--db"</span>, <span class="tok-str">"~/.local/share/ai-memory/memories.db"</span>, <span class="tok-str">"mcp"</span>, <span class="tok-str">"--tier"</span>, <span class="tok-str">"semantic"</span>],
       <span class="tok-str">"timeout"</span>: <span class="tok-num">30000</span>
     }
   }
 }<span class="lang-label">json</span></code></pre>
-                    <p style="font-size:.85rem">CLI shortcut: <code>gemini mcp add memory ai-memory -- --db ~/.local/share/ai-memory/memories.db mcp</code></p>
+                    <p style="font-size:.85rem">CLI shortcut: <code>gemini mcp add memory ai-memory -- --db ~/.local/share/ai-memory/memories.db mcp --tier semantic</code></p>
                     <p style="font-size:.85rem">Avoid underscores in server names (use hyphens). Tool names are auto-prefixed as <code>mcp_memory_&lt;toolName&gt;</code>. Gemini sanitizes env vars -- declare needed vars in <code>env</code> field. Add <code>"trust": true</code> to skip confirmation prompts. See <a href="https://geminicli.com/docs/tools/mcp-server/">Gemini CLI MCP docs</a>.</p>
                 </div>
 
@@ -560,7 +560,7 @@
   <span class="tok-str">"mcpServers"</span>: {
     <span class="tok-str">"memory"</span>: {
       <span class="tok-str">"command"</span>: <span class="tok-str">"ai-memory"</span>,
-      <span class="tok-str">"args"</span>: [<span class="tok-str">"--db"</span>, <span class="tok-str">"~/.local/share/ai-memory/memories.db"</span>, <span class="tok-str">"mcp"</span>]
+      <span class="tok-str">"args"</span>: [<span class="tok-str">"--db"</span>, <span class="tok-str">"~/.local/share/ai-memory/memories.db"</span>, <span class="tok-str">"mcp"</span>, <span class="tok-str">"--tier"</span>, <span class="tok-str">"semantic"</span>]
     }
   }
 }<span class="lang-label">json</span></code></pre>
@@ -573,7 +573,7 @@
   <span class="tok-str">"mcpServers"</span>: {
     <span class="tok-str">"memory"</span>: {
       <span class="tok-str">"command"</span>: <span class="tok-str">"ai-memory"</span>,
-      <span class="tok-str">"args"</span>: [<span class="tok-str">"--db"</span>, <span class="tok-str">"~/.codeium/windsurf/ai-memory.db"</span>, <span class="tok-str">"mcp"</span>]
+      <span class="tok-str">"args"</span>: [<span class="tok-str">"--db"</span>, <span class="tok-str">"~/.codeium/windsurf/ai-memory.db"</span>, <span class="tok-str">"mcp"</span>, <span class="tok-str">"--tier"</span>, <span class="tok-str">"semantic"</span>]
     }
   }
 }<span class="lang-label">json</span></code></pre>
@@ -589,7 +589,9 @@
     <span class="tok-str">args</span>:
       - <span class="tok-str">"--db"</span>
       - <span class="tok-str">"~/.continue/ai-memory.db"</span>
-      - <span class="tok-str">"mcp"</span><span class="lang-label">yaml</span></code></pre>
+      - <span class="tok-str">"mcp"</span>
+      - <span class="tok-str">"--tier"</span>
+      - <span class="tok-str">"semantic"</span><span class="lang-label">yaml</span></code></pre>
                     <p style="font-size:.85rem">Continue.dev uses YAML configuration. Add the MCP server block to your existing config. Restart the Continue extension after saving.</p>
                 </div>
 
@@ -638,7 +640,7 @@
   <span class="tok-str">"mcpServers"</span>: {
     <span class="tok-str">"memory"</span>: {
       <span class="tok-str">"command"</span>: <span class="tok-str">"ai-memory"</span>,
-      <span class="tok-str">"args"</span>: [<span class="tok-str">"--db"</span>, <span class="tok-str">"path/to/memory.db"</span>, <span class="tok-str">"mcp"</span>]
+      <span class="tok-str">"args"</span>: [<span class="tok-str">"--db"</span>, <span class="tok-str">"path/to/memory.db"</span>, <span class="tok-str">"mcp"</span>, <span class="tok-str">"--tier"</span>, <span class="tok-str">"semantic"</span>]
     }
   }
 }<span class="lang-label">json</span></code></pre>
