@@ -20,7 +20,7 @@
      }
    }
    ```
-   > The `--tier` flag is optional (defaults to `semantic`). Options: `keyword`, `semantic`, `smart`, `autonomous`.
+   > The `--tier` flag selects the feature tier: `keyword`, `semantic` (default), `smart`, or `autonomous`. **Important:** The `--tier` flag must be passed in the MCP args -- the `config.toml` `tier` setting is not used when the server is launched by an AI client. Smart and autonomous tiers require [Ollama](https://ollama.com) running locally with the appropriate models.
    > **Other AI platforms** (OpenAI ChatGPT, xAI Grok, META Llama, etc.) have their own MCP configuration locations. Consult your platform's documentation for where to add MCP server entries. The server command and args are the same -- only the config file location differs.
 
 3. **Restart your AI client.**
@@ -94,14 +94,14 @@ Each AI platform has its own MCP configuration location. The server command and 
 ```toml
 [mcp_servers.memory]
 command = "ai-memory"
-args = ["--db", "~/.local/share/ai-memory/memories.db", "mcp"]
+args = ["--db", "~/.local/share/ai-memory/memories.db", "mcp", "--tier", "semantic"]
 enabled = true
 ```
 
 Or add via CLI:
 
 ```bash
-codex mcp add memory -- ai-memory --db ~/.local/share/ai-memory/memories.db mcp
+codex mcp add memory -- ai-memory --db ~/.local/share/ai-memory/memories.db mcp --tier semantic
 ```
 
 > **Notes for Codex CLI:** Codex uses TOML format with underscored key `mcp_servers`, not camelCase. Additional supported options include `env`, `cwd`, `startup_timeout_sec`, `tool_timeout_sec`, `enabled_tools` (restrict which memory tools are exposed), and `disabled_tools`. Use `/mcp` in the TUI to view server status. Codex also supports HTTP-based MCP servers via `url` and `bearer_token_env_var`. See [Codex MCP docs](https://developers.openai.com/codex/mcp).
@@ -113,7 +113,7 @@ codex mcp add memory -- ai-memory --db ~/.local/share/ai-memory/memories.db mcp
   "mcpServers": {
     "memory": {
       "command": "ai-memory",
-      "args": ["--db", "~/.local/share/ai-memory/memories.db", "mcp"],
+      "args": ["--db", "~/.local/share/ai-memory/memories.db", "mcp", "--tier", "semantic"],
       "timeout": 30000
     }
   }
@@ -123,7 +123,7 @@ codex mcp add memory -- ai-memory --db ~/.local/share/ai-memory/memories.db mcp
 Or add via CLI:
 
 ```bash
-gemini mcp add memory ai-memory -- --db ~/.local/share/ai-memory/memories.db mcp
+gemini mcp add memory ai-memory -- --db ~/.local/share/ai-memory/memories.db mcp --tier semantic
 ```
 
 > **Notes for Gemini CLI:** Avoid underscores in server names (use hyphens). Tool names are auto-prefixed as `mcp_<serverName>_<toolName>`. Gemini sanitizes environment variables -- explicitly declare needed vars in the `env` field (supports `$VAR` expansion). Add `"trust": true` to skip tool confirmation prompts. Additional supported options include `cwd`, `includeTools`, `excludeTools`, `url` (SSE), and `httpUrl` (HTTP). See [Gemini CLI MCP docs](https://geminicli.com/docs/tools/mcp-server/).
@@ -135,7 +135,7 @@ gemini mcp add memory ai-memory -- --db ~/.local/share/ai-memory/memories.db mcp
   "mcpServers": {
     "memory": {
       "command": "ai-memory",
-      "args": ["--db", "~/.local/share/ai-memory/memories.db", "mcp"]
+      "args": ["--db", "~/.local/share/ai-memory/memories.db", "mcp", "--tier", "semantic"]
     }
   }
 }
@@ -152,7 +152,7 @@ Or add via Cursor Settings > Tools & MCP.
   "mcpServers": {
     "memory": {
       "command": "ai-memory",
-      "args": ["--db", "~/.local/share/ai-memory/memories.db", "mcp"]
+      "args": ["--db", "~/.local/share/ai-memory/memories.db", "mcp", "--tier", "semantic"]
     }
   }
 }
@@ -168,6 +168,8 @@ mcpServers:
       - "--db"
       - "~/.local/share/ai-memory/memories.db"
       - "mcp"
+      - "--tier"
+      - "semantic"
 ```
 
 > **Note for Continue.dev:** Uses YAML list format. MCP tools only work in agent mode.
