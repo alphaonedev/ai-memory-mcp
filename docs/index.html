@@ -332,9 +332,10 @@
     <div class="container">
         <h1>Persistent Memory for <span>Any AI</span></h1>
         <p class="bluf">
-            Give any AI a memory that persists. Works with Claude, ChatGPT, Grok, Llama, and any MCP-compatible platform.
-            A single Rust binary with four feature tiers -- from zero-dependency keyword search to autonomous recall with local LLMs via Ollama.
-            Short-term, mid-term, and permanent memory so your AI remembers projects, preferences, and past decisions across every conversation.
+            Give any AI a memory that persists -- <strong style="color:var(--green)">without burning tokens on every message.</strong>
+            Built-in memory systems (Claude auto-memory, ChatGPT memory) load your entire memory into every conversation, costing tokens and money whether used or not.
+            ai-memory uses <strong>zero context tokens until recalled</strong> -- only relevant memories come back, ranked by a 6-factor algorithm.
+            Four feature tiers from zero-dependency keyword search to autonomous recall with local LLMs via Ollama.
         </p>
         <div class="stats-row">
             <div class="stat"><span class="num">4</span><span class="label">Feature Tiers</span></div>
@@ -667,6 +668,11 @@
         <p class="section-subtitle">Every capability at a glance. 4 feature tiers (keyword to autonomous), 17 MCP tools, three interfaces, one shared database. Works with any AI that supports MCP or HTTP.</p>
 
         <div class="feature-grid">
+            <div class="feature-card" style="border:1px solid var(--green);background:rgba(63,185,80,.04)">
+                <div class="icon-box icon-recall">$0</div>
+                <h4 style="color:var(--green)">Zero Token Cost</h4>
+                <p>Built-in memory systems (Claude auto-memory, ChatGPT memory) load your entire memory into <strong>every</strong> conversation -- burning tokens and money on every message. ai-memory uses <strong>zero context tokens until recalled</strong>. Only relevant memories come back, ranked by score. Replace auto-memory and stop paying for 200+ lines of idle context.</p>
+            </div>
             <div class="feature-card">
                 <div class="icon-box icon-store">S</div>
                 <h4>Store and Recall</h4>

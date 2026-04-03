@@ -29,6 +29,19 @@
 
 5. **Test** -- ask your AI assistant to store a memory. It should use `memory_store` automatically.
 
+6. **Disable built-in auto-memory (recommended).** ai-memory replaces built-in memory systems with zero-token-cost on-demand recall. Built-in systems load your entire memory into every message, burning tokens and money. Disable them:
+
+   **Claude Code (Desktop or CLI):** Add to `~/.claude/settings.json`:
+   ```json
+   {
+     "autoMemoryEnabled": false
+   }
+   ```
+
+   **ChatGPT:** Settings > Personalization > Memory > turn off (ai-memory replaces it via MCP/HTTP)
+
+   This stops the built-in system from injecting 200+ lines of memory context into every conversation. ai-memory uses zero tokens until `memory_recall` is called -- only relevant memories are returned, ranked by score.
+
 That's it. Everything below is optional detail.
 
 ---
