@@ -104,7 +104,8 @@ fn tool_definitions() -> Value {
                         "limit": {"type": "integer", "default": 10, "maximum": 50},
                         "tags": {"type": "string", "description": "Filter by tag"},
                         "since": {"type": "string", "description": "Only memories created after this RFC3339 timestamp"},
-                        "until": {"type": "string", "description": "Only memories created before this RFC3339 timestamp"}
+                        "until": {"type": "string", "description": "Only memories created before this RFC3339 timestamp"},
+                        "format": {"type": "string", "enum": ["json", "toon", "toon_compact"], "default": "json", "description": "Response format. 'toon' uses TOON (Token-Oriented Object Notation) for 40-60% fewer tokens. 'toon_compact' omits timestamps."}
                     },
                     "required": ["context"]
                 }
@@ -118,7 +119,8 @@ fn tool_definitions() -> Value {
                         "query": {"type": "string"},
                         "namespace": {"type": "string"},
                         "tier": {"type": "string", "enum": ["short", "mid", "long"]},
-                        "limit": {"type": "integer", "default": 20, "maximum": 200}
+                        "limit": {"type": "integer", "default": 20, "maximum": 200},
+                        "format": {"type": "string", "enum": ["json", "toon", "toon_compact"], "default": "json", "description": "Response format. 'toon' for 40-60% fewer tokens."}
                     },
                     "required": ["query"]
                 }
@@ -131,7 +133,8 @@ fn tool_definitions() -> Value {
                     "properties": {
                         "namespace": {"type": "string"},
                         "tier": {"type": "string", "enum": ["short", "mid", "long"]},
-                        "limit": {"type": "integer", "default": 20, "maximum": 200}
+                        "limit": {"type": "integer", "default": 20, "maximum": 200},
+                        "format": {"type": "string", "enum": ["json", "toon", "toon_compact"], "default": "json", "description": "Response format. 'toon' for 40-60% fewer tokens."}
                     }
                 }
             },
@@ -867,15 +870,34 @@ fn handle_request(
             };
 
             match result {
-                Ok(val) => ok_response(
-                    id,
-                    json!({
-                        "content": [{
-                            "type": "text",
-                            "text": serde_json::to_string_pretty(&val).unwrap_or_default()
-                        }]
-                    }),
-                ),
+                Ok(val) => {
+                    // Check if TOON format requested for recall/search/list
+                    let format_str = arguments.get("format").and_then(|v| v.as_str()).unwrap_or("json");
+                    let text = match format_str {
+                        "toon" if matches!(tool_name, "memory_recall" | "memory_list") => {
+                            crate::toon::memories_to_toon(&val, false)
+                        }
+                        "toon_compact" if matches!(tool_name, "memory_recall" | "memory_list") => {
+                            crate::toon::memories_to_toon(&val, true)
+                        }
+                        "toon" if tool_name == "memory_search" => {
+                            crate::toon::search_to_toon(&val, false)
+                        }
+                        "toon_compact" if tool_name == "memory_search" => {
+                            crate::toon::search_to_toon(&val, true)
+                        }
+                        _ => serde_json::to_string_pretty(&val).unwrap_or_default(),
+                    };
+                    ok_response(
+                        id,
+                        json!({
+                            "content": [{
+                                "type": "text",
+                                "text": text
+                            }]
+                        }),
+                    )
+                }
                 Err(e) => ok_response(
                     id,
                     json!({
