@@ -1163,3 +1163,121 @@ pub fn run_mcp_server(db_path: &Path, tier: FeatureTier, app_config: &AppConfig)
     eprintln!("ai-memory MCP server stopped");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn tool_definitions_returns_17_tools() {
+        let defs = tool_definitions();
+        let tools = defs["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 17);
+    }
+
+    #[test]
+    fn tool_definitions_all_have_names() {
+        let defs = tool_definitions();
+        let tools = defs["tools"].as_array().unwrap();
+        for tool in tools {
+            assert!(tool["name"].as_str().unwrap().starts_with("memory_"));
+        }
+    }
+
+    #[test]
+    fn tool_definitions_recall_has_toon_default() {
+        let defs = tool_definitions();
+        let tools = defs["tools"].as_array().unwrap();
+        let recall = tools.iter().find(|t| t["name"] == "memory_recall").unwrap();
+        let format_schema = &recall["inputSchema"]["properties"]["format"];
+        assert_eq!(format_schema["default"], "toon_compact");
+    }
+
+    #[test]
+    fn prompt_definitions_returns_2() {
+        let defs = prompt_definitions();
+        let prompts = defs["prompts"].as_array().unwrap();
+        assert_eq!(prompts.len(), 2);
+        assert_eq!(prompts[0]["name"], "recall-first");
+        assert_eq!(prompts[1]["name"], "memory-workflow");
+    }
+
+    #[test]
+    fn prompt_definitions_recall_first_has_arguments() {
+        let defs = prompt_definitions();
+        let prompts = defs["prompts"].as_array().unwrap();
+        let recall_first = &prompts[0];
+        let args = recall_first["arguments"].as_array().unwrap();
+        assert_eq!(args.len(), 1);
+        assert_eq!(args[0]["name"], "namespace");
+    }
+
+    #[test]
+    fn prompt_content_recall_first() {
+        let params = json!({});
+        let result = prompt_content("recall-first", &params).unwrap();
+        let msgs = result["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1);
+        let text = msgs[0]["content"]["text"].as_str().unwrap();
+        assert!(text.contains("RECALL FIRST"));
+        assert!(text.contains("TOON"));
+        assert!(text.contains("memory_recall"));
+        assert!(text.contains("memory_store"));
+        assert!(text.contains("DEDUP"));
+    }
+
+    #[test]
+    fn prompt_content_recall_first_with_namespace() {
+        let params = json!({"arguments": {"namespace": "my-project"}});
+        let result = prompt_content("recall-first", &params).unwrap();
+        let text = result["messages"][0]["content"]["text"].as_str().unwrap();
+        assert!(text.contains("my-project"));
+    }
+
+    #[test]
+    fn prompt_content_memory_workflow() {
+        let params = json!({});
+        let result = prompt_content("memory-workflow", &params).unwrap();
+        let text = result["messages"][0]["content"]["text"].as_str().unwrap();
+        assert!(text.contains("STORE"));
+        assert!(text.contains("RECALL"));
+        assert!(text.contains("SEARCH"));
+        assert!(text.contains("CONSOLIDATE"));
+        assert!(text.contains("TOON"));
+    }
+
+    #[test]
+    fn prompt_content_unknown() {
+        let params = json!({});
+        let result = prompt_content("nonexistent", &params);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unknown prompt"));
+    }
+
+    #[test]
+    fn prompt_content_role_is_user() {
+        let params = json!({});
+        let result = prompt_content("recall-first", &params).unwrap();
+        assert_eq!(result["messages"][0]["role"], "user");
+    }
+
+    #[test]
+    fn ok_response_structure() {
+        let resp = ok_response(json!(1), json!({"test": true}));
+        assert_eq!(resp.jsonrpc, "2.0");
+        assert_eq!(resp.id, json!(1));
+        assert!(resp.result.is_some());
+        assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn err_response_structure() {
+        let resp = err_response(json!(1), -32600, "test error".to_string());
+        assert_eq!(resp.jsonrpc, "2.0");
+        assert!(resp.error.is_some());
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, -32600);
+        assert_eq!(err.message, "test error");
+    }
+}

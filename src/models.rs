@@ -251,3 +251,52 @@ pub const PROMOTION_THRESHOLD: i64 = 5;
 /// How much to extend TTL on access (1 hour for short, 1 day for mid)
 pub const SHORT_TTL_EXTEND_SECS: i64 = 3600;
 pub const MID_TTL_EXTEND_SECS: i64 = 86400;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tier_from_str_valid() {
+        assert_eq!(Tier::from_str("short"), Some(Tier::Short));
+        assert_eq!(Tier::from_str("mid"), Some(Tier::Mid));
+        assert_eq!(Tier::from_str("long"), Some(Tier::Long));
+    }
+
+    #[test]
+    fn tier_from_str_invalid() {
+        assert_eq!(Tier::from_str("invalid"), None);
+        assert_eq!(Tier::from_str(""), None);
+        assert_eq!(Tier::from_str("SHORT"), None); // case-sensitive
+    }
+
+    #[test]
+    fn tier_as_str_roundtrip() {
+        for tier in [Tier::Short, Tier::Mid, Tier::Long] {
+            let s = tier.as_str();
+            assert_eq!(Tier::from_str(s), Some(tier));
+        }
+    }
+
+    #[test]
+    fn tier_default_ttl() {
+        assert_eq!(Tier::Short.default_ttl_secs(), Some(6 * 3600));
+        assert_eq!(Tier::Mid.default_ttl_secs(), Some(7 * 24 * 3600));
+        assert_eq!(Tier::Long.default_ttl_secs(), None);
+    }
+
+    #[test]
+    fn tier_display() {
+        assert_eq!(format!("{}", Tier::Short), "short");
+        assert_eq!(format!("{}", Tier::Mid), "mid");
+        assert_eq!(format!("{}", Tier::Long), "long");
+    }
+
+    #[test]
+    fn constants_valid() {
+        assert!(MAX_CONTENT_SIZE > 0);
+        assert!(PROMOTION_THRESHOLD > 0);
+        assert_eq!(SHORT_TTL_EXTEND_SECS, 3600);
+        assert_eq!(MID_TTL_EXTEND_SECS, 86400);
+    }
+}
