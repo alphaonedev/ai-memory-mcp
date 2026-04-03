@@ -432,11 +432,39 @@ ai-memory supports 4 feature tiers, selected at startup with `ai-memory mcp --ti
 | Tier | Recall Method | Extra Capabilities | Approx. Overhead |
 |------|---------------|-------------------|-----------------|
 | **keyword** | FTS5 only | Baseline 13 tools | 0 MB |
-| **semantic** | FTS5 + cosine similarity (hybrid) | MiniLM-L6-v2 embeddings, 384-dim vectors | ~256 MB |
-| **smart** | Hybrid + LLM query expansion | + Gemma 4 E2B via Ollama: `memory_expand_query`, `memory_auto_tag`, `memory_detect_contradiction` | ~1 GB |
-| **autonomous** | Hybrid + LLM expansion + cross-encoder reranking | + Gemma 4 E4B via Ollama, cross-encoder reranking | ~4 GB |
+| **semantic** | FTS5 + cosine similarity (hybrid) | MiniLM-L6-v2 embeddings (384-dim), HNSW index, 14 tools | ~256 MB |
+| **smart** | Hybrid + LLM query expansion | + nomic-embed-text (768-dim) + Gemma 4 E2B via Ollama: `memory_expand_query`, `memory_auto_tag`, `memory_detect_contradiction`, 17 tools | ~1 GB |
+| **autonomous** | Hybrid + LLM expansion + cross-encoder reranking | + Gemma 4 E4B via Ollama, neural cross-encoder (ms-marco-MiniLM), memory reflection, 17 tools | ~4 GB |
 
-**Keyword tier** is the default and requires no additional dependencies. **Semantic tier** bundles the Candle ML framework and downloads the all-MiniLM-L6-v2 model on first run (~80 MB). **Smart** and **autonomous** tiers require Ollama running locally with the appropriate Gemma 4 models installed (Google, USA-only license).
+### Capability Matrix
+
+Every capability mapped to its minimum tier. Each tier includes all capabilities from the tiers below it.
+
+| Capability | keyword | semantic | smart | autonomous |
+|-----------|---------|----------|-------|------------|
+| **Search & Recall** | | | | |
+| FTS5 keyword search | Yes | Yes | Yes | Yes |
+| Semantic embedding (cosine similarity) | -- | Yes | Yes | Yes |
+| Hybrid recall (FTS5 + cosine, 60/40 blend) | -- | Yes | Yes | Yes |
+| HNSW nearest-neighbor index | -- | Yes | Yes | Yes |
+| LLM query expansion (`memory_expand_query`) | -- | -- | Yes | Yes |
+| Neural cross-encoder reranking | -- | -- | -- | Yes |
+| **Memory Management** | | | | |
+| Store, update, delete, promote, link | Yes | Yes | Yes | Yes |
+| Manual consolidation | Yes | Yes | Yes | Yes |
+| Auto-consolidation (LLM summary) | -- | -- | Yes | Yes |
+| Auto-tagging (`memory_auto_tag`) | -- | -- | Yes | Yes |
+| Contradiction detection (`memory_detect_contradiction`) | -- | -- | Yes | Yes |
+| Autonomous memory reflection | -- | -- | -- | Yes |
+| **Models** | | | | |
+| Embedding model | -- | MiniLM-L6-v2 (384d) | nomic-embed-text (768d) | nomic-embed-text (768d) |
+| LLM | -- | -- | gemma4:e2b (~7.2GB) | gemma4:e4b (~9.6GB) |
+| **Resources** | | | | |
+| RAM | 0 MB | ~256 MB | ~1 GB | ~4 GB |
+| External dependencies | None | None | Ollama | Ollama |
+| MCP tools exposed | 13 | 14 | 17 | 17 |
+
+**Semantic tier** (default) bundles the Candle ML framework and downloads the all-MiniLM-L6-v2 model on first run (~90 MB). **Smart** and **autonomous** tiers require [Ollama](https://ollama.com) running locally with the appropriate models. The `--tier` flag **must** be passed in the MCP args -- the `config.toml` tier setting is not used when the server is launched by an AI client.
 
 ```bash
 # Keyword (default)

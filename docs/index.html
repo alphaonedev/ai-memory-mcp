@@ -770,9 +770,62 @@
             </div>
         </div>
 
+        <h3 style="margin-top:2.5rem;margin-bottom:.75rem">Capability Matrix</h3>
+        <p style="font-size:.9rem;color:var(--text-muted);margin-bottom:1rem">Every capability mapped to its minimum tier. Each tier includes all capabilities from the tiers below it.</p>
+
+        <div class="table-wrap">
+            <table class="api-table">
+                <thead>
+                    <tr>
+                        <th>Capability</th>
+                        <th><span class="tier-tag tier-tag-keyword">keyword</span></th>
+                        <th><span class="tier-tag tier-tag-semantic">semantic</span></th>
+                        <th><span class="tier-tag tier-tag-smart">smart</span></th>
+                        <th><span class="tier-tag tier-tag-autonomous">autonomous</span></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr><td colspan="5" style="color:var(--text-muted);font-weight:600;font-size:.75rem;text-transform:uppercase;letter-spacing:.06em;background:var(--bg-raised)">Search &amp; Recall</td></tr>
+                    <tr><td>FTS5 keyword search (<code>memory_search</code>)</td><td class="matrix-check">Yes</td><td class="matrix-check">Yes</td><td class="matrix-check">Yes</td><td class="matrix-check">Yes</td></tr>
+                    <tr><td>Semantic embedding (cosine similarity)</td><td class="matrix-dash">&mdash;</td><td class="matrix-check">Yes</td><td class="matrix-check">Yes</td><td class="matrix-check">Yes</td></tr>
+                    <tr><td>Hybrid recall (FTS5 + cosine, 60/40 blend)</td><td class="matrix-dash">&mdash;</td><td class="matrix-check">Yes</td><td class="matrix-check">Yes</td><td class="matrix-check">Yes</td></tr>
+                    <tr><td>HNSW approximate nearest-neighbor index</td><td class="matrix-dash">&mdash;</td><td class="matrix-check">Yes</td><td class="matrix-check">Yes</td><td class="matrix-check">Yes</td></tr>
+                    <tr><td>LLM query expansion (<code>memory_expand_query</code>)</td><td class="matrix-dash">&mdash;</td><td class="matrix-dash">&mdash;</td><td class="matrix-check">Yes</td><td class="matrix-check">Yes</td></tr>
+                    <tr><td>Neural cross-encoder reranking (ms-marco-MiniLM)</td><td class="matrix-dash">&mdash;</td><td class="matrix-dash">&mdash;</td><td class="matrix-dash">&mdash;</td><td class="matrix-check">Yes</td></tr>
+
+                    <tr><td colspan="5" style="color:var(--text-muted);font-weight:600;font-size:.75rem;text-transform:uppercase;letter-spacing:.06em;background:var(--bg-raised)">Memory Management</td></tr>
+                    <tr><td>Store, update, delete, promote</td><td class="matrix-check">Yes</td><td class="matrix-check">Yes</td><td class="matrix-check">Yes</td><td class="matrix-check">Yes</td></tr>
+                    <tr><td>Link memories (4 relation types)</td><td class="matrix-check">Yes</td><td class="matrix-check">Yes</td><td class="matrix-check">Yes</td><td class="matrix-check">Yes</td></tr>
+                    <tr><td>Bulk forget by pattern/namespace/tier</td><td class="matrix-check">Yes</td><td class="matrix-check">Yes</td><td class="matrix-check">Yes</td><td class="matrix-check">Yes</td></tr>
+                    <tr><td>Manual consolidation (user-provided summary)</td><td class="matrix-check">Yes</td><td class="matrix-check">Yes</td><td class="matrix-check">Yes</td><td class="matrix-check">Yes</td></tr>
+                    <tr><td>Auto-consolidation (LLM-generated summary)</td><td class="matrix-dash">&mdash;</td><td class="matrix-dash">&mdash;</td><td class="matrix-check">Yes</td><td class="matrix-check">Yes</td></tr>
+                    <tr><td>Auto-tagging (<code>memory_auto_tag</code>)</td><td class="matrix-dash">&mdash;</td><td class="matrix-dash">&mdash;</td><td class="matrix-check">Yes</td><td class="matrix-check">Yes</td></tr>
+                    <tr><td>Contradiction detection (<code>memory_detect_contradiction</code>)</td><td class="matrix-dash">&mdash;</td><td class="matrix-dash">&mdash;</td><td class="matrix-check">Yes</td><td class="matrix-check">Yes</td></tr>
+                    <tr><td>Autonomous memory reflection</td><td class="matrix-dash">&mdash;</td><td class="matrix-dash">&mdash;</td><td class="matrix-dash">&mdash;</td><td class="matrix-check">Yes</td></tr>
+
+                    <tr><td colspan="5" style="color:var(--text-muted);font-weight:600;font-size:.75rem;text-transform:uppercase;letter-spacing:.06em;background:var(--bg-raised)">Embedding Model</td></tr>
+                    <tr><td>Model</td><td class="matrix-dash">&mdash;</td><td>all-MiniLM-L6-v2</td><td>nomic-embed-text-v1.5</td><td>nomic-embed-text-v1.5</td></tr>
+                    <tr><td>Dimensions</td><td class="matrix-dash">&mdash;</td><td>384</td><td>768</td><td>768</td></tr>
+                    <tr><td>Runtime</td><td class="matrix-dash">&mdash;</td><td>Candle (local)</td><td>Ollama</td><td>Ollama</td></tr>
+                    <tr><td>Model size</td><td class="matrix-dash">&mdash;</td><td>~90 MB</td><td>~274 MB</td><td>~274 MB</td></tr>
+
+                    <tr><td colspan="5" style="color:var(--text-muted);font-weight:600;font-size:.75rem;text-transform:uppercase;letter-spacing:.06em;background:var(--bg-raised)">LLM (Language Model)</td></tr>
+                    <tr><td>Model</td><td class="matrix-dash">&mdash;</td><td class="matrix-dash">&mdash;</td><td>Gemma 4 Effective 2B</td><td>Gemma 4 Effective 4B</td></tr>
+                    <tr><td>Ollama tag</td><td class="matrix-dash">&mdash;</td><td class="matrix-dash">&mdash;</td><td><code>gemma4:e2b</code></td><td><code>gemma4:e4b</code></td></tr>
+                    <tr><td>Model size</td><td class="matrix-dash">&mdash;</td><td class="matrix-dash">&mdash;</td><td>~7.2 GB</td><td>~9.6 GB</td></tr>
+
+                    <tr><td colspan="5" style="color:var(--text-muted);font-weight:600;font-size:.75rem;text-transform:uppercase;letter-spacing:.06em;background:var(--bg-raised)">Resources</td></tr>
+                    <tr><td>Total RAM</td><td>0 MB</td><td>~256 MB</td><td>~1 GB</td><td>~4 GB</td></tr>
+                    <tr><td>External dependencies</td><td>None</td><td>None</td><td>Ollama</td><td>Ollama</td></tr>
+                    <tr><td>MCP tools exposed</td><td>13</td><td>14</td><td>17</td><td>17</td></tr>
+                    <tr><td>Ollama models to pull</td><td class="matrix-dash">&mdash;</td><td class="matrix-dash">&mdash;</td><td><code>nomic-embed-text</code> + <code>gemma4:e2b</code></td><td><code>nomic-embed-text</code> + <code>gemma4:e4b</code></td></tr>
+                </tbody>
+            </table>
+        </div>
+
         <p style="font-size:.88rem;margin-top:1.5rem">
             <strong>Graceful fallback:</strong> If Ollama is unavailable at startup, smart and autonomous tiers fall back to semantic automatically. You never lose access to your memories.
-            Configure your tier in <code>~/.config/ai-memory/config.toml</code> or pass <code>--tier</code> at the command line.
+            The <code>--tier</code> flag must be passed in the MCP args -- the <code>config.toml</code> tier setting is not used when the server is launched by an AI client.
         </p>
 
         <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:1.25rem;margin-top:1.25rem">
