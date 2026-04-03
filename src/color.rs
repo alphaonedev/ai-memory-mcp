@@ -68,3 +68,70 @@ pub fn priority_bar(p: i32) -> String {
         wrap("91", &bar)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn with_color_off<F: FnOnce()>(f: F) {
+        COLOR_ENABLED.store(false, Ordering::Relaxed);
+        f();
+    }
+
+    #[test]
+    fn tier_colors_no_ansi() {
+        with_color_off(|| {
+            assert_eq!(short("test"), "test");
+            assert_eq!(mid("test"), "test");
+            assert_eq!(long("test"), "test");
+        });
+    }
+
+    #[test]
+    fn semantic_colors_no_ansi() {
+        with_color_off(|| {
+            assert_eq!(dim("test"), "test");
+            assert_eq!(bold("test"), "test");
+            assert_eq!(cyan("test"), "test");
+        });
+    }
+
+    #[test]
+    fn tier_color_dispatch() {
+        with_color_off(|| {
+            assert_eq!(tier_color("short", "x"), "x");
+            assert_eq!(tier_color("mid", "x"), "x");
+            assert_eq!(tier_color("long", "x"), "x");
+            assert_eq!(tier_color("unknown", "x"), "x");
+        });
+    }
+
+    #[test]
+    fn priority_bar_length() {
+        with_color_off(|| {
+            let bar = priority_bar(5);
+            // 5 filled + 5 empty = 10 chars (each is multi-byte unicode)
+            assert!(bar.contains("█"));
+            assert!(bar.contains("░"));
+        });
+    }
+
+    #[test]
+    fn priority_bar_clamps() {
+        with_color_off(|| {
+            let bar_min = priority_bar(0); // clamps to 1
+            let bar_max = priority_bar(15); // clamps to 10
+            assert!(bar_min.contains("░"));
+            assert!(!bar_max.contains("░")); // all filled
+        });
+    }
+
+    #[test]
+    fn wrap_with_color_enabled() {
+        COLOR_ENABLED.store(true, Ordering::Relaxed);
+        let result = wrap("91", "red");
+        assert!(result.contains("\x1b[91m"));
+        assert!(result.contains("\x1b[0m"));
+        assert!(result.contains("red"));
+    }
+}
