@@ -11,7 +11,7 @@
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange?logo=rust)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![SQLite](https://img.shields.io/badge/sqlite-FTS5-003B57?logo=sqlite)](https://www.sqlite.org/)
-[![Tests](https://img.shields.io/badge/tests-40-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-75_(35_unit_+_40_integration)-brightgreen)]()
 [![MCP](https://img.shields.io/badge/MCP-17_tools-blueviolet)]()
 
 **ai-memory is a persistent memory system for AI assistants.** It works with **any AI that supports MCP** -- Claude, ChatGPT, Grok, Llama, and more. It stores what your AI learns in a local SQLite database, ranks memories by relevance when recalling, and auto-promotes important knowledge to permanent storage. Install it once, and every AI assistant you use remembers your architecture, your preferences, your corrections -- forever.
@@ -315,7 +315,7 @@ Beyond MCP, ai-memory also exposes a full HTTP REST API (20 endpoints on port 90
 - **Color CLI output** -- ANSI tier labels (red/yellow/green), priority bars, bold titles, cyan namespaces
 
 ### Quality
-- **40 tests** -- unit + integration
+- **75 tests** -- 35 unit tests (config, embeddings, hnsw, llm, reranker, validate) + 40 integration tests
 - **Criterion benchmarks** -- insert, recall, search at 1K scale
 - **GitHub Actions CI/CD** -- fmt, clippy, test, build on Ubuntu + macOS, release on tag
 

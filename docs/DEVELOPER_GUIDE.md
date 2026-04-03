@@ -739,7 +739,7 @@ ai-memory completions fish
 
 ## Testing
 
-The project has **48 tests** total: 8 unit tests in `src/validate.rs` and 40 integration tests in `tests/integration.rs`.
+The project has **75 tests** total: 35 unit tests across 6 modules (`src/config.rs` 9, `src/validate.rs` 8, `src/reranker.rs` 7, `src/embeddings.rs` 5, `src/hnsw.rs` 4, `src/llm.rs` 2) and 40 integration tests in `tests/integration.rs`.
 
 ```bash
 # Run all tests
