@@ -2,6 +2,7 @@
 // Licensed under the MIT License. See LICENSE file in the project root.
 
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
 // Embedding models
@@ -253,6 +254,138 @@ pub struct CapabilityModels {
 }
 
 // ---------------------------------------------------------------------------
+// Persistent config file (~/.config/ai-memory/config.toml)
+// ---------------------------------------------------------------------------
+
+const CONFIG_DIR: &str = ".config/ai-memory";
+const CONFIG_FILE: &str = "config.toml";
+
+/// Persistent configuration loaded from `~/.config/ai-memory/config.toml`.
+///
+/// All fields are optional — CLI flags override file values, which override
+/// compiled defaults.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AppConfig {
+    /// Feature tier: keyword, semantic, smart, autonomous
+    pub tier: Option<String>,
+    /// Path to the SQLite database file
+    pub db: Option<String>,
+    /// Ollama base URL (default: http://localhost:11434)
+    pub ollama_url: Option<String>,
+    /// Embedding model override: mini_lm_l6_v2 or nomic_embed_v15
+    pub embedding_model: Option<String>,
+    /// LLM model override (Ollama tag, e.g. "gemma4:e2b")
+    pub llm_model: Option<String>,
+    /// Enable cross-encoder reranking (true/false)
+    pub cross_encoder: Option<bool>,
+    /// Default namespace for new memories
+    pub default_namespace: Option<String>,
+    /// Maximum memory budget in MB (used for auto tier selection)
+    pub max_memory_mb: Option<usize>,
+}
+
+impl AppConfig {
+    /// Returns the config file path: `~/.config/ai-memory/config.toml`
+    pub fn config_path() -> Option<PathBuf> {
+        let home = std::env::var("HOME").ok()?;
+        Some(Path::new(&home).join(CONFIG_DIR).join(CONFIG_FILE))
+    }
+
+    /// Load config from disk. Returns `AppConfig::default()` if file is missing.
+    pub fn load() -> Self {
+        let Some(path) = Self::config_path() else {
+            return Self::default();
+        };
+        Self::load_from(&path)
+    }
+
+    /// Load config from a specific path.
+    pub fn load_from(path: &Path) -> Self {
+        match std::fs::read_to_string(path) {
+            Ok(contents) => match toml::from_str(&contents) {
+                Ok(cfg) => {
+                    eprintln!("ai-memory: loaded config from {}", path.display());
+                    cfg
+                }
+                Err(e) => {
+                    eprintln!("ai-memory: config parse error ({}): {}", path.display(), e);
+                    Self::default()
+                }
+            },
+            Err(_) => Self::default(),
+        }
+    }
+
+    /// Resolve the effective feature tier from config (CLI flag overrides).
+    pub fn effective_tier(&self, cli_tier: Option<&str>) -> FeatureTier {
+        let tier_str = cli_tier
+            .or(self.tier.as_deref())
+            .unwrap_or("semantic");
+        FeatureTier::from_str(tier_str).unwrap_or(FeatureTier::Semantic)
+    }
+
+    /// Resolve the effective database path (CLI flag overrides config).
+    pub fn effective_db(&self, cli_db: &Path) -> PathBuf {
+        // If CLI provided a non-default path, use it
+        let default_db = PathBuf::from("ai-memory.db");
+        if cli_db != default_db {
+            return cli_db.to_path_buf();
+        }
+        // Otherwise check config
+        self.db
+            .as_ref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| cli_db.to_path_buf())
+    }
+
+    /// Resolve Ollama URL (config or default).
+    pub fn effective_ollama_url(&self) -> &str {
+        self.ollama_url.as_deref().unwrap_or("http://localhost:11434")
+    }
+
+    /// Write a default config file if one doesn't exist yet.
+    pub fn write_default_if_missing() {
+        let Some(path) = Self::config_path() else {
+            return;
+        };
+        if path.exists() {
+            return;
+        }
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let default_toml = r#"# ai-memory configuration
+# See: https://github.com/alphaonedev/ai-memory-mcp
+
+# Feature tier: keyword, semantic, smart, autonomous
+# tier = "semantic"
+
+# Path to SQLite database
+# db = "~/.claude/ai-memory.db"
+
+# Ollama base URL (for smart/autonomous tiers)
+# ollama_url = "http://localhost:11434"
+
+# Embedding model: mini_lm_l6_v2 (384-dim) or nomic_embed_v15 (768-dim)
+# embedding_model = "mini_lm_l6_v2"
+
+# LLM model tag for Ollama
+# llm_model = "gemma4:e2b"
+
+# Enable neural cross-encoder reranking (autonomous tier)
+# cross_encoder = true
+
+# Default namespace for new memories
+# default_namespace = "global"
+
+# Memory budget in MB (for auto tier selection)
+# max_memory_mb = 4096
+"#;
+        let _ = std::fs::write(&path, default_toml);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -320,5 +453,39 @@ mod tests {
         assert!(json.contains("\"tier\": \"smart\""));
         assert!(json.contains("nomic"));
         assert!(json.contains("gemma4:e2b"));
+    }
+
+    #[test]
+    fn config_default_is_empty() {
+        let cfg = AppConfig::default();
+        assert!(cfg.tier.is_none());
+        assert!(cfg.db.is_none());
+        assert!(cfg.ollama_url.is_none());
+    }
+
+    #[test]
+    fn config_parse_toml() {
+        let toml_str = r#"
+            tier = "smart"
+            db = "/tmp/test.db"
+            ollama_url = "http://localhost:11434"
+            cross_encoder = true
+        "#;
+        let cfg: AppConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.tier.as_deref(), Some("smart"));
+        assert_eq!(cfg.db.as_deref(), Some("/tmp/test.db"));
+        assert!(cfg.cross_encoder.unwrap());
+    }
+
+    #[test]
+    fn config_effective_tier() {
+        let cfg = AppConfig {
+            tier: Some("smart".to_string()),
+            ..Default::default()
+        };
+        // CLI override wins
+        assert_eq!(cfg.effective_tier(Some("autonomous")), FeatureTier::Autonomous);
+        // Config value used when no CLI
+        assert_eq!(cfg.effective_tier(None), FeatureTier::Smart);
     }
 }

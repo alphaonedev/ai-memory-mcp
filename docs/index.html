@@ -8,7 +8,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>ai-memory -- Persistent Memory for Any AI</title>
-    <meta name="description" content="Give any AI persistent memory across sessions. MCP-based memory management for Claude, ChatGPT, Grok, Llama, and any MCP-compatible platform. A single Rust binary with three interfaces (MCP, HTTP, CLI), three-tier recall, SQLite FTS5, and 6-factor ranking.">
+    <meta name="description" content="Give any AI persistent memory across sessions. MCP-based memory management for Claude, ChatGPT, Grok, Llama, and any MCP-compatible platform. A single Rust binary with three interfaces (MCP, HTTP, CLI), four feature tiers (keyword, semantic, smart, autonomous) with local LLMs via Ollama, SQLite FTS5, HNSW vector index, and 6-factor ranking.">
     <meta name="theme-color" content="#0d1117">
     <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/">
     <style>
@@ -333,10 +333,11 @@
         <h1>Persistent Memory for <span>Any AI</span></h1>
         <p class="bluf">
             Give any AI a memory that persists. Works with Claude, ChatGPT, Grok, Llama, and any MCP-compatible platform.
-            A single Rust binary gives your AI real memory -- short-term, mid-term, and permanent -- so it
-            remembers your projects, preferences, and past decisions across every conversation.
+            A single Rust binary with four feature tiers -- from zero-dependency keyword search to autonomous recall with local LLMs via Ollama.
+            Short-term, mid-term, and permanent memory so your AI remembers projects, preferences, and past decisions across every conversation.
         </p>
         <div class="stats-row">
+            <div class="stat"><span class="num">4</span><span class="label">Feature Tiers</span></div>
             <div class="stat"><span class="num">17</span><span class="label">MCP Tools</span></div>
             <div class="stat"><span class="num">20</span><span class="label">HTTP Endpoints</span></div>
             <div class="stat"><span class="num">24</span><span class="label">CLI Commands</span></div>
@@ -425,16 +426,78 @@
      ================================================================ -->
 <section id="install">
     <div class="container">
-        <h2>Install in 60 Seconds</h2>
-        <p class="section-subtitle">Three steps. Build, configure your AI platform, and go.</p>
+        <h2>Install</h2>
+        <p class="section-subtitle">Build the binary, optionally install Ollama for advanced tiers, configure your AI platform, and go.</p>
 
         <ol class="steps">
             <li>
                 <h4>Build the binary</h4>
                 <p>Clone the repo and compile. You need Rust installed (<a href="https://rustup.rs">rustup.rs</a> if you don't have it).</p>
                 <pre><code><span class="tok-cmd">git clone</span> <span class="tok-url">https://github.com/alphaonedev/ai-memory-mcp.git</span>
-<span class="tok-cmd">cd</span> ai-memory
+<span class="tok-cmd">cd</span> ai-memory-mcp
 <span class="tok-cmd">cargo install</span> <span class="tok-flag">--path</span> .<span class="lang-label">bash</span></code></pre>
+                <p style="font-size:.85rem;color:var(--text-muted)">This installs the <code>ai-memory</code> binary to <code>~/.cargo/bin/</code>. The <strong style="color:var(--green)">keyword</strong> and <strong style="color:var(--accent)">semantic</strong> tiers work immediately with zero additional dependencies.</p>
+            </li>
+            <li>
+                <h4>Install Ollama <span style="font-size:.65rem;font-weight:700;text-transform:uppercase;background:rgba(210,153,34,.12);color:var(--orange);padding:.2em .6em;border-radius:3px;letter-spacing:.05em;vertical-align:middle;margin-left:.5rem">Smart &amp; Autonomous Tiers</span></h4>
+                <p>The <strong style="color:var(--orange)">smart</strong> and <strong style="color:var(--purple)">autonomous</strong> tiers use local LLMs via <a href="https://ollama.com">Ollama</a> for query expansion, auto-tagging, contradiction detection, and cross-encoder reranking. Skip this step if you only need keyword or semantic search.</p>
+
+                <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:1rem;margin:1.25rem 0">
+                    <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:1.25rem">
+                        <h4 style="font-size:.95rem;margin-bottom:.6rem;color:var(--text)">macOS</h4>
+                        <pre style="margin:0;font-size:.8rem"><code><span class="tok-cm"># Install via Homebrew</span>
+<span class="tok-cmd">brew</span> install ollama
+
+<span class="tok-cm"># Or download the macOS app:</span>
+<span class="tok-cm"># https://ollama.com/download/mac</span>
+
+<span class="tok-cm"># Start the Ollama service</span>
+<span class="tok-cmd">ollama</span> serve &amp;
+<span class="tok-cm"># (or launch the Ollama.app -- it runs as a menu bar item)</span>
+
+<span class="tok-cm"># Pull models for your tier</span>
+<span class="tok-cmd">ollama</span> pull nomic-embed-text  <span class="tok-cm"># Embeddings (smart+)</span>
+<span class="tok-cmd">ollama</span> pull gemma4:e2b         <span class="tok-cm"># LLM — Smart (~1GB)</span>
+<span class="tok-cmd">ollama</span> pull gemma4:e4b         <span class="tok-cm"># LLM — Autonomous (~2.3GB)</span></code></pre>
+                    </div>
+                    <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:1.25rem">
+                        <h4 style="font-size:.95rem;margin-bottom:.6rem;color:var(--text)">Linux</h4>
+                        <pre style="margin:0;font-size:.8rem"><code><span class="tok-cm"># One-line install script</span>
+<span class="tok-cmd">curl</span> -fsSL https://ollama.com/install.sh | sh
+
+<span class="tok-cm"># Enable and start the systemd service</span>
+<span class="tok-cmd">sudo</span> systemctl enable ollama
+<span class="tok-cmd">sudo</span> systemctl start ollama
+
+<span class="tok-cm"># Pull models for your tier</span>
+<span class="tok-cmd">ollama</span> pull nomic-embed-text  <span class="tok-cm"># Embeddings (smart+)</span>
+<span class="tok-cmd">ollama</span> pull gemma4:e2b         <span class="tok-cm"># LLM — Smart (~1GB)</span>
+<span class="tok-cmd">ollama</span> pull gemma4:e4b         <span class="tok-cm"># LLM — Autonomous (~2.3GB)</span></code></pre>
+                    </div>
+                    <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:1.25rem">
+                        <h4 style="font-size:.95rem;margin-bottom:.6rem;color:var(--text)">Windows</h4>
+                        <pre style="margin:0;font-size:.8rem"><code><span class="tok-cm"># Install via winget</span>
+<span class="tok-cmd">winget</span> install Ollama.Ollama
+
+<span class="tok-cm"># Or download the installer:</span>
+<span class="tok-cm"># https://ollama.com/download/windows</span>
+
+<span class="tok-cm"># Ollama runs as a system service after install</span>
+
+<span class="tok-cm"># Pull models for your tier</span>
+<span class="tok-cmd">ollama</span> pull nomic-embed-text  <span class="tok-cm"># Embeddings (smart+)</span>
+<span class="tok-cmd">ollama</span> pull gemma4:e2b         <span class="tok-cm"># LLM — Smart (~1GB)</span>
+<span class="tok-cmd">ollama</span> pull gemma4:e4b         <span class="tok-cm"># LLM — Autonomous (~2.3GB)</span></code></pre>
+                    </div>
+                </div>
+
+                <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:1.25rem;margin-top:1rem">
+                    <h4 style="font-size:.95rem;margin-bottom:.6rem;color:var(--text)">Verify Ollama</h4>
+                    <pre style="margin:0 0 .75rem;font-size:.8rem"><code><span class="tok-cm"># Check Ollama is running and models are available</span>
+<span class="tok-cmd">curl</span> http://localhost:11434/api/tags
+<span class="tok-cmd">ollama</span> run gemma4:e2b <span class="tok-str">"Hello, world"</span>   <span class="tok-cm"># Should respond in ~1s</span></code></pre>
+                    <p style="font-size:.85rem;color:var(--text-muted);margin:0">ai-memory connects to Ollama at <code>localhost:11434</code> automatically. Override with <code>ollama_url</code> in <code>~/.config/ai-memory/config.toml</code> or <code>--ollama-url</code> flag. If Ollama is unavailable, ai-memory gracefully falls back to the semantic tier.</p>
+                </div>
             </li>
             <li>
                 <h4>Configure your AI platform</h4>
@@ -641,13 +704,13 @@
      ================================================================ -->
 <section id="feature-tiers">
     <div class="container">
-        <h2>Feature Tiers</h2>
-        <p class="section-subtitle">Choose the tier that fits your resources. Each tier builds on the one below it. Set via <code>ai-memory mcp --tier &lt;name&gt;</code>.</p>
+        <h2>Feature Tiers <span class="badge">4 Levels</span></h2>
+        <p class="section-subtitle">Each tier builds on the one below it. Choose based on your resources and needs. Set via <code>ai-memory mcp --tier &lt;name&gt;</code> or in <code>~/.config/ai-memory/config.toml</code>.</p>
 
         <div class="table-wrap">
             <table class="api-table">
                 <thead>
-                    <tr><th>Tier</th><th>Memory</th><th>Embeddings</th><th>LLM</th><th>Key Features</th></tr>
+                    <tr><th>Tier</th><th>RAM</th><th>Embedding Model</th><th>LLM</th><th>Dependencies</th><th>Key Features</th></tr>
                 </thead>
                 <tbody>
                     <tr>
@@ -655,81 +718,72 @@
                         <td>0 MB</td>
                         <td class="matrix-dash">&mdash;</td>
                         <td class="matrix-dash">&mdash;</td>
-                        <td>FTS5 full-text search</td>
+                        <td>None</td>
+                        <td>FTS5 full-text search, 13 MCP tools</td>
                     </tr>
                     <tr>
                         <td><span class="tier-tag tier-tag-semantic">semantic</span></td>
-                        <td>256 MB</td>
-                        <td>MiniLM-L6-v2</td>
+                        <td>~256 MB</td>
+                        <td>all-MiniLM-L6-v2 <span style="color:var(--text-muted);font-size:.75rem">(384-dim, local via Candle)</span></td>
                         <td class="matrix-dash">&mdash;</td>
-                        <td>+ Hybrid recall (keyword + cosine similarity)</td>
+                        <td>None <span style="color:var(--text-muted);font-size:.75rem">(model auto-downloads ~90MB)</span></td>
+                        <td>+ Hybrid recall (FTS5 + cosine similarity), HNSW vector index, 14 MCP tools</td>
                     </tr>
                     <tr>
                         <td><span class="tier-tag tier-tag-smart">smart</span></td>
-                        <td>1 GB</td>
-                        <td>nomic-embed v1.5</td>
-                        <td>Gemma 4 E2B</td>
-                        <td>+ Query expansion, auto-tagging, auto-consolidation</td>
+                        <td>~1 GB</td>
+                        <td>nomic-embed-text-v1.5 <span style="color:var(--text-muted);font-size:.75rem">(768-dim, via Ollama)</span></td>
+                        <td>Gemma 4 E2B <span style="color:var(--text-muted);font-size:.75rem">(~1GB)</span></td>
+                        <td><a href="https://ollama.com">Ollama</a></td>
+                        <td>+ LLM query expansion, auto-tagging, auto-consolidation, 17 MCP tools</td>
                     </tr>
                     <tr>
                         <td><span class="tier-tag tier-tag-autonomous">autonomous</span></td>
-                        <td>4 GB</td>
-                        <td>nomic-embed v1.5</td>
-                        <td>Gemma 4 E4B</td>
-                        <td>+ Cross-encoder reranking, contradiction analysis</td>
+                        <td>~4 GB</td>
+                        <td>nomic-embed-text-v1.5 <span style="color:var(--text-muted);font-size:.75rem">(768-dim, via Ollama)</span></td>
+                        <td>Gemma 4 E4B <span style="color:var(--text-muted);font-size:.75rem">(~2.3GB)</span></td>
+                        <td><a href="https://ollama.com">Ollama</a></td>
+                        <td>+ Neural cross-encoder reranking (ms-marco-MiniLM), contradiction analysis, 17 MCP tools</td>
                     </tr>
                 </tbody>
             </table>
         </div>
 
-        <p style="font-size:.88rem;margin-top:1rem">
-            The <strong style="color:var(--green)">keyword</strong> tier has zero dependencies beyond the binary itself.
-            The <strong style="color:var(--accent)">semantic</strong> tier downloads a small embedding model on first run.
-            The <strong style="color:var(--orange)">smart</strong> and <strong style="color:var(--purple)">autonomous</strong> tiers require
-            <a href="https://ollama.com">Ollama</a> running locally with Gemma 4 models (USA-only).
-        </p>
-
-        <h3 style="margin-top:2.5rem;margin-bottom:.75rem">Ollama Setup <span style="font-size:.65rem;font-weight:700;text-transform:uppercase;background:rgba(210,153,34,.12);color:var(--orange);padding:.2em .6em;border-radius:3px;letter-spacing:.05em;vertical-align:middle;margin-left:.5rem">Smart &amp; Autonomous Only</span></h3>
-        <p style="font-size:.9rem">Install <a href="https://ollama.com">Ollama</a> for your platform, then pull the Gemma 4 model for your tier.</p>
-
-        <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:1rem;margin:1.25rem 0">
-            <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:1.25rem">
-                <h4 style="font-size:.95rem;margin-bottom:.6rem;color:var(--text)">macOS</h4>
-                <pre style="margin:0;font-size:.8rem"><code><span class="tok-cm"># Homebrew</span>
-<span class="tok-cmd">brew</span> install ollama
-<span class="tok-cm"># Or download from https://ollama.com/download/mac</span>
-
-<span class="tok-cmd">ollama</span> serve &amp;
-<span class="tok-cmd">ollama</span> pull gemma4:e2b    <span class="tok-cm"># Smart (~1GB)</span>
-<span class="tok-cmd">ollama</span> pull gemma4:e4b    <span class="tok-cm"># Autonomous (~2.3GB)</span></code></pre>
+        <div class="feature-grid" style="margin-top:1.5rem">
+            <div class="feature-card" style="border-left:3px solid var(--green)">
+                <h4 style="color:var(--green)">Keyword Tier</h4>
+                <p>Pure SQLite FTS5 full-text search. Zero ML dependencies, zero memory overhead. The binary is entirely self-contained. Ideal for low-resource environments, CI runners, or when you just need fast text matching.</p>
             </div>
-            <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:1.25rem">
-                <h4 style="font-size:.95rem;margin-bottom:.6rem;color:var(--text)">Linux</h4>
-                <pre style="margin:0;font-size:.8rem"><code><span class="tok-cmd">curl</span> -fsSL https://ollama.com/install.sh | sh
-<span class="tok-cmd">sudo</span> systemctl enable ollama
-<span class="tok-cmd">sudo</span> systemctl start ollama
-
-<span class="tok-cmd">ollama</span> pull gemma4:e2b    <span class="tok-cm"># Smart (~1GB)</span>
-<span class="tok-cmd">ollama</span> pull gemma4:e4b    <span class="tok-cm"># Autonomous (~2.3GB)</span></code></pre>
+            <div class="feature-card" style="border-left:3px solid var(--accent)">
+                <h4 style="color:var(--accent)">Semantic Tier <span style="font-size:.7rem;color:var(--text-muted)">(default)</span></h4>
+                <p>Adds dense vector embeddings via <strong>all-MiniLM-L6-v2</strong> (384-dim), loaded locally through the Candle ML framework. Recall blends FTS5 keyword scores with cosine similarity (60/40 split). HNSW index for fast approximate nearest-neighbor search. The model auto-downloads from HuggingFace on first run (~90MB).</p>
             </div>
-            <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:1.25rem">
-                <h4 style="font-size:.95rem;margin-bottom:.6rem;color:var(--text)">Windows</h4>
-                <pre style="margin:0;font-size:.8rem"><code><span class="tok-cm"># Download from https://ollama.com/download/windows, or:</span>
-<span class="tok-cmd">winget</span> install Ollama.Ollama
-
-<span class="tok-cmd">ollama</span> pull gemma4:e2b    <span class="tok-cm"># Smart (~1GB)</span>
-<span class="tok-cmd">ollama</span> pull gemma4:e4b    <span class="tok-cm"># Autonomous (~2.3GB)</span></code></pre>
+            <div class="feature-card" style="border-left:3px solid var(--orange)">
+                <h4 style="color:var(--orange)">Smart Tier</h4>
+                <p>Upgrades to <strong>nomic-embed-text-v1.5</strong> (768-dim) via Ollama for higher-quality embeddings. Adds an on-device LLM (<strong>Gemma 4 Effective 2B</strong>) that powers three new tools: <code>memory_expand_query</code> (semantic query broadening), <code>memory_auto_tag</code> (content-aware tagging), and <code>memory_detect_contradiction</code> (conflict detection). Requires <a href="https://ollama.com">Ollama</a> running locally.</p>
+            </div>
+            <div class="feature-card" style="border-left:3px solid var(--purple)">
+                <h4 style="color:var(--purple)">Autonomous Tier</h4>
+                <p>Upgrades the LLM to <strong>Gemma 4 Effective 4B</strong> for more nuanced reasoning. Adds a neural <strong>cross-encoder reranker</strong> (ms-marco-MiniLM-L-6-v2) that re-scores (query, document) pairs after hybrid retrieval for significantly better recall precision. Full autonomous memory reflection and contradiction resolution. Requires <a href="https://ollama.com">Ollama</a>.</p>
             </div>
         </div>
 
-        <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:1.25rem;margin-top:1rem">
-            <h4 style="font-size:.95rem;margin-bottom:.6rem;color:var(--text)">Verify &amp; Configure</h4>
-            <pre style="margin:0 0 .75rem;font-size:.8rem"><code><span class="tok-cm"># Check Ollama is running</span>
-<span class="tok-cmd">curl</span> http://localhost:11434/api/tags
+        <p style="font-size:.88rem;margin-top:1.5rem">
+            <strong>Graceful fallback:</strong> If Ollama is unavailable at startup, smart and autonomous tiers fall back to semantic automatically. You never lose access to your memories.
+            Configure your tier in <code>~/.config/ai-memory/config.toml</code> or pass <code>--tier</code> at the command line.
+        </p>
 
-<span class="tok-cm"># Test the model</span>
-<span class="tok-cmd">ollama</span> run gemma4:e2b <span class="tok-str">"Hello, world"</span></code></pre>
-            <p style="font-size:.85rem;color:var(--text-muted);margin:0">ai-memory connects to Ollama at <code>localhost:11434</code> automatically. No additional configuration needed. If Ollama is not running, ai-memory gracefully falls back to the semantic tier.</p>
+        <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:1.25rem;margin-top:1.25rem">
+            <h4 style="font-size:.95rem;margin-bottom:.6rem;color:var(--text)">Configuration File</h4>
+            <pre style="margin:0;font-size:.8rem"><code><span class="tok-cm"># ~/.config/ai-memory/config.toml</span>
+<span class="tok-cm"># Created automatically on first run with defaults commented out</span>
+
+<span class="tok-flag">tier</span> = <span class="tok-str">"smart"</span>                        <span class="tok-cm"># keyword | semantic | smart | autonomous</span>
+<span class="tok-flag">db</span> = <span class="tok-str">"~/.claude/ai-memory.db"</span>         <span class="tok-cm"># SQLite database path</span>
+<span class="tok-flag">ollama_url</span> = <span class="tok-str">"http://localhost:11434"</span> <span class="tok-cm"># Ollama API endpoint</span>
+<span class="tok-flag">llm_model</span> = <span class="tok-str">"gemma4:e2b"</span>             <span class="tok-cm"># LLM model tag (smart: e2b, autonomous: e4b)</span>
+<span class="tok-flag">cross_encoder</span> = <span class="tok-kw">true</span>                 <span class="tok-cm"># Neural reranking (autonomous tier)</span>
+<span class="tok-flag">default_namespace</span> = <span class="tok-str">"global"</span>         <span class="tok-cm"># Default namespace for new memories</span><span class="lang-label">toml</span></code></pre>
         </div>
     </div>
 </section>
@@ -746,7 +800,7 @@
         </p>
 
         <div class="diagram-wrap">
-            <svg viewBox="0 0 800 220" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="MCP integration flow with multiple AI clients">
+            <svg viewBox="0 0 800 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="MCP integration flow with multiple AI clients and feature tiers">
                 <!-- AI Client 1: Claude -->
                 <rect x="10" y="10" width="130" height="40" rx="6" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
                 <text x="75" y="28" text-anchor="middle" fill="#58a6ff" font-family="system-ui" font-size="11" font-weight="700">Claude</text>
@@ -778,19 +832,40 @@
 
                 <!-- MCP Server -->
                 <rect x="275" y="80" width="190" height="60" rx="8" fill="#161b22" stroke="#bc8cff" stroke-width="2"/>
-                <text x="370" y="105" text-anchor="middle" fill="#e6edf3" font-family="system-ui" font-size="13" font-weight="700">MCP Server</text>
-                <text x="370" y="125" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="11">JSON-RPC / 17 tools</text>
+                <text x="370" y="100" text-anchor="middle" fill="#e6edf3" font-family="system-ui" font-size="13" font-weight="700">MCP Server</text>
+                <text x="370" y="116" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="10">JSON-RPC / up to 17 tools</text>
+                <text x="370" y="131" text-anchor="middle" fill="#8b949e" font-family="monospace" font-size="8">--tier keyword|semantic|smart|autonomous</text>
 
-                <line x1="465" y1="110" x2="530" y2="110" stroke="#bc8cff" stroke-width="2" class="animate-flow"/>
-                <polygon points="530,105 540,110 530,115" fill="#bc8cff"/>
-                <text x="497" y="100" text-anchor="middle" fill="#8b949e" font-family="monospace" font-size="10">rusqlite</text>
+                <!-- Arrow to SQLite -->
+                <line x1="465" y1="100" x2="530" y2="100" stroke="#bc8cff" stroke-width="2" class="animate-flow"/>
+                <polygon points="530,95 540,100 530,105" fill="#bc8cff"/>
+                <text x="497" y="90" text-anchor="middle" fill="#8b949e" font-family="monospace" font-size="9">rusqlite</text>
 
-                <!-- SQLite -->
-                <rect x="545" y="80" width="190" height="60" rx="8" fill="#161b22" stroke="#3fb950" stroke-width="2"/>
-                <text x="640" y="105" text-anchor="middle" fill="#e6edf3" font-family="system-ui" font-size="13" font-weight="700">SQLite + FTS5</text>
-                <text x="640" y="125" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="11">WAL mode</text>
+                <!-- SQLite + HNSW -->
+                <rect x="545" y="75" width="190" height="55" rx="8" fill="#161b22" stroke="#3fb950" stroke-width="2"/>
+                <text x="640" y="97" text-anchor="middle" fill="#e6edf3" font-family="system-ui" font-size="13" font-weight="700">SQLite + FTS5</text>
+                <text x="640" y="117" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="10">WAL mode | HNSW index</text>
 
-                <text x="400" y="210" text-anchor="middle" fill="#58a6ff" font-family="system-ui" font-size="11" font-weight="600">ai-memory --db path/to/memory.db mcp</text>
+                <!-- Arrow from MCP down to Ollama -->
+                <line x1="370" y1="140" x2="370" y2="175" stroke="#d29922" stroke-width="1.5" class="animate-flow"/>
+                <polygon points="366,175 370,182 374,175" fill="#d29922"/>
+                <text x="395" y="165" text-anchor="start" fill="#d29922" font-family="monospace" font-size="8" opacity=".7">smart+ tiers</text>
+
+                <!-- Ollama box -->
+                <rect x="275" y="185" width="190" height="55" rx="8" fill="#161b22" stroke="#d29922" stroke-width="1.5"/>
+                <text x="370" y="207" text-anchor="middle" fill="#d29922" font-family="system-ui" font-size="12" font-weight="700">Ollama (local LLM)</text>
+                <text x="370" y="224" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="9">nomic-embed | Gemma 4 E2B/E4B</text>
+
+                <!-- Smart tier capabilities -->
+                <rect x="510" y="185" width="230" height="55" rx="6" fill="#161b22" stroke="#484f58" stroke-width="1"/>
+                <text x="625" y="202" text-anchor="middle" fill="#d29922" font-family="system-ui" font-size="9" font-weight="600">Smart: query expansion, auto-tag</text>
+                <text x="625" y="216" text-anchor="middle" fill="#bc8cff" font-family="system-ui" font-size="9" font-weight="600">Autonomous: + cross-encoder reranker</text>
+                <text x="625" y="230" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="8">contradiction detection, neural reranking</text>
+
+                <!-- Arrow from Ollama to capabilities -->
+                <line x1="465" y1="212" x2="510" y2="212" stroke="#d29922" stroke-width="1" class="animate-flow" opacity=".6"/>
+
+                <text x="400" y="265" text-anchor="middle" fill="#58a6ff" font-family="system-ui" font-size="11" font-weight="600">ai-memory --db path/to/memory.db mcp --tier smart</text>
             </svg>
         </div>
 
@@ -1200,10 +1275,10 @@
 <section id="architecture">
     <div class="container">
         <h2>Architecture</h2>
-        <p class="section-subtitle">Single Rust binary. Three universal interfaces. One shared database layer. Zero runtime dependencies.</p>
+        <p class="section-subtitle">Single Rust binary. Three universal interfaces. Four feature tiers with optional local LLMs via Ollama.</p>
 
         <div class="diagram-wrap">
-            <svg viewBox="0 0 760 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Architecture diagram showing multiple AI clients">
+            <svg viewBox="0 0 760 480" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Architecture diagram showing multiple AI clients, feature tiers, and Ollama integration">
                 <!-- Multiple AI Clients -->
                 <rect x="40" y="10" width="100" height="35" rx="6" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
                 <text x="90" y="32" text-anchor="middle" fill="#58a6ff" font-family="system-ui" font-size="10" font-weight="700">Claude</text>
@@ -1230,17 +1305,14 @@
                 <line x1="210" y1="45" x2="600" y2="80" stroke="#3fb950" stroke-width="1" opacity=".3"/>
 
                 <!-- Three interfaces -->
-                <!-- CLI -->
                 <rect x="30" y="80" width="140" height="48" rx="8" fill="#161b22" stroke="#3fb950" stroke-width="1.5"/>
                 <text x="100" y="102" text-anchor="middle" fill="#3fb950" font-family="system-ui" font-size="12" font-weight="700">CLI</text>
                 <text x="100" y="118" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="10">24 commands</text>
 
-                <!-- MCP -->
                 <rect x="280" y="80" width="140" height="48" rx="8" fill="#161b22" stroke="#bc8cff" stroke-width="1.5"/>
                 <text x="350" y="102" text-anchor="middle" fill="#bc8cff" font-family="system-ui" font-size="12" font-weight="700">MCP Server</text>
                 <text x="350" y="118" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="10">17 tools / stdio</text>
 
-                <!-- HTTP -->
                 <rect x="530" y="80" width="140" height="48" rx="8" fill="#161b22" stroke="#d29922" stroke-width="1.5"/>
                 <text x="600" y="102" text-anchor="middle" fill="#d29922" font-family="system-ui" font-size="12" font-weight="700">HTTP API</text>
                 <text x="600" y="118" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="10">20 endpoints / Axum</text>
@@ -1251,30 +1323,95 @@
                 <text x="600" y="146" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="8">Universal</text>
 
                 <!-- Down to validation -->
-                <line x1="100" y1="150" x2="100" y2="185" stroke="#30363d" stroke-width="1"/>
-                <line x1="350" y1="150" x2="350" y2="185" stroke="#30363d" stroke-width="1"/>
-                <line x1="600" y1="150" x2="600" y2="185" stroke="#30363d" stroke-width="1"/>
+                <line x1="100" y1="150" x2="100" y2="175" stroke="#30363d" stroke-width="1"/>
+                <line x1="350" y1="150" x2="350" y2="175" stroke="#30363d" stroke-width="1"/>
+                <line x1="600" y1="150" x2="600" y2="175" stroke="#30363d" stroke-width="1"/>
 
                 <!-- Validation layer -->
-                <rect x="50" y="185" width="600" height="35" rx="6" fill="#161b22" stroke="#f85149" stroke-width="1"/>
-                <text x="350" y="207" text-anchor="middle" fill="#f85149" font-family="system-ui" font-size="12" font-weight="600">Validation Layer (validate.rs) + Structured Errors (errors.rs)</text>
+                <rect x="50" y="175" width="600" height="30" rx="6" fill="#161b22" stroke="#f85149" stroke-width="1"/>
+                <text x="350" y="195" text-anchor="middle" fill="#f85149" font-family="system-ui" font-size="11" font-weight="600">Validation Layer (validate.rs) + Structured Errors (errors.rs)</text>
 
-                <!-- Down to DB -->
-                <line x1="350" y1="220" x2="350" y2="250" stroke="#30363d" stroke-width="1.5"/>
-                <polygon points="346,250 350,257 354,250" fill="#30363d"/>
+                <!-- Down from validation to feature tier bar -->
+                <line x1="350" y1="205" x2="350" y2="225" stroke="#30363d" stroke-width="1.5"/>
+
+                <!-- ================================================ -->
+                <!-- FEATURE TIERS — the new visualization            -->
+                <!-- ================================================ -->
+                <rect x="30" y="225" width="700" height="95" rx="8" fill="#0d1117" stroke="#484f58" stroke-width="1" stroke-dasharray="4 2"/>
+                <text x="380" y="242" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="9" font-weight="600" letter-spacing=".06em" text-transform="uppercase">FEATURE TIERS</text>
+
+                <!-- Keyword tier -->
+                <rect x="45" y="252" width="140" height="55" rx="6" fill="#161b22" stroke="#3fb950" stroke-width="1.5"/>
+                <text x="115" y="271" text-anchor="middle" fill="#3fb950" font-family="system-ui" font-size="11" font-weight="700">Keyword</text>
+                <text x="115" y="284" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="8">FTS5 only</text>
+                <text x="115" y="298" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="8">0 MB | 13 tools</text>
+
+                <!-- Semantic tier -->
+                <rect x="200" y="252" width="140" height="55" rx="6" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
+                <text x="270" y="271" text-anchor="middle" fill="#58a6ff" font-family="system-ui" font-size="11" font-weight="700">Semantic</text>
+                <text x="270" y="284" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="8">MiniLM-L6 384d</text>
+                <text x="270" y="298" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="8">256 MB | 14 tools</text>
+                <!-- Candle label -->
+                <text x="270" y="250" text-anchor="middle" fill="#58a6ff" font-family="monospace" font-size="7" opacity=".6">candle (local)</text>
+
+                <!-- Arrow from keyword to semantic -->
+                <line x1="185" y1="280" x2="200" y2="280" stroke="#30363d" stroke-width="1" class="animate-flow"/>
+                <polygon points="197,277 203,280 197,283" fill="#30363d"/>
+
+                <!-- Smart tier -->
+                <rect x="355" y="252" width="155" height="55" rx="6" fill="#161b22" stroke="#d29922" stroke-width="1.5"/>
+                <text x="432" y="271" text-anchor="middle" fill="#d29922" font-family="system-ui" font-size="11" font-weight="700">Smart</text>
+                <text x="432" y="284" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="8">nomic 768d + Gemma4 E2B</text>
+                <text x="432" y="298" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="8">1 GB | 17 tools</text>
+
+                <!-- Arrow from semantic to smart -->
+                <line x1="340" y1="280" x2="355" y2="280" stroke="#30363d" stroke-width="1" class="animate-flow"/>
+                <polygon points="352,277 358,280 352,283" fill="#30363d"/>
+
+                <!-- Autonomous tier -->
+                <rect x="525" y="252" width="190" height="55" rx="6" fill="#161b22" stroke="#bc8cff" stroke-width="1.5"/>
+                <text x="620" y="271" text-anchor="middle" fill="#bc8cff" font-family="system-ui" font-size="11" font-weight="700">Autonomous</text>
+                <text x="620" y="284" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="8">nomic 768d + Gemma4 E4B + reranker</text>
+                <text x="620" y="298" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="8">4 GB | 17 tools + cross-encoder</text>
+
+                <!-- Arrow from smart to autonomous -->
+                <line x1="510" y1="280" x2="525" y2="280" stroke="#30363d" stroke-width="1" class="animate-flow"/>
+                <polygon points="522,277 528,280 522,283" fill="#30363d"/>
+
+                <!-- ================================================ -->
+                <!-- Ollama box (right side, connected to smart/auto) -->
+                <!-- ================================================ -->
+                <rect x="600" y="335" width="140" height="50" rx="8" fill="#161b22" stroke="#d29922" stroke-width="1.5"/>
+                <text x="670" y="357" text-anchor="middle" fill="#d29922" font-family="system-ui" font-size="12" font-weight="700">Ollama</text>
+                <text x="670" y="373" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="9">localhost:11434</text>
+
+                <!-- Animated lines from Ollama up to smart and autonomous -->
+                <line x1="670" y1="335" x2="620" y2="307" stroke="#d29922" stroke-width="1.2" class="animate-flow" opacity=".7"/>
+                <line x1="650" y1="335" x2="432" y2="307" stroke="#d29922" stroke-width="1.2" class="animate-flow" opacity=".5"/>
+
+                <!-- Ollama model labels -->
+                <text x="540" y="330" text-anchor="middle" fill="#d29922" font-family="monospace" font-size="7" opacity=".7">gemma4:e2b / e4b</text>
+                <text x="680" y="330" text-anchor="middle" fill="#d29922" font-family="monospace" font-size="7" opacity=".7">nomic-embed-text</text>
+
+                <!-- Down from tier bar to DB -->
+                <line x1="350" y1="320" x2="350" y2="345" stroke="#30363d" stroke-width="1.5"/>
+                <polygon points="346,345 350,352 354,345" fill="#30363d"/>
 
                 <!-- DB layer -->
-                <rect x="170" y="257" width="360" height="55" rx="8" fill="#161b22" stroke="#39d2c0" stroke-width="2"/>
-                <text x="350" y="280" text-anchor="middle" fill="#39d2c0" font-family="system-ui" font-size="13" font-weight="700">SQLite + FTS5 (db.rs)</text>
-                <text x="350" y="300" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="10">WAL mode | schema v2 | 5 indexes | 40 tests</text>
+                <rect x="120" y="352" width="360" height="55" rx="8" fill="#161b22" stroke="#39d2c0" stroke-width="2"/>
+                <text x="300" y="375" text-anchor="middle" fill="#39d2c0" font-family="system-ui" font-size="13" font-weight="700">SQLite + FTS5 + HNSW (db.rs)</text>
+                <text x="300" y="395" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="10">WAL mode | schema v3 | embeddings | 40 tests</text>
 
-                <!-- Tiers -->
-                <rect x="200" y="325" width="70" height="22" rx="4" fill="rgba(248,81,73,.15)" stroke="#f85149" stroke-width="1"/>
-                <text x="235" y="340" text-anchor="middle" fill="#f85149" font-family="monospace" font-size="10">short 6h</text>
-                <rect x="305" y="325" width="70" height="22" rx="4" fill="rgba(210,153,34,.15)" stroke="#d29922" stroke-width="1"/>
-                <text x="340" y="340" text-anchor="middle" fill="#d29922" font-family="monospace" font-size="10">mid 7d</text>
-                <rect x="410" y="325" width="90" height="22" rx="4" fill="rgba(63,185,80,.15)" stroke="#3fb950" stroke-width="1"/>
-                <text x="455" y="340" text-anchor="middle" fill="#3fb950" font-family="monospace" font-size="10">long forever</text>
+                <!-- Memory tiers -->
+                <rect x="145" y="420" width="70" height="22" rx="4" fill="rgba(248,81,73,.15)" stroke="#f85149" stroke-width="1"/>
+                <text x="180" y="435" text-anchor="middle" fill="#f85149" font-family="monospace" font-size="10">short 6h</text>
+                <rect x="250" y="420" width="70" height="22" rx="4" fill="rgba(210,153,34,.15)" stroke="#d29922" stroke-width="1"/>
+                <text x="285" y="435" text-anchor="middle" fill="#d29922" font-family="monospace" font-size="10">mid 7d</text>
+                <rect x="355" y="420" width="90" height="22" rx="4" fill="rgba(63,185,80,.15)" stroke="#3fb950" stroke-width="1"/>
+                <text x="400" y="435" text-anchor="middle" fill="#3fb950" font-family="monospace" font-size="10">long forever</text>
+
+                <!-- HNSW label near DB -->
+                <text x="300" y="460" text-anchor="middle" fill="#8b949e" font-family="monospace" font-size="8">instant-distance HNSW | cosine similarity | 6-factor ranking</text>
             </svg>
         </div>
     </div>
