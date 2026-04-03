@@ -8,10 +8,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
 use std::path::Path;
+use std::sync::Arc;
 
-use crate::config::{FeatureTier, TierConfig};
+use crate::config::{AppConfig, FeatureTier, TierConfig};
 use crate::db;
 use crate::embeddings::Embedder;
+use crate::hnsw::VectorIndex;
 use crate::llm::OllamaClient;
 use crate::models::*;
 use crate::reranker::CrossEncoder;
@@ -228,16 +230,16 @@ fn tool_definitions() -> Value {
             },
             {
                 "name": "memory_consolidate",
-                "description": "Consolidate multiple memories into one long-term summary. Deletes source memories and creates derived_from links.",
+                "description": "Consolidate multiple memories into one long-term summary. Deletes source memories and creates derived_from links. If summary is omitted and LLM is available (smart/autonomous tier), auto-generates a summary.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "ids": {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 100, "description": "Memory IDs to consolidate (minimum 2, maximum 100)"},
                         "title": {"type": "string", "description": "Title for the consolidated memory"},
-                        "summary": {"type": "string", "description": "Summary content for the consolidated memory"},
+                        "summary": {"type": "string", "description": "Summary content (optional — auto-generated via LLM if omitted at smart/autonomous tier)"},
                         "namespace": {"type": "string", "default": "global"}
                     },
-                    "required": ["ids", "title", "summary"]
+                    "required": ["ids", "title"]
                 }
             },
             {
@@ -289,6 +291,7 @@ fn handle_store(
     conn: &rusqlite::Connection,
     params: &Value,
     embedder: Option<&Embedder>,
+    vector_index: Option<&VectorIndex>,
 ) -> Result<Value, String> {
     let title = params["title"].as_str().ok_or("title is required")?;
     let content = params["content"].as_str().ok_or("content is required")?;
@@ -355,6 +358,10 @@ fn handle_store(
                 if let Err(e) = db::set_embedding(conn, &actual_id, &embedding) {
                     tracing::warn!("failed to store embedding for {}: {}", &actual_id, e);
                 }
+                // Add to HNSW index for fast ANN search
+                if let Some(idx) = vector_index {
+                    idx.insert(actual_id.clone(), embedding);
+                }
             }
             Err(e) => {
                 tracing::warn!("failed to generate embedding for {}: {}", &actual_id, e);
@@ -374,6 +381,8 @@ fn handle_recall(
     conn: &rusqlite::Connection,
     params: &Value,
     embedder: Option<&Embedder>,
+    vector_index: Option<&VectorIndex>,
+    reranker: Option<&CrossEncoder>,
 ) -> Result<Value, String> {
     let _ = db::gc_if_needed(conn);
     let context = params["context"].as_str().ok_or("context is required")?;
@@ -396,8 +405,21 @@ fn handle_recall(
                     tags,
                     since,
                     until,
+                    vector_index,
                 )
                 .map_err(|e| e.to_string())?;
+
+                // Apply cross-encoder reranking if available
+                if let Some(ce) = reranker {
+                    let scored: Vec<(Memory, f64)> = results
+                        .into_iter()
+                        .map(|m| (m, 1.0)) // original score = 1.0 (already ranked)
+                        .collect();
+                    let reranked = ce.rerank(context, scored);
+                    let memories: Vec<Memory> = reranked.into_iter().map(|(m, _)| m).collect();
+                    return Ok(json!({"memories": memories, "count": memories.len(), "mode": "hybrid+rerank"}));
+                }
+
                 return Ok(json!({"memories": results, "count": results.len(), "mode": "hybrid"}));
             }
             Err(e) => {
@@ -517,10 +539,17 @@ fn handle_list(conn: &rusqlite::Connection, params: &Value) -> Result<Value, Str
     Ok(json!({"memories": results, "count": results.len()}))
 }
 
-fn handle_delete(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
+fn handle_delete(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    vector_index: Option<&VectorIndex>,
+) -> Result<Value, String> {
     let id = params["id"].as_str().ok_or("id is required")?;
     let deleted = db::delete(conn, id).map_err(|e| e.to_string())?;
     if deleted {
+        if let Some(idx) = vector_index {
+            idx.remove(id);
+        }
         Ok(json!({"deleted": true}))
     } else {
         Err("memory not found".into())
@@ -655,7 +684,11 @@ fn handle_get_links(conn: &rusqlite::Connection, params: &Value) -> Result<Value
     Ok(json!({"links": links, "count": links.len()}))
 }
 
-fn handle_consolidate(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
+fn handle_consolidate(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    llm: Option<&OllamaClient>,
+) -> Result<Value, String> {
     let ids_arr = params["ids"]
         .as_array()
         .ok_or("ids is required (array of memory IDs)")?;
@@ -667,22 +700,48 @@ fn handle_consolidate(conn: &rusqlite::Connection, params: &Value) -> Result<Val
         }
     }
     let title = params["title"].as_str().ok_or("title is required")?;
-    let summary = params["summary"].as_str().ok_or("summary is required")?;
     let namespace = params["namespace"].as_str().unwrap_or("global");
 
-    validate::validate_consolidate(&ids, title, summary, namespace).map_err(|e| e.to_string())?;
+    // Auto-generate summary via LLM if not provided
+    let summary: String = if let Some(s) = params["summary"].as_str() {
+        s.to_string()
+    } else if let Some(llm_client) = llm {
+        // Fetch memory contents for LLM summarization
+        let mut memory_pairs: Vec<(String, String)> = Vec::new();
+        for id in &ids {
+            match db::get(conn, id) {
+                Ok(Some(mem)) => memory_pairs.push((mem.title, mem.content)),
+                Ok(None) => return Err(format!("memory not found: {}", id)),
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        llm_client
+            .summarize_memories(&memory_pairs)
+            .map_err(|e| format!("LLM summarization failed: {e}"))?
+    } else {
+        return Err("summary is required (or use smart/autonomous tier for auto-summarization)".into());
+    };
 
+    validate::validate_consolidate(&ids, title, &summary, namespace).map_err(|e| e.to_string())?;
+
+    let auto_generated = params["summary"].as_str().is_none();
     let new_id = db::consolidate(
         conn,
         &ids,
         title,
-        summary,
+        &summary,
         namespace,
         &Tier::Long,
         "consolidation",
     )
     .map_err(|e| e.to_string())?;
-    Ok(json!({"id": new_id, "consolidated": ids.len()}))
+
+    let mut result = json!({"id": new_id, "consolidated": ids.len()});
+    if auto_generated {
+        result["auto_summary"] = json!(true);
+        result["summary_preview"] = json!(summary.chars().take(200).collect::<String>());
+    }
+    Ok(result)
 }
 
 // --- MCP protocol handler ---
@@ -695,6 +754,7 @@ fn handle_request(
     llm: Option<&OllamaClient>,
     reranker: Option<&CrossEncoder>,
     tier_config: &TierConfig,
+    vector_index: Option<&VectorIndex>,
 ) -> RpcResponse {
     let id = req.id.clone().unwrap_or(Value::Null);
 
@@ -734,11 +794,11 @@ fn handle_request(
             };
 
             let result = match tool_name {
-                "memory_store" => handle_store(conn, arguments, embedder),
-                "memory_recall" => handle_recall(conn, arguments, embedder),
+                "memory_store" => handle_store(conn, arguments, embedder, vector_index),
+                "memory_recall" => handle_recall(conn, arguments, embedder, vector_index, reranker),
                 "memory_search" => handle_search(conn, arguments),
                 "memory_list" => handle_list(conn, arguments),
-                "memory_delete" => handle_delete(conn, arguments),
+                "memory_delete" => handle_delete(conn, arguments, vector_index),
                 "memory_promote" => handle_promote(conn, arguments),
                 "memory_forget" => handle_forget(conn, arguments),
                 "memory_stats" => handle_stats(conn, db_path),
@@ -746,7 +806,7 @@ fn handle_request(
                 "memory_get" => handle_get(conn, arguments),
                 "memory_link" => handle_link(conn, arguments),
                 "memory_get_links" => handle_get_links(conn, arguments),
-                "memory_consolidate" => handle_consolidate(conn, arguments),
+                "memory_consolidate" => handle_consolidate(conn, arguments, llm),
                 "memory_capabilities" => handle_capabilities(tier_config),
                 "memory_expand_query" => handle_expand_query(llm, arguments),
                 "memory_auto_tag" => handle_auto_tag(conn, llm, arguments),
@@ -780,7 +840,7 @@ fn handle_request(
 
 /// Run the MCP server over stdio. Blocks until stdin closes.
 /// Initializes components based on the requested feature tier.
-pub fn run_mcp_server(db_path: &Path, tier: FeatureTier) -> anyhow::Result<()> {
+pub fn run_mcp_server(db_path: &Path, tier: FeatureTier, app_config: &AppConfig) -> anyhow::Result<()> {
     let conn = db::open(db_path)?;
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -788,11 +848,37 @@ pub fn run_mcp_server(db_path: &Path, tier: FeatureTier) -> anyhow::Result<()> {
     let tier_config = tier.config();
     eprintln!("ai-memory: requested tier = {}", tier.as_str());
 
+    // --- Initialize LLM (smart tier and above) — before embedder so Ollama
+    //     client can be shared with nomic embedder ---
+    let llm: Option<Arc<OllamaClient>> = if let Some(ref llm_model) = tier_config.llm_model {
+        let model_id = llm_model.ollama_model_id();
+        eprintln!("ai-memory: connecting to Ollama for {} ...", llm_model.display_name());
+        let ollama_url = app_config.effective_ollama_url();
+        match OllamaClient::new_with_url(ollama_url, model_id) {
+            Ok(client) => {
+                eprintln!("ai-memory: Ollama connected, ensuring model {} is available...", model_id);
+                if let Err(e) = client.ensure_model() {
+                    eprintln!("ai-memory: model pull failed: {e} (LLM features disabled)");
+                    None
+                } else {
+                    eprintln!("ai-memory: LLM ready ({})", llm_model.display_name());
+                    Some(Arc::new(client))
+                }
+            }
+            Err(e) => {
+                eprintln!("ai-memory: Ollama not available: {e} (LLM features disabled)");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // --- Initialize embedder (semantic tier and above) ---
-    let embedder = if tier_config.embedding_model.is_some() {
-        match Embedder::new() {
+    let embedder = if let Some(ref emb_model) = tier_config.embedding_model {
+        match Embedder::for_model(*emb_model, llm.clone()) {
             Ok(emb) => {
-                eprintln!("ai-memory: embedder loaded (all-MiniLM-L6-v2, 384-dim)");
+                eprintln!("ai-memory: embedder loaded ({})", emb.model_description());
                 // Backfill embeddings for memories that don't have them
                 match db::get_unembedded_ids(&conn) {
                     Ok(unembedded) if !unembedded.is_empty() => {
@@ -826,24 +912,18 @@ pub fn run_mcp_server(db_path: &Path, tier: FeatureTier) -> anyhow::Result<()> {
         None
     };
 
-    // --- Initialize LLM (smart tier and above) ---
-    let llm = if let Some(ref llm_model) = tier_config.llm_model {
-        let model_id = llm_model.ollama_model_id();
-        eprintln!("ai-memory: connecting to Ollama for {} ...", llm_model.display_name());
-        match OllamaClient::new(model_id) {
-            Ok(client) => {
-                eprintln!("ai-memory: Ollama connected, ensuring model {} is available...", model_id);
-                if let Err(e) = client.ensure_model() {
-                    eprintln!("ai-memory: model pull failed: {e} (LLM features disabled)");
-                    None
-                } else {
-                    eprintln!("ai-memory: LLM ready ({})", llm_model.display_name());
-                    Some(client)
-                }
+    // --- Build HNSW vector index (semantic tier and above) ---
+    let vector_index = if embedder.is_some() {
+        match db::get_all_embeddings(&conn) {
+            Ok(entries) if !entries.is_empty() => {
+                eprintln!("ai-memory: building HNSW index ({} vectors)...", entries.len());
+                let idx = VectorIndex::build(entries);
+                eprintln!("ai-memory: HNSW index ready ({} entries)", idx.len());
+                Some(idx)
             }
-            Err(e) => {
-                eprintln!("ai-memory: Ollama not available: {e} (LLM features disabled)");
-                None
+            _ => {
+                eprintln!("ai-memory: no embeddings for HNSW index, using linear scan");
+                Some(VectorIndex::empty())
             }
         }
     } else {
@@ -852,8 +932,14 @@ pub fn run_mcp_server(db_path: &Path, tier: FeatureTier) -> anyhow::Result<()> {
 
     // --- Initialize cross-encoder reranker (autonomous tier) ---
     let reranker = if tier_config.cross_encoder {
-        eprintln!("ai-memory: cross-encoder reranker active");
-        Some(CrossEncoder::new())
+        eprintln!("ai-memory: loading neural cross-encoder (ms-marco-MiniLM-L-6-v2)...");
+        let ce = CrossEncoder::new_neural();
+        if ce.is_neural() {
+            eprintln!("ai-memory: neural cross-encoder ready");
+        } else {
+            eprintln!("ai-memory: using lexical cross-encoder fallback");
+        }
+        Some(ce)
     } else {
         None
     };
@@ -897,9 +983,10 @@ pub fn run_mcp_server(db_path: &Path, tier: FeatureTier) -> anyhow::Result<()> {
             db_path,
             &req,
             embedder.as_ref(),
-            llm.as_ref(),
+            llm.as_deref(),
             reranker.as_ref(),
             &tier_config,
+            vector_index.as_ref(),
         );
         let out = serde_json::to_string(&resp)?;
         writeln!(stdout, "{out}")?;

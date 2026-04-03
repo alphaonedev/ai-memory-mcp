@@ -891,8 +891,35 @@ pub fn get_unembedded_ids(conn: &Connection) -> Result<Vec<(String, String, Stri
     rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
 }
 
+/// Get all stored embeddings as (id, embedding) pairs for building the HNSW index.
+pub fn get_all_embeddings(conn: &Connection) -> Result<Vec<(String, Vec<f32>)>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, embedding FROM memories WHERE embedding IS NOT NULL"
+    )?;
+    let rows = stmt.query_map([], |row| {
+        let id: String = row.get(0)?;
+        let bytes: Vec<u8> = row.get(1)?;
+        Ok((id, bytes))
+    })?;
+    let mut entries = Vec::new();
+    for row in rows {
+        let (id, bytes) = row?;
+        if bytes.is_empty() {
+            continue;
+        }
+        let floats: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        entries.push((id, floats));
+    }
+    Ok(entries)
+}
+
 /// Hybrid recall — FTS5 keyword search + semantic cosine similarity.
 /// Returns memories ranked by a blended score of keyword and semantic relevance.
+/// When an HNSW `vector_index` is provided, uses approximate nearest-neighbor
+/// search instead of scanning all embeddings linearly.
 #[allow(clippy::too_many_arguments)]
 pub fn recall_hybrid(
     conn: &Connection,
@@ -903,6 +930,7 @@ pub fn recall_hybrid(
     tags_filter: Option<&str>,
     since: Option<&str>,
     until: Option<&str>,
+    vector_index: Option<&crate::hnsw::VectorIndex>,
 ) -> Result<Vec<Memory>> {
     let now = Utc::now().to_rfc3339();
     let fts_query = sanitize_fts_query(context, true);
@@ -971,31 +999,65 @@ pub fn recall_hybrid(
         scored.insert(mem.id.clone(), (mem, fts_score, cosine));
     }
 
-    // Semantic-only candidates (may not overlap with FTS results)
-    let sem_rows = sem_stmt.query_map(
-        params![namespace, now, tags_filter, since, until],
-        |row| {
-            let mem = row_to_memory(row)?;
-            let emb_bytes: Option<Vec<u8>> = row.get(14)?;
-            Ok((mem, emb_bytes))
-        },
-    )?;
-
-    for row in sem_rows {
-        let (mem, emb_bytes) = row?;
-        if scored.contains_key(&mem.id) {
-            continue; // Already in FTS results
-        }
-        if let Some(bytes) = emb_bytes {
-            if !bytes.is_empty() {
-                let emb: Vec<f32> = bytes
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                    .collect();
-                let cosine = crate::embeddings::Embedder::cosine_similarity(query_embedding, &emb) as f64;
-                // Only include if cosine similarity is meaningful
-                if cosine > 0.3 {
+    // Semantic-only candidates — use HNSW index for fast ANN if available,
+    // otherwise fall back to linear scan over all embeddings.
+    if let Some(idx) = vector_index {
+        // HNSW approximate nearest-neighbor search
+        let ann_limit = (limit * 5).max(50);
+        let hits = idx.search(query_embedding, ann_limit);
+        for hit in hits {
+            if scored.contains_key(&hit.id) {
+                continue;
+            }
+            let cosine = (1.0 - hit.distance) as f64;
+            if cosine > 0.3 {
+                if let Some(mem) = get(conn, &hit.id)? {
+                    // Apply namespace/expiry/tag filters
+                    if let Some(ns) = namespace {
+                        if mem.namespace != ns { continue; }
+                    }
+                    if let Some(exp) = &mem.expires_at {
+                        if exp.as_str() <= now.as_str() { continue; }
+                    }
+                    if let Some(tf) = tags_filter {
+                        if !mem.tags.iter().any(|t| t == tf) { continue; }
+                    }
+                    if let Some(s) = since {
+                        if mem.created_at.as_str() < s { continue; }
+                    }
+                    if let Some(u) = until {
+                        if mem.created_at.as_str() > u { continue; }
+                    }
                     scored.insert(mem.id.clone(), (mem, 0.0, cosine));
+                }
+            }
+        }
+    } else {
+        // Fallback: linear scan over all embeddings
+        let sem_rows = sem_stmt.query_map(
+            params![namespace, now, tags_filter, since, until],
+            |row| {
+                let mem = row_to_memory(row)?;
+                let emb_bytes: Option<Vec<u8>> = row.get(14)?;
+                Ok((mem, emb_bytes))
+            },
+        )?;
+
+        for row in sem_rows {
+            let (mem, emb_bytes) = row?;
+            if scored.contains_key(&mem.id) {
+                continue;
+            }
+            if let Some(bytes) = emb_bytes {
+                if !bytes.is_empty() {
+                    let emb: Vec<f32> = bytes
+                        .chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect();
+                    let cosine = crate::embeddings::Embedder::cosine_similarity(query_embedding, &emb) as f64;
+                    if cosine > 0.3 {
+                        scored.insert(mem.id.clone(), (mem, 0.0, cosine));
+                    }
                 }
             }
         }

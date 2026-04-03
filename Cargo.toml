@@ -34,6 +34,7 @@ hf-hub = { version = "0.3", features = ["tokio"] }
 tokenizers = { version = "0.21", features = ["onig"] }
 instant-distance = "0.6"
 reqwest = { version = "0.11", features = ["blocking", "json"] }
+toml = "0.8"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

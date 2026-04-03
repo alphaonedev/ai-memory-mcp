@@ -7,6 +7,7 @@ mod db;
 mod embeddings;
 mod errors;
 mod handlers;
+mod hnsw;
 mod llm;
 mod mcp;
 mod models;
@@ -356,36 +357,38 @@ fn human_age(iso: &str) -> String {
 #[tokio::main]
 async fn main() -> Result<()> {
     color::init();
+    let app_config = config::AppConfig::load();
+    config::AppConfig::write_default_if_missing();
     let cli = Cli::parse();
+    let db_path = app_config.effective_db(&cli.db);
     let j = cli.json;
     match cli.command {
-        Command::Serve(a) => serve(cli.db, a).await,
+        Command::Serve(a) => serve(db_path, a).await,
         Command::Mcp { tier } => {
-            let feature_tier = config::FeatureTier::from_str(&tier)
-                .unwrap_or(config::FeatureTier::Semantic);
-            mcp::run_mcp_server(&cli.db, feature_tier)?;
+            let feature_tier = app_config.effective_tier(Some(&tier));
+            mcp::run_mcp_server(&db_path, feature_tier, &app_config)?;
             Ok(())
         }
-        Command::Store(a) => cmd_store(cli.db, a, j),
-        Command::Update(a) => cmd_update(cli.db, a, j),
-        Command::Recall(a) => cmd_recall(cli.db, a, j),
-        Command::Search(a) => cmd_search(cli.db, a, j),
-        Command::Get(a) => cmd_get(cli.db, a, j),
-        Command::List(a) => cmd_list(cli.db, a, j),
-        Command::Delete(a) => cmd_delete(cli.db, a, j),
-        Command::Promote(a) => cmd_promote(cli.db, a, j),
-        Command::Forget(a) => cmd_forget(cli.db, a, j),
-        Command::Link(a) => cmd_link(cli.db, a, j),
-        Command::Consolidate(a) => cmd_consolidate(cli.db, a, j),
-        Command::Resolve(a) => cmd_resolve(cli.db, a, j),
-        Command::Shell => cmd_shell(cli.db),
-        Command::Sync(a) => cmd_sync(cli.db, a, j),
-        Command::AutoConsolidate(a) => cmd_auto_consolidate(cli.db, a, j),
-        Command::Gc => cmd_gc(cli.db, j),
-        Command::Stats => cmd_stats(cli.db, j),
-        Command::Namespaces => cmd_namespaces(cli.db, j),
-        Command::Export => cmd_export(cli.db),
-        Command::Import => cmd_import(cli.db, j),
+        Command::Store(a) => cmd_store(db_path, a, j),
+        Command::Update(a) => cmd_update(db_path, a, j),
+        Command::Recall(a) => cmd_recall(db_path, a, j),
+        Command::Search(a) => cmd_search(db_path, a, j),
+        Command::Get(a) => cmd_get(db_path, a, j),
+        Command::List(a) => cmd_list(db_path, a, j),
+        Command::Delete(a) => cmd_delete(db_path, a, j),
+        Command::Promote(a) => cmd_promote(db_path, a, j),
+        Command::Forget(a) => cmd_forget(db_path, a, j),
+        Command::Link(a) => cmd_link(db_path, a, j),
+        Command::Consolidate(a) => cmd_consolidate(db_path, a, j),
+        Command::Resolve(a) => cmd_resolve(db_path, a, j),
+        Command::Shell => cmd_shell(db_path),
+        Command::Sync(a) => cmd_sync(db_path, a, j),
+        Command::AutoConsolidate(a) => cmd_auto_consolidate(db_path, a, j),
+        Command::Gc => cmd_gc(db_path, j),
+        Command::Stats => cmd_stats(db_path, j),
+        Command::Namespaces => cmd_namespaces(db_path, j),
+        Command::Export => cmd_export(db_path),
+        Command::Import => cmd_import(db_path, j),
         Command::Completions(a) => {
             generate(
                 a.shell,

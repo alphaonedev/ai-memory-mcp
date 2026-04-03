@@ -224,6 +224,102 @@ impl OllamaClient {
         Ok(tags)
     }
 
+    /// Generate an embedding vector via Ollama's /api/embed endpoint.
+    ///
+    /// Used for nomic-embed-text-v1.5 on smart/autonomous tiers.
+    pub fn embed_text(&self, text: &str, embed_model: &str) -> Result<Vec<f32>> {
+        let url = format!("{}/api/embed", self.base_url);
+        let payload = json!({
+            "model": embed_model,
+            "input": text,
+        });
+
+        let resp = self
+            .client
+            .post(&url)
+            .timeout(GENERATE_TIMEOUT)
+            .json(&payload)
+            .send()
+            .context("Failed to send embed request to Ollama")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().unwrap_or_default();
+            return Err(anyhow!("Ollama embed failed ({}): {}", status, text));
+        }
+
+        let body: Value = resp
+            .json()
+            .context("Failed to parse Ollama embed response")?;
+
+        // Ollama returns {"embeddings": [[...], ...]} — take the first one
+        let embedding = body["embeddings"]
+            .as_array()
+            .and_then(|arr| arr.first())
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| anyhow!("Missing embeddings in Ollama response"))?;
+
+        let floats: Vec<f32> = embedding
+            .iter()
+            .filter_map(|v| v.as_f64().map(|f| f as f32))
+            .collect();
+
+        if floats.is_empty() {
+            return Err(anyhow!("Empty embedding returned from Ollama"));
+        }
+
+        Ok(floats)
+    }
+
+    /// Ensure an embedding model is pulled in Ollama.
+    pub fn ensure_embed_model(&self, model: &str) -> Result<()> {
+        let url = format!("{}/api/tags", self.base_url);
+        let resp = self
+            .client
+            .get(&url)
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .context("Failed to list Ollama models")?;
+
+        let body: Value = resp.json().context("Failed to parse /api/tags response")?;
+        let model_exists = body["models"]
+            .as_array()
+            .map(|models| {
+                models.iter().any(|m| {
+                    let name = m["name"].as_str().unwrap_or("");
+                    name == model
+                        || name.starts_with(&format!("{}:", model))
+                        || model == name.split(':').next().unwrap_or("")
+                })
+            })
+            .unwrap_or(false);
+
+        if model_exists {
+            return Ok(());
+        }
+
+        tracing::info!("Pulling Ollama embedding model '{}'...", model);
+        let pull_url = format!("{}/api/pull", self.base_url);
+        let pull_client = reqwest::blocking::Client::builder()
+            .timeout(PULL_TIMEOUT)
+            .build()
+            .context("Failed to build pull client")?;
+        let resp = pull_client
+            .post(&pull_url)
+            .json(&json!({ "name": model }))
+            .send()
+            .context("Failed to pull embedding model from Ollama")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().unwrap_or_default();
+            return Err(anyhow!("Ollama embed model pull failed ({}): {}", status, text));
+        }
+
+        tracing::info!("Embedding model '{}' pulled successfully", model);
+        Ok(())
+    }
+
     /// Returns true if two memory contents contradict each other.
     pub fn detect_contradiction(&self, mem_a: &str, mem_b: &str) -> Result<bool> {
         let prompt = CONTRADICTION_PROMPT
