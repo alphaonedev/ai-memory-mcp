@@ -1011,8 +1011,26 @@ pub fn run_mcp_server(db_path: &Path, tier: FeatureTier, app_config: &AppConfig)
     let stdin = io::stdin();
     let mut stdout = io::stdout();
 
-    let tier_config = tier.config();
+    let mut tier_config = tier.config();
     eprintln!("ai-memory: requested tier = {}", tier.as_str());
+
+    // Apply config.toml overrides — tiers gate features, models are independently configurable
+    // Only override if the tier actually uses an LLM (smart/autonomous)
+    if tier_config.llm_model.is_some() {
+        if let Some(ref llm_override) = app_config.llm_model {
+            match llm_override.as_str() {
+                "gemma4:e2b" => {
+                    tier_config.llm_model = Some(crate::config::LlmModel::Gemma4E2B);
+                    eprintln!("ai-memory: llm_model override from config: gemma4:e2b");
+                }
+                "gemma4:e4b" => {
+                    tier_config.llm_model = Some(crate::config::LlmModel::Gemma4E4B);
+                    eprintln!("ai-memory: llm_model override from config: gemma4:e4b");
+                }
+                other => eprintln!("ai-memory: unknown llm_model '{}', using tier default", other),
+            }
+        }
+    }
 
     // --- Initialize LLM (smart tier and above) — before embedder so Ollama
     //     client can be shared with nomic embedder ---

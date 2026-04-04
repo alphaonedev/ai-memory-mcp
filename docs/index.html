@@ -842,8 +842,9 @@
         </div>
 
         <p style="font-size:.88rem;margin-top:1.5rem">
-            <strong>Graceful fallback:</strong> If Ollama is unavailable at startup, smart and autonomous tiers fall back to semantic automatically. You never lose access to your memories.
-            The <code>--tier</code> flag must be passed in the MCP args -- the <code>config.toml</code> tier setting is not used when the server is launched by an AI client.
+            <strong>Tiers gate features, not models.</strong> The <code>--tier</code> flag controls which tools are exposed. The LLM model is independently configurable via <code>llm_model</code> in <code>config.toml</code>.
+            For example, run autonomous tier (all features) with the faster e2b model: <code>llm_model = "gemma4:e2b"</code> (46 tok/s vs 26 tok/s for e4b).
+            If Ollama is unavailable at startup, smart and autonomous tiers fall back to semantic automatically.
         </p>
 
         <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:1.25rem;margin-top:1.25rem">
@@ -851,10 +852,10 @@
             <pre style="margin:0;font-size:.8rem"><code><span class="tok-cm"># ~/.config/ai-memory/config.toml</span>
 <span class="tok-cm"># Created automatically on first run with defaults commented out</span>
 
-<span class="tok-flag">tier</span> = <span class="tok-str">"smart"</span>                        <span class="tok-cm"># keyword | semantic | smart | autonomous</span>
+<span class="tok-flag">tier</span> = <span class="tok-str">"autonomous"</span>                   <span class="tok-cm"># keyword | semantic | smart | autonomous</span>
 <span class="tok-flag">db</span> = <span class="tok-str">"~/.claude/ai-memory.db"</span>         <span class="tok-cm"># SQLite database path</span>
 <span class="tok-flag">ollama_url</span> = <span class="tok-str">"http://localhost:11434"</span> <span class="tok-cm"># Ollama API endpoint</span>
-<span class="tok-flag">llm_model</span> = <span class="tok-str">"gemma4:e2b"</span>             <span class="tok-cm"># LLM model tag (smart: e2b, autonomous: e4b)</span>
+<span class="tok-flag">llm_model</span> = <span class="tok-str">"gemma4:e2b"</span>             <span class="tok-cm"># independently configurable (e2b=46tok/s, e4b=26tok/s)</span>
 <span class="tok-flag">cross_encoder</span> = <span class="tok-kw">true</span>                 <span class="tok-cm"># Neural reranking (autonomous tier)</span>
 <span class="tok-flag">default_namespace</span> = <span class="tok-str">"global"</span>         <span class="tok-cm"># Default namespace for new memories</span><span class="lang-label">toml</span></code></pre>
         </div>

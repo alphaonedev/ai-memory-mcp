@@ -468,7 +468,17 @@ Every capability mapped to its minimum tier. Each tier includes all capabilities
 | External dependencies | None | None | Ollama | Ollama |
 | MCP tools exposed | 13 | 14 | 17 | 17 |
 
-**Semantic tier** (default) bundles the Candle ML framework and downloads the all-MiniLM-L6-v2 model on first run (~90 MB). **Smart** and **autonomous** tiers require [Ollama](https://ollama.com) running locally with the appropriate models. The `--tier` flag **must** be passed in the MCP args -- the `config.toml` tier setting is not used when the server is launched by an AI client.
+**Semantic tier** (default) bundles the Candle ML framework and downloads the all-MiniLM-L6-v2 model on first run (~90 MB). **Smart** and **autonomous** tiers require [Ollama](https://ollama.com) running locally.
+
+**Tiers gate features, not models.** The `--tier` flag controls which tools are exposed. The LLM model is independently configurable via `llm_model` in `~/.config/ai-memory/config.toml`. For example, run autonomous tier (all 17 tools + reranker) with the faster e2b model:
+
+```toml
+# ~/.config/ai-memory/config.toml
+tier = "autonomous"        # all features enabled
+llm_model = "gemma4:e2b"   # faster model (46 tok/s vs 26 tok/s for e4b)
+```
+
+The `--tier` flag **must** be passed in the MCP args -- the `config.toml` tier setting is not used when the server is launched by an AI client.
 
 ```bash
 # Keyword (default)
