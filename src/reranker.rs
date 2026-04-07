@@ -63,7 +63,10 @@ impl CrossEncoder {
         match Self::load_neural() {
             Ok(ce) => ce,
             Err(e) => {
-                eprintln!("ai-memory: neural cross-encoder failed ({}), using lexical fallback", e);
+                eprintln!(
+                    "ai-memory: neural cross-encoder failed ({}), using lexical fallback",
+                    e
+                );
                 Self::Lexical
             }
         }
@@ -73,11 +76,20 @@ impl CrossEncoder {
         let device = Device::Cpu;
 
         let api = Api::new().context("failed to init HuggingFace Hub API")?;
-        let repo = api.repo(Repo::new(CROSS_ENCODER_MODEL_ID.to_string(), RepoType::Model));
+        let repo = api.repo(Repo::new(
+            CROSS_ENCODER_MODEL_ID.to_string(),
+            RepoType::Model,
+        ));
 
-        let config_path = repo.get("config.json").context("failed to download config.json")?;
-        let tokenizer_path = repo.get("tokenizer.json").context("failed to download tokenizer.json")?;
-        let weights_path = repo.get("model.safetensors").context("failed to download model.safetensors")?;
+        let config_path = repo
+            .get("config.json")
+            .context("failed to download config.json")?;
+        let tokenizer_path = repo
+            .get("tokenizer.json")
+            .context("failed to download tokenizer.json")?;
+        let weights_path = repo
+            .get("model.safetensors")
+            .context("failed to download model.safetensors")?;
 
         // Load BERT config
         let config_data = std::fs::read_to_string(&config_path)
@@ -129,11 +141,28 @@ impl CrossEncoder {
     pub fn score(&self, query: &str, title: &str, content: &str) -> f32 {
         match self {
             Self::Lexical => lexical_score(query, title, content),
-            Self::Neural { model, tokenizer, classifier_weight, classifier_bias, device } => {
-                match Self::neural_score(model, tokenizer, classifier_weight, classifier_bias, device, query, title, content) {
+            Self::Neural {
+                model,
+                tokenizer,
+                classifier_weight,
+                classifier_bias,
+                device,
+            } => {
+                match Self::neural_score(
+                    model,
+                    tokenizer,
+                    classifier_weight,
+                    classifier_bias,
+                    device,
+                    query,
+                    title,
+                    content,
+                ) {
                     Ok(s) => s,
                     Err(e) => {
-                        tracing::warn!("neural cross-encoder score failed: {e}, using lexical fallback");
+                        tracing::warn!(
+                            "neural cross-encoder score failed: {e}, using lexical fallback"
+                        );
                         lexical_score(query, title, content)
                     }
                 }
@@ -196,11 +225,7 @@ impl CrossEncoder {
     /// **Blend formula:** `final = 0.6 * original + 0.4 * cross_encoder`
     ///
     /// Results are returned sorted by `final_score` descending.
-    pub fn rerank(
-        &self,
-        query: &str,
-        mut candidates: Vec<(Memory, f64)>,
-    ) -> Vec<(Memory, f64)> {
+    pub fn rerank(&self, query: &str, mut candidates: Vec<(Memory, f64)>) -> Vec<(Memory, f64)> {
         let mut scored: Vec<(Memory, f64)> = candidates
             .drain(..)
             .map(|(mem, original_score)| {
@@ -245,7 +270,11 @@ fn lexical_score(query: &str, title: &str, content: &str) -> f32 {
     // 1. Jaccard term overlap
     let intersection = query_set.intersection(&doc_terms).count() as f32;
     let union = query_set.union(&doc_terms).count() as f32;
-    let jaccard = if union > 0.0 { intersection / union } else { 0.0 };
+    let jaccard = if union > 0.0 {
+        intersection / union
+    } else {
+        0.0
+    };
 
     // 2. TF-IDF-like term weighting
     let doc_all: Vec<&str> = title_terms
@@ -320,10 +349,7 @@ fn tfidf_score(query_terms: &[&str], doc_tokens: &[&str]) -> f32 {
         }
 
         let tf_norm = tf / total;
-        let doc_freq = tf_map
-            .keys()
-            .filter(|k| k.to_lowercase() == *qt)
-            .count() as f32;
+        let doc_freq = tf_map.keys().filter(|k| k.to_lowercase() == *qt).count() as f32;
         let idf = (unique / (1.0 + doc_freq)).ln() + 1.0;
 
         score_sum += tf_norm * idf;
@@ -379,7 +405,11 @@ mod tests {
     #[test]
     fn lexical_score_rewards_title_match() {
         let content = "This document discusses network configuration for LAN setups.";
-        let s_title_match = lexical_score("network configuration", "Network Configuration Guide", content);
+        let s_title_match = lexical_score(
+            "network configuration",
+            "Network Configuration Guide",
+            content,
+        );
         let s_no_title = lexical_score("network configuration", "Unrelated Title", content);
         assert!(
             s_title_match > s_no_title,
@@ -402,10 +432,7 @@ mod tests {
         let ce = CrossEncoder::new();
         let a = make_memory("Rust cross-encoder", "cross-encoder reranking for search");
         let b = make_memory("Grocery list", "milk eggs bread butter cheese");
-        let candidates = vec![
-            (b.clone(), 0.55),
-            (a.clone(), 0.45),
-        ];
+        let candidates = vec![(b.clone(), 0.55), (a.clone(), 0.45)];
         let reranked = ce.rerank("cross-encoder reranking", candidates);
         assert_eq!(reranked[0].0.title, "Rust cross-encoder");
     }

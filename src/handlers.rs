@@ -332,13 +332,16 @@ pub async fn recall_memories_get(
         p.until.as_deref(),
     ) {
         Ok(r) => {
-            let scored: Vec<serde_json::Value> = r.iter().map(|(m, s)| {
-                let mut v = serde_json::to_value(m).unwrap_or_default();
-                if let Some(obj) = v.as_object_mut() {
-                    obj.insert("score".to_string(), json!((*s * 1000.0).round() / 1000.0));
-                }
-                v
-            }).collect();
+            let scored: Vec<serde_json::Value> = r
+                .iter()
+                .map(|(m, s)| {
+                    let mut v = serde_json::to_value(m).unwrap_or_default();
+                    if let Some(obj) = v.as_object_mut() {
+                        obj.insert("score".to_string(), json!((*s * 1000.0).round() / 1000.0));
+                    }
+                    v
+                })
+                .collect();
             Json(json!({"memories": scored, "count": scored.len()})).into_response()
         }
         Err(e) => {
@@ -375,13 +378,16 @@ pub async fn recall_memories_post(
         body.until.as_deref(),
     ) {
         Ok(r) => {
-            let scored: Vec<serde_json::Value> = r.iter().map(|(m, s)| {
-                let mut v = serde_json::to_value(m).unwrap_or_default();
-                if let Some(obj) = v.as_object_mut() {
-                    obj.insert("score".to_string(), json!((*s * 1000.0).round() / 1000.0));
-                }
-                v
-            }).collect();
+            let scored: Vec<serde_json::Value> = r
+                .iter()
+                .map(|(m, s)| {
+                    let mut v = serde_json::to_value(m).unwrap_or_default();
+                    if let Some(obj) = v.as_object_mut() {
+                        obj.insert("score".to_string(), json!((*s * 1000.0).round() / 1000.0));
+                    }
+                    v
+                })
+                .collect();
             Json(json!({"memories": scored, "count": scored.len()})).into_response()
         }
         Err(e) => {
@@ -731,7 +737,16 @@ mod tests {
             expires_at: None,
         };
         db::insert(&lock.0, &mem).unwrap();
-        let results = db::recall(&lock.0, "recall handler", Some("test"), 10, None, None, None).unwrap();
+        let results = db::recall(
+            &lock.0,
+            "recall handler",
+            Some("test"),
+            10,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(!results.is_empty());
         assert!(results[0].1 > 0.0); // has score
     }
@@ -754,7 +769,18 @@ mod tests {
     async fn list_empty_namespace() {
         let state = test_state();
         let lock = state.lock().await;
-        let results = db::list(&lock.0, Some("nonexistent"), None, 10, 0, None, None, None, None).unwrap();
+        let results = db::list(
+            &lock.0,
+            Some("nonexistent"),
+            None,
+            10,
+            0,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(results.is_empty());
     }
 }

@@ -653,7 +653,12 @@ fn cmd_update(db_path: PathBuf, args: UpdateArgs, json_out: bool) -> Result<()> 
     Ok(())
 }
 
-fn cmd_recall(db_path: PathBuf, args: RecallArgs, json_out: bool, app_config: &config::AppConfig) -> Result<()> {
+fn cmd_recall(
+    db_path: PathBuf,
+    args: RecallArgs,
+    json_out: bool,
+    app_config: &config::AppConfig,
+) -> Result<()> {
     let conn = db::open(&db_path)?;
     let _ = db::gc_if_needed(&conn);
 
@@ -716,9 +721,7 @@ fn cmd_recall(db_path: PathBuf, args: RecallArgs, json_out: bool, app_config: &c
     // Build HNSW vector index if embedder is available
     let vector_index = if embedder.is_some() {
         match db::get_all_embeddings(&conn) {
-            Ok(entries) if !entries.is_empty() => {
-                Some(hnsw::VectorIndex::build(entries))
-            }
+            Ok(entries) if !entries.is_empty() => Some(hnsw::VectorIndex::build(entries)),
             _ => Some(hnsw::VectorIndex::empty()),
         }
     } else {
@@ -756,30 +759,44 @@ fn cmd_recall(db_path: PathBuf, args: RecallArgs, json_out: bool, app_config: &c
             Err(e) => {
                 eprintln!("ai-memory: embedding query failed: {e}, falling back to keyword");
                 let results = db::recall(
-                    &conn, &args.context, args.namespace.as_deref(),
-                    args.limit, args.tags.as_deref(),
-                    args.since.as_deref(), args.until.as_deref(),
+                    &conn,
+                    &args.context,
+                    args.namespace.as_deref(),
+                    args.limit,
+                    args.tags.as_deref(),
+                    args.since.as_deref(),
+                    args.until.as_deref(),
                 )?;
                 (results, "keyword")
             }
         }
     } else {
         let results = db::recall(
-            &conn, &args.context, args.namespace.as_deref(),
-            args.limit, args.tags.as_deref(),
-            args.since.as_deref(), args.until.as_deref(),
+            &conn,
+            &args.context,
+            args.namespace.as_deref(),
+            args.limit,
+            args.tags.as_deref(),
+            args.since.as_deref(),
+            args.until.as_deref(),
         )?;
         (results, "keyword")
     };
 
     if json_out {
-        let scored: Vec<serde_json::Value> = results.iter().map(|(m, s)| {
-            let mut v = serde_json::to_value(m).unwrap_or_default();
-            if let Some(obj) = v.as_object_mut() {
-                obj.insert("score".to_string(), serde_json::json!((s * 1000.0).round() / 1000.0));
-            }
-            v
-        }).collect();
+        let scored: Vec<serde_json::Value> = results
+            .iter()
+            .map(|(m, s)| {
+                let mut v = serde_json::to_value(m).unwrap_or_default();
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert(
+                        "score".to_string(),
+                        serde_json::json!((s * 1000.0).round() / 1000.0),
+                    );
+                }
+                v
+            })
+            .collect();
         println!(
             "{}",
             serde_json::to_string(
@@ -1597,8 +1614,12 @@ fn cmd_auto_consolidate(db_path: PathBuf, args: AutoConsolidateArgs, json_out: b
 }
 
 fn cmd_mine(db_path: PathBuf, args: MineArgs, json_out: bool) -> Result<()> {
-    let format = mine::Format::from_str(&args.format)
-        .ok_or_else(|| anyhow::anyhow!("invalid format: {} (use claude, chatgpt, slack)", args.format))?;
+    let format = mine::Format::from_str(&args.format).ok_or_else(|| {
+        anyhow::anyhow!(
+            "invalid format: {} (use claude, chatgpt, slack)",
+            args.format
+        )
+    })?;
     let tier = Tier::from_str(&args.tier)
         .ok_or_else(|| anyhow::anyhow!("invalid tier: {} (use short, mid, long)", args.tier))?;
     let namespace = args.namespace.unwrap_or_else(|| match format {
@@ -1694,9 +1715,9 @@ fn cmd_mine(db_path: PathBuf, args: MineArgs, json_out: bool) -> Result<()> {
             }
         };
 
-        let expires_at = tier.default_ttl_secs().map(|s| {
-            (now + Duration::seconds(s)).to_rfc3339()
-        });
+        let expires_at = tier
+            .default_ttl_secs()
+            .map(|s| (now + Duration::seconds(s)).to_rfc3339());
 
         let mem = models::Memory {
             id: uuid::Uuid::new_v4().to_string(),

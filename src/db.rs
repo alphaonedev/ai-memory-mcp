@@ -138,10 +138,7 @@ fn migrate(conn: &Connection) -> Result<()> {
             }
             drop(stmt);
             if !has_embedding {
-                conn.execute(
-                    "ALTER TABLE memories ADD COLUMN embedding BLOB",
-                    [],
-                )?;
+                conn.execute("ALTER TABLE memories ADD COLUMN embedding BLOB", [])?;
             }
         }
         conn.execute("DELETE FROM schema_version", [])?;
@@ -882,9 +879,8 @@ pub fn get_embedding(conn: &Connection, id: &str) -> Result<Option<Vec<f32>>> {
 
 /// Get all memory IDs that are missing embeddings.
 pub fn get_unembedded_ids(conn: &Connection) -> Result<Vec<(String, String, String)>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, title, content FROM memories WHERE embedding IS NULL"
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT id, title, content FROM memories WHERE embedding IS NULL")?;
     let rows = stmt.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -892,14 +888,14 @@ pub fn get_unembedded_ids(conn: &Connection) -> Result<Vec<(String, String, Stri
             row.get::<_, String>(2)?,
         ))
     })?;
-    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
 }
 
 /// Get all stored embeddings as (id, embedding) pairs for building the HNSW index.
 pub fn get_all_embeddings(conn: &Connection) -> Result<Vec<(String, Vec<f32>)>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, embedding FROM memories WHERE embedding IS NOT NULL"
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT id, embedding FROM memories WHERE embedding IS NOT NULL")?;
     let rows = stmt.query_map([], |row| {
         let id: String = row.get(0)?;
         let bytes: Vec<u8> = row.get(1)?;
@@ -982,7 +978,15 @@ pub fn recall_hybrid(
     let mut scored: HashMap<String, (Memory, f64, f64)> = HashMap::new(); // id -> (memory, fts_score, cosine_score)
 
     let fts_rows = fts_stmt.query_map(
-        params![fts_query, namespace, now, tags_filter, since, until, fts_limit as i64],
+        params![
+            fts_query,
+            namespace,
+            now,
+            tags_filter,
+            since,
+            until,
+            fts_limit as i64
+        ],
         |row| {
             let mem = row_to_memory(row)?;
             let fts_score: f64 = row.get(15)?;
@@ -1018,19 +1022,29 @@ pub fn recall_hybrid(
                 if let Some(mem) = get(conn, &hit.id)? {
                     // Apply namespace/expiry/tag filters
                     if let Some(ns) = namespace {
-                        if mem.namespace != ns { continue; }
+                        if mem.namespace != ns {
+                            continue;
+                        }
                     }
                     if let Some(exp) = &mem.expires_at {
-                        if exp.as_str() <= now.as_str() { continue; }
+                        if exp.as_str() <= now.as_str() {
+                            continue;
+                        }
                     }
                     if let Some(tf) = tags_filter {
-                        if !mem.tags.iter().any(|t| t == tf) { continue; }
+                        if !mem.tags.iter().any(|t| t == tf) {
+                            continue;
+                        }
                     }
                     if let Some(s) = since {
-                        if mem.created_at.as_str() < s { continue; }
+                        if mem.created_at.as_str() < s {
+                            continue;
+                        }
                     }
                     if let Some(u) = until {
-                        if mem.created_at.as_str() > u { continue; }
+                        if mem.created_at.as_str() > u {
+                            continue;
+                        }
                     }
                     scored.insert(mem.id.clone(), (mem, 0.0, cosine));
                 }
@@ -1038,14 +1052,12 @@ pub fn recall_hybrid(
         }
     } else {
         // Fallback: linear scan over all embeddings
-        let sem_rows = sem_stmt.query_map(
-            params![namespace, now, tags_filter, since, until],
-            |row| {
+        let sem_rows =
+            sem_stmt.query_map(params![namespace, now, tags_filter, since, until], |row| {
                 let mem = row_to_memory(row)?;
                 let emb_bytes: Option<Vec<u8>> = row.get(14)?;
                 Ok((mem, emb_bytes))
-            },
-        )?;
+            })?;
 
         for row in sem_rows {
             let (mem, emb_bytes) = row?;
@@ -1058,7 +1070,9 @@ pub fn recall_hybrid(
                         .chunks_exact(4)
                         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                         .collect();
-                    let cosine = crate::embeddings::Embedder::cosine_similarity(query_embedding, &emb) as f64;
+                    let cosine =
+                        crate::embeddings::Embedder::cosine_similarity(query_embedding, &emb)
+                            as f64;
                     if cosine > 0.3 {
                         scored.insert(mem.id.clone(), (mem, 0.0, cosine));
                     }
@@ -1074,7 +1088,11 @@ pub fn recall_hybrid(
     let mut results: Vec<(Memory, f64)> = scored
         .into_values()
         .map(|(mem, fts_score, cosine)| {
-            let norm_fts = if max_fts_score > 0.0 { fts_score / max_fts_score } else { 0.0 };
+            let norm_fts = if max_fts_score > 0.0 {
+                fts_score / max_fts_score
+            } else {
+                0.0
+            };
             let content_len = mem.content.len() as f64;
             // Lerp semantic_weight from 0.50 (≤500 chars) to 0.15 (≥5000 chars)
             let semantic_weight = if content_len <= 500.0 {
@@ -1143,9 +1161,9 @@ mod tests {
             created_at: now.clone(),
             updated_at: now,
             last_accessed_at: None,
-            expires_at: tier.default_ttl_secs().map(|s| {
-                (chrono::Utc::now() + chrono::Duration::seconds(s)).to_rfc3339()
-            }),
+            expires_at: tier
+                .default_ttl_secs()
+                .map(|s| (chrono::Utc::now() + chrono::Duration::seconds(s)).to_rfc3339()),
         }
     }
 
@@ -1182,7 +1200,19 @@ mod tests {
         let mem = make_memory("Original", "test", Tier::Mid, 5);
         let id = insert(&conn, &mem).unwrap();
 
-        let updated = update(&conn, &id, Some("Updated Title"), None, None, None, None, Some(9), None, None).unwrap();
+        let updated = update(
+            &conn,
+            &id,
+            Some("Updated Title"),
+            None,
+            None,
+            None,
+            None,
+            Some(9),
+            None,
+            None,
+        )
+        .unwrap();
         assert!(updated);
 
         let got = get(&conn, &id).unwrap().unwrap();
@@ -1194,7 +1224,19 @@ mod tests {
     #[test]
     fn update_nonexistent_returns_false() {
         let conn = test_db();
-        let updated = update(&conn, "bad-id", Some("New"), None, None, None, None, None, None, None).unwrap();
+        let updated = update(
+            &conn,
+            "bad-id",
+            Some("New"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(!updated);
     }
 
@@ -1230,7 +1272,18 @@ mod tests {
         insert(&conn, &make_memory("Long", "test", Tier::Long, 5)).unwrap();
         insert(&conn, &make_memory("Mid", "test", Tier::Mid, 5)).unwrap();
 
-        let results = list(&conn, None, Some(&Tier::Long), 100, 0, None, None, None, None).unwrap();
+        let results = list(
+            &conn,
+            None,
+            Some(&Tier::Long),
+            100,
+            0,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].title, "Long");
     }
@@ -1239,7 +1292,11 @@ mod tests {
     fn list_with_limit() {
         let conn = test_db();
         for i in 0..5 {
-            insert(&conn, &make_memory(&format!("Mem {i}"), "test", Tier::Long, 5)).unwrap();
+            insert(
+                &conn,
+                &make_memory(&format!("Mem {i}"), "test", Tier::Long, 5),
+            )
+            .unwrap();
         }
         let results = list(&conn, None, None, 3, 0, None, None, None, None).unwrap();
         assert_eq!(results.len(), 3);
@@ -1248,7 +1305,11 @@ mod tests {
     #[test]
     fn search_keyword_match() {
         let conn = test_db();
-        insert(&conn, &make_memory("PostgreSQL config", "test", Tier::Long, 5)).unwrap();
+        insert(
+            &conn,
+            &make_memory("PostgreSQL config", "test", Tier::Long, 5),
+        )
+        .unwrap();
         insert(&conn, &make_memory("Redis cache", "test", Tier::Long, 5)).unwrap();
 
         let results = search(&conn, "PostgreSQL", None, None, 10, None, None, None, None).unwrap();
@@ -1260,15 +1321,34 @@ mod tests {
     fn search_no_match() {
         let conn = test_db();
         insert(&conn, &make_memory("PostgreSQL", "test", Tier::Long, 5)).unwrap();
-        let results = search(&conn, "nonexistent_term_xyz", None, None, 10, None, None, None, None).unwrap();
+        let results = search(
+            &conn,
+            "nonexistent_term_xyz",
+            None,
+            None,
+            10,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(results.len(), 0);
     }
 
     #[test]
     fn recall_returns_scored() {
         let conn = test_db();
-        insert(&conn, &make_memory("Rust programming language", "test", Tier::Long, 8)).unwrap();
-        insert(&conn, &make_memory("Python scripting", "test", Tier::Long, 5)).unwrap();
+        insert(
+            &conn,
+            &make_memory("Rust programming language", "test", Tier::Long, 8),
+        )
+        .unwrap();
+        insert(
+            &conn,
+            &make_memory("Python scripting", "test", Tier::Long, 5),
+        )
+        .unwrap();
 
         let results = recall(&conn, "Rust programming", None, 10, None, None, None).unwrap();
         assert!(!results.is_empty());
@@ -1305,8 +1385,16 @@ mod tests {
     #[test]
     fn find_contradictions_similar_titles() {
         let conn = test_db();
-        insert(&conn, &make_memory("Database is PostgreSQL", "infra", Tier::Long, 8)).unwrap();
-        insert(&conn, &make_memory("Database is MySQL", "infra", Tier::Long, 5)).unwrap();
+        insert(
+            &conn,
+            &make_memory("Database is PostgreSQL", "infra", Tier::Long, 8),
+        )
+        .unwrap();
+        insert(
+            &conn,
+            &make_memory("Database is MySQL", "infra", Tier::Long, 5),
+        )
+        .unwrap();
 
         let contradictions = find_contradictions(&conn, "Database is PostgreSQL", "infra").unwrap();
         assert!(!contradictions.is_empty());
@@ -1330,7 +1418,16 @@ mod tests {
         let id1 = insert(&conn, &make_memory("Part 1", "test", Tier::Mid, 5)).unwrap();
         let id2 = insert(&conn, &make_memory("Part 2", "test", Tier::Mid, 5)).unwrap();
 
-        let new_id = consolidate(&conn, &[id1.clone(), id2.clone()], "Combined", "Part 1 + Part 2", "test", &Tier::Long, "test").unwrap();
+        let new_id = consolidate(
+            &conn,
+            &[id1.clone(), id2.clone()],
+            "Combined",
+            "Part 1 + Part 2",
+            "test",
+            &Tier::Long,
+            "test",
+        )
+        .unwrap();
         // Original memories should be deleted
         assert!(get(&conn, &id1).unwrap().is_none());
         assert!(get(&conn, &id2).unwrap().is_none());

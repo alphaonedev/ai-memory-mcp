@@ -2026,7 +2026,11 @@ fn test_mcp_prompts_list() {
         .and_then(|mut child| {
             use std::io::Write;
             if let Some(ref mut stdin) = child.stdin {
-                writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"prompts/list","params":{{}}}}"#).ok();
+                writeln!(
+                    stdin,
+                    r#"{{"jsonrpc":"2.0","id":1,"method":"prompts/list","params":{{}}}}"#
+                )
+                .ok();
             }
             drop(child.stdin.take());
             child.wait_with_output()
@@ -2034,8 +2038,11 @@ fn test_mcp_prompts_list() {
         .expect("failed to run mcp");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let resp: serde_json::Value = serde_json::from_str(stdout.trim()).expect("invalid JSON response");
-    let prompts = resp["result"]["prompts"].as_array().expect("prompts should be array");
+    let resp: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("invalid JSON response");
+    let prompts = resp["result"]["prompts"]
+        .as_array()
+        .expect("prompts should be array");
     assert_eq!(prompts.len(), 2);
     assert_eq!(prompts[0]["name"], "recall-first");
     assert_eq!(prompts[1]["name"], "memory-workflow");
@@ -2047,7 +2054,10 @@ fn test_mcp_prompts_list() {
 fn test_mcp_prompts_get_recall_first() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
     let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-mcp-prompt-get-{}.db", uuid::Uuid::new_v4()));
+    let db_path = dir.join(format!(
+        "ai-memory-mcp-prompt-get-{}.db",
+        uuid::Uuid::new_v4()
+    ));
 
     let output = cmd(binary)
         .args(["--db", db_path.to_str().unwrap(), "mcp"])
@@ -2066,13 +2076,24 @@ fn test_mcp_prompts_get_recall_first() {
         .expect("failed to run mcp");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let resp: serde_json::Value = serde_json::from_str(stdout.trim()).expect("invalid JSON response");
-    let messages = resp["result"]["messages"].as_array().expect("messages should be array");
+    let resp: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("invalid JSON response");
+    let messages = resp["result"]["messages"]
+        .as_array()
+        .expect("messages should be array");
     assert_eq!(messages.len(), 1);
-    let text = messages[0]["content"]["text"].as_str().expect("text content");
-    assert!(text.contains("RECALL FIRST"), "should contain recall-first rule");
+    let text = messages[0]["content"]["text"]
+        .as_str()
+        .expect("text content");
+    assert!(
+        text.contains("RECALL FIRST"),
+        "should contain recall-first rule"
+    );
     assert!(text.contains("TOON"), "should mention TOON format");
-    assert!(text.contains("memory_recall"), "should reference memory_recall tool");
+    assert!(
+        text.contains("memory_recall"),
+        "should reference memory_recall tool"
+    );
 
     let _ = std::fs::remove_file(&db_path);
 }
@@ -2081,7 +2102,10 @@ fn test_mcp_prompts_get_recall_first() {
 fn test_mcp_recall_default_toon() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
     let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-mcp-toon-def-{}.db", uuid::Uuid::new_v4()));
+    let db_path = dir.join(format!(
+        "ai-memory-mcp-toon-def-{}.db",
+        uuid::Uuid::new_v4()
+    ));
 
     let output = cmd(binary)
         .args(["--db", db_path.to_str().unwrap(), "mcp"])
@@ -2102,12 +2126,22 @@ fn test_mcp_recall_default_toon() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
-    assert!(lines.len() >= 2, "expected >=2 responses, got {}", lines.len());
+    assert!(
+        lines.len() >= 2,
+        "expected >=2 responses, got {}",
+        lines.len()
+    );
 
-    let recall_resp: serde_json::Value = serde_json::from_str(lines[1]).expect("invalid recall response");
-    let text = recall_resp["result"]["content"][0]["text"].as_str().expect("recall text");
-    assert!(text.contains("memories[") || text.starts_with("count:"),
-        "default should be TOON compact, got: {}", &text[..text.len().min(100)]);
+    let recall_resp: serde_json::Value =
+        serde_json::from_str(lines[1]).expect("invalid recall response");
+    let text = recall_resp["result"]["content"][0]["text"]
+        .as_str()
+        .expect("recall text");
+    assert!(
+        text.contains("memories[") || text.starts_with("count:"),
+        "default should be TOON compact, got: {}",
+        &text[..text.len().min(100)]
+    );
     assert!(text.contains("|"), "should contain pipe delimiters");
 
     let _ = std::fs::remove_file(&db_path);

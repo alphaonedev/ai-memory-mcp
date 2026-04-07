@@ -161,14 +161,11 @@ fn parse_claude_conversation(
 
                 let content = extract_message_content(msg);
                 if !content.is_empty() {
-                    let ts = msg
-                        .get("create_time")
-                        .and_then(|t| t.as_f64())
-                        .map(|t| {
-                            chrono::DateTime::from_timestamp(t as i64, 0)
-                                .map(|dt| dt.to_rfc3339())
-                                .unwrap_or_default()
-                        });
+                    let ts = msg.get("create_time").and_then(|t| t.as_f64()).map(|t| {
+                        chrono::DateTime::from_timestamp(t as i64, 0)
+                            .map(|dt| dt.to_rfc3339())
+                            .unwrap_or_default()
+                    });
                     let sort_key = msg
                         .get("create_time")
                         .and_then(|t| t.as_f64())
@@ -243,9 +240,8 @@ pub fn parse_chatgpt(path: &Path) -> Result<Vec<Conversation>> {
                         continue;
                     }
 
-                    let content = extract_message_content(
-                        msg.as_object().unwrap_or(&serde_json::Map::new()),
-                    );
+                    let content =
+                        extract_message_content(msg.as_object().unwrap_or(&serde_json::Map::new()));
                     if content.is_empty() {
                         continue;
                     }
@@ -290,10 +286,7 @@ pub fn parse_chatgpt(path: &Path) -> Result<Vec<Conversation>> {
 /// Structure: channel_name/YYYY-MM-DD.json
 pub fn parse_slack(path: &Path) -> Result<Vec<Conversation>> {
     if !path.is_dir() {
-        bail!(
-            "Slack export path must be a directory: {}",
-            path.display()
-        );
+        bail!("Slack export path must be a directory: {}", path.display());
     }
 
     let mut conversations = Vec::new();
@@ -310,10 +303,7 @@ pub fn parse_slack(path: &Path) -> Result<Vec<Conversation>> {
         if !channel_path.is_dir() {
             continue;
         }
-        let channel_name = entry
-            .file_name()
-            .to_string_lossy()
-            .to_string();
+        let channel_name = entry.file_name().to_string_lossy().to_string();
 
         // Collect all JSON files in the channel, sorted by date
         let mut json_files: Vec<_> = fs::read_dir(&channel_path)?
@@ -412,7 +402,10 @@ fn extract_message_content(msg: &serde_json::Map<String, serde_json::Value>) -> 
     // Try content.parts array first (ChatGPT format)
     if let Some(content) = msg.get("content") {
         if let Some(parts) = content["parts"].as_array() {
-            let text: Vec<String> = parts.iter().filter_map(|p| p.as_str().map(String::from)).collect();
+            let text: Vec<String> = parts
+                .iter()
+                .filter_map(|p| p.as_str().map(String::from))
+                .collect();
             if !text.is_empty() {
                 return text.join("\n");
             }
@@ -561,8 +554,16 @@ mod tests {
             id: "test1".to_string(),
             title: Some("My Chat".to_string()),
             messages: vec![
-                Message { role: "user".to_string(), content: "Hello".to_string(), timestamp: None },
-                Message { role: "assistant".to_string(), content: "Hi!".to_string(), timestamp: None },
+                Message {
+                    role: "user".to_string(),
+                    content: "Hello".to_string(),
+                    timestamp: None,
+                },
+                Message {
+                    role: "assistant".to_string(),
+                    content: "Hi!".to_string(),
+                    timestamp: None,
+                },
             ],
             created_at: None,
         };
@@ -578,9 +579,11 @@ mod tests {
         let conv = Conversation {
             id: "test2".to_string(),
             title: None,
-            messages: vec![
-                Message { role: "user".to_string(), content: "What is the weather?".to_string(), timestamp: None },
-            ],
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: "What is the weather?".to_string(),
+                timestamp: None,
+            }],
             created_at: None,
         };
         let mem = conversation_to_memory(&conv, Format::ChatGpt).unwrap();

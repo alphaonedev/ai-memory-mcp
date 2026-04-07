@@ -13,13 +13,29 @@ use serde_json::Value;
 
 /// Standard memory fields in TOON column order.
 const MEMORY_FIELDS: &[&str] = &[
-    "id", "title", "tier", "namespace", "priority", "confidence",
-    "score", "access_count", "tags", "source", "created_at", "updated_at",
+    "id",
+    "title",
+    "tier",
+    "namespace",
+    "priority",
+    "confidence",
+    "score",
+    "access_count",
+    "tags",
+    "source",
+    "created_at",
+    "updated_at",
 ];
 
 /// Compact memory fields — omits timestamps for tighter output.
 const MEMORY_FIELDS_COMPACT: &[&str] = &[
-    "id", "title", "tier", "namespace", "priority", "score", "tags",
+    "id",
+    "title",
+    "tier",
+    "namespace",
+    "priority",
+    "score",
+    "tags",
 ];
 
 /// Serialize a recall/list/search response to TOON format.
@@ -35,7 +51,11 @@ const MEMORY_FIELDS_COMPACT: &[&str] = &[
 /// def456|Redis cache|long|infra|8|1.0|0.541|0|redis,cache|claude|2026-04-03T15:01:00+00:00|2026-04-03T15:01:00+00:00
 /// ```
 pub fn memories_to_toon(response: &Value, compact: bool) -> String {
-    let fields = if compact { MEMORY_FIELDS_COMPACT } else { MEMORY_FIELDS };
+    let fields = if compact {
+        MEMORY_FIELDS_COMPACT
+    } else {
+        MEMORY_FIELDS
+    };
     let mut out = String::with_capacity(1024);
 
     // Metadata line — key:value pairs for non-array fields
@@ -90,7 +110,13 @@ fn format_value(val: Option<&Value>) -> String {
         None | Some(Value::Null) => String::new(),
         Some(Value::String(s)) => escape_toon(s),
         Some(Value::Number(n)) => n.to_string(),
-        Some(Value::Bool(b)) => if *b { "1".to_string() } else { "0".to_string() },
+        Some(Value::Bool(b)) => {
+            if *b {
+                "1".to_string()
+            } else {
+                "0".to_string()
+            }
+        }
         Some(Value::Array(arr)) => {
             // Tags: join with comma
             let items: Vec<String> = arr
@@ -152,7 +178,11 @@ mod tests {
         let toon = memories_to_toon(&resp, false);
         let lines: Vec<&str> = toon.lines().collect();
         assert_eq!(lines.len(), 3); // meta + header + 1 row
-        assert!(lines[2].starts_with("abc-123|PostgreSQL config|long|infra|9|"), "got: {}", lines[2]);
+        assert!(
+            lines[2].starts_with("abc-123|PostgreSQL config|long|infra|9|"),
+            "got: {}",
+            lines[2]
+        );
         assert!(lines[2].contains("postgres,database"));
         assert!(lines[2].contains("claude"));
     }
@@ -191,7 +221,12 @@ mod tests {
         let toon = memories_to_toon(&resp, true);
         let json_str = serde_json::to_string(&resp).unwrap();
         // TOON should be significantly shorter than JSON
-        assert!(toon.len() < json_str.len(), "TOON ({}) should be shorter than JSON ({})", toon.len(), json_str.len());
+        assert!(
+            toon.len() < json_str.len(),
+            "TOON ({}) should be shorter than JSON ({})",
+            toon.len(),
+            json_str.len()
+        );
     }
 
     #[test]

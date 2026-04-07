@@ -324,9 +324,7 @@ impl AppConfig {
 
     /// Resolve the effective feature tier from config (CLI flag overrides).
     pub fn effective_tier(&self, cli_tier: Option<&str>) -> FeatureTier {
-        let tier_str = cli_tier
-            .or(self.tier.as_deref())
-            .unwrap_or("semantic");
+        let tier_str = cli_tier.or(self.tier.as_deref()).unwrap_or("semantic");
         FeatureTier::from_str(tier_str).unwrap_or(FeatureTier::Semantic)
     }
 
@@ -346,7 +344,9 @@ impl AppConfig {
 
     /// Resolve Ollama URL for LLM generation (config or default).
     pub fn effective_ollama_url(&self) -> &str {
-        self.ollama_url.as_deref().unwrap_or("http://localhost:11434")
+        self.ollama_url
+            .as_deref()
+            .unwrap_or("http://localhost:11434")
     }
 
     /// Resolve URL for embedding model (falls back to ollama_url).
@@ -498,7 +498,10 @@ mod tests {
             ..Default::default()
         };
         // CLI override wins
-        assert_eq!(cfg.effective_tier(Some("autonomous")), FeatureTier::Autonomous);
+        assert_eq!(
+            cfg.effective_tier(Some("autonomous")),
+            FeatureTier::Autonomous
+        );
         // Config value used when no CLI
         assert_eq!(cfg.effective_tier(None), FeatureTier::Smart);
     }
