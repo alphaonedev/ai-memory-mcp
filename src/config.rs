@@ -270,8 +270,10 @@ pub struct AppConfig {
     pub tier: Option<String>,
     /// Path to the SQLite database file
     pub db: Option<String>,
-    /// Ollama base URL (default: http://localhost:11434)
+    /// Ollama base URL for LLM generation (default: http://localhost:11434)
     pub ollama_url: Option<String>,
+    /// Separate URL for embedding model (defaults to ollama_url if unset)
+    pub embed_url: Option<String>,
     /// Embedding model override: mini_lm_l6_v2 or nomic_embed_v15
     pub embedding_model: Option<String>,
     /// LLM model override (Ollama tag, e.g. "gemma4:e2b")
@@ -338,9 +340,17 @@ impl AppConfig {
             .unwrap_or_else(|| cli_db.to_path_buf())
     }
 
-    /// Resolve Ollama URL (config or default).
+    /// Resolve Ollama URL for LLM generation (config or default).
     pub fn effective_ollama_url(&self) -> &str {
         self.ollama_url.as_deref().unwrap_or("http://localhost:11434")
+    }
+
+    /// Resolve URL for embedding model (falls back to ollama_url).
+    pub fn effective_embed_url(&self) -> &str {
+        self.embed_url
+            .as_deref()
+            .or(self.ollama_url.as_deref())
+            .unwrap_or("http://localhost:11434")
     }
 
     /// Write a default config file if one doesn't exist yet.

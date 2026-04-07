@@ -83,47 +83,80 @@ def load_dataset(dataset_path, variant):
     sys.exit(1)
 
 
-def ingest_sessions(binary, db_path, instance):
-    """Ingest all haystack sessions from one evaluation instance as memories."""
+def ingest_sessions(binary, db_path, instance, per_turn=False):
+    """Ingest all haystack sessions from one evaluation instance as memories.
+
+    If per_turn is True, each user/assistant exchange is stored as a separate
+    memory (more realistic — matches real ai-memory usage).  The session ID
+    tag is preserved on every memory so recall scoring still works.
+    """
     sessions = instance["haystack_sessions"]
     session_ids = instance["haystack_session_ids"]
-    session_dates = instance.get("haystack_dates", [None] * len(sessions))
 
     for i, (session, sid) in enumerate(zip(sessions, session_ids)):
-        # Build content from conversation turns
-        lines = []
-        for turn in session:
-            role = turn.get("role", "unknown")
-            content = turn.get("content", "")
-            lines.append(f"[{role}]: {content}")
-        full_content = "\n".join(lines)
+        if per_turn:
+            # Store each meaningful exchange as its own memory
+            turn_idx = 0
+            for turn in session:
+                role = turn.get("role", "unknown")
+                content = turn.get("content", "").strip()
+                if not content:
+                    continue
+                # Title: first 100 chars of content
+                title = content[:100]
+                # Truncate content to 64KB
+                if len(content) > 65000:
+                    content = content[:65000]
+                cmd = [
+                    binary, "--db", db_path, "store",
+                    "--tier", "long",
+                    "--namespace", "longmemeval",
+                    "--title", title,
+                    "--content", f"[{role}]: {content}",
+                    "--source", "import",
+                    "--tags", f"sid:{sid}",
+                    "--priority", "5",
+                    "--json",
+                ]
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                if result.returncode != 0 and turn_idx == 0:
+                    print(f"  Warning: Failed to store turn from {sid}: {result.stderr.strip()}", file=sys.stderr)
+                turn_idx += 1
+        else:
+            # Original: store entire session as one memory
+            lines = []
+            for turn in session:
+                role = turn.get("role", "unknown")
+                content = turn.get("content", "")
+                lines.append(f"[{role}]: {content}")
+            full_content = "\n".join(lines)
 
-        # Truncate to 64KB (ai-memory limit)
-        if len(full_content) > 65000:
-            full_content = full_content[:65000]
+            # Truncate to 64KB (ai-memory limit)
+            if len(full_content) > 65000:
+                full_content = full_content[:65000]
 
-        # Title from first user message or session ID
-        title = f"Session {sid}"
-        for turn in session:
-            if turn.get("role") == "user" and turn.get("content", "").strip():
-                title = turn["content"].strip()[:100]
-                break
+            # Title from first user message or session ID
+            title = f"Session {sid}"
+            for turn in session:
+                if turn.get("role") == "user" and turn.get("content", "").strip():
+                    title = turn["content"].strip()[:100]
+                    break
 
-        cmd = [
-            binary, "--db", db_path, "store",
-            "--tier", "long",
-            "--namespace", "longmemeval",
-            "--title", title,
-            "--content", full_content,
-            "--source", "import",
-            "--tags", f"sid:{sid}",
-            "--priority", "5",
-            "--json",
-        ]
+            cmd = [
+                binary, "--db", db_path, "store",
+                "--tier", "long",
+                "--namespace", "longmemeval",
+                "--title", title,
+                "--content", full_content,
+                "--source", "import",
+                "--tags", f"sid:{sid}",
+                "--priority", "5",
+                "--json",
+            ]
 
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if result.returncode != 0:
-            print(f"  Warning: Failed to store session {sid}: {result.stderr.strip()}", file=sys.stderr)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if result.returncode != 0:
+                print(f"  Warning: Failed to store session {sid}: {result.stderr.strip()}", file=sys.stderr)
 
 
 def evaluate_question(binary, db_path, question_text, ground_truth_sids, k_values, tier):
@@ -135,9 +168,12 @@ def evaluate_question(binary, db_path, question_text, ground_truth_sids, k_value
         "recall", question_text,
         "--limit", str(max_k),
         "--namespace", "longmemeval",
+        "--tier", tier,
     ]
 
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    # Semantic/smart/autonomous tiers need more time for embedding backfill
+    timeout = 30 if tier == "keyword" else 300
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if result.returncode != 0:
         return {k: False for k in k_values}, []
 
@@ -176,7 +212,7 @@ def evaluate_question(binary, db_path, question_text, ground_truth_sids, k_value
     return hits, recalled_sids
 
 
-def run_benchmark(binary, dataset, tier, k_values, verbose=False):
+def run_benchmark(binary, dataset, tier, k_values, verbose=False, per_turn=False):
     """Run full benchmark for one tier. Returns per-category and overall results."""
     results_by_category = defaultdict(lambda: {k: {"hits": 0, "total": 0} for k in k_values})
     overall = {k: {"hits": 0, "total": 0} for k in k_values}
@@ -201,7 +237,7 @@ def run_benchmark(binary, dataset, tier, k_values, verbose=False):
             db_path = os.path.join(tmpdir, "bench.db")
 
             # Ingest all sessions for this instance
-            ingest_sessions(binary, db_path, instance)
+            ingest_sessions(binary, db_path, instance, per_turn=per_turn)
 
             # Evaluate the question
             hits, recalled = evaluate_question(binary, db_path, question, gt_sids, k_values, tier)
@@ -284,6 +320,8 @@ def main():
     parser.add_argument("--output", default=None,
                         help="Output directory for CSV results (default: benchmarks/longmemeval/results/)")
     parser.add_argument("--verbose", action="store_true", help="Print per-question progress")
+    parser.add_argument("--per-turn", action="store_true",
+                        help="Store each conversation turn as a separate memory (more realistic)")
     parser.add_argument("--binary", default=None, help="Path to ai-memory binary")
     args = parser.parse_args()
 
@@ -314,7 +352,8 @@ def main():
         print(f"{'#'*60}\n")
 
         results_by_category, overall, elapsed = run_benchmark(
-            binary, dataset, tier, k_values, verbose=args.verbose
+            binary, dataset, tier, k_values, verbose=args.verbose,
+            per_turn=args.per_turn
         )
         rows, headers = format_results(tier, results_by_category, overall, k_values, elapsed)
         save_csv(output_dir, tier, rows, headers)

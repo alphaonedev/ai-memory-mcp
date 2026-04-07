@@ -1067,13 +1067,24 @@ pub fn recall_hybrid(
         }
     }
 
-    // Normalize FTS scores and compute blended score
+    // Normalize FTS scores and compute blended score.
+    // Adaptive blend: semantic weight decreases for longer content (embeddings
+    // lose information on long text; FTS stays precise).  Short memories
+    // (< 500 chars) get 50/50, long memories (> 5 000 chars) get 15/85.
     let mut results: Vec<(Memory, f64)> = scored
         .into_values()
         .map(|(mem, fts_score, cosine)| {
             let norm_fts = if max_fts_score > 0.0 { fts_score / max_fts_score } else { 0.0 };
-            // Blend: 40% semantic, 60% keyword (FTS is already a composite score)
-            let blended = 0.4 * cosine + 0.6 * norm_fts;
+            let content_len = mem.content.len() as f64;
+            // Lerp semantic_weight from 0.50 (≤500 chars) to 0.15 (≥5000 chars)
+            let semantic_weight = if content_len <= 500.0 {
+                0.50
+            } else if content_len >= 5000.0 {
+                0.15
+            } else {
+                0.50 - 0.35 * ((content_len - 500.0) / 4500.0)
+            };
+            let blended = semantic_weight * cosine + (1.0 - semantic_weight) * norm_fts;
             (mem, blended)
         })
         .collect();

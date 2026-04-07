@@ -764,20 +764,41 @@ Integration tests run through the CLI binary, creating temporary databases for i
 
 ## Benchmarks
 
+### Criterion (microbenchmarks)
+
 Criterion benchmarks are in `benches/recall.rs`. They test insert, recall, and search performance at 1,000 memories scale.
 
 ```bash
-# Run benchmarks
 cargo bench
-
-# Benchmarks:
-# - recall/short_query   -- single keyword recall
-# - recall/medium_query  -- multi-word recall
-# - recall/long_query    -- long context recall
-# - search/simple_search -- single keyword search
-# - search/filtered_search -- filtered by namespace and tier
-# - insert/store_memory  -- single memory insert throughput
+# recall/short_query, recall/medium_query, recall/long_query
+# search/simple_search, search/filtered_search
+# insert/store_memory
 ```
+
+### LongMemEval (end-to-end accuracy)
+
+The `benchmarks/longmemeval/` directory evaluates recall accuracy against the [LongMemEval](https://github.com/xiaowu0162/LongMemEval) dataset (ICLR 2025). Four harnesses are available:
+
+| Harness | Strategy | R@5 | Speed |
+|---------|----------|-----|-------|
+| `harness_99.py --no-expand` | Parallel FTS5, 10 cores | **97.0%** | 232 q/s (2.2s) |
+| `harness_99.py` | LLM expansion + parallel FTS5 | **97.8%** | 142 q/s (3.5s) |
+| `harness_fast.py` | Single-process native SQLite | 96.2% | 57 q/s (8.8s) |
+| `harness.py` | CLI subprocess per operation | 96.2% | 1.2 q/s (414s) |
+
+Best result: **97.8% R@5 (489/500), 99.0% R@10, 99.8% R@20** -- 499/500 at R@20.
+
+```bash
+# Quick run (keyword, ~2s)
+python3 benchmarks/longmemeval/harness_99.py \
+  --dataset-path /tmp/LongMemEval --variant S --no-expand --workers 10
+
+# Full run with LLM expansion (requires Ollama + gemma3:4b)
+python3 benchmarks/longmemeval/harness_99.py \
+  --dataset-path /tmp/LongMemEval --variant S --workers 10
+```
+
+See `benchmarks/longmemeval/README.md` for full replication instructions.
 
 ## CI/CD Pipeline
 

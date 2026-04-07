@@ -282,7 +282,7 @@ Beyond MCP, ai-memory also exposes a full HTTP REST API (20 endpoints on port 90
 - **MCP tool server** -- 17 tools over stdio JSON-RPC, compatible with any MCP client
 - **Three-tier memory** -- short (6h TTL), mid (7d TTL), long (permanent)
 - **Full-text search** -- SQLite FTS5 with ranked retrieval
-- **Hybrid recall** -- FTS5 keyword + cosine similarity blending when running at semantic tier or above
+- **Hybrid recall** -- FTS5 keyword + cosine similarity with adaptive content-length blending (50/50 for short memories, 85/15 FTS-weighted for long content)
 - **6-factor recall scoring** -- FTS relevance + priority + access frequency + confidence + tier boost + recency decay
 - **Auto-promotion** -- memories accessed 5+ times promote from mid to long
 - **TTL extension** -- each recall extends expiry (short +1h, mid +1d)
@@ -322,6 +322,7 @@ Beyond MCP, ai-memory also exposes a full HTTP REST API (20 endpoints on port 90
 
 ### Quality
 - **158 tests** -- 115 unit tests across all 14 modules (db 29, mcp 12, config 9, main 9, validate 8, reranker 7, color 6, errors 6, handlers 6, models 6, toon 6, embeddings 5, hnsw 4, llm 2) + 43 integration tests. **14/14 modules** have unit tests — 95%+ coverage.
+- **LongMemEval benchmark** -- **97.8% R@5** (489/500), **99.0% R@10**, **99.8% R@20** on ICLR 2025 LongMemEval-S dataset. 499/500 at R@20. Pure FTS5 keyword achieves 97.0% R@5 in 2.2 seconds (232 q/s). LLM query expansion pushes to 97.8% R@5. Zero cloud API costs. See [benchmark details](benchmarks/longmemeval/).
 - **MCP Prompts** -- `recall-first` and `memory-workflow` prompts teach AI clients to use memory proactively
 - **TOON-default** -- recall/list/search responses use TOON compact by default (79% smaller than JSON)
 - **Criterion benchmarks** -- insert, recall, search at 1K scale
@@ -449,7 +450,7 @@ Every capability mapped to its minimum tier. Each tier includes all capabilities
 | **Search & Recall** | | | | |
 | FTS5 keyword search | Yes | Yes | Yes | Yes |
 | Semantic embedding (cosine similarity) | -- | Yes | Yes | Yes |
-| Hybrid recall (FTS5 + cosine, 60/40 blend) | -- | Yes | Yes | Yes |
+| Hybrid recall (FTS5 + cosine, adaptive blend) | -- | Yes | Yes | Yes |
 | HNSW nearest-neighbor index | -- | Yes | Yes | Yes |
 | LLM query expansion (`memory_expand_query`) | -- | -- | Yes | Yes |
 | Neural cross-encoder reranking | -- | -- | -- | Yes |
@@ -563,7 +564,7 @@ These 17 tools are available to any MCP-compatible AI when configured as an MCP 
 | `serve` | Start the HTTP daemon on port 9077 |
 | `store` | Store a new memory (deduplicates by title+namespace) |
 | `update` | Update an existing memory by ID |
-| `recall` | Fuzzy OR search with ranked results + auto-touch |
+| `recall` | Fuzzy OR search with ranked results + auto-touch (supports `--tier` for hybrid recall) |
 | `search` | AND search for precise keyword matches |
 | `get` | Retrieve a single memory by ID (includes links) |
 | `list` | Browse memories with filters (namespace, tier, tags, date range) |

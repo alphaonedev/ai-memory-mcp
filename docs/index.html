@@ -320,6 +320,7 @@
             <a href="#security">Security</a>
             <a href="#architecture">Architecture</a>
             <a href="#matrix">Matrix</a>
+            <a href="#benchmarks">Benchmarks</a>
             <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub</a>
         </div>
     </div>
@@ -1671,6 +1672,83 @@
                 <text x="587" y="18" text-anchor="middle" fill="#8b949e" font-family="system-ui" font-size="10">on tag: v*</text>
             </svg>
         </div>
+    </div>
+</section>
+
+<!-- ================================================================
+     BENCHMARKS
+     ================================================================ -->
+<section id="benchmarks" class="alt">
+    <div class="container">
+        <h2>LongMemEval Benchmark</h2>
+        <p class="section-subtitle">ICLR 2025 dataset, 500 questions, 6 categories</p>
+
+        <h3>Results</h3>
+        <div class="table-wrap">
+            <table class="api-table">
+                <thead>
+                    <tr><th>Config</th><th>R@1</th><th>R@5</th><th>R@10</th><th>R@20</th><th>Time</th><th>Speed</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td>Parallel FTS5 (keyword)</td><td>86.2%</td><td>97.0%</td><td>98.2%</td><td>99.4%</td><td>2.2s</td><td>232 q/s</td></tr>
+                    <tr><td>LLM-expanded + parallel FTS5</td><td>86.8%</td><td>97.8%</td><td>99.0%</td><td>99.8%</td><td>3.5s</td><td>142 q/s</td></tr>
+                </tbody>
+            </table>
+        </div>
+
+        <h3>Per-Category Breakdown (LLM-expanded)</h3>
+        <div class="table-wrap">
+            <table class="api-table">
+                <thead>
+                    <tr><th>Category</th><th>R@1</th><th>R@5</th><th>R@10</th><th>R@20</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td>single-session-assistant</td><td>100.0%</td><td>100.0%</td><td>100.0%</td><td>100.0%</td></tr>
+                    <tr><td>knowledge-update</td><td>91.0%</td><td>100.0%</td><td>100.0%</td><td>100.0%</td></tr>
+                    <tr><td>single-session-user</td><td>88.6%</td><td>98.6%</td><td>100.0%</td><td>100.0%</td></tr>
+                    <tr><td>multi-session</td><td>88.0%</td><td>97.7%</td><td>98.5%</td><td>100.0%</td></tr>
+                    <tr><td>temporal-reasoning</td><td>79.7%</td><td>96.2%</td><td>98.5%</td><td>99.2%</td></tr>
+                    <tr><td>single-session-preference</td><td>73.3%</td><td>93.3%</td><td>96.7%</td><td>100.0%</td></tr>
+                    <tr style="font-weight:700"><td>OVERALL</td><td>86.8%</td><td>97.8%</td><td>99.0%</td><td>99.8%</td></tr>
+                </tbody>
+            </table>
+        </div>
+
+        <div class="card-grid" style="grid-template-columns:repeat(auto-fill,minmax(200px,1fr));margin:2rem 0">
+            <div class="card" style="text-align:center">
+                <span style="font-size:1.8rem;font-weight:800;color:var(--green);display:block;margin-bottom:.25rem">499/500</span>
+                <span style="font-size:.82rem;color:var(--text-muted)">recalled at R@20</span>
+            </div>
+            <div class="card" style="text-align:center">
+                <span style="font-size:1.8rem;font-weight:800;color:var(--accent);display:block;margin-bottom:.25rem">$0</span>
+                <span style="font-size:.82rem;color:var(--text-muted)">Zero cloud API costs</span>
+            </div>
+            <div class="card" style="text-align:center">
+                <span style="font-size:1.8rem;font-weight:800;color:var(--orange);display:block;margin-bottom:.25rem">3.5s</span>
+                <span style="font-size:.82rem;color:var(--text-muted)">recall on 10 cores</span>
+            </div>
+            <div class="card" style="text-align:center">
+                <span style="font-size:1.8rem;font-weight:800;color:var(--purple);display:block;margin-bottom:.25rem">FTS5</span>
+                <span style="font-size:.82rem;color:var(--text-muted)">Pure SQLite FTS5 + BM25</span>
+            </div>
+        </div>
+
+        <h3>Reproduce</h3>
+        <pre><code><span class="tok-cm"># 1. Clone dataset</span>
+<span class="tok-cmd">git</span> clone <span class="tok-flag">--depth</span> <span class="tok-num">1</span> <span class="tok-url">https://github.com/xiaowu0162/LongMemEval</span> /tmp/LongMemEval
+<span class="tok-kw">cd</span> /tmp/LongMemEval/data
+<span class="tok-cmd">curl</span> <span class="tok-flag">-sLO</span> <span class="tok-url">https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_s_cleaned.json</span>
+<span class="tok-kw">cd</span> -
+
+<span class="tok-cm"># 2. Install</span>
+<span class="tok-cmd">cargo</span> install <span class="tok-flag">--git</span> <span class="tok-url">https://github.com/alphaonedev/ai-memory-mcp.git</span>
+<span class="tok-cmd">pip</span> install tabulate requests
+
+<span class="tok-cm"># 3. Run (keyword -- 2.2s)</span>
+<span class="tok-cmd">python3</span> benchmarks/longmemeval/harness_99.py <span class="tok-flag">--dataset-path</span> /tmp/LongMemEval <span class="tok-flag">--variant</span> S <span class="tok-flag">--no-expand</span> <span class="tok-flag">--workers</span> <span class="tok-num">10</span>
+
+<span class="tok-cm"># 4. Run (LLM-expanded -- requires Ollama with gemma3:4b)</span>
+<span class="tok-cmd">python3</span> benchmarks/longmemeval/harness_99.py <span class="tok-flag">--dataset-path</span> /tmp/LongMemEval <span class="tok-flag">--variant</span> S <span class="tok-flag">--workers</span> <span class="tok-num">10</span><span class="lang-label">bash</span></code></pre>
     </div>
 </section>
 
