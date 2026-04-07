@@ -42,9 +42,19 @@ MCP is the primary integration layer. For AI platforms that do not yet support M
 
 ## Install in 60 Seconds
 
-You need Rust installed. That is it. No Docker, no Python, no Node.
+Pre-built binaries require no dependencies. Building from source needs Rust and a C compiler.
 
-**Step 1: Install Rust** (skip if you already have it)
+**Fastest: Pre-built binary (no Rust required)**
+
+```bash
+# macOS / Linux
+curl -fsSL https://raw.githubusercontent.com/alphaonedev/ai-memory-mcp/main/install.sh | sh
+
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/alphaonedev/ai-memory-mcp/main/install.ps1 | iex
+```
+
+**Step 1: Install Rust** (skip if using pre-built binaries)
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -52,13 +62,17 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 Follow the prompts, then restart your terminal (or run `source ~/.cargo/env`).
 
-**Step 2: Install ai-memory**
+**Step 2: From source (requires Rust)**
 
 ```bash
 cargo install --git https://github.com/alphaonedev/ai-memory-mcp.git
 ```
 
 This compiles the binary and puts it in your PATH. It takes a minute or two.
+
+> **Build dependencies for source builds:**
+> - Ubuntu/Debian: `sudo apt-get install build-essential pkg-config`
+> - Fedora/RHEL: `sudo dnf install gcc pkg-config`
 
 **Step 3: Connect your AI**
 

@@ -4,7 +4,19 @@
 
 ## Install in 60 Seconds
 
-1. **Install the binary:**
+1. **Install the binary** (pick one):
+
+   **One-liner (pre-built binary, Linux/macOS):**
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/alphaonedev/ai-memory-mcp/main/install.sh | sh
+   ```
+
+   **Windows (PowerShell):**
+   ```powershell
+   irm https://raw.githubusercontent.com/alphaonedev/ai-memory-mcp/main/install.ps1 | iex
+   ```
+
+   **From source (requires Rust + C compiler):**
    ```bash
    cargo install --git https://github.com/alphaonedev/ai-memory-mcp.git
    ```
@@ -50,10 +62,18 @@ That's it. Everything below is optional detail.
 
 ## Prerequisites
 
+> **Pre-built binaries have no prerequisites** -- just run `install.sh` or `install.ps1` as shown above. The requirements below only apply when building from source.
+
 - **Rust toolchain** (1.75+): Install via [rustup](https://rustup.rs/)
   ```bash
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
   ```
+
+- **C compiler**: Required for the candle ML backend and bundled SQLite:
+  - **Ubuntu/Debian:** `sudo apt-get install build-essential pkg-config`
+  - **Fedora/RHEL:** `sudo dnf install gcc pkg-config`
+  - **macOS:** Xcode command line tools (`xcode-select --install`) -- usually already present
+  - **Windows:** MSVC C++ build tools via [Visual Studio Installer](https://visualstudio.microsoft.com/visual-cpp-build-tools/) (select "Desktop development with C++")
 
 ## Install from Source (One-Liner)
 
@@ -71,15 +91,60 @@ cd ai-memory
 cargo install --path .
 ```
 
-## Binary Download
+## Pre-built Binaries
 
-Pre-built binaries are available on the [Releases](https://github.com/alphaonedev/ai-memory-mcp/releases) page for Linux (x86_64) and macOS (aarch64). Download the tarball for your platform:
+Pre-built binaries are available on the [Releases](https://github.com/alphaonedev/ai-memory-mcp/releases) page for Linux (x86_64) and macOS (aarch64). Releases are created on git tags.
+
+The easiest way to install is via the install scripts:
+
+```bash
+# Linux/macOS
+curl -fsSL https://raw.githubusercontent.com/alphaonedev/ai-memory-mcp/main/install.sh | sh
+
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/alphaonedev/ai-memory-mcp/main/install.ps1 | iex
+```
+
+Or download and install manually:
 
 ```bash
 tar xzf ai-memory-x86_64-unknown-linux-gnu.tar.gz
 chmod +x ai-memory
 sudo mv ai-memory /usr/local/bin/
 ```
+
+## Platform Notes
+
+- **macOS Gatekeeper**: Pre-built binaries downloaded outside the App Store may be quarantined. If you get "cannot be opened because the developer cannot be verified", run:
+  ```bash
+  xattr -d com.apple.quarantine ~/.cargo/bin/ai-memory
+  # or wherever the binary was installed:
+  xattr -d com.apple.quarantine /usr/local/bin/ai-memory
+  ```
+
+- **Windows**: Use the PowerShell install script (`install.ps1`) for pre-built binaries. For building from source, use `cargo install` with the MSVC toolchain (the default Rust target on Windows). MinGW is not supported.
+
+- **WSL (Windows Subsystem for Linux)**: Works as native Linux. Follow the Ubuntu/Debian instructions for both pre-built binaries and building from source.
+
+- **Docker**: A `Dockerfile` is included in the repository root. Build and run:
+  ```bash
+  docker build -t ai-memory .
+  docker run --rm -v ai-memory-data:/data ai-memory --db /data/ai-memory.db serve
+  ```
+
+## Network Requirements
+
+- **First run with `semantic` tier (or above)**: Downloads a ~100MB embedding model from HuggingFace. No account or API key is required. The model is cached in `~/.cache/huggingface/` for subsequent runs. After the initial download, no network access is needed for keyword or semantic tiers.
+- **Smart/autonomous tiers**: Require a running Ollama instance (local network only, no external calls).
+
+## Disk Space
+
+| Component | Size |
+|-----------|------|
+| `ai-memory` binary (pre-built) | ~50 MB |
+| Cargo build from source (including build artifacts) | ~500 MB |
+| Semantic embedding model (downloaded on first run) | ~100 MB |
+| Ollama models (smart/autonomous tiers only) | ~1--2.3 GB |
 
 ## MCP Server Setup (Recommended)
 

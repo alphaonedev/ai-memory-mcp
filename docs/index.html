@@ -463,16 +463,35 @@
 <section id="install">
     <div class="container">
         <h2>Install</h2>
-        <p class="section-subtitle">Build the binary, optionally install Ollama for advanced tiers, configure your AI platform, and go.</p>
+        <p class="section-subtitle">Grab the binary, optionally install Ollama for advanced tiers, configure your AI platform, and go.</p>
 
         <ol class="steps">
             <li>
-                <h4>Build the binary</h4>
-                <p>Clone the repo and compile. You need Rust installed (<a href="https://rustup.rs">rustup.rs</a> if you don't have it).</p>
+                <h4>Quick install (pre-built binary)</h4>
+                <p>Download the latest release for your platform. No build tools required.</p>
+
+                <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:1rem;margin:1.25rem 0">
+                    <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:1.25rem">
+                        <h4 style="font-size:.95rem;margin-bottom:.6rem;color:var(--text)">macOS / Linux</h4>
+                        <pre style="margin:0;font-size:.8rem"><code><span class="tok-cmd">curl</span> <span class="tok-flag">-fsSL</span> <span class="tok-url">https://github.com/alphaonedev/ai-memory-mcp/releases/latest/download/install.sh</span> | <span class="tok-cmd">sh</span></code></pre>
+                        <p style="font-size:.82rem;color:var(--text-muted);margin:.75rem 0 0">Detects your OS and architecture automatically. Installs to <code>~/.local/bin/</code> (add to <code>PATH</code> if not already).</p>
+                    </div>
+                    <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:1.25rem">
+                        <h4 style="font-size:.95rem;margin-bottom:.6rem;color:var(--text)">Windows</h4>
+                        <pre style="margin:0;font-size:.8rem"><code><span class="tok-cmd">irm</span> <span class="tok-url">https://github.com/alphaonedev/ai-memory-mcp/releases/latest/download/install.ps1</span> | <span class="tok-cmd">iex</span></code></pre>
+                        <p style="font-size:.82rem;color:var(--text-muted);margin:.75rem 0 0">Run in PowerShell. Installs to <code>%LOCALAPPDATA%\ai-memory\</code> and adds it to your <code>PATH</code>.</p>
+                    </div>
+                </div>
+
+                <p style="font-size:.85rem;color:var(--text-muted)">The <strong style="color:var(--green)">keyword</strong> and <strong style="color:var(--accent)">semantic</strong> tiers work immediately with zero additional dependencies.</p>
+            </li>
+            <li>
+                <h4>Build from source (alternative)</h4>
+                <p>Clone the repo and compile. You need <a href="https://rustup.rs">Rust</a>, a C compiler, and <code>pkg-config</code> installed.</p>
                 <pre><code><span class="tok-cmd">git clone</span> <span class="tok-url">https://github.com/alphaonedev/ai-memory-mcp.git</span>
 <span class="tok-cmd">cd</span> ai-memory-mcp
 <span class="tok-cmd">cargo install</span> <span class="tok-flag">--path</span> .<span class="lang-label">bash</span></code></pre>
-                <p style="font-size:.85rem;color:var(--text-muted)">This installs the <code>ai-memory</code> binary to <code>~/.cargo/bin/</code>. The <strong style="color:var(--green)">keyword</strong> and <strong style="color:var(--accent)">semantic</strong> tiers work immediately with zero additional dependencies.</p>
+                <p style="font-size:.85rem;color:var(--text-muted)">This installs the <code>ai-memory</code> binary to <code>~/.cargo/bin/</code>. On Debian/Ubuntu, install build deps with <code>sudo apt install build-essential pkg-config</code>. On macOS, Xcode Command Line Tools provides everything needed.</p>
             </li>
             <li>
                 <h4>Install Ollama <span style="font-size:.65rem;font-weight:700;text-transform:uppercase;background:rgba(210,153,34,.12);color:var(--orange);padding:.2em .6em;border-radius:3px;letter-spacing:.05em;vertical-align:middle;margin-left:.5rem">Smart &amp; Autonomous Tiers</span></h4>

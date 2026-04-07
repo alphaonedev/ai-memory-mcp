@@ -1,0 +1,11 @@
+target/
+.git/
+docs/
+benchmarks/
+*.md
+!LICENSE.md
+Dockerfile
+.dockerignore
+.github/
+.vscode/
+.idea/
