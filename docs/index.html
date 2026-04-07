@@ -463,36 +463,61 @@
 <section id="install">
     <div class="container">
         <h2>Install</h2>
-        <p class="section-subtitle">Grab the binary, optionally install Ollama for advanced tiers, configure your AI platform, and go.</p>
+        <p class="section-subtitle">One command. No dependencies for pre-built binaries. Three installation methods.</p>
+
+        <!-- ---- Install Methods ---- -->
+        <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:1.25rem;margin:2rem 0">
+            <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:10px;padding:1.5rem;position:relative">
+                <span style="position:absolute;top:1rem;right:1rem;font-size:.6rem;font-weight:700;text-transform:uppercase;background:rgba(63,185,80,.15);color:var(--green);padding:.25em .7em;border-radius:3px;letter-spacing:.06em">Recommended</span>
+                <h4 style="font-size:1rem;margin-bottom:.25rem;color:var(--text)">macOS / Linux</h4>
+                <p style="font-size:.8rem;color:var(--text-muted);margin-bottom:.75rem">Pre-built binary. Auto-detects OS &amp; architecture.</p>
+                <pre style="margin:0;font-size:.78rem"><code><span class="tok-cmd">curl</span> <span class="tok-flag">-fsSL</span> <span class="tok-url">https://raw.githubusercontent.com/alphaonedev/ai-memory-mcp/main/install.sh</span> | <span class="tok-cmd">sh</span></code></pre>
+            </div>
+            <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:10px;padding:1.5rem">
+                <h4 style="font-size:1rem;margin-bottom:.25rem;color:var(--text)">Windows</h4>
+                <p style="font-size:.8rem;color:var(--text-muted);margin-bottom:.75rem">PowerShell installer. Adds to PATH automatically.</p>
+                <pre style="margin:0;font-size:.78rem"><code><span class="tok-cmd">irm</span> <span class="tok-url">https://raw.githubusercontent.com/alphaonedev/ai-memory-mcp/main/install.ps1</span> | <span class="tok-cmd">iex</span></code></pre>
+            </div>
+            <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:10px;padding:1.5rem">
+                <h4 style="font-size:1rem;margin-bottom:.25rem;color:var(--text)">Cargo <span style="font-size:.7rem;color:var(--text-muted);font-weight:400">(crates.io)</span></h4>
+                <p style="font-size:.8rem;color:var(--text-muted);margin-bottom:.75rem">From source. Needs <a href="https://rustup.rs">Rust</a> + C compiler.</p>
+                <pre style="margin:0;font-size:.78rem"><code><span class="tok-cmd">cargo</span> install ai-memory</code></pre>
+            </div>
+            <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:10px;padding:1.5rem">
+                <h4 style="font-size:1rem;margin-bottom:.25rem;color:var(--text)">Docker</h4>
+                <p style="font-size:.8rem;color:var(--text-muted);margin-bottom:.75rem">Containerized HTTP server on port 9077.</p>
+                <pre style="margin:0;font-size:.78rem"><code><span class="tok-cmd">docker</span> build <span class="tok-flag">-t</span> ai-memory .
+<span class="tok-cmd">docker</span> run <span class="tok-flag">-p</span> <span class="tok-num">9077</span>:<span class="tok-num">9077</span> <span class="tok-flag">-v</span> data:/data ai-memory</code></pre>
+            </div>
+            <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:10px;padding:1.5rem">
+                <h4 style="font-size:1rem;margin-bottom:.25rem;color:var(--text)">cargo-binstall</h4>
+                <p style="font-size:.8rem;color:var(--text-muted);margin-bottom:.75rem">Pre-built binary via cargo. No compile step.</p>
+                <pre style="margin:0;font-size:.78rem"><code><span class="tok-cmd">cargo</span> binstall ai-memory</code></pre>
+            </div>
+        </div>
+
+        <div style="text-align:center;margin-bottom:2.5rem">
+            <p style="font-size:.8rem;color:var(--text-muted);margin:0">
+                <strong style="color:var(--text)">Supported platforms:</strong>
+                macOS (Intel + Apple Silicon) &nbsp;&bull;&nbsp;
+                Linux (x86_64 + ARM64) &nbsp;&bull;&nbsp;
+                Windows (x86_64) &nbsp;&bull;&nbsp;
+                WSL &nbsp;&bull;&nbsp;
+                Docker
+            </p>
+            <p style="font-size:.75rem;color:var(--text-muted);margin:.4rem 0 0">
+                <strong style="color:var(--text)">Build from source?</strong>
+                Ubuntu/Debian: <code>sudo apt install build-essential pkg-config</code> &nbsp;&bull;&nbsp;
+                Fedora/RHEL: <code>sudo dnf install gcc pkg-config</code> &nbsp;&bull;&nbsp;
+                macOS: Xcode CLT (pre-installed) &nbsp;&bull;&nbsp;
+                Windows: MSVC C++ build tools
+            </p>
+        </div>
 
         <ol class="steps">
-            <li>
-                <h4>Quick install (pre-built binary)</h4>
-                <p>Download the latest release for your platform. No build tools required.</p>
-
-                <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:1rem;margin:1.25rem 0">
-                    <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:1.25rem">
-                        <h4 style="font-size:.95rem;margin-bottom:.6rem;color:var(--text)">macOS / Linux</h4>
-                        <pre style="margin:0;font-size:.8rem"><code><span class="tok-cmd">curl</span> <span class="tok-flag">-fsSL</span> <span class="tok-url">https://github.com/alphaonedev/ai-memory-mcp/releases/latest/download/install.sh</span> | <span class="tok-cmd">sh</span></code></pre>
-                        <p style="font-size:.82rem;color:var(--text-muted);margin:.75rem 0 0">Detects your OS and architecture automatically. Installs to <code>~/.local/bin/</code> (add to <code>PATH</code> if not already).</p>
-                    </div>
-                    <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:1.25rem">
-                        <h4 style="font-size:.95rem;margin-bottom:.6rem;color:var(--text)">Windows</h4>
-                        <pre style="margin:0;font-size:.8rem"><code><span class="tok-cmd">irm</span> <span class="tok-url">https://github.com/alphaonedev/ai-memory-mcp/releases/latest/download/install.ps1</span> | <span class="tok-cmd">iex</span></code></pre>
-                        <p style="font-size:.82rem;color:var(--text-muted);margin:.75rem 0 0">Run in PowerShell. Installs to <code>%LOCALAPPDATA%\ai-memory\</code> and adds it to your <code>PATH</code>.</p>
-                    </div>
-                </div>
-
-                <p style="font-size:.85rem;color:var(--text-muted)">The <strong style="color:var(--green)">keyword</strong> and <strong style="color:var(--accent)">semantic</strong> tiers work immediately with zero additional dependencies.</p>
-            </li>
-            <li>
-                <h4>Build from source (alternative)</h4>
-                <p>Clone the repo and compile. You need <a href="https://rustup.rs">Rust</a>, a C compiler, and <code>pkg-config</code> installed.</p>
-                <pre><code><span class="tok-cmd">git clone</span> <span class="tok-url">https://github.com/alphaonedev/ai-memory-mcp.git</span>
-<span class="tok-cmd">cd</span> ai-memory-mcp
-<span class="tok-cmd">cargo install</span> <span class="tok-flag">--path</span> .<span class="lang-label">bash</span></code></pre>
-                <p style="font-size:.85rem;color:var(--text-muted)">This installs the <code>ai-memory</code> binary to <code>~/.cargo/bin/</code>. On Debian/Ubuntu, install build deps with <code>sudo apt install build-essential pkg-config</code>. On macOS, Xcode Command Line Tools provides everything needed.</p>
-            </li>
+            <li style="list-style:none;counter-increment:none">
+                <h4 style="margin-bottom:.75rem">Optional: Ollama for Smart &amp; Autonomous tiers <span style="font-size:.65rem;font-weight:700;text-transform:uppercase;background:rgba(210,153,34,.12);color:var(--orange);padding:.2em .6em;border-radius:3px;letter-spacing:.05em;vertical-align:middle;margin-left:.5rem">Optional</span></h4>
+                <p style="font-size:.85rem;color:var(--text-muted);margin-bottom:1rem">The <strong style="color:var(--green)">keyword</strong> and <strong style="color:var(--accent)">semantic</strong> tiers work with zero dependencies. The <strong style="color:var(--orange)">smart</strong> and <strong style="color:var(--purple)">autonomous</strong> tiers add LLM-powered query expansion, auto-tagging, and neural reranking via <a href="https://ollama.com">Ollama</a>.</p>
             <li>
                 <h4>Install Ollama <span style="font-size:.65rem;font-weight:700;text-transform:uppercase;background:rgba(210,153,34,.12);color:var(--orange);padding:.2em .6em;border-radius:3px;letter-spacing:.05em;vertical-align:middle;margin-left:.5rem">Smart &amp; Autonomous Tiers</span></h4>
                 <p>The <strong style="color:var(--orange)">smart</strong> and <strong style="color:var(--purple)">autonomous</strong> tiers use local LLMs via <a href="https://ollama.com">Ollama</a> for query expansion, auto-tagging, contradiction detection, and cross-encoder reranking. Skip this step if you only need keyword or semantic search.</p>
