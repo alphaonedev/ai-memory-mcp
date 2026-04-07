@@ -50,9 +50,19 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             artifact: ai-memory
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: ai-memory
+            cross: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            artifact: ai-memory
           - target: aarch64-apple-darwin
             os: macos-latest
             artifact: ai-memory
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            artifact: ai-memory.exe
     steps:
       - uses: actions/checkout@v4
 
@@ -63,26 +73,44 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
       - name: Build release binary
+        if: ${{ !matrix.cross }}
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Package binary
+      - name: Build release binary (cross)
+        if: matrix.cross
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Package binary (unix)
+        if: ${{ !contains(matrix.target, 'windows') }}
         run: |
           mkdir -p dist
           cp target/${{ matrix.target }}/release/${{ matrix.artifact }} dist/
           cd dist
           tar czf ai-memory-${{ matrix.target }}.tar.gz ${{ matrix.artifact }}
 
+      - name: Package binary (windows)
+        if: contains(matrix.target, 'windows')
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.artifact }}" -Destination dist/
+          Compress-Archive -Path "dist/${{ matrix.artifact }}" -DestinationPath "dist/ai-memory-${{ matrix.target }}.zip"
+
       - name: Upload release artifact
         uses: actions/upload-artifact@v4
         with:
           name: ai-memory-${{ matrix.target }}
-          path: dist/ai-memory-${{ matrix.target }}.tar.gz
+          path: dist/ai-memory-${{ matrix.target }}.*
 
       - name: Create GitHub Release
         if: github.event_name == 'push'
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/ai-memory-${{ matrix.target }}.tar.gz
+          files: dist/ai-memory-${{ matrix.target }}.*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

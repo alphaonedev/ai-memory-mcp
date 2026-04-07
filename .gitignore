@@ -12,3 +12,6 @@
 *.pfx
 *.secret
 credentials*
+
+# Benchmark results
+benchmarks/longmemeval/results/

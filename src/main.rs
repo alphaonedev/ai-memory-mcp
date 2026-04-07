@@ -10,6 +10,7 @@ mod handlers;
 mod hnsw;
 mod llm;
 mod mcp;
+mod mine;
 mod models;
 mod reranker;
 mod toon;
@@ -116,6 +117,29 @@ enum Command {
     Completions(CompletionsArgs),
     /// Generate man page
     Man,
+    /// Import memories from historical conversations (Claude, ChatGPT, Slack exports)
+    Mine(MineArgs),
+}
+
+#[derive(Args)]
+struct MineArgs {
+    /// Path to the export file or directory
+    path: PathBuf,
+    /// Export format: claude, chatgpt, slack
+    #[arg(long, short)]
+    format: String,
+    /// Namespace for imported memories (auto-detected if omitted)
+    #[arg(long, short)]
+    namespace: Option<String>,
+    /// Memory tier for imported memories
+    #[arg(long, short, default_value = "mid")]
+    tier: String,
+    /// Minimum message count to import a conversation
+    #[arg(long, default_value_t = 3)]
+    min_messages: usize,
+    /// Dry run — show what would be imported without writing
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
 }
 
 #[derive(Args)]
@@ -405,6 +429,7 @@ async fn main() -> Result<()> {
             man.render(&mut std::io::stdout())?;
             Ok(())
         }
+        Command::Mine(a) => cmd_mine(db_path, a, j),
     }
 }
 
@@ -1457,6 +1482,168 @@ fn cmd_auto_consolidate(db_path: PathBuf, args: AutoConsolidateArgs, json_out: b
     } else {
         println!("auto-consolidated {} memories", total);
     }
+    Ok(())
+}
+
+fn cmd_mine(db_path: PathBuf, args: MineArgs, json_out: bool) -> Result<()> {
+    let format = mine::Format::from_str(&args.format)
+        .ok_or_else(|| anyhow::anyhow!("invalid format: {} (use claude, chatgpt, slack)", args.format))?;
+    let tier = Tier::from_str(&args.tier)
+        .ok_or_else(|| anyhow::anyhow!("invalid tier: {} (use short, mid, long)", args.tier))?;
+    let namespace = args.namespace.unwrap_or_else(|| match format {
+        mine::Format::Claude => "claude-export".to_string(),
+        mine::Format::ChatGpt => "chatgpt-export".to_string(),
+        mine::Format::Slack => "slack-export".to_string(),
+    });
+
+    let path = std::path::Path::new(&args.path);
+
+    // Parse conversations
+    let conversations = match format {
+        mine::Format::Claude => mine::parse_claude(path)?,
+        mine::Format::ChatGpt => mine::parse_chatgpt(path)?,
+        mine::Format::Slack => mine::parse_slack(path)?,
+    };
+
+    // Filter by minimum message count
+    let filtered: Vec<_> = conversations
+        .iter()
+        .filter(|c| c.messages.len() >= args.min_messages)
+        .collect();
+
+    if args.dry_run {
+        if json_out {
+            let items: Vec<serde_json::Value> = filtered
+                .iter()
+                .filter_map(|c| {
+                    mine::conversation_to_memory(c, format).map(|m| {
+                        serde_json::json!({
+                            "title": m.title,
+                            "content_length": m.content.len(),
+                            "messages": c.messages.len(),
+                            "source": m.source_format,
+                        })
+                    })
+                })
+                .collect();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "dry_run": true,
+                    "total_conversations": conversations.len(),
+                    "filtered": filtered.len(),
+                    "would_import": items.len(),
+                    "namespace": namespace,
+                    "tier": tier.as_str(),
+                    "memories": items,
+                }))?
+            );
+        } else {
+            println!("Dry run — no memories will be stored\n");
+            println!("Total conversations found: {}", conversations.len());
+            println!(
+                "After filter (>={} messages): {}",
+                args.min_messages,
+                filtered.len()
+            );
+            println!("Namespace: {}", namespace);
+            println!("Tier: {}\n", tier);
+            for c in &filtered {
+                if let Some(m) = mine::conversation_to_memory(c, format) {
+                    println!(
+                        "  {} ({} msgs, {} bytes)",
+                        m.title,
+                        c.messages.len(),
+                        m.content.len()
+                    );
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    // Store memories
+    let conn = db::open(&db_path)?;
+    let _ = db::gc_if_needed(&conn);
+    let now = Utc::now();
+
+    let mut imported = 0usize;
+    let mut skipped = 0usize;
+    let mut errors = 0usize;
+
+    // Use a transaction for bulk performance
+    conn.execute_batch("BEGIN")?;
+
+    for conv in &filtered {
+        let mined = match mine::conversation_to_memory(conv, format) {
+            Some(m) => m,
+            None => {
+                skipped += 1;
+                continue;
+            }
+        };
+
+        let expires_at = tier.default_ttl_secs().map(|s| {
+            (now + Duration::seconds(s)).to_rfc3339()
+        });
+
+        let mem = models::Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: tier.clone(),
+            namespace: namespace.clone(),
+            title: mined.title,
+            content: mined.content,
+            tags: vec![format.source_tag().to_string()],
+            priority: 5,
+            confidence: 0.8,
+            source: mined.source_format,
+            access_count: 0,
+            created_at: mined.created_at.unwrap_or_else(|| now.to_rfc3339()),
+            updated_at: now.to_rfc3339(),
+            last_accessed_at: None,
+            expires_at,
+        };
+
+        match db::insert(&conn, &mem) {
+            Ok(_) => imported += 1,
+            Err(e) => {
+                errors += 1;
+                eprintln!("warning: failed to store '{}': {}", mem.title, e);
+            }
+        }
+
+        // Commit in batches of 100
+        if imported % 100 == 0 && imported > 0 {
+            conn.execute_batch("COMMIT")?;
+            conn.execute_batch("BEGIN")?;
+        }
+    }
+
+    conn.execute_batch("COMMIT")?;
+
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "imported": imported,
+                "skipped": skipped,
+                "errors": errors,
+                "total_conversations": conversations.len(),
+                "namespace": namespace,
+                "tier": tier.as_str(),
+            }))?
+        );
+    } else {
+        println!(
+            "Imported {} memories from {} conversations (skipped: {}, errors: {})",
+            imported,
+            conversations.len(),
+            skipped,
+            errors
+        );
+        println!("Namespace: {}, Tier: {}", namespace, tier);
+    }
+
     Ok(())
 }
 
