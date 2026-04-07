@@ -73,9 +73,14 @@ pub fn priority_bar(p: i32) -> String {
 mod tests {
     use super::*;
 
+    use std::sync::Mutex;
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
     fn with_color_off<F: FnOnce()>(f: F) {
+        let _guard = TEST_LOCK.lock().unwrap();
         COLOR_ENABLED.store(false, Ordering::Relaxed);
         f();
+        COLOR_ENABLED.store(true, Ordering::Relaxed);
     }
 
     #[test]
@@ -128,6 +133,7 @@ mod tests {
 
     #[test]
     fn wrap_with_color_enabled() {
+        let _guard = TEST_LOCK.lock().unwrap();
         COLOR_ENABLED.store(true, Ordering::Relaxed);
         let result = wrap("91", "red");
         assert!(result.contains("\x1b[91m"));

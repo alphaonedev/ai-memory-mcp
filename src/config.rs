@@ -294,7 +294,11 @@ impl AppConfig {
     }
 
     /// Load config from disk. Returns `AppConfig::default()` if file is missing.
+    /// Set `AI_MEMORY_NO_CONFIG=1` to skip config loading (used by integration tests).
     pub fn load() -> Self {
+        if std::env::var("AI_MEMORY_NO_CONFIG").is_ok() {
+            return Self::default();
+        }
         let Some(path) = Self::config_path() else {
             return Self::default();
         };

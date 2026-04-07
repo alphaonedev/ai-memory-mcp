@@ -1,4 +1,13 @@
 // Integration tests — all run through the CLI binary
+//
+// AI_MEMORY_NO_CONFIG=1 prevents loading ~/.config/ai-memory/config.toml
+// which may set tier=autonomous and trigger embedder/LLM initialization.
+
+fn cmd(binary: &str) -> std::process::Command {
+    let mut c = std::process::Command::new(binary);
+    c.env("AI_MEMORY_NO_CONFIG", "1");
+    c
+}
 
 #[test]
 fn test_cli_store_and_recall() {
@@ -7,7 +16,7 @@ fn test_cli_store_and_recall() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
 
     // Store
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args([
             "--db",
             db_path.to_str().unwrap(),
@@ -38,7 +47,7 @@ fn test_cli_store_and_recall() {
     assert_eq!(stored["namespace"], "test-project");
 
     // Recall
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args([
             "--db",
             db_path.to_str().unwrap(),
@@ -59,7 +68,7 @@ fn test_cli_store_and_recall() {
     assert!(recalled["count"].as_u64().unwrap() >= 1);
 
     // Search
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args([
             "--db",
             db_path.to_str().unwrap(),
@@ -74,7 +83,7 @@ fn test_cli_store_and_recall() {
     assert!(searched["count"].as_u64().unwrap() >= 1);
 
     // List
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args(["--db", db_path.to_str().unwrap(), "--json", "list"])
         .output()
         .unwrap();
@@ -83,7 +92,7 @@ fn test_cli_store_and_recall() {
     assert!(listed["count"].as_u64().unwrap() >= 1);
 
     // Stats
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args(["--db", db_path.to_str().unwrap(), "--json", "stats"])
         .output()
         .unwrap();
@@ -92,7 +101,7 @@ fn test_cli_store_and_recall() {
     assert!(stats["total"].as_u64().unwrap() >= 1);
 
     // Namespaces
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args(["--db", db_path.to_str().unwrap(), "--json", "namespaces"])
         .output()
         .unwrap();
@@ -101,7 +110,7 @@ fn test_cli_store_and_recall() {
     assert!(!ns["namespaces"].as_array().unwrap().is_empty());
 
     // Export
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args(["--db", db_path.to_str().unwrap(), "export"])
         .output()
         .unwrap();
@@ -111,7 +120,7 @@ fn test_cli_store_and_recall() {
 
     // Delete
     let id = stored["id"].as_str().unwrap();
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args(["--db", db_path.to_str().unwrap(), "--json", "delete", id])
         .output()
         .unwrap();
@@ -129,7 +138,7 @@ fn test_deduplication() {
 
     // Store same title+namespace twice
     for content in ["first version", "second version"] {
-        let output = std::process::Command::new(binary)
+        let output = cmd(binary)
             .args([
                 "--db",
                 db_path.to_str().unwrap(),
@@ -150,7 +159,7 @@ fn test_deduplication() {
     }
 
     // Should only have 1 memory (deduped)
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args(["--db", db_path.to_str().unwrap(), "--json", "stats"])
         .output()
         .unwrap();
@@ -172,7 +181,7 @@ fn test_gc_removes_expired() {
 
     // Store a short-term memory (6h TTL) — we can't easily test real expiry,
     // but we can verify gc runs without error
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args([
             "--db",
             db_path.to_str().unwrap(),
@@ -189,7 +198,7 @@ fn test_gc_removes_expired() {
         .unwrap();
     assert!(output.status.success());
 
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args(["--db", db_path.to_str().unwrap(), "--json", "gc"])
         .output()
         .unwrap();
@@ -208,7 +217,7 @@ fn test_content_size_limit() {
     let db_path = dir.join(format!("ai-memory-size-test-{}.db", uuid::Uuid::new_v4()));
 
     let huge_content = "x".repeat(70_000);
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args([
             "--db",
             db_path.to_str().unwrap(),
@@ -233,7 +242,7 @@ fn test_import_export_roundtrip() {
     let db2 = dir.join(format!("ai-memory-import-{}.db", uuid::Uuid::new_v4()));
 
     // Store in db1
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args([
             "--db",
             db1.to_str().unwrap(),
@@ -250,19 +259,19 @@ fn test_import_export_roundtrip() {
     assert!(output.status.success());
 
     // Export from db1
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args(["--db", db1.to_str().unwrap(), "export"])
         .output()
         .unwrap();
     assert!(output.status.success());
 
     // Import into db2
-    let export_output = std::process::Command::new(binary)
+    let export_output = cmd(binary)
         .args(["--db", db1.to_str().unwrap(), "export"])
         .output()
         .unwrap();
 
-    let mut child = std::process::Command::new(binary)
+    let mut child = cmd(binary)
         .args(["--db", db2.to_str().unwrap(), "--json", "import"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -284,7 +293,7 @@ fn test_import_export_roundtrip() {
     );
 
     // Verify db2 has the memory
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args(["--db", db2.to_str().unwrap(), "--json", "stats"])
         .output()
         .unwrap();
@@ -306,7 +315,7 @@ fn test_reject_empty_title() {
     let dir = std::env::temp_dir();
     let db_path = dir.join(format!("ai-memory-val-title-{}.db", uuid::Uuid::new_v4()));
 
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args([
             "--db",
             db_path.to_str().unwrap(),
@@ -329,7 +338,7 @@ fn test_reject_bad_source() {
     let dir = std::env::temp_dir();
     let db_path = dir.join(format!("ai-memory-val-source-{}.db", uuid::Uuid::new_v4()));
 
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args([
             "--db",
             db_path.to_str().unwrap(),
@@ -354,7 +363,7 @@ fn test_reject_bad_namespace() {
     let dir = std::env::temp_dir();
     let db_path = dir.join(format!("ai-memory-val-ns-{}.db", uuid::Uuid::new_v4()));
 
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args([
             "--db",
             db_path.to_str().unwrap(),
@@ -383,7 +392,7 @@ fn test_reject_oversized_content() {
     let db_path = dir.join(format!("ai-memory-val-size-{}.db", uuid::Uuid::new_v4()));
 
     let huge = "x".repeat(70_000);
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args([
             "--db",
             db_path.to_str().unwrap(),
@@ -406,7 +415,7 @@ fn test_reject_bad_priority() {
     let dir = std::env::temp_dir();
     let db_path = dir.join(format!("ai-memory-val-prio-{}.db", uuid::Uuid::new_v4()));
 
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args([
             "--db",
             db_path.to_str().unwrap(),
@@ -422,7 +431,7 @@ fn test_reject_bad_priority() {
         .unwrap();
     assert!(!output.status.success(), "should reject priority 0");
 
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args([
             "--db",
             db_path.to_str().unwrap(),
@@ -447,7 +456,7 @@ fn test_reject_bad_confidence() {
     let dir = std::env::temp_dir();
     let db_path = dir.join(format!("ai-memory-val-conf-{}.db", uuid::Uuid::new_v4()));
 
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args([
             "--db",
             db_path.to_str().unwrap(),
@@ -463,7 +472,7 @@ fn test_reject_bad_confidence() {
         .unwrap();
     assert!(!output.status.success(), "should reject confidence > 1.0");
 
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args([
             "--db",
             db_path.to_str().unwrap(),
@@ -495,7 +504,7 @@ fn test_recall_priority_order() {
         ("beta recall test", "9"),
         ("gamma recall test", "5"),
     ] {
-        let output = std::process::Command::new(binary)
+        let output = cmd(binary)
             .args([
                 "--db",
                 db_path.to_str().unwrap(),
@@ -521,7 +530,7 @@ fn test_recall_priority_order() {
         );
     }
 
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args([
             "--db",
             db_path.to_str().unwrap(),
@@ -559,7 +568,7 @@ fn test_ttl_assignment() {
     let db_path = dir.join(format!("ai-memory-ttl-{}.db", uuid::Uuid::new_v4()));
 
     // Store short-term
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args([
             "--db",
             db_path.to_str().unwrap(),
@@ -584,7 +593,7 @@ fn test_ttl_assignment() {
     );
 
     // Store mid-term
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args([
             "--db",
             db_path.to_str().unwrap(),
@@ -609,7 +618,7 @@ fn test_ttl_assignment() {
     );
 
     // Store long-term
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args([
             "--db",
             db_path.to_str().unwrap(),
@@ -648,7 +657,7 @@ fn test_auto_promotion() {
     ));
 
     // Store a mid-term memory
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args([
             "--db",
             db_path.to_str().unwrap(),
@@ -671,7 +680,7 @@ fn test_auto_promotion() {
 
     // Recall 6 times (promotion threshold is 5)
     for _ in 0..6 {
-        let output = std::process::Command::new(binary)
+        let output = cmd(binary)
             .args([
                 "--db",
                 db_path.to_str().unwrap(),
@@ -687,7 +696,7 @@ fn test_auto_promotion() {
     }
 
     // Verify it became long-term
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args(["--db", db_path.to_str().unwrap(), "--json", "get", &id])
         .output()
         .unwrap();
@@ -719,7 +728,7 @@ fn test_forget_by_pattern() {
         ("forget alpha", "ephemeral data to remove"),
         ("forget beta", "ephemeral data to discard"),
     ] {
-        let output = std::process::Command::new(binary)
+        let output = cmd(binary)
             .args([
                 "--db",
                 db_path.to_str().unwrap(),
@@ -739,7 +748,7 @@ fn test_forget_by_pattern() {
     }
 
     // Verify 3 exist
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args(["--db", db_path.to_str().unwrap(), "--json", "stats"])
         .output()
         .unwrap();
@@ -747,7 +756,7 @@ fn test_forget_by_pattern() {
     assert_eq!(stats["total"].as_u64().unwrap(), 3);
 
     // Forget by pattern
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args([
             "--db",
             db_path.to_str().unwrap(),
@@ -768,7 +777,7 @@ fn test_forget_by_pattern() {
     );
 
     // Verify count decreased
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args(["--db", db_path.to_str().unwrap(), "--json", "stats"])
         .output()
         .unwrap();
@@ -790,7 +799,7 @@ fn test_namespace_isolation() {
     let db_path = dir.join(format!("ai-memory-nsiso-{}.db", uuid::Uuid::new_v4()));
 
     // Store in ns-a
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args([
             "--db",
             db_path.to_str().unwrap(),
@@ -809,7 +818,7 @@ fn test_namespace_isolation() {
     assert!(output.status.success());
 
     // Store in ns-b
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args([
             "--db",
             db_path.to_str().unwrap(),
@@ -828,7 +837,7 @@ fn test_namespace_isolation() {
     assert!(output.status.success());
 
     // Recall in ns-a should not return ns-b
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args([
             "--db",
             db_path.to_str().unwrap(),
@@ -862,7 +871,7 @@ fn test_link_creation() {
     let db_path = dir.join(format!("ai-memory-link-{}.db", uuid::Uuid::new_v4()));
 
     // Store two memories
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args([
             "--db",
             db_path.to_str().unwrap(),
@@ -883,7 +892,7 @@ fn test_link_creation() {
     let src: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let src_id = src["id"].as_str().unwrap().to_string();
 
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args([
             "--db",
             db_path.to_str().unwrap(),
@@ -905,7 +914,7 @@ fn test_link_creation() {
     let tgt_id = tgt["id"].as_str().unwrap().to_string();
 
     // Link them
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args([
             "--db",
             db_path.to_str().unwrap(),
@@ -921,7 +930,7 @@ fn test_link_creation() {
     assert!(output.status.success());
 
     // Get source and verify links appear
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args(["--db", db_path.to_str().unwrap(), "--json", "get", &src_id])
         .output()
         .unwrap();
@@ -956,7 +965,7 @@ fn test_consolidation() {
             "third piece of knowledge about consolidation",
         ),
     ] {
-        let output = std::process::Command::new(binary)
+        let output = cmd(binary)
             .args([
                 "--db",
                 db_path.to_str().unwrap(),
@@ -979,7 +988,7 @@ fn test_consolidation() {
     }
 
     // Verify 3 exist
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args(["--db", db_path.to_str().unwrap(), "--json", "stats"])
         .output()
         .unwrap();
@@ -988,7 +997,7 @@ fn test_consolidation() {
 
     // Consolidate
     let ids_str = ids.join(",");
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args([
             "--db",
             db_path.to_str().unwrap(),
@@ -1011,7 +1020,7 @@ fn test_consolidation() {
     );
 
     // Verify total decreased (3 removed, 1 added = 1)
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args(["--db", db_path.to_str().unwrap(), "--json", "stats"])
         .output()
         .unwrap();
@@ -1032,7 +1041,7 @@ fn test_promote_command() {
     let dir = std::env::temp_dir();
     let db_path = dir.join(format!("ai-memory-promote-cmd-{}.db", uuid::Uuid::new_v4()));
 
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args([
             "--db",
             db_path.to_str().unwrap(),
@@ -1054,14 +1063,14 @@ fn test_promote_command() {
     let id = stored["id"].as_str().unwrap().to_string();
 
     // Promote
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args(["--db", db_path.to_str().unwrap(), "--json", "promote", &id])
         .output()
         .unwrap();
     assert!(output.status.success());
 
     // Verify tier=long
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args(["--db", db_path.to_str().unwrap(), "--json", "get", &id])
         .output()
         .unwrap();
@@ -1082,7 +1091,7 @@ fn test_namespaces_command() {
 
     // Store in two namespaces
     for (ns, title) in [("ns-alpha", "alpha mem"), ("ns-beta", "beta mem")] {
-        let output = std::process::Command::new(binary)
+        let output = cmd(binary)
             .args([
                 "--db",
                 db_path.to_str().unwrap(),
@@ -1101,7 +1110,7 @@ fn test_namespaces_command() {
         assert!(output.status.success());
     }
 
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args(["--db", db_path.to_str().unwrap(), "--json", "namespaces"])
         .output()
         .unwrap();
@@ -1126,7 +1135,7 @@ fn test_unicode_handling() {
     let dir = std::env::temp_dir();
     let db_path = dir.join(format!("ai-memory-unicode-{}.db", uuid::Uuid::new_v4()));
 
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args([
             "--db",
             db_path.to_str().unwrap(),
@@ -1145,7 +1154,7 @@ fn test_unicode_handling() {
         .unwrap();
     assert!(output.status.success(), "store with unicode failed");
 
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args([
             "--db",
             db_path.to_str().unwrap(),
@@ -1175,7 +1184,7 @@ fn test_boundary_priority_min() {
     let dir = std::env::temp_dir();
     let db_path = dir.join(format!("ai-memory-bnd-pmin-{}.db", uuid::Uuid::new_v4()));
 
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args([
             "--db",
             db_path.to_str().unwrap(),
@@ -1201,7 +1210,7 @@ fn test_boundary_priority_max() {
     let dir = std::env::temp_dir();
     let db_path = dir.join(format!("ai-memory-bnd-pmax-{}.db", uuid::Uuid::new_v4()));
 
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args([
             "--db",
             db_path.to_str().unwrap(),
@@ -1227,7 +1236,7 @@ fn test_boundary_confidence_zero() {
     let dir = std::env::temp_dir();
     let db_path = dir.join(format!("ai-memory-bnd-c0-{}.db", uuid::Uuid::new_v4()));
 
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args([
             "--db",
             db_path.to_str().unwrap(),
@@ -1253,7 +1262,7 @@ fn test_boundary_confidence_one() {
     let dir = std::env::temp_dir();
     let db_path = dir.join(format!("ai-memory-bnd-c1-{}.db", uuid::Uuid::new_v4()));
 
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args([
             "--db",
             db_path.to_str().unwrap(),
@@ -1280,7 +1289,7 @@ fn test_boundary_max_title_length() {
     let db_path = dir.join(format!("ai-memory-bnd-tlen-{}.db", uuid::Uuid::new_v4()));
 
     let long_title = "a".repeat(512);
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args([
             "--db",
             db_path.to_str().unwrap(),
@@ -1307,7 +1316,7 @@ fn test_export_includes_links() {
     let db_path = dir.join(format!("ai-memory-explink-{}.db", uuid::Uuid::new_v4()));
 
     // Store two memories
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args([
             "--db",
             db_path.to_str().unwrap(),
@@ -1327,7 +1336,7 @@ fn test_export_includes_links() {
     let src: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let src_id = src["id"].as_str().unwrap().to_string();
 
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args([
             "--db",
             db_path.to_str().unwrap(),
@@ -1348,7 +1357,7 @@ fn test_export_includes_links() {
     let tgt_id = tgt["id"].as_str().unwrap().to_string();
 
     // Link them
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args([
             "--db",
             db_path.to_str().unwrap(),
@@ -1362,7 +1371,7 @@ fn test_export_includes_links() {
     assert!(output.status.success());
 
     // Export
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args(["--db", db_path.to_str().unwrap(), "export"])
         .output()
         .unwrap();
@@ -1385,7 +1394,7 @@ fn test_import_roundtrip_count_match() {
 
     // Store 3 memories in db1
     for i in 0..3 {
-        let output = std::process::Command::new(binary)
+        let output = cmd(binary)
             .args([
                 "--db",
                 db1.to_str().unwrap(),
@@ -1405,7 +1414,7 @@ fn test_import_roundtrip_count_match() {
     }
 
     // Get source count
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args(["--db", db1.to_str().unwrap(), "--json", "stats"])
         .output()
         .unwrap();
@@ -1413,14 +1422,14 @@ fn test_import_roundtrip_count_match() {
     let src_count = src_stats["total"].as_u64().unwrap();
 
     // Export from db1
-    let export_output = std::process::Command::new(binary)
+    let export_output = cmd(binary)
         .args(["--db", db1.to_str().unwrap(), "export"])
         .output()
         .unwrap();
     assert!(export_output.status.success());
 
     // Import into db2
-    let mut child = std::process::Command::new(binary)
+    let mut child = cmd(binary)
         .args(["--db", db2.to_str().unwrap(), "--json", "import"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -1438,7 +1447,7 @@ fn test_import_roundtrip_count_match() {
     assert!(result.status.success());
 
     // Verify counts match
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args(["--db", db2.to_str().unwrap(), "--json", "stats"])
         .output()
         .unwrap();
@@ -1461,7 +1470,7 @@ fn test_update_via_cli() {
     let dir = std::env::temp_dir();
     let db_path = dir.join(format!("ai-memory-update-{}.db", uuid::Uuid::new_v4()));
 
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args([
             "--db",
             db_path.to_str().unwrap(),
@@ -1483,7 +1492,7 @@ fn test_update_via_cli() {
     let id = stored["id"].as_str().unwrap().to_string();
 
     // Update title
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args([
             "--db",
             db_path.to_str().unwrap(),
@@ -1498,7 +1507,7 @@ fn test_update_via_cli() {
     assert!(output.status.success());
 
     // Verify changed
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args(["--db", db_path.to_str().unwrap(), "--json", "get", &id])
         .output()
         .unwrap();
@@ -1519,7 +1528,7 @@ fn test_stats_accuracy() {
 
     let count = 5;
     for i in 0..count {
-        let output = std::process::Command::new(binary)
+        let output = cmd(binary)
             .args([
                 "--db",
                 db_path.to_str().unwrap(),
@@ -1538,7 +1547,7 @@ fn test_stats_accuracy() {
         assert!(output.status.success());
     }
 
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args(["--db", db_path.to_str().unwrap(), "--json", "stats"])
         .output()
         .unwrap();
@@ -1561,7 +1570,7 @@ fn test_gc_preserves_long_term() {
     let db_path = dir.join(format!("ai-memory-gckeep-{}.db", uuid::Uuid::new_v4()));
 
     // Store short-term and long-term
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args([
             "--db",
             db_path.to_str().unwrap(),
@@ -1580,7 +1589,7 @@ fn test_gc_preserves_long_term() {
         .unwrap();
     assert!(output.status.success());
 
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args([
             "--db",
             db_path.to_str().unwrap(),
@@ -1602,14 +1611,14 @@ fn test_gc_preserves_long_term() {
     let long_id = long_stored["id"].as_str().unwrap().to_string();
 
     // Run GC (short hasn't expired yet, so nothing deleted)
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args(["--db", db_path.to_str().unwrap(), "--json", "gc"])
         .output()
         .unwrap();
     assert!(output.status.success());
 
     // Verify long-term still exists
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args(["--db", db_path.to_str().unwrap(), "--json", "get", &long_id])
         .output()
         .unwrap();
@@ -1629,7 +1638,7 @@ fn test_search_with_since_future() {
     let dir = std::env::temp_dir();
     let db_path = dir.join(format!("ai-memory-since-{}.db", uuid::Uuid::new_v4()));
 
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args([
             "--db",
             db_path.to_str().unwrap(),
@@ -1648,7 +1657,7 @@ fn test_search_with_since_future() {
     assert!(output.status.success());
 
     // Search with --since far in the future
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args([
             "--db",
             db_path.to_str().unwrap(),
@@ -1685,7 +1694,7 @@ fn test_health_endpoint() {
     drop(listener);
 
     // Start the server in the background
-    let mut child = std::process::Command::new(binary)
+    let mut child = cmd(binary)
         .args([
             "--db",
             db_path.to_str().unwrap(),
@@ -1732,7 +1741,7 @@ fn test_mcp_initialize() {
     let dir = std::env::temp_dir();
     let db_path = dir.join(format!("ai-memory-mcp-init-{}.db", uuid::Uuid::new_v4()));
 
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args(["--db", db_path.to_str().unwrap(), "mcp"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -1770,7 +1779,7 @@ fn test_mcp_tools_list() {
     let dir = std::env::temp_dir();
     let db_path = dir.join(format!("ai-memory-mcp-tools-{}.db", uuid::Uuid::new_v4()));
 
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args(["--db", db_path.to_str().unwrap(), "mcp"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -1823,7 +1832,7 @@ fn test_mcp_store_and_recall() {
     let db_path = dir.join(format!("ai-memory-mcp-store-{}.db", uuid::Uuid::new_v4()));
 
     // Send store then recall in sequence
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args(["--db", db_path.to_str().unwrap(), "mcp"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -1871,7 +1880,7 @@ fn test_mcp_invalid_jsonrpc_version() {
     let dir = std::env::temp_dir();
     let db_path = dir.join(format!("ai-memory-mcp-ver-{}.db", uuid::Uuid::new_v4()));
 
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args(["--db", db_path.to_str().unwrap(), "mcp"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -1909,7 +1918,7 @@ fn test_mcp_unknown_tool() {
     let dir = std::env::temp_dir();
     let db_path = dir.join(format!("ai-memory-mcp-unk-{}.db", uuid::Uuid::new_v4()));
 
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args(["--db", db_path.to_str().unwrap(), "mcp"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -1942,7 +1951,7 @@ fn test_mcp_missing_tool_name() {
     let dir = std::env::temp_dir();
     let db_path = dir.join(format!("ai-memory-mcp-noname-{}.db", uuid::Uuid::new_v4()));
 
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args(["--db", db_path.to_str().unwrap(), "mcp"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -1976,7 +1985,7 @@ fn test_mcp_stats() {
     let dir = std::env::temp_dir();
     let db_path = dir.join(format!("ai-memory-mcp-stats-{}.db", uuid::Uuid::new_v4()));
 
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args(["--db", db_path.to_str().unwrap(), "mcp"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -2008,7 +2017,7 @@ fn test_mcp_prompts_list() {
     let dir = std::env::temp_dir();
     let db_path = dir.join(format!("ai-memory-mcp-prompts-{}.db", uuid::Uuid::new_v4()));
 
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args(["--db", db_path.to_str().unwrap(), "mcp"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -2040,7 +2049,7 @@ fn test_mcp_prompts_get_recall_first() {
     let dir = std::env::temp_dir();
     let db_path = dir.join(format!("ai-memory-mcp-prompt-get-{}.db", uuid::Uuid::new_v4()));
 
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args(["--db", db_path.to_str().unwrap(), "mcp"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -2074,7 +2083,7 @@ fn test_mcp_recall_default_toon() {
     let dir = std::env::temp_dir();
     let db_path = dir.join(format!("ai-memory-mcp-toon-def-{}.db", uuid::Uuid::new_v4()));
 
-    let output = std::process::Command::new(binary)
+    let output = cmd(binary)
         .args(["--db", db_path.to_str().unwrap(), "mcp"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
