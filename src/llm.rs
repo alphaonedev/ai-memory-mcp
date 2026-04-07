@@ -110,7 +110,10 @@ impl OllamaClient {
         }
 
         // Pull the model
-        tracing::info!("Pulling Ollama model '{}' (this may take a while)...", self.model);
+        tracing::info!(
+            "Pulling Ollama model '{}' (this may take a while)...",
+            self.model
+        );
 
         let pull_url = format!("{}/api/pull", self.base_url);
         let pull_client = reqwest::blocking::Client::builder()
@@ -163,16 +166,10 @@ impl OllamaClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().unwrap_or_default();
-            return Err(anyhow!(
-                "Chat generate failed ({}): {}",
-                status,
-                text
-            ));
+            return Err(anyhow!("Chat generate failed ({}): {}", status, text));
         }
 
-        let body: Value = resp
-            .json()
-            .context("Failed to parse chat response")?;
+        let body: Value = resp.json().context("Failed to parse chat response")?;
 
         // Ollama /api/chat returns {"message": {"content": "..."}}
         let response_text = body["message"]["content"]
@@ -320,7 +317,11 @@ impl OllamaClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().unwrap_or_default();
-            return Err(anyhow!("Ollama embed model pull failed ({}): {}", status, text));
+            return Err(anyhow!(
+                "Ollama embed model pull failed ({}): {}",
+                status,
+                text
+            ));
         }
 
         tracing::info!("Embedding model '{}' pulled successfully", model);

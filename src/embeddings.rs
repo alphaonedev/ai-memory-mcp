@@ -59,7 +59,10 @@ impl Embedder {
         let (config_path, tokenizer_path, weights_path) = match Self::download_via_hf_hub() {
             Ok(paths) => paths,
             Err(e) => {
-                eprintln!("ai-memory: hf-hub download failed ({}), trying fallback dir", e);
+                eprintln!(
+                    "ai-memory: hf-hub download failed ({}), trying fallback dir",
+                    e
+                );
                 Self::load_from_fallback()?
             }
         };
@@ -146,12 +149,12 @@ impl Embedder {
     /// Generate an embedding for a single text input.
     pub fn embed(&self, text: &str) -> Result<Vec<f32>> {
         match self {
-            Self::Local { model, tokenizer, device } => {
-                Self::embed_local(model, tokenizer, device, text)
-            }
-            Self::Ollama { client, model_name } => {
-                client.embed_text(text, model_name)
-            }
+            Self::Local {
+                model,
+                tokenizer,
+                device,
+            } => Self::embed_local(model, tokenizer, device, text),
+            Self::Ollama { client, model_name } => client.embed_text(text, model_name),
         }
     }
 
@@ -170,12 +173,9 @@ impl Embedder {
         let token_type_ids = encoding.get_type_ids();
         let seq_len = input_ids.len();
 
-        let input_ids =
-            Tensor::new(input_ids, device)?.reshape((1, seq_len))?;
-        let attention_mask_tensor =
-            Tensor::new(attention_mask, device)?.reshape((1, seq_len))?;
-        let token_type_ids =
-            Tensor::new(token_type_ids, device)?.reshape((1, seq_len))?;
+        let input_ids = Tensor::new(input_ids, device)?.reshape((1, seq_len))?;
+        let attention_mask_tensor = Tensor::new(attention_mask, device)?.reshape((1, seq_len))?;
+        let token_type_ids = Tensor::new(token_type_ids, device)?.reshape((1, seq_len))?;
 
         let hidden = model
             .forward(&input_ids, &token_type_ids, Some(&attention_mask_tensor))
@@ -224,16 +224,24 @@ impl Embedder {
         }
     }
 
-    fn download_via_hf_hub() -> Result<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)> {
+    fn download_via_hf_hub() -> Result<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)>
+    {
         let api = Api::new().context("failed to initialise HuggingFace Hub API")?;
         let repo = api.repo(Repo::new(MINILM_MODEL_ID.to_string(), RepoType::Model));
-        let config_path = repo.get("config.json").context("failed to download config.json")?;
-        let tokenizer_path = repo.get("tokenizer.json").context("failed to download tokenizer.json")?;
-        let weights_path = repo.get("model.safetensors").context("failed to download model.safetensors")?;
+        let config_path = repo
+            .get("config.json")
+            .context("failed to download config.json")?;
+        let tokenizer_path = repo
+            .get("tokenizer.json")
+            .context("failed to download tokenizer.json")?;
+        let weights_path = repo
+            .get("model.safetensors")
+            .context("failed to download model.safetensors")?;
         Ok((config_path, tokenizer_path, weights_path))
     }
 
-    fn load_from_fallback() -> Result<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)> {
+    fn load_from_fallback() -> Result<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)>
+    {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
         let dir = std::path::PathBuf::from(home).join(FALLBACK_MODEL_SUBDIR);
         let dir = dir.as_path();

@@ -330,41 +330,39 @@ fn prompt_content(name: &str, params: &Value) -> Result<Value, String> {
                     "content": {
                         "type": "text",
                         "text": format!(
-"You have access to a persistent memory system (ai-memory). Follow these rules:\n\
-1. RECALL FIRST: At conversation start, call memory_recall with the user's apparent topic. Before answering any question about prior work, recall first.\n\
-2. STORE LEARNINGS: When the user corrects you or teaches something, call memory_store with tier:long, priority:9.\n\
-3. TOON FORMAT: All recall/list/search responses default to TOON compact (79% smaller than JSON). Pass format:\"json\" only if you need structured parsing.\n\
-4. TIERS: short=6h ephemeral, mid=7d working knowledge, long=permanent. Mid auto-promotes to long at 5 accesses.\n\
-5. DEDUP: Storing with an existing title+namespace updates the existing memory, not a duplicate.\n\
-6. NAMESPACES: Organize by project/topic. Always pass namespace when storing and recalling.\n\
-7. CAPABILITIES: Call memory_capabilities once per session to discover available features (tier-dependent).\n\
-8. TAGS: Use tags for cross-cutting concerns. memory_auto_tag can generate them if available.{ns_hint}")
+            "You have access to a persistent memory system (ai-memory). Follow these rules:\n\
+            1. RECALL FIRST: At conversation start, call memory_recall with the user's apparent topic. Before answering any question about prior work, recall first.\n\
+            2. STORE LEARNINGS: When the user corrects you or teaches something, call memory_store with tier:long, priority:9.\n\
+            3. TOON FORMAT: All recall/list/search responses default to TOON compact (79% smaller than JSON). Pass format:\"json\" only if you need structured parsing.\n\
+            4. TIERS: short=6h ephemeral, mid=7d working knowledge, long=permanent. Mid auto-promotes to long at 5 accesses.\n\
+            5. DEDUP: Storing with an existing title+namespace updates the existing memory, not a duplicate.\n\
+            6. NAMESPACES: Organize by project/topic. Always pass namespace when storing and recalling.\n\
+            7. CAPABILITIES: Call memory_capabilities once per session to discover available features (tier-dependent).\n\
+            8. TAGS: Use tags for cross-cutting concerns. memory_auto_tag can generate them if available.{ns_hint}")
                     }
                 }]
             }))
         }
-        "memory-workflow" => {
-            Ok(json!({
-                "messages": [{
-                    "role": "user",
-                    "content": {
-                        "type": "text",
-                        "text": "\
-STORE: memory_store(title, content, tier, namespace, tags, priority) — dedup by title+ns\n\
-RECALL: memory_recall(context, namespace) → ranked results (TOON compact default)\n\
-SEARCH: memory_search(query, namespace) → exact AND match (TOON compact default)\n\
-LIST: memory_list(namespace, tier) → browse with filters (TOON compact default)\n\
-GET: memory_get(id) → single memory with links\n\
-PROMOTE: memory_promote(id) — mid→long, clears expiry\n\
-CONSOLIDATE: memory_consolidate(ids, title) — merge N→1, LLM summary if available\n\
-LINK: memory_link(source_id, target_id, relation) — related_to|supersedes|contradicts|derived_from\n\
-TAG: memory_auto_tag(id) — LLM generates tags (smart+ tier)\n\
-EXPAND: memory_expand_query(query) — LLM broadens search terms (smart+ tier)\n\
-CONTRADICT: memory_detect_contradiction(id_a, id_b) — LLM checks conflict (smart+ tier)"
-                    }
-                }]
-            }))
-        }
+        "memory-workflow" => Ok(json!({
+            "messages": [{
+                "role": "user",
+                "content": {
+                    "type": "text",
+                    "text": "\
+        STORE: memory_store(title, content, tier, namespace, tags, priority) — dedup by title+ns\n\
+        RECALL: memory_recall(context, namespace) → ranked results (TOON compact default)\n\
+        SEARCH: memory_search(query, namespace) → exact AND match (TOON compact default)\n\
+        LIST: memory_list(namespace, tier) → browse with filters (TOON compact default)\n\
+        GET: memory_get(id) → single memory with links\n\
+        PROMOTE: memory_promote(id) — mid→long, clears expiry\n\
+        CONSOLIDATE: memory_consolidate(ids, title) — merge N→1, LLM summary if available\n\
+        LINK: memory_link(source_id, target_id, relation) — related_to|supersedes|contradicts|derived_from\n\
+        TAG: memory_auto_tag(id) — LLM generates tags (smart+ tier)\n\
+        EXPAND: memory_expand_query(query) — LLM broadens search terms (smart+ tier)\n\
+        CONTRADICT: memory_detect_contradiction(id_a, id_b) — LLM checks conflict (smart+ tier)"
+                }
+            }]
+        })),
         _ => Err(format!("unknown prompt: {name}")),
     }
 }
@@ -426,21 +424,23 @@ fn handle_store(
 
     // True dedup: check for exact title+namespace match (#97)
     let existing = db::find_contradictions(conn, &mem.title, &mem.namespace).unwrap_or_default();
-    let exact_dup = existing.iter().find(|c| c.title == mem.title && c.namespace == mem.namespace);
+    let exact_dup = existing
+        .iter()
+        .find(|c| c.title == mem.title && c.namespace == mem.namespace);
     if let Some(dup) = exact_dup {
         // Update existing memory instead of creating a duplicate
         // update(conn, id, title, content, tier, namespace, tags, priority, confidence, expires_at)
         db::update(
             conn,
             &dup.id,
-            None,                   // title (unchanged)
+            None,                       // title (unchanged)
             Some(mem.content.as_str()), // content (update)
-            Some(&mem.tier),        // tier
-            None,                   // namespace (unchanged)
-            Some(&mem.tags),        // tags
-            Some(mem.priority),     // priority
-            Some(mem.confidence),   // confidence
-            None,                   // expires_at
+            Some(&mem.tier),            // tier
+            None,                       // namespace (unchanged)
+            Some(&mem.tags),            // tags
+            Some(mem.priority),         // priority
+            Some(mem.confidence),       // confidence
+            None,                       // expires_at
         )
         .map_err(|e| e.to_string())?;
         return Ok(json!({
@@ -510,7 +510,10 @@ fn handle_recall(
             .map(|(mem, score)| {
                 let mut val = serde_json::to_value(&mem).unwrap_or_default();
                 if let Some(obj) = val.as_object_mut() {
-                    obj.insert("score".to_string(), json!((score * 1000.0).round() / 1000.0));
+                    obj.insert(
+                        "score".to_string(),
+                        json!((score * 1000.0).round() / 1000.0),
+                    );
                 }
                 val
             })
@@ -538,11 +541,15 @@ fn handle_recall(
                 if let Some(ce) = reranker {
                     let reranked = ce.rerank(context, results);
                     let memories = scored_memories(reranked);
-                    return Ok(json!({"memories": memories, "count": memories.len(), "mode": "hybrid+rerank"}));
+                    return Ok(
+                        json!({"memories": memories, "count": memories.len(), "mode": "hybrid+rerank"}),
+                    );
                 }
 
                 let memories = scored_memories(results);
-                return Ok(json!({"memories": memories, "count": memories.len(), "mode": "hybrid"}));
+                return Ok(
+                    json!({"memories": memories, "count": memories.len(), "mode": "hybrid"}),
+                );
             }
             Err(e) => {
                 tracing::warn!("embedding failed, falling back to FTS: {}", e);
@@ -557,7 +564,10 @@ fn handle_recall(
     Ok(json!({"memories": memories, "count": memories.len(), "mode": "keyword"}))
 }
 
-fn handle_capabilities(tier_config: &TierConfig, reranker: Option<&CrossEncoder>) -> Result<Value, String> {
+fn handle_capabilities(
+    tier_config: &TierConfig,
+    reranker: Option<&CrossEncoder>,
+) -> Result<Value, String> {
     let mut caps = tier_config.capabilities();
     // Report actual cross-encoder state, not just config (#93)
     if let Some(ce) = reranker {
@@ -570,10 +580,7 @@ fn handle_capabilities(tier_config: &TierConfig, reranker: Option<&CrossEncoder>
     serde_json::to_value(caps).map_err(|e| e.to_string())
 }
 
-fn handle_expand_query(
-    llm: Option<&OllamaClient>,
-    params: &Value,
-) -> Result<Value, String> {
+fn handle_expand_query(llm: Option<&OllamaClient>, params: &Value) -> Result<Value, String> {
     let llm = llm.ok_or("query expansion requires smart or autonomous tier (Ollama LLM)")?;
     let query = params["query"].as_str().ok_or("query is required")?;
     let terms = llm.expand_query(query).map_err(|e| e.to_string())?;
@@ -600,8 +607,19 @@ fn handle_auto_tag(
             all_tags.push(t.clone());
         }
     }
-    db::update(conn, id, None, None, None, None, Some(&all_tags), None, None, None)
-        .map_err(|e| e.to_string())?;
+    db::update(
+        conn,
+        id,
+        None,
+        None,
+        None,
+        None,
+        Some(&all_tags),
+        None,
+        None,
+        None,
+    )
+    .map_err(|e| e.to_string())?;
     Ok(json!({"id": id, "new_tags": tags, "all_tags": all_tags}))
 }
 
@@ -610,7 +628,8 @@ fn handle_detect_contradiction(
     llm: Option<&OllamaClient>,
     params: &Value,
 ) -> Result<Value, String> {
-    let llm = llm.ok_or("contradiction detection requires smart or autonomous tier (Ollama LLM)")?;
+    let llm =
+        llm.ok_or("contradiction detection requires smart or autonomous tier (Ollama LLM)")?;
     let id_a = params["id_a"].as_str().ok_or("id_a is required")?;
     let id_b = params["id_b"].as_str().ok_or("id_b is required")?;
     let mem_a = db::get(conn, id_a)
@@ -855,7 +874,9 @@ fn handle_consolidate(
             .summarize_memories(&memory_pairs)
             .map_err(|e| format!("LLM summarization failed: {e}"))?
     } else {
-        return Err("summary is required (or use smart/autonomous tier for auto-summarization)".into());
+        return Err(
+            "summary is required (or use smart/autonomous tier for auto-summarization)".into(),
+        );
     };
 
     validate::validate_consolidate(&ids, title, &summary, namespace).map_err(|e| e.to_string())?;
@@ -964,7 +985,10 @@ fn handle_request(
             match result {
                 Ok(val) => {
                     // Check if TOON format requested for recall/search/list
-                    let format_str = arguments.get("format").and_then(|v| v.as_str()).unwrap_or("toon_compact");
+                    let format_str = arguments
+                        .get("format")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("toon_compact");
                     let text = match format_str {
                         "toon" if matches!(tool_name, "memory_recall" | "memory_list") => {
                             crate::toon::memories_to_toon(&val, false)
@@ -1006,7 +1030,11 @@ fn handle_request(
 
 /// Run the MCP server over stdio. Blocks until stdin closes.
 /// Initializes components based on the requested feature tier.
-pub fn run_mcp_server(db_path: &Path, tier: FeatureTier, app_config: &AppConfig) -> anyhow::Result<()> {
+pub fn run_mcp_server(
+    db_path: &Path,
+    tier: FeatureTier,
+    app_config: &AppConfig,
+) -> anyhow::Result<()> {
     let conn = db::open(db_path)?;
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -1027,7 +1055,10 @@ pub fn run_mcp_server(db_path: &Path, tier: FeatureTier, app_config: &AppConfig)
                     tier_config.llm_model = Some(crate::config::LlmModel::Gemma4E4B);
                     eprintln!("ai-memory: llm_model override from config: gemma4:e4b");
                 }
-                other => eprintln!("ai-memory: unknown llm_model '{}', using tier default", other),
+                other => eprintln!(
+                    "ai-memory: unknown llm_model '{}', using tier default",
+                    other
+                ),
             }
         }
     }
@@ -1038,13 +1069,21 @@ pub fn run_mcp_server(db_path: &Path, tier: FeatureTier, app_config: &AppConfig)
             match emb_override.as_str() {
                 "mini_lm_l6_v2" => {
                     tier_config.embedding_model = Some(crate::config::EmbeddingModel::MiniLmL6V2);
-                    eprintln!("ai-memory: embedding_model override from config: mini_lm_l6_v2 (local)");
+                    eprintln!(
+                        "ai-memory: embedding_model override from config: mini_lm_l6_v2 (local)"
+                    );
                 }
                 "nomic_embed_v15" => {
-                    tier_config.embedding_model = Some(crate::config::EmbeddingModel::NomicEmbedV15);
-                    eprintln!("ai-memory: embedding_model override from config: nomic_embed_v15 (Ollama)");
+                    tier_config.embedding_model =
+                        Some(crate::config::EmbeddingModel::NomicEmbedV15);
+                    eprintln!(
+                        "ai-memory: embedding_model override from config: nomic_embed_v15 (Ollama)"
+                    );
                 }
-                other => eprintln!("ai-memory: unknown embedding_model '{}', using tier default", other),
+                other => eprintln!(
+                    "ai-memory: unknown embedding_model '{}', using tier default",
+                    other
+                ),
             }
         }
     }
@@ -1053,11 +1092,17 @@ pub fn run_mcp_server(db_path: &Path, tier: FeatureTier, app_config: &AppConfig)
     //     client can be shared with nomic embedder ---
     let llm: Option<Arc<OllamaClient>> = if let Some(ref llm_model) = tier_config.llm_model {
         let model_id = llm_model.ollama_model_id();
-        eprintln!("ai-memory: connecting to Ollama for {} ...", llm_model.display_name());
+        eprintln!(
+            "ai-memory: connecting to Ollama for {} ...",
+            llm_model.display_name()
+        );
         let ollama_url = app_config.effective_ollama_url();
         match OllamaClient::new_with_url(ollama_url, model_id) {
             Ok(client) => {
-                eprintln!("ai-memory: Ollama connected, ensuring model {} is available...", model_id);
+                eprintln!(
+                    "ai-memory: Ollama connected, ensuring model {} is available...",
+                    model_id
+                );
                 if let Err(e) = client.ensure_model() {
                     eprintln!("ai-memory: model pull failed: {e} (LLM features disabled)");
                     None
@@ -1112,7 +1157,11 @@ pub fn run_mcp_server(db_path: &Path, tier: FeatureTier, app_config: &AppConfig)
                                     }
                                 }
                                 Err(e) => {
-                                    eprintln!("ai-memory: embed failed for {}: {}", &id[..8.min(id.len())], e);
+                                    eprintln!(
+                                        "ai-memory: embed failed for {}: {}",
+                                        &id[..8.min(id.len())],
+                                        e
+                                    );
                                 }
                             }
                         }
@@ -1135,7 +1184,10 @@ pub fn run_mcp_server(db_path: &Path, tier: FeatureTier, app_config: &AppConfig)
     let vector_index = if embedder.is_some() {
         match db::get_all_embeddings(&conn) {
             Ok(entries) if !entries.is_empty() => {
-                eprintln!("ai-memory: building HNSW index ({} vectors)...", entries.len());
+                eprintln!(
+                    "ai-memory: building HNSW index ({} vectors)...",
+                    entries.len()
+                );
                 let idx = VectorIndex::build(entries);
                 eprintln!("ai-memory: HNSW index ready ({} entries)", idx.len());
                 Some(idx)
@@ -1173,7 +1225,10 @@ pub fn run_mcp_server(db_path: &Path, tier: FeatureTier, app_config: &AppConfig)
     } else {
         "keyword"
     };
-    eprintln!("ai-memory MCP server started (stdio, tier={})", effective_tier);
+    eprintln!(
+        "ai-memory MCP server started (stdio, tier={})",
+        effective_tier
+    );
 
     for line in stdin.lock().lines() {
         let line = line?;

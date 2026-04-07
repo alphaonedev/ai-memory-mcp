@@ -213,9 +213,7 @@ mod tests {
 
     #[test]
     fn insert_and_search_overflow() {
-        let entries = vec![
-            ("a".into(), make_embedding(&[1.0, 0.0, 0.0])),
-        ];
+        let entries = vec![("a".into(), make_embedding(&[1.0, 0.0, 0.0]))];
         let idx = VectorIndex::build(entries);
         idx.insert("b".into(), make_embedding(&[0.9, 0.1, 0.0]));
         let results = idx.search(&make_embedding(&[1.0, 0.0, 0.0]), 2);
