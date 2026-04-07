@@ -156,10 +156,10 @@ struct StoreArgs {
     tier: String,
     #[arg(long, short)]
     namespace: Option<String>,
-    #[arg(long, short = 'T')]
+    #[arg(long, short = 'T', allow_hyphen_values = true)]
     title: String,
     /// Content (use - to read from stdin)
-    #[arg(long, short)]
+    #[arg(long, short, allow_hyphen_values = true)]
     content: String,
     #[arg(long, default_value = "")]
     tags: String,
@@ -182,9 +182,9 @@ struct StoreArgs {
 #[derive(Args)]
 struct UpdateArgs {
     id: String,
-    #[arg(long, short = 'T')]
+    #[arg(long, short = 'T', allow_hyphen_values = true)]
     title: Option<String>,
-    #[arg(long, short)]
+    #[arg(long, short, allow_hyphen_values = true)]
     content: Option<String>,
     #[arg(long, short)]
     tier: Option<String>,
@@ -203,6 +203,7 @@ struct UpdateArgs {
 
 #[derive(Args)]
 struct RecallArgs {
+    #[arg(allow_hyphen_values = true)]
     context: String,
     #[arg(long, short)]
     namespace: Option<String>,
@@ -214,10 +215,14 @@ struct RecallArgs {
     since: Option<String>,
     #[arg(long)]
     until: Option<String>,
+    /// Feature tier for recall: keyword, semantic, smart, autonomous
+    #[arg(long, short = 'T')]
+    tier: Option<String>,
 }
 
 #[derive(Args)]
 struct SearchArgs {
+    #[arg(allow_hyphen_values = true)]
     query: String,
     #[arg(long, short)]
     namespace: Option<String>,
@@ -288,9 +293,9 @@ struct LinkArgs {
 struct ConsolidateArgs {
     /// Comma-separated memory IDs
     ids: String,
-    #[arg(long, short = 'T')]
+    #[arg(long, short = 'T', allow_hyphen_values = true)]
     title: String,
-    #[arg(long, short = 's')]
+    #[arg(long, short = 's', allow_hyphen_values = true)]
     summary: String,
     #[arg(long, short)]
     namespace: Option<String>,
@@ -396,7 +401,7 @@ async fn main() -> Result<()> {
         }
         Command::Store(a) => cmd_store(db_path, a, j),
         Command::Update(a) => cmd_update(db_path, a, j),
-        Command::Recall(a) => cmd_recall(db_path, a, j),
+        Command::Recall(a) => cmd_recall(db_path, a, j, &app_config),
         Command::Search(a) => cmd_search(db_path, a, j),
         Command::Get(a) => cmd_get(db_path, a, j),
         Command::List(a) => cmd_list(db_path, a, j),
@@ -648,20 +653,126 @@ fn cmd_update(db_path: PathBuf, args: UpdateArgs, json_out: bool) -> Result<()> 
     Ok(())
 }
 
-fn cmd_recall(db_path: PathBuf, args: RecallArgs, json_out: bool) -> Result<()> {
+fn cmd_recall(db_path: PathBuf, args: RecallArgs, json_out: bool, app_config: &config::AppConfig) -> Result<()> {
     let conn = db::open(&db_path)?;
     let _ = db::gc_if_needed(&conn);
-    let results = db::recall(
-        &conn,
-        &args.context,
-        args.namespace.as_deref(),
-        args.limit,
-        args.tags.as_deref(),
-        args.since.as_deref(),
-        args.until.as_deref(),
-    )?;
+
+    // Resolve feature tier
+    let feature_tier = app_config.effective_tier(args.tier.as_deref());
+    let tier_config = feature_tier.config();
+
+    // Initialize embedder if tier supports it
+    let embedder = if let Some(ref emb_model) = tier_config.embedding_model {
+        let ollama_client = if tier_config.llm_model.is_some() {
+            let ollama_url = app_config.effective_ollama_url();
+            llm::OllamaClient::new_with_url(ollama_url, "nomic-embed-text")
+                .ok()
+                .map(Arc::new)
+        } else {
+            None
+        };
+        let embed_client = {
+            let embed_url = app_config.effective_embed_url();
+            let ollama_url = app_config.effective_ollama_url();
+            if embed_url != ollama_url {
+                llm::OllamaClient::new_with_url(embed_url, "nomic-embed-text")
+                    .ok()
+                    .map(Arc::new)
+                    .or(ollama_client.clone())
+            } else {
+                ollama_client.clone()
+            }
+        };
+        match embeddings::Embedder::for_model(*emb_model, embed_client) {
+            Ok(emb) => {
+                eprintln!("ai-memory: embedder loaded ({})", emb.model_description());
+                // Backfill embeddings for memories that don't have them
+                if let Ok(unembedded) = db::get_unembedded_ids(&conn) {
+                    if !unembedded.is_empty() {
+                        eprintln!("ai-memory: backfilling {} memories...", unembedded.len());
+                        let mut ok = 0usize;
+                        for (id, title, content) in &unembedded {
+                            let text = format!("{} {}", title, content);
+                            if let Ok(embedding) = emb.embed(&text) {
+                                if db::set_embedding(&conn, id, &embedding).is_ok() {
+                                    ok += 1;
+                                }
+                            }
+                        }
+                        eprintln!("ai-memory: backfilled {}/{}", ok, unembedded.len());
+                    }
+                }
+                Some(emb)
+            }
+            Err(e) => {
+                eprintln!("ai-memory: embedder failed: {e}, falling back to keyword");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Build HNSW vector index if embedder is available
+    let vector_index = if embedder.is_some() {
+        match db::get_all_embeddings(&conn) {
+            Ok(entries) if !entries.is_empty() => {
+                Some(hnsw::VectorIndex::build(entries))
+            }
+            _ => Some(hnsw::VectorIndex::empty()),
+        }
+    } else {
+        None
+    };
+
+    // Initialize cross-encoder reranker for autonomous tier
+    let reranker = if tier_config.cross_encoder {
+        Some(reranker::CrossEncoder::new_neural())
+    } else {
+        None
+    };
+
+    // Perform recall: hybrid if embedder available, keyword otherwise
+    let (results, mode) = if let Some(ref emb) = embedder {
+        match emb.embed(&args.context) {
+            Ok(query_emb) => {
+                let results = db::recall_hybrid(
+                    &conn,
+                    &args.context,
+                    &query_emb,
+                    args.namespace.as_deref(),
+                    args.limit.min(50),
+                    args.tags.as_deref(),
+                    args.since.as_deref(),
+                    args.until.as_deref(),
+                    vector_index.as_ref(),
+                )?;
+                if let Some(ref ce) = reranker {
+                    (ce.rerank(&args.context, results), "hybrid+rerank")
+                } else {
+                    (results, "hybrid")
+                }
+            }
+            Err(e) => {
+                eprintln!("ai-memory: embedding query failed: {e}, falling back to keyword");
+                let results = db::recall(
+                    &conn, &args.context, args.namespace.as_deref(),
+                    args.limit, args.tags.as_deref(),
+                    args.since.as_deref(), args.until.as_deref(),
+                )?;
+                (results, "keyword")
+            }
+        }
+    } else {
+        let results = db::recall(
+            &conn, &args.context, args.namespace.as_deref(),
+            args.limit, args.tags.as_deref(),
+            args.since.as_deref(), args.until.as_deref(),
+        )?;
+        (results, "keyword")
+    };
+
     if json_out {
-        // Include scores in JSON output
         let scored: Vec<serde_json::Value> = results.iter().map(|(m, s)| {
             let mut v = serde_json::to_value(m).unwrap_or_default();
             if let Some(obj) = v.as_object_mut() {
@@ -672,7 +783,7 @@ fn cmd_recall(db_path: PathBuf, args: RecallArgs, json_out: bool) -> Result<()> 
         println!(
             "{}",
             serde_json::to_string(
-                &serde_json::json!({"memories": scored, "count": results.len()})
+                &serde_json::json!({"memories": scored, "count": results.len(), "mode": mode})
             )?
         );
         return Ok(());
@@ -705,7 +816,7 @@ fn cmd_recall(db_path: PathBuf, args: RecallArgs, json_out: bool) -> Result<()> 
         let preview: String = mem.content.chars().take(200).collect();
         println!("  {}\n", color::dim(&preview));
     }
-    println!("{} memory(ies) recalled", results.len());
+    println!("{} memory(ies) recalled [{}]", results.len(), mode);
     Ok(())
 }
 

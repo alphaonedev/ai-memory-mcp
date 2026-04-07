@@ -1032,6 +1032,23 @@ pub fn run_mcp_server(db_path: &Path, tier: FeatureTier, app_config: &AppConfig)
         }
     }
 
+    // Apply embedding model override from config.toml
+    if tier_config.embedding_model.is_some() {
+        if let Some(ref emb_override) = app_config.embedding_model {
+            match emb_override.as_str() {
+                "mini_lm_l6_v2" => {
+                    tier_config.embedding_model = Some(crate::config::EmbeddingModel::MiniLmL6V2);
+                    eprintln!("ai-memory: embedding_model override from config: mini_lm_l6_v2 (local)");
+                }
+                "nomic_embed_v15" => {
+                    tier_config.embedding_model = Some(crate::config::EmbeddingModel::NomicEmbedV15);
+                    eprintln!("ai-memory: embedding_model override from config: nomic_embed_v15 (Ollama)");
+                }
+                other => eprintln!("ai-memory: unknown embedding_model '{}', using tier default", other),
+            }
+        }
+    }
+
     // --- Initialize LLM (smart tier and above) — before embedder so Ollama
     //     client can be shared with nomic embedder ---
     let llm: Option<Arc<OllamaClient>> = if let Some(ref llm_model) = tier_config.llm_model {
@@ -1059,8 +1076,26 @@ pub fn run_mcp_server(db_path: &Path, tier: FeatureTier, app_config: &AppConfig)
     };
 
     // --- Initialize embedder (semantic tier and above) ---
+    // Use a separate embed client if embed_url is configured differently from ollama_url
+    let embed_client: Option<Arc<OllamaClient>> = {
+        let embed_url = app_config.effective_embed_url();
+        let ollama_url = app_config.effective_ollama_url();
+        if embed_url != ollama_url {
+            // Separate embed URL configured — create a dedicated client for embeddings
+            eprintln!("ai-memory: using separate embed URL: {}", embed_url);
+            match OllamaClient::new_with_url(embed_url, "nomic-embed-text") {
+                Ok(client) => Some(Arc::new(client)),
+                Err(e) => {
+                    eprintln!("ai-memory: embed client failed: {e}, falling back to LLM client");
+                    llm.clone()
+                }
+            }
+        } else {
+            llm.clone()
+        }
+    };
     let embedder = if let Some(ref emb_model) = tier_config.embedding_model {
-        match Embedder::for_model(*emb_model, llm.clone()) {
+        match Embedder::for_model(*emb_model, embed_client) {
             Ok(emb) => {
                 eprintln!("ai-memory: embedder loaded ({})", emb.model_description());
                 // Backfill embeddings for memories that don't have them

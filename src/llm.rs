@@ -95,9 +95,12 @@ impl OllamaClient {
                 models.iter().any(|m| {
                     let name = m["name"].as_str().unwrap_or("");
                     // Match "model" or "model:tag" against our model string
+                    // Also match when our model base (before ':') matches the served name
+                    let our_base = self.model.split(':').next().unwrap_or(&self.model);
                     name == self.model
                         || name.starts_with(&format!("{}:", self.model))
                         || self.model == name.split(':').next().unwrap_or("")
+                        || name == our_base
                 })
             })
             .unwrap_or(false);
@@ -131,20 +134,23 @@ impl OllamaClient {
         Ok(())
     }
 
-    /// Generates a completion from Ollama. Uses stream: false for simplicity.
+    /// Generates a completion using the /api/chat endpoint (Ollama chat format).
+    /// This is compatible with both Ollama and vMLX/OpenAI-compatible servers.
     /// Returns the response text.
     pub fn generate(&self, prompt: &str, system: Option<&str>) -> Result<String> {
-        let url = format!("{}/api/generate", self.base_url);
+        let url = format!("{}/api/chat", self.base_url);
 
-        let mut payload = json!({
+        let mut messages = Vec::new();
+        if let Some(sys) = system {
+            messages.push(json!({"role": "system", "content": sys}));
+        }
+        messages.push(json!({"role": "user", "content": prompt}));
+
+        let payload = json!({
             "model": self.model,
-            "prompt": prompt,
+            "messages": messages,
             "stream": false,
         });
-
-        if let Some(sys) = system {
-            payload["system"] = Value::String(sys.to_string());
-        }
 
         let resp = self
             .client
@@ -152,13 +158,13 @@ impl OllamaClient {
             .timeout(GENERATE_TIMEOUT)
             .json(&payload)
             .send()
-            .context("Failed to send generate request to Ollama")?;
+            .context("Failed to send chat request")?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().unwrap_or_default();
             return Err(anyhow!(
-                "Ollama generate failed ({}): {}",
+                "Chat generate failed ({}): {}",
                 status,
                 text
             ));
@@ -166,11 +172,12 @@ impl OllamaClient {
 
         let body: Value = resp
             .json()
-            .context("Failed to parse Ollama generate response")?;
+            .context("Failed to parse chat response")?;
 
-        let response_text = body["response"]
+        // Ollama /api/chat returns {"message": {"content": "..."}}
+        let response_text = body["message"]["content"]
             .as_str()
-            .ok_or_else(|| anyhow!("Missing 'response' field in Ollama output"))?
+            .ok_or_else(|| anyhow!("Missing 'message.content' field in chat output"))?
             .to_string();
 
         Ok(response_text)
