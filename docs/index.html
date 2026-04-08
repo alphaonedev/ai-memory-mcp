@@ -467,7 +467,7 @@
 <section id="install">
     <div class="container">
         <h2>Install</h2>
-        <p class="section-subtitle">One command. No dependencies for pre-built binaries. Three installation methods.</p>
+        <p class="section-subtitle">One command. No dependencies for pre-built binaries. Seven installation methods.</p>
 
         <!-- ---- Install Methods ---- -->
         <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:1.25rem;margin:2rem 0">
@@ -481,6 +481,18 @@
                 <h4 style="font-size:1rem;margin-bottom:.25rem;color:var(--text)">Windows</h4>
                 <p style="font-size:.8rem;color:var(--text-muted);margin-bottom:.75rem">PowerShell installer. Adds to PATH automatically.</p>
                 <pre style="margin:0;font-size:.78rem"><code><span class="tok-cmd">irm</span> <span class="tok-url">https://raw.githubusercontent.com/alphaonedev/ai-memory-mcp/main/install.ps1</span> | <span class="tok-cmd">iex</span></code></pre>
+            </div>
+            <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:10px;padding:1.5rem">
+                <h4 style="font-size:1rem;margin-bottom:.25rem;color:var(--text)">Ubuntu <span style="font-size:.7rem;color:var(--text-muted);font-weight:400">(PPA)</span></h4>
+                <p style="font-size:.8rem;color:var(--text-muted);margin-bottom:.75rem">Native apt package. Auto-updates with system.</p>
+                <pre style="margin:0;font-size:.78rem"><code><span class="tok-cmd">sudo</span> add-apt-repository ppa:jbridger2021/ai-memory
+<span class="tok-cmd">sudo</span> apt update
+<span class="tok-cmd">sudo</span> apt install ai-memory</code></pre>
+            </div>
+            <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:10px;padding:1.5rem">
+                <h4 style="font-size:1rem;margin-bottom:.25rem;color:var(--text)">Homebrew <span style="font-size:.7rem;color:var(--text-muted);font-weight:400">(macOS + Linux)</span></h4>
+                <p style="font-size:.8rem;color:var(--text-muted);margin-bottom:.75rem">Tap formula. Pre-built binary, no compile.</p>
+                <pre style="margin:0;font-size:.78rem"><code><span class="tok-cmd">brew</span> install alphaonedev/tap/ai-memory</code></pre>
             </div>
             <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:10px;padding:1.5rem">
                 <h4 style="font-size:1rem;margin-bottom:.25rem;color:var(--text)">Cargo <span style="font-size:.7rem;color:var(--text-muted);font-weight:400">(crates.io)</span></h4>
