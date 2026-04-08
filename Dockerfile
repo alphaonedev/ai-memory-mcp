@@ -24,7 +24,8 @@ LABEL org.opencontainers.image.title="ai-memory" \
       org.opencontainers.image.version="0.5.1" \
       org.opencontainers.image.source="https://github.com/alphaonedev/ai-memory-mcp" \
       org.opencontainers.image.licenses="MIT" \
-      org.opencontainers.image.vendor="AlphaOne LLC"
+      org.opencontainers.image.vendor="AlphaOne LLC" \
+      io.modelcontextprotocol.server.name="io.github.alphaonedev/ai-memory"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \

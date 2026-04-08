@@ -1,5 +1,5 @@
 {
-  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-09-29/server.schema.json",
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.alphaonedev/ai-memory",
   "description": "Persistent memory for any AI — zero token cost until recall",
   "version": "0.5.1",
@@ -11,15 +11,16 @@
   "packages": [
     {
       "registryType": "oci",
-      "identifier": "ghcr.io/alphaonedev/ai-memory",
-      "version": "0.5.1",
-      "registryBaseUrl": "https://ghcr.io",
+      "identifier": "ghcr.io/alphaonedev/ai-memory:0.5.1",
       "runtimeHint": "docker",
       "transport": {
         "type": "stdio"
       },
       "runtimeArguments": [],
-      "packageArguments": ["mcp", "--tier", "semantic"],
+      "packageArguments": [
+        {"type": "positional", "value": "mcp"},
+        {"type": "named", "name": "--tier", "value": "semantic", "description": "Feature tier: keyword, semantic, smart, autonomous"}
+      ],
       "environmentVariables": [
         {
           "name": "AI_MEMORY_DB",
