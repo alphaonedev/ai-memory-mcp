@@ -1,16 +1,18 @@
 # syntax=docker/dockerfile:1
 
 # ---- Build stage ----
-FROM rust:1.82-slim AS builder
+FROM rust:1.86-slim AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     libssl-dev \
+    build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
+COPY benches/ benches/
 
 RUN cargo build --release && strip target/release/ai-memory
 
@@ -19,7 +21,7 @@ FROM debian:bookworm-slim
 
 LABEL org.opencontainers.image.title="ai-memory" \
       org.opencontainers.image.description="AI-agnostic persistent memory system — MCP server, HTTP API, and CLI" \
-      org.opencontainers.image.version="0.4.0" \
+      org.opencontainers.image.version="0.5.0" \
       org.opencontainers.image.source="https://github.com/alphaonedev/ai-memory-mcp" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.vendor="AlphaOne LLC"
