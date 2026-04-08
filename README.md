@@ -34,6 +34,7 @@ ai-memory integrates with any AI platform that supports the **Model Context Prot
 | **Windsurf** (Codeium) | MCP stdio | JSON (`~/.codeium/windsurf/mcp_config.json`) | Fully supported |
 | **Continue.dev** | MCP stdio | YAML (`~/.continue/config.yaml`) | Fully supported |
 | **Llama Stack** (META) | MCP remote HTTP | YAML / Python SDK | Fully supported |
+| **OpenClaw** | MCP stdio | JSON (`mcp.servers` in config) | Fully supported |
 | **Any MCP client** | MCP stdio or HTTP | Varies | Universal |
 
 MCP is the primary integration layer. For AI platforms that do not yet support MCP natively, the **HTTP API** (20 endpoints on localhost) and the **CLI** (25 commands) provide universal access -- any AI, script, or automation that can make HTTP calls or run shell commands can use ai-memory.
@@ -294,6 +295,34 @@ tool_groups:
 ```
 
 > **Notes:** Supports `${env.VAR_NAME}` interpolation in run.yaml. Transport is migrating from SSE to Streamable HTTP. See [Llama Stack Tools docs](https://llama-stack.readthedocs.io/en/latest/building_applications/tools.html).
+
+</details>
+
+<details>
+<summary><strong>OpenClaw</strong></summary>
+
+Add via CLI or edit the OpenClaw config directly. Config uses `mcp.servers` (not `mcpServers`).
+
+```bash
+openclaw mcp set memory '{"command":"ai-memory","args":["--db","~/.local/share/ai-memory/memories.db","mcp","--tier","semantic"]}'
+```
+
+Or add to your OpenClaw config file:
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "memory": {
+        "command": "ai-memory",
+        "args": ["--db", "~/.local/share/ai-memory/memories.db", "mcp", "--tier", "semantic"]
+      }
+    }
+  }
+}
+```
+
+> **Notes:** OpenClaw uses `mcp.servers` key (not `mcpServers`). CLI management: `openclaw mcp list`, `openclaw mcp show`, `openclaw mcp set`, `openclaw mcp unset`. Supports stdio, remote URL, and Streamable HTTP transports. Prefer `--token-file` over inline secrets. See [OpenClaw MCP docs](https://docs.openclaw.ai/cli/mcp).
 
 </details>
 

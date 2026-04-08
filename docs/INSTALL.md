@@ -1,6 +1,6 @@
 # Installation Guide
 
-> **BLUF (Bottom Line Up Front):** `ai-memory` is an AI-agnostic memory management system that works with **any MCP-compatible AI client** -- including Claude AI, OpenAI ChatGPT, xAI Grok, META Llama, and others. Install the binary, configure your AI client's MCP settings, and you get 17 memory tools instantly. The default `semantic` tier includes embedding-based hybrid recall out of the box. Total time: ~60 seconds (pre-built binary + fast internet; first semantic-tier run also downloads a ~100MB embedding model).
+> **BLUF (Bottom Line Up Front):** `ai-memory` is an AI-agnostic memory management system that works with **any MCP-compatible AI client** -- including Claude AI, OpenAI ChatGPT, xAI Grok, META Llama, OpenClaw, and others. Install the binary, configure your AI client's MCP settings, and you get 17 memory tools instantly. The default `semantic` tier includes embedding-based hybrid recall out of the box. Total time: ~60 seconds (pre-built binary + fast internet; first semantic-tier run also downloads a ~100MB embedding model).
 
 ## Install in 60 Seconds (pre-built binary + fast internet)
 
@@ -198,7 +198,7 @@ sudo mv ai-memory /usr/local/bin/
 
 ## MCP Server Setup (Recommended)
 
-The primary integration path is the **MCP tool server**. MCP (Model Context Protocol) is an open standard -- `ai-memory` works with **any MCP-compatible AI client**, including Claude AI, OpenAI ChatGPT, xAI Grok, META Llama, and others.
+The primary integration path is the **MCP tool server**. MCP (Model Context Protocol) is an open standard -- `ai-memory` works with **any MCP-compatible AI client**, including Claude AI, OpenAI ChatGPT, xAI Grok, META Llama, OpenClaw, and others.
 
 ### Step 1: Add MCP configuration
 
@@ -489,6 +489,35 @@ tool_groups:
 ```
 
 > **Notes for Llama Stack:** Supports `${env.VARIABLE_NAME}` syntax for environment variable interpolation in run.yaml. Transport is migrating from SSE to Streamable HTTP as the primary protocol. See [Llama Stack Tools docs](https://llama-stack.readthedocs.io/en/latest/building_applications/tools.html).
+
+#### OpenClaw
+
+| Scope | File | Notes |
+|-------|------|-------|
+| **Single config** | Platform config file | OpenClaw uses a single configuration file (no separate global/project scopes) |
+
+> **Important:** OpenClaw uses `mcp.servers` (NOT `mcpServers`). The key structure is different from most other platforms.
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "memory": {
+        "command": "ai-memory",
+        "args": ["--db", "~/.local/share/ai-memory/memories.db", "mcp", "--tier", "semantic"]
+      }
+    }
+  }
+}
+```
+
+Or add via CLI:
+
+```bash
+openclaw mcp set memory '{"command":"ai-memory","args":["--db","~/.local/share/ai-memory/memories.db","mcp","--tier","semantic"]}'
+```
+
+> **Notes for OpenClaw:** Uses `mcp.servers` key (not camelCase `mcpServers` — this is critical). CLI management: `openclaw mcp list`, `openclaw mcp show <name>`, `openclaw mcp unset <name>`. See [OpenClaw MCP docs](https://docs.openclaw.ai/cli/mcp).
 
 If `ai-memory` is not in your PATH, use the full path to the binary in any of the configurations above:
 
