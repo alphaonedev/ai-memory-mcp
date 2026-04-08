@@ -1,6 +1,6 @@
 # Claude Memory Integration
 
-> **Note:** `ai-memory` is AI-agnostic and works with any MCP-compatible AI client (Claude AI, OpenAI ChatGPT, xAI Grok, META Llama, and others). This file contains **Claude Code-specific** integration instructions.
+> **Note:** `ai-memory` is AI-agnostic and works with any MCP-compatible AI client (Claude AI, OpenAI ChatGPT, xAI Grok, META Llama, OpenClaw, and others). This file contains **Claude Code-specific** integration instructions.
 
 This project is `ai-memory` -- a persistent memory daemon that replaces Claude Code's built-in auto-memory. **Zero token cost until recall** -- unlike auto-memory which loads 200+ lines into every conversation, ai-memory uses zero context tokens until explicitly called. **TOON compact** is the default response format (79% smaller than JSON). 161 tests, 15/15 modules, 95%+ coverage. **LongMemEval benchmark: 97.8% R@5, 99.0% R@10, 99.8% R@20** (489/500, ICLR 2025 dataset).
 

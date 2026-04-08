@@ -600,6 +600,7 @@
                     <span class="integration-tab" onclick="switchTab('tab-continue')">Continue.dev</span>
                     <span class="integration-tab" onclick="switchTab('tab-grok')">Grok</span>
                     <span class="integration-tab" onclick="switchTab('tab-llama')">Llama</span>
+                    <span class="integration-tab" onclick="switchTab('tab-openclaw')">OpenClaw</span>
                     <span class="integration-tab" onclick="switchTab('tab-mcp-generic')">Any MCP Client</span>
                 </div>
 
@@ -768,6 +769,26 @@
 <span class="tok-cm"># Or use the REST API directly in custom tool definitions:</span>
 <span class="tok-cm">#   POST /api/v1/memories, GET /api/v1/recall, etc.</span><span class="lang-label">bash</span></code></pre>
                     <p style="font-size:.85rem">META Llama uses Llama Stack for tool registration. Run <code>ai-memory serve</code> and register as a toolgroup via Python SDK or <code>run.yaml</code> (supports <code>${env.VAR_NAME}</code> interpolation). Transport migrating from SSE to Streamable HTTP. See <a href="https://llama-stack.readthedocs.io/en/latest/building_applications/tools.html">Llama Stack Tools docs</a>.</p>
+                </div>
+
+                <div id="tab-openclaw" class="integration-panel">
+                    <p><strong>OpenClaw Configuration:</strong></p>
+                    <table style="font-size:.85rem; margin-bottom:1rem; width:100%; border-collapse:collapse;">
+                        <tr style="border-bottom:1px solid #ddd;"><th style="text-align:left;padding:4px 8px;">Scope</th><th style="text-align:left;padding:4px 8px;">File</th><th style="text-align:left;padding:4px 8px;">Applies to</th></tr>
+                        <tr><td style="padding:4px 8px;"><strong>Single config</strong></td><td style="padding:4px 8px;">Platform config file</td><td style="padding:4px 8px;">All projects (single config file)</td></tr>
+                    </table>
+                    <p style="font-size:.85rem"><strong>Important:</strong> OpenClaw uses <code>mcp.servers</code> (NOT <code>mcpServers</code>). The key structure is different from most other platforms.</p>
+                    <pre><code>{
+  <span class="tok-str">"mcp"</span>: {
+    <span class="tok-str">"servers"</span>: {
+      <span class="tok-str">"memory"</span>: {
+        <span class="tok-str">"command"</span>: <span class="tok-str">"ai-memory"</span>,
+        <span class="tok-str">"args"</span>: [<span class="tok-str">"--db"</span>, <span class="tok-str">"~/.local/share/ai-memory/memories.db"</span>, <span class="tok-str">"mcp"</span>, <span class="tok-str">"--tier"</span>, <span class="tok-str">"semantic"</span>]
+      }
+    }
+  }
+}<span class="lang-label">json</span></code></pre>
+                    <p style="font-size:.85rem">CLI shortcut: <code>openclaw mcp set memory '{"command":"ai-memory","args":["--db","~/.local/share/ai-memory/memories.db","mcp","--tier","semantic"]}'</code>. Management: <code>openclaw mcp list</code>, <code>openclaw mcp show &lt;name&gt;</code>, <code>openclaw mcp unset &lt;name&gt;</code>. See <a href="https://docs.openclaw.ai/cli/mcp">OpenClaw MCP docs</a>.</p>
                 </div>
 
                 <div id="tab-mcp-generic" class="integration-panel">
