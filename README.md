@@ -436,6 +436,22 @@ Beyond MCP, ai-memory also exposes a full HTTP REST API (20 endpoints on port 90
 
 ---
 
+## Benchmark
+
+<p align="center">
+  <img src="docs/benchmark.svg" alt="LongMemEval benchmark results" width="820">
+</p>
+
+Evaluated on the [ICLR 2025 LongMemEval-S](benchmarks/longmemeval/) dataset (500 questions, 6 categories). Pure FTS5 keyword tier achieves 97.0% R@5 in 2.2 seconds. LLM query expansion (smart tier) pushes to 97.8% R@5. All inference runs locally — zero cloud API calls, zero cost.
+
+| Tier | R@5 | Speed | Dependencies |
+|------|-----|-------|-------------|
+| **keyword** | 97.0% | 232 q/s | None |
+| **semantic** | 97.4% | 45 q/s | Embedding model (~100MB) |
+| **smart** | 97.8% | 12 q/s | Ollama + Gemma 4 E2B |
+
+---
+
 ## Integration Methods
 
 ### MCP (Primary -- for MCP-compatible AI platforms)
