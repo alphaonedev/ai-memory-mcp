@@ -51,6 +51,9 @@ Pre-built binaries require no dependencies. Building from source needs Rust and 
 # macOS / Linux
 curl -fsSL https://raw.githubusercontent.com/alphaonedev/ai-memory-mcp/main/install.sh | sh
 
+# Ubuntu (PPA)
+sudo add-apt-repository ppa:jbridger2021/ai-memory && sudo apt install ai-memory
+
 # Windows (PowerShell)
 irm https://raw.githubusercontent.com/alphaonedev/ai-memory-mcp/main/install.ps1 | iex
 ```

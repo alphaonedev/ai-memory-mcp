@@ -31,16 +31,23 @@
    cargo binstall ai-memory
    ```
 
-   **Ubuntu/Debian (.deb):**
+   **Ubuntu (PPA — recommended):**
+   ```bash
+   sudo add-apt-repository ppa:jbridger2021/ai-memory
+   sudo apt update
+   sudo apt install ai-memory
+   ```
+
+   **Ubuntu/Debian (.deb manual install):**
    ```bash
    # Download from https://github.com/alphaonedev/ai-memory-mcp/releases/latest
-   sudo dpkg -i ai-memory_0.5.0_amd64.deb   # or arm64
+   sudo dpkg -i ai-memory_0.5.1_amd64.deb   # or arm64
    ```
 
    **Fedora/RHEL (.rpm):**
    ```bash
    # Download from https://github.com/alphaonedev/ai-memory-mcp/releases/latest
-   sudo rpm -i ai-memory-0.5.0.x86_64.rpm    # or aarch64
+   sudo rpm -i ai-memory-0.5.1-1.x86_64.rpm    # or aarch64
    ```
 
    **Docker:**
