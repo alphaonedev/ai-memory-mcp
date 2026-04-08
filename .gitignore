@@ -15,3 +15,4 @@ credentials*
 
 # Benchmark results
 benchmarks/longmemeval/results/
+.mcpregistry_*
