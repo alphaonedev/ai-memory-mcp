@@ -1,0 +1,17 @@
+name: ai-memory
+arch: "${ARCH}"
+platform: linux
+version: "${VERSION}"
+maintainer: "AlphaOne LLC <alphaonedev@users.noreply.github.com>"
+description: "AI-agnostic persistent memory system — MCP server, HTTP API, and CLI"
+vendor: "AlphaOne LLC"
+homepage: "https://alphaonedev.github.io/ai-memory-mcp/"
+license: MIT
+section: utils
+priority: optional
+
+contents:
+  - src: dist/ai-memory
+    dst: /usr/bin/ai-memory
+    file_info:
+      mode: 0755
