@@ -55,9 +55,11 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             artifact: ai-memory
+            nfpm_arch: amd64
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
             artifact: ai-memory
+            nfpm_arch: arm64
           - target: x86_64-apple-darwin
             os: macos-latest
             artifact: ai-memory
@@ -96,16 +98,31 @@ jobs:
           Copy-Item "target/${{ matrix.target }}/release/${{ matrix.artifact }}" -Destination dist/
           Compress-Archive -Path "dist/${{ matrix.artifact }}" -DestinationPath "dist/ai-memory-${{ matrix.target }}.zip"
 
+      - name: Build deb and rpm packages
+        if: matrix.nfpm_arch
+        run: |
+          # Install nfpm
+          curl -sfL https://github.com/goreleaser/nfpm/releases/download/v2.41.1/nfpm_2.41.1_$(uname -s)_$(uname -m).tar.gz | tar xz -C /usr/local/bin nfpm
+
+          VERSION="${GITHUB_REF_NAME#v}"
+
+          # Build .deb
+          ARCH=${{ matrix.nfpm_arch }} VERSION=$VERSION nfpm package -p deb -f nfpm.yaml -t dist/
+          # Build .rpm
+          ARCH=${{ matrix.nfpm_arch }} VERSION=$VERSION nfpm package -p rpm -f nfpm.yaml -t dist/
+
+          ls -la dist/*.deb dist/*.rpm
+
       - name: Upload release artifact
         uses: actions/upload-artifact@v5
         with:
           name: ai-memory-${{ matrix.target }}
-          path: dist/ai-memory-${{ matrix.target }}.*
+          path: dist/ai-memory*
 
       - name: Create GitHub Release
         if: github.event_name == 'push'
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/ai-memory-${{ matrix.target }}.*
+          files: dist/ai-memory*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
