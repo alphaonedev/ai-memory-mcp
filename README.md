@@ -13,6 +13,7 @@
 [![SQLite](https://img.shields.io/badge/sqlite-FTS5-003B57?logo=sqlite)](https://www.sqlite.org/)
 [![Tests](https://img.shields.io/badge/tests-161_(118_unit_+_43_integration)-brightgreen)]()
 [![MCP](https://img.shields.io/badge/MCP-17_tools-blueviolet)]()
+[![Crates.io Version](https://img.shields.io/crates/v/ai-memory)]()
 
 **ai-memory is a persistent memory system for AI assistants.** It works with **any AI that supports MCP** -- Claude, ChatGPT, Grok, Llama, and more. It stores what your AI learns in a local SQLite database, ranks memories by relevance when recalling, and auto-promotes important knowledge to permanent storage. Install it once, and every AI assistant you use remembers your architecture, your preferences, your corrections -- forever.
 
@@ -71,6 +72,14 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 Follow the prompts, then restart your terminal (or run `source ~/.cargo/env`).
 
 **Step 2: From source (requires Rust)**
+
+Latest release from [Crates.io](https://crates.io/crates/ai-memory):
+
+```bash
+cargo install ai-memory
+```
+
+Latest from the git repository:
 
 ```bash
 cargo install --git https://github.com/alphaonedev/ai-memory-mcp.git
