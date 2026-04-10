@@ -153,3 +153,87 @@ Memories are ranked by: FTS relevance + priority weight + access frequency + con
 - Priority reinforcement: +1 every 10 accesses (max 10)
 - Contradiction detection on store: warns about similar titles in same namespace
 - Deduplication: upsert on title+namespace, tier never downgrades
+
+---
+
+## Using CLAUDE.md in Your Projects
+
+> **This section is for users who want Claude Code to proactively use ai-memory in their own projects.** The instructions above describe how ai-memory works internally. The template below is what you put in **your** project's `CLAUDE.md` to instruct Claude to use ai-memory as its primary memory facility.
+
+### Why CLAUDE.md?
+
+Claude Code reads `CLAUDE.md` files at the start of every conversation. By adding ai-memory directives to your project's `CLAUDE.md`, you ensure Claude **always** recalls relevant context before starting work and **always** stores important findings — without being prompted.
+
+### CLAUDE.md Template
+
+Copy the following into your project's `CLAUDE.md` (create it if it doesn't exist). Customize the namespace and any project-specific notes.
+
+````markdown
+# Project — Claude Instructions
+
+## AI Memory (MANDATORY)
+
+Use `ai-memory` for persistent memory across conversations. This is NOT optional.
+
+### On every conversation start:
+1. Run `ai-memory recall "<topic>"` to check for relevant context before starting work
+2. If the user references prior work, recall related memories first
+
+### While working:
+- Store important findings, decisions, and bug fixes as they happen — don't wait until the end
+- Use namespace `my-project` for all project memories
+- Default tier: `long`, default priority: `5` (use `9-10` for critical knowledge)
+
+### When finishing work:
+- Store a memory summarizing what was done, why, and any gotchas for next time
+- Update existing memories if your work changes previously recorded facts
+
+### Quick reference:
+```bash
+ai-memory recall "search query"                                      # fuzzy search
+ai-memory search "exact keywords"                                    # precise match
+ai-memory store -T "Title" -n my-project -t long -p 5 -c "content"  # store
+ai-memory update <id> -c "new content"                               # update
+ai-memory list -n my-project                                         # browse
+```
+````
+
+### Where to Place CLAUDE.md
+
+| Location | Scope | Use when |
+|----------|-------|----------|
+| `<project-root>/CLAUDE.md` | Project-wide | Default — applies to every Claude Code session in the project |
+| `<subfolder>/CLAUDE.md` | Subdirectory | Adds directives when Claude works in that subdirectory |
+| `~/.claude/CLAUDE.md` | User-global | Applies to all projects (put ai-memory directives here for universal recall) |
+
+Claude Code loads all applicable `CLAUDE.md` files hierarchically — project root + any parent/child directories + user-global. The ai-memory directives in any of them will take effect.
+
+### Claude Code Desktop
+
+Claude Code Desktop reads the same `CLAUDE.md` files. The same template works for both CLI and Desktop — no separate configuration needed. Place `CLAUDE.md` in your project root and it applies to both.
+
+### Combining with MCP
+
+For the best experience, use **both** MCP and CLAUDE.md together:
+
+1. **MCP** (in `~/.claude.json`) gives Claude native `memory_recall`, `memory_store`, etc. tools
+2. **CLAUDE.md** (in your project) instructs Claude **when** and **how** to use those tools proactively
+
+Without CLAUDE.md, Claude has the tools but may not use them unless asked. Without MCP, Claude falls back to the CLI commands in CLAUDE.md. Both together gives you proactive, tool-native memory.
+
+### Session Hooks (Optional)
+
+For automatic recall at session start without relying on CLAUDE.md directives, use the session-start hook in `hooks/session-start.sh`:
+
+```json
+// Add to ~/.claude/settings.json
+{
+  "hooks": {
+    "PreToolUse": [
+      { "command": "~/.claude/hooks/session-start.sh" }
+    ]
+  }
+}
+```
+
+This auto-recalls memories matching the current working directory on every session start.
