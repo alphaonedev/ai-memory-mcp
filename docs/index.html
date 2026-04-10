@@ -318,6 +318,7 @@
         <div class="links">
             <a href="#platforms">Platforms</a>
             <a href="#install">Install</a>
+            <a href="#claude-integration">Claude Code</a>
             <a href="#features">Features</a>
             <a href="#mcp">Interfaces</a>
             <a href="#architecture">Architecture</a>
@@ -865,6 +866,125 @@
 <span class="tok-cm"># CLI:  ai-memory stats</span><span class="lang-label">text</span></code></pre>
             </li>
         </ol>
+    </div>
+</section>
+
+<!-- ================================================================
+     CLAUDE CODE INTEGRATION
+     ================================================================ -->
+<section id="claude-integration">
+    <div class="container">
+        <h2>Claude Code Integration <span class="badge">CLI &amp; Desktop</span></h2>
+        <p class="section-subtitle">Make Claude Code proactively use ai-memory in every conversation. Works with both <strong>Claude Code CLI</strong> and <strong>Claude Code Desktop</strong>.</p>
+
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:1.5rem;margin-top:1.5rem">
+
+            <!-- Step 1: MCP -->
+            <div class="card" style="border-left:3px solid var(--green)">
+                <h3 style="color:var(--green);margin-bottom:.75rem">Step 1: MCP Server</h3>
+                <p style="font-size:.9rem;margin-bottom:.75rem">Add to <code>~/.claude.json</code> (user scope) so ai-memory is available in every project:</p>
+                <pre style="font-size:.8rem"><code>{
+  <span class="tok-str">"mcpServers"</span>: {
+    <span class="tok-str">"memory"</span>: {
+      <span class="tok-str">"command"</span>: <span class="tok-str">"ai-memory"</span>,
+      <span class="tok-str">"args"</span>: [<span class="tok-str">"--db"</span>, <span class="tok-str">"~/.claude/ai-memory.db"</span>,
+             <span class="tok-str">"mcp"</span>, <span class="tok-str">"--tier"</span>, <span class="tok-str">"semantic"</span>]
+    }
+  }
+}<span class="lang-label">json</span></code></pre>
+                <p style="font-size:.8rem;color:var(--text-muted)">This gives Claude 17 native memory tools. No daemon, no ports.</p>
+            </div>
+
+            <!-- Step 2: Disable auto-memory -->
+            <div class="card" style="border-left:3px solid var(--orange)">
+                <h3 style="color:var(--orange);margin-bottom:.75rem">Step 2: Disable Auto-Memory</h3>
+                <p style="font-size:.9rem;margin-bottom:.75rem">Stop paying for 200+ lines of built-in memory context on every message:</p>
+                <pre style="font-size:.8rem"><code><span class="tok-cm">// ~/.claude/settings.json</span>
+{
+  <span class="tok-str">"autoMemoryEnabled"</span>: <span class="tok-kw">false</span>
+}<span class="lang-label">json</span></code></pre>
+                <p style="font-size:.8rem;color:var(--text-muted)">ai-memory uses zero tokens until explicitly recalled &mdash; far more efficient than auto-memory.</p>
+            </div>
+
+            <!-- Step 3: CLAUDE.md -->
+            <div class="card" style="border-left:3px solid var(--accent)">
+                <h3 style="color:var(--accent);margin-bottom:.75rem">Step 3: Project CLAUDE.md</h3>
+                <p style="font-size:.9rem;margin-bottom:.75rem">Add a <code>CLAUDE.md</code> to your project root so Claude <strong>proactively</strong> uses ai-memory:</p>
+                <pre style="font-size:.8rem"><code><span class="tok-cm"># Project &mdash; Claude Instructions</span>
+
+<span class="tok-cm">## AI Memory (MANDATORY)</span>
+
+Use <span class="tok-str">`ai-memory`</span> for persistent memory.
+
+<span class="tok-cm">### On every conversation start:</span>
+1. Run <span class="tok-cmd">ai-memory recall "&lt;topic&gt;"</span>
+2. Recall related memories for prior work
+
+<span class="tok-cm">### While working:</span>
+- Store findings and decisions as they happen
+- Use namespace <span class="tok-str">`my-project`</span>
+
+<span class="tok-cm">### When finishing:</span>
+- Store a summary of what was done<span class="lang-label">markdown</span></code></pre>
+            </div>
+        </div>
+
+        <!-- Why CLAUDE.md matters -->
+        <div class="card" style="margin-top:1.5rem;border-left:3px solid var(--purple)">
+            <h3 style="color:var(--purple);margin-bottom:.75rem">Why CLAUDE.md Matters</h3>
+            <p style="font-size:.9rem;line-height:1.7">Without <code>CLAUDE.md</code>, Claude has the memory tools (via MCP) but may not use them unless explicitly asked. The <code>CLAUDE.md</code> file is read at the start of <strong>every</strong> conversation &mdash; it instructs Claude to recall context before starting work and store findings as it goes. This turns ai-memory from a passive tool into an <strong>active memory system</strong> that Claude uses autonomously.</p>
+
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:1rem;margin-top:1rem">
+                <div style="background:var(--bg-code);padding:1rem;border-radius:8px">
+                    <h4 style="font-size:.85rem;color:var(--text-muted);margin-bottom:.5rem">CLAUDE.md Placement</h4>
+                    <table style="font-size:.8rem;width:100%;border-collapse:collapse">
+                        <tr style="border-bottom:1px solid var(--border)"><td style="padding:4px 0"><code>&lt;project&gt;/CLAUDE.md</code></td><td style="padding:4px 0;color:var(--text-muted)">Project-wide (default)</td></tr>
+                        <tr style="border-bottom:1px solid var(--border)"><td style="padding:4px 0"><code>&lt;subfolder&gt;/CLAUDE.md</code></td><td style="padding:4px 0;color:var(--text-muted)">Subdirectory scope</td></tr>
+                        <tr><td style="padding:4px 0"><code>~/.claude/CLAUDE.md</code></td><td style="padding:4px 0;color:var(--text-muted)">User-global (all projects)</td></tr>
+                    </table>
+                </div>
+                <div style="background:var(--bg-code);padding:1rem;border-radius:8px">
+                    <h4 style="font-size:.85rem;color:var(--text-muted);margin-bottom:.5rem">CLI vs Desktop</h4>
+                    <p style="font-size:.8rem;line-height:1.6">Both <strong>Claude Code CLI</strong> and <strong>Claude Code Desktop</strong> read the same <code>CLAUDE.md</code> files and use the same MCP configuration. No separate setup needed &mdash; one configuration works for both.</p>
+                </div>
+                <div style="background:var(--bg-code);padding:1rem;border-radius:8px">
+                    <h4 style="font-size:.85rem;color:var(--text-muted);margin-bottom:.5rem">Best Practice</h4>
+                    <p style="font-size:.8rem;line-height:1.6">Use <strong>MCP + CLAUDE.md together</strong>. MCP gives Claude the tools; CLAUDE.md tells Claude when and how to use them. Session hooks (<code>hooks/session-start.sh</code>) provide an optional third layer of auto-recall.</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Full CLAUDE.md template -->
+        <details style="margin-top:1.5rem">
+            <summary style="cursor:pointer;font-weight:600;color:var(--accent);font-size:1rem;padding:.75rem 0">Full CLAUDE.md Template (copy-paste ready)</summary>
+            <pre style="margin-top:.75rem;font-size:.8rem"><code><span class="tok-cm"># Project &mdash; Claude Instructions</span>
+
+<span class="tok-cm">## AI Memory (MANDATORY)</span>
+
+Use `ai-memory` for persistent memory across conversations. This is NOT optional.
+
+<span class="tok-cm">### On every conversation start:</span>
+1. Run `ai-memory recall "&lt;topic&gt;"` to check for relevant context before starting work
+2. If the user references prior work, recall related memories first
+
+<span class="tok-cm">### While working:</span>
+- Store important findings, decisions, and bug fixes as they happen &mdash; don't wait until the end
+- Use namespace `my-project` for all project memories
+- Default tier: `long`, default priority: `5` (use `9-10` for critical knowledge)
+
+<span class="tok-cm">### When finishing work:</span>
+- Store a memory summarizing what was done, why, and any gotchas for next time
+- Update existing memories if your work changes previously recorded facts
+
+<span class="tok-cm">### Quick reference:</span>
+```bash
+ai-memory recall "search query"                                      <span class="tok-cm"># fuzzy search</span>
+ai-memory search "exact keywords"                                    <span class="tok-cm"># precise match</span>
+ai-memory store -T "Title" -n my-project -t long -p 5 -c "content"  <span class="tok-cm"># store</span>
+ai-memory update &lt;id&gt; -c "new content"                               <span class="tok-cm"># update</span>
+ai-memory list -n my-project                                         <span class="tok-cm"># browse</span>
+```<span class="lang-label">markdown</span></code></pre>
+        </details>
     </div>
 </section>
 
