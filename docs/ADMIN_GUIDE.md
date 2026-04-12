@@ -198,7 +198,9 @@ At the `semantic` tier and above, ai-memory downloads a sentence-transformer mod
 
 ### Configuration File (config.toml)
 
-`ai-memory` supports an optional configuration file at `~/.config/ai-memory/config.toml`. This file is read on startup and supports the following keys:
+`ai-memory` supports an optional configuration file at `~/.config/ai-memory/config.toml`. This file is read once at process startup and supports the following keys:
+
+> **Note:** Configuration is loaded once at process startup. Changes to `config.toml` require restarting the ai-memory process (MCP server, HTTP daemon, or CLI) to take effect.
 
 | Key | Description |
 |-----|-------------|

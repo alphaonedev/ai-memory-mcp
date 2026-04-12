@@ -802,6 +802,8 @@ rm -f ai-memory.db ai-memory.db-wal ai-memory.db-shm
 
 Memory TTLs (time-to-live) can be customized per tier via `config.toml`. When garbage collection runs, expired memories can optionally be archived instead of permanently deleted by setting `archive_on_gc = true`. Archived memories can be listed, restored, or purged using the 4 archive tools (`memory_archive_list`, `memory_archive_restore`, `memory_archive_purge`, `memory_archive_stats`). See the [Admin Guide](ADMIN_GUIDE.md) for full configuration details.
 
+> **Note:** Configuration is loaded once at process startup. Changes to `config.toml` require restarting the ai-memory process (MCP server, HTTP daemon, or CLI) to take effect.
+
 **Setting environment variables by platform:**
 
 macOS / Linux (add to `~/.bashrc`, `~/.zshrc`, or equivalent):
