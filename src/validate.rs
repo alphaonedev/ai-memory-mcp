@@ -403,7 +403,10 @@ mod tests {
             confidence: None,
             expires_at: Some("2020-01-01T00:00:00Z".to_string()),
         };
-        assert!(validate_update(&update).is_ok(), "past expires_at should be allowed in update");
+        assert!(
+            validate_update(&update).is_ok(),
+            "past expires_at should be allowed in update"
+        );
     }
 
     #[test]

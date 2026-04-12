@@ -442,7 +442,10 @@ fn handle_store(
     let source = params["source"].as_str().unwrap_or("claude").to_string();
     let priority_i64 = params["priority"].as_i64().unwrap_or(5);
     if !(1..=10).contains(&priority_i64) {
-        return Err(format!("priority must be between 1 and 10 (got {})", priority_i64));
+        return Err(format!(
+            "priority must be between 1 and 10 (got {})",
+            priority_i64
+        ));
     }
     let priority = priority_i64 as i32;
     let confidence = params["confidence"].as_f64().unwrap_or(1.0);
@@ -1170,10 +1173,26 @@ fn handle_request(
                         .and_then(|v| v.as_str())
                         .unwrap_or("toon_compact");
                     let text = match format_str {
-                        "toon" if matches!(tool_name, "memory_recall" | "memory_list" | "memory_session_start" | "memory_archive_list") => {
+                        "toon"
+                            if matches!(
+                                tool_name,
+                                "memory_recall"
+                                    | "memory_list"
+                                    | "memory_session_start"
+                                    | "memory_archive_list"
+                            ) =>
+                        {
                             crate::toon::memories_to_toon(&val, false)
                         }
-                        "toon_compact" if matches!(tool_name, "memory_recall" | "memory_list" | "memory_session_start" | "memory_archive_list") => {
+                        "toon_compact"
+                            if matches!(
+                                tool_name,
+                                "memory_recall"
+                                    | "memory_list"
+                                    | "memory_session_start"
+                                    | "memory_archive_list"
+                            ) =>
+                        {
                             crate::toon::memories_to_toon(&val, true)
                         }
                         "toon" if tool_name == "memory_search" => {
