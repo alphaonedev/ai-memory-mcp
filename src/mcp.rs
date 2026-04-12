@@ -430,7 +430,7 @@ fn handle_store(
     if let Some(dup) = exact_dup {
         // Update existing memory instead of creating a duplicate
         // update(conn, id, title, content, tier, namespace, tags, priority, confidence, expires_at)
-        db::update(
+        let (_found, content_changed) = db::update(
             conn,
             &dup.id,
             None,                       // title (unchanged)
@@ -443,6 +443,18 @@ fn handle_store(
             None,                       // expires_at
         )
         .map_err(|e| e.to_string())?;
+        // Regenerate embedding if content changed during dedup update
+        if content_changed {
+            if let Some(emb) = embedder {
+                let text = format!("{} {}", mem.title, mem.content);
+                if let Ok(embedding) = emb.embed(&text) {
+                    let _ = db::set_embedding(conn, &dup.id, &embedding);
+                    if let Some(idx) = vector_index {
+                        idx.insert(dup.id.clone(), embedding);
+                    }
+                }
+            }
+        }
         return Ok(json!({
             "id": dup.id,
             "tier": mem.tier,
@@ -607,19 +619,8 @@ fn handle_auto_tag(
             all_tags.push(t.clone());
         }
     }
-    db::update(
-        conn,
-        id,
-        None,
-        None,
-        None,
-        None,
-        Some(&all_tags),
-        None,
-        None,
-        None,
-    )
-    .map_err(|e| e.to_string())?;
+    db::update(conn, id, None, None, None, None, Some(&all_tags), None, None, None)
+        .map_err(|e| e.to_string())?;
     Ok(json!({"id": id, "new_tags": tags, "all_tags": all_tags}))
 }
 
@@ -708,19 +709,8 @@ fn handle_delete(
 
 fn handle_promote(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
     let id = params["id"].as_str().ok_or("id is required")?;
-    db::update(
-        conn,
-        id,
-        None,
-        None,
-        Some(&Tier::Long),
-        None,
-        None,
-        None,
-        None,
-        None,
-    )
-    .map_err(|e| e.to_string())?;
+    db::update(conn, id, None, None, Some(&Tier::Long), None, None, None, None, None)
+        .map_err(|e| e.to_string())?;
     conn.execute(
         "UPDATE memories SET expires_at = NULL WHERE id = ?1",
         rusqlite::params![id],
@@ -742,8 +732,14 @@ fn handle_stats(conn: &rusqlite::Connection, db_path: &Path) -> Result<Value, St
     serde_json::to_value(stats).map_err(|e| e.to_string())
 }
 
-fn handle_update(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
+fn handle_update(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    embedder: Option<&Embedder>,
+    vector_index: Option<&VectorIndex>,
+) -> Result<Value, String> {
     let id = params["id"].as_str().ok_or("id is required")?;
+    validate::validate_id(id).map_err(|e| e.to_string())?;
     let title = params["title"].as_str();
     let content = params["content"].as_str();
     let tier = params["tier"].as_str().and_then(Tier::from_str);
@@ -779,7 +775,7 @@ fn handle_update(conn: &rusqlite::Connection, params: &Value) -> Result<Value, S
         validate::validate_expires_at(Some(ts)).map_err(|e| e.to_string())?;
     }
 
-    let updated = db::update(
+    let (found, content_changed) = db::update(
         conn,
         id,
         title,
@@ -793,8 +789,24 @@ fn handle_update(conn: &rusqlite::Connection, params: &Value) -> Result<Value, S
     )
     .map_err(|e| e.to_string())?;
 
-    if !updated {
+    if !found {
         return Err("memory not found".into());
+    }
+
+    // Regenerate embedding when title or content changed
+    if content_changed {
+        if let Some(emb) = embedder {
+            let mem = db::get(conn, id).map_err(|e| e.to_string())?;
+            if let Some(ref m) = mem {
+                let text = format!("{} {}", m.title, m.content);
+                if let Ok(embedding) = emb.embed(&text) {
+                    let _ = db::set_embedding(conn, id, &embedding);
+                    if let Some(idx) = vector_index {
+                        idx.insert(id.to_string(), embedding);
+                    }
+                }
+            }
+        }
     }
 
     let mem = db::get(conn, id).map_err(|e| e.to_string())?;
@@ -970,7 +982,7 @@ fn handle_request(
                 "memory_promote" => handle_promote(conn, arguments),
                 "memory_forget" => handle_forget(conn, arguments),
                 "memory_stats" => handle_stats(conn, db_path),
-                "memory_update" => handle_update(conn, arguments),
+                "memory_update" => handle_update(conn, arguments, embedder, vector_index),
                 "memory_get" => handle_get(conn, arguments),
                 "memory_link" => handle_link(conn, arguments),
                 "memory_get_links" => handle_get_links(conn, arguments),

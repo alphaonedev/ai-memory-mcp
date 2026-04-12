@@ -282,6 +282,8 @@ pub fn touch(conn: &Connection, id: &str) -> Result<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Update a memory by ID. Returns (found, content_changed) so callers can
+/// re-generate embeddings when the searchable text has changed.
 pub fn update(
     conn: &Connection,
     id: &str,
@@ -293,19 +295,30 @@ pub fn update(
     priority: Option<i32>,
     confidence: Option<f64>,
     expires_at: Option<&str>,
-) -> Result<bool> {
+) -> Result<(bool, bool)> {
     let mut stmt = conn.prepare("SELECT * FROM memories WHERE id = ?1")?;
     let mut rows = stmt.query_map(params![id], row_to_memory)?;
     let existing = match rows.next() {
         Some(Ok(m)) => m,
-        _ => return Ok(false),
+        _ => return Ok((false, false)),
     };
     drop(rows);
     drop(stmt);
 
-    let title = title.unwrap_or(&existing.title);
-    let content = content.unwrap_or(&existing.content);
-    let tier = tier.unwrap_or(&existing.tier);
+    let new_title = title.unwrap_or(&existing.title);
+    let new_content = content.unwrap_or(&existing.content);
+    let content_changed = new_title != existing.title || new_content != existing.content;
+
+    // Tier downgrade protection: never downgrade, consistent with insert path.
+    let effective_tier = match (tier, &existing.tier) {
+        (Some(requested), existing_tier) => match (existing_tier, requested) {
+            (Tier::Long, _) => &Tier::Long,           // long never downgrades
+            (Tier::Mid, Tier::Short) => &Tier::Mid,    // mid never downgrades to short
+            (_, requested) => requested,               // upgrades and same-tier are fine
+        },
+        (None, existing_tier) => existing_tier,
+    };
+
     let namespace = namespace.unwrap_or(&existing.namespace);
     let tags = tags.unwrap_or(&existing.tags);
     let priority = priority.unwrap_or(existing.priority);
@@ -319,12 +332,29 @@ pub fn update(
     let tags_json = serde_json::to_string(tags)?;
     let now = Utc::now().to_rfc3339();
 
+    // Check for title+namespace collision with a DIFFERENT memory
+    if new_title != existing.title || namespace != existing.namespace {
+        let collision: Option<String> = conn
+            .query_row(
+                "SELECT id FROM memories WHERE title = ?1 AND namespace = ?2 AND id != ?3",
+                params![new_title, namespace, id],
+                |r| r.get(0),
+            )
+            .ok();
+        if let Some(other_id) = collision {
+            anyhow::bail!(
+                "title '{}' already exists in namespace '{}' (memory {})",
+                new_title, namespace, other_id
+            );
+        }
+    }
+
     conn.execute(
         "UPDATE memories SET tier=?1, namespace=?2, title=?3, content=?4, tags=?5, priority=?6, confidence=?7, updated_at=?8, expires_at=?9
          WHERE id=?10",
-        params![tier.as_str(), namespace, title, content, tags_json, priority, confidence, now, expires_at, id],
+        params![effective_tier.as_str(), namespace, new_title, new_content, tags_json, priority, confidence, now, expires_at, id],
     )?;
-    Ok(true)
+    Ok((true, content_changed))
 }
 
 pub fn delete(conn: &Connection, id: &str) -> Result<bool> {
@@ -1200,7 +1230,7 @@ mod tests {
         let mem = make_memory("Original", "test", Tier::Mid, 5);
         let id = insert(&conn, &mem).unwrap();
 
-        let updated = update(
+        let (found, content_changed) = update(
             &conn,
             &id,
             Some("Updated Title"),
@@ -1213,7 +1243,8 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(updated);
+        assert!(found);
+        assert!(content_changed); // title changed
 
         let got = get(&conn, &id).unwrap().unwrap();
         assert_eq!(got.title, "Updated Title");
@@ -1222,9 +1253,29 @@ mod tests {
     }
 
     #[test]
+    fn update_content_changed_flag() {
+        let conn = test_db();
+        let mem = make_memory("Stable", "test", Tier::Mid, 5);
+        let id = insert(&conn, &mem).unwrap();
+
+        // Updating only priority — content_changed should be false
+        let (found, content_changed) =
+            update(&conn, &id, None, None, None, None, None, Some(8), None, None).unwrap();
+        assert!(found);
+        assert!(!content_changed);
+
+        // Updating content — content_changed should be true
+        let (found, content_changed) =
+            update(&conn, &id, None, Some("New content"), None, None, None, None, None, None)
+                .unwrap();
+        assert!(found);
+        assert!(content_changed);
+    }
+
+    #[test]
     fn update_nonexistent_returns_false() {
         let conn = test_db();
-        let updated = update(
+        let (found, _) = update(
             &conn,
             "bad-id",
             Some("New"),
@@ -1237,7 +1288,61 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(!updated);
+        assert!(!found);
+    }
+
+    #[test]
+    fn update_tier_downgrade_protection() {
+        let conn = test_db();
+        // Long-tier memory should never be downgraded
+        let mem = make_memory("Permanent", "test", Tier::Long, 9);
+        let id = insert(&conn, &mem).unwrap();
+
+        let (found, _) = update(
+            &conn, &id, None, None, Some(&Tier::Short), None, None, None, None, None,
+        )
+        .unwrap();
+        assert!(found);
+        let got = get(&conn, &id).unwrap().unwrap();
+        assert_eq!(got.tier, Tier::Long); // still long
+
+        // Mid-tier should not downgrade to short
+        let mem2 = make_memory("Working", "test", Tier::Mid, 5);
+        let id2 = insert(&conn, &mem2).unwrap();
+
+        let (found, _) = update(
+            &conn, &id2, None, None, Some(&Tier::Short), None, None, None, None, None,
+        )
+        .unwrap();
+        assert!(found);
+        let got2 = get(&conn, &id2).unwrap().unwrap();
+        assert_eq!(got2.tier, Tier::Mid); // still mid
+
+        // Mid-tier CAN upgrade to long
+        let (found, _) = update(
+            &conn, &id2, None, None, Some(&Tier::Long), None, None, None, None, None,
+        )
+        .unwrap();
+        assert!(found);
+        let got3 = get(&conn, &id2).unwrap().unwrap();
+        assert_eq!(got3.tier, Tier::Long); // upgraded
+    }
+
+    #[test]
+    fn update_title_collision_returns_error() {
+        let conn = test_db();
+        let mem_a = make_memory("Alpha", "test", Tier::Mid, 5);
+        let mem_b = make_memory("Beta", "test", Tier::Mid, 5);
+        let id_a = insert(&conn, &mem_a).unwrap();
+        let _id_b = insert(&conn, &mem_b).unwrap();
+
+        // Updating Alpha's title to "Beta" in same namespace should fail
+        let result = update(
+            &conn, &id_a, Some("Beta"), None, None, None, None, None, None, None,
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("already exists in namespace"));
     }
 
     #[test]

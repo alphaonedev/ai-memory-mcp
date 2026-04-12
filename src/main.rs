@@ -596,6 +596,7 @@ fn cmd_store(db_path: PathBuf, args: StoreArgs, json_out: bool) -> Result<()> {
 
 fn cmd_update(db_path: PathBuf, args: UpdateArgs, json_out: bool) -> Result<()> {
     let conn = db::open(&db_path)?;
+    validate::validate_id(&args.id)?;
     let tier = args.tier.as_deref().and_then(Tier::from_str);
     let tags: Option<Vec<String>> = args.tags.as_ref().map(|t| {
         t.split(',')
@@ -627,7 +628,7 @@ fn cmd_update(db_path: PathBuf, args: UpdateArgs, json_out: bool) -> Result<()> 
             validate::validate_expires_at(Some(ts))?;
         }
     }
-    let updated = db::update(
+    let (found, _content_changed) = db::update(
         &conn,
         &args.id,
         args.title.as_deref(),
@@ -639,7 +640,7 @@ fn cmd_update(db_path: PathBuf, args: UpdateArgs, json_out: bool) -> Result<()> 
         args.confidence,
         args.expires_at.as_deref(),
     )?;
-    if !updated {
+    if !found {
         eprintln!("not found: {}", args.id);
         std::process::exit(1);
     }
@@ -970,7 +971,7 @@ fn cmd_delete(db_path: PathBuf, args: DeleteArgs, json_out: bool) -> Result<()> 
 
 fn cmd_promote(db_path: PathBuf, args: PromoteArgs, json_out: bool) -> Result<()> {
     let conn = db::open(&db_path)?;
-    let updated = db::update(
+    let (found, _) = db::update(
         &conn,
         &args.id,
         None,
@@ -982,7 +983,7 @@ fn cmd_promote(db_path: PathBuf, args: PromoteArgs, json_out: bool) -> Result<()
         None,
         Some(""),
     )?;
-    if !updated {
+    if !found {
         eprintln!("not found: {}", args.id);
         std::process::exit(1);
     }
@@ -1186,7 +1187,7 @@ fn cmd_resolve(db_path: PathBuf, args: ResolveArgs, json_out: bool) -> Result<()
     let conn = db::open(&db_path)?;
     validate::validate_link(&args.winner_id, &args.loser_id, "supersedes")?;
     db::create_link(&conn, &args.winner_id, &args.loser_id, "supersedes")?;
-    db::update(
+    let _ = db::update(
         &conn,
         &args.loser_id,
         None,
