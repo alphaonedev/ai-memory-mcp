@@ -30,6 +30,15 @@ impl Tier {
         }
     }
 
+    /// Numeric rank for tier comparison: Short=0, Mid=1, Long=2.
+    pub fn rank(&self) -> u8 {
+        match self {
+            Self::Short => 0,
+            Self::Mid => 1,
+            Self::Long => 2,
+        }
+    }
+
     pub fn default_ttl_secs(&self) -> Option<i64> {
         match self {
             Self::Short => Some(6 * 3600),
@@ -298,5 +307,14 @@ mod tests {
         assert!(PROMOTION_THRESHOLD > 0);
         assert_eq!(SHORT_TTL_EXTEND_SECS, 3600);
         assert_eq!(MID_TTL_EXTEND_SECS, 86400);
+    }
+
+    #[test]
+    fn tier_rank_ordering() {
+        assert!(Tier::Short.rank() < Tier::Mid.rank());
+        assert!(Tier::Mid.rank() < Tier::Long.rank());
+        assert_eq!(Tier::Short.rank(), 0);
+        assert_eq!(Tier::Mid.rank(), 1);
+        assert_eq!(Tier::Long.rank(), 2);
     }
 }
