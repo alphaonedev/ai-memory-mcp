@@ -660,9 +660,14 @@ fn cmd_store(
     if json_out {
         let mut j = serde_json::to_value(&mem)?;
         j["id"] = serde_json::json!(actual_id);
-        if !contradictions.is_empty() {
-            j["potential_contradictions"] =
-                serde_json::json!(contradictions.iter().map(|c| &c.id).collect::<Vec<_>>());
+        // Exclude self-ID from contradictions (happens on upsert)
+        let filtered: Vec<&String> = contradictions
+            .iter()
+            .filter(|c| c.id != actual_id)
+            .map(|c| &c.id)
+            .collect();
+        if !filtered.is_empty() {
+            j["potential_contradictions"] = serde_json::json!(filtered);
         }
         println!("{}", serde_json::to_string(&j)?);
     } else {
@@ -681,6 +686,7 @@ fn cmd_store(
 }
 
 fn cmd_update(db_path: PathBuf, args: UpdateArgs, json_out: bool) -> Result<()> {
+    validate::validate_id(&args.id)?;
     let conn = db::open(&db_path)?;
     validate::validate_id(&args.id)?;
     let tier = args.tier.as_deref().and_then(Tier::from_str);
@@ -982,6 +988,7 @@ fn cmd_search(
 }
 
 fn cmd_get(db_path: PathBuf, args: GetArgs, json_out: bool) -> Result<()> {
+    validate::validate_id(&args.id)?;
     let conn = db::open(&db_path)?;
     match db::get(&conn, &args.id)? {
         Some(mem) => {
@@ -1059,6 +1066,7 @@ fn cmd_list(
 }
 
 fn cmd_delete(db_path: PathBuf, args: DeleteArgs, json_out: bool) -> Result<()> {
+    validate::validate_id(&args.id)?;
     let conn = db::open(&db_path)?;
     if db::delete(&conn, &args.id)? {
         if json_out {
@@ -1074,6 +1082,7 @@ fn cmd_delete(db_path: PathBuf, args: DeleteArgs, json_out: bool) -> Result<()> 
 }
 
 fn cmd_promote(db_path: PathBuf, args: PromoteArgs, json_out: bool) -> Result<()> {
+    validate::validate_id(&args.id)?;
     let conn = db::open(&db_path)?;
     let (found, _) = db::update(
         &conn,
@@ -1091,11 +1100,6 @@ fn cmd_promote(db_path: PathBuf, args: PromoteArgs, json_out: bool) -> Result<()
         eprintln!("not found: {}", args.id);
         std::process::exit(1);
     }
-    // Clear expires_at for long-term
-    conn.execute(
-        "UPDATE memories SET expires_at = NULL WHERE id = ?1",
-        rusqlite::params![args.id],
-    )?;
     if json_out {
         println!(
             "{}",

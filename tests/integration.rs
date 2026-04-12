@@ -2146,3 +2146,194 @@ fn test_mcp_recall_default_toon() {
 
     let _ = std::fs::remove_file(&db_path);
 }
+
+// --- Patch 2 (v0.5.4.2) tests ---
+
+#[test]
+fn test_cli_validate_id_rejects_invalid() {
+    let dir = std::env::temp_dir();
+    let db_path = dir.join(format!("ai-memory-validate-id-{}.db", uuid::Uuid::new_v4()));
+    let binary = env!("CARGO_BIN_EXE_ai-memory");
+
+    // delete with empty/whitespace ID
+    let output = cmd(binary)
+        .args(["--db", db_path.to_str().unwrap(), "--json", "delete", "   "])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "should reject empty/whitespace ID");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("id cannot be empty"), "stderr: {}", stderr);
+
+    // update with empty ID
+    let output = cmd(binary)
+        .args(["--db", db_path.to_str().unwrap(), "--json", "update", "  ", "--content", "test"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "should reject empty ID on update");
+
+    let _ = std::fs::remove_file(&db_path);
+}
+
+#[test]
+fn test_tier_downgrade_rejected() {
+    let dir = std::env::temp_dir();
+    let db_path = dir.join(format!("ai-memory-tier-downgrade-{}.db", uuid::Uuid::new_v4()));
+    let binary = env!("CARGO_BIN_EXE_ai-memory");
+
+    // Store a long-term memory
+    let output = cmd(binary)
+        .args([
+            "--db", db_path.to_str().unwrap(), "--json",
+            "store", "-t", "long", "-T", "Important Fact", "--content", "This is permanent",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stored: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let id = stored["id"].as_str().unwrap();
+
+    // Attempt to downgrade to short
+    let output = cmd(binary)
+        .args([
+            "--db", db_path.to_str().unwrap(), "--json",
+            "update", id, "--tier", "short",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "should reject long→short downgrade");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("tier downgrade not allowed"), "stderr: {}", stderr);
+
+    // Verify memory is still long-term
+    let output = cmd(binary)
+        .args(["--db", db_path.to_str().unwrap(), "--json", "get", id])
+        .output()
+        .unwrap();
+    let got: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(got["memory"]["tier"].as_str().unwrap(), "long");
+
+    let _ = std::fs::remove_file(&db_path);
+}
+
+#[test]
+fn test_tier_upgrade_allowed() {
+    let dir = std::env::temp_dir();
+    let db_path = dir.join(format!("ai-memory-tier-upgrade-{}.db", uuid::Uuid::new_v4()));
+    let binary = env!("CARGO_BIN_EXE_ai-memory");
+
+    // Store a short-term memory
+    let output = cmd(binary)
+        .args([
+            "--db", db_path.to_str().unwrap(), "--json",
+            "store", "-t", "short", "-T", "Temp Note", "--content", "Upgrade me",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stored: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let id = stored["id"].as_str().unwrap();
+
+    // Upgrade to long
+    let output = cmd(binary)
+        .args([
+            "--db", db_path.to_str().unwrap(), "--json",
+            "update", id, "--tier", "long",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "should allow short→long upgrade");
+
+    let _ = std::fs::remove_file(&db_path);
+}
+
+#[test]
+fn test_duplicate_title_no_self_contradiction() {
+    let dir = std::env::temp_dir();
+    let db_path = dir.join(format!("ai-memory-selfref-{}.db", uuid::Uuid::new_v4()));
+    let binary = env!("CARGO_BIN_EXE_ai-memory");
+
+    // Store a memory
+    let output = cmd(binary)
+        .args([
+            "--db", db_path.to_str().unwrap(), "--json",
+            "store", "-t", "long", "-T", "Dupe Test", "--content", "Original",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    // Store again with same title (upsert)
+    let output = cmd(binary)
+        .args([
+            "--db", db_path.to_str().unwrap(), "--json",
+            "store", "-t", "long", "-T", "Dupe Test", "--content", "Updated via upsert",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stored: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    // Should NOT have potential_contradictions pointing to self
+    if let Some(contras) = stored["potential_contradictions"].as_array() {
+        let id = stored["id"].as_str().unwrap();
+        for c in contras {
+            assert_ne!(c.as_str().unwrap(), id, "self-contradiction detected");
+        }
+    }
+
+    let _ = std::fs::remove_file(&db_path);
+}
+
+#[test]
+fn test_promote_clears_expires_at() {
+    let dir = std::env::temp_dir();
+    let db_path = dir.join(format!("ai-memory-promote-{}.db", uuid::Uuid::new_v4()));
+    let binary = env!("CARGO_BIN_EXE_ai-memory");
+
+    // Store a short-term memory (has expires_at)
+    let output = cmd(binary)
+        .args([
+            "--db", db_path.to_str().unwrap(), "--json",
+            "store", "-t", "short", "-T", "Promote Expiry", "--content", "Should clear expiry",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stored: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let id = stored["id"].as_str().unwrap();
+    assert!(stored["expires_at"].as_str().is_some(), "short should have expires_at");
+
+    // Promote
+    let output = cmd(binary)
+        .args(["--db", db_path.to_str().unwrap(), "--json", "promote", id])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    // Verify expires_at is cleared
+    let output = cmd(binary)
+        .args(["--db", db_path.to_str().unwrap(), "--json", "get", id])
+        .output()
+        .unwrap();
+    let got: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(got["memory"]["tier"].as_str().unwrap(), "long");
+    assert!(
+        got["memory"]["expires_at"].is_null(),
+        "expires_at should be null after promote, got: {:?}",
+        got["memory"]["expires_at"]
+    );
+
+    let _ = std::fs::remove_file(&db_path);
+}
+
+#[test]
+fn test_version_flag_patch2() {
+    let binary = env!("CARGO_BIN_EXE_ai-memory");
+    let output = cmd(binary).args(["--version"]).output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("0.5.4-patch.2"),
+        "version should be 0.5.4-patch.2, got: {}",
+        stdout
+    );
+}
