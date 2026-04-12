@@ -395,12 +395,24 @@ async fn main() -> Result<()> {
     // Track whether command writes to DB (for WAL checkpoint)
     let is_write_command = matches!(
         cli.command,
-        Command::Store(_) | Command::Update(_) | Command::Delete(_) |
-        Command::Promote(_) | Command::Forget(_) | Command::Link(_) |
-        Command::Consolidate(_) | Command::Resolve(_) | Command::Sync(_) |
-        Command::AutoConsolidate(_) | Command::Gc | Command::Import
+        Command::Store(_)
+            | Command::Update(_)
+            | Command::Delete(_)
+            | Command::Promote(_)
+            | Command::Forget(_)
+            | Command::Link(_)
+            | Command::Consolidate(_)
+            | Command::Resolve(_)
+            | Command::Sync(_)
+            | Command::AutoConsolidate(_)
+            | Command::Gc
+            | Command::Import
     );
-    let db_path_for_checkpoint = if is_write_command { Some(db_path.clone()) } else { None };
+    let db_path_for_checkpoint = if is_write_command {
+        Some(db_path.clone())
+    } else {
+        None
+    };
 
     let result = match cli.command {
         Command::Serve(a) => serve(db_path, a).await,

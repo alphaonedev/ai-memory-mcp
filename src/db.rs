@@ -179,7 +179,7 @@ fn migrate(conn: &Connection) -> Result<()> {
                     last_accessed_at TEXT,
                     expires_at       TEXT,
                     archived_at      TEXT NOT NULL
-                );"
+                );",
             )?;
         }
         conn.execute("DELETE FROM schema_version", [])?;
@@ -872,9 +872,8 @@ pub fn gc_with_count(conn: &Connection, dry_run: bool) -> Result<(usize, Vec<Mem
     let now = Utc::now().to_rfc3339();
 
     // Find expired memories
-    let mut stmt = conn.prepare(
-        "SELECT * FROM memories WHERE expires_at IS NOT NULL AND expires_at < ?1",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT * FROM memories WHERE expires_at IS NOT NULL AND expires_at < ?1")?;
     let expired: Vec<Memory> = stmt
         .query_map(params![now], row_to_memory)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -895,9 +894,20 @@ pub fn gc_with_count(conn: &Connection, dry_run: bool) -> Result<(usize, Vec<Mem
                   access_count, created_at, updated_at, last_accessed_at, expires_at, archived_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 params![
-                    mem.id, mem.tier.as_str(), mem.namespace, mem.title, mem.content,
-                    tags_json, mem.priority, mem.confidence, mem.source, mem.access_count,
-                    mem.created_at, mem.updated_at, mem.last_accessed_at, mem.expires_at,
+                    mem.id,
+                    mem.tier.as_str(),
+                    mem.namespace,
+                    mem.title,
+                    mem.content,
+                    tags_json,
+                    mem.priority,
+                    mem.confidence,
+                    mem.source,
+                    mem.access_count,
+                    mem.created_at,
+                    mem.updated_at,
+                    mem.last_accessed_at,
+                    mem.expires_at,
                     archived_at,
                 ],
             )?;
@@ -924,7 +934,11 @@ pub fn gc_with_count(conn: &Connection, dry_run: bool) -> Result<(usize, Vec<Mem
 }
 
 /// List archived memories with optional namespace filter.
-pub fn archive_list(conn: &Connection, namespace: Option<&str>, limit: usize) -> Result<Vec<(Memory, String)>> {
+pub fn archive_list(
+    conn: &Connection,
+    namespace: Option<&str>,
+    limit: usize,
+) -> Result<Vec<(Memory, String)>> {
     let mut stmt = conn.prepare(
         "SELECT id, tier, namespace, title, content, tags, priority, confidence, source,
                 access_count, created_at, updated_at, last_accessed_at, expires_at, archived_at
@@ -1023,9 +1037,18 @@ pub fn archive_restore(conn: &Connection, id: &str) -> Result<bool> {
               access_count, created_at, updated_at, last_accessed_at, expires_at)
              VALUES (?1, 'long', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL)",
             params![
-                mem.id, mem.namespace, mem.title, mem.content, tags_json,
-                mem.priority, mem.confidence, mem.source, mem.access_count,
-                mem.created_at, now, mem.last_accessed_at,
+                mem.id,
+                mem.namespace,
+                mem.title,
+                mem.content,
+                tags_json,
+                mem.priority,
+                mem.confidence,
+                mem.source,
+                mem.access_count,
+                mem.created_at,
+                now,
+                mem.last_accessed_at,
             ],
         )?;
         conn.execute("DELETE FROM memory_archive WHERE id = ?1", params![id])?;
