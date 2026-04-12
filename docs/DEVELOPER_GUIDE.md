@@ -4,16 +4,16 @@
 
 `ai-memory` is an AI-agnostic memory management system built as a single Rust binary that serves three roles:
 
-1. **MCP tool server** -- stdio JSON-RPC server exposing 17 memory tools + 2 MCP prompts for any MCP-compatible AI client (Claude AI, OpenAI ChatGPT, xAI Grok, META Llama, and others)
+1. **MCP tool server** -- stdio JSON-RPC server exposing 21 memory tools + 2 MCP prompts for any MCP-compatible AI client (Claude AI, OpenAI ChatGPT, xAI Grok, META Llama, and others)
 2. **CLI tool** -- direct SQLite operations for store, recall, search, list, etc. (completely AI-agnostic)
-3. **HTTP daemon** -- an Axum web server exposing the same operations as a REST API with 20 endpoints (completely AI-agnostic)
+3. **HTTP daemon** -- an Axum web server exposing the same operations as a REST API with 24 endpoints (completely AI-agnostic)
 
 **Key architectural features:** Zero token cost (no context loaded until recall), TOON compact default response format (79% smaller than JSON), MCP prompts capability (`recall-first` behavioral rules + `memory-workflow` reference card), 4 feature tiers with optional local LLMs via Ollama, true dedup on title+namespace, 6-factor recall scoring with score field in responses.
 
 All three interfaces share the same database layer (`db.rs`) and validation layer (`validate.rs`). The daemon adds automatic garbage collection (every 30 minutes) and graceful shutdown with WAL checkpointing.
 
 ```
-main.rs          -- CLI parsing (clap), daemon setup (axum), command dispatch (25 commands)
+main.rs          -- CLI parsing (clap), daemon setup (axum), command dispatch (26 commands)
 models.rs        -- Data structures: Memory, MemoryLink, query types, constants
 handlers.rs      -- HTTP request handlers (Axum extractors + JSON responses), error sanitization
 db.rs            -- All SQLite operations: CRUD, FTS5, recall scoring, GC, migration, FTS query sanitization, transactional touch/consolidate
@@ -21,11 +21,12 @@ mcp.rs           -- MCP (Model Context Protocol) server over stdio JSON-RPC, 23 
 validate.rs      -- Input validation for all write paths
 errors.rs        -- Structured error types (ApiError, MemoryError), error sanitization for HTTP responses
 color.rs         -- ANSI color output for CLI (zero dependencies, auto-detects terminal)
-config.rs        -- Tier configuration system (keyword, semantic, smart, autonomous) and feature gating
+config.rs        -- Tier configuration system (keyword, semantic, smart, autonomous), feature gating, TtlConfig, and archive_on_gc
 embeddings.rs    -- Embedding pipeline: HuggingFace model loading, vector generation, cosine similarity
 llm.rs           -- LLM integration via Ollama for query expansion, auto-tagging, contradiction detection
 mine.rs          -- Retroactive conversation import from Claude, ChatGPT, and Slack exports
 reranker.rs      -- Hybrid recall algorithm: blends semantic (embedding) and keyword (FTS5) scores
+hnsw.rs          -- In-memory HNSW vector index for approximate nearest-neighbor search
 ```
 
 ### Embedding Pipeline (semantic tier and above)
@@ -37,18 +38,22 @@ When running at the `semantic` tier or higher, ai-memory loads a HuggingFace emb
 3. **Storage** -- embeddings are stored as BLOB columns in the `memories` table (schema migration v3)
 4. **Hybrid recall** (`reranker.rs`) -- at recall time, the query is embedded and compared against stored embeddings via cosine similarity, then blended with FTS5 keyword scores to produce a final ranking
 
+**Embedding models:**
+- `all-MiniLM-L6-v2` (384 dimensions, ~90 MB) -- used at the `semantic` tier
+- `nomic-embed-text-v1.5` (768 dimensions, ~270 MB) -- used at the `smart` and `autonomous` tiers
+
 ## Code Structure
 
 ### `src/main.rs`
 
 - `Cli` struct with `clap` derive -- defines all CLI commands and global flags (`--db`, `--json`)
-- `Command` enum -- `Serve`, `Mcp`, `Store`, `Update`, `Recall`, `Search`, `Get`, `List`, `Delete`, `Promote`, `Forget`, `Link`, `Consolidate`, `Resolve`, `Shell`, `Sync`, `AutoConsolidate`, `Gc`, `Stats`, `Namespaces`, `Export`, `Import`, `Completions`, `Man`, `Mine` (25 commands)
+- `Command` enum -- `Serve`, `Mcp`, `Store`, `Update`, `Recall`, `Search`, `Get`, `List`, `Delete`, `Promote`, `Forget`, `Link`, `Consolidate`, `Resolve`, `Shell`, `Sync`, `AutoConsolidate`, `Gc`, `Stats`, `Namespaces`, `Export`, `Import`, `Completions`, `Man`, `Mine`, `Archive` (26 commands)
 - `StoreArgs` includes `--expires-at` and `--ttl-secs` flags for custom expiration
 - `UpdateArgs` includes `--expires-at` flag for setting expiration on existing memories
 - `ListArgs` includes `--offset` flag for pagination
 - `auto_namespace()` -- detects namespace from git remote URL or directory name
 - `human_age()` -- formats ISO timestamps as "2h ago", "3d ago" for CLI output
-- `serve()` -- starts the Axum server with all routes (20 endpoints including `POST /memories/{id}/promote`), spawns GC task, handles graceful shutdown via SIGINT with WAL checkpoint
+- `serve()` -- starts the Axum server with all routes (24 endpoints including `POST /memories/{id}/promote` and 4 archive endpoints), spawns GC task, handles graceful shutdown via SIGINT with WAL checkpoint
 - `cmd_*()` functions -- one per CLI command, each opens the DB directly
 
 ### `src/models.rs`
@@ -58,6 +63,8 @@ When running at the `semantic` tier or higher, ai-memory loads a HuggingFace emb
 - `MemoryLink` struct -- typed directional links between memories
 - Request types: `CreateMemory`, `UpdateMemory`, `SearchQuery`, `ListQuery`, `RecallQuery`, `RecallBody`, `LinkBody`, `ForgetQuery`, `ConsolidateBody`, `ImportBody`
 - Response types: `Stats`, `TierCount`, `NamespaceCount`
+- `TtlConfig` struct -- per-tier TTL overrides loaded from `config.toml` (`short_ttl_secs`, `mid_ttl_secs`, `long_ttl_secs`, `short_extend_secs`, `mid_extend_secs`)
+- `ResolvedTtl` struct -- resolved TTL values after merging config defaults with per-tier overrides
 - Constants: `MAX_CONTENT_SIZE` (65536), `PROMOTION_THRESHOLD` (5), `SHORT_TTL_EXTEND_SECS` (3600), `MID_TTL_EXTEND_SECS` (86400)
 
 ### `src/mcp.rs`
@@ -65,18 +72,29 @@ When running at the `semantic` tier or higher, ai-memory loads a HuggingFace emb
 The MCP (Model Context Protocol) server implementation. MCP is an open standard -- this server works with any MCP-compatible AI client. Runs over stdio, processing one JSON-RPC message per line. Exposes **23 tools**.
 
 - `RpcRequest` / `RpcResponse` / `RpcError` -- JSON-RPC 2.0 types
-- `tool_definitions()` -- returns the 17 tool schemas for `tools/list` (4 new: `memory_capabilities`, `memory_expand_query`, `memory_auto_tag`, `memory_detect_contradiction`)
+- `tool_definitions()` -- returns the 21 tool schemas for `tools/list` (includes `memory_capabilities`, `memory_expand_query`, `memory_auto_tag`, `memory_detect_contradiction`, `memory_archive_list`, `memory_archive_restore`, `memory_archive_purge`, `memory_archive_stats`)
   - `memory_recall` schema includes `until` parameter and `format` parameter (enum: `"json"`, `"toon"`, `"toon_compact"`, default: `"toon_compact"`)
   - `memory_search` schema includes `format` parameter (enum: `"json"`, `"toon"`, `"toon_compact"`, default: `"toon_compact"`) and enforces `maximum: 200` on limit
   - `memory_list` schema includes `format` parameter (enum: `"json"`, `"toon"`, `"toon_compact"`, default: `"toon_compact"`) and enforces `maximum: 200` on limit
   - `memory_consolidate` schema enforces `minItems: 2, maxItems: 100` on IDs
   - `memory_update` schema includes `expires_at` parameter
-- `handle_store()`, `handle_recall()`, `handle_search()`, `handle_list()`, `handle_delete()`, `handle_promote()`, `handle_forget()`, `handle_stats()`, `handle_update()`, `handle_get()`, `handle_link()`, `handle_get_links()`, `handle_consolidate()` -- one handler per tool
+- `handle_store()`, `handle_recall()`, `handle_search()`, `handle_list()`, `handle_delete()`, `handle_promote()`, `handle_forget()`, `handle_stats()`, `handle_update()`, `handle_get()`, `handle_link()`, `handle_get_links()`, `handle_consolidate()`, `handle_archive_list()`, `handle_archive_restore()`, `handle_archive_purge()`, `handle_archive_stats()` -- one handler per tool
 - `handle_request()` -- routes JSON-RPC methods: `initialize`, `notifications/initialized`, `tools/list`, `tools/call`, `ping`
 - Notification handling: all JSON-RPC notifications (requests without an `id` field) are correctly skipped without sending a response, per the JSON-RPC 2.0 specification
 - `run_mcp_server()` -- main loop: reads lines from stdin, parses JSON-RPC, dispatches, writes responses to stdout
 
 Protocol version: `2024-11-05`. All tool responses are wrapped in MCP content blocks (`{"content": [{"type": "text", "text": "..."}]}`). The protocol is AI-agnostic -- any MCP client can connect.
+
+**MCP Prompts:** The server exposes 2 prompts via `prompts/list`:
+- **recall-first** -- System prompt with 8 behavioral rules for proactive memory use. Supports an optional `namespace` argument for scoped recall.
+- **memory-workflow** -- Quick reference card for all 21 tool usage patterns.
+
+**MCP Error Codes:** The server uses standard JSON-RPC 2.0 error codes:
+- `-32700` -- Parse error (malformed JSON)
+- `-32600` -- Invalid request (missing required fields)
+- `-32601` -- Method not found (unknown JSON-RPC method)
+- `-32602` -- Invalid params (bad tool arguments)
+- Application-level errors are returned as text in the MCP content block with `"isError": true`, not as JSON-RPC error codes.
 
 ### `src/validate.rs`
 
@@ -125,7 +143,7 @@ Structured error types for the HTTP API:
 
 ### `src/handlers.rs`
 
-All HTTP handlers for the 20-endpoint REST API. State is `Arc<Mutex<(Connection, PathBuf)>>`. Each handler acquires the lock, validates input, performs DB operations, returns JSON.
+All HTTP handlers for the 24-endpoint REST API. State is `Arc<Mutex<(Connection, PathBuf)>>`. Each handler acquires the lock, validates input, performs DB operations, returns JSON.
 
 Key handlers:
 - `create_memory` / `bulk_create` -- memory creation with deduplication (bulk limited to 1,000 items)
@@ -134,7 +152,10 @@ Key handlers:
 - `search` / `recall` -- FTS-powered search with sanitized queries
 - `forget` / `consolidate` -- bulk operations
 - `import_memories` -- import with 1,000 item limit
+- `archive_list` / `archive_restore` / `archive_purge` / `archive_stats` -- archive management endpoints
 - All ID path parameters are validated before database access
+
+> **Note:** HTTP handlers are tested via integration tests (`tests/integration.rs`), not unit tests.
 
 ### `src/db.rs`
 
@@ -161,6 +182,11 @@ The database layer. Key functions:
 | `list_namespaces()` | List namespaces with memory counts |
 | `export_all()` / `export_links()` | Full data export |
 | `checkpoint()` | WAL checkpoint (TRUNCATE) for clean shutdown |
+| `archive_memory()` | Move a memory to the archive table |
+| `list_archived()` | List all archived memories |
+| `restore_archived()` | Restore an archived memory to the active table |
+| `purge_archive()` | Permanently delete all archived memories |
+| `archive_stats()` | Archive statistics (count, size, date range) |
 | `health_check()` | Verifies DB accessibility and FTS5 integrity |
 
 **Transaction safety**: `touch()` and `consolidate()` use `BEGIN IMMEDIATE` to acquire a write lock upfront, preventing deadlocks and ensuring the entire read-modify-write cycle is atomic. This is critical for `touch()` because it reads the current access count, computes promotion/reinforcement logic, and writes back -- all of which must be atomic under concurrent access.
@@ -168,6 +194,14 @@ The database layer. Key functions:
 **FTS query sanitization**: The `sanitize_fts_query()` function strips all FTS5 special characters (`*`, `"`, `(`, `)`, `:`, `+`, `-`, `~`, `^`, `{`, `}`, `[`, `]`, `|`, `\`) from user input and wraps each remaining token in double quotes. This prevents injection of FTS query syntax that could cause unexpected results or errors.
 
 **Migration error handling**: The migration logic only ignores "duplicate column" errors (indicating the migration already ran). All other errors are propagated, ensuring real failures are caught early.
+
+### `src/hnsw.rs`
+
+In-memory HNSW (Hierarchical Navigable Small World) vector index for approximate nearest-neighbor search. The `VectorIndex` struct provides `insert`, `search`, and `remove` operations on dense embeddings. When the index is small (below the HNSW threshold), it falls back to linear scan. The index has no persistence -- it is rebuilt from the database on startup. This keeps the on-disk format simple (embeddings stored as BLOBs in SQLite) while providing fast in-memory ANN search during runtime.
+
+### `src/toon.rs`
+
+TOON (Token-Oriented Object Notation) serializer. Converts JSON recall/search/list responses into the compact TOON wire format. The format spec is documented in the [TOON Format Specification](#toon-format-specification) section below.
 
 ## Database Schema
 
@@ -227,9 +261,38 @@ CREATE TABLE memory_links (
 
 Relation types: `related_to`, `supersedes`, `contradicts`, `derived_from`.
 
+### `archived_memories` table
+
+```sql
+CREATE TABLE archived_memories (
+    id               TEXT PRIMARY KEY,
+    tier             TEXT NOT NULL,
+    namespace        TEXT NOT NULL DEFAULT 'global',
+    title            TEXT NOT NULL,
+    content          TEXT NOT NULL,
+    tags             TEXT NOT NULL DEFAULT '[]',
+    priority         INTEGER NOT NULL DEFAULT 5,
+    confidence       REAL NOT NULL DEFAULT 1.0,
+    source           TEXT NOT NULL DEFAULT 'api',
+    access_count     INTEGER NOT NULL DEFAULT 0,
+    created_at       TEXT NOT NULL,
+    updated_at       TEXT NOT NULL,
+    last_accessed_at TEXT,
+    expires_at       TEXT,
+    archived_at      TEXT NOT NULL,
+    archive_reason   TEXT NOT NULL DEFAULT 'gc'
+);
+
+-- Indexes
+CREATE INDEX idx_archived_memories_namespace ON archived_memories(namespace);
+CREATE INDEX idx_archived_memories_archived_at ON archived_memories(archived_at);
+```
+
+Added in schema migration v3 -> v4. Stores memories archived by GC before deletion. The 16 columns mirror the `memories` table with two additions: `archived_at` (timestamp of archival) and `archive_reason` (why the memory was archived, e.g., `'gc'`).
+
 ### `schema_version` table
 
-Tracks migration state. Current version: 3.
+Tracks migration state. Current version: 4.
 
 ## Recall Scoring Formula
 
@@ -261,14 +324,131 @@ The `config.rs` module defines 4 feature tiers that gate functionality:
 
 | Tier | Embeddings | LLM | Tools Available |
 |------|-----------|-----|-----------------|
-| `keyword` | No | No | 13 base tools + `memory_capabilities` |
-| `semantic` | Yes | No | 14 base tools + `memory_capabilities` |
+| `keyword` | No | No | 13 base tools + `memory_capabilities` + 4 archive tools |
+| `semantic` | Yes | No | 14 base tools + `memory_capabilities` + 4 archive tools |
 | `smart` | Yes | Yes | All 23 tools |
 | `autonomous` | Yes | Yes | All 23 tools + autonomous behaviors |
 
 The tier is set at startup via `ai-memory mcp --tier <tier>` and cannot be changed at runtime. The `memory_capabilities` tool reports the active tier and which features are available, allowing AI clients to adapt their behavior.
 
+> **Note:** Configuration is loaded once at process startup. Changes to `config.toml` require restarting the ai-memory process (MCP server, HTTP daemon, or CLI) to take effect.
+
 The recency decay factor ensures that recent memories rank higher when other factors are similar. A memory updated today gets a boost of ~1.0, a memory from 10 days ago gets ~0.5, and a memory from 100 days ago gets ~0.09.
+
+### TOON Format Specification
+
+TOON (Token-Oriented Object Notation) is a token-efficient serialization format designed for LLM communication. It replaces JSON for recall, search, and list responses, reducing output size by 40-60% by declaring field names once as a header and listing values row by row with pipe delimiters.
+
+The implementation is in `src/toon.rs`.
+
+#### Structure Overview
+
+A TOON response consists of three parts in order:
+
+1. **Metadata line** (optional) -- key:value pairs for scalar fields
+2. **Header line** -- declares field names once
+3. **Data rows** -- one per object, values matching header column order
+
+#### Metadata Line Syntax
+
+Scalar (non-array) response fields are serialized as pipe-delimited `key:value` pairs on the first line:
+
+```
+count:3|mode:hybrid
+```
+
+If there are no metadata fields, this line is omitted entirely.
+
+#### Header Line Syntax
+
+The header declares the array name followed by field names in square brackets, pipe-delimited, ending with a colon:
+
+```
+memories[id|title|tier|namespace|priority|confidence|score|access_count|tags|source|created_at|updated_at]:
+```
+
+Field names appear exactly once in the entire output regardless of how many data rows follow. This is the primary source of token savings over JSON.
+
+#### Data Row Syntax
+
+Each data row contains values pipe-delimited in the same order as the header fields:
+
+```
+abc-123|PostgreSQL 16 config|long|infra|9|1.0|0.763|2|postgres,database|claude|2026-04-03T15:00:00+00:00|2026-04-03T15:00:00+00:00
+```
+
+- **Strings** are output as-is (unless they require escaping)
+- **Numbers** (integers and floats) are output as their string representation
+- **Booleans** are output as `1` (true) or `0` (false)
+- **Arrays** (e.g., tags) are joined with commas: `postgres,database`
+- **Objects** are output as the literal `[object]`
+- **Null/missing values** are represented as an empty string (zero characters between the delimiters), e.g., `abc||mid` means the second field is null
+
+#### Escaping Rules
+
+Two characters require escaping in TOON values:
+
+| Character | Escaped As | Reason |
+|-----------|-----------|--------|
+| `\|` (pipe) | `\\|` | Pipe is the field delimiter |
+| `\n` (newline) | `\\n` | Newline is the row delimiter |
+
+Escaping is only applied when the value actually contains a pipe or newline character. Values without these characters are output verbatim with no additional escaping.
+
+Example: a title containing a pipe like `A|B` is serialized as `A\|B` in the data row.
+
+#### Compact vs Full Mode
+
+TOON supports two modes that differ only in which fields are included:
+
+**Full mode** (12 fields):
+```
+memories[id|title|tier|namespace|priority|confidence|score|access_count|tags|source|created_at|updated_at]:
+```
+
+**Compact mode** (7 fields) -- omits timestamps, confidence, access_count, and source for tighter output:
+```
+memories[id|title|tier|namespace|priority|score|tags]:
+```
+
+The MCP server defaults to compact mode (`toon_compact`). Clients can request `"toon"` for full mode or `"json"` for standard JSON via the `format` parameter on recall, search, and list tools.
+
+#### Search Response Normalization
+
+Search responses use a `"results"` key instead of `"memories"`. The TOON serializer normalizes this internally -- the output always uses the `memories[...]` header regardless of the source key.
+
+#### Complete Parsing Example
+
+Given this JSON response:
+
+```json
+{
+  "memories": [
+    {"id": "abc-123", "title": "PostgreSQL config", "tier": "long", "namespace": "infra", "priority": 9, "score": 0.763, "tags": ["postgres", "db"]},
+    {"id": "def-456", "title": "Redis cache", "tier": "long", "namespace": "infra", "priority": 8, "score": 0.541, "tags": ["redis"]},
+    {"id": "ghi-789", "title": "Deploy notes", "tier": "mid", "namespace": "infra", "priority": 5, "score": 0.320, "tags": []}
+  ],
+  "count": 3,
+  "mode": "hybrid"
+}
+```
+
+TOON compact output:
+
+```
+count:3|mode:hybrid
+memories[id|title|tier|namespace|priority|score|tags]:
+abc-123|PostgreSQL config|long|infra|9|0.763|postgres,db
+def-456|Redis cache|long|infra|8|0.541|redis
+ghi-789|Deploy notes|mid|infra|5|0.32|
+```
+
+To parse TOON:
+
+1. Read the first line. If it does not start with a bracket-containing identifier (e.g., `memories[`), parse it as metadata: split on `|`, then split each segment on `:` to get key-value pairs.
+2. Read the header line. Extract the array name and field list: strip the trailing `:`, extract the portion inside `[...]`, and split on `|` to get the ordered field names.
+3. Read each subsequent non-empty line as a data row. Split on `|` (respecting `\|` escapes), mapping each positional value to the corresponding header field name.
+4. Unescape `\|` to `|` and `\n` to newline in each value. Empty values represent null/missing fields.
 
 ## API Reference
 
@@ -276,7 +456,7 @@ Base URL: `http://127.0.0.1:9077/api/v1`
 
 All responses are JSON. Error responses include `{"error": "message"}`. Database errors are sanitized -- clients receive `"Internal server error"` instead of raw SQLite error details.
 
-The HTTP API exposes **20 endpoints**.
+The HTTP API exposes **24 endpoints**.
 
 ### Health Check
 
@@ -547,7 +727,7 @@ Global flags:
 
 ### `serve`
 
-Start the HTTP daemon (20 endpoints).
+Start the HTTP daemon (24 endpoints).
 
 ```bash
 ai-memory serve --host 127.0.0.1 --port 9077
@@ -768,7 +948,7 @@ ai-memory completions fish
 
 ## Testing
 
-The project has **177 tests** total: 118 unit tests across all 15 modules (`src/db.rs` 29, `src/mcp.rs` 12, `src/config.rs` 9, `src/main.rs` 9, `src/mine.rs` 9, `src/validate.rs` 8, `src/reranker.rs` 7, `src/color.rs` 6, `src/errors.rs` 6, `src/models.rs` 6, `src/toon.rs` 6, `src/embeddings.rs` 5, `src/hnsw.rs` 4, `src/llm.rs` 2, `src/handlers.rs` 0) and 43 integration tests in `tests/integration.rs`. **15/15 modules** have unit tests — 95%+ coverage.
+The project has **188 tests** total: 139 unit tests across all 15 modules + 49 integration tests in `tests/integration.rs`. **15/15 modules** have unit tests — 95%+ coverage.
 
 ```bash
 # Run all tests
@@ -868,7 +1048,7 @@ cargo build --release
 - `tokenizers` -- HuggingFace tokenizers for text preprocessing
 - `reqwest` -- HTTP client for Ollama API communication (LLM inference)
 
-These dependencies are compiled conditionally based on feature flags. The `keyword` tier build excludes embedding and LLM dependencies entirely.
+All dependencies are always compiled; tier selection controls which features are activated at runtime.
 
 Release profile settings (from `Cargo.toml`):
 - `opt-level = 3`

@@ -120,6 +120,37 @@ enum Command {
     Man,
     /// Import memories from historical conversations (Claude, ChatGPT, Slack exports)
     Mine(MineArgs),
+    /// Manage the memory archive (list, restore, purge, stats)
+    Archive(ArchiveArgs),
+}
+
+#[derive(Args)]
+struct ArchiveArgs {
+    #[command(subcommand)]
+    action: ArchiveAction,
+}
+
+#[derive(Subcommand)]
+enum ArchiveAction {
+    /// List archived memories
+    List {
+        #[arg(long, short)]
+        namespace: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+    },
+    /// Restore an archived memory back to active
+    Restore { id: String },
+    /// Permanently delete old archive entries
+    Purge {
+        /// Delete archive entries older than N days (all if omitted)
+        #[arg(long)]
+        older_than_days: Option<i64>,
+    },
+    /// Show archive statistics
+    Stats,
 }
 
 #[derive(Args)]
@@ -416,18 +447,18 @@ async fn main() -> Result<()> {
     };
 
     let result = match cli.command {
-        Command::Serve(a) => serve(db_path, a).await,
+        Command::Serve(a) => serve(db_path, a, &app_config).await,
         Command::Mcp { tier } => {
             let feature_tier = app_config.effective_tier(Some(&tier));
             mcp::run_mcp_server(&db_path, feature_tier, &app_config)?;
             Ok(())
         }
-        Command::Store(a) => cmd_store(db_path, a, j),
+        Command::Store(a) => cmd_store(db_path, a, j, &app_config),
         Command::Update(a) => cmd_update(db_path, a, j),
         Command::Recall(a) => cmd_recall(db_path, a, j, &app_config),
-        Command::Search(a) => cmd_search(db_path, a, j),
+        Command::Search(a) => cmd_search(db_path, a, j, &app_config),
         Command::Get(a) => cmd_get(db_path, a, j),
-        Command::List(a) => cmd_list(db_path, a, j),
+        Command::List(a) => cmd_list(db_path, a, j, &app_config),
         Command::Delete(a) => cmd_delete(db_path, a, j),
         Command::Promote(a) => cmd_promote(db_path, a, j),
         Command::Forget(a) => cmd_forget(db_path, a, j),
@@ -437,7 +468,7 @@ async fn main() -> Result<()> {
         Command::Shell => cmd_shell(db_path),
         Command::Sync(a) => cmd_sync(db_path, a, j),
         Command::AutoConsolidate(a) => cmd_auto_consolidate(db_path, a, j),
-        Command::Gc => cmd_gc(db_path, j),
+        Command::Gc => cmd_gc(db_path, j, &app_config),
         Command::Stats => cmd_stats(db_path, j),
         Command::Namespaces => cmd_namespaces(db_path, j),
         Command::Export => cmd_export(db_path),
@@ -457,7 +488,8 @@ async fn main() -> Result<()> {
             man.render(&mut std::io::stdout())?;
             Ok(())
         }
-        Command::Mine(a) => cmd_mine(db_path, a, j),
+        Command::Mine(a) => cmd_mine(db_path, a, j, &app_config),
+        Command::Archive(a) => cmd_archive(db_path, a, j),
     };
 
     // WAL checkpoint after write commands to prevent unbounded WAL growth
@@ -472,7 +504,7 @@ async fn main() -> Result<()> {
     result
 }
 
-async fn serve(db_path: PathBuf, args: ServeArgs) -> Result<()> {
+async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &config::AppConfig) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::from_default_env()
@@ -481,8 +513,15 @@ async fn serve(db_path: PathBuf, args: ServeArgs) -> Result<()> {
         )
         .init();
 
+    let resolved_ttl = app_config.effective_ttl();
+    let archive_on_gc = app_config.effective_archive_on_gc();
     let conn = db::open(&db_path)?;
-    let state: handlers::Db = Arc::new(Mutex::new((conn, db_path.clone())));
+    let state: handlers::Db = Arc::new(Mutex::new((
+        conn,
+        db_path.clone(),
+        resolved_ttl,
+        archive_on_gc,
+    )));
 
     // Automatic GC
     let gc_state = state.clone();
@@ -490,7 +529,7 @@ async fn serve(db_path: PathBuf, args: ServeArgs) -> Result<()> {
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(GC_INTERVAL_SECS)).await;
             let lock = gc_state.lock().await;
-            match db::gc(&lock.0) {
+            match db::gc(&lock.0, lock.3) {
                 Ok(n) if n > 0 => tracing::info!("gc: expired {n} memories"),
                 _ => {}
             }
@@ -530,6 +569,13 @@ async fn serve(db_path: PathBuf, args: ServeArgs) -> Result<()> {
         .route("/api/v1/gc", post(handlers::run_gc))
         .route("/api/v1/export", get(handlers::export_memories))
         .route("/api/v1/import", post(handlers::import_memories))
+        .route("/api/v1/archive", get(handlers::list_archive))
+        .route("/api/v1/archive", delete(handlers::purge_archive))
+        .route(
+            "/api/v1/archive/{id}/restore",
+            post(handlers::restore_archive),
+        )
+        .route("/api/v1/archive/stats", get(handlers::archive_stats))
         .layer(TraceLayer::new_for_http())
         .layer(DefaultBodyLimit::max(50 * 1024 * 1024)) // 50MB max request body
         .layer(CorsLayer::permissive())
@@ -548,9 +594,15 @@ async fn serve(db_path: PathBuf, args: ServeArgs) -> Result<()> {
 
 // --- CLI ---
 
-fn cmd_store(db_path: PathBuf, args: StoreArgs, json_out: bool) -> Result<()> {
+fn cmd_store(
+    db_path: PathBuf,
+    args: StoreArgs,
+    json_out: bool,
+    app_config: &config::AppConfig,
+) -> Result<()> {
     let conn = db::open(&db_path)?;
-    let _ = db::gc_if_needed(&conn);
+    let resolved_ttl = app_config.effective_ttl();
+    let _ = db::gc_if_needed(&conn, app_config.effective_archive_on_gc());
     let tier = Tier::from_str(&args.tier)
         .ok_or_else(|| anyhow::anyhow!("invalid tier: {} (use short, mid, long)", args.tier))?;
     let namespace = args.namespace.unwrap_or_else(auto_namespace);
@@ -583,7 +635,7 @@ fn cmd_store(db_path: PathBuf, args: StoreArgs, json_out: bool) -> Result<()> {
     let now = Utc::now();
     let expires_at = args.expires_at.or_else(|| {
         args.ttl_secs
-            .or(tier.default_ttl_secs())
+            .or(resolved_ttl.ttl_for_tier(&tier))
             .map(|s| (now + Duration::seconds(s)).to_rfc3339())
     });
     let mem = models::Memory {
@@ -630,6 +682,7 @@ fn cmd_store(db_path: PathBuf, args: StoreArgs, json_out: bool) -> Result<()> {
 
 fn cmd_update(db_path: PathBuf, args: UpdateArgs, json_out: bool) -> Result<()> {
     let conn = db::open(&db_path)?;
+    validate::validate_id(&args.id)?;
     let tier = args.tier.as_deref().and_then(Tier::from_str);
     let tags: Option<Vec<String>> = args.tags.as_ref().map(|t| {
         t.split(',')
@@ -661,7 +714,7 @@ fn cmd_update(db_path: PathBuf, args: UpdateArgs, json_out: bool) -> Result<()> 
             validate::validate_expires_at_format(ts)?;
         }
     }
-    let updated = db::update(
+    let (found, _content_changed) = db::update(
         &conn,
         &args.id,
         args.title.as_deref(),
@@ -673,7 +726,7 @@ fn cmd_update(db_path: PathBuf, args: UpdateArgs, json_out: bool) -> Result<()> 
         args.confidence,
         args.expires_at.as_deref(),
     )?;
-    if !updated {
+    if !found {
         eprintln!("not found: {}", args.id);
         std::process::exit(1);
     }
@@ -694,7 +747,7 @@ fn cmd_recall(
     app_config: &config::AppConfig,
 ) -> Result<()> {
     let conn = db::open(&db_path)?;
-    let _ = db::gc_if_needed(&conn);
+    let _ = db::gc_if_needed(&conn, app_config.effective_archive_on_gc());
 
     // Resolve feature tier
     let feature_tier = app_config.effective_tier(args.tier.as_deref());
@@ -769,6 +822,8 @@ fn cmd_recall(
         None
     };
 
+    let resolved_ttl = app_config.effective_ttl();
+
     // Perform recall: hybrid if embedder available, keyword otherwise
     let (results, mode) = if let Some(ref emb) = embedder {
         match emb.embed(&args.context) {
@@ -783,6 +838,8 @@ fn cmd_recall(
                     args.since.as_deref(),
                     args.until.as_deref(),
                     vector_index.as_ref(),
+                    resolved_ttl.short_extend_secs,
+                    resolved_ttl.mid_extend_secs,
                 )?;
                 if let Some(ref ce) = reranker {
                     (ce.rerank(&args.context, results), "hybrid+rerank")
@@ -800,6 +857,8 @@ fn cmd_recall(
                     args.tags.as_deref(),
                     args.since.as_deref(),
                     args.until.as_deref(),
+                    resolved_ttl.short_extend_secs,
+                    resolved_ttl.mid_extend_secs,
                 )?;
                 (results, "keyword")
             }
@@ -813,6 +872,8 @@ fn cmd_recall(
             args.tags.as_deref(),
             args.since.as_deref(),
             args.until.as_deref(),
+            resolved_ttl.short_extend_secs,
+            resolved_ttl.mid_extend_secs,
         )?;
         (results, "keyword")
     };
@@ -871,9 +932,14 @@ fn cmd_recall(
     Ok(())
 }
 
-fn cmd_search(db_path: PathBuf, args: SearchArgs, json_out: bool) -> Result<()> {
+fn cmd_search(
+    db_path: PathBuf,
+    args: SearchArgs,
+    json_out: bool,
+    app_config: &config::AppConfig,
+) -> Result<()> {
     let conn = db::open(&db_path)?;
-    let _ = db::gc_if_needed(&conn);
+    let _ = db::gc_if_needed(&conn, app_config.effective_archive_on_gc());
     let tier = args.tier.as_deref().and_then(Tier::from_str);
     let results = db::search(
         &conn,
@@ -943,9 +1009,14 @@ fn cmd_get(db_path: PathBuf, args: GetArgs, json_out: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_list(db_path: PathBuf, args: ListArgs, json_out: bool) -> Result<()> {
+fn cmd_list(
+    db_path: PathBuf,
+    args: ListArgs,
+    json_out: bool,
+    app_config: &config::AppConfig,
+) -> Result<()> {
     let conn = db::open(&db_path)?;
-    let _ = db::gc_if_needed(&conn);
+    let _ = db::gc_if_needed(&conn, app_config.effective_archive_on_gc());
     let tier = args.tier.as_deref().and_then(Tier::from_str);
     let results = db::list(
         &conn,
@@ -1004,7 +1075,7 @@ fn cmd_delete(db_path: PathBuf, args: DeleteArgs, json_out: bool) -> Result<()> 
 
 fn cmd_promote(db_path: PathBuf, args: PromoteArgs, json_out: bool) -> Result<()> {
     let conn = db::open(&db_path)?;
-    let updated = db::update(
+    let (found, _) = db::update(
         &conn,
         &args.id,
         None,
@@ -1016,7 +1087,7 @@ fn cmd_promote(db_path: PathBuf, args: PromoteArgs, json_out: bool) -> Result<()
         None,
         Some(""),
     )?;
-    if !updated {
+    if !found {
         eprintln!("not found: {}", args.id);
         std::process::exit(1);
     }
@@ -1105,9 +1176,9 @@ fn cmd_consolidate(db_path: PathBuf, args: ConsolidateArgs, json_out: bool) -> R
     Ok(())
 }
 
-fn cmd_gc(db_path: PathBuf, json_out: bool) -> Result<()> {
+fn cmd_gc(db_path: PathBuf, json_out: bool, app_config: &config::AppConfig) -> Result<()> {
     let conn = db::open(&db_path)?;
-    let count = db::gc(&conn)?;
+    let count = db::gc(&conn, app_config.effective_archive_on_gc())?;
     if json_out {
         println!("{}", serde_json::json!({"expired_deleted": count}));
     } else {
@@ -1220,7 +1291,7 @@ fn cmd_resolve(db_path: PathBuf, args: ResolveArgs, json_out: bool) -> Result<()
     let conn = db::open(&db_path)?;
     validate::validate_link(&args.winner_id, &args.loser_id, "supersedes")?;
     db::create_link(&conn, &args.winner_id, &args.loser_id, "supersedes")?;
-    db::update(
+    let _ = db::update(
         &conn,
         &args.loser_id,
         None,
@@ -1232,7 +1303,12 @@ fn cmd_resolve(db_path: PathBuf, args: ResolveArgs, json_out: bool) -> Result<()
         Some(0.1),
         None,
     )?;
-    db::touch(&conn, &args.winner_id)?;
+    db::touch(
+        &conn,
+        &args.winner_id,
+        models::SHORT_TTL_EXTEND_SECS,
+        models::MID_TTL_EXTEND_SECS,
+    )?;
     if json_out {
         println!(
             "{}",
@@ -1283,7 +1359,17 @@ fn cmd_shell(db_path: PathBuf) -> Result<()> {
                     eprintln!("usage: recall <context>");
                     continue;
                 }
-                match db::recall(&conn, &ctx, None, 10, None, None, None) {
+                match db::recall(
+                    &conn,
+                    &ctx,
+                    None,
+                    10,
+                    None,
+                    None,
+                    None,
+                    models::SHORT_TTL_EXTEND_SECS,
+                    models::MID_TTL_EXTEND_SECS,
+                ) {
                     Ok(results) => {
                         for (mem, score) in &results {
                             println!(
@@ -1609,11 +1695,7 @@ fn cmd_auto_consolidate(db_path: PathBuf, args: AutoConsolidateArgs, json_out: b
                 );
                 let content: String = group
                     .iter()
-                    .map(|m| {
-                        // Safe truncation at char boundary to avoid panic on multi-byte UTF-8
-                        let preview: String = m.content.chars().take(200).collect();
-                        format!("- {}: {}", m.title, preview)
-                    })
+                    .map(|m| format!("- {}: {}", m.title, &m.content[..m.content.len().min(200)]))
                     .collect::<Vec<_>>()
                     .join("\n");
                 db::consolidate(
@@ -1651,7 +1733,83 @@ fn cmd_auto_consolidate(db_path: PathBuf, args: AutoConsolidateArgs, json_out: b
     Ok(())
 }
 
-fn cmd_mine(db_path: PathBuf, args: MineArgs, json_out: bool) -> Result<()> {
+fn cmd_archive(db_path: PathBuf, args: ArchiveArgs, json_out: bool) -> Result<()> {
+    let conn = db::open(&db_path)?;
+    match args.action {
+        ArchiveAction::List {
+            namespace,
+            limit,
+            offset,
+        } => {
+            let items = db::list_archived(&conn, namespace.as_deref(), limit, offset)?;
+            if json_out {
+                println!(
+                    "{}",
+                    serde_json::json!({"archived": items, "count": items.len()})
+                );
+            } else {
+                if items.is_empty() {
+                    println!("no archived memories");
+                } else {
+                    for item in &items {
+                        println!(
+                            "[{}] {} (archived: {})",
+                            id_short(item["id"].as_str().unwrap_or("")),
+                            item["title"].as_str().unwrap_or(""),
+                            item["archived_at"].as_str().unwrap_or("")
+                        );
+                    }
+                    println!("{} archived memories", items.len());
+                }
+            }
+        }
+        ArchiveAction::Restore { id } => {
+            validate::validate_id(&id)?;
+            let restored = db::restore_archived(&conn, &id)?;
+            if json_out {
+                println!("{}", serde_json::json!({"restored": restored, "id": id}));
+            } else if restored {
+                println!("restored: {}", id_short(&id));
+            } else {
+                eprintln!("not found in archive: {}", id);
+                std::process::exit(1);
+            }
+        }
+        ArchiveAction::Purge { older_than_days } => {
+            let purged = db::purge_archive(&conn, older_than_days)?;
+            if json_out {
+                println!("{}", serde_json::json!({"purged": purged}));
+            } else {
+                println!("purged {} archived memories", purged);
+            }
+        }
+        ArchiveAction::Stats => {
+            let stats = db::archive_stats(&conn)?;
+            if json_out {
+                println!("{}", stats);
+            } else {
+                println!("archived: {} total", stats["archived_total"]);
+                if let Some(by_ns) = stats["by_namespace"].as_array() {
+                    for ns in by_ns {
+                        println!(
+                            "  {}: {}",
+                            ns["namespace"].as_str().unwrap_or(""),
+                            ns["count"]
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_mine(
+    db_path: PathBuf,
+    args: MineArgs,
+    json_out: bool,
+    app_config: &config::AppConfig,
+) -> Result<()> {
     let format = mine::Format::from_str(&args.format).ok_or_else(|| {
         anyhow::anyhow!(
             "invalid format: {} (use claude, chatgpt, slack)",
@@ -1734,7 +1892,7 @@ fn cmd_mine(db_path: PathBuf, args: MineArgs, json_out: bool) -> Result<()> {
 
     // Store memories
     let conn = db::open(&db_path)?;
-    let _ = db::gc_if_needed(&conn);
+    let _ = db::gc_if_needed(&conn, app_config.effective_archive_on_gc());
     let now = Utc::now();
 
     let mut imported = 0usize;
@@ -1753,8 +1911,9 @@ fn cmd_mine(db_path: PathBuf, args: MineArgs, json_out: bool) -> Result<()> {
             }
         };
 
-        let expires_at = tier
-            .default_ttl_secs()
+        let expires_at = app_config
+            .effective_ttl()
+            .ttl_for_tier(&tier)
             .map(|s| (now + Duration::seconds(s)).to_rfc3339());
 
         let mem = models::Memory {

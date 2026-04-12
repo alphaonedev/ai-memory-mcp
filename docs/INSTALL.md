@@ -1,6 +1,6 @@
 # Installation Guide
 
-> **BLUF (Bottom Line Up Front):** `ai-memory` is an AI-agnostic memory management system that works with **any MCP-compatible AI client** -- including Claude AI, OpenAI ChatGPT, xAI Grok, META Llama, OpenClaw, and others. Install the binary, configure your AI client's MCP settings, and you get 17 memory tools instantly. The default `semantic` tier includes embedding-based hybrid recall out of the box. Total time: ~60 seconds (pre-built binary + fast internet; first semantic-tier run also downloads a ~100MB embedding model).
+> **BLUF (Bottom Line Up Front):** `ai-memory` is an AI-agnostic memory management system that works with **any MCP-compatible AI client** -- including Claude AI, OpenAI ChatGPT, xAI Grok, META Llama, OpenClaw, and others. Install the binary, configure your AI client's MCP settings, and you get 21 memory tools instantly. The default `semantic` tier includes embedding-based hybrid recall out of the box. Total time: ~60 seconds (pre-built binary + fast internet; first semantic-tier run also downloads a ~100MB embedding model).
 
 ## Install in 60 Seconds (pre-built binary + fast internet)
 
@@ -100,7 +100,7 @@
 
 3. **Restart your AI client.**
 
-4. **Verify** -- you should see 17 new tools: `memory_store`, `memory_recall`, `memory_search`, `memory_list`, `memory_delete`, `memory_promote`, `memory_forget`, `memory_stats`, `memory_update`, `memory_get`, `memory_link`, `memory_get_links`, `memory_consolidate`, `memory_capabilities`, `memory_expand_query`, `memory_auto_tag`, `memory_detect_contradiction`.
+4. **Verify** -- you should see 21 new tools: `memory_store`, `memory_recall`, `memory_search`, `memory_list`, `memory_delete`, `memory_promote`, `memory_forget`, `memory_stats`, `memory_update`, `memory_get`, `memory_link`, `memory_get_links`, `memory_consolidate`, `memory_capabilities`, `memory_expand_query`, `memory_auto_tag`, `memory_detect_contradiction`, `memory_archive_list`, `memory_archive_restore`, `memory_archive_purge`, `memory_archive_stats`.
 
 5. **Test** -- ask your AI assistant to store a memory. It should use `memory_store` automatically.
 
@@ -547,7 +547,7 @@ If `ai-memory` is not in your PATH, use the full path to the binary in any of th
 
 ### Step 2: Verify
 
-Restart your AI client. You should see 17 new tools available: `memory_store`, `memory_recall`, `memory_search`, `memory_list`, `memory_delete`, `memory_promote`, `memory_forget`, `memory_stats`, `memory_update`, `memory_get`, `memory_link`, `memory_get_links`, `memory_consolidate`, `memory_capabilities`, `memory_expand_query`, `memory_auto_tag`, `memory_detect_contradiction`.
+Restart your AI client. You should see 21 new tools available: `memory_store`, `memory_recall`, `memory_search`, `memory_list`, `memory_delete`, `memory_promote`, `memory_forget`, `memory_stats`, `memory_update`, `memory_get`, `memory_link`, `memory_get_links`, `memory_consolidate`, `memory_capabilities`, `memory_expand_query`, `memory_auto_tag`, `memory_detect_contradiction`, `memory_archive_list`, `memory_archive_restore`, `memory_archive_purge`, `memory_archive_stats`.
 
 ### Step 3: Test
 
@@ -667,6 +667,7 @@ ai-memory completions bash > ~/.local/share/bash-completion/completions/ai-memor
 
 # Zsh
 ai-memory completions zsh > ~/.zfunc/_ai-memory
+# Then add to ~/.zshrc: fpath+=~/.zfunc && autoload -Uz compinit && compinit
 
 # Fish
 ai-memory completions fish > ~/.config/fish/completions/ai-memory.fish
@@ -797,6 +798,12 @@ rm -f ai-memory.db ai-memory.db-wal ai-memory.db-shm
 |----------|---------|-------------|
 | `AI_MEMORY_DB` | `ai-memory.db` | Path to the SQLite database file |
 | `RUST_LOG` | (none) | Log level filter (e.g., `ai_memory=info,tower_http=info`) |
+
+### TTL and Archive Configuration
+
+Memory TTLs (time-to-live) can be customized per tier via `config.toml`. When garbage collection runs, expired memories can optionally be archived instead of permanently deleted by setting `archive_on_gc = true`. Archived memories can be listed, restored, or purged using the 4 archive tools (`memory_archive_list`, `memory_archive_restore`, `memory_archive_purge`, `memory_archive_stats`). See the [Admin Guide](ADMIN_GUIDE.md) for full configuration details.
+
+> **Note:** Configuration is loaded once at process startup. Changes to `config.toml` require restarting the ai-memory process (MCP server, HTTP daemon, or CLI) to take effect.
 
 **Setting environment variables by platform:**
 
