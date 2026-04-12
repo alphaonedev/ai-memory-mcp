@@ -346,7 +346,18 @@ pub fn update(
 
     let title = title.unwrap_or(&existing.title);
     let content = content.unwrap_or(&existing.content);
-    let tier = tier.unwrap_or(&existing.tier);
+    // Protect against tier downgrade: long > mid > short
+    let tier = match tier {
+        Some(new_tier) if new_tier.rank() < existing.tier.rank() => {
+            anyhow::bail!(
+                "tier downgrade not allowed: {} → {} (use delete + re-store to downgrade)",
+                existing.tier.as_str(),
+                new_tier.as_str()
+            );
+        }
+        Some(t) => t,
+        None => &existing.tier,
+    };
     let namespace = namespace.unwrap_or(&existing.namespace);
     let tags = tags.unwrap_or(&existing.tags);
     let priority = priority.unwrap_or(existing.priority);
@@ -1950,6 +1961,58 @@ mod tests {
         assert_eq!(result, "helloworld");
         let result2 = strip_invisible("normal text");
         assert_eq!(result2, "normal text");
+    }
+
+    #[test]
+    fn update_rejects_tier_downgrade_long_to_short() {
+        let conn = test_db();
+        let mem = make_memory("Downgrade Test", "test", Tier::Long, 5);
+        let id = insert(&conn, &mem).unwrap();
+        let result = update(
+            &conn, &id, None, None,
+            Some(&Tier::Short), None, None, None, None, None,
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("tier downgrade not allowed"), "got: {}", err);
+    }
+
+    #[test]
+    fn update_rejects_tier_downgrade_long_to_mid() {
+        let conn = test_db();
+        let mem = make_memory("Downgrade Test 2", "test", Tier::Long, 5);
+        let id = insert(&conn, &mem).unwrap();
+        let result = update(
+            &conn, &id, None, None,
+            Some(&Tier::Mid), None, None, None, None, None,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn update_allows_tier_upgrade_short_to_long() {
+        let conn = test_db();
+        let mem = make_memory("Upgrade Test", "test", Tier::Short, 5);
+        let id = insert(&conn, &mem).unwrap();
+        let result = update(
+            &conn, &id, None, None,
+            Some(&Tier::Long), None, None, None, None, None,
+        );
+        assert!(result.unwrap());
+        let got = get(&conn, &id).unwrap().unwrap();
+        assert_eq!(got.tier, Tier::Long);
+    }
+
+    #[test]
+    fn update_allows_same_tier() {
+        let conn = test_db();
+        let mem = make_memory("Same Tier", "test", Tier::Mid, 5);
+        let id = insert(&conn, &mem).unwrap();
+        let result = update(
+            &conn, &id, None, None,
+            Some(&Tier::Mid), None, None, None, None, None,
+        );
+        assert!(result.unwrap());
     }
 
     #[test]
