@@ -157,12 +157,18 @@ pub async fn update_memory(
         body.confidence,
         body.expires_at.as_deref(),
     ) {
-        Ok(true) => {
+        Ok((true, _)) => {
             let mem = db::get(&lock.0, &id).ok().flatten();
             Json(json!(mem)).into_response()
         }
-        Ok(false) => (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response(),
+        Ok((false, _)) => {
+            (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response()
+        }
         Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("already exists in namespace") {
+                return (StatusCode::CONFLICT, Json(json!({"error": msg}))).into_response();
+            }
             tracing::error!("handler error: {e}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -217,7 +223,7 @@ pub async fn promote_memory(State(state): State<Db>, Path(id): Path<String>) -> 
         None,
         None,
     ) {
-        Ok(true) => {
+        Ok((true, _)) => {
             if let Err(e) = lock.0.execute(
                 "UPDATE memories SET expires_at = NULL WHERE id = ?1",
                 rusqlite::params![id],
@@ -231,7 +237,9 @@ pub async fn promote_memory(State(state): State<Db>, Path(id): Path<String>) -> 
             }
             Json(json!({"promoted": true, "id": id, "tier": "long"})).into_response()
         }
-        Ok(false) => (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response(),
+        Ok((false, _)) => {
+            (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response()
+        }
         Err(e) => {
             tracing::error!("handler error: {e}");
             (
