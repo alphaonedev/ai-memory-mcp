@@ -541,6 +541,8 @@ mid_secs = 1209600   # 14 days (default: 604800 = 7 days)
 
 Long-term memories never expire regardless of TTL settings. CLI flags `--ttl-secs` and `--expires-at` on individual memories override the tier defaults.
 
+> **Note:** Configuration is loaded once at process startup. Changes to `config.toml` require restarting the ai-memory process (MCP server, HTTP daemon, or CLI) to take effect.
+
 ## Archive Management
 
 When `archive_on_gc = true` is set in `config.toml`, garbage collection archives expired memories instead of permanently deleting them. This gives you a safety net to recover accidentally expired memories.

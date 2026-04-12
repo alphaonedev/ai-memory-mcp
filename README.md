@@ -779,7 +779,9 @@ extend_mid_hours = 24      # TTL extension on recall for mid-tier memories in ho
 gc_interval_minutes = 30   # how often garbage collection runs in minutes (default: 30)
 ```
 
-All five fields are optional -- omit any to keep the default. Changes take effect on the next server start or GC cycle.
+All five fields are optional -- omit any to keep the default.
+
+> **Note:** Configuration is loaded once at process startup. Changes to `config.toml` require restarting the ai-memory process (MCP server, HTTP daemon, or CLI) to take effect.
 
 ---
 

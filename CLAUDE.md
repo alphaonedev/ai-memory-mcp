@@ -155,6 +155,8 @@ Memories are ranked by: FTS relevance + priority weight + access frequency + con
 - Contradiction detection on store: warns about similar titles in same namespace
 - Deduplication: upsert on title+namespace, tier never downgrades
 
+> **Note:** Configuration is loaded once at process startup. Changes to `config.toml` require restarting the ai-memory process (MCP server, HTTP daemon, or CLI) to take effect.
+
 ---
 
 ## Using CLAUDE.md in Your Projects
