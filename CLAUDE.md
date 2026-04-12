@@ -2,7 +2,7 @@
 
 > **Note:** `ai-memory` is AI-agnostic and works with any MCP-compatible AI client (Claude AI, OpenAI ChatGPT, xAI Grok, META Llama, OpenClaw, and others). This file contains **Claude Code-specific** integration instructions.
 
-This project is `ai-memory` -- a persistent memory daemon that replaces Claude Code's built-in auto-memory. **Zero token cost until recall** -- unlike auto-memory which loads 200+ lines into every conversation, ai-memory uses zero context tokens until explicitly called. **TOON compact** is the default response format (79% smaller than JSON). 177 tests, 15/15 modules, 95%+ coverage. **LongMemEval benchmark: 97.8% R@5, 99.0% R@10, 99.8% R@20** (489/500, ICLR 2025 dataset).
+This project is `ai-memory` -- a persistent memory daemon that replaces Claude Code's built-in auto-memory. **Zero token cost until recall** -- unlike auto-memory which loads 200+ lines into every conversation, ai-memory uses zero context tokens until explicitly called. **TOON compact** is the default response format (79% smaller than JSON). 188 tests, 15/15 modules, 95%+ coverage. **LongMemEval benchmark: 97.8% R@5, 99.0% R@10, 99.8% R@20** (489/500, ICLR 2025 dataset).
 
 ## Step 1: Disable Auto-Memory
 
@@ -55,7 +55,7 @@ Claude Code supports three MCP configuration scopes:
 
 > **Windows:** Use `%USERPROFILE%\.claude.json` and forward slashes in db paths: `"C:/Users/YourName/.claude/ai-memory.db"`.
 
-This gives Claude Code 23 native tools: `memory_store`, `memory_recall`, `memory_search`, `memory_list`, `memory_delete`, `memory_promote`, `memory_forget`, `memory_stats`, `memory_update`, `memory_get`, `memory_link`, `memory_get_links`, `memory_consolidate`, `memory_capabilities`, `memory_expand_query`, `memory_auto_tag`, `memory_detect_contradiction`, `memory_gc`, `memory_session_start`, `memory_archive_list`, `memory_archive_purge`, `memory_archive_restore`, `memory_archive_stats`.
+This gives Claude Code 23 native tools: `memory_store`, `memory_recall`, `memory_search`, `memory_list`, `memory_delete`, `memory_promote`, `memory_forget`, `memory_stats`, `memory_update`, `memory_get`, `memory_link`, `memory_get_links`, `memory_consolidate`, `memory_capabilities`, `memory_expand_query`, `memory_auto_tag`, `memory_detect_contradiction`, `memory_gc`, `memory_session_start`, `memory_archive_list`, `memory_archive_restore`, `memory_archive_purge`, `memory_archive_stats`.
 
 ## Alternative: CLI Integration
 
@@ -93,7 +93,7 @@ ai-memory --db /root/.claude/ai-memory.db store \
 ### Namespace auto-detection:
 If you omit `--namespace`, it auto-detects from the git remote or directory name.
 
-### All 25 commands:
+### All 26 commands:
 - `mcp` -- run as MCP tool server over stdio (primary integration path)
 - `serve` -- start the HTTP daemon on port 9077
 - `store` -- store a new memory (deduplicates by title+namespace)
@@ -119,6 +119,7 @@ If you omit `--namespace`, it auto-detects from the git remote or directory name
 - `completions` -- generate shell completions (bash, zsh, fish)
 - `man` -- generate roff man page to stdout (pipe to `man -l -` to view)
 - `mine` -- import memories from historical conversations (Claude, ChatGPT, Slack exports)
+- `archive` -- manage the memory archive (list, restore, purge, stats)
 
 ### Feature tiers:
 - `keyword` -- FTS5 only, no embedding model, lowest resource usage
@@ -139,8 +140,8 @@ def456|Redis cache|long|infra|8|0.541|redis,cache
 
 ### MCP Prompts (recall-first behavior):
 The MCP server provides 2 prompts via `prompts/list`:
-- **recall-first** -- System prompt with 9 rules: recall at session start, store corrections, TOON format, tier strategy, dedup awareness, namespace organization, capabilities check
-- **memory-workflow** -- Quick reference card for all 17 tool usage patterns
+- **recall-first** -- System prompt with 8 rules: recall at session start, store corrections, TOON format, tier strategy, dedup awareness, namespace organization, capabilities check
+- **memory-workflow** -- Quick reference card for all 23 tool usage patterns
 
 These prompts teach AI clients to use memory proactively. The `recall-first` prompt supports an optional `namespace` argument for scoped recall.
 
@@ -153,6 +154,35 @@ Memories are ranked by: FTS relevance + priority weight + access frequency + con
 - Priority reinforcement: +1 every 10 accesses (max 10)
 - Contradiction detection on store: warns about similar titles in same namespace
 - Deduplication: upsert on title+namespace, tier never downgrades
+
+### Configurable TTL and Archive
+
+TTL defaults are configurable via the `[ttl]` section in `~/.config/ai-memory/config.toml`:
+
+```toml
+[ttl]
+short_ttl_secs = 21600      # 6h  (0 = never expires)
+mid_ttl_secs = 604800        # 7d  (0 = never expires)
+long_ttl_secs = 0            # never expires
+short_extend_secs = 3600     # +1h on recall
+mid_extend_secs = 86400      # +1d on recall
+archive_on_gc = true         # archive expired memories before GC deletes them
+```
+
+Set any TTL to `0` to disable expiry for that tier.
+
+**Archive:** When `archive_on_gc = true` (default), expired memories are archived before GC deletion. Manage the archive via CLI:
+
+```bash
+ai-memory archive list              # browse archived memories
+ai-memory archive restore <id>      # restore (expires_at cleared — becomes permanent)
+ai-memory archive purge             # permanently delete archived memories
+ai-memory archive stats             # archive size and counts
+```
+
+**Per-memory overrides:** Use `--expires-at` or `--ttl-secs` on `store`/`update` to override config defaults for individual memories.
+
+> **Note:** Configuration is loaded once at process startup. Changes to `config.toml` require restarting the ai-memory process (MCP server, HTTP daemon, or CLI) to take effect.
 
 ---
 

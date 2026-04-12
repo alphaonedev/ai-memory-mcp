@@ -2,7 +2,7 @@
 
 `ai-memory` is an AI-agnostic memory management system. It works with **any MCP-compatible AI client** -- including Claude AI, OpenAI ChatGPT, xAI Grok, META Llama, and others. The HTTP API and CLI are completely platform-independent.
 
-**Key features for admins:** Zero token cost until recall (replaces built-in auto-memory), TOON compact default response format (79% smaller than JSON), MCP prompts for proactive AI behavior (`recall-first`, `memory-workflow`), 4 feature tiers (keyword → autonomous with local LLMs via Ollama), 177 tests with 95%+ coverage across 15/15 modules.
+**Key features for admins:** Zero token cost until recall (replaces built-in auto-memory), TOON compact default response format (79% smaller than JSON), MCP prompts for proactive AI behavior (`recall-first`, `memory-workflow`), 4 feature tiers (keyword → autonomous with local LLMs via Ollama), 188 tests with 95%+ coverage across 15/15 modules.
 
 ## Deployment Options
 
@@ -41,7 +41,7 @@ Run the HTTP daemon directly in the foreground:
 ai-memory --db /path/to/ai-memory.db serve
 ```
 
-The daemon listens on `127.0.0.1:9077` by default and exposes 20 HTTP endpoints.
+The daemon listens on `127.0.0.1:9077` by default and exposes 24 HTTP endpoints.
 
 ### Systemd (Production HTTP Daemon)
 
@@ -69,6 +69,18 @@ EOF
 sudo mkdir -p /var/lib/ai-memory
 sudo systemctl daemon-reload
 sudo systemctl enable --now ai-memory
+```
+
+**Production Hardening:** Add security directives to the `[Service]` section to restrict the daemon's privileges:
+
+```ini
+[Service]
+User=ai-memory
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+ReadWritePaths=/var/lib/ai-memory
 ```
 
 Check status:
@@ -120,10 +132,10 @@ The `--tier` flag controls which features are enabled. Each tier builds on the p
 
 | Tier | Tools | Embedding Model | LLM Required | Approx. Memory |
 |------|-------|----------------|--------------|----------------|
-| `keyword` | 14 | No | No | Minimal |
-| `semantic` (default) | 14 | Yes (HuggingFace) | No | ~256 MB |
-| `smart` | 17 | Yes | Yes (Ollama) | ~1 GB |
-| `autonomous` | 17 | Yes | Yes (Ollama) | ~4 GB |
+| `keyword` | 21 | No | No | Minimal |
+| `semantic` (default) | 21 | Yes (HuggingFace) | No | ~256 MB |
+| `smart` | 21 | Yes | Yes (Ollama) | ~1 GB |
+| `autonomous` | 21 | Yes | Yes (Ollama) | ~4 GB |
 
 Set the tier when starting the MCP server or HTTP daemon:
 
@@ -195,22 +207,140 @@ At the `semantic` tier and above, ai-memory downloads a sentence-transformer mod
 |----------|---------|-------------|
 | `AI_MEMORY_DB` | `ai-memory.db` | Database path (overridden by `--db`) |
 | `RUST_LOG` | (none) | Logging filter (e.g., `ai_memory=info,tower_http=debug`) |
+| `AI_MEMORY_NO_CONFIG` | (none) | Set to `1` to skip config file loading (useful for testing) |
 
 ### Configuration File (config.toml)
 
-`ai-memory` supports an optional configuration file at `~/.config/ai-memory/config.toml`. This file is read on startup and supports the following keys:
+`ai-memory` supports an optional configuration file at `~/.config/ai-memory/config.toml`. This file is read once at process startup and supports the following keys:
 
-| Key | Description |
-|-----|-------------|
-| `tier` | Feature tier (`keyword`, `semantic`, `smart`, `autonomous`) |
-| `db` | Path to the SQLite database file |
-| `ollama_url` | URL for the Ollama instance |
-| `embed_url` | URL for the embedding service |
-| `embedding_model` | Name of the embedding model to use |
-| `llm_model` | Name of the LLM model to use |
-| `cross_encoder` | Name of the cross-encoder model |
-| `default_namespace` | Default namespace for memories |
-| `max_memory_mb` | Maximum memory budget in MB |
+> **Note:** Configuration is loaded once at process startup. Changes to `config.toml` require restarting the ai-memory process (MCP server, HTTP daemon, or CLI) to take effect.
+
+| Key | Type | Default | Valid Values | Description |
+|-----|------|---------|--------------|-------------|
+| `tier` | String | `"semantic"` | `"keyword"`, `"semantic"`, `"smart"`, `"autonomous"` | Feature tier controlling which AI capabilities are active |
+| `db` | String | `"ai-memory.db"` | Any valid file path | Path to the SQLite database file |
+| `ollama_url` | String | `"http://localhost:11434"` | Any URL | Ollama base URL for LLM generation (smart/autonomous tiers) |
+| `embed_url` | String | Value of `ollama_url` | Any URL | Separate URL for the embedding service; falls back to `ollama_url` if unset |
+| `embedding_model` | String | Tier-dependent | `"mini_lm_l6_v2"` (384-dim, ~90 MB), `"nomic_embed_v15"` (768-dim, ~270 MB) | HuggingFace sentence-transformer model for semantic search |
+| `llm_model` | String | Tier-dependent | `"gemma4:e2b"` (~1 GB Q4), `"gemma4:e4b"` (~2.3 GB Q4) | Ollama LLM model tag for smart/autonomous features |
+| `cross_encoder` | **Bool** | `false` (`true` for autonomous tier) | `true`, `false` | Enable neural cross-encoder reranking (not a string -- must be bare `true`/`false` without quotes) |
+| `default_namespace` | String | `"global"` | Any valid namespace (max 128 bytes, no slashes/spaces/nulls) | Default namespace applied to new memories |
+| `max_memory_mb` | Integer | Tier-dependent | Any positive integer | Maximum memory budget in MB; used for automatic tier selection via `from_memory_budget()` |
+| `archive_on_gc` | Bool | `true` | `true`, `false` | Archive expired memories instead of permanently deleting them during GC |
+| `[ttl]` | Section | -- | -- | Per-tier TTL overrides (all sub-fields are integers in seconds) |
+| `ttl.short_ttl_secs` | Integer | `21600` (6 hours) | `0` = never expires, or positive integer | TTL for short-tier memories in seconds |
+| `ttl.mid_ttl_secs` | Integer | `604800` (7 days) | `0` = never expires, or positive integer | TTL for mid-tier memories in seconds |
+| `ttl.long_ttl_secs` | Integer | `0` (never expires) | `0` = never expires, or positive integer | TTL for long-tier memories in seconds |
+| `ttl.short_extend_secs` | Integer | `3600` (1 hour) | Non-negative integer | TTL extension on access for short-tier memories |
+| `ttl.mid_extend_secs` | Integer | `86400` (1 day) | Non-negative integer | TTL extension on access for mid-tier memories |
+
+> **Note:** Set any TTL to `0` to disable expiry for that tier. Values are clamped to a 10-year maximum (315,360,000 seconds). Negative extension values are clamped to 0.
+
+> **Note:** Restored memories have their `expires_at` cleared (set to NULL) and become permanent.
+
+#### Complete Annotated config.toml
+
+Below is a complete example showing every supported field with explanatory comments. Copy this to `~/.config/ai-memory/config.toml` and uncomment the lines you want to customize.
+
+```toml
+# =============================================================================
+# ai-memory configuration
+# Location: ~/.config/ai-memory/config.toml
+# Docs: https://github.com/alphaonedev/ai-memory-mcp
+#
+# All fields are optional. CLI flags and MCP args override these values.
+# Changes require restarting the ai-memory process to take effect.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Feature tier (controls which AI capabilities are active)
+# ---------------------------------------------------------------------------
+# Valid values: "keyword", "semantic", "smart", "autonomous"
+#   keyword    — FTS5 keyword search only, no models, minimal RAM
+#   semantic   — adds embedding-based hybrid recall (~256 MB)
+#   smart      — adds query expansion, auto-tagging, contradiction detection (~1 GB, requires Ollama)
+#   autonomous — full feature set with cross-encoder reranking (~4 GB, requires Ollama)
+# Default: "semantic"
+# tier = "semantic"
+
+# ---------------------------------------------------------------------------
+# Database path
+# ---------------------------------------------------------------------------
+# Path to the SQLite database file.
+# Default: "ai-memory.db" (relative to working directory)
+# db = "~/.claude/ai-memory.db"
+
+# ---------------------------------------------------------------------------
+# Ollama URLs (smart and autonomous tiers only)
+# ---------------------------------------------------------------------------
+# Base URL for Ollama LLM generation.
+# Default: "http://localhost:11434"
+# ollama_url = "http://localhost:11434"
+
+# Separate URL for embedding requests. Falls back to ollama_url if unset.
+# Default: same as ollama_url
+# embed_url = "http://localhost:11434"
+
+# ---------------------------------------------------------------------------
+# Model selection
+# ---------------------------------------------------------------------------
+# Embedding model for semantic search (semantic tier and above).
+# Valid values:
+#   "mini_lm_l6_v2"   — sentence-transformers/all-MiniLM-L6-v2, 384-dim, ~90 MB
+#   "nomic_embed_v15"  — nomic-ai/nomic-embed-text-v1.5, 768-dim, ~270 MB
+# Default: tier-dependent (mini_lm_l6_v2 for semantic, nomic_embed_v15 for smart/autonomous)
+# embedding_model = "mini_lm_l6_v2"
+
+# LLM model served via Ollama (smart and autonomous tiers).
+# Valid values:
+#   "gemma4:e2b"  — Google Gemma 4 Effective 2B, ~1 GB Q4 (smart tier default)
+#   "gemma4:e4b"  — Google Gemma 4 Effective 4B, ~2.3 GB Q4 (autonomous tier default)
+# Default: tier-dependent (gemma4:e2b for smart, gemma4:e4b for autonomous)
+# llm_model = "gemma4:e2b"
+
+# ---------------------------------------------------------------------------
+# Cross-encoder reranking
+# ---------------------------------------------------------------------------
+# Enable neural cross-encoder reranking for improved recall precision.
+# NOTE: This is a boolean, NOT a string. Use bare true/false without quotes.
+# Default: false (true for autonomous tier)
+# cross_encoder = true
+
+# ---------------------------------------------------------------------------
+# Namespace and memory limits
+# ---------------------------------------------------------------------------
+# Default namespace applied to new memories when none is specified.
+# Default: "global"
+# default_namespace = "global"
+
+# Maximum memory budget in MB. Used for automatic tier selection when tier
+# is not explicitly set — the highest tier that fits within this budget is chosen.
+# Default: tier-dependent (0/256/1024/4096 for keyword/semantic/smart/autonomous)
+# max_memory_mb = 4096
+
+# ---------------------------------------------------------------------------
+# Garbage collection
+# ---------------------------------------------------------------------------
+# Archive expired memories before GC permanently deletes them.
+# When true, expired memories are moved to the archive table and can be
+# restored later. When false, GC permanently deletes expired memories.
+# Default: true
+# archive_on_gc = true
+
+# ---------------------------------------------------------------------------
+# Per-tier TTL overrides
+# ---------------------------------------------------------------------------
+# Customize time-to-live and access-extension durations per memory tier.
+# Set any TTL to 0 to disable expiry for that tier.
+# Values are clamped to a 10-year maximum (315,360,000 seconds).
+# Negative extension values are clamped to 0.
+# [ttl]
+# short_ttl_secs = 21600        # 6 hours (default)
+# mid_ttl_secs = 604800         # 7 days (default)
+# long_ttl_secs = 0             # 0 = never expires (default)
+# short_extend_secs = 3600      # +1 hour on access (default)
+# mid_extend_secs = 86400       # +1 day on access (default)
+```
 
 **Precedence:** CLI flags and MCP args take precedence over `config.toml` values. When the MCP server is launched by an AI client, the `--tier` flag in the MCP args is used, not the `config.toml` `tier` setting.
 
@@ -237,6 +367,8 @@ The HTTP daemon handles SIGINT (Ctrl+C) gracefully:
 4. Exits cleanly
 
 For systemd, use `KillSignal=SIGINT` and `TimeoutStopSec=10` to ensure the checkpoint completes.
+
+> **Note:** The HTTP daemon handles SIGINT (Ctrl+C) gracefully with WAL checkpoint. Systemd sends SIGTERM by default -- the service file sets `KillSignal=SIGINT` to ensure clean shutdown.
 
 The MCP server exits cleanly when stdin closes (AI client session ends).
 
@@ -292,12 +424,22 @@ systemctl start ai-memory
 
 ### Migration
 
-The schema is auto-migrated on startup. The `schema_version` table tracks the current version (currently 3). Migrations are forward-only and non-destructive.
+The schema is auto-migrated on startup. The `schema_version` table tracks the current version (currently 4). Migrations are forward-only and non-destructive.
 
 - v1 -> v2: Added `confidence` (REAL) and `source` (TEXT) columns
 - v2 -> v3: Added `embedding` (BLOB) column for storing dense vector embeddings
+- v3 -> v4: Added `archived_memories` table for GC archival
 
 Migration error handling: only expected errors (e.g., "duplicate column" when re-running a migration) are silently ignored. Real failures are propagated and will prevent startup, ensuring data integrity.
+
+### Upgrade Procedure
+
+1. Stop the service: `sudo systemctl stop ai-memory`
+2. Backup the database: `sqlite3 /var/lib/ai-memory/ai-memory.db ".backup /var/lib/ai-memory/ai-memory-backup.db"`
+3. Install the new binary (e.g., `cargo install ai-memory` or replace the binary at `/usr/local/bin/ai-memory`)
+4. Start the service: `sudo systemctl start ai-memory`
+
+Schema migrations run automatically on startup. No manual migration steps are required.
 
 ### Database Maintenance
 
@@ -310,6 +452,24 @@ ai-memory gc
 # Via API
 curl -X POST http://127.0.0.1:9077/api/v1/gc
 ```
+
+By default, GC archives expired memories before deleting them. To disable archiving and permanently delete instead, set `archive_on_gc = false` in `config.toml`. Archived memories are moved to a separate archive table and can be listed, restored, or purged:
+
+```bash
+# List archived memories
+curl http://127.0.0.1:9077/api/v1/archive
+
+# Restore an archived memory
+curl -X POST http://127.0.0.1:9077/api/v1/archive/<id>/restore
+
+# Purge all archived memories permanently (optional: ?older_than_days=N)
+curl -X DELETE http://127.0.0.1:9077/api/v1/archive
+
+# View archive statistics
+curl http://127.0.0.1:9077/api/v1/archive/stats
+```
+
+**Disk space guidance:** Approximate database growth: ~2KB per memory (keyword tier), ~3.5KB per memory (semantic tier, 384-dim embeddings), ~5KB per memory (768-dim embeddings). WAL file may grow up to ~50MB during heavy write bursts; checkpoint occurs on graceful shutdown. Archive table grows unboundedly -- use `ai-memory archive purge` periodically.
 
 Compact the database (reduces file size after many deletions):
 
@@ -379,9 +539,37 @@ By default, the HTTP daemon binds to `127.0.0.1` only. It is **not accessible fr
 
 The MCP server communicates over stdio only -- no network exposure.
 
+### CORS
+
+The HTTP server uses `CorsLayer::permissive()` -- any origin can make requests. For production, use a reverse proxy with restrictive CORS headers.
+
 ### No Authentication
 
 There is no authentication mechanism. This is by design -- the daemon is intended for localhost access only by your AI client (Claude AI, ChatGPT, Grok, Llama, or any other). If you expose it to a network, you are responsible for adding a reverse proxy with authentication.
+
+### Multi-User Warning
+
+ai-memory is a single-user tool. Namespaces do not provide access control. If multiple users share a database, any user can read/write any namespace.
+
+### TLS / Reverse Proxy
+
+ai-memory does not support TLS natively. For HTTPS, terminate TLS at a reverse proxy. Minimal nginx example:
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name memory.example.com;
+
+    ssl_certificate     /etc/ssl/certs/memory.pem;
+    ssl_certificate_key /etc/ssl/private/memory.key;
+
+    location / {
+        proxy_pass http://127.0.0.1:9077;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+}
+```
 
 ### Data at Rest
 
@@ -401,7 +589,9 @@ Both are cleaned up on graceful shutdown (the daemon runs `PRAGMA wal_checkpoint
 
 ## HTTP API Endpoints
 
-The HTTP daemon exposes **20 endpoints** under `/api/v1`:
+Maximum request body size: 50 MB.
+
+The HTTP daemon exposes **24 endpoints** under `/api/v1`:
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -425,6 +615,300 @@ The HTTP daemon exposes **20 endpoints** under `/api/v1`:
 | `POST` | `/gc` | Trigger garbage collection |
 | `GET` | `/export` | Export all memories and links |
 | `POST` | `/import` | Import memories and links (max 1,000) |
+| `GET` | `/archive` | List archived memories |
+| `POST` | `/archive/{id}/restore` | Restore an archived memory |
+| `DELETE` | `/archive` | Permanently delete archived memories (optional `?older_than_days=N`) |
+| `GET` | `/archive/stats` | Archive statistics |
+
+### HTTP API Request/Response Examples
+
+Below are curl examples showing the exact JSON request bodies and response formats for the most important endpoints. The base URL is `http://127.0.0.1:9077/api/v1`.
+
+#### POST /memories (Store)
+
+Create a new memory. Only `title` and `content` are required; all other fields have defaults.
+
+```bash
+curl -X POST http://127.0.0.1:9077/api/v1/memories \
+  -H "Content-Type: application/json" \
+  -d '{
+    "title": "Project uses PostgreSQL 16",
+    "content": "The production database runs PostgreSQL 16 with pgvector for embeddings.",
+    "tier": "long",
+    "namespace": "infra",
+    "tags": ["postgres", "database"],
+    "priority": 9,
+    "confidence": 1.0,
+    "source": "user",
+    "ttl_secs": 604800
+  }'
+```
+
+**Required fields:**
+| Field | Type | Description |
+|-------|------|-------------|
+| `title` | string | Memory title (max 512 bytes) |
+| `content` | string | Memory content (max 64 KB) |
+
+**Optional fields:**
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `tier` | string | `"mid"` | `"short"`, `"mid"`, or `"long"` |
+| `namespace` | string | `"global"` | Namespace for grouping (max 128 bytes, no slashes/spaces) |
+| `tags` | array | `[]` | String tags (max 50 tags, each max 128 bytes) |
+| `priority` | integer | `5` | 1-10 (clamped) |
+| `confidence` | float | `1.0` | 0.0-1.0 (clamped) |
+| `source` | string | `"api"` | One of: `user`, `claude`, `hook`, `api`, `cli`, `import`, `consolidation`, `system` |
+| `expires_at` | string | (none) | Explicit expiry timestamp (RFC3339) |
+| `ttl_secs` | integer | (none) | TTL in seconds (overrides tier default) |
+
+**Response (201 Created):**
+
+```json
+{
+  "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "tier": "long",
+  "namespace": "infra",
+  "title": "Project uses PostgreSQL 16"
+}
+```
+
+If potential contradictions are found (memories with similar titles in the same namespace), the response includes:
+
+```json
+{
+  "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "tier": "long",
+  "namespace": "infra",
+  "title": "Project uses PostgreSQL 16",
+  "potential_contradictions": ["existing-id-1", "existing-id-2"]
+}
+```
+
+Deduplication: if a memory with the same title+namespace already exists, it is upserted (tier never downgrades, priority keeps the maximum).
+
+**Minimal example (defaults applied):**
+
+```bash
+curl -X POST http://127.0.0.1:9077/api/v1/memories \
+  -H "Content-Type: application/json" \
+  -d '{"title": "Quick note", "content": "Something to remember."}'
+```
+
+Response: `{"id": "...", "tier": "mid", "namespace": "global", "title": "Quick note"}`
+
+#### GET /memories/{id} (Get)
+
+Retrieve a single memory by ID, including its links to other memories.
+
+```bash
+curl http://127.0.0.1:9077/api/v1/memories/a1b2c3d4-e5f6-7890-abcd-ef1234567890
+```
+
+**Response (200 OK):**
+
+```json
+{
+  "memory": {
+    "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "tier": "long",
+    "namespace": "infra",
+    "title": "Project uses PostgreSQL 16",
+    "content": "The production database runs PostgreSQL 16 with pgvector for embeddings.",
+    "tags": ["postgres", "database"],
+    "priority": 9,
+    "confidence": 1.0,
+    "source": "user",
+    "access_count": 3,
+    "created_at": "2026-04-03T15:00:00+00:00",
+    "updated_at": "2026-04-03T15:00:00+00:00",
+    "last_accessed_at": "2026-04-10T09:30:00+00:00",
+    "expires_at": null
+  },
+  "links": [
+    {
+      "source_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "target_id": "f7e8d9c0-b1a2-3456-7890-abcdef123456",
+      "relation": "related_to",
+      "created_at": "2026-04-05T12:00:00+00:00"
+    }
+  ]
+}
+```
+
+**Response (404 Not Found):** `{"error": "not found"}`
+
+Note: `last_accessed_at` and `expires_at` are omitted from the JSON when null.
+
+#### GET /recall?context=... (Recall)
+
+Fuzzy OR search with ranked results. Automatically bumps access count, extends TTL, and auto-promotes frequently accessed mid-tier memories to long-term.
+
+```bash
+curl "http://127.0.0.1:9077/api/v1/recall?context=database+migration+postgres&namespace=infra&limit=5"
+```
+
+**Query parameters:**
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `context` | string | (required) | Search context / query text |
+| `namespace` | string | (none) | Filter by namespace |
+| `limit` | integer | `10` | Max results (capped at 50) |
+| `tags` | string | (none) | Comma-separated tag filter |
+| `since` | string | (none) | Only memories updated after this RFC3339 timestamp |
+| `until` | string | (none) | Only memories updated before this RFC3339 timestamp |
+
+**Response (200 OK):**
+
+```json
+{
+  "memories": [
+    {
+      "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "tier": "long",
+      "namespace": "infra",
+      "title": "Project uses PostgreSQL 16",
+      "content": "The production database runs PostgreSQL 16 with pgvector for embeddings.",
+      "tags": ["postgres", "database"],
+      "priority": 9,
+      "confidence": 1.0,
+      "source": "user",
+      "access_count": 4,
+      "created_at": "2026-04-03T15:00:00+00:00",
+      "updated_at": "2026-04-03T15:00:00+00:00",
+      "last_accessed_at": "2026-04-12T10:00:00+00:00",
+      "score": 0.763
+    }
+  ],
+  "count": 1
+}
+```
+
+Each memory in the response includes a `score` field (float, rounded to 3 decimal places) representing the composite relevance score. Memories are returned sorted by score descending.
+
+Recall is also available via POST for larger query bodies:
+
+```bash
+curl -X POST http://127.0.0.1:9077/api/v1/recall \
+  -H "Content-Type: application/json" \
+  -d '{
+    "context": "database migration postgres",
+    "namespace": "infra",
+    "limit": 5,
+    "tags": "postgres",
+    "since": "2026-01-01T00:00:00Z"
+  }'
+```
+
+#### PUT /memories/{id} (Update)
+
+Partial update -- only provided fields are modified. All fields are optional.
+
+```bash
+curl -X PUT http://127.0.0.1:9077/api/v1/memories/a1b2c3d4-e5f6-7890-abcd-ef1234567890 \
+  -H "Content-Type: application/json" \
+  -d '{
+    "content": "PostgreSQL 16.2 with pgvector 0.7 for embeddings. Upgraded 2026-04-10.",
+    "priority": 10,
+    "tags": ["postgres", "database", "pgvector"]
+  }'
+```
+
+**Updatable fields:**
+| Field | Type | Description |
+|-------|------|-------------|
+| `title` | string | New title |
+| `content` | string | New content |
+| `tier` | string | New tier (`"short"`, `"mid"`, `"long"`) |
+| `namespace` | string | New namespace |
+| `tags` | array | Replace tags entirely |
+| `priority` | integer | New priority (1-10) |
+| `confidence` | float | New confidence (0.0-1.0) |
+| `expires_at` | string | New expiry (RFC3339) |
+
+**Response (200 OK):** Returns the full updated memory object:
+
+```json
+{
+  "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "tier": "long",
+  "namespace": "infra",
+  "title": "Project uses PostgreSQL 16",
+  "content": "PostgreSQL 16.2 with pgvector 0.7 for embeddings. Upgraded 2026-04-10.",
+  "tags": ["postgres", "database", "pgvector"],
+  "priority": 10,
+  "confidence": 1.0,
+  "source": "user",
+  "access_count": 4,
+  "created_at": "2026-04-03T15:00:00+00:00",
+  "updated_at": "2026-04-12T10:05:00+00:00"
+}
+```
+
+**Response (404 Not Found):** `{"error": "not found"}`
+
+**Response (409 Conflict):** `{"error": "title already exists in namespace ..."}` (if updating the title to one that already exists in the same namespace)
+
+#### GET /archive (List Archived)
+
+List memories that were archived by garbage collection.
+
+```bash
+curl "http://127.0.0.1:9077/api/v1/archive?namespace=infra&limit=20&offset=0"
+```
+
+**Query parameters:**
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `namespace` | string | (none) | Filter by namespace |
+| `limit` | integer | `50` | Max results (capped at 1000) |
+| `offset` | integer | `0` | Pagination offset |
+
+**Response (200 OK):**
+
+```json
+{
+  "archived": [
+    {
+      "id": "expired-memory-id",
+      "tier": "short",
+      "namespace": "infra",
+      "title": "Temp debug session",
+      "content": "Debugging connection pooling issue...",
+      "tags": ["debug"],
+      "priority": 3,
+      "confidence": 1.0,
+      "source": "claude",
+      "access_count": 1,
+      "created_at": "2026-04-01T10:00:00+00:00",
+      "updated_at": "2026-04-01T10:00:00+00:00",
+      "expires_at": "2026-04-01T16:00:00+00:00",
+      "archived_at": "2026-04-02T00:30:00+00:00",
+      "archive_reason": "gc"
+    }
+  ],
+  "count": 1
+}
+```
+
+#### POST /archive/{id}/restore (Restore)
+
+Restore an archived memory back to the active memories table. The restored memory has its `expires_at` cleared (becomes permanent).
+
+```bash
+curl -X POST http://127.0.0.1:9077/api/v1/archive/expired-memory-id/restore
+```
+
+**Response (200 OK):**
+
+```json
+{
+  "restored": true,
+  "id": "expired-memory-id"
+}
+```
+
+**Response (404 Not Found):** `{"error": "not found in archive"}`
 
 ## Monitoring
 
@@ -512,7 +996,7 @@ Runs on `ubuntu-latest` and `macos-latest`:
 
 1. **Formatting** -- `cargo fmt --check`
 2. **Linting** -- `cargo clippy -- -D warnings`
-3. **Tests** -- `cargo test` (177 tests: 118 unit + 43 integration, 15/15 modules)
+3. **Tests** -- `cargo test` (188 tests: 139 unit + 49 integration, 15/15 modules)
 4. **Build** -- `cargo build --release`
 
 Uses `Swatinem/rust-cache@v2` for build caching.

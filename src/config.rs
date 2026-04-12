@@ -4,6 +4,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+use crate::models::Tier;
+
 // ---------------------------------------------------------------------------
 // Embedding models
 // ---------------------------------------------------------------------------
@@ -254,6 +256,107 @@ pub struct CapabilityModels {
 }
 
 // ---------------------------------------------------------------------------
+// TTL configuration
+// ---------------------------------------------------------------------------
+
+/// Per-tier TTL overrides loaded from `[ttl]` section of config.toml.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TtlConfig {
+    /// Short-tier default TTL in seconds (default: 21600 = 6 hours)
+    pub short_ttl_secs: Option<i64>,
+    /// Mid-tier default TTL in seconds (default: 604800 = 7 days)
+    pub mid_ttl_secs: Option<i64>,
+    /// Long-tier TTL in seconds (default: none = never expires). Set >0 to add expiry.
+    pub long_ttl_secs: Option<i64>,
+    /// Short-tier TTL extension on access in seconds (default: 3600 = 1 hour)
+    pub short_extend_secs: Option<i64>,
+    /// Mid-tier TTL extension on access in seconds (default: 86400 = 1 day)
+    pub mid_extend_secs: Option<i64>,
+}
+
+/// Resolved TTL values after merging config overrides with compiled defaults.
+#[derive(Debug, Clone)]
+pub struct ResolvedTtl {
+    pub short_ttl_secs: Option<i64>,
+    pub mid_ttl_secs: Option<i64>,
+    pub long_ttl_secs: Option<i64>,
+    pub short_extend_secs: i64,
+    pub mid_extend_secs: i64,
+}
+
+impl Default for ResolvedTtl {
+    fn default() -> Self {
+        Self {
+            short_ttl_secs: Tier::Short.default_ttl_secs(),
+            mid_ttl_secs: Tier::Mid.default_ttl_secs(),
+            long_ttl_secs: Tier::Long.default_ttl_secs(),
+            short_extend_secs: crate::models::SHORT_TTL_EXTEND_SECS,
+            mid_extend_secs: crate::models::MID_TTL_EXTEND_SECS,
+        }
+    }
+}
+
+/// Maximum configurable TTL: 10 years in seconds. Prevents integer overflow
+/// when adding Duration to Utc::now().
+const MAX_TTL_SECS: i64 = 315_360_000;
+
+impl ResolvedTtl {
+    /// Build from optional config overrides, falling back to compiled defaults.
+    /// TTL values are clamped to MAX_TTL_SECS (10 years) to prevent overflow.
+    /// Extension values are clamped to non-negative.
+    pub fn from_config(cfg: Option<&TtlConfig>) -> Self {
+        let defaults = Self::default();
+        let Some(c) = cfg else {
+            return defaults;
+        };
+        let clamp_ttl = |v: i64| -> Option<i64> {
+            if v <= 0 {
+                None
+            } else {
+                Some(v.min(MAX_TTL_SECS))
+            }
+        };
+        Self {
+            short_ttl_secs: c
+                .short_ttl_secs
+                .map(clamp_ttl)
+                .unwrap_or(defaults.short_ttl_secs),
+            mid_ttl_secs: c
+                .mid_ttl_secs
+                .map(clamp_ttl)
+                .unwrap_or(defaults.mid_ttl_secs),
+            long_ttl_secs: c
+                .long_ttl_secs
+                .map(clamp_ttl)
+                .unwrap_or(defaults.long_ttl_secs),
+            short_extend_secs: c
+                .short_extend_secs
+                .unwrap_or(defaults.short_extend_secs)
+                .max(0),
+            mid_extend_secs: c.mid_extend_secs.unwrap_or(defaults.mid_extend_secs).max(0),
+        }
+    }
+
+    /// Get the default TTL for a given tier.
+    pub fn ttl_for_tier(&self, tier: &Tier) -> Option<i64> {
+        match tier {
+            Tier::Short => self.short_ttl_secs,
+            Tier::Mid => self.mid_ttl_secs,
+            Tier::Long => self.long_ttl_secs,
+        }
+    }
+
+    /// Get the TTL extension on access for a given tier.
+    pub fn extend_for_tier(&self, tier: &Tier) -> Option<i64> {
+        match tier {
+            Tier::Short => Some(self.short_extend_secs),
+            Tier::Mid => Some(self.mid_extend_secs),
+            Tier::Long => None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Persistent config file (~/.config/ai-memory/config.toml)
 // ---------------------------------------------------------------------------
 
@@ -284,6 +387,10 @@ pub struct AppConfig {
     pub default_namespace: Option<String>,
     /// Maximum memory budget in MB (used for auto tier selection)
     pub max_memory_mb: Option<usize>,
+    /// Per-tier TTL overrides
+    pub ttl: Option<TtlConfig>,
+    /// Archive memories before GC deletion (default: true)
+    pub archive_on_gc: Option<bool>,
 }
 
 impl AppConfig {
@@ -349,6 +456,16 @@ impl AppConfig {
             .unwrap_or("http://localhost:11434")
     }
 
+    /// Resolve TTL configuration from config file, falling back to compiled defaults.
+    pub fn effective_ttl(&self) -> ResolvedTtl {
+        ResolvedTtl::from_config(self.ttl.as_ref())
+    }
+
+    /// Whether to archive memories before GC deletion (default: true).
+    pub fn effective_archive_on_gc(&self) -> bool {
+        self.archive_on_gc.unwrap_or(true)
+    }
+
     /// Resolve URL for embedding model (falls back to ollama_url).
     pub fn effective_embed_url(&self) -> &str {
         self.embed_url
@@ -394,6 +511,17 @@ impl AppConfig {
 
 # Memory budget in MB (for auto tier selection)
 # max_memory_mb = 4096
+
+# Archive expired memories before GC deletion (default: true)
+# archive_on_gc = true
+
+# Per-tier TTL overrides (uncomment to customize)
+# [ttl]
+# short_ttl_secs = 21600        # 6 hours (default)
+# mid_ttl_secs = 604800         # 7 days (default)
+# long_ttl_secs = 0             # 0 = never expires (default)
+# short_extend_secs = 3600      # +1h on access (default)
+# mid_extend_secs = 86400       # +1d on access (default)
 "#;
         let _ = std::fs::write(&path, default_toml);
     }
@@ -489,6 +617,80 @@ mod tests {
         assert_eq!(cfg.tier.as_deref(), Some("smart"));
         assert_eq!(cfg.db.as_deref(), Some("/tmp/test.db"));
         assert!(cfg.cross_encoder.unwrap());
+    }
+
+    #[test]
+    fn resolved_ttl_defaults_match_hardcoded() {
+        let resolved = ResolvedTtl::default();
+        assert_eq!(resolved.short_ttl_secs, Some(6 * 3600));
+        assert_eq!(resolved.mid_ttl_secs, Some(7 * 24 * 3600));
+        assert_eq!(resolved.long_ttl_secs, None);
+        assert_eq!(resolved.short_extend_secs, 3600);
+        assert_eq!(resolved.mid_extend_secs, 86400);
+    }
+
+    #[test]
+    fn resolved_ttl_from_partial_config() {
+        let cfg = TtlConfig {
+            mid_ttl_secs: Some(90 * 24 * 3600), // ~3 months
+            ..Default::default()
+        };
+        let resolved = ResolvedTtl::from_config(Some(&cfg));
+        assert_eq!(resolved.short_ttl_secs, Some(6 * 3600)); // unchanged
+        assert_eq!(resolved.mid_ttl_secs, Some(90 * 24 * 3600)); // overridden
+        assert_eq!(resolved.long_ttl_secs, None); // unchanged
+    }
+
+    #[test]
+    fn resolved_ttl_zero_means_no_expiry() {
+        let cfg = TtlConfig {
+            short_ttl_secs: Some(0),
+            mid_ttl_secs: Some(0),
+            ..Default::default()
+        };
+        let resolved = ResolvedTtl::from_config(Some(&cfg));
+        assert_eq!(resolved.short_ttl_secs, None); // 0 → no expiry
+        assert_eq!(resolved.mid_ttl_secs, None);
+    }
+
+    #[test]
+    fn resolved_ttl_clamps_overflow() {
+        let cfg = TtlConfig {
+            mid_ttl_secs: Some(i64::MAX),
+            short_extend_secs: Some(-3600),
+            ..Default::default()
+        };
+        let resolved = ResolvedTtl::from_config(Some(&cfg));
+        // i64::MAX should be clamped to MAX_TTL_SECS (10 years)
+        assert_eq!(resolved.mid_ttl_secs, Some(super::MAX_TTL_SECS));
+        // negative extend should be clamped to 0
+        assert_eq!(resolved.short_extend_secs, 0);
+    }
+
+    #[test]
+    fn ttl_config_parse_toml() {
+        let toml_str = r#"
+            tier = "semantic"
+            archive_on_gc = false
+            [ttl]
+            mid_ttl_secs = 7776000
+            short_extend_secs = 7200
+        "#;
+        let cfg: AppConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.ttl.as_ref().unwrap().mid_ttl_secs, Some(7776000));
+        assert_eq!(cfg.ttl.as_ref().unwrap().short_extend_secs, Some(7200));
+        assert!(!cfg.effective_archive_on_gc());
+    }
+
+    #[test]
+    fn resolved_ttl_tier_methods() {
+        let resolved = ResolvedTtl::default();
+        assert_eq!(resolved.ttl_for_tier(&Tier::Short), Some(6 * 3600));
+        assert_eq!(resolved.ttl_for_tier(&Tier::Mid), Some(7 * 24 * 3600));
+        assert_eq!(resolved.ttl_for_tier(&Tier::Long), None);
+        assert_eq!(resolved.extend_for_tier(&Tier::Short), Some(3600));
+        assert_eq!(resolved.extend_for_tier(&Tier::Mid), Some(86400));
+        assert_eq!(resolved.extend_for_tier(&Tier::Long), None);
     }
 
     #[test]

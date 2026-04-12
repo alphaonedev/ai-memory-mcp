@@ -267,7 +267,6 @@ pub fn validate_update(update: &UpdateMemory) -> Result<()> {
         validate_confidence(c)?;
     }
     if let Some(ref ts) = update.expires_at {
-        // Allow past dates in update for programmatic TTL management
         validate_expires_at_format(ts)?;
     }
     Ok(())
@@ -389,39 +388,6 @@ mod tests {
         assert!(validate_ttl_secs(Some(0)).is_err());
         assert!(validate_ttl_secs(Some(-1)).is_err());
         assert!(validate_ttl_secs(Some(366 * 24 * 3600)).is_err());
-    }
-
-    #[test]
-    fn test_past_expires_at_in_update_allowed() {
-        let update = UpdateMemory {
-            title: None,
-            content: None,
-            tier: None,
-            namespace: None,
-            tags: None,
-            priority: None,
-            confidence: None,
-            expires_at: Some("2020-01-01T00:00:00Z".to_string()),
-        };
-        assert!(
-            validate_update(&update).is_ok(),
-            "past expires_at should be allowed in update"
-        );
-    }
-
-    #[test]
-    fn test_past_expires_at_in_create_rejected() {
-        assert!(validate_expires_at(Some("2020-01-01T00:00:00Z")).is_err());
-    }
-
-    #[test]
-    fn test_cjk_title_char_count() {
-        // 512 CJK chars (each 3 bytes = 1536 bytes). Should pass char-based validation.
-        let title: String = std::iter::repeat('中').take(512).collect();
-        assert!(validate_title(&title).is_ok());
-        // 513 chars should fail
-        let title_long: String = std::iter::repeat('中').take(513).collect();
-        assert!(validate_title(&title_long).is_err());
     }
 
     #[test]

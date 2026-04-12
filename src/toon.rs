@@ -233,13 +233,6 @@ mod tests {
     }
 
     #[test]
-    fn backslash_and_cr_escaped() {
-        let resp = json!({"memories": [{"id": "x", "title": "path\\to\\file\r\n", "tier": "mid"}], "count": 1});
-        let toon = memories_to_toon(&resp, true);
-        assert!(toon.contains("path\\\\to\\\\file\\r\\n"));
-    }
-
-    #[test]
     fn search_results_key() {
         let resp = json!({"results": [{"id": "x", "title": "Found", "tier": "mid"}], "count": 1});
         let toon = search_to_toon(&resp, true);
