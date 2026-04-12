@@ -283,6 +283,47 @@ fn tool_definitions() -> Value {
                     },
                     "required": ["id_a", "id_b"]
                 }
+            },
+            {
+                "name": "memory_archive_list",
+                "description": "List archived (expired) memories. Archived memories are preserved before GC deletion.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "namespace": {"type": "string", "description": "Filter by namespace"},
+                        "limit": {"type": "integer", "description": "Max results (default 50, max 1000)"},
+                        "offset": {"type": "integer", "description": "Pagination offset"}
+                    }
+                }
+            },
+            {
+                "name": "memory_archive_restore",
+                "description": "Restore an archived memory back to the active memory store (expires_at cleared).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string", "description": "ID of the archived memory to restore"}
+                    },
+                    "required": ["id"]
+                }
+            },
+            {
+                "name": "memory_archive_purge",
+                "description": "Permanently delete archived memories. Optionally only those older than N days.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "older_than_days": {"type": "integer", "description": "Only purge entries archived more than N days ago. Omit to purge all."}
+                    }
+                }
+            },
+            {
+                "name": "memory_archive_stats",
+                "description": "Show archive statistics: total count and breakdown by namespace.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {}
+                }
             }
         ]
     })
@@ -374,6 +415,7 @@ fn handle_store(
     params: &Value,
     embedder: Option<&Embedder>,
     vector_index: Option<&VectorIndex>,
+    resolved_ttl: &crate::config::ResolvedTtl,
 ) -> Result<Value, String> {
     let title = params["title"].as_str().ok_or("title is required")?;
     let content = params["content"].as_str().ok_or("content is required")?;
@@ -401,8 +443,8 @@ fn handle_store(
     validate::validate_confidence(confidence).map_err(|e| e.to_string())?;
 
     let now = chrono::Utc::now();
-    let expires_at = tier
-        .default_ttl_secs()
+    let expires_at = resolved_ttl
+        .ttl_for_tier(&tier)
         .map(|s| (now + chrono::Duration::seconds(s)).to_rfc3339());
 
     let mem = Memory {
@@ -507,7 +549,7 @@ fn handle_recall(
     vector_index: Option<&VectorIndex>,
     reranker: Option<&CrossEncoder>,
 ) -> Result<Value, String> {
-    let _ = db::gc_if_needed(conn);
+    let _ = db::gc_if_needed(conn, true);
     let context = params["context"].as_str().ok_or("context is required")?;
     let namespace = params["namespace"].as_str();
     let limit = params["limit"].as_u64().unwrap_or(10) as usize;
@@ -915,6 +957,38 @@ fn handle_consolidate(
 
 // --- MCP protocol handler ---
 
+// ---------------------------------------------------------------------------
+// Archive tool handlers
+// ---------------------------------------------------------------------------
+
+fn handle_archive_list(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
+    let namespace = params["namespace"].as_str();
+    let limit = params["limit"].as_u64().unwrap_or(50) as usize;
+    let offset = params["offset"].as_u64().unwrap_or(0) as usize;
+    let items = db::list_archived(conn, namespace, limit.min(1000), offset)
+        .map_err(|e| e.to_string())?;
+    Ok(json!({"archived": items, "count": items.len()}))
+}
+
+fn handle_archive_restore(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
+    let id = params["id"].as_str().ok_or("id is required")?;
+    let restored = db::restore_archived(conn, id).map_err(|e| e.to_string())?;
+    if !restored {
+        return Err("not found in archive".into());
+    }
+    Ok(json!({"restored": true, "id": id}))
+}
+
+fn handle_archive_purge(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
+    let older_than_days = params["older_than_days"].as_i64();
+    let purged = db::purge_archive(conn, older_than_days).map_err(|e| e.to_string())?;
+    Ok(json!({"purged": purged}))
+}
+
+fn handle_archive_stats(conn: &rusqlite::Connection) -> Result<Value, String> {
+    db::archive_stats(conn).map_err(|e| e.to_string())
+}
+
 fn handle_request(
     conn: &rusqlite::Connection,
     db_path: &Path,
@@ -924,6 +998,7 @@ fn handle_request(
     reranker: Option<&CrossEncoder>,
     tier_config: &TierConfig,
     vector_index: Option<&VectorIndex>,
+    resolved_ttl: &crate::config::ResolvedTtl,
 ) -> RpcResponse {
     let id = req.id.clone().unwrap_or(Value::Null);
 
@@ -974,7 +1049,7 @@ fn handle_request(
             };
 
             let result = match tool_name {
-                "memory_store" => handle_store(conn, arguments, embedder, vector_index),
+                "memory_store" => handle_store(conn, arguments, embedder, vector_index, resolved_ttl),
                 "memory_recall" => handle_recall(conn, arguments, embedder, vector_index, reranker),
                 "memory_search" => handle_search(conn, arguments),
                 "memory_list" => handle_list(conn, arguments),
@@ -991,6 +1066,10 @@ fn handle_request(
                 "memory_expand_query" => handle_expand_query(llm, arguments),
                 "memory_auto_tag" => handle_auto_tag(conn, llm, arguments),
                 "memory_detect_contradiction" => handle_detect_contradiction(conn, llm, arguments),
+                "memory_archive_list" => handle_archive_list(conn, arguments),
+                "memory_archive_restore" => handle_archive_restore(conn, arguments),
+                "memory_archive_purge" => handle_archive_purge(conn, arguments),
+                "memory_archive_stats" => handle_archive_stats(conn),
                 _ => Err(format!("unknown tool: {tool_name}")),
             };
 
@@ -1264,6 +1343,7 @@ pub fn run_mcp_server(
             continue;
         }
 
+        let resolved_ttl = app_config.effective_ttl();
         let resp = handle_request(
             &conn,
             db_path,
@@ -1273,6 +1353,7 @@ pub fn run_mcp_server(
             reranker.as_ref(),
             &tier_config,
             vector_index.as_ref(),
+            &resolved_ttl,
         );
         let out = serde_json::to_string(&resp)?;
         writeln!(stdout, "{out}")?;
@@ -1290,10 +1371,10 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn tool_definitions_returns_17_tools() {
+    fn tool_definitions_returns_21_tools() {
         let defs = tool_definitions();
         let tools = defs["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 17);
+        assert_eq!(tools.len(), 21);
     }
 
     #[test]
