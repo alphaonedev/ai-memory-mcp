@@ -70,7 +70,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
 );
 "#;
 
-const CURRENT_SCHEMA_VERSION: i64 = 3;
+const CURRENT_SCHEMA_VERSION: i64 = 4;
 
 pub fn open(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path).context("failed to open database")?;
@@ -141,6 +141,31 @@ fn migrate(conn: &Connection) -> Result<()> {
                 conn.execute("ALTER TABLE memories ADD COLUMN embedding BLOB", [])?;
             }
         }
+        if version < 4 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS archived_memories (
+                    id               TEXT PRIMARY KEY,
+                    tier             TEXT NOT NULL,
+                    namespace        TEXT NOT NULL DEFAULT 'global',
+                    title            TEXT NOT NULL,
+                    content          TEXT NOT NULL,
+                    tags             TEXT NOT NULL DEFAULT '[]',
+                    priority         INTEGER NOT NULL DEFAULT 5,
+                    confidence       REAL NOT NULL DEFAULT 1.0,
+                    source           TEXT NOT NULL DEFAULT 'api',
+                    access_count     INTEGER NOT NULL DEFAULT 0,
+                    created_at       TEXT NOT NULL,
+                    updated_at       TEXT NOT NULL,
+                    last_accessed_at TEXT,
+                    expires_at       TEXT,
+                    archived_at      TEXT NOT NULL,
+                    archive_reason   TEXT NOT NULL DEFAULT 'ttl_expired'
+                );
+                CREATE INDEX IF NOT EXISTS idx_archived_namespace ON archived_memories(namespace);
+                CREATE INDEX IF NOT EXISTS idx_archived_at ON archived_memories(archived_at);",
+            )?;
+        }
+
         conn.execute("DELETE FROM schema_version", [])?;
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
@@ -229,11 +254,11 @@ pub fn get(conn: &Connection, id: &str) -> Result<Option<Memory>> {
 }
 
 /// Bump access count, extend TTL, auto-promote — atomic via transaction.
-pub fn touch(conn: &Connection, id: &str) -> Result<()> {
+pub fn touch(conn: &Connection, id: &str, short_extend: i64, mid_extend: i64) -> Result<()> {
     let now = Utc::now();
     let now_str = now.to_rfc3339();
-    let short_expires = (now + chrono::Duration::seconds(SHORT_TTL_EXTEND_SECS)).to_rfc3339();
-    let mid_expires = (now + chrono::Duration::seconds(MID_TTL_EXTEND_SECS)).to_rfc3339();
+    let short_expires = (now + chrono::Duration::seconds(short_extend)).to_rfc3339();
+    let mid_expires = (now + chrono::Duration::seconds(mid_extend)).to_rfc3339();
 
     conn.execute_batch("BEGIN IMMEDIATE")?;
 
@@ -553,7 +578,7 @@ pub fn recall(
 
     // Touch all recalled memories (bumps access, extends TTL, auto-promotes)
     for (mem, _) in &results {
-        if let Err(e) = touch(conn, &mem.id) {
+        if let Err(e) = touch(conn, &mem.id, SHORT_TTL_EXTEND_SECS, MID_TTL_EXTEND_SECS) {
             tracing::warn!("touch failed for memory {}: {}", &mem.id, e);
         }
     }
@@ -792,7 +817,7 @@ pub fn stats(conn: &Connection, db_path: &Path) -> Result<Stats> {
 }
 
 /// Run GC if there are any expired memories. Lightweight check first.
-pub fn gc_if_needed(conn: &Connection) -> Result<usize> {
+pub fn gc_if_needed(conn: &Connection, archive: bool) -> Result<usize> {
     let now = Utc::now().to_rfc3339();
     let has_expired: bool = conn
         .query_row(
@@ -802,19 +827,183 @@ pub fn gc_if_needed(conn: &Connection) -> Result<usize> {
         )
         .unwrap_or(false);
     if has_expired {
-        gc(conn)
+        gc(conn, archive)
     } else {
         Ok(0)
     }
 }
 
-pub fn gc(conn: &Connection) -> Result<usize> {
+pub fn gc(conn: &Connection, archive: bool) -> Result<usize> {
     let now = Utc::now().to_rfc3339();
-    let deleted = conn.execute(
-        "DELETE FROM memories WHERE expires_at IS NOT NULL AND expires_at < ?1",
-        params![now],
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| -> Result<usize> {
+        if archive {
+            conn.execute(
+                "INSERT OR REPLACE INTO archived_memories
+                 (id, tier, namespace, title, content, tags, priority, confidence,
+                  source, access_count, created_at, updated_at, last_accessed_at,
+                  expires_at, archived_at, archive_reason)
+                 SELECT id, tier, namespace, title, content, tags, priority, confidence,
+                        source, access_count, created_at, updated_at, last_accessed_at,
+                        expires_at, ?1, 'ttl_expired'
+                 FROM memories
+                 WHERE expires_at IS NOT NULL AND expires_at < ?1",
+                params![now],
+            )?;
+        }
+        let deleted = conn.execute(
+            "DELETE FROM memories WHERE expires_at IS NOT NULL AND expires_at < ?1",
+            params![now],
+        )?;
+        Ok(deleted)
+    })();
+    match result {
+        Ok(n) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(n)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Archive operations
+// ---------------------------------------------------------------------------
+
+pub fn list_archived(
+    conn: &Connection,
+    namespace: Option<&str>,
+    limit: usize,
+    offset: usize,
+) -> Result<Vec<serde_json::Value>> {
+    let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match namespace {
+        Some(ns) => (
+            "SELECT id, tier, namespace, title, content, tags, priority, confidence, \
+             source, access_count, created_at, updated_at, last_accessed_at, \
+             expires_at, archived_at, archive_reason \
+             FROM archived_memories WHERE namespace = ?1 \
+             ORDER BY archived_at DESC LIMIT ?2 OFFSET ?3"
+                .to_string(),
+            vec![Box::new(ns.to_string()), Box::new(limit as i64), Box::new(offset as i64)],
+        ),
+        None => (
+            "SELECT id, tier, namespace, title, content, tags, priority, confidence, \
+             source, access_count, created_at, updated_at, last_accessed_at, \
+             expires_at, archived_at, archive_reason \
+             FROM archived_memories \
+             ORDER BY archived_at DESC LIMIT ?1 OFFSET ?2"
+                .to_string(),
+            vec![Box::new(limit as i64), Box::new(offset as i64)],
+        ),
+    };
+    let params_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_refs.as_slice(), |row| {
+        Ok(serde_json::json!({
+            "id": row.get::<_, String>(0)?,
+            "tier": row.get::<_, String>(1)?,
+            "namespace": row.get::<_, String>(2)?,
+            "title": row.get::<_, String>(3)?,
+            "content": row.get::<_, String>(4)?,
+            "tags": row.get::<_, String>(5)?,
+            "priority": row.get::<_, i32>(6)?,
+            "confidence": row.get::<_, f64>(7)?,
+            "source": row.get::<_, String>(8)?,
+            "access_count": row.get::<_, i64>(9)?,
+            "created_at": row.get::<_, String>(10)?,
+            "updated_at": row.get::<_, String>(11)?,
+            "last_accessed_at": row.get::<_, Option<String>>(12)?,
+            "expires_at": row.get::<_, Option<String>>(13)?,
+            "archived_at": row.get::<_, String>(14)?,
+            "archive_reason": row.get::<_, String>(15)?,
+        }))
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
+    let now = Utc::now().to_rfc3339();
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| -> Result<bool> {
+        let exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM archived_memories WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap_or(false);
+        if !exists {
+            return Ok(false);
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO memories
+             (id, tier, namespace, title, content, tags, priority, confidence,
+              source, access_count, created_at, updated_at, last_accessed_at, expires_at)
+             SELECT id, tier, namespace, title, content, tags, priority, confidence,
+                    source, access_count, created_at, ?1, last_accessed_at, NULL
+             FROM archived_memories WHERE id = ?2",
+            params![now, id],
+        )?;
+        conn.execute(
+            "DELETE FROM archived_memories WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(true)
+    })();
+    match result {
+        Ok(v) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(v)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
+}
+
+pub fn purge_archive(conn: &Connection, older_than_days: Option<i64>) -> Result<usize> {
+    match older_than_days {
+        Some(days) => {
+            let cutoff = (Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+            let deleted = conn.execute(
+                "DELETE FROM archived_memories WHERE archived_at < ?1",
+                params![cutoff],
+            )?;
+            Ok(deleted)
+        }
+        None => {
+            let deleted = conn.execute("DELETE FROM archived_memories", [])?;
+            Ok(deleted)
+        }
+    }
+}
+
+pub fn archive_stats(conn: &Connection) -> Result<serde_json::Value> {
+    let total: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM archived_memories",
+        [],
+        |r| r.get(0),
     )?;
-    Ok(deleted)
+    let mut stmt = conn.prepare(
+        "SELECT namespace, COUNT(*) FROM archived_memories GROUP BY namespace ORDER BY COUNT(*) DESC",
+    )?;
+    let by_ns: Vec<serde_json::Value> = stmt
+        .query_map([], |row| {
+            Ok(serde_json::json!({
+                "namespace": row.get::<_, String>(0)?,
+                "count": row.get::<_, i64>(1)?,
+            }))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(serde_json::json!({
+        "archived_total": total,
+        "by_namespace": by_ns,
+    }))
 }
 
 pub fn export_all(conn: &Connection) -> Result<Vec<Memory>> {
@@ -1142,7 +1331,7 @@ pub fn recall_hybrid(
 
     // Touch all recalled memories
     for (mem, _) in &results {
-        if let Err(e) = touch(conn, &mem.id) {
+        if let Err(e) = touch(conn, &mem.id, SHORT_TTL_EXTEND_SECS, MID_TTL_EXTEND_SECS) {
             tracing::warn!("touch failed for memory {}: {}", &mem.id, e);
         }
     }
@@ -1480,10 +1669,10 @@ mod tests {
         let id = insert(&conn, &mem).unwrap();
         assert_eq!(get(&conn, &id).unwrap().unwrap().access_count, 0);
 
-        touch(&conn, &id).unwrap();
+        touch(&conn, &id, SHORT_TTL_EXTEND_SECS, MID_TTL_EXTEND_SECS).unwrap();
         assert_eq!(get(&conn, &id).unwrap().unwrap().access_count, 1);
 
-        touch(&conn, &id).unwrap();
+        touch(&conn, &id, SHORT_TTL_EXTEND_SECS, MID_TTL_EXTEND_SECS).unwrap();
         assert_eq!(get(&conn, &id).unwrap().unwrap().access_count, 2);
     }
 
@@ -1561,7 +1750,7 @@ mod tests {
         mem.expires_at = Some("2020-01-01T00:00:00+00:00".to_string()); // past
         insert(&conn, &mem).unwrap();
 
-        let removed = gc(&conn).unwrap();
+        let removed = gc(&conn, false).unwrap();
         assert_eq!(removed, 1);
     }
 
@@ -1569,8 +1758,71 @@ mod tests {
     fn gc_preserves_long_term() {
         let conn = test_db();
         insert(&conn, &make_memory("Permanent", "test", Tier::Long, 5)).unwrap();
-        let removed = gc(&conn).unwrap();
+        let removed = gc(&conn, false).unwrap();
         assert_eq!(removed, 0);
+    }
+
+    #[test]
+    fn gc_archives_before_delete() {
+        let conn = test_db();
+        let mut mem = make_memory("Archivable", "test", Tier::Short, 5);
+        mem.expires_at = Some("2020-01-01T00:00:00+00:00".to_string());
+        insert(&conn, &mem).unwrap();
+
+        let removed = gc(&conn, true).unwrap();
+        assert_eq!(removed, 1);
+
+        // Should be in archive
+        let archived = list_archived(&conn, None, 10, 0).unwrap();
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0]["title"], "Archivable");
+        assert_eq!(archived[0]["archive_reason"], "ttl_expired");
+    }
+
+    #[test]
+    fn restore_archived_memory() {
+        let conn = test_db();
+        let mut mem = make_memory("Restorable", "test", Tier::Short, 5);
+        mem.expires_at = Some("2020-01-01T00:00:00+00:00".to_string());
+        let id = insert(&conn, &mem).unwrap();
+
+        gc(&conn, true).unwrap();
+        assert!(get(&conn, &id).unwrap().is_none()); // gone from active
+
+        let restored = restore_archived(&conn, &id).unwrap();
+        assert!(restored);
+
+        let got = get(&conn, &id).unwrap().unwrap();
+        assert_eq!(got.title, "Restorable");
+        assert!(got.expires_at.is_none()); // restored without expiry
+    }
+
+    #[test]
+    fn purge_archive_removes_all() {
+        let conn = test_db();
+        let mut mem = make_memory("Purgeable", "test", Tier::Short, 5);
+        mem.expires_at = Some("2020-01-01T00:00:00+00:00".to_string());
+        insert(&conn, &mem).unwrap();
+        gc(&conn, true).unwrap();
+
+        let purged = purge_archive(&conn, None).unwrap();
+        assert_eq!(purged, 1);
+        assert_eq!(list_archived(&conn, None, 10, 0).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn archive_stats_counts() {
+        let conn = test_db();
+        let mut m1 = make_memory("Stats A", "ns1", Tier::Short, 5);
+        m1.expires_at = Some("2020-01-01T00:00:00+00:00".to_string());
+        let mut m2 = make_memory("Stats B", "ns1", Tier::Short, 5);
+        m2.expires_at = Some("2020-01-01T00:00:00+00:00".to_string());
+        insert(&conn, &m1).unwrap();
+        insert(&conn, &m2).unwrap();
+        gc(&conn, true).unwrap();
+
+        let stats = archive_stats(&conn).unwrap();
+        assert_eq!(stats["archived_total"], 2);
     }
 
     #[test]

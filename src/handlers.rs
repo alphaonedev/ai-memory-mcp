@@ -8,16 +8,18 @@ use axum::{
     Json,
 };
 use chrono::{Duration, Utc};
+use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+use crate::config::ResolvedTtl;
 use crate::db;
 use crate::models::*;
 use crate::validate;
 
-pub type Db = Arc<Mutex<(rusqlite::Connection, std::path::PathBuf)>>;
+pub type Db = Arc<Mutex<(rusqlite::Connection, std::path::PathBuf, ResolvedTtl, bool)>>;
 
 const MAX_BULK_SIZE: usize = 1000;
 
@@ -48,9 +50,10 @@ pub async fn create_memory(
             .into_response();
     }
     let now = Utc::now();
+    let lock = state.lock().await;
     let expires_at = body.expires_at.or_else(|| {
         body.ttl_secs
-            .or(body.tier.default_ttl_secs())
+            .or(lock.2.ttl_for_tier(&body.tier))
             .map(|s| (now + Duration::seconds(s)).to_rfc3339())
     });
     let mem = Memory {
@@ -69,7 +72,6 @@ pub async fn create_memory(
         last_accessed_at: None,
         expires_at,
     };
-    let lock = state.lock().await;
 
     // Check for contradictions
     let contradictions =
@@ -505,7 +507,7 @@ pub async fn get_stats(State(state): State<Db>) -> impl IntoResponse {
 
 pub async fn run_gc(State(state): State<Db>) -> impl IntoResponse {
     let lock = state.lock().await;
-    match db::gc(&lock.0) {
+    match db::gc(&lock.0, lock.3) {
         Ok(n) => Json(json!({"expired_deleted": n})).into_response(),
         Err(e) => {
             tracing::error!("handler error: {e}");
@@ -652,7 +654,7 @@ pub async fn bulk_create(
         }
         let expires_at = body.expires_at.or_else(|| {
             body.ttl_secs
-                .or(body.tier.default_ttl_secs())
+                .or(lock.2.ttl_for_tier(&body.tier))
                 .map(|s| (now + Duration::seconds(s)).to_rfc3339())
         });
         let mem = Memory {
@@ -679,6 +681,84 @@ pub async fn bulk_create(
     Json(json!({"created": created, "errors": errors})).into_response()
 }
 
+// ---------------------------------------------------------------------------
+// Archive endpoints
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct ArchiveListQuery {
+    pub namespace: Option<String>,
+    #[serde(default = "default_archive_limit")]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub offset: Option<usize>,
+}
+
+fn default_archive_limit() -> Option<usize> {
+    Some(50)
+}
+
+pub async fn list_archive(
+    State(state): State<Db>,
+    Query(q): Query<ArchiveListQuery>,
+) -> impl IntoResponse {
+    let lock = state.lock().await;
+    let limit = q.limit.unwrap_or(50).min(1000);
+    let offset = q.offset.unwrap_or(0);
+    match db::list_archived(&lock.0, q.namespace.as_deref(), limit, offset) {
+        Ok(items) => Json(json!({"archived": items, "count": items.len()})).into_response(),
+        Err(e) => {
+            tracing::error!("handler error: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "internal server error"}))).into_response()
+        }
+    }
+}
+
+pub async fn restore_archive(
+    State(state): State<Db>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let lock = state.lock().await;
+    match db::restore_archived(&lock.0, &id) {
+        Ok(true) => Json(json!({"restored": true, "id": id})).into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, Json(json!({"error": "not found in archive"}))).into_response(),
+        Err(e) => {
+            tracing::error!("handler error: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "internal server error"}))).into_response()
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PurgeQuery {
+    pub older_than_days: Option<i64>,
+}
+
+pub async fn purge_archive(
+    State(state): State<Db>,
+    Query(q): Query<PurgeQuery>,
+) -> impl IntoResponse {
+    let lock = state.lock().await;
+    match db::purge_archive(&lock.0, q.older_than_days) {
+        Ok(n) => Json(json!({"purged": n})).into_response(),
+        Err(e) => {
+            tracing::error!("handler error: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "internal server error"}))).into_response()
+        }
+    }
+}
+
+pub async fn archive_stats(State(state): State<Db>) -> impl IntoResponse {
+    let lock = state.lock().await;
+    match db::archive_stats(&lock.0) {
+        Ok(stats) => Json(stats).into_response(),
+        Err(e) => {
+            tracing::error!("handler error: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "internal server error"}))).into_response()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -686,7 +766,7 @@ mod tests {
     fn test_state() -> Db {
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let path = std::path::PathBuf::from(":memory:");
-        Arc::new(Mutex::new((conn, path)))
+        Arc::new(Mutex::new((conn, path, ResolvedTtl::default(), true)))
     }
 
     #[tokio::test]
