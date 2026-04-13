@@ -1144,53 +1144,6 @@ fn handle_namespace_set_standard(
     let namespace = params["namespace"]
         .as_str()
         .ok_or("namespace is required")?;
-    let id = params["id"].as_str().ok_or("id is required")?;
-    validate::validate_id(id).map_err(|e| e.to_string())?;
-    db::set_namespace_standard(conn, namespace, id).map_err(|e| e.to_string())?;
-    Ok(json!({"set": true, "namespace": namespace, "standard_id": id}))
-}
-
-fn handle_namespace_get_standard(
-    conn: &rusqlite::Connection,
-    params: &Value,
-) -> Result<Value, String> {
-    let namespace = params["namespace"]
-        .as_str()
-        .ok_or("namespace is required")?;
-    let standard_id = db::get_namespace_standard(conn, namespace).map_err(|e| e.to_string())?;
-    match standard_id {
-        Some(id) => {
-            let mem = db::get(conn, &id).map_err(|e| e.to_string())?;
-            match mem {
-                Some(m) => Ok(json!({
-                    "namespace": namespace,
-                    "standard_id": id,
-                    "title": m.title,
-                    "content": m.content,
-                    "priority": m.priority
-                })),
-                None => Ok(
-                    json!({"namespace": namespace, "standard_id": id, "warning": "standard memory not found — may have been deleted"}),
-                ),
-            }
-        }
-        None => Ok(json!({"namespace": namespace, "standard_id": null})),
-    }
-}
-
-// --- MCP protocol handler ---
-
-// ---------------------------------------------------------------------------
-// Namespace standard handlers
-// ---------------------------------------------------------------------------
-
-fn handle_namespace_set_standard(
-    conn: &rusqlite::Connection,
-    params: &Value,
-) -> Result<Value, String> {
-    let namespace = params["namespace"]
-        .as_str()
-        .ok_or("namespace is required")?;
     validate::validate_namespace(namespace).map_err(|e| e.to_string())?;
     let id = params["id"].as_str().ok_or("id is required")?;
     validate::validate_id(id).map_err(|e| e.to_string())?;
