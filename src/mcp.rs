@@ -349,12 +349,13 @@ fn tool_definitions() -> Value {
             },
             {
                 "name": "memory_namespace_set_standard",
-                "description": "Set a memory as the standard/policy for a namespace. This memory will be automatically prepended to recall and session_start results scoped to that namespace.",
+                "description": "Set a memory as the standard/policy for a namespace. Auto-prepended to recall and session_start. Supports rule layering: set a parent namespace to inherit its standard too (global '*' + parent + namespace).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "namespace": {"type": "string", "description": "Namespace to set the standard for"},
-                        "id": {"type": "string", "description": "Memory ID to use as the standard"}
+                        "id": {"type": "string", "description": "Memory ID to use as the standard"},
+                        "parent": {"type": "string", "description": "Optional parent namespace to inherit standards from (rule layering)"}
                     },
                     "required": ["namespace", "id"]
                 }
@@ -601,9 +602,9 @@ fn handle_store(
 }
 
 /// Inject namespace standard into a recall/session_start response.
-/// Only runs when namespace is explicitly provided. Deduplicates from results.
 /// Inject namespace standards into a recall/session_start response.
-/// Two levels: global ("*") applies to all recalls, namespace-specific applies when scoped.
+/// Three-level rule layering: global ("*") + parent chain + namespace-specific.
+/// Max depth 5 to prevent cycles.
 fn inject_namespace_standard(
     conn: &rusqlite::Connection,
     namespace: Option<&str>,
@@ -612,23 +613,47 @@ fn inject_namespace_standard(
     let mut standards: Vec<Value> = Vec::new();
     let mut standard_ids: Vec<String> = Vec::new();
 
+    // Helper: add a standard if not already present (dedup by memory ID)
+    let add_standard = |std: Value, ids: &mut Vec<String>, stds: &mut Vec<Value>| {
+        let id = std["id"].as_str().unwrap_or_default().to_string();
+        if !ids.contains(&id) {
+            ids.push(id);
+            stds.push(std);
+        }
+    };
+
     // Level 1: global standard ("*") — always applies
     if let Some(global) = lookup_namespace_standard(conn, "*") {
-        let id = global["id"].as_str().unwrap_or_default().to_string();
-        standard_ids.push(id);
-        standards.push(global);
+        add_standard(global, &mut standard_ids, &mut standards);
     }
 
-    // Level 2: namespace-specific standard — only when scoped
+    // Level 2+: walk parent chain from namespace, then add namespace itself
     if let Some(ns) = namespace {
         if ns != "*" {
-            if let Some(ns_std) = lookup_namespace_standard(conn, ns) {
-                let id = ns_std["id"].as_str().unwrap_or_default().to_string();
-                // Don't duplicate if global and namespace point to the same memory
-                if !standard_ids.contains(&id) {
-                    standard_ids.push(id);
-                    standards.push(ns_std);
+            // Collect the parent chain (bottom-up), then reverse to get top-down order
+            let mut chain: Vec<String> = Vec::new();
+            let mut current = ns.to_string();
+            for _ in 0..5 {
+                // max depth 5
+                if let Some(parent) = db::get_namespace_parent(conn, &current) {
+                    if parent == "*" || chain.contains(&parent) {
+                        break; // don't re-add global or cycle
+                    }
+                    chain.push(parent.clone());
+                    current = parent;
+                } else {
+                    break;
                 }
+            }
+            // Add parents top-down (grandparent first, then parent)
+            for ancestor in chain.into_iter().rev() {
+                if let Some(std) = lookup_namespace_standard(conn, &ancestor) {
+                    add_standard(std, &mut standard_ids, &mut standards);
+                }
+            }
+            // Add the namespace's own standard last (most specific)
+            if let Some(ns_std) = lookup_namespace_standard(conn, ns) {
+                add_standard(ns_std, &mut standard_ids, &mut standards);
             }
         }
     }
@@ -1178,8 +1203,16 @@ fn handle_namespace_set_standard(
     validate::validate_namespace(namespace).map_err(|e| e.to_string())?;
     let id = params["id"].as_str().ok_or("id is required")?;
     validate::validate_id(id).map_err(|e| e.to_string())?;
-    db::set_namespace_standard(conn, namespace, id).map_err(|e| e.to_string())?;
-    Ok(json!({"set": true, "namespace": namespace, "standard_id": id}))
+    let parent = params["parent"].as_str();
+    if let Some(p) = parent {
+        validate::validate_namespace(p).map_err(|e| e.to_string())?;
+    }
+    db::set_namespace_standard(conn, namespace, id, parent).map_err(|e| e.to_string())?;
+    let mut resp = json!({"set": true, "namespace": namespace, "standard_id": id});
+    if let Some(p) = parent {
+        resp["parent"] = json!(p);
+    }
+    Ok(resp)
 }
 
 fn handle_namespace_get_standard(
