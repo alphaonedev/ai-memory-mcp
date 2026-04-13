@@ -207,13 +207,13 @@ jobs:
 
       - name: Build source package
         run: |
-          debuild -S -sa -k3CC4DC662D9BBDD0C2BBF815A8DDC77E9747CBC9 --no-sign
+          debuild -S -sa -k4BAA63E9957BD865FA881D1E64A81A0A19B5E324 --no-sign
           dpkg-source -b .
 
       - name: Sign source package
         run: |
           cd ..
-          debsign -k3CC4DC662D9BBDD0C2BBF815A8DDC77E9747CBC9 ai-memory_${{ steps.version.outputs.version }}-1_source.changes
+          debsign -k4BAA63E9957BD865FA881D1E64A81A0A19B5E324 ai-memory_${{ steps.version.outputs.version }}-1_source.changes
 
       - name: Upload to PPA
         run: |
