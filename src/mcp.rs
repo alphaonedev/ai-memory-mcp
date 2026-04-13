@@ -963,6 +963,7 @@ fn handle_update(
                 if let Ok(embedding) = emb.embed(&text) {
                     let _ = db::set_embedding(conn, id, &embedding);
                     if let Some(idx) = vector_index {
+                        idx.remove(id);
                         idx.insert(id.to_string(), embedding);
                     }
                 }
