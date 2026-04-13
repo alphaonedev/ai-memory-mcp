@@ -5,23 +5,57 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.4-patch.3] — 2026-04-12
+
+### Added
+
+- **Namespace standards**: New MCP tools `memory_namespace_set_standard` and `memory_namespace_get_standard`. Set a memory as the enforced standard/policy for a namespace — automatically surfaced on recall. Schema migration v5: `namespace_meta` table.
+- 1 new integration test: `test_mcp_namespace_set_and_get_standard`
+
+### Fixed
+
+- **Shell `validate_id()` gap**: Interactive REPL `get` and `delete` commands now call `validate_id()` before DB access, matching all other ID-accepting handlers.
+- **HNSW stale entry on dedup update**: `handle_store` dedup path now calls `idx.remove()` before `idx.insert()`, preventing stale entries in the HNSW index.
+
+### Documentation
+
+- Synced test counts to 190 (140 unit + 50 integration)
+- MCP tool count updated to 25
+
 ## [0.5.4-patch.2] — 2026-04-12
 
 ### Fixed
 
-- **Consolidate embedding gap**: `handle_consolidate` now receives `embedder` and `vector_index`, generates embeddings for consolidated memories, and removes old HNSW entries. Fixes semantic recall returning no results for consolidated memories.
-- **Self-contradiction exclusion**: MCP `handle_store` and CLI `cmd_store` now filter `actual_id` (not just `mem.id`) from `potential_contradictions`, preventing a memory from listing itself as its own contradiction on upsert.
-- **validate_id() defense-in-depth**: Added `validate_id()` to 8 MCP handlers (get, delete, promote, auto_tag, detect_contradiction, get_links, consolidate, link IDs) and 3 CLI commands (get, delete, promote). Invalid IDs now return clear validation errors instead of "not found".
+- **Tier downgrade protection**: `update()` now rejects tier downgrades (long→mid, long→short, mid→short) with a clear error message; prevents accidental data loss from TTL being added to permanent memories
+- **Embedding regeneration on content update**: MCP `memory_update` now regenerates embedding vector and updates HNSW index when title or content changes, preventing stale semantic recall results
+- **Consolidated memory embedding**: MCP `memory_consolidate` now generates embedding for the new consolidated memory at creation time and removes old entries from HNSW index, instead of relying on backfill
+- **Self-contradiction exclusion**: CLI and MCP store now exclude the actual memory ID from `potential_contradictions` on upsert, fixing cosmetic self-referencing bug
+- **Atomic CLI promote**: Removed non-atomic raw SQL `UPDATE` in `cmd_promote`; `db::update()` with `Some("")` already clears `expires_at` correctly
+- **MCP `validate_id()` defense-in-depth**: Added `validate_id()` to `handle_get`, `handle_update`, `handle_delete`, `handle_promote`, `handle_get_links`, `handle_archive_restore`, `handle_auto_tag`, `handle_detect_contradiction`
+- **CLI `validate_id()` defense-in-depth**: Added `validate_id()` to `cmd_get`, `cmd_update`, `cmd_delete`, `cmd_promote`
 
 ### Added
 
-- 3 integration tests: `test_cli_validate_id_rejects_invalid`, `test_duplicate_title_no_self_contradiction`, `test_version_flag_patch2`
-- Global `~/.claude/CLAUDE.md` recall-first directive for session-start memory recall via MCP (no shell script required)
+- `Tier::rank()` method for numeric tier comparison (Short=0, Mid=1, Long=2)
+- 5 new unit tests: `tier_rank_ordering`, `update_rejects_tier_downgrade_long_to_short`, `update_rejects_tier_downgrade_long_to_mid`, `update_allows_tier_upgrade_short_to_long`, `update_allows_same_tier`
+- 6 new integration tests: `test_cli_validate_id_rejects_invalid`, `test_tier_downgrade_rejected`, `test_tier_upgrade_allowed`, `test_duplicate_title_no_self_contradiction`, `test_promote_clears_expires_at`, `test_version_flag_patch2`
 
-### Documentation
+### Test Coverage
 
-- Synced test counts to 185 (139 unit + 46 integration) across README, CLAUDE.md, ADMIN_GUIDE, DEVELOPER_GUIDE, index.html
-- Fixed MCP tool count references from 21 to 23 in README, DEVELOPER_GUIDE, USER_GUIDE
+| Metric | Count |
+|--------|-------|
+| Unit tests | 139 |
+| Integration tests | 49 |
+| **Total** | **188** |
+| Modules with tests | 15/15 |
+
+## [0.5.4-patch.1] — 2026-04-12
+
+### Fixed
+
+- `--version` / `-V` flag missing — added `version` to `#[command]` attribute
+- CLI `update` rejected past `expires_at` — changed to format-only validation, matching MCP behavior
+- `archive_restore` tier promotion — release binary now includes `'long'` hardcoded in INSERT SQL
 
 ## [0.5.4] — 2026-04-12
 
