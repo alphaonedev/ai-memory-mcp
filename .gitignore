@@ -19,3 +19,4 @@ benchmarks/longmemeval/results/
 
 # Dev-only files (not pushed to production)
 ROADMAP.md
+ENGINEERINGSTANDARD.md

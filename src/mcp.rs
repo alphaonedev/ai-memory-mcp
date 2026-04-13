@@ -602,24 +602,55 @@ fn handle_store(
 
 /// Inject namespace standard into a recall/session_start response.
 /// Only runs when namespace is explicitly provided. Deduplicates from results.
+/// Inject namespace standards into a recall/session_start response.
+/// Two levels: global ("*") applies to all recalls, namespace-specific applies when scoped.
 fn inject_namespace_standard(
     conn: &rusqlite::Connection,
     namespace: Option<&str>,
     response: &mut Value,
 ) {
-    let ns = match namespace {
-        Some(ns) => ns,
-        None => return, // unscoped — no standard
-    };
-    if let Some(standard) = lookup_namespace_standard(conn, ns) {
-        let standard_id = standard["id"].as_str().unwrap_or_default().to_string();
-        // Deduplicate: remove standard from results array if present
-        if let Some(memories) = response["memories"].as_array_mut() {
-            memories.retain(|m| m["id"].as_str().unwrap_or_default() != standard_id);
-            // Update count to reflect deduplication
-            response["count"] = json!(memories.len());
+    let mut standards: Vec<Value> = Vec::new();
+    let mut standard_ids: Vec<String> = Vec::new();
+
+    // Level 1: global standard ("*") — always applies
+    if let Some(global) = lookup_namespace_standard(conn, "*") {
+        let id = global["id"].as_str().unwrap_or_default().to_string();
+        standard_ids.push(id);
+        standards.push(global);
+    }
+
+    // Level 2: namespace-specific standard — only when scoped
+    if let Some(ns) = namespace {
+        if ns != "*" {
+            if let Some(ns_std) = lookup_namespace_standard(conn, ns) {
+                let id = ns_std["id"].as_str().unwrap_or_default().to_string();
+                // Don't duplicate if global and namespace point to the same memory
+                if !standard_ids.contains(&id) {
+                    standard_ids.push(id);
+                    standards.push(ns_std);
+                }
+            }
         }
-        response["standard"] = standard;
+    }
+
+    if standards.is_empty() {
+        return;
+    }
+
+    // Deduplicate: remove standard memories from results array
+    if let Some(memories) = response["memories"].as_array_mut() {
+        memories.retain(|m| {
+            let mid = m["id"].as_str().unwrap_or_default();
+            !standard_ids.iter().any(|sid| sid == mid)
+        });
+        response["count"] = json!(memories.len());
+    }
+
+    // Return as single object if one standard, array if multiple
+    if standards.len() == 1 {
+        response["standard"] = standards.into_iter().next().unwrap();
+    } else {
+        response["standards"] = json!(standards);
     }
 }
 
