@@ -1263,6 +1263,55 @@ fn lookup_namespace_standard(conn: &rusqlite::Connection, namespace: &str) -> Op
     serde_json::to_value(&mem).ok()
 }
 
+/// Auto-register namespace parent chain from the filesystem path.
+/// Walks from cwd up to home dir, checks if each directory name has a namespace
+/// standard set, and registers the parent chain.
+///
+/// Example: cwd = /home/user/monorepo/frontend
+///   → checks "frontend" (cwd), "monorepo" (parent), stops at home dir
+///   → if "monorepo" has a standard, sets parent_namespace of "frontend" to "monorepo"
+fn auto_register_path_hierarchy(conn: &rusqlite::Connection, namespace: &str) {
+    // Only run if this namespace doesn't already have an explicit parent
+    if db::get_namespace_parent(conn, namespace).is_some() {
+        return;
+    }
+    let cwd = match std::env::current_dir() {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let home = dirs::home_dir().unwrap_or_default();
+    // Walk up from parent of cwd (cwd itself IS the namespace)
+    let mut current = cwd.parent().map(|p| p.to_path_buf());
+    while let Some(dir) = current {
+        // Stop at or above home directory
+        if dir == home || !dir.starts_with(&home) {
+            break;
+        }
+        if let Some(dir_name) = dir.file_name().and_then(|n| n.to_str()) {
+            // Check if this directory name has a namespace standard
+            if db::get_namespace_standard(conn, dir_name)
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                // Found a parent with a standard — register it
+                let now = chrono::Utc::now().to_rfc3339();
+                let _ = conn.execute(
+                    "UPDATE namespace_meta SET parent_namespace = ?1, updated_at = ?2 WHERE namespace = ?3 AND parent_namespace IS NULL",
+                    rusqlite::params![dir_name, now, namespace],
+                );
+                tracing::info!(
+                    "auto-registered parent namespace: {} -> {}",
+                    namespace,
+                    dir_name
+                );
+                break;
+            }
+        }
+        current = dir.parent().map(|p| p.to_path_buf());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Archive tool handlers
 // ---------------------------------------------------------------------------
@@ -1367,6 +1416,11 @@ fn handle_session_start(
                 }
             }
         }
+    }
+
+    // Auto-register parent chain from filesystem path (runs once, skips if parent already set)
+    if let Some(ns) = namespace {
+        auto_register_path_hierarchy(conn, ns);
     }
 
     // Auto-prepend namespace standard (after LLM summary, separate field)
