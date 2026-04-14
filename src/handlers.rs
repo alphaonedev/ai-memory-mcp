@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use axum::{
+    Json,
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
-    Json,
 };
 use chrono::{Duration, Utc};
 use serde::Deserialize;

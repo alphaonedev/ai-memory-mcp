@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use candle_core::{Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config};
-use hf_hub::{api::sync::Api, Repo, RepoType};
+use hf_hub::{Repo, RepoType, api::sync::Api};
 use std::sync::Arc;
 use tokenizers::Tokenizer;
 
@@ -220,11 +220,7 @@ impl Embedder {
         let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
         let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
         let denom = norm_a * norm_b;
-        if denom < 1e-12 {
-            0.0
-        } else {
-            dot / denom
-        }
+        if denom < 1e-12 { 0.0 } else { dot / denom }
     }
 
     fn download_via_hf_hub() -> Result<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)>
