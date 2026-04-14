@@ -3,12 +3,12 @@
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use std::collections::HashMap;
 use std::path::Path;
 
 use crate::models::{
-    Memory, MemoryLink, NamespaceCount, Stats, Tier, TierCount, PROMOTION_THRESHOLD,
+    Memory, MemoryLink, NamespaceCount, PROMOTION_THRESHOLD, Stats, Tier, TierCount,
 };
 
 const SCHEMA: &str = r"
@@ -1322,36 +1322,36 @@ pub fn recall_hybrid(
                 continue;
             }
             let cosine = f64::from(1.0 - hit.distance);
-            if cosine > 0.3 {
-                if let Some(mem) = get(conn, &hit.id)? {
-                    // Apply namespace/expiry/tag filters
-                    if let Some(ns) = namespace {
-                        if mem.namespace != ns {
-                            continue;
-                        }
-                    }
-                    if let Some(exp) = &mem.expires_at {
-                        if exp.as_str() <= now.as_str() {
-                            continue;
-                        }
-                    }
-                    if let Some(tf) = tags_filter {
-                        if !mem.tags.iter().any(|t| t == tf) {
-                            continue;
-                        }
-                    }
-                    if let Some(s) = since {
-                        if mem.created_at.as_str() < s {
-                            continue;
-                        }
-                    }
-                    if let Some(u) = until {
-                        if mem.created_at.as_str() > u {
-                            continue;
-                        }
-                    }
-                    scored.insert(mem.id.clone(), (mem, 0.0, cosine));
+            if cosine > 0.3
+                && let Some(mem) = get(conn, &hit.id)?
+            {
+                // Apply namespace/expiry/tag filters
+                if let Some(ns) = namespace
+                    && mem.namespace != ns
+                {
+                    continue;
                 }
+                if let Some(exp) = &mem.expires_at
+                    && exp.as_str() <= now.as_str()
+                {
+                    continue;
+                }
+                if let Some(tf) = tags_filter
+                    && !mem.tags.iter().any(|t| t == tf)
+                {
+                    continue;
+                }
+                if let Some(s) = since
+                    && mem.created_at.as_str() < s
+                {
+                    continue;
+                }
+                if let Some(u) = until
+                    && mem.created_at.as_str() > u
+                {
+                    continue;
+                }
+                scored.insert(mem.id.clone(), (mem, 0.0, cosine));
             }
         }
     } else {
@@ -1368,19 +1368,19 @@ pub fn recall_hybrid(
             if scored.contains_key(&mem.id) {
                 continue;
             }
-            if let Some(bytes) = emb_bytes {
-                if !bytes.is_empty() {
-                    let emb: Vec<f32> = bytes
-                        .chunks_exact(4)
-                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                        .collect();
-                    let cosine = f64::from(crate::embeddings::Embedder::cosine_similarity(
-                        query_embedding,
-                        &emb,
-                    ));
-                    if cosine > 0.3 {
-                        scored.insert(mem.id.clone(), (mem, 0.0, cosine));
-                    }
+            if let Some(bytes) = emb_bytes
+                && !bytes.is_empty()
+            {
+                let emb: Vec<f32> = bytes
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                let cosine = f64::from(crate::embeddings::Embedder::cosine_similarity(
+                    query_embedding,
+                    &emb,
+                ));
+                if cosine > 0.3 {
+                    scored.insert(mem.id.clone(), (mem, 0.0, cosine));
                 }
             }
         }
@@ -1542,7 +1542,7 @@ pub fn is_namespace_standard(conn: &Connection, id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{Memory, Tier, MID_TTL_EXTEND_SECS, SHORT_TTL_EXTEND_SECS};
+    use crate::models::{MID_TTL_EXTEND_SECS, Memory, SHORT_TTL_EXTEND_SECS, Tier};
 
     fn test_db() -> Connection {
         open(std::path::Path::new(":memory:")).unwrap()
@@ -2101,10 +2101,12 @@ mod tests {
         // Restore should fail because id exists in active table
         let result = restore_archived(&conn, &id);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("already exists in active table"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("already exists in active table")
+        );
     }
 
     #[test]
