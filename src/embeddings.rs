@@ -15,7 +15,7 @@ const MINILM_MODEL_ID: &str = "sentence-transformers/all-MiniLM-L6-v2";
 #[allow(dead_code)]
 const MINILM_DIM: usize = 384;
 const MAX_SEQ_LEN: usize = 256;
-/// Fallback subdirectory under $HOME for pre-downloaded MiniLM model files
+/// Fallback subdirectory under $HOME for pre-downloaded `MiniLM` model files
 const FALLBACK_MODEL_SUBDIR: &str =
     ".cache/huggingface/hub/models--sentence-transformers--all-MiniLM-L6-v2/snapshots/main";
 
@@ -49,6 +49,13 @@ unsafe impl Send for Embedder {}
 unsafe impl Sync for Embedder {}
 
 impl Embedder {
+    /// Create a new local (candle) embedder for MiniLM-L6-v2.
+    /// Downloads the model if it is not already cached.
+    #[allow(dead_code)]
+    pub fn new() -> Result<Self> {
+        Self::new_local()
+    }
+
     /// Create a local candle embedder (MiniLM-L6-v2, 384-dim).
     pub fn new_local() -> Result<Self> {
         let device = Device::Cpu;
@@ -56,10 +63,7 @@ impl Embedder {
         let (config_path, tokenizer_path, weights_path) = match Self::download_via_hf_hub() {
             Ok(paths) => paths,
             Err(e) => {
-                eprintln!(
-                    "ai-memory: hf-hub download failed ({}), trying fallback dir",
-                    e
-                );
+                eprintln!("ai-memory: hf-hub download failed ({e}), trying fallback dir");
                 Self::load_from_fallback()?
             }
         };
@@ -199,6 +203,12 @@ impl Embedder {
         Ok(embedding)
     }
 
+    /// Generate embeddings for multiple texts in one call.
+    #[allow(dead_code)]
+    pub fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        texts.iter().map(|t| self.embed(t)).collect()
+    }
+
     /// Compute cosine similarity between two embedding vectors.
     pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
         // Handle dimension mismatch gracefully (e.g. mixed 384/768 embeddings)
@@ -252,6 +262,9 @@ impl Embedder {
     }
 }
 
+/// Constant for backward compatibility — dimension of the default (`MiniLM`) embedding.
+#[allow(dead_code)]
+pub const EMBEDDING_DIM: usize = MINILM_DIM;
 
 #[cfg(test)]
 mod tests {
