@@ -5,7 +5,6 @@ use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 use std::time::Duration;
 
-#[allow(dead_code)]
 const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
 
 const GENERATE_TIMEOUT: Duration = Duration::from_secs(30);
