@@ -37,12 +37,16 @@ SQLite is the backbone. Local-first is the moat. Every feature must preserve thi
 
 ## Execution Model
 
-All implementation is AI-executed via Claude Code agents operating 24x7x365. The human role is:
-- **Gatekeeper** — `@alphaonedev` approves all merges to `main` (CODEOWNERS enforced)
-- **Architect** — approve design decisions
-- **Quality gate** — vet all code against [Engineering Standards](docs/ENGINEERING_STANDARDS.md)
+**Human-led, AI-accelerated development.** Humans maintain full oversight over all AI code implementations. AI coding agents (Claude Code, OpenAI Codex, xAI Grok, and others) are tools under human direction — not autonomous developers.
 
-**LOE unit** = 1 session (one focused Claude Code interaction producing reviewable output).
+- **Owner & Gatekeeper** — `@alphaonedev` approves all merges to `main` (CODEOWNERS enforced). Every line of code is human-reviewed before it reaches production.
+- **Architect** — humans make all design decisions. AI agents propose, humans approve.
+- **Quality gate** — humans vet all code against [Engineering Standards](docs/ENGINEERING_STANDARDS.md). AI agents run the checks, humans interpret the results.
+- **Contributors** — both human developers and human-supervised AI coding sessions. All contributions follow the same PR process regardless of who (or what) wrote the code.
+
+**LOE unit** = 1 session (one focused AI-assisted coding interaction producing human-reviewable output).
+
+**Future possibility:** As AI agent development matures, ai-memory itself could enable the transition to AI-led development teams — agents that remember what they built, why they built it, and what broke last time. The persistent memory that makes autonomous AI development viable may be the product we're building. That future isn't here yet, but when it arrives, ai-memory will be the infrastructure it runs on.
 
 ---
 
