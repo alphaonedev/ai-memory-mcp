@@ -194,8 +194,10 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Import GPG key
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
         run: |
-          echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --import
+          printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --import
           echo "allow-loopback-pinentry" >> ~/.gnupg/gpg-agent.conf
           gpgconf --reload gpg-agent
 
