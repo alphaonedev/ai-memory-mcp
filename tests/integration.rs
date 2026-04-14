@@ -1860,10 +1860,12 @@ fn test_mcp_store_and_recall() {
     let store_resp: serde_json::Value =
         serde_json::from_str(lines[0]).expect("invalid store response");
     assert_eq!(store_resp["id"], 1);
-    assert!(store_resp["result"]["content"][0]["text"]
-        .as_str()
-        .unwrap()
-        .contains("\"id\""));
+    assert!(
+        store_resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("\"id\"")
+    );
 
     // Verify recall response
     let recall_resp: serde_json::Value =

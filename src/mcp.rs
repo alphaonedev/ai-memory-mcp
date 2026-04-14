@@ -5,7 +5,7 @@
 //! Exposes memory operations as tools for any MCP-compatible AI client over stdio JSON-RPC.
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
 use std::path::Path;
 use std::sync::Arc;
@@ -545,17 +545,16 @@ fn handle_store(
         )
         .map_err(|e| e.to_string())?;
         // Regenerate embedding if content changed during dedup update
-        if content_changed
-            && let Some(emb) = embedder {
-                let text = format!("{} {}", mem.title, mem.content);
-                if let Ok(embedding) = emb.embed(&text) {
-                    let _ = db::set_embedding(conn, &dup.id, &embedding);
-                    if let Some(idx) = vector_index {
-                        idx.remove(&dup.id);
-                        idx.insert(dup.id.clone(), embedding);
-                    }
+        if content_changed && let Some(emb) = embedder {
+            let text = format!("{} {}", mem.title, mem.content);
+            if let Ok(embedding) = emb.embed(&text) {
+                let _ = db::set_embedding(conn, &dup.id, &embedding);
+                if let Some(idx) = vector_index {
+                    idx.remove(&dup.id);
+                    idx.insert(dup.id.clone(), embedding);
                 }
             }
+        }
         return Ok(json!({
             "id": dup.id,
             "tier": mem.tier,
@@ -630,33 +629,34 @@ fn inject_namespace_standard(
 
     // Level 2+: walk parent chain from namespace, then add namespace itself
     if let Some(ns) = namespace
-        && ns != "*" {
-            // Collect the parent chain (bottom-up), then reverse to get top-down order
-            let mut chain: Vec<String> = Vec::new();
-            let mut current = ns.to_string();
-            for _ in 0..5 {
-                // max depth 5
-                if let Some(parent) = db::get_namespace_parent(conn, &current) {
-                    if parent == "*" || chain.contains(&parent) {
-                        break; // don't re-add global or cycle
-                    }
-                    chain.push(parent.clone());
-                    current = parent;
-                } else {
-                    break;
+        && ns != "*"
+    {
+        // Collect the parent chain (bottom-up), then reverse to get top-down order
+        let mut chain: Vec<String> = Vec::new();
+        let mut current = ns.to_string();
+        for _ in 0..5 {
+            // max depth 5
+            if let Some(parent) = db::get_namespace_parent(conn, &current) {
+                if parent == "*" || chain.contains(&parent) {
+                    break; // don't re-add global or cycle
                 }
-            }
-            // Add parents top-down (grandparent first, then parent)
-            for ancestor in chain.into_iter().rev() {
-                if let Some(std) = lookup_namespace_standard(conn, &ancestor) {
-                    add_standard(std, &mut standard_ids, &mut standards);
-                }
-            }
-            // Add the namespace's own standard last (most specific)
-            if let Some(ns_std) = lookup_namespace_standard(conn, ns) {
-                add_standard(ns_std, &mut standard_ids, &mut standards);
+                chain.push(parent.clone());
+                current = parent;
+            } else {
+                break;
             }
         }
+        // Add parents top-down (grandparent first, then parent)
+        for ancestor in chain.into_iter().rev() {
+            if let Some(std) = lookup_namespace_standard(conn, &ancestor) {
+                add_standard(std, &mut standard_ids, &mut standards);
+            }
+        }
+        // Add the namespace's own standard last (most specific)
+        if let Some(ns_std) = lookup_namespace_standard(conn, ns) {
+            add_standard(ns_std, &mut standard_ids, &mut standards);
+        }
+    }
 
     if standards.is_empty() {
         return;
@@ -779,11 +779,12 @@ fn handle_capabilities(
     let mut caps = tier_config.capabilities();
     // Report actual cross-encoder state, not just config (#93)
     if let Some(ce) = reranker
-        && !ce.is_neural() {
-            caps.features.cross_encoder_reranking = false;
-            caps.features.memory_reflection = false;
-            caps.models.cross_encoder = "lexical-fallback (neural download failed)".to_string();
-        }
+        && !ce.is_neural()
+    {
+        caps.features.cross_encoder_reranking = false;
+        caps.features.memory_reflection = false;
+        caps.models.cross_encoder = "lexical-fallback (neural download failed)".to_string();
+    }
     serde_json::to_value(caps).map_err(|e| e.to_string())
 }
 
@@ -1012,20 +1013,19 @@ fn handle_update(
     }
 
     // Regenerate embedding when title or content changed
-    if content_changed
-        && let Some(emb) = embedder {
-            let mem = db::get(conn, id).map_err(|e| e.to_string())?;
-            if let Some(ref m) = mem {
-                let text = format!("{} {}", m.title, m.content);
-                if let Ok(embedding) = emb.embed(&text) {
-                    let _ = db::set_embedding(conn, id, &embedding);
-                    if let Some(idx) = vector_index {
-                        idx.remove(id);
-                        idx.insert(id.to_string(), embedding);
-                    }
+    if content_changed && let Some(emb) = embedder {
+        let mem = db::get(conn, id).map_err(|e| e.to_string())?;
+        if let Some(ref m) = mem {
+            let text = format!("{} {}", m.title, m.content);
+            if let Ok(embedding) = emb.embed(&text) {
+                let _ = db::set_embedding(conn, id, &embedding);
+                if let Some(idx) = vector_index {
+                    idx.remove(id);
+                    idx.insert(id.to_string(), embedding);
                 }
             }
         }
+    }
 
     let mem = db::get(conn, id).map_err(|e| e.to_string())?;
     Ok(json!({"updated": true, "memory": mem}))
@@ -1401,20 +1401,21 @@ fn handle_session_start(
     });
 
     if let Some(llm_client) = llm
-        && !results.is_empty() {
-            let pairs: Vec<(String, String)> = results
-                .iter()
-                .map(|m| (m.title.clone(), m.content.clone()))
-                .collect();
-            match llm_client.summarize_memories(&pairs) {
-                Ok(summary) => {
-                    response["summary"] = json!(summary);
-                }
-                Err(e) => {
-                    tracing::warn!("session_start LLM summary failed: {}", e);
-                }
+        && !results.is_empty()
+    {
+        let pairs: Vec<(String, String)> = results
+            .iter()
+            .map(|m| (m.title.clone(), m.content.clone()))
+            .collect();
+        match llm_client.summarize_memories(&pairs) {
+            Ok(summary) => {
+                response["summary"] = json!(summary);
+            }
+            Err(e) => {
+                tracing::warn!("session_start LLM summary failed: {}", e);
             }
         }
+    }
 
     // Auto-register parent chain from filesystem path (runs once, skips if parent already set)
     if let Some(ns) = namespace {
@@ -1606,42 +1607,41 @@ pub fn run_mcp_server(
     // Apply config.toml overrides — tiers gate features, models are independently configurable
     // Only override if the tier actually uses an LLM (smart/autonomous)
     if tier_config.llm_model.is_some()
-        && let Some(ref llm_override) = app_config.llm_model {
-            match llm_override.as_str() {
-                "gemma4:e2b" => {
-                    tier_config.llm_model = Some(crate::config::LlmModel::Gemma4E2B);
-                    eprintln!("ai-memory: llm_model override from config: gemma4:e2b");
-                }
-                "gemma4:e4b" => {
-                    tier_config.llm_model = Some(crate::config::LlmModel::Gemma4E4B);
-                    eprintln!("ai-memory: llm_model override from config: gemma4:e4b");
-                }
-                other => eprintln!("ai-memory: unknown llm_model '{other}', using tier default"),
+        && let Some(ref llm_override) = app_config.llm_model
+    {
+        match llm_override.as_str() {
+            "gemma4:e2b" => {
+                tier_config.llm_model = Some(crate::config::LlmModel::Gemma4E2B);
+                eprintln!("ai-memory: llm_model override from config: gemma4:e2b");
             }
+            "gemma4:e4b" => {
+                tier_config.llm_model = Some(crate::config::LlmModel::Gemma4E4B);
+                eprintln!("ai-memory: llm_model override from config: gemma4:e4b");
+            }
+            other => eprintln!("ai-memory: unknown llm_model '{other}', using tier default"),
         }
+    }
 
     // Apply embedding model override from config.toml
     if tier_config.embedding_model.is_some()
-        && let Some(ref emb_override) = app_config.embedding_model {
-            match emb_override.as_str() {
-                "mini_lm_l6_v2" => {
-                    tier_config.embedding_model = Some(crate::config::EmbeddingModel::MiniLmL6V2);
-                    eprintln!(
-                        "ai-memory: embedding_model override from config: mini_lm_l6_v2 (local)"
-                    );
-                }
-                "nomic_embed_v15" => {
-                    tier_config.embedding_model =
-                        Some(crate::config::EmbeddingModel::NomicEmbedV15);
-                    eprintln!(
-                        "ai-memory: embedding_model override from config: nomic_embed_v15 (Ollama)"
-                    );
-                }
-                other => {
-                    eprintln!("ai-memory: unknown embedding_model '{other}', using tier default");
-                }
+        && let Some(ref emb_override) = app_config.embedding_model
+    {
+        match emb_override.as_str() {
+            "mini_lm_l6_v2" => {
+                tier_config.embedding_model = Some(crate::config::EmbeddingModel::MiniLmL6V2);
+                eprintln!("ai-memory: embedding_model override from config: mini_lm_l6_v2 (local)");
+            }
+            "nomic_embed_v15" => {
+                tier_config.embedding_model = Some(crate::config::EmbeddingModel::NomicEmbedV15);
+                eprintln!(
+                    "ai-memory: embedding_model override from config: nomic_embed_v15 (Ollama)"
+                );
+            }
+            other => {
+                eprintln!("ai-memory: unknown embedding_model '{other}', using tier default");
             }
         }
+    }
 
     // --- Initialize LLM (smart tier and above) — before embedder so Ollama
     //     client can be shared with nomic embedder ---
