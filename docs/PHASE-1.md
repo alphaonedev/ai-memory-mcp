@@ -426,9 +426,9 @@ Tasks must be completed in this order where arrows exist. Tasks without dependen
 
 ---
 
-## Collaborator Assignment Summary
+## Collaborator Assignments
 
-### Collaborator 1 — Schema & Agent Identity (Track A)
+### @alphaonedev — Schema & Agent Identity (Track A)
 
 | Task | Branch | Sessions | Dependencies |
 |------|--------|:--------:|:------------:|
@@ -437,9 +437,104 @@ Tasks must be completed in this order where arrows exist. Tasks without dependen
 | 1.3 Agent Registration | `feature/agent-register` | 0.5 | 1.2 |
 | **Total** | | **2** | |
 
-**Start first.** Everything else depends on 1.1. Collaborator 1 should merge 1.1 ASAP so Collaborators 2 and 3 can begin their tracks.
+**Start first.** Everything else depends on 1.1. Merge 1.1 ASAP so @qtfkwk and @bentompkins can begin. Lightest task load allows bandwidth for PR reviews as gatekeeper.
 
-### Collaborator 2 — Memory Hierarchy & Visibility (Track B)
+<details>
+<summary><strong>Starter Prompt for AI Coder — Task 1.1 (Schema Migration)</strong></summary>
+
+```
+I am working on the ai-memory project (https://github.com/alphaonedev/ai-memory-mcp), a Rust-based persistent memory system for AI agents using SQLite.
+
+Read the following files to understand the current codebase:
+- src/models.rs (Memory struct definition)
+- src/db.rs (all database operations, schema creation)
+- src/mcp.rs (MCP tool handlers)
+- src/handlers.rs (HTTP API handlers)
+- src/main.rs (CLI commands)
+- docs/PHASE-1.md (full task specification)
+- docs/ENGINEERING_STANDARDS.md (code standards)
+
+TASK: Add a `metadata` JSON column to the memories table (Task 1.1 in PHASE-1.md).
+
+Requirements:
+1. Add `metadata TEXT NOT NULL DEFAULT '{}'` column to memories table schema in db.rs
+2. Add schema version detection and ALTER TABLE migration for existing databases
+3. Add `metadata` field to Memory struct in models.rs as `serde_json::Value`
+4. Preserve metadata through ALL CRUD operations: store, update, get, list, recall, search, export, import, archive
+5. Add metadata to TOON output in toon.rs
+6. Add metadata to memory_archive table schema
+7. Write minimum 8 new unit tests covering metadata CRUD, migration, roundtrip, and default values
+
+Constraints:
+- Branch from `develop`: git checkout develop && git checkout -b feature/schema-metadata
+- Must pass: cargo clippy -- -D warnings -D clippy::all -D clippy::pedantic
+- Must pass: AI_MEMORY_NO_CONFIG=1 cargo test
+- All existing 192 tests must continue to pass
+- SPDX header on any new files: // Copyright 2026 AlphaOne LLC // SPDX-License-Identifier: Apache-2.0
+- No new unwrap() calls in production code
+- All SQL must use parameterized queries (params![])
+```
+
+</details>
+
+<details>
+<summary><strong>Starter Prompt for AI Coder — Task 1.2 (Agent Identity)</strong></summary>
+
+```
+I am working on the ai-memory project (https://github.com/alphaonedev/ai-memory-mcp), a Rust-based persistent memory system for AI agents using SQLite.
+
+Read: src/models.rs, src/db.rs, src/mcp.rs, src/handlers.rs, src/main.rs, docs/PHASE-1.md
+
+PREREQUISITE: Task 1.1 (metadata column) must be merged. The Memory struct now has a `metadata: serde_json::Value` field.
+
+TASK: Add agent_id support (Task 1.2 in PHASE-1.md).
+
+Requirements:
+1. Add --agent-id CLI flag to main.rs (optional, defaults to hostname or "anonymous")
+2. Add agent_id parameter to MCP memory_store tool in mcp.rs
+3. On store: populate metadata.agent_id automatically from flag/parameter
+4. On recall/list/get: include agent_id in response (extracted from metadata)
+5. Add --agent-id filter to list and search commands
+6. Add agent_id to HTTP API POST /api/v1/memories body in handlers.rs
+7. Write minimum 4 new unit tests
+
+Constraints:
+- Branch: feature/agent-identity from develop
+- Pedantic clippy clean, all tests pass, no new unwrap()
+```
+
+</details>
+
+<details>
+<summary><strong>Starter Prompt for AI Coder — Task 1.3 (Agent Registration)</strong></summary>
+
+```
+I am working on the ai-memory project (https://github.com/alphaonedev/ai-memory-mcp), a Rust-based persistent memory system for AI agents using SQLite.
+
+Read: src/models.rs, src/db.rs, src/mcp.rs, src/handlers.rs, src/main.rs, docs/PHASE-1.md
+
+PREREQUISITE: Tasks 1.1 and 1.2 must be merged. agent_id is now in metadata.
+
+TASK: Add agent registration (Task 1.3 in PHASE-1.md).
+
+Requirements:
+1. New MCP tool: memory_agent_register — params: agent_id (required), agent_type (required: "ai:claude-opus-4.6", "ai:codex-5.4", "ai:grok-4.2", "human", "system"), capabilities (optional JSON array)
+2. Store agent as a special memory: tier=long, namespace="_agents", title="agent:<agent_id>"
+3. New MCP tool: memory_agent_list — returns all registered agents
+4. New CLI command: ai-memory agents — list registered agents
+5. Add HTTP API: GET /api/v1/agents, POST /api/v1/agents
+6. Write minimum 4 new unit tests
+
+Constraints:
+- Branch: feature/agent-register from develop
+- Pedantic clippy clean, all tests pass, no new unwrap()
+```
+
+</details>
+
+---
+
+### @qtfkwk — Memory Hierarchy & Visibility (Track B)
 
 | Task | Branch | Sessions | Dependencies |
 |------|--------|:--------:|:------------:|
@@ -451,7 +546,138 @@ Tasks must be completed in this order where arrows exist. Tasks without dependen
 
 **Start after 1.1 merges.** Tasks 1.5, 1.6, 1.7 can run in parallel after 1.4 merges.
 
-### Collaborator 3 — Governance & Smart Recall (Track C)
+<details>
+<summary><strong>Starter Prompt for AI Coder — Task 1.4 (Hierarchical Namespaces)</strong></summary>
+
+```
+I am working on the ai-memory project (https://github.com/alphaonedev/ai-memory-mcp), a Rust-based persistent memory system for AI agents using SQLite.
+
+Read: src/validate.rs, src/models.rs, src/db.rs, docs/PHASE-1.md, docs/ENGINEERING_STANDARDS.md
+
+PREREQUISITE: Task 1.1 (metadata column) must be merged.
+
+TASK: Add hierarchical namespace paths (Task 1.4 in PHASE-1.md).
+
+Requirements:
+1. Update validate_namespace() in validate.rs to accept /-delimited paths: "alphaone/engineering/platform"
+2. Maximum depth: 8 levels. Maximum path length: 512 chars.
+3. Namespace path normalization: strip leading/trailing /, collapse //, lowercase
+4. Existing flat namespaces ("ai-memory", "global") remain valid — hierarchy is opt-in
+5. Add namespace_depth() helper function in models.rs — returns number of levels
+6. Add namespace_parent() helper: "alphaone/engineering/platform" → "alphaone/engineering"
+7. Add namespace_ancestors() helper: returns vec of all ancestors from most specific to least
+8. Write minimum 10 new unit tests covering valid paths, invalid paths, parent extraction, ancestors, edge cases
+
+Key design decision: The / character is currently rejected by validate_namespace(). You need to allow / as a delimiter while still rejecting \ and null bytes. Keep all other existing validation rules.
+
+Constraints:
+- Branch: feature/hierarchical-namespaces from develop
+- Pedantic clippy clean, all tests pass
+- ZERO breaking changes to existing flat namespace behavior
+- No new unwrap() in production code
+```
+
+</details>
+
+<details>
+<summary><strong>Starter Prompt for AI Coder — Task 1.5 (Visibility Rules)</strong></summary>
+
+```
+I am working on the ai-memory project (https://github.com/alphaonedev/ai-memory-mcp), a Rust-based persistent memory system for AI agents using SQLite.
+
+Read: src/db.rs (recall and search functions), src/mcp.rs, src/main.rs, src/models.rs, docs/PHASE-1.md
+
+PREREQUISITE: Task 1.4 (hierarchical namespaces) must be merged. namespace_parent() and namespace_ancestors() are now available.
+
+TASK: Add scope-based visibility rules (Task 1.5 in PHASE-1.md).
+
+Requirements:
+1. Add "scope" field to memory metadata: "private" (default), "team", "unit", "org", "collective"
+2. Add --scope flag to CLI store command and MCP memory_store
+3. Modify recall() and search() in db.rs to apply visibility filtering:
+   - An agent at "alphaone/engineering/platform/agent-1":
+     - Sees "private" memories only in its exact namespace
+     - Sees "team" memories in "alphaone/engineering/platform/*"
+     - Sees "unit" memories in "alphaone/engineering/*"
+     - Sees "org" memories in "alphaone/*"
+     - Sees "collective" memories everywhere
+4. Add --as-agent flag to recall/search for specifying the querying agent's namespace position
+5. When no hierarchy exists (flat namespaces), default to current behavior (namespace-exact match)
+6. Write minimum 10 new unit tests
+
+Implementation hint: Scope visibility can be implemented with SQL WHERE clauses using namespace prefix matching:
+WHERE (json_extract(metadata, '$.scope') = 'collective')
+   OR (json_extract(metadata, '$.scope') = 'org' AND namespace LIKE 'alphaone/%')
+   OR (json_extract(metadata, '$.scope') = 'unit' AND namespace LIKE 'alphaone/engineering/%')
+   ... etc
+
+Constraints:
+- Branch: feature/visibility-rules from develop
+- Pedantic clippy clean, all tests pass, no new unwrap()
+```
+
+</details>
+
+<details>
+<summary><strong>Starter Prompt for AI Coder — Task 1.6 (N-Level Rule Inheritance)</strong></summary>
+
+```
+I am working on the ai-memory project (https://github.com/alphaonedev/ai-memory-mcp), a Rust-based persistent memory system for AI agents using SQLite.
+
+Read: src/mcp.rs (search for namespace_set_standard, namespace_get_standard, session_start), src/db.rs, docs/PHASE-1.md
+
+PREREQUISITE: Task 1.4 (hierarchical namespaces) must be merged.
+
+TASK: Extend the rule inheritance system from 3 levels to N levels (Task 1.6 in PHASE-1.md).
+
+Currently the system supports: global (*) → parent namespace → namespace. This needs to support arbitrary depth: * → org → unit → team → agent.
+
+Requirements:
+1. Extend namespace_set_standard in mcp.rs to store standards at any hierarchy level
+2. On session_start or recall, collect standards from ALL ancestor namespaces using namespace_ancestors()
+3. Standards are concatenated in order: most general first (global *), most specific last
+4. Add --inherit flag to namespace_get_standard to show the full inherited chain
+5. Write minimum 6 new unit tests: 4-level chain, missing intermediates skipped, existing 3-level behavior unchanged
+
+Constraints:
+- Branch: feature/n-level-rules from develop
+- Pedantic clippy clean, all tests pass, no new unwrap()
+```
+
+</details>
+
+<details>
+<summary><strong>Starter Prompt for AI Coder — Task 1.7 (Vertical Promotion)</strong></summary>
+
+```
+I am working on the ai-memory project (https://github.com/alphaonedev/ai-memory-mcp), a Rust-based persistent memory system for AI agents using SQLite.
+
+Read: src/mcp.rs (search for memory_promote), src/db.rs (promote function), src/main.rs, docs/PHASE-1.md
+
+PREREQUISITE: Task 1.4 (hierarchical namespaces) must be merged.
+
+TASK: Add vertical memory promotion across the namespace hierarchy (Task 1.7 in PHASE-1.md).
+
+Currently memory_promote changes tier (short→mid→long). This adds a new dimension: promoting a memory UP the namespace hierarchy (agent→team→unit→org).
+
+Requirements:
+1. Extend memory_promote MCP tool with optional to_namespace parameter
+2. When to_namespace is specified: CLONE the memory to the target namespace, create a "derived_from" link between clone and original
+3. Add --to-namespace flag to CLI promote command
+4. Validate that to_namespace is an ancestor of the memory's current namespace (use namespace_ancestors())
+5. Original memory remains at its level unchanged. Promoted copy exists at the higher level.
+6. Write minimum 4 new unit tests
+
+Constraints:
+- Branch: feature/vertical-promotion from develop
+- Pedantic clippy clean, all tests pass, no new unwrap()
+```
+
+</details>
+
+---
+
+### @bentompkins — Governance & Smart Recall (Track C)
 
 | Task | Branch | Sessions | Dependencies |
 |------|--------|:--------:|:------------:|
@@ -462,7 +688,164 @@ Tasks must be completed in this order where arrows exist. Tasks without dependen
 | 1.12 Hierarchy-Aware Recall | `feature/hierarchy-recall` | 0.5 | 1.5 + 1.11 |
 | **Total** | | **4.5** | |
 
-**Start 1.8 and 1.11 in parallel after 1.1 merges.** 1.11 (budget recall) has no dependency on governance — can start immediately after schema lands. 1.12 waits for both visibility rules (from Collaborator 2) and budget recall.
+**Start 1.8 and 1.11 in parallel after 1.1 merges.** Budget recall (1.11) has no dependency on governance — can start immediately. 1.12 waits for visibility rules (from @qtfkwk) and budget recall.
+
+<details>
+<summary><strong>Starter Prompt for AI Coder — Task 1.8 (Governance Metadata)</strong></summary>
+
+```
+I am working on the ai-memory project (https://github.com/alphaonedev/ai-memory-mcp), a Rust-based persistent memory system for AI agents using SQLite.
+
+Read: src/models.rs, src/config.rs, src/mcp.rs (search for namespace_set_standard), src/validate.rs, docs/PHASE-1.md
+
+PREREQUISITE: Task 1.1 (metadata column) must be merged.
+
+TASK: Add governance metadata to namespace standards (Task 1.8 in PHASE-1.md).
+
+Requirements:
+1. Define governance types in models.rs:
+   - GovernanceLevel enum: Any, Registered, Owner, Approve
+   - ApproverType enum: Human, Agent(String), Consensus(u32)
+   - GovernancePolicy struct: write, promote, delete (GovernanceLevel), approver (ApproverType)
+2. GovernancePolicy must implement Serialize/Deserialize for JSON storage
+3. Governance is stored as JSON within the namespace standard's metadata field
+4. Extend namespace_set_standard MCP tool to accept an optional governance JSON parameter
+5. Extend namespace_get_standard MCP tool to return governance policy in response
+6. Default governance when not set: { write: Any, promote: Any, delete: Owner, approver: Human }
+7. Add governance validation in validate.rs
+8. Write minimum 6 new unit tests
+
+Constraints:
+- Branch: feature/governance-metadata from develop
+- Pedantic clippy clean, all tests pass, no new unwrap()
+```
+
+</details>
+
+<details>
+<summary><strong>Starter Prompt for AI Coder — Task 1.9 (Governance Enforcement)</strong></summary>
+
+```
+I am working on the ai-memory project (https://github.com/alphaonedev/ai-memory-mcp), a Rust-based persistent memory system for AI agents using SQLite.
+
+Read: src/db.rs (store, delete, update functions), src/mcp.rs, src/handlers.rs, src/models.rs, docs/PHASE-1.md
+
+PREREQUISITE: Task 1.8 (governance metadata) must be merged. GovernancePolicy is now available.
+
+TASK: Enforce governance policies on memory operations (Task 1.9 in PHASE-1.md).
+
+Requirements:
+1. Before store in db.rs: check governance write policy for the target namespace
+   - Any: allow (current behavior)
+   - Registered: agent must be registered (agent_id exists in _agents namespace)
+   - Owner: only the namespace owner can write
+   - Approve: queue the action instead of executing
+2. Same enforcement for delete and promote operations
+3. New table: pending_actions (id TEXT PK, action_type TEXT, memory_id TEXT, namespace TEXT, payload TEXT, requested_by TEXT, requested_at TEXT, status TEXT DEFAULT 'pending')
+4. New MCP tools: memory_pending_list, memory_pending_approve, memory_pending_reject
+5. New CLI commands: ai-memory pending list, ai-memory pending approve <id>, ai-memory pending reject <id>
+6. Add pending actions to HTTP API: GET /api/v1/pending, POST /api/v1/pending/:id/approve, POST /api/v1/pending/:id/reject
+7. Write minimum 10 new unit tests
+
+Key design: When governance blocks an operation, return a response like {"status": "pending", "pending_id": "...", "reason": "governance requires approval"} instead of an error. The caller knows the action was received but not yet executed.
+
+Constraints:
+- Branch: feature/governance-enforcement from develop
+- Pedantic clippy clean, all tests pass, no new unwrap()
+```
+
+</details>
+
+<details>
+<summary><strong>Starter Prompt for AI Coder — Task 1.10 (Governance Approvers)</strong></summary>
+
+```
+I am working on the ai-memory project (https://github.com/alphaonedev/ai-memory-mcp), a Rust-based persistent memory system for AI agents using SQLite.
+
+Read: src/db.rs, src/mcp.rs (pending_approve handler), src/models.rs (ApproverType), docs/PHASE-1.md
+
+PREREQUISITE: Task 1.9 (governance enforcement) must be merged. pending_actions table and approve/reject tools exist.
+
+TASK: Implement approver type logic (Task 1.10 in PHASE-1.md).
+
+Requirements:
+1. On memory_pending_approve, check who is approving against the namespace's governance approver type:
+   - Human: accept approval (no automated check — any approval is valid)
+   - Agent(agent_id): only accept if the approving agent matches the designated agent_id
+   - Consensus(n): track approvals in a JSON array on the pending_action. Auto-execute when n different agents have approved.
+2. Add approvals column to pending_actions: TEXT DEFAULT '[]' (JSON array of {agent_id, approved_at})
+3. Consensus auto-executes the pending action when threshold is met
+4. Write minimum 6 new unit tests
+
+Constraints:
+- Branch: feature/governance-approvers from develop
+- Pedantic clippy clean, all tests pass, no new unwrap()
+```
+
+</details>
+
+<details>
+<summary><strong>Starter Prompt for AI Coder — Task 1.11 (Budget-Aware Recall)</strong></summary>
+
+```
+I am working on the ai-memory project (https://github.com/alphaonedev/ai-memory-mcp), a Rust-based persistent memory system for AI agents using SQLite.
+
+Read: src/db.rs (recall function — this is the main function to modify), src/mcp.rs (memory_recall handler), src/main.rs (recall CLI command), src/toon.rs, docs/PHASE-1.md
+
+PREREQUISITE: Task 1.1 (metadata column) must be merged.
+
+TASK: Add context-budget-aware recall (Task 1.11 in PHASE-1.md). THIS IS THE #1 DIFFERENTIATOR FEATURE — no competitor has this.
+
+Requirements:
+1. Add budget_tokens parameter to recall() in db.rs (optional, type Option<usize>, default None = unlimited)
+2. Add --budget flag to CLI recall command in main.rs
+3. Add budget_tokens to MCP memory_recall tool parameters in mcp.rs
+4. Implementation:
+   - Run existing recall (scored, ranked) — do NOT change the scoring logic
+   - After scoring and ranking, estimate token count per memory: (title.len() + content.len()) / 4
+   - Accumulate memories in ranked order until budget would be exceeded
+   - Return as many memories as fit within the budget
+5. Add tokens_used and budget_tokens to recall response metadata
+6. Add budget_tokens to HTTP API recall endpoints in handlers.rs
+7. TOON output should include budget info in the meta line
+8. Write minimum 6 new unit tests
+
+The value: LLMs have finite context windows. Being able to say "give me the most relevant memories that fit in 4K tokens" means agents never waste context on low-relevance memories. This is a capability no other memory system offers.
+
+Constraints:
+- Branch: feature/budget-recall from develop
+- Pedantic clippy clean, all tests pass, no new unwrap()
+```
+
+</details>
+
+<details>
+<summary><strong>Starter Prompt for AI Coder — Task 1.12 (Hierarchy-Aware Recall)</strong></summary>
+
+```
+I am working on the ai-memory project (https://github.com/alphaonedev/ai-memory-mcp), a Rust-based persistent memory system for AI agents using SQLite.
+
+Read: src/db.rs (recall function), src/models.rs (namespace_ancestors), docs/PHASE-1.md
+
+PREREQUISITES: Task 1.5 (visibility rules from @qtfkwk) AND Task 1.11 (budget recall) must be merged.
+
+TASK: Make recall hierarchy-aware (Task 1.12 in PHASE-1.md).
+
+Requirements:
+1. When an agent recalls with a hierarchical namespace, automatically query memories from ALL ancestor namespaces (filtered by scope/visibility from Task 1.5)
+2. Ancestor memories are scored and ranked alongside the agent's own memories
+3. Add a namespace proximity boost to scoring: memories from the agent's own namespace get the highest boost, parent namespace slightly less, grandparent less, etc. Suggested formula: boost = 1.0 / (1.0 + depth_distance * 0.3)
+4. Example: agent at "alphaone/engineering/platform/agent-1" recalls "PostgreSQL" → gets results from agent-1 namespace (boost 1.0), platform team (boost ~0.77), engineering unit (boost ~0.63), alphaone org (boost ~0.53)
+5. Flat namespace recall must remain unchanged (backward compat) — if no / in namespace, skip hierarchy logic
+6. Budget limiting (from Task 1.11) applies AFTER hierarchy-aware scoring
+7. Write minimum 4 new unit tests
+
+Constraints:
+- Branch: feature/hierarchy-recall from develop
+- Pedantic clippy clean, all tests pass, no new unwrap()
+```
+
+</details>
 
 ---
 
