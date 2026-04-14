@@ -11,13 +11,11 @@
 
 ## North Star
 
-In 20 years, every system will have dozens of AI agents — operational, security, development, monitoring, planning. These agents will come and go. Models will change. Vendors will die. Platforms will shift.
+AI agents are stateless by default. Every session starts from zero. Models get replaced. Vendors shut down. Infrastructure gets rebuilt. The knowledge disappears with them.
 
-But the **collective knowledge** — what the agents learned, what worked, what failed, what matters — must persist across all of them, forever.
+ai-memory makes knowledge persistent. What agents learn survives the agent, the model, the vendor, and the platform. One agent learns it, every agent knows it — across systems, across teams, across time.
 
-ai-memory is that knowledge layer. Not a tool. Not a library. **Infrastructure.**
-
-Like DNS for names, SMTP for email, SQLite for embedded databases — ai-memory for AI agent memory.
+The goal is simple: **no AI agent should ever have to relearn what any AI agent already knows.**
 
 ---
 
