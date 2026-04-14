@@ -2400,14 +2400,14 @@ fn test_promote_clears_expires_at() {
 }
 
 #[test]
-fn test_version_flag_patch4() {
+fn test_version_flag_patch5() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
     let output = cmd(binary).args(["--version"]).output().unwrap();
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("0.5.4-patch.4"),
-        "version should be 0.5.4-patch.4, got: {}",
+        stdout.contains("0.5.4-patch.5"),
+        "version should be 0.5.4-patch.5, got: {}",
         stdout
     );
 }
@@ -2728,6 +2728,106 @@ fn test_namespace_standard_cascade_on_delete() {
         "standard should be null after deleting the standard memory, got: {}",
         get_data
     );
+
+    let _ = std::fs::remove_file(&db_path);
+}
+
+#[test]
+fn test_cli_prefix_id_resolution() {
+    let dir = std::env::temp_dir();
+    let db_path = dir.join(format!("ai-memory-prefix-test-{}.db", uuid::Uuid::new_v4()));
+    let binary = env!("CARGO_BIN_EXE_ai-memory");
+
+    // Store a memory
+    let output = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--json",
+            "store",
+            "-t",
+            "long",
+            "-T",
+            "Prefix resolution test",
+            "--content",
+            "Testing that short IDs work with get, update, promote, and delete",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "store failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stored: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let full_id = stored["id"].as_str().unwrap().to_string();
+    let short_id = &full_id[..8];
+
+    // Get by short prefix
+    let output = cmd(binary)
+        .args(["--db", db_path.to_str().unwrap(), "--json", "get", short_id])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "get by prefix failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let got: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(got["memory"]["id"], full_id);
+    assert_eq!(got["memory"]["title"], "Prefix resolution test");
+
+    // Update by short prefix
+    let output = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--json",
+            "update",
+            short_id,
+            "--content",
+            "Updated via prefix",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "update by prefix failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify updated content
+    let output = cmd(binary)
+        .args(["--db", db_path.to_str().unwrap(), "--json", "get", &full_id])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let got: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(got["memory"]["content"], "Updated via prefix");
+
+    // Delete by short prefix
+    let output = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--json",
+            "delete",
+            short_id,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "delete by prefix failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify deleted
+    let output = cmd(binary)
+        .args(["--db", db_path.to_str().unwrap(), "--json", "get", &full_id])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "get after delete should fail");
 
     let _ = std::fs::remove_file(&db_path);
 }
