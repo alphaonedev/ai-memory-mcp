@@ -1542,7 +1542,7 @@ pub fn is_namespace_standard(conn: &Connection, id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{Memory, Tier};
+    use crate::models::{Memory, Tier, MID_TTL_EXTEND_SECS, SHORT_TTL_EXTEND_SECS};
 
     fn test_db() -> Connection {
         open(std::path::Path::new(":memory:")).unwrap()
