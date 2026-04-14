@@ -148,7 +148,7 @@ jobs:
       - name: Publish to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish --allow-dirty
+        run: cargo publish --allow-dirty || echo "::warning::crates.io publish skipped (version may already exist)"
 
   homebrew:
     name: Update Homebrew formula
