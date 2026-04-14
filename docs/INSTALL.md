@@ -127,7 +127,7 @@ That's it. Everything below is optional detail.
 
 > **Pre-built binaries have no prerequisites** -- just run `install.sh` or `install.ps1` as shown above. The requirements below only apply when building from source.
 
-- **Rust toolchain** (1.75+): Install via [rustup](https://rustup.rs/)
+- **Rust toolchain (1.87+): Install via [rustup](https://rustup.rs/)
   ```bash
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
   ```
