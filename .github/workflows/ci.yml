@@ -31,7 +31,7 @@ jobs:
         run: cargo fmt --check
 
       - name: Clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy -- -D warnings -D clippy::all -D clippy::pedantic
 
       - name: Run tests
         env:
