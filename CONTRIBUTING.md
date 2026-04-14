@@ -52,12 +52,14 @@ cargo test
 ## Pull Request Process
 
 1. Fork the repository.
-2. Create a feature branch from `main` (`git checkout -b feature/my-change`).
+2. Create a feature branch from `develop` (`git checkout develop && git checkout -b feature/my-change`).
 3. Make your changes, following the code style and testing guidelines above.
-4. Ensure `cargo fmt`, `cargo clippy`, and `cargo test` all pass.
-5. Push your branch and open a pull request against `main`.
+4. Ensure `cargo fmt`, `cargo clippy -- -D warnings -D clippy::all -D clippy::pedantic`, and `AI_MEMORY_NO_CONFIG=1 cargo test` all pass.
+5. Push your branch and open a pull request against `develop` (not `main`).
 6. Fill out the PR description with what changed and why.
 7. Address any review feedback.
+
+**Note:** All PRs target the `develop` branch. The `main` branch is for production releases only — `develop` → `main` merges are done by maintainers when cutting a release.
 
 See the 8-step feature checklist in [DEVELOPER_GUIDE.md](docs/DEVELOPER_GUIDE.md) for end-to-end guidance on adding new features.
 
