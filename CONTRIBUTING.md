@@ -24,7 +24,7 @@ Open a feature request at [GitHub Issues](https://github.com/alphaonedev/ai-memo
 
 ### Prerequisites
 
-- **Rust 1.75+** (install via [rustup](https://rustup.rs/))
+- **Rust 1.87+** (install via [rustup](https://rustup.rs/))
 - **C compiler** (gcc, clang, or MSVC)
 - Git
 
@@ -57,17 +57,18 @@ All three checks must pass before submitting a PR:
 cargo fmt --check
 cargo clippy -- -D warnings -D clippy::all -D clippy::pedantic
 AI_MEMORY_NO_CONFIG=1 cargo test
+cargo audit
 ```
 
-- All existing tests must pass. The `AI_MEMORY_NO_CONFIG=1` env var prevents loading `~/.config/ai-memory/config.toml` which may trigger embedder/LLM initialization.
+- All four checks must pass. CI will reject PRs that fail any of them.
+- `AI_MEMORY_NO_CONFIG=1` prevents loading `~/.config/ai-memory/config.toml` which may trigger embedder/LLM initialization.
 - New code must include tests. Bug fixes should include a regression test.
 - If you add a new MCP tool, HTTP endpoint, or CLI command, include integration tests covering the primary usage path.
 - If clippy pedantic requires `#[allow(clippy::...)]`, justify it in your PR description.
-- Run `cargo audit` to check for known vulnerabilities in dependencies.
 
 ## Pull Request Process
 
-1. Fork the repository.
+1. Fork the repository (external contributors) or branch directly (collaborators).
 2. Create a feature branch from `develop` (`git checkout develop && git checkout -b feature/my-change`).
 3. Make your changes, following the code style and testing guidelines above.
 4. Ensure `cargo fmt`, `cargo clippy -- -D warnings -D clippy::all -D clippy::pedantic`, and `AI_MEMORY_NO_CONFIG=1 cargo test` all pass.

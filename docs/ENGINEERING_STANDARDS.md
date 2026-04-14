@@ -41,7 +41,7 @@ PRs to `develop` do not require owner approval but must pass all CI checks (fmt,
 
 ### 1.4 Code Style
 
-- **Rust 1.75+** minimum supported version.
+- **Rust 1.87+** minimum supported version (MSRV). Required for `is_multiple_of()` stabilization.
 - **`cargo fmt`** is mandatory. CI enforces via `cargo fmt --check`. Always run before committing.
 - **`cargo clippy`** with pedantic:
   ```
@@ -81,10 +81,12 @@ Every PR must pass these gates before merge:
 | `cargo clippy -- -D warnings -D clippy::all -D clippy::pedantic` | Zero warnings |
 | `AI_MEMORY_NO_CONFIG=1 cargo test` | All passing, 0 failures |
 | `cargo audit` | 0 vulnerabilities (warnings acceptable if transitive) |
-| Functional test | All categories pass |
-| Security review | 0 ship-blocking findings |
+| Functional test | All categories pass (maintainer performs during review) |
+| Security review | 0 ship-blocking findings (maintainer performs during review) |
 | Documentation sync | Test counts and tool counts updated in all docs |
 | CLA | Signed (see [CLA.md](../CLA.md)) |
+
+Contributors are responsible for the first four gates. Maintainers perform the functional test, security review, and documentation sync verification during PR review.
 
 ---
 
@@ -249,6 +251,7 @@ Before tagging a release:
 - [ ] Test counts updated in 7 locations (see Section 2.6)
 - [ ] MCP tool counts updated in 4 locations (see Section 2.6)
 - [ ] `Cargo.toml` version matches the tag
+- [ ] All new source files have SPDX headers
 
 ### 4.4 Post-Release
 
