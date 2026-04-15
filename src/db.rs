@@ -888,6 +888,8 @@ fn sanitize_fts_query(input: &str, use_or: bool) -> String {
                         && *c != ')'
                         && *c != ':'
                         && *c != '|'
+                        && *c != '+'
+                        && *c != '-'
                 })
                 .collect();
             if clean.is_empty() {
@@ -2343,6 +2345,12 @@ mod tests {
         // Empty input returns placeholder
         let sanitized3 = sanitize_fts_query("", true);
         assert_eq!(sanitized3, "\"_empty_\"");
+        // + and - prefix operators are stripped (prevents exclusion injection)
+        let sanitized4 = sanitize_fts_query("-secret +required", true);
+        assert!(!sanitized4.contains('-'));
+        assert!(!sanitized4.contains('+'));
+        assert!(sanitized4.contains("secret"));
+        assert!(sanitized4.contains("required"));
     }
 
     #[test]
