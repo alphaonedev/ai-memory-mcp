@@ -2402,14 +2402,14 @@ fn test_promote_clears_expires_at() {
 }
 
 #[test]
-fn test_version_flag_patch5() {
+fn test_version_flag_patch6() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
     let output = cmd(binary).args(["--version"]).output().unwrap();
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("0.5.4-patch.5"),
-        "version should be 0.5.4-patch.5, got: {}",
+        stdout.contains("0.5.4-patch.6"),
+        "version should be 0.5.4-patch.6, got: {}",
         stdout
     );
 }
