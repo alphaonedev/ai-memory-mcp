@@ -5,7 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.6.0-alpha.1] — 2026-04-16 — Phase 1 Track A complete
+## [0.6.0-alpha.2] — 2026-04-16 — Phase 1 Track A complete + release-plumbing reconciliation
+
+Supersedes **0.6.0-alpha.1** (2026-04-16, same day — partial publish). alpha.1
+shipped the Task 1.3 feature to crates.io, Ubuntu PPA, Homebrew, and GitHub
+Release binaries, but Docker (GHCR) and Fedora COPR failed due to a pre-existing
+divergence between `main` and `release/v0.6.0`:
+
+- Dockerfile pinned to `rust:1.87-slim` while code uses let-chains stabilized in
+  1.88 (fixed on main in #187, never back-merged)
+- Fedora COPR workflow `sed` blindly injected SemVer pre-release strings into
+  RPM `Version:` field, which forbids `-`
+
+alpha.2 back-merges `main` → `release/v0.6.0` (commits from `ce8fd47` through
+`36747b2`, including RUSTSEC-2026-0098/0099 fixes), bumps `rust-version` to 1.88
+(the honest MSRV), updates `time` 0.3.45 → 0.3.47 (RUSTSEC-2026-0009 DoS), and
+patches the COPR workflow to split SemVer pre-release versions into `Version:` +
+`Release:` pairs per Fedora packaging guidelines. No feature changes vs alpha.1.
+
+alpha.1 will be **yanked from crates.io** once alpha.2 publishes successfully.
+
+## [0.6.0-alpha.1] — 2026-04-16 — Phase 1 Track A complete (PARTIAL — yanked, superseded by alpha.2)
 
 First cut of the v0.6.0 release train. Integration branch for Phase 1 tasks 1.3–1.12
 plus the already-landed foundation work (1.1, 1.2). Pre-release; API is not yet stable.
