@@ -2402,15 +2402,18 @@ fn test_promote_clears_expires_at() {
 }
 
 #[test]
-fn test_version_flag_patch6() {
+fn test_version_flag_matches_cargo_pkg_version() {
+    // Pin the CLI --version output to whatever Cargo.toml says, so the test
+    // stays green across release-train bumps (0.5.4-patch.6 → 0.6.0-alpha.0
+    // → 0.6.0-alpha.1 → …) without having to be re-hardcoded each time.
     let binary = env!("CARGO_BIN_EXE_ai-memory");
+    let expected = env!("CARGO_PKG_VERSION");
     let output = cmd(binary).args(["--version"]).output().unwrap();
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("0.5.4-patch.6"),
-        "version should be 0.5.4-patch.6, got: {}",
-        stdout
+        stdout.contains(expected),
+        "--version output should contain CARGO_PKG_VERSION ({expected}), got: {stdout}"
     );
 }
 
