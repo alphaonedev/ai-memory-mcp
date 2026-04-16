@@ -8,6 +8,7 @@ mod embeddings;
 mod errors;
 mod handlers;
 mod hnsw;
+mod identity;
 mod llm;
 mod mcp;
 mod mine;
@@ -62,6 +63,11 @@ struct Cli {
     /// Output as JSON (machine-parseable)
     #[arg(long, global = true, default_value_t = false)]
     json: bool,
+    /// Agent identifier used for store operations. If unset, an NHI-hardened
+    /// default is synthesized (see `ai-memory store --help`). Accepts the
+    /// `AI_MEMORY_AGENT_ID` environment variable as a fallback.
+    #[arg(long, env = "AI_MEMORY_AGENT_ID", global = true)]
+    agent_id: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -268,6 +274,9 @@ struct SearchArgs {
     until: Option<String>,
     #[arg(long)]
     tags: Option<String>,
+    /// Filter by `metadata.agent_id` (exact match)
+    #[arg(long)]
+    agent_id: Option<String>,
 }
 
 #[derive(Args)]
@@ -291,6 +300,9 @@ struct ListArgs {
     tags: Option<String>,
     #[arg(long, default_value_t = 0)]
     offset: usize,
+    /// Filter by `metadata.agent_id` (exact match)
+    #[arg(long)]
+    agent_id: Option<String>,
 }
 
 #[derive(Args)]
@@ -424,6 +436,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let db_path = app_config.effective_db(&cli.db);
     let j = cli.json;
+    let cli_agent_id: Option<String> = cli.agent_id.clone();
     // Track whether command writes to DB (for WAL checkpoint)
     let is_write_command = matches!(
         cli.command,
@@ -453,7 +466,7 @@ async fn main() -> Result<()> {
             mcp::run_mcp_server(&db_path, feature_tier, &app_config)?;
             Ok(())
         }
-        Command::Store(a) => cmd_store(&db_path, a, j, &app_config),
+        Command::Store(a) => cmd_store(&db_path, a, j, &app_config, cli_agent_id.as_deref()),
         Command::Update(a) => cmd_update(&db_path, &a, j),
         Command::Recall(a) => cmd_recall(&db_path, &a, j, &app_config),
         Command::Search(a) => cmd_search(&db_path, &a, j, &app_config),
@@ -615,6 +628,7 @@ fn cmd_store(
     args: StoreArgs,
     json_out: bool,
     app_config: &config::AppConfig,
+    cli_agent_id: Option<&str>,
 ) -> Result<()> {
     let conn = db::open(db_path)?;
     let resolved_ttl = app_config.effective_ttl();
@@ -654,6 +668,16 @@ fn cmd_store(
             .or(resolved_ttl.ttl_for_tier(&tier))
             .map(|s| (now + Duration::seconds(s)).to_rfc3339())
     });
+    // Resolve agent_id via the NHI-hardened precedence chain. `cli_agent_id`
+    // already reflects `--agent-id` flag or `AI_MEMORY_AGENT_ID` env (clap
+    // merges both). When neither is set we fall through to the host/anonymous
+    // defaults provided by `crate::identity`.
+    let agent_id = identity::resolve_agent_id(cli_agent_id, None)?;
+    let mut metadata = models::default_metadata();
+    if let Some(obj) = metadata.as_object_mut() {
+        obj.insert("agent_id".to_string(), serde_json::Value::String(agent_id));
+    }
+
     let mem = models::Memory {
         id: uuid::Uuid::new_v4().to_string(),
         tier,
@@ -669,7 +693,7 @@ fn cmd_store(
         updated_at: now.to_rfc3339(),
         last_accessed_at: None,
         expires_at,
-        metadata: models::default_metadata(),
+        metadata,
     };
     let contradictions =
         db::find_contradictions(&conn, &mem.title, &mem.namespace).unwrap_or_default();
@@ -990,6 +1014,7 @@ fn cmd_search(
         args.since.as_deref(),
         args.until.as_deref(),
         args.tags.as_deref(),
+        args.agent_id.as_deref(),
     )?;
     if json_out {
         println!(
@@ -1065,6 +1090,7 @@ fn cmd_list(
         args.since.as_deref(),
         args.until.as_deref(),
         args.tags.as_deref(),
+        args.agent_id.as_deref(),
     )?;
     if json_out {
         println!(
@@ -1450,7 +1476,7 @@ fn cmd_shell(db_path: &Path) -> Result<()> {
                     eprintln!("usage: search <query>");
                     continue;
                 }
-                match db::search(&conn, &q, None, None, 20, None, None, None, None) {
+                match db::search(&conn, &q, None, None, 20, None, None, None, None, None) {
                     Ok(results) => {
                         for mem in &results {
                             println!(
@@ -1467,7 +1493,7 @@ fn cmd_shell(db_path: &Path) -> Result<()> {
             }
             "list" | "ls" => {
                 let ns = parts.get(1).copied();
-                match db::list(&conn, ns, None, 20, 0, None, None, None, None) {
+                match db::list(&conn, ns, None, 20, 0, None, None, None, None, None) {
                     Ok(results) => {
                         for mem in &results {
                             let age = human_age(&mem.updated_at);
@@ -1710,6 +1736,7 @@ fn cmd_auto_consolidate(db_path: &Path, args: &AutoConsolidateArgs, json_out: bo
             tier_filter.as_ref(),
             200,
             0,
+            None,
             None,
             None,
             None,

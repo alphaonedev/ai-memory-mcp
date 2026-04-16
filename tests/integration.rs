@@ -2912,18 +2912,33 @@ fn test_mcp_store_invalid_metadata_defaults_to_empty() {
         );
     }
 
-    // List should show all 3 with empty metadata
+    // List should show all 3 with metadata that contains ONLY the NHI-hardened
+    // agent_id injected by handle_store (Task 1.2). The invalid input metadata
+    // is replaced with `{}` first, then agent_id is added.
     let list_resp: serde_json::Value = serde_json::from_str(lines[3]).unwrap();
     let list_text = list_resp["result"]["content"][0]["text"].as_str().unwrap();
     let list_data: serde_json::Value = serde_json::from_str(list_text).unwrap();
     let memories = list_data["memories"].as_array().unwrap();
     assert_eq!(memories.len(), 3);
     for mem in memories {
+        let meta = mem["metadata"]
+            .as_object()
+            .unwrap_or_else(|| panic!("metadata must be an object, got: {}", mem["metadata"]));
         assert_eq!(
-            mem["metadata"],
-            serde_json::json!({}),
-            "invalid metadata should default to empty object, got: {}",
-            mem["metadata"]
+            meta.len(),
+            1,
+            "invalid input metadata should reduce to just agent_id, got: {:?}",
+            meta
+        );
+        assert!(
+            meta.contains_key("agent_id"),
+            "agent_id must be present after injection, got: {:?}",
+            meta
+        );
+        let id = meta["agent_id"].as_str().unwrap_or_default();
+        assert!(
+            !id.is_empty() && (id.starts_with("host:") || id.starts_with("anonymous:")),
+            "injected agent_id must use NHI-prefixed default, got: {id}"
         );
     }
 
@@ -3076,5 +3091,372 @@ fn test_cli_prefix_id_resolution() {
         .unwrap();
     assert!(!output.status.success(), "get after delete should fail");
 
+    let _ = std::fs::remove_file(&db_path);
+}
+
+// ===========================================================================
+// Task 1.2 — Agent Identity in Metadata (NHI-hardened)
+// ===========================================================================
+
+/// Helper: fresh DB path for each test.
+fn fresh_db() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("ai-memory-agentid-{}.db", uuid::Uuid::new_v4()))
+}
+
+/// Helper: extract `metadata.agent_id` from a stored-memory JSON payload.
+fn agent_id_of(v: &serde_json::Value) -> String {
+    v["metadata"]["agent_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+#[test]
+fn test_agentid_explicit_flag_wins() {
+    let db_path = fresh_db();
+    let binary = env!("CARGO_BIN_EXE_ai-memory");
+
+    let output = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--agent-id",
+            "alice",
+            "--json",
+            "store",
+            "-T",
+            "nhi-explicit",
+            "-c",
+            "hi",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "store failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stored: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(agent_id_of(&stored), "alice");
+    let _ = std::fs::remove_file(&db_path);
+}
+
+#[test]
+fn test_agentid_default_is_nhi_prefixed() {
+    let db_path = fresh_db();
+    let binary = env!("CARGO_BIN_EXE_ai-memory");
+
+    // Ensure no env override leaks in.
+    let output = cmd(binary)
+        .env_remove("AI_MEMORY_AGENT_ID")
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--json",
+            "store",
+            "-T",
+            "nhi-default",
+            "-c",
+            "hi",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stored: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let id = agent_id_of(&stored);
+    // One of: host:<sanitized-hostname>:pid-<pid>-<uuid8>
+    //      or anonymous:pid-<pid>-<uuid8>
+    assert!(
+        id.starts_with("host:") || id.starts_with("anonymous:"),
+        "expected NHI-prefixed default, got: {id}"
+    );
+    assert!(
+        id.contains(":pid-"),
+        "expected pid discriminator, got: {id}"
+    );
+    let _ = std::fs::remove_file(&db_path);
+}
+
+#[test]
+fn test_agentid_env_var_supplies_default() {
+    let db_path = fresh_db();
+    let binary = env!("CARGO_BIN_EXE_ai-memory");
+
+    let output = cmd(binary)
+        .env("AI_MEMORY_AGENT_ID", "charlie")
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--json",
+            "store",
+            "-T",
+            "nhi-env",
+            "-c",
+            "hi",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stored: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(agent_id_of(&stored), "charlie");
+    let _ = std::fs::remove_file(&db_path);
+}
+
+#[test]
+fn test_agentid_list_filter() {
+    let db_path = fresh_db();
+    let binary = env!("CARGO_BIN_EXE_ai-memory");
+
+    for (agent, title) in [("alice", "nhi-list-a"), ("bob", "nhi-list-b")] {
+        let out = cmd(binary)
+            .args([
+                "--db",
+                db_path.to_str().unwrap(),
+                "--agent-id",
+                agent,
+                "--json",
+                "store",
+                "-T",
+                title,
+                "-c",
+                "content",
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "store {agent} failed");
+    }
+
+    let out = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--json",
+            "list",
+            "--agent-id",
+            "alice",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let resp: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let memories = resp["memories"].as_array().expect("memories array");
+    assert_eq!(memories.len(), 1, "should return only alice's memory");
+    assert_eq!(agent_id_of(&memories[0]), "alice");
+    let _ = std::fs::remove_file(&db_path);
+}
+
+#[test]
+fn test_agentid_search_filter() {
+    let db_path = fresh_db();
+    let binary = env!("CARGO_BIN_EXE_ai-memory");
+
+    for (agent, title) in [("alice", "nhi_search_a"), ("bob", "nhi_search_b")] {
+        let out = cmd(binary)
+            .args([
+                "--db",
+                db_path.to_str().unwrap(),
+                "--agent-id",
+                agent,
+                "--json",
+                "store",
+                "-T",
+                title,
+                "-c",
+                "NhiSearchableToken body text",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "store {agent} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let out = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--json",
+            "search",
+            "NhiSearchableToken",
+            "--agent-id",
+            "bob",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let resp: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let results = resp["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 1, "should return only bob's result");
+    assert_eq!(agent_id_of(&results[0]), "bob");
+    let _ = std::fs::remove_file(&db_path);
+}
+
+#[test]
+fn test_agentid_update_preserves_provenance() {
+    let db_path = fresh_db();
+    let binary = env!("CARGO_BIN_EXE_ai-memory");
+
+    let out = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--agent-id",
+            "alice",
+            "--json",
+            "store",
+            "-T",
+            "nhi-update",
+            "-c",
+            "v1",
+        ])
+        .output()
+        .unwrap();
+    let stored: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let id = stored["id"].as_str().unwrap().to_string();
+    assert_eq!(agent_id_of(&stored), "alice");
+
+    // Update content as a different agent (content + confidence) — agent_id must not change.
+    let out = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--agent-id",
+            "bob",
+            "update",
+            &id,
+            "-c",
+            "v2",
+            "--confidence",
+            "0.9",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "update failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = cmd(binary)
+        .args(["--db", db_path.to_str().unwrap(), "--json", "get", &id])
+        .output()
+        .unwrap();
+    let got: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let mem = &got["memory"];
+    assert_eq!(agent_id_of(mem), "alice", "provenance must be immutable");
+    assert_eq!(mem["content"], "v2");
+    let _ = std::fs::remove_file(&db_path);
+}
+
+#[test]
+fn test_agentid_dedup_preserves_original() {
+    let db_path = fresh_db();
+    let binary = env!("CARGO_BIN_EXE_ai-memory");
+
+    // First store with alice.
+    let out = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--agent-id",
+            "alice",
+            "--json",
+            "store",
+            "-T",
+            "nhi-dedup",
+            "-n",
+            "ns-dedup",
+            "-c",
+            "original",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    // Second store with bob under same title+namespace (triggers dedup).
+    let out = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--agent-id",
+            "bob",
+            "--json",
+            "store",
+            "-T",
+            "nhi-dedup",
+            "-n",
+            "ns-dedup",
+            "-c",
+            "updated-by-bob",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    // List: should be exactly 1 memory, agent_id still alice.
+    let out = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--json",
+            "list",
+            "-n",
+            "ns-dedup",
+        ])
+        .output()
+        .unwrap();
+    let resp: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let memories = resp["memories"].as_array().unwrap();
+    assert_eq!(memories.len(), 1);
+    assert_eq!(agent_id_of(&memories[0]), "alice");
+    assert_eq!(memories[0]["content"], "updated-by-bob");
+    let _ = std::fs::remove_file(&db_path);
+}
+
+#[test]
+fn test_agentid_validator_rejects_bad_input() {
+    let db_path = fresh_db();
+    let binary = env!("CARGO_BIN_EXE_ai-memory");
+
+    // Shell metacharacter must be rejected before any DB write.
+    let out = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--agent-id",
+            "alice;rm",
+            "store",
+            "-T",
+            "nhi-bad-agent",
+            "-c",
+            "c",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "expected rejection for metachar");
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        err.contains("agent_id"),
+        "expected agent_id error, got: {err}"
+    );
+
+    // Whitespace must be rejected.
+    let out = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--agent-id",
+            "alice bob",
+            "store",
+            "-T",
+            "nhi-bad-agent-ws",
+            "-c",
+            "c",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "expected rejection for whitespace");
     let _ = std::fs::remove_file(&db_path);
 }
