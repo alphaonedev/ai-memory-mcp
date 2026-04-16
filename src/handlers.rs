@@ -751,6 +751,10 @@ pub struct ConsolidateBody {
     pub namespace: String,
     #[serde(default)]
     pub tier: Option<Tier>,
+    /// Optional `agent_id` for the consolidator (attributable on the result).
+    /// If unset, resolved from `X-Agent-Id` header or per-request anonymous id.
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 fn default_ns() -> String {
     "global".to_string()
@@ -758,6 +762,7 @@ fn default_ns() -> String {
 
 pub async fn consolidate_memories(
     State(state): State<Db>,
+    headers: HeaderMap,
     Json(body): Json<ConsolidateBody>,
 ) -> impl IntoResponse {
     if let Err(e) =
@@ -769,6 +774,18 @@ pub async fn consolidate_memories(
         )
             .into_response();
     }
+    let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+    let consolidator_agent_id =
+        match crate::identity::resolve_http_agent_id(body.agent_id.as_deref(), header_agent_id) {
+            Ok(id) => id,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": format!("invalid agent_id: {e}")})),
+                )
+                    .into_response();
+            }
+        };
     let lock = state.lock().await;
     let tier = body.tier.unwrap_or(Tier::Long);
     match db::consolidate(
@@ -779,6 +796,7 @@ pub async fn consolidate_memories(
         &body.namespace,
         &tier,
         "consolidation",
+        &consolidator_agent_id,
     ) {
         Ok(new_id) => (
             StatusCode::CREATED,

@@ -850,6 +850,7 @@ pub fn delete_link(conn: &Connection, source_id: &str, target_id: &str) -> Resul
 
 /// Consolidate multiple memories into one. Returns the new memory ID.
 /// Deletes the source memories and creates links from new → old (`derived_from`).
+#[allow(clippy::too_many_arguments)]
 pub fn consolidate(
     conn: &Connection,
     ids: &[String],
@@ -858,6 +859,7 @@ pub fn consolidate(
     namespace: &str,
     tier: &Tier,
     source: &str,
+    consolidator_agent_id: &str,
 ) -> Result<String> {
     let now = Utc::now().to_rfc3339();
     let new_id = uuid::Uuid::new_v4().to_string();
@@ -870,15 +872,29 @@ pub fn consolidate(
         let mut all_tags: Vec<String> = Vec::new();
         let mut total_access = 0i64;
         let mut merged_metadata = serde_json::Map::new();
+        // Collect original agent_ids separately — they go into
+        // `consolidated_from_agents` for forensic attribution.
+        // The consolidator's own agent_id becomes `agent_id` on the result.
+        let mut source_agent_ids: Vec<String> = Vec::new();
         for id in ids {
             match get(conn, id)? {
                 Some(mem) => {
                     max_priority = max_priority.max(mem.priority);
                     all_tags.extend(mem.tags);
                     total_access = total_access.saturating_add(mem.access_count);
-                    // Merge metadata: later values overwrite earlier ones on key conflict
+                    // Merge metadata: later values overwrite earlier ones on key conflict.
+                    // Intentionally SKIP `agent_id` to avoid last-write-wins forgery;
+                    // the consolidator's id is authoritative on the result.
                     if let serde_json::Value::Object(map) = mem.metadata {
                         for (k, v) in map {
+                            if k == "agent_id" {
+                                if let serde_json::Value::String(aid) = &v
+                                    && !source_agent_ids.contains(aid)
+                                {
+                                    source_agent_ids.push(aid.clone());
+                                }
+                                continue;
+                            }
                             if let Some(existing) = merged_metadata.get(&k)
                                 && std::mem::discriminant(existing) != std::mem::discriminant(&v)
                             {
@@ -911,6 +927,23 @@ pub fn consolidate(
                     .collect(),
             ),
         );
+        // NHI: the consolidator owns the new memory (authoritative agent_id);
+        // original authors are preserved as a separate array for forensics.
+        merged_metadata.insert(
+            "agent_id".to_string(),
+            serde_json::Value::String(consolidator_agent_id.to_string()),
+        );
+        if !source_agent_ids.is_empty() {
+            merged_metadata.insert(
+                "consolidated_from_agents".to_string(),
+                serde_json::Value::Array(
+                    source_agent_ids
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
+            );
+        }
         let merged_metadata_value = serde_json::Value::Object(merged_metadata);
         crate::validate::validate_metadata(&merged_metadata_value)
             .context("merged metadata exceeds size limit")?;
@@ -1357,7 +1390,20 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
             access_count = MAX(memories.access_count, excluded.access_count),
             expires_at = CASE WHEN excluded.tier = 'long' OR memories.tier = 'long' THEN NULL
                               ELSE COALESCE(excluded.expires_at, memories.expires_at) END,
-            metadata = CASE WHEN excluded.updated_at > memories.updated_at THEN excluded.metadata ELSE memories.metadata END",
+            -- Preserve metadata.agent_id across newer-wins merge (NHI provenance immutable).
+            metadata = CASE
+                WHEN json_extract(memories.metadata, '$.agent_id') IS NOT NULL
+                THEN json_set(
+                    CASE WHEN excluded.updated_at > memories.updated_at
+                         THEN excluded.metadata
+                         ELSE memories.metadata END,
+                    '$.agent_id',
+                    json_extract(memories.metadata, '$.agent_id')
+                )
+                ELSE CASE WHEN excluded.updated_at > memories.updated_at
+                          THEN excluded.metadata
+                          ELSE memories.metadata END
+            END",
         params![
             mem.id, mem.tier.as_str(), mem.namespace, mem.title, mem.content,
             tags_json, mem.priority, mem.confidence, mem.source, mem.access_count,
@@ -2247,6 +2293,7 @@ mod tests {
             "test",
             &Tier::Long,
             "test",
+            "test-consolidator",
         )
         .unwrap();
         // Original memories should be deleted
@@ -2835,6 +2882,7 @@ mod tests {
             "test",
             &Tier::Long,
             "consolidation",
+            "test-consolidator",
         )
         .unwrap();
 
@@ -2882,6 +2930,7 @@ mod tests {
             "test",
             &Tier::Long,
             "consolidation",
+            "test-consolidator",
         );
         let err = result.expect_err("consolidate should fail for oversized merged metadata");
         let msg = err.to_string();

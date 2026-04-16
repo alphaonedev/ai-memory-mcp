@@ -1179,6 +1179,7 @@ fn handle_consolidate(
     llm: Option<&OllamaClient>,
     embedder: Option<&Embedder>,
     vector_index: Option<&VectorIndex>,
+    mcp_client: Option<&str>,
 ) -> Result<Value, String> {
     let ids_arr = params["ids"]
         .as_array()
@@ -1229,6 +1230,11 @@ fn handle_consolidate(
         }
     }
 
+    // NHI: the caller (consolidator) owns the new memory's agent_id;
+    // source authors are preserved as a forensic array by db::consolidate.
+    let explicit_agent_id = params["agent_id"].as_str();
+    let consolidator_agent_id = crate::identity::resolve_agent_id(explicit_agent_id, mcp_client)
+        .map_err(|e| e.to_string())?;
     let new_id = db::consolidate(
         conn,
         &ids,
@@ -1237,6 +1243,7 @@ fn handle_consolidate(
         namespace,
         &Tier::Long,
         "consolidation",
+        &consolidator_agent_id,
     )
     .map_err(|e| e.to_string())?;
 
@@ -1623,7 +1630,7 @@ fn handle_request(
                 "memory_link" => handle_link(conn, arguments),
                 "memory_get_links" => handle_get_links(conn, arguments),
                 "memory_consolidate" => {
-                    handle_consolidate(conn, arguments, llm, embedder, vector_index)
+                    handle_consolidate(conn, arguments, llm, embedder, vector_index, mcp_client)
                 }
                 "memory_capabilities" => handle_capabilities(tier_config, reranker),
                 "memory_expand_query" => handle_expand_query(llm, arguments),

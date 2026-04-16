@@ -3540,3 +3540,298 @@ fn test_mcp_update_preserves_agent_id() {
 
     let _ = std::fs::remove_file(&db_path);
 }
+
+// ===========================================================================
+// Regression tests for the systematic sweep that followed T-3 discovery.
+// Each of these found a new real gap in additional metadata-writing paths.
+// ===========================================================================
+
+/// GAP 1: Import forgery — an attacker-crafted JSON file could claim any
+/// `metadata.agent_id` because `cmd_import` blindly trusted the imported
+/// value. Fix: restamp with caller's id by default; `--trust-source` preserves.
+#[test]
+fn test_import_restamps_agent_id_by_default() {
+    let db_path = fresh_db();
+    let binary = env!("CARGO_BIN_EXE_ai-memory");
+    let forge_path = std::env::temp_dir().join(format!("forge-{}.json", uuid::Uuid::new_v4()));
+
+    let forged = serde_json::json!({
+        "memories": [{
+            "id": "a0000000-0000-0000-0000-000000000001",
+            "tier": "long",
+            "namespace": "forge",
+            "title": "forgery",
+            "content": "claim",
+            "tags": [],
+            "priority": 9,
+            "confidence": 1.0,
+            "source": "user",
+            "access_count": 0,
+            "created_at": "2026-04-16T10:00:00+00:00",
+            "updated_at": "2026-04-16T10:00:00+00:00",
+            "metadata": {"agent_id": "alphaonedev@admin", "other": "data"}
+        }],
+        "links": []
+    });
+    std::fs::write(&forge_path, forged.to_string()).unwrap();
+
+    let out = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--agent-id",
+            "alice",
+            "import",
+        ])
+        .stdin(std::fs::File::open(&forge_path).unwrap())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    let out = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--json",
+            "list",
+            "-n",
+            "forge",
+        ])
+        .output()
+        .unwrap();
+    let resp: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let meta = &resp["memories"][0]["metadata"];
+    assert_eq!(
+        meta["agent_id"], "alice",
+        "import must restamp agent_id with caller's id, got: {meta}"
+    );
+    assert_eq!(
+        meta["imported_from_agent_id"], "alphaonedev@admin",
+        "original claim must be preserved for forensics"
+    );
+
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(&forge_path);
+}
+
+#[test]
+fn test_import_trust_source_preserves_agent_id() {
+    let db_path = fresh_db();
+    let binary = env!("CARGO_BIN_EXE_ai-memory");
+    let forge_path = std::env::temp_dir().join(format!("backup-{}.json", uuid::Uuid::new_v4()));
+
+    let backup = serde_json::json!({
+        "memories": [{
+            "id": "b0000000-0000-0000-0000-000000000001",
+            "tier": "long",
+            "namespace": "backup",
+            "title": "genuine-backup",
+            "content": "c",
+            "tags": [],
+            "priority": 5,
+            "confidence": 1.0,
+            "source": "user",
+            "access_count": 0,
+            "created_at": "2026-04-16T10:00:00+00:00",
+            "updated_at": "2026-04-16T10:00:00+00:00",
+            "metadata": {"agent_id": "original-alice"}
+        }],
+        "links": []
+    });
+    std::fs::write(&forge_path, backup.to_string()).unwrap();
+
+    let out = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--agent-id",
+            "restorer",
+            "import",
+            "--trust-source",
+        ])
+        .stdin(std::fs::File::open(&forge_path).unwrap())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    let out = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--json",
+            "list",
+            "-n",
+            "backup",
+        ])
+        .output()
+        .unwrap();
+    let resp: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        resp["memories"][0]["metadata"]["agent_id"], "original-alice",
+        "--trust-source must preserve agent_id from JSON"
+    );
+
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(&forge_path);
+}
+
+/// GAP 2: Consolidate attribution was nondeterministic (last-write-wins from
+/// merged metadata). Fix: consolidator's agent_id becomes authoritative;
+/// original authors preserved in `metadata.consolidated_from_agents`.
+#[test]
+fn test_consolidate_attributes_to_consolidator() {
+    let db_path = fresh_db();
+    let binary = env!("CARGO_BIN_EXE_ai-memory");
+
+    let mut ids = Vec::new();
+    for (agent, title) in [("alice", "cg-1"), ("bob", "cg-2"), ("charlie", "cg-3")] {
+        let out = cmd(binary)
+            .args([
+                "--db",
+                db_path.to_str().unwrap(),
+                "--agent-id",
+                agent,
+                "--json",
+                "store",
+                "-T",
+                title,
+                "-n",
+                "cg",
+                "-c",
+                "c",
+            ])
+            .output()
+            .unwrap();
+        let j: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        ids.push(j["id"].as_str().unwrap().to_string());
+    }
+
+    let out = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--agent-id",
+            "consolidator-dana",
+            "consolidate",
+            "--title",
+            "merged",
+            "--summary",
+            "A+B+C",
+            "--namespace",
+            "cg",
+            &ids.join(","),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "consolidate failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--json",
+            "list",
+            "-n",
+            "cg",
+        ])
+        .output()
+        .unwrap();
+    let resp: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let meta = &resp["memories"][0]["metadata"];
+
+    assert_eq!(
+        meta["agent_id"], "consolidator-dana",
+        "consolidator's agent_id must be authoritative"
+    );
+    let sources = meta["consolidated_from_agents"].as_array().unwrap();
+    let source_strs: Vec<&str> = sources.iter().filter_map(|v| v.as_str()).collect();
+    assert!(source_strs.contains(&"alice"));
+    assert!(source_strs.contains(&"bob"));
+    assert!(source_strs.contains(&"charlie"));
+
+    let _ = std::fs::remove_file(&db_path);
+}
+
+/// GAP 3: `cmd_mine` produced memories with no `agent_id`, making them orphan
+/// w.r.t. every filter. Fix: inject caller's id + `mined_from` source tag.
+#[test]
+fn test_mine_stamps_caller_agent_id() {
+    let db_path = fresh_db();
+    let binary = env!("CARGO_BIN_EXE_ai-memory");
+
+    // Minimal Claude conversations.json the miner can parse.
+    let mine_dir = std::env::temp_dir().join(format!("mine-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&mine_dir).unwrap();
+    // Claude's format is JSONL (one conversation object per line, no outer array).
+    let conv_path = mine_dir.join("conversations.jsonl");
+    let conv = serde_json::json!({
+        "uuid": "c1",
+        "name": "A test conversation",
+        "created_at": "2026-04-16T00:00:00Z",
+        "updated_at": "2026-04-16T00:00:00Z",
+        "chat_messages": [
+            {"uuid":"m1","text":"hello from claude","sender":"human","created_at":"2026-04-16T00:00:00Z"},
+            {"uuid":"m2","text":"hi back","sender":"assistant","created_at":"2026-04-16T00:00:01Z"},
+            {"uuid":"m3","text":"continue","sender":"human","created_at":"2026-04-16T00:00:02Z"}
+        ]
+    });
+    std::fs::write(&conv_path, format!("{conv}\n")).unwrap();
+
+    let out = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--agent-id",
+            "miner-eve",
+            "--json",
+            "mine",
+            "--format",
+            "claude",
+            "--min-messages",
+            "1",
+            conv_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "mine failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--json",
+            "list",
+            "-n",
+            "claude-export",
+        ])
+        .output()
+        .unwrap();
+    let resp: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let memories = resp["memories"].as_array().unwrap();
+    assert!(
+        !memories.is_empty(),
+        "mine should have imported at least 1 memory"
+    );
+    for mem in memories {
+        assert_eq!(
+            mem["metadata"]["agent_id"], "miner-eve",
+            "mined memories must carry caller's agent_id, got: {}",
+            mem["metadata"]
+        );
+        assert!(
+            mem["metadata"]["mined_from"].is_string(),
+            "mined memories must be tagged with mined_from source"
+        );
+    }
+
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_dir_all(&mine_dir);
+}
