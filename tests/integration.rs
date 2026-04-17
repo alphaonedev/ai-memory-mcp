@@ -8121,8 +8121,12 @@ fn test_serve_mtls_fingerprint_allowlist_accepts_only_known_peer() {
 
     // Wait for TLS bind. wait_for_health would fail here since curl
     // without a client cert gets rejected; so we poll via curl+mTLS.
+    // Windows CI is measurably slower at completing the first mTLS
+    // handshake (RSA key parse + custom verifier init + cert gen on
+    // the same runner); 30s is generous for Linux and correct for
+    // Windows.
     let mut ready = false;
-    for _ in 0..60 {
+    for _ in 0..300 {
         std::thread::sleep(std::time::Duration::from_millis(100));
         let out = std::process::Command::new("curl")
             .args([
