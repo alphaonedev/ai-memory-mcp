@@ -40,6 +40,9 @@ use crate::models::Tier;
 const DEFAULT_DB: &str = "ai-memory.db";
 const DEFAULT_PORT: u16 = 9077;
 const GC_INTERVAL_SECS: u64 = 1800;
+/// WAL auto-checkpoint cadence in the HTTP daemon. Bounds `*-wal`
+/// file growth between `SQLite`'s internal page-count checkpoints.
+const WAL_CHECKPOINT_INTERVAL_SECS: u64 = 600;
 
 fn id_short(id: &str) -> &str {
     let end = id.len().min(8);
@@ -701,6 +704,37 @@ async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &config::AppConfig
                 Ok(n) if n > 0 => tracing::info!("gc: purged {n} old archived memories"),
                 _ => {}
             }
+        }
+    });
+
+    // v0.6.0 GA: periodic WAL checkpoint. Under continuous writes the WAL
+    // file grows until SQLite's auto-checkpoint fires (every 1000 pages by
+    // default) — which is inconsistent timing and can leave the file at
+    // hundreds of MB between auto-checkpoints. A dedicated task running on
+    // a fixed cadence keeps the WAL bounded and makes operational storage
+    // behaviour predictable. We stagger from GC to avoid lock-contention
+    // bursts. See docs/ARCHITECTURAL_LIMITS.md for why this workaround is
+    // necessary in a single-connection daemon.
+    let checkpoint_state = state.clone();
+    tokio::spawn(async move {
+        // First checkpoint runs halfway through the GC interval so the two
+        // long-running maintenance tasks never overlap on cold start.
+        tokio::time::sleep(tokio::time::Duration::from_secs(
+            WAL_CHECKPOINT_INTERVAL_SECS / 2,
+        ))
+        .await;
+        loop {
+            {
+                let lock = checkpoint_state.lock().await;
+                match db::checkpoint(&lock.0) {
+                    Ok(()) => tracing::debug!("wal checkpoint: ok"),
+                    Err(e) => tracing::warn!("wal checkpoint failed: {e}"),
+                }
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(
+                WAL_CHECKPOINT_INTERVAL_SECS,
+            ))
+            .await;
         }
     });
 
