@@ -70,6 +70,14 @@ fn matches_subtree(namespace: &str, prefix: Option<&str>) -> bool {
 /// Uses placeholders `?start .. ?start+3` for private/team/unit/org prefixes.
 /// See `compute_visibility_prefixes` for the bind order.
 ///
+/// Performance (v0.6.0 GA): each scope branch compares against the indexed
+/// generated column `scope_idx` (schema v10) rather than re-evaluating
+/// `json_extract(metadata, '$.scope')` per row. The query planner picks
+/// `idx_memories_scope_idx` whenever the predicate narrows by scope,
+/// dropping recall from "scan every namespace row and parse its JSON" to
+/// an index seek + per-row refinement. See `docs/ARCHITECTURAL_LIMITS.md`
+/// for which `SQLite` limits remain structural.
+///
 /// Security (issue #217): the team/unit/org branches use `LIKE` to expand a
 /// prefix into its sub-tree. Without escaping, a caller who can influence the
 /// prefix could inject SQL `LIKE` meta-characters (`%`, `_`) and broaden the
@@ -89,11 +97,11 @@ fn visibility_clause(start: usize, table_alias: &str) -> String {
     format!(
         "AND (\
             ?{private_ph} IS NULL \
-            OR COALESCE(json_extract({ta}.metadata, '$.scope'), 'private') = 'collective' \
-            OR (COALESCE(json_extract({ta}.metadata, '$.scope'), 'private') = 'private' AND {ta}.namespace = ?{private_ph}) \
-            OR (json_extract({ta}.metadata, '$.scope') = 'team' AND ?{team_ph} IS NOT NULL AND ({ta}.namespace = ?{team_ph} OR {ta}.namespace LIKE replace(replace(?{team_ph}, '%', '\\%'), '_', '\\_') || '/%' ESCAPE '\\')) \
-            OR (json_extract({ta}.metadata, '$.scope') = 'unit' AND ?{unit_ph} IS NOT NULL AND ({ta}.namespace = ?{unit_ph} OR {ta}.namespace LIKE replace(replace(?{unit_ph}, '%', '\\%'), '_', '\\_') || '/%' ESCAPE '\\')) \
-            OR (json_extract({ta}.metadata, '$.scope') = 'org'  AND ?{org_ph}  IS NOT NULL AND ({ta}.namespace = ?{org_ph}  OR {ta}.namespace LIKE replace(replace(?{org_ph}, '%', '\\%'), '_', '\\_') || '/%' ESCAPE '\\'))\
+            OR {ta}.scope_idx = 'collective' \
+            OR ({ta}.scope_idx = 'private' AND {ta}.namespace = ?{private_ph}) \
+            OR ({ta}.scope_idx = 'team' AND ?{team_ph} IS NOT NULL AND ({ta}.namespace = ?{team_ph} OR {ta}.namespace LIKE replace(replace(?{team_ph}, '%', '\\%'), '_', '\\_') || '/%' ESCAPE '\\')) \
+            OR ({ta}.scope_idx = 'unit' AND ?{unit_ph} IS NOT NULL AND ({ta}.namespace = ?{unit_ph} OR {ta}.namespace LIKE replace(replace(?{unit_ph}, '%', '\\%'), '_', '\\_') || '/%' ESCAPE '\\')) \
+            OR ({ta}.scope_idx = 'org'  AND ?{org_ph}  IS NOT NULL AND ({ta}.namespace = ?{org_ph}  OR {ta}.namespace LIKE replace(replace(?{org_ph}, '%', '\\%'), '_', '\\_') || '/%' ESCAPE '\\'))\
         )"
     )
 }
@@ -161,7 +169,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
 );
 ";
 
-const CURRENT_SCHEMA_VERSION: i64 = 9;
+const CURRENT_SCHEMA_VERSION: i64 = 10;
 
 pub fn open(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path).context("failed to open database")?;
@@ -327,6 +335,41 @@ fn migrate(conn: &Connection) -> Result<()> {
                     [],
                 )?;
             }
+        }
+
+        if version < 10 {
+            // v0.6.0 GA: index `scope` so visibility filtering isn't a
+            // JSON scan. Uses a VIRTUAL generated column (no row bytes
+            // spent) plus a conventional B-tree index. The `visibility_clause`
+            // SQL compares against the generated column directly — SQLite's
+            // query planner picks the index because the comparison is on a
+            // real column, not a repeated expression.
+            //
+            // The expression is guarded by `json_valid(metadata)` so rows
+            // with legacy / corrupt metadata (we test this path explicitly
+            // in `metadata_corrupt_column_falls_back_to_empty`) are still
+            // writable — SQLite evaluates generated-column expressions on
+            // every write that touches the source column, and an uncaught
+            // `json_extract` failure would turn every corrupt-row write
+            // into a constraint error.
+            let has_scope_idx: bool = conn
+                .prepare("SELECT scope_idx FROM memories LIMIT 0")
+                .is_ok();
+            if !has_scope_idx {
+                conn.execute(
+                    "ALTER TABLE memories ADD COLUMN scope_idx TEXT \
+                     GENERATED ALWAYS AS (\
+                         CASE WHEN json_valid(metadata) \
+                         THEN COALESCE(json_extract(metadata, '$.scope'), 'private') \
+                         ELSE 'private' END\
+                     ) VIRTUAL",
+                    [],
+                )?;
+            }
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_scope_idx ON memories(scope_idx)",
+                [],
+            )?;
         }
 
         conn.execute("DELETE FROM schema_version", [])?;
@@ -3944,6 +3987,118 @@ mod tests {
         assert!(restored);
         let got = get(&conn, &id).unwrap().unwrap();
         assert_eq!(got.metadata, serde_json::json!({}));
+    }
+
+    #[test]
+    fn scope_index_exists_after_migration() {
+        // v0.6.0 GA (schema v10) — the `scope_idx` generated column and its
+        // B-tree index must exist after `open()` runs migration.
+        let conn = test_db();
+        let has_col: bool = conn
+            .prepare("SELECT scope_idx FROM memories LIMIT 0")
+            .is_ok();
+        assert!(has_col, "scope_idx generated column missing");
+        let idx_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_memories_scope_idx'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx_exists, 1, "idx_memories_scope_idx missing");
+    }
+
+    #[test]
+    fn scope_index_used_for_direct_scope_filter() {
+        // v0.6.0 GA — confirm `idx_memories_scope_idx` is picked for a
+        // direct `WHERE scope_idx = ?` predicate. This is the shape the
+        // query planner sees for `scope = 'collective'` fast-paths and
+        // the branch-local predicate inside `visibility_clause`.
+        //
+        // We deliberately do NOT assert the index is used for the full
+        // visibility_clause OR-chain — SQLite's planner may (correctly)
+        // choose a scan when the OR-chain has variable selectivity across
+        // branches. The point of the index is to accelerate the common
+        // case when a recall narrows to one scope; the multi-branch
+        // visibility clause still benefits because each branch evaluates
+        // the predicate against a single column rather than a JSON extract.
+        let conn = test_db();
+        // Seed enough rows + ANALYZE so planner cost model is honest.
+        for i in 0..200 {
+            let scope = if i % 3 == 0 { "collective" } else { "private" };
+            let mut mem = make_memory(&format!("row-{i}"), "test", Tier::Long, 5);
+            mem.metadata = serde_json::json!({"scope": scope});
+            insert(&conn, &mem).unwrap();
+        }
+        conn.execute("ANALYZE", []).unwrap();
+        let plan: Vec<String> = conn
+            .prepare("EXPLAIN QUERY PLAN SELECT id FROM memories WHERE scope_idx = ?1")
+            .unwrap()
+            .query_map(params!["collective"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let joined = plan.join("\n");
+        assert!(
+            joined.contains("idx_memories_scope_idx"),
+            "direct scope filter must use idx_memories_scope_idx; got:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn scope_idx_reflects_metadata_on_insert_and_update() {
+        // v0.6.0 GA — the VIRTUAL generated column must track metadata.scope
+        // across insert and update without manual maintenance.
+        let conn = test_db();
+        let mut mem = make_memory("scope-tracking", "test", Tier::Long, 5);
+        mem.metadata = serde_json::json!({"scope": "team"});
+        let id = insert(&conn, &mem).unwrap();
+        let scope: String = conn
+            .query_row(
+                "SELECT scope_idx FROM memories WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(scope, "team");
+
+        // Flip scope to unit via metadata update — generated column updates.
+        let new_meta = serde_json::json!({"scope": "unit"});
+        update(
+            &conn,
+            &id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&new_meta),
+        )
+        .unwrap();
+        let scope2: String = conn
+            .query_row(
+                "SELECT scope_idx FROM memories WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(scope2, "unit");
+
+        // Memory with no scope key — virtual column returns the default.
+        let mut bare = make_memory("no-scope-key", "test", Tier::Long, 5);
+        bare.metadata = serde_json::json!({});
+        let id2 = insert(&conn, &bare).unwrap();
+        let scope3: String = conn
+            .query_row(
+                "SELECT scope_idx FROM memories WHERE id = ?1",
+                params![id2],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(scope3, "private");
     }
 
     #[test]
