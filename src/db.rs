@@ -824,6 +824,65 @@ pub fn search(
         .map_err(Into::into)
 }
 
+/// Task 1.12 — proximity boost applied to a memory's score based on its
+/// depth distance from the queried agent namespace. Uses the formula
+/// `1 / (1 + depth_distance * 0.3)` per spec. Distance 0 = full strength
+/// (1.0), each step up the hierarchy dampens linearly.
+#[must_use]
+pub fn proximity_boost(agent_ns: &str, memory_ns: &str) -> f64 {
+    let agent_depth = crate::models::namespace_depth(agent_ns);
+    let memory_depth = crate::models::namespace_depth(memory_ns);
+    let distance = agent_depth.saturating_sub(memory_depth);
+    #[allow(clippy::cast_precision_loss)]
+    let d = distance as f64;
+    1.0 / (1.0 + d * 0.3)
+}
+
+/// Task 1.12 — SQL fragment + boolean indicating whether hierarchy
+/// expansion is in play. When active the `namespace` SQL param binds
+/// NULL (so `?N IS NULL OR m.namespace = ?N` passes trivially) and a
+/// separate `AND m.namespace IN (<ancestors>)` clause narrows to the
+/// hierarchy. When inactive the returned fragment is empty.
+///
+/// Ancestor strings are interpolated because `SQLite` `IN` with a
+/// variable-length positional list is awkward, and the inputs come
+/// from `namespace_ancestors()` → `validate_namespace`-approved
+/// strings. Single-quote doubling is applied defensively.
+fn hierarchy_in_clause(namespace: Option<&str>) -> (Option<String>, bool) {
+    let Some(ns) = namespace else {
+        return (None, false);
+    };
+    if !ns.contains('/') {
+        return (None, false);
+    }
+    let ancestors = crate::models::namespace_ancestors(ns);
+    if ancestors.is_empty() {
+        return (None, false);
+    }
+    let quoted: Vec<String> = ancestors
+        .iter()
+        .map(|a| format!("'{}'", a.replace('\'', "''")))
+        .collect();
+    (
+        Some(format!("AND m.namespace IN ({})", quoted.join(","))),
+        true,
+    )
+}
+
+/// Task 1.12 — apply proximity boost to scored memories ranked against
+/// an agent's hierarchical namespace. Re-sorts by boosted score.
+fn apply_proximity_boost(scored: Vec<(Memory, f64)>, agent_ns: &str) -> Vec<(Memory, f64)> {
+    let mut boosted: Vec<(Memory, f64)> = scored
+        .into_iter()
+        .map(|(mem, score)| {
+            let boost = proximity_boost(agent_ns, &mem.namespace);
+            (mem, score * boost)
+        })
+        .collect();
+    boosted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    boosted
+}
+
 /// Task 1.11 — rough token estimate for a memory. Uses the "~4 chars per
 /// token" heuristic on `title + content`. Deliberately byte-length-based:
 /// fast, deterministic, and correct enough for budget gating.
@@ -879,6 +938,13 @@ pub fn recall(
     let fts_query = sanitize_fts_query(context, true);
     let (vis_p, vis_t, vis_u, vis_o) = compute_visibility_prefixes(as_agent);
 
+    // Task 1.12: hierarchy expansion. If `namespace` is hierarchical (contains
+    // `/`), broaden the filter to the full ancestor chain. Flat namespaces
+    // keep exact-match semantics (backward compat).
+    let (hierarchy_in, hierarchy_active) = hierarchy_in_clause(namespace);
+    let hierarchy_fragment = hierarchy_in.unwrap_or_default();
+    let effective_namespace = if hierarchy_active { None } else { namespace };
+
     let sql = format!(
         "SELECT m.id, m.tier, m.namespace, m.title, m.content, m.tags, m.priority,
                 m.confidence, m.source, m.access_count, m.created_at, m.updated_at,
@@ -894,6 +960,7 @@ pub fn recall(
          JOIN memories m ON m.rowid = fts.rowid
          WHERE memories_fts MATCH ?1
            AND (?2 IS NULL OR m.namespace = ?2)
+           {hierarchy_fragment}
            AND (m.expires_at IS NULL OR m.expires_at > ?3)
            AND (?4 IS NULL OR EXISTS (SELECT 1 FROM json_each(m.tags) WHERE json_each.value = ?4))
            AND (?5 IS NULL OR m.created_at >= ?5)
@@ -907,7 +974,7 @@ pub fn recall(
     let rows = stmt.query_map(
         params![
             fts_query,
-            namespace,
+            effective_namespace,
             now,
             tags_filter,
             since,
@@ -926,8 +993,15 @@ pub fn recall(
     )?;
     let results: Vec<(Memory, f64)> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
 
-    // Task 1.11: apply optional token budget in rank order.
-    let (budgeted, tokens_used) = apply_token_budget(results, budget_tokens);
+    // Task 1.12: proximity boost when hierarchy expansion is active.
+    let boosted = if let (true, Some(anchor)) = (hierarchy_active, namespace) {
+        apply_proximity_boost(results, anchor)
+    } else {
+        results
+    };
+
+    // Task 1.11: apply optional token budget in rank order (AFTER proximity).
+    let (budgeted, tokens_used) = apply_token_budget(boosted, budget_tokens);
 
     // Touch all recalled memories that SURVIVED the budget cut — no sense
     // bumping access counts on memories the caller will never see.
@@ -1880,6 +1954,28 @@ pub fn recall_hybrid(
     let prefixes = compute_visibility_prefixes(as_agent);
     let (vis_p, vis_t, vis_u, vis_o) = prefixes.clone();
 
+    // Task 1.12: hierarchy expansion (same logic as `recall`). Hierarchical
+    // `namespace` broadens filter to ancestor chain; flat namespaces stay
+    // exact-match.
+    let (fts_hierarchy_in, hierarchy_active) = hierarchy_in_clause(namespace);
+    let fts_hierarchy_fragment = fts_hierarchy_in.unwrap_or_default();
+    // Semantic stmt has no `m.` alias and binds at slot 1 — compute separately.
+    let sem_hierarchy_fragment = if hierarchy_active {
+        if let Some(ns) = namespace {
+            let ancestors = crate::models::namespace_ancestors(ns);
+            let quoted: Vec<String> = ancestors
+                .iter()
+                .map(|a| format!("'{}'", a.replace('\'', "''")))
+                .collect();
+            format!("AND memories.namespace IN ({})", quoted.join(","))
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+    let effective_namespace = if hierarchy_active { None } else { namespace };
+
     // Step 1: Get FTS candidates (up to 3x limit to have a good pool)
     let fts_limit = (limit * 3).max(30);
     let fts_sql = format!(
@@ -1895,6 +1991,7 @@ pub fn recall_hybrid(
          JOIN memories m ON m.rowid = fts.rowid
          WHERE memories_fts MATCH ?1
            AND (?2 IS NULL OR m.namespace = ?2)
+           {fts_hierarchy_fragment}
            AND (m.expires_at IS NULL OR m.expires_at > ?3)
            AND (?4 IS NULL OR EXISTS (SELECT 1 FROM json_each(m.tags) WHERE json_each.value = ?4))
            AND (?5 IS NULL OR m.created_at >= ?5)
@@ -1914,6 +2011,7 @@ pub fn recall_hybrid(
          FROM memories
          WHERE embedding IS NOT NULL
            AND (?1 IS NULL OR namespace = ?1)
+           {sem_hierarchy_fragment}
            AND (expires_at IS NULL OR expires_at > ?2)
            AND (?3 IS NULL OR EXISTS (SELECT 1 FROM json_each(memories.tags) WHERE json_each.value = ?3))
            AND (?4 IS NULL OR created_at >= ?4)
@@ -1929,7 +2027,7 @@ pub fn recall_hybrid(
     let fts_rows = fts_stmt.query_map(
         params![
             fts_query,
-            namespace,
+            effective_namespace,
             now,
             tags_filter,
             since,
@@ -1977,11 +2075,18 @@ pub fn recall_hybrid(
             if cosine > 0.3
                 && let Some(mem) = get(conn, &hit.id)?
             {
-                // Apply namespace/expiry/tag filters
-                if let Some(ns) = namespace
-                    && mem.namespace != ns
-                {
-                    continue;
+                // Apply namespace/expiry/tag filters. Task 1.12: when
+                // hierarchy expansion is active, allow any ancestor match
+                // (namespace_ancestors gives us the set); otherwise exact.
+                if let Some(ns) = namespace {
+                    if hierarchy_active {
+                        let ancestors = crate::models::namespace_ancestors(ns);
+                        if !ancestors.iter().any(|a| a == &mem.namespace) {
+                            continue;
+                        }
+                    } else if mem.namespace != ns {
+                        continue;
+                    }
                 }
                 if let Some(exp) = &mem.expires_at
                     && exp.as_str() <= now.as_str()
@@ -2014,7 +2119,7 @@ pub fn recall_hybrid(
         // Fallback: linear scan over all embeddings
         let sem_rows = sem_stmt.query_map(
             params![
-                namespace,
+                effective_namespace,
                 now,
                 tags_filter,
                 since,
@@ -2083,8 +2188,15 @@ pub fn recall_hybrid(
     results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     results.truncate(limit);
 
-    // Task 1.11: apply token budget in rank order.
-    let (budgeted, tokens_used) = apply_token_budget(results, budget_tokens);
+    // Task 1.12: proximity boost (if hierarchy expansion is active).
+    let boosted = if let (true, Some(anchor)) = (hierarchy_active, namespace) {
+        apply_proximity_boost(results, anchor)
+    } else {
+        results
+    };
+
+    // Task 1.11: apply token budget in rank order (AFTER proximity).
+    let (budgeted, tokens_used) = apply_token_budget(boosted, budget_tokens);
 
     // Touch surviving memories only.
     for (mem, _) in &budgeted {
