@@ -132,6 +132,29 @@ enum Command {
     Archive(ArchiveArgs),
     /// Register or list agents (Task 1.3)
     Agents(AgentsArgs),
+    /// List / approve / reject governance-pending actions (Task 1.9)
+    Pending(PendingArgs),
+}
+
+#[derive(Args)]
+struct PendingArgs {
+    #[command(subcommand)]
+    action: PendingAction,
+}
+
+#[derive(Subcommand)]
+enum PendingAction {
+    /// List pending actions (optionally filter by status).
+    List {
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
+    /// Approve a pending action by id.
+    Approve { id: String },
+    /// Reject a pending action by id.
+    Reject { id: String },
 }
 
 #[derive(Args)]
@@ -537,8 +560,8 @@ async fn main() -> Result<()> {
         Command::Search(a) => cmd_search(&db_path, &a, j, &app_config),
         Command::Get(a) => cmd_get(&db_path, &a, j),
         Command::List(a) => cmd_list(&db_path, &a, j, &app_config),
-        Command::Delete(a) => cmd_delete(&db_path, &a, j),
-        Command::Promote(a) => cmd_promote(&db_path, &a, j),
+        Command::Delete(a) => cmd_delete(&db_path, &a, j, cli_agent_id.as_deref()),
+        Command::Promote(a) => cmd_promote(&db_path, &a, j, cli_agent_id.as_deref()),
         Command::Forget(a) => cmd_forget(&db_path, &a, j),
         Command::Link(a) => cmd_link(&db_path, &a, j),
         Command::Consolidate(a) => cmd_consolidate(&db_path, a, j, cli_agent_id.as_deref()),
@@ -571,6 +594,7 @@ async fn main() -> Result<()> {
         Command::Mine(a) => cmd_mine(&db_path, a, j, &app_config, cli_agent_id.as_deref()),
         Command::Archive(a) => cmd_archive(&db_path, a, j),
         Command::Agents(a) => cmd_agents(&db_path, a, j),
+        Command::Pending(a) => cmd_pending(&db_path, a, j, cli_agent_id.as_deref()),
     };
 
     // WAL checkpoint after write commands to prevent unbounded WAL growth
@@ -584,6 +608,7 @@ async fn main() -> Result<()> {
     result
 }
 
+#[allow(clippy::too_many_lines)]
 async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &config::AppConfig) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -671,6 +696,15 @@ async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &config::AppConfig
         .route("/api/v1/archive/stats", get(handlers::archive_stats))
         .route("/api/v1/agents", get(handlers::list_agents))
         .route("/api/v1/agents", post(handlers::register_agent))
+        .route("/api/v1/pending", get(handlers::list_pending))
+        .route(
+            "/api/v1/pending/{id}/approve",
+            post(handlers::approve_pending),
+        )
+        .route(
+            "/api/v1/pending/{id}/reject",
+            post(handlers::reject_pending),
+        )
         .layer(axum::middleware::from_fn_with_state(
             api_key_state,
             handlers::api_key_auth,
@@ -693,6 +727,7 @@ async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &config::AppConfig
 
 // --- CLI ---
 
+#[allow(clippy::too_many_lines)]
 fn cmd_store(
     db_path: &Path,
     args: StoreArgs,
@@ -745,13 +780,58 @@ fn cmd_store(
     let agent_id = identity::resolve_agent_id(cli_agent_id, None)?;
     let mut metadata = models::default_metadata();
     if let Some(obj) = metadata.as_object_mut() {
-        obj.insert("agent_id".to_string(), serde_json::Value::String(agent_id));
+        obj.insert(
+            "agent_id".to_string(),
+            serde_json::Value::String(agent_id.clone()),
+        );
     }
     // #151 scope: validate + merge into metadata
     if let Some(ref s) = args.scope {
         validate::validate_scope(s)?;
         if let Some(obj) = metadata.as_object_mut() {
             obj.insert("scope".to_string(), serde_json::Value::String(s.clone()));
+        }
+    }
+
+    // Task 1.9: governance enforcement (store-side)
+    {
+        use models::{GovernanceDecision, GovernedAction};
+        let payload = serde_json::json!({
+            "title": &args.title,
+            "namespace": &namespace,
+            "tier": &args.tier,
+        });
+        match db::enforce_governance(
+            &conn,
+            GovernedAction::Store,
+            &namespace,
+            &agent_id,
+            None,
+            None,
+            &payload,
+        )? {
+            GovernanceDecision::Allow => {}
+            GovernanceDecision::Deny(reason) => {
+                eprintln!("store denied by governance: {reason}");
+                std::process::exit(1);
+            }
+            GovernanceDecision::Pending(pending_id) => {
+                if json_out {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "status": "pending",
+                            "pending_id": pending_id,
+                            "reason": "governance requires approval",
+                            "action": "store",
+                            "namespace": &namespace,
+                        })
+                    );
+                } else {
+                    println!("store queued for approval: pending_id={pending_id} ns={namespace}");
+                }
+                return Ok(());
+            }
         }
     }
 
@@ -1218,24 +1298,73 @@ fn cmd_list(
     Ok(())
 }
 
-fn cmd_delete(db_path: &Path, args: &DeleteArgs, json_out: bool) -> Result<()> {
+fn cmd_delete(
+    db_path: &Path,
+    args: &DeleteArgs,
+    json_out: bool,
+    cli_agent_id: Option<&str>,
+) -> Result<()> {
     validate::validate_id(&args.id)?;
     let conn = db::open(db_path)?;
-    // Try exact delete first; if not found, resolve prefix to get the full ID
-    if db::delete(&conn, &args.id)? {
-        if json_out {
-            println!("{}", serde_json::json!({"deleted": true, "id": args.id}));
-        } else {
-            println!("deleted: {}", args.id);
-        }
-    } else if let Some(mem) = db::get_by_prefix(&conn, &args.id)? {
-        let full_id = mem.id.clone();
-        if db::delete(&conn, &full_id)? {
-            if json_out {
-                println!("{}", serde_json::json!({"deleted": true, "id": full_id}));
-            } else {
-                println!("deleted: {full_id}");
+    // Resolve the target first for governance owner context.
+    let target = db::resolve_id(&conn, &args.id)?;
+    let Some(target) = target else {
+        eprintln!("not found: {}", args.id);
+        std::process::exit(1);
+    };
+
+    // Task 1.9: governance enforcement (delete-side)
+    {
+        use models::{GovernanceDecision, GovernedAction};
+        let caller_agent_id = identity::resolve_agent_id(cli_agent_id, None)?;
+        let mem_owner = target
+            .metadata
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let payload = serde_json::json!({"id": target.id, "title": target.title});
+        match db::enforce_governance(
+            &conn,
+            GovernedAction::Delete,
+            &target.namespace,
+            &caller_agent_id,
+            Some(&target.id),
+            mem_owner.as_deref(),
+            &payload,
+        )? {
+            GovernanceDecision::Allow => {}
+            GovernanceDecision::Deny(reason) => {
+                eprintln!("delete denied by governance: {reason}");
+                std::process::exit(1);
             }
+            GovernanceDecision::Pending(pending_id) => {
+                if json_out {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "status": "pending",
+                            "pending_id": pending_id,
+                            "reason": "governance requires approval",
+                            "action": "delete",
+                            "memory_id": target.id,
+                        })
+                    );
+                } else {
+                    println!(
+                        "delete queued for approval: pending_id={pending_id} id={}",
+                        target.id
+                    );
+                }
+                return Ok(());
+            }
+        }
+    }
+
+    if db::delete(&conn, &target.id)? {
+        if json_out {
+            println!("{}", serde_json::json!({"deleted": true, "id": target.id}));
+        } else {
+            println!("deleted: {}", target.id);
         }
     } else {
         eprintln!("not found: {}", args.id);
@@ -1244,21 +1373,78 @@ fn cmd_delete(db_path: &Path, args: &DeleteArgs, json_out: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_promote(db_path: &Path, args: &PromoteArgs, json_out: bool) -> Result<()> {
+#[allow(clippy::too_many_lines)]
+fn cmd_promote(
+    db_path: &Path,
+    args: &PromoteArgs,
+    json_out: bool,
+    cli_agent_id: Option<&str>,
+) -> Result<()> {
     validate::validate_id(&args.id)?;
     if let Some(ref to_ns) = args.to_namespace {
         validate::validate_namespace(to_ns)?;
     }
     let conn = db::open(db_path)?;
-    // Resolve prefix if exact ID not found
-    let resolved_id = if db::get(&conn, &args.id)?.is_some() {
-        args.id.clone()
-    } else if let Some(mem) = db::get_by_prefix(&conn, &args.id)? {
-        mem.id
+    // Resolve target; capture the memory for governance owner context.
+    let target = if let Some(m) = db::get(&conn, &args.id)? {
+        m
+    } else if let Some(m) = db::get_by_prefix(&conn, &args.id)? {
+        m
     } else {
         eprintln!("not found: {}", args.id);
         std::process::exit(1);
     };
+    let resolved_id = target.id.clone();
+
+    // Task 1.9: governance enforcement (promote-side)
+    {
+        use models::{GovernanceDecision, GovernedAction};
+        let caller_agent_id = identity::resolve_agent_id(cli_agent_id, None)?;
+        let mem_owner = target
+            .metadata
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let payload = serde_json::json!({
+            "id": resolved_id,
+            "to_namespace": args.to_namespace,
+        });
+        match db::enforce_governance(
+            &conn,
+            GovernedAction::Promote,
+            &target.namespace,
+            &caller_agent_id,
+            Some(&resolved_id),
+            mem_owner.as_deref(),
+            &payload,
+        )? {
+            GovernanceDecision::Allow => {}
+            GovernanceDecision::Deny(reason) => {
+                eprintln!("promote denied by governance: {reason}");
+                std::process::exit(1);
+            }
+            GovernanceDecision::Pending(pending_id) => {
+                if json_out {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "status": "pending",
+                            "pending_id": pending_id,
+                            "reason": "governance requires approval",
+                            "action": "promote",
+                            "memory_id": resolved_id,
+                        })
+                    );
+                } else {
+                    println!(
+                        "promote queued for approval: pending_id={pending_id} id={resolved_id}"
+                    );
+                }
+                return Ok(());
+            }
+        }
+    }
+
     // Task 1.7: vertical (namespace) promotion when --to-namespace is set
     if let Some(ref to_ns) = args.to_namespace {
         let clone_id = db::promote_to_namespace(&conn, &resolved_id, to_ns)?;
@@ -2187,6 +2373,76 @@ fn cmd_agents(db_path: &Path, args: AgentsArgs, json_out: bool) -> Result<()> {
                         caps.join(",")
                     }
                 );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_pending(
+    db_path: &Path,
+    args: PendingArgs,
+    json_out: bool,
+    cli_agent_id: Option<&str>,
+) -> Result<()> {
+    let conn = db::open(db_path)?;
+    match args.action {
+        PendingAction::List { status, limit } => {
+            let items = db::list_pending_actions(&conn, status.as_deref(), limit)?;
+            if json_out {
+                println!(
+                    "{}",
+                    serde_json::json!({"count": items.len(), "pending": items})
+                );
+            } else if items.is_empty() {
+                println!("no pending actions");
+            } else {
+                for item in &items {
+                    println!(
+                        "[{}] {} ns={} action={} by={} ({})",
+                        id_short(&item.id),
+                        item.status,
+                        item.namespace,
+                        item.action_type,
+                        item.requested_by,
+                        item.requested_at
+                    );
+                }
+                println!("{} pending action(s)", items.len());
+            }
+        }
+        PendingAction::Approve { id } => {
+            validate::validate_id(&id)?;
+            let agent = identity::resolve_agent_id(cli_agent_id, None)?;
+            let ok = db::decide_pending_action(&conn, &id, true, &agent)?;
+            if !ok {
+                eprintln!("pending action not found or already decided: {id}");
+                std::process::exit(1);
+            }
+            if json_out {
+                println!(
+                    "{}",
+                    serde_json::json!({"approved": true, "id": id, "decided_by": agent})
+                );
+            } else {
+                println!("approved: {id} (by {agent})");
+            }
+        }
+        PendingAction::Reject { id } => {
+            validate::validate_id(&id)?;
+            let agent = identity::resolve_agent_id(cli_agent_id, None)?;
+            let ok = db::decide_pending_action(&conn, &id, false, &agent)?;
+            if !ok {
+                eprintln!("pending action not found or already decided: {id}");
+                std::process::exit(1);
+            }
+            if json_out {
+                println!(
+                    "{}",
+                    serde_json::json!({"rejected": true, "id": id, "decided_by": agent})
+                );
+            } else {
+                println!("rejected: {id} (by {agent})");
             }
         }
     }

@@ -8,8 +8,9 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::models::{
-    AGENTS_NAMESPACE, AgentRegistration, Memory, MemoryLink, NamespaceCount, PROMOTION_THRESHOLD,
-    Stats, Tier, TierCount, namespace_ancestors,
+    AGENTS_NAMESPACE, AgentRegistration, GovernanceDecision, GovernanceLevel, GovernancePolicy,
+    GovernedAction, Memory, MemoryLink, NamespaceCount, PROMOTION_THRESHOLD, PendingAction, Stats,
+    Tier, TierCount, namespace_ancestors,
 };
 
 /// Computed 4-tuple of visibility prefixes for an agent position (Task 1.5).
@@ -149,7 +150,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
 );
 ";
 
-const CURRENT_SCHEMA_VERSION: i64 = 7;
+const CURRENT_SCHEMA_VERSION: i64 = 8;
 
 pub fn open(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path).context("failed to open database")?;
@@ -284,6 +285,25 @@ fn migrate(conn: &Connection) -> Result<()> {
                     [],
                 )?;
             }
+        }
+        if version < 8 {
+            // Task 1.9: pending_actions table for governance-queued operations
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS pending_actions (
+                    id            TEXT PRIMARY KEY,
+                    action_type   TEXT NOT NULL,
+                    memory_id     TEXT,
+                    namespace     TEXT NOT NULL,
+                    payload       TEXT NOT NULL DEFAULT '{}',
+                    requested_by  TEXT NOT NULL,
+                    requested_at  TEXT NOT NULL,
+                    status        TEXT NOT NULL DEFAULT 'pending',
+                    decided_by    TEXT,
+                    decided_at    TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_pending_status    ON pending_actions(status);
+                CREATE INDEX IF NOT EXISTS idx_pending_namespace ON pending_actions(namespace);",
+            )?;
         }
 
         conn.execute("DELETE FROM schema_version", [])?;
@@ -2120,6 +2140,242 @@ pub fn clear_namespace_standard(conn: &Connection, namespace: &str) -> Result<bo
         params![namespace],
     )?;
     Ok(changed > 0)
+}
+
+// ---------------------------------------------------------------------------
+// Task 1.9 — governance enforcement + pending_actions CRUD
+// ---------------------------------------------------------------------------
+
+/// Resolve the explicit governance policy for a namespace from its standard
+/// memory's `metadata.governance`. Returns `None` when no policy is set —
+/// enforcement is **opt-in**, so namespaces without explicit policy skip
+/// every governance check (historical behavior preserved). The "default
+/// policy" (`{ write: Any, promote: Any, delete: Owner, approver: Human }`)
+/// is surfaced by `get_standard` for display purposes only; it does not
+/// gate operations.
+pub fn resolve_governance_policy(conn: &Connection, namespace: &str) -> Option<GovernancePolicy> {
+    let standard_id = get_namespace_standard(conn, namespace).ok()??;
+    let mem = get(conn, &standard_id).ok()??;
+    match GovernancePolicy::from_metadata(&mem.metadata) {
+        Some(Ok(p)) => Some(p),
+        _ => None,
+    }
+}
+
+/// Return true if `agent_id` matches a registered agent in `_agents`.
+fn is_registered_agent(conn: &Connection, agent_id: &str) -> bool {
+    let title = format!("agent:{agent_id}");
+    conn.query_row(
+        "SELECT 1 FROM memories WHERE namespace = ?1 AND title = ?2",
+        params![AGENTS_NAMESPACE, &title],
+        |r| r.get::<_, i64>(0),
+    )
+    .is_ok()
+}
+
+/// Evaluate a governance level against caller context.
+/// - `memory_owner`: the existing memory's `metadata.agent_id` (delete/promote paths).
+///   Pass `None` for store operations.
+/// - `namespace_owner`: the `metadata.agent_id` of the namespace's standard memory,
+///   used as the "owner" for store operations. Resolved once by the caller.
+fn evaluate_level(
+    conn: &Connection,
+    level: &GovernanceLevel,
+    agent_id: &str,
+    memory_owner: Option<&str>,
+    namespace_owner: Option<&str>,
+) -> GovernanceDecision {
+    match level {
+        GovernanceLevel::Any => GovernanceDecision::Allow,
+        GovernanceLevel::Registered => {
+            if is_registered_agent(conn, agent_id) {
+                GovernanceDecision::Allow
+            } else {
+                GovernanceDecision::Deny(format!(
+                    "governance: caller '{agent_id}' is not a registered agent"
+                ))
+            }
+        }
+        GovernanceLevel::Owner => {
+            let owner = memory_owner.or(namespace_owner);
+            match owner {
+                Some(o) if o == agent_id => GovernanceDecision::Allow,
+                Some(o) => GovernanceDecision::Deny(format!(
+                    "governance: caller '{agent_id}' is not the owner ('{o}')"
+                )),
+                None => GovernanceDecision::Deny(
+                    "governance: owner-level action has no resolvable owner".into(),
+                ),
+            }
+        }
+        GovernanceLevel::Approve => {
+            // Caller translates this into a queued pending_action — the enforcement
+            // helpers below own the queueing so the db layer is the single source
+            // of truth for pending ids.
+            GovernanceDecision::Pending(String::new())
+        }
+    }
+}
+
+/// Resolve the namespace-owner (`metadata.agent_id` of the namespace's
+/// standard memory) used for `Owner`-level store checks.
+fn namespace_owner(conn: &Connection, namespace: &str) -> Option<String> {
+    let standard_id = get_namespace_standard(conn, namespace).ok().flatten()?;
+    let mem = get(conn, &standard_id).ok().flatten()?;
+    mem.metadata
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+/// Enforce governance for a `GovernedAction`. On [`GovernanceDecision::Pending`],
+/// a row is inserted into `pending_actions` and the returned `pending_id` is
+/// embedded in the decision.
+pub fn enforce_governance(
+    conn: &Connection,
+    action: GovernedAction,
+    namespace: &str,
+    agent_id: &str,
+    memory_id: Option<&str>,
+    memory_owner: Option<&str>,
+    payload: &serde_json::Value,
+) -> Result<GovernanceDecision> {
+    // Opt-in enforcement: namespaces without an explicit policy are unaffected.
+    let Some(policy) = resolve_governance_policy(conn, namespace) else {
+        return Ok(GovernanceDecision::Allow);
+    };
+    let level = match action {
+        GovernedAction::Store => &policy.write,
+        GovernedAction::Delete => &policy.delete,
+        GovernedAction::Promote => &policy.promote,
+    };
+    let ns_owner = if matches!(action, GovernedAction::Store) {
+        namespace_owner(conn, namespace)
+    } else {
+        None
+    };
+
+    let decision = evaluate_level(conn, level, agent_id, memory_owner, ns_owner.as_deref());
+    if let GovernanceDecision::Pending(_) = decision {
+        let pending_id =
+            queue_pending_action(conn, action, namespace, memory_id, agent_id, payload)?;
+        return Ok(GovernanceDecision::Pending(pending_id));
+    }
+    Ok(decision)
+}
+
+/// Insert a `pending_actions` row and return its id.
+pub fn queue_pending_action(
+    conn: &Connection,
+    action: GovernedAction,
+    namespace: &str,
+    memory_id: Option<&str>,
+    requested_by: &str,
+    payload: &serde_json::Value,
+) -> Result<String> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = Utc::now().to_rfc3339();
+    let payload_json = serde_json::to_string(payload)?;
+    conn.execute(
+        "INSERT INTO pending_actions (id, action_type, memory_id, namespace, payload, requested_by, requested_at, status)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending')",
+        params![
+            id,
+            action.as_str(),
+            memory_id,
+            namespace,
+            payload_json,
+            requested_by,
+            now,
+        ],
+    )?;
+    Ok(id)
+}
+
+pub fn list_pending_actions(
+    conn: &Connection,
+    status: Option<&str>,
+    limit: usize,
+) -> Result<Vec<PendingAction>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, action_type, memory_id, namespace, payload, requested_by,
+                requested_at, status, decided_by, decided_at
+         FROM pending_actions
+         WHERE (?1 IS NULL OR status = ?1)
+         ORDER BY requested_at DESC
+         LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![status, limit], |row| {
+        let payload_str: String = row.get(4)?;
+        let payload: serde_json::Value =
+            serde_json::from_str(&payload_str).unwrap_or(serde_json::Value::Null);
+        Ok(PendingAction {
+            id: row.get(0)?,
+            action_type: row.get(1)?,
+            memory_id: row.get(2)?,
+            namespace: row.get(3)?,
+            payload,
+            requested_by: row.get(5)?,
+            requested_at: row.get(6)?,
+            status: row.get(7)?,
+            decided_by: row.get(8)?,
+            decided_at: row.get(9)?,
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+#[allow(dead_code)]
+pub fn get_pending_action(conn: &Connection, id: &str) -> Result<Option<PendingAction>> {
+    let row = conn.query_row(
+        "SELECT id, action_type, memory_id, namespace, payload, requested_by,
+                requested_at, status, decided_by, decided_at
+         FROM pending_actions WHERE id = ?1",
+        params![id],
+        |row| {
+            let payload_str: String = row.get(4)?;
+            let payload: serde_json::Value =
+                serde_json::from_str(&payload_str).unwrap_or(serde_json::Value::Null);
+            Ok(PendingAction {
+                id: row.get(0)?,
+                action_type: row.get(1)?,
+                memory_id: row.get(2)?,
+                namespace: row.get(3)?,
+                payload,
+                requested_by: row.get(5)?,
+                requested_at: row.get(6)?,
+                status: row.get(7)?,
+                decided_by: row.get(8)?,
+                decided_at: row.get(9)?,
+            })
+        },
+    );
+    match row {
+        Ok(p) => Ok(Some(p)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Mark a pending action as approved or rejected. Returns true on status
+/// transition. Does NOT execute the action itself — the caller replays
+/// the payload on approval (the db layer doesn't know how to execute
+/// cross-interface write semantics).
+pub fn decide_pending_action(
+    conn: &Connection,
+    id: &str,
+    approve: bool,
+    decided_by: &str,
+) -> Result<bool> {
+    let new_status = if approve { "approved" } else { "rejected" };
+    let now = Utc::now().to_rfc3339();
+    let updated = conn.execute(
+        "UPDATE pending_actions SET status = ?1, decided_by = ?2, decided_at = ?3
+         WHERE id = ?4 AND status = 'pending'",
+        params![new_status, decided_by, now, id],
+    )?;
+    Ok(updated > 0)
 }
 
 /// Check if a memory ID is a namespace standard (used by consolidate to warn).
