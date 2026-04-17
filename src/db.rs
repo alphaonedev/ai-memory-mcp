@@ -8,9 +8,9 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::models::{
-    AGENTS_NAMESPACE, AgentRegistration, GovernanceDecision, GovernanceLevel, GovernancePolicy,
-    GovernedAction, Memory, MemoryLink, NamespaceCount, PROMOTION_THRESHOLD, PendingAction, Stats,
-    Tier, TierCount, namespace_ancestors,
+    AGENTS_NAMESPACE, AgentRegistration, Approval, ApproverType, GovernanceDecision,
+    GovernanceLevel, GovernancePolicy, GovernedAction, Memory, MemoryLink, NamespaceCount,
+    PROMOTION_THRESHOLD, PendingAction, Stats, Tier, TierCount, namespace_ancestors,
 };
 
 /// Computed 4-tuple of visibility prefixes for an agent position (Task 1.5).
@@ -150,7 +150,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
 );
 ";
 
-const CURRENT_SCHEMA_VERSION: i64 = 8;
+const CURRENT_SCHEMA_VERSION: i64 = 9;
 
 pub fn open(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path).context("failed to open database")?;
@@ -304,6 +304,18 @@ fn migrate(conn: &Connection) -> Result<()> {
                 CREATE INDEX IF NOT EXISTS idx_pending_status    ON pending_actions(status);
                 CREATE INDEX IF NOT EXISTS idx_pending_namespace ON pending_actions(namespace);",
             )?;
+        }
+        if version < 9 {
+            // Task 1.10: approvals JSON array for consensus approver type
+            let has_approvals: bool = conn
+                .prepare("SELECT approvals FROM pending_actions LIMIT 0")
+                .is_ok();
+            if !has_approvals {
+                conn.execute(
+                    "ALTER TABLE pending_actions ADD COLUMN approvals TEXT NOT NULL DEFAULT '[]'",
+                    [],
+                )?;
+            }
         }
 
         conn.execute("DELETE FROM schema_version", [])?;
@@ -2299,7 +2311,7 @@ pub fn list_pending_actions(
 ) -> Result<Vec<PendingAction>> {
     let mut stmt = conn.prepare(
         "SELECT id, action_type, memory_id, namespace, payload, requested_by,
-                requested_at, status, decided_by, decided_at
+                requested_at, status, decided_by, decided_at, approvals
          FROM pending_actions
          WHERE (?1 IS NULL OR status = ?1)
          ORDER BY requested_at DESC
@@ -2309,6 +2321,8 @@ pub fn list_pending_actions(
         let payload_str: String = row.get(4)?;
         let payload: serde_json::Value =
             serde_json::from_str(&payload_str).unwrap_or(serde_json::Value::Null);
+        let approvals_str: String = row.get(10)?;
+        let approvals: Vec<Approval> = serde_json::from_str(&approvals_str).unwrap_or_default();
         Ok(PendingAction {
             id: row.get(0)?,
             action_type: row.get(1)?,
@@ -2320,23 +2334,25 @@ pub fn list_pending_actions(
             status: row.get(7)?,
             decided_by: row.get(8)?,
             decided_at: row.get(9)?,
+            approvals,
         })
     })?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .map_err(Into::into)
 }
 
-#[allow(dead_code)]
 pub fn get_pending_action(conn: &Connection, id: &str) -> Result<Option<PendingAction>> {
     let row = conn.query_row(
         "SELECT id, action_type, memory_id, namespace, payload, requested_by,
-                requested_at, status, decided_by, decided_at
+                requested_at, status, decided_by, decided_at, approvals
          FROM pending_actions WHERE id = ?1",
         params![id],
         |row| {
             let payload_str: String = row.get(4)?;
             let payload: serde_json::Value =
                 serde_json::from_str(&payload_str).unwrap_or(serde_json::Value::Null);
+            let approvals_str: String = row.get(10)?;
+            let approvals: Vec<Approval> = serde_json::from_str(&approvals_str).unwrap_or_default();
             Ok(PendingAction {
                 id: row.get(0)?,
                 action_type: row.get(1)?,
@@ -2348,6 +2364,7 @@ pub fn get_pending_action(conn: &Connection, id: &str) -> Result<Option<PendingA
                 status: row.get(7)?,
                 decided_by: row.get(8)?,
                 decided_at: row.get(9)?,
+                approvals,
             })
         },
     );
@@ -2376,6 +2393,158 @@ pub fn decide_pending_action(
         params![new_status, decided_by, now, id],
     )?;
     Ok(updated > 0)
+}
+
+/// Task 1.10 — outcome of an approver-aware approve call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApproveOutcome {
+    /// Approver check failed; policy identifies the reason.
+    Rejected(String),
+    /// Consensus quorum not yet met; vote recorded.
+    Pending { votes: usize, quorum: u32 },
+    /// Fully approved (Human single-step, matching Agent, or consensus
+    /// threshold met). Caller may now replay the payload via
+    /// `execute_pending_action`.
+    Approved,
+}
+
+/// Task 1.10 — approver-type aware approve. Enforces the
+/// `metadata.governance.approver` of the pending action's namespace.
+pub fn approve_with_approver_type(
+    conn: &Connection,
+    pending_id: &str,
+    approver_agent_id: &str,
+) -> Result<ApproveOutcome> {
+    let Some(pa) = get_pending_action(conn, pending_id)? else {
+        return Ok(ApproveOutcome::Rejected(format!(
+            "pending action not found: {pending_id}"
+        )));
+    };
+    if pa.status != "pending" {
+        return Ok(ApproveOutcome::Rejected(format!(
+            "already decided: status={}",
+            pa.status
+        )));
+    }
+    // Resolve the namespace's approver type. If no policy, default to Human —
+    // which accepts any approval (back-compat with 1.9 callers).
+    let approver =
+        resolve_governance_policy(conn, &pa.namespace).map_or(ApproverType::Human, |p| p.approver);
+
+    match approver {
+        ApproverType::Human => {
+            let ok = decide_pending_action(conn, pending_id, true, approver_agent_id)?;
+            if ok {
+                Ok(ApproveOutcome::Approved)
+            } else {
+                Ok(ApproveOutcome::Rejected("decision write failed".into()))
+            }
+        }
+        ApproverType::Agent(required) => {
+            if approver_agent_id != required {
+                return Ok(ApproveOutcome::Rejected(format!(
+                    "designated approver is '{required}'; got '{approver_agent_id}'"
+                )));
+            }
+            let ok = decide_pending_action(conn, pending_id, true, approver_agent_id)?;
+            if ok {
+                Ok(ApproveOutcome::Approved)
+            } else {
+                Ok(ApproveOutcome::Rejected("decision write failed".into()))
+            }
+        }
+        ApproverType::Consensus(quorum) => {
+            let mut approvals = pa.approvals.clone();
+            if approvals.iter().any(|a| a.agent_id == approver_agent_id) {
+                return Ok(ApproveOutcome::Pending {
+                    votes: approvals.len(),
+                    quorum,
+                });
+            }
+            approvals.push(Approval {
+                agent_id: approver_agent_id.to_string(),
+                approved_at: Utc::now().to_rfc3339(),
+            });
+            let approvals_json = serde_json::to_string(&approvals)?;
+            conn.execute(
+                "UPDATE pending_actions SET approvals = ?1 WHERE id = ?2 AND status = 'pending'",
+                params![approvals_json, pending_id],
+            )?;
+            let votes = approvals.len();
+            if u32::try_from(votes).unwrap_or(u32::MAX) >= quorum {
+                // Threshold met — transition status so the caller can replay.
+                let ok = decide_pending_action(conn, pending_id, true, approver_agent_id)?;
+                if ok {
+                    return Ok(ApproveOutcome::Approved);
+                }
+                return Ok(ApproveOutcome::Rejected(
+                    "decision write failed at consensus threshold".into(),
+                ));
+            }
+            Ok(ApproveOutcome::Pending { votes, quorum })
+        }
+    }
+}
+
+/// Task 1.10 — Execute an approved pending action's payload. Callers invoke
+/// this after `approve_with_approver_type` returns `Approved`. Returns the
+/// affected memory id (new id for store, existing id for delete/promote).
+pub fn execute_pending_action(conn: &Connection, pending_id: &str) -> Result<Option<String>> {
+    let Some(pa) = get_pending_action(conn, pending_id)? else {
+        anyhow::bail!("pending action not found: {pending_id}");
+    };
+    if pa.status != "approved" {
+        anyhow::bail!("cannot execute non-approved action (status={})", pa.status);
+    }
+    match pa.action_type.as_str() {
+        "store" => {
+            let mut mem: Memory = serde_json::from_value(pa.payload.clone())
+                .map_err(|e| anyhow::anyhow!("invalid store payload: {e}"))?;
+            // Stamp fresh id + timestamps so the execution is idempotent on replay.
+            mem.id = uuid::Uuid::new_v4().to_string();
+            let now = Utc::now().to_rfc3339();
+            mem.created_at.clone_from(&now);
+            mem.updated_at = now;
+            mem.access_count = 0;
+            let actual_id = insert(conn, &mem)?;
+            Ok(Some(actual_id))
+        }
+        "delete" => {
+            if let Some(mid) = pa.memory_id.clone() {
+                delete(conn, &mid)?;
+                Ok(Some(mid))
+            } else {
+                Ok(None)
+            }
+        }
+        "promote" => {
+            if let Some(mid) = pa.memory_id.clone() {
+                if let Some(to_ns) = pa.payload.get("to_namespace").and_then(|v| v.as_str()) {
+                    // Vertical promotion to ancestor.
+                    let clone_id = promote_to_namespace(conn, &mid, to_ns)?;
+                    return Ok(Some(clone_id));
+                }
+                // Tier bump to long + clear expiry.
+                let (_found, _changed) = update(
+                    conn,
+                    &mid,
+                    None,
+                    None,
+                    Some(&Tier::Long),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(""),
+                    None,
+                )?;
+                Ok(Some(mid))
+            } else {
+                Ok(None)
+            }
+        }
+        other => anyhow::bail!("unknown action_type: {other}"),
+    }
 }
 
 /// Check if a memory ID is a namespace standard (used by consolidate to warn).

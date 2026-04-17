@@ -346,6 +346,7 @@ pub async fn approve_pending(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    use crate::db::ApproveOutcome;
     if let Err(e) = validate::validate_id(&id) {
         return (
             StatusCode::BAD_REQUEST,
@@ -365,13 +366,40 @@ pub async fn approve_pending(
         }
     };
     let lock = state.lock().await;
-    match db::decide_pending_action(&lock.0, &id, true, &agent_id) {
-        Ok(true) => {
-            Json(json!({"approved": true, "id": id, "decided_by": agent_id})).into_response()
-        }
-        Ok(false) => (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "pending action not found or already decided"})),
+    match db::approve_with_approver_type(&lock.0, &id, &agent_id) {
+        Ok(ApproveOutcome::Approved) => match db::execute_pending_action(&lock.0, &id) {
+            Ok(memory_id) => Json(json!({
+                "approved": true,
+                "id": id,
+                "decided_by": agent_id,
+                "executed": true,
+                "memory_id": memory_id,
+            }))
+            .into_response(),
+            Err(e) => {
+                tracing::error!("execute pending error: {e}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "approved but execution failed"})),
+                )
+                    .into_response()
+            }
+        },
+        Ok(ApproveOutcome::Pending { votes, quorum }) => (
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "approved": false,
+                "status": "pending",
+                "id": id,
+                "votes": votes,
+                "quorum": quorum,
+                "reason": "consensus threshold not yet reached",
+            })),
+        )
+            .into_response(),
+        Ok(ApproveOutcome::Rejected(reason)) => (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": format!("approve rejected: {reason}")})),
         )
             .into_response(),
         Err(e) => {

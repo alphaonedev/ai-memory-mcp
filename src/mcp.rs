@@ -1858,16 +1858,33 @@ fn handle_pending_approve(
     params: &Value,
     mcp_client: Option<&str>,
 ) -> Result<Value, String> {
+    use crate::db::ApproveOutcome;
     let id = params["id"].as_str().ok_or("id is required")?;
     validate::validate_id(id).map_err(|e| e.to_string())?;
     let agent_id = crate::identity::resolve_agent_id(params["agent_id"].as_str(), mcp_client)
         .map_err(|e| e.to_string())?;
-    let transitioned =
-        db::decide_pending_action(conn, id, true, &agent_id).map_err(|e| e.to_string())?;
-    if !transitioned {
-        return Err(format!("pending action not found or already decided: {id}"));
+    match db::approve_with_approver_type(conn, id, &agent_id).map_err(|e| e.to_string())? {
+        ApproveOutcome::Approved => {
+            // Task 1.10: auto-execute the queued action on final approval.
+            let executed = db::execute_pending_action(conn, id).map_err(|e| e.to_string())?;
+            Ok(json!({
+                "approved": true,
+                "id": id,
+                "decided_by": agent_id,
+                "executed": true,
+                "memory_id": executed,
+            }))
+        }
+        ApproveOutcome::Pending { votes, quorum } => Ok(json!({
+            "approved": false,
+            "status": "pending",
+            "id": id,
+            "votes": votes,
+            "quorum": quorum,
+            "reason": "consensus threshold not yet reached",
+        })),
+        ApproveOutcome::Rejected(reason) => Err(format!("approve rejected: {reason}")),
     }
-    Ok(json!({"approved": true, "id": id, "decided_by": agent_id}))
 }
 
 fn handle_pending_reject(
