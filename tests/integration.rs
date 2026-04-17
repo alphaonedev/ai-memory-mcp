@@ -8034,6 +8034,32 @@ fn test_serve_native_tls_health_probe() {
     let _ = std::fs::remove_file(&key_path);
 }
 
+/// Build a `reqwest::blocking::Client` presenting the given PEM cert +
+/// key as its client identity. Accepts any server cert (self-signed in
+/// these tests — the peer authenticates US via fingerprint allowlist).
+/// Uses reqwest's rustls-tls backend; `from_pem` expects both cert and
+/// key concatenated into a single PEM blob.
+fn build_mtls_probe_client(
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+) -> reqwest::blocking::Client {
+    // Transitive deps pull reqwest's native-tls backend via hf-hub's
+    // default-tls feature, so the test uses `from_pkcs8_pem` (native-tls
+    // variant) for maximum cross-platform consistency. The daemon in
+    // production goes through `use_preconfigured_tls` with a rustls
+    // ClientConfig (see src/main.rs).
+    let cert = std::fs::read(cert_path).expect("read client cert");
+    let key = std::fs::read(key_path).expect("read client key");
+    let identity =
+        reqwest::Identity::from_pkcs8_pem(&cert, &key).expect("parse mTLS identity (PKCS#8 PEM)");
+    reqwest::blocking::Client::builder()
+        .identity(identity)
+        .danger_accept_invalid_certs(true)
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .expect("build reqwest mTLS client")
+}
+
 /// Compute SHA-256 fingerprint of a PEM cert's DER body via `openssl`
 /// (same CLI available on all CI runners). Returns hex without `:`.
 fn cert_sha256_fingerprint(cert_path: &std::path::Path) -> Option<String> {
@@ -8119,31 +8145,20 @@ fn test_serve_mtls_fingerprint_allowlist_accepts_only_known_peer() {
         .spawn()
         .unwrap();
 
-    // Wait for TLS bind. wait_for_health would fail here since curl
-    // without a client cert gets rejected; so we poll via curl+mTLS.
-    // Windows CI is measurably slower at completing the first mTLS
-    // handshake (RSA key parse + custom verifier init + cert gen on
-    // the same runner); 30s is generous for Linux and correct for
-    // Windows.
+    // Build a reqwest::blocking client presenting peer-A's cert. We use
+    // reqwest (rustls-tls backend) instead of `curl --cert` because
+    // curl on Windows CI is often the schannel build and doesn't
+    // accept PEM client certs the same way curl-openssl does.
+    let client_a = build_mtls_probe_client(&peer_a_cert, &peer_a_key);
+
+    // Wait for TLS bind — 30s poll window; Windows is slower on the
+    // first handshake (RSA key parse + custom verifier init).
+    let health_url = format!("https://127.0.0.1:{port_b}/api/v1/health");
     let mut ready = false;
     for _ in 0..300 {
         std::thread::sleep(std::time::Duration::from_millis(100));
-        let out = std::process::Command::new("curl")
-            .args([
-                "-sk",
-                "--cert",
-                peer_a_cert.to_str().unwrap(),
-                "--key",
-                peer_a_key.to_str().unwrap(),
-                "-o",
-                "/dev/null",
-                "-w",
-                "%{http_code}",
-                &format!("https://127.0.0.1:{port_b}/api/v1/health"),
-            ])
-            .output();
-        if let Ok(o) = out
-            && String::from_utf8_lossy(&o.stdout) == "200"
+        if let Ok(resp) = client_a.get(&health_url).send()
+            && resp.status().is_success()
         {
             ready = true;
             break;
@@ -8163,26 +8178,18 @@ fn test_serve_mtls_fingerprint_allowlist_accepts_only_known_peer() {
         "source": "api",
         "metadata": {},
     });
-    let seed_out = std::process::Command::new("curl")
-        .args([
-            "-sk",
-            "--cert",
-            peer_a_cert.to_str().unwrap(),
-            "--key",
-            peer_a_key.to_str().unwrap(),
-            "-X",
-            "POST",
-            "-H",
-            "content-type: application/json",
-            "-H",
-            "x-agent-id: peer-b",
-            "-d",
-            &seed.to_string(),
-            &format!("https://127.0.0.1:{port_b}/api/v1/memories"),
-        ])
-        .output()
-        .unwrap();
-    assert!(seed_out.status.success());
+    let seed_resp = client_a
+        .post(format!("https://127.0.0.1:{port_b}/api/v1/memories"))
+        .header("content-type", "application/json")
+        .header("x-agent-id", "peer-b")
+        .body(seed.to_string())
+        .send()
+        .expect("seed POST via mTLS must succeed");
+    assert!(
+        seed_resp.status().is_success(),
+        "seed status {}",
+        seed_resp.status()
+    );
 
     // Start the sync-daemon on peer A with peer-A's client cert.
     let mut daemon_ok = cmd(bin)
@@ -8239,26 +8246,15 @@ fn test_serve_mtls_fingerprint_allowlist_accepts_only_known_peer() {
         "authorised peer-A cert failed to sync through mTLS allowlist"
     );
 
-    // Negative case: curl with peer-C's cert must be rejected.
-    let neg = std::process::Command::new("curl")
-        .args([
-            "-sk",
-            "--cert",
-            peer_c_cert.to_str().unwrap(),
-            "--key",
-            peer_c_key.to_str().unwrap(),
-            "-o",
-            "/dev/null",
-            "-w",
-            "%{http_code}",
-            &format!("https://127.0.0.1:{port_b}/api/v1/health"),
-        ])
-        .output()
-        .unwrap();
-    let code = String::from_utf8_lossy(&neg.stdout);
+    // Negative case: reqwest with peer-C's cert must be rejected at
+    // handshake. The `send()` call returns an error (not an HTTP code)
+    // because the TLS layer fails before any HTTP exchange.
+    let client_c = build_mtls_probe_client(&peer_c_cert, &peer_c_key);
+    let neg = client_c.get(&health_url).send();
     assert!(
-        code == "000" || code.starts_with('5') || code.is_empty(),
-        "unauthorised cert must be rejected; got HTTP {code}"
+        neg.is_err(),
+        "unauthorised cert must be rejected at TLS handshake; got {:?}",
+        neg
     );
 
     let _ = serve_b.kill();
