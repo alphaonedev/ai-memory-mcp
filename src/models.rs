@@ -331,6 +331,13 @@ impl GovernedAction {
     }
 }
 
+/// A single approval vote recorded on a consensus-gated pending action (Task 1.10).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Approval {
+    pub agent_id: String,
+    pub approved_at: String,
+}
+
 /// Row returned by `db::list_pending_actions`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingAction {
@@ -346,6 +353,9 @@ pub struct PendingAction {
     pub decided_by: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decided_at: Option<String>,
+    /// Task 1.10: consensus vote log. Empty for Human/Agent paths.
+    #[serde(default)]
+    pub approvals: Vec<Approval>,
 }
 
 // ---------------------------------------------------------------------------

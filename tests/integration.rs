@@ -6602,3 +6602,364 @@ fn test_enforce_mcp_pending_tools() {
     assert_eq!(appr_body["approved"], true);
     let _ = std::fs::remove_file(&db);
 }
+
+// ---------------------------------------------------------------------------
+// Task 1.10 — Approver Types (Human/Agent/Consensus) + auto-execute
+// ---------------------------------------------------------------------------
+
+fn fresh_approver_db() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("ai-memory-approver-{}.db", uuid::Uuid::new_v4()))
+}
+
+fn queue_store(
+    binary: &str,
+    db_path: &std::path::Path,
+    namespace: &str,
+    title: &str,
+    requester: &str,
+) -> String {
+    let out = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--agent-id",
+            requester,
+            "--json",
+            "store",
+            "-n",
+            namespace,
+            "-T",
+            title,
+            "-c",
+            "body",
+            "-t",
+            "long",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "queue store failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["status"], "pending", "expected pending, got: {v}");
+    v["pending_id"].as_str().unwrap().to_string()
+}
+
+fn approve(
+    binary: &str,
+    db_path: &std::path::Path,
+    pending_id: &str,
+    approver: &str,
+) -> std::process::Output {
+    cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--agent-id",
+            approver,
+            "--json",
+            "pending",
+            "approve",
+            pending_id,
+        ])
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn test_approver_human_any_approver_accepted() {
+    let db = fresh_approver_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    set_governance(
+        bin,
+        &db,
+        "alphaone",
+        serde_json::json!({"write":"approve","promote":"any","delete":"owner","approver":"human"}),
+        "owner",
+    );
+    let pid = queue_store(bin, &db, "alphaone", "human-target", "alice");
+    let out = approve(bin, &db, &pid, "any-random-approver");
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["approved"], true);
+    assert_eq!(v["executed"], true);
+    assert!(v["memory_id"].is_string());
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_approver_agent_rejects_wrong_caller() {
+    let db = fresh_approver_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    set_governance(
+        bin,
+        &db,
+        "alphaone",
+        serde_json::json!({
+            "write":"approve","promote":"any","delete":"owner",
+            "approver":{"agent":"maintainer"}
+        }),
+        "owner",
+    );
+    let pid = queue_store(bin, &db, "alphaone", "agent-target", "alice");
+    let out = approve(bin, &db, &pid, "some-other-agent");
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("designated approver") || err.to_lowercase().contains("rejected"),
+        "got: {err}"
+    );
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_approver_agent_accepts_matching_caller() {
+    let db = fresh_approver_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    set_governance(
+        bin,
+        &db,
+        "alphaone",
+        serde_json::json!({
+            "write":"approve","promote":"any","delete":"owner",
+            "approver":{"agent":"maintainer"}
+        }),
+        "owner",
+    );
+    let pid = queue_store(bin, &db, "alphaone", "agent-ok", "alice");
+    let out = approve(bin, &db, &pid, "maintainer");
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["approved"], true);
+    assert_eq!(v["executed"], true);
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_approver_consensus_below_threshold_pending() {
+    let db = fresh_approver_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    set_governance(
+        bin,
+        &db,
+        "alphaone",
+        serde_json::json!({
+            "write":"approve","promote":"any","delete":"owner",
+            "approver":{"consensus":3}
+        }),
+        "owner",
+    );
+    let pid = queue_store(bin, &db, "alphaone", "cons-target", "alice");
+
+    let v1 = approve(bin, &db, &pid, "approver-1");
+    assert!(v1.status.success());
+    let j1: serde_json::Value = serde_json::from_slice(&v1.stdout).unwrap();
+    assert_eq!(j1["approved"], false);
+    assert_eq!(j1["status"], "pending");
+    assert_eq!(j1["votes"], 1);
+    assert_eq!(j1["quorum"], 3);
+
+    let v2 = approve(bin, &db, &pid, "approver-2");
+    let j2: serde_json::Value = serde_json::from_slice(&v2.stdout).unwrap();
+    assert_eq!(j2["votes"], 2);
+    assert_eq!(j2["approved"], false);
+
+    let list = cmd(bin)
+        .args(["--db", db.to_str().unwrap(), "--json", "pending", "list"])
+        .output()
+        .unwrap();
+    let lv: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert_eq!(lv["count"], 1);
+    assert_eq!(lv["pending"][0]["status"], "pending");
+    assert_eq!(lv["pending"][0]["approvals"].as_array().unwrap().len(), 2);
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_approver_consensus_threshold_auto_executes() {
+    let db = fresh_approver_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    set_governance(
+        bin,
+        &db,
+        "alphaone",
+        serde_json::json!({
+            "write":"approve","promote":"any","delete":"owner",
+            "approver":{"consensus":2}
+        }),
+        "owner",
+    );
+    let pid = queue_store(bin, &db, "alphaone", "cons-exec", "alice");
+
+    let v1 = approve(bin, &db, &pid, "a1");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&v1.stdout).unwrap()["approved"],
+        false
+    );
+    let v2 = approve(bin, &db, &pid, "a2");
+    assert!(v2.status.success());
+    let j2: serde_json::Value = serde_json::from_slice(&v2.stdout).unwrap();
+    assert_eq!(j2["approved"], true);
+    assert_eq!(j2["executed"], true);
+    let memory_id = j2["memory_id"].as_str().unwrap();
+
+    let list = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--json",
+            "list",
+            "-n",
+            "alphaone",
+        ])
+        .output()
+        .unwrap();
+    let lv: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    let titles: Vec<String> = lv["memories"]
+        .as_array()
+        .unwrap_or(&Vec::new())
+        .iter()
+        .filter_map(|m| m["title"].as_str().map(str::to_string))
+        .collect();
+    assert!(titles.contains(&"cons-exec".to_string()));
+    let ids: Vec<String> = lv["memories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["id"].as_str().map(str::to_string))
+        .collect();
+    assert!(ids.iter().any(|i| i == memory_id));
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_approver_consensus_same_agent_does_not_double_count() {
+    let db = fresh_approver_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    set_governance(
+        bin,
+        &db,
+        "alphaone",
+        serde_json::json!({
+            "write":"approve","promote":"any","delete":"owner",
+            "approver":{"consensus":2}
+        }),
+        "owner",
+    );
+    let pid = queue_store(bin, &db, "alphaone", "cons-dup", "alice");
+
+    let v1a = approve(bin, &db, &pid, "a1");
+    let v1b = approve(bin, &db, &pid, "a1");
+    let j1a: serde_json::Value = serde_json::from_slice(&v1a.stdout).unwrap();
+    let j1b: serde_json::Value = serde_json::from_slice(&v1b.stdout).unwrap();
+    assert_eq!(j1a["votes"], 1);
+    assert_eq!(j1b["votes"], 1, "same agent must not double-count");
+
+    let v2 = approve(bin, &db, &pid, "a2");
+    let j2: serde_json::Value = serde_json::from_slice(&v2.stdout).unwrap();
+    assert_eq!(j2["approved"], true);
+    assert_eq!(j2["executed"], true);
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_approver_agent_rejected_not_counted_for_consensus() {
+    let db = fresh_approver_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    set_governance(
+        bin,
+        &db,
+        "alphaone",
+        serde_json::json!({
+            "write":"approve","promote":"any","delete":"owner",
+            "approver":{"agent":"only-me"}
+        }),
+        "owner",
+    );
+    let pid = queue_store(bin, &db, "alphaone", "agent-no-count", "alice");
+    let rej = approve(bin, &db, &pid, "wrong-caller");
+    assert!(!rej.status.success());
+
+    let list = cmd(bin)
+        .args(["--db", db.to_str().unwrap(), "--json", "pending", "list"])
+        .output()
+        .unwrap();
+    let lv: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert_eq!(lv["count"], 1);
+    assert_eq!(lv["pending"][0]["status"], "pending");
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_approver_delete_consensus_executes_delete() {
+    let db = fresh_approver_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    set_governance(
+        bin,
+        &db,
+        "alphaone",
+        serde_json::json!({
+            "write":"any","promote":"any","delete":"approve",
+            "approver":{"consensus":2}
+        }),
+        "owner",
+    );
+    let st = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--agent-id",
+            "alice",
+            "--json",
+            "store",
+            "-n",
+            "alphaone",
+            "-T",
+            "will-delete",
+            "-c",
+            "x",
+            "-t",
+            "long",
+        ])
+        .output()
+        .unwrap();
+    let id = serde_json::from_slice::<serde_json::Value>(&st.stdout).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let del = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--agent-id",
+            "alice",
+            "--json",
+            "delete",
+            &id,
+        ])
+        .output()
+        .unwrap();
+    assert!(del.status.success());
+    let jd: serde_json::Value = serde_json::from_slice(&del.stdout).unwrap();
+    assert_eq!(jd["status"], "pending");
+    let pid = jd["pending_id"].as_str().unwrap().to_string();
+
+    let _ = approve(bin, &db, &pid, "v1");
+    let v2 = approve(bin, &db, &pid, "v2");
+    let j2: serde_json::Value = serde_json::from_slice(&v2.stdout).unwrap();
+    assert_eq!(j2["approved"], true);
+    assert_eq!(j2["executed"], true);
+
+    let get = cmd(bin)
+        .args(["--db", db.to_str().unwrap(), "get", &id])
+        .output()
+        .unwrap();
+    assert!(
+        !get.status.success(),
+        "memory must be deleted after consensus"
+    );
+    let _ = std::fs::remove_file(&db);
+}
