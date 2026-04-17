@@ -92,6 +92,7 @@ pub async fn health(State(state): State<Db>) -> impl IntoResponse {
         .into_response()
 }
 
+#[allow(clippy::too_many_lines)]
 pub async fn create_memory(
     State(state): State<Db>,
     headers: HeaderMap,
@@ -161,6 +162,57 @@ pub async fn create_memory(
         expires_at,
         metadata,
     };
+
+    // Task 1.9: governance enforcement (store-side).
+    {
+        use crate::models::{GovernanceDecision, GovernedAction};
+        let agent_for_gov = mem
+            .metadata
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let payload = serde_json::to_value(&mem).unwrap_or_default();
+        match db::enforce_governance(
+            &lock.0,
+            GovernedAction::Store,
+            &mem.namespace,
+            &agent_for_gov,
+            None,
+            None,
+            &payload,
+        ) {
+            Ok(GovernanceDecision::Allow) => {}
+            Ok(GovernanceDecision::Deny(reason)) => {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({"error": format!("store denied by governance: {reason}")})),
+                )
+                    .into_response();
+            }
+            Ok(GovernanceDecision::Pending(pending_id)) => {
+                return (
+                    StatusCode::ACCEPTED,
+                    Json(json!({
+                        "status": "pending",
+                        "pending_id": pending_id,
+                        "reason": "governance requires approval",
+                        "action": "store",
+                        "namespace": mem.namespace,
+                    })),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                tracing::error!("governance error: {e}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "governance check failed"})),
+                )
+                    .into_response();
+            }
+        }
+    }
 
     // Check for contradictions
     let contradictions =
@@ -240,6 +292,130 @@ pub async fn register_agent(
                 "agent_type": body.agent_type,
                 "capabilities": capabilities,
             })),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!("handler error: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "internal server error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Task 1.9 — pending_actions endpoints
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct PendingListQuery {
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default = "default_pending_limit")]
+    pub limit: Option<usize>,
+}
+
+#[allow(clippy::unnecessary_wraps)]
+fn default_pending_limit() -> Option<usize> {
+    Some(100)
+}
+
+pub async fn list_pending(
+    State(state): State<Db>,
+    Query(p): Query<PendingListQuery>,
+) -> impl IntoResponse {
+    let limit = p.limit.unwrap_or(100).min(1000);
+    let lock = state.lock().await;
+    match db::list_pending_actions(&lock.0, p.status.as_deref(), limit) {
+        Ok(items) => Json(json!({"count": items.len(), "pending": items})).into_response(),
+        Err(e) => {
+            tracing::error!("handler error: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "internal server error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+pub async fn approve_pending(
+    State(state): State<Db>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = validate::validate_id(&id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
+    let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+    let agent_id = match crate::identity::resolve_http_agent_id(None, header_agent_id) {
+        Ok(a) => a,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("invalid agent_id: {e}")})),
+            )
+                .into_response();
+        }
+    };
+    let lock = state.lock().await;
+    match db::decide_pending_action(&lock.0, &id, true, &agent_id) {
+        Ok(true) => {
+            Json(json!({"approved": true, "id": id, "decided_by": agent_id})).into_response()
+        }
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "pending action not found or already decided"})),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!("handler error: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "internal server error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+pub async fn reject_pending(
+    State(state): State<Db>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = validate::validate_id(&id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
+    let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+    let agent_id = match crate::identity::resolve_http_agent_id(None, header_agent_id) {
+        Ok(a) => a,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("invalid agent_id: {e}")})),
+            )
+                .into_response();
+        }
+    };
+    let lock = state.lock().await;
+    match db::decide_pending_action(&lock.0, &id, false, &agent_id) {
+        Ok(true) => {
+            Json(json!({"rejected": true, "id": id, "decided_by": agent_id})).into_response()
+        }
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "pending action not found or already decided"})),
         )
             .into_response(),
         Err(e) => {
@@ -385,7 +561,11 @@ pub async fn update_memory(
     }
 }
 
-pub async fn delete_memory(State(state): State<Db>, Path(id): Path<String>) -> impl IntoResponse {
+pub async fn delete_memory(
+    State(state): State<Db>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
     if let Err(e) = validate::validate_id(&id) {
         return (
             StatusCode::BAD_REQUEST,
@@ -394,61 +574,9 @@ pub async fn delete_memory(State(state): State<Db>, Path(id): Path<String>) -> i
             .into_response();
     }
     let lock = state.lock().await;
-    // Try exact delete first; fall back to prefix resolution
-    match db::delete(&lock.0, &id) {
-        Ok(true) => Json(json!({"deleted": true})).into_response(),
-        Ok(false) => {
-            // Prefix fallback
-            match db::get_by_prefix(&lock.0, &id) {
-                Ok(Some(mem)) => {
-                    let full_id = mem.id;
-                    match db::delete(&lock.0, &full_id) {
-                        Ok(true) => Json(json!({"deleted": true})).into_response(),
-                        _ => (StatusCode::NOT_FOUND, Json(json!({"error": "not found"})))
-                            .into_response(),
-                    }
-                }
-                Ok(None) => {
-                    (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response()
-                }
-                Err(e) => {
-                    let msg = e.to_string();
-                    if msg.contains("ambiguous ID prefix") {
-                        (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response()
-                    } else {
-                        tracing::error!("handler error: {e}");
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(json!({"error": "internal server error"})),
-                        )
-                            .into_response()
-                    }
-                }
-            }
-        }
-        Err(e) => {
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
-        }
-    }
-}
-
-pub async fn promote_memory(State(state): State<Db>, Path(id): Path<String>) -> impl IntoResponse {
-    if let Err(e) = validate::validate_id(&id) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": e.to_string()})),
-        )
-            .into_response();
-    }
-    let lock = state.lock().await;
-    // Resolve prefix if exact ID not found
-    let resolved_id = match db::resolve_id(&lock.0, &id) {
-        Ok(Some(mem)) => mem.id,
+    // Resolve the target memory so governance has owner context.
+    let target = match db::resolve_id(&lock.0, &id) {
+        Ok(Some(m)) => m,
         Ok(None) => {
             return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response();
         }
@@ -465,6 +593,169 @@ pub async fn promote_memory(State(state): State<Db>, Path(id): Path<String>) -> 
                 .into_response();
         }
     };
+
+    // Task 1.9: governance enforcement (delete-side).
+    {
+        use crate::models::{GovernanceDecision, GovernedAction};
+        let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+        let agent_id = match crate::identity::resolve_http_agent_id(None, header_agent_id) {
+            Ok(a) => a,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": format!("invalid agent_id: {e}")})),
+                )
+                    .into_response();
+            }
+        };
+        let mem_owner = target
+            .metadata
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let payload = json!({"id": target.id, "title": target.title});
+        match db::enforce_governance(
+            &lock.0,
+            GovernedAction::Delete,
+            &target.namespace,
+            &agent_id,
+            Some(&target.id),
+            mem_owner.as_deref(),
+            &payload,
+        ) {
+            Ok(GovernanceDecision::Allow) => {}
+            Ok(GovernanceDecision::Deny(reason)) => {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({"error": format!("delete denied by governance: {reason}")})),
+                )
+                    .into_response();
+            }
+            Ok(GovernanceDecision::Pending(pending_id)) => {
+                return (
+                    StatusCode::ACCEPTED,
+                    Json(json!({
+                        "status": "pending",
+                        "pending_id": pending_id,
+                        "reason": "governance requires approval",
+                        "action": "delete",
+                        "memory_id": target.id,
+                    })),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                tracing::error!("governance error: {e}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "governance check failed"})),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    match db::delete(&lock.0, &target.id) {
+        Ok(true) => Json(json!({"deleted": true})).into_response(),
+        _ => (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response(),
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+pub async fn promote_memory(
+    State(state): State<Db>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = validate::validate_id(&id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
+    let lock = state.lock().await;
+    // Resolve prefix if exact ID not found — capture full memory for governance.
+    let target = match db::resolve_id(&lock.0, &id) {
+        Ok(Some(mem)) => mem,
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response();
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("ambiguous ID prefix") {
+                return (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response();
+            }
+            tracing::error!("handler error: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "internal server error"})),
+            )
+                .into_response();
+        }
+    };
+    // Task 1.9: governance enforcement (promote-side).
+    {
+        use crate::models::{GovernanceDecision, GovernedAction};
+        let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+        let agent_id = match crate::identity::resolve_http_agent_id(None, header_agent_id) {
+            Ok(a) => a,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": format!("invalid agent_id: {e}")})),
+                )
+                    .into_response();
+            }
+        };
+        let mem_owner = target
+            .metadata
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let payload = json!({"id": target.id});
+        match db::enforce_governance(
+            &lock.0,
+            GovernedAction::Promote,
+            &target.namespace,
+            &agent_id,
+            Some(&target.id),
+            mem_owner.as_deref(),
+            &payload,
+        ) {
+            Ok(GovernanceDecision::Allow) => {}
+            Ok(GovernanceDecision::Deny(reason)) => {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({"error": format!("promote denied by governance: {reason}")})),
+                )
+                    .into_response();
+            }
+            Ok(GovernanceDecision::Pending(pending_id)) => {
+                return (
+                    StatusCode::ACCEPTED,
+                    Json(json!({
+                        "status": "pending",
+                        "pending_id": pending_id,
+                        "reason": "governance requires approval",
+                        "action": "promote",
+                        "memory_id": target.id,
+                    })),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                tracing::error!("governance error: {e}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "governance check failed"})),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    let resolved_id = target.id.clone();
     match db::update(
         &lock.0,
         &resolved_id,

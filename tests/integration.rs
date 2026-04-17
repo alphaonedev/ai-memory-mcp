@@ -1835,7 +1835,7 @@ fn test_mcp_tools_list() {
     let tools = resp["result"]["tools"]
         .as_array()
         .expect("tools should be array");
-    assert_eq!(tools.len(), 28, "expected 28 MCP tools");
+    assert_eq!(tools.len(), 31, "expected 31 MCP tools");
 
     let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
     assert!(tool_names.contains(&"memory_store"));
@@ -5952,5 +5952,653 @@ fn test_governance_legacy_memory_defaults_not_mutated() {
         metadata.get("governance").is_none(),
         "no governance param must not inject a policy; got metadata={metadata}"
     );
+    let _ = std::fs::remove_file(&db);
+}
+
+// ---------------------------------------------------------------------------
+// Task 1.9 — Governance Enforcement
+// ---------------------------------------------------------------------------
+
+fn fresh_enforce_db() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("ai-memory-enforce-{}.db", uuid::Uuid::new_v4()))
+}
+
+/// Set a governance policy on a namespace. Seeds the standard memory under
+/// `owner_agent_id`, then calls memory_namespace_set_standard with the policy.
+fn set_governance(
+    binary: &str,
+    db_path: &std::path::Path,
+    namespace: &str,
+    governance: serde_json::Value,
+    owner_agent_id: &str,
+) {
+    let out = cmd(binary)
+        .env_remove("AI_MEMORY_AGENT_ID")
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--agent-id",
+            owner_agent_id,
+            "--json",
+            "store",
+            "-n",
+            namespace,
+            "-T",
+            &format!("{namespace}-standard"),
+            "-c",
+            "policy",
+            "-t",
+            "long",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let sid = v["id"].as_str().unwrap().to_string();
+
+    use std::io::Write;
+    let mut child = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "mcp",
+            "--tier",
+            "keyword",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdin = child.stdin.as_mut().unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"memory_namespace_set_standard","arguments":{
+                "namespace": namespace,
+                "id": sid,
+                "governance": governance,
+            }}
+        })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    drop(child.stdin.take());
+    let _ = child.wait_with_output();
+}
+
+#[test]
+fn test_enforce_any_allows_store() {
+    let db = fresh_enforce_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    set_governance(
+        bin,
+        &db,
+        "alphaone",
+        serde_json::json!({"write":"any","promote":"any","delete":"any","approver":"human"}),
+        "owner",
+    );
+    let out = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--agent-id",
+            "stranger",
+            "--json",
+            "store",
+            "-n",
+            "alphaone",
+            "-T",
+            "any-write",
+            "-c",
+            "hi",
+            "-t",
+            "long",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "any-write must allow: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_enforce_registered_blocks_unregistered() {
+    let db = fresh_enforce_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    set_governance(
+        bin,
+        &db,
+        "alphaone",
+        serde_json::json!({"write":"registered","promote":"any","delete":"owner","approver":"human"}),
+        "owner",
+    );
+    let out = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--agent-id",
+            "stranger-not-registered",
+            "store",
+            "-n",
+            "alphaone",
+            "-T",
+            "blocked-write",
+            "-c",
+            "hi",
+            "-t",
+            "long",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "unregistered must be blocked");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("not a registered agent"), "got: {err}");
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_enforce_registered_allows_registered() {
+    let db = fresh_enforce_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    let _ = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "agents",
+            "register",
+            "--agent-id",
+            "alice",
+            "--agent-type",
+            "human",
+        ])
+        .output()
+        .unwrap();
+    set_governance(
+        bin,
+        &db,
+        "alphaone",
+        serde_json::json!({"write":"registered","promote":"any","delete":"owner","approver":"human"}),
+        "owner",
+    );
+    let out = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--agent-id",
+            "alice",
+            "store",
+            "-n",
+            "alphaone",
+            "-T",
+            "allowed-write",
+            "-c",
+            "hi",
+            "-t",
+            "long",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_enforce_owner_blocks_non_owner_delete() {
+    let db = fresh_enforce_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    set_governance(
+        bin,
+        &db,
+        "alphaone",
+        serde_json::json!({"write":"any","promote":"any","delete":"owner","approver":"human"}),
+        "owner",
+    );
+    let store = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--agent-id",
+            "alice",
+            "--json",
+            "store",
+            "-n",
+            "alphaone",
+            "-T",
+            "alice-mem",
+            "-c",
+            "hi",
+            "-t",
+            "long",
+        ])
+        .output()
+        .unwrap();
+    let id = serde_json::from_slice::<serde_json::Value>(&store.stdout).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let del = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--agent-id",
+            "bob",
+            "delete",
+            &id,
+        ])
+        .output()
+        .unwrap();
+    assert!(!del.status.success());
+    let err = String::from_utf8_lossy(&del.stderr);
+    assert!(err.contains("not the owner"), "got: {err}");
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_enforce_owner_allows_self_delete() {
+    let db = fresh_enforce_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    set_governance(
+        bin,
+        &db,
+        "alphaone",
+        serde_json::json!({"write":"any","promote":"any","delete":"owner","approver":"human"}),
+        "owner",
+    );
+    let store = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--agent-id",
+            "alice",
+            "--json",
+            "store",
+            "-n",
+            "alphaone",
+            "-T",
+            "alice-mem-2",
+            "-c",
+            "hi",
+            "-t",
+            "long",
+        ])
+        .output()
+        .unwrap();
+    let id = serde_json::from_slice::<serde_json::Value>(&store.stdout).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let del = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--agent-id",
+            "alice",
+            "delete",
+            &id,
+        ])
+        .output()
+        .unwrap();
+    assert!(del.status.success());
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_enforce_approve_queues_pending() {
+    let db = fresh_enforce_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    set_governance(
+        bin,
+        &db,
+        "alphaone",
+        serde_json::json!({"write":"approve","promote":"any","delete":"owner","approver":"human"}),
+        "owner",
+    );
+    let out = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--agent-id",
+            "alice",
+            "--json",
+            "store",
+            "-n",
+            "alphaone",
+            "-T",
+            "queued",
+            "-c",
+            "hi",
+            "-t",
+            "long",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["status"], "pending");
+    assert!(v["pending_id"].is_string());
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_enforce_pending_list_and_approve() {
+    let db = fresh_enforce_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    set_governance(
+        bin,
+        &db,
+        "alphaone",
+        serde_json::json!({"write":"approve","promote":"any","delete":"owner","approver":"human"}),
+        "owner",
+    );
+    let queued = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--agent-id",
+            "alice",
+            "--json",
+            "store",
+            "-n",
+            "alphaone",
+            "-T",
+            "needs-approval",
+            "-c",
+            "hi",
+            "-t",
+            "long",
+        ])
+        .output()
+        .unwrap();
+    let pending_id =
+        serde_json::from_slice::<serde_json::Value>(&queued.stdout).unwrap()["pending_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+    let list = cmd(bin)
+        .args(["--db", db.to_str().unwrap(), "--json", "pending", "list"])
+        .output()
+        .unwrap();
+    assert!(list.status.success());
+    let lv: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert_eq!(lv["count"], 1);
+
+    let ap = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--agent-id",
+            "approver",
+            "--json",
+            "pending",
+            "approve",
+            &pending_id,
+        ])
+        .output()
+        .unwrap();
+    assert!(ap.status.success());
+    let av: serde_json::Value = serde_json::from_slice(&ap.stdout).unwrap();
+    assert_eq!(av["approved"], true);
+    assert_eq!(av["decided_by"], "approver");
+
+    let ap2 = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--agent-id",
+            "approver",
+            "pending",
+            "approve",
+            &pending_id,
+        ])
+        .output()
+        .unwrap();
+    assert!(!ap2.status.success());
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_enforce_pending_reject_status() {
+    let db = fresh_enforce_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    set_governance(
+        bin,
+        &db,
+        "alphaone",
+        serde_json::json!({"write":"approve","promote":"any","delete":"owner","approver":"human"}),
+        "owner",
+    );
+    let queued = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--agent-id",
+            "alice",
+            "--json",
+            "store",
+            "-n",
+            "alphaone",
+            "-T",
+            "to-reject",
+            "-c",
+            "hi",
+            "-t",
+            "long",
+        ])
+        .output()
+        .unwrap();
+    let pending_id =
+        serde_json::from_slice::<serde_json::Value>(&queued.stdout).unwrap()["pending_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+    let rj = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--agent-id",
+            "approver",
+            "--json",
+            "pending",
+            "reject",
+            &pending_id,
+        ])
+        .output()
+        .unwrap();
+    assert!(rj.status.success());
+    let rv: serde_json::Value = serde_json::from_slice(&rj.stdout).unwrap();
+    assert_eq!(rv["rejected"], true);
+
+    let list = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--json",
+            "pending",
+            "list",
+            "--status",
+            "rejected",
+        ])
+        .output()
+        .unwrap();
+    let lv: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert_eq!(lv["count"], 1);
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_enforce_unset_falls_back_to_default_policy() {
+    // Default: { write: Any, promote: Any, delete: Owner, approver: Human }
+    let db = fresh_enforce_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    let out = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--agent-id",
+            "anyone",
+            "--json",
+            "store",
+            "-n",
+            "anywhere",
+            "-T",
+            "default-allow",
+            "-c",
+            "hi",
+            "-t",
+            "long",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "default write policy is Any");
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_enforce_promote_with_approve_policy() {
+    let db = fresh_enforce_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    set_governance(
+        bin,
+        &db,
+        "alphaone",
+        serde_json::json!({"write":"any","promote":"approve","delete":"any","approver":"human"}),
+        "owner",
+    );
+    let store = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--agent-id",
+            "alice",
+            "--json",
+            "store",
+            "-n",
+            "alphaone",
+            "-T",
+            "will-be-promoted",
+            "-c",
+            "hi",
+            "-t",
+            "mid",
+        ])
+        .output()
+        .unwrap();
+    let id = serde_json::from_slice::<serde_json::Value>(&store.stdout).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let pr = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--agent-id",
+            "alice",
+            "--json",
+            "promote",
+            &id,
+        ])
+        .output()
+        .unwrap();
+    assert!(pr.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&pr.stdout).unwrap();
+    assert_eq!(v["status"], "pending");
+    assert!(v["pending_id"].is_string());
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_enforce_mcp_pending_tools() {
+    let db = fresh_enforce_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    set_governance(
+        bin,
+        &db,
+        "alphaone",
+        serde_json::json!({"write":"approve","promote":"any","delete":"owner","approver":"human"}),
+        "owner",
+    );
+    let queued = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--agent-id",
+            "alice",
+            "--json",
+            "store",
+            "-n",
+            "alphaone",
+            "-T",
+            "mcp-pending-flow",
+            "-c",
+            "x",
+            "-t",
+            "long",
+        ])
+        .output()
+        .unwrap();
+    let pending_id =
+        serde_json::from_slice::<serde_json::Value>(&queued.stdout).unwrap()["pending_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+    use std::io::Write;
+    let mut child = cmd(bin)
+        .args(["--db", db.to_str().unwrap(), "mcp", "--tier", "keyword"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdin = child.stdin.as_mut().unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"memory_pending_list","arguments":{}}
+        })
+    )
+    .unwrap();
+    writeln!(stdin, "{}",
+        serde_json::json!({
+            "jsonrpc":"2.0","id":3,"method":"tools/call",
+            "params":{"name":"memory_pending_approve","arguments":{"id": pending_id, "agent_id": "approver-mcp"}}
+        })).unwrap();
+    stdin.flush().unwrap();
+    drop(child.stdin.take());
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+
+    let list_resp: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    let list_text = list_resp["result"]["content"][0]["text"].as_str().unwrap();
+    let list_body: serde_json::Value = serde_json::from_str(list_text).unwrap();
+    assert_eq!(list_body["count"], 1);
+
+    let appr_resp: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
+    let appr_text = appr_resp["result"]["content"][0]["text"].as_str().unwrap();
+    let appr_body: serde_json::Value = serde_json::from_str(appr_text).unwrap();
+    assert_eq!(appr_body["approved"], true);
     let _ = std::fs::remove_file(&db);
 }

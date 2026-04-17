@@ -295,6 +295,60 @@ pub struct NamespaceCount {
 pub const AGENTS_NAMESPACE: &str = "_agents";
 
 // ---------------------------------------------------------------------------
+// Task 1.9 — Governance Enforcement
+// ---------------------------------------------------------------------------
+
+/// The outcome of a governance check. Callers MAY execute on `Allow`,
+/// MUST reject on `Deny`, and SHOULD queue + return the `pending_id` on
+/// `Pending`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GovernanceDecision {
+    /// Allowed; proceed with the action.
+    Allow,
+    /// Denied; surface the reason to the caller.
+    Deny(String),
+    /// Queued for approval; the caller receives the new `pending_id`.
+    Pending(String),
+}
+
+/// Actions that governance gates. Used as the `action_type` column value in
+/// `pending_actions` and as the discriminator for enforcement calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GovernedAction {
+    Store,
+    Delete,
+    Promote,
+}
+
+impl GovernedAction {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Store => "store",
+            Self::Delete => "delete",
+            Self::Promote => "promote",
+        }
+    }
+}
+
+/// Row returned by `db::list_pending_actions`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingAction {
+    pub id: String,
+    pub action_type: String,
+    pub memory_id: Option<String>,
+    pub namespace: String,
+    pub payload: Value,
+    pub requested_by: String,
+    pub requested_at: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decided_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decided_at: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
 // Task 1.8 — Governance Metadata
 // ---------------------------------------------------------------------------
 
