@@ -5005,3 +5005,398 @@ fn test_scope_invalid_as_agent_rejected() {
     assert!(!out.status.success(), "invalid --as-agent must be rejected");
     let _ = std::fs::remove_file(&db);
 }
+
+// ---------------------------------------------------------------------------
+// Task 1.6 — N-Level Rule Inheritance
+// ---------------------------------------------------------------------------
+
+fn fresh_inherit_db() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("ai-memory-inherit-{}.db", uuid::Uuid::new_v4()))
+}
+
+/// Seed a standard memory in a namespace, then set_standard it.
+fn seed_standard(
+    binary: &str,
+    db_path: &std::path::Path,
+    namespace: &str,
+    title: &str,
+    content: &str,
+) -> String {
+    let out = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--json",
+            "store",
+            "-n",
+            namespace,
+            "-T",
+            title,
+            "-c",
+            content,
+            "-t",
+            "long",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "seed store failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let id = v["id"].as_str().unwrap().to_string();
+
+    // Set via MCP (CLI doesn't expose set_namespace_standard)
+    use std::io::Write;
+    let mut child = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "mcp",
+            "--tier",
+            "keyword",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdin = child.stdin.as_mut().unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"memory_namespace_set_standard","arguments":{
+                "namespace": namespace,
+                "id": id,
+            }}
+        })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    drop(child.stdin.take());
+    let _ = child.wait_with_output();
+    id
+}
+
+/// Invoke memory_namespace_get_standard via MCP, returning the parsed body.
+fn get_standard_inherit(
+    binary: &str,
+    db_path: &std::path::Path,
+    namespace: &str,
+) -> serde_json::Value {
+    use std::io::Write;
+    let mut child = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "mcp",
+            "--tier",
+            "keyword",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdin = child.stdin.as_mut().unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"memory_namespace_get_standard","arguments":{
+                "namespace": namespace,
+                "inherit": true,
+            }}
+        })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    drop(child.stdin.take());
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    let resp: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    serde_json::from_str(text).unwrap()
+}
+
+#[test]
+fn test_inherit_4_level_chain() {
+    let db = fresh_inherit_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+
+    // Seed standards at all 4 levels plus global
+    seed_standard(bin, &db, "*", "global-policy", "Global: always follow CLA");
+    seed_standard(bin, &db, "alphaone", "org-policy", "Org: use Apache-2.0");
+    seed_standard(
+        bin,
+        &db,
+        "alphaone/eng",
+        "unit-policy",
+        "Unit: cargo fmt strict",
+    );
+    seed_standard(
+        bin,
+        &db,
+        "alphaone/eng/platform",
+        "team-policy",
+        "Team: weekly sync Wednesday",
+    );
+
+    let body = get_standard_inherit(bin, &db, "alphaone/eng/platform");
+    let chain = body["chain"].as_array().expect("chain array");
+    // Chain order: most-general first
+    assert_eq!(
+        chain
+            .iter()
+            .map(|v| v.as_str().unwrap_or(""))
+            .collect::<Vec<_>>(),
+        vec!["*", "alphaone", "alphaone/eng", "alphaone/eng/platform"]
+    );
+
+    let standards = body["standards"].as_array().expect("standards array");
+    assert_eq!(standards.len(), 4, "all 4 standards resolved");
+    assert_eq!(standards[0]["title"], "global-policy");
+    assert_eq!(standards[1]["title"], "org-policy");
+    assert_eq!(standards[2]["title"], "unit-policy");
+    assert_eq!(standards[3]["title"], "team-policy");
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_inherit_missing_intermediates_skipped() {
+    let db = fresh_inherit_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+
+    // Global and team set; org and unit have NO standard
+    seed_standard(bin, &db, "*", "global-only", "Global");
+    seed_standard(bin, &db, "alphaone/eng/platform", "team-only", "Team");
+
+    let body = get_standard_inherit(bin, &db, "alphaone/eng/platform");
+    let chain = body["chain"].as_array().unwrap();
+    assert_eq!(chain.len(), 4, "chain still contains all 4 path elements");
+
+    let standards = body["standards"].as_array().unwrap();
+    assert_eq!(standards.len(), 2, "only the 2 with standards resolve");
+    assert_eq!(standards[0]["title"], "global-only");
+    assert_eq!(standards[1]["title"], "team-only");
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_inherit_preserves_3_level_flat_behavior() {
+    // Legacy flat namespaces use explicit parent chain (namespace_meta).
+    // This test regresses the historical 3-level behavior.
+    let db = fresh_inherit_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+
+    seed_standard(bin, &db, "*", "g", "g");
+    // Flat namespaces — no `/`
+    seed_standard(bin, &db, "ai-memory", "ai-mem-std", "ai-mem-std");
+
+    let body = get_standard_inherit(bin, &db, "ai-memory");
+    let standards = body["standards"].as_array().unwrap();
+    // At minimum global + ai-memory resolve
+    let titles: Vec<String> = standards
+        .iter()
+        .filter_map(|s| s["title"].as_str().map(str::to_string))
+        .collect();
+    assert!(titles.contains(&"g".to_string()));
+    assert!(titles.contains(&"ai-mem-std".to_string()));
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_inherit_recall_auto_prepends_chain() {
+    // session_start / recall should already inject the chain when namespace is set.
+    let db = fresh_inherit_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+
+    seed_standard(bin, &db, "alphaone", "org-s", "org standard");
+    seed_standard(bin, &db, "alphaone/eng", "unit-s", "unit standard");
+    seed_standard(bin, &db, "alphaone/eng/platform", "team-s", "team standard");
+
+    // Store an unrelated memory in the team namespace
+    let _ = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "store",
+            "-n",
+            "alphaone/eng/platform",
+            "-T",
+            "regular-note",
+            "-c",
+            "something",
+            "-t",
+            "long",
+        ])
+        .output()
+        .unwrap();
+
+    // Invoke recall via MCP and look for standards[]
+    use std::io::Write;
+    let mut child = cmd(bin)
+        .args(["--db", db.to_str().unwrap(), "mcp", "--tier", "keyword"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdin = child.stdin.as_mut().unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"memory_recall","arguments":{
+                "context": "note",
+                "namespace": "alphaone/eng/platform",
+                "format": "json"
+            }}
+        })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    drop(child.stdin.take());
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    let resp: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let body: serde_json::Value = serde_json::from_str(text).unwrap();
+
+    // Multiple standards → "standards" key (plural). 3 levels set, all should resolve.
+    let standards = body["standards"].as_array().expect("standards array");
+    let titles: Vec<String> = standards
+        .iter()
+        .filter_map(|s| s["title"].as_str().map(str::to_string))
+        .collect();
+    assert!(titles.contains(&"org-s".to_string()));
+    assert!(titles.contains(&"unit-s".to_string()));
+    assert!(titles.contains(&"team-s".to_string()));
+    // Order: most-general first
+    assert_eq!(titles[0], "org-s");
+    assert_eq!(titles[titles.len() - 1], "team-s");
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_inherit_global_only() {
+    // Only global `*` has a standard — chain still walks cleanly.
+    let db = fresh_inherit_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+
+    seed_standard(bin, &db, "*", "only-global", "global rule");
+    let body = get_standard_inherit(bin, &db, "alphaone/eng/platform/agent-1");
+    let standards = body["standards"].as_array().unwrap();
+    assert_eq!(standards.len(), 1);
+    assert_eq!(standards[0]["title"], "only-global");
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_inherit_no_standards_returns_empty() {
+    let db = fresh_inherit_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    let body = get_standard_inherit(bin, &db, "alphaone/eng/platform");
+    let standards = body["standards"].as_array().unwrap();
+    assert!(standards.is_empty());
+    assert_eq!(body["count"], 0);
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_inherit_deep_namespace_8_levels() {
+    let db = fresh_inherit_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+
+    // 8-level path matches MAX_NAMESPACE_DEPTH
+    let deep = "a/b/c/d/e/f/g/h";
+    seed_standard(bin, &db, "*", "root-s", "root");
+    seed_standard(bin, &db, "a", "top-s", "top");
+    seed_standard(bin, &db, deep, "leaf-s", "leaf");
+
+    let body = get_standard_inherit(bin, &db, deep);
+    let chain = body["chain"].as_array().unwrap();
+    assert_eq!(chain.len(), 9, "* + 8 /-levels");
+    let standards = body["standards"].as_array().unwrap();
+    assert_eq!(standards.len(), 3, "only the 3 set");
+    assert_eq!(standards[0]["title"], "root-s");
+    assert_eq!(standards[2]["title"], "leaf-s");
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_inherit_default_omits_chain() {
+    // Without inherit=true, the old single-namespace response shape is used.
+    let db = fresh_inherit_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+
+    seed_standard(bin, &db, "alphaone", "org-only", "org");
+
+    // get_standard with inherit=false (default) must return single-object shape
+    use std::io::Write;
+    let mut child = cmd(bin)
+        .args(["--db", db.to_str().unwrap(), "mcp", "--tier", "keyword"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdin = child.stdin.as_mut().unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"memory_namespace_get_standard","arguments":{
+                "namespace": "alphaone",
+            }}
+        })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    drop(child.stdin.take());
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    let resp: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let body: serde_json::Value = serde_json::from_str(text).unwrap();
+
+    assert!(
+        body["chain"].is_null(),
+        "chain must not be present without inherit=true"
+    );
+    assert_eq!(body["title"], "org-only");
+    let _ = std::fs::remove_file(&db);
+}
