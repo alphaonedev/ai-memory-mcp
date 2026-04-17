@@ -372,11 +372,12 @@ fn tool_definitions() -> Value {
             },
             {
                 "name": "memory_namespace_get_standard",
-                "description": "Get the standard/policy memory for a namespace, if one is set.",
+                "description": "Get the standard/policy memory for a namespace, if one is set. With inherit=true returns the full N-level resolved chain (Task 1.6).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "namespace": {"type": "string", "description": "Namespace to get the standard for"}
+                        "namespace": {"type": "string", "description": "Namespace to get the standard for"},
+                        "inherit": {"type": "boolean", "default": false, "description": "Task 1.6: when true, return the full inheritance chain (global * → ancestors → namespace) as a list instead of the single namespace's standard."}
                     },
                     "required": ["namespace"]
                 }
@@ -684,10 +685,73 @@ fn handle_store(
     Ok(response)
 }
 
-/// Inject namespace standard into a `recall/session_start` response.
+/// Build the standards-inheritance chain for a namespace, most-general
+/// first. Task 1.6 extends this from the historical 3-level scheme
+/// (global → parent → namespace) to N levels by walking the `/`-derived
+/// ancestors from [`crate::models::namespace_ancestors`] plus any
+/// `namespace_meta` explicit-parent chain rooted at the top of the
+/// hierarchical path (which keeps legacy flat-namespace setups working).
+///
+/// Returned vector is top-down: `[*, org, unit, team, agent]` for a
+/// 4-level hierarchical namespace. Cycle-safe and bounded.
+fn build_namespace_chain(conn: &rusqlite::Connection, namespace: &str) -> Vec<String> {
+    const MAX_EXPLICIT_DEPTH: usize = 8;
+    let mut chain: Vec<String> = Vec::new();
+
+    if namespace == "*" {
+        chain.push("*".to_string());
+        return chain;
+    }
+
+    // Always start with the global standard — most general.
+    chain.push("*".to_string());
+
+    // 1. /-derived ancestors. `namespace_ancestors` returns most-specific-first;
+    //    reverse for top-down (root ancestor first, then namespace itself last).
+    let mut hierarchy_chain: Vec<String> = crate::models::namespace_ancestors(namespace)
+        .into_iter()
+        .rev()
+        .collect();
+
+    // 2. If the ROOTmost of the /-chain has an explicit `namespace_meta` parent,
+    //    prepend that chain (bounded by MAX_EXPLICIT_DEPTH + cycle-safe).
+    //    Supports legacy flat namespaces (e.g. `ai-memory` → `ai-memory-mcp`).
+    if let Some(root) = hierarchy_chain.first().cloned() {
+        let mut explicit_above: Vec<String> = Vec::new();
+        let mut current = root;
+        for _ in 0..MAX_EXPLICIT_DEPTH {
+            match db::get_namespace_parent(conn, &current) {
+                Some(p)
+                    if p != "*"
+                        && !explicit_above.contains(&p)
+                        && !hierarchy_chain.contains(&p) =>
+                {
+                    explicit_above.push(p.clone());
+                    current = p;
+                }
+                _ => break,
+            }
+        }
+        // `explicit_above` is [immediate-explicit-parent, grandparent, ...];
+        // reverse to prepend in top-down order.
+        for p in explicit_above.into_iter().rev() {
+            chain.push(p);
+        }
+    }
+
+    // 3. Append the /-derived chain (top-down).
+    for entry in hierarchy_chain.drain(..) {
+        if !chain.contains(&entry) {
+            chain.push(entry);
+        }
+    }
+
+    chain
+}
+
 /// Inject namespace standards into a `recall/session_start` response.
-/// Three-level rule layering: global ("*") + parent chain + namespace-specific.
-/// Max depth 5 to prevent cycles.
+/// N-level rule layering: global ("*") → root → ... → namespace-specific.
+/// Uses [`build_namespace_chain`] to resolve the full ancestor path.
 fn inject_namespace_standard(
     conn: &rusqlite::Connection,
     namespace: Option<&str>,
@@ -705,39 +769,16 @@ fn inject_namespace_standard(
         }
     };
 
-    // Level 1: global standard ("*") — always applies
-    if let Some(global) = lookup_namespace_standard(conn, "*") {
-        add_standard(global, &mut standard_ids, &mut standards);
-    }
+    let chain = if let Some(ns) = namespace {
+        build_namespace_chain(conn, ns)
+    } else {
+        // No namespace context — only the global standard applies.
+        vec!["*".to_string()]
+    };
 
-    // Level 2+: walk parent chain from namespace, then add namespace itself
-    if let Some(ns) = namespace
-        && ns != "*"
-    {
-        // Collect the parent chain (bottom-up), then reverse to get top-down order
-        let mut chain: Vec<String> = Vec::new();
-        let mut current = ns.to_string();
-        for _ in 0..5 {
-            // max depth 5
-            if let Some(parent) = db::get_namespace_parent(conn, &current) {
-                if parent == "*" || chain.contains(&parent) {
-                    break; // don't re-add global or cycle
-                }
-                chain.push(parent.clone());
-                current = parent;
-            } else {
-                break;
-            }
-        }
-        // Add parents top-down (grandparent first, then parent)
-        for ancestor in chain.into_iter().rev() {
-            if let Some(std) = lookup_namespace_standard(conn, &ancestor) {
-                add_standard(std, &mut standard_ids, &mut standards);
-            }
-        }
-        // Add the namespace's own standard last (most specific)
-        if let Some(ns_std) = lookup_namespace_standard(conn, ns) {
-            add_standard(ns_std, &mut standard_ids, &mut standards);
+    for link in chain {
+        if let Some(std) = lookup_namespace_standard(conn, &link) {
+            add_standard(std, &mut standard_ids, &mut standards);
         }
     }
 
@@ -1397,6 +1438,32 @@ fn handle_namespace_get_standard(
         .as_str()
         .ok_or("namespace is required")?;
     validate::validate_namespace(namespace).map_err(|e| e.to_string())?;
+
+    // Task 1.6: --inherit returns the full resolved chain, most-general-first.
+    let inherit = params["inherit"].as_bool().unwrap_or(false);
+    if inherit {
+        let chain = build_namespace_chain(conn, namespace);
+        let mut standards: Vec<Value> = Vec::new();
+        for link in &chain {
+            if let Some(std) = lookup_namespace_standard(conn, link) {
+                let entry = json!({
+                    "namespace": link,
+                    "standard_id": std["id"].clone(),
+                    "title": std["title"].clone(),
+                    "content": std["content"].clone(),
+                    "priority": std["priority"].clone(),
+                });
+                standards.push(entry);
+            }
+        }
+        return Ok(json!({
+            "namespace": namespace,
+            "chain": chain,
+            "standards": standards,
+            "count": standards.len(),
+        }));
+    }
+
     let standard_id = db::get_namespace_standard(conn, namespace).map_err(|e| e.to_string())?;
     match standard_id {
         Some(id) => {
