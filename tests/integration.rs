@@ -7209,3 +7209,252 @@ fn test_budget_mcp_tool_schema_and_response() {
     assert_eq!(body["budget_tokens"], 200);
     let _ = std::fs::remove_file(&db);
 }
+
+// ---------------------------------------------------------------------------
+// Task 1.12 — Hierarchy-Aware Recall
+// ---------------------------------------------------------------------------
+
+fn fresh_hier_recall_db() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("ai-memory-hier-{}.db", uuid::Uuid::new_v4()))
+}
+
+fn store_at(binary: &str, db_path: &std::path::Path, namespace: &str, title: &str) {
+    let out = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--json",
+            "store",
+            "-n",
+            namespace,
+            "-T",
+            title,
+            "-c",
+            "postgres content for test",
+            "-t",
+            "long",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "store failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn recall_titles(
+    binary: &str,
+    db_path: &std::path::Path,
+    namespace: &str,
+    ctx: &str,
+) -> Vec<String> {
+    let out = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--json",
+            "recall",
+            ctx,
+            "-n",
+            namespace,
+            "--limit",
+            "50",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "recall failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    v["memories"]
+        .as_array()
+        .unwrap_or(&Vec::new())
+        .iter()
+        .filter_map(|m| m["title"].as_str().map(str::to_string))
+        .collect()
+}
+
+#[test]
+fn test_hier_recall_returns_ancestor_memories() {
+    let db = fresh_hier_recall_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    store_at(bin, &db, "alphaone", "org-note");
+    store_at(bin, &db, "alphaone/engineering", "unit-note");
+    store_at(bin, &db, "alphaone/engineering/platform", "team-note");
+    store_at(
+        bin,
+        &db,
+        "alphaone/engineering/platform/agent-1",
+        "agent-note",
+    );
+    // Sibling outside the ancestor chain
+    store_at(
+        bin,
+        &db,
+        "alphaone/engineering/platform/agent-2",
+        "sibling-note",
+    );
+    store_at(bin, &db, "other-org", "outsider-note");
+
+    let titles = recall_titles(
+        bin,
+        &db,
+        "alphaone/engineering/platform/agent-1",
+        "postgres",
+    );
+    assert!(titles.contains(&"org-note".to_string()));
+    assert!(titles.contains(&"unit-note".to_string()));
+    assert!(titles.contains(&"team-note".to_string()));
+    assert!(titles.contains(&"agent-note".to_string()));
+    assert!(
+        !titles.contains(&"sibling-note".to_string()),
+        "sibling not in ancestor chain"
+    );
+    assert!(!titles.contains(&"outsider-note".to_string()));
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_hier_recall_proximity_boost_ranks_closest_first() {
+    let db = fresh_hier_recall_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    store_at(bin, &db, "alphaone", "org-note");
+    store_at(bin, &db, "alphaone/engineering", "unit-note");
+    store_at(bin, &db, "alphaone/engineering/platform", "team-note");
+    store_at(
+        bin,
+        &db,
+        "alphaone/engineering/platform/agent-1",
+        "agent-note",
+    );
+
+    let titles = recall_titles(
+        bin,
+        &db,
+        "alphaone/engineering/platform/agent-1",
+        "postgres",
+    );
+    assert_eq!(titles[0], "agent-note");
+    assert_eq!(titles[titles.len() - 1], "org-note");
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_hier_recall_flat_namespace_unchanged() {
+    let db = fresh_hier_recall_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    store_at(bin, &db, "global", "flat-a");
+    store_at(bin, &db, "other", "flat-b");
+
+    let titles = recall_titles(bin, &db, "global", "postgres");
+    assert!(titles.contains(&"flat-a".to_string()));
+    assert!(
+        !titles.contains(&"flat-b".to_string()),
+        "flat namespace must stay exact-match"
+    );
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_hier_recall_budget_applied_after_proximity() {
+    let db = fresh_hier_recall_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    // Short body so a tight budget fits the closest memory.
+    let body = "postgres tag";
+    let entries = [
+        ("alphaone", "org"),
+        ("alphaone/engineering", "unit"),
+        ("alphaone/engineering/platform", "team"),
+        ("alphaone/engineering/platform/agent-1", "self"),
+    ];
+    for (ns, title) in entries {
+        let out = cmd(bin)
+            .args([
+                "--db",
+                db.to_str().unwrap(),
+                "--json",
+                "store",
+                "-n",
+                ns,
+                "-T",
+                title,
+                "-c",
+                body,
+                "-t",
+                "long",
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+    }
+
+    // Each memory ≈ (4 title + 12 content) / 4 = 4 tokens.
+    // Budget 10 should fit 2 memories max; closest ("self") wins top slot.
+    let out = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--json",
+            "recall",
+            "postgres",
+            "-n",
+            "alphaone/engineering/platform/agent-1",
+            "--budget-tokens",
+            "10",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let mems = v["memories"].as_array().unwrap();
+    assert!(!mems.is_empty());
+    assert_eq!(mems[0]["title"], "self");
+    assert!(v["tokens_used"].as_u64().unwrap() <= 10);
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_hier_recall_2_level_ancestor_only() {
+    let db = fresh_hier_recall_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    store_at(bin, &db, "alphaone", "org");
+    store_at(bin, &db, "alphaone/engineering", "unit");
+    store_at(bin, &db, "alphaone/engineering/platform", "descendant");
+
+    let titles = recall_titles(bin, &db, "alphaone/engineering", "postgres");
+    assert!(titles.contains(&"org".to_string()));
+    assert!(titles.contains(&"unit".to_string()));
+    assert!(
+        !titles.contains(&"descendant".to_string()),
+        "descendant of queried ns must NOT appear — only ancestors"
+    );
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_hier_recall_touches_only_ancestor_matches() {
+    let db = fresh_hier_recall_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    store_at(bin, &db, "alphaone", "ancestor-note");
+    store_at(bin, &db, "alphaone/engineering/agent-1", "agent-note");
+    store_at(bin, &db, "other-root", "outsider");
+
+    let _ = recall_titles(bin, &db, "alphaone/engineering/agent-1", "postgres");
+
+    let list = cmd(bin)
+        .args(["--db", db.to_str().unwrap(), "--json", "list"])
+        .output()
+        .unwrap();
+    let lv: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    let outsider = lv["memories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["title"] == "outsider")
+        .unwrap();
+    assert_eq!(outsider["access_count"], 0);
+    let _ = std::fs::remove_file(&db);
+}
