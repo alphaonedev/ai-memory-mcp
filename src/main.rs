@@ -793,18 +793,33 @@ fn cmd_store(
         }
     }
 
-    // Task 1.9: governance enforcement (store-side)
+    let mem = models::Memory {
+        id: uuid::Uuid::new_v4().to_string(),
+        tier,
+        namespace,
+        title: args.title,
+        content,
+        tags,
+        priority: args.priority.clamp(1, 10),
+        confidence: args.confidence.clamp(0.0, 1.0),
+        source: args.source,
+        access_count: 0,
+        created_at: now.to_rfc3339(),
+        updated_at: now.to_rfc3339(),
+        last_accessed_at: None,
+        expires_at,
+        metadata,
+    };
+
+    // Task 1.9: governance enforcement (store-side). Payload is the full
+    // Memory so Task 1.10's execute_pending_action can replay it on approval.
     {
         use models::{GovernanceDecision, GovernedAction};
-        let payload = serde_json::json!({
-            "title": &args.title,
-            "namespace": &namespace,
-            "tier": &args.tier,
-        });
+        let payload = serde_json::to_value(&mem).unwrap_or_default();
         match db::enforce_governance(
             &conn,
             GovernedAction::Store,
-            &namespace,
+            &mem.namespace,
             &agent_id,
             None,
             None,
@@ -824,34 +839,19 @@ fn cmd_store(
                             "pending_id": pending_id,
                             "reason": "governance requires approval",
                             "action": "store",
-                            "namespace": &namespace,
+                            "namespace": &mem.namespace,
                         })
                     );
                 } else {
-                    println!("store queued for approval: pending_id={pending_id} ns={namespace}");
+                    println!(
+                        "store queued for approval: pending_id={pending_id} ns={}",
+                        &mem.namespace
+                    );
                 }
                 return Ok(());
             }
         }
     }
-
-    let mem = models::Memory {
-        id: uuid::Uuid::new_v4().to_string(),
-        tier,
-        namespace,
-        title: args.title,
-        content,
-        tags,
-        priority: args.priority.clamp(1, 10),
-        confidence: args.confidence.clamp(0.0, 1.0),
-        source: args.source,
-        access_count: 0,
-        created_at: now.to_rfc3339(),
-        updated_at: now.to_rfc3339(),
-        last_accessed_at: None,
-        expires_at,
-        metadata,
-    };
     let contradictions =
         db::find_contradictions(&conn, &mem.title, &mem.namespace).unwrap_or_default();
     let actual_id = db::insert(&conn, &mem)?;
@@ -2412,20 +2412,50 @@ fn cmd_pending(
             }
         }
         PendingAction::Approve { id } => {
+            use db::ApproveOutcome;
             validate::validate_id(&id)?;
             let agent = identity::resolve_agent_id(cli_agent_id, None)?;
-            let ok = db::decide_pending_action(&conn, &id, true, &agent)?;
-            if !ok {
-                eprintln!("pending action not found or already decided: {id}");
-                std::process::exit(1);
-            }
-            if json_out {
-                println!(
-                    "{}",
-                    serde_json::json!({"approved": true, "id": id, "decided_by": agent})
-                );
-            } else {
-                println!("approved: {id} (by {agent})");
+            match db::approve_with_approver_type(&conn, &id, &agent)? {
+                ApproveOutcome::Approved => {
+                    let executed = db::execute_pending_action(&conn, &id)?;
+                    if json_out {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "approved": true,
+                                "id": id,
+                                "decided_by": agent,
+                                "executed": true,
+                                "memory_id": executed,
+                            })
+                        );
+                    } else {
+                        println!("approved + executed: {id} (by {agent})");
+                    }
+                }
+                ApproveOutcome::Pending { votes, quorum } => {
+                    if json_out {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "approved": false,
+                                "status": "pending",
+                                "id": id,
+                                "votes": votes,
+                                "quorum": quorum,
+                                "reason": "consensus threshold not yet reached",
+                            })
+                        );
+                    } else {
+                        println!(
+                            "approval recorded: {id} ({votes}/{quorum} consensus, not yet met)"
+                        );
+                    }
+                }
+                ApproveOutcome::Rejected(reason) => {
+                    eprintln!("approve rejected: {reason}");
+                    std::process::exit(1);
+                }
             }
         }
         PendingAction::Reject { id } => {
