@@ -2355,11 +2355,7 @@ pub fn sync_state_load(conn: &Connection, agent_id: &str) -> Result<crate::model
 /// if we've never successfully pushed to them (foundation-era rows also
 /// return `None` because the column was added in schema v12).
 #[must_use]
-pub fn sync_state_last_pushed(
-    conn: &Connection,
-    agent_id: &str,
-    peer_id: &str,
-) -> Option<String> {
+pub fn sync_state_last_pushed(conn: &Connection, agent_id: &str, peer_id: &str) -> Option<String> {
     conn.query_row(
         "SELECT last_pushed_at FROM sync_state WHERE agent_id = ?1 AND peer_id = ?2",
         params![agent_id, peer_id],
