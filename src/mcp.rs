@@ -405,6 +405,39 @@ fn tool_definitions() -> Value {
                 }
             },
             {
+                "name": "memory_pending_list",
+                "description": "List pending governance-queued actions (Task 1.9). Filter by status: pending (default) / approved / rejected.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "status": {"type": "string", "enum": ["pending", "approved", "rejected"]},
+                        "limit":  {"type": "integer", "default": 100, "maximum": 1000}
+                    }
+                }
+            },
+            {
+                "name": "memory_pending_approve",
+                "description": "Approve a pending action by id (Task 1.9). Caller identity is stamped as decided_by.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string", "description": "Pending action id"}
+                    },
+                    "required": ["id"]
+                }
+            },
+            {
+                "name": "memory_pending_reject",
+                "description": "Reject a pending action by id (Task 1.9). Caller identity is stamped as decided_by.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string", "description": "Pending action id"}
+                    },
+                    "required": ["id"]
+                }
+            },
+            {
                 "name": "memory_agent_register",
                 "description": "Register an agent in the reserved _agents namespace. Stores agent_type and capabilities, refreshes last_seen_at on re-registration while preserving registered_at. agent_id is claimed, not attested.",
                 "inputSchema": {
@@ -601,6 +634,37 @@ fn handle_store(
         expires_at,
         metadata,
     };
+
+    // Task 1.9: governance enforcement (store-side).
+    {
+        use crate::models::{GovernanceDecision, GovernedAction};
+        let payload = serde_json::to_value(&mem).unwrap_or_default();
+        match db::enforce_governance(
+            conn,
+            GovernedAction::Store,
+            &mem.namespace,
+            &agent_id,
+            None,
+            None,
+            &payload,
+        )
+        .map_err(|e| e.to_string())?
+        {
+            GovernanceDecision::Allow => {}
+            GovernanceDecision::Deny(reason) => {
+                return Err(format!("store denied by governance: {reason}"));
+            }
+            GovernanceDecision::Pending(pending_id) => {
+                return Ok(json!({
+                    "status": "pending",
+                    "pending_id": pending_id,
+                    "reason": "governance requires approval",
+                    "action": "store",
+                    "namespace": mem.namespace,
+                }));
+            }
+        }
+    }
 
     // True dedup: check for exact title+namespace match (#97)
     let existing = db::find_contradictions(conn, &mem.title, &mem.namespace).unwrap_or_default();
@@ -1062,43 +1126,128 @@ fn handle_delete(
     conn: &rusqlite::Connection,
     params: &Value,
     vector_index: Option<&VectorIndex>,
+    mcp_client: Option<&str>,
 ) -> Result<Value, String> {
     let id = params["id"].as_str().ok_or("id is required")?;
     validate::validate_id(id).map_err(|e| e.to_string())?;
-    // Try exact delete first; fall back to prefix resolution
-    let deleted = db::delete(conn, id).map_err(|e| e.to_string())?;
+
+    // Resolve the memory first so governance has owner context.
+    let target = if let Some(m) = db::get(conn, id).map_err(|e| e.to_string())? {
+        Some(m)
+    } else {
+        db::get_by_prefix(conn, id).map_err(|e| e.to_string())?
+    };
+    let Some(target) = target else {
+        return Err("memory not found".into());
+    };
+
+    // Task 1.9: governance enforcement (delete-side).
+    {
+        use crate::models::{GovernanceDecision, GovernedAction};
+        let agent_id = crate::identity::resolve_agent_id(params["agent_id"].as_str(), mcp_client)
+            .map_err(|e| e.to_string())?;
+        let mem_owner = target
+            .metadata
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let payload = json!({"id": target.id, "title": target.title});
+        match db::enforce_governance(
+            conn,
+            GovernedAction::Delete,
+            &target.namespace,
+            &agent_id,
+            Some(&target.id),
+            mem_owner.as_deref(),
+            &payload,
+        )
+        .map_err(|e| e.to_string())?
+        {
+            GovernanceDecision::Allow => {}
+            GovernanceDecision::Deny(reason) => {
+                return Err(format!("delete denied by governance: {reason}"));
+            }
+            GovernanceDecision::Pending(pending_id) => {
+                return Ok(json!({
+                    "status": "pending",
+                    "pending_id": pending_id,
+                    "reason": "governance requires approval",
+                    "action": "delete",
+                    "memory_id": target.id,
+                }));
+            }
+        }
+    }
+
+    let deleted = db::delete(conn, &target.id).map_err(|e| e.to_string())?;
     if deleted {
         if let Some(idx) = vector_index {
-            idx.remove(id);
+            idx.remove(&target.id);
         }
         Ok(json!({"deleted": true}))
-    } else if let Some(mem) = db::get_by_prefix(conn, id).map_err(|e| e.to_string())? {
-        let full_id = mem.id.clone();
-        let deleted = db::delete(conn, &full_id).map_err(|e| e.to_string())?;
-        if deleted {
-            if let Some(idx) = vector_index {
-                idx.remove(&full_id);
-            }
-            Ok(json!({"deleted": true}))
-        } else {
-            Err("memory not found".into())
-        }
     } else {
         Err("memory not found".into())
     }
 }
 
-fn handle_promote(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
+fn handle_promote(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    mcp_client: Option<&str>,
+) -> Result<Value, String> {
     let id = params["id"].as_str().ok_or("id is required")?;
     validate::validate_id(id).map_err(|e| e.to_string())?;
-    // Resolve prefix if exact ID not found
-    let resolved_id = if db::get(conn, id).map_err(|e| e.to_string())?.is_some() {
-        id.to_string()
-    } else if let Some(mem) = db::get_by_prefix(conn, id).map_err(|e| e.to_string())? {
-        mem.id
+    // Resolve prefix if exact ID not found; capture the memory so governance
+    // has owner context (Task 1.9).
+    let target = if let Some(m) = db::get(conn, id).map_err(|e| e.to_string())? {
+        m
+    } else if let Some(m) = db::get_by_prefix(conn, id).map_err(|e| e.to_string())? {
+        m
     } else {
         return Err("memory not found".into());
     };
+    let resolved_id = target.id.clone();
+
+    // Task 1.9: governance enforcement (promote-side).
+    {
+        use crate::models::{GovernanceDecision, GovernedAction};
+        let agent_id = crate::identity::resolve_agent_id(params["agent_id"].as_str(), mcp_client)
+            .map_err(|e| e.to_string())?;
+        let mem_owner = target
+            .metadata
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let payload = json!({
+            "id": resolved_id,
+            "to_namespace": params["to_namespace"].as_str(),
+        });
+        match db::enforce_governance(
+            conn,
+            GovernedAction::Promote,
+            &target.namespace,
+            &agent_id,
+            Some(&resolved_id),
+            mem_owner.as_deref(),
+            &payload,
+        )
+        .map_err(|e| e.to_string())?
+        {
+            GovernanceDecision::Allow => {}
+            GovernanceDecision::Deny(reason) => {
+                return Err(format!("promote denied by governance: {reason}"));
+            }
+            GovernanceDecision::Pending(pending_id) => {
+                return Ok(json!({
+                    "status": "pending",
+                    "pending_id": pending_id,
+                    "reason": "governance requires approval",
+                    "action": "promote",
+                    "memory_id": resolved_id,
+                }));
+            }
+        }
+    }
 
     // Task 1.7: optional vertical promotion to an ancestor namespace.
     // When `to_namespace` is supplied, clone (don't move) the memory to the
@@ -1695,6 +1844,49 @@ fn handle_agent_list(conn: &rusqlite::Connection) -> Result<Value, String> {
     }))
 }
 
+fn handle_pending_list(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
+    let status = params["status"].as_str();
+    let limit = usize::try_from(params["limit"].as_u64().unwrap_or(100))
+        .expect("u64 as usize")
+        .min(1000);
+    let items = db::list_pending_actions(conn, status, limit).map_err(|e| e.to_string())?;
+    Ok(json!({"count": items.len(), "pending": items}))
+}
+
+fn handle_pending_approve(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    mcp_client: Option<&str>,
+) -> Result<Value, String> {
+    let id = params["id"].as_str().ok_or("id is required")?;
+    validate::validate_id(id).map_err(|e| e.to_string())?;
+    let agent_id = crate::identity::resolve_agent_id(params["agent_id"].as_str(), mcp_client)
+        .map_err(|e| e.to_string())?;
+    let transitioned =
+        db::decide_pending_action(conn, id, true, &agent_id).map_err(|e| e.to_string())?;
+    if !transitioned {
+        return Err(format!("pending action not found or already decided: {id}"));
+    }
+    Ok(json!({"approved": true, "id": id, "decided_by": agent_id}))
+}
+
+fn handle_pending_reject(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    mcp_client: Option<&str>,
+) -> Result<Value, String> {
+    let id = params["id"].as_str().ok_or("id is required")?;
+    validate::validate_id(id).map_err(|e| e.to_string())?;
+    let agent_id = crate::identity::resolve_agent_id(params["agent_id"].as_str(), mcp_client)
+        .map_err(|e| e.to_string())?;
+    let transitioned =
+        db::decide_pending_action(conn, id, false, &agent_id).map_err(|e| e.to_string())?;
+    if !transitioned {
+        return Err(format!("pending action not found or already decided: {id}"));
+    }
+    Ok(json!({"rejected": true, "id": id, "decided_by": agent_id}))
+}
+
 fn handle_archive_list(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
     let namespace = params["namespace"].as_str();
     let limit = usize::try_from(params["limit"].as_u64().unwrap_or(50)).expect("u64 as usize");
@@ -1891,8 +2083,11 @@ fn handle_request(
                 ),
                 "memory_search" => handle_search(conn, arguments),
                 "memory_list" => handle_list(conn, arguments),
-                "memory_delete" => handle_delete(conn, arguments, vector_index),
-                "memory_promote" => handle_promote(conn, arguments),
+                "memory_delete" => handle_delete(conn, arguments, vector_index, mcp_client),
+                "memory_promote" => handle_promote(conn, arguments, mcp_client),
+                "memory_pending_list" => handle_pending_list(conn, arguments),
+                "memory_pending_approve" => handle_pending_approve(conn, arguments, mcp_client),
+                "memory_pending_reject" => handle_pending_reject(conn, arguments, mcp_client),
                 "memory_forget" => handle_forget(conn, arguments, archive_on_gc),
                 "memory_stats" => handle_stats(conn, db_path),
                 "memory_update" => handle_update(conn, arguments, embedder, vector_index),
@@ -2233,10 +2428,10 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn tool_definitions_returns_28_tools() {
+    fn tool_definitions_returns_31_tools() {
         let defs = tool_definitions();
         let tools = defs["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 28);
+        assert_eq!(tools.len(), 31);
     }
 
     #[test]
