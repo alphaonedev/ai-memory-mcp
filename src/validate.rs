@@ -250,19 +250,50 @@ pub fn validate_governance_policy(policy: &crate::models::GovernancePolicy) -> R
     Ok(())
 }
 
-/// Validate an agent type against the closed `VALID_AGENT_TYPES` set.
+/// Maximum length for an `agent_type` string.
+const MAX_AGENT_TYPE_LEN: usize = 64;
+
+/// Validate an agent type. Accepts any value matching one of these forms
+/// (red-team #235 — the original closed whitelist blocked future agents):
+///
+/// - **Anything in [`VALID_AGENT_TYPES`]** — the curated short-list including
+///   `human`, `system`, and known AI model identifiers
+/// - **Any `ai:<name>` form** — `^ai:[A-Za-z0-9_.-]{1,60}$`. Lets operators
+///   register `ai:claude-opus-4.8`, `ai:gpt-5`, `ai:gemini-2.5`, etc. without
+///   waiting for a code release
+///
+/// Strict format guard: alphanumeric + `_-:.` only, max 64 bytes total.
+/// This keeps the value safe for SQL storage, JSON serialization, and
+/// shell display while removing the closed-list hard stop.
 pub fn validate_agent_type(agent_type: &str) -> Result<()> {
     if agent_type.is_empty() {
         bail!("agent_type cannot be empty");
     }
-    if !VALID_AGENT_TYPES.contains(&agent_type) {
+    if agent_type.len() > MAX_AGENT_TYPE_LEN {
+        bail!("agent_type exceeds max length of {MAX_AGENT_TYPE_LEN} bytes");
+    }
+    // Curated set always wins.
+    if VALID_AGENT_TYPES.contains(&agent_type) {
+        return Ok(());
+    }
+    // Open `ai:<name>` namespace for forward compatibility with future models.
+    if let Some(name) = agent_type.strip_prefix("ai:") {
+        if name.is_empty() {
+            bail!("agent_type 'ai:' must include a name (e.g. 'ai:claude-opus-4.7')");
+        }
+        if name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        {
+            return Ok(());
+        }
         bail!(
-            "invalid agent_type '{}' — must be one of: {}",
-            agent_type,
-            VALID_AGENT_TYPES.join(", ")
+            "agent_type '{agent_type}' contains invalid characters in the ai: name \
+             part (allowed: alphanumeric, _-.)"
         );
     }
-    Ok(())
+    let valid = VALID_AGENT_TYPES.join(", ");
+    bail!("invalid agent_type '{agent_type}' — must be one of: {valid} (or any ai:<name> form)");
 }
 
 /// Validate a list of capability strings. Shares `validate_tags` rules
@@ -747,7 +778,7 @@ mod tests {
     }
 
     #[test]
-    fn test_valid_agent_type() {
+    fn test_valid_agent_type_curated_values() {
         assert!(validate_agent_type("ai:claude-opus-4.6").is_ok());
         assert!(validate_agent_type("ai:codex-5.4").is_ok());
         assert!(validate_agent_type("ai:grok-4.2").is_ok());
@@ -756,11 +787,31 @@ mod tests {
     }
 
     #[test]
+    fn test_valid_agent_type_open_ai_namespace_redteam_235() {
+        // Red-team #235 — any `ai:<name>` form must be accepted so operators
+        // can register future / custom AI agents without code changes.
+        assert!(validate_agent_type("ai:claude-opus-4.8").is_ok());
+        assert!(validate_agent_type("ai:gpt-5").is_ok());
+        assert!(validate_agent_type("ai:gemini-2.5").is_ok());
+        assert!(validate_agent_type("ai:custom_internal-model.v2").is_ok());
+        assert!(validate_agent_type("ai:claude").is_ok());
+    }
+
+    #[test]
     fn test_invalid_agent_type() {
+        // Empty.
         assert!(validate_agent_type("").is_err());
-        assert!(validate_agent_type("bogus").is_err());
+        // Wrong prefix case (only lowercase `ai:` matches the open form).
         assert!(validate_agent_type("AI:CLAUDE").is_err());
-        assert!(validate_agent_type("ai:claude").is_err());
+        // Plain word without `ai:` and not in curated set.
+        assert!(validate_agent_type("bogus").is_err());
+        // `ai:` with no name part.
+        assert!(validate_agent_type("ai:").is_err());
+        // Invalid char inside the ai: name part.
+        assert!(validate_agent_type("ai:foo bar").is_err());
+        assert!(validate_agent_type("ai:foo;rm").is_err());
+        // Too long.
+        assert!(validate_agent_type(&format!("ai:{}", "x".repeat(80))).is_err());
     }
 
     #[test]
