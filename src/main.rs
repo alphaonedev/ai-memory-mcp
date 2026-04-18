@@ -180,7 +180,10 @@ enum AgentsAction {
         /// Agent identifier
         #[arg(long)]
         agent_id: String,
-        /// Agent type (ai:claude-opus-4.6, ai:claude-opus-4.7, ai:codex-5.4, ai:grok-4.2, human, system)
+        /// Agent type. Curated values: human, system, ai:claude-opus-4.6,
+        /// ai:claude-opus-4.7, ai:codex-5.4, ai:grok-4.2. Any `ai:<name>`
+        /// form is also accepted (e.g. `ai:gpt-5`, `ai:gemini-2.5`) —
+        /// red-team #235.
         #[arg(long)]
         agent_type: String,
         /// Comma-separated capability tags
