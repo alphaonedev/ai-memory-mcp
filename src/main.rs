@@ -265,12 +265,6 @@ struct ServeArgs {
     /// attested `agent_id` extraction (Layer 2b) lands post-v0.6.0.
     #[arg(long, requires = "tls_cert")]
     mtls_allowlist: Option<PathBuf>,
-    /// Seconds to wait for in-flight requests to complete on graceful
-    /// shutdown (SIGINT). Default 30. Bumped from 10 in v0.6.0 because
-    /// large `/sync/push` batches can take longer than 10s under load
-    /// (red-team #233).
-    #[arg(long, default_value_t = 30)]
-    shutdown_grace_secs: u64,
 }
 
 #[derive(Args)]
@@ -496,14 +490,6 @@ struct SyncDaemonArgs {
     /// Layer 2 client-key PEM. Must pair with `--client-cert`.
     #[arg(long, requires = "client_cert")]
     client_key: Option<PathBuf>,
-    /// Disable server-cert verification on outbound HTTPS to peers.
-    /// **DANGEROUS** — accepts any server cert without validation,
-    /// enabling MITM attacks. Use only in trusted local labs with
-    /// self-signed peer certs and no mTLS. For untrusted networks,
-    /// pair `--client-cert` with the peer's `--mtls-allowlist` so
-    /// the peer authenticates US (red-team #232).
-    #[arg(long, default_value_t = false)]
-    insecure_skip_server_verify: bool,
 }
 
 #[derive(Args)]
@@ -901,13 +887,11 @@ async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &config::AppConfig
     // compatible with every prior release. The `requires = …` clap
     // attributes prevent the half-configured case.
     if let (Some(cert), Some(key)) = (&args.tls_cert, &args.tls_key) {
+        tracing::info!("ai-memory listening on https://{addr}");
         // rustls 0.23 needs an explicit CryptoProvider; install ring
         // before any TLS setup. Idempotent — second install is a
         // harmless no-op via ignore.
         let _ = rustls::crypto::ring::default_provider().install_default();
-        // Load TLS / mTLS config BEFORE printing the "listening" log
-        // so a misconfigured cert / key / allowlist surfaces the error
-        // first (red-team #248).
         let tls_config = if let Some(allowlist_path) = &args.mtls_allowlist {
             tracing::info!(
                 "mTLS enabled — client certs required. Allowlist: {}",
@@ -915,39 +899,23 @@ async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &config::AppConfig
             );
             load_mtls_rustls_config(cert, key, allowlist_path).await?
         } else {
-            tracing::warn!(
-                "TLS enabled but mTLS NOT configured — sync endpoints \
-                 (/api/v1/sync/push, /api/v1/sync/since) accept any client. \
-                 Set --mtls-allowlist for production peer-mesh deployments \
-                 (red-team #231)."
-            );
             load_rustls_config(cert, key).await?
         };
-        tracing::info!("ai-memory listening on https://{addr}");
         let socket_addr: std::net::SocketAddr = addr.parse()?;
         // axum-server doesn't have a direct graceful-shutdown on the
         // TLS builder yet; spawn the signal listener on the Handle
-        // instead so ctrl_c triggers a graceful shutdown. Window is
-        // operator-configurable via --shutdown-grace-secs (default 30,
-        // bumped from 10 in v0.6.0 — red-team #233).
-        let grace = std::time::Duration::from_secs(args.shutdown_grace_secs);
+        // instead so ctrl_c triggers a graceful shutdown.
         let handle = axum_server::Handle::new();
         let handle_clone = handle.clone();
         tokio::spawn(async move {
             shutdown.await;
-            handle_clone.graceful_shutdown(Some(grace));
+            handle_clone.graceful_shutdown(Some(std::time::Duration::from_secs(10)));
         });
         axum_server::bind_rustls(socket_addr, tls_config)
             .handle(handle)
             .serve(app.into_make_service())
             .await?;
     } else {
-        tracing::warn!(
-            "TLS NOT enabled — sync endpoints (/api/v1/sync/push, \
-             /api/v1/sync/since) accept any caller over plain HTTP. \
-             Set --tls-cert + --tls-key + --mtls-allowlist for production \
-             peer-mesh deployments (red-team #231)."
-        );
         tracing::info!("ai-memory listening on http://{addr}");
         let listener = tokio::net::TcpListener::bind(&addr).await?;
         axum::serve(listener, app)
@@ -2849,31 +2817,18 @@ async fn cmd_sync_daemon(
     // the trust anchor, so fingerprint pinning of the peer's server
     // cert is a Layer 2b refinement tracked in #224.
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let client = if let (Some(cert_path), Some(key_path)) = (&args.client_cert, &args.client_key) {
-        // mTLS path — daemon presents client cert; the peer's
-        // FingerprintAllowlistVerifier authenticates us. Server-cert
-        // pinning on this side is Layer 2b (post-v0.6.0).
-        let rustls_config = build_rustls_client_config(cert_path, key_path).await?;
-        reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .use_preconfigured_tls(rustls_config)
-            .build()?
-    } else {
-        // No client cert — server cert verification is the only
-        // remaining trust anchor. Default to system trust roots
-        // (the secure path) UNLESS the operator explicitly opts in
-        // to the insecure mode (red-team #232 — was silent MITM
-        // risk before v0.6.0).
-        let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30));
-        if args.insecure_skip_server_verify {
-            tracing::warn!(
-                "sync-daemon: --insecure-skip-server-verify set — peer server \
-                 certificates will NOT be validated. MITM attacks possible. \
-                 Do NOT use in production (red-team #232)."
-            );
-            builder = builder.danger_accept_invalid_certs(true);
+    let client = match (&args.client_cert, &args.client_key) {
+        (Some(cert_path), Some(key_path)) => {
+            let rustls_config = build_rustls_client_config(cert_path, key_path).await?;
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .use_preconfigured_tls(rustls_config)
+                .build()?
         }
-        builder.build()?
+        _ => reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .danger_accept_invalid_certs(true)
+            .build()?,
     };
 
     tracing::info!(
