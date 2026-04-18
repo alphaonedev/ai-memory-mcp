@@ -5,64 +5,126 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — v0.6.0 GA disclosures
+## [0.6.0] — 2026-04-17 — Phase 1 complete + Phase 3 foundation (the grand slam)
 
-The following items are **MANDATORY DISCLOSURES** for the v0.6.0 GA release.
-Operators upgrading from v0.5.4.x MUST read this section before deploying.
+First **GA** release on the v0.6.0 train. Tagged after a full-spectrum red-team
+audit (#230) — 0 ship-blockers, 15 findings fixed, 5 deferred to v0.6.1 with
+explicit notes. All quality gates green: 158/158 tests pass, fmt clean, clippy
+pedantic clean, cargo audit clean (one accepted unmaintained-crate advisory on
+transitive `rustls-pemfile`, RUSTSEC-2025-0134).
 
-### Breaking changes
+### Headline capabilities
 
-- **Consensus governance now requires agent pre-registration** (issue #234).
-  The fix for security issue #216 (one caller satisfying `Consensus(N)` with
-  N spoofed agent_ids) added an `is_registered_agent()` gate. Existing
-  `consensus:N` policies become **indefinitely-locked** unless approver
-  agents are registered first via `ai-memory agents register --agent-id <id>
-  --agent-type <type>`.
+- **Phase 1 (Schema, Hierarchy & Governance) — complete.** Tasks 1.1–1.12.
+  Metadata JSON column, agent identity (NHI-hardened), agent registration,
+  hierarchical namespaces (8 levels), scope-based visibility (private / team /
+  unit / org / collective), N-level rule inheritance, vertical promotion,
+  governance metadata + enforcement, approver types (human / agent / consensus),
+  context-budget-aware recall, hierarchy-aware recall.
 
-  Migration: register all consensus approvers before upgrading. Example:
+- **Phase 3 (Memory Sharing & Sync) foundation — pulled forward.**
+  - **`ai-memory sync-daemon`** — peer-to-peer HTTP knowledge mesh. Two
+    instances exchange memories live; one agent learns it, every peer knows
+    it within a cycle. No cloud, no login, no SaaS.
+  - **Native TLS** for `serve` (Layer 1) — `--tls-cert` + `--tls-key`,
+    rustls under the hood, no OpenSSL.
+  - **mTLS with SHA-256 fingerprint allowlist** (Layer 2) —
+    `--mtls-allowlist`, `known_hosts`-style trust, no CA / PKI required.
+    Unknown peers rejected at the TLS handshake.
+  - **Vector clocks** (`sync_state` table) per agent / per peer.
+  - **`sync --dry-run`** — preview changes before merging two databases.
 
+### MUST READ before upgrading from v0.5.4.x — breaking changes
+
+- **Consensus governance now requires agent pre-registration** (issue #234,
+  fixes #216). Existing `consensus:N` policies become **indefinitely-locked**
+  unless approver agents are registered first.
+
+  Migration:
   ```bash
   ai-memory agents register --agent-id alice --agent-type human
   ai-memory agents register --agent-id bob   --agent-type human
   ai-memory agents register --agent-id carol --agent-type human
   ```
 
-### Security disclosures (peer-mesh sync)
-
-- **Sync endpoints are unauthenticated when TLS is not enabled** (issue #231).
-  `POST /api/v1/sync/push` and `GET /api/v1/sync/since` accept all callers
-  when `serve` runs without `--tls-cert + --tls-key`. Production peer-mesh
-  deployments **MUST** set `--tls-cert + --tls-key + --mtls-allowlist`.
-  See `docs/ADMIN_GUIDE.md` § Peer-mesh security.
-
-- **sync-daemon does no server-cert verification without --client-cert**
-  (issue #232). The daemon uses `danger_accept_invalid_certs(true)` when
-  `--client-cert` is not provided — any server cert is accepted. For
-  untrusted networks, ALWAYS use mTLS in both directions.
-
-- **Any valid mTLS peer can dump the full database** (issue #239). By design,
-  the trust boundary is the mTLS cert. Sync endpoints bypass per-memory
-  visibility filtering. **Allowlist only peers you fully trust.** Per-namespace
-  / per-scope sync filtering is a Phase 5 feature.
-
-- **Body-claimed `sender_agent_id` is not yet attested to the cert CN/SAN**
-  (issue #238). mTLS gates network access but the receiving handler accepts
-  `sender_agent_id` from the body without checking the cert identity. A peer
-  with a valid cert can claim any agent_id. Tracked as Layer 2b for v0.7.
+- **`sync-daemon` no longer accepts arbitrary self-signed peer server certs
+  by default** (issue #232). Previously the daemon used
+  `danger_accept_invalid_certs(true)` when `--client-cert` was absent —
+  silent MITM risk. Now it uses the system trust store. Self-signed peer
+  servers fail handshake unless ONE of:
+    1. The peer's cert is added to the system trust store, OR
+    2. mTLS is configured on both ends (`--client-cert` + peer's
+       `--mtls-allowlist`), **OR**
+    3. The new `--insecure-skip-server-verify` flag is passed (with WARN).
 
 ### Schema migration
 
-- v0.5.4.6 → v0.6.0 runs six additive migrations (v7 through v12). All are
-  idempotent, transactional, and default-safe. Worst-case lock on a 10M-row
+- v0.5.4.6 → v0.6.0 runs six additive migrations (v7 through v12). All
+  idempotent, transactional, default-safe. Worst-case lock on a 10M-row
   database: 1–3 seconds during v10 (scope_idx index build). Schedule a brief
   maintenance window for large databases.
 
-### Surface gaps tracked for v0.6.1
+### Security hardening (post-red-team)
 
-- Namespace standards / governance config is currently **MCP-only** (issue
-  #236). HTTP and CLI surfaces will land in v0.6.1.
-- `--agent-type` accepts only 6 hardcoded values (issue #235). Workaround:
-  use `system` for custom agents, or wait for v0.6.1.
+- **Sync endpoints WARN at startup when not protected by TLS / mTLS**
+  (issue #231). Production peer-mesh deployments **MUST** set
+  `--tls-cert + --tls-key + --mtls-allowlist`. See `docs/ADMIN_GUIDE.md`
+  § Peer-mesh security.
+- **`--shutdown-grace-secs`** flag on `serve`, default bumped 10s → 30s
+  (issue #233). Avoids dropping in-flight `/sync/push` requests under load.
+- **`..` and `.` rejected as namespace segments** (issue #240). Prevents
+  hierarchy confusion + visibility prefix-match games.
+- **`/api/v1/sync/push` capped at MAX_BULK_SIZE (1000)** per request
+  (issue #242). Matches `bulk_create` / `import` limits.
+- **Allowlist parser tolerates UTF-8 BOM + internal whitespace** in the
+  hex string (issue #243). Better operator UX for Windows-edited files.
+- **`/api/v1/sync/since?since=garbage` returns 400 instead of 200**
+  (issue #247) — RFC 3339 parse validation before DB query.
+- **"listening on https://..." log moved AFTER TLS validation** (issue
+  #248). No more misleading log line followed by a startup error.
+- **`sync-daemon --interval 0 / --batch-size 0`** now logs WARN before
+  clamping (issue #250).
+- **`agent-type` whitelist opened** (issue #235). Curated values (`human`,
+  `system`, `ai:claude-opus-4.6/4.7`, `ai:codex-5.4`, `ai:grok-4.2`)
+  retained, plus any `ai:<name>` form. No more code releases needed for
+  new agent models.
+- **TLS cipher policy documented** inline (issue #245). rustls 0.23
+  defaults: TLS 1.2 + 1.3 only, AEAD ciphers, no legacy CBC.
+
+### Disclosed by design (intentional, documented)
+
+- **Any valid mTLS peer can dump the full database** via `since=<old-ts>`
+  on `/api/v1/sync/since` (issue #239). The trust boundary IS the mTLS
+  cert. Allowlist only peers you fully trust. Per-namespace / per-scope
+  sync filtering is a Phase 5 feature.
+- **Body-claimed `sender_agent_id` is not yet attested to the cert CN/SAN**
+  (issue #238). mTLS gates network access but the receiving handler
+  accepts `sender_agent_id` from the body. Tracked as Layer 2b for v0.7.
+
+### Tracked for v0.6.1
+
+- **#236** Namespace standards + governance config has no CLI / HTTP surface
+  (MCP-only today). New surface — Sensitive-class change deferred post-GA.
+- **#249** Top-level `agent_id` convenience field on HTTP `Memory` responses.
+  Cosmetic; data already present at `metadata.agent_id`.
+- **#246** `serde_json` recursion-depth limit on sync_push body. Defensive only.
+- **#244** Missing-vs-empty allowlist file UX polish.
+
+### Documentation site
+
+- New Docusaurus-based documentation site (PR #253) at
+  https://alphaonedev.github.io/ai-memory-mcp/ with 25 doc pages organized
+  for User / Admin / Developer audiences. Linked prominently from
+  `README.md` and `docs/index.html`.
+
+### Acknowledgements
+
+The full red-team audit (#230) was performed by Claude Opus 4.7 (1M context)
+under @binary2029's supervision. 6 follow-up PRs (#254, #255, #256, #257,
+#258, plus this version-bump PR) closed 13 issues; 2 more (#237, #241) closed
+on verification.
+
+## [0.6.0-alpha.2] — 2026-04-16 — Phase 1 Track A complete + release-plumbing reconciliation
 
 ## [0.6.0-alpha.2] — 2026-04-16 — Phase 1 Track A complete + release-plumbing reconciliation
 
