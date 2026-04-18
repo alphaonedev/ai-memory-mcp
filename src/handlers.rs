@@ -1667,6 +1667,21 @@ pub async fn sync_since(
     headers: HeaderMap,
     Query(q): Query<SyncSinceQuery>,
 ) -> impl IntoResponse {
+    // Validate `since` parses as RFC 3339 BEFORE hitting the DB so a
+    // garbage timestamp returns a clear 400 instead of a 200 with the
+    // entire database (red-team #247).
+    if let Some(ref s) = q.since
+        && !s.is_empty()
+        && chrono::DateTime::parse_from_rfc3339(s).is_err()
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "invalid `since` parameter — expected RFC 3339 timestamp"
+            })),
+        )
+            .into_response();
+    }
     let limit = q.limit.unwrap_or(500).min(10_000);
     let lock = state.lock().await;
     let mems = match db::memories_updated_since(&lock.0, q.since.as_deref(), limit) {
@@ -2188,6 +2203,32 @@ mod tests {
             .filter_map(|m| m["title"].as_str().map(str::to_string))
             .collect();
         assert_eq!(titles, vec!["new-mem".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn sync_since_rejects_garbage_timestamp_with_400() {
+        // Red-team #247 — `since=garbage` previously returned 200 with all
+        // memories. Now must return 400 with a clear error.
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/sync/since", axum_get(sync_since))
+            .with_state(state);
+
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/sync/since?since=not-a-date")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v["error"].as_str().unwrap().contains("RFC 3339"));
     }
 
     #[tokio::test]
