@@ -11,8 +11,9 @@ Phase 1 baseline (Tasks 1.1–1.12 from alpha train) plus the v0.6.0.0 sprint
 additions that push autonomy, multi-agent primitives, ops, and SDK coverage
 further into the cloud-agentic end-state.
 
-### Added — v0.6.0.0 sprint (autonomy + ops + SDKs)
+### Added — v0.6.0.0 sprint (autonomy + multi-agent + cloud + ops + SDKs)
 
+**Autonomy / recall**
 - **Time-decay half-life on recall scoring** — per-tier exponential decay
   multiplier on the hybrid-recall score blend. Default half-lives: short
   7 d, mid 30 d, long 365 d. Configurable via `[scoring]` in `config.toml`;
@@ -23,8 +24,6 @@ further into the cloud-agentic end-state.
   query embedding is fused 70/30 with an embedding of the joined context
   tokens, biasing recall toward memories that match both the explicit
   query AND nearby conversation topics. CLI: `--context-tokens tok1,tok2`.
-  Fusion is caller-side; `db::recall_hybrid` signature is unchanged beyond
-  the new `&ResolvedScoring` argument.
 - **Post-store LLM autonomy hooks** — opt-in synchronous hooks that fire
   `llm::auto_tag` + `llm::detect_contradiction` on every successful
   `memory_store`. Results persist into `metadata.auto_tags` and
@@ -33,20 +32,76 @@ further into the cloud-agentic end-state.
   config. Off by default (adds Ollama round-trip latency). Skipped for
   content under 50 bytes, when no LLM is wired, and for `_`-prefixed
   internal namespaces.
-- **TypeScript SDK scaffold** under `sdk/typescript/` — `@alphaone/ai-memory`
-  (v0.6.0-alpha.0), strict TS, undici-based fetch, covers all current +
-  v0.6.0.0 target endpoints (14+ methods), Jest tests guarded by
-  `AI_MEMORY_TEST_DAEMON` env var. Not yet published to npm.
-- **Python SDK scaffold** under `sdk/python/` — `ai-memory` (v0.6.0-alpha.0),
-  sync (`AiMemoryClient`) + async (`AsyncAiMemoryClient`) clients via
-  `httpx`, Pydantic v2 models (15/15 Memory fields), exception hierarchy,
-  HMAC-SHA256 webhook verifier. Not yet published to PyPI.
-- **Hardened systemd units** under `packaging/systemd/` — `ai-memory.service`,
-  `ai-memory-sync.service`, `ai-memory-backup.service`, `ai-memory-backup.timer`
-  with README. Full sandbox (`ProtectSystem=strict`,
-  `MemoryDenyWriteExecute=yes`, `SystemCallFilter=@system-service`,
-  `CapabilityBoundingSet=` empty, `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`).
-  Target `systemd-analyze security` exposure score <5.0.
+- **Semantic clustering** — new `memory_cluster` MCP tool groups a
+  namespace's memories into k semantic clusters using in-process
+  k-means over stored embeddings. k defaults to `ceil(sqrt(n/2))`
+  clamped to `[2, 16]`. Centroid labels are the 3 most-common tags
+  across cluster members. No new deps.
+
+**Multi-agent primitives**
+- **Agent-to-agent notify + inbox** — `memory_notify(target, title, payload)`
+  + `memory_inbox([agent_id, unread_only])` MCP tools. Messages are
+  ordinary memories in the reserved `_messages/<target>` namespace;
+  sender identity stamped in metadata; `access_count == 0` is the
+  conventional unread marker. No new schema.
+- **Webhook subscribe / unsubscribe / list** — `memory_subscribe` +
+  `memory_unsubscribe` + `memory_list_subscriptions` MCP tools. Events
+  fire on `memory_store` (v0.6.1 extends to delete/promote/link) and
+  POST an HMAC-SHA256-signed JSON payload to subscriber URLs
+  (`X-Ai-Memory-Signature: sha256=<hex>`). SSRF-hardened — private-range
+  IPs rejected, https required for non-loopback hosts. Migration v13
+  adds the `subscriptions` table.
+- **Row-level ACLs** — `memory_grant` + `memory_revoke` + `memory_list_acls`
+  MCP tools with new `memory_acl` table (migration v14). When any ACL
+  row exists for a memory, only listed agents can recall it (explicit
+  allow-list mode). When none exist, existing scope-based visibility
+  applies unchanged (backwards-compatible default). Read enforcement
+  is wired in `recall_hybrid`; get/update/delete enforcement is a
+  v0.6.1 follow-up.
+
+**Cloud foundation**
+- **Optional SQLCipher encryption at rest** — new cargo feature
+  `sqlcipher` swaps `rusqlite` to the
+  `bundled-sqlcipher-vendored-openssl` feature. Default builds are
+  byte-for-byte unchanged. Operators who want encryption build with
+  `cargo build --no-default-features --features sqlcipher` and supply
+  `--db-passphrase-file <path>` at startup. Passphrase never appears
+  in the process list or shell history.
+
+**Ops**
+- **Prometheus `/metrics` endpoint** (and `/api/v1/metrics`) exposes
+  `ai_memory_store_total`, `ai_memory_recall_total`,
+  `ai_memory_recall_latency_seconds`, `ai_memory_autonomy_hook_total`,
+  `ai_memory_contradiction_detected_total`,
+  `ai_memory_webhook_dispatched_total`,
+  `ai_memory_webhook_failed_total`, `ai_memory_memories`,
+  `ai_memory_hnsw_size`, `ai_memory_subscriptions_active`. Pure Rust,
+  no new transitive C deps.
+- **Hardened systemd units** under `packaging/systemd/` —
+  `ai-memory.service`, `ai-memory-sync.service`,
+  `ai-memory-backup.service`, `ai-memory-backup.timer` with README.
+  Full sandbox (`ProtectSystem=strict`, `MemoryDenyWriteExecute=yes`,
+  `SystemCallFilter=@system-service`, `CapabilityBoundingSet=` empty,
+  `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`). Target
+  `systemd-analyze security` exposure score <5.0.
+- **Backup / restore CLI** — `ai-memory backup --to <dir> [--keep N]`
+  writes a hot-backup-safe SQLite `VACUUM INTO` snapshot plus a
+  sha256 manifest. `ai-memory restore --from <path>` verifies the
+  manifest before replacing the current DB; previous DB is moved
+  aside to `<db>.pre-restore-<ts>.db` as a safety net. Paired with
+  the hourly `ai-memory-backup.timer` systemd unit.
+
+**SDKs**
+- **TypeScript SDK scaffold** under `sdk/typescript/` —
+  `@alphaone/ai-memory` (v0.6.0-alpha.0), strict TS, undici-based
+  fetch, covers all current + v0.6.0.0 target endpoints (18+ methods),
+  Jest tests guarded by `AI_MEMORY_TEST_DAEMON` env var. Includes
+  HMAC-SHA256 webhook verifier. Not yet published to npm.
+- **Python SDK scaffold** under `sdk/python/` — `ai-memory`
+  (v0.6.0-alpha.0), sync (`AiMemoryClient`) + async
+  (`AsyncAiMemoryClient`) clients via `httpx`, Pydantic v2 models
+  (15/15 Memory fields), exception hierarchy, HMAC-SHA256 webhook
+  verifier. Not yet published to PyPI.
 
 ### v0.6.0 GA disclosures (unchanged from pre-sprint baseline)
 
