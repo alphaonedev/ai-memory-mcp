@@ -223,6 +223,28 @@ impl Embedder {
         if denom < 1e-12 { 0.0 } else { dot / denom }
     }
 
+    /// Fuse a primary query embedding with a secondary context embedding via
+    /// weighted linear combination (v0.6.0.0 contextual recall).
+    ///
+    /// `primary_weight` clamped to `[0.0, 1.0]`. The result is returned
+    /// un-normalized — `cosine_similarity` divides out magnitudes, so the
+    /// downstream signal is direction-only. Returns `primary.to_vec()` when
+    /// dimensions differ (graceful fallback, same policy as
+    /// `cosine_similarity`).
+    #[must_use]
+    pub fn fuse(primary: &[f32], secondary: &[f32], primary_weight: f32) -> Vec<f32> {
+        if primary.len() != secondary.len() {
+            return primary.to_vec();
+        }
+        let w = primary_weight.clamp(0.0, 1.0);
+        let one_minus_w = 1.0 - w;
+        primary
+            .iter()
+            .zip(secondary.iter())
+            .map(|(p, s)| w * p + one_minus_w * s)
+            .collect()
+    }
+
     fn download_via_hf_hub() -> Result<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)>
     {
         let api = Api::new().context("failed to initialise HuggingFace Hub API")?;
@@ -303,5 +325,55 @@ mod tests {
         let b = vec![1.0, 0.0]; // Different dimension
         let sim = Embedder::cosine_similarity(&a, &b);
         assert_eq!(sim, 0.0);
+    }
+
+    // --- v0.6.0.0 contextual recall — fuse() ---
+
+    #[test]
+    fn fuse_weighted_sum() {
+        let p = vec![1.0, 0.0, 0.0];
+        let s = vec![0.0, 1.0, 0.0];
+        let f = Embedder::fuse(&p, &s, 0.7);
+        assert!((f[0] - 0.7).abs() < 1e-6);
+        assert!((f[1] - 0.3).abs() < 1e-6);
+        assert!((f[2] - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fuse_primary_weight_clamped() {
+        let p = vec![1.0, 1.0];
+        let s = vec![0.0, 0.0];
+        let f = Embedder::fuse(&p, &s, 2.0);
+        // Clamped to 1.0 — pure primary
+        assert!((f[0] - 1.0).abs() < 1e-6);
+        assert!((f[1] - 1.0).abs() < 1e-6);
+
+        let f = Embedder::fuse(&p, &s, -0.5);
+        // Clamped to 0.0 — pure secondary
+        assert!((f[0] - 0.0).abs() < 1e-6);
+        assert!((f[1] - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fuse_dimension_mismatch_returns_primary() {
+        let p = vec![1.0, 2.0, 3.0];
+        let s = vec![4.0, 5.0]; // mismatched
+        let f = Embedder::fuse(&p, &s, 0.7);
+        assert_eq!(f, p);
+    }
+
+    #[test]
+    fn fuse_cosine_pulls_toward_context() {
+        // Query vector: [1, 0]. Context pulls toward [0, 1] at 30%.
+        // Fused direction sits between them.
+        let q = vec![1.0_f32, 0.0];
+        let ctx = vec![0.0_f32, 1.0];
+        let fused = Embedder::fuse(&q, &ctx, 0.7);
+        // cos(fused, q) should exceed cos(fused, ctx) because primary weight is 70%.
+        let sim_q = Embedder::cosine_similarity(&fused, &q);
+        let sim_ctx = Embedder::cosine_similarity(&fused, &ctx);
+        assert!(sim_q > sim_ctx);
+        assert!(sim_q > 0.9); // ~0.919 analytically
+        assert!(sim_ctx > 0.3); // ~0.394 analytically
     }
 }
