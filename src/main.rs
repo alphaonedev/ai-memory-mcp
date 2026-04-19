@@ -3730,7 +3730,7 @@ fn prune_old_snapshots(dir: &Path, keep: usize) -> Result<()> {
             }
         })
         .collect();
-    snaps.sort_by(|a, b| b.0.cmp(&a.0));
+    snaps.sort_by_key(|b| std::cmp::Reverse(b.0));
     for (_, path) in snaps.into_iter().skip(keep) {
         let _ = std::fs::remove_file(&path);
         // Matching manifest (same stem, .manifest.json extension pattern)
@@ -3763,7 +3763,7 @@ fn cmd_restore(db_path: &Path, args: &RestoreArgs, json_out: bool) -> Result<()>
                 }
             })
             .collect();
-        snaps.sort_by(|a, b| b.0.cmp(&a.0));
+        snaps.sort_by_key(|b| std::cmp::Reverse(b.0));
         let snap = snaps
             .into_iter()
             .next()
