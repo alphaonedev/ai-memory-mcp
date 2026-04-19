@@ -111,6 +111,7 @@ fn tool_definitions() -> Value {
                         "until": {"type": "string", "description": "Only memories created before this RFC3339 timestamp"},
                         "as_agent": {"type": "string", "description": "Querying agent's namespace position (Task 1.5). Enables scope-based visibility filtering — results include private memories at this namespace, team/unit/org memories at ancestor subtrees, and collective memories globally."},
                         "budget_tokens": {"type": "integer", "minimum": 1, "description": "Task 1.11 — context-budget-aware recall. Return the top-ranked memories whose cumulative estimated tokens (title+content, ~4 chars/token) fit in N. Response includes tokens_used + budget_tokens."},
+                        "context_tokens": {"type": "array", "items": {"type": "string"}, "description": "v0.6.0.0 contextual recall — recent conversation tokens used to bias the query embedding at 70/30 (primary/context). Pulls results toward memories that match both the explicit query and nearby conversation topics."},
                         "format": {"type": "string", "enum": ["json", "toon", "toon_compact"], "default": "toon_compact", "description": "Response format. Default 'toon_compact' saves 79% tokens vs JSON. 'toon' includes timestamps. 'json' for structured parsing."}
                     },
                     "required": ["context"]
@@ -982,6 +983,7 @@ fn inject_namespace_standard(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 fn handle_recall(
     conn: &rusqlite::Connection,
     params: &Value,
@@ -1026,6 +1028,16 @@ fn handle_recall(
         .as_u64()
         .and_then(|n| usize::try_from(n).ok());
 
+    // v0.6.0.0 contextual recall — caller-supplied recent conversation tokens.
+    let context_tokens: Vec<String> = params["context_tokens"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
     // Helper: tack tokens_used / budget_tokens onto the response metadata.
     let decorate_budget = |resp: &mut Value, tokens_used: usize| {
         resp["tokens_used"] = json!(tokens_used);
@@ -1037,7 +1049,23 @@ fn handle_recall(
     // Use hybrid recall if embedder is available
     if let Some(emb) = embedder {
         match emb.embed(context) {
-            Ok(query_emb) => {
+            Ok(primary_emb) => {
+                // v0.6.0.0: fuse primary query with context-token embedding
+                // at 70/30 when caller supplied conversation tokens.
+                let query_emb = if context_tokens.is_empty() {
+                    primary_emb
+                } else {
+                    let joined = context_tokens.join(" ");
+                    match emb.embed(&joined) {
+                        Ok(ctx_emb) => {
+                            crate::embeddings::Embedder::fuse(&primary_emb, &ctx_emb, 0.7)
+                        }
+                        Err(e) => {
+                            tracing::warn!("context_tokens embed failed, using primary only: {e}");
+                            primary_emb
+                        }
+                    }
+                };
                 let (results, tokens_used) = db::recall_hybrid(
                     conn,
                     context,
