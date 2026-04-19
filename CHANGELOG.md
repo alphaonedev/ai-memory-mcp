@@ -5,6 +5,169 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — v0.6.1 + v0.7 tracks
+
+### Added — v0.7 Storage Abstraction Layer (Track B PR 1)
+
+- **Storage Abstraction Layer (SAL) — `MemoryStore` trait + `SqliteStore`
+  + `PostgresStore`** — preview surface for v0.7. Gated behind
+  `--features sal` (trait + sqlite adapter) and `--features sal-postgres`
+  (adds the Postgres + pgvector backend). Default builds unchanged.
+  Trait design carries over from the red-team-hardened #222 proposal:
+  typed `StoreError` with `#[non_exhaustive]`, `CallerContext` on every
+  mutator, optional `Transaction` handle, `verify()` contract, advertised
+  `Capabilities` bitflags (NATIVE_VECTOR, FULLTEXT, DURABLE, etc.).
+- **Postgres adapter ships with**:
+  - `src/store/postgres_schema.sql` — idempotent bootstrap creating the
+    `memories` table with a `vector(384)` column, pgvector `hnsw` index
+    for cosine NN search, `gin` FTS + tags + metadata indexes.
+  - `packaging/docker-compose.postgres.yml` — `pgvector/pgvector:pg16`
+    fixture for integration tests. Hardened container
+    (`cap_drop: [ALL]`, `no-new-privileges`, tmpfs for `/tmp`).
+  - Live integration tests in `src/store/postgres.rs` that skip when
+    `AI_MEMORY_TEST_POSTGRES_URL` is unset — keeps default `cargo test`
+    offline while giving CI a straightforward opt-in path.
+  - Unit-level tests: capability bits, RFC3339 parse helpers, schema
+    constants.
+
+### Added — v0.7 quorum replication primitives (Track C PR 1)
+
+- **ADR-0001 — Quorum replication + chaos-testing methodology**
+  (`docs/ADR-0001-quorum-replication.md`). Full design doc covering the
+  W-of-N write-quorum model, failure modes, chaos-fault classes, and
+  the implementation phasing. Explicitly states that v0.7 will NOT
+  publish a "<0.01% loss" probability — instead it will publish a
+  convergence-bound report per chaos campaign.
+- **Quorum-write primitives** (`src/replication.rs`) — `QuorumPolicy`
+  (N / W / deadlines / clock-skew threshold), `AckTracker` (collects
+  local commit + peer acks, surfaces timeouts + id-drift), typed
+  `QuorumError`. Pure-logic, I/O-free so unit tests don't need a live
+  peer mesh.
+- **12 unit tests** covering: single-node degenerate case,
+  majority-default, W clamping, peer ack deduplication, deadline
+  expiry reporting Unreachable vs Timeout, id-drift handling,
+  Error trait participation.
+
+### Added — v0.6.1 curator daemon (Track A)
+
+### Added
+- **Autonomous curator daemon** — new `ai-memory curator` subcommand with
+  `--once` (single sweep + JSON report) and `--daemon` (continuous loop,
+  interval configurable via `--interval-secs`, clamped to `[60, 86400]`).
+  Invokes `auto_tag` + `detect_contradiction` on memories that lack an
+  `auto_tags` metadata key, persisting results on success. Dry-run mode
+  emits the same report without touching any row. Hard operation cap
+  per cycle (`--max-ops`, default 100) prevents runaway LLM usage.
+  Complements the synchronous post-store hooks shipped in v0.6.0.0
+  (#265) — the curator catches memories stored before hooks were enabled,
+  or when the LLM was offline, or that become interesting only after
+  more context accumulates.
+- **Curator systemd unit** — `packaging/systemd/ai-memory-curator.service`
+  with the same sandbox posture as the main daemon
+  (`ProtectSystem=strict`, empty `CapabilityBoundingSet`,
+  `MemoryDenyWriteExecute`, `@system-service` syscall filter).
+- **Curator Prometheus metrics** — `ai_memory_curator_cycles_total`,
+  `ai_memory_curator_operations_total{kind,result}`,
+  `ai_memory_curator_cycle_duration_seconds{dry_run}`.
+
+### Added — full autonomy loop (earning the "100% autonomous" claim)
+
+Builds on Track A's curator with the four passes required to make the
+"100% autonomous" claim honest:
+
+- **Autonomous consolidation** — the curator scans each namespace for
+  near-duplicate memories (Jaccard keyword overlap ≥ 0.55 on a
+  token-length-≥3 bag), clusters up to 8 members per group, calls
+  `LLM.summarize_memories`, and commits the consolidated memory via
+  the existing `db::consolidate` transaction. Source memories are
+  archived, not lost.
+- **Autonomous forgetting of superseded memories** — when a memory's
+  `metadata.confirmed_contradictions` points at a newer, equal- or
+  higher-confidence memory, the curator archives the stale one.
+  Confidence + freshness BOTH required — never forgets on detection
+  alone.
+- **Priority feedback** — memories with `access_count ≥ 10` and a
+  recall in the last 7 days get priority +1 (cap 10); memories cold
+  for 30+ days drop priority -1 (floor 1). Arithmetic only; no LLM.
+- **Rollback log** — every autonomous action (consolidate, forget,
+  priority-adjust) writes a `RollbackEntry` memory into
+  `_curator/rollback/<ts>` carrying the pre-action snapshot. Reversible
+  via `ai-memory curator --rollback <id>` or `--rollback-last N`.
+  Once reversed, the log memory is tagged `_reversed` — the history
+  itself is preserved as an audit trail.
+- **Self-report** — at the end of every cycle the curator writes its
+  own `CuratorReport` as a memory in `_curator/reports/<ts>`. Agents
+  can recall "what did the curator do yesterday" using the ordinary
+  `memory_recall` path.
+
+### Testing — end-to-end autonomy coverage
+
+- `AutonomyLlm` trait introduced as the narrow LLM surface the passes
+  need; `OllamaClient` impls it in prod, `StubLlm` stubs it in tests.
+- 10 unit tests in `src/autonomy.rs` including a full
+  `full_autonomy_cycle_end_to_end` that seeds duplicates + a
+  superseded pair, runs `run_autonomy_passes`, and asserts that
+  clusters were formed, memories forgotten, rollback entries written,
+  and the rollback-log namespace populated.
+- `reverse_consolidation_restores_originals` verifies the undo path
+  by consolidating two memories, rolling back, and asserting both
+  originals are back and the merged memory is gone.
+
+### Honest-claim note
+
+v0.6.1 earns the **"fully-autonomous curator loop"** claim: the
+system can tag, consolidate, forget, rebalance priority, report on
+itself, and reverse any of its own actions — without human input.
+It does **not** yet claim multi-agent autonomy across a federation
+(that's Track C) or cross-backend autonomy (that's Track B).
+"100% autonomous" without those caveats would still be overclaiming.
+
+### Added — cross-backend migration (Track B PR 2)
+
+- **`ai-memory migrate --from <url> --to <url>`** CLI subcommand,
+  gated behind `--features sal`. Supported URL shapes:
+  - `sqlite:///absolute/path.db` / `sqlite://./relative.db` → `SqliteStore`
+  - `postgres://user:pass@host:port/db` → `PostgresStore`
+    (only under `--features sal-postgres`)
+- Reads pages via `MemoryStore::list`, writes via `MemoryStore::store`.
+  **Idempotent on re-run** — source ids are preserved verbatim and
+  both adapters upsert on id.
+- `--batch N` (1..10 000, default 1000), `--namespace <ns>` filter,
+  `--dry-run`, `--json` for machine-readable reports.
+- **6 unit tests**: sqlite URL parsing, unknown-scheme rejection,
+  sqlite→sqlite full-roundtrip, dry-run writes nothing, idempotent
+  re-run, namespace filter.
+- Pagination strategy: slides `until` window backwards with dedup by
+  id — handles identical `created_at` timestamps that break naïve
+  `since`-cursor paging on SQLite.
+
+### What's still out of scope for v0.7-alpha
+
+Explicitly deferred to v0.7.1 (noted in `src/migrate.rs` docblock):
+
+- **Daemon-level adapter selection** (`ai-memory serve --store-url
+  postgres://…`) — requires refactoring `handlers.rs` from
+  `crate::db::` free functions to dispatch through
+  `Box<dyn MemoryStore>`. That's a big change and belongs in its
+  own PR.
+- **Live dual-write** — reverse migration (pg → sqlite) works using
+  the same command but there is no always-on replication between
+  heterogenous backends yet.
+- **Schema rewriting** — both adapters currently agree on the
+  `Memory` shape so no field mapping is needed.
+
+### Cross-backend-autonomy claim now earned
+
+v0.7-alpha earns: **"one-shot migration between SQLite and
+Postgres/pgvector, bidirectional, idempotent"**.
+
+Still honest caveats:
+- A production deployment running `ai-memory serve` against Postgres
+  as the live store needs v0.7.1's adapter-selection refactor.
+- The migration is file-level point-in-time. For zero-downtime cutover
+  you still need to stop writes on the source, migrate, and restart
+  against the destination — documented in the module docblock.
+
 ## [0.6.0] — 2026-04-19 — Phase 1 complete + v0.6.0.0 sprint
 
 Phase 1 baseline (Tasks 1.1–1.12 from alpha train) plus the v0.6.0.0 sprint

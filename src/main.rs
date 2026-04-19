@@ -3,8 +3,10 @@
 
 #![recursion_limit = "256"]
 
+mod autonomy;
 mod color;
 mod config;
+mod curator;
 mod db;
 mod embeddings;
 mod errors;
@@ -14,9 +16,14 @@ mod identity;
 mod llm;
 mod mcp;
 mod metrics;
+#[cfg(feature = "sal")]
+mod migrate;
 mod mine;
 mod models;
+mod replication;
 mod reranker;
+#[cfg(feature = "sal")]
+mod store;
 mod subscriptions;
 mod toon;
 mod validate;
@@ -163,6 +170,80 @@ enum Command {
     /// replacing the current DB. The current DB is moved aside as a safety
     /// net before the replacement.
     Restore(RestoreArgs),
+    /// v0.6.1: run the autonomous curator. `--once` runs a single sweep
+    /// and prints a JSON report; `--daemon` loops with `--interval-secs`
+    /// between cycles. Auto-tags memories without tags and flags
+    /// contradictions against nearby siblings in the same namespace.
+    Curator(CuratorArgs),
+    /// v0.7: migrate memories between SAL backends. Gated behind
+    /// `--features sal`. Reads pages via `MemoryStore::list`, writes
+    /// via `MemoryStore::store`. Idempotent: source ids are preserved
+    /// and both adapters upsert on id.
+    #[cfg(feature = "sal")]
+    Migrate(MigrateArgs),
+}
+
+#[derive(Args)]
+#[allow(clippy::struct_excessive_bools)]
+struct CuratorArgs {
+    /// Run exactly one sweep and exit. Mutually exclusive with --daemon.
+    #[arg(long, conflicts_with = "daemon")]
+    once: bool,
+    /// Loop forever, sleeping --interval-secs between sweeps. SIGINT /
+    /// SIGTERM trigger a clean shutdown between cycles.
+    #[arg(long)]
+    daemon: bool,
+    /// Seconds between daemon sweeps. Clamped to [60, 86400].
+    #[arg(long, default_value_t = 3600)]
+    interval_secs: u64,
+    /// Hard cap on LLM-invoking operations per cycle.
+    #[arg(long, default_value_t = 100)]
+    max_ops: usize,
+    /// Emit the report without persisting any metadata changes.
+    #[arg(long)]
+    dry_run: bool,
+    /// Only curate memories in these namespaces. Repeat flag for multiple.
+    #[arg(long = "include-namespace")]
+    include_namespaces: Vec<String>,
+    /// Exclude these namespaces from curation. Repeat flag for multiple.
+    #[arg(long = "exclude-namespace")]
+    exclude_namespaces: Vec<String>,
+    /// Print the report as JSON rather than a human-readable summary.
+    #[arg(long)]
+    json: bool,
+    /// Reverse rollback-log entries instead of running a sweep. Accepts
+    /// a specific rollback-memory id, or `--last N` for the most recent.
+    /// Mutually exclusive with `--once` and `--daemon`.
+    #[arg(long, conflicts_with_all = ["once", "daemon"])]
+    rollback: Option<String>,
+    /// With `--rollback`, reverse the N most recent rollback-log entries
+    /// instead of a single id.
+    #[arg(long)]
+    rollback_last: Option<usize>,
+}
+
+#[cfg(feature = "sal")]
+#[derive(Args)]
+struct MigrateArgs {
+    /// Source URL. `sqlite:///path/to/file.db` or
+    /// `postgres://user:pass@host:port/dbname`.
+    #[arg(long)]
+    from: String,
+    /// Destination URL. Same URL shape as `--from`.
+    #[arg(long)]
+    to: String,
+    /// Page size. Clamped to [1, 10000]. Default 1000.
+    #[arg(long, default_value_t = 1000)]
+    batch: usize,
+    /// Only migrate memories in this namespace.
+    #[arg(long)]
+    namespace: Option<String>,
+    /// Emit the report but do NOT write to the destination.
+    #[arg(long)]
+    dry_run: bool,
+    /// Emit the report as JSON rather than human-readable text.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args)]
@@ -654,6 +735,7 @@ fn human_age(iso: &str) -> String {
 }
 
 #[tokio::main]
+#[allow(clippy::too_many_lines)]
 async fn main() -> Result<()> {
     color::init();
     let app_config = config::AppConfig::load();
@@ -757,6 +839,9 @@ async fn main() -> Result<()> {
         Command::Pending(a) => cmd_pending(&db_path, a, j, cli_agent_id.as_deref()),
         Command::Backup(a) => cmd_backup(&db_path, &a, j),
         Command::Restore(a) => cmd_restore(&db_path, &a, j),
+        Command::Curator(a) => cmd_curator(&db_path, &a, &app_config).await,
+        #[cfg(feature = "sal")]
+        Command::Migrate(a) => cmd_migrate(&a).await,
     };
 
     // WAL checkpoint after write commands to prevent unbounded WAL growth
@@ -3909,6 +3994,218 @@ fn cmd_restore(db_path: &Path, args: &RestoreArgs, json_out: bool) -> Result<()>
             snapshot_path.display(),
             db_path.display()
         );
+    }
+    Ok(())
+}
+
+async fn cmd_curator(
+    db_path: &Path,
+    args: &CuratorArgs,
+    app_config: &config::AppConfig,
+) -> Result<()> {
+    if args.rollback.is_some() || args.rollback_last.is_some() {
+        return cmd_curator_rollback(db_path, args);
+    }
+
+    if !args.once && !args.daemon {
+        anyhow::bail!("curator requires --once, --daemon, --rollback <id>, or --rollback-last N");
+    }
+
+    let cfg = curator::CuratorConfig {
+        interval_secs: args.interval_secs,
+        max_ops_per_cycle: args.max_ops,
+        dry_run: args.dry_run,
+        include_namespaces: args.include_namespaces.clone(),
+        exclude_namespaces: args.exclude_namespaces.clone(),
+    };
+
+    let feature_tier = app_config.effective_tier(None);
+    let llm = build_curator_llm(feature_tier);
+
+    if args.once {
+        let conn = db::open(db_path)?;
+        let report = curator::run_once(&conn, llm.as_ref(), &cfg)?;
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        } else {
+            print_curator_report(&report);
+        }
+        return Ok(());
+    }
+
+    // Daemon mode. Install a tokio ctrl_c watcher that flips the shutdown
+    // flag; the daemon loop polls it between cycles so SIGINT / SIGTERM
+    // land cleanly on the next wake-up.
+    let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shutdown_for_signal = shutdown.clone();
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        shutdown_for_signal.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+
+    let db_owned = db_path.to_path_buf();
+    let llm_arc = llm.map(std::sync::Arc::new);
+    tokio::task::spawn_blocking(move || {
+        curator::run_daemon(db_owned, llm_arc, cfg, shutdown);
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("curator daemon join: {e}"))?;
+    Ok(())
+}
+
+fn cmd_curator_rollback(db_path: &Path, args: &CuratorArgs) -> Result<()> {
+    let conn = db::open(db_path)?;
+
+    if let Some(id) = &args.rollback {
+        let Some(mem) = db::get(&conn, id)? else {
+            anyhow::bail!("rollback entry {id} not found");
+        };
+        let entry: autonomy::RollbackEntry = serde_json::from_str(&mem.content)
+            .context("rollback entry content is not a valid RollbackEntry JSON")?;
+        let applied = autonomy::reverse_rollback_entry(&conn, &entry)?;
+        // Mark the log entry as reversed by appending a tag. We don't
+        // delete the log memory — its history is the audit trail.
+        let mut tags = mem.tags.clone();
+        if !tags.iter().any(|t| t == "_reversed") {
+            tags.push("_reversed".to_string());
+            db::update(
+                &conn,
+                &mem.id,
+                None,
+                None,
+                None,
+                None,
+                Some(&tags),
+                None,
+                None,
+                None,
+                None,
+            )?;
+        }
+        println!(
+            "rollback {id}: {}",
+            if applied { "applied" } else { "no-op" }
+        );
+        return Ok(());
+    }
+
+    if let Some(n) = args.rollback_last {
+        let log = db::list(
+            &conn,
+            Some("_curator/rollback"),
+            None,
+            n.max(1),
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )?;
+        let mut reversed = 0usize;
+        for mem in &log {
+            if mem.tags.iter().any(|t| t == "_reversed") {
+                continue;
+            }
+            let Ok(entry) = serde_json::from_str::<autonomy::RollbackEntry>(&mem.content) else {
+                continue;
+            };
+            let applied = autonomy::reverse_rollback_entry(&conn, &entry)?;
+            if applied {
+                reversed += 1;
+                let mut tags = mem.tags.clone();
+                tags.push("_reversed".to_string());
+                db::update(
+                    &conn,
+                    &mem.id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(&tags),
+                    None,
+                    None,
+                    None,
+                    None,
+                )?;
+            }
+        }
+        println!("reversed {reversed} rollback entries");
+        return Ok(());
+    }
+
+    unreachable!("cmd_curator_rollback entered without --rollback or --rollback-last");
+}
+
+fn build_curator_llm(tier: config::FeatureTier) -> Option<llm::OllamaClient> {
+    // The curator currently shares the default Ollama endpoint with the
+    // interactive `auto_tag` / `detect_contradiction` tools. A dedicated
+    // model override lives on `config.curator.model` in the v0.7 track.
+    let llm_model = tier.config().llm_model?;
+    let model = llm_model.ollama_model_id().to_string();
+    llm::OllamaClient::new(&model).ok()
+}
+
+fn print_curator_report(r: &curator::CuratorReport) {
+    println!("curator cycle report");
+    println!("  started_at:        {}", r.started_at);
+    println!("  completed_at:      {}", r.completed_at);
+    println!("  duration_ms:       {}", r.cycle_duration_ms);
+    println!("  memories_scanned:  {}", r.memories_scanned);
+    println!("  memories_eligible: {}", r.memories_eligible);
+    println!("  operations:        {}", r.operations_attempted);
+    println!("  auto_tagged:       {}", r.auto_tagged);
+    println!("  contradictions:    {}", r.contradictions_found);
+    println!("  skipped (cap):     {}", r.operations_skipped_cap);
+    println!("  errors:            {}", r.errors.len());
+    println!("  dry_run:           {}", r.dry_run);
+    for e in &r.errors {
+        println!("    - {e}");
+    }
+}
+
+#[cfg(feature = "sal")]
+async fn cmd_migrate(args: &MigrateArgs) -> Result<()> {
+    let src = migrate::open_store(&args.from)
+        .await
+        .context("open source store")?;
+    let dst = migrate::open_store(&args.to)
+        .await
+        .context("open destination store")?;
+    let report = migrate::migrate(
+        src.as_ref(),
+        dst.as_ref(),
+        args.batch,
+        args.namespace.clone(),
+        args.dry_run,
+    )
+    .await;
+    if args.json {
+        let value = serde_json::json!({
+            "from_url": args.from,
+            "to_url": args.to,
+            "memories_read": report.memories_read,
+            "memories_written": report.memories_written,
+            "batches": report.batches,
+            "errors": report.errors,
+            "dry_run": report.dry_run,
+        });
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        println!("migration report");
+        println!("  from:              {}", args.from);
+        println!("  to:                {}", args.to);
+        println!("  memories_read:     {}", report.memories_read);
+        println!("  memories_written:  {}", report.memories_written);
+        println!("  batches:           {}", report.batches);
+        println!("  dry_run:           {}", report.dry_run);
+        println!("  errors:            {}", report.errors.len());
+        for e in &report.errors {
+            println!("    - {e}");
+        }
+    }
+    if !report.errors.is_empty() {
+        anyhow::bail!("migration completed with {} error(s)", report.errors.len());
     }
     Ok(())
 }
