@@ -169,7 +169,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
 );
 ";
 
-const CURRENT_SCHEMA_VERSION: i64 = 12;
+const CURRENT_SCHEMA_VERSION: i64 = 14;
 
 pub fn open(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path).context("failed to open database")?;
@@ -405,6 +405,64 @@ fn migrate(conn: &Connection) -> Result<()> {
             if !has_last_pushed {
                 conn.execute("ALTER TABLE sync_state ADD COLUMN last_pushed_at TEXT", [])?;
             }
+        }
+
+        if version < 13 {
+            // v0.6.0.0 — webhook subscriptions (lands in a sibling PR; this
+            // migration is harmless idempotent if that PR is skipped).
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS subscriptions (
+                    id TEXT PRIMARY KEY,
+                    url TEXT NOT NULL,
+                    events TEXT NOT NULL DEFAULT '*',
+                    secret_hash TEXT,
+                    namespace_filter TEXT,
+                    agent_filter TEXT,
+                    created_by TEXT,
+                    created_at TEXT NOT NULL,
+                    last_dispatched_at TEXT,
+                    dispatch_count INTEGER NOT NULL DEFAULT 0,
+                    failure_count INTEGER NOT NULL DEFAULT 0
+                )",
+                [],
+            )?;
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_subscriptions_url ON subscriptions(url)",
+                [],
+            )?;
+        }
+
+        if version < 14 {
+            // v0.6.0.0 — row-level ACLs on memories. Grants an explicit
+            // allow-list of (agent_id, can_read/write/delete). Semantics:
+            //   - If no ACL row exists for a memory, the memory's visibility
+            //     is governed by existing scope-based rules (backwards
+            //     compatible).
+            //   - If ANY ACL row exists for a memory, ONLY agents with
+            //     matching ACL entries plus the memory's creator can access
+            //     it (explicit allow-list mode).
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS memory_acl (
+                    memory_id TEXT NOT NULL,
+                    agent_id TEXT NOT NULL,
+                    can_read INTEGER NOT NULL DEFAULT 1,
+                    can_write INTEGER NOT NULL DEFAULT 0,
+                    can_delete INTEGER NOT NULL DEFAULT 0,
+                    granted_by TEXT,
+                    granted_at TEXT NOT NULL,
+                    PRIMARY KEY (memory_id, agent_id),
+                    FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE
+                )",
+                [],
+            )?;
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memory_acl_agent ON memory_acl(agent_id)",
+                [],
+            )?;
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memory_acl_memory ON memory_acl(memory_id)",
+                [],
+            )?;
         }
 
         conn.execute("DELETE FROM schema_version", [])?;
@@ -1944,6 +2002,151 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
     Ok(actual_id)
 }
 
+// --- v0.6.0.0 row-level ACLs ---
+
+/// A row in the `memory_acl` table.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MemoryAcl {
+    pub memory_id: String,
+    pub agent_id: String,
+    pub can_read: bool,
+    pub can_write: bool,
+    pub can_delete: bool,
+    pub granted_by: Option<String>,
+    pub granted_at: String,
+}
+
+/// Grant an ACL entry. Re-granting upserts.
+pub fn acl_grant(
+    conn: &Connection,
+    memory_id: &str,
+    agent_id: &str,
+    can_read: bool,
+    can_write: bool,
+    can_delete: bool,
+    granted_by: Option<&str>,
+) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO memory_acl (memory_id, agent_id, can_read, can_write, can_delete, granted_by, granted_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+         ON CONFLICT(memory_id, agent_id) DO UPDATE SET \
+           can_read = excluded.can_read, \
+           can_write = excluded.can_write, \
+           can_delete = excluded.can_delete, \
+           granted_by = excluded.granted_by, \
+           granted_at = excluded.granted_at",
+        params![memory_id, agent_id, i64::from(can_read), i64::from(can_write), i64::from(can_delete), granted_by, now],
+    )?;
+    Ok(())
+}
+
+/// Revoke an ACL entry. Returns true if a row was removed.
+pub fn acl_revoke(conn: &Connection, memory_id: &str, agent_id: &str) -> Result<bool> {
+    let n = conn.execute(
+        "DELETE FROM memory_acl WHERE memory_id = ?1 AND agent_id = ?2",
+        params![memory_id, agent_id],
+    )?;
+    Ok(n > 0)
+}
+
+/// List all ACL rows for a memory.
+pub fn acl_list(conn: &Connection, memory_id: &str) -> Result<Vec<MemoryAcl>> {
+    let mut stmt = conn.prepare(
+        "SELECT memory_id, agent_id, can_read, can_write, can_delete, granted_by, granted_at \
+         FROM memory_acl WHERE memory_id = ?1",
+    )?;
+    let rows = stmt.query_map(params![memory_id], |row| {
+        Ok(MemoryAcl {
+            memory_id: row.get(0)?,
+            agent_id: row.get(1)?,
+            can_read: row.get::<_, i64>(2)? != 0,
+            can_write: row.get::<_, i64>(3)? != 0,
+            can_delete: row.get::<_, i64>(4)? != 0,
+            granted_by: row.get(5)?,
+            granted_at: row.get(6)?,
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+/// Count of ACL rows for a memory. >0 means the memory is in allow-list
+/// mode (default scope visibility is replaced by the ACL grant list).
+pub fn acl_count(conn: &Connection, memory_id: &str) -> Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM memory_acl WHERE memory_id = ?1",
+        params![memory_id],
+        |r| r.get::<_, i64>(0),
+    )
+    .map_err(Into::into)
+}
+
+/// Check whether `agent_id` has read access to `memory_id`. Returns
+/// `Ok(true)` when:
+///   - No ACL rows exist for the memory (falls back to existing scope
+///     visibility — caller is responsible for scope-level enforcement)
+///   - OR an ACL row exists for (`memory_id`, `agent_id`) with
+///     `can_read = 1`
+///
+/// Returns `Ok(false)` when ACL rows exist for the memory but none
+/// grant the given agent read access.
+pub fn acl_can_read(conn: &Connection, memory_id: &str, agent_id: Option<&str>) -> Result<bool> {
+    let total = acl_count(conn, memory_id)?;
+    if total == 0 {
+        return Ok(true);
+    }
+    let Some(aid) = agent_id else {
+        return Ok(false);
+    };
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM memory_acl WHERE memory_id = ?1 AND agent_id = ?2 AND can_read = 1",
+        params![memory_id, aid],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+/// Check whether `agent_id` has write access to `memory_id`. Stricter
+/// than read: returns `Ok(true)` only when an ACL row explicitly
+/// grants `can_write = 1`. An empty ACL falls back to the pre-v0.6.0.0
+/// behavior (open-write within scope); callers should combine this
+/// check with their existing scope enforcement.
+#[allow(dead_code)]
+pub fn acl_can_write(conn: &Connection, memory_id: &str, agent_id: Option<&str>) -> Result<bool> {
+    let total = acl_count(conn, memory_id)?;
+    if total == 0 {
+        return Ok(true);
+    }
+    let Some(aid) = agent_id else {
+        return Ok(false);
+    };
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM memory_acl WHERE memory_id = ?1 AND agent_id = ?2 AND can_write = 1",
+        params![memory_id, aid],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+/// Check whether `agent_id` has delete access to `memory_id`.
+#[allow(dead_code)]
+pub fn acl_can_delete(conn: &Connection, memory_id: &str, agent_id: Option<&str>) -> Result<bool> {
+    let total = acl_count(conn, memory_id)?;
+    if total == 0 {
+        return Ok(true);
+    }
+    let Some(aid) = agent_id else {
+        return Ok(false);
+    };
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM memory_acl WHERE memory_id = ?1 AND agent_id = ?2 AND can_delete = 1",
+        params![memory_id, aid],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
 // --- Embedding support ---
 
 /// Store an embedding vector for a memory.
@@ -2275,6 +2478,13 @@ pub fn recall_hybrid(
         .collect();
 
     results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // v0.6.0.0: row-level ACL enforcement. When a memory has any ACL
+    // rows, only listed agents can recall it. Applied BEFORE the limit
+    // truncate so the caller doesn't see phantom gaps where denied
+    // memories would have been.
+    results.retain(|(mem, _)| acl_can_read(conn, &mem.id, as_agent).unwrap_or(true));
+
     results.truncate(limit);
 
     // Task 1.12: proximity boost (if hierarchy expansion is active).

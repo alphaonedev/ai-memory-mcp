@@ -458,6 +458,44 @@ fn tool_definitions() -> Value {
                     "type": "object",
                     "properties": {}
                 }
+            },
+            {
+                "name": "memory_grant",
+                "description": "v0.6.0.0 — grant an agent row-level read/write/delete permission on a memory. Semantics: when at least one ACL row exists for a memory, ONLY agents in the grant list can access it (explicit allow-list mode). When no ACL rows exist, existing scope-based visibility applies (backwards-compatible default).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "memory_id": {"type": "string"},
+                        "agent_id": {"type": "string"},
+                        "can_read": {"type": "boolean", "default": true},
+                        "can_write": {"type": "boolean", "default": false},
+                        "can_delete": {"type": "boolean", "default": false}
+                    },
+                    "required": ["memory_id", "agent_id"]
+                }
+            },
+            {
+                "name": "memory_revoke",
+                "description": "v0.6.0.0 — revoke an agent's ACL entry on a memory. When the last ACL row is removed, the memory reverts to scope-based visibility.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "memory_id": {"type": "string"},
+                        "agent_id": {"type": "string"}
+                    },
+                    "required": ["memory_id", "agent_id"]
+                }
+            },
+            {
+                "name": "memory_list_acls",
+                "description": "v0.6.0.0 — list all ACL entries for a memory.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "memory_id": {"type": "string"}
+                    },
+                    "required": ["memory_id"]
+                }
             }
         ]
     })
@@ -1862,6 +1900,73 @@ fn handle_agent_list(conn: &rusqlite::Connection) -> Result<Value, String> {
     }))
 }
 
+// --- v0.6.0.0 row-level ACLs ---
+
+fn handle_grant(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    mcp_client: Option<&str>,
+) -> Result<Value, String> {
+    let memory_id = params["memory_id"]
+        .as_str()
+        .ok_or("memory_id is required")?;
+    let agent_id = params["agent_id"].as_str().ok_or("agent_id is required")?;
+    validate::validate_id(memory_id).map_err(|e| e.to_string())?;
+    validate::validate_agent_id(agent_id).map_err(|e| e.to_string())?;
+    // Caller must exist — the memory's author / accountable human fronts
+    // the grant. Caller's resolved agent_id becomes `granted_by`.
+    let granter = crate::identity::resolve_agent_id(None, mcp_client).map_err(|e| e.to_string())?;
+    let can_read = params["can_read"].as_bool().unwrap_or(true);
+    let can_write = params["can_write"].as_bool().unwrap_or(false);
+    let can_delete = params["can_delete"].as_bool().unwrap_or(false);
+    db::acl_grant(
+        conn,
+        memory_id,
+        agent_id,
+        can_read,
+        can_write,
+        can_delete,
+        Some(&granter),
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(json!({
+        "memory_id": memory_id,
+        "agent_id": agent_id,
+        "can_read": can_read,
+        "can_write": can_write,
+        "can_delete": can_delete,
+        "granted_by": granter,
+    }))
+}
+
+fn handle_revoke(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
+    let memory_id = params["memory_id"]
+        .as_str()
+        .ok_or("memory_id is required")?;
+    let agent_id = params["agent_id"].as_str().ok_or("agent_id is required")?;
+    validate::validate_id(memory_id).map_err(|e| e.to_string())?;
+    validate::validate_agent_id(agent_id).map_err(|e| e.to_string())?;
+    let removed = db::acl_revoke(conn, memory_id, agent_id).map_err(|e| e.to_string())?;
+    Ok(json!({
+        "memory_id": memory_id,
+        "agent_id": agent_id,
+        "removed": removed,
+    }))
+}
+
+fn handle_list_acls(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
+    let memory_id = params["memory_id"]
+        .as_str()
+        .ok_or("memory_id is required")?;
+    validate::validate_id(memory_id).map_err(|e| e.to_string())?;
+    let acls = db::acl_list(conn, memory_id).map_err(|e| e.to_string())?;
+    Ok(json!({
+        "memory_id": memory_id,
+        "count": acls.len(),
+        "acls": acls,
+    }))
+}
+
 fn handle_pending_list(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
     let status = params["status"].as_str();
     let limit = usize::try_from(params["limit"].as_u64().unwrap_or(100))
@@ -2149,6 +2254,9 @@ fn handle_request(
                 }
                 "memory_agent_register" => handle_agent_register(conn, arguments),
                 "memory_agent_list" => handle_agent_list(conn),
+                "memory_grant" => handle_grant(conn, arguments, mcp_client),
+                "memory_revoke" => handle_revoke(conn, arguments),
+                "memory_list_acls" => handle_list_acls(conn, arguments),
                 _ => Err(format!("unknown tool: {tool_name}")),
             };
 
@@ -2463,10 +2571,12 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn tool_definitions_returns_31_tools() {
+    fn tool_definitions_returns_34_tools() {
+        // v0.6.0.0 adds memory_grant + memory_revoke + memory_list_acls
+        // on top of the 31 baseline.
         let defs = tool_definitions();
         let tools = defs["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 31);
+        assert_eq!(tools.len(), 34);
     }
 
     #[test]
