@@ -358,6 +358,13 @@ struct RecallArgs {
     /// for unlimited (limit-based only).
     #[arg(long)]
     budget_tokens: Option<usize>,
+    /// v0.6.0.0 contextual recall. Comma-separated list of recent
+    /// conversation tokens used to bias the query embedding at 70/30
+    /// (primary/context). Shifts the recall towards memories that
+    /// match both the explicit query and the conversation's nearby
+    /// topics.
+    #[arg(long, value_delimiter = ',')]
+    context_tokens: Option<Vec<String>>,
 }
 
 #[derive(Args)]
@@ -1589,7 +1596,27 @@ fn cmd_recall(
     // Perform recall: hybrid if embedder available, keyword otherwise
     let (results, tokens_used, mode) = if let Some(ref emb) = embedder {
         match emb.embed(&args.context) {
-            Ok(query_emb) => {
+            Ok(primary_emb) => {
+                // v0.6.0.0 contextual recall. Fuse the primary query
+                // embedding with an embedding over recent conversation
+                // tokens (caller-supplied) at 70/30. Fusion is done
+                // caller-side so recall_hybrid stays unaware of the bias —
+                // the vector it receives is the final query direction.
+                let query_emb = match args.context_tokens.as_deref() {
+                    Some(tokens) if !tokens.is_empty() => {
+                        let joined = tokens.join(" ");
+                        match emb.embed(&joined) {
+                            Ok(ctx_emb) => embeddings::Embedder::fuse(&primary_emb, &ctx_emb, 0.7),
+                            Err(e) => {
+                                eprintln!(
+                                    "ai-memory: context_tokens embed failed: {e}, using primary only"
+                                );
+                                primary_emb
+                            }
+                        }
+                    }
+                    _ => primary_emb,
+                };
                 let (results, tokens_used) = db::recall_hybrid(
                     &conn,
                     &args.context,
