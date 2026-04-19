@@ -879,6 +879,7 @@ fn inject_namespace_standard(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_recall(
     conn: &rusqlite::Connection,
     params: &Value,
@@ -887,6 +888,7 @@ fn handle_recall(
     reranker: Option<&CrossEncoder>,
     archive_on_gc: bool,
     resolved_ttl: &crate::config::ResolvedTtl,
+    resolved_scoring: &crate::config::ResolvedScoring,
 ) -> Result<Value, String> {
     // Helper: serialize scored memories with score field (#95)
     fn scored_memories(results: Vec<(Memory, f64)>) -> Vec<Value> {
@@ -948,6 +950,7 @@ fn handle_recall(
                     resolved_ttl.mid_extend_secs,
                     as_agent,
                     budget_tokens,
+                    resolved_scoring,
                 )
                 .map_err(|e| e.to_string())?;
 
@@ -2047,6 +2050,7 @@ fn handle_request(
     tier_config: &TierConfig,
     vector_index: Option<&VectorIndex>,
     resolved_ttl: &crate::config::ResolvedTtl,
+    resolved_scoring: &crate::config::ResolvedScoring,
     archive_on_gc: bool,
     mcp_client: Option<&str>,
 ) -> RpcResponse {
@@ -2115,6 +2119,7 @@ fn handle_request(
                     reranker,
                     archive_on_gc,
                     resolved_ttl,
+                    resolved_scoring,
                 ),
                 "memory_search" => handle_search(conn, arguments),
                 "memory_list" => handle_list(conn, arguments),
@@ -2433,6 +2438,7 @@ pub fn run_mcp_server(
         }
 
         let resolved_ttl = app_config.effective_ttl();
+        let resolved_scoring = app_config.effective_scoring();
         let archive_on_gc = app_config.effective_archive_on_gc();
         let resp = handle_request(
             &conn,
@@ -2444,6 +2450,7 @@ pub fn run_mcp_server(
             &tier_config,
             vector_index.as_ref(),
             &resolved_ttl,
+            &resolved_scoring,
             archive_on_gc,
             mcp_client_name.as_deref(),
         );

@@ -1584,6 +1584,7 @@ fn cmd_recall(
     };
 
     let resolved_ttl = app_config.effective_ttl();
+    let resolved_scoring = app_config.effective_scoring();
 
     // Perform recall: hybrid if embedder available, keyword otherwise
     let (results, tokens_used, mode) = if let Some(ref emb) = embedder {
@@ -1603,6 +1604,7 @@ fn cmd_recall(
                     resolved_ttl.mid_extend_secs,
                     args.as_agent.as_deref(),
                     args.budget_tokens,
+                    &resolved_scoring,
                 )?;
                 if let Some(ref ce) = reranker {
                     (
