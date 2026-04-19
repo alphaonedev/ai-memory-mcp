@@ -41,6 +41,11 @@ pub struct AppState {
     pub db: Db,
     pub embedder: Arc<Option<Embedder>>,
     pub vector_index: Arc<Mutex<Option<VectorIndex>>>,
+    /// v0.7 federation config — `Some` when `--quorum-writes N` +
+    /// `--quorum-peers` are configured at serve time. Writes fan out
+    /// to peers via `FederationConfig::broadcast_store_quorum` when
+    /// this is `Some`.
+    pub federation: Arc<Option<crate::federation::FederationConfig>>,
 }
 
 impl FromRef<AppState> for Db {
@@ -323,6 +328,42 @@ pub async fn create_memory(
             });
             if !contradiction_ids.is_empty() {
                 response["potential_contradictions"] = json!(contradiction_ids);
+            }
+            // v0.7 federation: fan out to peers when --quorum-writes is
+            // configured. The local commit already landed; if quorum
+            // is not met we return 503 but we do NOT roll back the
+            // local write — per ADR-0001, caller sees
+            // BackendUnavailable{quorum} and the sync-daemon's
+            // eventual-consistency loop catches straggling peers up.
+            if let Some(fed) = app.federation.as_ref() {
+                let mut mem_echo = mem.clone();
+                mem_echo.id = actual_id.clone();
+                match crate::federation::broadcast_store_quorum(fed, &mem_echo).await {
+                    Ok(tracker) => match crate::federation::finalise_quorum(&tracker) {
+                        Ok(got) => {
+                            response["quorum_acks"] = json!(got);
+                            return (StatusCode::CREATED, Json(response)).into_response();
+                        }
+                        Err(err) => {
+                            let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
+                            return (
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                [("Retry-After", "2")],
+                                Json(serde_json::to_value(&payload).unwrap_or_default()),
+                            )
+                                .into_response();
+                        }
+                    },
+                    Err(err) => {
+                        let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            [("Retry-After", "2")],
+                            Json(serde_json::to_value(&payload).unwrap_or_default()),
+                        )
+                            .into_response();
+                    }
+                }
             }
             (StatusCode::CREATED, Json(response)).into_response()
         }
@@ -1944,6 +1985,7 @@ mod tests {
             db,
             embedder: Arc::new(None),
             vector_index: Arc::new(Mutex::new(None)),
+            federation: Arc::new(None),
         }
     }
 
