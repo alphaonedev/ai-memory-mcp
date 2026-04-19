@@ -5,13 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.6.0] — 2026-04-19 — Phase 1 complete + v0.6.0.0 sprint (cloud-agentic foundation)
+## [0.6.0] — 2026-04-19 — Phase 1 complete + v0.6.0.0 sprint
 
 Phase 1 baseline (Tasks 1.1–1.12 from alpha train) plus the v0.6.0.0 sprint
-additions that push autonomy, multi-agent primitives, ops, and SDK coverage
-further into the cloud-agentic end-state.
+additions covering opt-in LLM autonomy hooks, decay-aware recall, multi-agent
+messaging primitives, at-rest encryption, ops surfaces, and SDK scaffolds.
 
-### Added — v0.6.0.0 sprint (autonomy + multi-agent + cloud + ops + SDKs)
+Defer-outs from this release (not shipped in 0.6.0):
+
+- **Autonomous curator daemon** — continuous background consolidation / GC
+  driven by LLM decisions. Deferred to v0.6.1. v0.6.0 ships only the
+  opt-in post-store hooks (synchronous, store path only).
+- **Multi-node replication + chaos testing** — durability claims beyond
+  single-node VACUUM INTO snapshots + optional peer sync are out of scope
+  for v0.6.0. No loss-probability target is published.
+- **Storage abstraction layer (Postgres / pgvector adapter)** — remains a
+  v0.7 track. v0.6.0 is SQLite-only; the SAL preview on `feat/sal-trait-redesign`
+  stays private/feature-gated until v0.7 extraction.
+
+### Added — v0.6.0.0 sprint (autonomy hooks + multi-agent + at-rest + ops + SDKs)
 
 **Autonomy / recall**
 - **Time-decay half-life on recall scoring** — per-tier exponential decay
@@ -32,12 +44,6 @@ further into the cloud-agentic end-state.
   config. Off by default (adds Ollama round-trip latency). Skipped for
   content under 50 bytes, when no LLM is wired, and for `_`-prefixed
   internal namespaces.
-- **Semantic clustering** — new `memory_cluster` MCP tool groups a
-  namespace's memories into k semantic clusters using in-process
-  k-means over stored embeddings. k defaults to `ceil(sqrt(n/2))`
-  clamped to `[2, 16]`. Centroid labels are the 3 most-common tags
-  across cluster members. No new deps.
-
 **Multi-agent primitives**
 - **Agent-to-agent notify + inbox** — `memory_notify(target, title, payload)`
   + `memory_inbox([agent_id, unread_only])` MCP tools. Messages are
@@ -51,15 +57,7 @@ further into the cloud-agentic end-state.
   (`X-Ai-Memory-Signature: sha256=<hex>`). SSRF-hardened — private-range
   IPs rejected, https required for non-loopback hosts. Migration v13
   adds the `subscriptions` table.
-- **Row-level ACLs** — `memory_grant` + `memory_revoke` + `memory_list_acls`
-  MCP tools with new `memory_acl` table (migration v14). When any ACL
-  row exists for a memory, only listed agents can recall it (explicit
-  allow-list mode). When none exist, existing scope-based visibility
-  applies unchanged (backwards-compatible default). Read enforcement
-  is wired in `recall_hybrid`; get/update/delete enforcement is a
-  v0.6.1 follow-up.
-
-**Cloud foundation**
+**At-rest encryption**
 - **Optional SQLCipher encryption at rest** — new cargo feature
   `sqlcipher` swaps `rusqlite` to the
   `bundled-sqlcipher-vendored-openssl` feature. Default builds are
