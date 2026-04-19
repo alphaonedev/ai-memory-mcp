@@ -116,6 +116,31 @@ pub async fn health(State(state): State<Db>) -> impl IntoResponse {
         .into_response()
 }
 
+/// v0.6.0.0 — Prometheus scrape endpoint. Refreshes gauge samples
+/// (`ai_memory_memories`) against the current DB before rendering so
+/// scrapers see up-to-date counts without needing a background refresh
+/// task.
+pub async fn prometheus_metrics(State(state): State<Db>) -> impl IntoResponse {
+    {
+        let lock = state.lock().await;
+        if let Ok(stats) = db::stats(&lock.0, &lock.1) {
+            crate::metrics::registry()
+                .memories_gauge
+                .set(stats.total.try_into().unwrap_or(i64::MAX));
+        }
+    }
+    let body = crate::metrics::render();
+    (
+        StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    )
+        .into_response()
+}
+
 #[allow(clippy::too_many_lines)]
 pub async fn create_memory(
     State(app): State<AppState>,
