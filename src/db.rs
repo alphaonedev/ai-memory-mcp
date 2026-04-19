@@ -8,8 +8,103 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::models::{
-    Memory, MemoryLink, NamespaceCount, PROMOTION_THRESHOLD, Stats, Tier, TierCount,
+    AGENTS_NAMESPACE, AgentRegistration, Approval, ApproverType, GovernanceDecision,
+    GovernanceLevel, GovernancePolicy, GovernedAction, Memory, MemoryLink, NamespaceCount,
+    PROMOTION_THRESHOLD, PendingAction, Stats, Tier, TierCount, namespace_ancestors,
 };
+
+/// Computed 4-tuple of visibility prefixes for an agent position (Task 1.5).
+/// Index 0 = agent's own namespace (private), 1 = parent (team),
+/// 2 = grandparent (unit), 3 = great-grandparent (org). Missing = `None`.
+type VisibilityPrefixes = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+fn compute_visibility_prefixes(as_agent: Option<&str>) -> VisibilityPrefixes {
+    let Some(ns) = as_agent else {
+        return (None, None, None, None);
+    };
+    let ancestors = namespace_ancestors(ns);
+    let p = ancestors.first().cloned();
+    let t = ancestors.get(1).cloned();
+    let u = ancestors.get(2).cloned();
+    let o = ancestors.get(3).cloned();
+    (p, t, u, o)
+}
+
+/// Rust-side visibility check for paths that can't easily attach SQL
+/// visibility (the HNSW branch of `recall_hybrid` iterates memories loaded
+/// via `get()`). Returns `true` when `as_agent` is unset (no filter) or
+/// when the memory's scope + namespace grant visibility to the caller.
+fn is_visible(mem: &Memory, prefixes: &VisibilityPrefixes) -> bool {
+    let (p, t, u, o) = prefixes;
+    if p.is_none() {
+        return true;
+    }
+    let scope = mem
+        .metadata
+        .get("scope")
+        .and_then(|v| v.as_str())
+        .unwrap_or("private");
+    match scope {
+        "collective" => true,
+        "private" => p.as_ref().is_some_and(|ns| &mem.namespace == ns),
+        "team" => matches_subtree(&mem.namespace, t.as_deref()),
+        "unit" => matches_subtree(&mem.namespace, u.as_deref()),
+        "org" => matches_subtree(&mem.namespace, o.as_deref()),
+        _ => false,
+    }
+}
+
+fn matches_subtree(namespace: &str, prefix: Option<&str>) -> bool {
+    match prefix {
+        None => false,
+        Some(p) => namespace == p || namespace.starts_with(&format!("{p}/")),
+    }
+}
+
+/// Generate the visibility WHERE-clause fragment starting at placeholder `start`.
+/// Uses placeholders `?start .. ?start+3` for private/team/unit/org prefixes.
+/// See `compute_visibility_prefixes` for the bind order.
+///
+/// Performance (v0.6.0 GA): each scope branch compares against the indexed
+/// generated column `scope_idx` (schema v10) rather than re-evaluating
+/// `json_extract(metadata, '$.scope')` per row. The query planner picks
+/// `idx_memories_scope_idx` whenever the predicate narrows by scope,
+/// dropping recall from "scan every namespace row and parse its JSON" to
+/// an index seek + per-row refinement. See `docs/ARCHITECTURAL_LIMITS.md`
+/// for which `SQLite` limits remain structural.
+///
+/// Security (issue #217): the team/unit/org branches use `LIKE` to expand a
+/// prefix into its sub-tree. Without escaping, a caller who can influence the
+/// prefix could inject SQL `LIKE` meta-characters (`%`, `_`) and broaden the
+/// match across unrelated namespaces. We neutralise this at SQL evaluation
+/// time by `replace()`-escaping `%` and `_` in the bound prefix and pairing
+/// the LIKE with `ESCAPE '\'`. `validate_namespace` already rejects backslash,
+/// so `\` cannot appear in the bound prefix and the escape sentinel is safe.
+/// The `=` equality side is unaffected by LIKE wildcards and binds the raw
+/// value so that legitimate namespaces containing `_` (e.g. `under_score`)
+/// continue to match exactly.
+fn visibility_clause(start: usize, table_alias: &str) -> String {
+    let private_ph = start;
+    let team_ph = start + 1;
+    let unit_ph = start + 2;
+    let org_ph = start + 3;
+    let ta = table_alias;
+    format!(
+        "AND (\
+            ?{private_ph} IS NULL \
+            OR {ta}.scope_idx = 'collective' \
+            OR ({ta}.scope_idx = 'private' AND {ta}.namespace = ?{private_ph}) \
+            OR ({ta}.scope_idx = 'team' AND ?{team_ph} IS NOT NULL AND ({ta}.namespace = ?{team_ph} OR {ta}.namespace LIKE replace(replace(?{team_ph}, '%', '\\%'), '_', '\\_') || '/%' ESCAPE '\\')) \
+            OR ({ta}.scope_idx = 'unit' AND ?{unit_ph} IS NOT NULL AND ({ta}.namespace = ?{unit_ph} OR {ta}.namespace LIKE replace(replace(?{unit_ph}, '%', '\\%'), '_', '\\_') || '/%' ESCAPE '\\')) \
+            OR ({ta}.scope_idx = 'org'  AND ?{org_ph}  IS NOT NULL AND ({ta}.namespace = ?{org_ph}  OR {ta}.namespace LIKE replace(replace(?{org_ph}, '%', '\\%'), '_', '\\_') || '/%' ESCAPE '\\'))\
+        )"
+    )
+}
 
 const SCHEMA: &str = r"
 CREATE TABLE IF NOT EXISTS memories (
@@ -74,10 +169,11 @@ CREATE TABLE IF NOT EXISTS schema_version (
 );
 ";
 
-const CURRENT_SCHEMA_VERSION: i64 = 7;
+const CURRENT_SCHEMA_VERSION: i64 = 13;
 
 pub fn open(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path).context("failed to open database")?;
+    apply_sqlcipher_key(&conn)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "busy_timeout", 5000)?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
@@ -86,6 +182,43 @@ pub fn open(path: &Path) -> Result<Connection> {
         .context("failed to initialize schema")?;
     migrate(&conn)?;
     Ok(conn)
+}
+
+/// v0.6.0.0 — apply the SQLCipher passphrase (PRAGMA key) when the
+/// `sqlcipher` cargo feature is built-in AND a passphrase has been
+/// provided via `AI_MEMORY_DB_PASSPHRASE` env var. The recommended
+/// way to set the env var is via the `--db-passphrase-file <path>`
+/// CLI flag, which reads the passphrase from a root-readable file
+/// and exports the env for the daemon's lifetime only. Passing the
+/// passphrase directly as an env var works but leaks to the process
+/// list (`ps -E`, `/proc/<pid>/environ`).
+///
+/// When the `sqlcipher` feature is NOT enabled, this function is a
+/// no-op — standard SQLite has no `PRAGMA key` so setting one errors.
+#[cfg(feature = "sqlcipher")]
+fn apply_sqlcipher_key(conn: &Connection) -> Result<()> {
+    let Ok(passphrase) = std::env::var("AI_MEMORY_DB_PASSPHRASE") else {
+        anyhow::bail!(
+            "sqlcipher build requires AI_MEMORY_DB_PASSPHRASE (set via --db-passphrase-file <path>)"
+        );
+    };
+    // PRAGMA key must be the FIRST operation on a new connection. The
+    // passphrase is quoted with SQL string-literal quoting rules.
+    let escaped = passphrase.replace('\'', "''");
+    conn.pragma_update(None, "key", format!("'{escaped}'"))
+        .context("PRAGMA key failed (wrong passphrase or unencrypted DB?)")?;
+    // Verify the key opened the database by running a cheap query.
+    conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| {
+        r.get::<_, i64>(0)
+    })
+    .context("SQLCipher unlock verification failed — wrong passphrase?")?;
+    Ok(())
+}
+
+#[cfg(not(feature = "sqlcipher"))]
+#[allow(clippy::unnecessary_wraps)]
+fn apply_sqlcipher_key(_conn: &Connection) -> Result<()> {
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -209,6 +342,136 @@ fn migrate(conn: &Connection) -> Result<()> {
                     [],
                 )?;
             }
+        }
+        if version < 8 {
+            // Task 1.9: pending_actions table for governance-queued operations
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS pending_actions (
+                    id            TEXT PRIMARY KEY,
+                    action_type   TEXT NOT NULL,
+                    memory_id     TEXT,
+                    namespace     TEXT NOT NULL,
+                    payload       TEXT NOT NULL DEFAULT '{}',
+                    requested_by  TEXT NOT NULL,
+                    requested_at  TEXT NOT NULL,
+                    status        TEXT NOT NULL DEFAULT 'pending',
+                    decided_by    TEXT,
+                    decided_at    TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_pending_status    ON pending_actions(status);
+                CREATE INDEX IF NOT EXISTS idx_pending_namespace ON pending_actions(namespace);",
+            )?;
+        }
+        if version < 9 {
+            // Task 1.10: approvals JSON array for consensus approver type
+            let has_approvals: bool = conn
+                .prepare("SELECT approvals FROM pending_actions LIMIT 0")
+                .is_ok();
+            if !has_approvals {
+                conn.execute(
+                    "ALTER TABLE pending_actions ADD COLUMN approvals TEXT NOT NULL DEFAULT '[]'",
+                    [],
+                )?;
+            }
+        }
+
+        if version < 10 {
+            // v0.6.0 GA: index `scope` so visibility filtering isn't a
+            // JSON scan. Uses a VIRTUAL generated column (no row bytes
+            // spent) plus a conventional B-tree index. The `visibility_clause`
+            // SQL compares against the generated column directly — SQLite's
+            // query planner picks the index because the comparison is on a
+            // real column, not a repeated expression.
+            //
+            // The expression is guarded by `json_valid(metadata)` so rows
+            // with legacy / corrupt metadata (we test this path explicitly
+            // in `metadata_corrupt_column_falls_back_to_empty`) are still
+            // writable — SQLite evaluates generated-column expressions on
+            // every write that touches the source column, and an uncaught
+            // `json_extract` failure would turn every corrupt-row write
+            // into a constraint error.
+            let has_scope_idx: bool = conn
+                .prepare("SELECT scope_idx FROM memories LIMIT 0")
+                .is_ok();
+            if !has_scope_idx {
+                conn.execute(
+                    "ALTER TABLE memories ADD COLUMN scope_idx TEXT \
+                     GENERATED ALWAYS AS (\
+                         CASE WHEN json_valid(metadata) \
+                         THEN COALESCE(json_extract(metadata, '$.scope'), 'private') \
+                         ELSE 'private' END\
+                     ) VIRTUAL",
+                    [],
+                )?;
+            }
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_scope_idx ON memories(scope_idx)",
+                [],
+            )?;
+        }
+
+        if version < 11 {
+            // Phase 3 foundation (issue #224): vector-clock sync state.
+            // Stores the latest `updated_at` timestamp this peer has seen
+            // from each known remote peer. Used by the future CRDT-lite
+            // merge to skip memories the caller has already seen and to
+            // emit incremental `GET /api/v1/sync/since?...` responses.
+            //
+            // The table is additive — it does NOT change any existing
+            // sync behaviour in v0.6.0 GA. Entries are created lazily by
+            // the HTTP sync endpoints and by `sync --dry-run` telemetry.
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS sync_state (
+                    agent_id       TEXT NOT NULL,
+                    peer_id        TEXT NOT NULL,
+                    last_seen_at   TEXT NOT NULL,
+                    last_pulled_at TEXT NOT NULL,
+                    PRIMARY KEY (agent_id, peer_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_sync_state_agent ON sync_state(agent_id);",
+            )?;
+        }
+
+        if version < 12 {
+            // Phase 3 Task 3b.1 (issue #224): track the high-watermark of
+            // local memories this agent has successfully pushed to each
+            // peer. The daemon uses it to stream only deltas on the next
+            // push cycle. Null for rows from v11 that predate this column.
+            let has_last_pushed: bool = conn
+                .prepare("SELECT last_pushed_at FROM sync_state LIMIT 0")
+                .is_ok();
+            if !has_last_pushed {
+                conn.execute("ALTER TABLE sync_state ADD COLUMN last_pushed_at TEXT", [])?;
+            }
+        }
+
+        if version < 13 {
+            // v0.6.0.0 — webhook subscriptions. Events fire on memory_store
+            // (and, in v0.6.1, delete/promote/link) and are dispatched as
+            // HMAC-SHA256-signed POSTs to subscriber URLs. `events` is a
+            // comma-separated whitelist; `*` = all current + future events.
+            // `secret_hash` stores a SHA-256 of the operator-supplied
+            // shared secret — the plaintext never lands in the DB.
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS subscriptions (
+                    id TEXT PRIMARY KEY,
+                    url TEXT NOT NULL,
+                    events TEXT NOT NULL DEFAULT '*',
+                    secret_hash TEXT,
+                    namespace_filter TEXT,
+                    agent_filter TEXT,
+                    created_by TEXT,
+                    created_at TEXT NOT NULL,
+                    last_dispatched_at TEXT,
+                    dispatch_count INTEGER NOT NULL DEFAULT 0,
+                    failure_count INTEGER NOT NULL DEFAULT 0
+                )",
+                [],
+            )?;
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_subscriptions_url ON subscriptions(url)",
+                [],
+            )?;
         }
 
         conn.execute("DELETE FROM schema_version", [])?;
@@ -661,12 +924,14 @@ pub fn search(
     until: Option<&str>,
     tags_filter: Option<&str>,
     agent_id: Option<&str>,
+    as_agent: Option<&str>,
 ) -> Result<Vec<Memory>> {
     let now = Utc::now().to_rfc3339();
     let tier_str = tier.map(|t| t.as_str().to_string());
     let fts_query = sanitize_fts_query(query, false);
+    let (vis_p, vis_t, vis_u, vis_o) = compute_visibility_prefixes(as_agent);
 
-    let mut stmt = conn.prepare(
+    let sql = format!(
         "SELECT m.id, m.tier, m.namespace, m.title, m.content, m.tags, m.priority,
                 m.confidence, m.source, m.access_count, m.created_at, m.updated_at,
                 m.last_accessed_at, m.expires_at, m.metadata
@@ -681,6 +946,7 @@ pub fn search(
            AND (?7 IS NULL OR m.created_at <= ?7)
            AND (?8 IS NULL OR EXISTS (SELECT 1 FROM json_each(m.tags) WHERE json_each.value = ?8))
            AND (?10 IS NULL OR json_extract(m.metadata, '$.agent_id') = ?10)
+           {vis}
          ORDER BY (fts.rank * -1)
            + (m.priority * 0.5)
            + (MIN(m.access_count, 50) * 0.1)
@@ -688,7 +954,9 @@ pub fn search(
            + (1.0 / (1.0 + (julianday('now') - julianday(m.updated_at)) * 0.1))
            DESC
          LIMIT ?9",
-    )?;
+        vis = visibility_clause(11, "m"),
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(
         params![
             fts_query,
@@ -701,6 +969,10 @@ pub fn search(
             tags_filter,
             limit,
             agent_id,
+            vis_p,
+            vis_t,
+            vis_u,
+            vis_o,
         ],
         row_to_memory,
     )?;
@@ -708,7 +980,102 @@ pub fn search(
         .map_err(Into::into)
 }
 
+/// Task 1.12 — proximity boost applied to a memory's score based on its
+/// depth distance from the queried agent namespace. Uses the formula
+/// `1 / (1 + depth_distance * 0.3)` per spec. Distance 0 = full strength
+/// (1.0), each step up the hierarchy dampens linearly.
+#[must_use]
+pub fn proximity_boost(agent_ns: &str, memory_ns: &str) -> f64 {
+    let agent_depth = crate::models::namespace_depth(agent_ns);
+    let memory_depth = crate::models::namespace_depth(memory_ns);
+    let distance = agent_depth.saturating_sub(memory_depth);
+    #[allow(clippy::cast_precision_loss)]
+    let d = distance as f64;
+    1.0 / (1.0 + d * 0.3)
+}
+
+/// Task 1.12 — SQL fragment + boolean indicating whether hierarchy
+/// expansion is in play. When active the `namespace` SQL param binds
+/// NULL (so `?N IS NULL OR m.namespace = ?N` passes trivially) and a
+/// separate `AND m.namespace IN (<ancestors>)` clause narrows to the
+/// hierarchy. When inactive the returned fragment is empty.
+///
+/// Ancestor strings are interpolated because `SQLite` `IN` with a
+/// variable-length positional list is awkward, and the inputs come
+/// from `namespace_ancestors()` → `validate_namespace`-approved
+/// strings. Single-quote doubling is applied defensively.
+fn hierarchy_in_clause(namespace: Option<&str>) -> (Option<String>, bool) {
+    let Some(ns) = namespace else {
+        return (None, false);
+    };
+    if !ns.contains('/') {
+        return (None, false);
+    }
+    let ancestors = crate::models::namespace_ancestors(ns);
+    if ancestors.is_empty() {
+        return (None, false);
+    }
+    let quoted: Vec<String> = ancestors
+        .iter()
+        .map(|a| format!("'{}'", a.replace('\'', "''")))
+        .collect();
+    (
+        Some(format!("AND m.namespace IN ({})", quoted.join(","))),
+        true,
+    )
+}
+
+/// Task 1.12 — apply proximity boost to scored memories ranked against
+/// an agent's hierarchical namespace. Re-sorts by boosted score.
+fn apply_proximity_boost(scored: Vec<(Memory, f64)>, agent_ns: &str) -> Vec<(Memory, f64)> {
+    let mut boosted: Vec<(Memory, f64)> = scored
+        .into_iter()
+        .map(|(mem, score)| {
+            let boost = proximity_boost(agent_ns, &mem.namespace);
+            (mem, score * boost)
+        })
+        .collect();
+    boosted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    boosted
+}
+
+/// Task 1.11 — rough token estimate for a memory. Uses the "~4 chars per
+/// token" heuristic on `title + content`. Deliberately byte-length-based:
+/// fast, deterministic, and correct enough for budget gating.
+#[must_use]
+pub fn estimate_memory_tokens(mem: &Memory) -> usize {
+    (mem.title.len() + mem.content.len()) / 4
+}
+
+/// Task 1.11 — truncate a scored recall list to fit within an optional
+/// token budget. Iterates in rank order; stops at the first memory whose
+/// inclusion would exceed the budget. Returns `(truncated, tokens_used)`.
+/// When `budget_tokens` is `None` the list is returned untouched, still
+/// with an accurate `tokens_used` tally so callers can surface it in
+/// response metadata.
+#[must_use]
+pub fn apply_token_budget(
+    scored: Vec<(Memory, f64)>,
+    budget_tokens: Option<usize>,
+) -> (Vec<(Memory, f64)>, usize) {
+    let mut used: usize = 0;
+    let mut out = Vec::with_capacity(scored.len());
+    for (mem, score) in scored {
+        let cost = estimate_memory_tokens(&mem);
+        if let Some(budget) = budget_tokens
+            && used.saturating_add(cost) > budget
+        {
+            break;
+        }
+        used = used.saturating_add(cost);
+        out.push((mem, score));
+    }
+    (out, used)
+}
+
 /// Recall — fuzzy OR search + touch + auto-promote + TTL extension.
+/// Task 1.11: after ranking, applies optional `budget_tokens` cap.
+/// Returns `(truncated_list, tokens_used)`.
 #[allow(clippy::too_many_arguments)]
 pub fn recall(
     conn: &Connection,
@@ -720,11 +1087,21 @@ pub fn recall(
     until: Option<&str>,
     short_extend: i64,
     mid_extend: i64,
-) -> Result<Vec<(Memory, f64)>> {
+    as_agent: Option<&str>,
+    budget_tokens: Option<usize>,
+) -> Result<(Vec<(Memory, f64)>, usize)> {
     let now = Utc::now().to_rfc3339();
     let fts_query = sanitize_fts_query(context, true);
+    let (vis_p, vis_t, vis_u, vis_o) = compute_visibility_prefixes(as_agent);
 
-    let mut stmt = conn.prepare(
+    // Task 1.12: hierarchy expansion. If `namespace` is hierarchical (contains
+    // `/`), broaden the filter to the full ancestor chain. Flat namespaces
+    // keep exact-match semantics (backward compat).
+    let (hierarchy_in, hierarchy_active) = hierarchy_in_clause(namespace);
+    let hierarchy_fragment = hierarchy_in.unwrap_or_default();
+    let effective_namespace = if hierarchy_active { None } else { namespace };
+
+    let sql = format!(
         "SELECT m.id, m.tier, m.namespace, m.title, m.content, m.tags, m.priority,
                 m.confidence, m.source, m.access_count, m.created_at, m.updated_at,
                 m.last_accessed_at, m.expires_at, m.metadata,
@@ -739,15 +1116,31 @@ pub fn recall(
          JOIN memories m ON m.rowid = fts.rowid
          WHERE memories_fts MATCH ?1
            AND (?2 IS NULL OR m.namespace = ?2)
+           {hierarchy_fragment}
            AND (m.expires_at IS NULL OR m.expires_at > ?3)
            AND (?4 IS NULL OR EXISTS (SELECT 1 FROM json_each(m.tags) WHERE json_each.value = ?4))
            AND (?5 IS NULL OR m.created_at >= ?5)
            AND (?6 IS NULL OR m.created_at <= ?6)
+           {vis}
          ORDER BY score DESC
          LIMIT ?7",
-    )?;
+        vis = visibility_clause(8, "m"),
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(
-        params![fts_query, namespace, now, tags_filter, since, until, limit],
+        params![
+            fts_query,
+            effective_namespace,
+            now,
+            tags_filter,
+            since,
+            until,
+            limit,
+            vis_p,
+            vis_t,
+            vis_u,
+            vis_o
+        ],
         |row| {
             let mem = row_to_memory(row)?;
             let score: f64 = row.get(15)?;
@@ -756,13 +1149,87 @@ pub fn recall(
     )?;
     let results: Vec<(Memory, f64)> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
 
-    // Touch all recalled memories (bumps access, extends TTL, auto-promotes)
-    for (mem, _) in &results {
+    // Task 1.12: proximity boost when hierarchy expansion is active.
+    let boosted = if let (true, Some(anchor)) = (hierarchy_active, namespace) {
+        apply_proximity_boost(results, anchor)
+    } else {
+        results
+    };
+
+    // Task 1.11: apply optional token budget in rank order (AFTER proximity).
+    let (budgeted, tokens_used) = apply_token_budget(boosted, budget_tokens);
+
+    // Touch all recalled memories that SURVIVED the budget cut — no sense
+    // bumping access counts on memories the caller will never see.
+    for (mem, _) in &budgeted {
         if let Err(e) = touch(conn, &mem.id, short_extend, mid_extend) {
             tracing::warn!("touch failed for memory {}: {}", &mem.id, e);
         }
     }
-    Ok(results)
+    Ok((budgeted, tokens_used))
+}
+
+/// Task 1.7 — vertical memory promotion.
+///
+/// Clones `source_id` into `to_namespace`, which must be a proper `/`-derived
+/// ancestor of the memory's current namespace. The original memory is
+/// **untouched** (vertical promotion is a fan-out, not a move). A
+/// `derived_from` link is created from the new clone back to the source so
+/// the promotion trail is queryable.
+///
+/// Returns the clone's new ID.
+///
+/// Errors when:
+/// - source doesn't exist
+/// - `to_namespace` is empty, equal to the source namespace, or not an
+///   ancestor of it (see `namespace_ancestors`)
+pub fn promote_to_namespace(
+    conn: &Connection,
+    source_id: &str,
+    to_namespace: &str,
+) -> Result<String> {
+    if to_namespace.is_empty() {
+        anyhow::bail!("to_namespace cannot be empty");
+    }
+    let source = get(conn, source_id)?
+        .ok_or_else(|| anyhow::anyhow!("source memory not found: {source_id}"))?;
+    if to_namespace == source.namespace {
+        anyhow::bail!(
+            "to_namespace must be a proper ancestor of the memory's namespace (got self: {})",
+            source.namespace
+        );
+    }
+    let ancestors = namespace_ancestors(&source.namespace);
+    if !ancestors.iter().any(|a| a == to_namespace) {
+        anyhow::bail!(
+            "to_namespace '{to_namespace}' is not an ancestor of '{}' (ancestors: {ancestors:?})",
+            source.namespace
+        );
+    }
+
+    let now = Utc::now().to_rfc3339();
+    let clone = Memory {
+        id: uuid::Uuid::new_v4().to_string(),
+        tier: source.tier.clone(),
+        namespace: to_namespace.to_string(),
+        title: source.title.clone(),
+        content: source.content.clone(),
+        tags: source.tags.clone(),
+        priority: source.priority,
+        confidence: source.confidence,
+        source: source.source.clone(),
+        access_count: 0,
+        created_at: now.clone(),
+        updated_at: now,
+        last_accessed_at: None,
+        expires_at: source.expires_at.clone(),
+        metadata: source.metadata.clone(),
+    };
+    let actual_id = insert(conn, &clone)?;
+    // Clone → source: derived_from. Safe to ignore if the link layer
+    // short-circuits on self-link (impossible here — distinct IDs).
+    create_link(conn, &actual_id, source_id, "derived_from")?;
+    Ok(actual_id)
 }
 
 /// Detect potential contradictions: memories in same namespace with similar titles.
@@ -1051,6 +1518,131 @@ pub fn list_namespaces(conn: &Connection) -> Result<Vec<NamespaceCount>> {
     })?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .map_err(Into::into)
+}
+
+/// Register or refresh an agent in the reserved `_agents` namespace.
+///
+/// Each agent is stored as a long-tier memory with `title = "agent:<agent_id>"`.
+/// Duplicate registration for the same `agent_id` refreshes `last_seen_at` and
+/// overwrites `agent_type` + `capabilities`, while preserving the original
+/// `registered_at` timestamp (caller-observable provenance).
+///
+/// Returns the stored memory ID.
+pub fn register_agent(
+    conn: &Connection,
+    agent_id: &str,
+    agent_type: &str,
+    capabilities: &[String],
+) -> Result<String> {
+    let title = format!("agent:{agent_id}");
+    let now = Utc::now().to_rfc3339();
+
+    // Preserve original registered_at across re-registration.
+    let registered_at = conn
+        .query_row(
+            "SELECT json_extract(metadata, '$.registered_at') FROM memories
+             WHERE namespace = ?1 AND title = ?2",
+            params![AGENTS_NAMESPACE, &title],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| now.clone());
+
+    let caps_json: Vec<serde_json::Value> = capabilities
+        .iter()
+        .map(|c| serde_json::Value::String(c.clone()))
+        .collect();
+
+    let metadata = serde_json::json!({
+        "agent_id": agent_id,
+        "agent_type": agent_type,
+        "capabilities": caps_json,
+        "registered_at": registered_at,
+        "last_seen_at": now,
+    });
+
+    let content = serde_json::to_string(&metadata)
+        .context("failed to serialize agent registration content")?;
+
+    let mem = Memory {
+        id: uuid::Uuid::new_v4().to_string(),
+        tier: Tier::Long,
+        namespace: AGENTS_NAMESPACE.to_string(),
+        title,
+        content,
+        tags: vec!["agent-registration".to_string()],
+        priority: 5,
+        confidence: 1.0,
+        source: "system".to_string(),
+        access_count: 0,
+        created_at: now.clone(),
+        updated_at: now,
+        last_accessed_at: None,
+        expires_at: None,
+        metadata,
+    };
+
+    insert(conn, &mem)
+}
+
+/// List every registered agent. Rows are drawn from the `_agents` namespace
+/// and parsed out of each memory's metadata.
+pub fn list_agents(conn: &Connection) -> Result<Vec<AgentRegistration>> {
+    let now = Utc::now().to_rfc3339();
+    let mut stmt = conn.prepare(
+        "SELECT metadata FROM memories
+         WHERE namespace = ?1
+           AND (expires_at IS NULL OR expires_at > ?2)
+         ORDER BY json_extract(metadata, '$.registered_at') ASC",
+    )?;
+    let rows = stmt.query_map(params![AGENTS_NAMESPACE, now], |row| {
+        row.get::<_, String>(0)
+    })?;
+
+    let mut agents = Vec::new();
+    for r in rows {
+        let raw = r?;
+        let meta: serde_json::Value =
+            serde_json::from_str(&raw).context("failed to parse agent metadata as JSON")?;
+        let agent_id = meta
+            .get("agent_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let agent_type = meta
+            .get("agent_type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let capabilities: Vec<String> = meta
+            .get("capabilities")
+            .and_then(serde_json::Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let registered_at = meta
+            .get("registered_at")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let last_seen_at = meta
+            .get("last_seen_at")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        agents.push(AgentRegistration {
+            agent_id,
+            agent_type,
+            capabilities,
+            registered_at,
+            last_seen_at,
+        });
+    }
+    Ok(agents)
 }
 
 pub fn stats(conn: &Connection, db_path: &Path) -> Result<Stats> {
@@ -1510,13 +2102,40 @@ pub fn recall_hybrid(
     vector_index: Option<&crate::hnsw::VectorIndex>,
     short_extend: i64,
     mid_extend: i64,
-) -> Result<Vec<(Memory, f64)>> {
+    as_agent: Option<&str>,
+    budget_tokens: Option<usize>,
+    scoring: &crate::config::ResolvedScoring,
+) -> Result<(Vec<(Memory, f64)>, usize)> {
     let now = Utc::now().to_rfc3339();
     let fts_query = sanitize_fts_query(context, true);
+    let prefixes = compute_visibility_prefixes(as_agent);
+    let (vis_p, vis_t, vis_u, vis_o) = prefixes.clone();
+
+    // Task 1.12: hierarchy expansion (same logic as `recall`). Hierarchical
+    // `namespace` broadens filter to ancestor chain; flat namespaces stay
+    // exact-match.
+    let (fts_hierarchy_in, hierarchy_active) = hierarchy_in_clause(namespace);
+    let fts_hierarchy_fragment = fts_hierarchy_in.unwrap_or_default();
+    // Semantic stmt has no `m.` alias and binds at slot 1 — compute separately.
+    let sem_hierarchy_fragment = if hierarchy_active {
+        if let Some(ns) = namespace {
+            let ancestors = crate::models::namespace_ancestors(ns);
+            let quoted: Vec<String> = ancestors
+                .iter()
+                .map(|a| format!("'{}'", a.replace('\'', "''")))
+                .collect();
+            format!("AND memories.namespace IN ({})", quoted.join(","))
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+    let effective_namespace = if hierarchy_active { None } else { namespace };
 
     // Step 1: Get FTS candidates (up to 3x limit to have a good pool)
     let fts_limit = (limit * 3).max(30);
-    let mut fts_stmt = conn.prepare(
+    let fts_sql = format!(
         "SELECT m.id, m.tier, m.namespace, m.title, m.content, m.tags, m.priority,
                 m.confidence, m.source, m.access_count, m.created_at, m.updated_at,
                 m.last_accessed_at, m.expires_at, m.metadata, m.embedding,
@@ -1529,27 +2148,35 @@ pub fn recall_hybrid(
          JOIN memories m ON m.rowid = fts.rowid
          WHERE memories_fts MATCH ?1
            AND (?2 IS NULL OR m.namespace = ?2)
+           {fts_hierarchy_fragment}
            AND (m.expires_at IS NULL OR m.expires_at > ?3)
            AND (?4 IS NULL OR EXISTS (SELECT 1 FROM json_each(m.tags) WHERE json_each.value = ?4))
            AND (?5 IS NULL OR m.created_at >= ?5)
            AND (?6 IS NULL OR m.created_at <= ?6)
+           {vis}
          ORDER BY fts_score DESC
          LIMIT ?7",
-    )?;
+        vis = visibility_clause(8, "m"),
+    );
+    let mut fts_stmt = conn.prepare(&fts_sql)?;
 
     // Step 2: Get semantic candidates — all memories with embeddings
-    let mut sem_stmt = conn.prepare(
+    let sem_sql = format!(
         "SELECT id, tier, namespace, title, content, tags, priority,
                 confidence, source, access_count, created_at, updated_at,
                 last_accessed_at, expires_at, metadata, embedding
          FROM memories
          WHERE embedding IS NOT NULL
            AND (?1 IS NULL OR namespace = ?1)
+           {sem_hierarchy_fragment}
            AND (expires_at IS NULL OR expires_at > ?2)
            AND (?3 IS NULL OR EXISTS (SELECT 1 FROM json_each(memories.tags) WHERE json_each.value = ?3))
            AND (?4 IS NULL OR created_at >= ?4)
-           AND (?5 IS NULL OR created_at <= ?5)",
-    )?;
+           AND (?5 IS NULL OR created_at <= ?5)
+           {vis}",
+        vis = visibility_clause(6, "memories"),
+    );
+    let mut sem_stmt = conn.prepare(&sem_sql)?;
 
     // Collect FTS results with scores
     let mut scored: HashMap<String, (Memory, f64, f64)> = HashMap::new(); // id -> (memory, fts_score, cosine_score)
@@ -1557,12 +2184,16 @@ pub fn recall_hybrid(
     let fts_rows = fts_stmt.query_map(
         params![
             fts_query,
-            namespace,
+            effective_namespace,
             now,
             tags_filter,
             since,
             until,
             fts_limit,
+            vis_p,
+            vis_t,
+            vis_u,
+            vis_o,
         ],
         |row| {
             let mem = row_to_memory(row)?;
@@ -1601,11 +2232,18 @@ pub fn recall_hybrid(
             if cosine > 0.3
                 && let Some(mem) = get(conn, &hit.id)?
             {
-                // Apply namespace/expiry/tag filters
-                if let Some(ns) = namespace
-                    && mem.namespace != ns
-                {
-                    continue;
+                // Apply namespace/expiry/tag filters. Task 1.12: when
+                // hierarchy expansion is active, allow any ancestor match
+                // (namespace_ancestors gives us the set); otherwise exact.
+                if let Some(ns) = namespace {
+                    if hierarchy_active {
+                        let ancestors = crate::models::namespace_ancestors(ns);
+                        if !ancestors.iter().any(|a| a == &mem.namespace) {
+                            continue;
+                        }
+                    } else if mem.namespace != ns {
+                        continue;
+                    }
                 }
                 if let Some(exp) = &mem.expires_at
                     && exp.as_str() <= now.as_str()
@@ -1627,17 +2265,33 @@ pub fn recall_hybrid(
                 {
                     continue;
                 }
+                // #151 visibility filter (HNSW branch)
+                if !is_visible(&mem, &prefixes) {
+                    continue;
+                }
                 scored.insert(mem.id.clone(), (mem, 0.0, cosine));
             }
         }
     } else {
         // Fallback: linear scan over all embeddings
-        let sem_rows =
-            sem_stmt.query_map(params![namespace, now, tags_filter, since, until], |row| {
+        let sem_rows = sem_stmt.query_map(
+            params![
+                effective_namespace,
+                now,
+                tags_filter,
+                since,
+                until,
+                vis_p,
+                vis_t,
+                vis_u,
+                vis_o
+            ],
+            |row| {
                 let mem = row_to_memory(row)?;
                 let emb_bytes: Option<Vec<u8>> = row.get(15)?;
                 Ok((mem, emb_bytes))
-            })?;
+            },
+        )?;
 
         for row in sem_rows {
             let (mem, emb_bytes) = row?;
@@ -1666,6 +2320,11 @@ pub fn recall_hybrid(
     // Adaptive blend: semantic weight decreases for longer content (embeddings
     // lose information on long text; FTS stays precise).  Short memories
     // (< 500 chars) get 50/50, long memories (> 5 000 chars) get 15/85.
+    // v0.6.0.0: multiply the blend by a per-tier exponential time-decay with
+    // half-life defaults 7 d (short) / 30 d (mid) / 365 d (long). The
+    // `legacy_scoring` config knob short-circuits the decay back to 1.0 for
+    // A/B comparison and emergency regression rollback.
+    let now_utc = Utc::now();
     let mut results: Vec<(Memory, f64)> = scored
         .into_values()
         .map(|(mem, fts_score, cosine)| {
@@ -1684,27 +2343,158 @@ pub fn recall_hybrid(
                 0.50 - 0.35 * ((content_len - 500.0) / 4500.0)
             };
             let blended = semantic_weight * cosine + (1.0 - semantic_weight) * norm_fts;
-            (mem, blended)
+            let age_days = chrono::DateTime::parse_from_rfc3339(&mem.created_at)
+                .ok()
+                .map_or(0.0, |ts| {
+                    let secs = (now_utc - ts.with_timezone(&Utc)).num_seconds();
+                    // Saturate at ~68 y (i32::MAX seconds). Practical: any memory
+                    // older than that decays all the way down and the exact age
+                    // doesn't matter. Precision loss here is negligible — we
+                    // only need ~hour granularity on a 1 e-9..1.0 multiplier.
+                    #[allow(clippy::cast_precision_loss)]
+                    {
+                        secs as f64 / 86_400.0
+                    }
+                });
+            let decay = scoring.decay_multiplier(&mem.tier, age_days);
+            (mem, blended * decay)
         })
         .collect();
 
     results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     results.truncate(limit);
 
-    // Touch all recalled memories
-    for (mem, _) in &results {
+    // Task 1.12: proximity boost (if hierarchy expansion is active).
+    let boosted = if let (true, Some(anchor)) = (hierarchy_active, namespace) {
+        apply_proximity_boost(results, anchor)
+    } else {
+        results
+    };
+
+    // Task 1.11: apply token budget in rank order (AFTER proximity).
+    let (budgeted, tokens_used) = apply_token_budget(boosted, budget_tokens);
+
+    // Touch surviving memories only.
+    for (mem, _) in &budgeted {
         if let Err(e) = touch(conn, &mem.id, short_extend, mid_extend) {
             tracing::warn!("touch failed for memory {}: {}", &mem.id, e);
         }
     }
 
-    Ok(results)
+    Ok((budgeted, tokens_used))
 }
 
 /// Checkpoint WAL for clean shutdown.
 pub fn checkpoint(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "wal_checkpoint", "TRUNCATE")?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3 foundation (issue #224) — sync_state helpers.
+//
+// These are additive: they do not change how the existing `ai-memory sync`
+// command behaves in v0.6.0 GA. They exist so HTTP sync endpoints and the
+// CRDT-lite merge follow-up can durably track "last updated_at seen from
+// peer X" per local agent.
+// ---------------------------------------------------------------------------
+
+/// Record the latest `updated_at` this local agent has observed from `peer_id`.
+/// Monotonic by timestamp — older writes do not overwrite newer ones.
+/// Lazily creates the row on first observation.
+pub fn sync_state_observe(
+    conn: &Connection,
+    agent_id: &str,
+    peer_id: &str,
+    seen_at: &str,
+) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO sync_state (agent_id, peer_id, last_seen_at, last_pulled_at) \
+         VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT(agent_id, peer_id) DO UPDATE SET \
+            last_seen_at = CASE WHEN excluded.last_seen_at > last_seen_at \
+                                THEN excluded.last_seen_at \
+                                ELSE last_seen_at END, \
+            last_pulled_at = excluded.last_pulled_at",
+        params![agent_id, peer_id, seen_at, now],
+    )?;
+    Ok(())
+}
+
+/// Load the full vector clock for `agent_id` — the set of
+/// (`peer_id` -> `last_seen_at`) this local agent tracks.
+pub fn sync_state_load(conn: &Connection, agent_id: &str) -> Result<crate::models::VectorClock> {
+    let mut stmt =
+        conn.prepare("SELECT peer_id, last_seen_at FROM sync_state WHERE agent_id = ?1")?;
+    let rows = stmt.query_map(params![agent_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut clock = crate::models::VectorClock::default();
+    for row in rows {
+        let (peer, at) = row?;
+        clock.entries.insert(peer, at);
+    }
+    Ok(clock)
+}
+
+/// Look up this peer's last-push watermark for `peer_id`. Returns `None`
+/// if we've never successfully pushed to them (foundation-era rows also
+/// return `None` because the column was added in schema v12).
+#[must_use]
+pub fn sync_state_last_pushed(conn: &Connection, agent_id: &str, peer_id: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT last_pushed_at FROM sync_state WHERE agent_id = ?1 AND peer_id = ?2",
+        params![agent_id, peer_id],
+        |r| r.get::<_, Option<String>>(0),
+    )
+    .ok()
+    .flatten()
+}
+
+/// Record that local memories up to `updated_at = pushed_at` have been
+/// accepted by `peer_id`. Creates the row if it doesn't exist; monotonic.
+pub fn sync_state_record_push(
+    conn: &Connection,
+    agent_id: &str,
+    peer_id: &str,
+    pushed_at: &str,
+) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO sync_state (agent_id, peer_id, last_seen_at, last_pulled_at, last_pushed_at) \
+         VALUES (?1, ?2, ?3, ?3, ?4) \
+         ON CONFLICT(agent_id, peer_id) DO UPDATE SET \
+            last_pushed_at = CASE \
+                WHEN excluded.last_pushed_at IS NULL THEN last_pushed_at \
+                WHEN last_pushed_at IS NULL THEN excluded.last_pushed_at \
+                WHEN excluded.last_pushed_at > last_pushed_at THEN excluded.last_pushed_at \
+                ELSE last_pushed_at END",
+        params![agent_id, peer_id, now, pushed_at],
+    )?;
+    Ok(())
+}
+
+/// Return memories whose `updated_at > since`, ordered by `updated_at`
+/// ascending. Used by `GET /api/v1/sync/since` to stream incremental
+/// updates to a peer. Caps at `limit` rows (caller-chosen pagination).
+pub fn memories_updated_since(
+    conn: &Connection,
+    since: Option<&str>,
+    limit: usize,
+) -> Result<Vec<Memory>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, tier, namespace, title, content, tags, priority, confidence, \
+                source, access_count, created_at, updated_at, last_accessed_at, \
+                expires_at, metadata \
+         FROM memories \
+         WHERE (?1 IS NULL OR updated_at > ?1) \
+         ORDER BY updated_at ASC \
+         LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![since, limit], row_to_memory)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
 }
 
 /// Deep health check — verifies DB is accessible and FTS is functional.
@@ -1802,6 +2592,419 @@ pub fn clear_namespace_standard(conn: &Connection, namespace: &str) -> Result<bo
         params![namespace],
     )?;
     Ok(changed > 0)
+}
+
+// ---------------------------------------------------------------------------
+// Task 1.9 — governance enforcement + pending_actions CRUD
+// ---------------------------------------------------------------------------
+
+/// Resolve the explicit governance policy for a namespace from its standard
+/// memory's `metadata.governance`. Returns `None` when no policy is set —
+/// enforcement is **opt-in**, so namespaces without explicit policy skip
+/// every governance check (historical behavior preserved). The "default
+/// policy" (`{ write: Any, promote: Any, delete: Owner, approver: Human }`)
+/// is surfaced by `get_standard` for display purposes only; it does not
+/// gate operations.
+pub fn resolve_governance_policy(conn: &Connection, namespace: &str) -> Option<GovernancePolicy> {
+    let standard_id = get_namespace_standard(conn, namespace).ok()??;
+    let mem = get(conn, &standard_id).ok()??;
+    match GovernancePolicy::from_metadata(&mem.metadata) {
+        Some(Ok(p)) => Some(p),
+        _ => None,
+    }
+}
+
+/// Return true if `agent_id` matches a registered agent in `_agents`.
+fn is_registered_agent(conn: &Connection, agent_id: &str) -> bool {
+    let title = format!("agent:{agent_id}");
+    conn.query_row(
+        "SELECT 1 FROM memories WHERE namespace = ?1 AND title = ?2",
+        params![AGENTS_NAMESPACE, &title],
+        |r| r.get::<_, i64>(0),
+    )
+    .is_ok()
+}
+
+/// Evaluate a governance level against caller context.
+/// - `memory_owner`: the existing memory's `metadata.agent_id` (delete/promote paths).
+///   Pass `None` for store operations.
+/// - `namespace_owner`: the `metadata.agent_id` of the namespace's standard memory,
+///   used as the "owner" for store operations. Resolved once by the caller.
+fn evaluate_level(
+    conn: &Connection,
+    level: &GovernanceLevel,
+    agent_id: &str,
+    memory_owner: Option<&str>,
+    namespace_owner: Option<&str>,
+) -> GovernanceDecision {
+    match level {
+        GovernanceLevel::Any => GovernanceDecision::Allow,
+        GovernanceLevel::Registered => {
+            if is_registered_agent(conn, agent_id) {
+                GovernanceDecision::Allow
+            } else {
+                GovernanceDecision::Deny(format!(
+                    "governance: caller '{agent_id}' is not a registered agent"
+                ))
+            }
+        }
+        GovernanceLevel::Owner => {
+            let owner = memory_owner.or(namespace_owner);
+            match owner {
+                Some(o) if o == agent_id => GovernanceDecision::Allow,
+                Some(o) => GovernanceDecision::Deny(format!(
+                    "governance: caller '{agent_id}' is not the owner ('{o}')"
+                )),
+                None => GovernanceDecision::Deny(
+                    "governance: owner-level action has no resolvable owner".into(),
+                ),
+            }
+        }
+        GovernanceLevel::Approve => {
+            // Caller translates this into a queued pending_action — the enforcement
+            // helpers below own the queueing so the db layer is the single source
+            // of truth for pending ids.
+            GovernanceDecision::Pending(String::new())
+        }
+    }
+}
+
+/// Resolve the namespace-owner (`metadata.agent_id` of the namespace's
+/// standard memory) used for `Owner`-level store checks.
+fn namespace_owner(conn: &Connection, namespace: &str) -> Option<String> {
+    let standard_id = get_namespace_standard(conn, namespace).ok().flatten()?;
+    let mem = get(conn, &standard_id).ok().flatten()?;
+    mem.metadata
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+/// Enforce governance for a `GovernedAction`. On [`GovernanceDecision::Pending`],
+/// a row is inserted into `pending_actions` and the returned `pending_id` is
+/// embedded in the decision.
+pub fn enforce_governance(
+    conn: &Connection,
+    action: GovernedAction,
+    namespace: &str,
+    agent_id: &str,
+    memory_id: Option<&str>,
+    memory_owner: Option<&str>,
+    payload: &serde_json::Value,
+) -> Result<GovernanceDecision> {
+    // Opt-in enforcement: namespaces without an explicit policy are unaffected.
+    let Some(policy) = resolve_governance_policy(conn, namespace) else {
+        return Ok(GovernanceDecision::Allow);
+    };
+    let level = match action {
+        GovernedAction::Store => &policy.write,
+        GovernedAction::Delete => &policy.delete,
+        GovernedAction::Promote => &policy.promote,
+    };
+    let ns_owner = if matches!(action, GovernedAction::Store) {
+        namespace_owner(conn, namespace)
+    } else {
+        None
+    };
+
+    let decision = evaluate_level(conn, level, agent_id, memory_owner, ns_owner.as_deref());
+    if let GovernanceDecision::Pending(_) = decision {
+        let pending_id =
+            queue_pending_action(conn, action, namespace, memory_id, agent_id, payload)?;
+        return Ok(GovernanceDecision::Pending(pending_id));
+    }
+    Ok(decision)
+}
+
+/// Insert a `pending_actions` row and return its id.
+pub fn queue_pending_action(
+    conn: &Connection,
+    action: GovernedAction,
+    namespace: &str,
+    memory_id: Option<&str>,
+    requested_by: &str,
+    payload: &serde_json::Value,
+) -> Result<String> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = Utc::now().to_rfc3339();
+    let payload_json = serde_json::to_string(payload)?;
+    conn.execute(
+        "INSERT INTO pending_actions (id, action_type, memory_id, namespace, payload, requested_by, requested_at, status)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending')",
+        params![
+            id,
+            action.as_str(),
+            memory_id,
+            namespace,
+            payload_json,
+            requested_by,
+            now,
+        ],
+    )?;
+    Ok(id)
+}
+
+pub fn list_pending_actions(
+    conn: &Connection,
+    status: Option<&str>,
+    limit: usize,
+) -> Result<Vec<PendingAction>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, action_type, memory_id, namespace, payload, requested_by,
+                requested_at, status, decided_by, decided_at, approvals
+         FROM pending_actions
+         WHERE (?1 IS NULL OR status = ?1)
+         ORDER BY requested_at DESC
+         LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![status, limit], |row| {
+        let payload_str: String = row.get(4)?;
+        let payload: serde_json::Value =
+            serde_json::from_str(&payload_str).unwrap_or(serde_json::Value::Null);
+        let approvals_str: String = row.get(10)?;
+        let approvals: Vec<Approval> = serde_json::from_str(&approvals_str).unwrap_or_default();
+        Ok(PendingAction {
+            id: row.get(0)?,
+            action_type: row.get(1)?,
+            memory_id: row.get(2)?,
+            namespace: row.get(3)?,
+            payload,
+            requested_by: row.get(5)?,
+            requested_at: row.get(6)?,
+            status: row.get(7)?,
+            decided_by: row.get(8)?,
+            decided_at: row.get(9)?,
+            approvals,
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+pub fn get_pending_action(conn: &Connection, id: &str) -> Result<Option<PendingAction>> {
+    let row = conn.query_row(
+        "SELECT id, action_type, memory_id, namespace, payload, requested_by,
+                requested_at, status, decided_by, decided_at, approvals
+         FROM pending_actions WHERE id = ?1",
+        params![id],
+        |row| {
+            let payload_str: String = row.get(4)?;
+            let payload: serde_json::Value =
+                serde_json::from_str(&payload_str).unwrap_or(serde_json::Value::Null);
+            let approvals_str: String = row.get(10)?;
+            let approvals: Vec<Approval> = serde_json::from_str(&approvals_str).unwrap_or_default();
+            Ok(PendingAction {
+                id: row.get(0)?,
+                action_type: row.get(1)?,
+                memory_id: row.get(2)?,
+                namespace: row.get(3)?,
+                payload,
+                requested_by: row.get(5)?,
+                requested_at: row.get(6)?,
+                status: row.get(7)?,
+                decided_by: row.get(8)?,
+                decided_at: row.get(9)?,
+                approvals,
+            })
+        },
+    );
+    match row {
+        Ok(p) => Ok(Some(p)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Mark a pending action as approved or rejected. Returns true on status
+/// transition. Does NOT execute the action itself — the caller replays
+/// the payload on approval (the db layer doesn't know how to execute
+/// cross-interface write semantics).
+pub fn decide_pending_action(
+    conn: &Connection,
+    id: &str,
+    approve: bool,
+    decided_by: &str,
+) -> Result<bool> {
+    let new_status = if approve { "approved" } else { "rejected" };
+    let now = Utc::now().to_rfc3339();
+    let updated = conn.execute(
+        "UPDATE pending_actions SET status = ?1, decided_by = ?2, decided_at = ?3
+         WHERE id = ?4 AND status = 'pending'",
+        params![new_status, decided_by, now, id],
+    )?;
+    Ok(updated > 0)
+}
+
+/// Task 1.10 — outcome of an approver-aware approve call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApproveOutcome {
+    /// Approver check failed; policy identifies the reason.
+    Rejected(String),
+    /// Consensus quorum not yet met; vote recorded.
+    Pending { votes: usize, quorum: u32 },
+    /// Fully approved (Human single-step, matching Agent, or consensus
+    /// threshold met). Caller may now replay the payload via
+    /// `execute_pending_action`.
+    Approved,
+}
+
+/// Task 1.10 — approver-type aware approve. Enforces the
+/// `metadata.governance.approver` of the pending action's namespace.
+pub fn approve_with_approver_type(
+    conn: &Connection,
+    pending_id: &str,
+    approver_agent_id: &str,
+) -> Result<ApproveOutcome> {
+    let Some(pa) = get_pending_action(conn, pending_id)? else {
+        return Ok(ApproveOutcome::Rejected(format!(
+            "pending action not found: {pending_id}"
+        )));
+    };
+    if pa.status != "pending" {
+        return Ok(ApproveOutcome::Rejected(format!(
+            "already decided: status={}",
+            pa.status
+        )));
+    }
+    // Resolve the namespace's approver type. If no policy, default to Human —
+    // which accepts any approval (back-compat with 1.9 callers).
+    let approver =
+        resolve_governance_policy(conn, &pa.namespace).map_or(ApproverType::Human, |p| p.approver);
+
+    match approver {
+        ApproverType::Human => {
+            let ok = decide_pending_action(conn, pending_id, true, approver_agent_id)?;
+            if ok {
+                Ok(ApproveOutcome::Approved)
+            } else {
+                Ok(ApproveOutcome::Rejected("decision write failed".into()))
+            }
+        }
+        ApproverType::Agent(required) => {
+            if approver_agent_id != required {
+                return Ok(ApproveOutcome::Rejected(format!(
+                    "designated approver is '{required}'; got '{approver_agent_id}'"
+                )));
+            }
+            let ok = decide_pending_action(conn, pending_id, true, approver_agent_id)?;
+            if ok {
+                Ok(ApproveOutcome::Approved)
+            } else {
+                Ok(ApproveOutcome::Rejected("decision write failed".into()))
+            }
+        }
+        ApproverType::Consensus(quorum) => {
+            // Issue #216: a single caller could previously satisfy any
+            // Consensus(n) quorum by varying the unauthenticated `agent_id`
+            // (`alice`, `bob`, `Alice`/`alice` were three distinct votes).
+            // Two changes harden the path:
+            //   1. Require each voter to be a registered agent — raises the
+            //      bar from "claim any string" to "operator pre-registered
+            //      this id". Combined with auth on the approve endpoint
+            //      (operator-deployed) this gives a real multi-party gate.
+            //   2. Canonicalize the agent_id to lowercase for both the
+            //      duplicate-vote check and storage so case-variants of the
+            //      same id collapse to a single vote.
+            if !is_registered_agent(conn, approver_agent_id) {
+                return Ok(ApproveOutcome::Rejected(format!(
+                    "consensus voter '{approver_agent_id}' is not a registered agent"
+                )));
+            }
+            let canonical_id = approver_agent_id.to_ascii_lowercase();
+            let mut approvals = pa.approvals.clone();
+            if approvals
+                .iter()
+                .any(|a| a.agent_id.eq_ignore_ascii_case(&canonical_id))
+            {
+                return Ok(ApproveOutcome::Pending {
+                    votes: approvals.len(),
+                    quorum,
+                });
+            }
+            approvals.push(Approval {
+                agent_id: canonical_id.clone(),
+                approved_at: Utc::now().to_rfc3339(),
+            });
+            let approvals_json = serde_json::to_string(&approvals)?;
+            conn.execute(
+                "UPDATE pending_actions SET approvals = ?1 WHERE id = ?2 AND status = 'pending'",
+                params![approvals_json, pending_id],
+            )?;
+            let votes = approvals.len();
+            if u32::try_from(votes).unwrap_or(u32::MAX) >= quorum {
+                // Threshold met — transition status so the caller can replay.
+                let ok = decide_pending_action(conn, pending_id, true, &canonical_id)?;
+                if ok {
+                    return Ok(ApproveOutcome::Approved);
+                }
+                return Ok(ApproveOutcome::Rejected(
+                    "decision write failed at consensus threshold".into(),
+                ));
+            }
+            Ok(ApproveOutcome::Pending { votes, quorum })
+        }
+    }
+}
+
+/// Task 1.10 — Execute an approved pending action's payload. Callers invoke
+/// this after `approve_with_approver_type` returns `Approved`. Returns the
+/// affected memory id (new id for store, existing id for delete/promote).
+pub fn execute_pending_action(conn: &Connection, pending_id: &str) -> Result<Option<String>> {
+    let Some(pa) = get_pending_action(conn, pending_id)? else {
+        anyhow::bail!("pending action not found: {pending_id}");
+    };
+    if pa.status != "approved" {
+        anyhow::bail!("cannot execute non-approved action (status={})", pa.status);
+    }
+    match pa.action_type.as_str() {
+        "store" => {
+            let mut mem: Memory = serde_json::from_value(pa.payload.clone())
+                .map_err(|e| anyhow::anyhow!("invalid store payload: {e}"))?;
+            // Stamp fresh id + timestamps so the execution is idempotent on replay.
+            mem.id = uuid::Uuid::new_v4().to_string();
+            let now = Utc::now().to_rfc3339();
+            mem.created_at.clone_from(&now);
+            mem.updated_at = now;
+            mem.access_count = 0;
+            let actual_id = insert(conn, &mem)?;
+            Ok(Some(actual_id))
+        }
+        "delete" => {
+            if let Some(mid) = pa.memory_id.clone() {
+                delete(conn, &mid)?;
+                Ok(Some(mid))
+            } else {
+                Ok(None)
+            }
+        }
+        "promote" => {
+            if let Some(mid) = pa.memory_id.clone() {
+                if let Some(to_ns) = pa.payload.get("to_namespace").and_then(|v| v.as_str()) {
+                    // Vertical promotion to ancestor.
+                    let clone_id = promote_to_namespace(conn, &mid, to_ns)?;
+                    return Ok(Some(clone_id));
+                }
+                // Tier bump to long + clear expiry.
+                let (_found, _changed) = update(
+                    conn,
+                    &mid,
+                    None,
+                    None,
+                    Some(&Tier::Long),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(""),
+                    None,
+                )?;
+                Ok(Some(mid))
+            } else {
+                Ok(None)
+            }
+        }
+        other => anyhow::bail!("unknown action_type: {other}"),
+    }
 }
 
 /// Check if a memory ID is a namespace standard (used by consolidate to warn).
@@ -2156,6 +3359,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(results.len(), 1);
@@ -2172,6 +3376,7 @@ mod tests {
             None,
             None,
             10,
+            None,
             None,
             None,
             None,
@@ -2196,7 +3401,7 @@ mod tests {
         )
         .unwrap();
 
-        let results = recall(
+        let (results, _tokens) = recall(
             &conn,
             "Rust programming",
             None,
@@ -2206,6 +3411,8 @@ mod tests {
             None,
             SHORT_TTL_EXTEND_SECS,
             MID_TTL_EXTEND_SECS,
+            None,
+            None,
         )
         .unwrap();
         assert!(!results.is_empty());
@@ -2230,6 +3437,8 @@ mod tests {
             None,
             SHORT_TTL_EXTEND_SECS,
             MID_TTL_EXTEND_SECS,
+            None,
+            None,
         );
         // May return empty or error, both acceptable
         assert!(results.is_ok() || results.is_err());
@@ -2745,6 +3954,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(results.len(), 1);
@@ -2758,7 +3968,7 @@ mod tests {
         mem.metadata = serde_json::json!({"context": "test-recall"});
         insert(&conn, &mem).unwrap();
 
-        let results = recall(
+        let (results, _tokens) = recall(
             &conn,
             "Recallable",
             Some("test"),
@@ -2768,6 +3978,8 @@ mod tests {
             None,
             3600,
             86400,
+            None,
+            None,
         )
         .unwrap();
         assert!(!results.is_empty());
@@ -3004,6 +4216,118 @@ mod tests {
         assert!(restored);
         let got = get(&conn, &id).unwrap().unwrap();
         assert_eq!(got.metadata, serde_json::json!({}));
+    }
+
+    #[test]
+    fn scope_index_exists_after_migration() {
+        // v0.6.0 GA (schema v10) — the `scope_idx` generated column and its
+        // B-tree index must exist after `open()` runs migration.
+        let conn = test_db();
+        let has_col: bool = conn
+            .prepare("SELECT scope_idx FROM memories LIMIT 0")
+            .is_ok();
+        assert!(has_col, "scope_idx generated column missing");
+        let idx_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_memories_scope_idx'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx_exists, 1, "idx_memories_scope_idx missing");
+    }
+
+    #[test]
+    fn scope_index_used_for_direct_scope_filter() {
+        // v0.6.0 GA — confirm `idx_memories_scope_idx` is picked for a
+        // direct `WHERE scope_idx = ?` predicate. This is the shape the
+        // query planner sees for `scope = 'collective'` fast-paths and
+        // the branch-local predicate inside `visibility_clause`.
+        //
+        // We deliberately do NOT assert the index is used for the full
+        // visibility_clause OR-chain — SQLite's planner may (correctly)
+        // choose a scan when the OR-chain has variable selectivity across
+        // branches. The point of the index is to accelerate the common
+        // case when a recall narrows to one scope; the multi-branch
+        // visibility clause still benefits because each branch evaluates
+        // the predicate against a single column rather than a JSON extract.
+        let conn = test_db();
+        // Seed enough rows + ANALYZE so planner cost model is honest.
+        for i in 0..200 {
+            let scope = if i % 3 == 0 { "collective" } else { "private" };
+            let mut mem = make_memory(&format!("row-{i}"), "test", Tier::Long, 5);
+            mem.metadata = serde_json::json!({"scope": scope});
+            insert(&conn, &mem).unwrap();
+        }
+        conn.execute("ANALYZE", []).unwrap();
+        let plan: Vec<String> = conn
+            .prepare("EXPLAIN QUERY PLAN SELECT id FROM memories WHERE scope_idx = ?1")
+            .unwrap()
+            .query_map(params!["collective"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let joined = plan.join("\n");
+        assert!(
+            joined.contains("idx_memories_scope_idx"),
+            "direct scope filter must use idx_memories_scope_idx; got:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn scope_idx_reflects_metadata_on_insert_and_update() {
+        // v0.6.0 GA — the VIRTUAL generated column must track metadata.scope
+        // across insert and update without manual maintenance.
+        let conn = test_db();
+        let mut mem = make_memory("scope-tracking", "test", Tier::Long, 5);
+        mem.metadata = serde_json::json!({"scope": "team"});
+        let id = insert(&conn, &mem).unwrap();
+        let scope: String = conn
+            .query_row(
+                "SELECT scope_idx FROM memories WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(scope, "team");
+
+        // Flip scope to unit via metadata update — generated column updates.
+        let new_meta = serde_json::json!({"scope": "unit"});
+        update(
+            &conn,
+            &id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&new_meta),
+        )
+        .unwrap();
+        let scope2: String = conn
+            .query_row(
+                "SELECT scope_idx FROM memories WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(scope2, "unit");
+
+        // Memory with no scope key — virtual column returns the default.
+        let mut bare = make_memory("no-scope-key", "test", Tier::Long, 5);
+        bare.metadata = serde_json::json!({});
+        let id2 = insert(&conn, &bare).unwrap();
+        let scope3: String = conn
+            .query_row(
+                "SELECT scope_idx FROM memories WHERE id = ?1",
+                params![id2],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(scope3, "private");
     }
 
     #[test]

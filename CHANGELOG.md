@@ -5,6 +5,305 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] — 2026-04-19 — Phase 1 complete + v0.6.0.0 sprint
+
+Phase 1 baseline (Tasks 1.1–1.12 from alpha train) plus the v0.6.0.0 sprint
+additions covering opt-in LLM autonomy hooks, decay-aware recall, multi-agent
+messaging primitives, at-rest encryption, ops surfaces, and SDK scaffolds.
+
+Defer-outs from this release (not shipped in 0.6.0):
+
+- **Autonomous curator daemon** — continuous background consolidation / GC
+  driven by LLM decisions. Deferred to v0.6.1. v0.6.0 ships only the
+  opt-in post-store hooks (synchronous, store path only).
+- **Multi-node replication + chaos testing** — durability claims beyond
+  single-node VACUUM INTO snapshots + optional peer sync are out of scope
+  for v0.6.0. No loss-probability target is published.
+- **Storage abstraction layer (Postgres / pgvector adapter)** — remains a
+  v0.7 track. v0.6.0 is SQLite-only; the SAL preview on `feat/sal-trait-redesign`
+  stays private/feature-gated until v0.7 extraction.
+
+### Added — v0.6.0.0 sprint (autonomy hooks + multi-agent + at-rest + ops + SDKs)
+
+**Autonomy / recall**
+- **Time-decay half-life on recall scoring** — per-tier exponential decay
+  multiplier on the hybrid-recall score blend. Default half-lives: short
+  7 d, mid 30 d, long 365 d. Configurable via `[scoring]` in `config.toml`;
+  `legacy_scoring = true` disables decay for A/B comparison and regression
+  rollback. Half-lives clamped to `[0.1, 36500]` days.
+- **Contextual recall (conversation-token bias)** — `memory_recall` accepts
+  an optional `context_tokens: array<string>`. When supplied, the primary
+  query embedding is fused 70/30 with an embedding of the joined context
+  tokens, biasing recall toward memories that match both the explicit
+  query AND nearby conversation topics. CLI: `--context-tokens tok1,tok2`.
+- **Post-store LLM autonomy hooks** — opt-in synchronous hooks that fire
+  `llm::auto_tag` + `llm::detect_contradiction` on every successful
+  `memory_store`. Results persist into `metadata.auto_tags` and
+  `metadata.confirmed_contradictions`. Enabled via
+  `AI_MEMORY_AUTONOMOUS_HOOKS=1` env var or `autonomous_hooks = true` in
+  config. Off by default (adds Ollama round-trip latency). Skipped for
+  content under 50 bytes, when no LLM is wired, and for `_`-prefixed
+  internal namespaces.
+**Multi-agent primitives**
+- **Agent-to-agent notify + inbox** — `memory_notify(target, title, payload)`
+  + `memory_inbox([agent_id, unread_only])` MCP tools. Messages are
+  ordinary memories in the reserved `_messages/<target>` namespace;
+  sender identity stamped in metadata; `access_count == 0` is the
+  conventional unread marker. No new schema.
+- **Webhook subscribe / unsubscribe / list** — `memory_subscribe` +
+  `memory_unsubscribe` + `memory_list_subscriptions` MCP tools. Events
+  fire on `memory_store` (v0.6.1 extends to delete/promote/link) and
+  POST an HMAC-SHA256-signed JSON payload to subscriber URLs
+  (`X-Ai-Memory-Signature: sha256=<hex>`). SSRF-hardened — private-range
+  IPs rejected, https required for non-loopback hosts. Migration v13
+  adds the `subscriptions` table.
+**At-rest encryption**
+- **Optional SQLCipher encryption at rest** — new cargo feature
+  `sqlcipher` swaps `rusqlite` to the
+  `bundled-sqlcipher-vendored-openssl` feature. Default builds are
+  byte-for-byte unchanged. Operators who want encryption build with
+  `cargo build --no-default-features --features sqlcipher` and supply
+  `--db-passphrase-file <path>` at startup. Passphrase never appears
+  in the process list or shell history.
+
+**Ops**
+- **Prometheus `/metrics` endpoint** (and `/api/v1/metrics`) exposes
+  `ai_memory_store_total`, `ai_memory_recall_total`,
+  `ai_memory_recall_latency_seconds`, `ai_memory_autonomy_hook_total`,
+  `ai_memory_contradiction_detected_total`,
+  `ai_memory_webhook_dispatched_total`,
+  `ai_memory_webhook_failed_total`, `ai_memory_memories`,
+  `ai_memory_hnsw_size`, `ai_memory_subscriptions_active`. Pure Rust,
+  no new transitive C deps.
+- **Hardened systemd units** under `packaging/systemd/` —
+  `ai-memory.service`, `ai-memory-sync.service`,
+  `ai-memory-backup.service`, `ai-memory-backup.timer` with README.
+  Full sandbox (`ProtectSystem=strict`, `MemoryDenyWriteExecute=yes`,
+  `SystemCallFilter=@system-service`, `CapabilityBoundingSet=` empty,
+  `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`). Target
+  `systemd-analyze security` exposure score <5.0.
+- **Backup / restore CLI** — `ai-memory backup --to <dir> [--keep N]`
+  writes a hot-backup-safe SQLite `VACUUM INTO` snapshot plus a
+  sha256 manifest. `ai-memory restore --from <path>` verifies the
+  manifest before replacing the current DB; previous DB is moved
+  aside to `<db>.pre-restore-<ts>.db` as a safety net. Paired with
+  the hourly `ai-memory-backup.timer` systemd unit.
+
+**SDKs**
+- **TypeScript SDK scaffold** under `sdk/typescript/` —
+  `@alphaone/ai-memory` (v0.6.0-alpha.0), strict TS, undici-based
+  fetch, covers all current + v0.6.0.0 target endpoints (18+ methods),
+  Jest tests guarded by `AI_MEMORY_TEST_DAEMON` env var. Includes
+  HMAC-SHA256 webhook verifier. Not yet published to npm.
+- **Python SDK scaffold** under `sdk/python/` — `ai-memory`
+  (v0.6.0-alpha.0), sync (`AiMemoryClient`) + async
+  (`AsyncAiMemoryClient`) clients via `httpx`, Pydantic v2 models
+  (15/15 Memory fields), exception hierarchy, HMAC-SHA256 webhook
+  verifier. Not yet published to PyPI.
+
+### v0.6.0 GA disclosures (unchanged from pre-sprint baseline)
+
+The following items are **MANDATORY DISCLOSURES** for the v0.6.0 release.
+Operators upgrading from v0.5.4.x MUST read this section before deploying.
+
+The following items are **MANDATORY DISCLOSURES** for the v0.6.0 GA release.
+Operators upgrading from v0.5.4.x MUST read this section before deploying.
+
+### Breaking changes
+
+- **Consensus governance now requires agent pre-registration** (issue #234).
+  The fix for security issue #216 (one caller satisfying `Consensus(N)` with
+  N spoofed agent_ids) added an `is_registered_agent()` gate. Existing
+  `consensus:N` policies become **indefinitely-locked** unless approver
+  agents are registered first via `ai-memory agents register --agent-id <id>
+  --agent-type <type>`.
+
+  Migration: register all consensus approvers before upgrading. Example:
+
+  ```bash
+  ai-memory agents register --agent-id alice --agent-type human
+  ai-memory agents register --agent-id bob   --agent-type human
+  ai-memory agents register --agent-id carol --agent-type human
+  ```
+
+### Security disclosures (peer-mesh sync)
+
+- **Sync endpoints are unauthenticated when TLS is not enabled** (issue #231).
+  `POST /api/v1/sync/push` and `GET /api/v1/sync/since` accept all callers
+  when `serve` runs without `--tls-cert + --tls-key`. Production peer-mesh
+  deployments **MUST** set `--tls-cert + --tls-key + --mtls-allowlist`.
+  See `docs/ADMIN_GUIDE.md` § Peer-mesh security.
+
+- **sync-daemon does no server-cert verification without --client-cert**
+  (issue #232). The daemon uses `danger_accept_invalid_certs(true)` when
+  `--client-cert` is not provided — any server cert is accepted. For
+  untrusted networks, ALWAYS use mTLS in both directions.
+
+- **Any valid mTLS peer can dump the full database** (issue #239). By design,
+  the trust boundary is the mTLS cert. Sync endpoints bypass per-memory
+  visibility filtering. **Allowlist only peers you fully trust.** Per-namespace
+  / per-scope sync filtering is a Phase 5 feature.
+
+- **Body-claimed `sender_agent_id` is not yet attested to the cert CN/SAN**
+  (issue #238). mTLS gates network access but the receiving handler accepts
+  `sender_agent_id` from the body without checking the cert identity. A peer
+  with a valid cert can claim any agent_id. Tracked as Layer 2b for v0.7.
+
+### Schema migration
+
+- v0.5.4.6 → v0.6.0 runs six additive migrations (v7 through v12). All are
+  idempotent, transactional, and default-safe. Worst-case lock on a 10M-row
+  database: 1–3 seconds during v10 (scope_idx index build). Schedule a brief
+  maintenance window for large databases.
+
+### Surface gaps tracked for v0.6.1
+
+- Namespace standards / governance config is currently **MCP-only** (issue
+  #236). HTTP and CLI surfaces will land in v0.6.1.
+- `--agent-type` accepts only 6 hardcoded values (issue #235). Workaround:
+  use `system` for custom agents, or wait for v0.6.1.
+
+## [0.6.0-alpha.2] — 2026-04-16 — Phase 1 Track A complete + release-plumbing reconciliation
+
+Supersedes **0.6.0-alpha.1** (2026-04-16, same day — partial publish). alpha.1
+shipped the Task 1.3 feature to crates.io, Ubuntu PPA, Homebrew, and GitHub
+Release binaries, but Docker (GHCR) and Fedora COPR failed due to a pre-existing
+divergence between `main` and `release/v0.6.0`:
+
+- Dockerfile pinned to `rust:1.87-slim` while code uses let-chains stabilized in
+  1.88 (fixed on main in #187, never back-merged)
+- Fedora COPR workflow `sed` blindly injected SemVer pre-release strings into
+  RPM `Version:` field, which forbids `-`
+
+alpha.2 back-merges `main` → `release/v0.6.0` (commits from `ce8fd47` through
+`36747b2`, including RUSTSEC-2026-0098/0099 fixes), bumps `rust-version` to 1.88
+(the honest MSRV), updates `time` 0.3.45 → 0.3.47 (RUSTSEC-2026-0009 DoS), and
+patches the COPR workflow to split SemVer pre-release versions into `Version:` +
+`Release:` pairs per Fedora packaging guidelines. No feature changes vs alpha.1.
+
+alpha.1 will be **yanked from crates.io** once alpha.2 publishes successfully.
+
+## [0.6.0-alpha.1] — 2026-04-16 — Phase 1 Track A complete (PARTIAL — yanked, superseded by alpha.2)
+
+First cut of the v0.6.0 release train. Integration branch for Phase 1 tasks 1.3–1.12
+plus the already-landed foundation work (1.1, 1.2). Pre-release; API is not yet stable.
+Successive alphas will be tagged at each track completion (A/B/C/D per
+[docs/PHASE-1.md](docs/PHASE-1.md) §Dependency Graph).
+
+### Added — Task 1.1 (schema metadata foundation)
+
+- **`metadata` JSON column** on `memories` and `archived_memories` tables, default `'{}'`.
+  Schema migration to v7. All CRUD paths preserve metadata.
+- **`Memory.metadata: serde_json::Value`** field with serde defaults.
+- **`CreateMemory.metadata`**, **`UpdateMemory.metadata`** — MCP, HTTP, and CLI all accept
+  arbitrary JSON metadata on store/update.
+- **TOON format** renders `metadata` column inline.
+
+### Added — Task 1.2 (Agent Identity in Metadata, NHI-hardened) — [#193]
+
+- **`metadata.agent_id`** on every stored memory, resolved via a defense-in-depth
+  precedence chain (explicit flag / body / MCP param → `AI_MEMORY_AGENT_ID` env →
+  MCP `initialize.clientInfo.name` → `host:<host>:pid-<pid>-<uuid8>` →
+  `anonymous:pid-<pid>-<uuid8>`).
+- **HTTP `X-Agent-Id` request header** honored when no body `agent_id` is supplied;
+  per-request `anonymous:req-<uuid8>` synthesized otherwise, with `WARN` log line.
+- **`--agent-id` global CLI flag** (also reads `AI_MEMORY_AGENT_ID` env var).
+- **`--agent-id` filter** on `list` and `search` (CLI, MCP tool param, HTTP query param).
+- **Immutability**: `metadata.agent_id` is preserved across UPDATE, UPSERT dedup,
+  import, sync, consolidate, and MCP `memory_update`. Enforced at both SQL level
+  (`json_set` CASE clauses in `db::insert` and `db::insert_if_newer`) and caller
+  level (`identity::preserve_agent_id` in every path that writes metadata).
+- **Validation**: `^[A-Za-z0-9_\-:@./]{1,128}$` — permits prefixed / scoped / SPIFFE
+  forms, rejects whitespace, null bytes, control chars, shell metacharacters.
+- **New module** `src/identity.rs` (17 unit tests): precedence chain, process
+  discriminator (`OnceLock<pid-<pid>-<uuid8>>`), component sanitization, HTTP
+  resolution, provenance preservation.
+- **`gethostname = "0.5"`** added as dependency (minimal, no transitive deps).
+- **28 new tests** (20+ beyond spec minimum of 4): 17 unit + 2 validator + 9 integration.
+
+### Security — red-team findings fixed during Task 1.2 review
+
+- **T-3 (HIGH)**: MCP `memory_update` could rewrite `metadata.agent_id` on an existing
+  memory, bypassing the documented immutability invariant. Fixed in commit `b228dcc`
+  by wiring `identity::preserve_agent_id` into `handle_update`. Regression test
+  `test_mcp_update_preserves_agent_id`.
+- **GAP 1 (HIGH)**: `cmd_import` blindly trusted `metadata.agent_id` in input JSON,
+  allowing an attacker-crafted file to forge any agent identity. Fixed in `356b448`:
+  restamps with caller's id by default; `--trust-source` flag opts into legitimate
+  backup-restore; original claim preserved as `imported_from_agent_id`. `cmd_sync`
+  gets the same treatment on `pull` and `merge` paths.
+- **GAP 2 (MEDIUM)**: `db::consolidate` merged source metadata with last-write-wins
+  semantics on `agent_id`, nondeterministically dropping attribution and giving the
+  consolidator no record. Fixed in `356b448`: consolidator's id is authoritative;
+  all source authors preserved in `metadata.consolidated_from_agents` array.
+  HTTP `ConsolidateBody` gains optional `agent_id` field plus `X-Agent-Id` header.
+- **GAP 3 (LOW)**: `cmd_mine` produced memories with empty metadata, orphaning them
+  from every agent_id filter. Fixed in `356b448`: caller's `agent_id` +
+  `mined_from` source tag injected into every mined memory.
+- **Defense-in-depth**: `db::insert_if_newer` (sync `merge` path) gains the same
+  SQL-level `json_set` preservation clause as `db::insert`.
+
+### Documentation — Phase 1.5 governance — [#194]
+
+- **Governance §2.1 + §2.1.1**: new `Supervised off-host agents` approved class with
+  7 binding pre-conditions (heartbeat, dead-man's switch, rate limit, lock-aware
+  operation, instance-disambiguating attribution, etc.).
+- **Governance §3.4.3.1**: concurrency lock primitive (short-tier `ai-memory` entry
+  as lock, 15-min TTL, race-loser-yields semantics, stale-lock human escalation).
+- **Governance §3.4.4.1 / §3.4.4.2**: audit-memory retention policy (immutable,
+  non-consolidatable, append-only) + volume control at scale.
+- **Governance new §3.5** (7 sub-sections): multi-agent coordination — branch
+  ownership, handoff procedure, stale-branch GC, inter-agent conflict resolution,
+  §3.4 SOP serialization, humans-in-CLI vs supervised off-host coordination,
+  single-agent operation default.
+- **Governance §5.4**: sole-approver policy applies uniformly to every approved
+  agent class.
+- **Workflow §8.5.1**: multi-agent operation cross-reference + lock acquisition
+  discipline.
+
+### Added — Task 1.3 (Agent Registration)
+
+- **`_agents` reserved namespace** holding one long-tier memory per registered
+  agent (`title = "agent:<agent_id>"`, `metadata.agent_type` +
+  `metadata.capabilities` + `metadata.registered_at` + `metadata.last_seen_at`).
+- **MCP tools**: `memory_agent_register`, `memory_agent_list` (brings tool count
+  to **28**).
+- **HTTP endpoints**: `POST /api/v1/agents`, `GET /api/v1/agents` (brings
+  endpoint count to **26**).
+- **CLI**: `ai-memory agents register --agent-id … --agent-type … [--capabilities …]`
+  and `ai-memory agents list` (default sub-command).
+- **`VALID_AGENT_TYPES`** closed set: `ai:claude-opus-4.6`, `ai:claude-opus-4.7`,
+  `ai:codex-5.4`, `ai:grok-4.2`, `human`, `system`. Enforced by
+  `validate_agent_type`.
+- **Re-registration semantics**: upsert refreshes `agent_type`, `capabilities`,
+  `last_seen_at`; preserves `registered_at` and `metadata.agent_id`
+  (rides existing immutability SQL clause).
+- **Trust model unchanged**: `agent_id` is still *claimed, not attested*. Future
+  work will pair registration with provable attestation.
+- **6 new integration tests**: register+list, duplicate-preserves-registered-at,
+  invalid-type-rejected, invalid-id-rejected, namespace-isolation (no leak into
+  `global`), and raw MCP JSON-RPC register/list roundtrip.
+
+### Pending — remaining Phase 1 tasks to land in this release train
+
+- Task 1.4 — Hierarchical Namespace Paths — depends on 1.1 ✓
+- Task 1.5 — Visibility Rules — depends on 1.4
+- Task 1.6 — N-Level Rule Inheritance — depends on 1.4
+- Task 1.7 — Vertical Promotion — depends on 1.4
+- Task 1.8 — Governance Metadata — depends on 1.1 ✓
+- Task 1.9 — Governance Roles — depends on 1.8
+- Task 1.10 — Approval Workflow — depends on 1.9
+- Task 1.11 — Budget-Aware Recall — depends on 1.1 ✓
+- Task 1.12 — Hierarchy-Aware Recall — depends on 1.4 + 1.11
+
+### Release engineering
+
+- Branched from `develop` @ `ee6cf9a` on 2026-04-16; all Phase 1 work now lands on `release/v0.6.0`.
+- Successive alphas (`v0.6.0-alpha.N`) tagged at each track completion; `v0.6.0-rc.1`
+  at feature-complete; `v0.6.0` GA when Phase 1 is done and external review window
+  closes.
+- `main` remains frozen at v0.5.4-patch.6 until v0.6.0 GA — no more 0.5.4 patches.
+
 ## [0.5.4-patch.4] — 2026-04-13
 
 ### Added
