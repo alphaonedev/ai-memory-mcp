@@ -10,6 +10,7 @@ mod curator;
 mod db;
 mod embeddings;
 mod errors;
+mod federation;
 mod handlers;
 mod hnsw;
 mod identity;
@@ -399,6 +400,31 @@ struct ServeArgs {
     /// (red-team #233).
     #[arg(long, default_value_t = 30)]
     shutdown_grace_secs: u64,
+
+    // -------- v0.7 federation (ADR-0001) ---------------------------
+    /// W-of-N write quorum. When >=1 and `--quorum-peers` is non-empty,
+    /// every HTTP write fans out to every peer and returns OK only
+    /// after the local commit + W-1 peer acks land within
+    /// `--quorum-timeout-ms`. Default 0 = federation disabled, daemon
+    /// behaves exactly like v0.6.0.
+    #[arg(long, default_value_t = 0)]
+    quorum_writes: usize,
+    /// Comma-separated list of peer base URLs. Each peer is assumed to
+    /// expose `POST /api/v1/sync/push` — the same endpoint the
+    /// sync-daemon already uses.
+    #[arg(long, value_delimiter = ',')]
+    quorum_peers: Vec<String>,
+    /// Deadline for quorum-ack collection. After this many ms the
+    /// write returns 503 `quorum_not_met`. Default 2000.
+    #[arg(long, default_value_t = 2000)]
+    quorum_timeout_ms: u64,
+    /// Optional mTLS client cert for outbound federation POSTs. Same
+    /// cert material the sync-daemon's `--client-cert` accepts.
+    #[arg(long)]
+    quorum_client_cert: Option<PathBuf>,
+    /// Optional mTLS client key for outbound federation POSTs.
+    #[arg(long)]
+    quorum_client_key: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -920,10 +946,32 @@ async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &config::AppConfig
         resolved_ttl,
         archive_on_gc,
     )));
+    // Federation: parsed from --quorum-writes / --quorum-peers. Disabled
+    // entirely when either is absent — daemon behaves exactly like
+    // v0.6.0 in that case.
+    let federation = federation::FederationConfig::build(
+        args.quorum_writes,
+        &args.quorum_peers,
+        std::time::Duration::from_millis(args.quorum_timeout_ms),
+        args.quorum_client_cert.as_deref(),
+        args.quorum_client_key.as_deref(),
+        format!("host:{}", gethostname::gethostname().to_string_lossy()),
+    )
+    .context("federation config")?;
+    if let Some(ref fed) = federation {
+        tracing::info!(
+            "federation enabled: W={} over {} peer(s), timeout {}ms",
+            fed.policy.w,
+            fed.peer_count(),
+            args.quorum_timeout_ms,
+        );
+    }
+
     let app_state = handlers::AppState {
         db: db_state.clone(),
         embedder: Arc::new(embedder),
         vector_index: Arc::new(Mutex::new(vector_index)),
+        federation: Arc::new(federation),
     };
     let state = db_state;
 
