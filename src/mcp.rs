@@ -458,6 +458,18 @@ fn tool_definitions() -> Value {
                     "type": "object",
                     "properties": {}
                 }
+            },
+            {
+                "name": "memory_cluster",
+                "description": "v0.6.0.0 — group a namespace's memories into semantic clusters using in-process k-means over the stored embeddings. Returns clusters sorted by member count, each with a centroid-tag label (up to 3 most-common tags across members). k defaults to ceil(sqrt(n/2)) clamped to [2, 16]. Namespaces with fewer than 4 embedded memories return each memory as its own singleton cluster.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "namespace": {"type": "string"},
+                        "k": {"type": "integer", "minimum": 2, "maximum": 16, "description": "Number of clusters; defaults to ceil(sqrt(n/2)) clamped to [2, 16]."}
+                    },
+                    "required": ["namespace"]
+                }
             }
         ]
     })
@@ -1862,6 +1874,26 @@ fn handle_agent_list(conn: &rusqlite::Connection) -> Result<Value, String> {
     }))
 }
 
+// --- v0.6.0.0 semantic clustering ---
+
+fn handle_cluster(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
+    let namespace = params["namespace"]
+        .as_str()
+        .ok_or("namespace is required")?;
+    validate::validate_namespace(namespace).map_err(|e| e.to_string())?;
+    let k = params["k"]
+        .as_u64()
+        .and_then(|n| usize::try_from(n).ok())
+        .filter(|n| (2..=16).contains(n));
+    let clusters =
+        crate::clustering::cluster_namespace(conn, namespace, k).map_err(|e| e.to_string())?;
+    Ok(json!({
+        "namespace": namespace,
+        "count": clusters.len(),
+        "clusters": clusters,
+    }))
+}
+
 fn handle_pending_list(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
     let status = params["status"].as_str();
     let limit = usize::try_from(params["limit"].as_u64().unwrap_or(100))
@@ -2149,6 +2181,7 @@ fn handle_request(
                 }
                 "memory_agent_register" => handle_agent_register(conn, arguments),
                 "memory_agent_list" => handle_agent_list(conn),
+                "memory_cluster" => handle_cluster(conn, arguments),
                 _ => Err(format!("unknown tool: {tool_name}")),
             };
 
@@ -2463,10 +2496,11 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn tool_definitions_returns_31_tools() {
+    fn tool_definitions_returns_32_tools() {
+        // v0.6.0.0 adds memory_cluster on top of the 31 baseline.
         let defs = tool_definitions();
         let tools = defs["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 31);
+        assert_eq!(tools.len(), 32);
     }
 
     #[test]

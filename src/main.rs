@@ -3,6 +3,7 @@
 
 #![recursion_limit = "256"]
 
+mod clustering;
 mod color;
 mod config;
 mod db;
