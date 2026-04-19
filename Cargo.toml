@@ -19,7 +19,7 @@ dirs = "6"
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 clap_mangen = "0.2"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
@@ -60,6 +60,18 @@ toml = "0.8"
 # only (which is what Prometheus scrapes by default via `Accept:
 # text/plain`). Per sprint authorization #260.
 prometheus = { version = "0.13", default-features = false }
+
+# v0.6.0.0 — SQLite variant selection. Default builds the standard
+# bundled SQLite (matching pre-v0.6.0.0 behavior byte-for-byte). The
+# `sqlcipher` feature swaps the underlying DB to SQLCipher (SQLite +
+# AES-256 encryption). The two are mutually exclusive at link time;
+# pick one via `cargo build --no-default-features --features sqlcipher`.
+# Operators who want encryption at rest also supply
+# `--db-passphrase-file <path>` at daemon startup to unlock the DB.
+[features]
+default = ["sqlite-bundled"]
+sqlite-bundled = ["rusqlite/bundled"]
+sqlcipher = ["rusqlite/bundled-sqlcipher-vendored-openssl"]
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
