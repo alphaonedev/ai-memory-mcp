@@ -79,6 +79,20 @@ thiserror = { version = "2", optional = true }
 sqlx = { version = "0.8", optional = true, default-features = false, features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid", "json", "macros"] }
 pgvector = { version = "0.4", optional = true, features = ["sqlx"] }
 
+# v0.7 — TurboQuant extreme embedding compression. Pinned to our
+# maintained fork `alphaonedev/turboquant` rather than the upstream
+# crates.io release. The fork tracks `AbdelStark/turboquant` monthly
+# and layers paper-compliance fixes (closed-form centroids for b=1,2
+# at dim≥64, empirical distortion-bound test, documented lower
+# bound). See `GAPS.md` on the fork for the full audit of the
+# deviations between upstream and arXiv 2504.19874v1 (Google
+# TurboQuant paper).
+#
+# Pinned to a specific commit — upstream changes cannot break us
+# without an explicit bump.
+turboquant = { git = "https://github.com/alphaonedev/turboquant", rev = "237d17818e99a06bb883d8044c402ee64ad60a56", optional = true }
+bincode = { version = "2", optional = true, features = ["serde"] }
+
 # v0.6.0.0 — SQLite variant selection. Default builds the standard
 # bundled SQLite (matching pre-v0.6.0.0 behavior byte-for-byte). The
 # `sqlcipher` feature swaps the underlying DB to SQLCipher (SQLite +
@@ -94,6 +108,10 @@ sqlcipher = ["rusqlite/bundled-sqlcipher-vendored-openssl"]
 # adapter. `sal-postgres` layers on the Postgres/pgvector backend.
 sal = ["dep:async-trait", "dep:bitflags", "dep:thiserror"]
 sal-postgres = ["sal", "dep:sqlx", "dep:pgvector"]
+# v0.7 — TurboQuant extreme embedding compression. Opt-in; ships the
+# EmbeddingCodec module under `src/compress.rs`. Uses our
+# `alphaonedev/turboquant` fork, not upstream.
+turboquant = ["dep:turboquant", "dep:bincode"]
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
