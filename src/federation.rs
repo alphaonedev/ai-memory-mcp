@@ -99,7 +99,7 @@ impl FederationConfig {
 
         let mut client_builder = reqwest::Client::builder()
             .timeout(timeout)
-            .connect_timeout(Duration::from_millis(2000))
+            .connect_timeout(Duration::from_secs(2))
             .use_rustls_tls();
         if let (Some(cert), Some(key)) = (client_cert_path, client_key_path) {
             let cert_pem =
