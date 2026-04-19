@@ -2037,6 +2037,7 @@ pub fn recall_hybrid(
     mid_extend: i64,
     as_agent: Option<&str>,
     budget_tokens: Option<usize>,
+    scoring: &crate::config::ResolvedScoring,
 ) -> Result<(Vec<(Memory, f64)>, usize)> {
     let now = Utc::now().to_rfc3339();
     let fts_query = sanitize_fts_query(context, true);
@@ -2252,6 +2253,11 @@ pub fn recall_hybrid(
     // Adaptive blend: semantic weight decreases for longer content (embeddings
     // lose information on long text; FTS stays precise).  Short memories
     // (< 500 chars) get 50/50, long memories (> 5 000 chars) get 15/85.
+    // v0.6.0.0: multiply the blend by a per-tier exponential time-decay with
+    // half-life defaults 7 d (short) / 30 d (mid) / 365 d (long). The
+    // `legacy_scoring` config knob short-circuits the decay back to 1.0 for
+    // A/B comparison and emergency regression rollback.
+    let now_utc = Utc::now();
     let mut results: Vec<(Memory, f64)> = scored
         .into_values()
         .map(|(mem, fts_score, cosine)| {
@@ -2270,7 +2276,21 @@ pub fn recall_hybrid(
                 0.50 - 0.35 * ((content_len - 500.0) / 4500.0)
             };
             let blended = semantic_weight * cosine + (1.0 - semantic_weight) * norm_fts;
-            (mem, blended)
+            let age_days = chrono::DateTime::parse_from_rfc3339(&mem.created_at)
+                .ok()
+                .map_or(0.0, |ts| {
+                    let secs = (now_utc - ts.with_timezone(&Utc)).num_seconds();
+                    // Saturate at ~68 y (i32::MAX seconds). Practical: any memory
+                    // older than that decays all the way down and the exact age
+                    // doesn't matter. Precision loss here is negligible — we
+                    // only need ~hour granularity on a 1 e-9..1.0 multiplier.
+                    #[allow(clippy::cast_precision_loss)]
+                    {
+                        secs as f64 / 86_400.0
+                    }
+                });
+            let decay = scoring.decay_multiplier(&mem.tier, age_days);
+            (mem, blended * decay)
         })
         .collect();
 
