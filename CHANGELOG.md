@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — v0.6.1 track
+
+### Added
+- **Autonomous curator daemon** — new `ai-memory curator` subcommand with
+  `--once` (single sweep + JSON report) and `--daemon` (continuous loop,
+  interval configurable via `--interval-secs`, clamped to `[60, 86400]`).
+  Invokes `auto_tag` + `detect_contradiction` on memories that lack an
+  `auto_tags` metadata key, persisting results on success. Dry-run mode
+  emits the same report without touching any row. Hard operation cap
+  per cycle (`--max-ops`, default 100) prevents runaway LLM usage.
+  Complements the synchronous post-store hooks shipped in v0.6.0.0
+  (#265) — the curator catches memories stored before hooks were enabled,
+  or when the LLM was offline, or that become interesting only after
+  more context accumulates.
+- **Curator systemd unit** — `packaging/systemd/ai-memory-curator.service`
+  with the same sandbox posture as the main daemon
+  (`ProtectSystem=strict`, empty `CapabilityBoundingSet`,
+  `MemoryDenyWriteExecute`, `@system-service` syscall filter).
+- **Curator Prometheus metrics** — `ai_memory_curator_cycles_total`,
+  `ai_memory_curator_operations_total{kind,result}`,
+  `ai_memory_curator_cycle_duration_seconds{dry_run}`.
+
 ## [0.6.0] — 2026-04-19 — Phase 1 complete + v0.6.0.0 sprint
 
 Phase 1 baseline (Tasks 1.1–1.12 from alpha train) plus the v0.6.0.0 sprint

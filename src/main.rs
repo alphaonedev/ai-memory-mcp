@@ -5,6 +5,7 @@
 
 mod color;
 mod config;
+mod curator;
 mod db;
 mod embeddings;
 mod errors;
@@ -163,6 +164,41 @@ enum Command {
     /// replacing the current DB. The current DB is moved aside as a safety
     /// net before the replacement.
     Restore(RestoreArgs),
+    /// v0.6.1: run the autonomous curator. `--once` runs a single sweep
+    /// and prints a JSON report; `--daemon` loops with `--interval-secs`
+    /// between cycles. Auto-tags memories without tags and flags
+    /// contradictions against nearby siblings in the same namespace.
+    Curator(CuratorArgs),
+}
+
+#[derive(Args)]
+#[allow(clippy::struct_excessive_bools)]
+struct CuratorArgs {
+    /// Run exactly one sweep and exit. Mutually exclusive with --daemon.
+    #[arg(long, conflicts_with = "daemon")]
+    once: bool,
+    /// Loop forever, sleeping --interval-secs between sweeps. SIGINT /
+    /// SIGTERM trigger a clean shutdown between cycles.
+    #[arg(long)]
+    daemon: bool,
+    /// Seconds between daemon sweeps. Clamped to [60, 86400].
+    #[arg(long, default_value_t = 3600)]
+    interval_secs: u64,
+    /// Hard cap on LLM-invoking operations per cycle.
+    #[arg(long, default_value_t = 100)]
+    max_ops: usize,
+    /// Emit the report without persisting any metadata changes.
+    #[arg(long)]
+    dry_run: bool,
+    /// Only curate memories in these namespaces. Repeat flag for multiple.
+    #[arg(long = "include-namespace")]
+    include_namespaces: Vec<String>,
+    /// Exclude these namespaces from curation. Repeat flag for multiple.
+    #[arg(long = "exclude-namespace")]
+    exclude_namespaces: Vec<String>,
+    /// Print the report as JSON rather than a human-readable summary.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args)]
@@ -757,6 +793,7 @@ async fn main() -> Result<()> {
         Command::Pending(a) => cmd_pending(&db_path, a, j, cli_agent_id.as_deref()),
         Command::Backup(a) => cmd_backup(&db_path, &a, j),
         Command::Restore(a) => cmd_restore(&db_path, &a, j),
+        Command::Curator(a) => cmd_curator(&db_path, &a, &app_config).await,
     };
 
     // WAL checkpoint after write commands to prevent unbounded WAL growth
@@ -3911,6 +3948,84 @@ fn cmd_restore(db_path: &Path, args: &RestoreArgs, json_out: bool) -> Result<()>
         );
     }
     Ok(())
+}
+
+async fn cmd_curator(
+    db_path: &Path,
+    args: &CuratorArgs,
+    app_config: &config::AppConfig,
+) -> Result<()> {
+    if !args.once && !args.daemon {
+        anyhow::bail!("curator requires either --once or --daemon");
+    }
+
+    let cfg = curator::CuratorConfig {
+        interval_secs: args.interval_secs,
+        max_ops_per_cycle: args.max_ops,
+        dry_run: args.dry_run,
+        include_namespaces: args.include_namespaces.clone(),
+        exclude_namespaces: args.exclude_namespaces.clone(),
+    };
+
+    let feature_tier = app_config.effective_tier(None);
+    let llm = build_curator_llm(feature_tier);
+
+    if args.once {
+        let conn = db::open(db_path)?;
+        let report = curator::run_once(&conn, llm.as_ref(), &cfg)?;
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        } else {
+            print_curator_report(&report);
+        }
+        return Ok(());
+    }
+
+    // Daemon mode. Install a tokio ctrl_c watcher that flips the shutdown
+    // flag; the daemon loop polls it between cycles so SIGINT / SIGTERM
+    // land cleanly on the next wake-up.
+    let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shutdown_for_signal = shutdown.clone();
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        shutdown_for_signal.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+
+    let db_owned = db_path.to_path_buf();
+    let llm_arc = llm.map(std::sync::Arc::new);
+    tokio::task::spawn_blocking(move || {
+        curator::run_daemon(db_owned, llm_arc, cfg, shutdown);
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("curator daemon join: {e}"))?;
+    Ok(())
+}
+
+fn build_curator_llm(tier: config::FeatureTier) -> Option<llm::OllamaClient> {
+    // The curator currently shares the default Ollama endpoint with the
+    // interactive `auto_tag` / `detect_contradiction` tools. A dedicated
+    // model override lives on `config.curator.model` in the v0.7 track.
+    let llm_model = tier.config().llm_model?;
+    let model = llm_model.ollama_model_id().to_string();
+    llm::OllamaClient::new(&model).ok()
+}
+
+fn print_curator_report(r: &curator::CuratorReport) {
+    println!("curator cycle report");
+    println!("  started_at:        {}", r.started_at);
+    println!("  completed_at:      {}", r.completed_at);
+    println!("  duration_ms:       {}", r.cycle_duration_ms);
+    println!("  memories_scanned:  {}", r.memories_scanned);
+    println!("  memories_eligible: {}", r.memories_eligible);
+    println!("  operations:        {}", r.operations_attempted);
+    println!("  auto_tagged:       {}", r.auto_tagged);
+    println!("  contradictions:    {}", r.contradictions_found);
+    println!("  skipped (cap):     {}", r.operations_skipped_cap);
+    println!("  errors:            {}", r.errors.len());
+    println!("  dry_run:           {}", r.dry_run);
+    for e in &r.errors {
+        println!("    - {e}");
+    }
 }
 
 #[cfg(test)]

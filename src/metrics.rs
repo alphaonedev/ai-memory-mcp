@@ -40,6 +40,9 @@ pub struct Metrics {
     pub memories_gauge: IntGauge,
     pub hnsw_size_gauge: IntGauge,
     pub subscriptions_active_gauge: IntGauge,
+    pub curator_cycles_total: IntCounter,
+    pub curator_operations_total: IntCounterVec,
+    pub curator_cycle_duration_seconds: HistogramVec,
 }
 
 /// Lazily-built process-global metrics handle.
@@ -57,6 +60,7 @@ impl Metrics {
         Self::try_new().expect("prometheus registry init failed")
     }
 
+    #[allow(clippy::too_many_lines)]
     fn try_new() -> prometheus::Result<Self> {
         let registry = Registry::new();
 
@@ -135,6 +139,31 @@ impl Metrics {
         )?;
         registry.register(Box::new(subscriptions_active_gauge.clone()))?;
 
+        let curator_cycles_total = IntCounter::new(
+            "ai_memory_curator_cycles_total",
+            "Total curator sweep cycles completed.",
+        )?;
+        registry.register(Box::new(curator_cycles_total.clone()))?;
+
+        let curator_operations_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "ai_memory_curator_operations_total",
+                "Curator operations, labeled by kind (auto_tag|contradiction|persist) and result.",
+            ),
+            &["kind", "result"],
+        )?;
+        registry.register(Box::new(curator_operations_total.clone()))?;
+
+        let curator_cycle_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "ai_memory_curator_cycle_duration_seconds",
+                "Curator sweep cycle wall-clock duration, labeled by dry_run.",
+            )
+            .buckets(vec![0.1, 0.5, 1.0, 5.0, 15.0, 60.0, 300.0, 900.0, 3600.0]),
+            &["dry_run"],
+        )?;
+        registry.register(Box::new(curator_cycle_duration_seconds.clone()))?;
+
         Ok(Self {
             registry,
             store_total,
@@ -147,6 +176,9 @@ impl Metrics {
             memories_gauge,
             hnsw_size_gauge,
             subscriptions_active_gauge,
+            curator_cycles_total,
+            curator_operations_total,
+            curator_cycle_duration_seconds,
         })
     }
 }
@@ -191,6 +223,34 @@ pub fn record_autonomy_hook(kind: &str, ok: bool) {
         .autonomy_hook_total
         .with_label_values(&[kind, result])
         .inc();
+}
+
+/// Convenience: record a completed curator cycle (v0.6.1).
+#[allow(dead_code)]
+pub fn curator_cycle_completed(
+    operations_attempted: usize,
+    auto_tagged: usize,
+    contradictions_found: usize,
+    errors: usize,
+) {
+    let r = registry();
+    r.curator_cycles_total.inc();
+    if auto_tagged > 0 {
+        r.curator_operations_total
+            .with_label_values(&["auto_tag", "ok"])
+            .inc_by(auto_tagged as u64);
+    }
+    if contradictions_found > 0 {
+        r.curator_operations_total
+            .with_label_values(&["contradiction", "ok"])
+            .inc_by(contradictions_found as u64);
+    }
+    let failed = operations_attempted.saturating_sub(auto_tagged + contradictions_found);
+    if failed > 0 || errors > 0 {
+        r.curator_operations_total
+            .with_label_values(&["any", "err"])
+            .inc_by(errors as u64);
+    }
 }
 
 #[cfg(test)]
