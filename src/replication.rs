@@ -88,7 +88,7 @@ impl QuorumPolicy {
     /// Returns `QuorumError::InvalidPolicy` if `n == 0`.
     pub fn majority(n: usize) -> Result<Self, QuorumError> {
         let w = n.div_ceil(2).max(1);
-        Self::new(n, w, Duration::from_millis(2000), Duration::from_secs(30))
+        Self::new(n, w, Duration::from_secs(2), Duration::from_secs(30))
     }
 }
 
