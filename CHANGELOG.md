@@ -168,6 +168,54 @@ Still honest caveats:
   you still need to stop writes on the source, migrate, and restart
   against the destination — documented in the module docblock.
 
+### Added — federation autonomy (Track C PR 2)
+
+- **Quorum writes wired into the HTTP daemon** (`src/federation.rs`).
+  `ai-memory serve --quorum-writes N --quorum-peers <url,url,…>` fans
+  out every successful write to each peer's `/api/v1/sync/push` and
+  returns OK only after the local commit + `W - 1` peer acks land
+  within `--quorum-timeout-ms`. Insufficient acks → `503` with body
+  `{"error":"quorum_not_met","got":X,"needed":Y,"reason":…}` and
+  `Retry-After: 2`. Local write is **not** rolled back on quorum
+  failure — the sync-daemon's eventual-consistency loop catches
+  stragglers up (per ADR-0001 § Model).
+- **Opt-in + default-off** — daemons without `--quorum-writes`
+  behave byte-for-byte identical to v0.6.0. Zero impact on
+  non-federated deployments.
+- **Optional mTLS for federation traffic** — `--quorum-client-cert`
+  + `--quorum-client-key` feed the outbound reqwest client an mTLS
+  identity so peer acks can be authenticated end-to-end.
+- **Chaos harness** — `packaging/chaos/run-chaos.sh` spawns a
+  three-node local fixture, issues a configurable burst of writes,
+  and injects one of four fault classes (`kill_primary_mid_write`,
+  `partition_minority`, `drop_random_acks`, `clock_skew_peer`).
+  Emits a JSONL convergence-bound report per cycle — the data
+  shape ADR-0001 commits to publishing instead of a loss probability.
+
+### Testing
+
+- **7 async mock-peer integration tests** in `src/federation.rs`
+  using real ephemeral-port axum servers: happy path, partition
+  minority (W=3, N=3, two peers fail), majority quorum tolerating
+  one peer down (W=2, N=3), timeout on a hanging peer classified
+  correctly, `config_build` disabled cases for `W=0` and empty peers,
+  `QuorumNotMetPayload::from_err` serialisation.
+- Full suite on default features: 289 unit + 158 integration tests
+  still green. fmt + clippy pedantic green.
+
+### Federation-autonomy claim now earned
+
+v0.7-alpha earns **"opt-in multi-agent federation with
+W-of-N quorum writes"**. The "100% autonomous" claim in v0.6.1
+(Track A-2) extends to federation: autonomous curator + autonomous
+quorum fan-out + autonomous rollback. What STILL remains
+before a full-fat "fully-autonomous federated deployment" claim:
+
+- Real chaos campaigns run against a production-shaped deployment
+  (the harness ships; the campaign runs land in v0.7.0).
+- Per-namespace quorum policy (v0.7.1).
+- Attested `sender_agent_id` from mTLS cert identity (v0.7 Layer 2b).
+
 ## [0.6.0] — 2026-04-19 — Phase 1 complete + v0.6.0.0 sprint
 
 Phase 1 baseline (Tasks 1.1–1.12 from alpha train) plus the v0.6.0.0 sprint
