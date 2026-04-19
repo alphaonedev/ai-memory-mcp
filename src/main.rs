@@ -13,6 +13,7 @@ mod hnsw;
 mod identity;
 mod llm;
 mod mcp;
+mod metrics;
 mod mine;
 mod models;
 mod reranker;
@@ -842,6 +843,11 @@ async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &config::AppConfig
 
     let app = Router::new()
         .route("/api/v1/health", get(handlers::health))
+        // v0.6.0.0: Prometheus scrape endpoint. Exposed at both /metrics
+        // (the community convention) and /api/v1/metrics (consistent with
+        // the rest of the REST surface).
+        .route("/metrics", get(handlers::prometheus_metrics))
+        .route("/api/v1/metrics", get(handlers::prometheus_metrics))
         .route("/api/v1/memories", get(handlers::list_memories))
         .route("/api/v1/memories", post(handlers::create_memory))
         .route("/api/v1/memories/bulk", post(handlers::bulk_create))
