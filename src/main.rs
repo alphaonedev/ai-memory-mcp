@@ -74,6 +74,16 @@ struct Cli {
     /// `AI_MEMORY_AGENT_ID` environment variable as a fallback.
     #[arg(long, env = "AI_MEMORY_AGENT_ID", global = true)]
     agent_id: Option<String>,
+    /// v0.6.0.0: path to a file containing the `SQLCipher` passphrase.
+    /// Only meaningful when the binary was built with
+    /// `--features sqlcipher` (standard builds ignore this flag). File
+    /// must be root-readable (mode 0400 recommended). The passphrase is
+    /// read once at startup and exported as `AI_MEMORY_DB_PASSPHRASE`
+    /// for the duration of the process — passing the passphrase
+    /// directly as an env var or as a flag value leaks to the process
+    /// list (`ps -E`) and shell history.
+    #[arg(long, global = true, value_name = "PATH")]
+    db_passphrase_file: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -615,6 +625,21 @@ async fn main() -> Result<()> {
         unsafe { std::env::set_var("AI_MEMORY_ANONYMIZE", "1") };
     }
     let cli = Cli::parse();
+    // v0.6.0.0: read the SQLCipher passphrase from a file and export it as
+    // AI_MEMORY_DB_PASSPHRASE for the duration of the process. File path
+    // comes from the --db-passphrase-file flag (global). No-op on standard
+    // SQLite builds (the env var is ignored unless the binary was built
+    // with --features sqlcipher).
+    if let Some(path) = &cli.db_passphrase_file {
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("reading passphrase file {}", path.display()))?;
+        let passphrase = raw.trim_end_matches(['\n', '\r']).to_string();
+        if passphrase.is_empty() {
+            anyhow::bail!("passphrase file {} is empty", path.display());
+        }
+        // SAFETY: single-threaded startup before any worker threads spawn.
+        unsafe { std::env::set_var("AI_MEMORY_DB_PASSPHRASE", passphrase) };
+    }
     let db_path = app_config.effective_db(&cli.db);
     let j = cli.json;
     let cli_agent_id: Option<String> = cli.agent_id.clone();
