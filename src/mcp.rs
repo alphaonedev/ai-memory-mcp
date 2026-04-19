@@ -15,7 +15,7 @@ use crate::db;
 use crate::embeddings::Embedder;
 use crate::hnsw::VectorIndex;
 use crate::llm::OllamaClient;
-use crate::models::{Memory, Tier};
+use crate::models::{GovernancePolicy, Memory, Tier};
 use crate::reranker::CrossEncoder;
 use crate::validate;
 
@@ -91,7 +91,8 @@ fn tool_definitions() -> Value {
                         "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": 1.0},
                         "source": {"type": "string", "enum": ["user", "claude", "hook", "api", "cli", "import", "consolidation", "system"], "default": "claude"},
                         "metadata": {"type": "object", "description": "Arbitrary JSON metadata", "default": {}},
-                        "agent_id": {"type": "string", "description": "Agent identifier. If omitted, the server synthesizes an NHI-hardened default (ai:<client>@<host>:pid-<pid>, host:<host>:pid-<pid>-<uuid8>, or anonymous:pid-<pid>-<uuid8>)."}
+                        "agent_id": {"type": "string", "description": "Agent identifier. If omitted, the server synthesizes an NHI-hardened default (ai:<client>@<host>:pid-<pid>, host:<host>:pid-<pid>-<uuid8>, or anonymous:pid-<pid>-<uuid8>)."},
+                        "scope": {"type": "string", "enum": ["private", "team", "unit", "org", "collective"], "description": "Task 1.5 visibility scope. Defaults to private when unset. Stored as metadata.scope."}
                     },
                     "required": ["title", "content"]
                 }
@@ -108,6 +109,9 @@ fn tool_definitions() -> Value {
                         "tags": {"type": "string", "description": "Filter by tag"},
                         "since": {"type": "string", "description": "Only memories created after this RFC3339 timestamp"},
                         "until": {"type": "string", "description": "Only memories created before this RFC3339 timestamp"},
+                        "as_agent": {"type": "string", "description": "Querying agent's namespace position (Task 1.5). Enables scope-based visibility filtering — results include private memories at this namespace, team/unit/org memories at ancestor subtrees, and collective memories globally."},
+                        "budget_tokens": {"type": "integer", "minimum": 1, "description": "Task 1.11 — context-budget-aware recall. Return the top-ranked memories whose cumulative estimated tokens (title+content, ~4 chars/token) fit in N. Response includes tokens_used + budget_tokens."},
+                        "context_tokens": {"type": "array", "items": {"type": "string"}, "description": "v0.6.0.0 contextual recall — recent conversation tokens used to bias the query embedding at 70/30 (primary/context). Pulls results toward memories that match both the explicit query and nearby conversation topics."},
                         "format": {"type": "string", "enum": ["json", "toon", "toon_compact"], "default": "toon_compact", "description": "Response format. Default 'toon_compact' saves 79% tokens vs JSON. 'toon' includes timestamps. 'json' for structured parsing."}
                     },
                     "required": ["context"]
@@ -124,6 +128,7 @@ fn tool_definitions() -> Value {
                         "tier": {"type": "string", "enum": ["short", "mid", "long"]},
                         "limit": {"type": "integer", "default": 20, "maximum": 200},
                         "agent_id": {"type": "string", "description": "Filter by metadata.agent_id (exact match)."},
+                        "as_agent": {"type": "string", "description": "Querying agent's namespace position (Task 1.5) for scope-based visibility filtering."},
                         "format": {"type": "string", "enum": ["json", "toon", "toon_compact"], "default": "toon_compact", "description": "Response format. Default 'toon_compact' saves 79% tokens. 'json' for structured parsing."}
                     },
                     "required": ["query"]
@@ -156,11 +161,12 @@ fn tool_definitions() -> Value {
             },
             {
                 "name": "memory_promote",
-                "description": "Promote a memory to long-term (permanent).",
+                "description": "Promote a memory. Default: bump tier to long-term (permanent, clears expiry). Task 1.7: when 'to_namespace' is supplied, clone the memory to a hierarchical-ancestor namespace and link clone → source with 'derived_from'. Original is untouched.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "id": {"type": "string"}
+                        "id": {"type": "string"},
+                        "to_namespace": {"type": "string", "description": "Task 1.7: hierarchical-ancestor namespace to clone this memory into. Must be a proper ancestor (per namespace_ancestors()). Original memory stays put; a new memory with derived_from link is created at the target namespace."}
                     },
                     "required": ["id"]
                 }
@@ -356,24 +362,35 @@ fn tool_definitions() -> Value {
             },
             {
                 "name": "memory_namespace_set_standard",
-                "description": "Set a memory as the standard/policy for a namespace. Auto-prepended to recall and session_start. Supports rule layering: set a parent namespace to inherit its standard too (global '*' + parent + namespace).",
+                "description": "Set a memory as the standard/policy for a namespace. Auto-prepended to recall and session_start. Supports rule layering (global '*' + parent chain + namespace). Task 1.8: accepts optional `governance` policy object merged into the standard memory's metadata.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "namespace": {"type": "string", "description": "Namespace to set the standard for"},
                         "id": {"type": "string", "description": "Memory ID to use as the standard"},
-                        "parent": {"type": "string", "description": "Optional parent namespace to inherit standards from (rule layering)"}
+                        "parent": {"type": "string", "description": "Optional parent namespace to inherit standards from (rule layering)"},
+                        "governance": {
+                            "type": "object",
+                            "description": "Task 1.8 governance policy. Stored in metadata.governance on the standard memory. Consumed by Task 1.9 enforcement + 1.10 approver types.",
+                            "properties": {
+                                "write":    {"type": "string", "enum": ["any", "registered", "owner", "approve"]},
+                                "promote":  {"type": "string", "enum": ["any", "registered", "owner", "approve"]},
+                                "delete":   {"type": "string", "enum": ["any", "registered", "owner", "approve"]},
+                                "approver": {"description": "ApproverType: \"human\" | {\"agent\": \"<id>\"} | {\"consensus\": <n>}"}
+                            }
+                        }
                     },
                     "required": ["namespace", "id"]
                 }
             },
             {
                 "name": "memory_namespace_get_standard",
-                "description": "Get the standard/policy memory for a namespace, if one is set.",
+                "description": "Get the standard/policy memory for a namespace, if one is set. With inherit=true returns the full N-level resolved chain (Task 1.6).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "namespace": {"type": "string", "description": "Namespace to get the standard for"}
+                        "namespace": {"type": "string", "description": "Namespace to get the standard for"},
+                        "inherit": {"type": "boolean", "default": false, "description": "Task 1.6: when true, return the full inheritance chain (global * → ancestors → namespace) as a list instead of the single namespace's standard."}
                     },
                     "required": ["namespace"]
                 }
@@ -387,6 +404,121 @@ fn tool_definitions() -> Value {
                         "namespace": {"type": "string", "description": "Namespace to clear the standard for"}
                     },
                     "required": ["namespace"]
+                }
+            },
+            {
+                "name": "memory_pending_list",
+                "description": "List pending governance-queued actions (Task 1.9). Filter by status: pending (default) / approved / rejected.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "status": {"type": "string", "enum": ["pending", "approved", "rejected"]},
+                        "limit":  {"type": "integer", "default": 100, "maximum": 1000}
+                    }
+                }
+            },
+            {
+                "name": "memory_pending_approve",
+                "description": "Approve a pending action by id (Task 1.9). Caller identity is stamped as decided_by.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string", "description": "Pending action id"}
+                    },
+                    "required": ["id"]
+                }
+            },
+            {
+                "name": "memory_pending_reject",
+                "description": "Reject a pending action by id (Task 1.9). Caller identity is stamped as decided_by.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string", "description": "Pending action id"}
+                    },
+                    "required": ["id"]
+                }
+            },
+            {
+                "name": "memory_agent_register",
+                "description": "Register an agent in the reserved _agents namespace. Stores agent_type and capabilities, refreshes last_seen_at on re-registration while preserving registered_at. agent_id is claimed, not attested.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "agent_id": {"type": "string", "description": "Agent identifier (same validation as metadata.agent_id)"},
+                        "agent_type": {"type": "string", "enum": ["ai:claude-opus-4.6", "ai:claude-opus-4.7", "ai:codex-5.4", "ai:grok-4.2", "human", "system"]},
+                        "capabilities": {"type": "array", "items": {"type": "string"}, "default": [], "description": "Optional capability tags"}
+                    },
+                    "required": ["agent_id", "agent_type"]
+                }
+            },
+            {
+                "name": "memory_agent_list",
+                "description": "List every registered agent.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {}
+                }
+            },
+            {
+                "name": "memory_notify",
+                "description": "v0.6.0.0 — send a message from the caller to another agent. Stored as a memory in the reserved `_messages/<target>` namespace with sender metadata. The sender is the caller's resolved agent_id. Target agent reads via `memory_inbox`. Payload is a free-form string.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "target_agent_id": {"type": "string", "description": "Recipient agent_id (same validation as metadata.agent_id)"},
+                        "title": {"type": "string", "description": "Short subject (≤ 200 chars, required)"},
+                        "payload": {"type": "string", "description": "Message body (required)"},
+                        "priority": {"type": "integer", "minimum": 1, "maximum": 10, "default": 5},
+                        "tier": {"type": "string", "enum": ["short", "mid", "long"], "default": "mid", "description": "short TTL default = 6h, mid = 7d, long = no expiry"}
+                    },
+                    "required": ["target_agent_id", "title", "payload"]
+                }
+            },
+            {
+                "name": "memory_inbox",
+                "description": "v0.6.0.0 — list messages sent to an agent via memory_notify. Reads the reserved `_messages/<agent_id>` namespace. `access_count == 0` is the conventional unread marker; recalling/reading a memory increments access_count via the normal touch path.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "agent_id": {"type": "string", "description": "Recipient agent_id. Defaults to the caller's resolved agent_id."},
+                        "unread_only": {"type": "boolean", "default": false, "description": "When true, return only messages with access_count == 0."},
+                        "limit": {"type": "integer", "default": 50, "maximum": 500}
+                    }
+                }
+            },
+            {
+                "name": "memory_subscribe",
+                "description": "v0.6.0.0 — register a webhook subscription. Events fire on memory_store today and additional events in v0.6.1+. Payload is a JSON body signed with HMAC-SHA256 when a secret is supplied (header: X-Ai-Memory-Signature: sha256=<hex>). URL must be https unless the host is a loopback address. The shared secret is stored hashed only; the plaintext the operator supplies is what they verify signatures with.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string", "description": "https:// endpoint (or http:// for loopback). SSRF guard rejects private-range IPs."},
+                        "events": {"type": "string", "default": "*", "description": "Comma-separated event whitelist or `*` for all. Known events: memory_store, memory_delete, memory_promote."},
+                        "secret": {"type": "string", "description": "Optional shared secret for HMAC signing. If omitted, payload is unsigned."},
+                        "namespace_filter": {"type": "string", "description": "Optional exact namespace match."},
+                        "agent_filter": {"type": "string", "description": "Optional agent_id filter — only events whose stored agent_id matches this value will fire."}
+                    },
+                    "required": ["url"]
+                }
+            },
+            {
+                "name": "memory_unsubscribe",
+                "description": "v0.6.0.0 — delete a subscription by id.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"}
+                    },
+                    "required": ["id"]
+                }
+            },
+            {
+                "name": "memory_list_subscriptions",
+                "description": "v0.6.0.0 — list active webhook subscriptions. Secrets are not exposed; only `secret_hash` is stored and even that is not returned.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {}
                 }
             }
         ]
@@ -474,13 +606,22 @@ fn prompt_content(name: &str, params: &Value) -> Result<Value, String> {
 
 // --- Tool handlers ---
 
+/// Minimum content length (bytes) before the post-store autonomy hook
+/// will invoke LLM `auto_tag` / `detect_contradiction`. Below this the
+/// LLM round-trip cost exceeds the informational payoff.
+const AUTONOMY_MIN_CONTENT_LEN: usize = 50;
+
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 fn handle_store(
     conn: &rusqlite::Connection,
+    db_path: &Path,
     params: &Value,
     embedder: Option<&Embedder>,
+    llm: Option<&OllamaClient>,
     vector_index: Option<&VectorIndex>,
     resolved_ttl: &crate::config::ResolvedTtl,
+    autonomous_hooks: bool,
     mcp_client: Option<&str>,
 ) -> Result<Value, String> {
     let title = params["title"].as_str().ok_or("title is required")?;
@@ -530,6 +671,17 @@ fn handle_store(
             serde_json::Value::String(agent_id.clone()),
         );
     }
+    // #151 scope: top-level `scope` param OR inline metadata.scope
+    let explicit_scope = params["scope"]
+        .as_str()
+        .or_else(|| metadata.get("scope").and_then(serde_json::Value::as_str))
+        .map(str::to_string);
+    if let Some(ref s) = explicit_scope {
+        validate::validate_scope(s).map_err(|e| e.to_string())?;
+        if let Some(obj) = metadata.as_object_mut() {
+            obj.insert("scope".to_string(), serde_json::Value::String(s.clone()));
+        }
+    }
     validate::validate_metadata(&metadata).map_err(|e| e.to_string())?;
 
     let now = chrono::Utc::now();
@@ -554,6 +706,37 @@ fn handle_store(
         expires_at,
         metadata,
     };
+
+    // Task 1.9: governance enforcement (store-side).
+    {
+        use crate::models::{GovernanceDecision, GovernedAction};
+        let payload = serde_json::to_value(&mem).unwrap_or_default();
+        match db::enforce_governance(
+            conn,
+            GovernedAction::Store,
+            &mem.namespace,
+            &agent_id,
+            None,
+            None,
+            &payload,
+        )
+        .map_err(|e| e.to_string())?
+        {
+            GovernanceDecision::Allow => {}
+            GovernanceDecision::Deny(reason) => {
+                return Err(format!("store denied by governance: {reason}"));
+            }
+            GovernanceDecision::Pending(pending_id) => {
+                return Ok(json!({
+                    "status": "pending",
+                    "pending_id": pending_id,
+                    "reason": "governance requires approval",
+                    "action": "store",
+                    "namespace": mem.namespace,
+                }));
+            }
+        }
+    }
 
     // True dedup: check for exact title+namespace match (#97)
     let existing = db::find_contradictions(conn, &mem.title, &mem.namespace).unwrap_or_default();
@@ -591,11 +774,17 @@ fn handle_store(
                 }
             }
         }
+        // #196: echo the preserved agent_id (original on dedup, not the caller's)
+        let echoed_agent_id = preserved_metadata
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
         return Ok(json!({
             "id": dup.id,
             "tier": mem.tier,
             "title": mem.title,
             "namespace": mem.namespace,
+            "agent_id": echoed_agent_id,
             "duplicate": true,
             "action": "updated existing memory"
         }));
@@ -629,18 +818,193 @@ fn handle_store(
         }
     }
 
-    let mut response =
-        json!({"id": actual_id, "tier": mem.tier, "title": mem.title, "namespace": mem.namespace});
+    // v0.6.0.0 post-store autonomy hooks. When enabled via
+    // `AI_MEMORY_AUTONOMOUS_HOOKS=1` or `autonomous_hooks = true` in
+    // config.toml AND an LLM is wired AND the content is long enough
+    // to be meaningfully taggable, fire `auto_tag` + `detect_contradiction`
+    // synchronously and persist the results into the memory's metadata.
+    // Best-effort: any LLM error is logged and does not fail the store.
+    // Skipped for internal/system namespaces to avoid feedback loops.
+    let mut auto_tags: Vec<String> = Vec::new();
+    let mut confirmed_contradictions: Vec<String> = Vec::new();
+    let hooks_skipped_reason: Option<&'static str> = if !autonomous_hooks {
+        Some("disabled")
+    } else if llm.is_none() {
+        Some("no_llm")
+    } else if mem.content.len() < AUTONOMY_MIN_CONTENT_LEN {
+        Some("content_too_short")
+    } else if mem.namespace.starts_with('_') {
+        Some("internal_namespace")
+    } else {
+        None
+    };
+    if hooks_skipped_reason.is_none()
+        && let Some(llm_client) = llm
+    {
+        match llm_client.auto_tag(&mem.title, &mem.content) {
+            Ok(tags) => {
+                auto_tags = tags.into_iter().take(8).collect();
+            }
+            Err(e) => {
+                tracing::warn!("auto_tag hook failed for {}: {}", &actual_id, e);
+            }
+        }
+        for cand in &existing {
+            if cand.id == actual_id || cand.id == mem.id {
+                continue;
+            }
+            match llm_client.detect_contradiction(&mem.content, &cand.content) {
+                Ok(true) => confirmed_contradictions.push(cand.id.clone()),
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        "detect_contradiction hook failed ({actual_id} vs {}): {e}",
+                        cand.id
+                    );
+                }
+            }
+        }
+        // Persist hook results into metadata. Best-effort — a failed update
+        // here does not fail the store (the memory is already committed).
+        if !auto_tags.is_empty() || !confirmed_contradictions.is_empty() {
+            let mut updated_metadata = mem.metadata.clone();
+            if let Some(obj) = updated_metadata.as_object_mut() {
+                if !auto_tags.is_empty() {
+                    obj.insert("auto_tags".to_string(), json!(auto_tags));
+                }
+                if !confirmed_contradictions.is_empty() {
+                    obj.insert(
+                        "confirmed_contradictions".to_string(),
+                        json!(confirmed_contradictions),
+                    );
+                }
+            }
+            if let Err(e) = db::update(
+                conn,
+                &actual_id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(&updated_metadata),
+            ) {
+                tracing::warn!(
+                    "autonomy-hook metadata update failed for {}: {}",
+                    &actual_id,
+                    e
+                );
+            }
+        }
+    }
+
+    // v0.6.0.0: fire webhook subscribers on successful store. Best-effort
+    // fire-and-forget — each subscriber gets its own OS thread; the
+    // response here does not wait on any webhook dispatch.
+    crate::subscriptions::dispatch_event(
+        conn,
+        "memory_store",
+        &actual_id,
+        &mem.namespace,
+        Some(&agent_id),
+        db_path,
+    );
+
+    // #196: echo the resolved agent_id
+    let mut response = json!({
+        "id": actual_id,
+        "tier": mem.tier,
+        "title": mem.title,
+        "namespace": mem.namespace,
+        "agent_id": agent_id,
+    });
     if !contradiction_ids.is_empty() {
         response["potential_contradictions"] = json!(contradiction_ids);
+    }
+    if !auto_tags.is_empty() {
+        response["auto_tags"] = json!(auto_tags);
+    }
+    if !confirmed_contradictions.is_empty() {
+        response["confirmed_contradictions"] = json!(confirmed_contradictions);
+    }
+    if let Some(reason) = hooks_skipped_reason
+        && autonomous_hooks
+    {
+        response["autonomy_hook_skipped"] = json!(reason);
     }
     Ok(response)
 }
 
-/// Inject namespace standard into a `recall/session_start` response.
+/// Build the standards-inheritance chain for a namespace, most-general
+/// first. Task 1.6 extends this from the historical 3-level scheme
+/// (global → parent → namespace) to N levels by walking the `/`-derived
+/// ancestors from [`crate::models::namespace_ancestors`] plus any
+/// `namespace_meta` explicit-parent chain rooted at the top of the
+/// hierarchical path (which keeps legacy flat-namespace setups working).
+///
+/// Returned vector is top-down: `[*, org, unit, team, agent]` for a
+/// 4-level hierarchical namespace. Cycle-safe and bounded.
+fn build_namespace_chain(conn: &rusqlite::Connection, namespace: &str) -> Vec<String> {
+    const MAX_EXPLICIT_DEPTH: usize = 8;
+    let mut chain: Vec<String> = Vec::new();
+
+    if namespace == "*" {
+        chain.push("*".to_string());
+        return chain;
+    }
+
+    // Always start with the global standard — most general.
+    chain.push("*".to_string());
+
+    // 1. /-derived ancestors. `namespace_ancestors` returns most-specific-first;
+    //    reverse for top-down (root ancestor first, then namespace itself last).
+    let mut hierarchy_chain: Vec<String> = crate::models::namespace_ancestors(namespace)
+        .into_iter()
+        .rev()
+        .collect();
+
+    // 2. If the ROOTmost of the /-chain has an explicit `namespace_meta` parent,
+    //    prepend that chain (bounded by MAX_EXPLICIT_DEPTH + cycle-safe).
+    //    Supports legacy flat namespaces (e.g. `ai-memory` → `ai-memory-mcp`).
+    if let Some(root) = hierarchy_chain.first().cloned() {
+        let mut explicit_above: Vec<String> = Vec::new();
+        let mut current = root;
+        for _ in 0..MAX_EXPLICIT_DEPTH {
+            match db::get_namespace_parent(conn, &current) {
+                Some(p)
+                    if p != "*"
+                        && !explicit_above.contains(&p)
+                        && !hierarchy_chain.contains(&p) =>
+                {
+                    explicit_above.push(p.clone());
+                    current = p;
+                }
+                _ => break,
+            }
+        }
+        // `explicit_above` is [immediate-explicit-parent, grandparent, ...];
+        // reverse to prepend in top-down order.
+        for p in explicit_above.into_iter().rev() {
+            chain.push(p);
+        }
+    }
+
+    // 3. Append the /-derived chain (top-down).
+    for entry in hierarchy_chain.drain(..) {
+        if !chain.contains(&entry) {
+            chain.push(entry);
+        }
+    }
+
+    chain
+}
+
 /// Inject namespace standards into a `recall/session_start` response.
-/// Three-level rule layering: global ("*") + parent chain + namespace-specific.
-/// Max depth 5 to prevent cycles.
+/// N-level rule layering: global ("*") → root → ... → namespace-specific.
+/// Uses [`build_namespace_chain`] to resolve the full ancestor path.
 fn inject_namespace_standard(
     conn: &rusqlite::Connection,
     namespace: Option<&str>,
@@ -658,39 +1022,16 @@ fn inject_namespace_standard(
         }
     };
 
-    // Level 1: global standard ("*") — always applies
-    if let Some(global) = lookup_namespace_standard(conn, "*") {
-        add_standard(global, &mut standard_ids, &mut standards);
-    }
+    let chain = if let Some(ns) = namespace {
+        build_namespace_chain(conn, ns)
+    } else {
+        // No namespace context — only the global standard applies.
+        vec!["*".to_string()]
+    };
 
-    // Level 2+: walk parent chain from namespace, then add namespace itself
-    if let Some(ns) = namespace
-        && ns != "*"
-    {
-        // Collect the parent chain (bottom-up), then reverse to get top-down order
-        let mut chain: Vec<String> = Vec::new();
-        let mut current = ns.to_string();
-        for _ in 0..5 {
-            // max depth 5
-            if let Some(parent) = db::get_namespace_parent(conn, &current) {
-                if parent == "*" || chain.contains(&parent) {
-                    break; // don't re-add global or cycle
-                }
-                chain.push(parent.clone());
-                current = parent;
-            } else {
-                break;
-            }
-        }
-        // Add parents top-down (grandparent first, then parent)
-        for ancestor in chain.into_iter().rev() {
-            if let Some(std) = lookup_namespace_standard(conn, &ancestor) {
-                add_standard(std, &mut standard_ids, &mut standards);
-            }
-        }
-        // Add the namespace's own standard last (most specific)
-        if let Some(ns_std) = lookup_namespace_standard(conn, ns) {
-            add_standard(ns_std, &mut standard_ids, &mut standards);
+    for link in chain {
+        if let Some(std) = lookup_namespace_standard(conn, &link) {
+            add_standard(std, &mut standard_ids, &mut standards);
         }
     }
 
@@ -715,6 +1056,8 @@ fn inject_namespace_standard(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 fn handle_recall(
     conn: &rusqlite::Connection,
     params: &Value,
@@ -723,6 +1066,7 @@ fn handle_recall(
     reranker: Option<&CrossEncoder>,
     archive_on_gc: bool,
     resolved_ttl: &crate::config::ResolvedTtl,
+    resolved_scoring: &crate::config::ResolvedScoring,
 ) -> Result<Value, String> {
     // Helper: serialize scored memories with score field (#95)
     fn scored_memories(results: Vec<(Memory, f64)>) -> Vec<Value> {
@@ -748,12 +1092,55 @@ fn handle_recall(
     let tags = params["tags"].as_str();
     let since = params["since"].as_str();
     let until = params["until"].as_str();
+    // #151 visibility
+    let as_agent = params["as_agent"].as_str();
+    if let Some(a) = as_agent {
+        validate::validate_namespace(a).map_err(|e| e.to_string())?;
+    }
+    // Task 1.11: optional token budget.
+    let budget_tokens = params["budget_tokens"]
+        .as_u64()
+        .and_then(|n| usize::try_from(n).ok());
+
+    // v0.6.0.0 contextual recall — caller-supplied recent conversation tokens.
+    let context_tokens: Vec<String> = params["context_tokens"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Helper: tack tokens_used / budget_tokens onto the response metadata.
+    let decorate_budget = |resp: &mut Value, tokens_used: usize| {
+        resp["tokens_used"] = json!(tokens_used);
+        if let Some(b) = budget_tokens {
+            resp["budget_tokens"] = json!(b);
+        }
+    };
 
     // Use hybrid recall if embedder is available
     if let Some(emb) = embedder {
         match emb.embed(context) {
-            Ok(query_emb) => {
-                let results = db::recall_hybrid(
+            Ok(primary_emb) => {
+                // v0.6.0.0: fuse primary query with context-token embedding
+                // at 70/30 when caller supplied conversation tokens.
+                let query_emb = if context_tokens.is_empty() {
+                    primary_emb
+                } else {
+                    let joined = context_tokens.join(" ");
+                    match emb.embed(&joined) {
+                        Ok(ctx_emb) => {
+                            crate::embeddings::Embedder::fuse(&primary_emb, &ctx_emb, 0.7)
+                        }
+                        Err(e) => {
+                            tracing::warn!("context_tokens embed failed, using primary only: {e}");
+                            primary_emb
+                        }
+                    }
+                };
+                let (results, tokens_used) = db::recall_hybrid(
                     conn,
                     context,
                     &query_emb,
@@ -765,6 +1152,9 @@ fn handle_recall(
                     vector_index,
                     resolved_ttl.short_extend_secs,
                     resolved_ttl.mid_extend_secs,
+                    as_agent,
+                    budget_tokens,
+                    resolved_scoring,
                 )
                 .map_err(|e| e.to_string())?;
 
@@ -773,6 +1163,7 @@ fn handle_recall(
                     let ce_reranked = ce.rerank(context, results);
                     let memories = scored_memories(ce_reranked);
                     let mut resp = json!({"memories": memories, "count": memories.len(), "mode": "hybrid+rerank"});
+                    decorate_budget(&mut resp, tokens_used);
                     inject_namespace_standard(conn, namespace, &mut resp);
                     return Ok(resp);
                 }
@@ -780,6 +1171,7 @@ fn handle_recall(
                 let memories = scored_memories(results);
                 let mut resp =
                     json!({"memories": memories, "count": memories.len(), "mode": "hybrid"});
+                decorate_budget(&mut resp, tokens_used);
                 inject_namespace_standard(conn, namespace, &mut resp);
                 return Ok(resp);
             }
@@ -790,7 +1182,7 @@ fn handle_recall(
     }
 
     // Fallback to keyword-only recall
-    let results = db::recall(
+    let (results, tokens_used) = db::recall(
         conn,
         context,
         namespace,
@@ -800,10 +1192,13 @@ fn handle_recall(
         until,
         resolved_ttl.short_extend_secs,
         resolved_ttl.mid_extend_secs,
+        as_agent,
+        budget_tokens,
     )
     .map_err(|e| e.to_string())?;
     let memories = scored_memories(results);
     let mut resp = json!({"memories": memories, "count": memories.len(), "mode": "keyword"});
+    decorate_budget(&mut resp, tokens_used);
     inject_namespace_standard(conn, namespace, &mut resp);
     Ok(resp)
 }
@@ -903,6 +1298,13 @@ fn handle_search(conn: &rusqlite::Connection, params: &Value) -> Result<Value, S
     let limit = usize::try_from(params["limit"].as_u64().unwrap_or(20)).expect("u64 as usize");
 
     let agent_id = params["agent_id"].as_str();
+    if let Some(aid) = agent_id {
+        validate::validate_agent_id(aid).map_err(|e| e.to_string())?;
+    }
+    let as_agent = params["as_agent"].as_str();
+    if let Some(a) = as_agent {
+        validate::validate_namespace(a).map_err(|e| e.to_string())?;
+    }
     let results = db::search(
         conn,
         query,
@@ -914,6 +1316,7 @@ fn handle_search(conn: &rusqlite::Connection, params: &Value) -> Result<Value, S
         None,
         None,
         agent_id,
+        as_agent,
     )
     .map_err(|e| e.to_string())?;
     Ok(json!({"results": results, "count": results.len()}))
@@ -924,6 +1327,9 @@ fn handle_list(conn: &rusqlite::Connection, params: &Value) -> Result<Value, Str
     let tier = params["tier"].as_str().and_then(Tier::from_str);
     let limit = usize::try_from(params["limit"].as_u64().unwrap_or(20)).expect("u64 as usize");
     let agent_id = params["agent_id"].as_str();
+    if let Some(aid) = agent_id {
+        validate::validate_agent_id(aid).map_err(|e| e.to_string())?;
+    }
 
     let results = db::list(
         conn,
@@ -945,43 +1351,147 @@ fn handle_delete(
     conn: &rusqlite::Connection,
     params: &Value,
     vector_index: Option<&VectorIndex>,
+    mcp_client: Option<&str>,
 ) -> Result<Value, String> {
     let id = params["id"].as_str().ok_or("id is required")?;
     validate::validate_id(id).map_err(|e| e.to_string())?;
-    // Try exact delete first; fall back to prefix resolution
-    let deleted = db::delete(conn, id).map_err(|e| e.to_string())?;
+
+    // Resolve the memory first so governance has owner context.
+    let target = if let Some(m) = db::get(conn, id).map_err(|e| e.to_string())? {
+        Some(m)
+    } else {
+        db::get_by_prefix(conn, id).map_err(|e| e.to_string())?
+    };
+    let Some(target) = target else {
+        return Err("memory not found".into());
+    };
+
+    // Task 1.9: governance enforcement (delete-side).
+    {
+        use crate::models::{GovernanceDecision, GovernedAction};
+        let agent_id = crate::identity::resolve_agent_id(params["agent_id"].as_str(), mcp_client)
+            .map_err(|e| e.to_string())?;
+        let mem_owner = target
+            .metadata
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let payload = json!({"id": target.id, "title": target.title});
+        match db::enforce_governance(
+            conn,
+            GovernedAction::Delete,
+            &target.namespace,
+            &agent_id,
+            Some(&target.id),
+            mem_owner.as_deref(),
+            &payload,
+        )
+        .map_err(|e| e.to_string())?
+        {
+            GovernanceDecision::Allow => {}
+            GovernanceDecision::Deny(reason) => {
+                return Err(format!("delete denied by governance: {reason}"));
+            }
+            GovernanceDecision::Pending(pending_id) => {
+                return Ok(json!({
+                    "status": "pending",
+                    "pending_id": pending_id,
+                    "reason": "governance requires approval",
+                    "action": "delete",
+                    "memory_id": target.id,
+                }));
+            }
+        }
+    }
+
+    let deleted = db::delete(conn, &target.id).map_err(|e| e.to_string())?;
     if deleted {
         if let Some(idx) = vector_index {
-            idx.remove(id);
+            idx.remove(&target.id);
         }
         Ok(json!({"deleted": true}))
-    } else if let Some(mem) = db::get_by_prefix(conn, id).map_err(|e| e.to_string())? {
-        let full_id = mem.id.clone();
-        let deleted = db::delete(conn, &full_id).map_err(|e| e.to_string())?;
-        if deleted {
-            if let Some(idx) = vector_index {
-                idx.remove(&full_id);
-            }
-            Ok(json!({"deleted": true}))
-        } else {
-            Err("memory not found".into())
-        }
     } else {
         Err("memory not found".into())
     }
 }
 
-fn handle_promote(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
+fn handle_promote(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    mcp_client: Option<&str>,
+) -> Result<Value, String> {
     let id = params["id"].as_str().ok_or("id is required")?;
     validate::validate_id(id).map_err(|e| e.to_string())?;
-    // Resolve prefix if exact ID not found
-    let resolved_id = if db::get(conn, id).map_err(|e| e.to_string())?.is_some() {
-        id.to_string()
-    } else if let Some(mem) = db::get_by_prefix(conn, id).map_err(|e| e.to_string())? {
-        mem.id
+    // Resolve prefix if exact ID not found; capture the memory so governance
+    // has owner context (Task 1.9).
+    let target = if let Some(m) = db::get(conn, id).map_err(|e| e.to_string())? {
+        m
+    } else if let Some(m) = db::get_by_prefix(conn, id).map_err(|e| e.to_string())? {
+        m
     } else {
         return Err("memory not found".into());
     };
+    let resolved_id = target.id.clone();
+
+    // Task 1.9: governance enforcement (promote-side).
+    {
+        use crate::models::{GovernanceDecision, GovernedAction};
+        let agent_id = crate::identity::resolve_agent_id(params["agent_id"].as_str(), mcp_client)
+            .map_err(|e| e.to_string())?;
+        let mem_owner = target
+            .metadata
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let payload = json!({
+            "id": resolved_id,
+            "to_namespace": params["to_namespace"].as_str(),
+        });
+        match db::enforce_governance(
+            conn,
+            GovernedAction::Promote,
+            &target.namespace,
+            &agent_id,
+            Some(&resolved_id),
+            mem_owner.as_deref(),
+            &payload,
+        )
+        .map_err(|e| e.to_string())?
+        {
+            GovernanceDecision::Allow => {}
+            GovernanceDecision::Deny(reason) => {
+                return Err(format!("promote denied by governance: {reason}"));
+            }
+            GovernanceDecision::Pending(pending_id) => {
+                return Ok(json!({
+                    "status": "pending",
+                    "pending_id": pending_id,
+                    "reason": "governance requires approval",
+                    "action": "promote",
+                    "memory_id": resolved_id,
+                }));
+            }
+        }
+    }
+
+    // Task 1.7: optional vertical promotion to an ancestor namespace.
+    // When `to_namespace` is supplied, clone (don't move) the memory to the
+    // target and link clone → source with `derived_from`. Original is
+    // untouched; tier is NOT changed by this path.
+    if let Some(to_ns) = params["to_namespace"].as_str() {
+        validate::validate_namespace(to_ns).map_err(|e| e.to_string())?;
+        let clone_id =
+            db::promote_to_namespace(conn, &resolved_id, to_ns).map_err(|e| e.to_string())?;
+        return Ok(json!({
+            "promoted": true,
+            "mode": "vertical",
+            "source_id": resolved_id,
+            "clone_id": clone_id,
+            "to_namespace": to_ns,
+        }));
+    }
+
+    // Default: tier promotion to long (historical behavior).
     let (found, _) = db::update(
         conn,
         &resolved_id,
@@ -999,7 +1509,7 @@ fn handle_promote(conn: &rusqlite::Connection, params: &Value) -> Result<Value, 
     if !found {
         return Err("memory not found".into());
     }
-    Ok(json!({"promoted": true, "id": resolved_id, "tier": "long"}))
+    Ok(json!({"promoted": true, "mode": "tier", "id": resolved_id, "tier": "long"}))
 }
 
 fn handle_forget(
@@ -1316,10 +1826,57 @@ fn handle_namespace_set_standard(
     if let Some(p) = parent {
         validate::validate_namespace(p).map_err(|e| e.to_string())?;
     }
+
+    // Task 1.8: optional governance policy merged into the standard memory's
+    // metadata.governance. Policy is deserialized + validated before write.
+    let governance_val = params.get("governance").filter(|v| !v.is_null());
+    if let Some(g) = governance_val {
+        let policy: crate::models::GovernancePolicy =
+            serde_json::from_value(g.clone()).map_err(|e| format!("invalid governance: {e}"))?;
+        validate::validate_governance_policy(&policy).map_err(|e| e.to_string())?;
+
+        // Load the standard memory, merge metadata.governance, write back.
+        let mut mem = db::get(conn, id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("memory not found: {id}"))?;
+        let mut metadata = if mem.metadata.is_object() {
+            mem.metadata.clone()
+        } else {
+            serde_json::json!({})
+        };
+        if let Some(obj) = metadata.as_object_mut() {
+            obj.insert(
+                "governance".to_string(),
+                serde_json::to_value(&policy).map_err(|e| e.to_string())?,
+            );
+        }
+        let (found, _) = db::update(
+            conn,
+            &mem.id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&metadata),
+        )
+        .map_err(|e| e.to_string())?;
+        if !found {
+            return Err(format!("memory not found during governance merge: {id}"));
+        }
+        mem.metadata = metadata;
+    }
+
     db::set_namespace_standard(conn, namespace, id, parent).map_err(|e| e.to_string())?;
     let mut resp = json!({"set": true, "namespace": namespace, "standard_id": id});
     if let Some(p) = parent {
         resp["parent"] = json!(p);
+    }
+    if let Some(g) = governance_val {
+        resp["governance"] = g.clone();
     }
     Ok(resp)
 }
@@ -1332,24 +1889,73 @@ fn handle_namespace_get_standard(
         .as_str()
         .ok_or("namespace is required")?;
     validate::validate_namespace(namespace).map_err(|e| e.to_string())?;
+
+    // Task 1.6: --inherit returns the full resolved chain, most-general-first.
+    let inherit = params["inherit"].as_bool().unwrap_or(false);
+    if inherit {
+        let chain = build_namespace_chain(conn, namespace);
+        let mut standards: Vec<Value> = Vec::new();
+        for link in &chain {
+            if let Some(std) = lookup_namespace_standard(conn, link) {
+                let gov = extract_governance(&std);
+                let entry = json!({
+                    "namespace": link,
+                    "standard_id": std["id"].clone(),
+                    "title": std["title"].clone(),
+                    "content": std["content"].clone(),
+                    "priority": std["priority"].clone(),
+                    "governance": gov,
+                });
+                standards.push(entry);
+            }
+        }
+        return Ok(json!({
+            "namespace": namespace,
+            "chain": chain,
+            "standards": standards,
+            "count": standards.len(),
+        }));
+    }
+
     let standard_id = db::get_namespace_standard(conn, namespace).map_err(|e| e.to_string())?;
     match standard_id {
         Some(id) => {
             let mem = db::get(conn, &id).map_err(|e| e.to_string())?;
             match mem {
-                Some(m) => Ok(json!({
-                    "namespace": namespace,
-                    "standard_id": id,
-                    "title": m.title,
-                    "content": m.content,
-                    "priority": m.priority
-                })),
+                Some(m) => {
+                    // Task 1.8: surface metadata.governance (or default policy).
+                    let gov = GovernancePolicy::from_metadata(&m.metadata)
+                        .map(Result::unwrap_or_default)
+                        .unwrap_or_default();
+                    Ok(json!({
+                        "namespace": namespace,
+                        "standard_id": id,
+                        "title": m.title,
+                        "content": m.content,
+                        "priority": m.priority,
+                        "governance": gov,
+                    }))
+                }
                 None => Ok(
                     json!({"namespace": namespace, "standard_id": id, "warning": "standard memory not found — may have been deleted"}),
                 ),
             }
         }
         None => Ok(json!({"namespace": namespace, "standard_id": null})),
+    }
+}
+
+/// Task 1.8 — extract metadata.governance from a serialized memory value,
+/// resolving to the default policy when missing or invalid. Used by the
+/// `--inherit` get-standard path and tool responses.
+fn extract_governance(mem_val: &Value) -> Value {
+    let default = serde_json::to_value(GovernancePolicy::default()).unwrap_or(Value::Null);
+    let Some(meta) = mem_val.get("metadata") else {
+        return default;
+    };
+    match GovernancePolicy::from_metadata(meta) {
+        Some(Ok(p)) => serde_json::to_value(&p).unwrap_or(default),
+        _ => default,
     }
 }
 
@@ -1424,6 +2030,292 @@ fn auto_register_path_hierarchy(conn: &rusqlite::Connection, namespace: &str) {
 // ---------------------------------------------------------------------------
 // Archive tool handlers
 // ---------------------------------------------------------------------------
+
+fn handle_agent_register(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
+    let agent_id = params["agent_id"].as_str().ok_or("agent_id is required")?;
+    let agent_type = params["agent_type"]
+        .as_str()
+        .ok_or("agent_type is required")?;
+    let capabilities: Vec<String> = params["capabilities"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    validate::validate_agent_id(agent_id).map_err(|e| e.to_string())?;
+    validate::validate_agent_type(agent_type).map_err(|e| e.to_string())?;
+    validate::validate_capabilities(&capabilities).map_err(|e| e.to_string())?;
+
+    let id =
+        db::register_agent(conn, agent_id, agent_type, &capabilities).map_err(|e| e.to_string())?;
+
+    Ok(json!({
+        "registered": true,
+        "id": id,
+        "agent_id": agent_id,
+        "agent_type": agent_type,
+        "capabilities": capabilities,
+    }))
+}
+
+fn handle_agent_list(conn: &rusqlite::Connection) -> Result<Value, String> {
+    let agents = db::list_agents(conn).map_err(|e| e.to_string())?;
+    Ok(json!({
+        "count": agents.len(),
+        "agents": agents,
+    }))
+}
+
+// --- v0.6.0.0 agent notify / inbox -----------------------------------------
+
+/// Compose the canonical inbox namespace for a given `agent_id`.
+///
+/// Reuses the same sanitization regex that `validate_namespace` enforces
+/// on writes, so any `agent_id` that passes `validate::validate_agent_id`
+/// produces an acceptable namespace here.
+fn messages_namespace_for(agent_id: &str) -> String {
+    format!("_messages/{agent_id}")
+}
+
+fn handle_notify(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    resolved_ttl: &crate::config::ResolvedTtl,
+    mcp_client: Option<&str>,
+) -> Result<Value, String> {
+    let target = params["target_agent_id"]
+        .as_str()
+        .ok_or("target_agent_id is required")?;
+    let title = params["title"].as_str().ok_or("title is required")?;
+    let payload = params["payload"].as_str().ok_or("payload is required")?;
+    let priority = i32::try_from(params["priority"].as_i64().unwrap_or(5))
+        .expect("i64 as i32")
+        .clamp(1, 10);
+    let tier_str = params["tier"].as_str().unwrap_or("mid");
+    let tier = Tier::from_str(tier_str).ok_or(format!("invalid tier: {tier_str}"))?;
+
+    validate::validate_agent_id(target).map_err(|e| e.to_string())?;
+    validate::validate_title(title).map_err(|e| e.to_string())?;
+    validate::validate_content(payload).map_err(|e| e.to_string())?;
+
+    let sender = crate::identity::resolve_agent_id(None, mcp_client).map_err(|e| e.to_string())?;
+    let namespace = messages_namespace_for(target);
+
+    let now = chrono::Utc::now();
+    let expires_at = resolved_ttl
+        .ttl_for_tier(&tier)
+        .map(|s| (now + chrono::Duration::seconds(s)).to_rfc3339());
+
+    let metadata = json!({
+        "agent_id": sender.clone(),
+        "recipient_agent_id": target,
+        "message_kind": "notify",
+    });
+
+    let mem = Memory {
+        id: uuid::Uuid::new_v4().to_string(),
+        tier,
+        namespace: namespace.clone(),
+        title: title.to_string(),
+        content: payload.to_string(),
+        tags: vec!["_message".to_string()],
+        priority,
+        confidence: 1.0,
+        source: "notify".to_string(),
+        access_count: 0,
+        created_at: now.to_rfc3339(),
+        updated_at: now.to_rfc3339(),
+        last_accessed_at: None,
+        expires_at,
+        metadata,
+    };
+    let actual_id = db::insert(conn, &mem).map_err(|e| e.to_string())?;
+
+    Ok(json!({
+        "id": actual_id,
+        "from": sender,
+        "to": target,
+        "namespace": namespace,
+        "tier": mem.tier,
+        "delivered_at": mem.created_at,
+    }))
+}
+
+fn handle_inbox(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    mcp_client: Option<&str>,
+) -> Result<Value, String> {
+    // Caller identity is the default inbox owner — agents read their own
+    // inbox unless an explicit agent_id is supplied.
+    let explicit = params["agent_id"].as_str();
+    let owner =
+        crate::identity::resolve_agent_id(explicit, mcp_client).map_err(|e| e.to_string())?;
+    let unread_only = params["unread_only"].as_bool().unwrap_or(false);
+    let limit = usize::try_from(params["limit"].as_u64().unwrap_or(50))
+        .expect("u64 as usize")
+        .min(500);
+    let namespace = messages_namespace_for(&owner);
+    let items = db::list(
+        conn,
+        Some(&namespace),
+        None,
+        limit,
+        0,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .map_err(|e| e.to_string())?;
+    let filtered: Vec<&Memory> = items
+        .iter()
+        .filter(|m| !unread_only || m.access_count == 0)
+        .collect();
+    let messages: Vec<Value> = filtered
+        .iter()
+        .map(|m| {
+            let sender = m
+                .metadata
+                .get("agent_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            json!({
+                "id": m.id,
+                "from": sender,
+                "title": m.title,
+                "payload": m.content,
+                "priority": m.priority,
+                "tier": m.tier,
+                "created_at": m.created_at,
+                "read": m.access_count > 0,
+                "access_count": m.access_count,
+            })
+        })
+        .collect();
+    Ok(json!({
+        "agent_id": owner,
+        "namespace": namespace,
+        "count": messages.len(),
+        "unread_only": unread_only,
+        "messages": messages,
+    }))
+}
+
+// --- v0.6.0.0 webhook subscriptions ---------------------------------------
+
+fn handle_subscribe(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    mcp_client: Option<&str>,
+) -> Result<Value, String> {
+    let url = params["url"].as_str().ok_or("url is required")?;
+    let events = params["events"].as_str().unwrap_or("*");
+    let secret = params["secret"].as_str();
+    let namespace_filter = params["namespace_filter"].as_str();
+    let agent_filter = params["agent_filter"].as_str();
+    let created_by =
+        crate::identity::resolve_agent_id(None, mcp_client).map_err(|e| e.to_string())?;
+
+    crate::subscriptions::validate_url(url).map_err(|e| e.to_string())?;
+
+    let id = crate::subscriptions::insert(
+        conn,
+        &crate::subscriptions::NewSubscription {
+            url,
+            events,
+            secret,
+            namespace_filter,
+            agent_filter,
+            created_by: Some(&created_by),
+        },
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(json!({
+        "id": id,
+        "url": url,
+        "events": events,
+        "namespace_filter": namespace_filter,
+        "agent_filter": agent_filter,
+        "created_by": created_by,
+    }))
+}
+
+fn handle_unsubscribe(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
+    let id = params["id"].as_str().ok_or("id is required")?;
+    let removed = crate::subscriptions::delete(conn, id).map_err(|e| e.to_string())?;
+    Ok(json!({"id": id, "removed": removed}))
+}
+
+fn handle_list_subscriptions(conn: &rusqlite::Connection) -> Result<Value, String> {
+    let subs = crate::subscriptions::list(conn).map_err(|e| e.to_string())?;
+    Ok(json!({"count": subs.len(), "subscriptions": subs}))
+}
+
+fn handle_pending_list(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
+    let status = params["status"].as_str();
+    let limit = usize::try_from(params["limit"].as_u64().unwrap_or(100))
+        .expect("u64 as usize")
+        .min(1000);
+    let items = db::list_pending_actions(conn, status, limit).map_err(|e| e.to_string())?;
+    Ok(json!({"count": items.len(), "pending": items}))
+}
+
+fn handle_pending_approve(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    mcp_client: Option<&str>,
+) -> Result<Value, String> {
+    use crate::db::ApproveOutcome;
+    let id = params["id"].as_str().ok_or("id is required")?;
+    validate::validate_id(id).map_err(|e| e.to_string())?;
+    let agent_id = crate::identity::resolve_agent_id(params["agent_id"].as_str(), mcp_client)
+        .map_err(|e| e.to_string())?;
+    match db::approve_with_approver_type(conn, id, &agent_id).map_err(|e| e.to_string())? {
+        ApproveOutcome::Approved => {
+            // Task 1.10: auto-execute the queued action on final approval.
+            let executed = db::execute_pending_action(conn, id).map_err(|e| e.to_string())?;
+            Ok(json!({
+                "approved": true,
+                "id": id,
+                "decided_by": agent_id,
+                "executed": true,
+                "memory_id": executed,
+            }))
+        }
+        ApproveOutcome::Pending { votes, quorum } => Ok(json!({
+            "approved": false,
+            "status": "pending",
+            "id": id,
+            "votes": votes,
+            "quorum": quorum,
+            "reason": "consensus threshold not yet reached",
+        })),
+        ApproveOutcome::Rejected(reason) => Err(format!("approve rejected: {reason}")),
+    }
+}
+
+fn handle_pending_reject(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    mcp_client: Option<&str>,
+) -> Result<Value, String> {
+    let id = params["id"].as_str().ok_or("id is required")?;
+    validate::validate_id(id).map_err(|e| e.to_string())?;
+    let agent_id = crate::identity::resolve_agent_id(params["agent_id"].as_str(), mcp_client)
+        .map_err(|e| e.to_string())?;
+    let transitioned =
+        db::decide_pending_action(conn, id, false, &agent_id).map_err(|e| e.to_string())?;
+    if !transitioned {
+        return Err(format!("pending action not found or already decided: {id}"));
+    }
+    Ok(json!({"rejected": true, "id": id, "decided_by": agent_id}))
+}
 
 fn handle_archive_list(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
     let namespace = params["namespace"].as_str();
@@ -1550,7 +2442,9 @@ fn handle_request(
     tier_config: &TierConfig,
     vector_index: Option<&VectorIndex>,
     resolved_ttl: &crate::config::ResolvedTtl,
+    resolved_scoring: &crate::config::ResolvedScoring,
     archive_on_gc: bool,
+    autonomous_hooks: bool,
     mcp_client: Option<&str>,
 ) -> RpcResponse {
     let id = req.id.clone().unwrap_or(Value::Null);
@@ -1604,10 +2498,13 @@ fn handle_request(
             let result = match tool_name {
                 "memory_store" => handle_store(
                     conn,
+                    db_path,
                     arguments,
                     embedder,
+                    llm,
                     vector_index,
                     resolved_ttl,
+                    autonomous_hooks,
                     mcp_client,
                 ),
                 "memory_recall" => handle_recall(
@@ -1618,11 +2515,15 @@ fn handle_request(
                     reranker,
                     archive_on_gc,
                     resolved_ttl,
+                    resolved_scoring,
                 ),
                 "memory_search" => handle_search(conn, arguments),
                 "memory_list" => handle_list(conn, arguments),
-                "memory_delete" => handle_delete(conn, arguments, vector_index),
-                "memory_promote" => handle_promote(conn, arguments),
+                "memory_delete" => handle_delete(conn, arguments, vector_index, mcp_client),
+                "memory_promote" => handle_promote(conn, arguments, mcp_client),
+                "memory_pending_list" => handle_pending_list(conn, arguments),
+                "memory_pending_approve" => handle_pending_approve(conn, arguments, mcp_client),
+                "memory_pending_reject" => handle_pending_reject(conn, arguments, mcp_client),
                 "memory_forget" => handle_forget(conn, arguments, archive_on_gc),
                 "memory_stats" => handle_stats(conn, db_path),
                 "memory_update" => handle_update(conn, arguments, embedder, vector_index),
@@ -1647,6 +2548,13 @@ fn handle_request(
                 "memory_namespace_clear_standard" => {
                     handle_namespace_clear_standard(conn, arguments)
                 }
+                "memory_agent_register" => handle_agent_register(conn, arguments),
+                "memory_agent_list" => handle_agent_list(conn),
+                "memory_notify" => handle_notify(conn, arguments, resolved_ttl, mcp_client),
+                "memory_inbox" => handle_inbox(conn, arguments, mcp_client),
+                "memory_subscribe" => handle_subscribe(conn, arguments, mcp_client),
+                "memory_unsubscribe" => handle_unsubscribe(conn, arguments),
+                "memory_list_subscriptions" => handle_list_subscriptions(conn),
                 _ => Err(format!("unknown tool: {tool_name}")),
             };
 
@@ -1931,7 +2839,9 @@ pub fn run_mcp_server(
         }
 
         let resolved_ttl = app_config.effective_ttl();
+        let resolved_scoring = app_config.effective_scoring();
         let archive_on_gc = app_config.effective_archive_on_gc();
+        let autonomous_hooks = app_config.effective_autonomous_hooks();
         let resp = handle_request(
             &conn,
             db_path,
@@ -1942,7 +2852,9 @@ pub fn run_mcp_server(
             &tier_config,
             vector_index.as_ref(),
             &resolved_ttl,
+            &resolved_scoring,
             archive_on_gc,
+            autonomous_hooks,
             mcp_client_name.as_deref(),
         );
         let out = serde_json::to_string(&resp)?;
@@ -1961,10 +2873,49 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn tool_definitions_returns_26_tools() {
+    fn tool_definitions_returns_36_tools() {
+        // v0.6.0.0 adds memory_notify + memory_inbox + memory_subscribe
+        // + memory_unsubscribe + memory_list_subscriptions on top of the
+        // 31 baseline.
         let defs = tool_definitions();
         let tools = defs["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 26);
+        assert_eq!(tools.len(), 36);
+    }
+
+    #[test]
+    fn tool_definitions_include_agent_register_and_list() {
+        let defs = tool_definitions();
+        let names: Vec<&str> = defs["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        assert!(names.contains(&"memory_agent_register"));
+        assert!(names.contains(&"memory_agent_list"));
+    }
+
+    #[test]
+    fn tool_definitions_include_notify_and_inbox() {
+        // v0.6.0.0 agent-to-agent messaging primitive.
+        let defs = tool_definitions();
+        let names: Vec<&str> = defs["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        assert!(names.contains(&"memory_notify"));
+        assert!(names.contains(&"memory_inbox"));
+    }
+
+    #[test]
+    fn messages_namespace_is_prefixed() {
+        assert_eq!(super::messages_namespace_for("alice"), "_messages/alice");
+        assert_eq!(
+            super::messages_namespace_for("ai:claude-opus-4.7"),
+            "_messages/ai:claude-opus-4.7"
+        );
     }
 
     #[test]

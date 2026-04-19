@@ -114,6 +114,10 @@ pub struct CreateMemory {
     /// via `crate::identity` (NHI-hardened precedence chain).
     #[serde(default)]
     pub agent_id: Option<String>,
+    /// Optional visibility scope (Task 1.5). One of `VALID_SCOPES`. When
+    /// unset, treated as `private` by the query layer.
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
 fn default_tier() -> Tier {
@@ -168,6 +172,10 @@ pub struct SearchQuery {
     /// Filter by `metadata.agent_id` (exact match).
     #[serde(default)]
     pub agent_id: Option<String>,
+    /// Task 1.5 visibility: the querying agent's namespace position.
+    /// When set, results are filtered per `metadata.scope` rules.
+    #[serde(default)]
+    pub as_agent: Option<String>,
 }
 
 #[allow(clippy::unnecessary_wraps)]
@@ -211,6 +219,14 @@ pub struct RecallQuery {
     pub since: Option<String>,
     #[serde(default)]
     pub until: Option<String>,
+    /// Task 1.5 visibility filtering.
+    #[serde(default)]
+    pub as_agent: Option<String>,
+    /// Task 1.11 — context-budget-aware recall. When set, return the
+    /// top-scored memories whose cumulative estimated tokens fit within
+    /// this budget.
+    #[serde(default)]
+    pub budget_tokens: Option<usize>,
 }
 
 #[allow(clippy::unnecessary_wraps)]
@@ -231,6 +247,12 @@ pub struct RecallBody {
     pub since: Option<String>,
     #[serde(default)]
     pub until: Option<String>,
+    /// Task 1.5 visibility filtering.
+    #[serde(default)]
+    pub as_agent: Option<String>,
+    /// Task 1.11 — context-budget-aware recall.
+    #[serde(default)]
+    pub budget_tokens: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -277,7 +299,349 @@ pub struct NamespaceCount {
     pub count: usize,
 }
 
+/// Namespace reserved for agent registrations (Task 1.3).
+pub const AGENTS_NAMESPACE: &str = "_agents";
+
+// ---------------------------------------------------------------------------
+// Task 1.9 — Governance Enforcement
+// ---------------------------------------------------------------------------
+
+/// The outcome of a governance check. Callers MAY execute on `Allow`,
+/// MUST reject on `Deny`, and SHOULD queue + return the `pending_id` on
+/// `Pending`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GovernanceDecision {
+    /// Allowed; proceed with the action.
+    Allow,
+    /// Denied; surface the reason to the caller.
+    Deny(String),
+    /// Queued for approval; the caller receives the new `pending_id`.
+    Pending(String),
+}
+
+/// Actions that governance gates. Used as the `action_type` column value in
+/// `pending_actions` and as the discriminator for enforcement calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GovernedAction {
+    Store,
+    Delete,
+    Promote,
+}
+
+impl GovernedAction {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Store => "store",
+            Self::Delete => "delete",
+            Self::Promote => "promote",
+        }
+    }
+}
+
+/// A single approval vote recorded on a consensus-gated pending action (Task 1.10).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Approval {
+    pub agent_id: String,
+    pub approved_at: String,
+}
+
+/// Row returned by `db::list_pending_actions`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingAction {
+    pub id: String,
+    pub action_type: String,
+    pub memory_id: Option<String>,
+    pub namespace: String,
+    pub payload: Value,
+    pub requested_by: String,
+    pub requested_at: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decided_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decided_at: Option<String>,
+    /// Task 1.10: consensus vote log. Empty for Human/Agent paths.
+    #[serde(default)]
+    pub approvals: Vec<Approval>,
+}
+
+// ---------------------------------------------------------------------------
+// Task 1.8 — Governance Metadata
+// ---------------------------------------------------------------------------
+
+/// Who is permitted to perform a governed action.
+///
+/// Stored inside a namespace standard's `metadata.governance` and consulted
+/// by Task 1.9 (enforcement) + Task 1.10 (approver types). Task 1.8 only
+/// defines the shape + validation — no runtime enforcement yet.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GovernanceLevel {
+    /// Any caller may perform the action (no gate).
+    Any,
+    /// Caller must be a registered agent (see Task 1.3 `_agents` namespace).
+    Registered,
+    /// Only the memory's original `metadata.agent_id` owner may perform the action.
+    Owner,
+    /// Action requires explicit approval by an `ApproverType` (handled in 1.9 + 1.10).
+    Approve,
+}
+
+impl GovernanceLevel {
+    /// Human-readable tag used by logs and error messages.
+    /// Consumed by Task 1.9 enforcement path.
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Any => "any",
+            Self::Registered => "registered",
+            Self::Owner => "owner",
+            Self::Approve => "approve",
+        }
+    }
+}
+
+/// Who approves actions gated by [`GovernanceLevel::Approve`].
+///
+/// Serialized representation (externally-tagged, `snake_case`):
+///
+/// - [`Self::Human`] → `"human"`
+/// - [`Self::Agent`] → `{"agent": "alice"}`
+/// - [`Self::Consensus`] → `{"consensus": 3}`
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ApproverType {
+    /// Human approval required (interactive or out-of-band).
+    Human,
+    /// Specific registered agent must approve, identified by `agent_id`.
+    Agent(String),
+    /// Consensus of N approvers (any mix of human/agent registrations).
+    Consensus(u32),
+}
+
+impl ApproverType {
+    /// Discriminator tag for logs / telemetry.
+    /// Consumed by Task 1.10 approver-types path.
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Human => "human",
+            Self::Agent(_) => "agent",
+            Self::Consensus(_) => "consensus",
+        }
+    }
+}
+
+/// Governance policy attached to a namespace's standard memory
+/// (stored in `metadata.governance`).
+///
+/// Default policy when a standard has no `metadata.governance`:
+/// `{ write: Any, promote: Any, delete: Owner, approver: Human }`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GovernancePolicy {
+    pub write: GovernanceLevel,
+    pub promote: GovernanceLevel,
+    pub delete: GovernanceLevel,
+    pub approver: ApproverType,
+}
+
+impl Default for GovernancePolicy {
+    fn default() -> Self {
+        Self {
+            write: GovernanceLevel::Any,
+            promote: GovernanceLevel::Any,
+            delete: GovernanceLevel::Owner,
+            approver: ApproverType::Human,
+        }
+    }
+}
+
+impl GovernancePolicy {
+    /// Parse a policy out of a `metadata.governance` JSON value. Returns
+    /// `None` when the field is missing/null. Parse errors propagate so
+    /// callers can surface them to the user instead of silently defaulting.
+    pub fn from_metadata(metadata: &Value) -> Option<Result<Self, serde_json::Error>> {
+        let gov = metadata.get("governance")?;
+        if gov.is_null() {
+            return None;
+        }
+        Some(serde_json::from_value(gov.clone()))
+    }
+}
+
+/// Closed set of visibility scopes stamped into `metadata.scope` (Task 1.5).
+/// Controls which agents can see a memory via hierarchical namespace matching.
+/// Memories without a `scope` field are treated as `private` by the query layer.
+pub const VALID_SCOPES: &[&str] = &["private", "team", "unit", "org", "collective"];
+
+/// Closed set of agent types. Extend carefully — values are persisted.
+pub const VALID_AGENT_TYPES: &[&str] = &[
+    "ai:claude-opus-4.6",
+    "ai:claude-opus-4.7",
+    "ai:codex-5.4",
+    "ai:grok-4.2",
+    "human",
+    "system",
+];
+
+#[derive(Debug, Deserialize)]
+pub struct RegisterAgentBody {
+    pub agent_id: String,
+    pub agent_type: String,
+    #[serde(default)]
+    pub capabilities: Option<Vec<String>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AgentRegistration {
+    pub agent_id: String,
+    pub agent_type: String,
+    pub capabilities: Vec<String>,
+    pub registered_at: String,
+    pub last_seen_at: String,
+}
+
+/// Phase 3 foundation (issue #224): vector clock tracking the latest
+/// `updated_at` this peer has seen from each known remote peer.
+///
+/// Entries are populated lazily — both on HTTP `/sync/push` (receiver
+/// records the sender's latest `updated_at`) and on HTTP `/sync/since`
+/// (sender advances `last_pulled_at`). Full CRDT-lite merge rules using
+/// the clock are **not** in the v0.6.0 GA foundation; they land in a
+/// follow-up PR under issue #224 Task 3a.1. The foundation ships the
+/// wire format so adding the merge semantics later does not force a
+/// schema migration.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct VectorClock {
+    /// Map of peer `agent_id` -> latest RFC3339 `updated_at` seen from
+    /// that peer. A peer absent from the map is equivalent to
+    /// "never-seen-anything." Encoded as a JSON object on the wire.
+    #[serde(default)]
+    pub entries: std::collections::BTreeMap<String, String>,
+}
+
+impl VectorClock {
+    /// Advance this clock to include `peer_id`'s latest seen timestamp.
+    /// Monotonic — an older timestamp never overwrites a newer one.
+    #[allow(dead_code)] // Consumed by Task 3a.1 CRDT-lite merge (issue #224).
+    pub fn observe(&mut self, peer_id: &str, at: &str) {
+        self.entries
+            .entry(peer_id.to_string())
+            .and_modify(|existing| {
+                if at > existing.as_str() {
+                    *existing = at.to_string();
+                }
+            })
+            .or_insert_with(|| at.to_string());
+    }
+
+    /// Look up the latest timestamp this clock has from `peer_id`.
+    #[must_use]
+    #[allow(dead_code)] // Consumed by Task 3a.1 CRDT-lite merge (issue #224).
+    pub fn latest_from(&self, peer_id: &str) -> Option<&str> {
+        self.entries.get(peer_id).map(String::as_str)
+    }
+}
+
+/// Phase 3 foundation: one row of the `sync_state` table serialised for
+/// diagnostic / API responses.
+#[allow(dead_code)] // Consumed by Task 3b.2 sync diagnostics API (issue #224).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncStateEntry {
+    pub agent_id: String,
+    pub peer_id: String,
+    pub last_seen_at: String,
+    pub last_pulled_at: String,
+}
+
 pub const MAX_CONTENT_SIZE: usize = 65_536;
+
+/// Maximum number of path segments in a hierarchical namespace (Task 1.4).
+/// `alphaone/engineering/platform/team/squad/pod/role/agent` = 8 levels.
+pub const MAX_NAMESPACE_DEPTH: usize = 8;
+
+/// Number of `/`-delimited segments in a namespace path.
+///
+/// Flat namespaces (`"global"`, `"ai-memory"`) return `1`. An empty string
+/// returns `0`.
+///
+/// # Examples
+/// ```
+/// # use ai_memory::models::namespace_depth;
+/// assert_eq!(namespace_depth("global"), 1);
+/// assert_eq!(namespace_depth("alphaone/engineering"), 2);
+/// assert_eq!(namespace_depth("alphaone/engineering/platform"), 3);
+/// ```
+#[must_use]
+pub fn namespace_depth(ns: &str) -> usize {
+    if ns.is_empty() {
+        return 0;
+    }
+    ns.split('/').filter(|s| !s.is_empty()).count()
+}
+
+/// Parent of a hierarchical namespace, or `None` for flat / empty inputs.
+///
+/// Part of the Task 1.4 hierarchical-namespace API. Consumed by Tasks 1.5
+/// (visibility rules), 1.6 (N-level inheritance), 1.7 (vertical promotion),
+/// and 1.12 (hierarchy-aware recall).
+#[allow(dead_code)]
+///
+/// Parent of `"a/b/c"` is `"a/b"`. Parent of `"flat"` is `None` (a flat
+/// namespace has no parent). Parent of `""` is `None`.
+///
+/// # Examples
+/// ```
+/// # use ai_memory::models::namespace_parent;
+/// assert_eq!(namespace_parent("alphaone/engineering/platform"), Some("alphaone/engineering".to_string()));
+/// assert_eq!(namespace_parent("alphaone"), None);
+/// assert_eq!(namespace_parent(""), None);
+/// ```
+#[must_use]
+pub fn namespace_parent(ns: &str) -> Option<String> {
+    ns.rsplit_once('/').map(|(parent, _)| parent.to_string())
+}
+
+/// Ancestors of a namespace, ordered most-specific-first (including the
+/// namespace itself as the first element).
+///
+/// Part of the Task 1.4 hierarchical-namespace API. Consumed by Tasks 1.6
+/// (N-level rule inheritance) and 1.12 (hierarchy-aware recall scoring).
+#[allow(dead_code)]
+///
+/// For `"a/b/c"` returns `["a/b/c", "a/b", "a"]`. For a flat namespace
+/// returns a single-element vec containing the namespace. For an empty
+/// input returns an empty vec.
+///
+/// # Examples
+/// ```
+/// # use ai_memory::models::namespace_ancestors;
+/// assert_eq!(
+///     namespace_ancestors("alphaone/engineering/platform"),
+///     vec!["alphaone/engineering/platform", "alphaone/engineering", "alphaone"]
+/// );
+/// assert_eq!(namespace_ancestors("global"), vec!["global"]);
+/// assert!(namespace_ancestors("").is_empty());
+/// ```
+#[must_use]
+pub fn namespace_ancestors(ns: &str) -> Vec<String> {
+    if ns.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(namespace_depth(ns));
+    let mut current = ns.to_string();
+    loop {
+        out.push(current.clone());
+        match namespace_parent(&current) {
+            Some(p) if !p.is_empty() => current = p,
+            _ => break,
+        }
+    }
+    out
+}
 pub const PROMOTION_THRESHOLD: i64 = 5;
 /// How much to extend TTL on access (1 hour for short, 1 day for mid)
 pub const SHORT_TTL_EXTEND_SECS: i64 = 3600;
@@ -338,5 +702,199 @@ mod tests {
         assert_eq!(Tier::Short.rank(), 0);
         assert_eq!(Tier::Mid.rank(), 1);
         assert_eq!(Tier::Long.rank(), 2);
+    }
+
+    // Task 1.4 — hierarchical namespace helpers --------------------------------
+
+    #[test]
+    fn depth_flat_namespace() {
+        assert_eq!(namespace_depth("global"), 1);
+        assert_eq!(namespace_depth("ai-memory"), 1);
+        assert_eq!(namespace_depth("under_score"), 1);
+    }
+
+    #[test]
+    fn depth_hierarchical() {
+        assert_eq!(namespace_depth("a/b"), 2);
+        assert_eq!(namespace_depth("alphaone/engineering"), 2);
+        assert_eq!(namespace_depth("alphaone/engineering/platform"), 3);
+        assert_eq!(
+            namespace_depth("a/b/c/d/e/f/g/h"),
+            8,
+            "max depth of 8 counts each segment"
+        );
+    }
+
+    #[test]
+    fn depth_empty_is_zero() {
+        assert_eq!(namespace_depth(""), 0);
+    }
+
+    #[test]
+    fn parent_hierarchical() {
+        assert_eq!(
+            namespace_parent("alphaone/engineering/platform"),
+            Some("alphaone/engineering".to_string())
+        );
+        assert_eq!(
+            namespace_parent("alphaone/engineering"),
+            Some("alphaone".to_string())
+        );
+    }
+
+    #[test]
+    fn parent_flat_is_none() {
+        assert_eq!(namespace_parent("global"), None);
+        assert_eq!(namespace_parent("ai-memory"), None);
+        assert_eq!(namespace_parent(""), None);
+    }
+
+    #[test]
+    fn ancestors_three_levels() {
+        let a = namespace_ancestors("alphaone/engineering/platform");
+        assert_eq!(
+            a,
+            vec![
+                "alphaone/engineering/platform".to_string(),
+                "alphaone/engineering".to_string(),
+                "alphaone".to_string(),
+            ],
+            "ancestors ordered most-specific-first"
+        );
+    }
+
+    #[test]
+    fn ancestors_flat_namespace() {
+        assert_eq!(namespace_ancestors("global"), vec!["global".to_string()]);
+        assert_eq!(
+            namespace_ancestors("ai-memory"),
+            vec!["ai-memory".to_string()]
+        );
+    }
+
+    #[test]
+    fn ancestors_empty_input() {
+        assert!(namespace_ancestors("").is_empty());
+    }
+
+    #[test]
+    fn ancestors_single_level() {
+        assert_eq!(namespace_ancestors("a"), vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn ancestors_max_depth() {
+        let a = namespace_ancestors("a/b/c/d/e/f/g/h");
+        assert_eq!(a.len(), 8);
+        assert_eq!(a[0], "a/b/c/d/e/f/g/h");
+        assert_eq!(a[7], "a");
+    }
+
+    // Task 1.8 — governance types ---------------------------------------
+
+    #[test]
+    fn governance_default_policy() {
+        let p = GovernancePolicy::default();
+        assert_eq!(p.write, GovernanceLevel::Any);
+        assert_eq!(p.promote, GovernanceLevel::Any);
+        assert_eq!(p.delete, GovernanceLevel::Owner);
+        assert_eq!(p.approver, ApproverType::Human);
+    }
+
+    #[test]
+    fn governance_level_serde_snake_case() {
+        // Serialize each level as a lowercase JSON string
+        for (level, expected) in [
+            (GovernanceLevel::Any, "any"),
+            (GovernanceLevel::Registered, "registered"),
+            (GovernanceLevel::Owner, "owner"),
+            (GovernanceLevel::Approve, "approve"),
+        ] {
+            let json = serde_json::to_string(&level).unwrap();
+            assert_eq!(json, format!("\"{expected}\""));
+            // Roundtrip
+            let back: GovernanceLevel = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, level);
+        }
+    }
+
+    #[test]
+    fn approver_type_serde_shapes() {
+        // Human → unit variant serializes as bare string
+        let json = serde_json::to_string(&ApproverType::Human).unwrap();
+        assert_eq!(json, "\"human\"");
+
+        // Agent(s) → externally tagged
+        let a = ApproverType::Agent("alice".to_string());
+        let json = serde_json::to_string(&a).unwrap();
+        assert_eq!(json, r#"{"agent":"alice"}"#);
+        let back: ApproverType = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, a);
+
+        // Consensus(n) → externally tagged, numeric payload
+        let c = ApproverType::Consensus(3);
+        let json = serde_json::to_string(&c).unwrap();
+        assert_eq!(json, r#"{"consensus":3}"#);
+        let back: ApproverType = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, c);
+    }
+
+    #[test]
+    fn governance_policy_full_roundtrip() {
+        let p = GovernancePolicy {
+            write: GovernanceLevel::Registered,
+            promote: GovernanceLevel::Approve,
+            delete: GovernanceLevel::Owner,
+            approver: ApproverType::Agent("maintainer".to_string()),
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let back: GovernancePolicy = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, p);
+    }
+
+    #[test]
+    fn governance_from_metadata_missing() {
+        let meta = serde_json::json!({"agent_id": "alice"});
+        assert!(GovernancePolicy::from_metadata(&meta).is_none());
+    }
+
+    #[test]
+    fn governance_from_metadata_null() {
+        let meta = serde_json::json!({"governance": null});
+        assert!(GovernancePolicy::from_metadata(&meta).is_none());
+    }
+
+    #[test]
+    fn governance_from_metadata_default_shape() {
+        let default = GovernancePolicy::default();
+        let meta = serde_json::json!({"governance": serde_json::to_value(&default).unwrap()});
+        let parsed = GovernancePolicy::from_metadata(&meta)
+            .expect("present")
+            .expect("valid");
+        assert_eq!(parsed, default);
+    }
+
+    #[test]
+    fn governance_from_metadata_invalid_returns_err() {
+        let meta = serde_json::json!({
+            "governance": {"write": "bogus", "promote": "any", "delete": "any", "approver": "human"}
+        });
+        let result = GovernancePolicy::from_metadata(&meta).expect("present");
+        assert!(result.is_err(), "unknown enum value must fail deserialize");
+    }
+
+    #[test]
+    fn governance_level_as_str_tags() {
+        assert_eq!(GovernanceLevel::Any.as_str(), "any");
+        assert_eq!(GovernanceLevel::Registered.as_str(), "registered");
+        assert_eq!(GovernanceLevel::Owner.as_str(), "owner");
+        assert_eq!(GovernanceLevel::Approve.as_str(), "approve");
+    }
+
+    #[test]
+    fn approver_type_kind_tags() {
+        assert_eq!(ApproverType::Human.kind(), "human");
+        assert_eq!(ApproverType::Agent("a".into()).kind(), "agent");
+        assert_eq!(ApproverType::Consensus(3).kind(), "consensus");
     }
 }

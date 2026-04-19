@@ -1,8 +1,8 @@
 [package]
 name = "ai-memory"
-version = "0.5.4-patch.6"
+version = "0.6.0"
 edition = "2024"
-rust-version = "1.87"
+rust-version = "1.88"
 authors = ["AlphaOne LLC"]
 description = "AI-agnostic persistent memory system — MCP server, HTTP API, and CLI for any AI platform"
 license = "Apache-2.0"
@@ -19,7 +19,7 @@ dirs = "6"
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 clap_mangen = "0.2"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
@@ -29,6 +29,22 @@ uuid = { version = "1", features = ["v4"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 gethostname = "0.5"
 
+# Native TLS for `serve` (Layer 1 — issue to be filed). axum-server
+# + rustls. Accepts PEM cert + key from --tls-cert / --tls-key. No
+# OpenSSL dep; rustls matches reqwest's rustls-tls choice already in
+# use for the sync-daemon's outbound HTTPS.
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+# rustls 0.23 requires an explicit CryptoProvider — `ring` matches
+# reqwest's default for the sync-daemon, keeping a single provider
+# across the process. PEM parsing is handled by
+# `RustlsConfig::from_pem` so no separate rustls-pemfile dep (which
+# is flagged unmaintained in the 2026 advisory DB).
+rustls = { version = "0.23", features = ["ring"] }
+# mTLS cert fingerprint allowlist (Layer 2) needs SHA-256 over the
+# client cert DER. RustCrypto sha2 — same family as the HKDF we'll use
+# for Layer 3 E2E encryption (#228).
+sha2 = "0.10"
+
 # Semantic embedding support
 candle-core = "0.10"
 candle-nn = "0.10"
@@ -36,8 +52,26 @@ candle-transformers = "0.10"
 hf-hub = { version = "0.5", features = ["tokio"] }
 tokenizers = { version = "0.22" }
 instant-distance = "0.6"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "native-tls"] }
 toml = "0.8"
+
+# v0.6.0.0 — Prometheus metrics endpoint at GET /metrics. Pure Rust, no
+# transitive C deps. `protobuf` feature stays off; we emit text format
+# only (which is what Prometheus scrapes by default via `Accept:
+# text/plain`). Per sprint authorization #260.
+prometheus = { version = "0.13", default-features = false }
+
+# v0.6.0.0 — SQLite variant selection. Default builds the standard
+# bundled SQLite (matching pre-v0.6.0.0 behavior byte-for-byte). The
+# `sqlcipher` feature swaps the underlying DB to SQLCipher (SQLite +
+# AES-256 encryption). The two are mutually exclusive at link time;
+# pick one via `cargo build --no-default-features --features sqlcipher`.
+# Operators who want encryption at rest also supply
+# `--db-passphrase-file <path>` at daemon startup to unlock the DB.
+[features]
+default = ["sqlite-bundled"]
+sqlite-bundled = ["rusqlite/bundled"]
+sqlcipher = ["rusqlite/bundled-sqlcipher-vendored-openssl"]
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

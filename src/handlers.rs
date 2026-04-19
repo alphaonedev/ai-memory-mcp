@@ -3,7 +3,7 @@
 
 use axum::{
     Json,
-    extract::{Path, Query, Request, State},
+    extract::{FromRef, Path, Query, Request, State},
     http::{HeaderMap, StatusCode},
     middleware::Next,
     response::IntoResponse,
@@ -17,13 +17,37 @@ use uuid::Uuid;
 
 use crate::config::ResolvedTtl;
 use crate::db;
+use crate::embeddings::Embedder;
+use crate::hnsw::VectorIndex;
 use crate::models::{
     CreateMemory, ForgetQuery, LinkBody, ListQuery, Memory, MemoryLink, RecallBody, RecallQuery,
-    SearchQuery, Tier, UpdateMemory,
+    RegisterAgentBody, SearchQuery, Tier, UpdateMemory,
 };
 use crate::validate;
 
 pub type Db = Arc<Mutex<(rusqlite::Connection, std::path::PathBuf, ResolvedTtl, bool)>>;
+
+/// Composite daemon state (issue #219/v0.7 prep).
+///
+/// Previously the Axum router held only `Db`. Closing the HTTP embedding gap
+/// (semantic recall silently missed HTTP-stored memories because the daemon
+/// never generated embeddings) requires the embedder and the in-memory HNSW
+/// index to be reachable from write handlers. We introduce `AppState` and
+/// use `FromRef` so every existing `State<Db>` handler keeps working
+/// unchanged — only the write paths opt into `State<AppState>` to pick up
+/// the embedder and vector index.
+#[derive(Clone)]
+pub struct AppState {
+    pub db: Db,
+    pub embedder: Arc<Option<Embedder>>,
+    pub vector_index: Arc<Mutex<Option<VectorIndex>>>,
+}
+
+impl FromRef<AppState> for Db {
+    fn from_ref(app: &AppState) -> Self {
+        app.db.clone()
+    }
+}
 
 const MAX_BULK_SIZE: usize = 1000;
 
@@ -92,11 +116,38 @@ pub async fn health(State(state): State<Db>) -> impl IntoResponse {
         .into_response()
 }
 
+/// v0.6.0.0 — Prometheus scrape endpoint. Refreshes gauge samples
+/// (`ai_memory_memories`) against the current DB before rendering so
+/// scrapers see up-to-date counts without needing a background refresh
+/// task.
+pub async fn prometheus_metrics(State(state): State<Db>) -> impl IntoResponse {
+    {
+        let lock = state.lock().await;
+        if let Ok(stats) = db::stats(&lock.0, &lock.1) {
+            crate::metrics::registry()
+                .memories_gauge
+                .set(stats.total.try_into().unwrap_or(i64::MAX));
+        }
+    }
+    let body = crate::metrics::render();
+    (
+        StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    )
+        .into_response()
+}
+
+#[allow(clippy::too_many_lines)]
 pub async fn create_memory(
-    State(state): State<Db>,
+    State(app): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<CreateMemory>,
 ) -> impl IntoResponse {
+    let state = app.db.clone();
     if let Err(e) = validate::validate_create(&body) {
         return (
             StatusCode::BAD_REQUEST,
@@ -122,6 +173,36 @@ pub async fn create_memory(
     if let Some(obj) = metadata.as_object_mut() {
         obj.insert("agent_id".to_string(), serde_json::Value::String(agent_id));
     }
+    // #151 scope: validate + merge into metadata if supplied at the top level
+    // (inline metadata.scope still works; top-level is a shortcut)
+    if let Some(ref s) = body.scope {
+        if let Err(e) = validate::validate_scope(s) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+        if let Some(obj) = metadata.as_object_mut() {
+            obj.insert("scope".to_string(), serde_json::Value::String(s.clone()));
+        }
+    }
+
+    // Issue #219: generate the embedding BEFORE taking the DB lock. Embedding
+    // (MiniLM ONNX / nomic via Ollama) is 10-200ms of work we do not want
+    // holding the single `Mutex<Connection>` on a multi-agent daemon.
+    let embedding_text = format!("{} {}", body.title, body.content);
+    let embedding: Option<Vec<f32>> =
+        app.embedder
+            .as_ref()
+            .as_ref()
+            .and_then(|emb| match emb.embed(&embedding_text) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!("embedding generation failed: {e}");
+                    None
+                }
+            });
 
     let now = Utc::now();
     let lock = state.lock().await;
@@ -148,6 +229,57 @@ pub async fn create_memory(
         metadata,
     };
 
+    // Task 1.9: governance enforcement (store-side).
+    {
+        use crate::models::{GovernanceDecision, GovernedAction};
+        let agent_for_gov = mem
+            .metadata
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let payload = serde_json::to_value(&mem).unwrap_or_default();
+        match db::enforce_governance(
+            &lock.0,
+            GovernedAction::Store,
+            &mem.namespace,
+            &agent_for_gov,
+            None,
+            None,
+            &payload,
+        ) {
+            Ok(GovernanceDecision::Allow) => {}
+            Ok(GovernanceDecision::Deny(reason)) => {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({"error": format!("store denied by governance: {reason}")})),
+                )
+                    .into_response();
+            }
+            Ok(GovernanceDecision::Pending(pending_id)) => {
+                return (
+                    StatusCode::ACCEPTED,
+                    Json(json!({
+                        "status": "pending",
+                        "pending_id": pending_id,
+                        "reason": "governance requires approval",
+                        "action": "store",
+                        "namespace": mem.namespace,
+                    })),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                tracing::error!("governance error: {e}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "governance check failed"})),
+                )
+                    .into_response();
+            }
+        }
+    }
+
     // Check for contradictions
     let contradictions =
         db::find_contradictions(&lock.0, &mem.title, &mem.namespace).unwrap_or_default();
@@ -159,12 +291,263 @@ pub async fn create_memory(
 
     match db::insert(&lock.0, &mem) {
         Ok(actual_id) => {
-            let mut response = json!({"id": actual_id, "tier": mem.tier, "namespace": mem.namespace, "title": mem.title});
+            // Issue #219: persist the embedding and warm the HNSW index so
+            // semantic recall can find this memory. Previously the HTTP path
+            // stored the row but never called `set_embedding`, silently
+            // excluding every HTTP-authored memory from semantic search.
+            if let Some(ref vec) = embedding
+                && let Err(e) = db::set_embedding(&lock.0, &actual_id, vec)
+            {
+                tracing::warn!("failed to store embedding for {actual_id}: {e}");
+            }
+            // Drop the DB lock before taking the vector index lock.
+            drop(lock);
+            if let Some(vec) = embedding {
+                let mut idx_lock = app.vector_index.lock().await;
+                if let Some(idx) = idx_lock.as_mut() {
+                    idx.insert(actual_id.clone(), vec);
+                }
+            }
+            // #196: echo the resolved agent_id so callers don't need a follow-up get.
+            let resolved_agent_id = mem
+                .metadata
+                .get("agent_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let mut response = json!({
+                "id": actual_id,
+                "tier": mem.tier,
+                "namespace": mem.namespace,
+                "title": mem.title,
+                "agent_id": resolved_agent_id,
+            });
             if !contradiction_ids.is_empty() {
                 response["potential_contradictions"] = json!(contradiction_ids);
             }
             (StatusCode::CREATED, Json(response)).into_response()
         }
+        Err(e) => {
+            tracing::error!("handler error: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "internal server error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+pub async fn register_agent(
+    State(state): State<Db>,
+    Json(body): Json<RegisterAgentBody>,
+) -> impl IntoResponse {
+    if let Err(e) = validate::validate_agent_id(&body.agent_id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
+    if let Err(e) = validate::validate_agent_type(&body.agent_type) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
+    let capabilities = body.capabilities.unwrap_or_default();
+    if let Err(e) = validate::validate_capabilities(&capabilities) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
+
+    let lock = state.lock().await;
+    match db::register_agent(&lock.0, &body.agent_id, &body.agent_type, &capabilities) {
+        Ok(id) => (
+            StatusCode::CREATED,
+            Json(json!({
+                "registered": true,
+                "id": id,
+                "agent_id": body.agent_id,
+                "agent_type": body.agent_type,
+                "capabilities": capabilities,
+            })),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!("handler error: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "internal server error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Task 1.9 — pending_actions endpoints
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct PendingListQuery {
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default = "default_pending_limit")]
+    pub limit: Option<usize>,
+}
+
+#[allow(clippy::unnecessary_wraps)]
+fn default_pending_limit() -> Option<usize> {
+    Some(100)
+}
+
+pub async fn list_pending(
+    State(state): State<Db>,
+    Query(p): Query<PendingListQuery>,
+) -> impl IntoResponse {
+    let limit = p.limit.unwrap_or(100).min(1000);
+    let lock = state.lock().await;
+    match db::list_pending_actions(&lock.0, p.status.as_deref(), limit) {
+        Ok(items) => Json(json!({"count": items.len(), "pending": items})).into_response(),
+        Err(e) => {
+            tracing::error!("handler error: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "internal server error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+pub async fn approve_pending(
+    State(state): State<Db>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    use crate::db::ApproveOutcome;
+    if let Err(e) = validate::validate_id(&id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
+    let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+    let agent_id = match crate::identity::resolve_http_agent_id(None, header_agent_id) {
+        Ok(a) => a,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("invalid agent_id: {e}")})),
+            )
+                .into_response();
+        }
+    };
+    let lock = state.lock().await;
+    match db::approve_with_approver_type(&lock.0, &id, &agent_id) {
+        Ok(ApproveOutcome::Approved) => match db::execute_pending_action(&lock.0, &id) {
+            Ok(memory_id) => Json(json!({
+                "approved": true,
+                "id": id,
+                "decided_by": agent_id,
+                "executed": true,
+                "memory_id": memory_id,
+            }))
+            .into_response(),
+            Err(e) => {
+                tracing::error!("execute pending error: {e}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "approved but execution failed"})),
+                )
+                    .into_response()
+            }
+        },
+        Ok(ApproveOutcome::Pending { votes, quorum }) => (
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "approved": false,
+                "status": "pending",
+                "id": id,
+                "votes": votes,
+                "quorum": quorum,
+                "reason": "consensus threshold not yet reached",
+            })),
+        )
+            .into_response(),
+        Ok(ApproveOutcome::Rejected(reason)) => (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": format!("approve rejected: {reason}")})),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!("handler error: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "internal server error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+pub async fn reject_pending(
+    State(state): State<Db>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = validate::validate_id(&id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
+    let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+    let agent_id = match crate::identity::resolve_http_agent_id(None, header_agent_id) {
+        Ok(a) => a,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("invalid agent_id: {e}")})),
+            )
+                .into_response();
+        }
+    };
+    let lock = state.lock().await;
+    match db::decide_pending_action(&lock.0, &id, false, &agent_id) {
+        Ok(true) => {
+            Json(json!({"rejected": true, "id": id, "decided_by": agent_id})).into_response()
+        }
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "pending action not found or already decided"})),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!("handler error: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "internal server error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+pub async fn list_agents(State(state): State<Db>) -> impl IntoResponse {
+    let lock = state.lock().await;
+    match db::list_agents(&lock.0) {
+        Ok(agents) => (
+            StatusCode::OK,
+            Json(json!({"count": agents.len(), "agents": agents})),
+        )
+            .into_response(),
         Err(e) => {
             tracing::error!("handler error: {e}");
             (
@@ -207,10 +590,11 @@ pub async fn get_memory(State(state): State<Db>, Path(id): Path<String>) -> impl
 }
 
 pub async fn update_memory(
-    State(state): State<Db>,
+    State(app): State<AppState>,
     Path(id): Path<String>,
     Json(body): Json<UpdateMemory>,
 ) -> impl IntoResponse {
+    let state = app.db.clone();
     if let Err(e) = validate::validate_id(&id) {
         return (
             StatusCode::BAD_REQUEST,
@@ -269,6 +653,33 @@ pub async fn update_memory(
     ) {
         Ok((true, _)) => {
             let mem = db::get(&lock.0, &resolved_id).ok().flatten();
+            // Issue #219: regenerate the embedding when the searchable text
+            // (title/content) changed. Without this, the semantic index keeps
+            // pointing at the old vector and stale semantic recall results
+            // linger even after the row is updated.
+            let content_changed = body.title.is_some() || body.content.is_some();
+            if content_changed && let Some(ref m) = mem {
+                let text = format!("{} {}", m.title, m.content);
+                if let Some(emb) = app.embedder.as_ref().as_ref() {
+                    match emb.embed(&text) {
+                        Ok(vec) => {
+                            if let Err(e) = db::set_embedding(&lock.0, &resolved_id, &vec) {
+                                tracing::warn!(
+                                    "failed to refresh embedding for {resolved_id}: {e}"
+                                );
+                            }
+                            // Drop DB lock before touching vector index.
+                            drop(lock);
+                            let mut idx_lock = app.vector_index.lock().await;
+                            if let Some(idx) = idx_lock.as_mut() {
+                                idx.remove(&resolved_id);
+                                idx.insert(resolved_id.clone(), vec);
+                            }
+                        }
+                        Err(e) => tracing::warn!("embedding regeneration failed: {e}"),
+                    }
+                }
+            }
             Json(json!(mem)).into_response()
         }
         Ok((false, _)) => {
@@ -289,7 +700,11 @@ pub async fn update_memory(
     }
 }
 
-pub async fn delete_memory(State(state): State<Db>, Path(id): Path<String>) -> impl IntoResponse {
+pub async fn delete_memory(
+    State(state): State<Db>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
     if let Err(e) = validate::validate_id(&id) {
         return (
             StatusCode::BAD_REQUEST,
@@ -298,61 +713,9 @@ pub async fn delete_memory(State(state): State<Db>, Path(id): Path<String>) -> i
             .into_response();
     }
     let lock = state.lock().await;
-    // Try exact delete first; fall back to prefix resolution
-    match db::delete(&lock.0, &id) {
-        Ok(true) => Json(json!({"deleted": true})).into_response(),
-        Ok(false) => {
-            // Prefix fallback
-            match db::get_by_prefix(&lock.0, &id) {
-                Ok(Some(mem)) => {
-                    let full_id = mem.id;
-                    match db::delete(&lock.0, &full_id) {
-                        Ok(true) => Json(json!({"deleted": true})).into_response(),
-                        _ => (StatusCode::NOT_FOUND, Json(json!({"error": "not found"})))
-                            .into_response(),
-                    }
-                }
-                Ok(None) => {
-                    (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response()
-                }
-                Err(e) => {
-                    let msg = e.to_string();
-                    if msg.contains("ambiguous ID prefix") {
-                        (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response()
-                    } else {
-                        tracing::error!("handler error: {e}");
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(json!({"error": "internal server error"})),
-                        )
-                            .into_response()
-                    }
-                }
-            }
-        }
-        Err(e) => {
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
-        }
-    }
-}
-
-pub async fn promote_memory(State(state): State<Db>, Path(id): Path<String>) -> impl IntoResponse {
-    if let Err(e) = validate::validate_id(&id) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": e.to_string()})),
-        )
-            .into_response();
-    }
-    let lock = state.lock().await;
-    // Resolve prefix if exact ID not found
-    let resolved_id = match db::resolve_id(&lock.0, &id) {
-        Ok(Some(mem)) => mem.id,
+    // Resolve the target memory so governance has owner context.
+    let target = match db::resolve_id(&lock.0, &id) {
+        Ok(Some(m)) => m,
         Ok(None) => {
             return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response();
         }
@@ -369,6 +732,169 @@ pub async fn promote_memory(State(state): State<Db>, Path(id): Path<String>) -> 
                 .into_response();
         }
     };
+
+    // Task 1.9: governance enforcement (delete-side).
+    {
+        use crate::models::{GovernanceDecision, GovernedAction};
+        let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+        let agent_id = match crate::identity::resolve_http_agent_id(None, header_agent_id) {
+            Ok(a) => a,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": format!("invalid agent_id: {e}")})),
+                )
+                    .into_response();
+            }
+        };
+        let mem_owner = target
+            .metadata
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let payload = json!({"id": target.id, "title": target.title});
+        match db::enforce_governance(
+            &lock.0,
+            GovernedAction::Delete,
+            &target.namespace,
+            &agent_id,
+            Some(&target.id),
+            mem_owner.as_deref(),
+            &payload,
+        ) {
+            Ok(GovernanceDecision::Allow) => {}
+            Ok(GovernanceDecision::Deny(reason)) => {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({"error": format!("delete denied by governance: {reason}")})),
+                )
+                    .into_response();
+            }
+            Ok(GovernanceDecision::Pending(pending_id)) => {
+                return (
+                    StatusCode::ACCEPTED,
+                    Json(json!({
+                        "status": "pending",
+                        "pending_id": pending_id,
+                        "reason": "governance requires approval",
+                        "action": "delete",
+                        "memory_id": target.id,
+                    })),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                tracing::error!("governance error: {e}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "governance check failed"})),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    match db::delete(&lock.0, &target.id) {
+        Ok(true) => Json(json!({"deleted": true})).into_response(),
+        _ => (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response(),
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+pub async fn promote_memory(
+    State(state): State<Db>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = validate::validate_id(&id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
+    let lock = state.lock().await;
+    // Resolve prefix if exact ID not found — capture full memory for governance.
+    let target = match db::resolve_id(&lock.0, &id) {
+        Ok(Some(mem)) => mem,
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response();
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("ambiguous ID prefix") {
+                return (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response();
+            }
+            tracing::error!("handler error: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "internal server error"})),
+            )
+                .into_response();
+        }
+    };
+    // Task 1.9: governance enforcement (promote-side).
+    {
+        use crate::models::{GovernanceDecision, GovernedAction};
+        let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+        let agent_id = match crate::identity::resolve_http_agent_id(None, header_agent_id) {
+            Ok(a) => a,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": format!("invalid agent_id: {e}")})),
+                )
+                    .into_response();
+            }
+        };
+        let mem_owner = target
+            .metadata
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let payload = json!({"id": target.id});
+        match db::enforce_governance(
+            &lock.0,
+            GovernedAction::Promote,
+            &target.namespace,
+            &agent_id,
+            Some(&target.id),
+            mem_owner.as_deref(),
+            &payload,
+        ) {
+            Ok(GovernanceDecision::Allow) => {}
+            Ok(GovernanceDecision::Deny(reason)) => {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({"error": format!("promote denied by governance: {reason}")})),
+                )
+                    .into_response();
+            }
+            Ok(GovernanceDecision::Pending(pending_id)) => {
+                return (
+                    StatusCode::ACCEPTED,
+                    Json(json!({
+                        "status": "pending",
+                        "pending_id": pending_id,
+                        "reason": "governance requires approval",
+                        "action": "promote",
+                        "memory_id": target.id,
+                    })),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                tracing::error!("governance error: {e}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "governance check failed"})),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    let resolved_id = target.id.clone();
     match db::update(
         &lock.0,
         &resolved_id,
@@ -414,6 +940,16 @@ pub async fn list_memories(
     State(state): State<Db>,
     Query(p): Query<ListQuery>,
 ) -> impl IntoResponse {
+    // #197: validate agent_id filter values
+    if let Some(ref aid) = p.agent_id
+        && let Err(e) = validate::validate_agent_id(aid)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("invalid agent_id filter: {e}")})),
+        )
+            .into_response();
+    }
     let lock = state.lock().await;
     let limit = p.limit.unwrap_or(20).min(200);
     match db::list(
@@ -451,6 +987,26 @@ pub async fn search_memories(
         )
             .into_response();
     }
+    // #197: validate agent_id filter values
+    if let Some(ref aid) = p.agent_id
+        && let Err(e) = validate::validate_agent_id(aid)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("invalid agent_id filter: {e}")})),
+        )
+            .into_response();
+    }
+    // #151 visibility: validate --as-agent namespace if supplied
+    if let Some(ref a) = p.as_agent
+        && let Err(e) = validate::validate_namespace(a)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("invalid as_agent: {e}")})),
+        )
+            .into_response();
+    }
     let lock = state.lock().await;
     let limit = p.limit.unwrap_or(20).min(200);
     match db::search(
@@ -464,6 +1020,7 @@ pub async fn search_memories(
         p.until.as_deref(),
         p.tags.as_deref(),
         p.agent_id.as_deref(),
+        p.as_agent.as_deref(),
     ) {
         Ok(r) => Json(json!({"results": r, "count": r.len(), "query": p.q})).into_response(),
         Err(e) => {
@@ -489,6 +1046,15 @@ pub async fn recall_memories_get(
         )
             .into_response();
     }
+    if let Some(ref a) = p.as_agent
+        && let Err(e) = validate::validate_namespace(a)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("invalid as_agent: {e}")})),
+        )
+            .into_response();
+    }
     let lock = state.lock().await;
     let limit = p.limit.unwrap_or(10).min(50);
     match db::recall(
@@ -501,8 +1067,10 @@ pub async fn recall_memories_get(
         p.until.as_deref(),
         lock.2.short_extend_secs,
         lock.2.mid_extend_secs,
+        p.as_agent.as_deref(),
+        p.budget_tokens,
     ) {
-        Ok(r) => {
+        Ok((r, tokens_used)) => {
             let scored: Vec<serde_json::Value> = r
                 .iter()
                 .map(|(m, s)| {
@@ -513,7 +1081,15 @@ pub async fn recall_memories_get(
                     v
                 })
                 .collect();
-            Json(json!({"memories": scored, "count": scored.len()})).into_response()
+            let mut resp = json!({
+                "memories": scored,
+                "count": scored.len(),
+                "tokens_used": tokens_used,
+            });
+            if let Some(b) = p.budget_tokens {
+                resp["budget_tokens"] = json!(b);
+            }
+            Json(resp).into_response()
         }
         Err(e) => {
             tracing::error!("handler error: {e}");
@@ -537,6 +1113,15 @@ pub async fn recall_memories_post(
         )
             .into_response();
     }
+    if let Some(ref a) = body.as_agent
+        && let Err(e) = validate::validate_namespace(a)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("invalid as_agent: {e}")})),
+        )
+            .into_response();
+    }
     let lock = state.lock().await;
     let limit = body.limit.unwrap_or(10).min(50);
     match db::recall(
@@ -549,8 +1134,10 @@ pub async fn recall_memories_post(
         body.until.as_deref(),
         lock.2.short_extend_secs,
         lock.2.mid_extend_secs,
+        body.as_agent.as_deref(),
+        body.budget_tokens,
     ) {
-        Ok(r) => {
+        Ok((r, tokens_used)) => {
             let scored: Vec<serde_json::Value> = r
                 .iter()
                 .map(|(m, s)| {
@@ -561,7 +1148,15 @@ pub async fn recall_memories_post(
                     v
                 })
                 .collect();
-            Json(json!({"memories": scored, "count": scored.len()})).into_response()
+            let mut resp = json!({
+                "memories": scored,
+                "count": scored.len(),
+                "tokens_used": tokens_used,
+            });
+            if let Some(b) = body.budget_tokens {
+                resp["budget_tokens"] = json!(b);
+            }
+            Json(resp).into_response()
         }
         Err(e) => {
             tracing::error!("handler error: {e}");
@@ -967,6 +1562,202 @@ pub async fn archive_stats(State(state): State<Db>) -> impl IntoResponse {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 3 foundation (issue #224) — HTTP sync endpoints.
+//
+// These ship in v0.6.0 GA as SKELETONS running today's timestamp-aware merge
+// (`db::insert_if_newer`). Field-level CRDT-lite merge rules, streaming,
+// resume-on-interrupt, and per-peer auth tokens are v0.8.0 targets.
+// ---------------------------------------------------------------------------
+
+/// Request body for `POST /api/v1/sync/push`.
+#[derive(Deserialize)]
+pub struct SyncPushBody {
+    /// Claimed `agent_id` of the peer pushing data. Recorded in
+    /// `sync_state` for vector clock advancement. Treated as identity
+    /// only (not attestation) — same NHI model as every other write.
+    pub sender_agent_id: String,
+    /// Vector clock the sender had at push time. Foundation accepts it
+    /// and stores the latest-seen timestamp; full clock reconciliation
+    /// lands with Task 3a.1.
+    #[serde(default)]
+    #[allow(dead_code)] // Consumed by Task 3a.1 CRDT-lite; shipped now for wire compat.
+    pub sender_clock: crate::models::VectorClock,
+    /// Memories the sender is offering. Applied via the existing
+    /// timestamp-aware merge (`insert_if_newer`).
+    pub memories: Vec<Memory>,
+    /// Preview mode — classify and count, do not write.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[derive(Deserialize)]
+pub struct SyncSinceQuery {
+    /// Return memories with `updated_at > since`. Absent = full snapshot.
+    pub since: Option<String>,
+    /// Pagination cap. Defaults to 500.
+    pub limit: Option<usize>,
+    /// Caller's claimed `agent_id`; optional but recorded in `sync_state`
+    /// so the caller can later push incremental updates.
+    pub peer: Option<String>,
+}
+
+pub async fn sync_push(
+    State(state): State<Db>,
+    headers: HeaderMap,
+    Json(body): Json<SyncPushBody>,
+) -> impl IntoResponse {
+    if let Err(e) = validate::validate_agent_id(&body.sender_agent_id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("invalid sender_agent_id: {e}")})),
+        )
+            .into_response();
+    }
+    // Cap memories per push, matching the bulk-create limit. Without
+    // this a malicious peer with a valid mTLS cert could flood the
+    // receiver and bottleneck the shared SQLite Mutex (red-team #242).
+    if body.memories.len() > MAX_BULK_SIZE {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!("sync_push limited to {} memories per request", MAX_BULK_SIZE)
+            })),
+        )
+            .into_response();
+    }
+    // Receiver's local identity — default to the caller-supplied header,
+    // fall back to the anonymous placeholder. Recorded in sync_state rows.
+    let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+    let local_agent_id = match crate::identity::resolve_http_agent_id(None, header_agent_id) {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("invalid x-agent-id: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    let lock = state.lock().await;
+    let mut applied = 0usize;
+    let mut noop = 0usize;
+    let mut skipped = 0usize;
+    let mut latest_seen: Option<String> = None;
+
+    for mem in &body.memories {
+        if validate::validate_memory(mem).is_err() {
+            skipped += 1;
+            continue;
+        }
+        if latest_seen
+            .as_deref()
+            .is_none_or(|current| mem.updated_at.as_str() > current)
+        {
+            latest_seen = Some(mem.updated_at.clone());
+        }
+        if body.dry_run {
+            noop += 1;
+            continue;
+        }
+        match db::insert_if_newer(&lock.0, mem) {
+            Ok(_id) => applied += 1,
+            Err(e) => {
+                tracing::warn!("sync_push: insert_if_newer failed for {}: {e}", mem.id);
+                skipped += 1;
+            }
+        }
+    }
+
+    // Advance the vector clock with the highest `updated_at` we observed.
+    // Skipped in dry-run mode since the caller is only previewing.
+    if !body.dry_run
+        && let Some(at) = latest_seen.as_deref()
+        && let Err(e) = db::sync_state_observe(&lock.0, &local_agent_id, &body.sender_agent_id, at)
+    {
+        tracing::warn!("sync_push: sync_state_observe failed: {e}");
+    }
+
+    // Receiver's current clock, returned so the sender can learn which
+    // peers the receiver has seen. Phase 3 Task 3a.1 will use this to
+    // short-circuit redundant pushes.
+    let receiver_clock = db::sync_state_load(&lock.0, &local_agent_id)
+        .unwrap_or_else(|_| crate::models::VectorClock::default());
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "applied": applied,
+            "noop": noop,
+            "skipped": skipped,
+            "dry_run": body.dry_run,
+            "receiver_agent_id": local_agent_id,
+            "receiver_clock": receiver_clock,
+        })),
+    )
+        .into_response()
+}
+
+pub async fn sync_since(
+    State(state): State<Db>,
+    headers: HeaderMap,
+    Query(q): Query<SyncSinceQuery>,
+) -> impl IntoResponse {
+    // Validate `since` parses as RFC 3339 BEFORE hitting the DB so a
+    // garbage timestamp returns a clear 400 instead of a 200 with the
+    // entire database (red-team #247).
+    if let Some(ref s) = q.since
+        && !s.is_empty()
+        && chrono::DateTime::parse_from_rfc3339(s).is_err()
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "invalid `since` parameter — expected RFC 3339 timestamp"
+            })),
+        )
+            .into_response();
+    }
+    let limit = q.limit.unwrap_or(500).min(10_000);
+    let lock = state.lock().await;
+    let mems = match db::memories_updated_since(&lock.0, q.since.as_deref(), limit) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!("sync_since: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "internal server error"})),
+            )
+                .into_response();
+        }
+    };
+
+    // Record the puller as a peer so subsequent incremental push/pull
+    // pairs have a durable clock entry. Best-effort; don't fail the
+    // response if the side-effect write fails.
+    let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+    if let (Some(peer), Ok(local_agent_id)) = (
+        q.peer.as_deref(),
+        crate::identity::resolve_http_agent_id(None, header_agent_id),
+    ) && validate::validate_agent_id(peer).is_ok()
+        && let Some(last) = mems.last()
+        && let Err(e) = db::sync_state_observe(&lock.0, &local_agent_id, peer, &last.updated_at)
+    {
+        tracing::debug!("sync_since: sync_state_observe failed: {e}");
+    }
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "count": mems.len(),
+            "limit": limit,
+            "memories": mems,
+        })),
+    )
+        .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1035,7 +1826,7 @@ mod tests {
             metadata: serde_json::json!({}),
         };
         db::insert(&lock.0, &mem).unwrap();
-        let results = db::recall(
+        let (results, _tokens) = db::recall(
             &lock.0,
             "recall handler",
             Some("test"),
@@ -1045,6 +1836,8 @@ mod tests {
             None,
             crate::models::SHORT_TTL_EXTEND_SECS,
             crate::models::MID_TTL_EXTEND_SECS,
+            None,
+            None,
         )
         .unwrap();
         assert!(!results.is_empty());
@@ -1141,10 +1934,407 @@ mod tests {
         assert_eq!(got.metadata["updated_by"], "handler");
     }
 
-    // --- API key auth middleware tests ---
+    // --- AppState wiring tests (issue #219) ---
 
-    use axum::{Router, body::Body, routing::get as axum_get};
+    use axum::{Router, body::Body, routing::get as axum_get, routing::post as axum_post};
     use tower::ServiceExt as _;
+
+    fn test_app_state(db: Db) -> AppState {
+        AppState {
+            db,
+            embedder: Arc::new(None),
+            vector_index: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    #[tokio::test]
+    async fn http_create_memory_uses_appstate_and_persists() {
+        // Issue #219 regression — HTTP write path must reach `create_memory`
+        // via `State<AppState>` and return 201 CREATED. Previously the daemon
+        // held only `Db` and had no path to the embedder/vector index.
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/memories", axum_post(create_memory))
+            .with_state(test_app_state(state.clone()));
+
+        let body = serde_json::json!({
+            "tier": "long",
+            "namespace": "http-embed-test",
+            "title": "Semantic-ready via HTTP",
+            "content": "HTTP-authored memories must now participate in semantic recall.",
+            "tags": ["issue-219"],
+            "priority": 7,
+            "confidence": 1.0,
+            "source": "api",
+            "metadata": {}
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/memories")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .header("x-agent-id", "alice")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // And the row is present in the DB.
+        let lock = state.lock().await;
+        let rows = db::list(
+            &lock.0,
+            Some("http-embed-test"),
+            None,
+            10,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(!rows.is_empty(), "HTTP-authored memory must be persisted");
+        assert_eq!(rows[0].title, "Semantic-ready via HTTP");
+    }
+
+    #[tokio::test]
+    async fn http_update_memory_uses_appstate() {
+        // Issue #219 — update path must also route via `AppState` so the
+        // embedder and vector index are reachable for content-change refresh.
+        let state = test_state();
+        let now = Utc::now();
+        let id = {
+            let lock = state.lock().await;
+            let mem = Memory {
+                id: Uuid::new_v4().to_string(),
+                tier: Tier::Long,
+                namespace: "http-embed-test".into(),
+                title: "Before update".into(),
+                content: "Original content.".into(),
+                tags: vec![],
+                priority: 5,
+                confidence: 1.0,
+                source: "test".into(),
+                access_count: 0,
+                created_at: now.to_rfc3339(),
+                updated_at: now.to_rfc3339(),
+                last_accessed_at: None,
+                expires_at: None,
+                metadata: serde_json::json!({}),
+            };
+            db::insert(&lock.0, &mem).unwrap()
+        };
+
+        let app = Router::new()
+            .route("/api/v1/memories/{id}", axum::routing::put(update_memory))
+            .with_state(test_app_state(state.clone()));
+
+        let patch = serde_json::json!({"content": "Updated content for semantic refresh."});
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/api/v1/memories/{id}"))
+                    .method("PUT")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&patch).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // --- Phase 3 foundation HTTP sync tests (issue #224) ---
+
+    #[tokio::test]
+    async fn http_sync_push_applies_and_advances_clock() {
+        // Smoke test for POST /api/v1/sync/push — memories land in the
+        // receiver's DB and the vector clock records the sender's latest
+        // `updated_at`. Full CRDT semantics are the v0.8.0 follow-up.
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/sync/push", axum_post(sync_push))
+            .with_state(state.clone());
+
+        let now = Utc::now().to_rfc3339();
+        let body = serde_json::json!({
+            "sender_agent_id": "peer-alice",
+            "sender_clock": {"entries": {}},
+            "memories": [{
+                "id": Uuid::new_v4().to_string(),
+                "tier": "long",
+                "namespace": "sync-smoke",
+                "title": "From peer",
+                "content": "Pushed via HTTP sync endpoint.",
+                "tags": [],
+                "priority": 5,
+                "confidence": 1.0,
+                "source": "api",
+                "access_count": 0,
+                "created_at": now,
+                "updated_at": now,
+                "last_accessed_at": null,
+                "expires_at": null,
+                "metadata": {"agent_id": "peer-alice"}
+            }],
+            "dry_run": false
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/sync/push")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .header("x-agent-id", "local-receiver")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Row landed.
+        let lock = state.lock().await;
+        let rows = db::list(
+            &lock.0,
+            Some("sync-smoke"),
+            None,
+            10,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        // Clock advanced — peer-alice registered against local-receiver.
+        let clock = db::sync_state_load(&lock.0, "local-receiver").unwrap();
+        assert!(
+            clock.latest_from("peer-alice").is_some(),
+            "push must record sender in sync_state; got: {:?}",
+            clock.entries
+        );
+    }
+
+    #[tokio::test]
+    async fn http_sync_push_rejects_oversized_batch_redteam_242() {
+        // Red-team #242 — sync_push must cap memories per request, matching
+        // bulk-create's MAX_BULK_SIZE. Without this a malicious peer can
+        // flood the receiver and bottleneck the SQLite Mutex.
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/sync/push", axum_post(sync_push))
+            .with_state(state);
+        let now = Utc::now().to_rfc3339();
+        // Build MAX_BULK_SIZE + 1 entries (1001).
+        let mems: Vec<serde_json::Value> = (0..=MAX_BULK_SIZE)
+            .map(|i| {
+                serde_json::json!({
+                    "id": Uuid::new_v4().to_string(),
+                    "tier": "long",
+                    "namespace": "oversize",
+                    "title": format!("m{i}"),
+                    "content": "x",
+                    "tags": [],
+                    "priority": 5,
+                    "confidence": 1.0,
+                    "source": "api",
+                    "access_count": 0,
+                    "created_at": now,
+                    "updated_at": now,
+                    "last_accessed_at": null,
+                    "expires_at": null,
+                    "metadata": {}
+                })
+            })
+            .collect();
+        let body = serde_json::json!({
+            "sender_agent_id": "peer-flood",
+            "sender_clock": {"entries": {}},
+            "memories": mems,
+            "dry_run": false,
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/sync/push")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn http_sync_push_dry_run_applies_nothing() {
+        // Phase 3 — dry_run=true must not write.
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/sync/push", axum_post(sync_push))
+            .with_state(state.clone());
+
+        let now = Utc::now().to_rfc3339();
+        let body = serde_json::json!({
+            "sender_agent_id": "peer-bob",
+            "sender_clock": {"entries": {}},
+            "memories": [{
+                "id": Uuid::new_v4().to_string(),
+                "tier": "long",
+                "namespace": "sync-dryrun",
+                "title": "Must not land",
+                "content": "Preview only.",
+                "tags": [],
+                "priority": 5,
+                "confidence": 1.0,
+                "source": "api",
+                "access_count": 0,
+                "created_at": now,
+                "updated_at": now,
+                "last_accessed_at": null,
+                "expires_at": null,
+                "metadata": {}
+            }],
+            "dry_run": true
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/sync/push")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let lock = state.lock().await;
+        let rows = db::list(
+            &lock.0,
+            Some("sync-dryrun"),
+            None,
+            10,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(rows.is_empty(), "dry_run must not write rows");
+    }
+
+    #[tokio::test]
+    async fn http_sync_since_streams_new_memories_only() {
+        // Phase 3 — GET /api/v1/sync/since?since=<ts> returns only memories
+        // with updated_at > ts.
+        let state = test_state();
+        // Seed one old + one new memory.
+        let old_ts = "2020-01-01T00:00:00+00:00";
+        let new_ts = Utc::now().to_rfc3339();
+        {
+            let lock = state.lock().await;
+            for (title, ts) in [("old-mem", old_ts), ("new-mem", new_ts.as_str())] {
+                let mem = Memory {
+                    id: Uuid::new_v4().to_string(),
+                    tier: Tier::Long,
+                    namespace: "since-test".into(),
+                    title: title.into(),
+                    content: "body".into(),
+                    tags: vec![],
+                    priority: 5,
+                    confidence: 1.0,
+                    source: "api".into(),
+                    access_count: 0,
+                    created_at: ts.to_string(),
+                    updated_at: ts.to_string(),
+                    last_accessed_at: None,
+                    expires_at: None,
+                    metadata: serde_json::json!({}),
+                };
+                db::insert(&lock.0, &mem).unwrap();
+            }
+        }
+
+        let app = Router::new()
+            .route("/api/v1/sync/since", axum_get(sync_since))
+            .with_state(state);
+
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/sync/since?since=2020-06-01T00:00:00%2B00:00")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let titles: Vec<String> = v["memories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m["title"].as_str().map(str::to_string))
+            .collect();
+        assert_eq!(titles, vec!["new-mem".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn sync_since_rejects_garbage_timestamp_with_400() {
+        // Red-team #247 — `since=garbage` previously returned 200 with all
+        // memories. Now must return 400 with a clear error.
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/sync/since", axum_get(sync_since))
+            .with_state(state);
+
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/sync/since?since=not-a-date")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v["error"].as_str().unwrap().contains("RFC 3339"));
+    }
+
+    #[tokio::test]
+    async fn sync_state_observe_is_monotonic() {
+        // Phase 3 — clock advancement must never go backwards.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let older = "2020-01-01T00:00:00+00:00";
+        let newer = "2026-04-17T00:00:00+00:00";
+
+        db::sync_state_observe(&conn, "local", "peer-a", newer).unwrap();
+        // A subsequent older observation must NOT overwrite.
+        db::sync_state_observe(&conn, "local", "peer-a", older).unwrap();
+        let clock = db::sync_state_load(&conn, "local").unwrap();
+        assert_eq!(clock.latest_from("peer-a"), Some(newer));
+    }
+
+    // --- API key auth middleware tests ---
 
     async fn dummy_handler() -> impl IntoResponse {
         (StatusCode::OK, "ok")

@@ -351,6 +351,107 @@ impl ResolvedTtl {
 }
 
 // ---------------------------------------------------------------------------
+// Recall scoring (time-decay half-life) — v0.6.0.0
+// ---------------------------------------------------------------------------
+
+/// Per-tier half-life (days) overrides loaded from `[scoring]` section of
+/// `config.toml`.
+///
+/// The half-life is the number of days it takes for a memory's recall score
+/// to drop to 50% of its undecayed value. Shorter half-lives prioritize fresh
+/// memories; longer half-lives give older memories more weight. Defaults are
+/// chosen so each tier's decay curve matches its retention expectations:
+/// `short` memories decay quickly (7 d), `mid` moderately (30 d), `long`
+/// slowly (365 d).
+///
+/// Setting `legacy_scoring = true` disables the decay multiplier entirely,
+/// restoring the pre-v0.6.0.0 blended-score behavior for A/B comparison or
+/// if a recall-quality regression is reported.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RecallScoringConfig {
+    /// Half-life for `short`-tier memories, in days (default 7).
+    pub half_life_days_short: Option<f64>,
+    /// Half-life for `mid`-tier memories, in days (default 30).
+    pub half_life_days_mid: Option<f64>,
+    /// Half-life for `long`-tier memories, in days (default 365).
+    pub half_life_days_long: Option<f64>,
+    /// When true, skip the decay multiplier entirely. Default false.
+    #[serde(default)]
+    pub legacy_scoring: bool,
+}
+
+/// Resolved scoring values after merging config overrides with compiled
+/// defaults. Half-lives are clamped to the range `[0.1, 36_500.0]` days
+/// (≈100 years) to keep the decay math well-behaved.
+#[derive(Debug, Clone, Copy)]
+pub struct ResolvedScoring {
+    pub half_life_days_short: f64,
+    pub half_life_days_mid: f64,
+    pub half_life_days_long: f64,
+    pub legacy_scoring: bool,
+}
+
+impl Default for ResolvedScoring {
+    fn default() -> Self {
+        Self {
+            half_life_days_short: 7.0,
+            half_life_days_mid: 30.0,
+            half_life_days_long: 365.0,
+            legacy_scoring: false,
+        }
+    }
+}
+
+impl ResolvedScoring {
+    const MIN_HALF_LIFE: f64 = 0.1;
+    const MAX_HALF_LIFE: f64 = 36_500.0;
+
+    /// Build from optional config overrides, falling back to compiled
+    /// defaults. Out-of-range values are silently clamped.
+    pub fn from_config(cfg: Option<&RecallScoringConfig>) -> Self {
+        let defaults = Self::default();
+        let Some(c) = cfg else {
+            return defaults;
+        };
+        let clamp = |v: f64| -> f64 { v.clamp(Self::MIN_HALF_LIFE, Self::MAX_HALF_LIFE) };
+        Self {
+            half_life_days_short: c
+                .half_life_days_short
+                .map_or(defaults.half_life_days_short, clamp),
+            half_life_days_mid: c
+                .half_life_days_mid
+                .map_or(defaults.half_life_days_mid, clamp),
+            half_life_days_long: c
+                .half_life_days_long
+                .map_or(defaults.half_life_days_long, clamp),
+            legacy_scoring: c.legacy_scoring,
+        }
+    }
+
+    /// Half-life in days for a given tier.
+    pub fn half_life_for_tier(&self, tier: &Tier) -> f64 {
+        match tier {
+            Tier::Short => self.half_life_days_short,
+            Tier::Mid => self.half_life_days_mid,
+            Tier::Long => self.half_life_days_long,
+        }
+    }
+
+    /// Compute the decay multiplier `exp(-ln(2) * age_days / half_life)`
+    /// for a memory of the given tier and age. Returns `1.0` when
+    /// `legacy_scoring` is true (no decay) or when `age_days` is non-positive
+    /// (future timestamps, clock skew, or new memories).
+    #[must_use]
+    pub fn decay_multiplier(&self, tier: &Tier, age_days: f64) -> f64 {
+        if self.legacy_scoring || age_days <= 0.0 {
+            return 1.0;
+        }
+        let half_life = self.half_life_for_tier(tier);
+        (-std::f64::consts::LN_2 * age_days / half_life).exp()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Persistent config file (~/.config/ai-memory/config.toml)
 // ---------------------------------------------------------------------------
 
@@ -389,6 +490,32 @@ pub struct AppConfig {
     pub api_key: Option<String>,
     /// Maximum archive age in days for automatic purge during GC (default: disabled)
     pub archive_max_days: Option<i64>,
+    /// Identity-resolution overrides (Task 1.2 follow-up #198).
+    pub identity: Option<IdentityConfig>,
+    /// Recall scoring — per-tier half-life for time-decay, and `legacy_scoring`
+    /// kill switch (v0.6.0.0).
+    pub scoring: Option<RecallScoringConfig>,
+    /// v0.6.0.0: when true, fire LLM autonomy hooks (`auto_tag` +
+    /// `detect_contradiction`) synchronously on every successful
+    /// `memory_store`. Off by default — the hook blocks store latency
+    /// behind an Ollama round-trip. `AI_MEMORY_AUTONOMOUS_HOOKS=1`
+    /// env var overrides the config file.
+    pub autonomous_hooks: Option<bool>,
+}
+
+/// Identity-resolution configuration (Task 1.2 follow-up #198).
+///
+/// Lets operators opt out of the default `host:<hostname>:pid-<pid>-<uuid8>`
+/// fallback when no explicit `agent_id` is supplied. `anonymize_default = true`
+/// swaps the hostname-revealing default for `anonymous:pid-<pid>-<uuid8>`,
+/// matching what the `AI_MEMORY_ANONYMIZE=1` env var does ephemerally.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct IdentityConfig {
+    /// When true, the "no flag, no env, no MCP clientInfo" fallback uses
+    /// `anonymous:pid-<pid>-<uuid8>` instead of the hostname-revealing
+    /// `host:<hostname>:pid-<pid>-<uuid8>`. Default false.
+    #[serde(default)]
+    pub anonymize_default: bool,
 }
 
 impl AppConfig {
@@ -458,9 +585,48 @@ impl AppConfig {
         ResolvedTtl::from_config(self.ttl.as_ref())
     }
 
+    /// Resolve recall-scoring configuration (time-decay half-life) from the
+    /// config file, falling back to compiled defaults. v0.6.0.0.
+    pub fn effective_scoring(&self) -> ResolvedScoring {
+        ResolvedScoring::from_config(self.scoring.as_ref())
+    }
+
     /// Whether to archive memories before GC deletion (default: true).
     pub fn effective_archive_on_gc(&self) -> bool {
         self.archive_on_gc.unwrap_or(true)
+    }
+
+    /// Whether post-store autonomy hooks (`auto_tag` + `detect_contradiction`)
+    /// fire on every successful `memory_store`. v0.6.0.0.
+    /// Precedence: `AI_MEMORY_AUTONOMOUS_HOOKS=1` env var (truthy) >
+    /// config file > default false. `AI_MEMORY_AUTONOMOUS_HOOKS=0` also
+    /// honored for explicit-off.
+    pub fn effective_autonomous_hooks(&self) -> bool {
+        if let Ok(v) = std::env::var("AI_MEMORY_AUTONOMOUS_HOOKS") {
+            let v = v.trim().to_ascii_lowercase();
+            if matches!(v.as_str(), "1" | "true" | "yes" | "on") {
+                return true;
+            }
+            if matches!(v.as_str(), "0" | "false" | "no" | "off" | "") {
+                return false;
+            }
+        }
+        self.autonomous_hooks.unwrap_or(false)
+    }
+
+    /// Whether to anonymize the default `agent_id` fallback (Task 1.2 #198).
+    /// Precedence: `AI_MEMORY_ANONYMIZE=1` env var (truthy) > config file > default false.
+    pub fn effective_anonymize_default(&self) -> bool {
+        if let Ok(v) = std::env::var("AI_MEMORY_ANONYMIZE") {
+            let v = v.trim().to_ascii_lowercase();
+            if matches!(v.as_str(), "1" | "true" | "yes" | "on") {
+                return true;
+            }
+            if matches!(v.as_str(), "0" | "false" | "no" | "off" | "") {
+                return false;
+            }
+        }
+        self.identity.as_ref().is_some_and(|i| i.anonymize_default)
     }
 
     /// Resolve URL for embedding model (falls back to `ollama_url`).
@@ -703,5 +869,112 @@ mod tests {
         );
         // Config value used when no CLI
         assert_eq!(cfg.effective_tier(None), FeatureTier::Smart);
+    }
+
+    // --- v0.6.0.0 recall scoring (time-decay half-life) ---
+
+    #[test]
+    fn scoring_defaults_match_spec() {
+        let s = ResolvedScoring::default();
+        assert!((s.half_life_days_short - 7.0).abs() < f64::EPSILON);
+        assert!((s.half_life_days_mid - 30.0).abs() < f64::EPSILON);
+        assert!((s.half_life_days_long - 365.0).abs() < f64::EPSILON);
+        assert!(!s.legacy_scoring);
+    }
+
+    #[test]
+    fn scoring_from_config_overrides() {
+        let cfg = RecallScoringConfig {
+            half_life_days_short: Some(3.5),
+            half_life_days_mid: Some(14.0),
+            half_life_days_long: Some(730.0),
+            legacy_scoring: false,
+        };
+        let s = ResolvedScoring::from_config(Some(&cfg));
+        assert!((s.half_life_days_short - 3.5).abs() < f64::EPSILON);
+        assert!((s.half_life_days_mid - 14.0).abs() < f64::EPSILON);
+        assert!((s.half_life_days_long - 730.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn scoring_clamps_out_of_range() {
+        let cfg = RecallScoringConfig {
+            half_life_days_short: Some(-10.0),
+            half_life_days_mid: Some(0.0),
+            half_life_days_long: Some(1_000_000.0),
+            legacy_scoring: false,
+        };
+        let s = ResolvedScoring::from_config(Some(&cfg));
+        assert!(s.half_life_days_short >= ResolvedScoring::MIN_HALF_LIFE);
+        assert!(s.half_life_days_mid >= ResolvedScoring::MIN_HALF_LIFE);
+        assert!(s.half_life_days_long <= ResolvedScoring::MAX_HALF_LIFE);
+    }
+
+    #[test]
+    fn scoring_decay_at_half_life_is_half() {
+        let s = ResolvedScoring::default();
+        // Short tier half-life is 7 days → at age=7d, decay=0.5
+        let d = s.decay_multiplier(&Tier::Short, 7.0);
+        assert!((d - 0.5).abs() < 1e-9);
+        let d = s.decay_multiplier(&Tier::Mid, 30.0);
+        assert!((d - 0.5).abs() < 1e-9);
+        let d = s.decay_multiplier(&Tier::Long, 365.0);
+        assert!((d - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn scoring_decay_monotonic() {
+        let s = ResolvedScoring::default();
+        let d_new = s.decay_multiplier(&Tier::Mid, 1.0);
+        let d_old = s.decay_multiplier(&Tier::Mid, 60.0);
+        // Older memories decay more (lower multiplier).
+        assert!(d_new > d_old);
+        assert!(d_new < 1.0);
+        assert!(d_old > 0.0);
+    }
+
+    #[test]
+    fn scoring_decay_zero_age_is_one() {
+        let s = ResolvedScoring::default();
+        assert!((s.decay_multiplier(&Tier::Short, 0.0) - 1.0).abs() < f64::EPSILON);
+        // Negative ages (clock skew, future timestamps) are also treated as fresh.
+        assert!((s.decay_multiplier(&Tier::Short, -5.0) - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn scoring_legacy_disables_decay() {
+        let cfg = RecallScoringConfig {
+            legacy_scoring: true,
+            ..Default::default()
+        };
+        let s = ResolvedScoring::from_config(Some(&cfg));
+        // No decay regardless of age.
+        assert!((s.decay_multiplier(&Tier::Short, 100.0) - 1.0).abs() < f64::EPSILON);
+        assert!((s.decay_multiplier(&Tier::Mid, 1000.0) - 1.0).abs() < f64::EPSILON);
+        assert!((s.decay_multiplier(&Tier::Long, 10_000.0) - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn effective_scoring_on_empty_config() {
+        let cfg = AppConfig::default();
+        let s = cfg.effective_scoring();
+        assert_eq!(s.half_life_days_short, 7.0);
+        assert!(!s.legacy_scoring);
+    }
+
+    #[test]
+    fn scoring_roundtrip_through_toml() {
+        let toml_src = r#"
+[scoring]
+half_life_days_short = 5.0
+half_life_days_mid = 25.0
+legacy_scoring = false
+"#;
+        let cfg: AppConfig = toml::from_str(toml_src).expect("parses");
+        let s = cfg.effective_scoring();
+        assert!((s.half_life_days_short - 5.0).abs() < f64::EPSILON);
+        assert!((s.half_life_days_mid - 25.0).abs() < f64::EPSILON);
+        // Unset long defaults.
+        assert!((s.half_life_days_long - 365.0).abs() < f64::EPSILON);
     }
 }

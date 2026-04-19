@@ -215,23 +215,37 @@ fn test_gc_removes_expired() {
 
 #[test]
 fn test_content_size_limit() {
+    use std::io::Write;
     let binary = env!("CARGO_BIN_EXE_ai-memory");
     let dir = std::env::temp_dir();
     let db_path = dir.join(format!("ai-memory-size-test-{}.db", uuid::Uuid::new_v4()));
 
     let huge_content = "x".repeat(70_000);
-    let output = cmd(binary)
+    // Pipe huge content via stdin (-c -) to avoid Windows' ~8191-char argv
+    // limit on CreateProcess (ERROR_FILENAME_EXCED_RANGE / code 206).
+    let mut child = cmd(binary)
         .args([
             "--db",
             db_path.to_str().unwrap(),
             "store",
             "-T",
             "too big",
-            "--content",
-            &huge_content,
+            "-c",
+            "-",
         ])
-        .output()
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(huge_content.as_bytes())
+        .unwrap();
+    drop(child.stdin.take());
+    let output = child.wait_with_output().unwrap();
     assert!(!output.status.success(), "should reject oversized content");
 
     let _ = std::fs::remove_file(&db_path);
@@ -390,23 +404,36 @@ fn test_reject_bad_namespace() {
 
 #[test]
 fn test_reject_oversized_content() {
+    use std::io::Write;
     let binary = env!("CARGO_BIN_EXE_ai-memory");
     let dir = std::env::temp_dir();
     let db_path = dir.join(format!("ai-memory-val-size-{}.db", uuid::Uuid::new_v4()));
 
     let huge = "x".repeat(70_000);
-    let output = cmd(binary)
+    // Pipe via stdin (-c -) for Windows argv-length compatibility.
+    let mut child = cmd(binary)
         .args([
             "--db",
             db_path.to_str().unwrap(),
             "store",
             "-T",
             "huge",
-            "--content",
-            &huge,
+            "-c",
+            "-",
         ])
-        .output()
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(huge.as_bytes())
+        .unwrap();
+    drop(child.stdin.take());
+    let output = child.wait_with_output().unwrap();
     assert!(!output.status.success(), "should reject oversized content");
 
     let _ = std::fs::remove_file(&db_path);
@@ -1808,7 +1835,7 @@ fn test_mcp_tools_list() {
     let tools = resp["result"]["tools"]
         .as_array()
         .expect("tools should be array");
-    assert_eq!(tools.len(), 26, "expected 26 MCP tools");
+    assert_eq!(tools.len(), 36, "expected 36 MCP tools");
 
     let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
     assert!(tool_names.contains(&"memory_store"));
@@ -1824,6 +1851,13 @@ fn test_mcp_tools_list() {
     assert!(tool_names.contains(&"memory_link"));
     assert!(tool_names.contains(&"memory_get_links"));
     assert!(tool_names.contains(&"memory_consolidate"));
+    assert!(tool_names.contains(&"memory_agent_register"));
+    assert!(tool_names.contains(&"memory_agent_list"));
+    assert!(tool_names.contains(&"memory_notify"));
+    assert!(tool_names.contains(&"memory_inbox"));
+    assert!(tool_names.contains(&"memory_subscribe"));
+    assert!(tool_names.contains(&"memory_unsubscribe"));
+    assert!(tool_names.contains(&"memory_list_subscriptions"));
 
     let _ = std::fs::remove_file(&db_path);
 }
@@ -2402,15 +2436,18 @@ fn test_promote_clears_expires_at() {
 }
 
 #[test]
-fn test_version_flag_patch6() {
+fn test_version_flag_matches_cargo_pkg_version() {
+    // Pin the CLI --version output to whatever Cargo.toml says, so the test
+    // stays green across release-train bumps (0.5.4-patch.6 → 0.6.0-alpha.0
+    // → 0.6.0-alpha.1 → …) without having to be re-hardcoded each time.
     let binary = env!("CARGO_BIN_EXE_ai-memory");
+    let expected = env!("CARGO_PKG_VERSION");
     let output = cmd(binary).args(["--version"]).output().unwrap();
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("0.5.4-patch.6"),
-        "version should be 0.5.4-patch.6, got: {}",
-        stdout
+        stdout.contains(expected),
+        "--version output should contain CARGO_PKG_VERSION ({expected}), got: {stdout}"
     );
 }
 
@@ -3834,4 +3871,4437 @@ fn test_mine_stamps_caller_agent_id() {
 
     let _ = std::fs::remove_file(&db_path);
     let _ = std::fs::remove_dir_all(&mine_dir);
+}
+
+/// Task 1.2 coverage gap: verify `metadata.agent_id` is present in the
+/// `memory_recall` response shape. The spec deliberately excluded the recall
+/// path from `--agent-id` filtering, but the field still needs to be visible
+/// in the response for downstream tooling to act on provenance.
+#[test]
+fn test_agentid_visible_in_recall_response() {
+    let binary = env!("CARGO_BIN_EXE_ai-memory");
+    let db_path = fresh_db();
+
+    // Store two memories by different agents. Using non-hyphenated tokens so
+    // FTS5 tokenizer doesn't split them.
+    for (agent, title) in [("alice", "RecallAgentATitle"), ("bob", "RecallAgentBTitle")] {
+        let out = cmd(binary)
+            .args([
+                "--db",
+                db_path.to_str().unwrap(),
+                "--agent-id",
+                agent,
+                "--json",
+                "store",
+                "-T",
+                title,
+                "-c",
+                "DistinctiveRecallToken body content",
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+    }
+
+    // Recall via MCP in JSON format — agent_id must be visible on every returned memory.
+    let req1 = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+    let req2 = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_recall","arguments":{"context":"DistinctiveRecallToken","format":"json"}}}"#;
+
+    let output = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "mcp",
+            "--tier",
+            "keyword",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            if let Some(ref mut stdin) = child.stdin {
+                writeln!(stdin, "{req1}").ok();
+                writeln!(stdin, "{req2}").ok();
+            }
+            drop(child.stdin.take());
+            child.wait_with_output()
+        })
+        .expect("failed to run mcp");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let last_line = stdout.trim().lines().last().unwrap();
+    let resp: serde_json::Value = serde_json::from_str(last_line).unwrap();
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let data: serde_json::Value = serde_json::from_str(text).unwrap();
+    let memories = data["memories"].as_array().expect("memories array");
+    assert!(
+        memories.len() >= 2,
+        "recall should return both memories, got: {data}"
+    );
+
+    let agents: Vec<String> = memories
+        .iter()
+        .filter_map(|m| m["metadata"]["agent_id"].as_str().map(ToString::to_string))
+        .collect();
+    assert!(
+        agents.contains(&"alice".to_string()),
+        "recall memories must include alice's agent_id, got: {agents:?}"
+    );
+    assert!(
+        agents.contains(&"bob".to_string()),
+        "recall memories must include bob's agent_id, got: {agents:?}"
+    );
+
+    let _ = std::fs::remove_file(&db_path);
+}
+
+/// Task 1.2 coverage gap: verify `agent_id` round-trips through both TOON
+/// non-compact (`format: "toon"`) and JSON formats. TOON **compact** format
+/// deliberately omits `metadata` for token efficiency (see src/toon.rs
+/// `MEMORY_FIELDS_COMPACT`), so `agent_id` is NOT visible in that format —
+/// that's a known tradeoff tracked separately. This test pins the two formats
+/// where agent_id must show up.
+#[test]
+fn test_agentid_visible_in_toon_and_json() {
+    let binary = env!("CARGO_BIN_EXE_ai-memory");
+    let db_path = fresh_db();
+
+    let out = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--agent-id",
+            "toon-alice",
+            "--json",
+            "store",
+            "-T",
+            "ToonTestMemoryTitle",
+            "-c",
+            "ToonDistinctiveContent body",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    // Non-compact TOON — metadata column present, agent_id must appear.
+    let req1 = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+    let req_toon = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_list","arguments":{"format":"toon"}}}"#;
+    let req_json = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"memory_list","arguments":{"format":"json"}}}"#;
+
+    let output = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "mcp",
+            "--tier",
+            "keyword",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            if let Some(ref mut stdin) = child.stdin {
+                writeln!(stdin, "{req1}").ok();
+                writeln!(stdin, "{req_toon}").ok();
+                writeln!(stdin, "{req_json}").ok();
+            }
+            drop(child.stdin.take());
+            child.wait_with_output()
+        })
+        .expect("failed to run mcp");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert!(
+        lines.len() >= 3,
+        "expected 3 responses (init+2 tools), got:\n{stdout}"
+    );
+
+    // lines[0] = initialize response; lines[1] = TOON tool call; lines[2] = JSON tool call.
+    // TOON (non-compact)
+    let resp_toon: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    let text_toon = resp_toon["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text_toon.contains("toon-alice"),
+        "TOON (non-compact) must surface agent_id within metadata; got:\n{text_toon}"
+    );
+
+    // JSON
+    let resp_json: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
+    let text_json = resp_json["result"]["content"][0]["text"].as_str().unwrap();
+    let data: serde_json::Value = serde_json::from_str(text_json).unwrap();
+    let stored_agent = data["memories"][0]["metadata"]["agent_id"].as_str();
+    assert_eq!(
+        stored_agent,
+        Some("toon-alice"),
+        "JSON response must surface agent_id; got:\n{data}"
+    );
+
+    let _ = std::fs::remove_file(&db_path);
+}
+
+// ---------------------------------------------------------------------------
+// Task 1.3 — Agent Registration
+// ---------------------------------------------------------------------------
+
+fn fresh_agent_db() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("ai-memory-agentreg-{}.db", uuid::Uuid::new_v4()))
+}
+
+fn register_via_cli(
+    binary: &str,
+    db_path: &std::path::Path,
+    agent_id: &str,
+    agent_type: &str,
+    capabilities: &str,
+) -> std::process::Output {
+    cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--json",
+            "agents",
+            "register",
+            "--agent-id",
+            agent_id,
+            "--agent-type",
+            agent_type,
+            "--capabilities",
+            capabilities,
+        ])
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn test_agent_register_and_list() {
+    let db_path = fresh_agent_db();
+    let binary = env!("CARGO_BIN_EXE_ai-memory");
+
+    let out = register_via_cli(
+        binary,
+        &db_path,
+        "alice",
+        "ai:claude-opus-4.6",
+        "recall,store",
+    );
+    assert!(
+        out.status.success(),
+        "register failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let reg: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(reg["registered"], true);
+    assert_eq!(reg["agent_id"], "alice");
+    assert_eq!(reg["agent_type"], "ai:claude-opus-4.6");
+
+    let out = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--json",
+            "agents",
+            "list",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let listed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(listed["count"], 1);
+    let first = &listed["agents"][0];
+    assert_eq!(first["agent_id"], "alice");
+    assert_eq!(first["agent_type"], "ai:claude-opus-4.6");
+    assert_eq!(first["capabilities"][0], "recall");
+    assert_eq!(first["capabilities"][1], "store");
+    assert!(first["registered_at"].as_str().unwrap().contains('T'));
+    assert!(first["last_seen_at"].as_str().unwrap().contains('T'));
+    let _ = std::fs::remove_file(&db_path);
+}
+
+#[test]
+fn test_agent_register_duplicate_preserves_registered_at() {
+    let db_path = fresh_agent_db();
+    let binary = env!("CARGO_BIN_EXE_ai-memory");
+
+    let _ = register_via_cli(binary, &db_path, "bob", "ai:codex-5.4", "search");
+    // Read back the original registered_at
+    let out1 = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--json",
+            "agents",
+            "list",
+        ])
+        .output()
+        .unwrap();
+    let listed1: serde_json::Value = serde_json::from_slice(&out1.stdout).unwrap();
+    let reg_at_1 = listed1["agents"][0]["registered_at"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Sleep enough that now() moves forward
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    // Re-register with a different type + capabilities
+    let out2 = register_via_cli(binary, &db_path, "bob", "human", "review,approve");
+    assert!(out2.status.success());
+
+    let out3 = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--json",
+            "agents",
+            "list",
+        ])
+        .output()
+        .unwrap();
+    let listed2: serde_json::Value = serde_json::from_slice(&out3.stdout).unwrap();
+    assert_eq!(listed2["count"], 1, "duplicate must upsert, not append");
+    let row = &listed2["agents"][0];
+    assert_eq!(
+        row["agent_type"], "human",
+        "agent_type updates on re-register"
+    );
+    assert_eq!(row["capabilities"][0], "review");
+    assert_eq!(
+        row["registered_at"].as_str().unwrap(),
+        reg_at_1,
+        "registered_at preserved across re-register"
+    );
+    assert_ne!(
+        row["last_seen_at"].as_str().unwrap(),
+        reg_at_1,
+        "last_seen_at bumps on re-register"
+    );
+    let _ = std::fs::remove_file(&db_path);
+}
+
+#[test]
+fn test_agent_register_rejects_invalid_type() {
+    let db_path = fresh_agent_db();
+    let binary = env!("CARGO_BIN_EXE_ai-memory");
+
+    let out = register_via_cli(binary, &db_path, "carol", "bogus-type", "");
+    assert!(
+        !out.status.success(),
+        "invalid agent_type should exit non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("invalid agent_type"),
+        "expected validation message, got: {stderr}"
+    );
+
+    // Confirm no row was created.
+    let out = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--json",
+            "agents",
+            "list",
+        ])
+        .output()
+        .unwrap();
+    let listed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(listed["count"], 0);
+    let _ = std::fs::remove_file(&db_path);
+}
+
+#[test]
+fn test_agent_register_rejects_invalid_agent_id() {
+    let db_path = fresh_agent_db();
+    let binary = env!("CARGO_BIN_EXE_ai-memory");
+
+    let out = register_via_cli(binary, &db_path, "evil;id", "system", "");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.to_lowercase().contains("agent_id"),
+        "expected agent_id validation message, got: {stderr}"
+    );
+    let _ = std::fs::remove_file(&db_path);
+}
+
+#[test]
+fn test_agents_list_uses_reserved_namespace() {
+    let db_path = fresh_agent_db();
+    let binary = env!("CARGO_BIN_EXE_ai-memory");
+
+    let _ = register_via_cli(binary, &db_path, "dave", "system", "heartbeat");
+
+    // Agent row lives in the _agents namespace
+    let out = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--json",
+            "list",
+            "-n",
+            "_agents",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let listed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let count = listed["count"].as_u64().unwrap_or(0);
+    assert_eq!(count, 1, "agent must occupy _agents namespace");
+
+    let title = listed["memories"][0]["title"].as_str().unwrap_or("");
+    assert_eq!(title, "agent:dave");
+
+    let agent_type = listed["memories"][0]["metadata"]["agent_type"]
+        .as_str()
+        .unwrap_or("");
+    assert_eq!(agent_type, "system");
+
+    // And does NOT appear under the default (global) namespace
+    let out = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--json",
+            "list",
+            "-n",
+            "global",
+        ])
+        .output()
+        .unwrap();
+    let listed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(listed["count"].as_u64().unwrap_or(0), 0);
+    let _ = std::fs::remove_file(&db_path);
+}
+
+#[test]
+fn test_mcp_agent_register_and_list() {
+    use std::io::Write;
+    let db_path = fresh_agent_db();
+    let binary = env!("CARGO_BIN_EXE_ai-memory");
+
+    let mut child = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "mcp",
+            "--tier",
+            "keyword",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let stdin = child.stdin.as_mut().unwrap();
+    let init = serde_json::json!({
+        "jsonrpc":"2.0","id":1,"method":"initialize",
+        "params":{"clientInfo":{"name":"test-suite","version":"1.0"}}
+    });
+    writeln!(stdin, "{init}").unwrap();
+
+    let reg = serde_json::json!({
+        "jsonrpc":"2.0","id":2,"method":"tools/call",
+        "params":{
+            "name":"memory_agent_register",
+            "arguments":{
+                "agent_id":"mcp-eve",
+                "agent_type":"ai:grok-4.2",
+                "capabilities":["code","chat"]
+            }
+        }
+    });
+    writeln!(stdin, "{reg}").unwrap();
+
+    let list = serde_json::json!({
+        "jsonrpc":"2.0","id":3,"method":"tools/call",
+        "params":{"name":"memory_agent_list","arguments":{}}
+    });
+    writeln!(stdin, "{list}").unwrap();
+    stdin.flush().unwrap();
+    drop(child.stdin.take());
+
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert!(
+        lines.len() >= 3,
+        "expected 3 JSON-RPC responses, got {}:\n{stdout}",
+        lines.len()
+    );
+
+    let reg_resp: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    let reg_text = reg_resp["result"]["content"][0]["text"].as_str().unwrap();
+    let reg_json: serde_json::Value = serde_json::from_str(reg_text).unwrap();
+    assert_eq!(reg_json["registered"], true);
+    assert_eq!(reg_json["agent_id"], "mcp-eve");
+
+    let list_resp: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
+    let list_text = list_resp["result"]["content"][0]["text"].as_str().unwrap();
+    let list_json: serde_json::Value = serde_json::from_str(list_text).unwrap();
+    assert_eq!(list_json["count"], 1);
+    assert_eq!(list_json["agents"][0]["agent_id"], "mcp-eve");
+    assert_eq!(list_json["agents"][0]["agent_type"], "ai:grok-4.2");
+    let caps = list_json["agents"][0]["capabilities"].as_array().unwrap();
+    assert_eq!(caps.len(), 2);
+
+    let _ = std::fs::remove_file(&db_path);
+}
+
+// ---------------------------------------------------------------------------
+// Task 1.2 follow-ups (#196-#199)
+// ---------------------------------------------------------------------------
+
+fn fresh_followup_db() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("ai-memory-followup-{}.db", uuid::Uuid::new_v4()))
+}
+
+#[test]
+fn test_196_cli_store_echoes_agent_id() {
+    // CLI already returned full metadata.agent_id pre-#196; this locks in the
+    // behavior so a future refactor doesn't regress it.
+    let db_path = fresh_followup_db();
+    let binary = env!("CARGO_BIN_EXE_ai-memory");
+    let out = cmd(binary)
+        .env_remove("AI_MEMORY_AGENT_ID")
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--agent-id",
+            "echo-test",
+            "--json",
+            "store",
+            "-T",
+            "echo-probe",
+            "-c",
+            "content",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["metadata"]["agent_id"], "echo-test");
+    let _ = std::fs::remove_file(&db_path);
+}
+
+#[test]
+fn test_196_mcp_store_echoes_resolved_agent_id() {
+    use std::io::Write;
+    let db_path = fresh_followup_db();
+    let binary = env!("CARGO_BIN_EXE_ai-memory");
+
+    let mut child = cmd(binary)
+        .env_remove("AI_MEMORY_AGENT_ID")
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "mcp",
+            "--tier",
+            "keyword",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdin = child.stdin.as_mut().unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "jsonrpc":"2.0","id":1,"method":"initialize",
+            "params":{"clientInfo":{"name":"echo-test","version":"1"}}
+        })
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"memory_store","arguments":{
+                "title":"echo-mcp","content":"hi","agent_id":"mcp-echo"
+            }}
+        })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    drop(child.stdin.take());
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    let resp: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let body: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(
+        body["agent_id"], "mcp-echo",
+        "#196: MCP memory_store must echo agent_id in response"
+    );
+    let _ = std::fs::remove_file(&db_path);
+}
+
+#[test]
+fn test_197_cli_list_rejects_invalid_agent_id_filter() {
+    let db_path = fresh_followup_db();
+    let binary = env!("CARGO_BIN_EXE_ai-memory");
+    let out = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "list",
+            "--agent-id",
+            "alice bob",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "#197: list must reject invalid agent_id filter with non-zero exit"
+    );
+    let err = String::from_utf8_lossy(&out.stderr).to_lowercase();
+    assert!(
+        err.contains("agent_id"),
+        "expected agent_id validation message, got: {err}"
+    );
+    let _ = std::fs::remove_file(&db_path);
+}
+
+#[test]
+fn test_197_cli_search_rejects_invalid_agent_id_filter() {
+    let db_path = fresh_followup_db();
+    let binary = env!("CARGO_BIN_EXE_ai-memory");
+    let out = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "search",
+            "foo",
+            "--agent-id",
+            "evil;id",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "#197: search must reject invalid agent_id filter"
+    );
+    let _ = std::fs::remove_file(&db_path);
+}
+
+#[test]
+fn test_197_mcp_list_rejects_invalid_agent_id_filter() {
+    use std::io::Write;
+    let db_path = fresh_followup_db();
+    let binary = env!("CARGO_BIN_EXE_ai-memory");
+
+    let mut child = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "mcp",
+            "--tier",
+            "keyword",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdin = child.stdin.as_mut().unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"memory_list","arguments":{"agent_id":"alice bob"}}
+        })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    drop(child.stdin.take());
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    let resp: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    // MCP tool errors surface via result.isError=true + error text.
+    let is_error = resp["result"]["isError"].as_bool().unwrap_or(false);
+    assert!(
+        is_error,
+        "#197: MCP memory_list must return isError=true for invalid agent_id filter; got: {resp}"
+    );
+    let _ = std::fs::remove_file(&db_path);
+}
+
+#[test]
+fn test_198_anonymize_env_skips_host_fallback() {
+    let db_path = fresh_followup_db();
+    let binary = env!("CARGO_BIN_EXE_ai-memory");
+
+    let out = cmd(binary)
+        .env_remove("AI_MEMORY_AGENT_ID")
+        .env("AI_MEMORY_ANONYMIZE", "1")
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--json",
+            "store",
+            "-T",
+            "anon-probe",
+            "-c",
+            "content",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "store failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let id = v["metadata"]["agent_id"].as_str().unwrap_or("");
+    assert!(
+        id.starts_with("anonymous:"),
+        "#198: AI_MEMORY_ANONYMIZE=1 must collapse fallback to anonymous:; got: {id}"
+    );
+    assert!(!id.starts_with("host:"), "must not leak hostname");
+    let _ = std::fs::remove_file(&db_path);
+}
+
+#[test]
+fn test_199_toon_compact_surfaces_agent_id() {
+    // Build a minimal response object and render via the library's TOON path
+    // by exercising `memory_list` through the MCP surface with format=toon_compact.
+    use std::io::Write;
+    let db_path = fresh_followup_db();
+    let binary = env!("CARGO_BIN_EXE_ai-memory");
+
+    // Seed a memory stamped with a known agent_id via CLI (fast), then verify
+    // TOON compact output surfaces it.
+    let seed = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--agent-id",
+            "toon-agent",
+            "store",
+            "-T",
+            "toon-compact-probe",
+            "-c",
+            "hi",
+            "-n",
+            "toon-ns",
+        ])
+        .output()
+        .unwrap();
+    assert!(seed.status.success());
+
+    let mut child = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "mcp",
+            "--tier",
+            "keyword",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdin = child.stdin.as_mut().unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"memory_list","arguments":{
+                "namespace":"toon-ns","format":"toon_compact"
+            }}
+        })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    drop(child.stdin.take());
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    let resp: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    // Header must declare agent_id column.
+    assert!(
+        text.contains("agent_id"),
+        "#199: toon_compact header must include agent_id column; got:\n{text}"
+    );
+    // Data row must contain the stamped id.
+    assert!(
+        text.contains("toon-agent"),
+        "#199: toon_compact data row must surface agent_id value; got:\n{text}"
+    );
+    let _ = std::fs::remove_file(&db_path);
+}
+
+// ---------------------------------------------------------------------------
+// Task 1.5 — Visibility Rules (scope-based filtering)
+// ---------------------------------------------------------------------------
+
+fn fresh_scope_db() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("ai-memory-scope-{}.db", uuid::Uuid::new_v4()))
+}
+
+/// Seed a memory with an explicit scope + namespace.
+fn seed_scoped(binary: &str, db_path: &std::path::Path, namespace: &str, title: &str, scope: &str) {
+    let out = cmd(binary)
+        .env_remove("AI_MEMORY_AGENT_ID")
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--agent-id",
+            "seed",
+            "--json",
+            "store",
+            "-n",
+            namespace,
+            "-T",
+            title,
+            "-c",
+            "content",
+            "-t",
+            "long",
+            "--scope",
+            scope,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "seed failed for {title}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn recall_as_agent(
+    binary: &str,
+    db_path: &std::path::Path,
+    as_agent: &str,
+    context: &str,
+) -> Vec<String> {
+    let out = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--json",
+            "recall",
+            context,
+            "--as-agent",
+            as_agent,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "recall failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    v["memories"]
+        .as_array()
+        .unwrap_or(&Vec::new())
+        .iter()
+        .filter_map(|m| m["title"].as_str().map(str::to_string))
+        .collect()
+}
+
+#[test]
+fn test_scope_private_visible_only_in_exact_namespace() {
+    let db = fresh_scope_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    seed_scoped(
+        bin,
+        &db,
+        "alphaone/eng/platform/agent-1",
+        "priv-self",
+        "private",
+    );
+    seed_scoped(
+        bin,
+        &db,
+        "alphaone/eng/platform/agent-2",
+        "priv-sibling",
+        "private",
+    );
+    seed_scoped(bin, &db, "alphaone/eng/platform", "priv-parent", "private");
+
+    let titles = recall_as_agent(bin, &db, "alphaone/eng/platform/agent-1", "priv");
+    assert!(titles.contains(&"priv-self".to_string()));
+    assert!(!titles.contains(&"priv-sibling".to_string()));
+    assert!(!titles.contains(&"priv-parent".to_string()));
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_scope_team_visible_in_parent_subtree() {
+    let db = fresh_scope_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    seed_scoped(bin, &db, "alphaone/eng/platform", "team-at-parent", "team");
+    seed_scoped(
+        bin,
+        &db,
+        "alphaone/eng/platform/agent-5",
+        "team-sibling",
+        "team",
+    );
+    seed_scoped(bin, &db, "alphaone/eng/ops", "team-other-team", "team");
+    seed_scoped(bin, &db, "other-org/eng/platform", "team-other-org", "team");
+
+    let titles = recall_as_agent(bin, &db, "alphaone/eng/platform/agent-1", "team");
+    assert!(titles.contains(&"team-at-parent".to_string()));
+    assert!(titles.contains(&"team-sibling".to_string()));
+    assert!(!titles.contains(&"team-other-team".to_string()));
+    assert!(!titles.contains(&"team-other-org".to_string()));
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_scope_unit_visible_in_grandparent_subtree() {
+    let db = fresh_scope_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    seed_scoped(bin, &db, "alphaone/eng", "unit-at-grand", "unit");
+    seed_scoped(
+        bin,
+        &db,
+        "alphaone/eng/ops/agent-7",
+        "unit-other-team",
+        "unit",
+    );
+    seed_scoped(bin, &db, "alphaone/sales", "unit-other-unit", "unit");
+
+    let titles = recall_as_agent(bin, &db, "alphaone/eng/platform/agent-1", "unit");
+    assert!(titles.contains(&"unit-at-grand".to_string()));
+    assert!(titles.contains(&"unit-other-team".to_string()));
+    assert!(!titles.contains(&"unit-other-unit".to_string()));
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_scope_org_visible_across_whole_org() {
+    let db = fresh_scope_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    seed_scoped(bin, &db, "alphaone", "org-at-root", "org");
+    seed_scoped(bin, &db, "alphaone/sales/xyz", "org-other-branch", "org");
+    seed_scoped(bin, &db, "other-corp", "org-outsider", "org");
+
+    let titles = recall_as_agent(bin, &db, "alphaone/eng/platform/agent-1", "org");
+    assert!(titles.contains(&"org-at-root".to_string()));
+    assert!(titles.contains(&"org-other-branch".to_string()));
+    assert!(!titles.contains(&"org-outsider".to_string()));
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_scope_collective_always_visible() {
+    let db = fresh_scope_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    seed_scoped(
+        bin,
+        &db,
+        "completely-unrelated-ns",
+        "coll-anywhere",
+        "collective",
+    );
+
+    let titles = recall_as_agent(bin, &db, "alphaone/eng/platform/agent-1", "coll");
+    assert!(titles.contains(&"coll-anywhere".to_string()));
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_scope_missing_treated_as_private() {
+    let db = fresh_scope_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    // seed WITHOUT scope (legacy-style)
+    cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "store",
+            "-n",
+            "alphaone/eng/platform/agent-1",
+            "-T",
+            "legacy-at-self",
+            "-c",
+            "legacy",
+            "-t",
+            "long",
+        ])
+        .output()
+        .unwrap();
+    cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "store",
+            "-n",
+            "alphaone/eng/platform/agent-2",
+            "-T",
+            "legacy-at-sibling",
+            "-c",
+            "legacy",
+            "-t",
+            "long",
+        ])
+        .output()
+        .unwrap();
+
+    let titles = recall_as_agent(bin, &db, "alphaone/eng/platform/agent-1", "legacy");
+    assert!(titles.contains(&"legacy-at-self".to_string()));
+    assert!(!titles.contains(&"legacy-at-sibling".to_string()));
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_scope_no_as_agent_returns_all() {
+    let db = fresh_scope_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    seed_scoped(bin, &db, "alphaone/eng/platform", "all-1", "private");
+    seed_scoped(bin, &db, "other/ns", "all-2", "team");
+    seed_scoped(bin, &db, "yet-another", "all-3", "collective");
+
+    // No --as-agent: visibility filtering disabled, all 3 visible
+    let out = cmd(bin)
+        .args(["--db", db.to_str().unwrap(), "--json", "recall", "all"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let titles: Vec<String> = v["memories"]
+        .as_array()
+        .unwrap_or(&Vec::new())
+        .iter()
+        .filter_map(|m| m["title"].as_str().map(str::to_string))
+        .collect();
+    assert!(titles.contains(&"all-1".to_string()));
+    assert!(titles.contains(&"all-2".to_string()));
+    assert!(titles.contains(&"all-3".to_string()));
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_scope_search_respects_as_agent() {
+    let db = fresh_scope_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    seed_scoped(
+        bin,
+        &db,
+        "alphaone/eng/platform/agent-1",
+        "search-my",
+        "private",
+    );
+    seed_scoped(
+        bin,
+        &db,
+        "alphaone/eng/platform/agent-2",
+        "search-neighbor",
+        "private",
+    );
+
+    let out = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--json",
+            "search",
+            "search",
+            "--as-agent",
+            "alphaone/eng/platform/agent-1",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let titles: Vec<String> = v["results"]
+        .as_array()
+        .unwrap_or(&Vec::new())
+        .iter()
+        .filter_map(|m| m["title"].as_str().map(str::to_string))
+        .collect();
+    assert!(titles.contains(&"search-my".to_string()));
+    assert!(!titles.contains(&"search-neighbor".to_string()));
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_scope_flat_namespace_only_sees_exact_match_plus_collective() {
+    let db = fresh_scope_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    seed_scoped(bin, &db, "global", "flat-private", "private");
+    seed_scoped(bin, &db, "other", "flat-elsewhere", "private");
+    seed_scoped(bin, &db, "global", "flat-team-at-self", "team");
+    seed_scoped(bin, &db, "shared", "flat-collective", "collective");
+
+    let titles = recall_as_agent(bin, &db, "global", "flat");
+    assert!(titles.contains(&"flat-private".to_string()));
+    assert!(!titles.contains(&"flat-elsewhere".to_string()));
+    assert!(titles.contains(&"flat-collective".to_string()));
+    // Flat agent has no parent; team-scope with no team_prefix → invisible
+    assert!(!titles.contains(&"flat-team-at-self".to_string()));
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_scope_invalid_rejected_at_store() {
+    let db = fresh_scope_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    let out = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "store",
+            "-T",
+            "bad-scope",
+            "-c",
+            "x",
+            "--scope",
+            "public",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "invalid --scope must be rejected");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("invalid scope"),
+        "expected validator message, got: {err}"
+    );
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_scope_invalid_as_agent_rejected() {
+    let db = fresh_scope_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    let out = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "recall",
+            "x",
+            "--as-agent",
+            "has space",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "invalid --as-agent must be rejected");
+    let _ = std::fs::remove_file(&db);
+}
+
+// ---------------------------------------------------------------------------
+// Task 1.6 — N-Level Rule Inheritance
+// ---------------------------------------------------------------------------
+
+fn fresh_inherit_db() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("ai-memory-inherit-{}.db", uuid::Uuid::new_v4()))
+}
+
+/// Seed a standard memory in a namespace, then set_standard it.
+fn seed_standard(
+    binary: &str,
+    db_path: &std::path::Path,
+    namespace: &str,
+    title: &str,
+    content: &str,
+) -> String {
+    let out = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--json",
+            "store",
+            "-n",
+            namespace,
+            "-T",
+            title,
+            "-c",
+            content,
+            "-t",
+            "long",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "seed store failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let id = v["id"].as_str().unwrap().to_string();
+
+    // Set via MCP (CLI doesn't expose set_namespace_standard)
+    use std::io::Write;
+    let mut child = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "mcp",
+            "--tier",
+            "keyword",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdin = child.stdin.as_mut().unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"memory_namespace_set_standard","arguments":{
+                "namespace": namespace,
+                "id": id,
+            }}
+        })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    drop(child.stdin.take());
+    let _ = child.wait_with_output();
+    id
+}
+
+/// Invoke memory_namespace_get_standard via MCP, returning the parsed body.
+fn get_standard_inherit(
+    binary: &str,
+    db_path: &std::path::Path,
+    namespace: &str,
+) -> serde_json::Value {
+    use std::io::Write;
+    let mut child = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "mcp",
+            "--tier",
+            "keyword",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdin = child.stdin.as_mut().unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"memory_namespace_get_standard","arguments":{
+                "namespace": namespace,
+                "inherit": true,
+            }}
+        })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    drop(child.stdin.take());
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    let resp: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    serde_json::from_str(text).unwrap()
+}
+
+#[test]
+fn test_inherit_4_level_chain() {
+    let db = fresh_inherit_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+
+    // Seed standards at all 4 levels plus global
+    seed_standard(bin, &db, "*", "global-policy", "Global: always follow CLA");
+    seed_standard(bin, &db, "alphaone", "org-policy", "Org: use Apache-2.0");
+    seed_standard(
+        bin,
+        &db,
+        "alphaone/eng",
+        "unit-policy",
+        "Unit: cargo fmt strict",
+    );
+    seed_standard(
+        bin,
+        &db,
+        "alphaone/eng/platform",
+        "team-policy",
+        "Team: weekly sync Wednesday",
+    );
+
+    let body = get_standard_inherit(bin, &db, "alphaone/eng/platform");
+    let chain = body["chain"].as_array().expect("chain array");
+    // Chain order: most-general first
+    assert_eq!(
+        chain
+            .iter()
+            .map(|v| v.as_str().unwrap_or(""))
+            .collect::<Vec<_>>(),
+        vec!["*", "alphaone", "alphaone/eng", "alphaone/eng/platform"]
+    );
+
+    let standards = body["standards"].as_array().expect("standards array");
+    assert_eq!(standards.len(), 4, "all 4 standards resolved");
+    assert_eq!(standards[0]["title"], "global-policy");
+    assert_eq!(standards[1]["title"], "org-policy");
+    assert_eq!(standards[2]["title"], "unit-policy");
+    assert_eq!(standards[3]["title"], "team-policy");
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_inherit_missing_intermediates_skipped() {
+    let db = fresh_inherit_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+
+    // Global and team set; org and unit have NO standard
+    seed_standard(bin, &db, "*", "global-only", "Global");
+    seed_standard(bin, &db, "alphaone/eng/platform", "team-only", "Team");
+
+    let body = get_standard_inherit(bin, &db, "alphaone/eng/platform");
+    let chain = body["chain"].as_array().unwrap();
+    assert_eq!(chain.len(), 4, "chain still contains all 4 path elements");
+
+    let standards = body["standards"].as_array().unwrap();
+    assert_eq!(standards.len(), 2, "only the 2 with standards resolve");
+    assert_eq!(standards[0]["title"], "global-only");
+    assert_eq!(standards[1]["title"], "team-only");
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_inherit_preserves_3_level_flat_behavior() {
+    // Legacy flat namespaces use explicit parent chain (namespace_meta).
+    // This test regresses the historical 3-level behavior.
+    let db = fresh_inherit_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+
+    seed_standard(bin, &db, "*", "g", "g");
+    // Flat namespaces — no `/`
+    seed_standard(bin, &db, "ai-memory", "ai-mem-std", "ai-mem-std");
+
+    let body = get_standard_inherit(bin, &db, "ai-memory");
+    let standards = body["standards"].as_array().unwrap();
+    // At minimum global + ai-memory resolve
+    let titles: Vec<String> = standards
+        .iter()
+        .filter_map(|s| s["title"].as_str().map(str::to_string))
+        .collect();
+    assert!(titles.contains(&"g".to_string()));
+    assert!(titles.contains(&"ai-mem-std".to_string()));
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_inherit_recall_auto_prepends_chain() {
+    // session_start / recall should already inject the chain when namespace is set.
+    let db = fresh_inherit_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+
+    seed_standard(bin, &db, "alphaone", "org-s", "org standard");
+    seed_standard(bin, &db, "alphaone/eng", "unit-s", "unit standard");
+    seed_standard(bin, &db, "alphaone/eng/platform", "team-s", "team standard");
+
+    // Store an unrelated memory in the team namespace
+    let _ = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "store",
+            "-n",
+            "alphaone/eng/platform",
+            "-T",
+            "regular-note",
+            "-c",
+            "something",
+            "-t",
+            "long",
+        ])
+        .output()
+        .unwrap();
+
+    // Invoke recall via MCP and look for standards[]
+    use std::io::Write;
+    let mut child = cmd(bin)
+        .args(["--db", db.to_str().unwrap(), "mcp", "--tier", "keyword"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdin = child.stdin.as_mut().unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"memory_recall","arguments":{
+                "context": "note",
+                "namespace": "alphaone/eng/platform",
+                "format": "json"
+            }}
+        })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    drop(child.stdin.take());
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    let resp: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let body: serde_json::Value = serde_json::from_str(text).unwrap();
+
+    // Multiple standards → "standards" key (plural). 3 levels set, all should resolve.
+    let standards = body["standards"].as_array().expect("standards array");
+    let titles: Vec<String> = standards
+        .iter()
+        .filter_map(|s| s["title"].as_str().map(str::to_string))
+        .collect();
+    assert!(titles.contains(&"org-s".to_string()));
+    assert!(titles.contains(&"unit-s".to_string()));
+    assert!(titles.contains(&"team-s".to_string()));
+    // Order: most-general first
+    assert_eq!(titles[0], "org-s");
+    assert_eq!(titles[titles.len() - 1], "team-s");
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_inherit_global_only() {
+    // Only global `*` has a standard — chain still walks cleanly.
+    let db = fresh_inherit_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+
+    seed_standard(bin, &db, "*", "only-global", "global rule");
+    let body = get_standard_inherit(bin, &db, "alphaone/eng/platform/agent-1");
+    let standards = body["standards"].as_array().unwrap();
+    assert_eq!(standards.len(), 1);
+    assert_eq!(standards[0]["title"], "only-global");
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_inherit_no_standards_returns_empty() {
+    let db = fresh_inherit_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    let body = get_standard_inherit(bin, &db, "alphaone/eng/platform");
+    let standards = body["standards"].as_array().unwrap();
+    assert!(standards.is_empty());
+    assert_eq!(body["count"], 0);
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_inherit_deep_namespace_8_levels() {
+    let db = fresh_inherit_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+
+    // 8-level path matches MAX_NAMESPACE_DEPTH
+    let deep = "a/b/c/d/e/f/g/h";
+    seed_standard(bin, &db, "*", "root-s", "root");
+    seed_standard(bin, &db, "a", "top-s", "top");
+    seed_standard(bin, &db, deep, "leaf-s", "leaf");
+
+    let body = get_standard_inherit(bin, &db, deep);
+    let chain = body["chain"].as_array().unwrap();
+    assert_eq!(chain.len(), 9, "* + 8 /-levels");
+    let standards = body["standards"].as_array().unwrap();
+    assert_eq!(standards.len(), 3, "only the 3 set");
+    assert_eq!(standards[0]["title"], "root-s");
+    assert_eq!(standards[2]["title"], "leaf-s");
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_inherit_default_omits_chain() {
+    // Without inherit=true, the old single-namespace response shape is used.
+    let db = fresh_inherit_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+
+    seed_standard(bin, &db, "alphaone", "org-only", "org");
+
+    // get_standard with inherit=false (default) must return single-object shape
+    use std::io::Write;
+    let mut child = cmd(bin)
+        .args(["--db", db.to_str().unwrap(), "mcp", "--tier", "keyword"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdin = child.stdin.as_mut().unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"memory_namespace_get_standard","arguments":{
+                "namespace": "alphaone",
+            }}
+        })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    drop(child.stdin.take());
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    let resp: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let body: serde_json::Value = serde_json::from_str(text).unwrap();
+
+    assert!(
+        body["chain"].is_null(),
+        "chain must not be present without inherit=true"
+    );
+    assert_eq!(body["title"], "org-only");
+    let _ = std::fs::remove_file(&db);
+}
+
+// ---------------------------------------------------------------------------
+// Task 1.7 — Vertical Memory Promotion
+// ---------------------------------------------------------------------------
+
+fn fresh_vpromote_db() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("ai-memory-vpromote-{}.db", uuid::Uuid::new_v4()))
+}
+
+fn seed_memory_at(binary: &str, db_path: &std::path::Path, namespace: &str, title: &str) -> String {
+    let out = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--json",
+            "store",
+            "-n",
+            namespace,
+            "-T",
+            title,
+            "-c",
+            "content",
+            "-t",
+            "long",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "seed failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    v["id"].as_str().unwrap().to_string()
+}
+
+#[test]
+fn test_vpromote_clones_to_ancestor_and_links() {
+    let db = fresh_vpromote_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    let src_id = seed_memory_at(bin, &db, "alphaone/eng/platform/agent-1", "runbook");
+
+    let out = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--json",
+            "promote",
+            &src_id,
+            "--to-namespace",
+            "alphaone/eng",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "vpromote failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["mode"], "vertical");
+    assert_eq!(v["to_namespace"], "alphaone/eng");
+    let clone_id = v["clone_id"].as_str().unwrap().to_string();
+    assert_ne!(clone_id, src_id, "clone must have distinct ID");
+
+    let src = cmd(bin)
+        .args(["--db", db.to_str().unwrap(), "--json", "get", &src_id])
+        .output()
+        .unwrap();
+    let src_v: serde_json::Value = serde_json::from_slice(&src.stdout).unwrap();
+    assert_eq!(
+        src_v["memory"]["namespace"],
+        "alphaone/eng/platform/agent-1"
+    );
+
+    let clone = cmd(bin)
+        .args(["--db", db.to_str().unwrap(), "--json", "get", &clone_id])
+        .output()
+        .unwrap();
+    let clone_v: serde_json::Value = serde_json::from_slice(&clone.stdout).unwrap();
+    assert_eq!(clone_v["memory"]["namespace"], "alphaone/eng");
+    assert_eq!(clone_v["memory"]["title"], "runbook");
+
+    let links = clone_v["links"].as_array().expect("links array");
+    assert!(
+        links.iter().any(|l| {
+            l["source_id"].as_str() == Some(&clone_id)
+                && l["target_id"].as_str() == Some(&src_id)
+                && l["relation"] == "derived_from"
+        }),
+        "clone must link derived_from → source; got: {links:?}"
+    );
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_vpromote_rejects_non_ancestor() {
+    let db = fresh_vpromote_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    let src_id = seed_memory_at(bin, &db, "alphaone/eng/platform", "runbook");
+    let out = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "promote",
+            &src_id,
+            "--to-namespace",
+            "other-org",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "promote to non-ancestor must fail");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.to_lowercase().contains("ancestor") || err.to_lowercase().contains("not"),
+        "expected ancestry error, got: {err}"
+    );
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_vpromote_rejects_self_namespace() {
+    let db = fresh_vpromote_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    let src_id = seed_memory_at(bin, &db, "alphaone/eng", "runbook");
+    let out = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "promote",
+            &src_id,
+            "--to-namespace",
+            "alphaone/eng",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "promote to self-namespace must fail (no-op)"
+    );
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_vpromote_without_flag_preserves_tier_behavior() {
+    let db = fresh_vpromote_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    let out = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--json",
+            "store",
+            "-n",
+            "alphaone/eng",
+            "-T",
+            "to-bump",
+            "-c",
+            "x",
+            "-t",
+            "mid",
+        ])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let id = v["id"].as_str().unwrap().to_string();
+
+    let out = cmd(bin)
+        .args(["--db", db.to_str().unwrap(), "--json", "promote", &id])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["promoted"], true);
+    assert_eq!(v["tier"], "long");
+
+    let get_out = cmd(bin)
+        .args(["--db", db.to_str().unwrap(), "--json", "get", &id])
+        .output()
+        .unwrap();
+    let g: serde_json::Value = serde_json::from_slice(&get_out.stdout).unwrap();
+    assert_eq!(g["memory"]["tier"], "long");
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_vpromote_to_root_ancestor() {
+    let db = fresh_vpromote_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    let src_id = seed_memory_at(bin, &db, "alphaone/eng/platform/agent-1", "root-promo");
+    let out = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--json",
+            "promote",
+            &src_id,
+            "--to-namespace",
+            "alphaone",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["mode"], "vertical");
+    assert_eq!(v["to_namespace"], "alphaone");
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_vpromote_flat_namespace_cannot_promote() {
+    let db = fresh_vpromote_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    let src_id = seed_memory_at(bin, &db, "global", "flat");
+    let out = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "promote",
+            &src_id,
+            "--to-namespace",
+            "some-other-ns",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "flat namespace cannot be promoted");
+    let _ = std::fs::remove_file(&db);
+}
+
+// ---------------------------------------------------------------------------
+// Task 1.8 — Governance Metadata
+// ---------------------------------------------------------------------------
+
+fn fresh_gov_db() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("ai-memory-gov-{}.db", uuid::Uuid::new_v4()))
+}
+
+fn store_std_mem(binary: &str, db_path: &std::path::Path, namespace: &str, title: &str) -> String {
+    let out = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--json",
+            "store",
+            "-n",
+            namespace,
+            "-T",
+            title,
+            "-c",
+            "policy-body",
+            "-t",
+            "long",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    v["id"].as_str().unwrap().to_string()
+}
+
+fn mcp_call(
+    binary: &str,
+    db_path: &std::path::Path,
+    name: &str,
+    args: serde_json::Value,
+) -> serde_json::Value {
+    use std::io::Write;
+    let mut child = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "mcp",
+            "--tier",
+            "keyword",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdin = child.stdin.as_mut().unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name": name, "arguments": args}
+        })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    drop(child.stdin.take());
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    let resp: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    serde_json::from_str(text).unwrap()
+}
+
+#[test]
+fn test_governance_set_and_get_roundtrip() {
+    let db = fresh_gov_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    let sid = store_std_mem(bin, &db, "alphaone/eng", "eng-policy");
+
+    let gov = serde_json::json!({
+        "write": "registered",
+        "promote": "approve",
+        "delete": "owner",
+        "approver": {"agent": "maintainer"}
+    });
+    let set_resp = mcp_call(
+        bin,
+        &db,
+        "memory_namespace_set_standard",
+        serde_json::json!({
+            "namespace": "alphaone/eng",
+            "id": sid,
+            "governance": gov.clone(),
+        }),
+    );
+    assert_eq!(set_resp["set"], true);
+    assert_eq!(set_resp["governance"], gov);
+
+    let get_resp = mcp_call(
+        bin,
+        &db,
+        "memory_namespace_get_standard",
+        serde_json::json!({"namespace": "alphaone/eng"}),
+    );
+    assert_eq!(get_resp["governance"]["write"], "registered");
+    assert_eq!(get_resp["governance"]["promote"], "approve");
+    assert_eq!(get_resp["governance"]["delete"], "owner");
+    assert_eq!(get_resp["governance"]["approver"]["agent"], "maintainer");
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_governance_default_returned_when_unset() {
+    let db = fresh_gov_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    let sid = store_std_mem(bin, &db, "plain", "plain-policy");
+
+    let _ = mcp_call(
+        bin,
+        &db,
+        "memory_namespace_set_standard",
+        serde_json::json!({"namespace": "plain", "id": sid}),
+    );
+    let get_resp = mcp_call(
+        bin,
+        &db,
+        "memory_namespace_get_standard",
+        serde_json::json!({"namespace": "plain"}),
+    );
+    let gov = &get_resp["governance"];
+    assert_eq!(gov["write"], "any");
+    assert_eq!(gov["promote"], "any");
+    assert_eq!(gov["delete"], "owner");
+    assert_eq!(gov["approver"], "human");
+    let _ = std::fs::remove_file(&db);
+}
+
+/// Invoke a tool and return the raw MCP response envelope — preserves
+/// `isError` + content-text for rejection tests where the content[0].text
+/// is an error string, not parseable JSON.
+fn mcp_call_raw(
+    binary: &str,
+    db_path: &std::path::Path,
+    name: &str,
+    args: serde_json::Value,
+) -> serde_json::Value {
+    use std::io::Write;
+    let mut child = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "mcp",
+            "--tier",
+            "keyword",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdin = child.stdin.as_mut().unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name": name, "arguments": args}
+        })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    drop(child.stdin.take());
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    serde_json::from_str(lines[1]).unwrap()
+}
+
+#[test]
+fn test_governance_invalid_rejected() {
+    let db = fresh_gov_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    let sid = store_std_mem(bin, &db, "alphaone/eng", "bogus-policy");
+
+    let resp = mcp_call_raw(
+        bin,
+        &db,
+        "memory_namespace_set_standard",
+        serde_json::json!({
+            "namespace": "alphaone/eng",
+            "id": sid,
+            "governance": {
+                "write": "open-to-all",
+                "promote": "any",
+                "delete": "any",
+                "approver": "human"
+            }
+        }),
+    );
+    assert_eq!(
+        resp["result"]["isError"], true,
+        "bogus level must return isError=true; got {resp}"
+    );
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_governance_consensus_quorum_rejected() {
+    let db = fresh_gov_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    let sid = store_std_mem(bin, &db, "alphaone", "cons-policy");
+
+    let resp = mcp_call_raw(
+        bin,
+        &db,
+        "memory_namespace_set_standard",
+        serde_json::json!({
+            "namespace": "alphaone",
+            "id": sid,
+            "governance": {
+                "write": "approve",
+                "promote": "any",
+                "delete": "owner",
+                "approver": {"consensus": 0}
+            }
+        }),
+    );
+    assert_eq!(
+        resp["result"]["isError"], true,
+        "consensus(0) must return isError=true; got {resp}"
+    );
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_governance_inherit_path_surfaces_per_level() {
+    let db = fresh_gov_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+
+    let org_id = store_std_mem(bin, &db, "alphaone", "org-pol");
+    let team_id = store_std_mem(bin, &db, "alphaone/eng", "team-pol");
+
+    let _ = mcp_call(
+        bin,
+        &db,
+        "memory_namespace_set_standard",
+        serde_json::json!({
+            "namespace": "alphaone",
+            "id": org_id,
+            "governance": {
+                "write": "any", "promote": "any", "delete": "owner",
+                "approver": "human"
+            }
+        }),
+    );
+    let _ = mcp_call(
+        bin,
+        &db,
+        "memory_namespace_set_standard",
+        serde_json::json!({
+            "namespace": "alphaone/eng",
+            "id": team_id,
+            "governance": {
+                "write": "registered", "promote": "owner", "delete": "approve",
+                "approver": {"consensus": 2}
+            }
+        }),
+    );
+
+    let resp = mcp_call(
+        bin,
+        &db,
+        "memory_namespace_get_standard",
+        serde_json::json!({"namespace": "alphaone/eng", "inherit": true}),
+    );
+    let standards = resp["standards"].as_array().unwrap();
+    assert!(standards.len() >= 2);
+    let org = standards
+        .iter()
+        .find(|s| s["namespace"] == "alphaone")
+        .unwrap();
+    let team = standards
+        .iter()
+        .find(|s| s["namespace"] == "alphaone/eng")
+        .unwrap();
+    assert_eq!(org["governance"]["write"], "any");
+    assert_eq!(team["governance"]["write"], "registered");
+    assert_eq!(team["governance"]["approver"]["consensus"], 2);
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_governance_legacy_memory_defaults_not_mutated() {
+    let db = fresh_gov_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    let sid = store_std_mem(bin, &db, "legacy", "legacy-policy");
+
+    let _ = mcp_call(
+        bin,
+        &db,
+        "memory_namespace_set_standard",
+        serde_json::json!({"namespace": "legacy", "id": sid}),
+    );
+    let out = cmd(bin)
+        .args(["--db", db.to_str().unwrap(), "--json", "get", &sid])
+        .output()
+        .unwrap();
+    let mem_val: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let metadata = &mem_val["memory"]["metadata"];
+    assert!(
+        metadata.get("governance").is_none(),
+        "no governance param must not inject a policy; got metadata={metadata}"
+    );
+    let _ = std::fs::remove_file(&db);
+}
+
+// ---------------------------------------------------------------------------
+// Task 1.9 — Governance Enforcement
+// ---------------------------------------------------------------------------
+
+fn fresh_enforce_db() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("ai-memory-enforce-{}.db", uuid::Uuid::new_v4()))
+}
+
+/// Set a governance policy on a namespace. Seeds the standard memory under
+/// `owner_agent_id`, then calls memory_namespace_set_standard with the policy.
+fn set_governance(
+    binary: &str,
+    db_path: &std::path::Path,
+    namespace: &str,
+    governance: serde_json::Value,
+    owner_agent_id: &str,
+) {
+    let out = cmd(binary)
+        .env_remove("AI_MEMORY_AGENT_ID")
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--agent-id",
+            owner_agent_id,
+            "--json",
+            "store",
+            "-n",
+            namespace,
+            "-T",
+            &format!("{namespace}-standard"),
+            "-c",
+            "policy",
+            "-t",
+            "long",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let sid = v["id"].as_str().unwrap().to_string();
+
+    use std::io::Write;
+    let mut child = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "mcp",
+            "--tier",
+            "keyword",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdin = child.stdin.as_mut().unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"memory_namespace_set_standard","arguments":{
+                "namespace": namespace,
+                "id": sid,
+                "governance": governance,
+            }}
+        })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    drop(child.stdin.take());
+    let _ = child.wait_with_output();
+}
+
+#[test]
+fn test_enforce_any_allows_store() {
+    let db = fresh_enforce_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    set_governance(
+        bin,
+        &db,
+        "alphaone",
+        serde_json::json!({"write":"any","promote":"any","delete":"any","approver":"human"}),
+        "owner",
+    );
+    let out = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--agent-id",
+            "stranger",
+            "--json",
+            "store",
+            "-n",
+            "alphaone",
+            "-T",
+            "any-write",
+            "-c",
+            "hi",
+            "-t",
+            "long",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "any-write must allow: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_enforce_registered_blocks_unregistered() {
+    let db = fresh_enforce_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    set_governance(
+        bin,
+        &db,
+        "alphaone",
+        serde_json::json!({"write":"registered","promote":"any","delete":"owner","approver":"human"}),
+        "owner",
+    );
+    let out = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--agent-id",
+            "stranger-not-registered",
+            "store",
+            "-n",
+            "alphaone",
+            "-T",
+            "blocked-write",
+            "-c",
+            "hi",
+            "-t",
+            "long",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "unregistered must be blocked");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("not a registered agent"), "got: {err}");
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_enforce_registered_allows_registered() {
+    let db = fresh_enforce_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    let _ = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "agents",
+            "register",
+            "--agent-id",
+            "alice",
+            "--agent-type",
+            "human",
+        ])
+        .output()
+        .unwrap();
+    set_governance(
+        bin,
+        &db,
+        "alphaone",
+        serde_json::json!({"write":"registered","promote":"any","delete":"owner","approver":"human"}),
+        "owner",
+    );
+    let out = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--agent-id",
+            "alice",
+            "store",
+            "-n",
+            "alphaone",
+            "-T",
+            "allowed-write",
+            "-c",
+            "hi",
+            "-t",
+            "long",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_enforce_owner_blocks_non_owner_delete() {
+    let db = fresh_enforce_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    set_governance(
+        bin,
+        &db,
+        "alphaone",
+        serde_json::json!({"write":"any","promote":"any","delete":"owner","approver":"human"}),
+        "owner",
+    );
+    let store = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--agent-id",
+            "alice",
+            "--json",
+            "store",
+            "-n",
+            "alphaone",
+            "-T",
+            "alice-mem",
+            "-c",
+            "hi",
+            "-t",
+            "long",
+        ])
+        .output()
+        .unwrap();
+    let id = serde_json::from_slice::<serde_json::Value>(&store.stdout).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let del = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--agent-id",
+            "bob",
+            "delete",
+            &id,
+        ])
+        .output()
+        .unwrap();
+    assert!(!del.status.success());
+    let err = String::from_utf8_lossy(&del.stderr);
+    assert!(err.contains("not the owner"), "got: {err}");
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_enforce_owner_allows_self_delete() {
+    let db = fresh_enforce_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    set_governance(
+        bin,
+        &db,
+        "alphaone",
+        serde_json::json!({"write":"any","promote":"any","delete":"owner","approver":"human"}),
+        "owner",
+    );
+    let store = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--agent-id",
+            "alice",
+            "--json",
+            "store",
+            "-n",
+            "alphaone",
+            "-T",
+            "alice-mem-2",
+            "-c",
+            "hi",
+            "-t",
+            "long",
+        ])
+        .output()
+        .unwrap();
+    let id = serde_json::from_slice::<serde_json::Value>(&store.stdout).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let del = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--agent-id",
+            "alice",
+            "delete",
+            &id,
+        ])
+        .output()
+        .unwrap();
+    assert!(del.status.success());
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_enforce_approve_queues_pending() {
+    let db = fresh_enforce_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    set_governance(
+        bin,
+        &db,
+        "alphaone",
+        serde_json::json!({"write":"approve","promote":"any","delete":"owner","approver":"human"}),
+        "owner",
+    );
+    let out = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--agent-id",
+            "alice",
+            "--json",
+            "store",
+            "-n",
+            "alphaone",
+            "-T",
+            "queued",
+            "-c",
+            "hi",
+            "-t",
+            "long",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["status"], "pending");
+    assert!(v["pending_id"].is_string());
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_enforce_pending_list_and_approve() {
+    let db = fresh_enforce_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    set_governance(
+        bin,
+        &db,
+        "alphaone",
+        serde_json::json!({"write":"approve","promote":"any","delete":"owner","approver":"human"}),
+        "owner",
+    );
+    let queued = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--agent-id",
+            "alice",
+            "--json",
+            "store",
+            "-n",
+            "alphaone",
+            "-T",
+            "needs-approval",
+            "-c",
+            "hi",
+            "-t",
+            "long",
+        ])
+        .output()
+        .unwrap();
+    let pending_id =
+        serde_json::from_slice::<serde_json::Value>(&queued.stdout).unwrap()["pending_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+    let list = cmd(bin)
+        .args(["--db", db.to_str().unwrap(), "--json", "pending", "list"])
+        .output()
+        .unwrap();
+    assert!(list.status.success());
+    let lv: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert_eq!(lv["count"], 1);
+
+    let ap = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--agent-id",
+            "approver",
+            "--json",
+            "pending",
+            "approve",
+            &pending_id,
+        ])
+        .output()
+        .unwrap();
+    assert!(ap.status.success());
+    let av: serde_json::Value = serde_json::from_slice(&ap.stdout).unwrap();
+    assert_eq!(av["approved"], true);
+    assert_eq!(av["decided_by"], "approver");
+
+    let ap2 = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--agent-id",
+            "approver",
+            "pending",
+            "approve",
+            &pending_id,
+        ])
+        .output()
+        .unwrap();
+    assert!(!ap2.status.success());
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_enforce_pending_reject_status() {
+    let db = fresh_enforce_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    set_governance(
+        bin,
+        &db,
+        "alphaone",
+        serde_json::json!({"write":"approve","promote":"any","delete":"owner","approver":"human"}),
+        "owner",
+    );
+    let queued = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--agent-id",
+            "alice",
+            "--json",
+            "store",
+            "-n",
+            "alphaone",
+            "-T",
+            "to-reject",
+            "-c",
+            "hi",
+            "-t",
+            "long",
+        ])
+        .output()
+        .unwrap();
+    let pending_id =
+        serde_json::from_slice::<serde_json::Value>(&queued.stdout).unwrap()["pending_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+    let rj = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--agent-id",
+            "approver",
+            "--json",
+            "pending",
+            "reject",
+            &pending_id,
+        ])
+        .output()
+        .unwrap();
+    assert!(rj.status.success());
+    let rv: serde_json::Value = serde_json::from_slice(&rj.stdout).unwrap();
+    assert_eq!(rv["rejected"], true);
+
+    let list = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--json",
+            "pending",
+            "list",
+            "--status",
+            "rejected",
+        ])
+        .output()
+        .unwrap();
+    let lv: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert_eq!(lv["count"], 1);
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_enforce_unset_falls_back_to_default_policy() {
+    // Default: { write: Any, promote: Any, delete: Owner, approver: Human }
+    let db = fresh_enforce_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    let out = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--agent-id",
+            "anyone",
+            "--json",
+            "store",
+            "-n",
+            "anywhere",
+            "-T",
+            "default-allow",
+            "-c",
+            "hi",
+            "-t",
+            "long",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "default write policy is Any");
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_enforce_promote_with_approve_policy() {
+    let db = fresh_enforce_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    set_governance(
+        bin,
+        &db,
+        "alphaone",
+        serde_json::json!({"write":"any","promote":"approve","delete":"any","approver":"human"}),
+        "owner",
+    );
+    let store = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--agent-id",
+            "alice",
+            "--json",
+            "store",
+            "-n",
+            "alphaone",
+            "-T",
+            "will-be-promoted",
+            "-c",
+            "hi",
+            "-t",
+            "mid",
+        ])
+        .output()
+        .unwrap();
+    let id = serde_json::from_slice::<serde_json::Value>(&store.stdout).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let pr = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--agent-id",
+            "alice",
+            "--json",
+            "promote",
+            &id,
+        ])
+        .output()
+        .unwrap();
+    assert!(pr.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&pr.stdout).unwrap();
+    assert_eq!(v["status"], "pending");
+    assert!(v["pending_id"].is_string());
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_enforce_mcp_pending_tools() {
+    let db = fresh_enforce_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    set_governance(
+        bin,
+        &db,
+        "alphaone",
+        serde_json::json!({"write":"approve","promote":"any","delete":"owner","approver":"human"}),
+        "owner",
+    );
+    let queued = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--agent-id",
+            "alice",
+            "--json",
+            "store",
+            "-n",
+            "alphaone",
+            "-T",
+            "mcp-pending-flow",
+            "-c",
+            "x",
+            "-t",
+            "long",
+        ])
+        .output()
+        .unwrap();
+    let pending_id =
+        serde_json::from_slice::<serde_json::Value>(&queued.stdout).unwrap()["pending_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+    use std::io::Write;
+    let mut child = cmd(bin)
+        .args(["--db", db.to_str().unwrap(), "mcp", "--tier", "keyword"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdin = child.stdin.as_mut().unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"memory_pending_list","arguments":{}}
+        })
+    )
+    .unwrap();
+    writeln!(stdin, "{}",
+        serde_json::json!({
+            "jsonrpc":"2.0","id":3,"method":"tools/call",
+            "params":{"name":"memory_pending_approve","arguments":{"id": pending_id, "agent_id": "approver-mcp"}}
+        })).unwrap();
+    stdin.flush().unwrap();
+    drop(child.stdin.take());
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+
+    let list_resp: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    let list_text = list_resp["result"]["content"][0]["text"].as_str().unwrap();
+    let list_body: serde_json::Value = serde_json::from_str(list_text).unwrap();
+    assert_eq!(list_body["count"], 1);
+
+    let appr_resp: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
+    let appr_text = appr_resp["result"]["content"][0]["text"].as_str().unwrap();
+    let appr_body: serde_json::Value = serde_json::from_str(appr_text).unwrap();
+    assert_eq!(appr_body["approved"], true);
+    let _ = std::fs::remove_file(&db);
+}
+
+// ---------------------------------------------------------------------------
+// Task 1.10 — Approver Types (Human/Agent/Consensus) + auto-execute
+// ---------------------------------------------------------------------------
+
+fn fresh_approver_db() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("ai-memory-approver-{}.db", uuid::Uuid::new_v4()))
+}
+
+fn queue_store(
+    binary: &str,
+    db_path: &std::path::Path,
+    namespace: &str,
+    title: &str,
+    requester: &str,
+) -> String {
+    let out = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--agent-id",
+            requester,
+            "--json",
+            "store",
+            "-n",
+            namespace,
+            "-T",
+            title,
+            "-c",
+            "body",
+            "-t",
+            "long",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "queue store failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["status"], "pending", "expected pending, got: {v}");
+    v["pending_id"].as_str().unwrap().to_string()
+}
+
+fn approve(
+    binary: &str,
+    db_path: &std::path::Path,
+    pending_id: &str,
+    approver: &str,
+) -> std::process::Output {
+    cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--agent-id",
+            approver,
+            "--json",
+            "pending",
+            "approve",
+            pending_id,
+        ])
+        .output()
+        .unwrap()
+}
+
+/// Register an agent so it can satisfy `Consensus(n)` voting (issue #216).
+fn register_voter(binary: &str, db_path: &std::path::Path, agent_id: &str) {
+    let out = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "agents",
+            "register",
+            "--agent-id",
+            agent_id,
+            "--agent-type",
+            "ai:claude-opus-4.7",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "register voter '{agent_id}' failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn test_approver_human_any_approver_accepted() {
+    let db = fresh_approver_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    set_governance(
+        bin,
+        &db,
+        "alphaone",
+        serde_json::json!({"write":"approve","promote":"any","delete":"owner","approver":"human"}),
+        "owner",
+    );
+    let pid = queue_store(bin, &db, "alphaone", "human-target", "alice");
+    let out = approve(bin, &db, &pid, "any-random-approver");
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["approved"], true);
+    assert_eq!(v["executed"], true);
+    assert!(v["memory_id"].is_string());
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_approver_agent_rejects_wrong_caller() {
+    let db = fresh_approver_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    set_governance(
+        bin,
+        &db,
+        "alphaone",
+        serde_json::json!({
+            "write":"approve","promote":"any","delete":"owner",
+            "approver":{"agent":"maintainer"}
+        }),
+        "owner",
+    );
+    let pid = queue_store(bin, &db, "alphaone", "agent-target", "alice");
+    let out = approve(bin, &db, &pid, "some-other-agent");
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("designated approver") || err.to_lowercase().contains("rejected"),
+        "got: {err}"
+    );
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_approver_agent_accepts_matching_caller() {
+    let db = fresh_approver_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    set_governance(
+        bin,
+        &db,
+        "alphaone",
+        serde_json::json!({
+            "write":"approve","promote":"any","delete":"owner",
+            "approver":{"agent":"maintainer"}
+        }),
+        "owner",
+    );
+    let pid = queue_store(bin, &db, "alphaone", "agent-ok", "alice");
+    let out = approve(bin, &db, &pid, "maintainer");
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["approved"], true);
+    assert_eq!(v["executed"], true);
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_approver_consensus_below_threshold_pending() {
+    let db = fresh_approver_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    set_governance(
+        bin,
+        &db,
+        "alphaone",
+        serde_json::json!({
+            "write":"approve","promote":"any","delete":"owner",
+            "approver":{"consensus":3}
+        }),
+        "owner",
+    );
+    let pid = queue_store(bin, &db, "alphaone", "cons-target", "alice");
+    register_voter(bin, &db, "approver-1");
+    register_voter(bin, &db, "approver-2");
+
+    let v1 = approve(bin, &db, &pid, "approver-1");
+    assert!(v1.status.success());
+    let j1: serde_json::Value = serde_json::from_slice(&v1.stdout).unwrap();
+    assert_eq!(j1["approved"], false);
+    assert_eq!(j1["status"], "pending");
+    assert_eq!(j1["votes"], 1);
+    assert_eq!(j1["quorum"], 3);
+
+    let v2 = approve(bin, &db, &pid, "approver-2");
+    let j2: serde_json::Value = serde_json::from_slice(&v2.stdout).unwrap();
+    assert_eq!(j2["votes"], 2);
+    assert_eq!(j2["approved"], false);
+
+    let list = cmd(bin)
+        .args(["--db", db.to_str().unwrap(), "--json", "pending", "list"])
+        .output()
+        .unwrap();
+    let lv: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert_eq!(lv["count"], 1);
+    assert_eq!(lv["pending"][0]["status"], "pending");
+    assert_eq!(lv["pending"][0]["approvals"].as_array().unwrap().len(), 2);
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_approver_consensus_threshold_auto_executes() {
+    let db = fresh_approver_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    set_governance(
+        bin,
+        &db,
+        "alphaone",
+        serde_json::json!({
+            "write":"approve","promote":"any","delete":"owner",
+            "approver":{"consensus":2}
+        }),
+        "owner",
+    );
+    let pid = queue_store(bin, &db, "alphaone", "cons-exec", "alice");
+    register_voter(bin, &db, "a1");
+    register_voter(bin, &db, "a2");
+
+    let v1 = approve(bin, &db, &pid, "a1");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&v1.stdout).unwrap()["approved"],
+        false
+    );
+    let v2 = approve(bin, &db, &pid, "a2");
+    assert!(v2.status.success());
+    let j2: serde_json::Value = serde_json::from_slice(&v2.stdout).unwrap();
+    assert_eq!(j2["approved"], true);
+    assert_eq!(j2["executed"], true);
+    let memory_id = j2["memory_id"].as_str().unwrap();
+
+    let list = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--json",
+            "list",
+            "-n",
+            "alphaone",
+        ])
+        .output()
+        .unwrap();
+    let lv: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    let titles: Vec<String> = lv["memories"]
+        .as_array()
+        .unwrap_or(&Vec::new())
+        .iter()
+        .filter_map(|m| m["title"].as_str().map(str::to_string))
+        .collect();
+    assert!(titles.contains(&"cons-exec".to_string()));
+    let ids: Vec<String> = lv["memories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["id"].as_str().map(str::to_string))
+        .collect();
+    assert!(ids.iter().any(|i| i == memory_id));
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_approver_consensus_same_agent_does_not_double_count() {
+    let db = fresh_approver_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    set_governance(
+        bin,
+        &db,
+        "alphaone",
+        serde_json::json!({
+            "write":"approve","promote":"any","delete":"owner",
+            "approver":{"consensus":2}
+        }),
+        "owner",
+    );
+    let pid = queue_store(bin, &db, "alphaone", "cons-dup", "alice");
+    register_voter(bin, &db, "a1");
+    register_voter(bin, &db, "a2");
+
+    let v1a = approve(bin, &db, &pid, "a1");
+    let v1b = approve(bin, &db, &pid, "a1");
+    let j1a: serde_json::Value = serde_json::from_slice(&v1a.stdout).unwrap();
+    let j1b: serde_json::Value = serde_json::from_slice(&v1b.stdout).unwrap();
+    assert_eq!(j1a["votes"], 1);
+    assert_eq!(j1b["votes"], 1, "same agent must not double-count");
+
+    let v2 = approve(bin, &db, &pid, "a2");
+    let j2: serde_json::Value = serde_json::from_slice(&v2.stdout).unwrap();
+    assert_eq!(j2["approved"], true);
+    assert_eq!(j2["executed"], true);
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_approver_agent_rejected_not_counted_for_consensus() {
+    let db = fresh_approver_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    set_governance(
+        bin,
+        &db,
+        "alphaone",
+        serde_json::json!({
+            "write":"approve","promote":"any","delete":"owner",
+            "approver":{"agent":"only-me"}
+        }),
+        "owner",
+    );
+    let pid = queue_store(bin, &db, "alphaone", "agent-no-count", "alice");
+    let rej = approve(bin, &db, &pid, "wrong-caller");
+    assert!(!rej.status.success());
+
+    let list = cmd(bin)
+        .args(["--db", db.to_str().unwrap(), "--json", "pending", "list"])
+        .output()
+        .unwrap();
+    let lv: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert_eq!(lv["count"], 1);
+    assert_eq!(lv["pending"][0]["status"], "pending");
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_approver_delete_consensus_executes_delete() {
+    let db = fresh_approver_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    set_governance(
+        bin,
+        &db,
+        "alphaone",
+        serde_json::json!({
+            "write":"any","promote":"any","delete":"approve",
+            "approver":{"consensus":2}
+        }),
+        "owner",
+    );
+    let st = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--agent-id",
+            "alice",
+            "--json",
+            "store",
+            "-n",
+            "alphaone",
+            "-T",
+            "will-delete",
+            "-c",
+            "x",
+            "-t",
+            "long",
+        ])
+        .output()
+        .unwrap();
+    let id = serde_json::from_slice::<serde_json::Value>(&st.stdout).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let del = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--agent-id",
+            "alice",
+            "--json",
+            "delete",
+            &id,
+        ])
+        .output()
+        .unwrap();
+    assert!(del.status.success());
+    let jd: serde_json::Value = serde_json::from_slice(&del.stdout).unwrap();
+    assert_eq!(jd["status"], "pending");
+    let pid = jd["pending_id"].as_str().unwrap().to_string();
+
+    register_voter(bin, &db, "v1");
+    register_voter(bin, &db, "v2");
+    let _ = approve(bin, &db, &pid, "v1");
+    let v2 = approve(bin, &db, &pid, "v2");
+    let j2: serde_json::Value = serde_json::from_slice(&v2.stdout).unwrap();
+    assert_eq!(j2["approved"], true);
+    assert_eq!(j2["executed"], true);
+
+    let get = cmd(bin)
+        .args(["--db", db.to_str().unwrap(), "get", &id])
+        .output()
+        .unwrap();
+    assert!(
+        !get.status.success(),
+        "memory must be deleted after consensus"
+    );
+    let _ = std::fs::remove_file(&db);
+}
+
+// ---------------------------------------------------------------------------
+// Security regression tests — issue #216 (Consensus voter hardening) and
+// issue #217 (LIKE-wildcard smuggling in visibility filter).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_consensus_unregistered_voter_rejected() {
+    // Issue #216: an unregistered agent_id can no longer satisfy a Consensus
+    // vote. Operators must pre-register voters via `agents register`.
+    let db = fresh_approver_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    set_governance(
+        bin,
+        &db,
+        "alphaone",
+        serde_json::json!({
+            "write":"approve","promote":"any","delete":"owner",
+            "approver":{"consensus":2}
+        }),
+        "owner",
+    );
+    let pid = queue_store(bin, &db, "alphaone", "needs-2", "alice");
+    register_voter(bin, &db, "approver-1");
+    // Only approver-1 is registered; approver-2 is not.
+
+    let v1 = approve(bin, &db, &pid, "approver-1");
+    assert!(v1.status.success(), "registered voter must succeed");
+    let j1: serde_json::Value = serde_json::from_slice(&v1.stdout).unwrap();
+    assert_eq!(j1["votes"], 1);
+
+    let v2 = approve(bin, &db, &pid, "approver-2");
+    assert!(
+        !v2.status.success(),
+        "unregistered voter must be rejected; stdout={}",
+        String::from_utf8_lossy(&v2.stdout)
+    );
+
+    // Quorum must not have been reached.
+    let list = cmd(bin)
+        .args(["--db", db.to_str().unwrap(), "--json", "pending", "list"])
+        .output()
+        .unwrap();
+    let lv: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert_eq!(lv["pending"][0]["status"], "pending");
+    assert_eq!(lv["pending"][0]["approvals"].as_array().unwrap().len(), 1);
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_consensus_case_variant_rejected_if_only_lowercase_registered() {
+    // Issue #216: a single caller cannot satisfy Consensus(2) by submitting
+    // {"alice","Alice"} when only "alice" was registered. The case-variant
+    // is treated as a distinct (and therefore unregistered) id.
+    let db = fresh_approver_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    set_governance(
+        bin,
+        &db,
+        "alphaone",
+        serde_json::json!({
+            "write":"approve","promote":"any","delete":"owner",
+            "approver":{"consensus":2}
+        }),
+        "owner",
+    );
+    let pid = queue_store(bin, &db, "alphaone", "case-attack", "alice");
+    register_voter(bin, &db, "alice");
+
+    let v1 = approve(bin, &db, &pid, "alice");
+    assert!(v1.status.success());
+    let v2 = approve(bin, &db, &pid, "Alice");
+    assert!(
+        !v2.status.success(),
+        "case-variant of registered id must not satisfy quorum"
+    );
+
+    let list = cmd(bin)
+        .args(["--db", db.to_str().unwrap(), "--json", "pending", "list"])
+        .output()
+        .unwrap();
+    let lv: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert_eq!(lv["pending"][0]["status"], "pending");
+    assert_eq!(lv["pending"][0]["approvals"].as_array().unwrap().len(), 1);
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_consensus_case_insensitive_dedup_when_variants_registered() {
+    // Issue #216: even if an operator registers both "alice" and "Alice"
+    // (operational mistake — they are distinct rows), the consensus dedup
+    // must collapse them so the attacker still only gets one vote.
+    let db = fresh_approver_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    set_governance(
+        bin,
+        &db,
+        "alphaone",
+        serde_json::json!({
+            "write":"approve","promote":"any","delete":"owner",
+            "approver":{"consensus":2}
+        }),
+        "owner",
+    );
+    let pid = queue_store(bin, &db, "alphaone", "case-dedup", "alice");
+    register_voter(bin, &db, "alice");
+    register_voter(bin, &db, "Alice");
+
+    let v1 = approve(bin, &db, &pid, "alice");
+    let j1: serde_json::Value = serde_json::from_slice(&v1.stdout).unwrap();
+    assert_eq!(j1["votes"], 1);
+
+    let v2 = approve(bin, &db, &pid, "Alice");
+    let j2: serde_json::Value = serde_json::from_slice(&v2.stdout).unwrap();
+    assert_eq!(
+        j2["votes"], 1,
+        "case-variant of an existing voter must not double-count"
+    );
+
+    let list = cmd(bin)
+        .args(["--db", db.to_str().unwrap(), "--json", "pending", "list"])
+        .output()
+        .unwrap();
+    let lv: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert_eq!(lv["pending"][0]["status"], "pending");
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_visibility_wildcard_percent_smuggling_blocked() {
+    // Issue #217: as_agent="%/y" used to expand the team-scope LIKE pattern
+    // to "%/%", matching every hierarchical namespace and exposing
+    // unrelated tenants' team-scoped memories. The fix escapes the bound
+    // prefix at SQL evaluation time.
+    let db = fresh_scope_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    seed_scoped(bin, &db, "alphaone/eng", "team-secret-alphaone", "team");
+    seed_scoped(bin, &db, "acme/legal", "team-secret-acme", "team");
+    seed_scoped(bin, &db, "competitor/hr", "team-secret-competitor", "team");
+
+    let titles = recall_as_agent(bin, &db, "%/y", "team");
+    assert!(
+        titles.is_empty(),
+        "wildcard smuggling must not expose any team-scoped memory; got: {titles:?}"
+    );
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_visibility_wildcard_underscore_smuggling_blocked() {
+    // Issue #217: as_agent="_/y" used to expand the team-scope LIKE pattern
+    // to "_/%", matching every namespace whose first segment is a single
+    // character. The fix neutralises `_` in the bound prefix.
+    let db = fresh_scope_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    seed_scoped(bin, &db, "a/x", "team-secret-a", "team");
+    seed_scoped(bin, &db, "b/y", "team-secret-b", "team");
+
+    let titles = recall_as_agent(bin, &db, "_/q", "team");
+    assert!(
+        titles.is_empty(),
+        "underscore-wildcard smuggling must not expose any team-scoped memory; got: {titles:?}"
+    );
+    let _ = std::fs::remove_file(&db);
+}
+
+// ---------------------------------------------------------------------------
+// Task 1.11 — Context-Budget-Aware Recall
+// ---------------------------------------------------------------------------
+
+fn fresh_budget_db() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("ai-memory-budget-{}.db", uuid::Uuid::new_v4()))
+}
+
+fn store_sized(binary: &str, db_path: &std::path::Path, title: &str, content: &str, priority: i32) {
+    let out = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--json",
+            "store",
+            "-T",
+            title,
+            "-c",
+            content,
+            "-t",
+            "long",
+            "-p",
+            &priority.to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "store failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn recall_with_budget(
+    binary: &str,
+    db_path: &std::path::Path,
+    context: &str,
+    budget: Option<usize>,
+) -> serde_json::Value {
+    let budget_str = budget.map(|n| n.to_string());
+    let mut args: Vec<&str> = vec![
+        "--db",
+        db_path.to_str().unwrap(),
+        "--json",
+        "recall",
+        context,
+    ];
+    if let Some(ref b) = budget_str {
+        args.push("--budget-tokens");
+        args.push(b);
+    }
+    let out = cmd(binary).args(args).output().unwrap();
+    assert!(
+        out.status.success(),
+        "recall failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+
+#[test]
+fn test_budget_unlimited_returns_all() {
+    let db = fresh_budget_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    store_sized(bin, &db, "t1", "alpha match foo", 5);
+    store_sized(bin, &db, "t2", "alpha match bar", 5);
+    store_sized(bin, &db, "t3", "alpha match baz", 5);
+
+    let v = recall_with_budget(bin, &db, "alpha", None);
+    assert_eq!(v["count"], 3);
+    assert!(v["tokens_used"].as_u64().unwrap() > 0);
+    assert!(v.get("budget_tokens").is_none_or(|v| v.is_null()));
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_budget_truncates_to_fit() {
+    let db = fresh_budget_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    let body = "alpha match ".repeat(3);
+    for i in 1..=5 {
+        store_sized(bin, &db, &format!("t{i}"), &body, 10 - i);
+    }
+
+    let v = recall_with_budget(bin, &db, "alpha", Some(25));
+    let count = v["count"].as_u64().unwrap() as usize;
+    assert!(
+        count >= 1 && count < 5,
+        "budget must truncate; got count={count}"
+    );
+    let tokens_used = v["tokens_used"].as_u64().unwrap();
+    assert!(
+        tokens_used <= 25,
+        "tokens_used ({tokens_used}) must be <= budget (25)"
+    );
+    assert_eq!(v["budget_tokens"], 25);
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_budget_zero_returns_empty() {
+    let db = fresh_budget_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    store_sized(bin, &db, "x", "something to find", 5);
+
+    let v = recall_with_budget(bin, &db, "something", Some(1));
+    assert_eq!(v["count"], 0);
+    assert_eq!(v["tokens_used"], 0);
+    assert_eq!(v["budget_tokens"], 1);
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_budget_preserves_rank_order() {
+    let db = fresh_budget_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    store_sized(
+        bin,
+        &db,
+        "low-pri",
+        "alpha match filler content here longer",
+        1,
+    );
+    store_sized(bin, &db, "high-pri", "alpha match short", 10);
+
+    let v = recall_with_budget(bin, &db, "alpha", Some(8));
+    let mems = v["memories"].as_array().unwrap();
+    if !mems.is_empty() {
+        assert_eq!(mems[0]["title"], "high-pri");
+    }
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_budget_response_includes_metadata() {
+    let db = fresh_budget_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    store_sized(bin, &db, "meta-test", "response metadata check", 5);
+
+    let v = recall_with_budget(bin, &db, "response", Some(100));
+    assert!(v["tokens_used"].as_u64().is_some());
+    assert_eq!(v["budget_tokens"], 100);
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_budget_touch_only_surviving() {
+    let db = fresh_budget_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    store_sized(bin, &db, "in-budget", "alpha short", 10);
+    store_sized(
+        bin,
+        &db,
+        "out-of-budget",
+        &("alpha ".to_string() + &"x".repeat(200)),
+        1,
+    );
+
+    let v = recall_with_budget(bin, &db, "alpha", Some(5));
+    let mems = v["memories"].as_array().unwrap();
+    assert!(!mems.is_empty());
+
+    let list = cmd(bin)
+        .args(["--db", db.to_str().unwrap(), "--json", "list"])
+        .output()
+        .unwrap();
+    let lv: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    let excluded = lv["memories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["title"] == "out-of-budget")
+        .unwrap();
+    assert_eq!(
+        excluded["access_count"], 0,
+        "excluded memory must not have access_count bumped"
+    );
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_budget_mcp_tool_schema_and_response() {
+    use std::io::Write;
+    let db = fresh_budget_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    store_sized(bin, &db, "mcp-target", "mcp budget test content", 5);
+
+    let mut child = cmd(bin)
+        .args(["--db", db.to_str().unwrap(), "mcp", "--tier", "keyword"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdin = child.stdin.as_mut().unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}})
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "jsonrpc":"2.0","id":3,"method":"tools/call",
+            "params":{"name":"memory_recall","arguments":{
+                "context":"budget",
+                "budget_tokens": 200,
+                "format":"json"
+            }}
+        })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    drop(child.stdin.take());
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+
+    let tools_resp: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    let recall_tool = tools_resp["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "memory_recall")
+        .unwrap();
+    assert!(
+        recall_tool["inputSchema"]["properties"]["budget_tokens"].is_object(),
+        "memory_recall must advertise budget_tokens"
+    );
+
+    let call_resp: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
+    let text = call_resp["result"]["content"][0]["text"].as_str().unwrap();
+    let body: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert!(body["tokens_used"].as_u64().is_some());
+    assert_eq!(body["budget_tokens"], 200);
+    let _ = std::fs::remove_file(&db);
+}
+
+// ---------------------------------------------------------------------------
+// Task 1.12 — Hierarchy-Aware Recall
+// ---------------------------------------------------------------------------
+
+fn fresh_hier_recall_db() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("ai-memory-hier-{}.db", uuid::Uuid::new_v4()))
+}
+
+fn store_at(binary: &str, db_path: &std::path::Path, namespace: &str, title: &str) {
+    let out = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--json",
+            "store",
+            "-n",
+            namespace,
+            "-T",
+            title,
+            "-c",
+            "postgres content for test",
+            "-t",
+            "long",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "store failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn recall_titles(
+    binary: &str,
+    db_path: &std::path::Path,
+    namespace: &str,
+    ctx: &str,
+) -> Vec<String> {
+    let out = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--json",
+            "recall",
+            ctx,
+            "-n",
+            namespace,
+            "--limit",
+            "50",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "recall failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    v["memories"]
+        .as_array()
+        .unwrap_or(&Vec::new())
+        .iter()
+        .filter_map(|m| m["title"].as_str().map(str::to_string))
+        .collect()
+}
+
+#[test]
+fn test_hier_recall_returns_ancestor_memories() {
+    let db = fresh_hier_recall_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    store_at(bin, &db, "alphaone", "org-note");
+    store_at(bin, &db, "alphaone/engineering", "unit-note");
+    store_at(bin, &db, "alphaone/engineering/platform", "team-note");
+    store_at(
+        bin,
+        &db,
+        "alphaone/engineering/platform/agent-1",
+        "agent-note",
+    );
+    // Sibling outside the ancestor chain
+    store_at(
+        bin,
+        &db,
+        "alphaone/engineering/platform/agent-2",
+        "sibling-note",
+    );
+    store_at(bin, &db, "other-org", "outsider-note");
+
+    let titles = recall_titles(
+        bin,
+        &db,
+        "alphaone/engineering/platform/agent-1",
+        "postgres",
+    );
+    assert!(titles.contains(&"org-note".to_string()));
+    assert!(titles.contains(&"unit-note".to_string()));
+    assert!(titles.contains(&"team-note".to_string()));
+    assert!(titles.contains(&"agent-note".to_string()));
+    assert!(
+        !titles.contains(&"sibling-note".to_string()),
+        "sibling not in ancestor chain"
+    );
+    assert!(!titles.contains(&"outsider-note".to_string()));
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_hier_recall_proximity_boost_ranks_closest_first() {
+    let db = fresh_hier_recall_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    store_at(bin, &db, "alphaone", "org-note");
+    store_at(bin, &db, "alphaone/engineering", "unit-note");
+    store_at(bin, &db, "alphaone/engineering/platform", "team-note");
+    store_at(
+        bin,
+        &db,
+        "alphaone/engineering/platform/agent-1",
+        "agent-note",
+    );
+
+    let titles = recall_titles(
+        bin,
+        &db,
+        "alphaone/engineering/platform/agent-1",
+        "postgres",
+    );
+    assert_eq!(titles[0], "agent-note");
+    assert_eq!(titles[titles.len() - 1], "org-note");
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_hier_recall_flat_namespace_unchanged() {
+    let db = fresh_hier_recall_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    store_at(bin, &db, "global", "flat-a");
+    store_at(bin, &db, "other", "flat-b");
+
+    let titles = recall_titles(bin, &db, "global", "postgres");
+    assert!(titles.contains(&"flat-a".to_string()));
+    assert!(
+        !titles.contains(&"flat-b".to_string()),
+        "flat namespace must stay exact-match"
+    );
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_hier_recall_budget_applied_after_proximity() {
+    let db = fresh_hier_recall_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    // Short body so a tight budget fits the closest memory.
+    let body = "postgres tag";
+    let entries = [
+        ("alphaone", "org"),
+        ("alphaone/engineering", "unit"),
+        ("alphaone/engineering/platform", "team"),
+        ("alphaone/engineering/platform/agent-1", "self"),
+    ];
+    for (ns, title) in entries {
+        let out = cmd(bin)
+            .args([
+                "--db",
+                db.to_str().unwrap(),
+                "--json",
+                "store",
+                "-n",
+                ns,
+                "-T",
+                title,
+                "-c",
+                body,
+                "-t",
+                "long",
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+    }
+
+    // Each memory ≈ (4 title + 12 content) / 4 = 4 tokens.
+    // Budget 10 should fit 2 memories max; closest ("self") wins top slot.
+    let out = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--json",
+            "recall",
+            "postgres",
+            "-n",
+            "alphaone/engineering/platform/agent-1",
+            "--budget-tokens",
+            "10",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let mems = v["memories"].as_array().unwrap();
+    assert!(!mems.is_empty());
+    assert_eq!(mems[0]["title"], "self");
+    assert!(v["tokens_used"].as_u64().unwrap() <= 10);
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_hier_recall_2_level_ancestor_only() {
+    let db = fresh_hier_recall_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    store_at(bin, &db, "alphaone", "org");
+    store_at(bin, &db, "alphaone/engineering", "unit");
+    store_at(bin, &db, "alphaone/engineering/platform", "descendant");
+
+    let titles = recall_titles(bin, &db, "alphaone/engineering", "postgres");
+    assert!(titles.contains(&"org".to_string()));
+    assert!(titles.contains(&"unit".to_string()));
+    assert!(
+        !titles.contains(&"descendant".to_string()),
+        "descendant of queried ns must NOT appear — only ancestors"
+    );
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn test_hier_recall_touches_only_ancestor_matches() {
+    let db = fresh_hier_recall_db();
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    store_at(bin, &db, "alphaone", "ancestor-note");
+    store_at(bin, &db, "alphaone/engineering/agent-1", "agent-note");
+    store_at(bin, &db, "other-root", "outsider");
+
+    let _ = recall_titles(bin, &db, "alphaone/engineering/agent-1", "postgres");
+
+    let list = cmd(bin)
+        .args(["--db", db.to_str().unwrap(), "--json", "list"])
+        .output()
+        .unwrap();
+    let lv: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    let outsider = lv["memories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["title"] == "outsider")
+        .unwrap();
+    assert_eq!(outsider["access_count"], 0);
+    let _ = std::fs::remove_file(&db);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3 foundation (issue #224) — CLI `sync --dry-run` end-to-end
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_cli_sync_dry_run_writes_nothing() {
+    // v0.6.0 GA Phase 3 foundation: --dry-run must classify new/update/noop
+    // and NOT mutate either side of the sync. Uses today's timestamp-aware
+    // merge semantics; the richer CRDT-lite preview lands with Task 3a.1.
+    let dir = std::env::temp_dir();
+    let local_db = dir.join(format!("ai-memory-sync-local-{}.db", uuid::Uuid::new_v4()));
+    let remote_db = dir.join(format!("ai-memory-sync-remote-{}.db", uuid::Uuid::new_v4()));
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+
+    // Seed local with one memory.
+    let out = cmd(bin)
+        .args([
+            "--db",
+            local_db.to_str().unwrap(),
+            "--json",
+            "store",
+            "-n",
+            "sync-dry",
+            "-T",
+            "local-only",
+            "-c",
+            "only exists locally",
+            "-t",
+            "long",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    // Seed remote with a different memory.
+    let out = cmd(bin)
+        .args([
+            "--db",
+            remote_db.to_str().unwrap(),
+            "--json",
+            "store",
+            "-n",
+            "sync-dry",
+            "-T",
+            "remote-only",
+            "-c",
+            "only exists remotely",
+            "-t",
+            "long",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    // Dry-run merge should report 1 would-pull-new and 1 would-push-new.
+    let out = cmd(bin)
+        .args([
+            "--db",
+            local_db.to_str().unwrap(),
+            "--json",
+            "sync",
+            remote_db.to_str().unwrap(),
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "sync --dry-run failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["dry_run"], true);
+    assert_eq!(
+        v["pull"]["new"], 1,
+        "remote-only memory should be classified as would-pull-new; got: {v}"
+    );
+    assert_eq!(
+        v["push"]["new"], 1,
+        "local-only memory should be classified as would-push-new; got: {v}"
+    );
+
+    // Critical: neither side was mutated. Each DB should still hold only
+    // its seeded memory.
+    for (db_path, expected_title) in [(&local_db, "local-only"), (&remote_db, "remote-only")] {
+        let list = cmd(bin)
+            .args([
+                "--db",
+                db_path.to_str().unwrap(),
+                "--json",
+                "list",
+                "-n",
+                "sync-dry",
+            ])
+            .output()
+            .unwrap();
+        let lv: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+        let titles: Vec<String> = lv["memories"]
+            .as_array()
+            .unwrap_or(&Vec::new())
+            .iter()
+            .filter_map(|m| m["title"].as_str().map(str::to_string))
+            .collect();
+        assert_eq!(
+            titles,
+            vec![expected_title.to_string()],
+            "dry-run must not write; {:?}",
+            db_path
+        );
+    }
+
+    let _ = std::fs::remove_file(&local_db);
+    let _ = std::fs::remove_file(&remote_db);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3 Task 3b.1 (issue #224) — sync-daemon end-to-end mesh.
+//
+// The defining grand-slam test: one peer's memory ends up on the other
+// within a couple of daemon cycles, no cloud, no login, no manual sync.
+// ---------------------------------------------------------------------------
+
+/// Find a free localhost TCP port by binding to :0 and dropping.
+fn free_port() -> u16 {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    drop(l);
+    port
+}
+
+/// Wait for the `/api/v1/health` endpoint to respond 200 — up to ~5s.
+fn wait_for_health(port: u16) -> bool {
+    for _ in 0..50 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if let Ok(out) = std::process::Command::new("curl")
+            .args([
+                "-s",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                &format!("http://127.0.0.1:{port}/api/v1/health"),
+            ])
+            .output()
+            && String::from_utf8_lossy(&out.stdout) == "200"
+        {
+            return true;
+        }
+    }
+    false
+}
+
+#[test]
+fn test_sync_daemon_mesh_propagates_memory_between_peers() {
+    // Phase 3 Task 3b.1 — the grand slam.
+    //
+    // Topology:
+    //   DB A  <— sync-daemon —>  HTTP serve B  —  DB B
+    //
+    // 1. Start `serve B` on a free port against db_B.
+    // 2. Seed a memory into db_B via HTTP POST /api/v1/memories.
+    // 3. Start `sync-daemon` pointed at serve-B's URL, syncing db_A.
+    // 4. Within a few cycles (interval=1s), db_A should contain a copy of
+    //    the memory. This is the cross-machine / no-cloud knowledge mesh.
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    let dir = std::env::temp_dir();
+    let db_a = dir.join(format!("ai-memory-mesh-a-{}.db", uuid::Uuid::new_v4()));
+    let db_b = dir.join(format!("ai-memory-mesh-b-{}.db", uuid::Uuid::new_v4()));
+
+    // 1. Serve B.
+    let port_b = free_port();
+    let mut serve_b = cmd(bin)
+        .args([
+            "--db",
+            db_b.to_str().unwrap(),
+            "serve",
+            "--port",
+            &port_b.to_string(),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    assert!(
+        wait_for_health(port_b),
+        "serve B health probe never returned 200"
+    );
+
+    // 2. Seed memory into db_B via HTTP.
+    let seed_body = serde_json::json!({
+        "tier": "long",
+        "namespace": "mesh-demo",
+        "title": "Live mesh memory",
+        "content": "Written to peer B; must reach peer A via sync-daemon.",
+        "tags": ["mesh"],
+        "priority": 7,
+        "confidence": 1.0,
+        "source": "api",
+        "metadata": {},
+    });
+    let seed_out = std::process::Command::new("curl")
+        .args([
+            "-s",
+            "-X",
+            "POST",
+            "-H",
+            "content-type: application/json",
+            "-H",
+            "x-agent-id: peer-b",
+            "-d",
+            &seed_body.to_string(),
+            &format!("http://127.0.0.1:{port_b}/api/v1/memories"),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        seed_out.status.success(),
+        "seed POST failed: {}",
+        String::from_utf8_lossy(&seed_out.stderr)
+    );
+
+    // 3. Start the sync-daemon — tight 1-second cycle, 30-second cap.
+    let mut daemon = cmd(bin)
+        .args([
+            "--db",
+            db_a.to_str().unwrap(),
+            "--agent-id",
+            "peer-a",
+            "sync-daemon",
+            "--peers",
+            &format!("http://127.0.0.1:{port_b}"),
+            "--interval",
+            "1",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+
+    // 4. Poll db_A via CLI until the memory appears (or timeout).
+    let mut found = false;
+    for _ in 0..30 {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let list = cmd(bin)
+            .args([
+                "--db",
+                db_a.to_str().unwrap(),
+                "--json",
+                "list",
+                "-n",
+                "mesh-demo",
+            ])
+            .output()
+            .unwrap();
+        if list.status.success() {
+            let v: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap_or_default();
+            if let Some(arr) = v["memories"].as_array()
+                && arr.iter().any(|m| m["title"] == "Live mesh memory")
+            {
+                found = true;
+                break;
+            }
+        }
+    }
+
+    // Teardown daemons.
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    let _ = serve_b.kill();
+    let _ = serve_b.wait();
+
+    assert!(
+        found,
+        "sync-daemon failed to mesh memory from peer B → peer A within 15s"
+    );
+
+    let _ = std::fs::remove_file(&db_a);
+    let _ = std::fs::remove_file(&db_b);
+}
+
+// ---------------------------------------------------------------------------
+// Native TLS tests (Layer 1) — `ai-memory serve --tls-cert/--tls-key`
+// ---------------------------------------------------------------------------
+
+/// Generate a self-signed PEM cert + key pair at the given paths. Returns
+/// the (cert_path, key_path) tuple. Skips the test if openssl isn't on
+/// the PATH (rare on CI runners, but this keeps local-dev friendly).
+fn gen_self_signed_cert(dir: &std::path::Path) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    let cert = dir.join(format!("ai-memory-test-cert-{}.pem", uuid::Uuid::new_v4()));
+    let key = dir.join(format!("ai-memory-test-key-{}.pem", uuid::Uuid::new_v4()));
+    let status = std::process::Command::new("openssl")
+        .args([
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-keyout",
+            key.to_str().unwrap(),
+            "-out",
+            cert.to_str().unwrap(),
+            "-days",
+            "1",
+            "-nodes",
+            "-subj",
+            "/CN=localhost",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    if let Ok(s) = status
+        && s.success()
+    {
+        return Some((cert, key));
+    }
+    None
+}
+
+#[test]
+fn test_serve_native_tls_health_probe() {
+    // Layer 1 — `ai-memory serve --tls-cert ... --tls-key ...` must serve
+    // the health endpoint over HTTPS (self-signed cert, --insecure probe).
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    let dir = std::env::temp_dir();
+    let db = dir.join(format!("ai-memory-tls-{}.db", uuid::Uuid::new_v4()));
+    let Some((cert_path, key_path)) = gen_self_signed_cert(&dir) else {
+        eprintln!("skipping: openssl not available on PATH");
+        return;
+    };
+
+    let port = free_port();
+    let mut child = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "serve",
+            "--port",
+            &port.to_string(),
+            "--tls-cert",
+            cert_path.to_str().unwrap(),
+            "--tls-key",
+            key_path.to_str().unwrap(),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+
+    // Poll HTTPS health endpoint — curl --insecure against the self-signed cert.
+    let mut ok = false;
+    for _ in 0..50 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if let Ok(out) = std::process::Command::new("curl")
+            .args([
+                "-sk",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                &format!("https://127.0.0.1:{port}/api/v1/health"),
+            ])
+            .output()
+            && String::from_utf8_lossy(&out.stdout) == "200"
+        {
+            ok = true;
+            break;
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(
+        ok,
+        "HTTPS health endpoint never returned 200; is axum-server bound?"
+    );
+
+    let _ = std::fs::remove_file(&db);
+    let _ = std::fs::remove_file(&cert_path);
+    let _ = std::fs::remove_file(&key_path);
+}
+
+/// Build a `reqwest::blocking::Client` presenting the given PEM cert +
+/// key as its client identity. Accepts any server cert (self-signed in
+/// these tests — the peer authenticates US via fingerprint allowlist).
+/// Uses reqwest's rustls-tls backend; `from_pem` expects both cert and
+/// key concatenated into a single PEM blob.
+fn build_mtls_probe_client(
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+) -> reqwest::blocking::Client {
+    // Transitive deps pull reqwest's native-tls backend via hf-hub's
+    // default-tls feature, so the test uses `from_pkcs8_pem` (native-tls
+    // variant) for maximum cross-platform consistency. The daemon in
+    // production goes through `use_preconfigured_tls` with a rustls
+    // ClientConfig (see src/main.rs).
+    let cert = std::fs::read(cert_path).expect("read client cert");
+    let key = std::fs::read(key_path).expect("read client key");
+    let identity =
+        reqwest::Identity::from_pkcs8_pem(&cert, &key).expect("parse mTLS identity (PKCS#8 PEM)");
+    reqwest::blocking::Client::builder()
+        .identity(identity)
+        .danger_accept_invalid_certs(true)
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .expect("build reqwest mTLS client")
+}
+
+/// Compute SHA-256 fingerprint of a PEM cert's DER body via `openssl`
+/// (same CLI available on all CI runners). Returns hex without `:`.
+fn cert_sha256_fingerprint(cert_path: &std::path::Path) -> Option<String> {
+    let out = std::process::Command::new("openssl")
+        .args([
+            "x509",
+            "-noout",
+            "-fingerprint",
+            "-sha256",
+            "-in",
+            cert_path.to_str().unwrap(),
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout);
+    // openssl emits `SHA256 Fingerprint=AA:BB:...` — strip label, colons.
+    let hex: String = s
+        .split('=')
+        .nth(1)?
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .collect();
+    Some(hex.to_ascii_lowercase())
+}
+
+#[test]
+fn test_serve_mtls_fingerprint_allowlist_accepts_only_known_peer() {
+    // Layer 2 — mTLS with SHA-256 fingerprint allowlist.
+    // Peer B runs serve with an allowlist containing peer-A's cert
+    // fingerprint. The sync-daemon on peer A presents peer-A's cert and
+    // must succeed. A second daemon presenting an unknown cert must be
+    // rejected at the TLS handshake.
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    let dir = std::env::temp_dir();
+    let db_a = dir.join(format!("ai-memory-mtls-a-{}.db", uuid::Uuid::new_v4()));
+    let db_b = dir.join(format!("ai-memory-mtls-b-{}.db", uuid::Uuid::new_v4()));
+
+    // Generate three self-signed keypairs: server (peer B's TLS cert),
+    // peer-A (authorised client), and peer-C (unauthorised client).
+    let Some((server_cert, server_key)) = gen_self_signed_cert(&dir) else {
+        eprintln!("skipping: openssl not available on PATH");
+        return;
+    };
+    let Some((peer_a_cert, peer_a_key)) = gen_self_signed_cert(&dir) else {
+        eprintln!("skipping: openssl not available on PATH");
+        return;
+    };
+    let Some((peer_c_cert, peer_c_key)) = gen_self_signed_cert(&dir) else {
+        eprintln!("skipping: openssl not available on PATH");
+        return;
+    };
+
+    let allowlist_path = dir.join(format!("ai-memory-mtls-allow-{}.txt", uuid::Uuid::new_v4()));
+    let peer_a_fp =
+        cert_sha256_fingerprint(&peer_a_cert).expect("failed to fingerprint peer A cert");
+    std::fs::write(
+        &allowlist_path,
+        format!("# authorised mTLS peers\n{peer_a_fp}\n"),
+    )
+    .unwrap();
+
+    // Start peer B's serve with mTLS + allowlist.
+    let port_b = free_port();
+    let mut serve_b = cmd(bin)
+        .args([
+            "--db",
+            db_b.to_str().unwrap(),
+            "serve",
+            "--port",
+            &port_b.to_string(),
+            "--tls-cert",
+            server_cert.to_str().unwrap(),
+            "--tls-key",
+            server_key.to_str().unwrap(),
+            "--mtls-allowlist",
+            allowlist_path.to_str().unwrap(),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+
+    // Build a reqwest::blocking client presenting peer-A's cert. We use
+    // reqwest (rustls-tls backend) instead of `curl --cert` because
+    // curl on Windows CI is often the schannel build and doesn't
+    // accept PEM client certs the same way curl-openssl does.
+    let client_a = build_mtls_probe_client(&peer_a_cert, &peer_a_key);
+
+    // Wait for TLS bind — 30s poll window; Windows is slower on the
+    // first handshake (RSA key parse + custom verifier init).
+    let health_url = format!("https://127.0.0.1:{port_b}/api/v1/health");
+    let mut ready = false;
+    for _ in 0..300 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if let Ok(resp) = client_a.get(&health_url).send()
+            && resp.status().is_success()
+        {
+            ready = true;
+            break;
+        }
+    }
+    assert!(ready, "mTLS serve never accepted peer A's cert for health");
+
+    // Seed a memory via mTLS POST.
+    let seed = serde_json::json!({
+        "tier": "long",
+        "namespace": "mtls-demo",
+        "title": "Peer B secret",
+        "content": "Only reachable via mTLS allowlist.",
+        "tags": ["mtls"],
+        "priority": 7,
+        "confidence": 1.0,
+        "source": "api",
+        "metadata": {},
+    });
+    let seed_resp = client_a
+        .post(format!("https://127.0.0.1:{port_b}/api/v1/memories"))
+        .header("content-type", "application/json")
+        .header("x-agent-id", "peer-b")
+        .body(seed.to_string())
+        .send()
+        .expect("seed POST via mTLS must succeed");
+    assert!(
+        seed_resp.status().is_success(),
+        "seed status {}",
+        seed_resp.status()
+    );
+
+    // Start the sync-daemon on peer A with peer-A's client cert.
+    let mut daemon_ok = cmd(bin)
+        .args([
+            "--db",
+            db_a.to_str().unwrap(),
+            "--agent-id",
+            "peer-a",
+            "sync-daemon",
+            "--peers",
+            &format!("https://127.0.0.1:{port_b}"),
+            "--interval",
+            "1",
+            "--client-cert",
+            peer_a_cert.to_str().unwrap(),
+            "--client-key",
+            peer_a_key.to_str().unwrap(),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+
+    // Positive case: memory should propagate to peer A.
+    let mut found = false;
+    for _ in 0..30 {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let list = cmd(bin)
+            .args([
+                "--db",
+                db_a.to_str().unwrap(),
+                "--json",
+                "list",
+                "-n",
+                "mtls-demo",
+            ])
+            .output()
+            .unwrap();
+        if list.status.success() {
+            let v: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap_or_default();
+            if let Some(arr) = v["memories"].as_array()
+                && arr.iter().any(|m| m["title"] == "Peer B secret")
+            {
+                found = true;
+                break;
+            }
+        }
+    }
+    let _ = daemon_ok.kill();
+    let _ = daemon_ok.wait();
+
+    assert!(
+        found,
+        "authorised peer-A cert failed to sync through mTLS allowlist"
+    );
+
+    // Negative case: reqwest with peer-C's cert must be rejected at
+    // handshake. The `send()` call returns an error (not an HTTP code)
+    // because the TLS layer fails before any HTTP exchange.
+    let client_c = build_mtls_probe_client(&peer_c_cert, &peer_c_key);
+    let neg = client_c.get(&health_url).send();
+    assert!(
+        neg.is_err(),
+        "unauthorised cert must be rejected at TLS handshake; got {:?}",
+        neg
+    );
+
+    let _ = serve_b.kill();
+    let _ = serve_b.wait();
+
+    for p in [
+        &db_a,
+        &db_b,
+        &server_cert,
+        &server_key,
+        &peer_a_cert,
+        &peer_a_key,
+        &peer_c_cert,
+        &peer_c_key,
+        &allowlist_path,
+    ] {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+#[test]
+fn test_serve_rejects_half_tls_config() {
+    // Layer 1 — clap's `requires = "tls_key"` must reject `--tls-cert`
+    // without `--tls-key` at arg-parse time.
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    let dir = std::env::temp_dir();
+    let db = dir.join(format!("ai-memory-tls-half-{}.db", uuid::Uuid::new_v4()));
+    let out = cmd(bin)
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "serve",
+            "--port",
+            &free_port().to_string(),
+            "--tls-cert",
+            "/nonexistent/cert.pem",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "half-configured TLS must be rejected"
+    );
+    let _ = std::fs::remove_file(&db);
 }
