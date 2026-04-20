@@ -86,13 +86,26 @@ ai-memory list --namespace _curator/reports --limit 10000 --json \
     > audit-cycles.json
 
 # Aggregate cycle reports for the headline numbers.
-jq '{
-    cycles: (.memories | length),
-    total_auto_tagged: ([.memories[].content | fromjson.auto_tagged] | add),
-    total_consolidated: ([.memories[].content | fromjson.memories_consolidated] | add),
-    total_forgotten: ([.memories[].content | fromjson.memories_forgotten] | add),
-    total_priority_adjustments: ([.memories[].content | fromjson.priority_adjustments] | add),
-    total_errors: ([.memories[].content | fromjson.errors_total] | add)
+# Field shapes map to src/curator.rs::CuratorReport + src/autonomy.rs::AutonomyPassReport:
+#   - Top-level: auto_tagged, contradictions_found, operations_attempted,
+#     operations_skipped_cap, errors (Vec<String>), autonomy (nested).
+#   - Nested under .autonomy: clusters_formed, memories_consolidated,
+#     memories_forgotten, priority_adjustments, rollback_entries_written,
+#     errors (Vec<String>).
+#   - There is NO `errors_total` scalar; errors are always arrays —
+#     aggregate with `(.errors | length)`.
+jq '[.memories[].content | fromjson] as $reports | {
+    cycles: ($reports | length),
+    total_auto_tagged:        ([$reports[].auto_tagged // 0] | add),
+    total_contradictions:     ([$reports[].contradictions_found // 0] | add),
+    total_ops_attempted:      ([$reports[].operations_attempted // 0] | add),
+    total_ops_skipped_cap:    ([$reports[].operations_skipped_cap // 0] | add),
+    total_consolidated:       ([$reports[].autonomy.memories_consolidated // 0] | add),
+    total_forgotten:          ([$reports[].autonomy.memories_forgotten // 0] | add),
+    total_priority_adjusts:   ([$reports[].autonomy.priority_adjustments // 0] | add),
+    total_rollback_entries:   ([$reports[].autonomy.rollback_entries_written // 0] | add),
+    total_curator_errors:     ([$reports[].errors // [] | length] | add),
+    total_autonomy_errors:    ([$reports[].autonomy.errors // [] | length] | add)
 }' audit-cycles.json > headline.json
 ```
 
@@ -116,7 +129,9 @@ R = (reversed actions / sampled actions) * 100
 
 - `cycles >= 160` (allow 8 missed-hour margin for panics, restarts,
   Ollama hiccups).
-- `total_errors <= 5%` of total operations.
+- `(total_curator_errors + total_autonomy_errors) <= 0.05 *
+  total_ops_attempted` — aggregate error rate ≤ 5% of attempted
+  operations. Computed directly from `headline.json`.
 - `R <= 10%` — operator agrees with at least 90% of curator
   decisions on the stratified sample.
 - Zero unreversible corruption: every `_reversed`-tagged entry still

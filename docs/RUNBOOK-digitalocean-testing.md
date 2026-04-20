@@ -9,6 +9,32 @@ autonomy, SAL, quorum, federation, migration).
 This runbook is **the** gate before cutting `v0.6.0` on the release
 branch. No tag without a green DigitalOcean campaign report.
 
+## Source of truth — the ship-gate repo
+
+The reproducible, versioned, CI-driven implementation of everything in
+this runbook lives at
+[`alphaonedev/ai-memory-ship-gate`](https://github.com/alphaonedev/ai-memory-ship-gate).
+That repo's `terraform/`, `scripts/phase{1,2,3,4}_*.sh`, and
+`.github/workflows/campaign.yml` are the **executable** forms of the
+commands below. This document describes the methodology; the other
+repo runs it.
+
+Reproduce a campaign without hand-pasting commands:
+
+```sh
+gh repo fork alphaonedev/ai-memory-ship-gate --clone
+gh secret set DIGITALOCEAN_TOKEN -R <your-fork>
+gh secret set DIGITALOCEAN_SSH_KEY_FINGERPRINT -R <your-fork>
+gh secret set DIGITALOCEAN_SSH_PRIVATE_KEY -R <your-fork>
+gh workflow run campaign.yml -R <your-fork> \
+  -f ai_memory_git_ref=release/v0.6.0 \
+  -f campaign_id=my-validation-run
+```
+
+The commands in the rest of this runbook are the manual-operator path
+for debugging individual phases — they are not the production ship
+procedure.
+
 ## Scope
 
 Validates the v0.6.0.0 release candidate across three axes on real
@@ -36,51 +62,54 @@ Three DigitalOcean droplets plus one shared Postgres database:
 
 Region: `nyc3` (or wherever latency to the operator is lowest).
 
-## Provisioning (Terraform stub)
+## Provisioning
+
+The production Terraform + cloud-init live in the ship-gate repo at
+<https://github.com/alphaonedev/ai-memory-ship-gate/tree/main/terraform>.
+That module creates three peer droplets + one chaos client + a
+campaign-scoped VPC + a firewall mesh + an in-droplet dead-man
+switch. It is the authoritative implementation — the snippet below is
+illustrative, not a copy to paste.
 
 ```hcl
-# packaging/terraform/digitalocean.tf — scaffold only
+# Illustrative shape — the real module lives in the ship-gate repo.
 resource "digitalocean_droplet" "aim_node" {
   for_each = toset(["a", "b", "c"])
   image    = "ubuntu-24-04-x64"
-  name     = "aim-node-${each.key}"
-  region   = "nyc3"
-  size     = "s-2vcpu-4gb"
-  ssh_keys = [var.ssh_key_id]
-  tags     = ["ai-memory", "v0.6.0.0-soak"]
-
-  user_data = templatefile("${path.module}/cloud-init.yaml", {
-    role           = "peer-${each.key}"
-    ai_memory_rev  = var.release_candidate_sha
-  })
-}
-
-resource "digitalocean_database_cluster" "aim_postgres" {
-  name       = "aim-postgres"
-  engine     = "pg"
-  version    = "16"
-  size       = "db-s-2vcpu-4gb"
-  region     = "nyc3"
-  node_count = 1
+  name     = "aim-${var.campaign_id}-node-${each.key}"
+  region   = var.region
+  size     = var.peer_size          # s-4vcpu-8gb (8GB needed for rustc)
+  ssh_keys = [var.ssh_key_fingerprint]
+  vpc_uuid = digitalocean_vpc.campaign.id
+  tags     = local.tags
+  user_data = local.cloud_init      # pinned to var.ai_memory_git_ref
 }
 ```
 
-The Terraform module + `cloud-init.yaml` live in
-`packaging/terraform/` — they are the scaffold for the v0.6.0.0 ship
-procedure; populate `var.ssh_key_id` and `var.release_candidate_sha`
-before `terraform apply`.
+Postgres is **not** provisioned as a DO managed database — the
+Phase 3 migration test brings Postgres up locally on `node-a` via
+`packaging/docker-compose.postgres.yml` for ~$0 marginal cost. A
+managed `pgvector` tier would add ~$60/mo to each campaign for
+identical test semantics.
 
 ## Deployment
 
-On each node, cloud-init installs the v0.6.0.0-RC binary and the
-hardened systemd units:
+On each node, the ship-gate cloud-init clones
+`github.com/alphaonedev/ai-memory-mcp` at the pinned ref and builds
+with `cargo build --release`:
 
 ```bash
-# Single command executed by cloud-init per node:
-curl -sSL https://raw.githubusercontent.com/alphaonedev/ai-memory-mcp/release/v0.6.0/install.sh \
-  | AI_MEMORY_CHANNEL=release-candidate sh
-systemctl enable --now ai-memory ai-memory-sync ai-memory-curator
+# Shape of what cloud-init runs on each droplet — real script at
+# https://github.com/alphaonedev/ai-memory-ship-gate/blob/main/terraform/cloud-init.yaml
+git clone https://github.com/alphaonedev/ai-memory-mcp.git /opt/ai-memory-mcp
+cd /opt/ai-memory-mcp && git checkout "$AI_MEMORY_GIT_REF"
+CARGO_BUILD_JOBS=2 cargo build --release
+install -m 0755 target/release/ai-memory /usr/local/bin/ai-memory
 ```
+
+Once a tag is cut, a prebuilt-binary path will replace the cold
+`cargo build` step. The channel-aware `install.sh` is tracked in
+`#TBD` — for v0.6.0 the build-from-ref path is canonical.
 
 Verify:
 
