@@ -123,6 +123,31 @@ impl PostgresStore {
                 detail: format!("init schema: {e}"),
             })?;
 
+        // Sanity-check that the embedding column dimension matches the
+        // default embedder (MiniLmL6V2 = 384). If a deployment has
+        // configured a different model (e.g. NomicEmbedV15 = 768), the
+        // table must be recreated with the matching vector(N) — we log
+        // a WARN here so operators notice before writes start failing.
+        // (#304 nit — schema previously had no mismatch detection.)
+        let typmod: Option<(i32,)> = sqlx::query_as(
+            "SELECT atttypmod FROM pg_attribute a
+             JOIN pg_class c ON c.oid = a.attrelid
+             WHERE c.relname = 'memories' AND a.attname = 'embedding'",
+        )
+        .fetch_optional(&pool)
+        .await
+        .ok()
+        .flatten();
+        if let Some((typmod,)) = typmod
+            && typmod != 384
+        {
+            tracing::warn!(
+                target = "store::postgres",
+                dim = typmod,
+                "memories.embedding column dimension is not 384; recreate with matching vector(N) for your embedder"
+            );
+        }
+
         Ok(Self { pool })
     }
 

@@ -2221,6 +2221,23 @@ fn handle_subscribe(
     let created_by =
         crate::identity::resolve_agent_id(None, mcp_client).map_err(|e| e.to_string())?;
 
+    // Require the caller to be a registered agent (#301 item 4).
+    // MCP stdio is single-tenant per process, but the same tool set is
+    // exposed on the HTTP daemon where a caller might not be attested.
+    // Registration in `_agents` is cheap (single memory_agent_register
+    // call) and provides an audit trail; refusing unregistered
+    // subscribers closes the "any MCP client owns the webhook fleet"
+    // hole flagged by the v0.6.0 security review.
+    let registered = crate::db::list_agents(conn)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .any(|a| a.agent_id == created_by);
+    if !registered {
+        return Err(format!(
+            "agent {created_by:?} is not registered; call memory_agent_register before memory_subscribe"
+        ));
+    }
+
     crate::subscriptions::validate_url(url).map_err(|e| e.to_string())?;
 
     let id = crate::subscriptions::insert(

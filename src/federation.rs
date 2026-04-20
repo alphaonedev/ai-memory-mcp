@@ -168,37 +168,46 @@ pub async fn broadcast_store_quorum(
         });
     }
 
+    // Deadline is computed ONCE here and never re-derived inside the
+    // loop. The tracker carries the same deadline internally — passing
+    // a single `Instant` through avoids the few-millisecond disagreement
+    // that previously caused `finalise()` to reject quorums met 1-2 ms
+    // earlier. (#299 item 1.)
     let deadline = now + config.policy.ack_timeout;
-    while let Some(result) = tokio::time::timeout(
-        deadline.saturating_duration_since(Instant::now()),
-        joins.join_next(),
-    )
-    .await
-    .ok()
-    .flatten()
-    {
-        match result {
-            Ok((peer_id, AckOutcome::Ack)) => {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, joins.join_next()).await {
+            Ok(Some(Ok((peer_id, AckOutcome::Ack)))) => {
                 tracker.lock().await.record_peer_ack(peer_id);
             }
-            Ok((peer_id, AckOutcome::IdDrift)) => {
+            Ok(Some(Ok((peer_id, AckOutcome::IdDrift)))) => {
                 tracker.lock().await.record_id_drift(peer_id);
             }
-            Ok((peer_id, AckOutcome::Fail(reason))) => {
+            Ok(Some(Ok((peer_id, AckOutcome::Fail(reason))))) => {
                 tracing::warn!("federation: peer {peer_id} failed for {}: {reason}", mem.id);
             }
-            Err(e) => {
+            Ok(Some(Err(e))) => {
                 tracing::warn!("federation: peer join error: {e}");
             }
+            Ok(None) | Err(_) => break, // joinset drained or timed out
         }
         // Early-exit once the tracker says quorum is met — we don't
-        // need to wait for stragglers. But we still fire-and-forget
-        // their pending requests (the JoinSet drop cancels the
-        // remaining tasks).
+        // need to wait for stragglers.
         if tracker.lock().await.is_quorum_met(Instant::now()) {
             break;
         }
     }
+
+    // Drain the JoinSet explicitly (#299 item 2). Previously we relied
+    // on `Drop` to abort in-flight tasks — but `Arc::try_unwrap` on
+    // the tracker could then spuriously fail because the spawned tasks
+    // held their Arc<Mutex<…>> handles until they actually unwound.
+    // `shutdown().await` waits for every task to finish (or be cancelled)
+    // before returning, guaranteeing the tracker is the sole Arc owner.
+    joins.shutdown().await;
 
     let tracker = Arc::try_unwrap(tracker)
         .map_err(|_| QuorumError::LocalWriteFailed {
