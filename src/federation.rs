@@ -211,13 +211,46 @@ pub async fn broadcast_store_quorum(
         }
     }
 
-    // Drain the JoinSet explicitly (#299 item 2). Previously we relied
-    // on `Drop` to abort in-flight tasks — but `Arc::try_unwrap` on
-    // the tracker could then spuriously fail because the spawned tasks
-    // held their Arc<Mutex<…>> handles until they actually unwound.
-    // `shutdown().await` waits for every task to finish (or be cancelled)
-    // before returning, guaranteeing the tracker is the sole Arc owner.
-    joins.shutdown().await;
+    // v0.6.0 correctness fix: once quorum is met, DETACH the remaining
+    // fanouts into a background task so they complete naturally rather
+    // than being aborted mid-flight. Ship-gate run 14 showed each peer
+    // receiving only ~50% of burst writes under W=2/N=3 — cause: when
+    // peer-B won the ack race, `joins.shutdown().await` aborted the
+    // in-flight POST to peer-C, which often reached reqwest's connect
+    // phase but never delivered the memory. Net effect: every write
+    // landed on leader + exactly one peer, leaving the other peer
+    // permanently behind until a sync-daemon (not running in the phase-2
+    // harness) caught it up.
+    //
+    // The spawned fanout tasks do NOT hold the tracker Arc (they only
+    // capture client/url/payload/id), so letting them outlive this
+    // function does not block the `Arc::try_unwrap` below. Errors inside
+    // the detached tasks are logged but otherwise ignored — the caller
+    // has already met quorum by the time we detach.
+    if !joins.is_empty() {
+        tokio::spawn(async move {
+            while let Some(res) = joins.join_next().await {
+                match res {
+                    Ok((peer_id, AckOutcome::Ack)) => {
+                        tracing::debug!("federation: post-quorum ack from {peer_id}");
+                    }
+                    Ok((peer_id, AckOutcome::IdDrift)) => {
+                        tracing::warn!(
+                            "federation: post-quorum id-drift from {peer_id} (peer rewrote id)"
+                        );
+                    }
+                    Ok((peer_id, AckOutcome::Fail(reason))) => {
+                        tracing::debug!(
+                            "federation: post-quorum peer {peer_id} did not ack: {reason}"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("federation: post-quorum join error: {e}");
+                    }
+                }
+            }
+        });
+    }
 
     let tracker = Arc::try_unwrap(tracker)
         .map_err(|_| QuorumError::LocalWriteFailed {
@@ -446,10 +479,45 @@ mod tests {
             .unwrap();
         let result = finalise_quorum(&tracker);
         assert!(result.is_ok(), "expected quorum met, got {result:?}");
-        // At least one peer called; happy-path race can finish before
-        // the second issues the request — that's by design (early-exit).
+        // At least one peer called before quorum returned. With v0.6.0's
+        // post-quorum detach, additional fan-outs complete in the
+        // background and may or may not have landed by the time this
+        // assertion runs — the synchronous contract is only "≥ 1 peer
+        // acked before return".
         let calls = count1.load(Ordering::Relaxed) + count2.load(Ordering::Relaxed);
         assert!(calls >= 1);
+    }
+
+    #[tokio::test]
+    async fn post_quorum_fanout_reaches_all_peers() {
+        // Contract: once quorum is met, the background detach must still
+        // deliver the write to every peer. Ship-gate run 14 uncovered the
+        // prior abort-on-quorum regression that left one peer permanently
+        // missing ~50% of burst writes under W=2/N=3.
+        let (url1, count1) = spawn_mock_peer(MockBehaviour::Ack).await;
+        let (url2, count2) = spawn_mock_peer(MockBehaviour::Ack).await;
+        let cfg = build_config(vec![url1, url2], 2, 2000);
+        let _tracker = broadcast_store_quorum(&cfg, &sample_memory())
+            .await
+            .unwrap();
+        // Give the detached fanout a slow path to complete. Mock handlers
+        // are in-process, so 200ms is comfortable without being flaky.
+        for _ in 0..20 {
+            if count1.load(Ordering::Relaxed) == 1 && count2.load(Ordering::Relaxed) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            count1.load(Ordering::Relaxed),
+            1,
+            "peer-1 must receive the write post-quorum"
+        );
+        assert_eq!(
+            count2.load(Ordering::Relaxed),
+            1,
+            "peer-2 must receive the write post-quorum"
+        );
     }
 
     #[tokio::test]
