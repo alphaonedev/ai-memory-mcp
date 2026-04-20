@@ -183,6 +183,16 @@ cycle() {
         }
     done
 
+    # Post-write settle window — lets detached post-quorum fanouts
+    # finish their retries before we measure. Ship-gate run 19 showed
+    # partition_minority at convergence_bound 0.2 because the 500ms
+    # iptables DROP triggered reqwest retransmits that were still in
+    # flight when the cycle tore down: SIGKILL of the leader aborted
+    # those retries, peers never got the writes. 3s covers the
+    # federation client's default 3s quorum-timeout, after which any
+    # in-flight fanout has either succeeded or given up.
+    sleep 3
+
     # Convergence check: count rows visible at each node in THIS cycle's
     # namespace. Per-cycle namespace isolation means count_nodeN reflects
     # only the writes this cycle attempted — no bleed-over from prior
