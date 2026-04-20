@@ -108,7 +108,7 @@ impl PostgresStore {
 
         // Sanity-check pgvector version. We support 0.7.x–0.8.x; older
         // versions have HNSW behaviour differences we haven't tested
-        // against. (#302 item 2 — prior code accepted any version.)
+        // against. (#302 item 2.)
         let extver: Option<(String,)> =
             sqlx::query_as("SELECT extversion FROM pg_extension WHERE extname = 'vector'")
                 .fetch_optional(&pool)
@@ -124,6 +124,31 @@ impl PostgresStore {
                 target = "store::postgres",
                 version = %ver,
                 "pgvector version outside the tested range 0.7.x–0.8.x; HNSW recall may differ"
+            );
+        }
+
+        // Sanity-check that the embedding column dimension matches the
+        // default embedder (MiniLmL6V2 = 384). If a deployment has
+        // configured a different model (e.g. NomicEmbedV15 = 768), the
+        // table must be recreated with the matching vector(N) — we log
+        // a WARN here so operators notice before writes start failing.
+        // (#304 nit.)
+        let typmod: Option<(i32,)> = sqlx::query_as(
+            "SELECT atttypmod FROM pg_attribute a
+             JOIN pg_class c ON c.oid = a.attrelid
+             WHERE c.relname = 'memories' AND a.attname = 'embedding'",
+        )
+        .fetch_optional(&pool)
+        .await
+        .ok()
+        .flatten();
+        if let Some((typmod,)) = typmod
+            && typmod != 384
+        {
+            tracing::warn!(
+                target = "store::postgres",
+                dim = typmod,
+                "memories.embedding column dimension is not 384; recreate with matching vector(N) for your embedder"
             );
         }
 
