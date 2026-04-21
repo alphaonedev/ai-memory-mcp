@@ -481,6 +481,7 @@ Beyond MCP, ai-memory also exposes a full HTTP REST API (24 endpoints on port 90
 - **Contradiction resolution** -- mark one memory as superseding another, demote the loser
 - **Forget by pattern** -- bulk delete by namespace + FTS pattern + tier
 - **Source tracking** -- tracks origin: user, claude, hook, api, cli, import, consolidation, system
+- **Agent identity (NHI)** -- every memory carries `metadata.agent_id` (claimed identity) with defense-in-depth immutability across update/dedup/import/sync/consolidate; filter `list`/`search` by agent
 - **Tagging** -- comma-separated tags with filter support
 
 ### Interfaces
@@ -906,6 +907,9 @@ ai-memory includes hardening across all input paths:
 | [User Guide](docs/USER_GUIDE.md) | AI assistant users who want persistent memory |
 | [Developer Guide](docs/DEVELOPER_GUIDE.md) | Building on or contributing to ai-memory |
 | [Admin Guide](docs/ADMIN_GUIDE.md) | Deploying, monitoring, and troubleshooting |
+| [Engineering Standards](docs/ENGINEERING_STANDARDS.md) | Code, test, security, and release standards (authoritative) |
+| [AI Developer Workflow](docs/AI_DEVELOPER_WORKFLOW.md) | Step-by-step workflow for AI coding agents contributing to this repo |
+| [AI Developer Governance Standard](docs/AI_DEVELOPER_GOVERNANCE.md) | Policy for AI participation: authority, attribution, review, audit |
 | [GitHub Pages](https://alphaonedev.github.io/ai-memory-mcp/) | Visual overview with animated diagrams |
 
 ---
