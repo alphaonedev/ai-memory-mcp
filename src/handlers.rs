@@ -63,7 +63,7 @@ pub struct ApiKeyState {
 }
 
 /// Constant-time byte-slice equality. Doesn't short-circuit on the
-/// Percent-decode a URL-encoded query value in place. Invalid %XX
+/// Percent-decode a URL-encoded query value in place. Invalid `%XX`
 /// escapes are passed through verbatim (lossy). Ultrareview #337.
 #[inline]
 fn percent_decode_lossy(input: &str) -> String {
@@ -75,7 +75,9 @@ fn percent_decode_lossy(input: &str) -> String {
             let h = (bytes[i + 1] as char).to_digit(16);
             let l = (bytes[i + 2] as char).to_digit(16);
             if let (Some(h), Some(l)) = (h, l) {
-                out.push((h * 16 + l) as u8);
+                // h and l are single hex digits (0..=15), so h*16 + l
+                // is always in 0..=255. Cast is lossless.
+                out.push(u8::try_from(h * 16 + l).unwrap_or(0));
                 i += 3;
                 continue;
             }
