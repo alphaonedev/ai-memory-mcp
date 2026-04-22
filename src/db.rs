@@ -564,11 +564,11 @@ fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
 
 /// Insert with upsert on title+namespace. Returns the ID (existing or new).
 ///
-/// Ultrareview #352: collapses the previous INSERT/ON-CONFLICT + separate
-/// SELECT into a single `INSERT ... RETURNING id`. Another concurrent
-/// writer could otherwise slot in between the two statements and the
-/// SELECT would return the wrong row id. SQLite 3.35+ supports
-/// `RETURNING`; it executes atomically within the INSERT.
+/// Ultrareview #352: collapses the previous `INSERT`/`ON CONFLICT` +
+/// separate `SELECT` into a single `INSERT ... RETURNING id`. Another
+/// concurrent writer could otherwise slot in between the two statements
+/// and the `SELECT` would return the wrong row id. `SQLite` 3.35+
+/// supports `RETURNING`; it executes atomically within the `INSERT`.
 pub fn insert(conn: &Connection, mem: &Memory) -> Result<String> {
     let tags_json = serde_json::to_string(&mem.tags)?;
     let metadata_json = serde_json::to_string(&mem.metadata)?;
