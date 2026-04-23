@@ -9440,6 +9440,102 @@ fn http_sync_push_applies_namespace_meta() {
 }
 
 #[test]
+fn http_sync_push_applies_namespace_meta_clears() {
+    // S35 follow-up: verify the `sync_push.namespace_meta_clears` field
+    // drops a peer-side namespace_meta row so a subsequent GET
+    // /api/v1/namespaces?namespace=… returns empty. Regression guard for
+    // the cross-peer clear path that PR #363 missed (clear handler used
+    // State<Db>, no federation broadcast).
+    let peer = DaemonGuard::spawn();
+
+    // Seed a standard memory + meta row via sync_push so the peer has
+    // something to clear.
+    let (code, created) = curl_post(
+        peer.port,
+        "/api/v1/memories",
+        &serde_json::json!({
+            "tier": "long",
+            "namespace": "s35-clear",
+            "title": "std-to-clear",
+            "content": "to be cleared",
+            "tags": [],
+            "priority": 5,
+            "confidence": 1.0,
+            "source": "api",
+            "metadata": {}
+        }),
+        Some("ai:s35c"),
+    );
+    assert_eq!(code, "201", "seed: {created}");
+    let standard_id = created["id"].as_str().unwrap().to_string();
+
+    // Install the meta row.
+    let (code, _resp) = curl_post(
+        peer.port,
+        "/api/v1/sync/push",
+        &serde_json::json!({
+            "sender_agent_id": "ai:s35-origin",
+            "memories": [],
+            "namespace_meta": [{
+                "namespace": "s35-clear",
+                "standard_id": standard_id,
+                "parent_namespace": null,
+                "updated_at": chrono::Utc::now().to_rfc3339()
+            }],
+            "dry_run": false
+        }),
+        None,
+    );
+    assert_eq!(code, "200");
+
+    // Confirm it's visible.
+    let (code, body) = curl_get(peer.port, "/api/v1/namespaces?namespace=s35-clear");
+    assert_eq!(code, "200");
+    assert!(
+        body.to_string().contains(&standard_id) || body.to_string().contains("s35-clear"),
+        "pre-clear should surface standard: {body}"
+    );
+
+    // Now fan out a clear via sync_push.namespace_meta_clears.
+    let (code, resp) = curl_post(
+        peer.port,
+        "/api/v1/sync/push",
+        &serde_json::json!({
+            "sender_agent_id": "ai:s35-origin",
+            "memories": [],
+            "namespace_meta_clears": ["s35-clear"],
+            "dry_run": false
+        }),
+        None,
+    );
+    assert_eq!(code, "200", "sync_push clear: {resp}");
+    assert_eq!(
+        resp["namespace_meta_cleared"].as_u64().unwrap_or(0),
+        1,
+        "expected namespace_meta_cleared=1: {resp}"
+    );
+
+    // Clearing again must no-op (row gone).
+    let (code, resp) = curl_post(
+        peer.port,
+        "/api/v1/sync/push",
+        &serde_json::json!({
+            "sender_agent_id": "ai:s35-origin",
+            "memories": [],
+            "namespace_meta_clears": ["s35-clear"],
+            "dry_run": false
+        }),
+        None,
+    );
+    assert_eq!(code, "200");
+    assert_eq!(
+        resp["namespace_meta_cleared"].as_u64().unwrap_or(0),
+        0,
+        "second clear must no-op: {resp}"
+    );
+}
+
+#[test]
 fn http_capabilities_reports_embedder_loaded_correctly() {
     // S18: capabilities.features.embedder_loaded must reflect runtime
     // embedder presence, not just config. Under AI_MEMORY_NO_CONFIG=1

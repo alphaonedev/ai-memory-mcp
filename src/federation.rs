@@ -1082,6 +1082,99 @@ pub async fn broadcast_namespace_meta_quorum(
     Ok(tracker)
 }
 
+/// v0.6.2 (S35 follow-up): fan out a namespace-standard *clear* to peers
+/// via `sync_push.namespace_meta_clears`. PR #363 shipped set-side fanout
+/// via `broadcast_namespace_meta_quorum` but left the clear path local-only
+/// — alice clearing on node-1 didn't propagate to bob on node-2, so the
+/// scenario-35 cross-peer clear assertion failed.
+///
+/// Same quorum contract as the set broadcast: local-write pre-counted, one
+/// POST per peer, `sync_push` bodies stuffed with the list of cleared
+/// namespaces, first W-of-N acks win.
+///
+/// # Errors
+///
+/// Returns `QuorumError::LocalWriteFailed` on pathological detach race.
+pub async fn broadcast_namespace_meta_clear_quorum(
+    config: &FederationConfig,
+    namespaces: &[String],
+) -> Result<AckTracker, QuorumError> {
+    let now = Instant::now();
+    let tracker = Arc::new(Mutex::new(AckTracker::new(config.policy.clone(), now)));
+    tracker.lock().await.record_local();
+
+    let body = serde_json::json!({
+        "sender_agent_id": config.sender_agent_id,
+        "memories": [],
+        "namespace_meta_clears": namespaces,
+        "dry_run": false,
+    });
+
+    // Use the joined namespace list as the ack-classifier's `target_id` so
+    // post-quorum logs carry enough context to trace back to the operation.
+    let target_id = namespaces.join(",");
+    let mut joins: JoinSet<(String, AckOutcome)> = JoinSet::new();
+    for peer in &config.peers {
+        let client = config.client.clone();
+        let url = peer.sync_push_url.clone();
+        let peer_id = peer.id.clone();
+        let payload = body.clone();
+        let target = target_id.clone();
+        joins.spawn(async move {
+            let outcome = post_and_classify(&client, &url, &payload, &target, Some(&target)).await;
+            (peer_id, outcome)
+        });
+    }
+
+    let deadline = now + config.policy.ack_timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, joins.join_next()).await {
+            Ok(Some(Ok((peer_id, AckOutcome::Ack)))) => {
+                tracker.lock().await.record_peer_ack(peer_id);
+            }
+            Ok(Some(Ok((peer_id, AckOutcome::IdDrift)))) => {
+                tracker.lock().await.record_id_drift(peer_id);
+            }
+            Ok(Some(Ok((peer_id, AckOutcome::Fail(reason))))) => {
+                tracing::warn!(
+                    "federation: namespace_meta_clear peer {peer_id} failed for [{}]: {reason}",
+                    target_id
+                );
+            }
+            Ok(Some(Err(e))) => {
+                tracing::warn!("federation: namespace_meta_clear peer join error: {e}");
+            }
+            Ok(None) | Err(_) => break,
+        }
+        if tracker.lock().await.is_quorum_met(Instant::now()) {
+            break;
+        }
+    }
+
+    if !joins.is_empty() {
+        tokio::spawn(async move {
+            while let Some(res) = joins.join_next().await {
+                if let Ok((peer_id, AckOutcome::Fail(reason))) = res {
+                    tracing::debug!(
+                        "federation: post-quorum namespace_meta_clear peer {peer_id} did not ack: {reason}"
+                    );
+                }
+            }
+        });
+    }
+
+    let tracker = Arc::try_unwrap(tracker)
+        .map_err(|_| QuorumError::LocalWriteFailed {
+            detail: "tracker arc still referenced at finalise".to_string(),
+        })?
+        .into_inner();
+    Ok(tracker)
+}
+
 /// Serialised 503 payload for failed quorum writes.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct QuorumNotMetPayload {
