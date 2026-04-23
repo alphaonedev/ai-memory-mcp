@@ -1907,7 +1907,7 @@ pub async fn consolidate_memories(
 }
 
 pub async fn bulk_create(
-    State(state): State<Db>,
+    State(app): State<AppState>,
     Json(bodies): Json<Vec<CreateMemory>>,
 ) -> impl IntoResponse {
     if bodies.len() > MAX_BULK_SIZE {
@@ -1918,42 +1918,70 @@ pub async fn bulk_create(
             .into_response();
     }
     let now = Utc::now();
-    let lock = state.lock().await;
-    let mut created = 0usize;
-    let mut errors = Vec::new();
-    for body in bodies {
-        if let Err(e) = validate::validate_create(&body) {
-            errors.push(format!("{}: {}", body.title, e));
-            continue;
-        }
-        let expires_at = body.expires_at.or_else(|| {
-            body.ttl_secs
-                .or(lock.2.ttl_for_tier(&body.tier))
-                .map(|s| (now + Duration::seconds(s)).to_rfc3339())
-        });
-        let mem = Memory {
-            id: Uuid::new_v4().to_string(),
-            tier: body.tier,
-            namespace: body.namespace,
-            title: body.title,
-            content: body.content,
-            tags: body.tags,
-            priority: body.priority.clamp(1, 10),
-            confidence: body.confidence.clamp(0.0, 1.0),
-            source: body.source,
-            access_count: 0,
-            created_at: now.to_rfc3339(),
-            updated_at: now.to_rfc3339(),
-            last_accessed_at: None,
-            expires_at,
-            metadata: body.metadata,
-        };
-        match db::insert(&lock.0, &mem) {
-            Ok(_) => created += 1,
-            Err(e) => errors.push(e.to_string()),
+    // Stage 1 — validate + insert locally. Collect the successfully-inserted
+    // `Memory` values so we can fanout each one after we release the DB lock
+    // (peers POST to our /sync/push and we'd deadlock on the Mutex if we
+    // held it across the network call).
+    let mut created_mems: Vec<Memory> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    {
+        let lock = app.db.lock().await;
+        for body in bodies {
+            if let Err(e) = validate::validate_create(&body) {
+                errors.push(format!("{}: {}", body.title, e));
+                continue;
+            }
+            let expires_at = body.expires_at.or_else(|| {
+                body.ttl_secs
+                    .or(lock.2.ttl_for_tier(&body.tier))
+                    .map(|s| (now + Duration::seconds(s)).to_rfc3339())
+            });
+            let mem = Memory {
+                id: Uuid::new_v4().to_string(),
+                tier: body.tier,
+                namespace: body.namespace,
+                title: body.title,
+                content: body.content,
+                tags: body.tags,
+                priority: body.priority.clamp(1, 10),
+                confidence: body.confidence.clamp(0.0, 1.0),
+                source: body.source,
+                access_count: 0,
+                created_at: now.to_rfc3339(),
+                updated_at: now.to_rfc3339(),
+                last_accessed_at: None,
+                expires_at,
+                metadata: body.metadata,
+            };
+            match db::insert(&lock.0, &mem) {
+                Ok(_) => created_mems.push(mem),
+                Err(e) => errors.push(e.to_string()),
+            }
         }
     }
-    Json(json!({"created": created, "errors": errors})).into_response()
+    // Stage 2 — federation fanout, once per successfully-inserted row. On
+    // quorum miss for one row, we record the failure in `errors` and keep
+    // going: a single memory's quorum miss should NOT abort 499 other
+    // memories the caller just paid for. This is deliberately weaker than
+    // `create_memory`'s 503 — caller opted in to bulk semantics.
+    if let Some(fed) = app.federation.as_ref() {
+        for mem in &created_mems {
+            match crate::federation::broadcast_store_quorum(fed, mem).await {
+                Ok(tracker) => {
+                    if let Err(err) = crate::federation::finalise_quorum(&tracker) {
+                        errors.push(format!("{}: {err}", mem.id));
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "bulk_create: fanout for {} failed (local committed): {e:?}",
+                        mem.id
+                    );
+                }
+            }
+        }
+    }
+    Json(json!({"created": created_mems.len(), "errors": errors})).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -3921,6 +3949,184 @@ mod tests {
         let lock = state.lock().await;
         let archived = db::list_archived(&lock.0, None, 10, 0).unwrap();
         assert_eq!(archived[0]["archive_reason"], "archive");
+    }
+
+    #[tokio::test]
+    async fn http_bulk_create_uses_appstate_and_persists() {
+        // S40 prep — bulk_create previously took `State<Db>` with no path
+        // to `app.federation`, so every bulk row stayed on the originator.
+        // Signature is now `State<AppState>` and each row is persisted.
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/memories/bulk", axum_post(bulk_create))
+            .with_state(test_app_state(state.clone()));
+
+        let bodies: Vec<serde_json::Value> = (0..5)
+            .map(|i| {
+                serde_json::json!({
+                    "tier": "long",
+                    "namespace": "bulk-appstate",
+                    "title": format!("bulk-{i}"),
+                    "content": format!("body-{i}"),
+                    "tags": [],
+                    "priority": 5,
+                    "confidence": 1.0,
+                    "source": "api",
+                    "metadata": {}
+                })
+            })
+            .collect();
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/memories/bulk")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&bodies).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["created"], 5);
+        assert!(v["errors"].as_array().unwrap().is_empty());
+
+        // Every row is visible in the DB (was the S40 gap — rows never
+        // made it past the local insert loop, leaving peers empty).
+        let lock = state.lock().await;
+        let rows = db::list(
+            &lock.0,
+            Some("bulk-appstate"),
+            None,
+            100,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 5, "bulk rows must persist via AppState");
+    }
+
+    #[tokio::test]
+    async fn http_bulk_create_fans_out_with_federation() {
+        // S40 — with federation configured, each successfully-inserted row
+        // in a bulk call must fan out to every peer. We spin up an axum
+        // mock peer that records sync_push POSTs and bulk-create N rows;
+        // the mock must see N POSTs (background-detached + foreground).
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+
+        let state = test_state();
+
+        // Mock peer that counts sync_push POSTs and always acks.
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_for_peer = count.clone();
+        #[derive(Clone)]
+        struct MockState {
+            count: Arc<AtomicUsize>,
+        }
+        async fn mock_sync_push(
+            axum::extract::State(s): axum::extract::State<MockState>,
+            Json(_body): Json<serde_json::Value>,
+        ) -> (StatusCode, Json<serde_json::Value>) {
+            s.count.fetch_add(1, Ordering::Relaxed);
+            (
+                StatusCode::OK,
+                Json(json!({"applied":1,"noop":0,"skipped":0})),
+            )
+        }
+        let peer_app = Router::new()
+            .route("/api/v1/sync/push", axum_post(mock_sync_push))
+            .with_state(MockState {
+                count: count_for_peer,
+            });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, peer_app).await.ok();
+        });
+
+        // Build a FederationConfig that targets the mock.
+        let peer_url = format!("http://{addr}");
+        let fed = crate::federation::FederationConfig::build(
+            2, // W=2 — local + 1 peer
+            &[peer_url],
+            std::time::Duration::from_millis(2000),
+            None,
+            None,
+            None,
+            "ai:bulk-test".to_string(),
+        )
+        .unwrap()
+        .expect("federation must be built");
+
+        let app_state = AppState {
+            db: state.clone(),
+            embedder: Arc::new(None),
+            vector_index: Arc::new(Mutex::new(None)),
+            federation: Arc::new(Some(fed)),
+            tier_config: Arc::new(crate::config::FeatureTier::Keyword.config()),
+        };
+        let router = Router::new()
+            .route("/api/v1/memories/bulk", axum_post(bulk_create))
+            .with_state(app_state);
+
+        // 4 rows — keeps the test fast while proving fanout ran per-row.
+        let n = 4;
+        let bodies: Vec<serde_json::Value> = (0..n)
+            .map(|i| {
+                serde_json::json!({
+                    "tier": "long",
+                    "namespace": "bulk-fanout",
+                    "title": format!("bulk-fanout-{i}"),
+                    "content": "c",
+                    "tags": [],
+                    "priority": 5,
+                    "confidence": 1.0,
+                    "source": "api",
+                    "metadata": {}
+                })
+            })
+            .collect();
+        let resp = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/memories/bulk")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&bodies).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["created"], n);
+
+        // Foreground fanout already waits for W-1 acks per row, so the
+        // per-row POST has landed by the time the request returns. Give
+        // detached stragglers a quick window just in case.
+        for _ in 0..20 {
+            if count.load(Ordering::Relaxed) >= n {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            n,
+            "mock peer must receive one sync_push POST per bulk row"
+        );
     }
 
     #[tokio::test]
