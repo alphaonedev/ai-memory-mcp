@@ -1907,7 +1907,7 @@ pub async fn consolidate_memories(
 }
 
 pub async fn bulk_create(
-    State(state): State<Db>,
+    State(app): State<AppState>,
     Json(bodies): Json<Vec<CreateMemory>>,
 ) -> impl IntoResponse {
     if bodies.len() > MAX_BULK_SIZE {
@@ -1918,42 +1918,70 @@ pub async fn bulk_create(
             .into_response();
     }
     let now = Utc::now();
-    let lock = state.lock().await;
-    let mut created = 0usize;
-    let mut errors = Vec::new();
-    for body in bodies {
-        if let Err(e) = validate::validate_create(&body) {
-            errors.push(format!("{}: {}", body.title, e));
-            continue;
-        }
-        let expires_at = body.expires_at.or_else(|| {
-            body.ttl_secs
-                .or(lock.2.ttl_for_tier(&body.tier))
-                .map(|s| (now + Duration::seconds(s)).to_rfc3339())
-        });
-        let mem = Memory {
-            id: Uuid::new_v4().to_string(),
-            tier: body.tier,
-            namespace: body.namespace,
-            title: body.title,
-            content: body.content,
-            tags: body.tags,
-            priority: body.priority.clamp(1, 10),
-            confidence: body.confidence.clamp(0.0, 1.0),
-            source: body.source,
-            access_count: 0,
-            created_at: now.to_rfc3339(),
-            updated_at: now.to_rfc3339(),
-            last_accessed_at: None,
-            expires_at,
-            metadata: body.metadata,
-        };
-        match db::insert(&lock.0, &mem) {
-            Ok(_) => created += 1,
-            Err(e) => errors.push(e.to_string()),
+    // Stage 1 — validate + insert locally. Collect the successfully-inserted
+    // `Memory` values so we can fanout each one after we release the DB lock
+    // (peers POST to our /sync/push and we'd deadlock on the Mutex if we
+    // held it across the network call).
+    let mut created_mems: Vec<Memory> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    {
+        let lock = app.db.lock().await;
+        for body in bodies {
+            if let Err(e) = validate::validate_create(&body) {
+                errors.push(format!("{}: {}", body.title, e));
+                continue;
+            }
+            let expires_at = body.expires_at.or_else(|| {
+                body.ttl_secs
+                    .or(lock.2.ttl_for_tier(&body.tier))
+                    .map(|s| (now + Duration::seconds(s)).to_rfc3339())
+            });
+            let mem = Memory {
+                id: Uuid::new_v4().to_string(),
+                tier: body.tier,
+                namespace: body.namespace,
+                title: body.title,
+                content: body.content,
+                tags: body.tags,
+                priority: body.priority.clamp(1, 10),
+                confidence: body.confidence.clamp(0.0, 1.0),
+                source: body.source,
+                access_count: 0,
+                created_at: now.to_rfc3339(),
+                updated_at: now.to_rfc3339(),
+                last_accessed_at: None,
+                expires_at,
+                metadata: body.metadata,
+            };
+            match db::insert(&lock.0, &mem) {
+                Ok(_) => created_mems.push(mem),
+                Err(e) => errors.push(e.to_string()),
+            }
         }
     }
-    Json(json!({"created": created, "errors": errors})).into_response()
+    // Stage 2 — federation fanout, once per successfully-inserted row. On
+    // quorum miss for one row, we record the failure in `errors` and keep
+    // going: a single memory's quorum miss should NOT abort 499 other
+    // memories the caller just paid for. This is deliberately weaker than
+    // `create_memory`'s 503 — caller opted in to bulk semantics.
+    if let Some(fed) = app.federation.as_ref() {
+        for mem in &created_mems {
+            match crate::federation::broadcast_store_quorum(fed, mem).await {
+                Ok(tracker) => {
+                    if let Err(err) = crate::federation::finalise_quorum(&tracker) {
+                        errors.push(format!("{}: {err}", mem.id));
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "bulk_create: fanout for {} failed (local committed): {e:?}",
+                        mem.id
+                    );
+                }
+            }
+        }
+    }
+    Json(json!({"created": created_mems.len(), "errors": errors})).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -2070,6 +2098,122 @@ pub async fn archive_stats(State(state): State<Db>) -> impl IntoResponse {
     }
 }
 
+/// Request body for `POST /api/v1/archive` — S29 explicit archive.
+#[derive(Debug, Deserialize)]
+pub struct ArchiveByIdsBody {
+    pub ids: Vec<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// POST /api/v1/archive — explicit archive of the given memory ids
+/// (S29). For each id:
+///   1. Call `db::archive_memory` locally to soft-move the row.
+///   2. If federation is configured, broadcast via
+///      `broadcast_archive_quorum` so peers land in the same terminal
+///      state (row out of `memories`, row into `archived_memories`).
+///
+/// On a quorum miss for ANY id, short-circuit with 503 via the shared
+/// `fanout_or_503`-style payload. This matches the posture of the
+/// delete + consolidate fanout endpoints.
+///
+/// Response body:
+/// ```json
+/// {"archived": [id1, id2], "missing": [id3], "count": 2}
+/// ```
+/// where `missing` enumerates ids that had no live row locally (common
+/// during retries). The response never includes content/metadata — use
+/// `GET /api/v1/archive` to list archive entries.
+pub async fn archive_by_ids(
+    State(app): State<AppState>,
+    Json(body): Json<ArchiveByIdsBody>,
+) -> impl IntoResponse {
+    // Bound the batch the same way bulk_create / sync_push do.
+    if body.ids.len() > MAX_BULK_SIZE {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("archive limited to {} ids per request", MAX_BULK_SIZE)})),
+        )
+            .into_response();
+    }
+    // Validate all ids up-front so we never start mutating on a bad batch.
+    for id in &body.ids {
+        if let Err(e) = validate::validate_id(id) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("invalid id {id}: {e}")})),
+            )
+                .into_response();
+        }
+    }
+    let reason = body.reason.as_deref().unwrap_or("archive").to_string();
+    let mut archived: Vec<String> = Vec::new();
+    let mut missing: Vec<String> = Vec::new();
+
+    for id in &body.ids {
+        // Local archive. Hold the lock only across this one call per id so
+        // we can release it before a potentially slow network fanout.
+        let moved = {
+            let lock = app.db.lock().await;
+            match db::archive_memory(&lock.0, id, Some(&reason)) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!("archive_by_ids: archive_memory({id}) failed: {e}");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": "internal server error"})),
+                    )
+                        .into_response();
+                }
+            }
+        };
+        if !moved {
+            // Row wasn't live locally — record as missing but keep going.
+            // Do NOT fan out (peers can't know to archive from a row they
+            // may have under a different state; the originator's local
+            // state is the trigger).
+            missing.push(id.clone());
+            continue;
+        }
+
+        // Fanout. Mirror the shape used by the other
+        // quorum-backed write endpoints (delete, consolidate) — on a
+        // miss, surface the `quorum_not_met` payload with 503 + Retry-After.
+        if let Some(fed) = app.federation.as_ref() {
+            match crate::federation::broadcast_archive_quorum(fed, id).await {
+                Ok(tracker) => {
+                    if let Err(err) = crate::federation::finalise_quorum(&tracker) {
+                        let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            [("Retry-After", "2")],
+                            Json(serde_json::to_value(&payload).unwrap_or_default()),
+                        )
+                            .into_response();
+                    }
+                }
+                Err(e) => {
+                    // Local commit already landed — sync-daemon catches
+                    // stragglers. Same posture as `fanout_or_503`.
+                    tracing::warn!("archive fanout error (local committed): {e:?}");
+                }
+            }
+        }
+        archived.push(id.clone());
+    }
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "archived": archived,
+            "missing": missing,
+            "count": archived.len(),
+            "reason": reason,
+        })),
+    )
+        .into_response()
+}
+
 // ---------------------------------------------------------------------------
 // Phase 3 foundation (issue #224) — HTTP sync endpoints.
 //
@@ -2102,6 +2246,12 @@ pub struct SyncPushBody {
     /// same delete reaches every peer well before any revival window.
     #[serde(default)]
     pub deletions: Vec<String>,
+    /// v0.6.2 (S29): memory IDs the sender has explicitly archived and
+    /// wants propagated. Applied via `db::archive_memory` — a soft move
+    /// from `memories` to `archived_memories`. Missing-on-peer IDs no-op.
+    /// Distinct from `deletions`, which is a hard DELETE.
+    #[serde(default)]
+    pub archives: Vec<String>,
     /// v0.6.2 (#325): memory links the sender wants propagated. Applied
     /// via `db::create_link` on each peer. Duplicates are a no-op thanks
     /// to the unique `(source_id, target_id, relation)` constraint on
@@ -2159,6 +2309,15 @@ pub async fn sync_push(
         )
             .into_response();
     }
+    if body.archives.len() > MAX_BULK_SIZE {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!("sync_push limited to {} archives per request", MAX_BULK_SIZE)
+            })),
+        )
+            .into_response();
+    }
     // Receiver's local identity — default to the caller-supplied header,
     // fall back to the anonymous placeholder. Recorded in sync_state rows.
     let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
@@ -2178,6 +2337,7 @@ pub async fn sync_push(
     let mut noop = 0usize;
     let mut skipped = 0usize;
     let mut deleted = 0usize;
+    let mut archived = 0usize;
     let mut latest_seen: Option<String> = None;
 
     // v0.6.0.1 (#322): peers that apply a synced memory must also refresh
@@ -2234,6 +2394,29 @@ pub async fn sync_push(
             Ok(false) => noop += 1,
             Err(e) => {
                 tracing::warn!("sync_push: delete failed for {del_id}: {e}");
+                skipped += 1;
+            }
+        }
+    }
+
+    // v0.6.2 (S29): process explicit archives. Soft-move from `memories`
+    // to `archived_memories` — distinct from deletions which hard-delete.
+    // Missing rows count as no-op (peer may have already archived or
+    // never received the original write).
+    for arch_id in &body.archives {
+        if validate::validate_id(arch_id).is_err() {
+            skipped += 1;
+            continue;
+        }
+        if body.dry_run {
+            noop += 1;
+            continue;
+        }
+        match db::archive_memory(&lock.0, arch_id, Some("sync_push")) {
+            Ok(true) => archived += 1,
+            Ok(false) => noop += 1,
+            Err(e) => {
+                tracing::warn!("sync_push: archive_memory failed for {arch_id}: {e}");
                 skipped += 1;
             }
         }
@@ -2328,6 +2511,7 @@ pub async fn sync_push(
         Json(json!({
             "applied": applied,
             "deleted": deleted,
+            "archived": archived,
             "links_applied": links_applied,
             "noop": noop,
             "skipped": skipped,
@@ -2387,11 +2571,28 @@ pub async fn sync_since(
         tracing::debug!("sync_since: sync_state_observe failed: {e}");
     }
 
+    // S39 diagnostic echo (v0.6.2). The testbook scenario writes 6 rows
+    // while peer-3 is suspended then queries `/sync/since?since=<ckpt>`
+    // and expects the 6 back. When the count comes back 0, the scenario
+    // can't tell whether:
+    //   a) the server parsed `since` differently than expected,
+    //   b) `limit` silently truncated, or
+    //   c) the returned timestamps don't actually cover the expected range.
+    // Echoing `updated_since` (what the server parsed, verbatim) plus
+    // earliest / latest `updated_at` from the result set lets the
+    // scenario pin the failure mode without changing any behavior. Fields
+    // are additive — no existing caller assertion regresses.
+    let earliest_updated_at = mems.first().map(|m| m.updated_at.clone());
+    let latest_updated_at = mems.last().map(|m| m.updated_at.clone());
+
     (
         StatusCode::OK,
         Json(json!({
             "count": mems.len(),
             "limit": limit,
+            "updated_since": q.since,
+            "earliest_updated_at": earliest_updated_at,
+            "latest_updated_at": latest_updated_at,
             "memories": mems,
         })),
     )
@@ -3575,6 +3776,377 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_sync_push_applies_archives() {
+        // S29 — sync_push must accept an `archives` field and move matching
+        // rows from `memories` to `archived_memories` via
+        // `db::archive_memory`. Missing ids no-op. The response exposes a
+        // new `archived` counter.
+        let state = test_state();
+        // Seed one row that the peer will ask us to archive; one id that
+        // doesn't exist here (must no-op, not error).
+        let id = {
+            let lock = state.lock().await;
+            let now = Utc::now().to_rfc3339();
+            let mem = Memory {
+                id: Uuid::new_v4().to_string(),
+                tier: Tier::Long,
+                namespace: "s29".into(),
+                title: "Archive M1".into(),
+                content: "body".into(),
+                tags: vec![],
+                priority: 5,
+                confidence: 1.0,
+                source: "api".into(),
+                access_count: 0,
+                created_at: now.clone(),
+                updated_at: now,
+                last_accessed_at: None,
+                expires_at: None,
+                metadata: serde_json::json!({}),
+            };
+            db::insert(&lock.0, &mem).unwrap()
+        };
+
+        let app = Router::new()
+            .route("/api/v1/sync/push", axum_post(sync_push))
+            .with_state(test_app_state(state.clone()));
+
+        let body = serde_json::json!({
+            "sender_agent_id": "peer-a",
+            "sender_clock": {"entries": {}},
+            "memories": [],
+            "archives": [id, "missing-on-peer"],
+            "dry_run": false
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/sync/push")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["archived"], 1, "live row must be archived");
+        assert_eq!(v["noop"], 1, "missing id must no-op");
+
+        // Row is gone from active memories, present in archive, with the
+        // correct `sync_push` reason.
+        let lock = state.lock().await;
+        assert!(db::get(&lock.0, &id).unwrap().is_none());
+        let archived = db::list_archived(&lock.0, None, 10, 0).unwrap();
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0]["id"], id);
+        assert_eq!(archived[0]["archive_reason"], "sync_push");
+    }
+
+    #[tokio::test]
+    async fn http_archive_by_ids_happy_path() {
+        // S29 — POST /api/v1/archive with `{ids:[...]}` soft-moves each
+        // live row to the archive table with the supplied reason.
+        // Missing ids are reported in a `missing` array, not an error.
+        let state = test_state();
+        let live_id = {
+            let lock = state.lock().await;
+            let now = Utc::now().to_rfc3339();
+            let mem = Memory {
+                id: Uuid::new_v4().to_string(),
+                tier: Tier::Long,
+                namespace: "s29".into(),
+                title: "Live for archive".into(),
+                content: "will be archived".into(),
+                tags: vec![],
+                priority: 5,
+                confidence: 1.0,
+                source: "api".into(),
+                access_count: 0,
+                created_at: now.clone(),
+                updated_at: now,
+                last_accessed_at: None,
+                expires_at: None,
+                metadata: serde_json::json!({}),
+            };
+            db::insert(&lock.0, &mem).unwrap()
+        };
+
+        let app = Router::new()
+            .route("/api/v1/archive", axum_post(archive_by_ids))
+            .with_state(test_app_state(state.clone()));
+
+        let body = serde_json::json!({
+            "ids": [live_id, "does-not-exist"],
+            "reason": "scenario_s29"
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/archive")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["count"], 1);
+        assert_eq!(v["archived"].as_array().unwrap().len(), 1);
+        assert_eq!(v["missing"].as_array().unwrap().len(), 1);
+        assert_eq!(v["reason"], "scenario_s29");
+
+        // Row is gone from active, present in archive with caller's reason.
+        let lock = state.lock().await;
+        assert!(db::get(&lock.0, &live_id).unwrap().is_none());
+        let archived = db::list_archived(&lock.0, None, 10, 0).unwrap();
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0]["id"], live_id);
+        assert_eq!(archived[0]["archive_reason"], "scenario_s29");
+    }
+
+    #[tokio::test]
+    async fn http_archive_by_ids_default_reason() {
+        // When `reason` is omitted the response + archive row must record
+        // the default "archive" reason (matches `db::archive_memory`).
+        let state = test_state();
+        let live_id = {
+            let lock = state.lock().await;
+            let now = Utc::now().to_rfc3339();
+            let mem = Memory {
+                id: Uuid::new_v4().to_string(),
+                tier: Tier::Long,
+                namespace: "s29-default".into(),
+                title: "Default reason".into(),
+                content: "c".into(),
+                tags: vec![],
+                priority: 5,
+                confidence: 1.0,
+                source: "api".into(),
+                access_count: 0,
+                created_at: now.clone(),
+                updated_at: now,
+                last_accessed_at: None,
+                expires_at: None,
+                metadata: serde_json::json!({}),
+            };
+            db::insert(&lock.0, &mem).unwrap()
+        };
+
+        let app = Router::new()
+            .route("/api/v1/archive", axum_post(archive_by_ids))
+            .with_state(test_app_state(state.clone()));
+        let body = serde_json::json!({"ids": [live_id]});
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/archive")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["reason"], "archive");
+        let lock = state.lock().await;
+        let archived = db::list_archived(&lock.0, None, 10, 0).unwrap();
+        assert_eq!(archived[0]["archive_reason"], "archive");
+    }
+
+    #[tokio::test]
+    async fn http_bulk_create_uses_appstate_and_persists() {
+        // S40 prep — bulk_create previously took `State<Db>` with no path
+        // to `app.federation`, so every bulk row stayed on the originator.
+        // Signature is now `State<AppState>` and each row is persisted.
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/memories/bulk", axum_post(bulk_create))
+            .with_state(test_app_state(state.clone()));
+
+        let bodies: Vec<serde_json::Value> = (0..5)
+            .map(|i| {
+                serde_json::json!({
+                    "tier": "long",
+                    "namespace": "bulk-appstate",
+                    "title": format!("bulk-{i}"),
+                    "content": format!("body-{i}"),
+                    "tags": [],
+                    "priority": 5,
+                    "confidence": 1.0,
+                    "source": "api",
+                    "metadata": {}
+                })
+            })
+            .collect();
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/memories/bulk")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&bodies).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["created"], 5);
+        assert!(v["errors"].as_array().unwrap().is_empty());
+
+        // Every row is visible in the DB (was the S40 gap — rows never
+        // made it past the local insert loop, leaving peers empty).
+        let lock = state.lock().await;
+        let rows = db::list(
+            &lock.0,
+            Some("bulk-appstate"),
+            None,
+            100,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 5, "bulk rows must persist via AppState");
+    }
+
+    #[tokio::test]
+    async fn http_bulk_create_fans_out_with_federation() {
+        // S40 — with federation configured, each successfully-inserted row
+        // in a bulk call must fan out to every peer. We spin up an axum
+        // mock peer that records sync_push POSTs and bulk-create N rows;
+        // the mock must see N POSTs (background-detached + foreground).
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+
+        let state = test_state();
+
+        // Mock peer that counts sync_push POSTs and always acks.
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_for_peer = count.clone();
+        #[derive(Clone)]
+        struct MockState {
+            count: Arc<AtomicUsize>,
+        }
+        async fn mock_sync_push(
+            axum::extract::State(s): axum::extract::State<MockState>,
+            Json(_body): Json<serde_json::Value>,
+        ) -> (StatusCode, Json<serde_json::Value>) {
+            s.count.fetch_add(1, Ordering::Relaxed);
+            (
+                StatusCode::OK,
+                Json(json!({"applied":1,"noop":0,"skipped":0})),
+            )
+        }
+        let peer_app = Router::new()
+            .route("/api/v1/sync/push", axum_post(mock_sync_push))
+            .with_state(MockState {
+                count: count_for_peer,
+            });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, peer_app).await.ok();
+        });
+
+        // Build a FederationConfig that targets the mock.
+        let peer_url = format!("http://{addr}");
+        let fed = crate::federation::FederationConfig::build(
+            2, // W=2 — local + 1 peer
+            &[peer_url],
+            std::time::Duration::from_millis(2000),
+            None,
+            None,
+            None,
+            "ai:bulk-test".to_string(),
+        )
+        .unwrap()
+        .expect("federation must be built");
+
+        let app_state = AppState {
+            db: state.clone(),
+            embedder: Arc::new(None),
+            vector_index: Arc::new(Mutex::new(None)),
+            federation: Arc::new(Some(fed)),
+            tier_config: Arc::new(crate::config::FeatureTier::Keyword.config()),
+        };
+        let router = Router::new()
+            .route("/api/v1/memories/bulk", axum_post(bulk_create))
+            .with_state(app_state);
+
+        // 4 rows — keeps the test fast while proving fanout ran per-row.
+        let n = 4;
+        let bodies: Vec<serde_json::Value> = (0..n)
+            .map(|i| {
+                serde_json::json!({
+                    "tier": "long",
+                    "namespace": "bulk-fanout",
+                    "title": format!("bulk-fanout-{i}"),
+                    "content": "c",
+                    "tags": [],
+                    "priority": 5,
+                    "confidence": 1.0,
+                    "source": "api",
+                    "metadata": {}
+                })
+            })
+            .collect();
+        let resp = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/memories/bulk")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&bodies).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["created"], n);
+
+        // Foreground fanout already waits for W-1 acks per row, so the
+        // per-row POST has landed by the time the request returns. Give
+        // detached stragglers a quick window just in case.
+        for _ in 0..20 {
+            if count.load(Ordering::Relaxed) >= n {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            n,
+            "mock peer must receive one sync_push POST per bulk row"
+        );
+    }
+
+    #[tokio::test]
     async fn http_sync_push_rejects_oversized_batch_redteam_242() {
         // Red-team #242 — sync_push must cap memories per request, matching
         // bulk-create's MAX_BULK_SIZE. Without this a malicious peer can
@@ -4002,6 +4574,91 @@ mod tests {
             .filter_map(|m| m["title"].as_str().map(str::to_string))
             .collect();
         assert_eq!(titles, vec!["new-mem".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn http_sync_since_includes_s39_diagnostic_fields() {
+        // S39 — the response must echo `updated_since` (parsed `since`)
+        // and earliest/latest `updated_at` from the returned set. This
+        // lets the scenario pin whether the server saw the expected
+        // checkpoint without changing the set-returning behavior.
+        let state = test_state();
+        // Seed three rows in strictly-ordered time so earliest != latest.
+        let mid_ts = "2024-06-01T00:00:00+00:00";
+        let newer_ts = "2025-06-01T00:00:00+00:00";
+        let newest_ts = "2026-01-01T00:00:00+00:00";
+        {
+            let lock = state.lock().await;
+            for (title, ts) in [("mid", mid_ts), ("newer", newer_ts), ("newest", newest_ts)] {
+                let mem = Memory {
+                    id: Uuid::new_v4().to_string(),
+                    tier: Tier::Long,
+                    namespace: "s39-diag".into(),
+                    title: title.into(),
+                    content: "c".into(),
+                    tags: vec![],
+                    priority: 5,
+                    confidence: 1.0,
+                    source: "api".into(),
+                    access_count: 0,
+                    created_at: ts.to_string(),
+                    updated_at: ts.to_string(),
+                    last_accessed_at: None,
+                    expires_at: None,
+                    metadata: serde_json::json!({}),
+                };
+                db::insert(&lock.0, &mem).unwrap();
+            }
+        }
+
+        let app = Router::new()
+            .route("/api/v1/sync/since", axum_get(sync_since))
+            .with_state(state.clone());
+
+        // Ask for rows strictly after 2024-01 — should return all 3.
+        let since = "2024-01-01T00:00:00%2B00:00";
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/api/v1/sync/since?since={since}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["count"], 3);
+        // Echoed `since` (unparsed, verbatim — that's the point).
+        assert_eq!(v["updated_since"], "2024-01-01T00:00:00+00:00");
+        assert_eq!(v["earliest_updated_at"], mid_ts);
+        assert_eq!(v["latest_updated_at"], newest_ts);
+
+        // Empty set → both timestamp fields are null. The `updated_since`
+        // field still echoes the parsed input.
+        let empty_app = Router::new()
+            .route("/api/v1/sync/since", axum_get(sync_since))
+            .with_state(state);
+        let resp = empty_app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/sync/since?since=2099-01-01T00:00:00%2B00:00")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["count"], 0);
+        assert!(v["earliest_updated_at"].is_null());
+        assert!(v["latest_updated_at"].is_null());
+        assert_eq!(v["updated_since"], "2099-01-01T00:00:00+00:00");
     }
 
     #[tokio::test]
