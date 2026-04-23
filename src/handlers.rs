@@ -2571,11 +2571,28 @@ pub async fn sync_since(
         tracing::debug!("sync_since: sync_state_observe failed: {e}");
     }
 
+    // S39 diagnostic echo (v0.6.2). The testbook scenario writes 6 rows
+    // while peer-3 is suspended then queries `/sync/since?since=<ckpt>`
+    // and expects the 6 back. When the count comes back 0, the scenario
+    // can't tell whether:
+    //   a) the server parsed `since` differently than expected,
+    //   b) `limit` silently truncated, or
+    //   c) the returned timestamps don't actually cover the expected range.
+    // Echoing `updated_since` (what the server parsed, verbatim) plus
+    // earliest / latest `updated_at` from the result set lets the
+    // scenario pin the failure mode without changing any behavior. Fields
+    // are additive — no existing caller assertion regresses.
+    let earliest_updated_at = mems.first().map(|m| m.updated_at.clone());
+    let latest_updated_at = mems.last().map(|m| m.updated_at.clone());
+
     (
         StatusCode::OK,
         Json(json!({
             "count": mems.len(),
             "limit": limit,
+            "updated_since": q.since,
+            "earliest_updated_at": earliest_updated_at,
+            "latest_updated_at": latest_updated_at,
             "memories": mems,
         })),
     )
@@ -4557,6 +4574,91 @@ mod tests {
             .filter_map(|m| m["title"].as_str().map(str::to_string))
             .collect();
         assert_eq!(titles, vec!["new-mem".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn http_sync_since_includes_s39_diagnostic_fields() {
+        // S39 — the response must echo `updated_since` (parsed `since`)
+        // and earliest/latest `updated_at` from the returned set. This
+        // lets the scenario pin whether the server saw the expected
+        // checkpoint without changing the set-returning behavior.
+        let state = test_state();
+        // Seed three rows in strictly-ordered time so earliest != latest.
+        let mid_ts = "2024-06-01T00:00:00+00:00";
+        let newer_ts = "2025-06-01T00:00:00+00:00";
+        let newest_ts = "2026-01-01T00:00:00+00:00";
+        {
+            let lock = state.lock().await;
+            for (title, ts) in [("mid", mid_ts), ("newer", newer_ts), ("newest", newest_ts)] {
+                let mem = Memory {
+                    id: Uuid::new_v4().to_string(),
+                    tier: Tier::Long,
+                    namespace: "s39-diag".into(),
+                    title: title.into(),
+                    content: "c".into(),
+                    tags: vec![],
+                    priority: 5,
+                    confidence: 1.0,
+                    source: "api".into(),
+                    access_count: 0,
+                    created_at: ts.to_string(),
+                    updated_at: ts.to_string(),
+                    last_accessed_at: None,
+                    expires_at: None,
+                    metadata: serde_json::json!({}),
+                };
+                db::insert(&lock.0, &mem).unwrap();
+            }
+        }
+
+        let app = Router::new()
+            .route("/api/v1/sync/since", axum_get(sync_since))
+            .with_state(state.clone());
+
+        // Ask for rows strictly after 2024-01 — should return all 3.
+        let since = "2024-01-01T00:00:00%2B00:00";
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/api/v1/sync/since?since={since}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["count"], 3);
+        // Echoed `since` (unparsed, verbatim — that's the point).
+        assert_eq!(v["updated_since"], "2024-01-01T00:00:00+00:00");
+        assert_eq!(v["earliest_updated_at"], mid_ts);
+        assert_eq!(v["latest_updated_at"], newest_ts);
+
+        // Empty set → both timestamp fields are null. The `updated_since`
+        // field still echoes the parsed input.
+        let empty_app = Router::new()
+            .route("/api/v1/sync/since", axum_get(sync_since))
+            .with_state(state);
+        let resp = empty_app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/sync/since?since=2099-01-01T00:00:00%2B00:00")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["count"], 0);
+        assert!(v["earliest_updated_at"].is_null());
+        assert!(v["latest_updated_at"].is_null());
+        assert_eq!(v["updated_since"], "2099-01-01T00:00:00+00:00");
     }
 
     #[tokio::test]
