@@ -1220,6 +1220,7 @@ fn handle_recall(
 pub(crate) fn handle_capabilities(
     tier_config: &TierConfig,
     reranker: Option<&CrossEncoder>,
+    embedder_loaded: bool,
 ) -> Result<Value, String> {
     let mut caps = tier_config.capabilities();
     // Report actual cross-encoder state, not just config (#93)
@@ -1230,6 +1231,11 @@ pub(crate) fn handle_capabilities(
         caps.features.memory_reflection = false;
         caps.models.cross_encoder = "lexical-fallback (neural download failed)".to_string();
     }
+    // v0.6.2 (S18): report whether the embedder successfully materialized
+    // at serve startup. `semantic_search` reflects the tier CONFIG while
+    // this bool reflects the RUNTIME — the two can diverge when the HF
+    // model fetch fails on an offline runner.
+    caps.features.embedder_loaded = embedder_loaded;
     serde_json::to_value(caps).map_err(|e| e.to_string())
 }
 
@@ -2571,7 +2577,9 @@ fn handle_request(
                 "memory_consolidate" => {
                     handle_consolidate(conn, arguments, llm, embedder, vector_index, mcp_client)
                 }
-                "memory_capabilities" => handle_capabilities(tier_config, reranker),
+                "memory_capabilities" => {
+                    handle_capabilities(tier_config, reranker, embedder.is_some())
+                }
                 "memory_expand_query" => handle_expand_query(llm, arguments),
                 "memory_auto_tag" => handle_auto_tag(conn, llm, arguments),
                 "memory_detect_contradiction" => handle_detect_contradiction(conn, llm, arguments),
