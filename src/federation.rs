@@ -557,6 +557,95 @@ pub async fn broadcast_archive_quorum(
     Ok(tracker)
 }
 
+/// v0.6.2 (S29): fan out a just-restored memory id to every peer. Payload
+/// rides on `sync_push` via `restores: [id]`, mirroring the shape used by
+/// `broadcast_archive_quorum`. On the receiving peer, `sync_push` moves
+/// the row from `archived_memories` back into `memories` via
+/// `db::restore_archived`. If the peer never saw the archive or the row
+/// isn't in its archive table, the sync call no-ops (same missing-on-peer
+/// posture used for archives and deletions).
+///
+/// Same quorum contract as `broadcast_store_quorum` / `broadcast_archive_quorum`.
+///
+/// # Errors
+///
+/// Returns `QuorumError::LocalWriteFailed` if the internal tracker Arc cannot
+/// be unwrapped (only occurs under a pathological detach race).
+pub async fn broadcast_restore_quorum(
+    config: &FederationConfig,
+    id: &str,
+) -> Result<AckTracker, QuorumError> {
+    let now = Instant::now();
+    let tracker = Arc::new(Mutex::new(AckTracker::new(config.policy.clone(), now)));
+    tracker.lock().await.record_local();
+
+    let body = serde_json::json!({
+        "sender_agent_id": config.sender_agent_id,
+        "memories": [],
+        "restores": [id],
+        "dry_run": false,
+    });
+
+    let mut joins: JoinSet<(String, AckOutcome)> = JoinSet::new();
+    for peer in &config.peers {
+        let client = config.client.clone();
+        let url = peer.sync_push_url.clone();
+        let peer_id = peer.id.clone();
+        let payload = body.clone();
+        let target_id = id.to_string();
+        joins.spawn(async move {
+            let outcome =
+                post_and_classify(&client, &url, &payload, &target_id, Some(&target_id)).await;
+            (peer_id, outcome)
+        });
+    }
+
+    let deadline = now + config.policy.ack_timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, joins.join_next()).await {
+            Ok(Some(Ok((peer_id, AckOutcome::Ack)))) => {
+                tracker.lock().await.record_peer_ack(peer_id);
+            }
+            Ok(Some(Ok((peer_id, AckOutcome::IdDrift)))) => {
+                tracker.lock().await.record_id_drift(peer_id);
+            }
+            Ok(Some(Ok((peer_id, AckOutcome::Fail(reason))))) => {
+                tracing::warn!("federation: restore peer {peer_id} failed for {id}: {reason}");
+            }
+            Ok(Some(Err(e))) => {
+                tracing::warn!("federation: restore peer join error: {e}");
+            }
+            Ok(None) | Err(_) => break,
+        }
+        if tracker.lock().await.is_quorum_met(Instant::now()) {
+            break;
+        }
+    }
+
+    if !joins.is_empty() {
+        tokio::spawn(async move {
+            while let Some(res) = joins.join_next().await {
+                if let Ok((peer_id, AckOutcome::Fail(reason))) = res {
+                    tracing::debug!(
+                        "federation: post-quorum restore peer {peer_id} did not ack: {reason}"
+                    );
+                }
+            }
+        });
+    }
+
+    let tracker = Arc::try_unwrap(tracker)
+        .map_err(|_| QuorumError::LocalWriteFailed {
+            detail: "tracker arc still referenced at finalise".to_string(),
+        })?
+        .into_inner();
+    Ok(tracker)
+}
+
 /// v0.6.2 (#325): fan out a just-committed memory link to every peer.
 /// Payload rides on `sync_push` via `links: [link]`. Same quorum contract
 /// as `broadcast_store_quorum`.
