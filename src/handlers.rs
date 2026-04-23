@@ -60,6 +60,15 @@ impl FromRef<AppState> for Db {
 
 const MAX_BULK_SIZE: usize = 1000;
 
+/// v0.6.2 (S40): maximum number of per-row `broadcast_store_quorum` fanouts
+/// in flight at once during `bulk_create`. Replaces the prior sequential
+/// for-loop (which paid 100ms × N rows of wall time and blew past the
+/// testbook's 20s settle on N=500) with bounded concurrency. The bound
+/// balances speedup against peer-side `SQLite` Mutex contention and the
+/// leader-side reqwest connection-pool / ephemeral-port envelope. See the
+/// comment above the loop in `bulk_create` for the full rationale.
+const BULK_FANOUT_CONCURRENCY: usize = 8;
+
 /// Shared state for API key authentication middleware.
 #[derive(Clone)]
 pub struct ApiKeyState {
@@ -1959,25 +1968,81 @@ pub async fn bulk_create(
             }
         }
     }
-    // Stage 2 — federation fanout, once per successfully-inserted row. On
-    // quorum miss for one row, we record the failure in `errors` and keep
-    // going: a single memory's quorum miss should NOT abort 499 other
-    // memories the caller just paid for. This is deliberately weaker than
-    // `create_memory`'s 503 — caller opted in to bulk semantics.
+    // Stage 2 — federation fanout, once per successfully-inserted row.
+    //
+    // v0.6.2 (S40): we run each row's `broadcast_store_quorum` *concurrently*
+    // via `tokio::task::JoinSet`, bounded by a semaphore so we never have
+    // more than `BULK_FANOUT_CONCURRENCY` in-flight fanouts at a time. The
+    // prior form looped sequentially and paid one full ack-round-trip per
+    // row — 500 rows × ~100ms = 50s, dwarfing the scenario's 20s settle
+    // window so peers only received the first ~200 writes in time.
+    //
+    // Why a bound instead of unbounded? Unbounded (`JoinSet.spawn` for
+    // each row at once) fires N × peers concurrent reqwest POSTs. At N=500
+    // × 3 peers = 1500 concurrent TCP connects this exhausts ephemeral
+    // ports and the reqwest client's connection pool, manifesting as
+    // `network: error sending request` on most rows. A bound of 32
+    // concurrent fanouts still pipelines the ack round-trip (100ms per
+    // row × 500 / 32 ≈ 1.6s wall), well inside the 20s scenario budget.
+    //
+    // Each row's broadcast still uses the full quorum contract (local +
+    // W-1 peer acks or 503). The semaphore only limits concurrency; it
+    // does NOT weaken any single row's guarantees. Non-quorum errors
+    // land in `errors` with the row id prefix, exactly as before. On a
+    // quorum miss we keep going — a single row's miss must not abort the
+    // other 499 the caller just paid for (bulk semantics, deliberately
+    // weaker than `create_memory`'s 503 short-circuit).
+    // Concurrency bound balances:
+    //   - Speedup over sequential: N / bound × ack — need bound ≥ a few to
+    //     clear 500 rows × 100ms ack inside the scenario's 20s settle.
+    //   - Peer-side contention: every concurrent fanout lands a sync_push
+    //     POST on the same SQLite Mutex on each peer. Too many in-flight
+    //     serialize at the peer's DB lock and either timeout the quorum
+    //     window or hit reqwest connection-pool / ephemeral-port limits
+    //     on the leader side.
+    //
+    // 8 is a conservative compromise: 500 × 100ms / 8 ≈ 6.2s wall, comfortably
+    // under the scenario's 20s budget while keeping the peer's per-writer
+    // queue short enough to avoid timeouts under typical testbook load.
+    // Tuned via the `BULK_FANOUT_CONCURRENCY` module constant.
     if let Some(fed) = app.federation.as_ref() {
+        let sem = Arc::new(tokio::sync::Semaphore::new(BULK_FANOUT_CONCURRENCY));
+        let mut joins: tokio::task::JoinSet<(String, Result<(), String>)> =
+            tokio::task::JoinSet::new();
         for mem in &created_mems {
-            match crate::federation::broadcast_store_quorum(fed, mem).await {
-                Ok(tracker) => {
-                    if let Err(err) = crate::federation::finalise_quorum(&tracker) {
-                        errors.push(format!("{}: {err}", mem.id));
+            let fed = fed.clone();
+            let mem = mem.clone();
+            let sem = sem.clone();
+            joins.spawn(async move {
+                // `acquire_owned` + a semaphore the task owns a clone of
+                // means the permit lives for the task's lifetime — it's
+                // released only when the task completes. A closed
+                // semaphore would be a bug; surface it via the error
+                // channel and keep going.
+                let Ok(_permit) = sem.acquire_owned().await else {
+                    return (mem.id.clone(), Err("fanout semaphore closed".to_string()));
+                };
+                let id = mem.id.clone();
+                let outcome = match crate::federation::broadcast_store_quorum(&fed, &mem).await {
+                    Ok(tracker) => match crate::federation::finalise_quorum(&tracker) {
+                        Ok(_) => Ok(()),
+                        Err(err) => Err(err.to_string()),
+                    },
+                    Err(e) => {
+                        tracing::warn!(
+                            "bulk_create: fanout for {id} failed (local committed): {e:?}"
+                        );
+                        Ok(())
                     }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "bulk_create: fanout for {} failed (local committed): {e:?}",
-                        mem.id
-                    );
-                }
+                };
+                (id, outcome)
+            });
+        }
+        while let Some(res) = joins.join_next().await {
+            match res {
+                Ok((id, Err(err))) => errors.push(format!("{id}: {err}")),
+                Ok((_, Ok(()))) => {}
+                Err(e) => tracing::warn!("bulk_create: fanout task join error: {e:?}"),
             }
         }
     }
@@ -2033,7 +2098,10 @@ pub async fn list_archive(
     }
 }
 
-pub async fn restore_archive(State(state): State<Db>, Path(id): Path<String>) -> impl IntoResponse {
+pub async fn restore_archive(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
     if let Err(e) = validate::validate_id(&id) {
         return (
             StatusCode::BAD_REQUEST,
@@ -2041,23 +2109,57 @@ pub async fn restore_archive(State(state): State<Db>, Path(id): Path<String>) ->
         )
             .into_response();
     }
-    let lock = state.lock().await;
-    match db::restore_archived(&lock.0, &id) {
-        Ok(true) => Json(json!({"restored": true, "id": id})).into_response(),
-        Ok(false) => (
+    let restored = {
+        let lock = app.db.lock().await;
+        match db::restore_archived(&lock.0, &id) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!("handler error: {e}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "internal server error"})),
+                )
+                    .into_response();
+            }
+        }
+    };
+    if !restored {
+        return (
             StatusCode::NOT_FOUND,
             Json(json!({"error": "not found in archive"})),
         )
-            .into_response(),
-        Err(e) => {
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
+            .into_response();
+    }
+
+    // v0.6.2 (S29): broadcast the restore to peers so they move the row
+    // from `archived_memories` → `memories` in lockstep. Without this, a
+    // POST /api/v1/archive/{id}/restore on node-1 leaves node-2..4 with
+    // the row still archived, so node-4 never sees M1 re-enter the active
+    // set (the testbook-v3 S29 assertion). Same posture as
+    // `archive_by_ids`: on a quorum miss we short-circuit with 503 so
+    // operators can retry.
+    if let Some(fed) = app.federation.as_ref() {
+        match crate::federation::broadcast_restore_quorum(fed, &id).await {
+            Ok(tracker) => {
+                if let Err(err) = crate::federation::finalise_quorum(&tracker) {
+                    let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        [("Retry-After", "2")],
+                        Json(serde_json::to_value(&payload).unwrap_or_default()),
+                    )
+                        .into_response();
+                }
+            }
+            Err(e) => {
+                // Local commit already landed — sync-daemon catches
+                // stragglers. Same posture as `fanout_or_503`.
+                tracing::warn!("restore fanout error (local committed): {e:?}");
+            }
         }
     }
+
+    Json(json!({"restored": true, "id": id})).into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -2252,6 +2354,13 @@ pub struct SyncPushBody {
     /// Distinct from `deletions`, which is a hard DELETE.
     #[serde(default)]
     pub archives: Vec<String>,
+    /// v0.6.2 (S29): memory IDs the sender has restored from archive and
+    /// wants propagated. Applied via `db::restore_archived` — moves the
+    /// row from `archived_memories` back into `memories`. The inverse of
+    /// `archives`. Missing-on-peer IDs (no row in the peer's archive
+    /// table, or a live row already exists) no-op so replays are safe.
+    #[serde(default)]
+    pub restores: Vec<String>,
     /// v0.6.2 (#325): memory links the sender wants propagated. Applied
     /// via `db::create_link` on each peer. Duplicates are a no-op thanks
     /// to the unique `(source_id, target_id, relation)` constraint on
@@ -2318,6 +2427,15 @@ pub async fn sync_push(
         )
             .into_response();
     }
+    if body.restores.len() > MAX_BULK_SIZE {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!("sync_push limited to {} restores per request", MAX_BULK_SIZE)
+            })),
+        )
+            .into_response();
+    }
     // Receiver's local identity — default to the caller-supplied header,
     // fall back to the anonymous placeholder. Recorded in sync_state rows.
     let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
@@ -2338,6 +2456,7 @@ pub async fn sync_push(
     let mut skipped = 0usize;
     let mut deleted = 0usize;
     let mut archived = 0usize;
+    let mut restored = 0usize;
     let mut latest_seen: Option<String> = None;
 
     // v0.6.0.1 (#322): peers that apply a synced memory must also refresh
@@ -2351,7 +2470,8 @@ pub async fn sync_push(
     // would serialize unrelated writers for hundreds of ms).
     let mut embedding_refresh: Vec<(String, String)> = Vec::new();
     for mem in &body.memories {
-        if validate::validate_memory(mem).is_err() {
+        if let Err(e) = validate::validate_memory(mem) {
+            tracing::warn!("sync_push: skipping memory {} ({}): {e}", mem.id, mem.title);
             skipped += 1;
             continue;
         }
@@ -2417,6 +2537,30 @@ pub async fn sync_push(
             Ok(false) => noop += 1,
             Err(e) => {
                 tracing::warn!("sync_push: archive_memory failed for {arch_id}: {e}");
+                skipped += 1;
+            }
+        }
+    }
+
+    // v0.6.2 (S29): process explicit restores — the inverse of archives.
+    // Move the row from `archived_memories` back into `memories`.
+    // No-op posture matches archives: missing rows (peer hasn't received
+    // the archive, or the row is already live) count as noop so replays
+    // and out-of-order restore/archive pairs don't error.
+    for res_id in &body.restores {
+        if validate::validate_id(res_id).is_err() {
+            skipped += 1;
+            continue;
+        }
+        if body.dry_run {
+            noop += 1;
+            continue;
+        }
+        match db::restore_archived(&lock.0, res_id) {
+            Ok(true) => restored += 1,
+            Ok(false) => noop += 1,
+            Err(e) => {
+                tracing::warn!("sync_push: restore_archived failed for {res_id}: {e}");
                 skipped += 1;
             }
         }
@@ -2512,6 +2656,7 @@ pub async fn sync_push(
             "applied": applied,
             "deleted": deleted,
             "archived": archived,
+            "restored": restored,
             "links_applied": links_applied,
             "noop": noop,
             "skipped": skipped,
@@ -2680,7 +2825,16 @@ pub async fn get_capabilities(State(app): State<AppState>) -> impl IntoResponse 
     // HTTP AppState (HTTP daemons that wire a cross-encoder record it via
     // the tier config's `cross_encoder` flag, which is enough for scenario
     // S30's equivalence check).
-    match crate::mcp::handle_capabilities(app.tier_config.as_ref(), None) {
+    //
+    // v0.6.2 (S18): forward the *runtime* embedder state so
+    // `features.embedder_loaded` reports whether the HF model actually
+    // materialized at serve startup (not just whether the tier config
+    // asked for one). An offline CI runner can fail the model fetch and
+    // end up with `semantic_search=true` (from config) but no embedder in
+    // the AppState — setup scripts need this signal to refuse to start
+    // scenarios that depend on semantic recall.
+    let embedder_loaded = app.embedder.as_ref().is_some();
+    match crate::mcp::handle_capabilities(app.tier_config.as_ref(), None, embedder_loaded) {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(e) => {
             tracing::error!("capabilities: {e}");
@@ -2751,10 +2905,32 @@ pub async fn notify(
     // the caller-resolved HTTP id — same effective provenance.
     let mcp_client = sender.clone();
     let result = crate::mcp::handle_notify(&lock.0, &params, &resolved_ttl, Some(&mcp_client));
+
+    // v0.6.2 (S32): capture the just-inserted notify row and fan it out to
+    // peers. Without this, alice's notify on node-1 lands in bob's inbox on
+    // node-1 only — when bob polls `/api/v1/inbox` against node-2 he sees
+    // nothing. The HTTP wrapper bypassed the `create_memory` fanout path
+    // that every other `db::insert` write uses, so we wire it here with the
+    // same posture as `fanout_or_503`: on quorum miss return 503; on a
+    // network error, swallow (local commit landed, sync-daemon catches up).
+    let fanout_mem = match &result {
+        Ok(v) => v
+            .get("id")
+            .and_then(|x| x.as_str())
+            .and_then(|id| db::get(&lock.0, id).ok().flatten()),
+        Err(_) => None,
+    };
     drop(lock);
 
     match result {
-        Ok(v) => (StatusCode::CREATED, Json(v)).into_response(),
+        Ok(v) => {
+            if let Some(mem) = fanout_mem
+                && let Some(resp) = fanout_or_503(&app, &mem).await
+            {
+                return resp;
+            }
+            (StatusCode::CREATED, Json(v)).into_response()
+        }
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response(),
     }
 }
