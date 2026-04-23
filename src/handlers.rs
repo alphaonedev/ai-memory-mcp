@@ -2572,6 +2572,13 @@ pub struct SyncPushBody {
     /// auto-detected one).
     #[serde(default)]
     pub namespace_meta: Vec<crate::models::NamespaceMetaEntry>,
+    /// v0.6.2 (S35 follow-up): namespaces whose standard the sender has
+    /// *cleared* and wants propagated. Applied via `db::clear_namespace_standard`
+    /// — missing-on-peer namespaces no-op so replays are safe. Without
+    /// this, alice clearing a standard on node-1 left the row visible on
+    /// node-2's peer, breaking cross-peer rule-lifecycle assertions.
+    #[serde(default)]
+    pub namespace_meta_clears: Vec<String>,
     /// Preview mode — classify and count, do not write.
     #[serde(default)]
     pub dry_run: bool,
@@ -2668,6 +2675,18 @@ pub async fn sync_push(
             Json(json!({
                 "error": format!(
                     "sync_push limited to {} namespace_meta per request",
+                    MAX_BULK_SIZE
+                )
+            })),
+        )
+            .into_response();
+    }
+    if body.namespace_meta_clears.len() > MAX_BULK_SIZE {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!(
+                    "sync_push limited to {} namespace_meta_clears per request",
                     MAX_BULK_SIZE
                 )
             })),
@@ -2931,6 +2950,30 @@ pub async fn sync_push(
         }
     }
 
+    // v0.6.2 (S35 follow-up): process incoming namespace_meta_clears. Applies
+    // via `db::clear_namespace_standard` so the peer drops its meta row and
+    // subsequent `get_standard` returns empty. Missing-on-peer namespaces
+    // no-op (`changed == 0`) — replays are safe.
+    let mut namespace_meta_cleared = 0usize;
+    for ns in &body.namespace_meta_clears {
+        if validate::validate_namespace(ns).is_err() {
+            skipped += 1;
+            continue;
+        }
+        if body.dry_run {
+            noop += 1;
+            continue;
+        }
+        match db::clear_namespace_standard(&lock.0, ns) {
+            Ok(true) => namespace_meta_cleared += 1,
+            Ok(false) => noop += 1,
+            Err(e) => {
+                tracing::warn!("sync_push: clear_namespace_standard failed for {ns}: {e}");
+                skipped += 1;
+            }
+        }
+    }
+
     // Advance the vector clock with the highest `updated_at` we observed.
     // Skipped in dry-run mode since the caller is only previewing.
     if !body.dry_run
@@ -2998,6 +3041,7 @@ pub async fn sync_push(
             "pendings_applied": pendings_applied,
             "pending_decisions_applied": pending_decisions_applied,
             "namespace_meta_applied": namespace_meta_applied,
+            "namespace_meta_cleared": namespace_meta_cleared,
             "noop": noop,
             "skipped": skipped,
             "dry_run": body.dry_run,
@@ -3821,17 +3865,10 @@ pub async fn get_namespace_standard(
 }
 
 pub async fn clear_namespace_standard(
-    State(state): State<Db>,
+    State(app): State<AppState>,
     Path(ns): Path<String>,
 ) -> impl IntoResponse {
-    let params = json!({"namespace": ns});
-    let lock = state.lock().await;
-    let result = crate::mcp::handle_namespace_clear_standard(&lock.0, &params);
-    drop(lock);
-    match result {
-        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response(),
-    }
+    clear_namespace_standard_inner(&app, &ns).await
 }
 
 // Query-string forms for the S34/S35 `/api/v1/namespaces?namespace=…` shape.
@@ -3877,7 +3914,7 @@ pub async fn get_namespace_standard_qs(
 }
 
 pub async fn clear_namespace_standard_qs(
-    State(state): State<Db>,
+    State(app): State<AppState>,
     Query(q): Query<NamespaceStandardQuery>,
 ) -> impl IntoResponse {
     let Some(ns) = q.namespace else {
@@ -3887,12 +3924,51 @@ pub async fn clear_namespace_standard_qs(
         )
             .into_response();
     };
+    clear_namespace_standard_inner(&app, &ns).await
+}
+
+/// v0.6.2 (S35 follow-up): shared implementation for path and query-string
+/// clear handlers. Runs the local clear then, on success, fans the cleared
+/// namespace out to peers via `broadcast_namespace_meta_clear_quorum`.
+/// Returns 503 `quorum_not_met` when federation is configured and the quorum
+/// contract fails — matching the pattern established by
+/// `set_namespace_standard_inner`.
+async fn clear_namespace_standard_inner(app: &AppState, ns: &str) -> axum::response::Response {
     let params = json!({"namespace": ns});
-    let lock = state.lock().await;
+    let lock = app.db.lock().await;
     let result = crate::mcp::handle_namespace_clear_standard(&lock.0, &params);
     drop(lock);
     match result {
-        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+        Ok(v) => {
+            if let Some(fed) = app.federation.as_ref() {
+                let namespaces = vec![ns.to_string()];
+                match crate::federation::broadcast_namespace_meta_clear_quorum(fed, &namespaces)
+                    .await
+                {
+                    Ok(tracker) => {
+                        if let Err(err) = crate::federation::finalise_quorum(&tracker) {
+                            let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
+                            return (
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                [("Retry-After", "2")],
+                                Json(serde_json::to_value(&payload).unwrap_or_default()),
+                            )
+                                .into_response();
+                        }
+                    }
+                    Err(err) => {
+                        let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            [("Retry-After", "2")],
+                            Json(serde_json::to_value(&payload).unwrap_or_default()),
+                        )
+                            .into_response();
+                    }
+                }
+            }
+            (StatusCode::OK, Json(v)).into_response()
+        }
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response(),
     }
 }
