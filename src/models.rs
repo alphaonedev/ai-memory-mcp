@@ -440,21 +440,42 @@ impl ApproverType {
 ///
 /// Default policy when a standard has no `metadata.governance`:
 /// `{ write: Any, promote: Any, delete: Owner, approver: Human }`.
+///
+/// v0.6.2 (S34 defensive): `promote`, `delete`, and `approver` carry
+/// `#[serde(default)]` so partial-policy payloads (a common shape for
+/// operator CLIs / test harnesses that only care about `write`) round-trip
+/// instead of 400-ing out on missing fields. `write` remains required —
+/// it's the core knob a policy is attempting to set.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GovernancePolicy {
     pub write: GovernanceLevel,
+    #[serde(default = "default_promote_level")]
     pub promote: GovernanceLevel,
+    #[serde(default = "default_delete_level")]
     pub delete: GovernanceLevel,
+    #[serde(default = "default_approver")]
     pub approver: ApproverType,
+}
+
+fn default_promote_level() -> GovernanceLevel {
+    GovernanceLevel::Any
+}
+
+fn default_delete_level() -> GovernanceLevel {
+    GovernanceLevel::Owner
+}
+
+fn default_approver() -> ApproverType {
+    ApproverType::Human
 }
 
 impl Default for GovernancePolicy {
     fn default() -> Self {
         Self {
             write: GovernanceLevel::Any,
-            promote: GovernanceLevel::Any,
-            delete: GovernanceLevel::Owner,
-            approver: ApproverType::Human,
+            promote: default_promote_level(),
+            delete: default_delete_level(),
+            approver: default_approver(),
         }
     }
 }
@@ -881,6 +902,39 @@ mod tests {
         });
         let result = GovernancePolicy::from_metadata(&meta).expect("present");
         assert!(result.is_err(), "unknown enum value must fail deserialize");
+    }
+
+    // v0.6.2 (S34 defense): partial policy payloads fall back to the
+    // `Default for GovernancePolicy` values for any field the caller omitted.
+    // `write` remains required — it's the core knob the policy expresses.
+
+    #[test]
+    fn governance_partial_policy_write_only_uses_defaults() {
+        let json = serde_json::json!({"write": "owner"});
+        let parsed: GovernancePolicy = serde_json::from_value(json).expect("write-only parses");
+        assert_eq!(parsed.write, GovernanceLevel::Owner);
+        assert_eq!(parsed.promote, GovernanceLevel::Any);
+        assert_eq!(parsed.delete, GovernanceLevel::Owner);
+        assert_eq!(parsed.approver, ApproverType::Human);
+    }
+
+    #[test]
+    fn governance_partial_policy_write_and_promote() {
+        let json = serde_json::json!({"write": "any", "promote": "registered"});
+        let parsed: GovernancePolicy = serde_json::from_value(json).expect("parses");
+        assert_eq!(parsed.promote, GovernanceLevel::Registered);
+        // Absent fields still take defaults.
+        assert_eq!(parsed.delete, GovernanceLevel::Owner);
+        assert_eq!(parsed.approver, ApproverType::Human);
+    }
+
+    #[test]
+    fn governance_missing_write_still_errors() {
+        // `write` is the core policy knob — must remain required to avoid
+        // silently accepting an empty object as "any writes allowed".
+        let json = serde_json::json!({"promote": "owner"});
+        let err = serde_json::from_value::<GovernancePolicy>(json);
+        assert!(err.is_err(), "missing write must fail deserialize");
     }
 
     #[test]
