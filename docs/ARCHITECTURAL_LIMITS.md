@@ -52,8 +52,7 @@ asynchronous — every write replicates to S3 on a delay. On crash you lose
 the unreplicated window. There is no multi-master.
 
 **Impact:** RPO (recovery point objective) is measured in seconds to
-minutes. For regulated workloads needing zero-data-loss, SQLite cannot
-deliver.
+minutes. For workloads needing zero-data-loss, SQLite cannot deliver.
 **Workaround:** Postgres + synchronous replication via pg_replica.
 
 ### 4. Shared filesystems (NFS, SMB, FUSE, EFS) are unsafe — **Structural**
@@ -97,8 +96,8 @@ Postgres has logical replication and `wal2json`. MySQL has binlog. SQLite
 has neither. Changes can be emitted via triggers, but there is no external
 consumer protocol.
 
-**Impact:** regulated industries and event-driven pipelines cannot tap
-changes without bolt-on triggers.
+**Impact:** event-driven pipelines cannot tap changes without bolt-on
+triggers.
 **v0.7 SAL:** Postgres adapter exposes CDC natively.
 
 ### 8. Schema migration DDL is feature-poor — **Workaround**
@@ -163,7 +162,7 @@ lock bursts. Shutdown still runs a final checkpoint.
 | Multi-region / HA / zero-data-loss | Postgres (v0.7) | Structural limit 3 rules out SQLite. |
 | Shared filesystem / Kubernetes PVC-per-replica | Postgres or Qdrant (v0.7) | Structural limit 4. |
 | Vector-first workload, low metadata | Qdrant or LanceDB (v0.7) | Native ANN beats in-process HNSW. |
-| Regulated (audit/CDC required) | Postgres (v0.7) | Structural limit 7. |
+| Change-data-capture (CDC) required | Postgres (v0.7) | Structural limit 7. |
 
 ## What v0.6.0 GA does *not* fix
 
