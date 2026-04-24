@@ -805,6 +805,68 @@ pub fn delete(conn: &Connection, id: &str) -> Result<bool> {
     Ok(changed > 0)
 }
 
+/// Move a memory from `memories` to `archived_memories`. Used by the
+/// HTTP `/api/v1/archive` explicit-archive endpoint (S29) and by
+/// `sync_push` when a peer pushes an `archives: [id]` record.
+///
+/// Unlike `gc(archive=true)` this does not filter on `expires_at` — the
+/// caller is explicitly asking for the row to be archived right now.
+///
+/// Returns `true` if a row was moved, `false` if no live memory existed
+/// with this id (e.g. it was already archived or never written locally).
+/// A missing-on-peer id is expected during normal fanout and callers
+/// treat it as a no-op.
+///
+/// # Errors
+///
+/// Returns an error if the INSERT-SELECT or DELETE fails.
+pub fn archive_memory(conn: &Connection, id: &str, reason: Option<&str>) -> Result<bool> {
+    let now = Utc::now().to_rfc3339();
+    let reason = reason.unwrap_or("archive");
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| -> Result<bool> {
+        let exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM memories WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap_or(false);
+        if !exists {
+            return Ok(false);
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO archived_memories
+             (id, tier, namespace, title, content, tags, priority, confidence,
+              source, access_count, created_at, updated_at, last_accessed_at,
+              expires_at, archived_at, archive_reason, metadata)
+             SELECT id, tier, namespace, title, content, tags, priority, confidence,
+                    source, access_count, created_at, updated_at, last_accessed_at,
+                    expires_at, ?1, ?2, metadata
+             FROM memories WHERE id = ?3",
+            params![now, reason, id],
+        )?;
+        // Clean up namespace_meta — mirrors `delete`'s cleanup so an archived
+        // row is not still referenced as the namespace standard.
+        conn.execute(
+            "DELETE FROM namespace_meta WHERE standard_id = ?1",
+            params![id],
+        )?;
+        let removed = conn.execute("DELETE FROM memories WHERE id = ?1", params![id])?;
+        Ok(removed > 0)
+    })();
+    match result {
+        Ok(moved) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(moved)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
+}
+
 /// Count memories that would be deleted by forget (for `dry_run`).
 pub fn forget_count(
     conn: &Connection,
@@ -1527,7 +1589,17 @@ fn sanitize_fts_query(input: &str, use_or: bool) -> String {
         })
         .map(|token| {
             // Strip FTS5 special characters to prevent injection.
-            // Hyphens are allowed inside words (e.g. "well-known").
+            // Hyphens are allowed inside words (e.g. "well-known"): the
+            // unicode61 tokenizer treats `-` as a separator when indexing,
+            // so `foo-bar` indexes as `foo` + `bar`. Keeping the hyphen in
+            // the per-token phrase (below we wrap each token in `"…"`)
+            // produces a phrase query that FTS5 evaluates by matching the
+            // hyphen-split component terms in order — which is exactly
+            // what callers expect when searching for hyphenated content.
+            // Dropping the `'-'` filter here fixes scenario S28 without
+            // reopening the `+`/`-` exclusion-injection hole (every token
+            // is already phrase-quoted before being joined, so `-` cannot
+            // reach FTS5 as a prefix operator).
             let clean: String = token
                 .chars()
                 .filter(|c| {
@@ -1541,7 +1613,6 @@ fn sanitize_fts_query(input: &str, use_or: bool) -> String {
                         && *c != ':'
                         && *c != '|'
                         && *c != '+'
-                        && *c != '-'
                 })
                 .collect();
             if clean.is_empty() {
@@ -2295,7 +2366,17 @@ pub fn recall_hybrid(
                 continue;
             }
             let cosine = f64::from(1.0 - hit.distance);
-            if cosine > 0.3
+            // v0.6.2 (S18 iteration): cosine gate relaxed 0.3 → 0.2.
+            // Scenario-18 caught a real-world miss at the old ceiling:
+            // semantically-related pairs with varied phrasing ("morning
+            // outdoor exercise routine" vs. "brisk uphill strides along
+            // the ridge line trails") landed at 0.25-0.29 cosine and
+            // silently fell below 0.3, returning zero semantic hits.
+            // 0.2 keeps clearly-unrelated content out (random noise
+            // hovers near 0) while admitting legitimate semantic
+            // associations; the blended score + FTS component still
+            // rank relevance on the way out.
+            if cosine > 0.2
                 && let Some(mem) = get(conn, &hit.id)?
             {
                 // Apply namespace/expiry/tag filters. Task 1.12: when
@@ -2375,7 +2456,8 @@ pub fn recall_hybrid(
                     query_embedding,
                     &emb,
                 ));
-                if cosine > 0.3 {
+                // v0.6.2 (S18): see matching note above at the HNSW gate.
+                if cosine > 0.2 {
                     scored.insert(mem.id.clone(), (mem, 0.0, cosine));
                 }
             }
@@ -2651,6 +2733,33 @@ pub fn get_namespace_parent(conn: &Connection, namespace: &str) -> Option<String
     .ok()
 }
 
+/// v0.6.2 (S35): read the full `namespace_meta` row for a namespace so the
+/// caller can fan it out to peers. Returns `None` when no standard is set.
+/// Mirrors the (`namespace`, `standard_id`, `parent_namespace`, `updated_at`)
+/// tuple used by `set_namespace_standard`.
+#[allow(clippy::unnecessary_wraps)]
+pub fn get_namespace_meta_entry(
+    conn: &Connection,
+    namespace: &str,
+) -> Result<Option<crate::models::NamespaceMetaEntry>> {
+    let row = conn
+        .query_row(
+            "SELECT namespace, standard_id, parent_namespace, updated_at
+             FROM namespace_meta WHERE namespace = ?1",
+            params![namespace],
+            |r| {
+                Ok(crate::models::NamespaceMetaEntry {
+                    namespace: r.get(0)?,
+                    standard_id: r.get(1)?,
+                    parent_namespace: r.get(2)?,
+                    updated_at: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                })
+            },
+        )
+        .ok();
+    Ok(row)
+}
+
 /// Clear the standard for a namespace.
 pub fn clear_namespace_standard(conn: &Connection, namespace: &str) -> Result<bool> {
     let changed = conn.execute(
@@ -2808,6 +2917,49 @@ pub fn queue_pending_action(
         ],
     )?;
     Ok(id)
+}
+
+/// v0.6.2 (S34): upsert a `pending_actions` row from a canonical `PendingAction`
+/// struct — used by `sync_push` to apply a peer-originated pending row so
+/// governance state is cluster-consistent. Preserves `approvals` and
+/// decision fields verbatim so re-plays converge. Uses `INSERT ... ON
+/// CONFLICT(id) DO UPDATE` because the originator's id is stable across
+/// peers (unlike `queue_pending_action` which mints a fresh UUID per
+/// queue call).
+pub fn upsert_pending_action(conn: &Connection, pa: &PendingAction) -> Result<()> {
+    let payload_json = serde_json::to_string(&pa.payload)?;
+    let approvals_json = serde_json::to_string(&pa.approvals)?;
+    conn.execute(
+        "INSERT INTO pending_actions
+         (id, action_type, memory_id, namespace, payload, requested_by,
+          requested_at, status, decided_by, decided_at, approvals)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+         ON CONFLICT(id) DO UPDATE SET
+            action_type  = excluded.action_type,
+            memory_id    = excluded.memory_id,
+            namespace    = excluded.namespace,
+            payload      = excluded.payload,
+            requested_by = excluded.requested_by,
+            requested_at = excluded.requested_at,
+            status       = excluded.status,
+            decided_by   = excluded.decided_by,
+            decided_at   = excluded.decided_at,
+            approvals    = excluded.approvals",
+        params![
+            pa.id,
+            pa.action_type,
+            pa.memory_id,
+            pa.namespace,
+            payload_json,
+            pa.requested_by,
+            pa.requested_at,
+            pa.status,
+            pa.decided_by,
+            pa.decided_at,
+            approvals_json,
+        ],
+    )?;
+    Ok(())
 }
 
 pub fn list_pending_actions(
@@ -3712,6 +3864,55 @@ mod tests {
     }
 
     #[test]
+    fn archive_memory_moves_live_row_to_archive() {
+        // S29 — explicit archive endpoint must move the row out of
+        // `memories` and into `archived_memories` with the caller-supplied
+        // reason. Unlike gc(archive=true), this is NOT gated on
+        // `expires_at` — the caller is asking for it right now.
+        let conn = test_db();
+        let mem = make_memory("Archive me", "s29", Tier::Long, 5);
+        let id = insert(&conn, &mem).unwrap();
+
+        let moved = archive_memory(&conn, &id, Some("explicit")).unwrap();
+        assert!(moved, "live row must be archived on first call");
+        assert!(
+            get(&conn, &id).unwrap().is_none(),
+            "row must be removed from active table"
+        );
+
+        let archived = list_archived(&conn, None, 10, 0).unwrap();
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0]["id"], id);
+        assert_eq!(archived[0]["archive_reason"], "explicit");
+
+        // Second call is a no-op — row is already out of `memories`.
+        let second = archive_memory(&conn, &id, Some("explicit")).unwrap();
+        assert!(
+            !second,
+            "second archive call must report no-op (no live row)"
+        );
+    }
+
+    #[test]
+    fn archive_memory_missing_id_returns_false() {
+        // Peers that never saw M1 must no-op, not error, on sync_push
+        // archives fanout.
+        let conn = test_db();
+        let moved = archive_memory(&conn, "nonexistent-id", None).unwrap();
+        assert!(!moved);
+    }
+
+    #[test]
+    fn archive_memory_default_reason_is_archive() {
+        let conn = test_db();
+        let mem = make_memory("Default reason", "s29", Tier::Long, 5);
+        let id = insert(&conn, &mem).unwrap();
+        assert!(archive_memory(&conn, &id, None).unwrap());
+        let archived = list_archived(&conn, None, 10, 0).unwrap();
+        assert_eq!(archived[0]["archive_reason"], "archive");
+    }
+
+    #[test]
     fn export_all_and_links() {
         let conn = test_db();
         let id1 = insert(&conn, &make_memory("Export A", "test", Tier::Long, 5)).unwrap();
@@ -3793,12 +3994,18 @@ mod tests {
         // Empty input returns placeholder
         let sanitized3 = sanitize_fts_query("", true);
         assert_eq!(sanitized3, "\"_empty_\"");
-        // + and - prefix operators are stripped (prevents exclusion injection)
+        // `+` prefix operator is stripped (prevents exclusion injection);
+        // `-` is now preserved inside phrase-quoted tokens so hyphenated
+        // content ("well-known", "foo-bar") searches correctly against
+        // the unicode61 tokenizer. Phrase-quoting keeps `-` from reaching
+        // FTS5 as a prefix operator, closing the injection hole.
         let sanitized4 = sanitize_fts_query("-secret +required", true);
-        assert!(!sanitized4.contains('-'));
         assert!(!sanitized4.contains('+'));
         assert!(sanitized4.contains("secret"));
         assert!(sanitized4.contains("required"));
+        // Hyphenated tokens pass through as phrase searches.
+        let sanitized5 = sanitize_fts_query("well-known", true);
+        assert!(sanitized5.contains("well-known"));
     }
 
     #[test]
