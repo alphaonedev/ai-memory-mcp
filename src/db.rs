@@ -2388,12 +2388,11 @@ pub const KG_QUERY_DEFAULT_LIMIT: usize = 200;
 /// pathological fan-out.
 pub const KG_QUERY_MAX_LIMIT: usize = 1000;
 
-/// Maximum traversal depth supported by [`kg_query`] in this build. The
-/// first slice of Pillar 2 / Stream C ships outbound depth=1
-/// ("expand neighbors"); the recursive-CTE multi-hop traversal lands in
-/// a follow-up iteration. Keeping the constant here lets the next slice
-/// raise the ceiling in one place without touching callers.
-pub const KG_QUERY_MAX_SUPPORTED_DEPTH: usize = 1;
+/// Maximum traversal depth supported by [`kg_query`]. The recursive-CTE
+/// implementation enforces an explicit ceiling so a crafted call cannot
+/// run an unbounded traversal; the charter (`v0.6.3-grand-slam.md`
+/// § Performance Budgets) sets the published budget at depth ≤ 5.
+pub const KG_QUERY_MAX_SUPPORTED_DEPTH: usize = 5;
 
 /// Outbound KG traversal from a source memory (Pillar 2 / Stream C —
 /// `memory_kg_query`). Returns one row per link reachable within
@@ -2410,16 +2409,22 @@ pub const KG_QUERY_MAX_SUPPORTED_DEPTH: usize = 1;
 ///   When omitted entirely (`None`), the agent filter is skipped.
 /// - `limit`: row cap, clamped to [1, [`KG_QUERY_MAX_LIMIT`]].
 ///
-/// `max_depth` must be in `[1, KG_QUERY_MAX_SUPPORTED_DEPTH]`. This
-/// build supports depth=1 only; passing a larger value yields an
-/// explicit error rather than a silent truncation. The recursive CTE
-/// path lands in the follow-up iteration that finishes Stream C.
+/// `max_depth` must be in `[1, KG_QUERY_MAX_SUPPORTED_DEPTH]`; passing
+/// a larger value yields an explicit error rather than a silent
+/// truncation, so callers learn they hit the ceiling instead of
+/// receiving a partial graph.
 ///
-/// Ordering is `COALESCE(valid_from, created_at) ASC, created_at ASC`,
-/// so the result is deterministic whether or not the caller scopes by
-/// time. The `depth` field is always 1 in this build; the `path` field
-/// is the simple `<source_id>-><target_id>` string and generalizes to
-/// multi-hop paths in the follow-up iteration.
+/// Multi-hop traversal uses a recursive CTE with cycle detection on
+/// the accumulated path, so cycles in the link graph cannot loop the
+/// traversal indefinitely. Each hop reapplies the same temporal /
+/// agent filters as the anchor — a chain only extends through links
+/// that pass every filter on every hop.
+///
+/// Ordering is `depth ASC, COALESCE(valid_from, created_at) ASC,
+/// created_at ASC` — shallower hops first, then time-ordered within
+/// each level. For depth=1 callers this collapses to the original
+/// time ordering. The `depth` field reflects the actual hop count and
+/// `path` is the full `src->mid->target` chain.
 pub fn kg_query(
     conn: &Connection,
     source_id: &str,
@@ -2435,8 +2440,7 @@ pub fn kg_query(
     }
     if max_depth > KG_QUERY_MAX_SUPPORTED_DEPTH {
         anyhow::bail!(
-            "max_depth={max_depth} exceeds supported depth={KG_QUERY_MAX_SUPPORTED_DEPTH}; \
-             multi-hop traversal lands in a follow-up iteration"
+            "max_depth={max_depth} exceeds supported depth={KG_QUERY_MAX_SUPPORTED_DEPTH}"
         );
     }
 
@@ -2452,50 +2456,78 @@ pub fn kg_query(
         .unwrap_or(KG_QUERY_DEFAULT_LIMIT)
         .clamp(1, KG_QUERY_MAX_LIMIT);
 
-    // Compose the predicate dynamically. Bind values are appended in the
-    // same order so positional placeholders line up.
-    let mut sql = String::from(
-        "SELECT ml.target_id, ml.relation, ml.valid_from, ml.valid_until,
-                ml.observed_by, m.title, m.namespace
-         FROM memory_links ml
-         JOIN memories m ON m.id = ml.target_id
-         WHERE ml.source_id = ?1",
-    );
-    let mut binds: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(source_id.to_string())];
-
+    // Build the per-hop predicate once; the anchor and recursive members
+    // both apply it to a row aliased `ml`. Bind values are appended in
+    // resolution order so positional placeholders line up.
+    let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    let mut hop_filter = String::new();
     if let Some(t) = valid_at {
-        sql.push_str(" AND ml.valid_from IS NOT NULL AND ml.valid_from <= ?");
-        sql.push_str(&(binds.len() + 1).to_string());
+        hop_filter.push_str(" AND ml.valid_from IS NOT NULL AND ml.valid_from <= ?");
         binds.push(Box::new(t.to_string()));
-        sql.push_str(" AND (ml.valid_until IS NULL OR ml.valid_until > ?");
-        sql.push_str(&(binds.len() + 1).to_string());
-        sql.push(')');
+        hop_filter.push_str(&binds.len().to_string());
+        hop_filter.push_str(" AND (ml.valid_until IS NULL OR ml.valid_until > ?");
         binds.push(Box::new(t.to_string()));
+        hop_filter.push_str(&binds.len().to_string());
+        hop_filter.push(')');
     }
-
     if let Some(agents) = allowed_agents {
         // Already short-circuited the empty case above.
-        let placeholders: Vec<String> = (0..agents.len())
-            .map(|i| format!("?{}", binds.len() + 1 + i))
-            .collect();
-        sql.push_str(" AND ml.observed_by IN (");
-        sql.push_str(&placeholders.join(", "));
-        sql.push(')');
-        for a in agents {
+        hop_filter.push_str(" AND ml.observed_by IN (");
+        for (i, a) in agents.iter().enumerate() {
             binds.push(Box::new(a.clone()));
+            if i > 0 {
+                hop_filter.push_str(", ");
+            }
+            hop_filter.push('?');
+            hop_filter.push_str(&binds.len().to_string());
         }
+        hop_filter.push(')');
     }
 
-    sql.push_str(" ORDER BY COALESCE(ml.valid_from, ml.created_at) ASC, ml.created_at ASC LIMIT ?");
-    sql.push_str(&(binds.len() + 1).to_string());
+    // Anchor binds source_id, recursive member binds max_depth, final
+    // SELECT binds the row cap. Order matters — placeholders are
+    // resolved by the position they occupy in the assembled string.
+    binds.push(Box::new(source_id.to_string()));
+    let source_ph = binds.len();
+    binds.push(Box::new(i64::try_from(max_depth).unwrap_or(i64::MAX)));
+    let max_depth_ph = binds.len();
     binds.push(Box::new(i64::try_from(cap).unwrap_or(i64::MAX)));
+    let limit_ph = binds.len();
+
+    let sql = format!(
+        "WITH RECURSIVE traversal(\
+            target_id, relation, valid_from, valid_until, observed_by, \
+            link_created_at, depth, path\
+         ) AS (\
+            SELECT ml.target_id, ml.relation, ml.valid_from, ml.valid_until, \
+                   ml.observed_by, ml.created_at, 1, \
+                   ml.source_id || '->' || ml.target_id \
+            FROM memory_links ml \
+            WHERE ml.source_id = ?{source_ph}{hop_filter} \
+            UNION ALL \
+            SELECT ml.target_id, ml.relation, ml.valid_from, ml.valid_until, \
+                   ml.observed_by, ml.created_at, t.depth + 1, \
+                   t.path || '->' || ml.target_id \
+            FROM memory_links ml \
+            JOIN traversal t ON ml.source_id = t.target_id \
+            WHERE t.depth < ?{max_depth_ph} \
+              AND t.path NOT LIKE '%' || ml.target_id || '%'\
+              {hop_filter}\
+         ) \
+         SELECT t.target_id, t.relation, t.valid_from, t.valid_until, \
+                t.observed_by, m.title, m.namespace, t.depth, t.path \
+         FROM traversal t \
+         JOIN memories m ON m.id = t.target_id \
+         ORDER BY t.depth ASC, COALESCE(t.valid_from, t.link_created_at) ASC, \
+                  t.link_created_at ASC \
+         LIMIT ?{limit_ph}",
+    );
 
     let mut stmt = conn.prepare(&sql)?;
     let bind_refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(AsRef::as_ref).collect();
-    let source_owned = source_id.to_string();
     let rows = stmt.query_map(rusqlite::params_from_iter(bind_refs), |row| {
         let target_id: String = row.get(0)?;
-        let path = format!("{source_owned}->{target_id}");
+        let depth: i64 = row.get(7)?;
         Ok(KgQueryNode {
             target_id,
             relation: row.get(1)?,
@@ -2504,8 +2536,8 @@ pub fn kg_query(
             observed_by: row.get(4)?,
             title: row.get(5)?,
             target_namespace: row.get(6)?,
-            depth: 1,
-            path,
+            depth: usize::try_from(depth).unwrap_or(0),
+            path: row.get(8)?,
         })
     })?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -6775,16 +6807,223 @@ mod tests {
 
     #[test]
     fn kg_query_rejects_unsupported_max_depth() {
-        // The first slice ships depth=1 only; depth>=2 must produce an
-        // explicit error so the recursive-CTE follow-up can lift the
-        // ceiling without surprising callers that already passed 2+.
+        // The recursive-CTE slice supports depth 1..=5; passing 6+ must
+        // produce an explicit error so callers learn they hit the
+        // ceiling rather than receiving a partial graph.
         let conn = test_db();
         let src = make_memory("s", "ns", Tier::Long, 5);
         insert(&conn, &src).unwrap();
-        let err = kg_query(&conn, &src.id, 2, None, None, None).unwrap_err();
+        let err = kg_query(
+            &conn,
+            &src.id,
+            KG_QUERY_MAX_SUPPORTED_DEPTH + 1,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("max_depth=2"));
-        assert!(msg.contains("supported depth=1"));
+        assert!(msg.contains(&format!("max_depth={}", KG_QUERY_MAX_SUPPORTED_DEPTH + 1)));
+        assert!(msg.contains(&format!("supported depth={KG_QUERY_MAX_SUPPORTED_DEPTH}")));
+    }
+
+    #[test]
+    fn kg_query_traverses_multiple_hops() {
+        // src -> mid -> leaf. depth=2 must return both hops, with
+        // depth/path reflecting the chain.
+        let conn = test_db();
+        let src = make_memory("src", "ns", Tier::Long, 5);
+        let mid = make_memory("mid", "ns", Tier::Long, 5);
+        let leaf = make_memory("leaf", "ns", Tier::Long, 5);
+        insert(&conn, &src).unwrap();
+        insert(&conn, &mid).unwrap();
+        insert(&conn, &leaf).unwrap();
+        insert_link_full(
+            &conn,
+            &src.id,
+            &mid.id,
+            "related_to",
+            Some("2026-01-01T00:00:00+00:00"),
+            None,
+            Some("agent-x"),
+        );
+        insert_link_full(
+            &conn,
+            &mid.id,
+            &leaf.id,
+            "supersedes",
+            Some("2026-01-02T00:00:00+00:00"),
+            None,
+            Some("agent-x"),
+        );
+
+        // depth=1 sees only mid.
+        let d1 = kg_query(&conn, &src.id, 1, None, None, None).unwrap();
+        assert_eq!(d1.len(), 1);
+        assert_eq!(d1[0].target_id, mid.id);
+        assert_eq!(d1[0].depth, 1);
+
+        // depth=2 sees both, ordered shallow-first.
+        let d2 = kg_query(&conn, &src.id, 2, None, None, None).unwrap();
+        assert_eq!(d2.len(), 2);
+        assert_eq!(d2[0].target_id, mid.id);
+        assert_eq!(d2[0].depth, 1);
+        assert_eq!(d2[0].path, format!("{}->{}", src.id, mid.id));
+        assert_eq!(d2[1].target_id, leaf.id);
+        assert_eq!(d2[1].depth, 2);
+        assert_eq!(d2[1].relation, "supersedes");
+        assert_eq!(d2[1].path, format!("{}->{}->{}", src.id, mid.id, leaf.id));
+    }
+
+    #[test]
+    fn kg_query_multi_hop_respects_valid_at_per_hop() {
+        // src -> mid valid 2026-01..02; mid -> leaf valid 2026-04+.
+        // At valid_at=2026-01-15 the second hop is not yet valid, so
+        // only mid is returned; at valid_at=2026-04-15 the first hop is
+        // closed, so both are filtered out.
+        let conn = test_db();
+        let src = make_memory("s", "ns", Tier::Long, 5);
+        let mid = make_memory("m", "ns", Tier::Long, 5);
+        let leaf = make_memory("l", "ns", Tier::Long, 5);
+        insert(&conn, &src).unwrap();
+        insert(&conn, &mid).unwrap();
+        insert(&conn, &leaf).unwrap();
+        insert_link_full(
+            &conn,
+            &src.id,
+            &mid.id,
+            "related_to",
+            Some("2026-01-01T00:00:00+00:00"),
+            Some("2026-02-01T00:00:00+00:00"),
+            None,
+        );
+        insert_link_full(
+            &conn,
+            &mid.id,
+            &leaf.id,
+            "related_to",
+            Some("2026-04-01T00:00:00+00:00"),
+            None,
+            None,
+        );
+
+        let mid_only = kg_query(
+            &conn,
+            &src.id,
+            3,
+            Some("2026-01-15T00:00:00+00:00"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(mid_only.len(), 1);
+        assert_eq!(mid_only[0].target_id, mid.id);
+
+        let neither = kg_query(
+            &conn,
+            &src.id,
+            3,
+            Some("2026-04-15T00:00:00+00:00"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(neither.is_empty());
+    }
+
+    #[test]
+    fn kg_query_detects_cycles() {
+        // a -> b -> c -> a forms a cycle. Even with max_depth=5, the
+        // traversal must stop revisiting nodes that are already on the
+        // path; the result lists each reachable node at most once.
+        let conn = test_db();
+        let a = make_memory("a", "ns", Tier::Long, 5);
+        let b = make_memory("b", "ns", Tier::Long, 5);
+        let c = make_memory("c", "ns", Tier::Long, 5);
+        insert(&conn, &a).unwrap();
+        insert(&conn, &b).unwrap();
+        insert(&conn, &c).unwrap();
+        insert_link_full(
+            &conn,
+            &a.id,
+            &b.id,
+            "related_to",
+            Some("2026-01-01T00:00:00+00:00"),
+            None,
+            None,
+        );
+        insert_link_full(
+            &conn,
+            &b.id,
+            &c.id,
+            "related_to",
+            Some("2026-01-02T00:00:00+00:00"),
+            None,
+            None,
+        );
+        insert_link_full(
+            &conn,
+            &c.id,
+            &a.id,
+            "related_to",
+            Some("2026-01-03T00:00:00+00:00"),
+            None,
+            None,
+        );
+
+        let nodes = kg_query(&conn, &a.id, 5, None, None, None).unwrap();
+        // Expect b at depth 1 and c at depth 2; the cycle back to a is
+        // pruned. (The c->a edge could in principle surface a again at
+        // depth 3, but only if a is not on its own path — and the
+        // anchor seeds path with `a->b`, so a IS on every descendant
+        // path through b/c.)
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0].target_id, b.id);
+        assert_eq!(nodes[0].depth, 1);
+        assert_eq!(nodes[1].target_id, c.id);
+        assert_eq!(nodes[1].depth, 2);
+    }
+
+    #[test]
+    fn kg_query_multi_hop_filters_by_allowed_agents_per_hop() {
+        // src -> mid (agent-a), mid -> leaf (agent-b). With allow=[a]
+        // only the first hop survives; with allow=[a,b] both surface.
+        let conn = test_db();
+        let src = make_memory("s", "ns", Tier::Long, 5);
+        let mid = make_memory("m", "ns", Tier::Long, 5);
+        let leaf = make_memory("l", "ns", Tier::Long, 5);
+        insert(&conn, &src).unwrap();
+        insert(&conn, &mid).unwrap();
+        insert(&conn, &leaf).unwrap();
+        insert_link_full(
+            &conn,
+            &src.id,
+            &mid.id,
+            "related_to",
+            Some("2026-01-01T00:00:00+00:00"),
+            None,
+            Some("agent-a"),
+        );
+        insert_link_full(
+            &conn,
+            &mid.id,
+            &leaf.id,
+            "related_to",
+            Some("2026-01-02T00:00:00+00:00"),
+            None,
+            Some("agent-b"),
+        );
+
+        let allow_a = vec!["agent-a".to_string()];
+        let only_first = kg_query(&conn, &src.id, 3, None, Some(&allow_a), None).unwrap();
+        assert_eq!(only_first.len(), 1);
+        assert_eq!(only_first[0].target_id, mid.id);
+
+        let allow_both = vec!["agent-a".to_string(), "agent-b".to_string()];
+        let both = kg_query(&conn, &src.id, 3, None, Some(&allow_both), None).unwrap();
+        assert_eq!(both.len(), 2);
+        assert_eq!(both[1].target_id, leaf.id);
+        assert_eq!(both[1].depth, 2);
     }
 
     #[test]
