@@ -66,6 +66,7 @@ reference hardware, not absolute floors for every machine.
 |---|---|---|
 | Published budgets | ✅ landed | this file |
 | `ai-memory bench` subcommand | ✅ landed (scaffold) | `src/bench.rs` — covers `memory_store` (no embedding), `memory_search` (FTS5), `memory_recall` (hot, depth=1) |
+| Per-tool MCP `tracing` spans | ✅ landed | `src/mcp.rs` `handle_request` — `mcp_tool_call` span carries `tool` + `rpc_id`; `elapsed_ms` emitted at exit |
 | Embedding-bound + KG operations in `bench` | 🚧 Stream E follow-up | next iterations of v0.6.3 |
 | `bench.yml` CI workflow | 🚧 Stream F | `.github/workflows/bench.yml` (planned) |
 | Measured numbers in CI history | ⏳ pending | populated once `bench.yml` lands |

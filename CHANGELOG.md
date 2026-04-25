@@ -61,6 +61,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in-flight. Closes Pillar 3 / Stream F doc deliverable from the
   v0.6.3 charter.
 
+- **Per-tool MCP tracing spans (Pillar 3 / Stream E)** — every
+  `tools/call` dispatch now runs inside an `info`-level
+  `mcp_tool_call` span carrying the tool name and JSON-RPC id. After
+  the handler returns, an `ok` event records `elapsed_ms`; an
+  `Err` outcome emits a `warn` event with the error message so
+  on-call dashboards can alert on per-tool error rate. The MCP server
+  entrypoint (`run_mcp_server`) installs a `tracing_subscriber::fmt`
+  subscriber pinned to `stderr` (stdio JSON-RPC owns stdout) honoring
+  `RUST_LOG`; `try_init` makes it a no-op when another command in the
+  same process already initialised tracing. Foundation for the v0.6.3
+  charter §"Stream E — Performance Instrumentation" ask;
+  paired with the `ai-memory bench` scaffold to give exporters
+  per-tool latency attribution against the published `PERFORMANCE.md`
+  budgets.
+
 ### Fixed
 
 - **[#358]** mTLS allowlist parser now tolerates inline trailing `#`

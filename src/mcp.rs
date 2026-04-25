@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::config::{AppConfig, FeatureTier, TierConfig};
 use crate::db;
@@ -2958,6 +2959,20 @@ fn handle_request(
                 Some(name) if !name.is_empty() => name,
                 _ => return err_response(id, -32602, "missing or empty tool name".into()),
             };
+
+            // Pillar 3 / Stream E — emit a structured tracing span around
+            // every MCP tool dispatch so production observability can
+            // attribute latency per tool. The span carries the tool name
+            // and JSON-RPC id; outcome and elapsed wall time are emitted
+            // as a child event after dispatch returns.
+            let span = tracing::info_span!(
+                "mcp_tool_call",
+                tool = tool_name,
+                rpc_id = ?id,
+            );
+            let _enter = span.enter();
+            let started = Instant::now();
+
             let empty_obj = json!({});
             let arguments = if req.params["arguments"].is_object() {
                 &req.params["arguments"]
@@ -3045,6 +3060,15 @@ fn handle_request(
                 }
             };
 
+            // Outcome + elapsed reported under the `mcp_tool_call` span so
+            // exporters can chart per-tool p95/p99 against PERFORMANCE.md
+            // budgets without needing per-handler instrumentation.
+            let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            match &result {
+                Ok(_) => tracing::info!(elapsed_ms, "ok"),
+                Err(err) => tracing::warn!(elapsed_ms, error = %err, "err"),
+            }
+
             match result {
                 Ok(val) => {
                     // Check if TOON format requested for recall/search/list
@@ -3108,6 +3132,20 @@ pub fn run_mcp_server(
     tier: FeatureTier,
     app_config: &AppConfig,
 ) -> anyhow::Result<()> {
+    // Pillar 3 / Stream E — wire `tracing` for the MCP entrypoint so the
+    // per-tool spans added in `handle_request` actually surface. The
+    // writer is pinned to stderr because stdio JSON-RPC owns stdout;
+    // emitting trace lines there would corrupt the protocol. `try_init`
+    // is a no-op if a subscriber was already installed by another
+    // command in the same process.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("ai_memory=info")),
+        )
+        .with_writer(std::io::stderr)
+        .try_init();
+
     let conn = db::open(db_path)?;
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -3552,5 +3590,151 @@ mod tests {
         let err = resp.error.unwrap();
         assert_eq!(err.code, -32600);
         assert_eq!(err.message, "test error");
+    }
+
+    /// Buffer-backed `MakeWriter` so `tracing` output can be asserted on
+    /// without polluting test stdout/stderr or installing a global
+    /// subscriber. Used by the Stream E span coverage tests below.
+    #[derive(Clone)]
+    struct VecWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for VecWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for VecWriter {
+        type Writer = VecWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn run_with_capture<F: FnOnce()>(f: F) -> String {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let writer = VecWriter(buf.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer)
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        String::from_utf8(buf.lock().unwrap().clone()).unwrap_or_default()
+    }
+
+    fn make_tools_call(tool: &str, args: Value) -> RpcRequest {
+        RpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!(1)),
+            method: "tools/call".into(),
+            params: json!({ "name": tool, "arguments": args }),
+        }
+    }
+
+    /// Pillar 3 / Stream E coverage — every successful `tools/call` must
+    /// emit a `mcp_tool_call` span carrying the tool name plus an `ok`
+    /// event with `elapsed_ms`. This is the single point of latency
+    /// instrumentation production exporters key off.
+    #[test]
+    fn tools_call_emits_span_with_tool_name_and_elapsed_ms() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let tier_config = FeatureTier::Keyword.config();
+        let resolved_ttl = crate::config::ResolvedTtl::default();
+        let resolved_scoring = crate::config::ResolvedScoring::default();
+        let req = make_tools_call("memory_list", json!({"limit": 1}));
+
+        let captured = run_with_capture(|| {
+            let resp = handle_request(
+                &conn,
+                std::path::Path::new(":memory:"),
+                &req,
+                None,
+                None,
+                None,
+                &tier_config,
+                None,
+                &resolved_ttl,
+                &resolved_scoring,
+                true,
+                false,
+                None,
+            );
+            assert!(resp.error.is_none(), "expected ok rpc response");
+        });
+
+        assert!(
+            captured.contains("mcp_tool_call"),
+            "missing span name in: {captured}"
+        );
+        assert!(
+            captured.contains("memory_list"),
+            "missing tool field in: {captured}"
+        );
+        assert!(
+            captured.contains("elapsed_ms"),
+            "missing elapsed_ms field in: {captured}"
+        );
+        assert!(
+            captured.contains(" ok"),
+            "missing ok outcome event in: {captured}"
+        );
+    }
+
+    /// Failure path — when the underlying handler returns an `Err`, the
+    /// span emits a `warn` level event with the error message so on-call
+    /// dashboards can alert on per-tool error rate.
+    #[test]
+    fn tools_call_emits_warn_event_on_handler_error() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let tier_config = FeatureTier::Keyword.config();
+        let resolved_ttl = crate::config::ResolvedTtl::default();
+        let resolved_scoring = crate::config::ResolvedScoring::default();
+        // memory_get with a missing/invalid id is a deterministic Err
+        // path: validate_id rejects empty strings.
+        let req = make_tools_call("memory_get", json!({"id": ""}));
+
+        let captured = run_with_capture(|| {
+            let resp = handle_request(
+                &conn,
+                std::path::Path::new(":memory:"),
+                &req,
+                None,
+                None,
+                None,
+                &tier_config,
+                None,
+                &resolved_ttl,
+                &resolved_scoring,
+                true,
+                false,
+                None,
+            );
+            // Handler errs are returned as ok_response with isError=true,
+            // not RpcError, by design (the JSON-RPC layer is reserved for
+            // protocol-level failures).
+            assert!(resp.error.is_none());
+        });
+
+        assert!(
+            captured.contains("mcp_tool_call"),
+            "missing span in err path: {captured}"
+        );
+        assert!(
+            captured.contains("memory_get"),
+            "missing tool field in err path: {captured}"
+        );
+        assert!(
+            captured.contains("WARN"),
+            "missing WARN level on err path: {captured}"
+        );
+        assert!(
+            captured.contains("err"),
+            "missing err outcome in: {captured}"
+        );
     }
 }
