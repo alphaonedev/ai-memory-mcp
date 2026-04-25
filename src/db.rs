@@ -169,7 +169,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
 );
 ";
 
-const CURRENT_SCHEMA_VERSION: i64 = 14;
+const CURRENT_SCHEMA_VERSION: i64 = 15;
 
 pub fn open(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path).context("failed to open database")?;
@@ -508,6 +508,79 @@ fn migrate(conn: &Connection) -> Result<()> {
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories(created_at)",
                 [],
+            )?;
+        }
+
+        if version < 15 {
+            // v0.6.3 Stream B — Temporal-Validity KG schema additions.
+            // Charter §"Critical Schema Reference" (lines 686–723):
+            // four temporal columns on `memory_links`, three temporal
+            // indexes for KG traversal queries, and an `entity_aliases`
+            // side table for the upcoming entity registry. Pure additive
+            // — no existing column or index is dropped or renamed, so
+            // existing `link()` / `links_for()` paths keep working with
+            // the new columns NULL on legacy rows. The `valid_from`
+            // backfill matches the charter pre-flight default
+            // (charter line 428): set to the source memory's
+            // `created_at` to avoid null-handling complexity in v0.6.3
+            // KG query code.
+            let has_valid_from = conn
+                .prepare("SELECT valid_from FROM memory_links LIMIT 0")
+                .is_ok();
+            if !has_valid_from {
+                conn.execute("ALTER TABLE memory_links ADD COLUMN valid_from TEXT", [])?;
+            }
+            let has_valid_until = conn
+                .prepare("SELECT valid_until FROM memory_links LIMIT 0")
+                .is_ok();
+            if !has_valid_until {
+                conn.execute("ALTER TABLE memory_links ADD COLUMN valid_until TEXT", [])?;
+            }
+            let has_observed_by = conn
+                .prepare("SELECT observed_by FROM memory_links LIMIT 0")
+                .is_ok();
+            if !has_observed_by {
+                conn.execute("ALTER TABLE memory_links ADD COLUMN observed_by TEXT", [])?;
+            }
+            let has_signature = conn
+                .prepare("SELECT signature FROM memory_links LIMIT 0")
+                .is_ok();
+            if !has_signature {
+                conn.execute("ALTER TABLE memory_links ADD COLUMN signature BLOB", [])?;
+            }
+
+            conn.execute(
+                "UPDATE memory_links \
+                 SET valid_from = (SELECT created_at FROM memories WHERE id = memory_links.source_id) \
+                 WHERE valid_from IS NULL",
+                [],
+            )?;
+
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_links_temporal_src \
+                 ON memory_links (source_id, valid_from, valid_until)",
+                [],
+            )?;
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_links_temporal_tgt \
+                 ON memory_links (target_id, valid_from, valid_until)",
+                [],
+            )?;
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_links_relation \
+                 ON memory_links (relation, valid_from)",
+                [],
+            )?;
+
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS entity_aliases (
+                    entity_id  TEXT NOT NULL,
+                    alias      TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (entity_id, alias)
+                );
+                CREATE INDEX IF NOT EXISTS idx_entity_aliases_alias
+                  ON entity_aliases (alias);",
             )?;
         }
 
@@ -4639,5 +4712,118 @@ mod tests {
         let purged = auto_purge_archive(&conn, Some(7)).unwrap();
         assert_eq!(purged, 1);
         assert!(list_archived(&conn, None, 10, 0).unwrap().is_empty());
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Schema v15 (v0.6.3 Stream B) — temporal-validity KG migration.
+    // ─────────────────────────────────────────────────────────────────
+
+    fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap();
+        let cols: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        cols.iter().any(|c| c == column)
+    }
+
+    fn index_exists(conn: &Connection, name: &str) -> bool {
+        conn.query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1",
+            params![name],
+            |r| r.get::<_, i64>(0),
+        )
+        .is_ok()
+    }
+
+    #[test]
+    fn schema_v15_memory_links_has_temporal_columns() {
+        let conn = test_db();
+        assert!(column_exists(&conn, "memory_links", "valid_from"));
+        assert!(column_exists(&conn, "memory_links", "valid_until"));
+        assert!(column_exists(&conn, "memory_links", "observed_by"));
+        assert!(column_exists(&conn, "memory_links", "signature"));
+    }
+
+    #[test]
+    fn schema_v15_memory_links_temporal_indexes_exist() {
+        let conn = test_db();
+        assert!(index_exists(&conn, "idx_links_temporal_src"));
+        assert!(index_exists(&conn, "idx_links_temporal_tgt"));
+        assert!(index_exists(&conn, "idx_links_relation"));
+    }
+
+    #[test]
+    fn schema_v15_entity_aliases_table_exists() {
+        let conn = test_db();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM entity_aliases", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+        assert!(index_exists(&conn, "idx_entity_aliases_alias"));
+    }
+
+    #[test]
+    fn schema_v15_entity_aliases_primary_key_unique() {
+        let conn = test_db();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO entity_aliases (entity_id, alias, created_at) VALUES (?1, ?2, ?3)",
+            params!["e1", "Alpha", &now],
+        )
+        .unwrap();
+        let dup = conn.execute(
+            "INSERT INTO entity_aliases (entity_id, alias, created_at) VALUES (?1, ?2, ?3)",
+            params!["e1", "Alpha", &now],
+        );
+        assert!(dup.is_err(), "expected PK uniqueness violation");
+    }
+
+    #[test]
+    fn schema_v15_existing_links_get_valid_from_backfilled() {
+        // Simulate a v14 database with one link, then re-run the
+        // v15 migration and assert valid_from was backfilled to the
+        // source memory's created_at. We do this by opening a fresh
+        // db (which is at v15), inserting a link with NULL valid_from,
+        // rolling schema_version back to 14, and re-opening to force
+        // the v15 block to re-execute the backfill UPDATE.
+        let path = std::env::temp_dir().join(format!(
+            "ai_memory_v15_backfill_{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        {
+            let conn = open(&path).unwrap();
+            let src = make_memory("src", "test", Tier::Long, 5);
+            let tgt = make_memory("tgt", "test", Tier::Long, 5);
+            insert(&conn, &src).unwrap();
+            insert(&conn, &tgt).unwrap();
+            // Insert a link directly with NULL valid_from to mimic
+            // pre-migration state.
+            conn.execute(
+                "INSERT INTO memory_links (source_id, target_id, relation, created_at, valid_from) \
+                 VALUES (?1, ?2, 'related_to', ?3, NULL)",
+                params![&src.id, &tgt.id, &chrono::Utc::now().to_rfc3339()],
+            )
+            .unwrap();
+            // Roll schema back to v14 and re-run migrate via re-open.
+            conn.execute("DELETE FROM schema_version", []).unwrap();
+            conn.execute("INSERT INTO schema_version (version) VALUES (14)", [])
+                .unwrap();
+        }
+
+        let conn2 = open(&path).unwrap();
+        let backfilled: Option<String> = conn2
+            .query_row("SELECT valid_from FROM memory_links LIMIT 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(
+            backfilled.is_some(),
+            "expected valid_from to be backfilled, got NULL"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

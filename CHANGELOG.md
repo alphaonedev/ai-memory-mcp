@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Temporal-validity KG schema (Stream B foundation)** — SQLite schema
+  bumps to v15 (`src/db.rs::migrate`). `memory_links` gains four nullable
+  temporal columns — `valid_from`, `valid_until`, `observed_by` (TEXT),
+  and `signature` (BLOB; placeholder for v0.7 attested identity). On
+  upgrade, existing links are backfilled: `valid_from` is set to the
+  source memory's `created_at` (charter pre-flight default — defensive
+  null avoidance). Three temporal indexes are created for the upcoming
+  recursive-CTE traversal in `memory_kg_query` / `memory_kg_timeline`:
+  `idx_links_temporal_src` (source_id, valid_from, valid_until),
+  `idx_links_temporal_tgt` (target_id, valid_from, valid_until), and
+  `idx_links_relation` (relation, valid_from). New `entity_aliases`
+  side table (entity_id, alias, created_at; PK on entity_id+alias)
+  with `idx_entity_aliases_alias` lookup index unblocks the upcoming
+  Stream C entity-registry tools. The Postgres declarative schema
+  (`src/store/postgres_schema.sql`) is mirrored for fresh-init parity;
+  existing PG installs do not auto-gain the new columns since the PG
+  store layer is still WIP (an explicit ALTER migration lands when
+  `link()` is wired up there). Pure additive — no existing query
+  breaks. Charter §"Critical Schema Reference", lines 686–723.
+
 - **Performance budgets published** — new `PERFORMANCE.md` at the repo
   root carries the authoritative p95/p99 latency contract for every
   hot-path operation (verbatim from the v0.6.3 grand-slam charter):
