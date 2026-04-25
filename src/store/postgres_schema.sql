@@ -93,17 +93,48 @@ CREATE INDEX IF NOT EXISTS memories_embedding_hnsw ON memories
 
 -- ─────────────────────────────────────────────────────────────────────
 -- memory_links — directional typed links between memories.
+--
+-- v0.6.3 Stream B: temporal columns + entity_aliases side table
+-- mirror SQLite schema v15 (see src/db.rs::migrate). Forward-compatible
+-- with v0.7 Apache AGE acceleration: same columns get projected as
+-- AGE graph edges. Existing PG installs at v0.6.2 will not gain the
+-- new columns automatically — the Postgres path is currently a fresh-
+-- init only target (see src/store/postgres.rs notes). An explicit ALTER
+-- migration lands when the link() implementation is wired up.
 -- ─────────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS memory_links (
     source_id   TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
     target_id   TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
     relation    TEXT NOT NULL DEFAULT 'related_to',
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    valid_from  TIMESTAMPTZ,
+    valid_until TIMESTAMPTZ,
+    observed_by TEXT,
+    signature   BYTEA,
     PRIMARY KEY (source_id, target_id, relation)
 );
 
 CREATE INDEX IF NOT EXISTS memory_links_source_idx ON memory_links (source_id);
 CREATE INDEX IF NOT EXISTS memory_links_target_idx ON memory_links (target_id);
+CREATE INDEX IF NOT EXISTS idx_links_temporal_src
+    ON memory_links (source_id, valid_from, valid_until);
+CREATE INDEX IF NOT EXISTS idx_links_temporal_tgt
+    ON memory_links (target_id, valid_from, valid_until);
+CREATE INDEX IF NOT EXISTS idx_links_relation
+    ON memory_links (relation, valid_from);
+
+-- ─────────────────────────────────────────────────────────────────────
+-- entity_aliases — alias→entity_id resolution (v0.6.3 Stream B/C).
+-- ─────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS entity_aliases (
+    entity_id  TEXT NOT NULL,
+    alias      TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (entity_id, alias)
+);
+
+CREATE INDEX IF NOT EXISTS idx_entity_aliases_alias
+    ON entity_aliases (alias);
 
 -- ─────────────────────────────────────────────────────────────────────
 -- archived_memories — GC archive for restoration.
