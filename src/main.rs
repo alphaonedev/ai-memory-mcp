@@ -203,6 +203,14 @@ struct BenchArgs {
     /// Emit results as JSON instead of the human-readable table.
     #[arg(long)]
     json: bool,
+    /// Opt in to the embedding-bound operations (`memory_store` with
+    /// embedding, `memory_recall` cold/full hybrid). Loads the local
+    /// candle `MiniLM` model the first time it's invoked; if the model
+    /// cache is missing or the load fails, the flag is treated as a
+    /// no-op and a clear message is emitted on stderr. Default off so
+    /// the `bench.yml` CI guard stays fast and deterministic.
+    #[arg(long)]
+    with_embedding: bool,
 }
 
 #[derive(Args)]
@@ -4409,13 +4417,39 @@ fn cmd_bench(args: &BenchArgs) -> Result<()> {
         warmup,
         namespace: bench::BENCH_NAMESPACE.to_string(),
     };
-    let results = bench::run(&conn, &config)?;
+    // Opt-in embedder load. If `--with-embedding` is set but the model
+    // cache is missing (no network, no pre-downloaded files), the run
+    // still completes — just without the two embedding-bound ops. This
+    // matches the documented "skips with a clear message if missing"
+    // behaviour so a forgetful operator doesn't get a hard error from
+    // a benign flag toggle.
+    let embedder = if args.with_embedding {
+        match embeddings::Embedder::new_local() {
+            Ok(emb) => {
+                eprintln!(
+                    "ai-memory bench: embedding-bound ops enabled ({})",
+                    emb.model_description()
+                );
+                Some(emb)
+            }
+            Err(e) => {
+                eprintln!(
+                    "ai-memory bench: --with-embedding requested but embedder unavailable: {e}; skipping embedding-bound operations"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let results = bench::run(&conn, &config, embedder.as_ref())?;
     if args.json {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "iterations": iterations,
                 "warmup": warmup,
+                "with_embedding": embedder.is_some(),
                 "results": results,
             }))?
         );

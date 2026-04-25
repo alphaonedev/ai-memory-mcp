@@ -76,6 +76,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Performance Budgets + CI Guard"; budgets are now continuously
   enforced against trunk and PRs.
 
+- **`ai-memory bench` embedding-bound coverage (Pillar 3 / Stream E)** —
+  the canonical `bench` workload now exercises both embedding-bound
+  budget rows from `PERFORMANCE.md`: `memory_store` (with embedding)
+  and `memory_recall` (cold, full hybrid), each gated against the
+  200 ms p95 row. The new ops are opt-in behind `--with-embedding`
+  so the default `cargo test` and `bench.yml` CI paths stay
+  embedding-free; when the flag is set the runner loads the local
+  candle MiniLM model and seeds a 200-row embedded corpus on top of
+  the existing in-memory disposable SQLite. If the model cache is
+  missing the flag is treated as a no-op with a clear stderr message
+  ("--with-embedding requested but embedder unavailable: …; skipping
+  embedding-bound operations") so a forgetful operator doesn't get a
+  hard error from a benign flag toggle. Local M4 measurements:
+  `memory_store` (with embedding) p95 ~43 ms, `memory_recall`
+  (cold, full hybrid) p95 ~25 ms — both PASS, both well inside the
+  200 ms / 10% tolerance enforced by `bench.yml`. Closes the last
+  KG-adjacent Stream E follow-up flagged in PERFORMANCE.md; the
+  curator-cycle and federation-ack rows remain tracked separately.
+
 - **`ai-memory bench` KG depth=3 + depth=5 coverage (Pillar 3 / Stream E)**
   — `memory_kg_query` is now exercised at the deepest hop of both
   documented budget buckets: depth=3 against the "depth ≤ 3" 100 ms

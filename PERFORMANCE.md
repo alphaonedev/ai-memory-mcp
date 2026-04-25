@@ -68,10 +68,10 @@ reference hardware, not absolute floors for every machine.
 | Component | State | Where |
 |---|---|---|
 | Published budgets | ✅ landed | this file |
-| `ai-memory bench` subcommand | ✅ landed | `src/bench.rs` — covers `memory_store` (no embedding), `memory_search` (FTS5), `memory_recall` (hot, depth=1), `memory_kg_query` (depth=1, depth=3, depth=5), `memory_kg_timeline` |
+| `ai-memory bench` subcommand | ✅ landed | `src/bench.rs` — covers `memory_store` (no embedding), `memory_search` (FTS5), `memory_recall` (hot, depth=1), `memory_kg_query` (depth=1, depth=3, depth=5), `memory_kg_timeline`. Opt-in `--with-embedding` adds `memory_store` (with embedding) and `memory_recall` (cold, full hybrid). |
 | Per-tool MCP `tracing` spans | ✅ landed | `src/mcp.rs` `handle_request` — `mcp_tool_call` span carries `tool` + `rpc_id`; `elapsed_ms` emitted at exit |
 | KG operations in `bench` | ✅ landed | `src/bench.rs` — fan-out fixture (50 × 4 outbound, every link `valid_from`-stamped) drives `kg_query` depth=1 + `kg_timeline`; chain fixture (50 chains × 5 hops) drives `kg_query` depth=3 + depth=5 |
-| Embedding-bound operations in `bench` | 🚧 Stream E follow-up | needs an embedder fixture decision (opt-in flag vs cfg(test) fake vs pre-cached model) — see iter-0017 handoff |
+| Embedding-bound operations in `bench` | ✅ landed (opt-in) | `src/bench.rs` — `--with-embedding` flag loads the local candle MiniLM model and exercises `memory_store` (embed + insert + set_embedding) and `memory_recall` (embed query + `recall_hybrid` against an embedded 200-row corpus). Default off so the `bench.yml` CI guard stays embedding-free; if the model cache is missing the flag is treated as a no-op with a clear stderr message. |
 | `bench.yml` CI workflow | ✅ landed | `.github/workflows/bench.yml` — gates every PR and trunk push on `ubuntu-latest`; uploads `bench-results` artifact (JSON + table) |
 | Measured numbers in CI history | ✅ collecting | each workflow run's summary carries the table; the JSON artifact is retained per GitHub Actions retention policy |
 
@@ -90,20 +90,41 @@ every pull request.
 
 ```
 $ ai-memory bench
-Operation                       Target (p95)   Measured (p95)   p50      p99      Status
-─────────────────────────────────────────────────────────────────────────────────────────
-memory_store (no embedding)     <   20 ms           0.4 ms         0.3      0.5    PASS
-memory_search (FTS5)            <  100 ms           0.5 ms         0.5      0.5    PASS
-memory_recall (hot, depth=1)    <   50 ms           4.8 ms         4.2      5.3    PASS
-memory_kg_query (depth=1)       <  100 ms           0.5 ms         0.5      0.5    PASS
-memory_kg_query (depth=3)       <  100 ms           0.6 ms         0.6      0.6    PASS
-memory_kg_query (depth=5)       <  250 ms           0.7 ms         0.6      1.0    PASS
-memory_kg_timeline              <  100 ms           0.1 ms         0.1      0.1    PASS
+Operation                           Target (p95)   Measured (p95)   p50      p99      Status
+─────────────────────────────────────────────────────────────────────────────────────────────
+memory_store (no embedding)         <   20 ms           0.4 ms         0.3      0.5    PASS
+memory_search (FTS5)                <  100 ms           0.5 ms         0.5      0.5    PASS
+memory_recall (hot, depth=1)        <   50 ms           4.8 ms         4.2      5.3    PASS
+memory_kg_query (depth=1)           <  100 ms           0.5 ms         0.5      0.5    PASS
+memory_kg_query (depth=3)           <  100 ms           0.6 ms         0.6      0.6    PASS
+memory_kg_query (depth=5)           <  250 ms           0.7 ms         0.6      1.0    PASS
+memory_kg_timeline                  <  100 ms           0.1 ms         0.1      0.1    PASS
 ```
 
 `--iterations` and `--warmup` (clamped to `[1, 100_000]` and
 `[0, 10_000]` respectively) tune the sample size. `--json` emits the
 same numbers as a single JSON document for downstream tooling.
+
+Pass `--with-embedding` to opt into the two embedding-bound rows. The
+flag loads the local candle MiniLM model on first invocation; if the
+model cache is missing it logs a clear message on stderr and falls
+back to the embedding-free workload so the run still completes:
+
+```
+$ ai-memory bench --with-embedding
+ai-memory bench: embedding-bound ops enabled (all-MiniLM-L6-v2 (384-dim, local))
+Operation                           Target (p95)   Measured (p95)   p50      p99      Status
+─────────────────────────────────────────────────────────────────────────────────────────────
+memory_store (no embedding)         <   20 ms           0.5 ms         0.3      0.6    PASS
+memory_search (FTS5)                <  100 ms           0.5 ms         0.5      0.5    PASS
+memory_recall (hot, depth=1)        <   50 ms           4.3 ms         3.5      4.6    PASS
+memory_kg_query (depth=1)           <  100 ms           0.4 ms         0.2      0.4    PASS
+memory_kg_query (depth=3)           <  100 ms           0.6 ms         0.5      0.6    PASS
+memory_kg_query (depth=5)           <  250 ms           0.6 ms         0.6      0.6    PASS
+memory_kg_timeline                  <  100 ms           0.1 ms         0.1      0.1    PASS
+memory_store (with embedding)       <  200 ms          42.7 ms        37.6     43.3    PASS
+memory_recall (cold, full hybrid)   <  200 ms          24.5 ms        15.7     27.8    PASS
+```
 
 The KG rows seed two in-process fixtures so every traversal runs
 end-to-end with no external service:
@@ -119,12 +140,24 @@ end-to-end with no external service:
   exercised at the documented depth ceiling rather than collapsing to
   a single hop.
 
-Embedding-bound paths (`memory_store` with embedding, `memory_recall`
-cold/full hybrid), the curator daemon, and the federation ack path are
-not yet wired in — they each need fixtures or external services that
-don't belong on the hot path of a `cargo test` run. They land in a
-follow-up Stream E iteration alongside the canonical 1000-memory
-workload at `benchmarks/v063/canonical_workload.json`.
+The embedding-bound rows (opt-in via `--with-embedding`) load the
+local candle MiniLM model and exercise:
+
+- `memory_store` (with embedding) — `embed(title + content) +
+  insert + set_embedding`, gated against the 200 ms p95 row.
+- `memory_recall` (cold, full hybrid) — `embed(query) +
+  recall_hybrid` against a freshly seeded 200-row embedded corpus
+  with a fresh in-memory HNSW index per run, gated against the
+  200 ms p95 row. No warm cache, no shared vector index — the goal
+  is the first-query path the budget table calls out.
+
+The opt-in is deliberate: the default workload stays embedding-free
+so `cargo test` and the `bench.yml` CI guard run in seconds with no
+candle model load. The curator daemon and the federation ack path
+still need fixtures or external services that don't belong on the
+hot path of a `cargo test` run; they land in follow-up Stream E
+iterations alongside the canonical 1000-memory workload at
+`benchmarks/v063/canonical_workload.json`.
 
 ## Why Publish These at All
 
