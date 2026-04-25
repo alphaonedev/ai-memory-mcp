@@ -1467,9 +1467,13 @@ pub fn create_link(
     if !target_exists {
         anyhow::bail!("target memory not found: {target_id}");
     }
+    // Schema v15 (Pillar 2 / Stream B) added `valid_from` for temporal
+    // KG queries. Backfill on migration handled legacy rows; here we
+    // populate it on the insert path so newly created links are
+    // visible to `memory_kg_timeline` without a downstream backfill.
     let now = Utc::now().to_rfc3339();
     conn.execute(
-        "INSERT OR IGNORE INTO memory_links (source_id, target_id, relation, created_at) VALUES (?1, ?2, ?3, ?4)",
+        "INSERT OR IGNORE INTO memory_links (source_id, target_id, relation, created_at, valid_from) VALUES (?1, ?2, ?3, ?4, ?4)",
         params![source_id, target_id, relation, now],
     )?;
     Ok(())
@@ -2229,6 +2233,93 @@ pub fn entity_get_by_alias(
         namespace: ns,
         aliases,
     }))
+}
+
+/// Default cap on rows returned by `kg_timeline` when the caller does
+/// not specify one (Pillar 2 / Stream C). Sized to fit a reasonable
+/// agent context window without paging — callers needing more should
+/// pass an explicit limit.
+pub const KG_TIMELINE_DEFAULT_LIMIT: usize = 200;
+
+/// Hard ceiling on `kg_timeline` rows. Matches the existing list/recall
+/// caps to keep the timeline bounded against pathological entities.
+pub const KG_TIMELINE_MAX_LIMIT: usize = 1000;
+
+/// Ordered fact timeline for an entity (Pillar 2 / Stream C —
+/// `memory_kg_timeline`). Returns outbound assertions from
+/// `source_id`, ordered by `valid_from ASC` and tie-broken by
+/// `created_at ASC` for deterministic display.
+///
+/// Filters:
+/// - `since` (RFC3339, inclusive): drop events with `valid_from < since`
+/// - `until` (RFC3339, inclusive): drop events with `valid_from > until`
+/// - `limit`: row cap, clamped to [1, [`KG_TIMELINE_MAX_LIMIT`]]
+///
+/// Rows with NULL `valid_from` are excluded — a link without a
+/// valid-from anchor cannot be ordered on the timeline. The schema-v15
+/// migration backfilled legacy rows to `created_at`, and the `link()`
+/// path stamps the column on every new insert, so this is a hard
+/// guarantee for current code; the explicit `IS NOT NULL` guard exists
+/// to keep external writes (`store/sqlite.rs`, custom migrations) from
+/// silently producing invisible links.
+///
+/// Cross-namespace by design: timelines often span the same canonical
+/// entity asserted by agents in different namespaces. Callers can
+/// post-filter by `target_namespace` if they need a namespace-scoped
+/// view.
+pub fn kg_timeline(
+    conn: &Connection,
+    source_id: &str,
+    since: Option<&str>,
+    until: Option<&str>,
+    limit: Option<usize>,
+) -> Result<Vec<crate::models::KgTimelineEvent>> {
+    use crate::models::KgTimelineEvent;
+
+    let cap = limit
+        .unwrap_or(KG_TIMELINE_DEFAULT_LIMIT)
+        .clamp(1, KG_TIMELINE_MAX_LIMIT);
+
+    // Compose the predicate dynamically for `since` / `until`. Bind
+    // values are appended in the same order so the placeholders line up.
+    let mut sql = String::from(
+        "SELECT ml.target_id, ml.relation, ml.valid_from, ml.valid_until,
+                ml.observed_by, m.title, m.namespace, ml.created_at
+         FROM memory_links ml
+         JOIN memories m ON m.id = ml.target_id
+         WHERE ml.source_id = ?1
+           AND ml.valid_from IS NOT NULL",
+    );
+    let mut binds: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(source_id.to_string())];
+    if let Some(s) = since {
+        sql.push_str(" AND ml.valid_from >= ?");
+        sql.push_str(&(binds.len() + 1).to_string());
+        binds.push(Box::new(s.to_string()));
+    }
+    if let Some(u) = until {
+        sql.push_str(" AND ml.valid_from <= ?");
+        sql.push_str(&(binds.len() + 1).to_string());
+        binds.push(Box::new(u.to_string()));
+    }
+    sql.push_str(" ORDER BY ml.valid_from ASC, ml.created_at ASC LIMIT ?");
+    sql.push_str(&(binds.len() + 1).to_string());
+    binds.push(Box::new(i64::try_from(cap).unwrap_or(i64::MAX)));
+
+    let mut stmt = conn.prepare(&sql)?;
+    let bind_refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(AsRef::as_ref).collect();
+    let rows = stmt.query_map(rusqlite::params_from_iter(bind_refs), |row| {
+        Ok(KgTimelineEvent {
+            target_id: row.get(0)?,
+            relation: row.get(1)?,
+            valid_from: row.get(2)?,
+            valid_until: row.get(3)?,
+            observed_by: row.get(4)?,
+            title: row.get(5)?,
+            target_namespace: row.get(6)?,
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
 }
 
 /// List all aliases registered for an entity, ordered by registration
@@ -5811,6 +5902,256 @@ mod tests {
         assert_eq!(reg.aliases.len(), 2);
         assert!(reg.aliases.contains(&"x".to_string()));
         assert!(reg.aliases.contains(&"y".to_string()));
+    }
+
+    // -- Pillar 2 / Stream C — kg_timeline ---------------------------------
+
+    /// Insert a link with an explicit `valid_from` so timeline tests can
+    /// pin event ordering without relying on wall-clock spread.
+    fn insert_link_at(
+        conn: &Connection,
+        source_id: &str,
+        target_id: &str,
+        relation: &str,
+        valid_from: &str,
+    ) {
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO memory_links (source_id, target_id, relation, created_at, valid_from) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![source_id, target_id, relation, now, valid_from],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn create_link_populates_valid_from_for_new_rows() {
+        let conn = test_db();
+        let src = make_memory("kg-src", "test", Tier::Long, 5);
+        let tgt = make_memory("kg-tgt", "test", Tier::Long, 5);
+        insert(&conn, &src).unwrap();
+        insert(&conn, &tgt).unwrap();
+        create_link(&conn, &src.id, &tgt.id, "related_to").unwrap();
+        let valid_from: Option<String> = conn
+            .query_row(
+                "SELECT valid_from FROM memory_links WHERE source_id = ?1",
+                params![&src.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            valid_from.is_some(),
+            "create_link must populate valid_from so kg_timeline can see new links"
+        );
+    }
+
+    #[test]
+    fn kg_timeline_returns_events_ordered_by_valid_from_ascending() {
+        let conn = test_db();
+        let src = make_memory("alpha", "kg/projects/alpha", Tier::Long, 5);
+        let s1 = make_memory("kickoff", "kg/projects/alpha", Tier::Long, 5);
+        let s2 = make_memory("design phase", "kg/projects/alpha", Tier::Long, 5);
+        let s3 = make_memory("implementation", "kg/projects/alpha", Tier::Long, 5);
+        insert(&conn, &src).unwrap();
+        insert(&conn, &s1).unwrap();
+        insert(&conn, &s2).unwrap();
+        insert(&conn, &s3).unwrap();
+
+        // Insert in a deliberately-shuffled order so ORDER BY isn't
+        // a happy accident of insertion order.
+        insert_link_at(
+            &conn,
+            &src.id,
+            &s2.id,
+            "supersedes",
+            "2026-02-03T00:00:00+00:00",
+        );
+        insert_link_at(
+            &conn,
+            &src.id,
+            &s1.id,
+            "related_to",
+            "2026-01-15T00:00:00+00:00",
+        );
+        insert_link_at(
+            &conn,
+            &src.id,
+            &s3.id,
+            "supersedes",
+            "2026-03-22T00:00:00+00:00",
+        );
+
+        let events = kg_timeline(&conn, &src.id, None, None, None).unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].target_id, s1.id);
+        assert_eq!(events[1].target_id, s2.id);
+        assert_eq!(events[2].target_id, s3.id);
+        assert_eq!(events[0].title, "kickoff");
+        assert_eq!(events[1].relation, "supersedes");
+        assert_eq!(events[0].target_namespace, "kg/projects/alpha");
+    }
+
+    #[test]
+    fn kg_timeline_filters_by_since_inclusive() {
+        let conn = test_db();
+        let src = make_memory("e", "ns", Tier::Long, 5);
+        let t1 = make_memory("e1", "ns", Tier::Long, 5);
+        let t2 = make_memory("e2", "ns", Tier::Long, 5);
+        insert(&conn, &src).unwrap();
+        insert(&conn, &t1).unwrap();
+        insert(&conn, &t2).unwrap();
+        insert_link_at(&conn, &src.id, &t1.id, "rel", "2026-01-01T00:00:00+00:00");
+        insert_link_at(&conn, &src.id, &t2.id, "rel", "2026-03-01T00:00:00+00:00");
+
+        let events = kg_timeline(
+            &conn,
+            &src.id,
+            Some("2026-02-01T00:00:00+00:00"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].target_id, t2.id);
+
+        // Boundary: since == valid_from should match (inclusive).
+        let on_boundary = kg_timeline(
+            &conn,
+            &src.id,
+            Some("2026-03-01T00:00:00+00:00"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(on_boundary.len(), 1);
+    }
+
+    #[test]
+    fn kg_timeline_filters_by_until_inclusive() {
+        let conn = test_db();
+        let src = make_memory("e", "ns", Tier::Long, 5);
+        let t1 = make_memory("e1", "ns", Tier::Long, 5);
+        let t2 = make_memory("e2", "ns", Tier::Long, 5);
+        insert(&conn, &src).unwrap();
+        insert(&conn, &t1).unwrap();
+        insert(&conn, &t2).unwrap();
+        insert_link_at(&conn, &src.id, &t1.id, "rel", "2026-01-01T00:00:00+00:00");
+        insert_link_at(&conn, &src.id, &t2.id, "rel", "2026-03-01T00:00:00+00:00");
+
+        let events = kg_timeline(
+            &conn,
+            &src.id,
+            None,
+            Some("2026-02-01T00:00:00+00:00"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].target_id, t1.id);
+    }
+
+    #[test]
+    fn kg_timeline_skips_links_with_null_valid_from() {
+        let conn = test_db();
+        let src = make_memory("s", "ns", Tier::Long, 5);
+        let t1 = make_memory("t1", "ns", Tier::Long, 5);
+        let t2 = make_memory("t2", "ns", Tier::Long, 5);
+        insert(&conn, &src).unwrap();
+        insert(&conn, &t1).unwrap();
+        insert(&conn, &t2).unwrap();
+        // Direct insert with NULL valid_from to simulate an external
+        // writer that bypassed `create_link`.
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO memory_links (source_id, target_id, relation, created_at, valid_from) \
+             VALUES (?1, ?2, 'rel', ?3, NULL)",
+            params![&src.id, &t1.id, &now],
+        )
+        .unwrap();
+        insert_link_at(&conn, &src.id, &t2.id, "rel", "2026-01-01T00:00:00+00:00");
+
+        let events = kg_timeline(&conn, &src.id, None, None, None).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].target_id, t2.id);
+    }
+
+    #[test]
+    fn kg_timeline_excludes_links_where_source_is_target() {
+        // The query is anchored on `source_id`; inbound edges (where the
+        // entity is the target) are intentionally NOT part of the
+        // timeline. This guards against accidentally widening the
+        // contract to a bidirectional view.
+        let conn = test_db();
+        let entity = make_memory("entity", "ns", Tier::Long, 5);
+        let other = make_memory("other", "ns", Tier::Long, 5);
+        insert(&conn, &entity).unwrap();
+        insert(&conn, &other).unwrap();
+        insert_link_at(
+            &conn,
+            &other.id,
+            &entity.id,
+            "rel",
+            "2026-01-01T00:00:00+00:00",
+        );
+        let events = kg_timeline(&conn, &entity.id, None, None, None).unwrap();
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn kg_timeline_limit_clamped_to_max() {
+        let conn = test_db();
+        let src = make_memory("s", "ns", Tier::Long, 5);
+        insert(&conn, &src).unwrap();
+        for i in 0..5 {
+            let t = make_memory(&format!("t{i}"), "ns", Tier::Long, 5);
+            insert(&conn, &t).unwrap();
+            insert_link_at(
+                &conn,
+                &src.id,
+                &t.id,
+                "rel",
+                &format!("2026-01-0{}T00:00:00+00:00", i + 1),
+            );
+        }
+        // Caller passes a wildly oversized limit — should be clamped
+        // to KG_TIMELINE_MAX_LIMIT (i.e. accepted, not errored), and
+        // since the row count is small, should return all 5.
+        let events = kg_timeline(&conn, &src.id, None, None, Some(usize::MAX)).unwrap();
+        assert_eq!(events.len(), 5);
+
+        // Caller passes 0 — clamp to 1.
+        let one = kg_timeline(&conn, &src.id, None, None, Some(0)).unwrap();
+        assert_eq!(one.len(), 1);
+    }
+
+    #[test]
+    fn kg_timeline_carries_observed_by_and_valid_until() {
+        let conn = test_db();
+        let src = make_memory("s", "ns", Tier::Long, 5);
+        let t = make_memory("t", "ns", Tier::Long, 5);
+        insert(&conn, &src).unwrap();
+        insert(&conn, &t).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO memory_links (source_id, target_id, relation, created_at, valid_from, valid_until, observed_by) \
+             VALUES (?1, ?2, 'supersedes', ?3, '2026-01-01T00:00:00+00:00', '2026-12-31T23:59:59+00:00', 'agent-pm-1')",
+            params![&src.id, &t.id, &now],
+        )
+        .unwrap();
+        let events = kg_timeline(&conn, &src.id, None, None, None).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].observed_by.as_deref(), Some("agent-pm-1"));
+        assert_eq!(
+            events[0].valid_until.as_deref(),
+            Some("2026-12-31T23:59:59+00:00")
+        );
+    }
+
+    #[test]
+    fn kg_timeline_empty_for_unknown_source() {
+        let conn = test_db();
+        let events = kg_timeline(&conn, "nonexistent-id", None, None, None).unwrap();
+        assert!(events.is_empty());
     }
 
     #[test]

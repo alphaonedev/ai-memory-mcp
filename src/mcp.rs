@@ -209,6 +209,20 @@ fn tool_definitions() -> Value {
                 }
             },
             {
+                "name": "memory_kg_timeline",
+                "description": "Pillar 2 / Stream C — ordered fact timeline for an entity. Returns outbound links from `source_id` (e.g. an entity registered via memory_entity_register) with their temporal-validity columns (valid_from, valid_until, observed_by) and the target memory's title/namespace. Events are ordered by valid_from ASC; rows with NULL valid_from are excluded. Cross-namespace by design — callers can post-filter by target_namespace if needed.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "source_id": {"type": "string", "description": "Memory ID whose outbound assertions form the timeline. Typically an entity_id from memory_entity_register, but any memory works."},
+                        "since": {"type": "string", "description": "RFC3339 timestamp; events with valid_from earlier than this are excluded (inclusive boundary)."},
+                        "until": {"type": "string", "description": "RFC3339 timestamp; events with valid_from later than this are excluded (inclusive boundary)."},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 200, "description": "Max events returned. Clamped to [1, 1000]."}
+                    },
+                    "required": ["source_id"]
+                }
+            },
+            {
                 "name": "memory_delete",
                 "description": "Delete a memory by ID.",
                 "inputSchema": {
@@ -1571,6 +1585,54 @@ fn handle_entity_get_by_alias(
     }
 }
 
+fn handle_kg_timeline(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
+    let source_id = params["source_id"]
+        .as_str()
+        .ok_or("source_id is required")?;
+    validate::validate_id(source_id).map_err(|e| e.to_string())?;
+    let since = params["since"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let until = params["until"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(s) = since {
+        validate::validate_expires_at_format(s).map_err(|e| e.to_string())?;
+    }
+    if let Some(u) = until {
+        validate::validate_expires_at_format(u).map_err(|e| e.to_string())?;
+    }
+    let limit = params["limit"]
+        .as_u64()
+        .and_then(|n| usize::try_from(n).ok());
+
+    let events =
+        db::kg_timeline(conn, source_id, since, until, limit).map_err(|e| e.to_string())?;
+
+    let events_json: Vec<Value> = events
+        .iter()
+        .map(|e| {
+            json!({
+                "target_id": e.target_id,
+                "relation": e.relation,
+                "valid_from": e.valid_from,
+                "valid_until": e.valid_until,
+                "observed_by": e.observed_by,
+                "title": e.title,
+                "target_namespace": e.target_namespace,
+            })
+        })
+        .collect();
+
+    Ok(json!({
+        "source_id": source_id,
+        "events": events_json,
+        "count": events.len(),
+    }))
+}
+
 fn handle_list(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
     let namespace = params["namespace"].as_str();
     let tier = params["tier"].as_str().and_then(Tier::from_str);
@@ -2793,6 +2855,7 @@ fn handle_request(
                 "memory_check_duplicate" => handle_check_duplicate(conn, arguments, embedder),
                 "memory_entity_register" => handle_entity_register(conn, arguments, mcp_client),
                 "memory_entity_get_by_alias" => handle_entity_get_by_alias(conn, arguments),
+                "memory_kg_timeline" => handle_kg_timeline(conn, arguments),
                 "memory_delete" => handle_delete(conn, arguments, vector_index, mcp_client),
                 "memory_promote" => handle_promote(conn, arguments, mcp_client),
                 "memory_pending_list" => handle_pending_list(conn, arguments),
@@ -3157,14 +3220,15 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn tool_definitions_returns_40_tools() {
+    fn tool_definitions_returns_41_tools() {
         // v0.6.3 adds memory_get_taxonomy (Pillar 1 / Stream A),
-        // memory_check_duplicate (Pillar 2 / Stream D), and
+        // memory_check_duplicate (Pillar 2 / Stream D),
         // memory_entity_register + memory_entity_get_by_alias
-        // (Pillar 2 / Stream B) on top of the 36-tool v0.6.0.0 surface.
+        // (Pillar 2 / Stream B), and memory_kg_timeline (Pillar 2 /
+        // Stream C) on top of the 36-tool v0.6.0.0 surface.
         let defs = tool_definitions();
         let tools = defs["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 40);
+        assert_eq!(tools.len(), 41);
     }
 
     #[test]
@@ -3182,6 +3246,14 @@ mod tests {
         let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
         assert!(names.contains(&"memory_entity_register"));
         assert!(names.contains(&"memory_entity_get_by_alias"));
+    }
+
+    #[test]
+    fn tool_definitions_include_kg_timeline() {
+        let defs = tool_definitions();
+        let tools = defs["tools"].as_array().unwrap();
+        let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        assert!(names.contains(&"memory_kg_timeline"));
     }
 
     #[test]

@@ -2204,6 +2204,85 @@ pub async fn entity_get_by_alias(
     }
 }
 
+/// Query parameters for `GET /api/v1/kg/timeline` (Pillar 2 / Stream C).
+#[derive(Debug, Deserialize)]
+pub struct KgTimelineQuery {
+    pub source_id: String,
+    pub since: Option<String>,
+    pub until: Option<String>,
+    pub limit: Option<usize>,
+}
+
+/// `GET /api/v1/kg/timeline?source_id=<>&since=<>&until=<>&limit=<>` —
+/// REST mirror of the MCP `memory_kg_timeline` tool. Returns outbound
+/// link assertions from `source_id` ordered by `valid_from ASC`.
+pub async fn kg_timeline(
+    State(state): State<Db>,
+    Query(p): Query<KgTimelineQuery>,
+) -> impl IntoResponse {
+    if let Err(e) = validate::validate_id(&p.source_id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("invalid source_id: {e}")})),
+        )
+            .into_response();
+    }
+    let since = p.since.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let until = p.until.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    if let Some(s) = since
+        && let Err(e) = validate::validate_expires_at_format(s)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("invalid since: {e}")})),
+        )
+            .into_response();
+    }
+    if let Some(u) = until
+        && let Err(e) = validate::validate_expires_at_format(u)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("invalid until: {e}")})),
+        )
+            .into_response();
+    }
+
+    let lock = state.lock().await;
+    match db::kg_timeline(&lock.0, &p.source_id, since, until, p.limit) {
+        Ok(events) => {
+            let events_json: Vec<serde_json::Value> = events
+                .iter()
+                .map(|e| {
+                    json!({
+                        "target_id": e.target_id,
+                        "relation": e.relation,
+                        "valid_from": e.valid_from,
+                        "valid_until": e.valid_until,
+                        "observed_by": e.observed_by,
+                        "title": e.title,
+                        "target_namespace": e.target_namespace,
+                    })
+                })
+                .collect();
+            Json(json!({
+                "source_id": p.source_id,
+                "events": events_json,
+                "count": events.len(),
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            tracing::error!("handler error: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "internal server error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
 pub async fn create_link(
     State(app): State<AppState>,
     Json(body): Json<LinkBody>,
