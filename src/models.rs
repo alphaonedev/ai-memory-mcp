@@ -338,6 +338,32 @@ pub struct Taxonomy {
     pub truncated: bool,
 }
 
+/// One nearest-neighbor result from a `memory_check_duplicate` lookup
+/// (Pillar 2 / Stream D). `similarity` is the cosine similarity in
+/// `[-1.0, 1.0]`, rounded to three decimals at the response layer.
+#[derive(Debug, Clone, Serialize)]
+pub struct DuplicateMatch {
+    pub id: String,
+    pub title: String,
+    pub namespace: String,
+    pub similarity: f32,
+}
+
+/// Result envelope returned by `db::check_duplicate`.
+///
+/// `is_duplicate` is `nearest.similarity >= threshold`. `nearest` is
+/// `None` only when the candidate pool is empty (no embedded, live
+/// memories matched the namespace filter). When `is_duplicate` is true,
+/// `nearest.id` doubles as the suggested merge target — we surface it
+/// under that name in the JSON response so the contract stays explicit.
+#[derive(Debug, Clone, Serialize)]
+pub struct DuplicateCheck {
+    pub is_duplicate: bool,
+    pub threshold: f32,
+    pub nearest: Option<DuplicateMatch>,
+    pub candidates_scanned: usize,
+}
+
 /// Namespace reserved for agent registrations (Task 1.3).
 pub const AGENTS_NAMESPACE: &str = "_agents";
 
