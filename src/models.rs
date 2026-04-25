@@ -427,8 +427,9 @@ pub struct KgTimelineEvent {
 /// `memory_kg_query`). Each node represents a memory reachable from the
 /// query's source through one outbound link, carrying the link's
 /// temporal-validity columns plus the target memory's display fields and
-/// the traversal path. `depth` is the number of hops from the source
-/// (always 1 in this build; multi-hop lands in a follow-up iteration).
+/// the traversal path. `depth` is the actual number of hops from the
+/// source (1..=`KG_QUERY_MAX_SUPPORTED_DEPTH`); `path` is the
+/// `src->mid->target` chain as discovered by the recursive CTE.
 #[derive(Debug, Clone, Serialize)]
 pub struct KgQueryNode {
     pub target_id: String,

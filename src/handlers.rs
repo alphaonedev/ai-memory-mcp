@@ -2368,7 +2368,7 @@ pub async fn kg_invalidate(
 /// `memory_kg_query`). POST is used because `allowed_agents` is a list;
 /// keeping it in a body avoids over-long query strings and keeps the
 /// surface symmetric with `POST /api/v1/kg/invalidate`. `max_depth`
-/// defaults to 1 in this build (multi-hop lands in a follow-up).
+/// defaults to 1 and is bounded by `KG_QUERY_MAX_SUPPORTED_DEPTH`.
 #[derive(Debug, Deserialize)]
 pub struct KgQueryBody {
     pub source_id: String,
@@ -2379,10 +2379,11 @@ pub struct KgQueryBody {
 }
 
 /// `POST /api/v1/kg/query` — REST mirror of the MCP `memory_kg_query`
-/// tool. Returns outbound depth=1 neighbors of `source_id` filtered by
-/// the temporal/agent windows. 400 for invalid IDs/timestamps; 422 when
-/// `max_depth` exceeds the supported ceiling (clearer than 500 for what
-/// is a documented limitation, not an internal error).
+/// tool. Returns outbound multi-hop traversal from `source_id` (1..=5
+/// hops) filtered by the temporal/agent windows. 400 for invalid
+/// IDs/timestamps; 422 when `max_depth` exceeds the supported ceiling
+/// (clearer than 500 for what is a documented limitation, not an
+/// internal error).
 pub async fn kg_query(State(state): State<Db>, Json(body): Json<KgQueryBody>) -> impl IntoResponse {
     if let Err(e) = validate::validate_id(&body.source_id) {
         return (

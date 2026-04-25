@@ -238,15 +238,15 @@ fn tool_definitions() -> Value {
             },
             {
                 "name": "memory_kg_query",
-                "description": "Pillar 2 / Stream C — outbound KG traversal from a source memory ('expand neighbors'). Returns one node per link reachable from `source_id`, with the link's temporal-validity columns (valid_from, valid_until, observed_by) and the target memory's title/namespace. Filters: `valid_at` keeps only links valid at that instant; `allowed_agents` keeps only links observed by an agent in the set (empty list returns zero rows by design — empty allowlist means 'no agents are trusted'). Ordered by COALESCE(valid_from, created_at) ASC for deterministic display. This build supports `max_depth=1` only; multi-hop recursive traversal lands in a follow-up iteration and a clear error is returned for `max_depth >= 2`.",
+                "description": "Pillar 2 / Stream C — outbound KG traversal from a source memory. Returns one node per link reachable from `source_id` within `max_depth` hops, with the link's temporal-validity columns (valid_from, valid_until, observed_by) and the target memory's title/namespace. Multi-hop traversal uses a recursive CTE with cycle detection — chains only extend through links that pass every filter on every hop. Filters: `valid_at` keeps only links valid at that instant; `allowed_agents` keeps only links observed by an agent in the set (empty list returns zero rows by design — empty allowlist means 'no agents are trusted'). Ordered by depth ASC, then COALESCE(valid_from, created_at) ASC, for stable shallow-first display. `max_depth` ceiling is 5 (matches the published performance budget); larger values return an explicit error.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "source_id": {"type": "string", "description": "Memory ID whose outbound links form the traversal frontier. Typically an entity_id from memory_entity_register, but any memory works."},
-                        "max_depth": {"type": "integer", "minimum": 1, "maximum": 1, "default": 1, "description": "Hops from the source. This build supports 1 only ('expand neighbors'); larger values return an explicit error until the recursive-CTE slice ships."},
+                        "max_depth": {"type": "integer", "minimum": 1, "maximum": 5, "default": 1, "description": "Hops from the source. Supported range: 1..=5 (matches the published performance budget for `memory_kg_query`). Larger values return an explicit error."},
                         "valid_at": {"type": "string", "description": "RFC3339 timestamp; only links valid at this instant (valid_from <= valid_at AND (valid_until IS NULL OR valid_until > valid_at)) are returned. Omit to skip the temporal filter (NULL valid_from rows are then included)."},
                         "allowed_agents": {"type": "array", "items": {"type": "string"}, "description": "If provided, only links whose observed_by is in this set are returned. An empty array returns zero rows. Omit to skip the agent filter."},
-                        "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 200, "description": "Max nodes returned. Clamped to [1, 1000]."}
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 200, "description": "Max nodes returned across all depths. Clamped to [1, 1000]."}
                     },
                     "required": ["source_id"]
                 }
