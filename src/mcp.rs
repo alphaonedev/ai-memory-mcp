@@ -168,6 +168,20 @@ fn tool_definitions() -> Value {
                 }
             },
             {
+                "name": "memory_check_duplicate",
+                "description": "Pillar 2 / Stream D — pre-write near-duplicate check. Embeds `title + content`, scans live memories with stored embeddings (optionally restricted to `namespace`), and returns the highest-cosine match. `is_duplicate` is `nearest.similarity >= threshold`; the response also surfaces `suggested_merge` (the nearest memory's id) when the threshold is met. Threshold is clamped to a hard floor of 0.5 so permissive callers can't dress unrelated content as a merge candidate. Requires the embedder to be loaded (semantic tier or above).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string", "description": "Title of the candidate memory. Combined with `content` to form the embedding input, matching memory_store's encoding."},
+                        "content": {"type": "string", "description": "Content of the candidate memory."},
+                        "namespace": {"type": "string", "description": "Restrict the duplicate scan to this namespace. Omit to scan all namespaces."},
+                        "threshold": {"type": "number", "minimum": 0.5, "maximum": 1.0, "default": 0.85, "description": "Cosine similarity threshold for declaring a duplicate. Clamped to >= 0.5. Default 0.85 is tuned for MiniLM-L6-v2 — near-paraphrases land at 0.88+."}
+                    },
+                    "required": ["title", "content"]
+                }
+            },
+            {
                 "name": "memory_delete",
                 "description": "Delete a memory by ID.",
                 "inputSchema": {
@@ -1384,6 +1398,64 @@ fn handle_get_taxonomy(conn: &rusqlite::Connection, params: &Value) -> Result<Va
         "tree": tax.tree,
         "total_count": tax.total_count,
         "truncated": tax.truncated,
+    }))
+}
+
+fn handle_check_duplicate(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    embedder: Option<&Embedder>,
+) -> Result<Value, String> {
+    let title = params["title"].as_str().ok_or("title is required")?;
+    let content = params["content"].as_str().ok_or("content is required")?;
+    let namespace = params["namespace"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    // Float defaults are awkward in JSON schema land — accept either an
+    // explicit threshold or fall back to the tuned default. The hard
+    // floor is enforced inside `db::check_duplicate`.
+    #[allow(clippy::cast_possible_truncation)]
+    let threshold = params["threshold"]
+        .as_f64()
+        .map_or(db::DUPLICATE_THRESHOLD_DEFAULT, |t| t as f32);
+
+    validate::validate_title(title).map_err(|e| e.to_string())?;
+    validate::validate_content(content).map_err(|e| e.to_string())?;
+    if let Some(ns) = namespace {
+        validate::validate_namespace(ns).map_err(|e| e.to_string())?;
+    }
+
+    let emb = embedder
+        .ok_or("memory_check_duplicate requires the embedder; enable semantic tier or above")?;
+    let text = format!("{title} {content}");
+    let query_embedding = emb.embed(&text).map_err(|e| e.to_string())?;
+
+    let check = db::check_duplicate(conn, &query_embedding, namespace, threshold)
+        .map_err(|e| e.to_string())?;
+
+    // Round similarity to 3 decimals at the response edge — keeps the
+    // JSON readable without leaking the f32's full quantisation noise.
+    let nearest_json = check.nearest.as_ref().map(|m| {
+        json!({
+            "id": m.id,
+            "title": m.title,
+            "namespace": m.namespace,
+            "similarity": (m.similarity * 1000.0).round() / 1000.0,
+        })
+    });
+    let suggested_merge = if check.is_duplicate {
+        check.nearest.as_ref().map(|m| m.id.clone())
+    } else {
+        None
+    };
+
+    Ok(json!({
+        "is_duplicate": check.is_duplicate,
+        "threshold": check.threshold,
+        "nearest": nearest_json,
+        "suggested_merge": suggested_merge,
+        "candidates_scanned": check.candidates_scanned,
     }))
 }
 
@@ -2606,6 +2678,7 @@ fn handle_request(
                 "memory_search" => handle_search(conn, arguments),
                 "memory_list" => handle_list(conn, arguments),
                 "memory_get_taxonomy" => handle_get_taxonomy(conn, arguments),
+                "memory_check_duplicate" => handle_check_duplicate(conn, arguments, embedder),
                 "memory_delete" => handle_delete(conn, arguments, vector_index, mcp_client),
                 "memory_promote" => handle_promote(conn, arguments, mcp_client),
                 "memory_pending_list" => handle_pending_list(conn, arguments),
@@ -2970,12 +3043,21 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn tool_definitions_returns_37_tools() {
-        // v0.6.3 (Pillar 1 / Stream A) adds memory_get_taxonomy on top
-        // of the 36-tool v0.6.0.0 surface.
+    fn tool_definitions_returns_38_tools() {
+        // v0.6.3 adds memory_get_taxonomy (Pillar 1 / Stream A) and
+        // memory_check_duplicate (Pillar 2 / Stream D) on top of the
+        // 36-tool v0.6.0.0 surface.
         let defs = tool_definitions();
         let tools = defs["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 37);
+        assert_eq!(tools.len(), 38);
+    }
+
+    #[test]
+    fn tool_definitions_include_check_duplicate() {
+        let defs = tool_definitions();
+        let tools = defs["tools"].as_array().unwrap();
+        let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        assert!(names.contains(&"memory_check_duplicate"));
     }
 
     #[test]

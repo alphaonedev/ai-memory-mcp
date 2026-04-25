@@ -1157,6 +1157,10 @@ async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &config::AppConfig
         // mirror of the MCP `memory_get_taxonomy` tool. Query params:
         // `prefix`, `depth`, `limit` (all optional).
         .route("/api/v1/taxonomy", get(handlers::get_taxonomy))
+        // Pillar 2 / Stream D — pre-write near-duplicate check. REST
+        // mirror of the MCP `memory_check_duplicate` tool. Body:
+        // `{title, content, namespace?, threshold?}`.
+        .route("/api/v1/check_duplicate", post(handlers::check_duplicate))
         .route("/api/v1/stats", get(handlers::get_stats))
         .route("/api/v1/gc", post(handlers::run_gc))
         .route("/api/v1/export", get(handlers::export_memories))
