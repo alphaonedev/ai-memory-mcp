@@ -709,11 +709,11 @@ openssl req -x509 -newkey rsa:2048 -keyout client.key -out client.pem \
 openssl x509 -in client.pem -outform DER | sha256sum
 ```
 
-3. Build the allowlist file (one fingerprint per line; `sha256:` prefix and `:` separators are optional):
+3. Build the allowlist file (one fingerprint per line; `sha256:` prefix and `:` separators are optional). Full-line `#` comments and inline trailing `# label` annotations after a fingerprint are both tolerated:
 
 ```
 # peer A's client cert
-sha256:25ab790783dbe969f994063db0412f1930e187e5e1e6c7d79bb76224a76b7bb7
+sha256:25ab790783dbe969f994063db0412f1930e187e5e1e6c7d79bb76224a76b7bb7  # node-1
 ```
 
 4. Run with all three flags:
