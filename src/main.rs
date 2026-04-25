@@ -1170,6 +1170,10 @@ async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &config::AppConfig
             "/api/v1/entities/by_alias",
             get(handlers::entity_get_by_alias),
         )
+        // Pillar 2 / Stream C — KG timeline. REST mirror of the MCP
+        // `memory_kg_timeline` tool. Query params: `source_id` (required),
+        // `since?`, `until?`, `limit?`.
+        .route("/api/v1/kg/timeline", get(handlers::kg_timeline))
         .route("/api/v1/stats", get(handlers::get_stats))
         .route("/api/v1/gc", post(handlers::run_gc))
         .route("/api/v1/export", get(handlers::export_memories))

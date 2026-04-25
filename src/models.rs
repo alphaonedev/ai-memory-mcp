@@ -403,6 +403,26 @@ pub struct EntityRegistration {
     pub created: bool,
 }
 
+/// Single row returned by `db::kg_timeline` (Pillar 2 / Stream C).
+///
+/// Captures one outbound assertion from a source memory: the
+/// `target_id` and its `relation`, the temporal-validity window
+/// (`valid_from` / `valid_until`), the agent that observed it
+/// (`observed_by`), and the target's display fields (`title`,
+/// `target_namespace`) for caller convenience. `valid_from` is the
+/// authoritative ordering key — events with NULL `valid_from` are
+/// excluded from the timeline by the query.
+#[derive(Debug, Clone, Serialize)]
+pub struct KgTimelineEvent {
+    pub target_id: String,
+    pub relation: String,
+    pub valid_from: String,
+    pub valid_until: Option<String>,
+    pub observed_by: Option<String>,
+    pub title: String,
+    pub target_namespace: String,
+}
+
 // ---------------------------------------------------------------------------
 // Task 1.9 — Governance Enforcement
 // ---------------------------------------------------------------------------
