@@ -432,6 +432,45 @@
 </section>
 
 <!-- ================================================================
+     SUBSTRATE FOR MULTI-AGENT AI
+     ================================================================ -->
+<section id="substrate" class="alt">
+    <div class="container">
+        <h2>Substrate for multi-agent AI</h2>
+        <p class="section-subtitle">ai-memory is not an agent runtime and not "autonomous AI." It is the memory layer that <em>multi-agent</em> autonomous deployments need underneath them — built for the operating shape that 24/7 multi-machine agent fleets actually have.</p>
+
+        <div class="platform-grid" style="grid-template-columns:repeat(auto-fill,minmax(260px,1fr))">
+            <div class="platform-card" style="text-align:left">
+                <span class="platform-icon">⊕</span>
+                <h4>Federation with W-of-N quorum</h4>
+                <p>Run agents across N peers. <code>broadcast_store_quorum</code> fans writes out, requires W acknowledgements before declaring success, and <code>spawn_catchup_loop</code> backfills lagging peers asynchronously. No race-conditions when 100 agents write in parallel.</p>
+            </div>
+            <div class="platform-card" style="text-align:left">
+                <span class="platform-icon">◐</span>
+                <h4>Curator daemon at swarm scale</h4>
+                <p>The same curator that keeps a single-agent corpus tidy keeps a swarm-shared corpus from degrading into noise. Many agents scribbling into shared memory without consolidation drifts into duplicates and contradictions within hours; the curator prevents that.</p>
+            </div>
+            <div class="platform-card" style="text-align:left">
+                <span class="platform-icon">⤳</span>
+                <h4>Subscriptions for inter-agent triggering</h4>
+                <p>Webhooks fire on memory events with HMAC-signed payloads, namespace + agent filters, and SSRF-hardened URL validation. Agent A writes a finding; agent B's webhook fires and dispatches the next step. The store becomes the message bus.</p>
+            </div>
+            <div class="platform-card" style="text-align:left">
+                <span class="platform-icon">⌽</span>
+                <h4>Namespace hierarchy + scoped governance</h4>
+                <p>Per-agent / per-team / per-org namespaces with N-level inheritance. Visibility scopes (private / team / unit / org / collective) and per-namespace governance policies (write / promote / delete authority, approver type, optional N-of-M consensus) — so a swarm operates inside boundaries you set.</p>
+            </div>
+        </div>
+
+        <div style="margin-top:1.5rem;padding:1.25rem 1.5rem;background:var(--bg-card);border:1px solid var(--border);border-radius:10px">
+            <p style="font-size:.7rem;text-transform:uppercase;letter-spacing:.15em;color:var(--orange);margin-bottom:.5rem;font-weight:700">Honest scope</p>
+            <p style="font-size:.95rem;line-height:1.6;margin-bottom:.6rem">Stack ai-memory under a 24/7 multi-machine agent runner (e.g. <a href="https://github.com/alphaonedev/openclaw" style="color:var(--accent)">OpenClaw</a>), an agent framework with auto-generated skills (e.g. Nous's <strong>Hermes Agent</strong>), or a self-organizing parallel swarm, and the combined system clears the <em>behavioral</em> bar for autonomous AI: it pursues goals across time, learns from outcomes, restructures itself, and operates without per-step human intervention.</p>
+            <p style="font-size:.95rem;line-height:1.6;margin:0">What's still left, honestly: no weight-level learning (skills accumulate around a frozen model), each LLM call is still stateless cognition, and the root goal is human-seeded. Those are real gaps. ai-memory does not close them. It does provide the multi-agent memory substrate that closing them at the system level requires.</p>
+        </div>
+    </div>
+</section>
+
+<!-- ================================================================
      WORKS WITH (Platform Cards)
      ================================================================ -->
 <section id="platforms" class="alt">
