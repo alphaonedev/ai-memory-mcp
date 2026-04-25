@@ -319,12 +319,7 @@ pub fn render_table(results: &[OperationResult]) -> String {
         let target_ms = r.target_p95_ms.round() as i64;
         let line = format!(
             "{:<30}  < {:>4} ms       {:>7.1} ms       {:>5.1}    {:>5.1}    {}\n",
-            r.label,
-            target_ms,
-            r.measured_p95_ms,
-            r.measured_p50_ms,
-            r.measured_p99_ms,
-            status_str
+            r.label, target_ms, r.measured_p95_ms, r.measured_p50_ms, r.measured_p99_ms, status_str
         );
         out.push_str(&line);
     }
