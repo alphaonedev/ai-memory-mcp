@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — v0.6.3 (Patch 3)
+
+### Fixed
+
+- **[#358]** mTLS allowlist parser now tolerates inline trailing `#`
+  comments after a fingerprint
+  (`load_fingerprint_allowlist`, `src/main.rs`). Previously, a line like
+  `sha256:abc…def  # node-1` was parsed whole and failed the 64-hex-char
+  length check (`got 74`), aborting `ai-memory serve` on startup. Full-line
+  `#` comments and the Ultrareview #338 strict character-set check
+  (rejects embedded whitespace inside the hex run) are preserved. Doc
+  update: `docs/ADMIN_GUIDE.md` now explicitly calls out trailing-comment
+  tolerance. Encountered in the a2a-gate mTLS matrix; the gate-side
+  generator fix in `ai-memory-ai2ai-gate#35` already worked around it for
+  v0.6.2 — this is the parser-side resolution.
+
 ## [v0.6.2] — 2026-04-24 — A2A-CERTIFIED
 
 First release to carry the a2a-gate **consecutive-green streak 3/3**

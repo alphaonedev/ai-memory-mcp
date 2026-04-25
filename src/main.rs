@@ -1351,6 +1351,14 @@ async fn load_fingerprint_allowlist(path: &Path) -> Result<std::collections::Has
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
+        // Issue #358: tolerate inline trailing comments — anything after `#`
+        // on a non-comment line is dropped before the strict hex/colon
+        // validation below. Safe because `#` is not a valid hex/colon char,
+        // so it cannot appear in a legitimate SHA-256 fingerprint.
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
         // Accept a leading `sha256:` marker for forward-compat with richer formats.
         let hex_part = line.strip_prefix("sha256:").unwrap_or(line);
         // Ultrareview #338: reject any non-hex, non-colon character —
@@ -4461,5 +4469,43 @@ mod tests {
     fn auto_namespace_returns_nonempty() {
         let ns = auto_namespace();
         assert!(!ns.is_empty());
+    }
+
+    // Issue #358: parser must accept inline trailing comments after a
+    // fingerprint, in addition to the existing full-line `#` comment skip.
+    #[tokio::test]
+    async fn fingerprint_allowlist_tolerates_trailing_comments() {
+        let fp_a = "a".repeat(64);
+        let fp_b = "b".repeat(64);
+        let fp_c = format!("{}:{}", "c".repeat(32), "c".repeat(32));
+        let body = format!(
+            "# authorised mTLS peers\n\
+             {fp_a}  # node-1\n\
+             \n\
+             sha256:{fp_b}\t# node-2 with tab\n\
+             {fp_c}\n"
+        );
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), body).unwrap();
+        let set = load_fingerprint_allowlist(tmp.path()).await.unwrap();
+        assert_eq!(set.len(), 3, "expected 3 fingerprints, got {}", set.len());
+        assert!(set.contains(&[0xaa; 32]));
+        assert!(set.contains(&[0xbb; 32]));
+        assert!(set.contains(&[0xcc; 32]));
+    }
+
+    #[tokio::test]
+    async fn fingerprint_allowlist_rejects_embedded_whitespace() {
+        // Ultrareview #338 strictness preserved — whitespace before the
+        // `#` is fine (gets trimmed), but whitespace inside the hex run
+        // still errors so soft-wrap copy-paste artefacts are caught.
+        let body = format!("{} {}\n", "a".repeat(32), "a".repeat(32));
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), body).unwrap();
+        let err = load_fingerprint_allowlist(tmp.path()).await.unwrap_err();
+        assert!(
+            err.to_string().contains("unexpected character"),
+            "expected strict char-set error, got: {err}"
+        );
     }
 }
