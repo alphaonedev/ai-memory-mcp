@@ -8,10 +8,10 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::models::{
-    AGENTS_NAMESPACE, AgentRegistration, Approval, ApproverType, GovernanceDecision,
-    GovernanceLevel, GovernancePolicy, GovernedAction, MAX_NAMESPACE_DEPTH, Memory, MemoryLink,
-    NamespaceCount, PROMOTION_THRESHOLD, PendingAction, Stats, Taxonomy, TaxonomyNode, Tier,
-    TierCount, namespace_ancestors,
+    AGENTS_NAMESPACE, AgentRegistration, Approval, ApproverType, DuplicateCheck, DuplicateMatch,
+    GovernanceDecision, GovernanceLevel, GovernancePolicy, GovernedAction, MAX_NAMESPACE_DEPTH,
+    Memory, MemoryLink, NamespaceCount, PROMOTION_THRESHOLD, PendingAction, Stats, Taxonomy,
+    TaxonomyNode, Tier, TierCount, namespace_ancestors,
 };
 
 /// Computed 4-tuple of visibility prefixes for an agent position (Task 1.5).
@@ -1739,6 +1739,10 @@ const TAXONOMY_MAX_LIMIT: usize = 10_000;
 /// — when truncated, `total_count` still reflects the full prefix
 /// total (a separate aggregation), and `truncated` is set so callers
 /// can warn the user. Hard ceiling: [`TAXONOMY_MAX_LIMIT`].
+// Body is intentionally one logical pipeline (SQL aggregation → tree
+// assembly → root materialisation); pulling helpers out hurts
+// readability more than it helps.
+#[allow(clippy::too_many_lines)]
 pub fn get_taxonomy(
     conn: &Connection,
     namespace_prefix: Option<&str>,
@@ -1913,6 +1917,115 @@ fn sort_taxonomy(node: &mut TaxonomyNode) {
     for child in &mut node.children {
         sort_taxonomy(child);
     }
+}
+
+/// Hard floor for duplicate-check threshold. Below this, anything can match
+/// random unrelated content — refuse to honor the lookup so callers don't
+/// silently get garbage merge suggestions.
+pub const DUPLICATE_THRESHOLD_MIN: f32 = 0.5;
+
+/// Default cosine similarity threshold for declaring a candidate a
+/// duplicate. Empirically tuned for MiniLM-L6-v2 (the local embedder):
+/// near-paraphrases of the same memory tend to land at 0.88+, while
+/// loosely related content sits well below 0.85. Callers can override.
+pub const DUPLICATE_THRESHOLD_DEFAULT: f32 = 0.85;
+
+/// Find the nearest-neighbor live memory by cosine similarity (Pillar 2 /
+/// Stream D — `memory_check_duplicate`).
+///
+/// Linear scan over `memories.embedding` rows that pass the live-row
+/// (non-expired) gate and the optional namespace filter. The chosen
+/// candidate is the highest-cosine match across the pool; the
+/// caller-supplied `threshold` is used purely to set `is_duplicate` on
+/// the response — the nearest neighbor is always returned (when the
+/// pool is non-empty) so callers can show "closest existing memory was
+/// X at similarity Y" even on a not-quite-duplicate.
+///
+/// Threshold is clamped at [`DUPLICATE_THRESHOLD_MIN`] so that wildly
+/// permissive thresholds can't be used to dress unrelated content as a
+/// merge suggestion.
+///
+/// Returns `(check, scanned)` where `scanned` is the count of embedded
+/// candidates compared (useful for diagnostics).
+pub fn check_duplicate(
+    conn: &Connection,
+    query_embedding: &[f32],
+    namespace: Option<&str>,
+    threshold: f32,
+) -> Result<DuplicateCheck> {
+    let effective_threshold = threshold.max(DUPLICATE_THRESHOLD_MIN);
+    let now = Utc::now().to_rfc3339();
+
+    // SQL filter handles the live-row + optional namespace gate; the
+    // cosine pass happens in Rust because SQLite has no native vector
+    // op. We only pull rows with non-NULL embeddings — anything missing
+    // an embedding can't be a near-duplicate by this definition.
+    let rows: Vec<(String, String, String, Vec<u8>)> = if let Some(ns) = namespace {
+        let mut stmt = conn.prepare(
+            "SELECT id, title, namespace, embedding FROM memories
+             WHERE embedding IS NOT NULL
+               AND (expires_at IS NULL OR expires_at > ?1)
+               AND namespace = ?2",
+        )?;
+        let mapped = stmt.query_map(params![now, ns], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+            ))
+        })?;
+        mapped.collect::<rusqlite::Result<Vec<_>>>()?
+    } else {
+        let mut stmt = conn.prepare(
+            "SELECT id, title, namespace, embedding FROM memories
+             WHERE embedding IS NOT NULL
+               AND (expires_at IS NULL OR expires_at > ?1)",
+        )?;
+        let mapped = stmt.query_map(params![now], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+            ))
+        })?;
+        mapped.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    let mut best: Option<DuplicateMatch> = None;
+    let mut scanned: usize = 0;
+    for (id, title, ns, bytes) in rows {
+        if bytes.is_empty() {
+            continue;
+        }
+        let candidate: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let similarity =
+            crate::embeddings::Embedder::cosine_similarity(query_embedding, &candidate);
+        scanned += 1;
+        let is_better = best.as_ref().is_none_or(|m| similarity > m.similarity);
+        if is_better {
+            best = Some(DuplicateMatch {
+                id,
+                title,
+                namespace: ns,
+                similarity,
+            });
+        }
+    }
+
+    let is_duplicate = best
+        .as_ref()
+        .is_some_and(|m| m.similarity >= effective_threshold);
+    Ok(DuplicateCheck {
+        is_duplicate,
+        threshold: effective_threshold,
+        nearest: best,
+        candidates_scanned: scanned,
+    })
 }
 
 /// Register or refresh an agent in the reserved `_agents` namespace.
@@ -4387,6 +4500,122 @@ mod tests {
         let got = get_embedding(&conn, &id).unwrap().unwrap();
         assert_eq!(got.len(), 4);
         assert!((got[0] - 0.1).abs() < 1e-6);
+    }
+
+    // -- Pillar 2 / Stream D — memory_check_duplicate -------------------
+
+    fn insert_with_embedding(
+        conn: &Connection,
+        title: &str,
+        ns: &str,
+        embedding: &[f32],
+    ) -> String {
+        let mem = make_memory(title, ns, Tier::Long, 5);
+        let id = insert(conn, &mem).unwrap();
+        set_embedding(conn, &id, embedding).unwrap();
+        id
+    }
+
+    #[test]
+    fn check_duplicate_empty_db_returns_no_match() {
+        let conn = test_db();
+        let q = vec![1.0_f32, 0.0, 0.0];
+        let r = check_duplicate(&conn, &q, None, 0.85).unwrap();
+        assert!(!r.is_duplicate);
+        assert!(r.nearest.is_none());
+        assert_eq!(r.candidates_scanned, 0);
+    }
+
+    #[test]
+    fn check_duplicate_finds_highest_cosine_match() {
+        let conn = test_db();
+        // a = [1,0,0]; b = [0,1,0]; c = [0.99,0.01,0]. Query = [1,0,0]
+        // expects `c` (cos ~0.9999) > `a` (cos =1.0 actually).
+        // Use distinct vectors: a=[1,0,0] cos 1.0, b=[0.7,0.7,0] cos 0.707,
+        // c=[0,1,0] cos 0.0. Best should be `a`.
+        let id_a = insert_with_embedding(&conn, "alpha", "ns", &[1.0, 0.0, 0.0]);
+        let _id_b = insert_with_embedding(&conn, "beta", "ns", &[0.7, 0.7, 0.0]);
+        let _id_c = insert_with_embedding(&conn, "gamma", "ns", &[0.0, 1.0, 0.0]);
+
+        let q = vec![1.0_f32, 0.0, 0.0];
+        let r = check_duplicate(&conn, &q, None, 0.85).unwrap();
+        let nearest = r.nearest.expect("expected a nearest match");
+        assert_eq!(nearest.id, id_a);
+        assert!(nearest.similarity > 0.99);
+        assert_eq!(r.candidates_scanned, 3);
+        assert!(r.is_duplicate);
+        assert!((r.threshold - 0.85).abs() < 1e-6);
+    }
+
+    #[test]
+    fn check_duplicate_below_threshold_not_flagged_but_returns_nearest() {
+        let conn = test_db();
+        let id_b = insert_with_embedding(&conn, "beta", "ns", &[0.7, 0.7, 0.0]);
+
+        // Cosine([1,0,0], [0.7,0.7,0]) ~ 0.707 — below default 0.85.
+        let q = vec![1.0_f32, 0.0, 0.0];
+        let r = check_duplicate(&conn, &q, None, 0.85).unwrap();
+        let nearest = r
+            .nearest
+            .expect("nearest must surface even when below threshold");
+        assert_eq!(nearest.id, id_b);
+        assert!(!r.is_duplicate);
+    }
+
+    #[test]
+    fn check_duplicate_threshold_clamped_to_floor() {
+        let conn = test_db();
+        // Caller passes a permissive 0.0; the response threshold must
+        // be clamped to DUPLICATE_THRESHOLD_MIN so unrelated content
+        // can't be dressed as a merge candidate.
+        let _ = insert_with_embedding(&conn, "x", "ns", &[1.0, 0.0, 0.0]);
+        let q = vec![0.0_f32, 1.0, 0.0]; // orthogonal — cosine 0.0
+        let r = check_duplicate(&conn, &q, None, 0.0).unwrap();
+        assert!((r.threshold - DUPLICATE_THRESHOLD_MIN).abs() < 1e-6);
+        assert!(!r.is_duplicate);
+    }
+
+    #[test]
+    fn check_duplicate_namespace_filter_isolates_scan() {
+        let conn = test_db();
+        let _hit_in_other_ns = insert_with_embedding(&conn, "x", "other", &[1.0, 0.0, 0.0]);
+        let id_target = insert_with_embedding(&conn, "y", "ns", &[0.6, 0.8, 0.0]);
+
+        let q = vec![1.0_f32, 0.0, 0.0];
+        let r = check_duplicate(&conn, &q, Some("ns"), 0.85).unwrap();
+        assert_eq!(r.candidates_scanned, 1);
+        assert_eq!(r.nearest.expect("namespace filter ignored").id, id_target);
+    }
+
+    #[test]
+    fn check_duplicate_skips_expired_rows() {
+        let conn = test_db();
+        // Short-tier memory with a backdated `expires_at` is past the
+        // live-row gate and must not be a candidate.
+        let mut mem = make_memory("expired", "ns", Tier::Short, 5);
+        mem.expires_at = Some((chrono::Utc::now() - chrono::Duration::seconds(60)).to_rfc3339());
+        let id = insert(&conn, &mem).unwrap();
+        set_embedding(&conn, &id, &[1.0, 0.0, 0.0]).unwrap();
+
+        let q = vec![1.0_f32, 0.0, 0.0];
+        let r = check_duplicate(&conn, &q, None, 0.85).unwrap();
+        assert_eq!(r.candidates_scanned, 0);
+        assert!(r.nearest.is_none());
+    }
+
+    #[test]
+    fn check_duplicate_skips_unembedded_rows() {
+        let conn = test_db();
+        // One memory with an embedding, one without — only the embedded
+        // row should appear in `candidates_scanned`.
+        let id_embedded = insert_with_embedding(&conn, "with-emb", "ns", &[1.0, 0.0, 0.0]);
+        let mem = make_memory("no-emb", "ns", Tier::Long, 5);
+        let _ = insert(&conn, &mem).unwrap();
+
+        let q = vec![1.0_f32, 0.0, 0.0];
+        let r = check_duplicate(&conn, &q, None, 0.85).unwrap();
+        assert_eq!(r.candidates_scanned, 1);
+        assert_eq!(r.nearest.expect("embedded match").id, id_embedded);
     }
 
     #[test]

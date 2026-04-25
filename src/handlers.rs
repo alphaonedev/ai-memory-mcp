@@ -1908,6 +1908,123 @@ pub async fn get_taxonomy(
     }
 }
 
+/// Request body for `POST /api/v1/check_duplicate` (Pillar 2 / Stream D).
+#[derive(Debug, Deserialize)]
+pub struct CheckDuplicateBody {
+    pub title: String,
+    pub content: String,
+    /// Restrict the duplicate scan to this namespace. Omit to scan all
+    /// namespaces.
+    pub namespace: Option<String>,
+    /// Cosine similarity threshold for declaring a duplicate. Clamped
+    /// to >= 0.5 inside `db::check_duplicate`. Defaults to the tuned
+    /// `DUPLICATE_THRESHOLD_DEFAULT` when omitted.
+    pub threshold: Option<f32>,
+}
+
+/// `POST /api/v1/check_duplicate` — REST mirror of the MCP
+/// `memory_check_duplicate` tool. Embeds `title + content`, scans
+/// embedded live memories, and returns the highest-cosine match plus
+/// `is_duplicate`/`suggested_merge` derived from the (clamped)
+/// threshold.
+pub async fn check_duplicate(
+    State(app): State<AppState>,
+    Json(body): Json<CheckDuplicateBody>,
+) -> impl IntoResponse {
+    if let Err(e) = validate::validate_title(&body.title) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("invalid title: {e}")})),
+        )
+            .into_response();
+    }
+    if let Err(e) = validate::validate_content(&body.content) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("invalid content: {e}")})),
+        )
+            .into_response();
+    }
+    let namespace = body
+        .namespace
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(ns) = namespace
+        && let Err(e) = validate::validate_namespace(ns)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("invalid namespace: {e}")})),
+        )
+            .into_response();
+    }
+    let threshold = body.threshold.unwrap_or(db::DUPLICATE_THRESHOLD_DEFAULT);
+
+    // Embed before taking the DB lock — same rationale as create_memory
+    // (issue #219). The embedder call is 10-200ms; we don't want it
+    // serialised behind the connection mutex.
+    let embedding_text = format!("{} {}", body.title, body.content);
+    let query_embedding = match app.embedder.as_ref().as_ref() {
+        Some(emb) => match emb.embed(&embedding_text) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("embedding generation failed: {e}");
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"error": "embedder failed to encode input"})),
+                )
+                    .into_response();
+            }
+        },
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "error": "memory_check_duplicate requires the embedder; daemon must be started with semantic tier or above"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let lock = app.db.lock().await;
+    let check = match db::check_duplicate(&lock.0, &query_embedding, namespace, threshold) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("handler error: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "internal server error"})),
+            )
+                .into_response();
+        }
+    };
+
+    let nearest_json = check.nearest.as_ref().map(|m| {
+        json!({
+            "id": m.id,
+            "title": m.title,
+            "namespace": m.namespace,
+            "similarity": (m.similarity * 1000.0).round() / 1000.0,
+        })
+    });
+    let suggested_merge = if check.is_duplicate {
+        check.nearest.as_ref().map(|m| m.id.clone())
+    } else {
+        None
+    };
+
+    Json(json!({
+        "is_duplicate": check.is_duplicate,
+        "threshold": check.threshold,
+        "nearest": nearest_json,
+        "suggested_merge": suggested_merge,
+        "candidates_scanned": check.candidates_scanned,
+    }))
+    .into_response()
+}
+
 pub async fn create_link(
     State(app): State<AppState>,
     Json(body): Json<LinkBody>,
