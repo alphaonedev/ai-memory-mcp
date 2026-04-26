@@ -5168,9 +5168,9 @@ mod tests {
     fn sanitize_fts_strips_operators_and_quotes() {
         // FTS5 special chars: " * ^ { } ( ) : - | are stripped
         let sanitized = sanitize_fts_query("test* \"injection\" (drop)", true);
-        assert!(!sanitized.contains("*"));
-        assert!(!sanitized.contains("("));
-        assert!(!sanitized.contains(")"));
+        assert!(!sanitized.contains('*'));
+        assert!(!sanitized.contains('('));
+        assert!(!sanitized.contains(')'));
         // Standalone boolean operators are removed
         let sanitized2 = sanitize_fts_query("hello AND world OR NOT NEAR test", true);
         assert!(sanitized2.contains("hello"));
