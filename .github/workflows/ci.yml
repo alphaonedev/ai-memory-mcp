@@ -452,20 +452,28 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: rustfmt, clippy, llvm-tools-preview
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install tarpaulin
-        run: cargo install cargo-tarpaulin --locked
+      # v0.6.3 W12-CI-fix: switched from cargo-tarpaulin to cargo-llvm-cov.
+      # tarpaulin 0.32.x trips a `pulp` 0.22.2 const-eval panic
+      # (`CheckSameSize::<i8, u16>::VALID`) under its source-based
+      # instrumentation. llvm-cov uses LLVM-native source-based instrumentation
+      # which doesn't hit the bug, and matches the canonical local measurement
+      # command the coverage campaign used (93.05% headline number).
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
 
-      - name: Generate coverage with branch flag
+      - name: Generate coverage report
         env:
           AI_MEMORY_NO_CONFIG: "1"
-        run: cargo tarpaulin --out Html --output-dir coverage --timeout 300 --exclude-files tests/* --exclude-files benches/*
+        run: |
+          cargo llvm-cov --features sal --no-fail-fast --html --output-dir coverage -- --test-threads=2
+          cargo llvm-cov report --features sal --summary-only | tee coverage/summary.txt
 
       - name: Upload coverage report
         uses: actions/upload-artifact@v5
         with:
           name: coverage-report
-          path: coverage/tarpaulin-report.html
+          path: coverage/
