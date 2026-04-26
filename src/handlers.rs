@@ -9517,4 +9517,1059 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
+
+    // ====================================================================
+    // W8/H8d — dual-form `*_qs` namespace handlers + `fanout_or_503` matrix
+    // --------------------------------------------------------------------
+    // `set/get/clear_namespace_standard_qs` are the query-string twins of
+    // the path-form handlers used by S34/S35 (`/api/v1/namespaces?namespace=…`).
+    // The QS-form arms were uncovered prior to this batch — both the
+    // happy paths and the 400-on-missing-namespace branches needed direct
+    // exercise. The `fanout_or_503` 503 paths are exercised through the
+    // QS-form `set` handler (`set_namespace_standard_inner` calls
+    // `fanout_or_503` for the standard memory and then
+    // `broadcast_namespace_meta_quorum` for the meta row); the same
+    // mock-peer helper used by the W3 federation tests drives both.
+    // ====================================================================
+
+    // --- helpers shared across the W8/H8d tests --------------------------
+
+    /// Spawn a mock peer that records every `POST /api/v1/sync/push` and
+    /// responds according to `behaviour`. Returns the base URL and the
+    /// shared call-counter so tests can both target the peer and assert
+    /// how many fanout POSTs reached it.
+    async fn h8d_spawn_mock_peer(
+        behaviour: H8dPeerBehaviour,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_for_peer = count.clone();
+        #[derive(Clone)]
+        struct PeerState {
+            count: Arc<AtomicUsize>,
+            behaviour: H8dPeerBehaviour,
+        }
+        async fn handler(
+            axum::extract::State(s): axum::extract::State<PeerState>,
+            Json(_body): Json<serde_json::Value>,
+        ) -> (StatusCode, Json<serde_json::Value>) {
+            s.count.fetch_add(1, Ordering::Relaxed);
+            match s.behaviour {
+                H8dPeerBehaviour::Ack => (
+                    StatusCode::OK,
+                    Json(json!({"applied": 1, "noop": 0, "skipped": 0})),
+                ),
+                H8dPeerBehaviour::Fail500 => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "stub failure"})),
+                ),
+                H8dPeerBehaviour::Fail503 => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"error": "stub unavailable"})),
+                ),
+                H8dPeerBehaviour::Fail400 => (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": "stub bad request"})),
+                ),
+                H8dPeerBehaviour::Hang => {
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                    (StatusCode::OK, Json(json!({"applied": 1})))
+                }
+            }
+        }
+        let app = Router::new()
+            .route("/api/v1/sync/push", axum_post(handler))
+            .with_state(PeerState {
+                count: count_for_peer,
+                behaviour,
+            });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        (format!("http://{addr}"), count)
+    }
+
+    #[derive(Clone, Copy)]
+    enum H8dPeerBehaviour {
+        /// Always returns 200 OK with the standard ack envelope.
+        Ack,
+        /// Always returns 500 Internal Server Error.
+        Fail500,
+        /// Always returns 503 Service Unavailable.
+        Fail503,
+        /// Always returns 400 Bad Request.
+        Fail400,
+        /// Sleeps 10s before responding — exercises timeout / unreachable
+        /// classification when `--quorum-timeout-ms` is shorter.
+        Hang,
+    }
+
+    /// Build an `AppState` wired to a `FederationConfig` that points at
+    /// `peer_urls` with quorum width `w` and the given timeout. Mirrors
+    /// the construction used by `http_bulk_create_fans_out_with_federation`.
+    fn h8d_app_state_with_fed(
+        db: Db,
+        peer_urls: Vec<String>,
+        w: usize,
+        timeout_ms: u64,
+    ) -> AppState {
+        let fed = crate::federation::FederationConfig::build(
+            w,
+            &peer_urls,
+            std::time::Duration::from_millis(timeout_ms),
+            None,
+            None,
+            None,
+            "ai:h8d-test".to_string(),
+        )
+        .unwrap()
+        .expect("federation must be built");
+        AppState {
+            db,
+            embedder: Arc::new(None),
+            vector_index: Arc::new(Mutex::new(None)),
+            federation: Arc::new(Some(fed)),
+            tier_config: Arc::new(crate::config::FeatureTier::Keyword.config()),
+            scoring: Arc::new(crate::config::ResolvedScoring::default()),
+        }
+    }
+
+    // --- get_namespace_standard_qs --------------------------------------
+
+    #[tokio::test]
+    async fn http_get_namespace_standard_qs_returns_standard_for_existing_ns() {
+        // Pre-seed a namespace standard via the inner DB call so we can
+        // assert the QS handler reads it back. We use the path-form set
+        // handler with no federation so the write is local-only.
+        let state = test_state();
+        let app_state = test_app_state(state.clone());
+        let set_router = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/standard",
+                axum_post(set_namespace_standard),
+            )
+            .with_state(app_state);
+        let resp = set_router
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces/qs-existing/standard")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&json!({})).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // Now fetch via the QS form. Should return 200 with the standard
+        // payload (namespace + standard_id).
+        let get_router = Router::new()
+            .route(
+                "/api/v1/namespaces",
+                axum::routing::get(get_namespace_standard_qs),
+            )
+            .with_state(state);
+        let resp = get_router
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces?namespace=qs-existing")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["namespace"], "qs-existing");
+        assert!(v["standard_id"].is_string(), "standard_id must be set");
+    }
+
+    #[tokio::test]
+    async fn http_get_namespace_standard_qs_returns_null_for_missing_ns_record() {
+        // A namespace that has never had a standard set returns the same
+        // `{namespace, standard_id: null}` envelope the path-form does —
+        // the MCP handler differentiates by `standard_id == null`.
+        let state = test_state();
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces",
+                axum::routing::get(get_namespace_standard_qs),
+            )
+            .with_state(state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces?namespace=qs-never-set")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["namespace"], "qs-never-set");
+        assert!(
+            v["standard_id"].is_null(),
+            "standard_id must be null for an unset namespace"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_get_namespace_standard_qs_falls_through_to_list_on_missing_param() {
+        // The QS-form GET deliberately reuses the bare /api/v1/namespaces
+        // route — when `?namespace=` is absent it must delegate to
+        // `list_namespaces`, NOT 400. This pins the chained-route contract
+        // documented inline at the handler.
+        let state = test_state();
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces",
+                axum::routing::get(get_namespace_standard_qs),
+            )
+            .with_state(state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            v["namespaces"].is_array(),
+            "fallthrough must produce the list shape, got {v:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_get_namespace_standard_qs_inherit_flag_returns_chain() {
+        // Cover the `?inherit=true` arm, which routes through the
+        // `chain` / `standards` branch of `handle_namespace_get_standard`.
+        let state = test_state();
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces",
+                axum::routing::get(get_namespace_standard_qs),
+            )
+            .with_state(state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces?namespace=child&inherit=true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v["chain"].is_array(), "inherit must surface the chain");
+        assert!(v["standards"].is_array());
+    }
+
+    #[tokio::test]
+    async fn http_get_namespace_standard_qs_invalid_namespace_returns_400() {
+        // Ultrareview #337 — URL-decoded namespace flows through
+        // `validate_namespace`. A namespace with disallowed bytes must
+        // surface as 400 from the handler, not 500.
+        let state = test_state();
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces",
+                axum::routing::get(get_namespace_standard_qs),
+            )
+            .with_state(state);
+        // Spaces decode out of `%20` and fail `validate_namespace`.
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces?namespace=bad%20ns")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // --- set_namespace_standard_qs --------------------------------------
+
+    #[tokio::test]
+    async fn http_set_namespace_standard_qs_happy_path_creates_placeholder() {
+        // Body carries `namespace` (S34 shape, no URL segment). With no
+        // federation configured the inner fn auto-seeds a placeholder
+        // standard memory and returns 201 CREATED.
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/namespaces", axum_post(set_namespace_standard_qs))
+            .with_state(test_app_state(state.clone()));
+        let body = json!({"namespace": "qs-set-happy"});
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["namespace"], "qs-set-happy");
+        assert_eq!(v["set"], true);
+        assert!(v["standard_id"].is_string());
+    }
+
+    #[tokio::test]
+    async fn http_set_namespace_standard_qs_missing_namespace_returns_400() {
+        // No `namespace` in body and no nested `standard.namespace` —
+        // the QS-form set handler bails with 400 before touching the DB.
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/namespaces", axum_post(set_namespace_standard_qs))
+            .with_state(test_app_state(state));
+        let body = json!({"governance": {"approver": "human"}});
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            v["error"].as_str().unwrap_or("").contains("namespace"),
+            "error must mention the missing namespace, got {v:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_set_namespace_standard_qs_invalid_governance_returns_400() {
+        // Pre-seed a real memory we can target by id, so we get past the
+        // placeholder branch and into `validate_governance_policy`.
+        let state = test_state();
+        let mem_id = {
+            let lock = state.lock().await;
+            let now = Utc::now().to_rfc3339();
+            let mem = Memory {
+                id: Uuid::new_v4().to_string(),
+                tier: Tier::Long,
+                namespace: "qs-set-bad-policy".into(),
+                title: "anchor".into(),
+                content: "anchor".into(),
+                tags: vec![],
+                priority: 5,
+                confidence: 1.0,
+                source: "test".into(),
+                access_count: 0,
+                created_at: now.clone(),
+                updated_at: now,
+                last_accessed_at: None,
+                expires_at: None,
+                metadata: serde_json::json!({}),
+            };
+            db::insert(&lock.0, &mem).unwrap()
+        };
+        let app = Router::new()
+            .route("/api/v1/namespaces", axum_post(set_namespace_standard_qs))
+            .with_state(test_app_state(state));
+        // `consensus: 0` is always invalid (validator rejects it).
+        let body = json!({
+            "namespace": "qs-set-bad-policy",
+            "id": mem_id,
+            "governance": {
+                "approver": {"consensus": 0},
+                "write": "approve",
+                "promote": "log",
+                "delete": "log"
+            }
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn http_set_namespace_standard_qs_nested_standard_payload_works() {
+        // S34's body shape nests fields under `standard: { … }`. The
+        // QS-form set handler must read either `body.namespace` or
+        // `body.standard.namespace`. This exercises the second arm.
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/namespaces", axum_post(set_namespace_standard_qs))
+            .with_state(test_app_state(state));
+        let body = json!({"standard": {"namespace": "qs-nested-ns"}});
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["namespace"], "qs-nested-ns");
+    }
+
+    // --- clear_namespace_standard_qs ------------------------------------
+
+    #[tokio::test]
+    async fn http_clear_namespace_standard_qs_happy_path_after_set() {
+        // Set then clear. Clear must return 200 with `{cleared: true|…}`.
+        let state = test_state();
+        let app_state = test_app_state(state.clone());
+        let set_router = Router::new()
+            .route("/api/v1/namespaces", axum_post(set_namespace_standard_qs))
+            .with_state(app_state.clone());
+        let _ = set_router
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({"namespace": "qs-clear-happy"})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let clear_router = Router::new()
+            .route(
+                "/api/v1/namespaces",
+                axum::routing::delete(clear_namespace_standard_qs),
+            )
+            .with_state(app_state);
+        let resp = clear_router
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces?namespace=qs-clear-happy")
+                    .method("DELETE")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["namespace"], "qs-clear-happy");
+    }
+
+    #[tokio::test]
+    async fn http_clear_namespace_standard_qs_idempotent_on_unset() {
+        // Clearing a namespace that has no standard set is a no-op
+        // success (idempotency). The MCP handler returns
+        // `{cleared: <bool>, namespace}` rather than 404.
+        let state = test_state();
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces",
+                axum::routing::delete(clear_namespace_standard_qs),
+            )
+            .with_state(test_app_state(state));
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces?namespace=qs-clear-noop")
+                    .method("DELETE")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn http_clear_namespace_standard_qs_missing_namespace_returns_400() {
+        // No `?namespace=…` → 400 BadRequest with an `error` payload that
+        // names the missing field.
+        let state = test_state();
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces",
+                axum::routing::delete(clear_namespace_standard_qs),
+            )
+            .with_state(test_app_state(state));
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces")
+                    .method("DELETE")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            v["error"].as_str().unwrap_or("").contains("namespace"),
+            "error must mention namespace, got {v:?}"
+        );
+    }
+
+    // --- fanout_or_503 / quorum_not_met error matrix --------------------
+
+    #[tokio::test]
+    async fn http_set_qs_fanout_503_when_all_peers_down() {
+        // Single peer, W=2 (local + 1 peer required). Peer 500s on every
+        // POST → cannot meet quorum → 503 `quorum_not_met` payload.
+        let state = test_state();
+        let (peer_url, _count) = h8d_spawn_mock_peer(H8dPeerBehaviour::Fail500).await;
+        let app_state = h8d_app_state_with_fed(state, vec![peer_url], 2, 1500);
+        let app = Router::new()
+            .route("/api/v1/namespaces", axum_post(set_namespace_standard_qs))
+            .with_state(app_state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({"namespace": "qs-fed-down"})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn http_set_qs_fanout_503_payload_shape_includes_quorum_fields() {
+        // The 503 body must round-trip through `QuorumNotMetPayload` and
+        // surface `error="quorum_not_met"`, `got`, `needed`, `reason`.
+        // Single peer down @ W=2 → got=1 (local), needed=2, reason names
+        // the failure (unreachable / 500 → "unreachable").
+        let state = test_state();
+        let (peer_url, _count) = h8d_spawn_mock_peer(H8dPeerBehaviour::Fail500).await;
+        let app_state = h8d_app_state_with_fed(state, vec![peer_url], 2, 1500);
+        let app = Router::new()
+            .route("/api/v1/namespaces", axum_post(set_namespace_standard_qs))
+            .with_state(app_state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({"namespace": "qs-503-shape"})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"], "quorum_not_met");
+        assert!(v["got"].as_u64().is_some(), "got must be a number");
+        assert!(v["needed"].as_u64().is_some(), "needed must be a number");
+        assert!(v["reason"].is_string(), "reason must be a string");
+        // Local always commits → got >= 1; needed must equal W=2.
+        assert_eq!(v["needed"].as_u64().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn http_set_qs_fanout_503_includes_retry_after_header() {
+        // The 503 path returns a `Retry-After: 2` header so clients can
+        // back off without parsing the body.
+        let state = test_state();
+        let (peer_url, _count) = h8d_spawn_mock_peer(H8dPeerBehaviour::Fail500).await;
+        let app_state = h8d_app_state_with_fed(state, vec![peer_url], 2, 1500);
+        let app = Router::new()
+            .route("/api/v1/namespaces", axum_post(set_namespace_standard_qs))
+            .with_state(app_state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({"namespace": "qs-503-retry-after"})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let retry = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(retry, "2", "503 must include Retry-After: 2");
+    }
+
+    #[tokio::test]
+    async fn http_set_qs_fanout_quorum_met_with_one_peer_down() {
+        // N=3, W=2 (majority). One peer 500s, one peer acks → quorum
+        // met → 201 CREATED. Exercises the quorum-not-all-fail success
+        // branch of `fanout_or_503` (`Ok(_) => None`).
+        let state = test_state();
+        let (peer_up, _) = h8d_spawn_mock_peer(H8dPeerBehaviour::Ack).await;
+        let (peer_down, _) = h8d_spawn_mock_peer(H8dPeerBehaviour::Fail500).await;
+        let app_state = h8d_app_state_with_fed(state, vec![peer_up, peer_down], 2, 1500);
+        let app = Router::new()
+            .route("/api/v1/namespaces", axum_post(set_namespace_standard_qs))
+            .with_state(app_state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({"namespace": "qs-quorum-met"})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn http_set_qs_fanout_quorum_not_met_strict_n_equals_w() {
+        // N=2, W=2 (all-or-nothing). Single peer down → 1/2 acks → 503.
+        // This is the "strict" all-acks-required posture (W=N).
+        let state = test_state();
+        let (peer_url, _) = h8d_spawn_mock_peer(H8dPeerBehaviour::Fail500).await;
+        let app_state = h8d_app_state_with_fed(state, vec![peer_url], 2, 1500);
+        let app = Router::new()
+            .route("/api/v1/namespaces", axum_post(set_namespace_standard_qs))
+            .with_state(app_state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({"namespace": "qs-strict-quorum"})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["needed"].as_u64().unwrap(), 2);
+        // got must be < needed in the failure case.
+        assert!(v["got"].as_u64().unwrap() < v["needed"].as_u64().unwrap());
+    }
+
+    #[tokio::test]
+    async fn http_set_qs_fanout_quorum_w_equals_one_any_success_writes_succeed() {
+        // W=1 → local commit alone is enough; peer down doesn't 503.
+        // This exercises the `K=1` (any-success) row in the matrix.
+        let state = test_state();
+        let (peer_url, _) = h8d_spawn_mock_peer(H8dPeerBehaviour::Fail500).await;
+        let app_state = h8d_app_state_with_fed(state, vec![peer_url], 1, 1500);
+        let app = Router::new()
+            .route("/api/v1/namespaces", axum_post(set_namespace_standard_qs))
+            .with_state(app_state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({"namespace": "qs-w1-any"})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn http_set_qs_fanout_503_when_peer_hangs_past_deadline() {
+        // Hanging peer + tight deadline → quorum_not_met with reason
+        // "timeout" or "unreachable" (depending on whether the request
+        // returned an error before the deadline). Either way → 503.
+        let state = test_state();
+        let (peer_url, _) = h8d_spawn_mock_peer(H8dPeerBehaviour::Hang).await;
+        let app_state = h8d_app_state_with_fed(state, vec![peer_url], 2, 200);
+        let app = Router::new()
+            .route("/api/v1/namespaces", axum_post(set_namespace_standard_qs))
+            .with_state(app_state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({"namespace": "qs-hang"})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let reason = v["reason"].as_str().unwrap_or("");
+        assert!(
+            reason == "timeout" || reason == "unreachable",
+            "expected timeout/unreachable, got {reason:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_set_qs_fanout_503_when_peer_returns_503() {
+        // A peer that itself replies 503 (overloaded) is still a
+        // failed ack. The leader's 503 response carries the federation
+        // payload, not the peer's. (Smoke-tests that 5xx-class peers
+        // beyond just 500 also count as failures.)
+        let state = test_state();
+        let (peer_url, _) = h8d_spawn_mock_peer(H8dPeerBehaviour::Fail503).await;
+        let app_state = h8d_app_state_with_fed(state, vec![peer_url], 2, 1500);
+        let app = Router::new()
+            .route("/api/v1/namespaces", axum_post(set_namespace_standard_qs))
+            .with_state(app_state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({"namespace": "qs-peer-503"})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"], "quorum_not_met");
+    }
+
+    #[tokio::test]
+    async fn http_set_qs_fanout_503_when_peer_returns_4xx() {
+        // 4xx from a peer also counts as a failed ack — the federation
+        // ack tracker requires a 200 to count toward quorum. (Closes the
+        // "200 + 4xx from peers" matrix row.)
+        let state = test_state();
+        let (peer_url, _) = h8d_spawn_mock_peer(H8dPeerBehaviour::Fail400).await;
+        let app_state = h8d_app_state_with_fed(state, vec![peer_url], 2, 1500);
+        let app = Router::new()
+            .route("/api/v1/namespaces", axum_post(set_namespace_standard_qs))
+            .with_state(app_state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({"namespace": "qs-peer-400"})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn http_set_qs_fanout_503_partition_minority_fails() {
+        // N=4 (local + 3 peers), W=3 (majority). Two peers down, one
+        // up → can't meet quorum (got = 2, needed = 3) → 503.
+        let state = test_state();
+        let (up, _) = h8d_spawn_mock_peer(H8dPeerBehaviour::Ack).await;
+        let (down1, _) = h8d_spawn_mock_peer(H8dPeerBehaviour::Fail500).await;
+        let (down2, _) = h8d_spawn_mock_peer(H8dPeerBehaviour::Fail500).await;
+        let app_state = h8d_app_state_with_fed(state, vec![up, down1, down2], 3, 1500);
+        let app = Router::new()
+            .route("/api/v1/namespaces", axum_post(set_namespace_standard_qs))
+            .with_state(app_state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({"namespace": "qs-minority"})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["needed"].as_u64().unwrap(), 3);
+        assert!(v["got"].as_u64().unwrap() < 3);
+    }
+
+    #[tokio::test]
+    async fn http_set_qs_fanout_majority_tolerates_minority_partition() {
+        // N=4, W=3 (majority). Two peers up, one down → quorum met
+        // (got = 3 ≥ needed = 3) → 201 CREATED. Mirror of the previous
+        // test but with the failure flipped into a success.
+        let state = test_state();
+        let (up1, _) = h8d_spawn_mock_peer(H8dPeerBehaviour::Ack).await;
+        let (up2, _) = h8d_spawn_mock_peer(H8dPeerBehaviour::Ack).await;
+        let (down, _) = h8d_spawn_mock_peer(H8dPeerBehaviour::Fail500).await;
+        let app_state = h8d_app_state_with_fed(state, vec![up1, up2, down], 3, 1500);
+        let app = Router::new()
+            .route("/api/v1/namespaces", axum_post(set_namespace_standard_qs))
+            .with_state(app_state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({"namespace": "qs-majority"})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn http_clear_qs_fanout_503_when_peer_down() {
+        // The CLEAR path uses `broadcast_namespace_meta_clear_quorum`,
+        // a different fanout function from `fanout_or_503`. Both share
+        // the QuorumNotMetPayload contract and Retry-After=2 header.
+        // This test exercises the clear-side 503 lane.
+        let state = test_state();
+        // Pre-seed a namespace standard so the clear has something to do.
+        // We do this with no federation by using a separate AppState.
+        let local_app_state = test_app_state(state.clone());
+        let set_router = Router::new()
+            .route("/api/v1/namespaces", axum_post(set_namespace_standard_qs))
+            .with_state(local_app_state);
+        let _ = set_router
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({"namespace": "qs-clear-fed"})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let (peer_url, _) = h8d_spawn_mock_peer(H8dPeerBehaviour::Fail500).await;
+        let app_state = h8d_app_state_with_fed(state, vec![peer_url], 2, 1500);
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces",
+                axum::routing::delete(clear_namespace_standard_qs),
+            )
+            .with_state(app_state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces?namespace=qs-clear-fed")
+                    .method("DELETE")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let retry = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(retry, "2", "clear 503 must include Retry-After: 2");
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"], "quorum_not_met");
+    }
+
+    #[tokio::test]
+    async fn http_set_qs_fanout_no_federation_returns_201_without_peers() {
+        // No `--quorum-peers` configured → `app.federation` is None →
+        // `fanout_or_503` short-circuits to None and the handler returns
+        // 201 without any peer involvement. Pins the no-fed branch.
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/namespaces", axum_post(set_namespace_standard_qs))
+            .with_state(test_app_state(state));
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({"namespace": "qs-no-fed"})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn http_set_qs_fanout_peer_called_at_least_once_on_quorum_failure() {
+        // Even when quorum fails, the leader must have *attempted* to
+        // POST to the peer at least once. This guards against the
+        // pre-flight short-circuit that would skip the fanout entirely.
+        use std::sync::atomic::Ordering;
+
+        let state = test_state();
+        let (peer_url, count) = h8d_spawn_mock_peer(H8dPeerBehaviour::Fail500).await;
+        let app_state = h8d_app_state_with_fed(state, vec![peer_url], 2, 1500);
+        let app = Router::new()
+            .route("/api/v1/namespaces", axum_post(set_namespace_standard_qs))
+            .with_state(app_state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({"namespace": "qs-fanout-attempt"})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // Wait briefly for any retry to settle so the count is stable.
+        for _ in 0..50 {
+            if count.load(Ordering::Relaxed) >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            count.load(Ordering::Relaxed) >= 1,
+            "leader must have attempted the fanout POST at least once"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_set_qs_fanout_peer_receives_post_on_happy_path() {
+        // Counterpart to the failure-attempt test: on a happy path,
+        // exactly one peer-side POST per fanout completes within a
+        // short settle window.
+        use std::sync::atomic::Ordering;
+
+        let state = test_state();
+        let (peer_url, count) = h8d_spawn_mock_peer(H8dPeerBehaviour::Ack).await;
+        let app_state = h8d_app_state_with_fed(state, vec![peer_url], 2, 1500);
+        let app = Router::new()
+            .route("/api/v1/namespaces", axum_post(set_namespace_standard_qs))
+            .with_state(app_state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({"namespace": "qs-fanout-happy"})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        // The set path triggers TWO fanout POSTs to each peer: one for
+        // the standard memory (`fanout_or_503`) and one for the
+        // namespace_meta row (`broadcast_namespace_meta_quorum`). Wait
+        // for at least one to land — the second may be background-detached.
+        for _ in 0..50 {
+            if count.load(Ordering::Relaxed) >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(count.load(Ordering::Relaxed) >= 1);
+    }
 }
