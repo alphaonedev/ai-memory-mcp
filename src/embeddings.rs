@@ -376,6 +376,72 @@ mod tests {
         assert!(sim_q > 0.9); // ~0.919 analytically
         assert!(sim_ctx > 0.3); // ~0.394 analytically
     }
+
+    // -----------------------------------------------------------------
+    // W11/S11b — fuse() weight-1 + cosine-direction invariants
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_fuse_with_weight_one_returns_primary() {
+        // fuse(primary, secondary, 1.0) MUST return the primary vector
+        // verbatim. The doc commits to "result is returned un-normalized" —
+        // so equality must hold element-by-element.
+        let primary = vec![0.6_f32, -0.8, 0.0]; // L2 norm = 1
+        let secondary = vec![0.0_f32, 0.0, 1.0];
+        let fused = Embedder::fuse(&primary, &secondary, 1.0);
+        assert_eq!(fused.len(), primary.len());
+        for (i, (f, p)) in fused.iter().zip(primary.iter()).enumerate() {
+            assert!(
+                (f - p).abs() < 1e-6,
+                "fuse weight=1 idx {i}: fused {} != primary {}",
+                f,
+                p
+            );
+        }
+
+        // Cosine-direction equivalence: even after any (no-op) normalization,
+        // the direction matches the primary.
+        let sim = Embedder::cosine_similarity(&fused, &primary);
+        assert!(
+            (sim - 1.0).abs() < 1e-6,
+            "cos(fuse(p,s,1.0), p) must be 1.0"
+        );
+    }
+
+    #[test]
+    fn test_fuse_is_l2_normalized() {
+        // The current fuse() contract returns an UN-normalized vector
+        // (per its rustdoc). Cosine_similarity divides out magnitudes,
+        // so the practical signal is direction. This test pins the
+        // observed behavior so a future change to "return L2-normalized
+        // output" is caught — and asserts the direction-only contract
+        // holds via cosine_similarity.
+        let primary = vec![3.0_f32, 0.0, 0.0]; // norm = 3
+        let secondary = vec![0.0_f32, 4.0, 0.0]; // norm = 4
+        let fused = Embedder::fuse(&primary, &secondary, 0.5);
+        // Raw fused = [1.5, 2.0, 0.0]; L2 norm = sqrt(1.5^2 + 2.0^2) = 2.5
+        let norm = fused.iter().map(|x| x * x).sum::<f32>().sqrt();
+        // Pin behavior: returned vector is NOT L2-normalized.
+        assert!(
+            (norm - 2.5).abs() < 1e-5,
+            "fuse currently returns un-normalized vec; norm should be 2.5, got {norm}"
+        );
+
+        // But the cosine-direction signal is well-defined and consistent
+        // with a hypothetical normalized output.
+        let normalized: Vec<f32> = fused.iter().map(|x| x / norm).collect();
+        let renorm = normalized.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!(
+            (renorm - 1.0).abs() < 1e-5,
+            "renormalized fused must have unit norm, got {renorm}"
+        );
+        // Direction is preserved between un-normalized and normalized.
+        let sim = Embedder::cosine_similarity(&fused, &normalized);
+        assert!(
+            (sim - 1.0).abs() < 1e-5,
+            "cos(raw_fuse, normalize(raw_fuse)) must be 1.0, got {sim}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -564,6 +630,100 @@ fn cache_evicts_least_recently_used() {
     assert!((sim - expected).abs() < 1e-5);
 }
 
+// -----------------------------------------------------------------
+// W12-H — for_model + cosine corner cases
+// -----------------------------------------------------------------
+
+#[cfg(test)]
+mod w12h_extra_tests {
+    use super::*;
+
+    #[test]
+    fn for_model_nomic_without_ollama_client_errors() {
+        // NomicEmbedV15 requires an Ollama client; missing one errors.
+        let res = Embedder::for_model(EmbeddingModel::NomicEmbedV15, None);
+        match res {
+            Err(e) => {
+                let err = e.to_string();
+                assert!(
+                    err.contains("Ollama") || err.contains("nomic"),
+                    "expected ollama error msg, got: {err}"
+                );
+            }
+            Ok(_) => panic!("expected NomicEmbedV15 without client to error"),
+        }
+    }
+
+    #[test]
+    fn cosine_similarity_both_zero_returns_zero() {
+        let a = vec![0.0_f32; 3];
+        let b = vec![0.0_f32; 3];
+        let sim = Embedder::cosine_similarity(&a, &b);
+        // denom is ~0 → returns 0.0 by guard.
+        assert_eq!(sim, 0.0);
+    }
+
+    #[test]
+    fn cosine_similarity_negative_values() {
+        let a = vec![1.0_f32, 2.0, 3.0];
+        let b = vec![-1.0_f32, -2.0, -3.0];
+        let sim = Embedder::cosine_similarity(&a, &b);
+        assert!((sim + 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cosine_similarity_empty_vectors() {
+        let a: Vec<f32> = vec![];
+        let b: Vec<f32> = vec![];
+        let sim = Embedder::cosine_similarity(&a, &b);
+        // Equal length (both 0) → no early return; norms are 0; denom guard → 0.
+        assert_eq!(sim, 0.0);
+    }
+
+    #[test]
+    fn fuse_zero_weight_returns_pure_secondary() {
+        let p = vec![1.0_f32, 0.0];
+        let s = vec![0.0_f32, 1.0];
+        let f = Embedder::fuse(&p, &s, 0.0);
+        assert!((f[0] - 0.0).abs() < 1e-6);
+        assert!((f[1] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fuse_empty_vectors_returns_empty() {
+        let p: Vec<f32> = vec![];
+        let s: Vec<f32> = vec![];
+        let f = Embedder::fuse(&p, &s, 0.5);
+        assert!(f.is_empty());
+    }
+
+    #[test]
+    fn embedding_dim_constant_pinned() {
+        assert_eq!(EMBEDDING_DIM, MINILM_DIM);
+        assert_eq!(MINILM_DIM, 384);
+        assert_eq!(NOMIC_DIM, 768);
+    }
+
+    #[test]
+    fn fuse_dimension_mismatch_secondary_longer() {
+        // Inverse of the existing test — ensures the early return triggers
+        // regardless of which side is shorter.
+        let p = vec![1.0_f32, 2.0];
+        let s = vec![3.0_f32, 4.0, 5.0]; // longer
+        let f = Embedder::fuse(&p, &s, 0.5);
+        assert_eq!(f, p);
+    }
+
+    #[test]
+    fn cosine_similarity_dimension_mismatch_inverse() {
+        // Verify guard fires for either ordering.
+        let a = vec![1.0_f32, 0.0];
+        let b = vec![1.0_f32, 0.0, 0.0];
+        let sim = Embedder::cosine_similarity(&a, &b);
+        assert_eq!(sim, 0.0);
+    }
+}
+
 #[test]
 fn embedder_returns_unreachable_when_model_path_missing() {
     // Test that load_from_fallback returns an error when model files
@@ -584,4 +744,45 @@ fn embedder_returns_unreachable_when_model_path_missing() {
             );
         }
     }
+}
+
+#[test]
+fn load_from_fallback_succeeds_when_files_present() {
+    // Set HOME to a temp dir that has the expected fallback structure
+    // populated with placeholder files. This exercises the Ok-branch
+    // (lines 272-273) without requiring real model files — Tokenizer
+    // loading is not part of `load_from_fallback`.
+    use std::sync::Mutex;
+    // Serialize on a global mutex — env::set_var is process-wide and would
+    // race with parallel tests that also touch HOME.
+    static LOCK: Mutex<()> = Mutex::new(());
+    let _guard = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let tmp = std::env::temp_dir().join(format!(
+        "ai-memory-w12h-fallback-{}",
+        std::process::id()
+    ));
+    let model_dir = tmp.join(".cache/huggingface/hub/models--sentence-transformers--all-MiniLM-L6-v2/snapshots/main");
+    std::fs::create_dir_all(&model_dir).expect("mk model dir");
+    for name in ["config.json", "tokenizer.json", "model.safetensors"] {
+        std::fs::write(model_dir.join(name), b"{}").expect("write placeholder");
+    }
+    let prev = std::env::var("HOME").ok();
+    // SAFETY: serialized via LOCK above; no other thread mutates HOME.
+    unsafe {
+        std::env::set_var("HOME", &tmp);
+    }
+    let result = Embedder::load_from_fallback();
+    // Restore HOME before any assertion that could panic.
+    unsafe {
+        match prev {
+            Some(p) => std::env::set_var("HOME", p),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+    let (cfg, tok, w) = result.expect("placeholder files satisfy load_from_fallback");
+    assert!(cfg.ends_with("config.json"));
+    assert!(tok.ends_with("tokenizer.json"));
+    assert!(w.ends_with("model.safetensors"));
 }

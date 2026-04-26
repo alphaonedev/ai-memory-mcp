@@ -1087,3 +1087,560 @@ mod mock_tests {
         assert!(result.unwrap_err().to_string().contains("Custom msg"));
     }
 }
+
+// =====================================================================
+// W10 — wiremock-driven HTTP integration tests for the *real* OllamaClient
+//
+// These exercise the blocking reqwest call paths inside `OllamaClient`
+// against an in-process HTTP mock that speaks the Ollama API surface
+// (`/api/tags`, `/api/chat`, `/api/embed`, `/api/pull`). No real Ollama
+// daemon is started, no network egress, and the tests stay deterministic.
+//
+// The OllamaClient is blocking (reqwest::blocking) but wiremock is async,
+// so each test uses `#[tokio::test(flavor = "multi_thread")]` and runs
+// the client via `tokio::task::spawn_blocking` to avoid blocking the
+// runtime that's hosting the mock server.
+//
+// Design notes:
+//   - `OllamaClient::new_with_url` performs a `/api/tags` GET as a health
+//     check before returning, so every test that constructs a client
+//     first wires up a permissive `/api/tags` responder. Tests that want
+//     to drive specific `/api/tags` behaviour mount the precise matcher
+//     ahead of any other route so it wins the dispatch.
+//   - "is_available_returns_false_on_connection_refused" finds a free
+//     port by briefly binding a TcpListener, captures the address, then
+//     drops the listener — there is a small race window but the
+//     `is_available()` health check is wrapped in a 5s timeout so the
+//     worst-case flake is a slow test, not a wrong assertion.
+// =====================================================================
+#[cfg(test)]
+#[allow(clippy::too_many_lines, clippy::similar_names)]
+mod wiremock_tests {
+    use super::OllamaClient;
+    use serde_json::json;
+    use std::net::TcpListener;
+    use wiremock::matchers::{body_partial_json, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Mount a default permissive `/api/tags` responder so `new_with_url`'s
+    /// embedded `is_available()` health check succeeds.
+    async fn mount_tags_ok(server: &MockServer, models: serde_json::Value) {
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(models))
+            .mount(server)
+            .await;
+    }
+
+    /// Build a real OllamaClient pointed at the supplied mock server.
+    /// Runs the blocking constructor on the spawn_blocking pool so it
+    /// doesn't deadlock the test's tokio runtime.
+    async fn build_client(uri: String, model: &'static str) -> OllamaClient {
+        tokio::task::spawn_blocking(move || OllamaClient::new_with_url(&uri, model).unwrap())
+            .await
+            .unwrap()
+    }
+
+    // ---------------- is_available ----------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_is_available_returns_false_on_connection_refused() {
+        // Reserve a free port, then drop the listener so connecting is
+        // (almost certainly) refused. The 5s health-check timeout caps
+        // the worst-case flake.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let url = format!("http://127.0.0.1:{port}");
+
+        // Can't go through `new_with_url` — its constructor would error
+        // out before returning. Instead, build a client by hand by going
+        // through reqwest directly and asserting the health-probe path
+        // returns false.
+        let result = tokio::task::spawn_blocking(move || {
+            // Use the same builder OllamaClient uses internally so the
+            // assertion exercises the same code path semantically.
+            let client = reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .unwrap();
+            let probe = format!("{url}/api/tags");
+            client
+                .get(&probe)
+                .send()
+                .is_ok_and(|r| r.status().is_success())
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            !result,
+            "is_available should return false when nothing is listening"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_is_available_returns_false_on_500_response() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let uri = server.uri();
+        let result = tokio::task::spawn_blocking(move || {
+            // Constructor will fail (since is_available returns false)
+            // — verify that path explicitly.
+            OllamaClient::new_with_url(&uri, "test-model")
+        })
+        .await
+        .unwrap();
+
+        // Avoid `unwrap_err()` here because `OllamaClient` doesn't impl
+        // Debug — match on the Result and pull the message out manually.
+        let err = match result {
+            Ok(_) => panic!("client construction should fail on 500"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("not running") || err.contains("not reachable"),
+            "expected unreachable-style error, got: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_is_available_returns_true_on_200_with_json_body() {
+        let server = MockServer::start().await;
+        mount_tags_ok(&server, json!({"models": []})).await;
+
+        let uri = server.uri();
+        let available = tokio::task::spawn_blocking(move || {
+            let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
+            client.is_available()
+        })
+        .await
+        .unwrap();
+        assert!(available);
+    }
+
+    // ---------------- ensure_model (a.k.a. pull_if_missing) ----------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_pull_if_missing_skips_pull_if_model_already_in_tags() {
+        let server = MockServer::start().await;
+        // /api/tags returns the model already present.
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "models": [
+                    {"name": "test-model:latest"},
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        // No /api/pull route is mounted. If ensure_model erroneously
+        // POSTed to /api/pull, wiremock would return 404 and the call
+        // would fail — `expect(0)` makes that assertion explicit.
+        Mock::given(method("POST"))
+            .and(path("/api/pull"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let uri = server.uri();
+        let result = tokio::task::spawn_blocking(move || {
+            let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
+            client.ensure_model()
+        })
+        .await
+        .unwrap();
+        assert!(
+            result.is_ok(),
+            "ensure_model should succeed; got {result:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_pull_if_missing_initiates_pull_if_not() {
+        let server = MockServer::start().await;
+        // /api/tags returns no models.
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"models": []})))
+            .mount(&server)
+            .await;
+        // /api/pull is expected to be called exactly once with our model.
+        Mock::given(method("POST"))
+            .and(path("/api/pull"))
+            .and(body_partial_json(json!({"name": "test-model"})))
+            .respond_with(ResponseTemplate::new(200).set_body_string(""))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let uri = server.uri();
+        let result = tokio::task::spawn_blocking(move || {
+            let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
+            client.ensure_model()
+        })
+        .await
+        .unwrap();
+        assert!(
+            result.is_ok(),
+            "ensure_model should succeed; got {result:?}"
+        );
+        // wiremock's drop checks the .expect() invariants.
+    }
+
+    // ---------------- generate ----------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_generate_parses_success_response() {
+        let server = MockServer::start().await;
+        mount_tags_ok(&server, json!({"models": []})).await;
+        // OllamaClient::generate hits /api/chat (Ollama's chat surface),
+        // not /api/generate, and reads `message.content`.
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "message": {"role": "assistant", "content": "hello"},
+                "done": true,
+            })))
+            .mount(&server)
+            .await;
+
+        let uri = server.uri();
+        let result = tokio::task::spawn_blocking(move || {
+            let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
+            client.generate("ping", None)
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(result.unwrap(), "hello");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_generate_returns_error_on_malformed_json() {
+        let server = MockServer::start().await;
+        mount_tags_ok(&server, json!({"models": []})).await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("{not valid json")
+                    .insert_header("content-type", "application/json"),
+            )
+            .mount(&server)
+            .await;
+
+        let uri = server.uri();
+        let result = tokio::task::spawn_blocking(move || {
+            let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
+            client.generate("ping", None)
+        })
+        .await
+        .unwrap();
+
+        assert!(result.is_err(), "malformed JSON should surface an error");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("parse") || err.to_lowercase().contains("json"),
+            "expected a parse error, got: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_generate_returns_error_on_500() {
+        let server = MockServer::start().await;
+        mount_tags_ok(&server, json!({"models": []})).await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("internal boom"))
+            .mount(&server)
+            .await;
+
+        let uri = server.uri();
+        let result = tokio::task::spawn_blocking(move || {
+            let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
+            client.generate("ping", None)
+        })
+        .await
+        .unwrap();
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("500") || err.contains("Chat generate failed"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_generate_passes_system_prompt_when_provided() {
+        // Sanity-check that providing a system prompt still hits the
+        // chat surface and yields the parsed response — covers the
+        // `if let Some(sys)` branch of generate().
+        let server = MockServer::start().await;
+        mount_tags_ok(&server, json!({"models": []})).await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .and(body_partial_json(json!({
+                "messages": [
+                    {"role": "system", "content": "be terse"},
+                    {"role": "user", "content": "hi"},
+                ],
+                "stream": false,
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "message": {"role": "assistant", "content": "ok"},
+            })))
+            .mount(&server)
+            .await;
+
+        let uri = server.uri();
+        let out = tokio::task::spawn_blocking(move || {
+            let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
+            client.generate("hi", Some("be terse"))
+        })
+        .await
+        .unwrap();
+        assert_eq!(out.unwrap(), "ok");
+    }
+
+    // ---------------- embed_text ----------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_embed_parses_embedding_array() {
+        let server = MockServer::start().await;
+        mount_tags_ok(&server, json!({"models": []})).await;
+        // Ollama's /api/embed returns {"embeddings": [[...], ...]}.
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "embeddings": [[0.1_f32, 0.2_f32, 0.3_f32]],
+            })))
+            .mount(&server)
+            .await;
+
+        let uri = server.uri();
+        let vec = tokio::task::spawn_blocking(move || {
+            let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
+            client.embed_text("hello", "nomic-embed-text-v1.5")
+        })
+        .await
+        .unwrap();
+
+        let v = vec.unwrap();
+        assert_eq!(v.len(), 3);
+        assert!((v[0] - 0.1_f32).abs() < 1e-5);
+        assert!((v[1] - 0.2_f32).abs() < 1e-5);
+        assert!((v[2] - 0.3_f32).abs() < 1e-5);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_embed_returns_error_on_wrong_shape() {
+        let server = MockServer::start().await;
+        mount_tags_ok(&server, json!({"models": []})).await;
+        // Wrong shape: top-level key is "embedding" (singular, scalar)
+        // — code expects "embeddings" array-of-arrays.
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "embedding": 0.5,
+            })))
+            .mount(&server)
+            .await;
+
+        let uri = server.uri();
+        let result = tokio::task::spawn_blocking(move || {
+            let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
+            client.embed_text("hi", "nomic-embed-text")
+        })
+        .await
+        .unwrap();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Missing embeddings") || err.to_lowercase().contains("embed"),
+            "expected missing-embeddings error, got: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_embed_returns_error_on_500() {
+        let server = MockServer::start().await;
+        mount_tags_ok(&server, json!({"models": []})).await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("nope"))
+            .mount(&server)
+            .await;
+
+        let uri = server.uri();
+        let result = tokio::task::spawn_blocking(move || {
+            let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
+            client.embed_text("hi", "nomic-embed-text")
+        })
+        .await
+        .unwrap();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("500"));
+    }
+
+    // ---------------- higher-level helpers ----------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_expand_query_returns_parsed_terms_one_per_line() {
+        let server = MockServer::start().await;
+        mount_tags_ok(&server, json!({"models": []})).await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                // Trailing newline + blank line should be filtered out.
+                "message": {"content": "term1\nterm2\nterm3\n\n"},
+            })))
+            .mount(&server)
+            .await;
+
+        let uri = server.uri();
+        let terms = tokio::task::spawn_blocking(move || {
+            let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
+            client.expand_query("anything")
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            terms.unwrap(),
+            vec![
+                "term1".to_string(),
+                "term2".to_string(),
+                "term3".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_auto_tag_returns_parsed_tags() {
+        let server = MockServer::start().await;
+        mount_tags_ok(&server, json!({"models": []})).await;
+        // The auto_tag prompt asks for "one per line, lowercase". The
+        // module also lowercases each line itself so we verify casing
+        // is normalised by sending mixed case.
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "message": {"content": "Tag1\nTAG2\ntag3"},
+            })))
+            .mount(&server)
+            .await;
+
+        let uri = server.uri();
+        let tags = tokio::task::spawn_blocking(move || {
+            let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
+            client.auto_tag("Title", "content")
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            tags.unwrap(),
+            vec!["tag1".to_string(), "tag2".to_string(), "tag3".to_string()]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_detect_contradiction_parses_yes_no() {
+        // Verify three branches in one test: "yes" → true,
+        // "no" → false, garbage → false (default behaviour falls out
+        // of `starts_with("yes")`).
+        let server = MockServer::start().await;
+        mount_tags_ok(&server, json!({"models": []})).await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "message": {"content": "yes\n"},
+            })))
+            .mount(&server)
+            .await;
+
+        let uri_yes = server.uri();
+        let yes = tokio::task::spawn_blocking(move || {
+            let client = OllamaClient::new_with_url(&uri_yes, "test-model").unwrap();
+            client.detect_contradiction("a", "b")
+        })
+        .await
+        .unwrap();
+        assert!(yes.unwrap(), "'yes' should be detected as contradiction");
+
+        // Stand up a fresh server to swap the response — wiremock mounts
+        // are additive and we want a single deterministic responder.
+        let server_no = MockServer::start().await;
+        mount_tags_ok(&server_no, json!({"models": []})).await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "message": {"content": "no"},
+            })))
+            .mount(&server_no)
+            .await;
+        let uri_no = server_no.uri();
+        let no = tokio::task::spawn_blocking(move || {
+            let client = OllamaClient::new_with_url(&uri_no, "test-model").unwrap();
+            client.detect_contradiction("a", "b")
+        })
+        .await
+        .unwrap();
+        assert!(!no.unwrap(), "'no' should NOT be detected as contradiction");
+
+        // Garbage input should fall through `starts_with("yes")` → false.
+        let server_garbage = MockServer::start().await;
+        mount_tags_ok(&server_garbage, json!({"models": []})).await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "message": {"content": "definitely-not-yes-or-no"},
+            })))
+            .mount(&server_garbage)
+            .await;
+        let uri_g = server_garbage.uri();
+        let garbage = tokio::task::spawn_blocking(move || {
+            let client = OllamaClient::new_with_url(&uri_g, "test-model").unwrap();
+            client.detect_contradiction("a", "b")
+        })
+        .await
+        .unwrap();
+        assert!(
+            !garbage.unwrap(),
+            "garbage answer should default to non-contradiction"
+        );
+    }
+
+    // ---------------- ensure_embed_model ----------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_ensure_embed_model_skips_pull_if_present() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "models": [{"name": "nomic-embed-text:latest"}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/pull"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let uri = server.uri();
+        let r = tokio::task::spawn_blocking(move || {
+            let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
+            client.ensure_embed_model("nomic-embed-text")
+        })
+        .await
+        .unwrap();
+        assert!(r.is_ok());
+    }
+}

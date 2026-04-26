@@ -8589,6 +8589,15 @@ struct OneshotDaemon {
 
 impl OneshotDaemon {
     fn new() -> Self {
+        Self::with_federation(None)
+    }
+
+    /// Build an in-process leader with an optional federation config.
+    /// Mirrors `new()` but lets a test wire `AppState.federation = Some(_)`
+    /// to exercise the quorum fan-out / `fanout_or_503` HTTP write path
+    /// against in-process mock peers (see `spawn_inproc_mock_peer`).
+    #[allow(dead_code)]
+    fn with_federation(federation: Option<ai_memory::federation::FederationConfig>) -> Self {
         let conn = ai_memory::db::open(std::path::Path::new(":memory:")).unwrap();
         let path = std::path::PathBuf::from(":memory:");
         let db: ai_memory::handlers::Db = std::sync::Arc::new(tokio::sync::Mutex::new((
@@ -8601,7 +8610,7 @@ impl OneshotDaemon {
             db,
             embedder: std::sync::Arc::new(None),
             vector_index: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
-            federation: std::sync::Arc::new(None),
+            federation: std::sync::Arc::new(federation),
             tier_config: std::sync::Arc::new(ai_memory::config::FeatureTier::Keyword.config()),
             scoring: std::sync::Arc::new(ai_memory::config::ResolvedScoring::default()),
         };
@@ -10245,25 +10254,157 @@ fn test_curator_autonomy_end_to_end_cycle() {
     assert!(report["cycle_duration_ms"].is_u64());
 }
 
-#[test]
-fn test_quorum_partial_failure_with_timeout() {
-    // Justice of Federation Tier 1: quorum partial failure with timeout.
-    // 3-peer mesh, W=2/N=3. Verifies that leader can achieve quorum with
-    // 2 acks out of 3 peers via HTTP fanout (integrating real TCP, not mocks).
-    let peer1 = DaemonGuard::spawn();
-    let peer2 = DaemonGuard::spawn();
-    let peer3 = DaemonGuard::spawn();
+/// Spawn a lightweight in-process axum mock peer that responds 200 to
+/// `POST /api/v1/sync/push` and records the call count. Returns the peer
+/// URL (`http://127.0.0.1:<port>`) and a shared counter the test can
+/// inspect to assert quorum fanout reached the peer.
+///
+/// Modeled after `src/federation.rs::tests::spawn_mock_peer`. Used only
+/// by the in-process federation integration tests (where the leader is
+/// an `OneshotDaemon` and the peers are these stubs); production code
+/// paths in `federation.rs` (broadcast_store_quorum, fanout_or_503, the
+/// reqwest fan-out, deadline plumbing, ack tracking) all run inside the
+/// test process and are attributed to coverage.
+#[allow(dead_code)]
+async fn spawn_inproc_mock_peer(
+    behaviour: InprocPeerBehaviour,
+) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use axum::{Json as AxumJson, Router, extract::State, http::StatusCode, routing::post};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    let peer_urls = vec![
-        format!("http://127.0.0.1:{}", peer1.port),
-        format!("http://127.0.0.1:{}", peer2.port),
-        format!("http://127.0.0.1:{}", peer3.port),
-    ];
+    #[derive(Clone)]
+    struct PeerState {
+        behaviour: InprocPeerBehaviour,
+        count: Arc<AtomicUsize>,
+    }
 
-    // Leader: W=2/N=3 quorum, short timeout (2s) to keep test fast.
-    let leader = spawn_leader_with_timeout(2, &peer_urls, 2000);
+    async fn handler(
+        State(state): State<PeerState>,
+        AxumJson(_payload): AxumJson<serde_json::Value>,
+    ) -> (StatusCode, AxumJson<serde_json::Value>) {
+        state.count.fetch_add(1, Ordering::Relaxed);
+        match state.behaviour {
+            InprocPeerBehaviour::Ack => (
+                StatusCode::OK,
+                AxumJson(serde_json::json!({"applied":1,"noop":0,"skipped":0})),
+            ),
+            InprocPeerBehaviour::Fail => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                AxumJson(serde_json::json!({"error":"stub fail"})),
+            ),
+        }
+    }
 
-    // Store a memory on the leader with quorum replication.
+    let counter = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route("/api/v1/sync/push", post(handler))
+        .with_state(PeerState {
+            behaviour,
+            count: counter.clone(),
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    (format!("http://{addr}"), counter)
+}
+
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
+enum InprocPeerBehaviour {
+    Ack,
+    Fail,
+}
+
+/// Build a `FederationConfig` pointing the leader at the given peer URLs
+/// with `W=quorum_writes` and a short ack timeout. Mirrors
+/// `FederationConfig::build()` minus the TLS plumbing — the test peers
+/// are plain HTTP, and there's no CA/identity work to do.
+#[allow(dead_code)]
+fn federation_cfg_for_test(
+    peer_urls: &[String],
+    quorum_writes: usize,
+    timeout_ms: u64,
+) -> ai_memory::federation::FederationConfig {
+    use std::time::Duration;
+    let timeout = Duration::from_millis(timeout_ms);
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .connect_timeout(Duration::from_secs(2))
+        .build()
+        .expect("build test reqwest client");
+    let n = 1 + peer_urls.len();
+    let policy = ai_memory::replication::QuorumPolicy::new(
+        n,
+        quorum_writes,
+        timeout,
+        Duration::from_secs(30),
+    )
+    .expect("valid quorum policy");
+    let peers = peer_urls
+        .iter()
+        .enumerate()
+        .map(|(i, raw)| {
+            let trimmed = raw.trim_end_matches('/');
+            ai_memory::federation::PeerEndpoint {
+                id: format!("peer-{i}"),
+                sync_push_url: format!("{trimmed}/api/v1/sync/push"),
+            }
+        })
+        .collect();
+    ai_memory::federation::FederationConfig {
+        policy,
+        peers,
+        client,
+        sender_agent_id: "ai:fed-test".to_string(),
+    }
+}
+
+/// Justice of Federation Tier 1: quorum partial failure with timeout.
+///
+/// 3-peer mesh, W=2/N=3. Verifies that the leader can achieve quorum
+/// with 2 acks out of 3 peers via HTTP fanout. Refactored from the
+/// original spawn-3-real-daemons form to leader-in-process +
+/// 3 in-process axum mock peers — production federation code paths
+/// (`broadcast_store_quorum`, `fanout_or_503`, the reqwest fan-out,
+/// `AckTracker` deadline plumbing) all run in the test process so
+/// `cargo llvm-cov` attributes their coverage to `federation.rs`.
+///
+/// Tests that genuinely need real sockets (mTLS handshake, multi-process
+/// sync mesh) correctly stay in their subprocess form below.
+#[tokio::test]
+async fn test_quorum_partial_failure_with_timeout() {
+    // 3 healthy peers; W=2 means 1 local + 1 peer ack is enough to
+    // satisfy quorum. The remaining peer(s) still receive the post-
+    // quorum detached fanout.
+    let (url1, count1) = spawn_inproc_mock_peer(InprocPeerBehaviour::Ack).await;
+    let (url2, count2) = spawn_inproc_mock_peer(InprocPeerBehaviour::Ack).await;
+    let (url3, count3) = spawn_inproc_mock_peer(InprocPeerBehaviour::Ack).await;
+    let peer_urls = vec![url1, url2, url3];
+
+    // W=2, short ack-timeout (2s) — still well above an in-process
+    // localhost round-trip even on the slowest CI runner.
+    let cfg = federation_cfg_for_test(&peer_urls, 2, 2000);
+    let leader = OneshotDaemon::with_federation(Some(cfg));
+
+    // Pre-register the writer agent. NOTE: register_agent also fans out
+    // to peers when federation is enabled (see handlers.rs:547), so each
+    // mock peer will see this POST in addition to the per-memory POSTs
+    // below — we account for that in the per-peer counter assertions.
+    let (code_reg, _) = route_post(
+        &leader,
+        "/api/v1/agents",
+        &serde_json::json!({"agent_id": "ai:fed-test", "agent_type": "ai:test"}),
+        None,
+    )
+    .await;
+    assert!(
+        code_reg == "200" || code_reg == "201",
+        "agent reg: {code_reg}"
+    );
+
     let body = serde_json::json!({
         "tier": "long",
         "namespace": "fed-partial-fail",
@@ -10276,32 +10417,43 @@ fn test_quorum_partial_failure_with_timeout() {
         "metadata": {}
     });
 
-    let (code, resp) = curl_post(leader.port, "/api/v1/memories", &body, Some("ai:fed-test"));
+    let (code, resp) = route_post(&leader, "/api/v1/memories", &body, Some("ai:fed-test")).await;
     assert_eq!(code, "201", "initial store: {resp}");
 
-    // Verify the memory reached at least 2 peers (quorum met for initial store).
-    let mem_id = resp["id"].as_str().unwrap().to_string();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    let mut acks = 0;
-    while std::time::Instant::now() < deadline && acks < 2 {
-        for peer in [&peer1, &peer2, &peer3] {
-            let (code, _body) = curl_get(peer.port, &format!("/api/v1/memories/{}", &mem_id));
-            if code == "200" {
-                acks += 1;
-            }
-        }
-        if acks >= 2 {
+    // Detached post-quorum fanout reaches every peer eventually. We
+    // expect ≥2 calls per peer (1 from register_agent, 1 from the store
+    // above). Wait for all three peers to record at least 2 calls.
+    use std::sync::atomic::Ordering;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        if count1.load(Ordering::Relaxed) >= 2
+            && count2.load(Ordering::Relaxed) >= 2
+            && count3.load(Ordering::Relaxed) >= 2
+        {
             break;
         }
-        acks = 0;
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     assert!(
-        acks >= 2,
-        "initial fanout did not reach 2 peers; acks={acks}"
+        count1.load(Ordering::Relaxed) >= 2,
+        "peer-1 must receive the fanout for both register_agent + memory POST; got {}",
+        count1.load(Ordering::Relaxed)
+    );
+    assert!(
+        count2.load(Ordering::Relaxed) >= 2,
+        "peer-2 must receive the fanout for both register_agent + memory POST; got {}",
+        count2.load(Ordering::Relaxed)
+    );
+    assert!(
+        count3.load(Ordering::Relaxed) >= 2,
+        "peer-3 must receive the fanout for both register_agent + memory POST; got {}",
+        count3.load(Ordering::Relaxed)
     );
 
-    // Test second memory to verify consistency
+    // Second write — verifies the AppState.federation arc is reusable
+    // and the leader's reqwest client/connection-pool survives a second
+    // round-trip. (Catches the v0.6.0-RC client_builder regression that
+    // wedged on the second write.)
     let body2 = serde_json::json!({
         "tier": "mid",
         "namespace": "fed-partial-fail",
@@ -10313,39 +10465,67 @@ fn test_quorum_partial_failure_with_timeout() {
         "source": "api",
         "metadata": {}
     });
-
-    let (code2, resp2) = curl_post(leader.port, "/api/v1/memories", &body2, Some("ai:fed-test"));
+    let (code2, resp2) = route_post(&leader, "/api/v1/memories", &body2, Some("ai:fed-test")).await;
     assert_eq!(code2, "201", "second store with W=2: {resp2}");
+
+    // Each peer should now have seen 3 POSTs (register + 2 memory writes).
+    let deadline2 = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while std::time::Instant::now() < deadline2 {
+        if count1.load(Ordering::Relaxed) >= 3
+            && count2.load(Ordering::Relaxed) >= 3
+            && count3.load(Ordering::Relaxed) >= 3
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        count1.load(Ordering::Relaxed) >= 3,
+        "peer-1 second-write fanout missed"
+    );
+    assert!(
+        count2.load(Ordering::Relaxed) >= 3,
+        "peer-2 second-write fanout missed"
+    );
+    assert!(
+        count3.load(Ordering::Relaxed) >= 3,
+        "peer-3 second-write fanout missed"
+    );
 }
 
-#[test]
-fn test_subscription_webhook_namespace_filter() {
-    // Justice of Federation Tier 1: subscription webhook with namespace_filter.
-    // Register a webhook subscription with a namespace filter, verify that
-    // the subscription is stored and can be retrieved. This exercises the
-    // HTTP-level subscription API with namespace filtering.
-    let d = DaemonGuard::spawn();
+/// Justice of Federation Tier 1: subscription webhook with namespace_filter.
+///
+/// Register a webhook subscription with a namespace filter, store memories
+/// in matching + non-matching namespaces, and verify the subscription
+/// survives the writes. Refactored from `DaemonGuard::spawn() + curl_*()`
+/// to `OneshotDaemon` since this test exercises only the subscription
+/// HTTP API + create_memory write path — no real-socket behavior needed.
+#[tokio::test]
+async fn test_subscription_webhook_namespace_filter() {
+    let d = OneshotDaemon::new();
 
     // Pre-register subscriber agent.
-    let _ = curl_post(
-        d.port,
+    let _ = route_post(
+        &d,
         "/api/v1/agents",
         &serde_json::json!({"agent_id": "webhook-receiver", "agent_type": "ai:generic"}),
         None,
-    );
+    )
+    .await;
 
     // Create a namespace filter subscription.
     let filter_ns = "webhook-test-foo";
 
-    let (code, resp) = curl_post(
-        d.port,
+    let (code, resp) = route_post(
+        &d,
         "/api/v1/subscriptions",
         &serde_json::json!({
             "agent_id": "webhook-receiver",
             "namespace": filter_ns
         }),
         Some("webhook-receiver"),
-    );
+    )
+    .await;
     assert!(
         code == "201" || code == "200",
         "subscribe code={code}: {resp}"
@@ -10353,7 +10533,7 @@ fn test_subscription_webhook_namespace_filter() {
 
     // Immediately verify the subscription was created.
     let (code_subs, body_subs) =
-        curl_get(d.port, "/api/v1/subscriptions?agent_id=webhook-receiver");
+        route_get(&d, "/api/v1/subscriptions?agent_id=webhook-receiver").await;
     assert_eq!(code_subs, "200");
     let subs = body_subs["subscriptions"]
         .as_array()
@@ -10377,12 +10557,13 @@ fn test_subscription_webhook_namespace_filter() {
         "metadata": {"test": "matching"}
     });
 
-    let (code_m, resp_m) = curl_post(
-        d.port,
+    let (code_m, resp_m) = route_post(
+        &d,
         "/api/v1/memories",
         &matching_body,
         Some("ai:webhook-test"),
-    );
+    )
+    .await;
     assert_eq!(code_m, "201", "store matching: {resp_m}");
 
     // Store a memory in a *non-matching* namespace.
@@ -10399,17 +10580,18 @@ fn test_subscription_webhook_namespace_filter() {
         "metadata": {"test": "non-matching"}
     });
 
-    let (code_nm, _resp_nm) = curl_post(
-        d.port,
+    let (code_nm, _resp_nm) = route_post(
+        &d,
         "/api/v1/memories",
         &non_matching_body,
         Some("ai:webhook-test"),
-    );
+    )
+    .await;
     assert_eq!(code_nm, "201", "store non-matching memory");
 
     // Verify the subscription is still active after storing memories.
     let (code_subs_final, body_subs_final) =
-        curl_get(d.port, "/api/v1/subscriptions?agent_id=webhook-receiver");
+        route_get(&d, "/api/v1/subscriptions?agent_id=webhook-receiver").await;
     assert_eq!(code_subs_final, "200");
     let subs_final = body_subs_final["subscriptions"]
         .as_array()
@@ -10422,7 +10604,11 @@ fn test_subscription_webhook_namespace_filter() {
     );
 }
 
-/// Helper to spawn a leader with custom timeout.
+/// Helper to spawn a leader with custom timeout. Retained for the
+/// real-socket mTLS handshake test (`test_serve_mtls_fingerprint_*`) and
+/// the multi-process sync mesh test, which both need a real
+/// `ai-memory serve` daemon.
+#[allow(dead_code)]
 fn spawn_leader_with_timeout(
     quorum_writes: usize,
     peer_urls: &[String],
@@ -12026,203 +12212,532 @@ fn test_cli_failure_matrix() {
 }
 
 // ============================================================================
-// Daemon-body coverage tests — covers long-running loops, signal handling,
-// graceful shutdown. Main.rs daemon subcommands: cmd_serve, cmd_sync_daemon,
-// cmd_curator --daemon
+// Daemon-body coverage tests — covers long-running loops, graceful
+// shutdown. The daemon subcommands (serve, sync-daemon, curator --daemon)
+// are exercised IN-PROCESS via `ai_memory::daemon_runtime`, not by spawning
+// the binary as a subprocess. Subprocess tests can't be attributed by
+// `cargo-llvm-cov` without extra `LLVM_PROFILE_FILE` plumbing the harness
+// doesn't provide, so the prior subprocess+SIGTERM tests passed but
+// contributed zero coverage to the loop bodies. The lib-side
+// `daemon_runtime::*` helpers mirror the production main.rs paths
+// (`build_router` + `axum::serve` + graceful shutdown for serve,
+// `sync_cycle_once` + JoinSet loop for sync-daemon, `curator::run_daemon`
+// blocking task for curator) so attribution lands on the same lib code
+// the production binary exercises.
 // ============================================================================
 
-#[test]
-#[cfg(unix)]
-fn test_daemon_cmd_serve_responds_to_health_then_terminates() {
-    // Coverage: cmd_serve body — HTTP daemon startup, listener bind, graceful
-    // shutdown. Tests main.rs lines 1322-1338 (TLS path) and 1333-1337 (HTTP path).
-    // The serve function spawns GC + checkpoint tasks, handles embedder init,
-    // and installs a ctrl_c signal watcher for graceful shutdown.
-    let bin = env!("CARGO_BIN_EXE_ai-memory");
+/// Helper: build a fresh in-memory `AppState` + `ApiKeyState` for the serve
+/// test. Mirrors `OneshotDaemon::new()` but uses an on-disk DB so the
+/// per-handler `db::open` calls (e.g. inside the sync handlers) can refer
+/// to the same path the daemon was built against.
+fn build_serve_state(
+    db_path: &std::path::Path,
+) -> (
+    ai_memory::handlers::ApiKeyState,
+    ai_memory::handlers::AppState,
+) {
+    let conn = ai_memory::db::open(db_path).unwrap();
+    let db: ai_memory::handlers::Db = std::sync::Arc::new(tokio::sync::Mutex::new((
+        conn,
+        db_path.to_path_buf(),
+        ai_memory::config::ResolvedTtl::default(),
+        true,
+    )));
+    let app_state = ai_memory::handlers::AppState {
+        db,
+        embedder: std::sync::Arc::new(None),
+        vector_index: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+        federation: std::sync::Arc::new(None),
+        tier_config: std::sync::Arc::new(ai_memory::config::FeatureTier::Keyword.config()),
+        scoring: std::sync::Arc::new(ai_memory::config::ResolvedScoring::default()),
+    };
+    let api_key_state = ai_memory::handlers::ApiKeyState { key: None };
+    (api_key_state, app_state)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_daemon_cmd_serve_responds_to_health_then_terminates() {
+    // Coverage: serve_http_with_shutdown — Router build via build_router,
+    // TcpListener bind, axum::serve with graceful shutdown notify. Mirrors
+    // the production HTTP path of main.rs::serve (lines 1326-1338 of
+    // v0.6.3). The shared `build_router` keeps the route table identical
+    // to the production daemon.
     let dir = std::env::temp_dir();
     let db = dir.join(format!("ai-memory-serve-test-{}.db", uuid::Uuid::new_v4()));
     let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
 
-    // Spawn serve daemon
-    let mut child = cmd(bin)
-        .args([
-            "--db",
-            db.to_str().unwrap(),
-            "serve",
-            "--port",
-            &port.to_string(),
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
+    let (api_key_state, app_state) = build_serve_state(&db);
+    let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+    let shutdown_for_daemon = shutdown.clone();
+    let addr_for_daemon = addr.clone();
 
-    // Create guard to ensure cleanup even on panic
-    let _guard = ChildGuard::new(
-        std::process::Command::new("sleep")
-            .arg("1")
-            .spawn()
-            .unwrap(),
-    )
-    .with_cleanup([db.clone()]);
+    // Spawn the daemon in-process. The handle is aborted in cleanup; a
+    // graceful shutdown via `shutdown.notify_one()` lets axum drain
+    // cleanly first.
+    let handle = tokio::spawn(async move {
+        ai_memory::daemon_runtime::serve_http_with_shutdown(
+            &addr_for_daemon,
+            api_key_state,
+            app_state,
+            shutdown_for_daemon,
+        )
+        .await
+    });
 
-    // Wait for HTTP listener to be ready
+    // Wait for the listener to come up. ~5s budget with 100ms backoff —
+    // identical wait_for_health semantics as the prior subprocess test,
+    // but talking to the in-process daemon over the loopback socket.
+    let mut ready = false;
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        if let Ok(resp) = reqwest::get(&format!("http://127.0.0.1:{port}/api/v1/health")).await
+            && resp.status() == reqwest::StatusCode::OK
+        {
+            ready = true;
+            break;
+        }
+    }
     assert!(
-        wait_for_health(port),
-        "serve health probe never returned 200 — HTTP daemon failed to bind"
+        ready,
+        "serve health probe never returned 200 — in-process HTTP daemon failed to bind"
     );
 
-    // Verify the health endpoint works (exercises HTTP handler path)
-    let health_resp = std::process::Command::new("curl")
-        .args([
-            "-s",
-            "-o",
-            "/dev/null",
-            "-w",
-            "%{http_code}",
-            &format!("http://127.0.0.1:{port}/api/v1/health"),
-        ])
-        .output()
-        .unwrap();
+    // Hit /api/v1/health a second time to exercise the handler path (same
+    // assertion the prior subprocess test made, but against the in-process
+    // daemon — coverage attribution lands on `handlers::health`).
+    let resp = reqwest::get(&format!("http://127.0.0.1:{port}/api/v1/health"))
+        .await
+        .expect("health request must succeed");
     assert_eq!(
-        String::from_utf8_lossy(&health_resp.stdout),
-        "200",
+        resp.status(),
+        reqwest::StatusCode::OK,
         "health endpoint must return 200"
     );
 
-    // Kill the daemon
-    let _ = child.kill();
+    // Trigger graceful shutdown. axum::serve resolves; the spawned task
+    // returns Ok(()).
+    shutdown.notify_one();
 
-    // Wait for exit — the daemon's signal handler or kill will terminate it
-    let exit = child.wait().unwrap();
-    // We accept any exit code (success or signal-terminated) — the key is that
-    // the daemon responds to the signal and terminates. child.kill() sends SIGKILL
-    // which results in exit codes like 137 (128+9) or similar on different OS.
-    assert!(
-        !exit.success() || exit.success(), // Always true; accepts any exit
-        "serve daemon must terminate"
-    );
+    // Bound the wait so a stuck shutdown doesn't hang the test runner.
+    let join = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+    match join {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(e))) => panic!("serve_http_with_shutdown errored: {e}"),
+        Ok(Err(e)) => panic!("daemon task panicked: {e}"),
+        Err(elapsed) => {
+            panic!("daemon failed to terminate within 5s of shutdown notify: {elapsed}")
+        }
+    }
 
     let _ = std::fs::remove_file(&db);
 }
 
-#[test]
-#[cfg(unix)]
-fn test_daemon_cmd_sync_daemon_pulls_then_terminates() {
-    // Coverage: cmd_sync_daemon body — sync loop startup, peer reconciliation,
-    // JoinSet parallel fanout, graceful shutdown. Tests main.rs lines 3329-3374
-    // (the main loop, signal handling, and peer batching). The sync-daemon spawns
-    // a JoinSet of peer-sync tasks and loops on a configurable interval, polling
-    // shutdown signal via tokio::select!.
-    let bin = env!("CARGO_BIN_EXE_ai-memory");
+#[tokio::test(flavor = "multi_thread")]
+async fn test_daemon_cmd_sync_daemon_pulls_then_terminates() {
+    // Coverage: run_sync_daemon_with_shutdown + sync_cycle_once — the loop
+    // body, JoinSet fanout across peers, sleep-vs-shutdown select.
+    // Mirrors main.rs::cmd_sync_daemon's loop (lines 3336-3374 of v0.6.3).
+    // Drives a real peer (an in-process serve_http_with_shutdown) so the
+    // pull/push round-trips exercise the production handlers + db sync
+    // state code paths.
     let dir = std::env::temp_dir();
     let db_peer = dir.join(format!("ai-memory-sync-peer-{}.db", uuid::Uuid::new_v4()));
     let db_local = dir.join(format!("ai-memory-sync-local-{}.db", uuid::Uuid::new_v4()));
 
-    // Start a serve daemon on the peer to sync against
+    // Initialise the local DB so the sync_cycle's `db::open` calls find a
+    // valid file. The schema is created on first open.
+    {
+        let _ = ai_memory::db::open(&db_local).unwrap();
+    }
+
+    // 1. Stand up an in-process peer via serve_http_with_shutdown.
     let peer_port = free_port();
-    let serve_child = cmd(bin)
-        .args([
-            "--db",
-            db_peer.to_str().unwrap(),
-            "serve",
-            "--port",
-            &peer_port.to_string(),
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
-    let _serve = ChildGuard::new(serve_child).with_cleanup([db_peer.clone()]);
+    let peer_addr = format!("127.0.0.1:{peer_port}");
+    let (peer_api_key, peer_state) = build_serve_state(&db_peer);
+    let peer_shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+    let peer_shutdown_for_daemon = peer_shutdown.clone();
+    let peer_addr_for_daemon = peer_addr.clone();
+    let peer_handle = tokio::spawn(async move {
+        ai_memory::daemon_runtime::serve_http_with_shutdown(
+            &peer_addr_for_daemon,
+            peer_api_key,
+            peer_state,
+            peer_shutdown_for_daemon,
+        )
+        .await
+    });
 
-    // Wait for peer to be ready
-    assert!(wait_for_health(peer_port), "peer serve never became ready");
+    // Wait for peer readiness.
+    let mut ready = false;
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        if let Ok(resp) = reqwest::get(&format!("http://127.0.0.1:{peer_port}/api/v1/health")).await
+            && resp.status() == reqwest::StatusCode::OK
+        {
+            ready = true;
+            break;
+        }
+    }
+    assert!(ready, "peer serve never became ready");
 
-    // Spawn the sync-daemon with a 1-second interval, pointed at the peer
-    let mut daemon_child = cmd(bin)
-        .args([
-            "--db",
-            db_local.to_str().unwrap(),
-            "sync-daemon",
-            "--peers",
-            &format!("http://127.0.0.1:{peer_port}"),
-            "--interval",
-            "1",
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
+    // 2. Run the sync-daemon loop in-process with interval=1 so at least
+    //    one full cycle (pull + push) executes before we trigger shutdown.
+    let sync_shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+    let sync_shutdown_for_daemon = sync_shutdown.clone();
+    let db_local_for_daemon = db_local.clone();
+    let peers = vec![format!("http://127.0.0.1:{peer_port}")];
+    let sync_handle = tokio::spawn(async move {
+        ai_memory::daemon_runtime::run_sync_daemon_with_shutdown(
+            db_local_for_daemon,
+            "test-agent".to_string(),
+            peers,
+            None,
+            1, // interval_secs
+            500,
+            sync_shutdown_for_daemon,
+        )
+        .await
+    });
 
-    // Let it run for a cycle or two
-    std::thread::sleep(std::time::Duration::from_secs(2));
+    // Let the daemon run a cycle or two (the JoinSet fanout completes,
+    // then the loop hits the sleep+shutdown select).
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
 
-    // Kill the daemon and verify it terminates
-    let _ = daemon_child.kill();
+    // 3. Trigger sync-daemon shutdown — the `select!` wakes on the notify
+    //    and returns Ok(()).
+    sync_shutdown.notify_one();
+    let join = tokio::time::timeout(std::time::Duration::from_secs(5), sync_handle).await;
+    match join {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(e))) => panic!("run_sync_daemon_with_shutdown errored: {e}"),
+        Ok(Err(e)) => panic!("sync-daemon task panicked: {e}"),
+        Err(elapsed) => {
+            panic!("sync-daemon failed to terminate within 5s of shutdown notify: {elapsed}")
+        }
+    }
 
-    let exit = daemon_child.wait().unwrap();
-    // Accept any exit (success or signal-terminated)
-    assert!(
-        !exit.success() || exit.success(), // Always true; accepts any exit
-        "sync-daemon must terminate"
-    );
+    // 4. Tear down the peer.
+    peer_shutdown.notify_one();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer_handle).await;
 
     let _ = std::fs::remove_file(&db_local);
+    let _ = std::fs::remove_file(&db_peer);
 }
 
-#[test]
-#[cfg(unix)]
-fn test_daemon_cmd_curator_daemon_cycles_then_terminates() {
-    // Coverage: cmd_curator --daemon body — curator daemon loop setup, cycle
-    // execution, signal handling via atomic bool. Tests main.rs lines 4317-4334
-    // (daemon mode: tokio::spawn of signal watcher, spawn_blocking of
-    // curator::run_daemon, and the shutdown flag propagation). The curator daemon
-    // runs on a blocking task, polls shutdown_flag between cycles (set by a ctrl_c
-    // watcher task), and exits cleanly when signaled.
-    let bin = env!("CARGO_BIN_EXE_ai-memory");
+#[tokio::test(flavor = "multi_thread")]
+async fn test_daemon_cmd_curator_daemon_cycles_then_terminates() {
+    // Coverage: run_curator_daemon_with_shutdown — wraps curator::run_daemon
+    // (lib code) on a spawn_blocking, with a Notify-driven shutdown flag.
+    // Mirrors main.rs::cmd_curator's daemon arm (lines 4317-4334 of v0.6.3).
+    // run_daemon's interval is clamped to 60s minimum, but its shutdown
+    // poll fires every 500ms, so we observe clean termination within
+    // ~500ms regardless.
     let dir = std::env::temp_dir();
     let db = dir.join(format!(
         "ai-memory-curator-test-{}.db",
         uuid::Uuid::new_v4()
     ));
+    {
+        let _ = ai_memory::db::open(&db).unwrap();
+    }
 
-    // Spawn curator in daemon mode with a short interval (5s) so we can observe it
-    let mut child = cmd(bin)
-        .args([
-            "--db",
-            db.to_str().unwrap(),
-            "curator",
-            "--daemon",
-            "--interval-secs",
-            "5",
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
+    let cfg = ai_memory::curator::CuratorConfig {
+        interval_secs: 60,
+        max_ops_per_cycle: 1,
+        dry_run: true,
+        include_namespaces: Vec::new(),
+        exclude_namespaces: Vec::new(),
+    };
+    let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+    let shutdown_for_daemon = shutdown.clone();
+    let db_for_daemon = db.clone();
+    let handle = tokio::spawn(async move {
+        ai_memory::daemon_runtime::run_curator_daemon_with_shutdown(
+            db_for_daemon,
+            cfg,
+            shutdown_for_daemon,
+        )
+        .await
+    });
 
-    // Create guard for cleanup on panic
-    let _guard = ChildGuard::new(
-        std::process::Command::new("sleep")
-            .arg("1")
-            .spawn()
-            .unwrap(),
-    )
-    .with_cleanup([db.clone()]);
+    // Let the daemon start (the spawn_blocking thread spins up; the inner
+    // loop's first cycle runs against the empty DB and emits a tracing
+    // info line; then it falls into the 60s sleep that polls shutdown
+    // every 500ms).
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-    // Let the daemon start (signal handling setup may take a few ms)
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    // Trigger shutdown — within ~500ms the `run_daemon` polling loop
+    // observes the AtomicBool and returns; the `spawn_blocking` join
+    // resolves; `run_curator_daemon_with_shutdown` returns Ok(()).
+    shutdown.notify_one();
+    let join = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+    match join {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(e))) => panic!("run_curator_daemon_with_shutdown errored: {e}"),
+        Ok(Err(e)) => panic!("curator daemon task panicked: {e}"),
+        Err(elapsed) => {
+            panic!("curator daemon failed to terminate within 5s of shutdown notify: {elapsed}")
+        }
+    }
 
-    // Kill the daemon
-    let _ = child.kill();
+    let _ = std::fs::remove_file(&db);
+}
 
-    // Wait for exit
-    let exit = child.wait().unwrap();
-    // Accept any exit
+// ============================================================================
+// Closer M-prime: tests for the three new daemon_runtime variants Wave 3
+// added when migrating main.rs to the lib helpers. The Wave 2 X tests above
+// only transitively exercise these via the OLD wrappers, so the interesting
+// code paths (custom shutdown future, custom reqwest::Client, primitive-arg
+// curator config) were dark. These tests target each variant directly.
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_daemon_serve_http_with_shutdown_future_runs_with_custom_cleanup() {
+    // Coverage: serve_http_with_shutdown_future — the variant of
+    // serve_http_with_shutdown that takes an arbitrary future instead of a
+    // Notify. Production main.rs::serve uses this so it can embed a WAL
+    // checkpoint cleanup step into the shutdown future. We pass a future
+    // that does nontrivial async work (a tokio sleep + observable side
+    // effect via an AtomicBool) before resolving, and confirm the helper
+    // runs the future and returns gracefully.
+    let dir = std::env::temp_dir();
+    let db = dir.join(format!(
+        "ai-memory-serve-future-test-{}.db",
+        uuid::Uuid::new_v4()
+    ));
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let (api_key_state, app_state) = build_serve_state(&db);
+
+    // Notify drives the inner shutdown signal; the outer shutdown future
+    // wraps it and additionally performs nontrivial cleanup work (sleep
+    // + AtomicBool flip) so we can observe that the helper actually
+    // awaited the user-supplied future before returning.
+    let inner_signal = std::sync::Arc::new(tokio::sync::Notify::new());
+    let inner_signal_for_future = inner_signal.clone();
+    let cleanup_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cleanup_ran_for_future = cleanup_ran.clone();
+
+    let shutdown_future = async move {
+        inner_signal_for_future.notified().await;
+        // Simulate the production WAL-checkpoint cleanup work — a tiny
+        // sleep + flag flip the test can verify ran before serve returned.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        cleanup_ran_for_future.store(true, std::sync::atomic::Ordering::SeqCst);
+    };
+
+    let addr_for_daemon = addr.clone();
+    let handle = tokio::spawn(async move {
+        ai_memory::daemon_runtime::serve_http_with_shutdown_future(
+            &addr_for_daemon,
+            api_key_state,
+            app_state,
+            shutdown_future,
+        )
+        .await
+    });
+
+    // Wait for readiness via the same health-probe pattern as the Wave 2
+    // serve test.
+    let mut ready = false;
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        if let Ok(resp) = reqwest::get(&format!("http://127.0.0.1:{port}/api/v1/health")).await
+            && resp.status() == reqwest::StatusCode::OK
+        {
+            ready = true;
+            break;
+        }
+    }
     assert!(
-        !exit.success() || exit.success(), // Always true; accepts any exit
-        "curator daemon must terminate"
+        ready,
+        "serve_http_with_shutdown_future health probe never returned 200"
     );
+
+    // Trigger shutdown — the user-supplied future's notified().await wakes,
+    // it does the cleanup work, then resolves; axum::serve drains; the
+    // helper returns Ok(()).
+    inner_signal.notify_one();
+
+    let join = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+    match join {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(e))) => panic!("serve_http_with_shutdown_future errored: {e}"),
+        Ok(Err(e)) => panic!("daemon task panicked: {e}"),
+        Err(elapsed) => {
+            panic!("daemon failed to terminate within 5s of shutdown notify: {elapsed}")
+        }
+    }
+
+    // Critical assertion: the user-supplied cleanup future ran. If the
+    // helper had dropped the future or wrapped it incorrectly, the bool
+    // would still be false. This verifies the future is actually awaited.
+    assert!(
+        cleanup_ran.load(std::sync::atomic::Ordering::SeqCst),
+        "shutdown future cleanup work did not run — helper failed to await user-supplied future"
+    );
+
+    let _ = std::fs::remove_file(&db);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_daemon_sync_with_shutdown_using_client_accepts_custom_client() {
+    // Coverage: run_sync_daemon_with_shutdown_using_client — the variant
+    // of run_sync_daemon_with_shutdown that takes a caller-built
+    // reqwest::Client. Production main.rs::cmd_sync_daemon constructs an
+    // mTLS-aware client via build_rustls_client_config and threads it in.
+    // We pass a custom client (non-default timeout, distinct user-agent)
+    // and confirm at least one cycle runs against an in-process peer
+    // and shutdown is honored.
+    let dir = std::env::temp_dir();
+    let db_peer = dir.join(format!(
+        "ai-memory-sync-client-peer-{}.db",
+        uuid::Uuid::new_v4()
+    ));
+    let db_local = dir.join(format!(
+        "ai-memory-sync-client-local-{}.db",
+        uuid::Uuid::new_v4()
+    ));
+    {
+        let _ = ai_memory::db::open(&db_local).unwrap();
+    }
+
+    // 1. In-process peer.
+    let peer_port = free_port();
+    let peer_addr = format!("127.0.0.1:{peer_port}");
+    let (peer_api_key, peer_state) = build_serve_state(&db_peer);
+    let peer_shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+    let peer_shutdown_for_daemon = peer_shutdown.clone();
+    let peer_addr_for_daemon = peer_addr.clone();
+    let peer_handle = tokio::spawn(async move {
+        ai_memory::daemon_runtime::serve_http_with_shutdown(
+            &peer_addr_for_daemon,
+            peer_api_key,
+            peer_state,
+            peer_shutdown_for_daemon,
+        )
+        .await
+    });
+
+    let mut ready = false;
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        if let Ok(resp) = reqwest::get(&format!("http://127.0.0.1:{peer_port}/api/v1/health")).await
+            && resp.status() == reqwest::StatusCode::OK
+        {
+            ready = true;
+            break;
+        }
+    }
+    assert!(ready, "peer serve never became ready");
+
+    // 2. Build a custom reqwest::Client that differs from the default the
+    //    plain run_sync_daemon_with_shutdown wrapper builds — non-default
+    //    timeout + a distinct user-agent. This is the production-shaped
+    //    use case (cmd_sync_daemon's mTLS client) compressed to test scale.
+    let custom_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .user_agent("ai-memory-sync-mprime-test/1")
+        .build()
+        .expect("custom client builds");
+
+    // 3. Run sync daemon loop with the custom client.
+    let sync_shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+    let sync_shutdown_for_daemon = sync_shutdown.clone();
+    let db_local_for_daemon = db_local.clone();
+    let peers = vec![format!("http://127.0.0.1:{peer_port}")];
+    let sync_handle = tokio::spawn(async move {
+        ai_memory::daemon_runtime::run_sync_daemon_with_shutdown_using_client(
+            custom_client,
+            db_local_for_daemon,
+            "test-agent-mprime".to_string(),
+            peers,
+            None,
+            1, // interval_secs
+            500,
+            sync_shutdown_for_daemon,
+        )
+        .await
+    });
+
+    // Allow at least one full cycle: JoinSet fanout, sync_cycle_once
+    // pull+push completes, the sleep+shutdown select runs.
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+    // 4. Trigger shutdown.
+    sync_shutdown.notify_one();
+    let join = tokio::time::timeout(std::time::Duration::from_secs(5), sync_handle).await;
+    match join {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(e))) => {
+            panic!("run_sync_daemon_with_shutdown_using_client errored: {e}")
+        }
+        Ok(Err(e)) => panic!("sync-daemon task panicked: {e}"),
+        Err(elapsed) => {
+            panic!("sync-daemon failed to terminate within 5s of shutdown notify: {elapsed}")
+        }
+    }
+
+    peer_shutdown.notify_one();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer_handle).await;
+
+    let _ = std::fs::remove_file(&db_local);
+    let _ = std::fs::remove_file(&db_peer);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_daemon_curator_with_primitives_runs_with_dry_run_config() {
+    // Coverage: run_curator_daemon_with_primitives — the primitive-arg
+    // flavour of the curator daemon helper. This path is independent
+    // of run_curator_daemon_with_shutdown (the typed-CuratorConfig path)
+    // and was fully dark prior to this test. Production
+    // main.rs::cmd_curator uses this variant to sidestep a bin/lib
+    // CuratorConfig type-mismatch.
+    let dir = std::env::temp_dir();
+    let db = dir.join(format!(
+        "ai-memory-curator-prim-test-{}.db",
+        uuid::Uuid::new_v4()
+    ));
+    {
+        let _ = ai_memory::db::open(&db).unwrap();
+    }
+
+    let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+    let shutdown_for_daemon = shutdown.clone();
+    let db_for_daemon = db.clone();
+    let handle = tokio::spawn(async move {
+        ai_memory::daemon_runtime::run_curator_daemon_with_primitives(
+            db_for_daemon,
+            1,    // interval_secs (clamped to 60s by run_daemon, but accepted here)
+            10,   // max_ops_per_cycle
+            true, // dry_run
+            Vec::new(),
+            Vec::new(),
+            None, // ollama_model — keyword-only path, no LLM
+            shutdown_for_daemon,
+        )
+        .await
+    });
+
+    // Let the daemon start: spawn_blocking thread spins up, run_daemon's
+    // first cycle runs against the empty DB, then it falls into the
+    // poll loop that observes shutdown every ~500ms.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    shutdown.notify_one();
+    let join = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+    match join {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(e))) => {
+            panic!("run_curator_daemon_with_primitives errored: {e}")
+        }
+        Ok(Err(e)) => panic!("curator daemon task panicked: {e}"),
+        Err(elapsed) => {
+            panic!("curator daemon failed to terminate within 5s of shutdown notify: {elapsed}")
+        }
+    }
 
     let _ = std::fs::remove_file(&db);
 }

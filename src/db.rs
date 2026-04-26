@@ -3559,6 +3559,7 @@ pub fn sync_state_load(conn: &Connection, agent_id: &str) -> Result<crate::model
 /// if we've never successfully pushed to them (foundation-era rows also
 /// return `None` because the column was added in schema v12).
 #[must_use]
+#[allow(dead_code)] // called via lib crate (daemon_runtime); bin sees it as unused
 pub fn sync_state_last_pushed(conn: &Connection, agent_id: &str, peer_id: &str) -> Option<String> {
     conn.query_row(
         "SELECT last_pushed_at FROM sync_state WHERE agent_id = ?1 AND peer_id = ?2",
@@ -3571,6 +3572,7 @@ pub fn sync_state_last_pushed(conn: &Connection, agent_id: &str, peer_id: &str) 
 
 /// Record that local memories up to `updated_at = pushed_at` have been
 /// accepted by `peer_id`. Creates the row if it doesn't exist; monotonic.
+#[allow(dead_code)] // called via lib crate (daemon_runtime); bin sees it as unused
 pub fn sync_state_record_push(
     conn: &Connection,
     agent_id: &str,

@@ -14,9 +14,11 @@
 
 pub mod autonomy;
 pub mod bench;
+pub mod cli;
 pub mod color;
 pub mod config;
 pub mod curator;
+pub mod daemon_runtime;
 pub mod db;
 pub mod embeddings;
 pub mod errors;
@@ -32,6 +34,7 @@ pub mod models;
 pub mod replication;
 pub mod reranker;
 pub mod subscriptions;
+pub mod tls;
 pub mod toon;
 pub mod validate;
 
