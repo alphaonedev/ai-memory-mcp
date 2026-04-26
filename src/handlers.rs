@@ -5407,7 +5407,7 @@ mod tests {
         let fed = crate::federation::FederationConfig::build(
             2, // W=2 — local + 1 peer
             &[peer_url],
-            std::time::Duration::from_millis(2000),
+            std::time::Duration::from_secs(2),
             None,
             None,
             None,

@@ -829,7 +829,7 @@ mod tests {
     fn test_valid_tags() {
         assert!(validate_tags(&["dns".to_string(), "bind9".to_string()]).is_ok());
         assert!(validate_tags(&[]).is_ok());
-        assert!(validate_tags(&["".to_string()]).is_err());
+        assert!(validate_tags(&[String::new()]).is_err());
         let too_many: Vec<String> = (0..51).map(|i| format!("tag{i}")).collect();
         assert!(validate_tags(&too_many).is_err());
     }
