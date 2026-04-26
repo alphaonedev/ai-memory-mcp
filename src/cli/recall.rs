@@ -3,19 +3,19 @@
 
 //! `cmd_recall` migration. See `cli::store` for the design pattern.
 //!
-//! The embedder construction logic is duplicated from `serve()` in
-//! `main.rs` and is isolated in `build_embedder_for_recall` so it can be
-//! unit-tested. That duplication will be killed in W6 when the embedder
-//! becomes a shared CLI fixture.
+//! W6 (v0.6.3) — embedder construction was unified into
+//! [`crate::daemon_runtime::build_embedder`]. Both `serve()` and this
+//! handler now call the same builder, killing the per-call-site
+//! duplication that the original W5b note flagged. The TestHelper that
+//! used to live here (`build_embedder_for_recall`) is gone.
 
 use crate::cli::CliOutput;
 use crate::cli::helpers::{human_age, id_short};
-use crate::config::{AppConfig, TierConfig};
-use crate::{color, db, embeddings, hnsw, llm, reranker, validate};
+use crate::config::AppConfig;
+use crate::{color, daemon_runtime, db, embeddings, hnsw, reranker, validate};
 use anyhow::Result;
 use clap::Args;
 use std::path::Path;
-use std::sync::Arc;
 
 /// Clap-derived arg shape for the `recall` subcommand. Definition moved
 /// from `main.rs` verbatim in W5b — fields and attrs unchanged.
@@ -54,63 +54,11 @@ pub struct RecallArgs {
     pub context_tokens: Option<Vec<String>>,
 }
 
-/// Construct the `Embedder` (if any) implied by `tier_config`. Mirrors
-/// the same logic in `serve()` (`main.rs`) so recall has parity with the
-/// daemon. Returns `Ok(None)` when the tier doesn't request an embedder
-/// (Keyword tier) or when the model fails to load (CLI degrades to
-/// keyword fallback). Emits status / failure lines on `out.stderr`.
-pub(crate) fn build_embedder_for_recall(
-    tier_config: &TierConfig,
-    app_config: &AppConfig,
-    out: &mut CliOutput<'_>,
-) -> Result<Option<embeddings::Embedder>> {
-    let Some(emb_model) = tier_config.embedding_model else {
-        return Ok(None);
-    };
-
-    let ollama_client = if tier_config.llm_model.is_some() {
-        let ollama_url = app_config.effective_ollama_url();
-        llm::OllamaClient::new_with_url(ollama_url, "nomic-embed-text")
-            .ok()
-            .map(Arc::new)
-    } else {
-        None
-    };
-    let embed_client = {
-        let embed_url = app_config.effective_embed_url();
-        let ollama_url = app_config.effective_ollama_url();
-        if embed_url == ollama_url {
-            ollama_client.clone()
-        } else {
-            llm::OllamaClient::new_with_url(embed_url, "nomic-embed-text")
-                .ok()
-                .map(Arc::new)
-                .or(ollama_client.clone())
-        }
-    };
-
-    match embeddings::Embedder::for_model(emb_model, embed_client) {
-        Ok(emb) => {
-            writeln!(
-                out.stderr,
-                "ai-memory: embedder loaded ({})",
-                emb.model_description()
-            )?;
-            Ok(Some(emb))
-        }
-        Err(e) => {
-            writeln!(
-                out.stderr,
-                "ai-memory: embedder failed: {e}, falling back to keyword"
-            )?;
-            Ok(None)
-        }
-    }
-}
-
-/// `recall` handler. Mirrors `cmd_recall` from `main.rs` verbatim except
-/// every emit routes through `out.stdout` / `out.stderr` instead of
-/// `println!` / `eprintln!`.
+/// `recall` handler. Mirrors `cmd_recall` from the pre-W5b `main.rs`
+/// verbatim except every emit routes through `out.stdout` / `out.stderr`
+/// instead of `println!` / `eprintln!`. The embedder is built via the
+/// shared [`crate::daemon_runtime::build_embedder`] helper so the offline
+/// recall path and the HTTP daemon use identical construction logic.
 #[allow(clippy::too_many_lines)]
 pub fn run(
     db_path: &Path,
@@ -130,8 +78,42 @@ pub fn run(
     let feature_tier = app_config.effective_tier(args.tier.as_deref());
     let tier_config = feature_tier.config();
 
-    // Initialize embedder if tier supports it
-    let embedder = build_embedder_for_recall(&tier_config, app_config, out)?;
+    // Initialize embedder if tier supports it. Use the shared builder so
+    // recall and the HTTP daemon agree on tier→embedder semantics
+    // (embed_url, model selection, error fallback). The shared builder
+    // is async; we drive it on a small inline runtime to keep `run()`
+    // sync. Tier=Keyword short-circuits inside the builder before any
+    // tokio work happens, so the runtime's only cost is the keyword path.
+    let embedder = {
+        // Bridge sync→async: build a single-threaded runtime just for
+        // this call. Cheap on the Keyword path (no tasks spawned), and
+        // safe because `run()` is itself called from `main.rs` which is
+        // already inside `#[tokio::main]` only when invoked through
+        // `daemon_runtime::run` — the inner runtime is never nested
+        // because we use `Handle::try_current()` to detect that case.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            tokio::task::block_in_place(|| {
+                handle.block_on(daemon_runtime::build_embedder(feature_tier, app_config))
+            })
+        } else {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(daemon_runtime::build_embedder(feature_tier, app_config))
+        }
+    };
+    if let Some(ref emb) = embedder {
+        writeln!(
+            out.stderr,
+            "ai-memory: embedder loaded ({})",
+            emb.model_description()
+        )?;
+    } else if tier_config.embedding_model.is_some() {
+        writeln!(
+            out.stderr,
+            "ai-memory: embedder failed to load, falling back to keyword"
+        )?;
+    }
 
     // Backfill embeddings for memories that don't have them
     if let Some(ref emb) = embedder
@@ -587,17 +569,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_build_embedder_for_recall_keyword_returns_none() {
-        // Direct unit test of the helper extracted out of cmd_recall.
-        let mut env = TestEnv::fresh();
+    #[tokio::test]
+    async fn test_shared_build_embedder_keyword_returns_none() {
+        // W6 — recall now delegates embedder construction to
+        // `daemon_runtime::build_embedder`. Smoke-test that the keyword
+        // tier short-circuit still yields `None` (no model load attempt,
+        // no panic).
         let cfg = AppConfig::default();
-        let tier_cfg = FeatureTier::Keyword.config();
-        let mut out = env.output();
-        let res = build_embedder_for_recall(&tier_cfg, &cfg, &mut out).unwrap();
+        let res = daemon_runtime::build_embedder(FeatureTier::Keyword, &cfg).await;
         assert!(res.is_none(), "keyword tier must not build an embedder");
-        // No stderr emissions for keyword.
-        drop(out);
-        assert_eq!(env.stderr_str(), "");
     }
 }
