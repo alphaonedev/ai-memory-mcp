@@ -7956,7 +7956,7 @@ fn test_sync_daemon_mesh_propagates_memory_between_peers() {
 // ---------------------------------------------------------------------------
 
 /// Generate a self-signed PEM cert + key pair at the given paths. Returns
-/// the (cert_path, key_path) tuple. Skips the test if openssl isn't on
+/// the (`cert_path`, `key_path`) tuple. Skips the test if openssl isn't on
 /// the PATH (rare on CI runners, but this keeps local-dev friendly).
 fn gen_self_signed_cert(dir: &std::path::Path) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
     let cert = dir.join(format!("ai-memory-test-cert-{}.pem", uuid::Uuid::new_v4()));
