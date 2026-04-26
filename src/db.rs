@@ -223,6 +223,8 @@ fn apply_sqlcipher_key(_conn: &Connection) -> Result<()> {
 }
 
 #[allow(clippy::too_many_lines)]
+const MIGRATION_V15_SQLITE: &str = include_str!("../migrations/sqlite/0010_v063_hierarchy_kg.sql");
+
 fn migrate(conn: &Connection) -> Result<()> {
     let version: i64 = conn
         .query_row(
@@ -534,6 +536,13 @@ fn migrate(conn: &Connection) -> Result<()> {
             // chrono's `to_rfc3339()` output). The Postgres adapter at
             // `src/store/postgres_schema.sql` uses `TIMESTAMPTZ` —
             // semantically equivalent across both backends.
+            //
+            // The DDL itself lives in migrations/sqlite/0010_v063_hierarchy_kg.sql
+            // (and migrations/postgres/0010_v063_hierarchy_kg.sql for the
+            // Postgres adapter). Loaded via include_str! at compile time
+            // and executed below via execute_batch. The column-existence
+            // checks remain inline here because SQLite cannot do
+            // ALTER TABLE ADD COLUMN IF NOT EXISTS.
             let has_valid_from = conn
                 .prepare("SELECT valid_from FROM memory_links LIMIT 0")
                 .is_ok();
@@ -559,39 +568,8 @@ fn migrate(conn: &Connection) -> Result<()> {
                 conn.execute("ALTER TABLE memory_links ADD COLUMN signature BLOB", [])?;
             }
 
-            conn.execute(
-                "UPDATE memory_links \
-                 SET valid_from = (SELECT created_at FROM memories WHERE id = memory_links.source_id) \
-                 WHERE valid_from IS NULL",
-                [],
-            )?;
-
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_links_temporal_src \
-                 ON memory_links (source_id, valid_from, valid_until)",
-                [],
-            )?;
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_links_temporal_tgt \
-                 ON memory_links (target_id, valid_from, valid_until)",
-                [],
-            )?;
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_links_relation \
-                 ON memory_links (relation, valid_from)",
-                [],
-            )?;
-
-            conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS entity_aliases (
-                    entity_id  TEXT NOT NULL,
-                    alias      TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    PRIMARY KEY (entity_id, alias)
-                );
-                CREATE INDEX IF NOT EXISTS idx_entity_aliases_alias
-                  ON entity_aliases (alias);",
-            )?;
+            // All INDEX and TABLE statements are idempotent; batch-run the migration
+            conn.execute_batch(MIGRATION_V15_SQLITE)?;
         }
 
         conn.execute("DELETE FROM schema_version", [])?;
