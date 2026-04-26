@@ -201,8 +201,14 @@ struct BenchArgs {
     #[arg(long, default_value_t = bench::DEFAULT_WARMUP)]
     warmup: usize,
     /// Emit results as JSON instead of the human-readable table.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "markdown")]
     json: bool,
+    /// Emit results as a GitHub-Flavored-Markdown table — sortable in
+    /// the GitHub UI when piped into `$GITHUB_STEP_SUMMARY` and
+    /// harvestable for the "Latest measured" column in `PERFORMANCE.md`.
+    /// Mutually exclusive with `--json`.
+    #[arg(long)]
+    markdown: bool,
     /// Opt in to the curator-cycle operation: seed the canonical
     /// 1000-memory workload (`benchmarks/v063/canonical_workload.json`)
     /// and time one [`curator::run_once`] sweep against the 60 s p95
@@ -4455,6 +4461,8 @@ fn cmd_bench(args: &BenchArgs) -> Result<()> {
                 "results": results,
             }))?
         );
+    } else if args.markdown {
+        print!("{}", bench::render_markdown(&results));
     } else {
         print!("{}", bench::render_table(&results));
     }

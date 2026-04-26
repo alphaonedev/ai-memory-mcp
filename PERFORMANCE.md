@@ -73,8 +73,8 @@ reference hardware, not absolute floors for every machine.
 | KG operations in `bench` | ✅ landed | `src/bench.rs` — fan-out fixture (50 × 4 outbound, every link `valid_from`-stamped) drives `kg_query` depth=1 + `kg_timeline`; chain fixture (50 chains × 5 hops) drives `kg_query` depth=3 + depth=5 |
 | Embedding-bound operations in `bench` | 🚧 Stream E follow-up | needs an embedder fixture decision (opt-in flag vs cfg(test) fake vs pre-cached model) — see iter-0017 handoff |
 | `curator cycle (1k memories)` in `bench` | 🚧 opt-in via `--with-curator` | `src/bench.rs` `run_curator_cycle` — seeds `benchmarks/v063/canonical_workload.json` into a disposable `SQLite` and runs one `curator::run_once` sweep (per-cycle op cap raised to 1000). Requires a reachable Ollama endpoint with the curator's model; CLI emits a no-op message and skips the row otherwise. Default `cargo test` and the `bench.yml` CI guard do not trigger this row. |
-| `bench.yml` CI workflow | ✅ landed | `.github/workflows/bench.yml` — gates every PR and trunk push on `ubuntu-latest`; uploads `bench-results` artifact (JSON + table) |
-| Measured numbers in CI history | ✅ collecting | each workflow run's summary carries the table; the JSON artifact is retained per GitHub Actions retention policy |
+| `bench.yml` CI workflow | ✅ landed | `.github/workflows/bench.yml` — gates every PR and trunk push on `ubuntu-latest`; uploads `bench-results` artifact (JSON + Markdown table) |
+| Measured numbers in CI history | ✅ collecting | each workflow run's summary carries a sortable Markdown table emitted by `ai-memory bench --markdown`; the JSON artifact is retained per GitHub Actions retention policy |
 
 The status table is updated as each Stream lands within the v0.6.3
 cycle. When measurements begin, this file will gain a "Latest measured"
@@ -105,6 +105,11 @@ memory_kg_timeline              <  100 ms           0.1 ms         0.1      0.1 
 `--iterations` and `--warmup` (clamped to `[1, 100_000]` and
 `[0, 10_000]` respectively) tune the sample size. `--json` emits the
 same numbers as a single JSON document for downstream tooling.
+`--markdown` emits a GitHub-Flavored-Markdown table — sortable in the
+GitHub UI when the CI workflow pipes it into `$GITHUB_STEP_SUMMARY`,
+and the data source future tooling will harvest to populate the
+"Latest measured" column promised in the [Status](#status) section.
+`--json` and `--markdown` are mutually exclusive.
 
 The KG rows seed two in-process fixtures so every traversal runs
 end-to-end with no external service:

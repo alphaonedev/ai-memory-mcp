@@ -712,6 +712,32 @@ pub fn render_table(results: &[OperationResult]) -> String {
     out
 }
 
+/// Render the same per-operation results as a GitHub-Flavored-Markdown
+/// table. Sortable in the GitHub UI when piped into `$GITHUB_STEP_SUMMARY`,
+/// and harvestable by future tooling that wants to populate the
+/// "Latest measured" column in `PERFORMANCE.md`. Same rounding +
+/// PASS/FAIL semantics as [`render_table`].
+#[must_use]
+pub fn render_markdown(results: &[OperationResult]) -> String {
+    let mut out = String::new();
+    out.push_str("| Operation | Target (p95) | Measured (p95) | p50 | p99 | Status |\n");
+    out.push_str("|---|---:|---:|---:|---:|:---:|\n");
+    for r in results {
+        let status_str = match r.status {
+            Status::Pass => "PASS",
+            Status::Fail => "FAIL",
+        };
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let target_ms = r.target_p95_ms.round() as i64;
+        let line = format!(
+            "| `{}` | < {} ms | {:.1} ms | {:.1} ms | {:.1} ms | {} |\n",
+            r.label, target_ms, r.measured_p95_ms, r.measured_p50_ms, r.measured_p99_ms, status_str,
+        );
+        out.push_str(&line);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -883,6 +909,80 @@ mod tests {
             "report.errors must surface the missing-LLM reason: {:?}",
             report.errors
         );
+    }
+
+    #[test]
+    fn render_markdown_includes_all_operations() {
+        // The Markdown table is what bench.yml pipes into
+        // `$GITHUB_STEP_SUMMARY` so GitHub renders it as a sortable
+        // table — every row in `render_table` must also appear here.
+        let conn = fresh_conn();
+        let results = run(&conn, &small_config()).unwrap();
+        let md = render_markdown(&results);
+        // Header + alignment row.
+        assert!(
+            md.starts_with("| Operation | Target (p95) | Measured (p95) | p50 | p99 | Status |\n")
+        );
+        assert!(md.contains("|---|---:|---:|---:|---:|:---:|\n"));
+        // Every operation label is present, wrapped in backticks.
+        for op in [
+            "memory_store (no embedding)",
+            "memory_search (FTS5)",
+            "memory_recall (hot, depth=1)",
+            "memory_kg_query (depth=1)",
+            "memory_kg_query (depth=3)",
+            "memory_kg_query (depth=5)",
+            "memory_kg_timeline",
+        ] {
+            let cell = format!("| `{op}` |");
+            assert!(md.contains(&cell), "missing row for {op}: {md}");
+        }
+    }
+
+    #[test]
+    fn render_markdown_carries_pass_fail_marker() {
+        // PASS/FAIL strings must survive into the Markdown output —
+        // they are how operators (and any future PERFORMANCE.md
+        // harvester) identify regressions.
+        let pass = OperationResult {
+            operation: Operation::StoreNoEmbedding,
+            label: Operation::StoreNoEmbedding.label(),
+            target_p95_ms: 20.0,
+            measured_p50_ms: 1.0,
+            measured_p95_ms: 5.0,
+            measured_p99_ms: 8.0,
+            samples: 100,
+            status: Status::Pass,
+        };
+        let fail = OperationResult {
+            status: Status::Fail,
+            measured_p95_ms: 50.0,
+            ..pass.clone()
+        };
+        let md = render_markdown(&[pass, fail]);
+        assert!(md.contains("| PASS |"));
+        assert!(md.contains("| FAIL |"));
+    }
+
+    #[test]
+    fn render_markdown_renders_curator_cycle_row() {
+        // Mirrors `render_table_renders_curator_cycle_row` for the
+        // markdown variant — operators reading the GitHub run summary
+        // see the same opt-in row they'd see in the plain-text table.
+        let results = vec![OperationResult {
+            operation: Operation::CuratorCycle,
+            label: Operation::CuratorCycle.label(),
+            target_p95_ms: Operation::CuratorCycle.target_p95_ms(),
+            measured_p50_ms: 12_000.0,
+            measured_p95_ms: 12_000.0,
+            measured_p99_ms: 12_000.0,
+            samples: 1,
+            status: Status::Pass,
+        }];
+        let md = render_markdown(&results);
+        assert!(md.contains("| `curator cycle (1k memories)` |"));
+        assert!(md.contains("| < 60000 ms |"));
+        assert!(md.contains("| PASS |"));
     }
 
     #[test]
