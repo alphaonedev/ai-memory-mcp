@@ -48,6 +48,36 @@ jobs:
       - name: Build release
         run: cargo build --release
 
+  msrv:
+    name: MSRV (Rust 1.93 — Ubuntu 26.04 LTS floor)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust 1.93
+        # Ubuntu 26.04 LTS (resolute) ships rustc 1.91/1.92/1.93 with 1.93 as
+        # the `rust-defaults` package default. Our `rust-version = "1.93"` in
+        # Cargo.toml matches that default — Launchpad's PPA builders and
+        # anyone running `cargo install ai-memory` on a default 26.04
+        # toolchain must succeed. This job pins 1.93 so
+        # a future stdlib-2026 or edition-2024-only API drift can't silently
+        # break the MSRV claim.
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.93"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv-1.93
+
+      - name: Build under MSRV
+        env:
+          AI_MEMORY_NO_CONFIG: "1"
+        # cargo check rather than full test — MSRV guards compilation floor,
+        # not test-suite behaviour. Tests continue to run on stable in the
+        # `check` matrix above.
+        run: cargo check --locked --all-targets
+
   release:
     name: Release (${{ matrix.target }})
     needs: check
@@ -64,7 +94,7 @@ jobs:
             artifact: ai-memory
             nfpm_arch: amd64
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-24.04-arm
+            os: ubuntu-24.04-arm  # runner image; PPA targets Ubuntu 26.04 resolute
             artifact: ai-memory
             nfpm_arch: arm64
           - target: x86_64-apple-darwin
@@ -331,7 +361,7 @@ jobs:
       - name: Update changelog version
         run: |
           VERSION=${{ steps.version.outputs.version }}
-          SERIES=noble
+          SERIES=resolute
           sed -i "1s/(.*)/(${VERSION}-1) ${SERIES}; urgency=medium/" debian/changelog
 
       - name: Create orig tarball
