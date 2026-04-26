@@ -5681,7 +5681,7 @@ fn mcp_call(
     binary: &str,
     db_path: &std::path::Path,
     name: &str,
-    args: serde_json::Value,
+    args: &serde_json::Value,
 ) -> serde_json::Value {
     use std::io::Write;
     let mut child = cmd(binary)
@@ -5739,7 +5739,7 @@ fn test_governance_set_and_get_roundtrip() {
         bin,
         &db,
         "memory_namespace_set_standard",
-        serde_json::json!({
+        &serde_json::json!({
             "namespace": "alphaone/eng",
             "id": sid,
             "governance": gov.clone(),
@@ -5752,7 +5752,7 @@ fn test_governance_set_and_get_roundtrip() {
         bin,
         &db,
         "memory_namespace_get_standard",
-        serde_json::json!({"namespace": "alphaone/eng"}),
+        &serde_json::json!({"namespace": "alphaone/eng"}),
     );
     assert_eq!(get_resp["governance"]["write"], "registered");
     assert_eq!(get_resp["governance"]["promote"], "approve");
@@ -5771,13 +5771,13 @@ fn test_governance_default_returned_when_unset() {
         bin,
         &db,
         "memory_namespace_set_standard",
-        serde_json::json!({"namespace": "plain", "id": sid}),
+        &serde_json::json!({"namespace": "plain", "id": sid}),
     );
     let get_resp = mcp_call(
         bin,
         &db,
         "memory_namespace_get_standard",
-        serde_json::json!({"namespace": "plain"}),
+        &serde_json::json!({"namespace": "plain"}),
     );
     let gov = &get_resp["governance"];
     assert_eq!(gov["write"], "any");
@@ -5794,7 +5794,7 @@ fn mcp_call_raw(
     binary: &str,
     db_path: &std::path::Path,
     name: &str,
-    args: serde_json::Value,
+    args: &serde_json::Value,
 ) -> serde_json::Value {
     use std::io::Write;
     let mut child = cmd(binary)
@@ -5844,7 +5844,7 @@ fn test_governance_invalid_rejected() {
         bin,
         &db,
         "memory_namespace_set_standard",
-        serde_json::json!({
+        &serde_json::json!({
             "namespace": "alphaone/eng",
             "id": sid,
             "governance": {
@@ -5872,7 +5872,7 @@ fn test_governance_consensus_quorum_rejected() {
         bin,
         &db,
         "memory_namespace_set_standard",
-        serde_json::json!({
+        &serde_json::json!({
             "namespace": "alphaone",
             "id": sid,
             "governance": {
@@ -5902,7 +5902,7 @@ fn test_governance_inherit_path_surfaces_per_level() {
         bin,
         &db,
         "memory_namespace_set_standard",
-        serde_json::json!({
+        &serde_json::json!({
             "namespace": "alphaone",
             "id": org_id,
             "governance": {
@@ -5915,7 +5915,7 @@ fn test_governance_inherit_path_surfaces_per_level() {
         bin,
         &db,
         "memory_namespace_set_standard",
-        serde_json::json!({
+        &serde_json::json!({
             "namespace": "alphaone/eng",
             "id": team_id,
             "governance": {
@@ -5929,7 +5929,7 @@ fn test_governance_inherit_path_surfaces_per_level() {
         bin,
         &db,
         "memory_namespace_get_standard",
-        serde_json::json!({"namespace": "alphaone/eng", "inherit": true}),
+        &serde_json::json!({"namespace": "alphaone/eng", "inherit": true}),
     );
     let standards = resp["standards"].as_array().unwrap();
     assert!(standards.len() >= 2);
@@ -5957,7 +5957,7 @@ fn test_governance_legacy_memory_defaults_not_mutated() {
         bin,
         &db,
         "memory_namespace_set_standard",
-        serde_json::json!({"namespace": "legacy", "id": sid}),
+        &serde_json::json!({"namespace": "legacy", "id": sid}),
     );
     let out = cmd(bin)
         .args(["--db", db.to_str().unwrap(), "--json", "get", &sid])
@@ -5986,7 +5986,7 @@ fn set_governance(
     binary: &str,
     db_path: &std::path::Path,
     namespace: &str,
-    governance: serde_json::Value,
+    governance: &serde_json::Value,
     owner_agent_id: &str,
 ) {
     let out = cmd(binary)
@@ -6060,7 +6060,7 @@ fn test_enforce_any_allows_store() {
         bin,
         &db,
         "alphaone",
-        serde_json::json!({"write":"any","promote":"any","delete":"any","approver":"human"}),
+        &serde_json::json!({"write":"any","promote":"any","delete":"any","approver":"human"}),
         "owner",
     );
     let out = cmd(bin)
@@ -6098,7 +6098,7 @@ fn test_enforce_registered_blocks_unregistered() {
         bin,
         &db,
         "alphaone",
-        serde_json::json!({"write":"registered","promote":"any","delete":"owner","approver":"human"}),
+        &serde_json::json!({"write":"registered","promote":"any","delete":"owner","approver":"human"}),
         "owner",
     );
     let out = cmd(bin)
@@ -6146,7 +6146,7 @@ fn test_enforce_registered_allows_registered() {
         bin,
         &db,
         "alphaone",
-        serde_json::json!({"write":"registered","promote":"any","delete":"owner","approver":"human"}),
+        &serde_json::json!({"write":"registered","promote":"any","delete":"owner","approver":"human"}),
         "owner",
     );
     let out = cmd(bin)
@@ -6179,7 +6179,7 @@ fn test_enforce_owner_blocks_non_owner_delete() {
         bin,
         &db,
         "alphaone",
-        serde_json::json!({"write":"any","promote":"any","delete":"owner","approver":"human"}),
+        &serde_json::json!({"write":"any","promote":"any","delete":"owner","approver":"human"}),
         "owner",
     );
     let store = cmd(bin)
@@ -6230,7 +6230,7 @@ fn test_enforce_owner_allows_self_delete() {
         bin,
         &db,
         "alphaone",
-        serde_json::json!({"write":"any","promote":"any","delete":"owner","approver":"human"}),
+        &serde_json::json!({"write":"any","promote":"any","delete":"owner","approver":"human"}),
         "owner",
     );
     let store = cmd(bin)
@@ -6279,7 +6279,7 @@ fn test_enforce_approve_queues_pending() {
         bin,
         &db,
         "alphaone",
-        serde_json::json!({"write":"approve","promote":"any","delete":"owner","approver":"human"}),
+        &serde_json::json!({"write":"approve","promote":"any","delete":"owner","approver":"human"}),
         "owner",
     );
     let out = cmd(bin)
@@ -6316,7 +6316,7 @@ fn test_enforce_pending_list_and_approve() {
         bin,
         &db,
         "alphaone",
-        serde_json::json!({"write":"approve","promote":"any","delete":"owner","approver":"human"}),
+        &serde_json::json!({"write":"approve","promote":"any","delete":"owner","approver":"human"}),
         "owner",
     );
     let queued = cmd(bin)
@@ -6394,7 +6394,7 @@ fn test_enforce_pending_reject_status() {
         bin,
         &db,
         "alphaone",
-        serde_json::json!({"write":"approve","promote":"any","delete":"owner","approver":"human"}),
+        &serde_json::json!({"write":"approve","promote":"any","delete":"owner","approver":"human"}),
         "owner",
     );
     let queued = cmd(bin)
@@ -6492,7 +6492,7 @@ fn test_enforce_promote_with_approve_policy() {
         bin,
         &db,
         "alphaone",
-        serde_json::json!({"write":"any","promote":"approve","delete":"any","approver":"human"}),
+        &serde_json::json!({"write":"any","promote":"approve","delete":"any","approver":"human"}),
         "owner",
     );
     let store = cmd(bin)
@@ -6545,7 +6545,7 @@ fn test_enforce_mcp_pending_tools() {
         bin,
         &db,
         "alphaone",
-        serde_json::json!({"write":"approve","promote":"any","delete":"owner","approver":"human"}),
+        &serde_json::json!({"write":"approve","promote":"any","delete":"owner","approver":"human"}),
         "owner",
     );
     let queued = cmd(bin)
@@ -6715,7 +6715,7 @@ fn test_approver_human_any_approver_accepted() {
         bin,
         &db,
         "alphaone",
-        serde_json::json!({"write":"approve","promote":"any","delete":"owner","approver":"human"}),
+        &serde_json::json!({"write":"approve","promote":"any","delete":"owner","approver":"human"}),
         "owner",
     );
     let pid = queue_store(bin, &db, "alphaone", "human-target", "alice");
@@ -6736,7 +6736,7 @@ fn test_approver_agent_rejects_wrong_caller() {
         bin,
         &db,
         "alphaone",
-        serde_json::json!({
+        &serde_json::json!({
             "write":"approve","promote":"any","delete":"owner",
             "approver":{"agent":"maintainer"}
         }),
@@ -6761,7 +6761,7 @@ fn test_approver_agent_accepts_matching_caller() {
         bin,
         &db,
         "alphaone",
-        serde_json::json!({
+        &serde_json::json!({
             "write":"approve","promote":"any","delete":"owner",
             "approver":{"agent":"maintainer"}
         }),
@@ -6784,7 +6784,7 @@ fn test_approver_consensus_below_threshold_pending() {
         bin,
         &db,
         "alphaone",
-        serde_json::json!({
+        &serde_json::json!({
             "write":"approve","promote":"any","delete":"owner",
             "approver":{"consensus":3}
         }),
@@ -6826,7 +6826,7 @@ fn test_approver_consensus_threshold_auto_executes() {
         bin,
         &db,
         "alphaone",
-        serde_json::json!({
+        &serde_json::json!({
             "write":"approve","promote":"any","delete":"owner",
             "approver":{"consensus":2}
         }),
@@ -6885,7 +6885,7 @@ fn test_approver_consensus_same_agent_does_not_double_count() {
         bin,
         &db,
         "alphaone",
-        serde_json::json!({
+        &serde_json::json!({
             "write":"approve","promote":"any","delete":"owner",
             "approver":{"consensus":2}
         }),
@@ -6917,7 +6917,7 @@ fn test_approver_agent_rejected_not_counted_for_consensus() {
         bin,
         &db,
         "alphaone",
-        serde_json::json!({
+        &serde_json::json!({
             "write":"approve","promote":"any","delete":"owner",
             "approver":{"agent":"only-me"}
         }),
@@ -6945,7 +6945,7 @@ fn test_approver_delete_consensus_executes_delete() {
         bin,
         &db,
         "alphaone",
-        serde_json::json!({
+        &serde_json::json!({
             "write":"any","promote":"any","delete":"approve",
             "approver":{"consensus":2}
         }),
@@ -7026,7 +7026,7 @@ fn test_consensus_unregistered_voter_rejected() {
         bin,
         &db,
         "alphaone",
-        serde_json::json!({
+        &serde_json::json!({
             "write":"approve","promote":"any","delete":"owner",
             "approver":{"consensus":2}
         }),
@@ -7070,7 +7070,7 @@ fn test_consensus_case_variant_rejected_if_only_lowercase_registered() {
         bin,
         &db,
         "alphaone",
-        serde_json::json!({
+        &serde_json::json!({
             "write":"approve","promote":"any","delete":"owner",
             "approver":{"consensus":2}
         }),
@@ -7108,7 +7108,7 @@ fn test_consensus_case_insensitive_dedup_when_variants_registered() {
         bin,
         &db,
         "alphaone",
-        serde_json::json!({
+        &serde_json::json!({
             "write":"approve","promote":"any","delete":"owner",
             "approver":{"consensus":2}
         }),
