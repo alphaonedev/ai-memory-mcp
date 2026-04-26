@@ -1973,4 +1973,636 @@ mod tests {
             other => panic!("expected QuorumNotMet, got {other:?}"),
         }
     }
+
+    // --- broadcast_delete_quorum tests (Wave 3) ---
+    //
+    // The delete fanout mirrors the store fanout but rides a `deletions: [id]`
+    // payload instead of memory bodies. These two cases hit the entire
+    // function body — happy ack loop, deadline check, post-quorum detach,
+    // tracker unwrap.
+
+    #[tokio::test]
+    async fn delete_quorum_two_peers_ack_meets_quorum() {
+        let (url1, count1) = spawn_mock_peer(MockBehaviour::Ack).await;
+        let (url2, count2) = spawn_mock_peer(MockBehaviour::Ack).await;
+        let cfg = build_config(vec![url1, url2], 2, 2000);
+        let tracker = broadcast_delete_quorum(&cfg, "mem-del").await.unwrap();
+        assert!(finalise_quorum(&tracker).is_ok());
+        for _ in 0..20 {
+            if count1.load(Ordering::Relaxed) == 1 && count2.load(Ordering::Relaxed) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(count1.load(Ordering::Relaxed), 1);
+        assert_eq!(count2.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn delete_quorum_partition_minority_fails() {
+        let (url1, _) = spawn_mock_peer(MockBehaviour::Fail).await;
+        let (url2, _) = spawn_mock_peer(MockBehaviour::Fail).await;
+        let cfg = build_config(vec![url1, url2], 3, 500);
+        let tracker = broadcast_delete_quorum(&cfg, "mem-del").await.unwrap();
+        let err = finalise_quorum(&tracker).unwrap_err();
+        match err {
+            QuorumError::QuorumNotMet { got, needed, .. } => {
+                assert_eq!(got, 1);
+                assert_eq!(needed, 3);
+            }
+            other => panic!("expected QuorumNotMet, got {other:?}"),
+        }
+    }
+
+    // --- broadcast_restore_quorum tests (Wave 3) ---
+
+    #[tokio::test]
+    async fn restore_quorum_two_peers_ack_meets_quorum() {
+        let (url1, count1) = spawn_mock_peer(MockBehaviour::Ack).await;
+        let (url2, count2) = spawn_mock_peer(MockBehaviour::Ack).await;
+        let cfg = build_config(vec![url1, url2], 2, 2000);
+        let tracker = broadcast_restore_quorum(&cfg, "mem-restore").await.unwrap();
+        assert!(finalise_quorum(&tracker).is_ok());
+        for _ in 0..20 {
+            if count1.load(Ordering::Relaxed) == 1 && count2.load(Ordering::Relaxed) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(count1.load(Ordering::Relaxed), 1);
+        assert_eq!(count2.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn restore_quorum_partition_minority_fails() {
+        let (url1, _) = spawn_mock_peer(MockBehaviour::Fail).await;
+        let (url2, _) = spawn_mock_peer(MockBehaviour::Fail).await;
+        let cfg = build_config(vec![url1, url2], 3, 500);
+        let tracker = broadcast_restore_quorum(&cfg, "mem-restore").await.unwrap();
+        let err = finalise_quorum(&tracker).unwrap_err();
+        assert!(matches!(err, QuorumError::QuorumNotMet { .. }));
+    }
+
+    // --- broadcast_link_quorum tests (Wave 3) ---
+
+    fn sample_link() -> MemoryLink {
+        MemoryLink {
+            source_id: "mem-a".to_string(),
+            target_id: "mem-b".to_string(),
+            relation: "related_to".to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+
+    #[tokio::test]
+    async fn link_quorum_two_peers_ack_meets_quorum() {
+        let (url1, count1) = spawn_mock_peer(MockBehaviour::Ack).await;
+        let (url2, count2) = spawn_mock_peer(MockBehaviour::Ack).await;
+        let cfg = build_config(vec![url1, url2], 2, 2000);
+        let tracker = broadcast_link_quorum(&cfg, &sample_link()).await.unwrap();
+        assert!(finalise_quorum(&tracker).is_ok());
+        for _ in 0..20 {
+            if count1.load(Ordering::Relaxed) == 1 && count2.load(Ordering::Relaxed) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(count1.load(Ordering::Relaxed), 1);
+        assert_eq!(count2.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn link_quorum_partition_minority_fails() {
+        let (url1, _) = spawn_mock_peer(MockBehaviour::Fail).await;
+        let (url2, _) = spawn_mock_peer(MockBehaviour::Fail).await;
+        let cfg = build_config(vec![url1, url2], 3, 500);
+        let tracker = broadcast_link_quorum(&cfg, &sample_link()).await.unwrap();
+        let err = finalise_quorum(&tracker).unwrap_err();
+        assert!(matches!(err, QuorumError::QuorumNotMet { .. }));
+    }
+
+    // --- broadcast_consolidate_quorum tests (Wave 3) ---
+
+    #[tokio::test]
+    async fn consolidate_quorum_two_peers_ack_meets_quorum() {
+        let (url1, count1) = spawn_mock_peer(MockBehaviour::Ack).await;
+        let (url2, count2) = spawn_mock_peer(MockBehaviour::Ack).await;
+        let cfg = build_config(vec![url1, url2], 2, 2000);
+        let new_mem = sample_memory();
+        let sources = vec!["src-a".to_string(), "src-b".to_string()];
+        let tracker = broadcast_consolidate_quorum(&cfg, &new_mem, &sources)
+            .await
+            .unwrap();
+        assert!(finalise_quorum(&tracker).is_ok());
+        for _ in 0..20 {
+            if count1.load(Ordering::Relaxed) == 1 && count2.load(Ordering::Relaxed) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(count1.load(Ordering::Relaxed), 1);
+        assert_eq!(count2.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn consolidate_quorum_partition_minority_fails() {
+        let (url1, _) = spawn_mock_peer(MockBehaviour::Fail).await;
+        let (url2, _) = spawn_mock_peer(MockBehaviour::Fail).await;
+        let cfg = build_config(vec![url1, url2], 3, 500);
+        let new_mem = sample_memory();
+        let tracker = broadcast_consolidate_quorum(&cfg, &new_mem, &[])
+            .await
+            .unwrap();
+        let err = finalise_quorum(&tracker).unwrap_err();
+        assert!(matches!(err, QuorumError::QuorumNotMet { .. }));
+    }
+
+    // --- broadcast_pending_quorum tests (Wave 3) ---
+
+    fn sample_pending() -> PendingAction {
+        PendingAction {
+            id: "pa-1".to_string(),
+            action_type: "delete".to_string(),
+            memory_id: Some("mem-x".to_string()),
+            namespace: "app".to_string(),
+            payload: serde_json::json!({}),
+            requested_by: "ai:test".to_string(),
+            requested_at: chrono::Utc::now().to_rfc3339(),
+            status: "pending".to_string(),
+            decided_by: None,
+            decided_at: None,
+            approvals: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_quorum_two_peers_ack_meets_quorum() {
+        let (url1, count1) = spawn_mock_peer(MockBehaviour::Ack).await;
+        let (url2, count2) = spawn_mock_peer(MockBehaviour::Ack).await;
+        let cfg = build_config(vec![url1, url2], 2, 2000);
+        let tracker = broadcast_pending_quorum(&cfg, &sample_pending())
+            .await
+            .unwrap();
+        assert!(finalise_quorum(&tracker).is_ok());
+        for _ in 0..20 {
+            if count1.load(Ordering::Relaxed) == 1 && count2.load(Ordering::Relaxed) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(count1.load(Ordering::Relaxed), 1);
+        assert_eq!(count2.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn pending_quorum_partition_minority_fails() {
+        let (url1, _) = spawn_mock_peer(MockBehaviour::Fail).await;
+        let (url2, _) = spawn_mock_peer(MockBehaviour::Fail).await;
+        let cfg = build_config(vec![url1, url2], 3, 500);
+        let tracker = broadcast_pending_quorum(&cfg, &sample_pending())
+            .await
+            .unwrap();
+        let err = finalise_quorum(&tracker).unwrap_err();
+        assert!(matches!(err, QuorumError::QuorumNotMet { .. }));
+    }
+
+    // --- broadcast_pending_decision_quorum tests (Wave 3) ---
+
+    fn sample_decision() -> PendingDecision {
+        PendingDecision {
+            id: "pa-1".to_string(),
+            approved: true,
+            decider: "ai:approver".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_decision_quorum_two_peers_ack_meets_quorum() {
+        let (url1, count1) = spawn_mock_peer(MockBehaviour::Ack).await;
+        let (url2, count2) = spawn_mock_peer(MockBehaviour::Ack).await;
+        let cfg = build_config(vec![url1, url2], 2, 2000);
+        let tracker = broadcast_pending_decision_quorum(&cfg, &sample_decision())
+            .await
+            .unwrap();
+        assert!(finalise_quorum(&tracker).is_ok());
+        for _ in 0..20 {
+            if count1.load(Ordering::Relaxed) == 1 && count2.load(Ordering::Relaxed) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(count1.load(Ordering::Relaxed), 1);
+        assert_eq!(count2.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn pending_decision_quorum_partition_minority_fails() {
+        let (url1, _) = spawn_mock_peer(MockBehaviour::Fail).await;
+        let (url2, _) = spawn_mock_peer(MockBehaviour::Fail).await;
+        let cfg = build_config(vec![url1, url2], 3, 500);
+        let tracker = broadcast_pending_decision_quorum(&cfg, &sample_decision())
+            .await
+            .unwrap();
+        let err = finalise_quorum(&tracker).unwrap_err();
+        assert!(matches!(err, QuorumError::QuorumNotMet { .. }));
+    }
+
+    // --- broadcast_namespace_meta_quorum tests (Wave 3) ---
+
+    fn sample_namespace_meta() -> NamespaceMetaEntry {
+        NamespaceMetaEntry {
+            namespace: "app/team".to_string(),
+            standard_id: "mem-std-1".to_string(),
+            parent_namespace: Some("app".to_string()),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+
+    #[tokio::test]
+    async fn namespace_meta_quorum_two_peers_ack_meets_quorum() {
+        let (url1, count1) = spawn_mock_peer(MockBehaviour::Ack).await;
+        let (url2, count2) = spawn_mock_peer(MockBehaviour::Ack).await;
+        let cfg = build_config(vec![url1, url2], 2, 2000);
+        let tracker = broadcast_namespace_meta_quorum(&cfg, &sample_namespace_meta())
+            .await
+            .unwrap();
+        assert!(finalise_quorum(&tracker).is_ok());
+        for _ in 0..20 {
+            if count1.load(Ordering::Relaxed) == 1 && count2.load(Ordering::Relaxed) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(count1.load(Ordering::Relaxed), 1);
+        assert_eq!(count2.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn namespace_meta_quorum_partition_minority_fails() {
+        let (url1, _) = spawn_mock_peer(MockBehaviour::Fail).await;
+        let (url2, _) = spawn_mock_peer(MockBehaviour::Fail).await;
+        let cfg = build_config(vec![url1, url2], 3, 500);
+        let tracker = broadcast_namespace_meta_quorum(&cfg, &sample_namespace_meta())
+            .await
+            .unwrap();
+        let err = finalise_quorum(&tracker).unwrap_err();
+        assert!(matches!(err, QuorumError::QuorumNotMet { .. }));
+    }
+
+    // --- broadcast_namespace_meta_clear_quorum tests (Wave 3) ---
+
+    #[tokio::test]
+    async fn namespace_meta_clear_quorum_two_peers_ack_meets_quorum() {
+        let (url1, count1) = spawn_mock_peer(MockBehaviour::Ack).await;
+        let (url2, count2) = spawn_mock_peer(MockBehaviour::Ack).await;
+        let cfg = build_config(vec![url1, url2], 2, 2000);
+        let namespaces = vec!["app/team".to_string(), "app/other".to_string()];
+        let tracker = broadcast_namespace_meta_clear_quorum(&cfg, &namespaces)
+            .await
+            .unwrap();
+        assert!(finalise_quorum(&tracker).is_ok());
+        for _ in 0..20 {
+            if count1.load(Ordering::Relaxed) == 1 && count2.load(Ordering::Relaxed) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(count1.load(Ordering::Relaxed), 1);
+        assert_eq!(count2.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn namespace_meta_clear_quorum_partition_minority_fails() {
+        let (url1, _) = spawn_mock_peer(MockBehaviour::Fail).await;
+        let (url2, _) = spawn_mock_peer(MockBehaviour::Fail).await;
+        let cfg = build_config(vec![url1, url2], 3, 500);
+        let namespaces = vec!["app/team".to_string()];
+        let tracker = broadcast_namespace_meta_clear_quorum(&cfg, &namespaces)
+            .await
+            .unwrap();
+        let err = finalise_quorum(&tracker).unwrap_err();
+        assert!(matches!(err, QuorumError::QuorumNotMet { .. }));
+    }
+
+    // --- QuorumNotMetPayload::from_err branch coverage (Wave 3) ---
+    //
+    // The non-Timeout reasons (Unreachable, IdDrift, InFlight) and the
+    // non-QuorumNotMet variants (InvalidPolicy, LocalWriteFailed) were
+    // never exercised — `from_err` had only the Timeout path covered.
+
+    #[test]
+    fn quorum_not_met_payload_unreachable_reason() {
+        let err = QuorumError::QuorumNotMet {
+            got: 1,
+            needed: 2,
+            reason: QuorumFailureReason::Unreachable,
+        };
+        let payload = QuorumNotMetPayload::from_err(&err);
+        assert_eq!(payload.reason, "unreachable");
+    }
+
+    #[test]
+    fn quorum_not_met_payload_id_drift_reason() {
+        let err = QuorumError::QuorumNotMet {
+            got: 1,
+            needed: 2,
+            reason: QuorumFailureReason::IdDrift,
+        };
+        let payload = QuorumNotMetPayload::from_err(&err);
+        assert_eq!(payload.reason, "id_drift");
+    }
+
+    #[test]
+    fn quorum_not_met_payload_in_flight_reason_maps_to_timeout() {
+        // InFlight is a transient internal state; HTTP payload maps it to
+        // "timeout" rather than leaking a fourth public reason string.
+        let err = QuorumError::QuorumNotMet {
+            got: 1,
+            needed: 2,
+            reason: QuorumFailureReason::InFlight,
+        };
+        let payload = QuorumNotMetPayload::from_err(&err);
+        assert_eq!(payload.reason, "timeout");
+    }
+
+    #[test]
+    fn quorum_not_met_payload_invalid_policy_branch() {
+        let err = QuorumError::InvalidPolicy {
+            detail: "bad-thing".to_string(),
+        };
+        let payload = QuorumNotMetPayload::from_err(&err);
+        assert_eq!(payload.error, "quorum_not_met");
+        assert_eq!(payload.got, 0);
+        assert_eq!(payload.needed, 0);
+        assert!(payload.reason.starts_with("invalid_policy:"));
+        assert!(payload.reason.contains("bad-thing"));
+    }
+
+    #[test]
+    fn quorum_not_met_payload_local_write_failed_branch() {
+        let err = QuorumError::LocalWriteFailed {
+            detail: "disk-full".to_string(),
+        };
+        let payload = QuorumNotMetPayload::from_err(&err);
+        assert_eq!(payload.error, "quorum_not_met");
+        assert!(payload.reason.starts_with("local_write_failed:"));
+        assert!(payload.reason.contains("disk-full"));
+    }
+
+    // --- FederationConfig::build coverage (Wave 3) ---
+
+    #[test]
+    fn config_build_constructs_when_w_and_peers_set() {
+        let cfg = FederationConfig::build(
+            2,
+            &[
+                "http://peer-a.example/".to_string(),
+                "http://peer-b.example".to_string(),
+            ],
+            Duration::from_millis(500),
+            None,
+            None,
+            None,
+            "ai:builder".to_string(),
+        )
+        .unwrap()
+        .expect("config should be Some when w>0 and peers nonempty");
+        assert_eq!(cfg.peer_count(), 2);
+        assert_eq!(cfg.peers[0].id, "peer-0");
+        assert_eq!(cfg.peers[1].id, "peer-1");
+        // Trailing slash is stripped during URL normalization.
+        assert_eq!(
+            cfg.peers[0].sync_push_url,
+            "http://peer-a.example/api/v1/sync/push"
+        );
+        assert_eq!(
+            cfg.peers[1].sync_push_url,
+            "http://peer-b.example/api/v1/sync/push"
+        );
+        assert_eq!(cfg.sender_agent_id, "ai:builder");
+    }
+
+    #[test]
+    fn config_build_rejects_duplicate_peer_urls() {
+        let result = FederationConfig::build(
+            2,
+            &[
+                "http://peer.example".to_string(),
+                "http://peer.example/".to_string(),
+            ],
+            Duration::from_millis(500),
+            None,
+            None,
+            None,
+            "ai:builder".to_string(),
+        );
+        let err = match result {
+            Ok(_) => panic!("expected duplicate-URL rejection"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("duplicate peer URL"),
+            "expected duplicate-URL rejection, got {msg:?}"
+        );
+    }
+
+    #[test]
+    fn config_build_rejects_missing_ca_cert_path() {
+        // ca_cert_path supplied but file doesn't exist → read error
+        let bogus = std::path::PathBuf::from("/definitely/does/not/exist/ca.pem");
+        let result = FederationConfig::build(
+            2,
+            &["http://peer.example".to_string()],
+            Duration::from_millis(500),
+            None,
+            None,
+            Some(&bogus),
+            "ai:builder".to_string(),
+        );
+        let err = match result {
+            Ok(_) => panic!("expected ca-cert read error"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("read --quorum-ca-cert"),
+            "expected ca-cert read error, got {msg:?}"
+        );
+    }
+
+    #[test]
+    fn config_build_rejects_invalid_ca_cert_pem() {
+        // Write a non-PEM file and confirm parse-side rejection.
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("not-a-cert.pem");
+        std::fs::write(&bad, b"this is not a valid pem certificate").unwrap();
+        let result = FederationConfig::build(
+            2,
+            &["http://peer.example".to_string()],
+            Duration::from_millis(500),
+            None,
+            None,
+            Some(&bad),
+            "ai:builder".to_string(),
+        );
+        let err = match result {
+            Ok(_) => panic!("expected ca-cert parse error"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("parse --quorum-ca-cert") || msg.contains("--quorum-ca-cert"),
+            "expected ca-cert parse error, got {msg:?}"
+        );
+    }
+
+    #[test]
+    fn config_build_rejects_missing_client_cert_path() {
+        let bogus_cert = std::path::PathBuf::from("/definitely/missing/cert.pem");
+        let bogus_key = std::path::PathBuf::from("/definitely/missing/key.pem");
+        let result = FederationConfig::build(
+            2,
+            &["http://peer.example".to_string()],
+            Duration::from_millis(500),
+            Some(&bogus_cert),
+            Some(&bogus_key),
+            None,
+            "ai:builder".to_string(),
+        );
+        let err = match result {
+            Ok(_) => panic!("expected client-cert read error"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("read --client-cert"),
+            "expected client-cert read error, got {msg:?}"
+        );
+    }
+
+    #[test]
+    fn peer_count_matches_peer_list() {
+        let cfg = build_config(
+            vec![
+                "http://a.example".to_string(),
+                "http://b.example".to_string(),
+                "http://c.example".to_string(),
+            ],
+            2,
+            500,
+        );
+        assert_eq!(cfg.peer_count(), 3);
+    }
+
+    // --- urlencoding_encode coverage (Wave 3) ---
+
+    #[test]
+    fn urlencoding_encode_passthrough_safe_chars() {
+        // ASCII alpha-numeric + RFC3986 unreserved (-_.~) pass through.
+        let encoded = urlencoding_encode("abcXYZ-09_.~");
+        assert_eq!(encoded, "abcXYZ-09_.~");
+    }
+
+    #[test]
+    fn urlencoding_encode_percent_encodes_reserved_and_high_bits() {
+        // Space, colon, plus, slash all get percent-encoded.
+        let encoded = urlencoding_encode("2026-04-26T12:00:00+00:00 / x");
+        assert!(
+            encoded.contains("%3A"),
+            "expected colon to be percent-encoded: {encoded}"
+        );
+        assert!(
+            encoded.contains("%2B"),
+            "expected + to be percent-encoded: {encoded}"
+        );
+        assert!(
+            encoded.contains("%2F"),
+            "expected / to be percent-encoded: {encoded}"
+        );
+        assert!(
+            encoded.contains("%20"),
+            "expected space to be percent-encoded: {encoded}"
+        );
+        // Hyphen IS in the unreserved set → must NOT be percent-encoded.
+        assert!(
+            !encoded.contains("%2D"),
+            "hyphen must pass through unencoded: {encoded}"
+        );
+    }
+
+    #[test]
+    fn urlencoding_encode_empty_string() {
+        assert_eq!(urlencoding_encode(""), "");
+    }
+
+    // --- broadcast_store_quorum id-drift path (Wave 3) ---
+    //
+    // The `IdDrift` arm in post_once + broadcast_store_quorum (lines around
+    // 243-244 / 362-366) was uncovered. A peer that returns a 200 with an
+    // `ids` array NOT containing the expected memory id should be classified
+    // as IdDrift, not Ack.
+
+    async fn id_drift_handler(
+        AxumJson(_body): AxumJson<serde_json::Value>,
+    ) -> (StatusCode, AxumJson<serde_json::Value>) {
+        // 200 OK but ids[0] disagrees with the memory the leader sent.
+        (
+            StatusCode::OK,
+            AxumJson(serde_json::json!({"ids": ["some-other-id"], "applied": 1})),
+        )
+    }
+
+    async fn spawn_id_drift_peer() -> String {
+        let app = Router::new().route("/api/v1/sync/push", post(id_drift_handler));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn id_drift_peer_does_not_count_as_ack() {
+        // Two peers, both return 200 but with `ids: [other-id]`. Quorum
+        // can't be met because neither counts as a peer ack — only the
+        // local commit registers.
+        let url1 = spawn_id_drift_peer().await;
+        let url2 = spawn_id_drift_peer().await;
+        let cfg = build_config(vec![url1, url2], 2, 1000);
+        let tracker = broadcast_store_quorum(&cfg, &sample_memory())
+            .await
+            .unwrap();
+        let result = finalise_quorum(&tracker);
+        // With W=2, N=3 (local + 2 peers), local + 0 peer-acks = 1 < 2.
+        let err = result.unwrap_err();
+        match err {
+            QuorumError::QuorumNotMet {
+                got,
+                needed,
+                reason,
+            } => {
+                assert_eq!(got, 1, "only local should count");
+                assert_eq!(needed, 2);
+                // IdDrift / Timeout / InFlight are all valid here. The
+                // tracker classifies based on whether ANY peer reported a
+                // drift (IdDrift), the deadline elapsed first (Timeout),
+                // or all peers reported but the deadline still hadn't
+                // passed when finalise was called (InFlight). The
+                // important invariant is just "peer with drifted ids does
+                // NOT count toward quorum".
+                assert!(
+                    matches!(
+                        reason,
+                        QuorumFailureReason::IdDrift
+                            | QuorumFailureReason::Timeout
+                            | QuorumFailureReason::InFlight
+                    ),
+                    "expected IdDrift / Timeout / InFlight, got {reason:?}"
+                );
+            }
+            other => panic!("expected QuorumNotMet, got {other:?}"),
+        }
+    }
 }
