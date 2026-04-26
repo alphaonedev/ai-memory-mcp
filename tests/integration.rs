@@ -5031,7 +5031,7 @@ fn fresh_inherit_db() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("ai-memory-inherit-{}.db", uuid::Uuid::new_v4()))
 }
 
-/// Seed a standard memory in a namespace, then set_standard it.
+/// Seed a standard memory in a namespace, then `set_standard` it.
 fn seed_standard(
     binary: &str,
     db_path: &std::path::Path,
