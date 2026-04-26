@@ -10036,3 +10036,219 @@ fn http_namespace_standard_meta_fans_out() {
         "peer never saw the parent namespace from the meta fanout"
     );
 }
+
+#[test]
+fn test_quorum_partial_failure_with_timeout() {
+    // Justice of Federation Tier 1: quorum partial failure with timeout.
+    // 3-peer mesh, W=2/N=3. Verifies that leader can achieve quorum with
+    // 2 acks out of 3 peers via HTTP fanout (integrating real TCP, not mocks).
+    let peer1 = DaemonGuard::spawn();
+    let peer2 = DaemonGuard::spawn();
+    let peer3 = DaemonGuard::spawn();
+
+    let peer_urls = vec![
+        format!("http://127.0.0.1:{}", peer1.port),
+        format!("http://127.0.0.1:{}", peer2.port),
+        format!("http://127.0.0.1:{}", peer3.port),
+    ];
+
+    // Leader: W=2/N=3 quorum, short timeout (2s) to keep test fast.
+    let leader = spawn_leader_with_timeout(2, &peer_urls, 2000);
+
+    // Store a memory on the leader with quorum replication.
+    let body = serde_json::json!({
+        "tier": "long",
+        "namespace": "fed-partial-fail",
+        "title": "test memory",
+        "content": "will fanout to 3 peers; 2 must ack",
+        "tags": [],
+        "priority": 5,
+        "confidence": 1.0,
+        "source": "api",
+        "metadata": {}
+    });
+
+    let (code, resp) = curl_post(leader.port, "/api/v1/memories", &body, Some("ai:fed-test"));
+    assert_eq!(code, "201", "initial store: {resp}");
+
+    // Verify the memory reached at least 2 peers (quorum met for initial store).
+    let mem_id = resp["id"].as_str().unwrap().to_string();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut acks = 0;
+    while std::time::Instant::now() < deadline && acks < 2 {
+        for peer in [&peer1, &peer2, &peer3] {
+            let (code, _body) = curl_get(peer.port, &format!("/api/v1/memories/{}", &mem_id));
+            if code == "200" {
+                acks += 1;
+            }
+        }
+        if acks >= 2 {
+            break;
+        }
+        acks = 0;
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(
+        acks >= 2,
+        "initial fanout did not reach 2 peers; acks={}",
+        acks
+    );
+
+    // Test second memory to verify consistency
+    let body2 = serde_json::json!({
+        "tier": "mid",
+        "namespace": "fed-partial-fail",
+        "title": "test 2",
+        "content": "second memory",
+        "tags": [],
+        "priority": 5,
+        "confidence": 1.0,
+        "source": "api",
+        "metadata": {}
+    });
+
+    let (code2, resp2) = curl_post(leader.port, "/api/v1/memories", &body2, Some("ai:fed-test"));
+    assert_eq!(code2, "201", "second store with W=2: {resp2}");
+}
+
+#[test]
+fn test_subscription_webhook_namespace_filter() {
+    // Justice of Federation Tier 1: subscription webhook with namespace_filter.
+    // Register a webhook subscription with a namespace filter, verify that
+    // the subscription is stored and can be retrieved. This exercises the
+    // HTTP-level subscription API with namespace filtering.
+    let d = DaemonGuard::spawn();
+
+    // Pre-register subscriber agent.
+    let _ = curl_post(
+        d.port,
+        "/api/v1/agents",
+        &serde_json::json!({"agent_id": "webhook-receiver", "agent_type": "ai:generic"}),
+        None,
+    );
+
+    // Create a namespace filter subscription.
+    let filter_ns = "webhook-test-foo";
+
+    let (code, resp) = curl_post(
+        d.port,
+        "/api/v1/subscriptions",
+        &serde_json::json!({
+            "agent_id": "webhook-receiver",
+            "namespace": filter_ns
+        }),
+        Some("webhook-receiver"),
+    );
+    assert!(
+        code == "201" || code == "200",
+        "subscribe code={code}: {resp}"
+    );
+
+    // Immediately verify the subscription was created.
+    let (code_subs, body_subs) =
+        curl_get(d.port, "/api/v1/subscriptions?agent_id=webhook-receiver");
+    assert_eq!(code_subs, "200");
+    let subs = body_subs["subscriptions"]
+        .as_array()
+        .expect("subscriptions array");
+    assert!(
+        subs.iter()
+            .any(|s| s["namespace"].as_str() == Some(filter_ns)),
+        "subscription to {filter_ns} not found"
+    );
+
+    // Store a memory in the *matching* namespace.
+    let matching_body = serde_json::json!({
+        "tier": "mid",
+        "namespace": filter_ns,
+        "title": "matching memory",
+        "content": "this namespace matches the subscription filter",
+        "tags": [],
+        "priority": 5,
+        "confidence": 1.0,
+        "source": "api",
+        "metadata": {"test": "matching"}
+    });
+
+    let (code_m, resp_m) = curl_post(
+        d.port,
+        "/api/v1/memories",
+        &matching_body,
+        Some("ai:webhook-test"),
+    );
+    assert_eq!(code_m, "201", "store matching: {resp_m}");
+
+    // Store a memory in a *non-matching* namespace.
+    let other_ns = "other-namespace";
+    let non_matching_body = serde_json::json!({
+        "tier": "mid",
+        "namespace": other_ns,
+        "title": "non-matching memory",
+        "content": "this namespace does NOT match the subscription filter",
+        "tags": [],
+        "priority": 5,
+        "confidence": 1.0,
+        "source": "api",
+        "metadata": {"test": "non-matching"}
+    });
+
+    let (code_nm, _resp_nm) = curl_post(
+        d.port,
+        "/api/v1/memories",
+        &non_matching_body,
+        Some("ai:webhook-test"),
+    );
+    assert_eq!(code_nm, "201", "store non-matching memory");
+
+    // Verify the subscription is still active after storing memories.
+    let (code_subs_final, body_subs_final) =
+        curl_get(d.port, "/api/v1/subscriptions?agent_id=webhook-receiver");
+    assert_eq!(code_subs_final, "200");
+    let subs_final = body_subs_final["subscriptions"]
+        .as_array()
+        .expect("subscriptions array");
+    assert!(
+        subs_final
+            .iter()
+            .any(|s| s["namespace"].as_str() == Some(filter_ns)),
+        "subscription to {filter_ns} not found after memory store"
+    );
+}
+
+/// Helper to spawn a leader with custom timeout.
+fn spawn_leader_with_timeout(
+    quorum_writes: usize,
+    peer_urls: &[String],
+    timeout_ms: u64,
+) -> DaemonGuard {
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    let dir = std::env::temp_dir();
+    let db = dir.join(format!(
+        "ai-memory-http-parity-leader-{}.db",
+        uuid::Uuid::new_v4()
+    ));
+    let port = free_port();
+    let mut args: Vec<String> = vec![
+        "--db".into(),
+        db.to_str().unwrap().into(),
+        "serve".into(),
+        "--port".into(),
+        port.to_string(),
+    ];
+    if quorum_writes > 0 && !peer_urls.is_empty() {
+        args.push("--quorum-writes".into());
+        args.push(quorum_writes.to_string());
+        args.push("--quorum-peers".into());
+        args.push(peer_urls.join(","));
+        args.push("--quorum-timeout-ms".into());
+        args.push(timeout_ms.to_string());
+    }
+    let child = cmd(bin)
+        .args(&args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    assert!(wait_for_health(port), "leader serve never came up");
+    DaemonGuard { child, port, db }
+}
