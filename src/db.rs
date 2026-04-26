@@ -5979,7 +5979,7 @@ mod tests {
             &conn,
             "Trim Test",
             "test",
-            &["".to_string(), "   ".to_string(), "ok".to_string()],
+            &[String::new(), "   ".to_string(), "ok".to_string()],
             &serde_json::json!({}),
             None,
         )
