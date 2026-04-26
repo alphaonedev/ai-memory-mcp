@@ -7756,6 +7756,131 @@ fn test_cli_bench_emits_json_with_seven_results_and_passes_budget() {
     }
 }
 
+fn verify_jsonl_entry(entry: &serde_json::Value, expected_iterations: i64, expected_warmup: i64) {
+    assert!(
+        entry.get("captured_at").is_some(),
+        "entry must have 'captured_at' field"
+    );
+    let captured_at_str = entry["captured_at"]
+        .as_str()
+        .expect("captured_at must be a string");
+    chrono::DateTime::parse_from_rfc3339(captured_at_str)
+        .expect("captured_at must be valid RFC3339");
+
+    assert_eq!(
+        entry["iterations"],
+        serde_json::json!(expected_iterations),
+        "entry must have iterations = {expected_iterations}"
+    );
+    assert_eq!(
+        entry["warmup"],
+        serde_json::json!(expected_warmup),
+        "entry must have warmup = {expected_warmup}"
+    );
+
+    let results = entry["results"]
+        .as_array()
+        .expect("entry must have 'results' array");
+    assert_eq!(
+        results.len(),
+        7,
+        "entry must have exactly 7 results, got {}",
+        results.len()
+    );
+}
+
+#[test]
+fn test_cli_bench_with_history_appends_jsonl_line() {
+    // Coverage for `bench::append_history()` — Stream E audit gap.
+    // The --history flag cherry-picked from PR #408 shipped without
+    // exercising the JSONL append codepath. This test runs bench twice
+    // with the same --history path and verifies: two JSONL records
+    // appended (no overwrite), each with captured_at RFC3339, iterations,
+    // warmup, and 7 results.
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    let history_path = std::env::temp_dir().join(format!(
+        "ai-memory-bench-history-{}.jsonl",
+        uuid::Uuid::new_v4()
+    ));
+
+    // First run: create file with one JSONL record.
+    let out = cmd(bin)
+        .args([
+            "bench",
+            "--json",
+            "--iterations",
+            "5",
+            "--warmup",
+            "0",
+            "--history",
+            history_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to spawn ai-memory bench (first run)");
+
+    assert!(
+        out.status.success(),
+        "bench (first run) exited non-zero: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Verify history file exists and has exactly one line.
+    let history_content = std::fs::read_to_string(&history_path)
+        .expect("failed to read history file after first run");
+    let lines: Vec<&str> = history_content.lines().collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "history file should contain exactly 1 line after first run, got {}",
+        lines.len()
+    );
+
+    // Parse and verify first entry.
+    let entry1: serde_json::Value =
+        serde_json::from_str(lines[0]).expect("first history entry must be valid JSON");
+    verify_jsonl_entry(&entry1, 5, 0);
+
+    // Second run: append a second entry to the same file.
+    let out = cmd(bin)
+        .args([
+            "bench",
+            "--json",
+            "--iterations",
+            "5",
+            "--warmup",
+            "0",
+            "--history",
+            history_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to spawn ai-memory bench (second run)");
+
+    assert!(
+        out.status.success(),
+        "bench (second run) exited non-zero: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Verify history file now has exactly two lines (append, not overwrite).
+    let history_content = std::fs::read_to_string(&history_path)
+        .expect("failed to read history file after second run");
+    let lines: Vec<&str> = history_content.lines().collect();
+    assert_eq!(
+        lines.len(),
+        2,
+        "history file should contain exactly 2 lines after second run (append behavior), got {}",
+        lines.len()
+    );
+
+    // Verify second entry is also valid JSONL with same structure.
+    let entry2: serde_json::Value =
+        serde_json::from_str(lines[1]).expect("second history entry must be valid JSON");
+    verify_jsonl_entry(&entry2, 5, 0);
+
+    // Cleanup: remove the history file.
+    std::fs::remove_file(&history_path).expect("failed to clean up history file");
+}
+
 #[test]
 fn test_cli_sync_dry_run_writes_nothing() {
     // v0.6.0 GA Phase 3 foundation: --dry-run must classify new/update/noop
