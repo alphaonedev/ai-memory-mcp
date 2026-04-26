@@ -19,21 +19,32 @@
 //!       (50 chains × 5 hops each = 300 memories + 250 links). depth=3
 //!       hits the "depth ≤ 3" 100 ms budget bucket; depth=5 hits the
 //!       "depth ≤ 5" 250 ms tail-case bucket.
+//! - Embedding-bound paths (opt-in via `run_with`):
+//!     - `memory_store` (with embedding) — `embed(text) + insert +
+//!       set_embedding`, gated against the 200 ms p95 row.
+//!     - `memory_recall` (cold, full hybrid) — `embed(query) +
+//!       recall_hybrid` against a corpus whose entries already carry
+//!       an embedding, gated against the 200 ms p95 row.
+//!     - `memory_check_duplicate` — `embed(title + content) +
+//!       check_duplicate` linear-scan against the same embedded corpus,
+//!       gated against the 50 ms p95 row.
 //!
-//! Both fixtures live in the same in-process disposable `SQLite` — no
-//! external service required.
-//!
-//! Embedding-bound paths (`memory_store` with embedding,
-//! `memory_recall` cold/full hybrid) still require an embedder process
-//! and are tracked as follow-up Stream E work — they don't belong on
-//! the hot path of a `cargo test` invocation.
+//! All embedding-free fixtures live in the same in-process disposable
+//! `SQLite` — no external service required. The embedding-bound ops
+//! load the local candle `MiniLM` model the first time they're invoked
+//! (CLI: `ai-memory bench --with-embedding`); they are NOT exercised
+//! from the default `cargo test` run or the `bench.yml` CI guard so
+//! the hot path stays fast and deterministic.
 
 use anyhow::Result;
 use rusqlite::Connection;
 use serde::Serialize;
 use std::time::{Duration, Instant};
 
+use crate::config::ResolvedScoring;
 use crate::db;
+use crate::embeddings::Embedder;
+use crate::hnsw::VectorIndex;
 use crate::models::{Memory, Tier};
 
 /// CI guard tolerance — measured p95 may exceed budget by this factor
@@ -74,6 +85,17 @@ pub enum Operation {
     KgQueryDepth5,
     /// `memory_kg_timeline` — ordered timeline for a single source.
     KgTimeline,
+    /// `memory_store` with embedding — `embed(text) + insert +
+    /// set_embedding`. Opt-in via `--with-embedding`; budget 200 ms p95.
+    StoreWithEmbedding,
+    /// `memory_recall` cold/full hybrid — `embed(query) + recall_hybrid`
+    /// against an embedded corpus. Opt-in via `--with-embedding`;
+    /// budget 200 ms p95.
+    RecallCold,
+    /// `memory_check_duplicate` — `embed(title + content) +
+    /// check_duplicate` linear-scan over the embedded corpus. Opt-in via
+    /// `--with-embedding`; budget 50 ms p95.
+    CheckDuplicate,
 }
 
 impl Operation {
@@ -87,6 +109,9 @@ impl Operation {
             Self::KgQueryDepth3 => "memory_kg_query (depth=3)",
             Self::KgQueryDepth5 => "memory_kg_query (depth=5)",
             Self::KgTimeline => "memory_kg_timeline",
+            Self::StoreWithEmbedding => "memory_store (with embedding)",
+            Self::RecallCold => "memory_recall (cold, full hybrid)",
+            Self::CheckDuplicate => "memory_check_duplicate",
         }
     }
 
@@ -97,6 +122,9 @@ impl Operation {
     /// at "depth ≤ 5" (250 ms). `SearchFts` and `KgTimeline` happen to
     /// share the same numeric budget as the depth ≤ 3 bucket despite
     /// belonging to different table rows in `PERFORMANCE.md`.
+    /// `StoreWithEmbedding` and `RecallCold` share the embedding-bound
+    /// 200 ms p95 budget rows. `CheckDuplicate` lives on its own 50 ms
+    /// p95 row.
     #[must_use]
     #[allow(clippy::match_same_arms)]
     pub fn target_p95_ms(self) -> f64 {
@@ -108,6 +136,9 @@ impl Operation {
             Self::KgQueryDepth3 => 100.0,
             Self::KgQueryDepth5 => 250.0,
             Self::KgTimeline => 100.0,
+            Self::StoreWithEmbedding => 200.0,
+            Self::RecallCold => 200.0,
+            Self::CheckDuplicate => 50.0,
         }
     }
 }
@@ -151,15 +182,27 @@ impl Default for BenchConfig {
 
 /// Run the bench workload and return per-operation results.
 ///
+/// The seven embedding-free ops always run; the two embedding-bound
+/// ops (`memory_store` with embedding, `memory_recall` cold/full hybrid)
+/// are appended only when `embedder` is `Some`. Pass `None` from tests
+/// and from the `bench.yml` CI guard so the hot path stays fast and
+/// deterministic — no candle model load, no Ollama, no network. The
+/// CLI exposes the embedder hand-off via `ai-memory bench
+/// --with-embedding`.
+///
 /// Each operation seeds its own data inside the supplied connection so
 /// callers can hand in either a fresh in-memory DB (for tests) or a
 /// disposable on-disk DB (for the CLI).
 ///
 /// # Errors
 ///
-/// Returns the underlying [`db`] error if any of the seeded inserts
-/// or queries fail.
-pub fn run(conn: &Connection, config: &BenchConfig) -> Result<Vec<OperationResult>> {
+/// Returns the underlying [`db`] or [`Embedder`] error if any seeded
+/// insert, embed, or query fails.
+pub fn run(
+    conn: &Connection,
+    config: &BenchConfig,
+    embedder: Option<&Embedder>,
+) -> Result<Vec<OperationResult>> {
     let store = run_store_no_embedding(conn, config)?;
     let search = run_search_fts(conn, config)?;
     let recall = run_recall_hot(conn, config)?;
@@ -171,7 +214,7 @@ pub fn run(conn: &Connection, config: &BenchConfig) -> Result<Vec<OperationResul
     let kg_query_d5 =
         run_kg_query_chain(conn, config, &kg_chain_sources, Operation::KgQueryDepth5, 5)?;
     let kg_timeline = run_kg_timeline(conn, config, &kg_sources)?;
-    Ok(vec![
+    let mut results = vec![
         store,
         search,
         recall,
@@ -179,7 +222,13 @@ pub fn run(conn: &Connection, config: &BenchConfig) -> Result<Vec<OperationResul
         kg_query_d3,
         kg_query_d5,
         kg_timeline,
-    ])
+    ];
+    if let Some(emb) = embedder {
+        results.push(run_store_with_embedding(conn, config, emb)?);
+        results.push(run_recall_cold(conn, config, emb)?);
+        results.push(run_check_duplicate(conn, config, emb)?);
+    }
+    Ok(results)
 }
 
 fn run_store_no_embedding(conn: &Connection, config: &BenchConfig) -> Result<OperationResult> {
@@ -351,6 +400,190 @@ fn run_kg_timeline(
     Ok(percentile_summary(Operation::KgTimeline, &samples))
 }
 
+/// Corpus size for the embedding-bound recall bench. Kept small enough
+/// that the per-iteration `embed(query) + linear-scan recall_hybrid`
+/// stays inside the 200 ms p95 budget on the M4 reference baseline,
+/// large enough for the cosine-similarity ranking to have signal.
+const EMBED_CORPUS_SIZE: usize = 200;
+
+/// Distinct title prefix for the embedding-bound `RecallCold` corpus,
+/// disjoint from `seed_corpus`'s "search"/"recall" prefixes so the
+/// embedded fixture coexists in the same connection without colliding
+/// on the `(title, namespace)` upsert.
+const EMBED_CORPUS_PREFIX: &str = "embed";
+
+fn run_store_with_embedding(
+    conn: &Connection,
+    config: &BenchConfig,
+    embedder: &Embedder,
+) -> Result<OperationResult> {
+    let total = config.warmup + config.iterations;
+    let mut samples = Vec::with_capacity(config.iterations);
+    for i in 0..total {
+        // Distinct prefix keeps these rows out of the `seed_corpus`
+        // namespace partitions so we don't churn the search/recall
+        // fixtures by upsert. Each iteration writes a fresh memory.
+        let mem = synth_memory(&config.namespace, i, "embed-store");
+        let text = format!("{} {}", mem.title, mem.content);
+        let start = Instant::now();
+        let vector = embedder.embed(&text)?;
+        let id = db::insert(conn, &mem)?;
+        db::set_embedding(conn, &id, &vector)?;
+        let elapsed = start.elapsed();
+        if i >= config.warmup {
+            samples.push(elapsed);
+        }
+    }
+    Ok(percentile_summary(Operation::StoreWithEmbedding, &samples))
+}
+
+fn run_recall_cold(
+    conn: &Connection,
+    config: &BenchConfig,
+    embedder: &Embedder,
+) -> Result<OperationResult> {
+    seed_embedded_corpus(conn, &config.namespace, embedder, EMBED_CORPUS_SIZE)?;
+    // Fresh in-memory HNSW for every run — the "cold" bench measures
+    // the first-query path: embed query + recall_hybrid against the
+    // freshly built vector index. No warmup queries, no shared cache.
+    let entries = db::get_all_embeddings(conn)?;
+    let vector_index = if entries.is_empty() {
+        VectorIndex::empty()
+    } else {
+        VectorIndex::build(entries)
+    };
+    let scoring = ResolvedScoring::default();
+    // Warmup absorbs the first-call cost of the candle BERT forward
+    // pass without polluting percentile samples.
+    for i in 0..config.warmup {
+        let q = format!("topic {} category {}", i % 50, i % 10);
+        let q_emb = embedder.embed(&q)?;
+        let _ = db::recall_hybrid(
+            conn,
+            &q,
+            &q_emb,
+            Some(&config.namespace),
+            10,
+            None,
+            None,
+            None,
+            Some(&vector_index),
+            0,
+            0,
+            None,
+            None,
+            &scoring,
+        )?;
+    }
+    let mut samples = Vec::with_capacity(config.iterations);
+    for i in 0..config.iterations {
+        let q = format!("topic {} category {}", i % 50, i % 10);
+        let start = Instant::now();
+        let q_emb = embedder.embed(&q)?;
+        let _ = db::recall_hybrid(
+            conn,
+            &q,
+            &q_emb,
+            Some(&config.namespace),
+            10,
+            None,
+            None,
+            None,
+            Some(&vector_index),
+            0,
+            0,
+            None,
+            None,
+            &scoring,
+        )?;
+        samples.push(start.elapsed());
+    }
+    Ok(percentile_summary(Operation::RecallCold, &samples))
+}
+
+/// Distinct title prefix for the embedding-bound `CheckDuplicate`
+/// corpus, disjoint from the other embedded prefixes so it can coexist
+/// in the same connection without colliding on the `(title, namespace)`
+/// upsert.
+const CHECK_DUP_CORPUS_PREFIX: &str = "dup-check";
+
+fn run_check_duplicate(
+    conn: &Connection,
+    config: &BenchConfig,
+    embedder: &Embedder,
+) -> Result<OperationResult> {
+    seed_check_duplicate_corpus(conn, &config.namespace, embedder, EMBED_CORPUS_SIZE)?;
+    let total = config.warmup + config.iterations;
+    let mut samples = Vec::with_capacity(config.iterations);
+    for i in 0..total {
+        // Mirror what an MCP caller would feed in: a `title + content`
+        // string at the same shape as the corpus entries, so the linear
+        // scan finds a nearest neighbor with non-trivial cosine — the
+        // path operators actually exercise pre-write.
+        let title = format!("bench-{CHECK_DUP_CORPUS_PREFIX}-candidate-{i}");
+        let content = format!(
+            "candidate memory {i} content about topic {} category {} for dup-check workload",
+            i % 50,
+            i % 10
+        );
+        let probe = format!("{title} {content}");
+        let start = Instant::now();
+        let q_emb = embedder.embed(&probe)?;
+        let _ = db::check_duplicate(
+            conn,
+            &q_emb,
+            Some(&config.namespace),
+            db::DUPLICATE_THRESHOLD_DEFAULT,
+        )?;
+        let elapsed = start.elapsed();
+        if i >= config.warmup {
+            samples.push(elapsed);
+        }
+    }
+    Ok(percentile_summary(Operation::CheckDuplicate, &samples))
+}
+
+/// Seed an embedded corpus dedicated to the `CheckDuplicate` workload.
+/// The probes fed into `db::check_duplicate` overlap heavily with these
+/// titles + contents so each scan produces a non-trivial nearest match
+/// rather than degenerate cosines, exercising the full sort path.
+fn seed_check_duplicate_corpus(
+    conn: &Connection,
+    namespace: &str,
+    embedder: &Embedder,
+    count: usize,
+) -> Result<()> {
+    for i in 0..count {
+        let mem = synth_memory(namespace, i, CHECK_DUP_CORPUS_PREFIX);
+        let text = format!("{} {}", mem.title, mem.content);
+        let id = db::insert(conn, &mem)?;
+        let vector = embedder.embed(&text)?;
+        db::set_embedding(conn, &id, &vector)?;
+    }
+    Ok(())
+}
+
+/// Seed a corpus whose entries each carry a real embedding vector.
+/// Used by [`run_recall_cold`] so the hybrid scoring path actually
+/// has semantic candidates to consider — without embeddings the
+/// "cold" bench would degenerate into the same FTS-only path the
+/// `RecallHot` runner already covers.
+fn seed_embedded_corpus(
+    conn: &Connection,
+    namespace: &str,
+    embedder: &Embedder,
+    count: usize,
+) -> Result<()> {
+    for i in 0..count {
+        let mem = synth_memory(namespace, i, EMBED_CORPUS_PREFIX);
+        let text = format!("{} {}", mem.title, mem.content);
+        let id = db::insert(conn, &mem)?;
+        let vector = embedder.embed(&text)?;
+        db::set_embedding(conn, &id, &vector)?;
+    }
+    Ok(())
+}
+
 /// Seed the in-process KG fixture: `KG_FIXTURE_SOURCES` source memories,
 /// each with `KG_FIXTURE_LINKS_PER_SOURCE` outbound links to distinct
 /// targets. Every link sets `valid_from` so `kg_timeline` (which skips
@@ -495,15 +728,18 @@ fn percentile(sorted: &[f64], q: f64) -> f64 {
 }
 
 /// Render a results table to a string in the same shape used in the
-/// `PERFORMANCE.md` "Operator Self-Verification" example.
+/// `PERFORMANCE.md` "Operator Self-Verification" example. The label
+/// column is 34 chars wide — enough to fit the longest current label
+/// (`memory_recall (cold, full hybrid)`, 33 chars) without spilling
+/// into the budget column.
 #[must_use]
 pub fn render_table(results: &[OperationResult]) -> String {
     let mut out = String::new();
     out.push_str(
-        "Operation                       Target (p95)   Measured (p95)   p50      p99      Status\n",
+        "Operation                           Target (p95)   Measured (p95)   p50      p99      Status\n",
     );
     out.push_str(
-        "─────────────────────────────────────────────────────────────────────────────────────────\n",
+        "─────────────────────────────────────────────────────────────────────────────────────────────\n",
     );
     for r in results {
         let status_str = match r.status {
@@ -517,7 +753,7 @@ pub fn render_table(results: &[OperationResult]) -> String {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let target_ms = r.target_p95_ms.round() as i64;
         let line = format!(
-            "{:<30}  < {:>4} ms       {:>7.1} ms       {:>5.1}    {:>5.1}    {}\n",
+            "{:<34}  < {:>4} ms       {:>7.1} ms       {:>5.1}    {:>5.1}    {}\n",
             r.label, target_ms, r.measured_p95_ms, r.measured_p50_ms, r.measured_p99_ms, status_str
         );
         out.push_str(&line);
@@ -559,7 +795,7 @@ mod tests {
     #[test]
     fn run_returns_all_seven_results() {
         let conn = fresh_conn();
-        let results = run(&conn, &small_config()).unwrap();
+        let results = run(&conn, &small_config(), None).unwrap();
         assert_eq!(results.len(), 7);
         assert_eq!(results[0].operation, Operation::StoreNoEmbedding);
         assert_eq!(results[1].operation, Operation::SearchFts);
@@ -573,6 +809,29 @@ mod tests {
             assert!(r.measured_p50_ms <= r.measured_p95_ms);
             assert!(r.measured_p95_ms <= r.measured_p99_ms);
             assert!(r.target_p95_ms > 0.0);
+        }
+    }
+
+    #[test]
+    fn run_with_none_embedder_skips_embedding_ops() {
+        // `run(.., None)` is the path the CLI takes when the user omits
+        // `--with-embedding` and the path the `bench.yml` CI guard
+        // exercises. It must never produce embedding-bound rows so the
+        // hot path stays free of candle/Ollama dependencies.
+        let conn = fresh_conn();
+        let results = run(&conn, &small_config(), None).unwrap();
+        assert_eq!(results.len(), 7);
+        for r in &results {
+            assert!(
+                !matches!(
+                    r.operation,
+                    Operation::StoreWithEmbedding
+                        | Operation::RecallCold
+                        | Operation::CheckDuplicate
+                ),
+                "embedding-bound op {:?} must not appear when embedder is None",
+                r.operation,
+            );
         }
     }
 
@@ -612,7 +871,7 @@ mod tests {
     #[test]
     fn render_table_includes_all_operations() {
         let conn = fresh_conn();
-        let results = run(&conn, &small_config()).unwrap();
+        let results = run(&conn, &small_config(), None).unwrap();
         let table = render_table(&results);
         assert!(table.contains("memory_store (no embedding)"));
         assert!(table.contains("memory_search (FTS5)"));
@@ -625,6 +884,48 @@ mod tests {
     }
 
     #[test]
+    fn render_table_includes_embedding_ops_when_present() {
+        // Synthesised results — render_table must not drop or relabel
+        // the embedding-bound rows when the CLI feeds them in.
+        let synthetic = vec![
+            OperationResult {
+                operation: Operation::StoreWithEmbedding,
+                label: Operation::StoreWithEmbedding.label(),
+                target_p95_ms: 200.0,
+                measured_p50_ms: 50.0,
+                measured_p95_ms: 90.0,
+                measured_p99_ms: 110.0,
+                samples: 30,
+                status: Status::Pass,
+            },
+            OperationResult {
+                operation: Operation::RecallCold,
+                label: Operation::RecallCold.label(),
+                target_p95_ms: 200.0,
+                measured_p50_ms: 60.0,
+                measured_p95_ms: 95.0,
+                measured_p99_ms: 130.0,
+                samples: 30,
+                status: Status::Pass,
+            },
+            OperationResult {
+                operation: Operation::CheckDuplicate,
+                label: Operation::CheckDuplicate.label(),
+                target_p95_ms: 50.0,
+                measured_p50_ms: 18.0,
+                measured_p95_ms: 26.0,
+                measured_p99_ms: 32.0,
+                samples: 30,
+                status: Status::Pass,
+            },
+        ];
+        let table = render_table(&synthetic);
+        assert!(table.contains("memory_store (with embedding)"));
+        assert!(table.contains("memory_recall (cold, full hybrid)"));
+        assert!(table.contains("memory_check_duplicate"));
+    }
+
+    #[test]
     fn operation_targets_match_performance_md() {
         // Pinned to PERFORMANCE.md — if you change a budget, change both.
         assert!((Operation::StoreNoEmbedding.target_p95_ms() - 20.0).abs() < 1e-9);
@@ -634,6 +935,9 @@ mod tests {
         assert!((Operation::KgQueryDepth3.target_p95_ms() - 100.0).abs() < 1e-9);
         assert!((Operation::KgQueryDepth5.target_p95_ms() - 250.0).abs() < 1e-9);
         assert!((Operation::KgTimeline.target_p95_ms() - 100.0).abs() < 1e-9);
+        assert!((Operation::StoreWithEmbedding.target_p95_ms() - 200.0).abs() < 1e-9);
+        assert!((Operation::RecallCold.target_p95_ms() - 200.0).abs() < 1e-9);
+        assert!((Operation::CheckDuplicate.target_p95_ms() - 50.0).abs() < 1e-9);
     }
 
     #[test]
