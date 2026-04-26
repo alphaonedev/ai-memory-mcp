@@ -616,10 +616,10 @@ mod tests {
         let now = chrono::Utc::now().to_rfc3339();
         for i in 0..5 {
             let mem = Memory {
-                id: format!("test-mem-{}", i),
+                id: format!("test-mem-{i}"),
                 tier: crate::models::Tier::Mid,
                 namespace: "test".to_string(),
-                title: format!("Memory {}", i),
+                title: format!("Memory {i}"),
                 content: "x".repeat(100), // long enough for MIN_CONTENT_LEN
                 tags: vec![],
                 priority: 5,

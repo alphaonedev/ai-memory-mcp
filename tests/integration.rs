@@ -560,7 +560,7 @@ fn test_recall_priority_order() {
                 "-T",
                 title,
                 "--content",
-                &format!("content about recall testing for {}", title),
+                &format!("content about recall testing for {title}"),
                 "-p",
                 priority,
             ])
@@ -594,9 +594,7 @@ fn test_recall_priority_order() {
     let second_priority = memories[1]["priority"].as_i64().unwrap();
     assert!(
         first_priority >= second_priority,
-        "higher priority should come first: {} vs {}",
-        first_priority,
-        second_priority
+        "higher priority should come first: {first_priority} vs {second_priority}"
     );
 
     let _ = std::fs::remove_file(&db_path);
@@ -1447,9 +1445,9 @@ fn test_import_roundtrip_count_match() {
                 "-n",
                 "irt-test",
                 "-T",
-                &format!("roundtrip mem {}", i),
+                &format!("roundtrip mem {i}"),
                 "--content",
-                &format!("content for roundtrip {}", i),
+                &format!("content for roundtrip {i}"),
             ])
             .output()
             .unwrap();
@@ -1581,9 +1579,9 @@ fn test_stats_accuracy() {
                 "-n",
                 "stats-test",
                 "-T",
-                &format!("stats mem {}", i),
+                &format!("stats mem {i}"),
                 "--content",
-                &format!("content {}", i),
+                &format!("content {i}"),
             ])
             .output()
             .unwrap();
@@ -1751,7 +1749,7 @@ fn test_health_endpoint() {
         .unwrap();
 
     // Wait for server to start
-    let url = format!("http://127.0.0.1:{}/api/v1/health", port);
+    let url = format!("http://127.0.0.1:{port}/api/v1/health");
     let mut ok = false;
     for _ in 0..30 {
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -2206,7 +2204,7 @@ fn test_mcp_recall_default_toon() {
         "default should be TOON compact, got: {}",
         &text[..text.len().min(100)]
     );
-    assert!(text.contains("|"), "should contain pipe delimiters");
+    assert!(text.contains('|'), "should contain pipe delimiters");
 
     let _ = std::fs::remove_file(&db_path);
 }
@@ -2229,7 +2227,7 @@ fn test_cli_validate_id_rejects_invalid() {
         "should reject empty/whitespace ID"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("id cannot be empty"), "stderr: {}", stderr);
+    assert!(stderr.contains("id cannot be empty"), "stderr: {stderr}");
 
     // update with empty ID
     let output = cmd(binary)
@@ -2580,8 +2578,7 @@ fn test_namespace_auto_detect_parent() {
     // Should have standards array (parent + child = 2 levels)
     assert!(
         recall_data.get("standards").is_some(),
-        "recall should include 'standards' array for multi-level layering, got: {}",
-        recall_data
+        "recall should include 'standards' array for multi-level layering, got: {recall_data}"
     );
     let standards = recall_data["standards"].as_array().unwrap();
     assert_eq!(
@@ -2789,8 +2786,7 @@ fn test_namespace_standard_cascade_on_delete() {
     let get_data: serde_json::Value = serde_json::from_str(get_text).unwrap();
     assert!(
         get_data["standard_id"].is_null(),
-        "standard should be null after deleting the standard memory, got: {}",
-        get_data
+        "standard should be null after deleting the standard memory, got: {get_data}"
     );
 
     let _ = std::fs::remove_file(&db_path);
@@ -2891,8 +2887,8 @@ fn test_mcp_update_metadata() {
         .and_then(|mut child| {
             use std::io::Write;
             if let Some(ref mut stdin) = child.stdin {
-                writeln!(stdin, r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"memory_update","arguments":{{"id":"{}","metadata":{{"version":2,"updated":true}}}}}}}}"#, id).ok();
-                writeln!(stdin, r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"memory_get","arguments":{{"id":"{}"}}}}}}"#, id).ok();
+                writeln!(stdin, r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"memory_update","arguments":{{"id":"{id}","metadata":{{"version":2,"updated":true}}}}}}}}"#).ok();
+                writeln!(stdin, r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"memory_get","arguments":{{"id":"{id}"}}}}}}"#).ok();
             }
             drop(child.stdin.take());
             child.wait_with_output()
@@ -2989,13 +2985,11 @@ fn test_mcp_store_invalid_metadata_defaults_to_empty() {
         assert_eq!(
             meta.len(),
             1,
-            "invalid input metadata should reduce to just agent_id, got: {:?}",
-            meta
+            "invalid input metadata should reduce to just agent_id, got: {meta:?}"
         );
         assert!(
             meta.contains_key("agent_id"),
-            "agent_id must be present after injection, got: {:?}",
-            meta
+            "agent_id must be present after injection, got: {meta:?}"
         );
         let id = meta["agent_id"].as_str().unwrap_or_default();
         assert!(
@@ -3738,7 +3732,7 @@ fn test_import_trust_source_preserves_agent_id() {
 }
 
 /// GAP 2: Consolidate attribution was nondeterministic (last-write-wins from
-/// merged metadata). Fix: consolidator's agent_id becomes authoritative;
+/// merged metadata). Fix: consolidator's `agent_id` becomes authoritative;
 /// original authors preserved in `metadata.consolidated_from_agents`.
 #[test]
 fn test_consolidate_attributes_to_consolidator() {
@@ -3987,7 +3981,7 @@ fn test_agentid_visible_in_recall_response() {
 /// deliberately omits `metadata` for token efficiency (see src/toon.rs
 /// `MEMORY_FIELDS_COMPACT`), so `agent_id` is NOT visible in that format —
 /// that's a known tradeoff tracked separately. This test pins the two formats
-/// where agent_id must show up.
+/// where `agent_id` must show up.
 #[test]
 fn test_agentid_visible_in_toon_and_json() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
@@ -5044,7 +5038,7 @@ fn fresh_inherit_db() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("ai-memory-inherit-{}.db", uuid::Uuid::new_v4()))
 }
 
-/// Seed a standard memory in a namespace, then set_standard it.
+/// Seed a standard memory in a namespace, then `set_standard` it.
 fn seed_standard(
     binary: &str,
     db_path: &std::path::Path,
@@ -5117,7 +5111,7 @@ fn seed_standard(
     id
 }
 
-/// Invoke memory_namespace_get_standard via MCP, returning the parsed body.
+/// Invoke `memory_namespace_get_standard` via MCP, returning the parsed body.
 fn get_standard_inherit(
     binary: &str,
     db_path: &std::path::Path,
@@ -5994,7 +5988,7 @@ fn fresh_enforce_db() -> std::path::PathBuf {
 }
 
 /// Set a governance policy on a namespace. Seeds the standard memory under
-/// `owner_agent_id`, then calls memory_namespace_set_standard with the policy.
+/// `owner_agent_id`, then calls `memory_namespace_set_standard` with the policy.
 fn set_governance(
     binary: &str,
     db_path: &std::path::Path,
@@ -7260,7 +7254,7 @@ fn test_budget_unlimited_returns_all() {
     let v = recall_with_budget(bin, &db, "alpha", None);
     assert_eq!(v["count"], 3);
     assert!(v["tokens_used"].as_u64().unwrap() > 0);
-    assert!(v.get("budget_tokens").is_none_or(|v| v.is_null()));
+    assert!(v.get("budget_tokens").is_none_or(serde_json::Value::is_null));
     let _ = std::fs::remove_file(&db);
 }
 
@@ -7858,8 +7852,7 @@ fn test_cli_sync_dry_run_writes_nothing() {
         assert_eq!(
             titles,
             vec![expected_title.to_string()],
-            "dry-run must not write; {:?}",
-            db_path
+            "dry-run must not write; {db_path:?}"
         );
     }
 
@@ -8039,7 +8032,7 @@ fn test_sync_daemon_mesh_propagates_memory_between_peers() {
 // ---------------------------------------------------------------------------
 
 /// Generate a self-signed PEM cert + key pair at the given paths. Returns
-/// the (cert_path, key_path) tuple. Skips the test if openssl isn't on
+/// the (`cert_path`, `key_path`) tuple. Skips the test if openssl isn't on
 /// the PATH (rare on CI runners, but this keeps local-dev friendly).
 fn gen_self_signed_cert(dir: &std::path::Path) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
     let cert = dir.join(format!("ai-memory-test-cert-{}.pem", uuid::Uuid::new_v4()));
@@ -8183,7 +8176,7 @@ fn cert_sha256_fingerprint(cert_path: &std::path::Path) -> Option<String> {
         .split('=')
         .nth(1)?
         .chars()
-        .filter(|c| c.is_ascii_hexdigit())
+        .filter(char::is_ascii_hexdigit)
         .collect();
     Some(hex.to_ascii_lowercase())
 }
@@ -8373,8 +8366,7 @@ fn test_serve_mtls_fingerprint_allowlist_accepts_only_known_peer() {
     let neg = client_c.get(&health_url).send();
     assert!(
         neg.is_err(),
-        "unauthorised cert must be rejected at TLS handshake; got {:?}",
-        neg
+        "unauthorised cert must be rejected at TLS handshake; got {neg:?}"
     );
 
     // _serve_b drops at end of scope: kills the daemon, reaps it, and
@@ -8580,7 +8572,7 @@ fn curl_delete(port: u16, path: &str, agent_id: Option<&str>) -> String {
 /// unwind-safe.
 ///
 /// For long-lived daemons (`serve`, `sync-daemon`, etc.) that span
-/// multiple assertions, use ChildGuard. For short-lived blocking
+/// multiple assertions, use `ChildGuard`. For short-lived blocking
 /// CLI calls (`output()` immediately), use `cmd_output_or_panic` —
 /// simpler, equally safe.
 struct ChildGuard {
@@ -10170,8 +10162,7 @@ fn test_quorum_partial_failure_with_timeout() {
     }
     assert!(
         acks >= 2,
-        "initial fanout did not reach 2 peers; acks={}",
-        acks
+        "initial fanout did not reach 2 peers; acks={acks}"
     );
 
     // Test second memory to verify consistency
@@ -10375,14 +10366,14 @@ fn curl_put(
 /// 47 untested endpoints in handlers.rs, exercising request parsing, middleware,
 /// business logic, and response serialization. Covers:
 ///
-/// Phase 1 (16 list/get/stats endpoints): health, metrics, stats, gc, archive_stats,
-/// list_agents, list_namespaces, list_pending, get_inbox, list_subscriptions,
-/// get_capabilities, session_start, and 4 namespace-standard routes.
+/// Phase 1 (16 list/get/stats endpoints): health, metrics, stats, gc, `archive_stats`,
+/// `list_agents`, `list_namespaces`, `list_pending`, `get_inbox`, `list_subscriptions`,
+/// `get_capabilities`, `session_start`, and 4 namespace-standard routes.
 ///
-/// Phase 2 (6 create/update/delete): create_memory, update_memory, delete_memory,
-/// promote_memory, create_link, delete_link.
+/// Phase 2 (6 create/update/delete): `create_memory`, `update_memory`, `delete_memory`,
+/// `promote_memory`, `create_link`, `delete_link`.
 ///
-/// Phase 3 (6 governance/webhook): approve_pending, reject_pending, register_agent,
+/// Phase 3 (6 governance/webhook): `approve_pending`, `reject_pending`, `register_agent`,
 /// notify, subscribe, unsubscribe.
 #[test]
 fn http_smoke_matrix_phases_1_3() {
@@ -10852,14 +10843,12 @@ fn test_cli_smoke_subcommand_help() {
         );
         assert!(
             !output.stdout.is_empty(),
-            "{} --help should have non-empty stdout",
-            subcmd
+            "{subcmd} --help should have non-empty stdout"
         );
         let stdout_str = String::from_utf8_lossy(&output.stdout);
         assert!(
             stdout_str.contains("Usage:") || stdout_str.contains("usage:"),
-            "{} --help should contain usage info",
-            subcmd
+            "{subcmd} --help should contain usage info"
         );
     }
 }

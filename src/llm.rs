@@ -354,6 +354,13 @@ mod tests {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unused_self,
+    clippy::unnecessary_wraps,
+    clippy::needless_pass_by_value,
+    clippy::wildcard_imports,
+    clippy::doc_markdown,
+)]
 pub mod test_support {
     use super::*;
 
@@ -378,12 +385,12 @@ pub mod test_support {
             true
         }
 
-        /// Mock ensure_model — always succeeds.
+        /// Mock `ensure_model` — always succeeds.
         pub fn ensure_model(&self) -> Result<()> {
             Ok(())
         }
 
-        /// Mock ensure_embed_model — always succeeds.
+        /// Mock `ensure_embed_model` — always succeeds.
         pub fn ensure_embed_model(&self, _model: &str) -> Result<()> {
             Ok(())
         }
@@ -411,7 +418,7 @@ pub mod test_support {
             }
         }
 
-        /// Mock expand_query — returns synthetic query expansion terms.
+        /// Mock `expand_query` — returns synthetic query expansion terms.
         pub fn expand_query(&self, query: &str) -> Result<Vec<String>> {
             let terms: Vec<String> = vec![
                 format!("{}-related", query),
@@ -420,19 +427,18 @@ pub mod test_support {
                 "vector-expansion".to_string(),
                 "query-variants".to_string(),
             ];
-            Ok(terms.iter().map(|s| s.to_string()).collect())
+            Ok(terms.to_vec())
         }
 
-        /// Mock summarize_memories — returns a canned summary.
+        /// Mock `summarize_memories` — returns a canned summary.
         pub fn summarize_memories(&self, memories: &[(String, String)]) -> Result<String> {
             let count = memories.len();
             Ok(format!(
-                "Summary of {} memories: consolidated facts and key decisions preserved",
-                count
+                "Summary of {count} memories: consolidated facts and key decisions preserved"
             ))
         }
 
-        /// Mock auto_tag — returns predictable tags.
+        /// Mock `auto_tag` — returns predictable tags.
         pub fn auto_tag(&self, title: &str, _content: &str) -> Result<Vec<String>> {
             let tags: Vec<String> = vec![
                 "important".to_string(),
@@ -442,16 +448,16 @@ pub mod test_support {
             Ok(tags)
         }
 
-        /// Mock embed_text — returns a fixed 768-dim vector (nomic standard).
+        /// Mock `embed_text` — returns a fixed 768-dim vector (nomic standard).
         pub fn embed_text(&self, text: &str, _embed_model: &str) -> Result<Vec<f32>> {
             let base_val = (text.len() % 10) as f32 / 100.0;
             let embedding: Vec<f32> = (0..768).map(|i| base_val + (i as f32) * 0.0001).collect();
             Ok(embedding)
         }
 
-        /// Mock detect_contradiction — simple heuristic based on keyword presence.
+        /// Mock `detect_contradiction` — simple heuristic based on keyword presence.
         pub fn detect_contradiction(&self, mem_a: &str, mem_b: &str) -> Result<bool> {
-            let combined = format!("{} {}", mem_a, mem_b).to_lowercase();
+            let combined = format!("{mem_a} {mem_b}").to_lowercase();
             let contradictory_keywords = &["not", "never", "always", "contradiction", "opposite"];
             let count = contradictory_keywords
                 .iter()
@@ -538,7 +544,7 @@ mod mock_tests {
         let result = client.summarize_memories(&memories);
         assert!(result.is_ok());
         let summary = result.unwrap();
-        assert!(summary.contains("2"));
+        assert!(summary.contains('2'));
     }
 
     #[test]
