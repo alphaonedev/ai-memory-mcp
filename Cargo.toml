@@ -119,6 +119,11 @@ tokio = { version = "1", features = ["full", "test-util"] }
 # a synchronous test body.
 assert_cmd = "2"
 predicates = "3"
+# W10 (v0.6.3) — `wiremock` lets the llm.rs tests stand up an in-process
+# HTTP server speaking the Ollama API surface, so OllamaClient's blocking
+# reqwest calls can be exercised end-to-end without any network or daemon.
+# Used only by tests; never linked into the release binary.
+wiremock = "0.6"
 # `libc` for the SIGINT graceful-shutdown integration test on unix —
 # already transitively in the dep tree via tokio, declared explicitly
 # here so the test can `use libc::SIGINT` without `rustc_private` errors.
