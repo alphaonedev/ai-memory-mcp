@@ -11,8 +11,12 @@
 // route-table code at zero in-process coverage. Using lib types directly
 // lets the bin route through the test-shared helpers, which propagates
 // the integration suite's coverage onto the production paths.
+use ai_memory::cli::crud::{DeleteArgs, GetArgs, ListArgs};
+use ai_memory::cli::forget::ForgetArgs;
 use ai_memory::cli::helpers::{auto_namespace, human_age, id_short};
 use ai_memory::cli::io::{ImportArgs, MineArgs};
+use ai_memory::cli::link::{LinkArgs, ResolveArgs};
+use ai_memory::cli::promote::PromoteArgs;
 use ai_memory::cli::store::StoreArgs;
 use ai_memory::cli::update::UpdateArgs;
 use ai_memory::{
@@ -499,65 +503,11 @@ struct SearchArgs {
     as_agent: Option<String>,
 }
 
-#[derive(Args)]
-struct GetArgs {
-    id: String,
-}
-
-#[derive(Args)]
-struct ListArgs {
-    #[arg(long, short)]
-    namespace: Option<String>,
-    #[arg(long, short)]
-    tier: Option<String>,
-    #[arg(long, default_value_t = 20)]
-    limit: usize,
-    #[arg(long)]
-    since: Option<String>,
-    #[arg(long)]
-    until: Option<String>,
-    #[arg(long)]
-    tags: Option<String>,
-    #[arg(long, default_value_t = 0)]
-    offset: usize,
-    /// Filter by `metadata.agent_id` (exact match)
-    #[arg(long)]
-    agent_id: Option<String>,
-}
-
-#[derive(Args)]
-struct DeleteArgs {
-    id: String,
-}
-
-#[derive(Args)]
-struct PromoteArgs {
-    id: String,
-    /// Task 1.7: clone this memory into a hierarchical-ancestor namespace
-    /// (the original is untouched). Must be an ancestor of the memory's
-    /// current namespace. Skips the tier bump — vertical promotion is a
-    /// separate axis from tier promotion.
-    #[arg(long)]
-    to_namespace: Option<String>,
-}
-
-#[derive(Args)]
-struct ForgetArgs {
-    #[arg(long, short)]
-    namespace: Option<String>,
-    #[arg(long, short)]
-    pattern: Option<String>,
-    #[arg(long, short)]
-    tier: Option<String>,
-}
-
-#[derive(Args)]
-struct LinkArgs {
-    source_id: String,
-    target_id: String,
-    #[arg(long, short, default_value = "related_to")]
-    relation: String,
-}
+// `GetArgs`, `ListArgs`, `DeleteArgs` moved to `cli::crud` (W5b/C5).
+// `PromoteArgs` moved to `cli::promote` (W5b/C5).
+// `ForgetArgs` moved to `cli::forget` (W5b/C5).
+// `LinkArgs`, `ResolveArgs` moved to `cli::link` (W5b/C5).
+// They are re-imported at the top of this file.
 
 #[derive(Args)]
 struct ConsolidateArgs {
@@ -569,14 +519,6 @@ struct ConsolidateArgs {
     summary: String,
     #[arg(long, short)]
     namespace: Option<String>,
-}
-
-#[derive(Args)]
-struct ResolveArgs {
-    /// ID of the memory that wins (supersedes)
-    winner_id: String,
-    /// ID of the memory that loses (superseded)
-    loser_id: String,
 }
 
 #[derive(Args)]
@@ -750,14 +692,63 @@ async fn main() -> Result<()> {
         }
         Command::Recall(a) => cmd_recall(&db_path, &a, j, &app_config),
         Command::Search(a) => cmd_search(&db_path, &a, j, &app_config),
-        Command::Get(a) => cmd_get(&db_path, &a, j),
-        Command::List(a) => cmd_list(&db_path, &a, j, &app_config),
-        Command::Delete(a) => cmd_delete(&db_path, &a, j, cli_agent_id.as_deref()),
-        Command::Promote(a) => cmd_promote(&db_path, &a, j, cli_agent_id.as_deref()),
-        Command::Forget(a) => cmd_forget(&db_path, &a, j),
-        Command::Link(a) => cmd_link(&db_path, &a, j),
+        Command::Get(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = ai_memory::cli::CliOutput::from_std(&mut so, &mut se);
+            cli::crud::cmd_get(&db_path, &a, j, &mut out)
+        }
+        Command::List(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = ai_memory::cli::CliOutput::from_std(&mut so, &mut se);
+            cli::crud::cmd_list(&db_path, &a, j, &app_config, &mut out)
+        }
+        Command::Delete(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = ai_memory::cli::CliOutput::from_std(&mut so, &mut se);
+            cli::crud::cmd_delete(&db_path, &a, j, cli_agent_id.as_deref(), &mut out)
+        }
+        Command::Promote(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = ai_memory::cli::CliOutput::from_std(&mut so, &mut se);
+            cli::promote::cmd_promote(&db_path, &a, j, cli_agent_id.as_deref(), &mut out)
+        }
+        Command::Forget(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = ai_memory::cli::CliOutput::from_std(&mut so, &mut se);
+            cli::forget::cmd_forget(&db_path, &a, j, &mut out)
+        }
+        Command::Link(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = ai_memory::cli::CliOutput::from_std(&mut so, &mut se);
+            cli::link::cmd_link(&db_path, &a, j, &mut out)
+        }
         Command::Consolidate(a) => cmd_consolidate(&db_path, a, j, cli_agent_id.as_deref()),
-        Command::Resolve(a) => cmd_resolve(&db_path, &a, j),
+        Command::Resolve(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = ai_memory::cli::CliOutput::from_std(&mut so, &mut se);
+            cli::link::cmd_resolve(&db_path, &a, j, &mut out)
+        }
         Command::Shell => cmd_shell(&db_path),
         Command::Sync(a) => cmd_sync(&db_path, &a, j, cli_agent_id.as_deref()),
         Command::SyncDaemon(a) => cmd_sync_daemon(&db_path, a, cli_agent_id.as_deref()).await,
@@ -1407,325 +1398,10 @@ fn cmd_search(
     Ok(())
 }
 
-fn cmd_get(db_path: &Path, args: &GetArgs, json_out: bool) -> Result<()> {
-    validate::validate_id(&args.id)?;
-    let conn = db::open(db_path)?;
-    if let Some(mem) = db::resolve_id(&conn, &args.id)? {
-        let links = db::get_links(&conn, &mem.id).unwrap_or_default();
-        if json_out {
-            println!(
-                "{}",
-                serde_json::to_string(&serde_json::json!({"memory": mem, "links": links}))?
-            );
-        } else {
-            println!("{}", serde_json::to_string_pretty(&mem)?);
-            if !links.is_empty() {
-                println!("\nlinks:");
-                for l in &links {
-                    println!("  {} --[{}]--> {}", l.source_id, l.relation, l.target_id);
-                }
-            }
-        }
-    } else {
-        eprintln!("not found: {}", args.id);
-        std::process::exit(1);
-    }
-    Ok(())
-}
-
-fn cmd_list(
-    db_path: &Path,
-    args: &ListArgs,
-    json_out: bool,
-    app_config: &config::AppConfig,
-) -> Result<()> {
-    // #197: validate agent_id filter values
-    if let Some(ref aid) = args.agent_id {
-        validate::validate_agent_id(aid)?;
-    }
-    let conn = db::open(db_path)?;
-    let _ = db::gc_if_needed(&conn, app_config.effective_archive_on_gc());
-    let tier = args.tier.as_deref().and_then(Tier::from_str);
-    let results = db::list(
-        &conn,
-        args.namespace.as_deref(),
-        tier.as_ref(),
-        args.limit,
-        args.offset,
-        None,
-        args.since.as_deref(),
-        args.until.as_deref(),
-        args.tags.as_deref(),
-        args.agent_id.as_deref(),
-    )?;
-    if json_out {
-        println!(
-            "{}",
-            serde_json::to_string(
-                &serde_json::json!({"memories": results, "count": results.len()})
-            )?
-        );
-        return Ok(());
-    }
-    if results.is_empty() {
-        eprintln!("no memories stored");
-        return Ok(());
-    }
-    for mem in &results {
-        let age = human_age(&mem.updated_at);
-        println!(
-            "[{}/{}] {} (p={}, ns={}, {})",
-            mem.tier,
-            id_short(&mem.id),
-            mem.title,
-            mem.priority,
-            mem.namespace,
-            age
-        );
-    }
-    println!("\n{} memory(ies)", results.len());
-    Ok(())
-}
-
-fn cmd_delete(
-    db_path: &Path,
-    args: &DeleteArgs,
-    json_out: bool,
-    cli_agent_id: Option<&str>,
-) -> Result<()> {
-    validate::validate_id(&args.id)?;
-    let conn = db::open(db_path)?;
-    // Resolve the target first for governance owner context.
-    let target = db::resolve_id(&conn, &args.id)?;
-    let Some(target) = target else {
-        eprintln!("not found: {}", args.id);
-        std::process::exit(1);
-    };
-
-    // Task 1.9: governance enforcement (delete-side)
-    {
-        use models::{GovernanceDecision, GovernedAction};
-        let caller_agent_id = identity::resolve_agent_id(cli_agent_id, None)?;
-        let mem_owner = target
-            .metadata
-            .get("agent_id")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
-        let payload = serde_json::json!({"id": target.id, "title": target.title});
-        match db::enforce_governance(
-            &conn,
-            GovernedAction::Delete,
-            &target.namespace,
-            &caller_agent_id,
-            Some(&target.id),
-            mem_owner.as_deref(),
-            &payload,
-        )? {
-            GovernanceDecision::Allow => {}
-            GovernanceDecision::Deny(reason) => {
-                eprintln!("delete denied by governance: {reason}");
-                std::process::exit(1);
-            }
-            GovernanceDecision::Pending(pending_id) => {
-                if json_out {
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "status": "pending",
-                            "pending_id": pending_id,
-                            "reason": "governance requires approval",
-                            "action": "delete",
-                            "memory_id": target.id,
-                        })
-                    );
-                } else {
-                    println!(
-                        "delete queued for approval: pending_id={pending_id} id={}",
-                        target.id
-                    );
-                }
-                return Ok(());
-            }
-        }
-    }
-
-    if db::delete(&conn, &target.id)? {
-        if json_out {
-            println!("{}", serde_json::json!({"deleted": true, "id": target.id}));
-        } else {
-            println!("deleted: {}", target.id);
-        }
-    } else {
-        eprintln!("not found: {}", args.id);
-        std::process::exit(1);
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_lines)]
-fn cmd_promote(
-    db_path: &Path,
-    args: &PromoteArgs,
-    json_out: bool,
-    cli_agent_id: Option<&str>,
-) -> Result<()> {
-    validate::validate_id(&args.id)?;
-    if let Some(ref to_ns) = args.to_namespace {
-        validate::validate_namespace(to_ns)?;
-    }
-    let conn = db::open(db_path)?;
-    // Resolve target; capture the memory for governance owner context.
-    let target = if let Some(m) = db::get(&conn, &args.id)? {
-        m
-    } else if let Some(m) = db::get_by_prefix(&conn, &args.id)? {
-        m
-    } else {
-        eprintln!("not found: {}", args.id);
-        std::process::exit(1);
-    };
-    let resolved_id = target.id.clone();
-
-    // Task 1.9: governance enforcement (promote-side)
-    {
-        use models::{GovernanceDecision, GovernedAction};
-        let caller_agent_id = identity::resolve_agent_id(cli_agent_id, None)?;
-        let mem_owner = target
-            .metadata
-            .get("agent_id")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
-        let payload = serde_json::json!({
-            "id": resolved_id,
-            "to_namespace": args.to_namespace,
-        });
-        match db::enforce_governance(
-            &conn,
-            GovernedAction::Promote,
-            &target.namespace,
-            &caller_agent_id,
-            Some(&resolved_id),
-            mem_owner.as_deref(),
-            &payload,
-        )? {
-            GovernanceDecision::Allow => {}
-            GovernanceDecision::Deny(reason) => {
-                eprintln!("promote denied by governance: {reason}");
-                std::process::exit(1);
-            }
-            GovernanceDecision::Pending(pending_id) => {
-                if json_out {
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "status": "pending",
-                            "pending_id": pending_id,
-                            "reason": "governance requires approval",
-                            "action": "promote",
-                            "memory_id": resolved_id,
-                        })
-                    );
-                } else {
-                    println!(
-                        "promote queued for approval: pending_id={pending_id} id={resolved_id}"
-                    );
-                }
-                return Ok(());
-            }
-        }
-    }
-
-    // Task 1.7: vertical (namespace) promotion when --to-namespace is set
-    if let Some(ref to_ns) = args.to_namespace {
-        let clone_id = db::promote_to_namespace(&conn, &resolved_id, to_ns)?;
-        if json_out {
-            println!(
-                "{}",
-                serde_json::to_string(&serde_json::json!({
-                    "promoted": true,
-                    "mode": "vertical",
-                    "source_id": resolved_id,
-                    "clone_id": clone_id,
-                    "to_namespace": to_ns,
-                }))?
-            );
-        } else {
-            println!(
-                "promoted (vertical): {} → {} (clone: {})",
-                id_short(&resolved_id),
-                to_ns,
-                id_short(&clone_id),
-            );
-        }
-        return Ok(());
-    }
-
-    let (found, _) = db::update(
-        &conn,
-        &resolved_id,
-        None,
-        None,
-        Some(&Tier::Long),
-        None,
-        None,
-        None,
-        None,
-        Some(""),
-        None,
-    )?;
-    if !found {
-        eprintln!("not found: {}", args.id);
-        std::process::exit(1);
-    }
-    if json_out {
-        println!(
-            "{}",
-            serde_json::json!({"promoted": true, "id": resolved_id, "tier": "long"})
-        );
-    } else {
-        println!("promoted to long-term: {resolved_id}");
-    }
-    Ok(())
-}
-
-fn cmd_forget(db_path: &Path, args: &ForgetArgs, json_out: bool) -> Result<()> {
-    let tier = args.tier.as_deref().and_then(Tier::from_str);
-    let conn = db::open(db_path)?;
-    match db::forget(
-        &conn,
-        args.namespace.as_deref(),
-        args.pattern.as_deref(),
-        tier.as_ref(),
-        true, // always archive from CLI
-    ) {
-        Ok(n) => {
-            if json_out {
-                println!("{}", serde_json::json!({"deleted": n}));
-            } else {
-                println!("forgot {n} memories");
-            }
-        }
-        Err(e) => {
-            eprintln!("error: {e}");
-            std::process::exit(1);
-        }
-    }
-    Ok(())
-}
-
-fn cmd_link(db_path: &Path, args: &LinkArgs, json_out: bool) -> Result<()> {
-    validate::validate_link(&args.source_id, &args.target_id, &args.relation)?;
-    let conn = db::open(db_path)?;
-    db::create_link(&conn, &args.source_id, &args.target_id, &args.relation)?;
-    if json_out {
-        println!("{}", serde_json::json!({"linked": true}));
-    } else {
-        println!(
-            "linked: {} --[{}]--> {}",
-            args.source_id, args.relation, args.target_id
-        );
-    }
-    Ok(())
-}
+// `cmd_get` / `cmd_list` / `cmd_delete` moved to `cli::crud` (W5b/C5).
+// `cmd_promote` moved to `cli::promote` (W5b/C5).
+// `cmd_forget` moved to `cli::forget` (W5b/C5).
+// `cmd_link` moved to `cli::link` (W5b/C5).
 
 fn cmd_consolidate(
     db_path: &Path,
@@ -1817,43 +1493,7 @@ fn cmd_namespaces(db_path: &Path, json_out: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_resolve(db_path: &Path, args: &ResolveArgs, json_out: bool) -> Result<()> {
-    let conn = db::open(db_path)?;
-    validate::validate_link(&args.winner_id, &args.loser_id, "supersedes")?;
-    db::create_link(&conn, &args.winner_id, &args.loser_id, "supersedes")?;
-    let _ = db::update(
-        &conn,
-        &args.loser_id,
-        None,
-        None,
-        None,
-        None,
-        None,
-        Some(1),
-        Some(0.1),
-        None,
-        None,
-    )?;
-    db::touch(
-        &conn,
-        &args.winner_id,
-        models::SHORT_TTL_EXTEND_SECS,
-        models::MID_TTL_EXTEND_SECS,
-    )?;
-    if json_out {
-        println!(
-            "{}",
-            serde_json::json!({"resolved": true, "winner": args.winner_id, "loser": args.loser_id})
-        );
-    } else {
-        println!(
-            "resolved: {} supersedes {}",
-            color::long(&args.winner_id),
-            color::dim(&args.loser_id)
-        );
-    }
-    Ok(())
-}
+// `cmd_resolve` moved to `cli::link` (W5b/C5).
 
 #[allow(clippy::too_many_lines)]
 fn cmd_shell(db_path: &Path) -> Result<()> {
