@@ -80,9 +80,15 @@ struct Cli {
     #[arg(long, global = true, default_value_t = false)]
     json: bool,
     /// Agent identifier used for store operations. If unset, an NHI-hardened
-    /// default is synthesized (see `ai-memory store --help`). Accepts the
-    /// `AI_MEMORY_AGENT_ID` environment variable as a fallback.
-    #[arg(long, env = "AI_MEMORY_AGENT_ID", global = true)]
+    /// default is synthesized (see `ai-memory store --help`). The
+    /// `AI_MEMORY_AGENT_ID` environment variable is read by
+    /// `identity::resolve_agent_id` as a fallback for *write* paths only —
+    /// it deliberately does NOT bind to this clap flag, because `global =
+    /// true` would otherwise propagate the env value into per-subcommand
+    /// `--agent-id` *filter* fields on `list` / `search`, silently hiding
+    /// memories from the caller (regression observed when the campaign
+    /// harness exported `AI_MEMORY_AGENT_ID`).
+    #[arg(long, global = true)]
     agent_id: Option<String>,
     /// v0.6.0.0: path to a file containing the `SQLCipher` passphrase.
     /// Only meaningful when the binary was built with

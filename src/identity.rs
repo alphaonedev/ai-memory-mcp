@@ -37,8 +37,13 @@ use anyhow::Result;
 
 use crate::validate;
 
-/// Environment variable override for `agent_id` (used by CLI via clap's
-/// `env = "AI_MEMORY_AGENT_ID"`; read directly for MCP fallback).
+/// Environment variable override for `agent_id`. Read directly here as
+/// step 2 of the precedence chain for *write* paths (CLI store/delete/
+/// update/sync, MCP tool calls). Intentionally NOT bound to clap's `env`
+/// attribute on the `--agent-id` flag because `global = true` would
+/// otherwise propagate the env value into the per-subcommand `--agent-id`
+/// *filter* fields on `list` / `search`, silently hiding memories from
+/// the caller.
 const ENV_AGENT_ID: &str = "AI_MEMORY_AGENT_ID";
 
 /// Environment variable opt-out for the hostname-revealing default (#198).
@@ -114,7 +119,7 @@ fn sanitize_component(input: &str) -> String {
 /// See module docs for precedence. Returned id is always valid per
 /// [`validate::validate_agent_id`].
 pub fn resolve_agent_id(explicit: Option<&str>, mcp_client: Option<&str>) -> Result<String> {
-    // 1. Explicit caller value (already env-merged by clap for CLI)
+    // 1. Explicit caller value (CLI `--agent-id` flag, MCP tool param)
     if let Some(id) = explicit
         && !id.is_empty()
     {
@@ -122,8 +127,10 @@ pub fn resolve_agent_id(explicit: Option<&str>, mcp_client: Option<&str>) -> Res
         return Ok(id.to_string());
     }
 
-    // 2. AI_MEMORY_AGENT_ID env var (for MCP path; CLI clap merges this already,
-    //    but MCP callers that don't pass it explicitly need this fallback)
+    // 2. AI_MEMORY_AGENT_ID env var. Read here (rather than via clap's `env`
+    //    attribute on the top-level `--agent-id` flag) so the env value
+    //    only affects *write* paths that route through this resolver — it
+    //    must NOT silently scope read filters on `list` / `search`.
     if let Ok(v) = std::env::var(ENV_AGENT_ID)
         && !v.is_empty()
     {
