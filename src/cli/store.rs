@@ -5,6 +5,7 @@
 //! tests can capture stdout/stderr into `Vec<u8>` buffers.
 
 use crate::cli::CliOutput;
+use crate::cli::governance::{GovernanceOutcome, enforce as enforce_governance};
 use crate::cli::helpers::auto_namespace;
 use crate::{config, db, identity, models, validate};
 use anyhow::Result;
@@ -149,10 +150,13 @@ pub fn run(
         metadata,
     };
 
+    // W5b/C5: governance enforcement routes through `cli::governance::enforce`
+    // so the print-side of Pending/Deny is covered by `cli::governance::tests`.
+    // Caller still owns the `process::exit(1)` on Deny.
     {
-        use models::{GovernanceDecision, GovernedAction};
+        use models::GovernedAction;
         let payload = serde_json::to_value(&mem).unwrap_or_default();
-        match db::enforce_governance(
+        match enforce_governance(
             &conn,
             GovernedAction::Store,
             &mem.namespace,
@@ -160,32 +164,14 @@ pub fn run(
             None,
             None,
             &payload,
+            json_out,
+            out,
         )? {
-            GovernanceDecision::Allow => {}
-            GovernanceDecision::Deny(reason) => {
-                writeln!(out.stderr, "store denied by governance: {reason}")?;
+            GovernanceOutcome::Allow => {}
+            GovernanceOutcome::Deny => {
                 std::process::exit(1);
             }
-            GovernanceDecision::Pending(pending_id) => {
-                if json_out {
-                    writeln!(
-                        out.stdout,
-                        "{}",
-                        serde_json::json!({
-                            "status": "pending",
-                            "pending_id": pending_id,
-                            "reason": "governance requires approval",
-                            "action": "store",
-                            "namespace": &mem.namespace,
-                        })
-                    )?;
-                } else {
-                    writeln!(
-                        out.stdout,
-                        "store queued for approval: pending_id={pending_id} ns={}",
-                        &mem.namespace
-                    )?;
-                }
+            GovernanceOutcome::Pending => {
                 return Ok(());
             }
         }
