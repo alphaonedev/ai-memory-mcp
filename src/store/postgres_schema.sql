@@ -85,6 +85,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS memories_title_ns_uidx
     ON memories (title, namespace);
 
 CREATE INDEX IF NOT EXISTS memories_namespace_idx ON memories (namespace);
+CREATE INDEX IF NOT EXISTS idx_memories_namespace_path
+    ON memories (namespace text_pattern_ops);
 CREATE INDEX IF NOT EXISTS memories_tier_idx      ON memories (tier);
 CREATE INDEX IF NOT EXISTS memories_priority_idx  ON memories (priority DESC);
 CREATE INDEX IF NOT EXISTS memories_updated_at_idx ON memories (updated_at DESC);
