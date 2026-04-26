@@ -1417,6 +1417,8 @@ fn test_export_includes_links() {
 
 #[test]
 fn test_import_roundtrip_count_match() {
+    use std::io::Write;
+
     let binary = env!("CARGO_BIN_EXE_ai-memory");
     let dir = std::env::temp_dir();
     let db1 = dir.join(format!("ai-memory-irt-src-{}.db", uuid::Uuid::new_v4()));
@@ -1466,7 +1468,6 @@ fn test_import_roundtrip_count_match() {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    use std::io::Write;
     child
         .stdin
         .take()
