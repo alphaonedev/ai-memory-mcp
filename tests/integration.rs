@@ -7261,7 +7261,7 @@ fn test_budget_truncates_to_fit() {
     }
 
     let v = recall_with_budget(bin, &db, "alpha", Some(25));
-    let count = v["count"].as_u64().unwrap() as usize;
+    let count = usize::try_from(v["count"].as_u64().unwrap()).unwrap();
     assert!(
         (1..5).contains(&count),
         "budget must truncate; got count={count}"
