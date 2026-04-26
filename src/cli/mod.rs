@@ -15,12 +15,25 @@
 //! Each handler takes `&mut CliOutput<'_>` and routes every emit
 //! through `writeln!` so tests can assert on captured bytes.
 
+pub mod agents;
+pub mod archive;
+pub mod backup;
+pub mod consolidate;
+pub mod crud;
+pub mod curator;
+pub mod forget;
+pub mod gc;
+pub mod governance;
 pub mod helpers;
 pub mod io;
 pub mod io_writer;
+pub mod link;
+pub mod promote;
 pub mod recall;
 pub mod search;
+pub mod shell;
 pub mod store;
+pub mod sync;
 pub mod update;
 
 #[cfg(test)]
