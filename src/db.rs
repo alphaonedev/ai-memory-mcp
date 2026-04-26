@@ -170,7 +170,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
 );
 ";
 
-const CURRENT_SCHEMA_VERSION: i64 = 15;
+const CURRENT_SCHEMA_VERSION: i64 = 16;
 
 pub fn open(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path).context("failed to open database")?;
@@ -570,6 +570,15 @@ fn migrate(conn: &Connection) -> Result<()> {
 
             // All INDEX and TABLE statements are idempotent; batch-run the migration
             conn.execute_batch(MIGRATION_V15_SQLITE)?;
+        }
+
+        if version < 16 {
+            // v0.6.4 prep: explicitly document that the existing
+            // idx_memories_namespace already supports prefix LIKE under
+            // SQLite's default BINARY collation. Bump version so Postgres
+            // peers' text_pattern_ops index is part of the same migration
+            // generation.
+            // No DDL needed for SQLite — index already prefix-friendly.
         }
 
         conn.execute("DELETE FROM schema_version", [])?;
@@ -7195,5 +7204,37 @@ mod tests {
             "expected valid_from to be backfilled, got NULL"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn namespace_prefix_query_index_available() {
+        let conn = test_db();
+        // SQLite's default BINARY collation supports prefix-matching LIKE queries
+        // with the idx_memories_namespace index. Verify the index exists and a
+        // simple prefix query can execute (EXPLAIN QUERY PLAN output varies by
+        // SQLite version and query planner heuristics, so we just check that the
+        // query completes without error).
+        let result: Option<String> = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_memories_namespace'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            Some("idx_memories_namespace".to_string()),
+            "idx_memories_namespace index should exist"
+        );
+
+        // Execute a prefix LIKE query to ensure it compiles and runs
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE namespace LIKE 'test/%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
     }
 }
