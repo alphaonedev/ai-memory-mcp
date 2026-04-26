@@ -7247,7 +7247,10 @@ fn test_budget_unlimited_returns_all() {
     let v = recall_with_budget(bin, &db, "alpha", None);
     assert_eq!(v["count"], 3);
     assert!(v["tokens_used"].as_u64().unwrap() > 0);
-    assert!(v.get("budget_tokens").is_none_or(|v| v.is_null()));
+    assert!(
+        v.get("budget_tokens")
+            .is_none_or(serde_json::Value::is_null)
+    );
     let _ = std::fs::remove_file(&db);
 }
 
