@@ -2193,7 +2193,7 @@ fn test_mcp_recall_default_toon() {
         "default should be TOON compact, got: {}",
         &text[..text.len().min(100)]
     );
-    assert!(text.contains("|"), "should contain pipe delimiters");
+    assert!(text.contains('|'), "should contain pipe delimiters");
 
     let _ = std::fs::remove_file(&db_path);
 }
