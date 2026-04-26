@@ -5039,6 +5039,8 @@ fn seed_standard(
     title: &str,
     content: &str,
 ) -> String {
+    use std::io::Write;
+
     let out = cmd(binary)
         .args([
             "--db",
@@ -5065,7 +5067,6 @@ fn seed_standard(
     let id = v["id"].as_str().unwrap().to_string();
 
     // Set via MCP (CLI doesn't expose set_namespace_standard)
-    use std::io::Write;
     let mut child = cmd(binary)
         .args([
             "--db",
