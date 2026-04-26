@@ -106,6 +106,12 @@ tower = { version = "0.5", features = ["util"] }
 # so cert / key / fingerprint bytes stay stable across machines (rcgen's
 # RNG is seeded but its DER encoding can shift between minor releases).
 rcgen = { version = "=0.14.7", default-features = false, features = ["pem", "ring"] }
+# W6 (v0.6.3) — re-declare tokio for tests with the `test-util` feature
+# turned on so `tokio::test(start_paused = true)` and `tokio::time::advance`
+# (used by the daemon_runtime gc/wal-checkpoint loop tests) compile. The
+# production tokio dep keeps just "full" to avoid leaking the test-util
+# surface into release binaries.
+tokio = { version = "1", features = ["full", "test-util"] }
 
 [[bench]]
 name = "recall"
