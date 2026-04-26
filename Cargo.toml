@@ -112,6 +112,18 @@ rcgen = { version = "=0.14.7", default-features = false, features = ["pem", "rin
 # production tokio dep keeps just "full" to avoid leaking the test-util
 # surface into release binaries.
 tokio = { version = "1", features = ["full", "test-util"] }
+# W7 (v0.6.3) / I7 — binary-spawn integration tests. `assert_cmd` and
+# `predicates` are the standard pair for CLI subprocess assertions; the
+# production `reqwest` dep already has the `blocking` feature on, which
+# the `serve` integration tests use to drive the daemon over HTTP from
+# a synchronous test body.
+assert_cmd = "2"
+predicates = "3"
+# `libc` for the SIGINT graceful-shutdown integration test on unix —
+# already transitively in the dep tree via tokio, declared explicitly
+# here so the test can `use libc::SIGINT` without `rustc_private` errors.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
 
 [[bench]]
 name = "recall"
