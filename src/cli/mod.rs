@@ -18,6 +18,8 @@
 pub mod helpers;
 pub mod io;
 pub mod io_writer;
+pub mod recall;
+pub mod search;
 pub mod store;
 pub mod update;
 
