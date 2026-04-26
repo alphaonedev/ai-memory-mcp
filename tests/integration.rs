@@ -3974,7 +3974,7 @@ fn test_agentid_visible_in_recall_response() {
 /// deliberately omits `metadata` for token efficiency (see src/toon.rs
 /// `MEMORY_FIELDS_COMPACT`), so `agent_id` is NOT visible in that format —
 /// that's a known tradeoff tracked separately. This test pins the two formats
-/// where agent_id must show up.
+/// where `agent_id` must show up.
 #[test]
 fn test_agentid_visible_in_toon_and_json() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
