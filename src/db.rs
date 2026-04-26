@@ -6549,7 +6549,7 @@ mod tests {
 
     // -- Pillar 2 / Stream C — kg_query (depth=1) ---------------------------
 
-    /// Insert a link with explicit temporal/observed_by columns so the
+    /// Insert a link with explicit `temporal/observed_by` columns so the
     /// `kg_query` filter tests can pin behavior without relying on
     /// wall-clock spread.
     fn insert_link_full(
