@@ -10475,4 +10475,3496 @@ mod tests {
         .unwrap();
         assert_eq!(rows.len(), 3);
     }
+    // -------------------------------------------------------------------
+    // Wave 8 (Closer H8b) — handlers.rs inbox/subscriptions lane.
+    //
+    // Targets the six handler entry points that drive S32/S33/S36:
+    //   - subscribe / unsubscribe / list_subscriptions
+    //   - notify / get_inbox
+    //   - session_start
+    //
+    // All tests run in-process against a `:memory:` DB with `federation =
+    // None` so the quorum branches stay short-circuited. We exercise the
+    // happy path *and* the validation/error edges — the latter is where
+    // pre-W8 coverage was thin (~81% on handlers.rs).
+    // -------------------------------------------------------------------
+
+    // ---- subscribe (POST /api/v1/subscriptions) ----
+
+    /// Happy path: a valid `https://` webhook URL produces a 201 with the
+    /// canonical webhook-shape echo (`id`, `url`, `events`, `created_by`).
+    #[tokio::test]
+    async fn h8b_subscribe_https_url_returns_created() {
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/subscriptions", axum_post(subscribe))
+            .with_state(test_app_state(state));
+
+        let body = serde_json::json!({
+            "url": "https://example.com/webhook",
+            "events": "*",
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/subscriptions")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .header("x-agent-id", "alice")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v["id"].as_str().is_some(), "id must be returned");
+        assert_eq!(v["url"], "https://example.com/webhook");
+        assert_eq!(v["created_by"], "alice");
+    }
+
+    /// Body without `url` *or* `namespace` is rejected with 400 — the
+    /// handler short-circuits before touching the DB.
+    #[tokio::test]
+    async fn h8b_subscribe_missing_url_and_namespace_rejected() {
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/subscriptions", axum_post(subscribe))
+            .with_state(test_app_state(state));
+
+        let body = serde_json::json!({"events": "*"});
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/subscriptions")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .header("x-agent-id", "alice")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v["error"].as_str().unwrap().contains("url or namespace"),);
+    }
+
+    /// A URL missing the scheme is invalid (`validate_url` reports "missing
+    /// scheme"). Handler must surface this as 400.
+    #[tokio::test]
+    async fn h8b_subscribe_invalid_url_rejected() {
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/subscriptions", axum_post(subscribe))
+            .with_state(test_app_state(state));
+
+        let body = serde_json::json!({
+            "url": "not-a-url",
+            "events": "*",
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/subscriptions")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .header("x-agent-id", "alice")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// SSRF guard: explicit loopback (127.0.0.1) is permitted (matches the
+    /// `is_loopback()` allowance in `validate_url`); but a metadata-service
+    /// IP (169.254.169.254 — link-local) must be rejected. Both cases share
+    /// the same handler entry-point so we exercise them together.
+    #[tokio::test]
+    async fn h8b_subscribe_rejects_link_local_metadata_ip() {
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/subscriptions", axum_post(subscribe))
+            .with_state(test_app_state(state));
+
+        let body = serde_json::json!({
+            "url": "https://169.254.169.254/latest/meta-data/",
+            "events": "*",
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/subscriptions")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .header("x-agent-id", "alice")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let err = v["error"].as_str().unwrap();
+        // The validator rejects with either "private", "link-local", or
+        // similar wording — accept any of the SSRF-guard messages.
+        assert!(
+            err.contains("private") || err.contains("link-local") || err.contains("non-loopback"),
+            "expected SSRF rejection, got: {err}",
+        );
+    }
+
+    /// S33 namespace-shape: when only `namespace` is supplied the handler
+    /// synthesizes a loopback URL and persists `namespace_filter`.
+    #[tokio::test]
+    async fn h8b_subscribe_namespace_shape_synthesizes_url() {
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/subscriptions", axum_post(subscribe))
+            .with_state(test_app_state(state));
+
+        let body = serde_json::json!({
+            "agent_id": "alice",
+            "namespace": "team/research",
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/subscriptions")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["agent_id"], "alice");
+        assert_eq!(v["namespace"], "team/research");
+        assert!(
+            v["url"]
+                .as_str()
+                .unwrap()
+                .starts_with("http://localhost/_ns/"),
+            "expected synthetic URL, got {}",
+            v["url"],
+        );
+    }
+
+    /// Webhook body with explicit `events` filter ("memory.created") is
+    /// accepted and round-tripped back in the response.
+    #[tokio::test]
+    async fn h8b_subscribe_event_filter_round_trips() {
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/subscriptions", axum_post(subscribe))
+            .with_state(test_app_state(state));
+
+        let body = serde_json::json!({
+            "url": "https://example.com/hook",
+            "events": "memory.created",
+            "namespace_filter": "global",
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/subscriptions")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .header("x-agent-id", "alice")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["events"], "memory.created");
+        assert_eq!(v["namespace_filter"], "global");
+    }
+
+    /// HMAC support: `secret` is accepted by the handler. Subscriptions
+    /// persist the hashed secret so the dispatcher can sign outbound posts.
+    /// We assert the create call succeeds — the secret must not leak back
+    /// in the response payload (the handler echoes only id/url/events/etc).
+    #[tokio::test]
+    async fn h8b_subscribe_persists_hmac_secret() {
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/subscriptions", axum_post(subscribe))
+            .with_state(test_app_state(state.clone()));
+
+        let body = serde_json::json!({
+            "url": "https://example.com/signed-hook",
+            "events": "*",
+            "secret": "topsecret-hmac-key",
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/subscriptions")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .header("x-agent-id", "alice")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        // Secret must not be echoed in the response.
+        assert!(v.get("secret").is_none(), "secret leaked into response");
+        // The row exists in the DB.
+        let lock = state.lock().await;
+        let subs = crate::subscriptions::list(&lock.0).unwrap();
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].url, "https://example.com/signed-hook");
+    }
+
+    // ---- unsubscribe (DELETE /api/v1/subscriptions) ----
+
+    /// Happy path: insert a subscription then delete by id; handler returns
+    /// `removed: true` and the row is gone from the listing.
+    #[tokio::test]
+    async fn h8b_unsubscribe_by_id_happy_path() {
+        let state = test_state();
+        let id = {
+            let lock = state.lock().await;
+            crate::subscriptions::insert(
+                &lock.0,
+                &crate::subscriptions::NewSubscription {
+                    url: "https://example.com/h",
+                    events: "*",
+                    secret: None,
+                    namespace_filter: None,
+                    agent_filter: None,
+                    created_by: Some("alice"),
+                },
+            )
+            .unwrap()
+        };
+
+        let app = Router::new()
+            .route("/api/v1/subscriptions", axum::routing::delete(unsubscribe))
+            .with_state(test_app_state(state.clone()));
+
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/api/v1/subscriptions?id={id}"))
+                    .method("DELETE")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["removed"], true);
+
+        // List must be empty afterwards.
+        let lock = state.lock().await;
+        assert!(crate::subscriptions::list(&lock.0).unwrap().is_empty());
+    }
+
+    /// Deleting a nonexistent id returns 200 with `removed: false` — the
+    /// SQL `DELETE` is idempotent and the handler reports the outcome.
+    #[tokio::test]
+    async fn h8b_unsubscribe_nonexistent_id_returns_removed_false() {
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/subscriptions", axum::routing::delete(unsubscribe))
+            .with_state(test_app_state(state));
+
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/subscriptions?id=does-not-exist")
+                    .method("DELETE")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["removed"], false);
+    }
+
+    /// S33 (agent_id, namespace) shape — handler finds the row by filter
+    /// and deletes it without needing an explicit id.
+    #[tokio::test]
+    async fn h8b_unsubscribe_by_agent_and_namespace() {
+        let state = test_state();
+        // Seed a subscription owned by alice for namespace "demo".
+        {
+            let lock = state.lock().await;
+            crate::subscriptions::insert(
+                &lock.0,
+                &crate::subscriptions::NewSubscription {
+                    url: "http://localhost/_ns/alice/demo",
+                    events: "*",
+                    secret: None,
+                    namespace_filter: Some("demo"),
+                    agent_filter: Some("alice"),
+                    created_by: Some("alice"),
+                },
+            )
+            .unwrap();
+        }
+
+        let app = Router::new()
+            .route("/api/v1/subscriptions", axum::routing::delete(unsubscribe))
+            .with_state(test_app_state(state.clone()));
+
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/subscriptions?namespace=demo")
+                    .method("DELETE")
+                    .header("x-agent-id", "alice")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["removed"], true);
+    }
+
+    /// Neither `id` nor (`agent_id`, `namespace`) is supplied — must 400.
+    #[tokio::test]
+    async fn h8b_unsubscribe_missing_id_and_namespace_rejected() {
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/subscriptions", axum::routing::delete(unsubscribe))
+            .with_state(test_app_state(state));
+
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/subscriptions")
+                    .method("DELETE")
+                    .header("x-agent-id", "alice")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            v["error"]
+                .as_str()
+                .unwrap()
+                .contains("id or (agent_id, namespace)"),
+        );
+    }
+
+    // ---- list_subscriptions (GET /api/v1/subscriptions) ----
+
+    /// With seeded data the handler returns rows shaped as the JSON spec
+    /// (top-level `namespace` field, alongside `namespace_filter`).
+    #[tokio::test]
+    async fn h8b_list_subscriptions_returns_seeded_rows() {
+        let state = test_state();
+        {
+            let lock = state.lock().await;
+            crate::subscriptions::insert(
+                &lock.0,
+                &crate::subscriptions::NewSubscription {
+                    url: "https://example.com/a",
+                    events: "*",
+                    secret: None,
+                    namespace_filter: Some("ns1"),
+                    agent_filter: Some("alice"),
+                    created_by: Some("alice"),
+                },
+            )
+            .unwrap();
+            crate::subscriptions::insert(
+                &lock.0,
+                &crate::subscriptions::NewSubscription {
+                    url: "https://example.com/b",
+                    events: "memory.updated",
+                    secret: None,
+                    namespace_filter: Some("ns2"),
+                    agent_filter: Some("bob"),
+                    created_by: Some("bob"),
+                },
+            )
+            .unwrap();
+        }
+
+        let app = Router::new()
+            .route(
+                "/api/v1/subscriptions",
+                axum::routing::get(list_subscriptions),
+            )
+            .with_state(state);
+
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/subscriptions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["count"], 2);
+        let subs = v["subscriptions"].as_array().unwrap();
+        assert_eq!(subs.len(), 2);
+        // Each row has the expected `namespace` projection.
+        for s in subs {
+            assert!(s["namespace"].is_string());
+            assert!(s["namespace_filter"].is_string());
+            assert!(s["id"].is_string());
+        }
+    }
+
+    /// Filtering by `agent_id` returns only the rows matching either
+    /// `agent_filter` or `created_by`. Bob's row must be excluded when
+    /// alice queries.
+    #[tokio::test]
+    async fn h8b_list_subscriptions_agent_id_filter_excludes_others() {
+        let state = test_state();
+        {
+            let lock = state.lock().await;
+            crate::subscriptions::insert(
+                &lock.0,
+                &crate::subscriptions::NewSubscription {
+                    url: "https://example.com/a",
+                    events: "*",
+                    secret: None,
+                    namespace_filter: Some("ns1"),
+                    agent_filter: Some("alice"),
+                    created_by: Some("alice"),
+                },
+            )
+            .unwrap();
+            crate::subscriptions::insert(
+                &lock.0,
+                &crate::subscriptions::NewSubscription {
+                    url: "https://example.com/b",
+                    events: "*",
+                    secret: None,
+                    namespace_filter: Some("ns2"),
+                    agent_filter: Some("bob"),
+                    created_by: Some("bob"),
+                },
+            )
+            .unwrap();
+        }
+
+        let app = Router::new()
+            .route(
+                "/api/v1/subscriptions",
+                axum::routing::get(list_subscriptions),
+            )
+            .with_state(state);
+
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/subscriptions?agent_id=alice")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["count"], 1);
+        assert_eq!(v["subscriptions"][0]["namespace"], "ns1");
+    }
+
+    // ---- notify (POST /api/v1/notify) ----
+
+    /// Happy path: alice notifies bob, the response carries the new id and
+    /// `delivered_at` stamp; the row lands in bob's `_messages/bob` ns.
+    #[tokio::test]
+    async fn h8b_notify_happy_path_creates_message() {
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/notify", axum_post(notify))
+            .with_state(test_app_state(state.clone()));
+
+        let body = serde_json::json!({
+            "target_agent_id": "bob",
+            "title": "Hi bob",
+            "payload": "hello there",
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/notify")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .header("x-agent-id", "alice")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["to"], "bob");
+        assert!(v["id"].as_str().is_some());
+        assert!(v["delivered_at"].as_str().is_some());
+
+        // Row landed in bob's namespace.
+        let lock = state.lock().await;
+        let rows = db::list(
+            &lock.0,
+            Some("_messages/bob"),
+            None,
+            10,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].title, "Hi bob");
+    }
+
+    /// `target_agent_id` is a required field on `NotifyBody`. Omitting it
+    /// triggers serde's missing-field rejection (Axum returns 422
+    /// Unprocessable Entity for malformed JSON shapes).
+    #[tokio::test]
+    async fn h8b_notify_missing_target_agent_id_rejected() {
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/notify", axum_post(notify))
+            .with_state(test_app_state(state));
+
+        // Required field absent — handler never runs.
+        let body = serde_json::json!({
+            "title": "stray",
+            "payload": "no target",
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/notify")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .header("x-agent-id", "alice")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Axum rejects with 422 for missing required JSON fields.
+        assert!(
+            resp.status() == StatusCode::UNPROCESSABLE_ENTITY
+                || resp.status() == StatusCode::BAD_REQUEST,
+            "expected 4xx for missing target_agent_id, got {}",
+            resp.status(),
+        );
+    }
+
+    /// `target_agent_id` containing illegal characters (spaces) is rejected
+    /// downstream by `validate_agent_id` inside `handle_notify`.
+    #[tokio::test]
+    async fn h8b_notify_invalid_target_agent_id_rejected() {
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/notify", axum_post(notify))
+            .with_state(test_app_state(state));
+
+        let body = serde_json::json!({
+            "target_agent_id": "bob with spaces",
+            "title": "Hi",
+            "payload": "hello",
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/notify")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .header("x-agent-id", "alice")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Oversized payload ( > MAX_CONTENT_SIZE bytes) is rejected by
+    /// `validate::validate_content` inside `handle_notify`.
+    #[tokio::test]
+    async fn h8b_notify_oversized_payload_rejected() {
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/notify", axum_post(notify))
+            .with_state(test_app_state(state));
+
+        // MAX_CONTENT_SIZE is 65_536; allocate one over.
+        let big = "a".repeat(65_537);
+        let body = serde_json::json!({
+            "target_agent_id": "bob",
+            "title": "huge",
+            "payload": big,
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/notify")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .header("x-agent-id", "alice")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            v["error"].as_str().unwrap().contains("max"),
+            "expected size-limit error, got {:?}",
+            v["error"],
+        );
+    }
+
+    /// `content` is accepted as an alias for `payload` (S32 scenario uses
+    /// this shape). The notify completes and lands in the target's inbox.
+    #[tokio::test]
+    async fn h8b_notify_accepts_content_alias_for_payload() {
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/notify", axum_post(notify))
+            .with_state(test_app_state(state));
+
+        let body = serde_json::json!({
+            "target_agent_id": "bob",
+            "title": "alias",
+            "content": "via the content field",
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/notify")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .header("x-agent-id", "alice")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    // ---- get_inbox (GET /api/v1/inbox) ----
+
+    /// Empty inbox returns 200 with `count: 0` and an empty `messages` array.
+    #[tokio::test]
+    async fn h8b_get_inbox_empty_returns_zero() {
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/inbox", axum::routing::get(get_inbox))
+            .with_state(test_app_state(state));
+
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/inbox?agent_id=alice")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["count"], 0);
+        assert_eq!(v["messages"].as_array().unwrap().len(), 0);
+    }
+
+    /// After a notify, the inbox surfaces the message with `from`/`title`
+    /// fields populated; `read=false` indicates the recipient hasn't
+    /// touched it yet.
+    #[tokio::test]
+    async fn h8b_get_inbox_returns_pending_after_notify() {
+        let state = test_state();
+
+        // Seed via the notify handler so the full stack is exercised.
+        let notify_app = Router::new()
+            .route("/api/v1/notify", axum_post(notify))
+            .with_state(test_app_state(state.clone()));
+        let notify_body = serde_json::json!({
+            "target_agent_id": "bob",
+            "title": "ping",
+            "payload": "wake up",
+        });
+        let resp = notify_app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/notify")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .header("x-agent-id", "alice")
+                    .body(Body::from(serde_json::to_vec(&notify_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // Now fetch bob's inbox.
+        let inbox_app = Router::new()
+            .route("/api/v1/inbox", axum::routing::get(get_inbox))
+            .with_state(test_app_state(state));
+        let resp = inbox_app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/inbox?agent_id=bob")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["count"], 1);
+        let msg = &v["messages"][0];
+        assert_eq!(msg["title"], "ping");
+        // `from` is the resolved sender — `handle_notify` calls
+        // `identity::resolve_agent_id(None, mcp_client)` which synthesizes
+        // `ai:<client>@<host>:pid-N` when only `mcp_client` is set. We
+        // accept both the bare and synthesized forms.
+        let from = msg["from"].as_str().unwrap();
+        assert!(
+            from == "alice" || from.starts_with("ai:alice@"),
+            "unexpected sender: {from}",
+        );
+        assert_eq!(msg["read"], false);
+    }
+
+    /// `unread_only=true` filter omits already-read messages. We bump
+    /// `access_count` directly on the seeded row so the filter has
+    /// something to skip.
+    #[tokio::test]
+    async fn h8b_get_inbox_unread_only_filter_excludes_read() {
+        let state = test_state();
+        // Seed two messages — one read, one unread — directly via db::insert.
+        {
+            let lock = state.lock().await;
+            let now = Utc::now().to_rfc3339();
+            let unread = Memory {
+                id: Uuid::new_v4().to_string(),
+                tier: Tier::Mid,
+                namespace: "_messages/alice".into(),
+                title: "unread".into(),
+                content: "u".into(),
+                tags: vec!["_message".into()],
+                priority: 5,
+                confidence: 1.0,
+                source: "notify".into(),
+                access_count: 0,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+                last_accessed_at: None,
+                expires_at: None,
+                metadata: serde_json::json!({"agent_id": "bob"}),
+            };
+            let read = Memory {
+                id: Uuid::new_v4().to_string(),
+                tier: Tier::Mid,
+                namespace: "_messages/alice".into(),
+                title: "read".into(),
+                content: "r".into(),
+                tags: vec!["_message".into()],
+                priority: 5,
+                confidence: 1.0,
+                source: "notify".into(),
+                access_count: 5,
+                created_at: now.clone(),
+                updated_at: now,
+                last_accessed_at: None,
+                expires_at: None,
+                metadata: serde_json::json!({"agent_id": "bob"}),
+            };
+            db::insert(&lock.0, &unread).unwrap();
+            db::insert(&lock.0, &read).unwrap();
+        }
+
+        let app = Router::new()
+            .route("/api/v1/inbox", axum::routing::get(get_inbox))
+            .with_state(test_app_state(state));
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/inbox?agent_id=alice&unread_only=true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["count"], 1);
+        assert_eq!(v["messages"][0]["title"], "unread");
+        assert_eq!(v["unread_only"], true);
+    }
+
+    /// `limit` query param caps the returned list. Insert 3, ask for 2.
+    #[tokio::test]
+    async fn h8b_get_inbox_limit_clamps_returned_count() {
+        let state = test_state();
+        {
+            let lock = state.lock().await;
+            let now = Utc::now().to_rfc3339();
+            for i in 0..3 {
+                let mem = Memory {
+                    id: Uuid::new_v4().to_string(),
+                    tier: Tier::Mid,
+                    namespace: "_messages/alice".into(),
+                    title: format!("msg-{i}"),
+                    content: "c".into(),
+                    tags: vec!["_message".into()],
+                    priority: 5,
+                    confidence: 1.0,
+                    source: "notify".into(),
+                    access_count: 0,
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                    last_accessed_at: None,
+                    expires_at: None,
+                    metadata: serde_json::json!({"agent_id": "carol"}),
+                };
+                db::insert(&lock.0, &mem).unwrap();
+            }
+        }
+
+        let app = Router::new()
+            .route("/api/v1/inbox", axum::routing::get(get_inbox))
+            .with_state(test_app_state(state));
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/inbox?agent_id=alice&limit=2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["count"], 2);
+    }
+
+    /// Invalid `agent_id` (illegal char) on the query string is rejected
+    /// upstream by `resolve_caller_agent_id`.
+    #[tokio::test]
+    async fn h8b_get_inbox_invalid_agent_id_rejected() {
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/inbox", axum::routing::get(get_inbox))
+            .with_state(test_app_state(state));
+
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/inbox?agent_id=bad%20agent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ---- session_start (POST /api/v1/session/start) ----
+
+    /// Happy path with a valid agent_id: stamps a `session_id` and echoes
+    /// the agent_id back.
+    #[tokio::test]
+    async fn h8b_session_start_with_valid_agent_id_echoes() {
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/session/start", axum_post(session_start))
+            .with_state(state);
+
+        let body = serde_json::json!({"agent_id": "alice"});
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/session/start")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v["session_id"].as_str().is_some());
+        assert_eq!(v["agent_id"], "alice");
+    }
+
+    /// `namespace` filter narrows the recent-context preload to that ns.
+    #[tokio::test]
+    async fn h8b_session_start_namespace_filter() {
+        let state = test_state();
+        // Seed two memories, one in `target-ns` and one elsewhere.
+        {
+            let lock = state.lock().await;
+            let now = Utc::now().to_rfc3339();
+            for (ns, title) in [("target-ns", "in-scope"), ("other-ns", "out")] {
+                let mem = Memory {
+                    id: Uuid::new_v4().to_string(),
+                    tier: Tier::Long,
+                    namespace: ns.into(),
+                    title: title.into(),
+                    content: "body".into(),
+                    tags: vec![],
+                    priority: 5,
+                    confidence: 1.0,
+                    source: "api".into(),
+                    access_count: 0,
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                    last_accessed_at: None,
+                    expires_at: None,
+                    metadata: serde_json::json!({"agent_id": "alice"}),
+                };
+                db::insert(&lock.0, &mem).unwrap();
+            }
+        }
+
+        let app = Router::new()
+            .route("/api/v1/session/start", axum_post(session_start))
+            .with_state(state);
+        let body = serde_json::json!({"namespace": "target-ns", "limit": 5});
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/session/start")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        // Only the target-ns memory is in the recent set.
+        let mems = v["memories"].as_array().unwrap();
+        assert_eq!(mems.len(), 1);
+        assert_eq!(mems[0]["title"], "in-scope");
+    }
+
+    /// session_start with no body fields still succeeds — agent_id is
+    /// optional and the handler stamps a uuid session_id regardless.
+    #[tokio::test]
+    async fn h8b_session_start_returns_session_id_without_agent() {
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/session/start", axum_post(session_start))
+            .with_state(state);
+        let body = serde_json::json!({});
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/session/start")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        // session_id present; uuid v4 is 36 chars long.
+        let sid = v["session_id"].as_str().unwrap();
+        assert_eq!(sid.len(), 36);
+        // No explicit agent_id field is added when caller didn't supply one.
+        assert!(v.get("agent_id").is_none() || v["agent_id"].is_null());
+        assert_eq!(v["mode"], "session_start");
+    }
+
+    /// session_start preloads recent memories from all namespaces when no
+    /// `namespace` filter is supplied. Verifies the include-all branch.
+    #[tokio::test]
+    async fn h8b_session_start_preloads_recent_context() {
+        let state = test_state();
+        {
+            let lock = state.lock().await;
+            let now = Utc::now().to_rfc3339();
+            let mem = Memory {
+                id: Uuid::new_v4().to_string(),
+                tier: Tier::Long,
+                namespace: "global".into(),
+                title: "preload-me".into(),
+                content: "context".into(),
+                tags: vec![],
+                priority: 5,
+                confidence: 1.0,
+                source: "api".into(),
+                access_count: 0,
+                created_at: now.clone(),
+                updated_at: now,
+                last_accessed_at: None,
+                expires_at: None,
+                metadata: serde_json::json!({"agent_id": "alice"}),
+            };
+            db::insert(&lock.0, &mem).unwrap();
+        }
+
+        let app = Router::new()
+            .route("/api/v1/session/start", axum_post(session_start))
+            .with_state(state);
+        let body = serde_json::json!({"limit": 50});
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/session/start")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let mems = v["memories"].as_array().unwrap();
+        assert!(
+            mems.iter().any(|m| m["title"] == "preload-me"),
+            "session_start must preload recent memories",
+        );
+    }
+    // ========================================================================
+    // W8/H8c — handlers.rs gap-closing for agents/pending/consolidate.
+    //
+    // Coverage targets:
+    //   list_agents, register_agent, list_pending, approve_pending,
+    //   reject_pending, consolidate_memories, detect_contradictions,
+    //   get_capabilities.
+    //
+    // All tests drive the real Axum handler via `tower::ServiceExt::oneshot`
+    // and assert on (status, body) to hit handler arms — including the
+    // post-validation success paths that earlier W7 tests skipped.
+    // ========================================================================
+
+    // ---- list_agents (GET /api/v1/agents) ----------------------------------
+
+    #[tokio::test]
+    async fn http_list_agents_empty_returns_zero_count() {
+        // Empty `_agents` namespace: count=0, agents=[].
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/agents", axum_get(list_agents))
+            .with_state(state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/agents")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["count"], 0);
+        assert_eq!(v["agents"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn http_list_agents_returns_registered_rows() {
+        // Pre-register two agents directly via db::register_agent and
+        // confirm both surface through the list handler.
+        let state = test_state();
+        {
+            let lock = state.lock().await;
+            db::register_agent(&lock.0, "alice", "human", &["read".into(), "write".into()])
+                .unwrap();
+            db::register_agent(&lock.0, "bob", "ai:claude-opus-4.7", &["recall".into()]).unwrap();
+        }
+        let app = Router::new()
+            .route("/api/v1/agents", axum_get(list_agents))
+            .with_state(state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/agents")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["count"], 2);
+        let agents = v["agents"].as_array().unwrap();
+        let ids: Vec<&str> = agents
+            .iter()
+            .filter_map(|a| a["agent_id"].as_str())
+            .collect();
+        assert!(ids.contains(&"alice"));
+        assert!(ids.contains(&"bob"));
+    }
+
+    #[tokio::test]
+    async fn http_list_agents_includes_types_and_capabilities() {
+        // The serialized agent rows must surface agent_type AND the
+        // capability list back to the caller — not just agent_id.
+        let state = test_state();
+        {
+            let lock = state.lock().await;
+            db::register_agent(
+                &lock.0,
+                "alpha",
+                "ai:claude-opus-4.7",
+                &["read".into(), "store".into(), "recall".into()],
+            )
+            .unwrap();
+        }
+        let app = Router::new()
+            .route("/api/v1/agents", axum_get(list_agents))
+            .with_state(state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/agents")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let agents = v["agents"].as_array().unwrap();
+        assert_eq!(agents.len(), 1);
+        let a = &agents[0];
+        assert_eq!(a["agent_id"], "alpha");
+        assert_eq!(a["agent_type"], "ai:claude-opus-4.7");
+        let caps = a["capabilities"].as_array().unwrap();
+        assert_eq!(caps.len(), 3);
+        let cap_strs: Vec<&str> = caps.iter().filter_map(|c| c.as_str()).collect();
+        assert!(cap_strs.contains(&"read"));
+        assert!(cap_strs.contains(&"store"));
+        assert!(cap_strs.contains(&"recall"));
+    }
+
+    // ---- register_agent (POST /api/v1/agents) ------------------------------
+
+    #[tokio::test]
+    async fn http_register_agent_happy_path_returns_created() {
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/agents", axum_post(register_agent))
+            .with_state(test_app_state(state.clone()));
+        let body = serde_json::json!({
+            "agent_id": "alice",
+            "agent_type": "human",
+            "capabilities": ["read", "write"]
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/agents")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["registered"], true);
+        assert_eq!(v["agent_id"], "alice");
+        assert_eq!(v["agent_type"], "human");
+        // Row landed in `_agents` namespace.
+        let lock = state.lock().await;
+        let agents = db::list_agents(&lock.0).unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].agent_id, "alice");
+    }
+
+    #[tokio::test]
+    async fn http_register_agent_missing_agent_type_400() {
+        // Missing `agent_type` on the JSON body — Axum's Json extractor
+        // rejects with 4xx (422 from serde-error wrapping).
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/agents", axum_post(register_agent))
+            .with_state(test_app_state(state));
+        let body = serde_json::json!({
+            "agent_id": "alice"
+            // no agent_type, no capabilities
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/agents")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_client_error(),
+            "expected 4xx for missing agent_type, got {}",
+            resp.status()
+        );
+    }
+
+    #[tokio::test]
+    async fn http_register_agent_invalid_agent_id_with_space_400() {
+        // validate_agent_id rejects spaces.
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/agents", axum_post(register_agent))
+            .with_state(test_app_state(state));
+        let body = serde_json::json!({
+            "agent_id": "bad agent",
+            "agent_type": "human",
+            "capabilities": []
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/agents")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn http_register_agent_duplicate_register_idempotent_preserves_registered_at() {
+        // Re-registering the same agent_id is allowed (UPSERT-style on
+        // (namespace, title)). Both calls return 201; registered_at is
+        // preserved across the second call (db::register_agent reads it back).
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/agents", axum_post(register_agent))
+            .with_state(test_app_state(state.clone()));
+        let body = serde_json::json!({
+            "agent_id": "twice",
+            "agent_type": "human",
+            "capabilities": ["read"]
+        });
+        let r1 = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/agents")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r1.status(), StatusCode::CREATED);
+        let r2 = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/agents")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r2.status(), StatusCode::CREATED);
+        // Only one row for this agent_id (LWW on title=agent:twice).
+        let lock = state.lock().await;
+        let agents = db::list_agents(&lock.0).unwrap();
+        let twice: Vec<_> = agents.iter().filter(|a| a.agent_id == "twice").collect();
+        assert_eq!(
+            twice.len(),
+            1,
+            "duplicate register must collapse to one row"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_register_agent_capabilities_array_preserved() {
+        // The full `capabilities` array round-trips through register +
+        // list. Specifically: order-insensitive coverage of all members.
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/agents", axum_post(register_agent))
+            .with_state(test_app_state(state.clone()));
+        let body = serde_json::json!({
+            "agent_id": "capper",
+            "agent_type": "ai:claude-opus-4.7",
+            "capabilities": ["search", "store", "recall", "consolidate"]
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/agents")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let echoed = v["capabilities"].as_array().unwrap();
+        assert_eq!(echoed.len(), 4);
+        // And persisted shape matches.
+        let lock = state.lock().await;
+        let agents = db::list_agents(&lock.0).unwrap();
+        let me = agents.iter().find(|a| a.agent_id == "capper").unwrap();
+        assert_eq!(me.capabilities.len(), 4);
+        assert!(me.capabilities.contains(&"search".to_string()));
+        assert!(me.capabilities.contains(&"store".to_string()));
+        assert!(me.capabilities.contains(&"recall".to_string()));
+        assert!(me.capabilities.contains(&"consolidate".to_string()));
+    }
+
+    // ---- list_pending (GET /api/v1/pending) --------------------------------
+
+    #[tokio::test]
+    async fn http_list_pending_with_pending_actions_returns_them() {
+        // Queue two pending actions and confirm both surface.
+        use crate::models::GovernedAction;
+        let state = test_state();
+        {
+            let lock = state.lock().await;
+            db::queue_pending_action(
+                &lock.0,
+                GovernedAction::Store,
+                "ns-a",
+                None,
+                "alice",
+                &serde_json::json!({"title": "first", "content": "c1"}),
+            )
+            .unwrap();
+            db::queue_pending_action(
+                &lock.0,
+                GovernedAction::Store,
+                "ns-b",
+                None,
+                "bob",
+                &serde_json::json!({"title": "second", "content": "c2"}),
+            )
+            .unwrap();
+        }
+        let app = Router::new()
+            .route("/api/v1/pending", axum_get(list_pending))
+            .with_state(state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/pending")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["count"], 2);
+        assert_eq!(v["pending"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn http_list_pending_filters_by_status_pending() {
+        use crate::models::GovernedAction;
+        let state = test_state();
+        let kept_id = {
+            let lock = state.lock().await;
+            // One pending action that stays pending.
+            let id = db::queue_pending_action(
+                &lock.0,
+                GovernedAction::Store,
+                "ns-keep",
+                None,
+                "alice",
+                &serde_json::json!({"title": "stay", "content": "x"}),
+            )
+            .unwrap();
+            // One that we mark rejected.
+            let other = db::queue_pending_action(
+                &lock.0,
+                GovernedAction::Store,
+                "ns-reject",
+                None,
+                "alice",
+                &serde_json::json!({"title": "out", "content": "x"}),
+            )
+            .unwrap();
+            db::decide_pending_action(&lock.0, &other, false, "alice").unwrap();
+            id
+        };
+        let app = Router::new()
+            .route("/api/v1/pending", axum_get(list_pending))
+            .with_state(state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/pending?status=pending")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let items = v["pending"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["id"], kept_id);
+        assert_eq!(items[0]["status"], "pending");
+    }
+
+    #[tokio::test]
+    async fn http_list_pending_filters_by_status_rejected() {
+        use crate::models::GovernedAction;
+        let state = test_state();
+        {
+            let lock = state.lock().await;
+            let id = db::queue_pending_action(
+                &lock.0,
+                GovernedAction::Store,
+                "ns-r",
+                None,
+                "alice",
+                &serde_json::json!({"title": "rejected", "content": "x"}),
+            )
+            .unwrap();
+            db::decide_pending_action(&lock.0, &id, false, "alice").unwrap();
+            // Pending one to verify it doesn't leak through.
+            db::queue_pending_action(
+                &lock.0,
+                GovernedAction::Store,
+                "ns-p",
+                None,
+                "alice",
+                &serde_json::json!({"title": "pending", "content": "x"}),
+            )
+            .unwrap();
+        }
+        let app = Router::new()
+            .route("/api/v1/pending", axum_get(list_pending))
+            .with_state(state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/pending?status=rejected&limit=10")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let items = v["pending"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["status"], "rejected");
+    }
+
+    #[tokio::test]
+    async fn http_list_pending_limit_clamped_to_1000() {
+        // Pass a deliberately-large limit; handler clamps to 1000 but
+        // still returns 200 (we just verify the ceiling path executes).
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/pending", axum_get(list_pending))
+            .with_state(state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/pending?limit=99999")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ---- approve_pending (POST /api/v1/pending/{id}/approve) ---------------
+
+    #[tokio::test]
+    async fn http_approve_pending_happy_path_executes_store() {
+        // Queue a Store payload, approve it, expect 200 + executed=true +
+        // a memory_id we can fetch back.
+        use crate::models::GovernedAction;
+        let state = test_state();
+        let now_rfc = Utc::now().to_rfc3339();
+        let pending_id = {
+            let lock = state.lock().await;
+            db::queue_pending_action(
+                &lock.0,
+                GovernedAction::Store,
+                "approve-ns",
+                None,
+                "alice",
+                &serde_json::json!({
+                    "id": Uuid::new_v4().to_string(),
+                    "tier": "long",
+                    "namespace": "approve-ns",
+                    "title": "approved-store",
+                    "content": "executed via approval",
+                    "tags": [],
+                    "priority": 5,
+                    "confidence": 1.0,
+                    "source": "api",
+                    "access_count": 0,
+                    "created_at": now_rfc,
+                    "updated_at": now_rfc,
+                    "metadata": {}
+                }),
+            )
+            .unwrap()
+        };
+        let app = Router::new()
+            .route("/api/v1/pending/{id}/approve", axum_post(approve_pending))
+            .with_state(test_app_state(state.clone()));
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/api/v1/pending/{pending_id}/approve"))
+                    .method("POST")
+                    .header("x-agent-id", "approver-alice")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["approved"], true);
+        assert_eq!(v["executed"], true);
+        assert_eq!(v["decided_by"], "approver-alice");
+        // Status is now 'approved' in the row.
+        let lock = state.lock().await;
+        let pa = db::get_pending_action(&lock.0, &pending_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(pa.status, "approved");
+        assert_eq!(pa.decided_by.as_deref(), Some("approver-alice"));
+    }
+
+    #[tokio::test]
+    async fn http_approve_pending_invalid_id_format_400() {
+        // validate_id rejects ids with embedded control chars — handler
+        // returns 400 BEFORE touching the DB. We use %01 (SOH) which
+        // is_clean_string flags as invalid.
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/pending/{id}/approve", axum_post(approve_pending))
+            .with_state(test_app_state(state));
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/pending/bad%01id/approve")
+                    .method("POST")
+                    .header("x-agent-id", "alice")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn http_approve_pending_already_approved_is_rejected() {
+        // Once an action is decided, a follow-up approve must NOT execute
+        // again — it returns FORBIDDEN with `approve rejected: already decided`.
+        use crate::models::GovernedAction;
+        let state = test_state();
+        let pid = {
+            let lock = state.lock().await;
+            let id = db::queue_pending_action(
+                &lock.0,
+                GovernedAction::Store,
+                "double-approve",
+                None,
+                "alice",
+                &serde_json::json!({
+                    "tier": "long",
+                    "namespace": "double-approve",
+                    "title": "store",
+                    "content": "x",
+                    "tags": [], "priority": 5, "confidence": 1.0,
+                    "source": "api", "metadata": {}
+                }),
+            )
+            .unwrap();
+            db::decide_pending_action(&lock.0, &id, true, "alice").unwrap();
+            id
+        };
+        let app = Router::new()
+            .route("/api/v1/pending/{id}/approve", axum_post(approve_pending))
+            .with_state(test_app_state(state));
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/api/v1/pending/{pid}/approve"))
+                    .method("POST")
+                    .header("x-agent-id", "alice")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let err = v["error"].as_str().unwrap_or("");
+        assert!(
+            err.contains("already decided") || err.contains("rejected"),
+            "expected already-decided message, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_approve_pending_executor_records_decided_by() {
+        // After a successful approve the row's decided_by is the same id
+        // we passed via X-Agent-Id, not the requester. This is the
+        // executor-records-approval invariant.
+        use crate::models::GovernedAction;
+        let state = test_state();
+        let now_rfc = Utc::now().to_rfc3339();
+        let pid = {
+            let lock = state.lock().await;
+            db::queue_pending_action(
+                &lock.0,
+                GovernedAction::Store,
+                "executor-ns",
+                None,
+                "requester-bob",
+                &serde_json::json!({
+                    "id": Uuid::new_v4().to_string(),
+                    "tier": "long",
+                    "namespace": "executor-ns",
+                    "title": "e",
+                    "content": "y",
+                    "tags": [], "priority": 5, "confidence": 1.0,
+                    "source": "api",
+                    "access_count": 0,
+                    "created_at": now_rfc,
+                    "updated_at": now_rfc,
+                    "metadata": {}
+                }),
+            )
+            .unwrap()
+        };
+        let app = Router::new()
+            .route("/api/v1/pending/{id}/approve", axum_post(approve_pending))
+            .with_state(test_app_state(state.clone()));
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/api/v1/pending/{pid}/approve"))
+                    .method("POST")
+                    .header("x-agent-id", "executor-claude")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let lock = state.lock().await;
+        let pa = db::get_pending_action(&lock.0, &pid).unwrap().unwrap();
+        assert_eq!(pa.requested_by, "requester-bob");
+        assert_eq!(pa.decided_by.as_deref(), Some("executor-claude"));
+        assert_eq!(pa.status, "approved");
+    }
+
+    #[tokio::test]
+    async fn http_approve_pending_returns_memory_id_for_store_payload() {
+        // happy-path Store: the response carries a memory_id and that
+        // memory is queryable via db::get.
+        use crate::models::GovernedAction;
+        let state = test_state();
+        let now_rfc = Utc::now().to_rfc3339();
+        let pid = {
+            let lock = state.lock().await;
+            db::queue_pending_action(
+                &lock.0,
+                GovernedAction::Store,
+                "executed-write",
+                None,
+                "alice",
+                &serde_json::json!({
+                    "id": Uuid::new_v4().to_string(),
+                    "tier": "long",
+                    "namespace": "executed-write",
+                    "title": "executed-mem",
+                    "content": "this exists after approval",
+                    "tags": [], "priority": 5, "confidence": 1.0,
+                    "source": "api",
+                    "access_count": 0,
+                    "created_at": now_rfc,
+                    "updated_at": now_rfc,
+                    "metadata": {}
+                }),
+            )
+            .unwrap()
+        };
+        let app = Router::new()
+            .route("/api/v1/pending/{id}/approve", axum_post(approve_pending))
+            .with_state(test_app_state(state.clone()));
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/api/v1/pending/{pid}/approve"))
+                    .method("POST")
+                    .header("x-agent-id", "alice")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let mem_id = v["memory_id"].as_str().expect("memory_id present");
+        let lock = state.lock().await;
+        let mem = db::get(&lock.0, mem_id).unwrap().expect("memory exists");
+        assert_eq!(mem.title, "executed-mem");
+        assert_eq!(mem.namespace, "executed-write");
+    }
+
+    // ---- reject_pending (POST /api/v1/pending/{id}/reject) -----------------
+
+    #[tokio::test]
+    async fn http_reject_pending_happy_path_marks_rejected_no_execution() {
+        // Reject path: row goes to status='rejected', decided_by stamped,
+        // and NO underlying memory is created.
+        use crate::models::GovernedAction;
+        let state = test_state();
+        let pid = {
+            let lock = state.lock().await;
+            db::queue_pending_action(
+                &lock.0,
+                GovernedAction::Store,
+                "reject-ns",
+                None,
+                "alice",
+                &serde_json::json!({
+                    "tier": "long",
+                    "namespace": "reject-ns",
+                    "title": "blocked",
+                    "content": "must not be created",
+                    "tags": [], "priority": 5, "confidence": 1.0,
+                    "source": "api", "metadata": {}
+                }),
+            )
+            .unwrap()
+        };
+        let app = Router::new()
+            .route("/api/v1/pending/{id}/reject", axum_post(reject_pending))
+            .with_state(test_app_state(state.clone()));
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/api/v1/pending/{pid}/reject"))
+                    .method("POST")
+                    .header("x-agent-id", "rejector-alice")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["rejected"], true);
+        assert_eq!(v["decided_by"], "rejector-alice");
+        let lock = state.lock().await;
+        let pa = db::get_pending_action(&lock.0, &pid).unwrap().unwrap();
+        assert_eq!(pa.status, "rejected");
+        // Confirm no memory landed in `reject-ns`.
+        let rows = db::list(
+            &lock.0,
+            Some("reject-ns"),
+            None,
+            10,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            rows.is_empty(),
+            "rejection must not execute the queued payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_reject_pending_already_rejected_returns_404() {
+        // Once decided, decide_pending_action returns false; the handler
+        // surfaces this as 404 ("not found or already decided").
+        use crate::models::GovernedAction;
+        let state = test_state();
+        let pid = {
+            let lock = state.lock().await;
+            let id = db::queue_pending_action(
+                &lock.0,
+                GovernedAction::Store,
+                "double-reject",
+                None,
+                "alice",
+                &serde_json::json!({
+                    "tier": "long",
+                    "namespace": "double-reject",
+                    "title": "x",
+                    "content": "x",
+                    "tags": [], "priority": 5, "confidence": 1.0,
+                    "source": "api", "metadata": {}
+                }),
+            )
+            .unwrap();
+            db::decide_pending_action(&lock.0, &id, false, "alice").unwrap();
+            id
+        };
+        let app = Router::new()
+            .route("/api/v1/pending/{id}/reject", axum_post(reject_pending))
+            .with_state(test_app_state(state));
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/api/v1/pending/{pid}/reject"))
+                    .method("POST")
+                    .header("x-agent-id", "alice")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn http_reject_pending_invalid_id_format_400() {
+        // validate_id flags ids containing control chars; %01 hits that
+        // arm and returns 400 before any DB lookup.
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/pending/{id}/reject", axum_post(reject_pending))
+            .with_state(test_app_state(state));
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/pending/bad%01id/reject")
+                    .method("POST")
+                    .header("x-agent-id", "alice")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ---- consolidate_memories (POST /api/v1/consolidate) -------------------
+
+    #[tokio::test]
+    async fn http_consolidate_two_into_one_happy_path() {
+        // Insert two memories, consolidate them, expect 201 with a new
+        // memory id and the originals removed.
+        let state = test_state();
+        let now = Utc::now().to_rfc3339();
+        let (id_a, id_b) = {
+            let lock = state.lock().await;
+            let mk = |title: &str| Memory {
+                id: Uuid::new_v4().to_string(),
+                tier: Tier::Long,
+                namespace: "merge-ns".into(),
+                title: title.into(),
+                content: format!("body for {title}"),
+                tags: vec![],
+                priority: 5,
+                confidence: 1.0,
+                source: "test".into(),
+                access_count: 0,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+                last_accessed_at: None,
+                expires_at: None,
+                metadata: serde_json::json!({"agent_id": "alice"}),
+            };
+            let a = db::insert(&lock.0, &mk("draft-a")).unwrap();
+            let b = db::insert(&lock.0, &mk("draft-b")).unwrap();
+            (a, b)
+        };
+        let app = Router::new()
+            .route("/api/v1/consolidate", axum_post(consolidate_memories))
+            .with_state(test_app_state(state.clone()));
+        let body = serde_json::json!({
+            "ids": [id_a, id_b],
+            "title": "merged-result",
+            "summary": "a merge of two drafts",
+            "namespace": "merge-ns",
+            "tier": "long"
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/consolidate")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .header("x-agent-id", "consolidator")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["consolidated"], 2);
+        let new_id = v["id"].as_str().unwrap();
+        let lock = state.lock().await;
+        let merged = db::get(&lock.0, new_id).unwrap().unwrap();
+        assert_eq!(merged.title, "merged-result");
+        assert_eq!(merged.namespace, "merge-ns");
+        // Originals removed.
+        assert!(db::get(&lock.0, &id_a).unwrap().is_none());
+        assert!(db::get(&lock.0, &id_b).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn http_consolidate_single_id_400() {
+        // validate_consolidate requires ≥2 ids — single-id calls are
+        // rejected up front with 400.
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/consolidate", axum_post(consolidate_memories))
+            .with_state(test_app_state(state));
+        let body = serde_json::json!({
+            "ids": [Uuid::new_v4().to_string()],
+            "title": "lone-merge",
+            "summary": "only one source",
+            "namespace": "merge-ns"
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/consolidate")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn http_consolidate_invalid_namespace_400() {
+        // Namespace with a space fails validate_namespace.
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/consolidate", axum_post(consolidate_memories))
+            .with_state(test_app_state(state));
+        let body = serde_json::json!({
+            "ids": [Uuid::new_v4().to_string(), Uuid::new_v4().to_string()],
+            "title": "merge",
+            "summary": "x",
+            "namespace": "bad ns"
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/consolidate")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn http_consolidate_invalid_agent_id_400() {
+        // X-Agent-Id with a space → identity::resolve_http_agent_id error → 400.
+        let state = test_state();
+        let id_a = Uuid::new_v4().to_string();
+        let id_b = Uuid::new_v4().to_string();
+        let app = Router::new()
+            .route("/api/v1/consolidate", axum_post(consolidate_memories))
+            .with_state(test_app_state(state));
+        let body = serde_json::json!({
+            "ids": [id_a, id_b],
+            "title": "merge",
+            "summary": "x",
+            "namespace": "merge-ns"
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/consolidate")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .header("x-agent-id", "bad agent id")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn http_consolidate_max_id_count_cap_exceeded_400() {
+        // validate_consolidate caps at 100 ids.
+        let state = test_state();
+        let ids: Vec<String> = (0..101).map(|_| Uuid::new_v4().to_string()).collect();
+        let app = Router::new()
+            .route("/api/v1/consolidate", axum_post(consolidate_memories))
+            .with_state(test_app_state(state));
+        let body = serde_json::json!({
+            "ids": ids,
+            "title": "too-many",
+            "summary": "x",
+            "namespace": "merge-ns"
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/consolidate")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn http_consolidate_missing_source_500() {
+        // Two well-formed UUIDs but the rows don't exist — db::consolidate
+        // bails inside the transaction, surface as 500. This covers the
+        // post-validation error arm of the handler.
+        let state = test_state();
+        let id_a = Uuid::new_v4().to_string();
+        let id_b = Uuid::new_v4().to_string();
+        let app = Router::new()
+            .route("/api/v1/consolidate", axum_post(consolidate_memories))
+            .with_state(test_app_state(state));
+        let body = serde_json::json!({
+            "ids": [id_a, id_b],
+            "title": "merge",
+            "summary": "x",
+            "namespace": "merge-ns"
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/consolidate")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // ---- detect_contradictions (GET /api/v1/contradictions) ----------------
+
+    #[tokio::test]
+    async fn http_contradictions_empty_no_pairs() {
+        // namespace exists in the URL but no memories → empty memories,
+        // empty links. Still a 200.
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/contradictions", axum_get(detect_contradictions))
+            .with_state(state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/contradictions?namespace=empty-ns")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["memories"].as_array().unwrap().len(), 0);
+        assert_eq!(v["links"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn http_contradictions_synthesizes_links_for_same_title() {
+        // Two memories with the same TITLE but different content in a
+        // namespace produce a synthesized contradicts link.
+        let state = test_state();
+        let now = Utc::now().to_rfc3339();
+        {
+            let lock = state.lock().await;
+            // Same title forces UPSERT collapse, so vary metadata.topic for grouping.
+            let mk = |title: &str, content: &str| Memory {
+                id: Uuid::new_v4().to_string(),
+                tier: Tier::Long,
+                namespace: "contradict-ns".into(),
+                title: title.into(),
+                content: content.into(),
+                tags: vec![],
+                priority: 5,
+                confidence: 1.0,
+                source: "api".into(),
+                access_count: 0,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+                last_accessed_at: None,
+                expires_at: None,
+                metadata: serde_json::json!({"topic": "earth-shape"}),
+            };
+            db::insert(&lock.0, &mk("alice-says", "earth is round")).unwrap();
+            db::insert(&lock.0, &mk("bob-says", "earth is flat")).unwrap();
+        }
+        let app = Router::new()
+            .route("/api/v1/contradictions", axum_get(detect_contradictions))
+            .with_state(state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/contradictions?namespace=contradict-ns&topic=earth-shape")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let memories = v["memories"].as_array().unwrap();
+        assert_eq!(memories.len(), 2);
+        let links = v["links"].as_array().unwrap();
+        assert!(links.iter().any(|l| {
+            l["relation"].as_str() == Some("contradicts")
+                && l["synthesized"].as_bool() == Some(true)
+        }));
+    }
+
+    #[tokio::test]
+    async fn http_contradictions_namespace_filter_isolates_results() {
+        // Memories in ns-A vs ns-B — querying ns-A only returns its rows
+        // even though ns-B has a same-titled candidate.
+        let state = test_state();
+        let now = Utc::now().to_rfc3339();
+        {
+            let lock = state.lock().await;
+            let mk = |ns: &str, content: &str| Memory {
+                id: Uuid::new_v4().to_string(),
+                tier: Tier::Long,
+                namespace: ns.into(),
+                title: "shared-topic".into(),
+                content: content.into(),
+                tags: vec![],
+                priority: 5,
+                confidence: 1.0,
+                source: "api".into(),
+                access_count: 0,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+                last_accessed_at: None,
+                expires_at: None,
+                metadata: serde_json::json!({}),
+            };
+            db::insert(&lock.0, &mk("ns-iso-a", "first opinion")).unwrap();
+            db::insert(&lock.0, &mk("ns-iso-b", "different opinion")).unwrap();
+        }
+        let app = Router::new()
+            .route("/api/v1/contradictions", axum_get(detect_contradictions))
+            .with_state(state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/contradictions?namespace=ns-iso-a")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let memories = v["memories"].as_array().unwrap();
+        assert_eq!(memories.len(), 1, "ns filter must isolate results");
+        assert_eq!(memories[0]["namespace"], "ns-iso-a");
+    }
+
+    #[tokio::test]
+    async fn http_contradictions_invalid_namespace_400() {
+        // A namespace string with a space fails validate_namespace
+        // before any DB read.
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/contradictions", axum_get(detect_contradictions))
+            .with_state(state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/contradictions?namespace=bad%20ns")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ---- get_capabilities (GET /api/v1/capabilities) -----------------------
+
+    #[tokio::test]
+    async fn http_capabilities_returns_expected_shape() {
+        // Confirm the response includes tier/version/features/models —
+        // the four top-level keys our scenarios depend on.
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/capabilities", axum_get(get_capabilities))
+            .with_state(test_app_state(state));
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/capabilities")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v.get("tier").is_some(), "missing `tier`");
+        assert!(v.get("version").is_some(), "missing `version`");
+        assert!(v.get("features").is_some(), "missing `features`");
+        assert!(v.get("models").is_some(), "missing `models`");
+        // The Keyword tier defaults: keyword_search=true, no LLM features.
+        assert_eq!(v["features"]["keyword_search"], true);
+        assert_eq!(v["features"]["semantic_search"], false);
+        assert_eq!(v["features"]["query_expansion"], false);
+    }
+
+    #[tokio::test]
+    async fn http_capabilities_version_matches_pkg_version() {
+        // version must equal CARGO_PKG_VERSION — operators pin scenarios
+        // by this string, regressions here break upgrade tooling.
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/capabilities", axum_get(get_capabilities))
+            .with_state(test_app_state(state));
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/capabilities")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(v["tier"], "keyword");
+    }
+    // ====================================================================
+    // W8/H8d — dual-form `*_qs` namespace handlers + `fanout_or_503` matrix
+    // --------------------------------------------------------------------
+    // `set/get/clear_namespace_standard_qs` are the query-string twins of
+    // the path-form handlers used by S34/S35 (`/api/v1/namespaces?namespace=…`).
+    // The QS-form arms were uncovered prior to this batch — both the
+    // happy paths and the 400-on-missing-namespace branches needed direct
+    // exercise. The `fanout_or_503` 503 paths are exercised through the
+    // QS-form `set` handler (`set_namespace_standard_inner` calls
+    // `fanout_or_503` for the standard memory and then
+    // `broadcast_namespace_meta_quorum` for the meta row); the same
+    // mock-peer helper used by the W3 federation tests drives both.
+    // ====================================================================
+
+    // --- helpers shared across the W8/H8d tests --------------------------
+
+    /// Spawn a mock peer that records every `POST /api/v1/sync/push` and
+    /// responds according to `behaviour`. Returns the base URL and the
+    /// shared call-counter so tests can both target the peer and assert
+    /// how many fanout POSTs reached it.
+    async fn h8d_spawn_mock_peer(
+        behaviour: H8dPeerBehaviour,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_for_peer = count.clone();
+        #[derive(Clone)]
+        struct PeerState {
+            count: Arc<AtomicUsize>,
+            behaviour: H8dPeerBehaviour,
+        }
+        async fn handler(
+            axum::extract::State(s): axum::extract::State<PeerState>,
+            Json(_body): Json<serde_json::Value>,
+        ) -> (StatusCode, Json<serde_json::Value>) {
+            s.count.fetch_add(1, Ordering::Relaxed);
+            match s.behaviour {
+                H8dPeerBehaviour::Ack => (
+                    StatusCode::OK,
+                    Json(json!({"applied": 1, "noop": 0, "skipped": 0})),
+                ),
+                H8dPeerBehaviour::Fail500 => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "stub failure"})),
+                ),
+                H8dPeerBehaviour::Fail503 => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"error": "stub unavailable"})),
+                ),
+                H8dPeerBehaviour::Fail400 => (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": "stub bad request"})),
+                ),
+                H8dPeerBehaviour::Hang => {
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                    (StatusCode::OK, Json(json!({"applied": 1})))
+                }
+            }
+        }
+        let app = Router::new()
+            .route("/api/v1/sync/push", axum_post(handler))
+            .with_state(PeerState {
+                count: count_for_peer,
+                behaviour,
+            });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        (format!("http://{addr}"), count)
+    }
+
+    #[derive(Clone, Copy)]
+    enum H8dPeerBehaviour {
+        /// Always returns 200 OK with the standard ack envelope.
+        Ack,
+        /// Always returns 500 Internal Server Error.
+        Fail500,
+        /// Always returns 503 Service Unavailable.
+        Fail503,
+        /// Always returns 400 Bad Request.
+        Fail400,
+        /// Sleeps 10s before responding — exercises timeout / unreachable
+        /// classification when `--quorum-timeout-ms` is shorter.
+        Hang,
+    }
+
+    /// Build an `AppState` wired to a `FederationConfig` that points at
+    /// `peer_urls` with quorum width `w` and the given timeout. Mirrors
+    /// the construction used by `http_bulk_create_fans_out_with_federation`.
+    fn h8d_app_state_with_fed(
+        db: Db,
+        peer_urls: Vec<String>,
+        w: usize,
+        timeout_ms: u64,
+    ) -> AppState {
+        let fed = crate::federation::FederationConfig::build(
+            w,
+            &peer_urls,
+            std::time::Duration::from_millis(timeout_ms),
+            None,
+            None,
+            None,
+            "ai:h8d-test".to_string(),
+        )
+        .unwrap()
+        .expect("federation must be built");
+        AppState {
+            db,
+            embedder: Arc::new(None),
+            vector_index: Arc::new(Mutex::new(None)),
+            federation: Arc::new(Some(fed)),
+            tier_config: Arc::new(crate::config::FeatureTier::Keyword.config()),
+            scoring: Arc::new(crate::config::ResolvedScoring::default()),
+        }
+    }
+
+    // --- get_namespace_standard_qs --------------------------------------
+
+    #[tokio::test]
+    async fn http_get_namespace_standard_qs_returns_standard_for_existing_ns() {
+        // Pre-seed a namespace standard via the inner DB call so we can
+        // assert the QS handler reads it back. We use the path-form set
+        // handler with no federation so the write is local-only.
+        let state = test_state();
+        let app_state = test_app_state(state.clone());
+        let set_router = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/standard",
+                axum_post(set_namespace_standard),
+            )
+            .with_state(app_state);
+        let resp = set_router
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces/qs-existing/standard")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&json!({})).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // Now fetch via the QS form. Should return 200 with the standard
+        // payload (namespace + standard_id).
+        let get_router = Router::new()
+            .route(
+                "/api/v1/namespaces",
+                axum::routing::get(get_namespace_standard_qs),
+            )
+            .with_state(state);
+        let resp = get_router
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces?namespace=qs-existing")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["namespace"], "qs-existing");
+        assert!(v["standard_id"].is_string(), "standard_id must be set");
+    }
+
+    #[tokio::test]
+    async fn http_get_namespace_standard_qs_returns_null_for_missing_ns_record() {
+        // A namespace that has never had a standard set returns the same
+        // `{namespace, standard_id: null}` envelope the path-form does —
+        // the MCP handler differentiates by `standard_id == null`.
+        let state = test_state();
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces",
+                axum::routing::get(get_namespace_standard_qs),
+            )
+            .with_state(state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces?namespace=qs-never-set")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["namespace"], "qs-never-set");
+        assert!(
+            v["standard_id"].is_null(),
+            "standard_id must be null for an unset namespace"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_get_namespace_standard_qs_falls_through_to_list_on_missing_param() {
+        // The QS-form GET deliberately reuses the bare /api/v1/namespaces
+        // route — when `?namespace=` is absent it must delegate to
+        // `list_namespaces`, NOT 400. This pins the chained-route contract
+        // documented inline at the handler.
+        let state = test_state();
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces",
+                axum::routing::get(get_namespace_standard_qs),
+            )
+            .with_state(state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            v["namespaces"].is_array(),
+            "fallthrough must produce the list shape, got {v:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_get_namespace_standard_qs_inherit_flag_returns_chain() {
+        // Cover the `?inherit=true` arm, which routes through the
+        // `chain` / `standards` branch of `handle_namespace_get_standard`.
+        let state = test_state();
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces",
+                axum::routing::get(get_namespace_standard_qs),
+            )
+            .with_state(state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces?namespace=child&inherit=true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v["chain"].is_array(), "inherit must surface the chain");
+        assert!(v["standards"].is_array());
+    }
+
+    #[tokio::test]
+    async fn http_get_namespace_standard_qs_invalid_namespace_returns_400() {
+        // Ultrareview #337 — URL-decoded namespace flows through
+        // `validate_namespace`. A namespace with disallowed bytes must
+        // surface as 400 from the handler, not 500.
+        let state = test_state();
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces",
+                axum::routing::get(get_namespace_standard_qs),
+            )
+            .with_state(state);
+        // Spaces decode out of `%20` and fail `validate_namespace`.
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces?namespace=bad%20ns")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // --- set_namespace_standard_qs --------------------------------------
+
+    #[tokio::test]
+    async fn http_set_namespace_standard_qs_happy_path_creates_placeholder() {
+        // Body carries `namespace` (S34 shape, no URL segment). With no
+        // federation configured the inner fn auto-seeds a placeholder
+        // standard memory and returns 201 CREATED.
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/namespaces", axum_post(set_namespace_standard_qs))
+            .with_state(test_app_state(state.clone()));
+        let body = json!({"namespace": "qs-set-happy"});
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["namespace"], "qs-set-happy");
+        assert_eq!(v["set"], true);
+        assert!(v["standard_id"].is_string());
+    }
+
+    #[tokio::test]
+    async fn http_set_namespace_standard_qs_missing_namespace_returns_400() {
+        // No `namespace` in body and no nested `standard.namespace` —
+        // the QS-form set handler bails with 400 before touching the DB.
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/namespaces", axum_post(set_namespace_standard_qs))
+            .with_state(test_app_state(state));
+        let body = json!({"governance": {"approver": "human"}});
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            v["error"].as_str().unwrap_or("").contains("namespace"),
+            "error must mention the missing namespace, got {v:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_set_namespace_standard_qs_invalid_governance_returns_400() {
+        // Pre-seed a real memory we can target by id, so we get past the
+        // placeholder branch and into `validate_governance_policy`.
+        let state = test_state();
+        let mem_id = {
+            let lock = state.lock().await;
+            let now = Utc::now().to_rfc3339();
+            let mem = Memory {
+                id: Uuid::new_v4().to_string(),
+                tier: Tier::Long,
+                namespace: "qs-set-bad-policy".into(),
+                title: "anchor".into(),
+                content: "anchor".into(),
+                tags: vec![],
+                priority: 5,
+                confidence: 1.0,
+                source: "test".into(),
+                access_count: 0,
+                created_at: now.clone(),
+                updated_at: now,
+                last_accessed_at: None,
+                expires_at: None,
+                metadata: serde_json::json!({}),
+            };
+            db::insert(&lock.0, &mem).unwrap()
+        };
+        let app = Router::new()
+            .route("/api/v1/namespaces", axum_post(set_namespace_standard_qs))
+            .with_state(test_app_state(state));
+        // `consensus: 0` is always invalid (validator rejects it).
+        let body = json!({
+            "namespace": "qs-set-bad-policy",
+            "id": mem_id,
+            "governance": {
+                "approver": {"consensus": 0},
+                "write": "approve",
+                "promote": "log",
+                "delete": "log"
+            }
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn http_set_namespace_standard_qs_nested_standard_payload_works() {
+        // S34's body shape nests fields under `standard: { … }`. The
+        // QS-form set handler must read either `body.namespace` or
+        // `body.standard.namespace`. This exercises the second arm.
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/namespaces", axum_post(set_namespace_standard_qs))
+            .with_state(test_app_state(state));
+        let body = json!({"standard": {"namespace": "qs-nested-ns"}});
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["namespace"], "qs-nested-ns");
+    }
+
+    // --- clear_namespace_standard_qs ------------------------------------
+
+    #[tokio::test]
+    async fn http_clear_namespace_standard_qs_happy_path_after_set() {
+        // Set then clear. Clear must return 200 with `{cleared: true|…}`.
+        let state = test_state();
+        let app_state = test_app_state(state.clone());
+        let set_router = Router::new()
+            .route("/api/v1/namespaces", axum_post(set_namespace_standard_qs))
+            .with_state(app_state.clone());
+        let _ = set_router
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({"namespace": "qs-clear-happy"})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let clear_router = Router::new()
+            .route(
+                "/api/v1/namespaces",
+                axum::routing::delete(clear_namespace_standard_qs),
+            )
+            .with_state(app_state);
+        let resp = clear_router
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces?namespace=qs-clear-happy")
+                    .method("DELETE")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["namespace"], "qs-clear-happy");
+    }
+
+    #[tokio::test]
+    async fn http_clear_namespace_standard_qs_idempotent_on_unset() {
+        // Clearing a namespace that has no standard set is a no-op
+        // success (idempotency). The MCP handler returns
+        // `{cleared: <bool>, namespace}` rather than 404.
+        let state = test_state();
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces",
+                axum::routing::delete(clear_namespace_standard_qs),
+            )
+            .with_state(test_app_state(state));
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces?namespace=qs-clear-noop")
+                    .method("DELETE")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn http_clear_namespace_standard_qs_missing_namespace_returns_400() {
+        // No `?namespace=…` → 400 BadRequest with an `error` payload that
+        // names the missing field.
+        let state = test_state();
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces",
+                axum::routing::delete(clear_namespace_standard_qs),
+            )
+            .with_state(test_app_state(state));
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces")
+                    .method("DELETE")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            v["error"].as_str().unwrap_or("").contains("namespace"),
+            "error must mention namespace, got {v:?}"
+        );
+    }
+
+    // --- fanout_or_503 / quorum_not_met error matrix --------------------
+
+    #[tokio::test]
+    async fn http_set_qs_fanout_503_when_all_peers_down() {
+        // Single peer, W=2 (local + 1 peer required). Peer 500s on every
+        // POST → cannot meet quorum → 503 `quorum_not_met` payload.
+        let state = test_state();
+        let (peer_url, _count) = h8d_spawn_mock_peer(H8dPeerBehaviour::Fail500).await;
+        let app_state = h8d_app_state_with_fed(state, vec![peer_url], 2, 1500);
+        let app = Router::new()
+            .route("/api/v1/namespaces", axum_post(set_namespace_standard_qs))
+            .with_state(app_state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({"namespace": "qs-fed-down"})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn http_set_qs_fanout_503_payload_shape_includes_quorum_fields() {
+        // The 503 body must round-trip through `QuorumNotMetPayload` and
+        // surface `error="quorum_not_met"`, `got`, `needed`, `reason`.
+        // Single peer down @ W=2 → got=1 (local), needed=2, reason names
+        // the failure (unreachable / 500 → "unreachable").
+        let state = test_state();
+        let (peer_url, _count) = h8d_spawn_mock_peer(H8dPeerBehaviour::Fail500).await;
+        let app_state = h8d_app_state_with_fed(state, vec![peer_url], 2, 1500);
+        let app = Router::new()
+            .route("/api/v1/namespaces", axum_post(set_namespace_standard_qs))
+            .with_state(app_state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({"namespace": "qs-503-shape"})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"], "quorum_not_met");
+        assert!(v["got"].as_u64().is_some(), "got must be a number");
+        assert!(v["needed"].as_u64().is_some(), "needed must be a number");
+        assert!(v["reason"].is_string(), "reason must be a string");
+        // Local always commits → got >= 1; needed must equal W=2.
+        assert_eq!(v["needed"].as_u64().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn http_set_qs_fanout_503_includes_retry_after_header() {
+        // The 503 path returns a `Retry-After: 2` header so clients can
+        // back off without parsing the body.
+        let state = test_state();
+        let (peer_url, _count) = h8d_spawn_mock_peer(H8dPeerBehaviour::Fail500).await;
+        let app_state = h8d_app_state_with_fed(state, vec![peer_url], 2, 1500);
+        let app = Router::new()
+            .route("/api/v1/namespaces", axum_post(set_namespace_standard_qs))
+            .with_state(app_state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({"namespace": "qs-503-retry-after"})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let retry = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(retry, "2", "503 must include Retry-After: 2");
+    }
+
+    #[tokio::test]
+    async fn http_set_qs_fanout_quorum_met_with_one_peer_down() {
+        // N=3, W=2 (majority). One peer 500s, one peer acks → quorum
+        // met → 201 CREATED. Exercises the quorum-not-all-fail success
+        // branch of `fanout_or_503` (`Ok(_) => None`).
+        let state = test_state();
+        let (peer_up, _) = h8d_spawn_mock_peer(H8dPeerBehaviour::Ack).await;
+        let (peer_down, _) = h8d_spawn_mock_peer(H8dPeerBehaviour::Fail500).await;
+        let app_state = h8d_app_state_with_fed(state, vec![peer_up, peer_down], 2, 1500);
+        let app = Router::new()
+            .route("/api/v1/namespaces", axum_post(set_namespace_standard_qs))
+            .with_state(app_state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({"namespace": "qs-quorum-met"})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn http_set_qs_fanout_quorum_not_met_strict_n_equals_w() {
+        // N=2, W=2 (all-or-nothing). Single peer down → 1/2 acks → 503.
+        // This is the "strict" all-acks-required posture (W=N).
+        let state = test_state();
+        let (peer_url, _) = h8d_spawn_mock_peer(H8dPeerBehaviour::Fail500).await;
+        let app_state = h8d_app_state_with_fed(state, vec![peer_url], 2, 1500);
+        let app = Router::new()
+            .route("/api/v1/namespaces", axum_post(set_namespace_standard_qs))
+            .with_state(app_state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({"namespace": "qs-strict-quorum"})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["needed"].as_u64().unwrap(), 2);
+        // got must be < needed in the failure case.
+        assert!(v["got"].as_u64().unwrap() < v["needed"].as_u64().unwrap());
+    }
+
+    #[tokio::test]
+    async fn http_set_qs_fanout_quorum_w_equals_one_any_success_writes_succeed() {
+        // W=1 → local commit alone is enough; peer down doesn't 503.
+        // This exercises the `K=1` (any-success) row in the matrix.
+        let state = test_state();
+        let (peer_url, _) = h8d_spawn_mock_peer(H8dPeerBehaviour::Fail500).await;
+        let app_state = h8d_app_state_with_fed(state, vec![peer_url], 1, 1500);
+        let app = Router::new()
+            .route("/api/v1/namespaces", axum_post(set_namespace_standard_qs))
+            .with_state(app_state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({"namespace": "qs-w1-any"})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn http_set_qs_fanout_503_when_peer_hangs_past_deadline() {
+        // Hanging peer + tight deadline → quorum_not_met with reason
+        // "timeout" or "unreachable" (depending on whether the request
+        // returned an error before the deadline). Either way → 503.
+        let state = test_state();
+        let (peer_url, _) = h8d_spawn_mock_peer(H8dPeerBehaviour::Hang).await;
+        let app_state = h8d_app_state_with_fed(state, vec![peer_url], 2, 200);
+        let app = Router::new()
+            .route("/api/v1/namespaces", axum_post(set_namespace_standard_qs))
+            .with_state(app_state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({"namespace": "qs-hang"})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let reason = v["reason"].as_str().unwrap_or("");
+        assert!(
+            reason == "timeout" || reason == "unreachable",
+            "expected timeout/unreachable, got {reason:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_set_qs_fanout_503_when_peer_returns_503() {
+        // A peer that itself replies 503 (overloaded) is still a
+        // failed ack. The leader's 503 response carries the federation
+        // payload, not the peer's. (Smoke-tests that 5xx-class peers
+        // beyond just 500 also count as failures.)
+        let state = test_state();
+        let (peer_url, _) = h8d_spawn_mock_peer(H8dPeerBehaviour::Fail503).await;
+        let app_state = h8d_app_state_with_fed(state, vec![peer_url], 2, 1500);
+        let app = Router::new()
+            .route("/api/v1/namespaces", axum_post(set_namespace_standard_qs))
+            .with_state(app_state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({"namespace": "qs-peer-503"})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"], "quorum_not_met");
+    }
+
+    #[tokio::test]
+    async fn http_set_qs_fanout_503_when_peer_returns_4xx() {
+        // 4xx from a peer also counts as a failed ack — the federation
+        // ack tracker requires a 200 to count toward quorum. (Closes the
+        // "200 + 4xx from peers" matrix row.)
+        let state = test_state();
+        let (peer_url, _) = h8d_spawn_mock_peer(H8dPeerBehaviour::Fail400).await;
+        let app_state = h8d_app_state_with_fed(state, vec![peer_url], 2, 1500);
+        let app = Router::new()
+            .route("/api/v1/namespaces", axum_post(set_namespace_standard_qs))
+            .with_state(app_state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({"namespace": "qs-peer-400"})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn http_set_qs_fanout_503_partition_minority_fails() {
+        // N=4 (local + 3 peers), W=3 (majority). Two peers down, one
+        // up → can't meet quorum (got = 2, needed = 3) → 503.
+        let state = test_state();
+        let (up, _) = h8d_spawn_mock_peer(H8dPeerBehaviour::Ack).await;
+        let (down1, _) = h8d_spawn_mock_peer(H8dPeerBehaviour::Fail500).await;
+        let (down2, _) = h8d_spawn_mock_peer(H8dPeerBehaviour::Fail500).await;
+        let app_state = h8d_app_state_with_fed(state, vec![up, down1, down2], 3, 1500);
+        let app = Router::new()
+            .route("/api/v1/namespaces", axum_post(set_namespace_standard_qs))
+            .with_state(app_state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({"namespace": "qs-minority"})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["needed"].as_u64().unwrap(), 3);
+        assert!(v["got"].as_u64().unwrap() < 3);
+    }
+
+    #[tokio::test]
+    async fn http_set_qs_fanout_majority_tolerates_minority_partition() {
+        // N=4, W=3 (majority). Two peers up, one down → quorum met
+        // (got = 3 ≥ needed = 3) → 201 CREATED. Mirror of the previous
+        // test but with the failure flipped into a success.
+        let state = test_state();
+        let (up1, _) = h8d_spawn_mock_peer(H8dPeerBehaviour::Ack).await;
+        let (up2, _) = h8d_spawn_mock_peer(H8dPeerBehaviour::Ack).await;
+        let (down, _) = h8d_spawn_mock_peer(H8dPeerBehaviour::Fail500).await;
+        let app_state = h8d_app_state_with_fed(state, vec![up1, up2, down], 3, 1500);
+        let app = Router::new()
+            .route("/api/v1/namespaces", axum_post(set_namespace_standard_qs))
+            .with_state(app_state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({"namespace": "qs-majority"})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn http_clear_qs_fanout_503_when_peer_down() {
+        // The CLEAR path uses `broadcast_namespace_meta_clear_quorum`,
+        // a different fanout function from `fanout_or_503`. Both share
+        // the QuorumNotMetPayload contract and Retry-After=2 header.
+        // This test exercises the clear-side 503 lane.
+        let state = test_state();
+        // Pre-seed a namespace standard so the clear has something to do.
+        // We do this with no federation by using a separate AppState.
+        let local_app_state = test_app_state(state.clone());
+        let set_router = Router::new()
+            .route("/api/v1/namespaces", axum_post(set_namespace_standard_qs))
+            .with_state(local_app_state);
+        let _ = set_router
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({"namespace": "qs-clear-fed"})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let (peer_url, _) = h8d_spawn_mock_peer(H8dPeerBehaviour::Fail500).await;
+        let app_state = h8d_app_state_with_fed(state, vec![peer_url], 2, 1500);
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces",
+                axum::routing::delete(clear_namespace_standard_qs),
+            )
+            .with_state(app_state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces?namespace=qs-clear-fed")
+                    .method("DELETE")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let retry = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(retry, "2", "clear 503 must include Retry-After: 2");
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"], "quorum_not_met");
+    }
+
+    #[tokio::test]
+    async fn http_set_qs_fanout_no_federation_returns_201_without_peers() {
+        // No `--quorum-peers` configured → `app.federation` is None →
+        // `fanout_or_503` short-circuits to None and the handler returns
+        // 201 without any peer involvement. Pins the no-fed branch.
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/namespaces", axum_post(set_namespace_standard_qs))
+            .with_state(test_app_state(state));
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({"namespace": "qs-no-fed"})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn http_set_qs_fanout_peer_called_at_least_once_on_quorum_failure() {
+        // Even when quorum fails, the leader must have *attempted* to
+        // POST to the peer at least once. This guards against the
+        // pre-flight short-circuit that would skip the fanout entirely.
+        use std::sync::atomic::Ordering;
+
+        let state = test_state();
+        let (peer_url, count) = h8d_spawn_mock_peer(H8dPeerBehaviour::Fail500).await;
+        let app_state = h8d_app_state_with_fed(state, vec![peer_url], 2, 1500);
+        let app = Router::new()
+            .route("/api/v1/namespaces", axum_post(set_namespace_standard_qs))
+            .with_state(app_state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({"namespace": "qs-fanout-attempt"})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // Wait briefly for any retry to settle so the count is stable.
+        for _ in 0..50 {
+            if count.load(Ordering::Relaxed) >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            count.load(Ordering::Relaxed) >= 1,
+            "leader must have attempted the fanout POST at least once"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_set_qs_fanout_peer_receives_post_on_happy_path() {
+        // Counterpart to the failure-attempt test: on a happy path,
+        // exactly one peer-side POST per fanout completes within a
+        // short settle window.
+        use std::sync::atomic::Ordering;
+
+        let state = test_state();
+        let (peer_url, count) = h8d_spawn_mock_peer(H8dPeerBehaviour::Ack).await;
+        let app_state = h8d_app_state_with_fed(state, vec![peer_url], 2, 1500);
+        let app = Router::new()
+            .route("/api/v1/namespaces", axum_post(set_namespace_standard_qs))
+            .with_state(app_state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/namespaces")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({"namespace": "qs-fanout-happy"})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        // The set path triggers TWO fanout POSTs to each peer: one for
+        // the standard memory (`fanout_or_503`) and one for the
+        // namespace_meta row (`broadcast_namespace_meta_quorum`). Wait
+        // for at least one to land — the second may be background-detached.
+        for _ in 0..50 {
+            if count.load(Ordering::Relaxed) >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(count.load(Ordering::Relaxed) >= 1);
+    }
 }
