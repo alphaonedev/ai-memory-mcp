@@ -2921,7 +2921,11 @@ fn test_mcp_store_invalid_metadata_defaults_to_empty() {
     // Then store with metadata as string (invalid — should default to {})
     // Then store with metadata as null (invalid — should default to {})
     // Verify all three have empty metadata
+    // env_remove(AI_MEMORY_AGENT_ID) so the assertion that the injected
+    // agent_id starts with `host:` or `anonymous:` (the NHI defaults)
+    // holds even when the runner exports an env override.
     let output = cmd(binary)
+        .env_remove("AI_MEMORY_AGENT_ID")
         .args(["--db", db_path.to_str().unwrap(), "mcp"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -3248,6 +3252,105 @@ fn test_agentid_env_var_supplies_default() {
     assert!(output.status.success());
     let stored: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(agent_id_of(&stored), "charlie");
+    let _ = std::fs::remove_file(&db_path);
+}
+
+// Regression: AI_MEMORY_AGENT_ID must NOT leak into list/search filter via
+// clap's `global = true` propagation. Symptom (campaign harness, iter #15+):
+// every list/search returned 0 rows because the env-derived caller id was
+// silently used as a filter, hiding all memories whose `agent_id` did not
+// match the runner's exported id.
+#[test]
+fn test_agentid_env_does_not_leak_to_list_filter() {
+    let db_path = fresh_db();
+    let binary = env!("CARGO_BIN_EXE_ai-memory");
+
+    // Seed two memories under different agents (with no env so the writes
+    // get the literal --agent-id values).
+    for (agent, title) in [("alice", "nhi-leak-a"), ("bob", "nhi-leak-b")] {
+        let out = cmd(binary)
+            .env_remove("AI_MEMORY_AGENT_ID")
+            .args([
+                "--db",
+                db_path.to_str().unwrap(),
+                "--agent-id",
+                agent,
+                "--json",
+                "store",
+                "-T",
+                title,
+                "-c",
+                "body",
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "store {agent} failed");
+    }
+
+    // Now `list` with the env exported but no `--agent-id` filter flag.
+    // The env value belongs to the writer-identity precedence chain — it
+    // must NOT silently scope read filters.
+    let out = cmd(binary)
+        .env("AI_MEMORY_AGENT_ID", "charlie")
+        .args(["--db", db_path.to_str().unwrap(), "--json", "list"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let resp: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let memories = resp["memories"].as_array().expect("memories array");
+    assert_eq!(
+        memories.len(),
+        2,
+        "env should not filter list results; got: {resp}"
+    );
+
+    // Same for `search` — env-derived id must not silently filter results.
+    let out = cmd(binary)
+        .env("AI_MEMORY_AGENT_ID", "charlie")
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--json",
+            "search",
+            "body",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let resp: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let memories = resp["results"]
+        .as_array()
+        .or_else(|| resp["memories"].as_array())
+        .expect("results/memories array");
+    assert_eq!(
+        memories.len(),
+        2,
+        "env should not filter search results; got: {resp}"
+    );
+
+    // Sanity: explicit --agent-id flag at top level still works as a filter.
+    let out = cmd(binary)
+        .env("AI_MEMORY_AGENT_ID", "charlie")
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--agent-id",
+            "alice",
+            "--json",
+            "list",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let resp: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let memories = resp["memories"].as_array().expect("memories array");
+    assert_eq!(
+        memories.len(),
+        1,
+        "explicit flag should filter; got: {resp}"
+    );
+    assert_eq!(agent_id_of(&memories[0]), "alice");
+
     let _ = std::fs::remove_file(&db_path);
 }
 
