@@ -3326,180 +3326,43 @@ async fn cmd_sync_daemon(
         peers = args.peers
     );
 
-    // Graceful shutdown: ctrl_c wakes up the loop.
-    let mut shutdown = Box::pin(tokio::signal::ctrl_c());
+    // Graceful shutdown: a tokio::sync::Notify driven by ctrl_c so the
+    // daemon body matches the shape that integration tests exercise via
+    // `daemon_runtime::run_sync_daemon_with_shutdown`. Production drives
+    // the notify from the OS signal; tests drive it from a tokio task.
+    // Either way the loop body and shutdown contract are identical —
+    // `daemon_runtime` is the single source of truth for the loop.
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_for_signal = shutdown.clone();
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        shutdown_for_signal.notify_one();
+    });
 
-    let db_path_owned: Arc<Path> = Arc::from(db_path);
-    let local_agent_id_arc: Arc<str> = Arc::from(local_agent_id.as_str());
-    let api_key_arc: Option<Arc<str>> = args.api_key.as_deref().map(Arc::from);
-    let peers_arc: Vec<Arc<str>> = args.peers.iter().map(|s| Arc::from(s.as_str())).collect();
-    loop {
-        // v0.6.0: reconcile peers in parallel. A slow or unreachable
-        // peer used to block every other peer behind it for the full
-        // cycle — now each peer runs on its own task and a single
-        // stuck peer only delays the deadline for the group, not the
-        // other peers' work. With N peers this cuts full-cycle latency
-        // from N×per-peer to max(per-peer).
-        let mut set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
-        for peer_url in &peers_arc {
-            let client = client.clone();
-            let db_path = db_path_owned.clone();
-            let local_agent_id = local_agent_id_arc.clone();
-            let peer_url = peer_url.clone();
-            let api_key = api_key_arc.clone();
-            set.spawn(async move {
-                if let Err(e) = sync_cycle_once(
-                    &client,
-                    &db_path,
-                    &local_agent_id,
-                    &peer_url,
-                    api_key.as_deref(),
-                    batch_size,
-                )
-                .await
-                {
-                    tracing::warn!("sync-daemon: peer {peer_url} cycle failed: {e}");
-                }
-            });
-        }
-        while set.join_next().await.is_some() {}
-
-        tokio::select! {
-            () = tokio::time::sleep(std::time::Duration::from_secs(interval)) => {}
-            _ = &mut shutdown => {
-                tracing::info!("sync-daemon: shutdown signal received");
-                return Ok(());
-            }
-        }
-    }
+    // Hand the loop body to the test-shared helper. The helper builds its
+    // own reqwest::Client from default settings, so we can't reuse the
+    // mTLS-aware `client` we just constructed — instead, the helper takes
+    // a pre-built client to honour our TLS configuration.
+    ai_memory::daemon_runtime::run_sync_daemon_with_shutdown_using_client(
+        client,
+        db_path.to_path_buf(),
+        local_agent_id,
+        args.peers,
+        args.api_key,
+        interval,
+        batch_size,
+        shutdown,
+    )
+    .await
 }
 
-/// One pull+push cycle against a single peer. Writes local db updates
-/// synchronously via a fresh connection (avoid holding open connections
-/// across await points). Any per-cycle failure is logged and the caller
-/// moves to the next peer — we never crash the daemon on a transient
-/// network error.
-async fn sync_cycle_once(
-    client: &reqwest::Client,
-    db_path: &Path,
-    local_agent_id: &str,
-    peer_url: &str,
-    api_key: Option<&str>,
-    batch_size: usize,
-) -> Result<()> {
-    let peer_url = peer_url.trim_end_matches('/');
-
-    // --- PULL --------------------------------------------------------
-    let since = {
-        let conn = db::open(db_path)?;
-        db::sync_state_load(&conn, local_agent_id)?
-            .entries
-            .get(peer_url)
-            .cloned()
-    };
-
-    let mut pull_url = format!(
-        "{peer_url}/api/v1/sync/since?limit={batch_size}&peer={}",
-        urlencoding_minimal(local_agent_id)
-    );
-    if let Some(ref s) = since {
-        pull_url.push_str("&since=");
-        pull_url.push_str(&urlencoding_minimal(s));
-    }
-
-    let mut req = client.get(&pull_url).header("x-agent-id", local_agent_id);
-    if let Some(key) = api_key {
-        req = req.header("x-api-key", key);
-    }
-    let resp = req.send().await?;
-    if !resp.status().is_success() {
-        anyhow::bail!("sync-daemon: pull status {}", resp.status());
-    }
-    let pulled: SyncSinceResponse = resp.json().await?;
-    let pull_count = pulled.memories.len();
-    let latest_pulled = pulled.memories.last().map(|m| m.updated_at.clone());
-
-    {
-        let conn = db::open(db_path)?;
-        for mem in &pulled.memories {
-            if validate::validate_memory(mem).is_ok() {
-                let _ = db::insert_if_newer(&conn, mem);
-            }
-        }
-        if let Some(ref at) = latest_pulled {
-            db::sync_state_observe(&conn, local_agent_id, peer_url, at)?;
-        }
-    }
-
-    // --- PUSH --------------------------------------------------------
-    let last_pushed = {
-        let conn = db::open(db_path)?;
-        db::sync_state_last_pushed(&conn, local_agent_id, peer_url)
-    };
-    let outgoing = {
-        let conn = db::open(db_path)?;
-        db::memories_updated_since(&conn, last_pushed.as_deref(), batch_size)?
-    };
-    let push_count = outgoing.len();
-    let latest_pushed = outgoing.last().map(|m| m.updated_at.clone());
-
-    if !outgoing.is_empty() {
-        let body = serde_json::json!({
-            "sender_agent_id": local_agent_id,
-            "sender_clock": { "entries": {} },
-            "memories": outgoing,
-            "dry_run": false,
-        });
-        let mut req = client
-            .post(format!("{peer_url}/api/v1/sync/push"))
-            .header("x-agent-id", local_agent_id)
-            .header("content-type", "application/json")
-            .json(&body);
-        if let Some(key) = api_key {
-            req = req.header("x-api-key", key);
-        }
-        let resp = req.send().await?;
-        if !resp.status().is_success() {
-            anyhow::bail!("sync-daemon: push status {}", resp.status());
-        }
-        if let Some(at) = latest_pushed {
-            let conn = db::open(db_path)?;
-            db::sync_state_record_push(&conn, local_agent_id, peer_url, &at)?;
-        }
-    }
-
-    tracing::info!("sync-daemon: peer={peer_url} pulled={pull_count} pushed={push_count}");
-    Ok(())
-}
-
-/// Minimal URL-component encoder — only the characters the sync-daemon
-/// queries actually emit (RFC3339 timestamps with `:` and `+`, and
-/// agent ids with `:`/`@`/`/`). Avoids pulling in a whole URL crate for
-/// a dozen callsites.
-fn urlencoding_minimal(s: &str) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char);
-            }
-            _ => {
-                let _ = write!(out, "%{b:02X}");
-            }
-        }
-    }
-    out
-}
-
-#[derive(serde::Deserialize)]
-struct SyncSinceResponse {
-    #[allow(dead_code)]
-    count: usize,
-    #[allow(dead_code)]
-    limit: usize,
-    memories: Vec<models::Memory>,
-}
+// Sync-daemon body — `sync_cycle_once`, `urlencoding_minimal`, and
+// `SyncSinceResponse` — moved to `daemon_runtime` (lib crate) in v0.6.3
+// Wave 3. The production binary calls
+// `daemon_runtime::run_sync_daemon_with_shutdown_using_client`, and the
+// integration suite drives the same loop body via in-process tokio
+// tests, eliminating the dual-implementation drift the W2 audit
+// flagged on issue #453.
 
 #[allow(clippy::too_many_lines)]
 fn cmd_auto_consolidate(

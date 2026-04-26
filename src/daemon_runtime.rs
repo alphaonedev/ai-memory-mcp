@@ -178,11 +178,40 @@ pub async fn run_sync_daemon_with_shutdown(
     batch_size: usize,
     shutdown: Arc<Notify>,
 ) -> Result<()> {
-    let interval = interval_secs.max(1);
-    let batch_size = batch_size.max(1);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()?;
+    run_sync_daemon_with_shutdown_using_client(
+        client,
+        db_path,
+        local_agent_id,
+        peers,
+        api_key,
+        interval_secs,
+        batch_size,
+        shutdown,
+    )
+    .await
+}
+
+/// Variant of [`run_sync_daemon_with_shutdown`] that takes a caller-built
+/// `reqwest::Client`. The production `cmd_sync_daemon()` constructs an
+/// mTLS-aware client (via `build_rustls_client_config`) and threads it
+/// in here so the helper drives the same loop body the test version
+/// drives — keeping `daemon_runtime` as the single source of truth for
+/// the sync-daemon loop while preserving the production TLS contract.
+pub async fn run_sync_daemon_with_shutdown_using_client(
+    client: reqwest::Client,
+    db_path: PathBuf,
+    local_agent_id: String,
+    peers: Vec<String>,
+    api_key: Option<String>,
+    interval_secs: u64,
+    batch_size: usize,
+    shutdown: Arc<Notify>,
+) -> Result<()> {
+    let interval = interval_secs.max(1);
+    let batch_size = batch_size.max(1);
 
     let db_path_owned: Arc<Path> = Arc::from(db_path.as_path());
     let local_agent_id_arc: Arc<str> = Arc::from(local_agent_id.as_str());
