@@ -13,11 +13,13 @@
 // the integration suite's coverage onto the production paths.
 use ai_memory::cli::helpers::{auto_namespace, human_age, id_short};
 use ai_memory::cli::io::{ImportArgs, MineArgs};
+use ai_memory::cli::recall::RecallArgs;
+use ai_memory::cli::search::SearchArgs;
 use ai_memory::cli::store::StoreArgs;
 use ai_memory::cli::update::UpdateArgs;
 use ai_memory::{
     autonomy, bench, cli, color, config, curator, db, embeddings, federation, handlers, hnsw,
-    identity, llm, mcp, models, reranker, tls, validate,
+    identity, llm, mcp, models, tls, validate,
 };
 
 #[cfg(feature = "sal")]
@@ -440,66 +442,6 @@ struct ServeArgs {
 }
 
 #[derive(Args)]
-struct RecallArgs {
-    #[arg(allow_hyphen_values = true)]
-    context: String,
-    #[arg(long, short)]
-    namespace: Option<String>,
-    #[arg(long, default_value_t = 10)]
-    limit: usize,
-    #[arg(long)]
-    tags: Option<String>,
-    #[arg(long)]
-    since: Option<String>,
-    #[arg(long)]
-    until: Option<String>,
-    /// Feature tier for recall: keyword, semantic, smart, autonomous
-    #[arg(long, short = 'T')]
-    tier: Option<String>,
-    /// Task 1.5: querying agent's namespace position. Enables scope-based
-    /// visibility filtering (private/team/unit/org/collective).
-    #[arg(long)]
-    as_agent: Option<String>,
-    /// Task 1.11: context-budget-aware recall. Return the top-ranked
-    /// memories whose cumulative estimated tokens fit within N. Omit
-    /// for unlimited (limit-based only).
-    #[arg(long)]
-    budget_tokens: Option<usize>,
-    /// v0.6.0.0 contextual recall. Comma-separated list of recent
-    /// conversation tokens used to bias the query embedding at 70/30
-    /// (primary/context). Shifts the recall towards memories that
-    /// match both the explicit query and the conversation's nearby
-    /// topics.
-    #[arg(long, value_delimiter = ',')]
-    context_tokens: Option<Vec<String>>,
-}
-
-#[derive(Args)]
-struct SearchArgs {
-    #[arg(allow_hyphen_values = true)]
-    query: String,
-    #[arg(long, short)]
-    namespace: Option<String>,
-    #[arg(long, short)]
-    tier: Option<String>,
-    #[arg(long, default_value_t = 20)]
-    limit: usize,
-    #[arg(long)]
-    since: Option<String>,
-    #[arg(long)]
-    until: Option<String>,
-    #[arg(long)]
-    tags: Option<String>,
-    /// Filter by `metadata.agent_id` (exact match)
-    #[arg(long)]
-    agent_id: Option<String>,
-    /// Task 1.5: querying agent's namespace position for scope-based
-    /// visibility filtering.
-    #[arg(long)]
-    as_agent: Option<String>,
-}
-
-#[derive(Args)]
 struct GetArgs {
     id: String,
 }
@@ -748,8 +690,22 @@ async fn main() -> Result<()> {
             let mut out = ai_memory::cli::CliOutput::from_std(&mut so, &mut se);
             cli::update::run(&db_path, &a, j, &mut out)
         }
-        Command::Recall(a) => cmd_recall(&db_path, &a, j, &app_config),
-        Command::Search(a) => cmd_search(&db_path, &a, j, &app_config),
+        Command::Recall(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = ai_memory::cli::CliOutput::from_std(&mut so, &mut se);
+            ai_memory::cli::recall::run(&db_path, &a, j, &app_config, &mut out)
+        }
+        Command::Search(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = ai_memory::cli::CliOutput::from_std(&mut so, &mut se);
+            ai_memory::cli::search::run(&db_path, &a, j, &mut out)
+        }
         Command::Get(a) => cmd_get(&db_path, &a, j),
         Command::List(a) => cmd_list(&db_path, &a, j, &app_config),
         Command::Delete(a) => cmd_delete(&db_path, &a, j, cli_agent_id.as_deref()),
@@ -1114,298 +1070,6 @@ async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &config::AppConfig
 }
 
 // --- CLI ---
-
-#[allow(clippy::too_many_lines)]
-fn cmd_recall(
-    db_path: &Path,
-    args: &RecallArgs,
-    json_out: bool,
-    app_config: &config::AppConfig,
-) -> Result<()> {
-    // #151: validate --as-agent namespace
-    if let Some(ref a) = args.as_agent {
-        validate::validate_namespace(a)?;
-    }
-    let conn = db::open(db_path)?;
-    let _ = db::gc_if_needed(&conn, app_config.effective_archive_on_gc());
-
-    // Resolve feature tier
-    let feature_tier = app_config.effective_tier(args.tier.as_deref());
-    let tier_config = feature_tier.config();
-
-    // Initialize embedder if tier supports it
-    let embedder = if let Some(ref emb_model) = tier_config.embedding_model {
-        let ollama_client = if tier_config.llm_model.is_some() {
-            let ollama_url = app_config.effective_ollama_url();
-            llm::OllamaClient::new_with_url(ollama_url, "nomic-embed-text")
-                .ok()
-                .map(Arc::new)
-        } else {
-            None
-        };
-        let embed_client = {
-            let embed_url = app_config.effective_embed_url();
-            let ollama_url = app_config.effective_ollama_url();
-            if embed_url == ollama_url {
-                ollama_client.clone()
-            } else {
-                llm::OllamaClient::new_with_url(embed_url, "nomic-embed-text")
-                    .ok()
-                    .map(Arc::new)
-                    .or(ollama_client.clone())
-            }
-        };
-        match embeddings::Embedder::for_model(*emb_model, embed_client) {
-            Ok(emb) => {
-                eprintln!("ai-memory: embedder loaded ({})", emb.model_description());
-                // Backfill embeddings for memories that don't have them
-                if let Ok(unembedded) = db::get_unembedded_ids(&conn)
-                    && !unembedded.is_empty()
-                {
-                    eprintln!("ai-memory: backfilling {} memories...", unembedded.len());
-                    let mut ok = 0usize;
-                    for (id, title, content) in &unembedded {
-                        let text = format!("{title} {content}");
-                        if let Ok(embedding) = emb.embed(&text)
-                            && db::set_embedding(&conn, id, &embedding).is_ok()
-                        {
-                            ok += 1;
-                        }
-                    }
-                    eprintln!("ai-memory: backfilled {}/{}", ok, unembedded.len());
-                }
-                Some(emb)
-            }
-            Err(e) => {
-                eprintln!("ai-memory: embedder failed: {e}, falling back to keyword");
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    // Build HNSW vector index if embedder is available
-    let vector_index = if embedder.is_some() {
-        match db::get_all_embeddings(&conn) {
-            Ok(entries) if !entries.is_empty() => Some(hnsw::VectorIndex::build(entries)),
-            _ => Some(hnsw::VectorIndex::empty()),
-        }
-    } else {
-        None
-    };
-
-    // Initialize cross-encoder reranker for autonomous tier
-    let reranker = if tier_config.cross_encoder {
-        Some(reranker::CrossEncoder::new_neural())
-    } else {
-        None
-    };
-
-    let resolved_ttl = app_config.effective_ttl();
-    let resolved_scoring = app_config.effective_scoring();
-
-    // Perform recall: hybrid if embedder available, keyword otherwise
-    let (results, tokens_used, mode) = if let Some(ref emb) = embedder {
-        match emb.embed(&args.context) {
-            Ok(primary_emb) => {
-                // v0.6.0.0 contextual recall. Fuse the primary query
-                // embedding with an embedding over recent conversation
-                // tokens (caller-supplied) at 70/30. Fusion is done
-                // caller-side so recall_hybrid stays unaware of the bias —
-                // the vector it receives is the final query direction.
-                let query_emb = match args.context_tokens.as_deref() {
-                    Some(tokens) if !tokens.is_empty() => {
-                        let joined = tokens.join(" ");
-                        match emb.embed(&joined) {
-                            Ok(ctx_emb) => embeddings::Embedder::fuse(&primary_emb, &ctx_emb, 0.7),
-                            Err(e) => {
-                                eprintln!(
-                                    "ai-memory: context_tokens embed failed: {e}, using primary only"
-                                );
-                                primary_emb
-                            }
-                        }
-                    }
-                    _ => primary_emb,
-                };
-                let (results, tokens_used) = db::recall_hybrid(
-                    &conn,
-                    &args.context,
-                    &query_emb,
-                    args.namespace.as_deref(),
-                    args.limit.min(50),
-                    args.tags.as_deref(),
-                    args.since.as_deref(),
-                    args.until.as_deref(),
-                    vector_index.as_ref(),
-                    resolved_ttl.short_extend_secs,
-                    resolved_ttl.mid_extend_secs,
-                    args.as_agent.as_deref(),
-                    args.budget_tokens,
-                    &resolved_scoring,
-                )?;
-                if let Some(ref ce) = reranker {
-                    (
-                        ce.rerank(&args.context, results),
-                        tokens_used,
-                        "hybrid+rerank",
-                    )
-                } else {
-                    (results, tokens_used, "hybrid")
-                }
-            }
-            Err(e) => {
-                eprintln!("ai-memory: embedding query failed: {e}, falling back to keyword");
-                let (results, tokens_used) = db::recall(
-                    &conn,
-                    &args.context,
-                    args.namespace.as_deref(),
-                    args.limit,
-                    args.tags.as_deref(),
-                    args.since.as_deref(),
-                    args.until.as_deref(),
-                    resolved_ttl.short_extend_secs,
-                    resolved_ttl.mid_extend_secs,
-                    args.as_agent.as_deref(),
-                    args.budget_tokens,
-                )?;
-                (results, tokens_used, "keyword")
-            }
-        }
-    } else {
-        let (results, tokens_used) = db::recall(
-            &conn,
-            &args.context,
-            args.namespace.as_deref(),
-            args.limit,
-            args.tags.as_deref(),
-            args.since.as_deref(),
-            args.until.as_deref(),
-            resolved_ttl.short_extend_secs,
-            resolved_ttl.mid_extend_secs,
-            args.as_agent.as_deref(),
-            args.budget_tokens,
-        )?;
-        (results, tokens_used, "keyword")
-    };
-
-    if json_out {
-        let scored: Vec<serde_json::Value> = results
-            .iter()
-            .map(|(m, s)| {
-                let mut v = serde_json::to_value(m).unwrap_or_default();
-                if let Some(obj) = v.as_object_mut() {
-                    obj.insert(
-                        "score".to_string(),
-                        serde_json::json!((s * 1000.0).round() / 1000.0),
-                    );
-                }
-                v
-            })
-            .collect();
-        let mut body = serde_json::json!({
-            "memories": scored,
-            "count": results.len(),
-            "mode": mode,
-            "tokens_used": tokens_used,
-        });
-        if let Some(b) = args.budget_tokens {
-            body["budget_tokens"] = serde_json::json!(b);
-        }
-        println!("{}", serde_json::to_string(&body)?);
-        return Ok(());
-    }
-    if results.is_empty() {
-        eprintln!("no memories found for: {}", args.context);
-        return Ok(());
-    }
-    for (mem, score) in &results {
-        let age = human_age(&mem.updated_at);
-        let config = if mem.confidence < 1.0 {
-            format!(" conf={:.0}%", mem.confidence * 100.0)
-        } else {
-            String::new()
-        };
-        println!(
-            "[{}] {} {} score={:.2} (ns={}, {}x, {}{})",
-            color::tier_color(
-                mem.tier.as_str(),
-                &format!("{}/{}", mem.tier, id_short(&mem.id))
-            ),
-            color::bold(&mem.title),
-            color::priority_bar(mem.priority),
-            score,
-            color::cyan(&mem.namespace),
-            mem.access_count,
-            color::dim(&age),
-            config
-        );
-        let preview: String = mem.content.chars().take(200).collect();
-        println!("  {}\n", color::dim(&preview));
-    }
-    println!("{} memory(ies) recalled [{}]", results.len(), mode);
-    Ok(())
-}
-
-fn cmd_search(
-    db_path: &Path,
-    args: &SearchArgs,
-    json_out: bool,
-    app_config: &config::AppConfig,
-) -> Result<()> {
-    // #197: validate agent_id filter values
-    if let Some(ref aid) = args.agent_id {
-        validate::validate_agent_id(aid)?;
-    }
-    // #151: validate --as-agent namespace
-    if let Some(ref a) = args.as_agent {
-        validate::validate_namespace(a)?;
-    }
-    let conn = db::open(db_path)?;
-    let _ = db::gc_if_needed(&conn, app_config.effective_archive_on_gc());
-    let tier = args.tier.as_deref().and_then(Tier::from_str);
-    let results = db::search(
-        &conn,
-        &args.query,
-        args.namespace.as_deref(),
-        tier.as_ref(),
-        args.limit,
-        None,
-        args.since.as_deref(),
-        args.until.as_deref(),
-        args.tags.as_deref(),
-        args.agent_id.as_deref(),
-        args.as_agent.as_deref(),
-    )?;
-    if json_out {
-        println!(
-            "{}",
-            serde_json::to_string(
-                &serde_json::json!({"results": results, "count": results.len()})
-            )?
-        );
-        return Ok(());
-    }
-    if results.is_empty() {
-        eprintln!("no results for: {}", args.query);
-        return Ok(());
-    }
-    for mem in &results {
-        let age = human_age(&mem.updated_at);
-        println!(
-            "[{}/{}] {} (p={}, ns={}, {})",
-            mem.tier,
-            id_short(&mem.id),
-            mem.title,
-            mem.priority,
-            mem.namespace,
-            age
-        );
-    }
-    println!("\n{} result(s)", results.len());
-    Ok(())
-}
 
 fn cmd_get(db_path: &Path, args: &GetArgs, json_out: bool) -> Result<()> {
     validate::validate_id(&args.id)?;
