@@ -45,8 +45,25 @@ pub fn tmp_db(scope: &str) -> PathBuf {
 /// newlines. Each request is one JSON-RPC frame; responses come back in
 /// matching order.
 pub fn mcp_exchange(db: &std::path::Path, requests: &[&str]) -> Vec<String> {
+    mcp_exchange_with_args(db, &[], requests)
+}
+
+/// Variant of [`mcp_exchange`] that lets a test inject extra arguments
+/// after `mcp`. The canonical use case is `--tier keyword`, which
+/// suppresses embedder loading so a test can deterministically exercise
+/// the "embedder required" branch of MCP tools without depending on
+/// HuggingFace model downloads working from CI.
+pub fn mcp_exchange_with_args(
+    db: &std::path::Path,
+    extra: &[&str],
+    requests: &[&str],
+) -> Vec<String> {
+    let db_path = db.to_str().unwrap();
+    let mut args: Vec<&str> = vec!["--db", db_path, "mcp"];
+    args.extend_from_slice(extra);
+
     let mut child = cmd()
-        .args(["--db", db.to_str().unwrap(), "mcp"])
+        .args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
