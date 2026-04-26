@@ -408,7 +408,8 @@ mod tests {
 
     #[test]
     fn lexical_score_returns_zero_for_empty_query() {
-        assert_eq!(lexical_score("", "some title", "some content"), 0.0);
+        let s = lexical_score("", "some title", "some content");
+        assert!(s.abs() < f32::EPSILON);
     }
 
     #[test]
