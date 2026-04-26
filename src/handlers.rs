@@ -5372,11 +5372,6 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::net::TcpListener;
 
-        let state = test_state();
-
-        // Mock peer that counts sync_push POSTs and always acks.
-        let count = Arc::new(AtomicUsize::new(0));
-        let count_for_peer = count.clone();
         #[derive(Clone)]
         struct MockState {
             count: Arc<AtomicUsize>,
@@ -5391,6 +5386,12 @@ mod tests {
                 Json(json!({"applied":1,"noop":0,"skipped":0})),
             )
         }
+
+        let state = test_state();
+
+        // Mock peer that counts sync_push POSTs and always acks.
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_for_peer = count.clone();
         let peer_app = Router::new()
             .route("/api/v1/sync/push", axum_post(mock_sync_push))
             .with_state(MockState {
