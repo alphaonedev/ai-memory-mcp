@@ -9517,4 +9517,1300 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
+
+    // ========================================================================
+    // W8/H8c — handlers.rs gap-closing for agents/pending/consolidate.
+    //
+    // Coverage targets:
+    //   list_agents, register_agent, list_pending, approve_pending,
+    //   reject_pending, consolidate_memories, detect_contradictions,
+    //   get_capabilities.
+    //
+    // All tests drive the real Axum handler via `tower::ServiceExt::oneshot`
+    // and assert on (status, body) to hit handler arms — including the
+    // post-validation success paths that earlier W7 tests skipped.
+    // ========================================================================
+
+    // ---- list_agents (GET /api/v1/agents) ----------------------------------
+
+    #[tokio::test]
+    async fn http_list_agents_empty_returns_zero_count() {
+        // Empty `_agents` namespace: count=0, agents=[].
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/agents", axum_get(list_agents))
+            .with_state(state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/agents")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["count"], 0);
+        assert_eq!(v["agents"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn http_list_agents_returns_registered_rows() {
+        // Pre-register two agents directly via db::register_agent and
+        // confirm both surface through the list handler.
+        let state = test_state();
+        {
+            let lock = state.lock().await;
+            db::register_agent(&lock.0, "alice", "human", &["read".into(), "write".into()])
+                .unwrap();
+            db::register_agent(&lock.0, "bob", "ai:claude-opus-4.7", &["recall".into()]).unwrap();
+        }
+        let app = Router::new()
+            .route("/api/v1/agents", axum_get(list_agents))
+            .with_state(state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/agents")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["count"], 2);
+        let agents = v["agents"].as_array().unwrap();
+        let ids: Vec<&str> = agents
+            .iter()
+            .filter_map(|a| a["agent_id"].as_str())
+            .collect();
+        assert!(ids.contains(&"alice"));
+        assert!(ids.contains(&"bob"));
+    }
+
+    #[tokio::test]
+    async fn http_list_agents_includes_types_and_capabilities() {
+        // The serialized agent rows must surface agent_type AND the
+        // capability list back to the caller — not just agent_id.
+        let state = test_state();
+        {
+            let lock = state.lock().await;
+            db::register_agent(
+                &lock.0,
+                "alpha",
+                "ai:claude-opus-4.7",
+                &["read".into(), "store".into(), "recall".into()],
+            )
+            .unwrap();
+        }
+        let app = Router::new()
+            .route("/api/v1/agents", axum_get(list_agents))
+            .with_state(state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/agents")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let agents = v["agents"].as_array().unwrap();
+        assert_eq!(agents.len(), 1);
+        let a = &agents[0];
+        assert_eq!(a["agent_id"], "alpha");
+        assert_eq!(a["agent_type"], "ai:claude-opus-4.7");
+        let caps = a["capabilities"].as_array().unwrap();
+        assert_eq!(caps.len(), 3);
+        let cap_strs: Vec<&str> = caps.iter().filter_map(|c| c.as_str()).collect();
+        assert!(cap_strs.contains(&"read"));
+        assert!(cap_strs.contains(&"store"));
+        assert!(cap_strs.contains(&"recall"));
+    }
+
+    // ---- register_agent (POST /api/v1/agents) ------------------------------
+
+    #[tokio::test]
+    async fn http_register_agent_happy_path_returns_created() {
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/agents", axum_post(register_agent))
+            .with_state(test_app_state(state.clone()));
+        let body = serde_json::json!({
+            "agent_id": "alice",
+            "agent_type": "human",
+            "capabilities": ["read", "write"]
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/agents")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["registered"], true);
+        assert_eq!(v["agent_id"], "alice");
+        assert_eq!(v["agent_type"], "human");
+        // Row landed in `_agents` namespace.
+        let lock = state.lock().await;
+        let agents = db::list_agents(&lock.0).unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].agent_id, "alice");
+    }
+
+    #[tokio::test]
+    async fn http_register_agent_missing_agent_type_400() {
+        // Missing `agent_type` on the JSON body — Axum's Json extractor
+        // rejects with 4xx (422 from serde-error wrapping).
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/agents", axum_post(register_agent))
+            .with_state(test_app_state(state));
+        let body = serde_json::json!({
+            "agent_id": "alice"
+            // no agent_type, no capabilities
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/agents")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_client_error(),
+            "expected 4xx for missing agent_type, got {}",
+            resp.status()
+        );
+    }
+
+    #[tokio::test]
+    async fn http_register_agent_invalid_agent_id_with_space_400() {
+        // validate_agent_id rejects spaces.
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/agents", axum_post(register_agent))
+            .with_state(test_app_state(state));
+        let body = serde_json::json!({
+            "agent_id": "bad agent",
+            "agent_type": "human",
+            "capabilities": []
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/agents")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn http_register_agent_duplicate_register_idempotent_preserves_registered_at() {
+        // Re-registering the same agent_id is allowed (UPSERT-style on
+        // (namespace, title)). Both calls return 201; registered_at is
+        // preserved across the second call (db::register_agent reads it back).
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/agents", axum_post(register_agent))
+            .with_state(test_app_state(state.clone()));
+        let body = serde_json::json!({
+            "agent_id": "twice",
+            "agent_type": "human",
+            "capabilities": ["read"]
+        });
+        let r1 = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/agents")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r1.status(), StatusCode::CREATED);
+        let r2 = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/agents")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r2.status(), StatusCode::CREATED);
+        // Only one row for this agent_id (LWW on title=agent:twice).
+        let lock = state.lock().await;
+        let agents = db::list_agents(&lock.0).unwrap();
+        let twice: Vec<_> = agents.iter().filter(|a| a.agent_id == "twice").collect();
+        assert_eq!(
+            twice.len(),
+            1,
+            "duplicate register must collapse to one row"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_register_agent_capabilities_array_preserved() {
+        // The full `capabilities` array round-trips through register +
+        // list. Specifically: order-insensitive coverage of all members.
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/agents", axum_post(register_agent))
+            .with_state(test_app_state(state.clone()));
+        let body = serde_json::json!({
+            "agent_id": "capper",
+            "agent_type": "ai:claude-opus-4.7",
+            "capabilities": ["search", "store", "recall", "consolidate"]
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/agents")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let echoed = v["capabilities"].as_array().unwrap();
+        assert_eq!(echoed.len(), 4);
+        // And persisted shape matches.
+        let lock = state.lock().await;
+        let agents = db::list_agents(&lock.0).unwrap();
+        let me = agents.iter().find(|a| a.agent_id == "capper").unwrap();
+        assert_eq!(me.capabilities.len(), 4);
+        assert!(me.capabilities.contains(&"search".to_string()));
+        assert!(me.capabilities.contains(&"store".to_string()));
+        assert!(me.capabilities.contains(&"recall".to_string()));
+        assert!(me.capabilities.contains(&"consolidate".to_string()));
+    }
+
+    // ---- list_pending (GET /api/v1/pending) --------------------------------
+
+    #[tokio::test]
+    async fn http_list_pending_with_pending_actions_returns_them() {
+        // Queue two pending actions and confirm both surface.
+        use crate::models::GovernedAction;
+        let state = test_state();
+        {
+            let lock = state.lock().await;
+            db::queue_pending_action(
+                &lock.0,
+                GovernedAction::Store,
+                "ns-a",
+                None,
+                "alice",
+                &serde_json::json!({"title": "first", "content": "c1"}),
+            )
+            .unwrap();
+            db::queue_pending_action(
+                &lock.0,
+                GovernedAction::Store,
+                "ns-b",
+                None,
+                "bob",
+                &serde_json::json!({"title": "second", "content": "c2"}),
+            )
+            .unwrap();
+        }
+        let app = Router::new()
+            .route("/api/v1/pending", axum_get(list_pending))
+            .with_state(state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/pending")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["count"], 2);
+        assert_eq!(v["pending"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn http_list_pending_filters_by_status_pending() {
+        use crate::models::GovernedAction;
+        let state = test_state();
+        let kept_id = {
+            let lock = state.lock().await;
+            // One pending action that stays pending.
+            let id = db::queue_pending_action(
+                &lock.0,
+                GovernedAction::Store,
+                "ns-keep",
+                None,
+                "alice",
+                &serde_json::json!({"title": "stay", "content": "x"}),
+            )
+            .unwrap();
+            // One that we mark rejected.
+            let other = db::queue_pending_action(
+                &lock.0,
+                GovernedAction::Store,
+                "ns-reject",
+                None,
+                "alice",
+                &serde_json::json!({"title": "out", "content": "x"}),
+            )
+            .unwrap();
+            db::decide_pending_action(&lock.0, &other, false, "alice").unwrap();
+            id
+        };
+        let app = Router::new()
+            .route("/api/v1/pending", axum_get(list_pending))
+            .with_state(state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/pending?status=pending")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let items = v["pending"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["id"], kept_id);
+        assert_eq!(items[0]["status"], "pending");
+    }
+
+    #[tokio::test]
+    async fn http_list_pending_filters_by_status_rejected() {
+        use crate::models::GovernedAction;
+        let state = test_state();
+        {
+            let lock = state.lock().await;
+            let id = db::queue_pending_action(
+                &lock.0,
+                GovernedAction::Store,
+                "ns-r",
+                None,
+                "alice",
+                &serde_json::json!({"title": "rejected", "content": "x"}),
+            )
+            .unwrap();
+            db::decide_pending_action(&lock.0, &id, false, "alice").unwrap();
+            // Pending one to verify it doesn't leak through.
+            db::queue_pending_action(
+                &lock.0,
+                GovernedAction::Store,
+                "ns-p",
+                None,
+                "alice",
+                &serde_json::json!({"title": "pending", "content": "x"}),
+            )
+            .unwrap();
+        }
+        let app = Router::new()
+            .route("/api/v1/pending", axum_get(list_pending))
+            .with_state(state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/pending?status=rejected&limit=10")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let items = v["pending"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["status"], "rejected");
+    }
+
+    #[tokio::test]
+    async fn http_list_pending_limit_clamped_to_1000() {
+        // Pass a deliberately-large limit; handler clamps to 1000 but
+        // still returns 200 (we just verify the ceiling path executes).
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/pending", axum_get(list_pending))
+            .with_state(state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/pending?limit=99999")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ---- approve_pending (POST /api/v1/pending/{id}/approve) ---------------
+
+    #[tokio::test]
+    async fn http_approve_pending_happy_path_executes_store() {
+        // Queue a Store payload, approve it, expect 200 + executed=true +
+        // a memory_id we can fetch back.
+        use crate::models::GovernedAction;
+        let state = test_state();
+        let now_rfc = Utc::now().to_rfc3339();
+        let pending_id = {
+            let lock = state.lock().await;
+            db::queue_pending_action(
+                &lock.0,
+                GovernedAction::Store,
+                "approve-ns",
+                None,
+                "alice",
+                &serde_json::json!({
+                    "id": Uuid::new_v4().to_string(),
+                    "tier": "long",
+                    "namespace": "approve-ns",
+                    "title": "approved-store",
+                    "content": "executed via approval",
+                    "tags": [],
+                    "priority": 5,
+                    "confidence": 1.0,
+                    "source": "api",
+                    "access_count": 0,
+                    "created_at": now_rfc,
+                    "updated_at": now_rfc,
+                    "metadata": {}
+                }),
+            )
+            .unwrap()
+        };
+        let app = Router::new()
+            .route("/api/v1/pending/{id}/approve", axum_post(approve_pending))
+            .with_state(test_app_state(state.clone()));
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/api/v1/pending/{pending_id}/approve"))
+                    .method("POST")
+                    .header("x-agent-id", "approver-alice")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["approved"], true);
+        assert_eq!(v["executed"], true);
+        assert_eq!(v["decided_by"], "approver-alice");
+        // Status is now 'approved' in the row.
+        let lock = state.lock().await;
+        let pa = db::get_pending_action(&lock.0, &pending_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(pa.status, "approved");
+        assert_eq!(pa.decided_by.as_deref(), Some("approver-alice"));
+    }
+
+    #[tokio::test]
+    async fn http_approve_pending_invalid_id_format_400() {
+        // validate_id rejects ids with embedded control chars — handler
+        // returns 400 BEFORE touching the DB. We use %01 (SOH) which
+        // is_clean_string flags as invalid.
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/pending/{id}/approve", axum_post(approve_pending))
+            .with_state(test_app_state(state));
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/pending/bad%01id/approve")
+                    .method("POST")
+                    .header("x-agent-id", "alice")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn http_approve_pending_already_approved_is_rejected() {
+        // Once an action is decided, a follow-up approve must NOT execute
+        // again — it returns FORBIDDEN with `approve rejected: already decided`.
+        use crate::models::GovernedAction;
+        let state = test_state();
+        let pid = {
+            let lock = state.lock().await;
+            let id = db::queue_pending_action(
+                &lock.0,
+                GovernedAction::Store,
+                "double-approve",
+                None,
+                "alice",
+                &serde_json::json!({
+                    "tier": "long",
+                    "namespace": "double-approve",
+                    "title": "store",
+                    "content": "x",
+                    "tags": [], "priority": 5, "confidence": 1.0,
+                    "source": "api", "metadata": {}
+                }),
+            )
+            .unwrap();
+            db::decide_pending_action(&lock.0, &id, true, "alice").unwrap();
+            id
+        };
+        let app = Router::new()
+            .route("/api/v1/pending/{id}/approve", axum_post(approve_pending))
+            .with_state(test_app_state(state));
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/api/v1/pending/{pid}/approve"))
+                    .method("POST")
+                    .header("x-agent-id", "alice")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let err = v["error"].as_str().unwrap_or("");
+        assert!(
+            err.contains("already decided") || err.contains("rejected"),
+            "expected already-decided message, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_approve_pending_executor_records_decided_by() {
+        // After a successful approve the row's decided_by is the same id
+        // we passed via X-Agent-Id, not the requester. This is the
+        // executor-records-approval invariant.
+        use crate::models::GovernedAction;
+        let state = test_state();
+        let now_rfc = Utc::now().to_rfc3339();
+        let pid = {
+            let lock = state.lock().await;
+            db::queue_pending_action(
+                &lock.0,
+                GovernedAction::Store,
+                "executor-ns",
+                None,
+                "requester-bob",
+                &serde_json::json!({
+                    "id": Uuid::new_v4().to_string(),
+                    "tier": "long",
+                    "namespace": "executor-ns",
+                    "title": "e",
+                    "content": "y",
+                    "tags": [], "priority": 5, "confidence": 1.0,
+                    "source": "api",
+                    "access_count": 0,
+                    "created_at": now_rfc,
+                    "updated_at": now_rfc,
+                    "metadata": {}
+                }),
+            )
+            .unwrap()
+        };
+        let app = Router::new()
+            .route("/api/v1/pending/{id}/approve", axum_post(approve_pending))
+            .with_state(test_app_state(state.clone()));
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/api/v1/pending/{pid}/approve"))
+                    .method("POST")
+                    .header("x-agent-id", "executor-claude")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let lock = state.lock().await;
+        let pa = db::get_pending_action(&lock.0, &pid).unwrap().unwrap();
+        assert_eq!(pa.requested_by, "requester-bob");
+        assert_eq!(pa.decided_by.as_deref(), Some("executor-claude"));
+        assert_eq!(pa.status, "approved");
+    }
+
+    #[tokio::test]
+    async fn http_approve_pending_returns_memory_id_for_store_payload() {
+        // happy-path Store: the response carries a memory_id and that
+        // memory is queryable via db::get.
+        use crate::models::GovernedAction;
+        let state = test_state();
+        let now_rfc = Utc::now().to_rfc3339();
+        let pid = {
+            let lock = state.lock().await;
+            db::queue_pending_action(
+                &lock.0,
+                GovernedAction::Store,
+                "executed-write",
+                None,
+                "alice",
+                &serde_json::json!({
+                    "id": Uuid::new_v4().to_string(),
+                    "tier": "long",
+                    "namespace": "executed-write",
+                    "title": "executed-mem",
+                    "content": "this exists after approval",
+                    "tags": [], "priority": 5, "confidence": 1.0,
+                    "source": "api",
+                    "access_count": 0,
+                    "created_at": now_rfc,
+                    "updated_at": now_rfc,
+                    "metadata": {}
+                }),
+            )
+            .unwrap()
+        };
+        let app = Router::new()
+            .route("/api/v1/pending/{id}/approve", axum_post(approve_pending))
+            .with_state(test_app_state(state.clone()));
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/api/v1/pending/{pid}/approve"))
+                    .method("POST")
+                    .header("x-agent-id", "alice")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let mem_id = v["memory_id"].as_str().expect("memory_id present");
+        let lock = state.lock().await;
+        let mem = db::get(&lock.0, mem_id).unwrap().expect("memory exists");
+        assert_eq!(mem.title, "executed-mem");
+        assert_eq!(mem.namespace, "executed-write");
+    }
+
+    // ---- reject_pending (POST /api/v1/pending/{id}/reject) -----------------
+
+    #[tokio::test]
+    async fn http_reject_pending_happy_path_marks_rejected_no_execution() {
+        // Reject path: row goes to status='rejected', decided_by stamped,
+        // and NO underlying memory is created.
+        use crate::models::GovernedAction;
+        let state = test_state();
+        let pid = {
+            let lock = state.lock().await;
+            db::queue_pending_action(
+                &lock.0,
+                GovernedAction::Store,
+                "reject-ns",
+                None,
+                "alice",
+                &serde_json::json!({
+                    "tier": "long",
+                    "namespace": "reject-ns",
+                    "title": "blocked",
+                    "content": "must not be created",
+                    "tags": [], "priority": 5, "confidence": 1.0,
+                    "source": "api", "metadata": {}
+                }),
+            )
+            .unwrap()
+        };
+        let app = Router::new()
+            .route("/api/v1/pending/{id}/reject", axum_post(reject_pending))
+            .with_state(test_app_state(state.clone()));
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/api/v1/pending/{pid}/reject"))
+                    .method("POST")
+                    .header("x-agent-id", "rejector-alice")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["rejected"], true);
+        assert_eq!(v["decided_by"], "rejector-alice");
+        let lock = state.lock().await;
+        let pa = db::get_pending_action(&lock.0, &pid).unwrap().unwrap();
+        assert_eq!(pa.status, "rejected");
+        // Confirm no memory landed in `reject-ns`.
+        let rows = db::list(
+            &lock.0,
+            Some("reject-ns"),
+            None,
+            10,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            rows.is_empty(),
+            "rejection must not execute the queued payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_reject_pending_already_rejected_returns_404() {
+        // Once decided, decide_pending_action returns false; the handler
+        // surfaces this as 404 ("not found or already decided").
+        use crate::models::GovernedAction;
+        let state = test_state();
+        let pid = {
+            let lock = state.lock().await;
+            let id = db::queue_pending_action(
+                &lock.0,
+                GovernedAction::Store,
+                "double-reject",
+                None,
+                "alice",
+                &serde_json::json!({
+                    "tier": "long",
+                    "namespace": "double-reject",
+                    "title": "x",
+                    "content": "x",
+                    "tags": [], "priority": 5, "confidence": 1.0,
+                    "source": "api", "metadata": {}
+                }),
+            )
+            .unwrap();
+            db::decide_pending_action(&lock.0, &id, false, "alice").unwrap();
+            id
+        };
+        let app = Router::new()
+            .route("/api/v1/pending/{id}/reject", axum_post(reject_pending))
+            .with_state(test_app_state(state));
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/api/v1/pending/{pid}/reject"))
+                    .method("POST")
+                    .header("x-agent-id", "alice")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn http_reject_pending_invalid_id_format_400() {
+        // validate_id flags ids containing control chars; %01 hits that
+        // arm and returns 400 before any DB lookup.
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/pending/{id}/reject", axum_post(reject_pending))
+            .with_state(test_app_state(state));
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/pending/bad%01id/reject")
+                    .method("POST")
+                    .header("x-agent-id", "alice")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ---- consolidate_memories (POST /api/v1/consolidate) -------------------
+
+    #[tokio::test]
+    async fn http_consolidate_two_into_one_happy_path() {
+        // Insert two memories, consolidate them, expect 201 with a new
+        // memory id and the originals removed.
+        let state = test_state();
+        let now = Utc::now().to_rfc3339();
+        let (id_a, id_b) = {
+            let lock = state.lock().await;
+            let mk = |title: &str| Memory {
+                id: Uuid::new_v4().to_string(),
+                tier: Tier::Long,
+                namespace: "merge-ns".into(),
+                title: title.into(),
+                content: format!("body for {title}"),
+                tags: vec![],
+                priority: 5,
+                confidence: 1.0,
+                source: "test".into(),
+                access_count: 0,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+                last_accessed_at: None,
+                expires_at: None,
+                metadata: serde_json::json!({"agent_id": "alice"}),
+            };
+            let a = db::insert(&lock.0, &mk("draft-a")).unwrap();
+            let b = db::insert(&lock.0, &mk("draft-b")).unwrap();
+            (a, b)
+        };
+        let app = Router::new()
+            .route("/api/v1/consolidate", axum_post(consolidate_memories))
+            .with_state(test_app_state(state.clone()));
+        let body = serde_json::json!({
+            "ids": [id_a, id_b],
+            "title": "merged-result",
+            "summary": "a merge of two drafts",
+            "namespace": "merge-ns",
+            "tier": "long"
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/consolidate")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .header("x-agent-id", "consolidator")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["consolidated"], 2);
+        let new_id = v["id"].as_str().unwrap();
+        let lock = state.lock().await;
+        let merged = db::get(&lock.0, new_id).unwrap().unwrap();
+        assert_eq!(merged.title, "merged-result");
+        assert_eq!(merged.namespace, "merge-ns");
+        // Originals removed.
+        assert!(db::get(&lock.0, &id_a).unwrap().is_none());
+        assert!(db::get(&lock.0, &id_b).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn http_consolidate_single_id_400() {
+        // validate_consolidate requires ≥2 ids — single-id calls are
+        // rejected up front with 400.
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/consolidate", axum_post(consolidate_memories))
+            .with_state(test_app_state(state));
+        let body = serde_json::json!({
+            "ids": [Uuid::new_v4().to_string()],
+            "title": "lone-merge",
+            "summary": "only one source",
+            "namespace": "merge-ns"
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/consolidate")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn http_consolidate_invalid_namespace_400() {
+        // Namespace with a space fails validate_namespace.
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/consolidate", axum_post(consolidate_memories))
+            .with_state(test_app_state(state));
+        let body = serde_json::json!({
+            "ids": [Uuid::new_v4().to_string(), Uuid::new_v4().to_string()],
+            "title": "merge",
+            "summary": "x",
+            "namespace": "bad ns"
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/consolidate")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn http_consolidate_invalid_agent_id_400() {
+        // X-Agent-Id with a space → identity::resolve_http_agent_id error → 400.
+        let state = test_state();
+        let id_a = Uuid::new_v4().to_string();
+        let id_b = Uuid::new_v4().to_string();
+        let app = Router::new()
+            .route("/api/v1/consolidate", axum_post(consolidate_memories))
+            .with_state(test_app_state(state));
+        let body = serde_json::json!({
+            "ids": [id_a, id_b],
+            "title": "merge",
+            "summary": "x",
+            "namespace": "merge-ns"
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/consolidate")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .header("x-agent-id", "bad agent id")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn http_consolidate_max_id_count_cap_exceeded_400() {
+        // validate_consolidate caps at 100 ids.
+        let state = test_state();
+        let ids: Vec<String> = (0..101).map(|_| Uuid::new_v4().to_string()).collect();
+        let app = Router::new()
+            .route("/api/v1/consolidate", axum_post(consolidate_memories))
+            .with_state(test_app_state(state));
+        let body = serde_json::json!({
+            "ids": ids,
+            "title": "too-many",
+            "summary": "x",
+            "namespace": "merge-ns"
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/consolidate")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn http_consolidate_missing_source_500() {
+        // Two well-formed UUIDs but the rows don't exist — db::consolidate
+        // bails inside the transaction, surface as 500. This covers the
+        // post-validation error arm of the handler.
+        let state = test_state();
+        let id_a = Uuid::new_v4().to_string();
+        let id_b = Uuid::new_v4().to_string();
+        let app = Router::new()
+            .route("/api/v1/consolidate", axum_post(consolidate_memories))
+            .with_state(test_app_state(state));
+        let body = serde_json::json!({
+            "ids": [id_a, id_b],
+            "title": "merge",
+            "summary": "x",
+            "namespace": "merge-ns"
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/consolidate")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // ---- detect_contradictions (GET /api/v1/contradictions) ----------------
+
+    #[tokio::test]
+    async fn http_contradictions_empty_no_pairs() {
+        // namespace exists in the URL but no memories → empty memories,
+        // empty links. Still a 200.
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/contradictions", axum_get(detect_contradictions))
+            .with_state(state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/contradictions?namespace=empty-ns")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["memories"].as_array().unwrap().len(), 0);
+        assert_eq!(v["links"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn http_contradictions_synthesizes_links_for_same_title() {
+        // Two memories with the same TITLE but different content in a
+        // namespace produce a synthesized contradicts link.
+        let state = test_state();
+        let now = Utc::now().to_rfc3339();
+        {
+            let lock = state.lock().await;
+            // Same title forces UPSERT collapse, so vary metadata.topic for grouping.
+            let mk = |title: &str, content: &str| Memory {
+                id: Uuid::new_v4().to_string(),
+                tier: Tier::Long,
+                namespace: "contradict-ns".into(),
+                title: title.into(),
+                content: content.into(),
+                tags: vec![],
+                priority: 5,
+                confidence: 1.0,
+                source: "api".into(),
+                access_count: 0,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+                last_accessed_at: None,
+                expires_at: None,
+                metadata: serde_json::json!({"topic": "earth-shape"}),
+            };
+            db::insert(&lock.0, &mk("alice-says", "earth is round")).unwrap();
+            db::insert(&lock.0, &mk("bob-says", "earth is flat")).unwrap();
+        }
+        let app = Router::new()
+            .route("/api/v1/contradictions", axum_get(detect_contradictions))
+            .with_state(state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/contradictions?namespace=contradict-ns&topic=earth-shape")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let memories = v["memories"].as_array().unwrap();
+        assert_eq!(memories.len(), 2);
+        let links = v["links"].as_array().unwrap();
+        assert!(links.iter().any(|l| {
+            l["relation"].as_str() == Some("contradicts")
+                && l["synthesized"].as_bool() == Some(true)
+        }));
+    }
+
+    #[tokio::test]
+    async fn http_contradictions_namespace_filter_isolates_results() {
+        // Memories in ns-A vs ns-B — querying ns-A only returns its rows
+        // even though ns-B has a same-titled candidate.
+        let state = test_state();
+        let now = Utc::now().to_rfc3339();
+        {
+            let lock = state.lock().await;
+            let mk = |ns: &str, content: &str| Memory {
+                id: Uuid::new_v4().to_string(),
+                tier: Tier::Long,
+                namespace: ns.into(),
+                title: "shared-topic".into(),
+                content: content.into(),
+                tags: vec![],
+                priority: 5,
+                confidence: 1.0,
+                source: "api".into(),
+                access_count: 0,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+                last_accessed_at: None,
+                expires_at: None,
+                metadata: serde_json::json!({}),
+            };
+            db::insert(&lock.0, &mk("ns-iso-a", "first opinion")).unwrap();
+            db::insert(&lock.0, &mk("ns-iso-b", "different opinion")).unwrap();
+        }
+        let app = Router::new()
+            .route("/api/v1/contradictions", axum_get(detect_contradictions))
+            .with_state(state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/contradictions?namespace=ns-iso-a")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let memories = v["memories"].as_array().unwrap();
+        assert_eq!(memories.len(), 1, "ns filter must isolate results");
+        assert_eq!(memories[0]["namespace"], "ns-iso-a");
+    }
+
+    #[tokio::test]
+    async fn http_contradictions_invalid_namespace_400() {
+        // A namespace string with a space fails validate_namespace
+        // before any DB read.
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/contradictions", axum_get(detect_contradictions))
+            .with_state(state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/contradictions?namespace=bad%20ns")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ---- get_capabilities (GET /api/v1/capabilities) -----------------------
+
+    #[tokio::test]
+    async fn http_capabilities_returns_expected_shape() {
+        // Confirm the response includes tier/version/features/models —
+        // the four top-level keys our scenarios depend on.
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/capabilities", axum_get(get_capabilities))
+            .with_state(test_app_state(state));
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/capabilities")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v.get("tier").is_some(), "missing `tier`");
+        assert!(v.get("version").is_some(), "missing `version`");
+        assert!(v.get("features").is_some(), "missing `features`");
+        assert!(v.get("models").is_some(), "missing `models`");
+        // The Keyword tier defaults: keyword_search=true, no LLM features.
+        assert_eq!(v["features"]["keyword_search"], true);
+        assert_eq!(v["features"]["semantic_search"], false);
+        assert_eq!(v["features"]["query_expansion"], false);
+    }
+
+    #[tokio::test]
+    async fn http_capabilities_version_matches_pkg_version() {
+        // version must equal CARGO_PKG_VERSION — operators pin scenarios
+        // by this string, regressions here break upgrade tooling.
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/v1/capabilities", axum_get(get_capabilities))
+            .with_state(test_app_state(state));
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/capabilities")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(v["tier"], "keyword");
+    }
 }
