@@ -5104,7 +5104,7 @@ fn seed_standard(
     id
 }
 
-/// Invoke memory_namespace_get_standard via MCP, returning the parsed body.
+/// Invoke `memory_namespace_get_standard` via MCP, returning the parsed body.
 fn get_standard_inherit(
     binary: &str,
     db_path: &std::path::Path,
