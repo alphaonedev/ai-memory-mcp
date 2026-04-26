@@ -980,8 +980,7 @@ mod tests {
         // Forgot m_old because it's superseded by m_new.
         assert!(
             report.memories_forgotten >= 1,
-            "expected ≥1 forget, got {:?}",
-            report
+            "expected ≥1 forget, got {report:?}"
         );
         // Rollback entries written for each action.
         assert!(report.rollback_entries_written >= report.clusters_formed);
