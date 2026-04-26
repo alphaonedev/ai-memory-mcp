@@ -616,3 +616,47 @@ mod tests {
         assert_eq!(Format::from_str("unknown"), None);
     }
 }
+
+#[test]
+fn mine_handles_empty_namespace() {
+    // Empty namespace string should still parse and convert to memory.
+    let conv = Conversation {
+        id: "test-empty-ns".to_string(),
+        title: Some("Empty Namespace Test".to_string()),
+        messages: vec![Message {
+            role: "user".to_string(),
+            content: "Test message with substantial content for conversion".to_string(),
+            timestamp: None,
+        }],
+        created_at: None,
+    };
+    let mem = conversation_to_memory(&conv, Format::Claude);
+    assert!(mem.is_some());
+    let m = mem.unwrap();
+    assert_eq!(m.source_format, "mine-claude");
+}
+
+#[test]
+fn mine_skips_archived_memories() {
+    // A conversation with no messages returns None (archived state).
+    let conv = Conversation {
+        id: "empty".to_string(),
+        title: Some("Should Skip".to_string()),
+        messages: vec![], // Empty — treated as archived
+        created_at: None,
+    };
+    assert!(conversation_to_memory(&conv, Format::Claude).is_none());
+}
+
+#[test]
+fn mine_with_zero_limit_returns_empty() {
+    // When mining with zero messages, conversation_to_memory returns None.
+    let conv = Conversation {
+        id: "zero-limit".to_string(),
+        title: None,
+        messages: vec![], // No messages
+        created_at: None,
+    };
+    let mem = conversation_to_memory(&conv, Format::ChatGpt);
+    assert!(mem.is_none());
+}
