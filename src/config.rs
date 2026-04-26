@@ -976,7 +976,7 @@ mod tests {
     fn effective_scoring_on_empty_config() {
         let cfg = AppConfig::default();
         let s = cfg.effective_scoring();
-        assert_eq!(s.half_life_days_short, 7.0);
+        assert!((s.half_life_days_short - 7.0).abs() < f64::EPSILON);
         assert!(!s.legacy_scoring);
     }
 
