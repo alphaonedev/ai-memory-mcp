@@ -7777,8 +7777,7 @@ fn test_cli_sync_dry_run_writes_nothing() {
         assert_eq!(
             titles,
             vec![expected_title.to_string()],
-            "dry-run must not write; {:?}",
-            db_path
+            "dry-run must not write; {db_path:?}"
         );
     }
 
