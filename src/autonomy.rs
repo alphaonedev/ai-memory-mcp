@@ -1146,11 +1146,15 @@ mod tests {
 
     #[test]
     fn priority_feedback_adjusts_memory() {
-        // Verify priority feedback changes memory priority based on access
+        // Verify priority feedback changes memory priority based on access.
+        // Policy at apply_priority_feedback: access_count >= 10 AND
+        // last_accessed_at within 7d → +1. Set both signals for the bump
+        // path, plus an explicit recent-access timestamp.
         let (_tmp, conn) = setup_conn();
         let mut mem = sample_mem("id", "ns", "Title", "content", Tier::Mid);
         mem.priority = 5;
         mem.access_count = 100;
+        mem.last_accessed_at = Some(chrono::Utc::now().to_rfc3339());
         db::insert(&conn, &mem).unwrap();
 
         let entry = apply_priority_feedback(&conn, &mem, false)
