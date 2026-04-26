@@ -3627,7 +3627,7 @@ mod tests {
         String::from_utf8(buf.lock().unwrap().clone()).unwrap_or_default()
     }
 
-    fn make_tools_call(tool: &str, args: Value) -> RpcRequest {
+    fn make_tools_call(tool: &str, args: &Value) -> RpcRequest {
         RpcRequest {
             jsonrpc: "2.0".into(),
             id: Some(json!(1)),
@@ -3646,7 +3646,7 @@ mod tests {
         let tier_config = FeatureTier::Keyword.config();
         let resolved_ttl = crate::config::ResolvedTtl::default();
         let resolved_scoring = crate::config::ResolvedScoring::default();
-        let req = make_tools_call("memory_list", json!({"limit": 1}));
+        let req = make_tools_call("memory_list", &json!({"limit": 1}));
 
         let captured = run_with_capture(|| {
             let resp = handle_request(
@@ -3696,7 +3696,7 @@ mod tests {
         let resolved_scoring = crate::config::ResolvedScoring::default();
         // memory_get with a missing/invalid id is a deterministic Err
         // path: validate_id rejects empty strings.
-        let req = make_tools_call("memory_get", json!({"id": ""}));
+        let req = make_tools_call("memory_get", &json!({"id": ""}));
 
         let captured = run_with_capture(|| {
             let resp = handle_request(
