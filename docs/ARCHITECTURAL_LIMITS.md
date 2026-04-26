@@ -152,6 +152,45 @@ a correctness issue, but a storage-footprint surprise.
 `db::checkpoint` on a 10-minute cadence, staggered from GC to avoid
 lock bursts. Shutdown still runs a final checkpoint.
 
+### 13. KG link invalidation is eventually consistent across peers — **Documented in v0.6.3**
+
+`memory_kg_invalidate` updates `valid_until` on the local SQLite copy
+without quorum-broadcasting the change. Peers learn about the
+invalidation asynchronously through the sync-daemon's pull cycle
+(default 2-second interval).
+
+Temporal anchoring makes this benign in steady state: a link's
+`valid_until` is timestamped, so a peer that learns of the
+invalidation 5 seconds late still records the same `valid_until =
+T_inv` and queries pinned to `valid_at < T_inv` correctly return the
+link as valid. But applications that require strongly-consistent
+invalidation (e.g. invalidate then immediately re-query the graph
+from a different peer) must wait at least `--interval` seconds, or
+read from the writing peer.
+
+Full design rationale + recovery procedures: see
+[`ADR-0003`](ADR-0003-kg-invalidation-eventual-consistency.md).
+
+### 14. KG schema v15 is backward-incompatible across the federation — **Documented in v0.6.3**
+
+The temporal-validity columns added to `memory_links` in v0.6.3
+(schema migration v15) are NOT wire-compatible with v0.6.2 peers.
+A v14-schema peer that receives a v15 push fails the INSERT (unknown
+columns) and the row is rejected.
+
+Operators upgrading a federation mesh from v0.6.2 to v0.6.3 must:
+
+1. Drain writes for the upgrade window
+2. Bring all peers down (do NOT do a rolling upgrade)
+3. Replace the binary on every peer
+4. Bring all peers up — migration runs on first open
+5. Verify schema_version 15 on every peer before resuming writes
+
+See [`MIGRATION-v0.6.2-to-v0.6.3.md`](MIGRATION-v0.6.2-to-v0.6.3.md)
+for the full procedure and
+[`ADR-0002`](ADR-0002-kg-schema-v15-backward-incompat.md) for the
+design rationale.
+
 ## Use-case guidance
 
 | Deployment | Backend | Notes |

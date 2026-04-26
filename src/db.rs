@@ -2003,10 +2003,35 @@ pub fn check_duplicate(
         if bytes.is_empty() {
             continue;
         }
+        // Skip blobs whose length is not a multiple of 4 (corrupted /
+        // truncated embedding column). chunks_exact silently drops a
+        // trailing partial chunk; we explicitly bail on the row so a
+        // bad blob doesn't compute against a shorter candidate vector
+        // (which would produce a wrong cosine score).
+        if !bytes.len().is_multiple_of(4) {
+            tracing::warn!(
+                memory_id = %id,
+                blob_len = bytes.len(),
+                "skipping duplicate-check candidate with malformed embedding length"
+            );
+            continue;
+        }
         let candidate: Vec<f32> = bytes
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
+        // Vectors of mismatched dimension would compute against a
+        // truncated query (Embedder::cosine_similarity zips). Skip
+        // rather than report a misleading similarity score.
+        if candidate.len() != query_embedding.len() {
+            tracing::warn!(
+                memory_id = %id,
+                expected = query_embedding.len(),
+                got = candidate.len(),
+                "skipping duplicate-check candidate with dimension mismatch"
+            );
+            continue;
+        }
         let similarity =
             crate::embeddings::Embedder::cosine_similarity(query_embedding, &candidate);
         scanned += 1;
@@ -5146,6 +5171,53 @@ mod tests {
         let r = check_duplicate(&conn, &q, None, 0.85).unwrap();
         assert_eq!(r.candidates_scanned, 1);
         assert_eq!(r.nearest.expect("embedded match").id, id_embedded);
+    }
+
+    #[test]
+    fn check_duplicate_skips_blob_with_non_multiple_of_4_length() {
+        // Regression: pre-fix, an embedding blob whose length was not
+        // a multiple of 4 would silently drop a trailing partial chunk
+        // via chunks_exact and compute cosine against a shorter
+        // candidate vector — producing a misleading score. The bounds
+        // check now skips the row entirely.
+        let conn = test_db();
+        let mem = make_memory("malformed-blob", "ns", Tier::Long, 5);
+        let id = insert(&conn, &mem).unwrap();
+        // Write a 7-byte blob (1 short of 8 = 2 f32s) directly to
+        // sqlite, bypassing set_embedding which only takes &[f32].
+        conn.execute(
+            "UPDATE memories SET embedding = ?1 WHERE id = ?2",
+            params![&[0u8; 7][..], &id],
+        )
+        .unwrap();
+
+        let q = vec![1.0_f32, 0.0];
+        let r = check_duplicate(&conn, &q, None, 0.85).unwrap();
+        assert_eq!(
+            r.candidates_scanned, 0,
+            "malformed blob must be skipped, not silently truncated"
+        );
+        assert!(r.nearest.is_none());
+    }
+
+    #[test]
+    fn check_duplicate_skips_blob_with_dimension_mismatch() {
+        // Regression: a blob with a valid length (multiple of 4) but
+        // wrong dimension vs the query embedding must NOT be scored;
+        // cosine_similarity zips and would silently truncate to the
+        // shorter input, producing a wrong similarity.
+        let conn = test_db();
+        // Insert a memory with a 3-dim embedding via the normal path.
+        let _id = insert_with_embedding(&conn, "different-dim", "ns", &[1.0, 0.0, 0.0]);
+
+        // Query with a 4-dim embedding — different from the candidate.
+        let q = vec![1.0_f32, 0.0, 0.0, 0.0];
+        let r = check_duplicate(&conn, &q, None, 0.85).unwrap();
+        assert_eq!(
+            r.candidates_scanned, 0,
+            "dimension-mismatched candidate must be skipped"
+        );
+        assert!(r.nearest.is_none());
     }
 
     #[test]

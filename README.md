@@ -6,11 +6,12 @@
 <p align="center"><em>universal AI memory</em></p>
 
 [![CI](https://github.com/alphaonedev/ai-memory-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/alphaonedev/ai-memory-mcp/actions/workflows/ci.yml)
-[![Rust](https://img.shields.io/badge/rust-1.87%2B-orange?logo=rust)](https://www.rust-lang.org/)
+[![Bench](https://github.com/alphaonedev/ai-memory-mcp/actions/workflows/bench.yml/badge.svg)](https://github.com/alphaonedev/ai-memory-mcp/actions/workflows/bench.yml)
+[![Rust](https://img.shields.io/badge/rust-1.88%2B-orange?logo=rust)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![SQLite](https://img.shields.io/badge/sqlite-FTS5-003B57?logo=sqlite)](https://www.sqlite.org/)
-[![Tests](https://img.shields.io/badge/tests-191_(140_unit_+_51_integration)-brightgreen)]()
-[![MCP](https://img.shields.io/badge/MCP-26_tools-blueviolet)]()
+[![Tests](https://img.shields.io/badge/tests-602_(372_unit_+_159_integration_+_71_other)-brightgreen)]()
+[![MCP](https://img.shields.io/badge/MCP-43_tools-blueviolet)]()
 [![Crates.io Version](https://img.shields.io/crates/v/ai-memory)]()
 
 **ai-memory is a persistent memory system for AI assistants.** It works with **any AI that supports MCP** -- Claude, ChatGPT, Grok, Llama, and more. It stores what your AI learns in a local SQLite database, ranks memories by relevance when recalling, and auto-promotes important knowledge to permanent storage. Install it once, and every AI assistant you use remembers your architecture, your preferences, your corrections -- forever.
@@ -558,6 +559,33 @@ Evaluated on the [ICLR 2025 LongMemEval-S](benchmarks/longmemeval/) dataset (500
 | **keyword** | 97.0% | 232 q/s | None |
 | **semantic** | 97.4% | 45 q/s | Embedding model (~100MB) |
 | **smart** | 97.8% | 12 q/s | Ollama + Gemma 4 E2B |
+
+### Performance Budgets (v0.6.3)
+
+Every release ships with **published p95/p99 budgets** for hot-path
+operations and a CI gate that fails any PR whose measured p95 exceeds
+the budget by more than 10 %. Targets are calibrated for M4 reference
+hardware; full table and methodology in
+[`PERFORMANCE.md`](PERFORMANCE.md).
+
+| Operation | Target p95 | Target p99 |
+|---|---|---|
+| `memory_session_start` (Claude Code hook) | < 100 ms | < 200 ms |
+| `memory_store` (no embedding) | < 20 ms | < 50 ms |
+| `memory_search` (FTS5) | < 100 ms | < 250 ms |
+| `memory_recall` (hot, depth=1) | < 50 ms | < 150 ms |
+| `memory_kg_query` (depth ≤ 3) | < 100 ms | < 250 ms |
+| `memory_kg_query` (depth ≤ 5) | < 250 ms | < 500 ms |
+| `memory_kg_timeline` | < 100 ms | < 250 ms |
+
+Run the same workload locally:
+
+```sh
+ai-memory bench                      # human-readable table
+ai-memory bench --json               # machine-parseable
+```
+
+p99 targets are informational until the v0.6.3 soak window closes.
 
 ---
 

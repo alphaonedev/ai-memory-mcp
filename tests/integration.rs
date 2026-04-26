@@ -7676,6 +7676,74 @@ fn test_hier_recall_touches_only_ancestor_matches() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn test_cli_bench_emits_json_with_seven_results_and_passes_budget() {
+    // End-to-end CLI integration test for the `ai-memory bench`
+    // subcommand (Pillar 3 / Stream E). Verifies that:
+    //   1. The binary exits 0 (no operation exceeded its p95 budget).
+    //   2. --json output is parseable and well-shaped.
+    //   3. All 7 hot-path operations are reported.
+    //   4. Each result carries the fields documented in PERFORMANCE.md.
+    //
+    // The bench subcommand seeds a disposable :memory: SQLite DB
+    // internally, so no fixture is required. Iterations are kept tiny
+    // to keep CI time bounded — the fact that the budgets are met
+    // even at 5 iterations is itself a smoke test of the budget math.
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    let out = cmd(bin)
+        .args(["bench", "--json", "--iterations", "5", "--warmup", "0"])
+        .output()
+        .expect("failed to spawn ai-memory bench");
+
+    assert!(
+        out.status.success(),
+        "bench exited non-zero (a budget regression?): stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stdout = String::from_utf8(out.stdout).expect("bench --json must emit UTF-8");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("bench --json must be valid JSON");
+
+    // Envelope shape.
+    assert_eq!(parsed["iterations"], serde_json::json!(5));
+    assert_eq!(parsed["warmup"], serde_json::json!(0));
+    let results = parsed["results"]
+        .as_array()
+        .expect("results must be a JSON array");
+    assert_eq!(
+        results.len(),
+        7,
+        "bench should report exactly 7 operations on release/v0.6.3, got {}",
+        results.len()
+    );
+
+    // Per-result fields. Every operation must report the documented
+    // schema so dashboards / CI parsers don't break silently.
+    for r in results {
+        for field in [
+            "operation",
+            "label",
+            "measured_p50_ms",
+            "measured_p95_ms",
+            "measured_p99_ms",
+            "target_p95_ms",
+            "samples",
+            "status",
+        ] {
+            assert!(
+                r.get(field).is_some(),
+                "bench result missing field {field}: {r:?}"
+            );
+        }
+        let status = r["status"].as_str().expect("status must be a string");
+        assert!(
+            status == "pass" || status == "fail",
+            "unexpected status value {status:?}"
+        );
+    }
+}
+
+#[test]
 fn test_cli_sync_dry_run_writes_nothing() {
     // v0.6.0 GA Phase 3 foundation: --dry-run must classify new/update/noop
     // and NOT mutate either side of the sync. Uses today's timestamp-aware
@@ -7840,9 +7908,12 @@ fn test_sync_daemon_mesh_propagates_memory_between_peers() {
     let db_a = dir.join(format!("ai-memory-mesh-a-{}.db", uuid::Uuid::new_v4()));
     let db_b = dir.join(format!("ai-memory-mesh-b-{}.db", uuid::Uuid::new_v4()));
 
-    // 1. Serve B.
+    // 1. Serve B. Wrap in a ChildGuard so an assert panic anywhere
+    // below still kills the spawned daemon and unlinks db_a/db_b
+    // during unwind. Bare `Child` would orphan the server to PID 1
+    // (the same failure mode #401 fixed in the mTLS test).
     let port_b = free_port();
-    let mut serve_b = cmd(bin)
+    let serve_b_child = cmd(bin)
         .args([
             "--db",
             db_b.to_str().unwrap(),
@@ -7854,6 +7925,7 @@ fn test_sync_daemon_mesh_propagates_memory_between_peers() {
         .stderr(std::process::Stdio::null())
         .spawn()
         .unwrap();
+    let _serve_b = ChildGuard::new(serve_b_child).with_cleanup([db_a.clone(), db_b.clone()]);
     assert!(
         wait_for_health(port_b),
         "serve B health probe never returned 200"
@@ -7893,7 +7965,9 @@ fn test_sync_daemon_mesh_propagates_memory_between_peers() {
     );
 
     // 3. Start the sync-daemon — tight 1-second cycle, 30-second cap.
-    let mut daemon = cmd(bin)
+    // Same ChildGuard pattern: an unwrap on the cmd output below could
+    // panic, and we don't want a leaked sync-daemon if it does.
+    let daemon_child = cmd(bin)
         .args([
             "--db",
             db_a.to_str().unwrap(),
@@ -7909,6 +7983,7 @@ fn test_sync_daemon_mesh_propagates_memory_between_peers() {
         .stderr(std::process::Stdio::null())
         .spawn()
         .unwrap();
+    let _daemon = ChildGuard::new(daemon_child);
 
     // 4. Poll db_A via CLI until the memory appears (or timeout).
     let mut found = false;
@@ -7936,19 +8011,14 @@ fn test_sync_daemon_mesh_propagates_memory_between_peers() {
         }
     }
 
-    // Teardown daemons.
-    let _ = daemon.kill();
-    let _ = daemon.wait();
-    let _ = serve_b.kill();
-    let _ = serve_b.wait();
+    // _serve_b and _daemon drop at end of scope: kill + reap + unlink
+    // temp DBs. No manual teardown needed.
 
     assert!(
         found,
         "sync-daemon failed to mesh memory from peer B → peer A within 15s"
     );
-
-    let _ = std::fs::remove_file(&db_a);
-    let _ = std::fs::remove_file(&db_b);
+    // Temp DBs are unlinked by the ChildGuard's cleanup_paths.
 }
 
 // ---------------------------------------------------------------------------
