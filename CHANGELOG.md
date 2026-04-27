@@ -5,7 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — v0.6.3 (Patch 4)
+## [v0.6.3] — 2026-04-27 — STRUCTURED MEMORY + PERFORMANCE
+
+The grand-slam release. Hierarchical namespace taxonomy + temporal-validity
+knowledge graph + entity registry + duplicate detection + bench tool with
+public p95 budgets — six streams (A through F) shipped together. Plus
+post-rc1 capabilities schema v2 (additive `schema_version="2"` + 5 new
+top-level blocks for hooks/permissions/compaction/approval/transcripts
+introspection) and a CI coverage gate locking in 93.05% baseline.
+
+**Validation evidence:**
+
+- 1 600 lib tests pass; line coverage **93.08%** (gate floor 92%)
+- Ship-gate campaign run #25007261531 — 4 phases green in 14m wall
+  (Phase 1 functional · Phase 2 multi-agent W=2/N=3 · Phase 3 v0.6.2→v0.6.3
+  migration · Phase 4 chaos 50 cycles kill_primary_mid_write)
+- A2A-gate campaign run #25007946890 — 48 scenarios green in 28m wall
+  (35 v0.6.0 baseline + 4 auto-append + 9 new for v0.6.3:
+  capabilities_v2_schema, taxonomy_walk, kg_query_temporal, kg_timeline,
+  entity_aliases, check_duplicate, lifecycle_end_to_end, sqlcipher_at_rest,
+  autonomous_tier_suite). Cell: ironclaw-mtls.
+
+Live evidence:
+<https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/>
 
 ### Added
 
