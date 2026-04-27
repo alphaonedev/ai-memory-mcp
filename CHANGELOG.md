@@ -5,6 +5,53 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.6.5] — 2026-04-27 — Distribution-channel hardening (3-bug patch)
+
+Patch release that closes three real distribution defects discovered
+by the post-v0.6.4 audit. **No source-code feature changes** — same
+ai-memory binary as v0.6.3 modulo the version stamp. Operators on
+v0.6.4 should upgrade if they use Docker or installed via crates.io;
+Homebrew / Ubuntu PPA / Fedora COPR users at v0.6.4 are unaffected.
+
+### Fixed
+
+- **Docker GHCR — broken at runtime in v0.6.4.** The build stage used
+  `rust:1.94-slim` which now resolves to a trixie-based image
+  (glibc 2.41) while the runtime stage uses `debian:bookworm-slim`
+  (glibc 2.36). `docker run ghcr.io/alphaonedev/ai-memory:0.6.4`
+  failed at startup with `GLIBC_2.39 not found`. **Fix:** pin build
+  stage to `rust:1.94-slim-bookworm`.
+
+- **crates.io — silently absent in v0.6.3 + v0.6.4.** Both publishes
+  failed with HTTP 503 from crates.io's WAF (the 22.1 MiB compressed
+  package exceeded the 10 MiB upload limit) but the CI workflow's
+  `cargo publish || echo "warning"` masking pattern reported `success`.
+  `audits/` directory alone was 140 MiB unpacked. **Fix:**
+  `package.include` in `Cargo.toml` restricts the published crate to
+  `src/`, `benches/`, `examples/`, `migrations/`, `Cargo.{toml,lock}`,
+  `README.md`, `LICENSE`, `CHANGELOG.md`, `PERFORMANCE.md`, and
+  `build.rs` — package now 558 KiB compressed (73 files), well under
+  the limit.
+
+- **CI silent-failure on crates.io publish.** Replaced
+  `cargo publish || echo "warning"` with proper retry-with-backoff
+  (3 attempts, 30s sleep). Genuine "version already exists" detected
+  explicitly via stderr grep so re-runs of the same tag are
+  idempotent; everything else (5xx, network errors, oversized package)
+  fails the job loudly. Class of bug: **silent CI failures masking
+  real distribution defects** is the kind of issue that prompted the
+  v0.6.5 patch in the first place.
+
+### Added
+
+- **`dockerfile-validate` CI job** runs on every push and PR. Builds
+  the Dockerfile via `docker build` and smoke-tests with
+  `docker run --rm ai-memory:ci-validate --version` + `--help`. Does
+  NOT push to GHCR (the existing `docker` job handles tag pushes).
+  Catches the Dockerfile-drift class of bugs (new `include_str!` for
+  missing dir, missing system dep, glibc mismatch, etc.) at PR time,
+  not at release time. **This job caught the v0.6.4 glibc bug above.**
+
 ## [v0.6.4] — 2026-04-27 — Docker-only patch on top of v0.6.3
 
 Single-fix patch release. v0.6.3 published successfully to crates.io,
