@@ -442,3 +442,54 @@ jobs:
       - name: Upload to COPR
         run: |
           copr-cli build alpha-one-ai/ai-memory ~/rpmbuild/SRPMS/ai-memory-*.src.rpm
+
+  coverage:
+    name: Code Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy, llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+
+      # v0.6.3 W12-CI-fix: switched from cargo-tarpaulin to cargo-llvm-cov.
+      # tarpaulin 0.32.x trips a `pulp` 0.22.2 const-eval panic
+      # (`CheckSameSize::<i8, u16>::VALID`) under its source-based
+      # instrumentation. llvm-cov uses LLVM-native source-based instrumentation
+      # which doesn't hit the bug, and matches the canonical local measurement
+      # command the coverage campaign used (93.05% headline number).
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Generate coverage report
+        env:
+          AI_MEMORY_NO_CONFIG: "1"
+        run: |
+          cargo llvm-cov --features sal --no-fail-fast --html --output-dir coverage -- --test-threads=2
+          # `cargo llvm-cov report` reads the saved profile data and does
+          # not accept `--features` (would error: "invalid option
+          # '--features' for subcommand 'report'"). The earlier pipe-to-
+          # `tee` form masked that failure since `tee` always exits 0.
+          cargo llvm-cov report --summary-only | tee coverage/summary.txt
+
+      # v0.6.3 coverage gate — fail-under 92% lines.
+      # Locks in the v0.6.3 baseline of 93.05% with a 1% absorb buffer so
+      # routine churn doesn't trip the gate but a regression of >1% does.
+      # Per-module floors for hot modules (handlers, db, federation, mcp,
+      # governance) are tracked in the v0.7 assertion table; this is the
+      # total-line floor.
+      - name: Enforce coverage floor (≥92% lines)
+        env:
+          AI_MEMORY_NO_CONFIG: "1"
+        run: |
+          cargo llvm-cov report --fail-under-lines 92
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v5
+        with:
+          name: coverage-report
+          path: coverage/

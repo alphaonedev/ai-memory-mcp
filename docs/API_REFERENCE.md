@@ -324,6 +324,183 @@ Relations: `related_to`, `supersedes`, `contradicts`, `derived_from`.
 
 Returns inbound + outbound links for a memory.
 
+## Knowledge Graph + taxonomy (v0.6.3)
+
+These endpoints operate on the temporal-validity knowledge graph
+(`memory_links` with `valid_from` / `valid_until` / `observed_by`
+columns added in schema v15) and the namespace taxonomy. See
+`docs/MIGRATION-v0.6.2-to-v0.6.3.md` for the schema changes and
+`docs/USER_GUIDE.md` for the matching MCP tools.
+
+### `GET /api/v1/taxonomy`
+
+Walk live (non-expired) memories grouped by namespace into a
+hierarchical tree.
+
+Query params: `prefix` (optional, restricts walk), `depth` (1-10, default 5),
+`limit` (1-10000, default 1000).
+
+```json
+{
+  "tree": [
+    { "namespace": "alphaone", "count": 0, "subtree_count": 47, "children": [...] }
+  ],
+  "total_count": 47,
+  "truncated": false
+}
+```
+
+### `POST /api/v1/check_duplicate`
+
+Embedding cosine-similarity duplicate detection.
+
+```json
+{
+  "title": "Project uses PostgreSQL 15",
+  "content": "The main database is PostgreSQL 15 with pgvector for embeddings.",
+  "namespace": "my-app",
+  "threshold": 0.85
+}
+```
+
+Response:
+
+```json
+{
+  "is_duplicate": true,
+  "threshold": 0.85,
+  "nearest": { "id": "...", "title": "...", "namespace": "...", "similarity": 0.92 },
+  "suggested_merge": "...",
+  "candidates_scanned": 412
+}
+```
+
+`threshold` is clamped to a 0.5 floor. Requires the `semantic` feature
+tier or higher. Returns `409` (Conflict) only on internal embedding
+errors; threshold mismatches return `200` with `is_duplicate: false`.
+
+### `POST /api/v1/entities`
+
+Register an entity-as-typed-memory. Idempotent on
+`(canonical_name, namespace)`.
+
+```json
+{
+  "canonical_name": "PostgreSQL",
+  "namespace": "my-app",
+  "aliases": ["pg", "postgres"],
+  "metadata": {}
+}
+```
+
+Response: `{"entity_id":"ent-...","canonical_name":"PostgreSQL","namespace":"my-app","aliases":["pg","postgres","PostgreSQL"],"created":true}`.
+
+Returns `409` if a non-entity memory with the same
+`(title, namespace)` exists.
+
+### `GET /api/v1/entities/by_alias`
+
+Resolve an alias to its canonical entity.
+
+Query params: `alias` (required), `namespace` (optional; without it,
+picks the most-recently-created match across namespaces).
+
+```json
+{
+  "found": true,
+  "entity_id": "ent-...",
+  "canonical_name": "PostgreSQL",
+  "namespace": "my-app",
+  "aliases": ["pg", "postgres", "PostgreSQL"]
+}
+```
+
+`found: false` (and null fields) when the alias resolves to nothing.
+
+### `GET /api/v1/kg/timeline`
+
+Ordered timeline of links anchored at a source. Skips links with NULL
+`valid_from`.
+
+Query params: `source_id` (required), `since` / `until` (RFC 3339,
+optional), `limit` (1-1000, default 200).
+
+```json
+{
+  "source_id": "...",
+  "events": [
+    { "target_id": "...", "relation": "depends_on", "valid_from": "...", "valid_until": null, "observed_by": "..." }
+  ],
+  "count": 1
+}
+```
+
+### `POST /api/v1/kg/invalidate`
+
+Mark a link superseded by setting `valid_until`. **Does NOT delete**
+the link — historical queries pinned to `valid_at < now` still see
+it. Idempotent.
+
+```json
+{
+  "source_id": "...",
+  "target_id": "...",
+  "relation": "depends_on",
+  "valid_until": "2026-04-26T03:00:00Z"
+}
+```
+
+Response: `{"found":true,"valid_until":"...","previous_valid_until":null}`.
+
+> **Federation:** invalidations apply locally and propagate
+> asynchronously via the sync-daemon — they are NOT quorum-broadcast.
+
+### `POST /api/v1/kg/query`
+
+Recursive-CTE traversal of the temporal knowledge graph rooted at a
+source memory.
+
+```json
+{
+  "source_id": "...",
+  "max_depth": 3,
+  "valid_at": "2026-04-26T00:00:00Z",
+  "allowed_agents": ["ai:claude-code@host:pid-12345"],
+  "limit": 200
+}
+```
+
+Constraints: `max_depth` clamped to 1..=5 (depth 0 errors,
+depth > 5 errors). `allowed_agents: []` (empty array) returns zero
+rows; omit the field to skip the agent filter entirely.
+
+Response:
+
+```json
+{
+  "source_id": "...",
+  "max_depth": 3,
+  "memories": [
+    {
+      "target_id": "...",
+      "title": "...",
+      "target_namespace": "my-app",
+      "relation": "depends_on",
+      "valid_from": "...",
+      "valid_until": null,
+      "observed_by": "...",
+      "depth": 1,
+      "path": "src->tgt"
+    }
+  ],
+  "paths": ["src->tgt->..."],
+  "count": 1
+}
+```
+
+Ordering: `depth ASC, COALESCE(valid_from, link_created_at) ASC,
+link_created_at ASC`.
+
 ## Namespaces
 
 ### `GET /api/v1/namespaces`
