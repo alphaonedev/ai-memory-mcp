@@ -148,10 +148,35 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Publish to crates.io
+      - name: Publish to crates.io (with retry)
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish --allow-dirty || echo "::warning::crates.io publish skipped (version may already exist)"
+        # v0.6.5 — replace silent-failure `|| echo "warning"` with proper retry.
+        # crates.io's Fastly cache returns 503 + sigsci WAF rejection under
+        # transient load (v0.6.3 + v0.6.4 both hit this — silently). The
+        # `version may already exist` swallow is detected explicitly so a
+        # genuine "already published" doesn't fail the job, but everything
+        # else (5xx, network errors, oversized package) fails loudly.
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if output=$(cargo publish --allow-dirty 2>&1); then
+              echo "::notice::crates.io publish succeeded on attempt $attempt"
+              echo "$output" | tail -10
+              exit 0
+            fi
+            echo "$output" | tail -20
+            if echo "$output" | grep -q "already exists\|crate version .* is already uploaded"; then
+              echo "::notice::crates.io: version already published (idempotent no-op)"
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              echo "::warning::crates.io publish failed on attempt $attempt — retrying after 30s"
+              sleep 30
+            fi
+          done
+          echo "::error::crates.io publish failed on all 3 attempts"
+          exit 1
 
   homebrew:
     name: Update Homebrew formula
