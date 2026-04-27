@@ -5,77 +5,6 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [v0.6.5] — 2026-04-27 — Distribution-channel hardening (3-bug patch)
-
-Patch release that closes three real distribution defects discovered
-by the post-v0.6.4 audit. **No source-code feature changes** — same
-ai-memory binary as v0.6.3 modulo the version stamp. Operators on
-v0.6.4 should upgrade if they use Docker or installed via crates.io;
-Homebrew / Ubuntu PPA / Fedora COPR users at v0.6.4 are unaffected.
-
-### Fixed
-
-- **Docker GHCR — broken at runtime in v0.6.4.** The build stage used
-  `rust:1.94-slim` which now resolves to a trixie-based image
-  (glibc 2.41) while the runtime stage uses `debian:bookworm-slim`
-  (glibc 2.36). `docker run ghcr.io/alphaonedev/ai-memory:0.6.4`
-  failed at startup with `GLIBC_2.39 not found`. **Fix:** pin build
-  stage to `rust:1.94-slim-bookworm`.
-
-- **crates.io — silently absent in v0.6.3 + v0.6.4.** Both publishes
-  failed with HTTP 503 from crates.io's WAF (the 22.1 MiB compressed
-  package exceeded the 10 MiB upload limit) but the CI workflow's
-  `cargo publish || echo "warning"` masking pattern reported `success`.
-  `audits/` directory alone was 140 MiB unpacked. **Fix:**
-  `package.include` in `Cargo.toml` restricts the published crate to
-  `src/`, `benches/`, `examples/`, `migrations/`, `Cargo.{toml,lock}`,
-  `README.md`, `LICENSE`, `CHANGELOG.md`, `PERFORMANCE.md`, and
-  `build.rs` — package now 558 KiB compressed (73 files), well under
-  the limit.
-
-- **CI silent-failure on crates.io publish.** Replaced
-  `cargo publish || echo "warning"` with proper retry-with-backoff
-  (3 attempts, 30s sleep). Genuine "version already exists" detected
-  explicitly via stderr grep so re-runs of the same tag are
-  idempotent; everything else (5xx, network errors, oversized package)
-  fails the job loudly. Class of bug: **silent CI failures masking
-  real distribution defects** is the kind of issue that prompted the
-  v0.6.5 patch in the first place.
-
-### Added
-
-- **`dockerfile-validate` CI job** runs on every push and PR. Builds
-  the Dockerfile via `docker build` and smoke-tests with
-  `docker run --rm ai-memory:ci-validate --version` + `--help`. Does
-  NOT push to GHCR (the existing `docker` job handles tag pushes).
-  Catches the Dockerfile-drift class of bugs (new `include_str!` for
-  missing dir, missing system dep, glibc mismatch, etc.) at PR time,
-  not at release time. **This job caught the v0.6.4 glibc bug above.**
-
-## [v0.6.4] — 2026-04-27 — Docker-only patch on top of v0.6.3
-
-Single-fix patch release. v0.6.3 published successfully to crates.io,
-Homebrew, Ubuntu PPA, and Fedora COPR; the Docker GHCR build failed
-at compile time because the `Dockerfile` build context did not include
-the `migrations/` directory. v0.6.3 introduced new `include_str!`
-references to `migrations/sqlite/0010_v063_hierarchy_kg.sql` (Streams
-A-C schema v15) — the gap was pre-existing in the Dockerfile but
-v0.6.2 did not surface it (no new migrations).
-
-### Fixed
-
-- **Dockerfile** — added `COPY migrations/ migrations/` to the build
-  stage so cargo build can resolve the v0.6.3 schema migration file
-  references at compile time. Restores Docker GHCR publishing.
-
-### Carries forward from v0.6.3
-
-All v0.6.3 features + validation evidence carry forward unchanged.
-See `[v0.6.3]` section below for the full grand-slam feature set,
-1 600 unit tests at 93.08% line coverage, ship-gate 4-phase pass,
-a2a-gate 48-scenario pass, and live test-hub evidence at
-<https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/>.
-
 ## [v0.6.3] — 2026-04-27 — STRUCTURED MEMORY + PERFORMANCE
 
 The grand-slam release. Hierarchical namespace taxonomy + temporal-validity
@@ -99,6 +28,36 @@ introspection) and a CI coverage gate locking in 93.05% baseline.
 
 Live evidence:
 <https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/>
+
+### Distribution-channel hardening (folded into v0.6.3 final cut)
+
+- **Dockerfile — `COPY migrations/`** added so cargo build can resolve
+  the new Stream A-C `include_str!` references at compile time. Without
+  it, the Docker build failed before publish.
+- **Dockerfile — pin build stage to `rust:1.94-slim-bookworm`** so the
+  produced binary's glibc matches the runtime stage
+  (`debian:bookworm-slim`, glibc 2.36). Without the explicit bookworm
+  pin, `rust:1.94-slim` resolves to a trixie-based image (glibc 2.41)
+  and the binary fails at startup with `version GLIBC_2.39 not found`.
+- **`Cargo.toml` `package.include`** restricts the published crate to
+  source-only (src, benches, examples, migrations, build.rs,
+  Cargo.{toml,lock}, README.md, LICENSE, CHANGELOG.md, PERFORMANCE.md).
+  Without it, the crate weighs 22 MiB compressed (140 MiB unpacked,
+  thanks to `audits/`) — over crates.io's 10 MiB upload limit; uploads
+  hit HTTP 503 from the Fastly WAF. Trimmed crate is 558 KiB compressed
+  (73 files), well under the limit.
+- **CI silent-failure on `cargo publish`** — replaced
+  `cargo publish || echo "warning"` with proper retry-with-backoff
+  (3 attempts × 30s sleep). Genuine "version already exists" detected
+  via stderr grep (idempotent re-run); everything else (5xx, network
+  errors, oversized package) fails the job loudly. This is the masking
+  bug that hid the crates.io 503s during initial v0.6.3 publish.
+- **New `dockerfile-validate` CI job** runs on every push + PR. Builds
+  the Docker image (no GHCR push) and smoke-tests with
+  `docker run --rm ai-memory:ci-validate --version` + `--help`. Closes
+  the Dockerfile-drift class of bugs (new `include_str!` for missing
+  dir, missing system dep, glibc mismatch, etc.) at PR time, not at
+  release time.
 
 ### Added
 
