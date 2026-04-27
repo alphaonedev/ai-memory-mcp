@@ -754,6 +754,11 @@ footer.site-foot a { color: var(--text-muted); }
       <a href="integrations.html">Integrations</a>
       <a href="for-everyone.html">For Everyone</a>
       <a href="release-pipeline.html">Release</a>
+      <a href="schema.html">Schema</a>
+      <a href="types.html">Types</a>
+      <a href="validators.html">Validators</a>
+      <a href="governance.html">Governance</a>
+      <a href="tracing.html">Tracing</a>
       <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
     </div>
   </div>
@@ -1839,8 +1844,8 @@ footer.site-foot a { color: var(--text-muted); }
 <section id="atlas">
   <div class="container">
     <span class="eyebrow">Visualization Atlas</span>
-    <h2>Six pages. Every facet, dedicated visualizations.</h2>
-    <p class="lede">This page is the hub. Each companion below dives deep into one slice of the system with its own visualization style. <strong>Pick what your audience needs.</strong></p>
+    <h2>Eleven pages. Every facet, dedicated visualizations.</h2>
+    <p class="lede">This page is the hub. Each companion below dives deep into one slice of the system with its own visualization style. Six audience-facing pages plus five SME-detail deep-dives (schema, types, validators, governance, tracing). <strong>Pick what your audience needs.</strong></p>
 
     <div class="grid-3" style="gap:1rem">
       <a href="whats-new-v063.html" style="text-decoration:none">
@@ -1894,6 +1899,59 @@ footer.site-foot a { color: var(--text-muted); }
           <div class="card-title">Release Pipeline</div>
           <p class="card-body">Tag → 5 platforms → 5 distribution channels → all signed. CI gates. SBOM. Reproducible builds. Procurement-ready operational spec.</p>
           <div style="margin-top:.85rem;font-family:var(--font-mono);font-size:.78rem;color:var(--pillar-3)">release-pipeline.html →</div>
+        </div>
+      </a>
+    </div>
+
+    <div style="margin-top:3rem;padding-top:2rem;border-top:1px solid var(--border)">
+      <span class="eyebrow">SME Deep-Dive Atlas</span>
+      <h2 style="margin-top:.5rem">Five reference pages. Every column, every type, every check.</h2>
+      <p class="lede">When the audience-facing pages are not enough — when an evaluating engineer needs to see every SQL column, every Rust type, every validator, every governance verdict, every log line. These pages are the reference contract for AI clients integrating against ai-memory.</p>
+    </div>
+
+    <div class="grid-3" style="gap:1rem;margin-top:1.5rem">
+      <a href="schema.html" style="text-decoration:none">
+        <div class="card p1" style="height:100%;display:flex;flex-direction:column">
+          <div class="card-eyebrow" style="color:var(--pillar-1)">▸ SQL ATLAS</div>
+          <div class="card-title">Schema</div>
+          <p class="card-body">Every SQLite table column-by-column. 9 tables, 15+ indexes, 6 foreign keys, v15 migration timeline. Postgres mirror via SAL. The persistence contract.</p>
+          <div style="margin-top:.85rem;font-family:var(--font-mono);font-size:.78rem;color:var(--pillar-1)">schema.html →</div>
+        </div>
+      </a>
+
+      <a href="types.html" style="text-decoration:none">
+        <div class="card p2" style="height:100%;display:flex;flex-direction:column">
+          <div class="card-eyebrow" style="color:var(--pillar-2)">▸ RUST TYPE REFERENCE</div>
+          <div class="card-title">Types</div>
+          <p class="card-body">Every public struct and enum from <code>src/models.rs</code>. 5 enums, 22 structs, 5 consts. Field-level types, defaults, serde tags. The wire-format contract.</p>
+          <div style="margin-top:.85rem;font-family:var(--font-mono);font-size:.78rem;color:var(--pillar-2)">types.html →</div>
+        </div>
+      </a>
+
+      <a href="validators.html" style="text-decoration:none">
+        <div class="card p3" style="height:100%;display:flex;flex-direction:column">
+          <div class="card-eyebrow" style="color:var(--pillar-3)">▸ INPUT-CHECK ATLAS</div>
+          <div class="card-title">Validators</div>
+          <p class="card-body">23 validate_* functions, every limit explicit, every closed set enumerated. Defense in depth — same checks on HTTP, MCP, CLI, federation receive.</p>
+          <div style="margin-top:.85rem;font-family:var(--font-mono);font-size:.78rem;color:var(--pillar-3)">validators.html →</div>
+        </div>
+      </a>
+
+      <a href="governance.html" style="text-decoration:none">
+        <div class="card p1" style="height:100%;display:flex;flex-direction:column">
+          <div class="card-eyebrow" style="color:var(--pillar-1)">▸ ALLOW / DENY / PENDING</div>
+          <div class="card-title">Governance</div>
+          <p class="card-body">The decision tree. 4 levels × 3 actions matrix. Three approver flavors (Human, Agent, Consensus). Pending-action lifecycle. Federation propagation.</p>
+          <div style="margin-top:.85rem;font-family:var(--font-mono);font-size:.78rem;color:var(--pillar-1)">governance.html →</div>
+        </div>
+      </a>
+
+      <a href="tracing.html" style="text-decoration:none">
+        <div class="card p2" style="height:100%;display:flex;flex-direction:column">
+          <div class="card-eyebrow" style="color:var(--pillar-2)">▸ OBSERVABILITY ATLAS</div>
+          <div class="card-title">Tracing</div>
+          <p class="card-body">176 log call sites across 11 modules. Setup, level taxonomy, canonical phrases AI clients can grep for. Incident-review recipes.</p>
+          <div style="margin-top:.85rem;font-family:var(--font-mono);font-size:.78rem;color:var(--pillar-2)">tracing.html →</div>
         </div>
       </a>
     </div>
