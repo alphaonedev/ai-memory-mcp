@@ -1,6 +1,6 @@
 [package]
 name = "ai-memory"
-version = "0.6.4"
+version = "0.6.3"
 edition = "2024"
 rust-version = "1.88"
 authors = ["AlphaOne LLC"]
@@ -10,6 +10,25 @@ repository = "https://github.com/alphaonedev/ai-memory-mcp"
 homepage = "https://alphaonedev.github.io/ai-memory-mcp/"
 keywords = ["mcp", "ai", "memory", "sqlite", "llm"]
 categories = ["artificial-intelligence", "command-line-utilities", "database"]
+# v0.6.5 — keep the published crate under crates.io's 10 MiB compressed
+# upload limit. v0.6.3 + v0.6.4 publishes failed silently with HTTP 503
+# from the WAF because the package was 22 MiB compressed (140 MiB
+# unpacked) — `audits/` alone was 140 MiB. We exclude everything that
+# isn't required to compile the crate. include explicitly lists what
+# stays so any new top-level directory must be opted in.
+include = [
+    "src/**/*",
+    "benches/**/*",
+    "examples/**/*",
+    "migrations/**/*",
+    "build.rs",
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "PERFORMANCE.md",
+]
 
 [dependencies]
 anyhow = "1"
