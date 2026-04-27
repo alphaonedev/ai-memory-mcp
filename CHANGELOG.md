@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.6.4] — 2026-04-27 — Docker-only patch on top of v0.6.3
+
+Single-fix patch release. v0.6.3 published successfully to crates.io,
+Homebrew, Ubuntu PPA, and Fedora COPR; the Docker GHCR build failed
+at compile time because the `Dockerfile` build context did not include
+the `migrations/` directory. v0.6.3 introduced new `include_str!`
+references to `migrations/sqlite/0010_v063_hierarchy_kg.sql` (Streams
+A-C schema v15) — the gap was pre-existing in the Dockerfile but
+v0.6.2 did not surface it (no new migrations).
+
+### Fixed
+
+- **Dockerfile** — added `COPY migrations/ migrations/` to the build
+  stage so cargo build can resolve the v0.6.3 schema migration file
+  references at compile time. Restores Docker GHCR publishing.
+
+### Carries forward from v0.6.3
+
+All v0.6.3 features + validation evidence carry forward unchanged.
+See `[v0.6.3]` section below for the full grand-slam feature set,
+1 600 unit tests at 93.08% line coverage, ship-gate 4-phase pass,
+a2a-gate 48-scenario pass, and live test-hub evidence at
+<https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/>.
+
 ## [v0.6.3] — 2026-04-27 — STRUCTURED MEMORY + PERFORMANCE
 
 The grand-slam release. Hierarchical namespace taxonomy + temporal-validity
