@@ -8,9 +8,10 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::models::{
-    AGENTS_NAMESPACE, AgentRegistration, Approval, ApproverType, GovernanceDecision,
-    GovernanceLevel, GovernancePolicy, GovernedAction, Memory, MemoryLink, NamespaceCount,
-    PROMOTION_THRESHOLD, PendingAction, Stats, Tier, TierCount, namespace_ancestors,
+    AGENTS_NAMESPACE, AgentRegistration, Approval, ApproverType, DuplicateCheck, DuplicateMatch,
+    GovernanceDecision, GovernanceLevel, GovernancePolicy, GovernedAction, MAX_NAMESPACE_DEPTH,
+    Memory, MemoryLink, NamespaceCount, PROMOTION_THRESHOLD, PendingAction, Stats, Taxonomy,
+    TaxonomyNode, Tier, TierCount, namespace_ancestors,
 };
 
 /// Computed 4-tuple of visibility prefixes for an agent position (Task 1.5).
@@ -169,7 +170,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
 );
 ";
 
-const CURRENT_SCHEMA_VERSION: i64 = 14;
+const CURRENT_SCHEMA_VERSION: i64 = 16;
 
 pub fn open(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path).context("failed to open database")?;
@@ -220,6 +221,8 @@ fn apply_sqlcipher_key(conn: &Connection) -> Result<()> {
 fn apply_sqlcipher_key(_conn: &Connection) -> Result<()> {
     Ok(())
 }
+
+const MIGRATION_V15_SQLITE: &str = include_str!("../migrations/sqlite/0010_v063_hierarchy_kg.sql");
 
 #[allow(clippy::too_many_lines)]
 fn migrate(conn: &Connection) -> Result<()> {
@@ -509,6 +512,73 @@ fn migrate(conn: &Connection) -> Result<()> {
                 "CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories(created_at)",
                 [],
             )?;
+        }
+
+        if version < 15 {
+            // v0.6.3 Stream B — Temporal-Validity KG schema additions.
+            // Charter §"Critical Schema Reference" (lines 686–723):
+            // four temporal columns on `memory_links`, three temporal
+            // indexes for KG traversal queries, and an `entity_aliases`
+            // side table for the upcoming entity registry. Pure additive
+            // — no existing column or index is dropped or renamed, so
+            // existing `link()` / `links_for()` paths keep working with
+            // the new columns NULL on legacy rows. The `valid_from`
+            // backfill matches the charter pre-flight default
+            // (charter line 428): set to the source memory's
+            // `created_at` to avoid null-handling complexity in v0.6.3
+            // KG query code.
+            //
+            // Type note: charter said `TIMESTAMP` for `valid_from` and
+            // `valid_until`. SQLite has no native TIMESTAMP type — it
+            // stores timestamps as TEXT (ISO-8601), REAL (Julian), or
+            // INTEGER (unix). The codebase uses TEXT throughout (matches
+            // every other timestamp column in this schema and matches
+            // chrono's `to_rfc3339()` output). The Postgres adapter at
+            // `src/store/postgres_schema.sql` uses `TIMESTAMPTZ` —
+            // semantically equivalent across both backends.
+            //
+            // The DDL itself lives in migrations/sqlite/0010_v063_hierarchy_kg.sql
+            // (and migrations/postgres/0010_v063_hierarchy_kg.sql for the
+            // Postgres adapter). Loaded via include_str! at compile time
+            // and executed below via execute_batch. The column-existence
+            // checks remain inline here because SQLite cannot do
+            // ALTER TABLE ADD COLUMN IF NOT EXISTS.
+            let has_valid_from = conn
+                .prepare("SELECT valid_from FROM memory_links LIMIT 0")
+                .is_ok();
+            if !has_valid_from {
+                conn.execute("ALTER TABLE memory_links ADD COLUMN valid_from TEXT", [])?;
+            }
+            let has_valid_until = conn
+                .prepare("SELECT valid_until FROM memory_links LIMIT 0")
+                .is_ok();
+            if !has_valid_until {
+                conn.execute("ALTER TABLE memory_links ADD COLUMN valid_until TEXT", [])?;
+            }
+            let has_observed_by = conn
+                .prepare("SELECT observed_by FROM memory_links LIMIT 0")
+                .is_ok();
+            if !has_observed_by {
+                conn.execute("ALTER TABLE memory_links ADD COLUMN observed_by TEXT", [])?;
+            }
+            let has_signature = conn
+                .prepare("SELECT signature FROM memory_links LIMIT 0")
+                .is_ok();
+            if !has_signature {
+                conn.execute("ALTER TABLE memory_links ADD COLUMN signature BLOB", [])?;
+            }
+
+            // All INDEX and TABLE statements are idempotent; batch-run the migration
+            conn.execute_batch(MIGRATION_V15_SQLITE)?;
+        }
+
+        if version < 16 {
+            // v0.6.4 prep: explicitly document that the existing
+            // idx_memories_namespace already supports prefix LIKE under
+            // SQLite's default BINARY collation. Bump version so Postgres
+            // peers' text_pattern_ops index is part of the same migration
+            // generation.
+            // No DDL needed for SQLite — index already prefix-friendly.
         }
 
         conn.execute("DELETE FROM schema_version", [])?;
@@ -1393,9 +1463,13 @@ pub fn create_link(
     if !target_exists {
         anyhow::bail!("target memory not found: {target_id}");
     }
+    // Schema v15 (Pillar 2 / Stream B) added `valid_from` for temporal
+    // KG queries. Backfill on migration handled legacy rows; here we
+    // populate it on the insert path so newly created links are
+    // visible to `memory_kg_timeline` without a downstream backfill.
     let now = Utc::now().to_rfc3339();
     conn.execute(
-        "INSERT OR IGNORE INTO memory_links (source_id, target_id, relation, created_at) VALUES (?1, ?2, ?3, ?4)",
+        "INSERT OR IGNORE INTO memory_links (source_id, target_id, relation, created_at, valid_from) VALUES (?1, ?2, ?3, ?4, ?4)",
         params![source_id, target_id, relation, now],
     )?;
     Ok(())
@@ -1641,6 +1715,901 @@ pub fn list_namespaces(conn: &Connection) -> Result<Vec<NamespaceCount>> {
     })?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .map_err(Into::into)
+}
+
+/// Hard cap on input groups walked when assembling a taxonomy tree.
+/// Even when callers pass a wildly large `limit`, we never walk more
+/// than this many `(namespace, count)` rows — bounds memory + time.
+const TAXONOMY_MAX_LIMIT: usize = 10_000;
+
+/// Build a hierarchical namespace taxonomy (Pillar 1 / Stream A).
+///
+/// Groups live (non-expired) memories by `namespace`, splits each on
+/// `/`, and folds them into a `TaxonomyNode` tree. The returned root
+/// represents `namespace_prefix` (or the synthetic empty-string root if
+/// no prefix is supplied); each child level descends one segment.
+///
+/// `max_depth` is interpreted as "show at most N levels *below the
+/// prefix*". Memories whose namespace would have required descending
+/// past the cutoff still contribute to the `subtree_count` of the
+/// boundary ancestor (their counts are not lost — only the leaf
+/// rendering is suppressed).
+///
+/// `limit` caps the number of input `(namespace, count)` rows we walk
+/// — when truncated, `total_count` still reflects the full prefix
+/// total (a separate aggregation), and `truncated` is set so callers
+/// can warn the user. Hard ceiling: [`TAXONOMY_MAX_LIMIT`].
+// Body is intentionally one logical pipeline (SQL aggregation → tree
+// assembly → root materialisation); pulling helpers out hurts
+// readability more than it helps.
+#[allow(clippy::too_many_lines)]
+pub fn get_taxonomy(
+    conn: &Connection,
+    namespace_prefix: Option<&str>,
+    max_depth: usize,
+    limit: usize,
+) -> Result<Taxonomy> {
+    let now = Utc::now().to_rfc3339();
+    let effective_limit = limit.min(TAXONOMY_MAX_LIMIT);
+    // Clamp depth so callers asking for "everything" can't construct a
+    // pathological deep walk; the namespace validator already rejects
+    // depths > MAX_NAMESPACE_DEPTH on writes.
+    let effective_depth = max_depth.min(MAX_NAMESPACE_DEPTH);
+
+    let prefix = namespace_prefix.unwrap_or("");
+
+    // Total count for the prefix is computed independently of the
+    // truncated row walk so the caller-visible total stays honest even
+    // when `limit` drops rows from the tree.
+    let total_count: usize = if prefix.is_empty() {
+        let v: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM memories WHERE expires_at IS NULL OR expires_at > ?1",
+            params![now],
+            |row| row.get(0),
+        )?;
+        usize::try_from(v).unwrap_or(0)
+    } else {
+        let v: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM memories
+             WHERE (expires_at IS NULL OR expires_at > ?1)
+               AND (namespace = ?2 OR namespace LIKE ?2 || '/%')",
+            params![now, prefix],
+            |row| row.get(0),
+        )?;
+        usize::try_from(v).unwrap_or(0)
+    };
+
+    // Group rows ordered by count DESC so a small `limit` keeps the
+    // densest namespaces, then alphabetic for stable tie-breaking.
+    let groups: Vec<(String, usize)> = if prefix.is_empty() {
+        let mut stmt = conn.prepare(
+            "SELECT namespace, COUNT(*) FROM memories
+             WHERE expires_at IS NULL OR expires_at > ?1
+             GROUP BY namespace
+             ORDER BY COUNT(*) DESC, namespace ASC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(
+            params![now, i64::try_from(effective_limit).unwrap_or(i64::MAX)],
+            |row| {
+                let ns: String = row.get(0)?;
+                let c: i64 = row.get(1)?;
+                Ok((ns, usize::try_from(c).unwrap_or(0)))
+            },
+        )?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    } else {
+        let mut stmt = conn.prepare(
+            "SELECT namespace, COUNT(*) FROM memories
+             WHERE (expires_at IS NULL OR expires_at > ?1)
+               AND (namespace = ?2 OR namespace LIKE ?2 || '/%')
+             GROUP BY namespace
+             ORDER BY COUNT(*) DESC, namespace ASC
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                now,
+                prefix,
+                i64::try_from(effective_limit).unwrap_or(i64::MAX)
+            ],
+            |row| {
+                let ns: String = row.get(0)?;
+                let c: i64 = row.get(1)?;
+                Ok((ns, usize::try_from(c).unwrap_or(0)))
+            },
+        )?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    let walked_count: usize = groups.iter().map(|(_, c)| *c).sum();
+    let truncated = walked_count < total_count;
+
+    // Synthesize the root node. `name` is the trailing segment of the
+    // prefix (or empty for the global root) so renderers can label it.
+    let root_name = prefix.rsplit('/').next().unwrap_or("").to_string();
+    let mut root = TaxonomyNode {
+        namespace: prefix.to_string(),
+        name: root_name,
+        count: 0,
+        subtree_count: 0,
+        children: Vec::new(),
+    };
+
+    for (ns, c) in groups {
+        // Compute path segments below the prefix. When prefix is empty,
+        // the whole namespace becomes the suffix; when ns == prefix
+        // exactly, segments is empty and the count lands on the root.
+        let suffix: &str = if prefix.is_empty() {
+            ns.as_str()
+        } else if ns == prefix {
+            ""
+        } else if ns.len() > prefix.len() + 1
+            && ns.starts_with(prefix)
+            && ns.as_bytes()[prefix.len()] == b'/'
+        {
+            &ns[prefix.len() + 1..]
+        } else {
+            // Defensive: SQL filter shouldn't return this, but skip rather
+            // than panic if it ever does (e.g. a stray match like
+            // "alphaone-sibling" matching prefix "alphaone").
+            continue;
+        };
+        let all_segments: Vec<&str> = if suffix.is_empty() {
+            Vec::new()
+        } else {
+            suffix.split('/').collect()
+        };
+        let take = all_segments.len().min(effective_depth);
+        let used = &all_segments[..take];
+        let exact_match_in_view = take == all_segments.len();
+
+        // Walk into the tree. Every ancestor's subtree_count grows by c
+        // — including the root — and only the deepest visible node's
+        // `count` does, and only when it represents the exact namespace
+        // (not a clamped boundary).
+        root.subtree_count += c;
+        if used.is_empty() {
+            root.count += c;
+            continue;
+        }
+
+        let mut path_so_far = prefix.to_string();
+        let mut node = &mut root;
+        for (i, seg) in used.iter().enumerate() {
+            if !path_so_far.is_empty() {
+                path_so_far.push('/');
+            }
+            path_so_far.push_str(seg);
+            let pos = node.children.iter().position(|ch| ch.name == *seg);
+            let idx = if let Some(p) = pos {
+                p
+            } else {
+                node.children.push(TaxonomyNode {
+                    namespace: path_so_far.clone(),
+                    name: (*seg).to_string(),
+                    count: 0,
+                    subtree_count: 0,
+                    children: Vec::new(),
+                });
+                node.children.len() - 1
+            };
+            node = &mut node.children[idx];
+            node.subtree_count += c;
+            let is_leaf = i + 1 == used.len();
+            if is_leaf && exact_match_in_view {
+                node.count += c;
+            }
+        }
+    }
+
+    sort_taxonomy(&mut root);
+
+    Ok(Taxonomy {
+        tree: root,
+        total_count,
+        truncated,
+    })
+}
+
+fn sort_taxonomy(node: &mut TaxonomyNode) {
+    node.children.sort_by(|a, b| a.name.cmp(&b.name));
+    for child in &mut node.children {
+        sort_taxonomy(child);
+    }
+}
+
+/// Hard floor for duplicate-check threshold. Below this, anything can match
+/// random unrelated content — refuse to honor the lookup so callers don't
+/// silently get garbage merge suggestions.
+pub const DUPLICATE_THRESHOLD_MIN: f32 = 0.5;
+
+/// Default cosine similarity threshold for declaring a candidate a
+/// duplicate. Empirically tuned for MiniLM-L6-v2 (the local embedder):
+/// near-paraphrases of the same memory tend to land at 0.88+, while
+/// loosely related content sits well below 0.85. Callers can override.
+pub const DUPLICATE_THRESHOLD_DEFAULT: f32 = 0.85;
+
+/// Find the nearest-neighbor live memory by cosine similarity (Pillar 2 /
+/// Stream D — `memory_check_duplicate`).
+///
+/// Linear scan over `memories.embedding` rows that pass the live-row
+/// (non-expired) gate and the optional namespace filter. The chosen
+/// candidate is the highest-cosine match across the pool; the
+/// caller-supplied `threshold` is used purely to set `is_duplicate` on
+/// the response — the nearest neighbor is always returned (when the
+/// pool is non-empty) so callers can show "closest existing memory was
+/// X at similarity Y" even on a not-quite-duplicate.
+///
+/// Threshold is clamped at [`DUPLICATE_THRESHOLD_MIN`] so that wildly
+/// permissive thresholds can't be used to dress unrelated content as a
+/// merge suggestion.
+///
+/// Returns `(check, scanned)` where `scanned` is the count of embedded
+/// candidates compared (useful for diagnostics).
+pub fn check_duplicate(
+    conn: &Connection,
+    query_embedding: &[f32],
+    namespace: Option<&str>,
+    threshold: f32,
+) -> Result<DuplicateCheck> {
+    let effective_threshold = threshold.max(DUPLICATE_THRESHOLD_MIN);
+    let now = Utc::now().to_rfc3339();
+
+    // SQL filter handles the live-row + optional namespace gate; the
+    // cosine pass happens in Rust because SQLite has no native vector
+    // op. We only pull rows with non-NULL embeddings — anything missing
+    // an embedding can't be a near-duplicate by this definition.
+    let rows: Vec<(String, String, String, Vec<u8>)> = if let Some(ns) = namespace {
+        let mut stmt = conn.prepare(
+            "SELECT id, title, namespace, embedding FROM memories
+             WHERE embedding IS NOT NULL
+               AND (expires_at IS NULL OR expires_at > ?1)
+               AND namespace = ?2",
+        )?;
+        let mapped = stmt.query_map(params![now, ns], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+            ))
+        })?;
+        mapped.collect::<rusqlite::Result<Vec<_>>>()?
+    } else {
+        let mut stmt = conn.prepare(
+            "SELECT id, title, namespace, embedding FROM memories
+             WHERE embedding IS NOT NULL
+               AND (expires_at IS NULL OR expires_at > ?1)",
+        )?;
+        let mapped = stmt.query_map(params![now], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+            ))
+        })?;
+        mapped.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    let mut best: Option<DuplicateMatch> = None;
+    let mut scanned: usize = 0;
+    for (id, title, ns, bytes) in rows {
+        if bytes.is_empty() {
+            continue;
+        }
+        // Skip blobs whose length is not a multiple of 4 (corrupted /
+        // truncated embedding column). chunks_exact silently drops a
+        // trailing partial chunk; we explicitly bail on the row so a
+        // bad blob doesn't compute against a shorter candidate vector
+        // (which would produce a wrong cosine score).
+        if !bytes.len().is_multiple_of(4) {
+            tracing::warn!(
+                memory_id = %id,
+                blob_len = bytes.len(),
+                "skipping duplicate-check candidate with malformed embedding length"
+            );
+            continue;
+        }
+        let candidate: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        // Vectors of mismatched dimension would compute against a
+        // truncated query (Embedder::cosine_similarity zips). Skip
+        // rather than report a misleading similarity score.
+        if candidate.len() != query_embedding.len() {
+            tracing::warn!(
+                memory_id = %id,
+                expected = query_embedding.len(),
+                got = candidate.len(),
+                "skipping duplicate-check candidate with dimension mismatch"
+            );
+            continue;
+        }
+        let similarity =
+            crate::embeddings::Embedder::cosine_similarity(query_embedding, &candidate);
+        scanned += 1;
+        let is_better = best.as_ref().is_none_or(|m| similarity > m.similarity);
+        if is_better {
+            best = Some(DuplicateMatch {
+                id,
+                title,
+                namespace: ns,
+                similarity,
+            });
+        }
+    }
+
+    let is_duplicate = best
+        .as_ref()
+        .is_some_and(|m| m.similarity >= effective_threshold);
+    Ok(DuplicateCheck {
+        is_duplicate,
+        threshold: effective_threshold,
+        nearest: best,
+        candidates_scanned: scanned,
+    })
+}
+
+/// Register an entity (canonical name + aliases) under a namespace
+/// (Pillar 2 / Stream B).
+///
+/// An entity is stored as a long-tier memory:
+/// - `title = canonical_name`
+/// - `namespace = namespace`
+/// - `tags` includes [`ENTITY_TAG`]
+/// - `metadata.kind = "entity"` (so the resolver can never confuse an
+///   entity with a regular memory that happens to share a title)
+///
+/// Aliases live in the `entity_aliases` side table keyed by
+/// `(entity_id, alias)`.
+///
+/// **Idempotency:** if an entity with this `(canonical_name, namespace)`
+/// already exists, its ID is reused and `aliases` are merged with
+/// `INSERT OR IGNORE`. The returned [`EntityRegistration::created`] is
+/// `false` in that case.
+///
+/// **Collision detection:** if a non-entity memory already occupies
+/// `(title=canonical_name, namespace=namespace)`, the call errors
+/// rather than silently upgrading it (the upsert path on `insert`
+/// would otherwise overwrite the existing row's content/tags). Callers
+/// must rename the entity or its colliding memory.
+///
+/// `extra_metadata` is merged into the entity memory's metadata; any
+/// caller-supplied `kind` field is overwritten with `"entity"` and
+/// `agent_id` is stamped from the caller (NHI provenance) when
+/// `extra_metadata` does not already specify one.
+pub fn entity_register(
+    conn: &Connection,
+    canonical_name: &str,
+    namespace: &str,
+    aliases: &[String],
+    extra_metadata: &serde_json::Value,
+    agent_id: Option<&str>,
+) -> Result<crate::models::EntityRegistration> {
+    use crate::models::{ENTITY_KIND, ENTITY_TAG, EntityRegistration};
+
+    // Look up an existing entity in this namespace by canonical_name +
+    // metadata.kind. If a non-entity memory occupies the same
+    // (title, namespace), surface a hard error instead of upserting.
+    let existing_id: Option<String> = match conn.query_row(
+        "SELECT id FROM memories
+         WHERE namespace = ?1 AND title = ?2
+           AND COALESCE(json_extract(metadata, '$.kind'), '') = ?3",
+        params![namespace, canonical_name, ENTITY_KIND],
+        |r| r.get::<_, String>(0),
+    ) {
+        Ok(id) => Some(id),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(e) => return Err(e.into()),
+    };
+
+    let (entity_id, created) = if let Some(id) = existing_id {
+        (id, false)
+    } else {
+        let collision: Option<String> = match conn.query_row(
+            "SELECT id FROM memories
+             WHERE namespace = ?1 AND title = ?2
+               AND COALESCE(json_extract(metadata, '$.kind'), '') != ?3",
+            params![namespace, canonical_name, ENTITY_KIND],
+            |r| r.get::<_, String>(0),
+        ) {
+            Ok(id) => Some(id),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => return Err(e.into()),
+        };
+        if collision.is_some() {
+            anyhow::bail!(
+                "entity_register: title '{canonical_name}' in namespace '{namespace}' is already used by a non-entity memory"
+            );
+        }
+
+        // Build metadata: caller-supplied object merged, kind forced
+        // to "entity", agent_id preserved from caller when not set.
+        let mut meta_map = match extra_metadata {
+            serde_json::Value::Object(m) => m.clone(),
+            _ => serde_json::Map::new(),
+        };
+        meta_map.insert(
+            "kind".to_string(),
+            serde_json::Value::String(ENTITY_KIND.to_string()),
+        );
+        if let Some(a) = agent_id {
+            meta_map
+                .entry("agent_id".to_string())
+                .or_insert(serde_json::Value::String(a.to_string()));
+        }
+        let metadata = serde_json::Value::Object(meta_map);
+
+        let now = Utc::now().to_rfc3339();
+        let mem = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Long,
+            namespace: namespace.to_string(),
+            title: canonical_name.to_string(),
+            content: canonical_name.to_string(),
+            tags: vec![ENTITY_TAG.to_string()],
+            priority: 7,
+            confidence: 1.0,
+            source: "api".to_string(),
+            access_count: 0,
+            created_at: now.clone(),
+            updated_at: now,
+            last_accessed_at: None,
+            expires_at: None,
+            metadata,
+        };
+        let id = insert(conn, &mem).context("insert entity memory")?;
+        (id, true)
+    };
+
+    let now = Utc::now().to_rfc3339();
+    {
+        let mut stmt = conn.prepare(
+            "INSERT OR IGNORE INTO entity_aliases (entity_id, alias, created_at)
+             VALUES (?1, ?2, ?3)",
+        )?;
+        for alias in aliases {
+            let trimmed = alias.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            stmt.execute(params![entity_id, trimmed, now])?;
+        }
+    }
+
+    let aliases_out = list_entity_aliases(conn, &entity_id)?;
+
+    Ok(EntityRegistration {
+        entity_id,
+        canonical_name: canonical_name.to_string(),
+        namespace: namespace.to_string(),
+        aliases: aliases_out,
+        created,
+    })
+}
+
+/// Resolve an alias to its registered entity (Pillar 2 / Stream B).
+///
+/// When `namespace` is `Some`, only entities in that namespace are
+/// considered. When `None`, all namespaces are searched and the
+/// most-recently-created matching entity wins (deterministic
+/// disambiguation when the same alias was registered in multiple
+/// namespaces).
+///
+/// Returns `Ok(None)` if no entity claims this alias under the given
+/// filter. Returns the full alias set for the resolved entity.
+pub fn entity_get_by_alias(
+    conn: &Connection,
+    alias: &str,
+    namespace: Option<&str>,
+) -> Result<Option<crate::models::EntityRecord>> {
+    use crate::models::{ENTITY_KIND, EntityRecord};
+
+    let trimmed = alias.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    let row: std::result::Result<(String, String, String), rusqlite::Error> =
+        if let Some(ns) = namespace {
+            conn.query_row(
+                "SELECT m.id, m.title, m.namespace
+                 FROM entity_aliases ea
+                 JOIN memories m ON m.id = ea.entity_id
+                 WHERE ea.alias = ?1
+                   AND m.namespace = ?2
+                   AND COALESCE(json_extract(m.metadata, '$.kind'), '') = ?3
+                 ORDER BY m.created_at DESC
+                 LIMIT 1",
+                params![trimmed, ns, ENTITY_KIND],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+        } else {
+            conn.query_row(
+                "SELECT m.id, m.title, m.namespace
+                 FROM entity_aliases ea
+                 JOIN memories m ON m.id = ea.entity_id
+                 WHERE ea.alias = ?1
+                   AND COALESCE(json_extract(m.metadata, '$.kind'), '') = ?2
+                 ORDER BY m.created_at DESC
+                 LIMIT 1",
+                params![trimmed, ENTITY_KIND],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+        };
+
+    let (entity_id, canonical_name, ns) = match row {
+        Ok(t) => t,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+
+    let aliases = list_entity_aliases(conn, &entity_id)?;
+    Ok(Some(EntityRecord {
+        entity_id,
+        canonical_name,
+        namespace: ns,
+        aliases,
+    }))
+}
+
+/// Default cap on rows returned by `kg_timeline` when the caller does
+/// not specify one (Pillar 2 / Stream C). Sized to fit a reasonable
+/// agent context window without paging — callers needing more should
+/// pass an explicit limit.
+pub const KG_TIMELINE_DEFAULT_LIMIT: usize = 200;
+
+/// Hard ceiling on `kg_timeline` rows. Matches the existing list/recall
+/// caps to keep the timeline bounded against pathological entities.
+pub const KG_TIMELINE_MAX_LIMIT: usize = 1000;
+
+/// Ordered fact timeline for an entity (Pillar 2 / Stream C —
+/// `memory_kg_timeline`). Returns outbound assertions from
+/// `source_id`, ordered by `valid_from ASC` and tie-broken by
+/// `created_at ASC` for deterministic display.
+///
+/// Filters:
+/// - `since` (RFC3339, inclusive): drop events with `valid_from < since`
+/// - `until` (RFC3339, inclusive): drop events with `valid_from > until`
+/// - `limit`: row cap, clamped to [1, [`KG_TIMELINE_MAX_LIMIT`]]
+///
+/// Rows with NULL `valid_from` are excluded — a link without a
+/// valid-from anchor cannot be ordered on the timeline. The schema-v15
+/// migration backfilled legacy rows to `created_at`, and the `link()`
+/// path stamps the column on every new insert, so this is a hard
+/// guarantee for current code; the explicit `IS NOT NULL` guard exists
+/// to keep external writes (`store/sqlite.rs`, custom migrations) from
+/// silently producing invisible links.
+///
+/// Cross-namespace by design: timelines often span the same canonical
+/// entity asserted by agents in different namespaces. Callers can
+/// post-filter by `target_namespace` if they need a namespace-scoped
+/// view.
+///
+/// v0.7 AGE acceleration onramp (charter §"Stream C" bullet 4). When
+/// the v0.7 SAL ships with Apache AGE, the equivalent property-graph
+/// query is:
+///
+/// ```cypher
+/// MATCH (s {id: $source_id})-[r {valid_from IS NOT NULL,
+///        valid_from >= $since, valid_from <= $until}]->(t)
+/// WHERE t.id <> s.id  // exclude self-loops
+/// RETURN t.id, r.relation, r.valid_from, r.valid_until, r.observed_by
+/// ORDER BY r.valid_from ASC, r.created_at ASC
+/// LIMIT $limit
+/// ```
+///
+/// Stub left here per charter intent so the v0.7 migration has a 1:1
+/// reference query.
+pub fn kg_timeline(
+    conn: &Connection,
+    source_id: &str,
+    since: Option<&str>,
+    until: Option<&str>,
+    limit: Option<usize>,
+) -> Result<Vec<crate::models::KgTimelineEvent>> {
+    use crate::models::KgTimelineEvent;
+
+    let cap = limit
+        .unwrap_or(KG_TIMELINE_DEFAULT_LIMIT)
+        .clamp(1, KG_TIMELINE_MAX_LIMIT);
+
+    // Compose the predicate dynamically for `since` / `until`. Bind
+    // values are appended in the same order so the placeholders line up.
+    let mut sql = String::from(
+        "SELECT ml.target_id, ml.relation, ml.valid_from, ml.valid_until,
+                ml.observed_by, m.title, m.namespace, ml.created_at
+         FROM memory_links ml
+         JOIN memories m ON m.id = ml.target_id
+         WHERE ml.source_id = ?1
+           AND ml.valid_from IS NOT NULL",
+    );
+    let mut binds: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(source_id.to_string())];
+    if let Some(s) = since {
+        sql.push_str(" AND ml.valid_from >= ?");
+        sql.push_str(&(binds.len() + 1).to_string());
+        binds.push(Box::new(s.to_string()));
+    }
+    if let Some(u) = until {
+        sql.push_str(" AND ml.valid_from <= ?");
+        sql.push_str(&(binds.len() + 1).to_string());
+        binds.push(Box::new(u.to_string()));
+    }
+    sql.push_str(" ORDER BY ml.valid_from ASC, ml.created_at ASC LIMIT ?");
+    sql.push_str(&(binds.len() + 1).to_string());
+    binds.push(Box::new(i64::try_from(cap).unwrap_or(i64::MAX)));
+
+    let mut stmt = conn.prepare(&sql)?;
+    let bind_refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(AsRef::as_ref).collect();
+    let rows = stmt.query_map(rusqlite::params_from_iter(bind_refs), |row| {
+        Ok(KgTimelineEvent {
+            target_id: row.get(0)?,
+            relation: row.get(1)?,
+            valid_from: row.get(2)?,
+            valid_until: row.get(3)?,
+            observed_by: row.get(4)?,
+            title: row.get(5)?,
+            target_namespace: row.get(6)?,
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+/// Outcome of [`invalidate_link`] (Pillar 2 / Stream C —
+/// `memory_kg_invalidate`). `valid_until` is the timestamp now stored on
+/// the link; `previous_valid_until` is the prior value, or `None` if
+/// this was the first invalidation. Callers can use the prior value to
+/// distinguish a fresh supersession from an idempotent retry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidateResult {
+    pub valid_until: String,
+    pub previous_valid_until: Option<String>,
+}
+
+/// Mark a KG link as superseded by setting its `valid_until` column
+/// (Pillar 2 / Stream C — `memory_kg_invalidate`). Returns `Ok(None)`
+/// when the `(source_id, target_id, relation)` triple does not match an
+/// existing link. The supplied `valid_until` defaults to the current
+/// wall-clock time in RFC3339 form when omitted; callers needing
+/// historical or future supersession can pass an explicit value.
+///
+/// Idempotent: calling repeatedly overwrites the prior `valid_until`
+/// (the prior value is returned in `previous_valid_until` so callers
+/// can detect the overwrite). The schema does not yet carry an audit
+/// column for the supersession reason; that arrives with v0.7
+/// attestation. Until then, callers should record the rationale in
+/// their own logs or a paired memory.
+pub fn invalidate_link(
+    conn: &Connection,
+    source_id: &str,
+    target_id: &str,
+    relation: &str,
+    valid_until: Option<&str>,
+) -> Result<Option<InvalidateResult>> {
+    let stamp = valid_until.map_or_else(|| Utc::now().to_rfc3339(), str::to_string);
+
+    let prior = match conn.query_row(
+        "SELECT valid_until FROM memory_links \
+         WHERE source_id = ?1 AND target_id = ?2 AND relation = ?3",
+        params![source_id, target_id, relation],
+        |r| r.get::<_, Option<String>>(0),
+    ) {
+        Ok(v) => v,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+
+    conn.execute(
+        "UPDATE memory_links SET valid_until = ?4 \
+         WHERE source_id = ?1 AND target_id = ?2 AND relation = ?3",
+        params![source_id, target_id, relation, &stamp],
+    )?;
+
+    Ok(Some(InvalidateResult {
+        valid_until: stamp,
+        previous_valid_until: prior,
+    }))
+}
+
+/// Default cap on rows returned by `kg_query` when the caller does not
+/// specify one (Pillar 2 / Stream C). Mirrors `kg_timeline`'s default so
+/// the two traversal tools behave consistently for agents driving them.
+pub const KG_QUERY_DEFAULT_LIMIT: usize = 200;
+
+/// Hard ceiling on `kg_query` rows. Matches `kg_timeline` and the
+/// existing list/recall caps to keep traversal bounded against
+/// pathological fan-out.
+pub const KG_QUERY_MAX_LIMIT: usize = 1000;
+
+/// Maximum traversal depth supported by [`kg_query`]. The recursive-CTE
+/// implementation enforces an explicit ceiling so a crafted call cannot
+/// run an unbounded traversal; the charter (`v0.6.3-grand-slam.md`
+/// § Performance Budgets) sets the published budget at depth ≤ 5.
+pub const KG_QUERY_MAX_SUPPORTED_DEPTH: usize = 5;
+
+/// Outbound KG traversal from a source memory (Pillar 2 / Stream C —
+/// `memory_kg_query`). Returns one row per link reachable within
+/// `max_depth` hops, filtered by:
+///
+/// - `valid_at` (RFC3339, optional): only links valid at that instant —
+///   `valid_from <= valid_at AND (valid_until IS NULL OR valid_until > valid_at)`.
+///   When omitted, the temporal filter is skipped and rows with NULL
+///   `valid_from` are also returned (legacy / un-anchored links).
+/// - `allowed_agents` (optional): when provided, only links with
+///   `observed_by` in the set are returned. An **empty** allowlist
+///   returns zero rows by design — callers signaling "no agents are
+///   trusted" must get an empty traversal, not the unfiltered fallback.
+///   When omitted entirely (`None`), the agent filter is skipped.
+/// - `limit`: row cap, clamped to [1, [`KG_QUERY_MAX_LIMIT`]].
+///
+/// `max_depth` must be in `[1, KG_QUERY_MAX_SUPPORTED_DEPTH]`; passing
+/// a larger value yields an explicit error rather than a silent
+/// truncation, so callers learn they hit the ceiling instead of
+/// receiving a partial graph.
+///
+/// Multi-hop traversal uses a recursive CTE with cycle detection on
+/// the accumulated path, so cycles in the link graph cannot loop the
+/// traversal indefinitely. Each hop reapplies the same temporal /
+/// agent filters as the anchor — a chain only extends through links
+/// that pass every filter on every hop.
+///
+/// Ordering is `depth ASC, COALESCE(valid_from, created_at) ASC,
+/// created_at ASC` — shallower hops first, then time-ordered within
+/// each level. For depth=1 callers this collapses to the original
+/// time ordering. The `depth` field reflects the actual hop count and
+/// `path` is the full `src->mid->target` chain.
+pub fn kg_query(
+    conn: &Connection,
+    source_id: &str,
+    max_depth: usize,
+    valid_at: Option<&str>,
+    allowed_agents: Option<&[String]>,
+    limit: Option<usize>,
+) -> Result<Vec<crate::models::KgQueryNode>> {
+    use crate::models::KgQueryNode;
+
+    if max_depth == 0 {
+        anyhow::bail!("max_depth must be >= 1");
+    }
+    if max_depth > KG_QUERY_MAX_SUPPORTED_DEPTH {
+        anyhow::bail!(
+            "max_depth={max_depth} exceeds supported depth={KG_QUERY_MAX_SUPPORTED_DEPTH}"
+        );
+    }
+
+    // Empty allowlist == "no agents are trusted" — short-circuit so we
+    // don't have to invent a SQL `IN ()` clause (which is invalid).
+    if let Some(agents) = allowed_agents
+        && agents.is_empty()
+    {
+        return Ok(Vec::new());
+    }
+
+    let cap = limit
+        .unwrap_or(KG_QUERY_DEFAULT_LIMIT)
+        .clamp(1, KG_QUERY_MAX_LIMIT);
+
+    // Build the per-hop predicate once; the anchor and recursive members
+    // both apply it to a row aliased `ml`. Bind values are appended in
+    // resolution order so positional placeholders line up.
+    let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    let mut hop_filter = String::new();
+    if let Some(t) = valid_at {
+        hop_filter.push_str(" AND ml.valid_from IS NOT NULL AND ml.valid_from <= ?");
+        binds.push(Box::new(t.to_string()));
+        hop_filter.push_str(&binds.len().to_string());
+        hop_filter.push_str(" AND (ml.valid_until IS NULL OR ml.valid_until > ?");
+        binds.push(Box::new(t.to_string()));
+        hop_filter.push_str(&binds.len().to_string());
+        hop_filter.push(')');
+    }
+    if let Some(agents) = allowed_agents {
+        // Already short-circuited the empty case above.
+        hop_filter.push_str(" AND ml.observed_by IN (");
+        for (i, a) in agents.iter().enumerate() {
+            binds.push(Box::new(a.clone()));
+            if i > 0 {
+                hop_filter.push_str(", ");
+            }
+            hop_filter.push('?');
+            hop_filter.push_str(&binds.len().to_string());
+        }
+        hop_filter.push(')');
+    }
+
+    // Anchor binds source_id, recursive member binds max_depth, final
+    // SELECT binds the row cap. Order matters — placeholders are
+    // resolved by the position they occupy in the assembled string.
+    binds.push(Box::new(source_id.to_string()));
+    let source_ph = binds.len();
+    binds.push(Box::new(i64::try_from(max_depth).unwrap_or(i64::MAX)));
+    let max_depth_ph = binds.len();
+    binds.push(Box::new(i64::try_from(cap).unwrap_or(i64::MAX)));
+    let limit_ph = binds.len();
+
+    // v0.7 AGE acceleration onramp (charter §"Stream C — KG Query Layer"
+    // bullet 4). The recursive CTE below is the v0.6.3 SQLite/Postgres
+    // implementation. When the v0.7 SAL ships with Apache AGE wired in,
+    // the equivalent property-graph query will look like:
+    //
+    //   MATCH (s {id: $source_id})-[r*1..$max_depth {valid_from <= $t,
+    //          observed_by IN $allowed_agents}]->(t)
+    //   WHERE NONE(n IN nodes(path) WHERE n.id = t.id)  -- cycle prune
+    //   RETURN t.id, last(r).relation, t.title, length(r) AS depth,
+    //          [n IN nodes(path) | n.id] AS path
+    //   ORDER BY depth, last(r).valid_from
+    //   LIMIT $limit
+    //
+    // Stub left here per charter intent so the v0.7 migration to AGE
+    // has a 1:1 reference query alongside the SQL implementation.
+
+    let sql = format!(
+        "WITH RECURSIVE traversal(\
+            target_id, relation, valid_from, valid_until, observed_by, \
+            link_created_at, depth, path\
+         ) AS (\
+            SELECT ml.target_id, ml.relation, ml.valid_from, ml.valid_until, \
+                   ml.observed_by, ml.created_at, 1, \
+                   json_array(ml.source_id, ml.target_id) \
+            FROM memory_links ml \
+            WHERE ml.source_id = ?{source_ph}{hop_filter} \
+            UNION ALL \
+            SELECT ml.target_id, ml.relation, ml.valid_from, ml.valid_until, \
+                   ml.observed_by, ml.created_at, t.depth + 1, \
+                   json_insert(t.path, '$[' || json_array_length(t.path) || ']', ml.target_id) \
+            FROM memory_links ml \
+            JOIN traversal t ON ml.source_id = t.target_id \
+            WHERE t.depth < ?{max_depth_ph} \
+              AND NOT EXISTS (SELECT 1 FROM json_each(t.path) WHERE value = ml.target_id)\
+              {hop_filter}\
+         ) \
+         SELECT t.target_id, t.relation, t.valid_from, t.valid_until, \
+                t.observed_by, m.title, m.namespace, t.depth, \
+                (SELECT group_concat(value, '->') FROM json_each(t.path)) \
+         FROM traversal t \
+         JOIN memories m ON m.id = t.target_id \
+         ORDER BY t.depth ASC, COALESCE(t.valid_from, t.link_created_at) ASC, \
+                  t.link_created_at ASC \
+         LIMIT ?{limit_ph}",
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let bind_refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(AsRef::as_ref).collect();
+    let rows = stmt.query_map(rusqlite::params_from_iter(bind_refs), |row| {
+        let target_id: String = row.get(0)?;
+        let depth: i64 = row.get(7)?;
+        Ok(KgQueryNode {
+            target_id,
+            relation: row.get(1)?,
+            valid_from: row.get(2)?,
+            valid_until: row.get(3)?,
+            observed_by: row.get(4)?,
+            title: row.get(5)?,
+            target_namespace: row.get(6)?,
+            depth: usize::try_from(depth).unwrap_or(0),
+            path: row.get(8)?,
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+/// List all aliases registered for an entity, ordered by registration
+/// time then alphabetical for stable display.
+fn list_entity_aliases(conn: &Connection, entity_id: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT alias FROM entity_aliases
+         WHERE entity_id = ?1
+         ORDER BY created_at ASC, alias ASC",
+    )?;
+    let aliases: Vec<String> = stmt
+        .query_map(params![entity_id], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(aliases)
 }
 
 /// Register or refresh an agent in the reserved `_agents` namespace.
@@ -2590,6 +3559,7 @@ pub fn sync_state_load(conn: &Connection, agent_id: &str) -> Result<crate::model
 /// if we've never successfully pushed to them (foundation-era rows also
 /// return `None` because the column was added in schema v12).
 #[must_use]
+#[allow(dead_code)] // called via lib crate (daemon_runtime); bin sees it as unused
 pub fn sync_state_last_pushed(conn: &Connection, agent_id: &str, peer_id: &str) -> Option<String> {
     conn.query_row(
         "SELECT last_pushed_at FROM sync_state WHERE agent_id = ?1 AND peer_id = ?2",
@@ -2602,6 +3572,7 @@ pub fn sync_state_last_pushed(conn: &Connection, agent_id: &str, peer_id: &str) 
 
 /// Record that local memories up to `updated_at = pushed_at` have been
 /// accepted by `peer_id`. Creates the row if it doesn't exist; monotonic.
+#[allow(dead_code)] // called via lib crate (daemon_runtime); bin sees it as unused
 pub fn sync_state_record_push(
     conn: &Connection,
     agent_id: &str,
@@ -3234,6 +4205,48 @@ pub fn is_namespace_standard(conn: &Connection, id: &str) -> bool {
     )
     .unwrap_or(0)
         > 0
+}
+
+/// v0.6.3 (capabilities schema v2): count namespace standards whose
+/// `metadata.governance` is non-null. A "rule" here means a namespace
+/// has an explicit governance policy attached to its standard memory.
+/// The count is a transparent passthrough — the full permission system
+/// arrives in v0.7 (arch-enhancement-spec §3).
+pub fn count_active_governance_rules(conn: &Connection) -> Result<usize> {
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memories m
+             INNER JOIN namespace_meta nm ON nm.standard_id = m.id
+             WHERE json_extract(m.metadata, '$.governance') IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    Ok(usize::try_from(count.max(0)).unwrap_or(0))
+}
+
+/// v0.6.3 (capabilities schema v2): count rows in the `subscriptions`
+/// table. Used by `handle_capabilities` as a proxy for "registered
+/// hooks" — the hook pipeline itself is v0.7 Bucket 0 work.
+pub fn count_subscriptions(conn: &Connection) -> Result<usize> {
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM subscriptions", [], |r| r.get(0))
+        .unwrap_or(0);
+    Ok(usize::try_from(count.max(0)).unwrap_or(0))
+}
+
+/// v0.6.3 (capabilities schema v2): count `pending_actions` rows whose
+/// `status` matches the predicate. Used by `handle_capabilities` to
+/// surface live approval queue depth.
+pub fn count_pending_actions_by_status(conn: &Connection, status: &str) -> Result<usize> {
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pending_actions WHERE status = ?1",
+            params![status],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    Ok(usize::try_from(count.max(0)).unwrap_or(0))
 }
 
 #[cfg(test)]
@@ -3937,6 +4950,160 @@ mod tests {
     }
 
     #[test]
+    fn taxonomy_flat_namespaces_only() {
+        // No `/` anywhere — every namespace is a direct child of the root.
+        let conn = test_db();
+        insert(&conn, &make_memory("A", "alpha", Tier::Long, 5)).unwrap();
+        insert(&conn, &make_memory("B", "alpha", Tier::Long, 5)).unwrap();
+        insert(&conn, &make_memory("C", "beta", Tier::Long, 5)).unwrap();
+
+        let tax = get_taxonomy(&conn, None, 8, 1000).unwrap();
+        assert_eq!(tax.total_count, 3);
+        assert!(!tax.truncated);
+        assert_eq!(tax.tree.namespace, "");
+        assert_eq!(tax.tree.subtree_count, 3);
+        assert_eq!(tax.tree.count, 0); // no memories at the synthetic root
+        assert_eq!(tax.tree.children.len(), 2);
+        let alpha = tax
+            .tree
+            .children
+            .iter()
+            .find(|c| c.name == "alpha")
+            .unwrap();
+        assert_eq!(alpha.count, 2);
+        assert_eq!(alpha.subtree_count, 2);
+        assert!(alpha.children.is_empty());
+        let beta = tax.tree.children.iter().find(|c| c.name == "beta").unwrap();
+        assert_eq!(beta.count, 1);
+    }
+
+    #[test]
+    fn taxonomy_hierarchical_tree() {
+        // Mixed depths: tree must aggregate counts up the spine.
+        let conn = test_db();
+        insert(&conn, &make_memory("a", "alphaone", Tier::Long, 5)).unwrap();
+        insert(&conn, &make_memory("b", "alphaone/eng", Tier::Long, 5)).unwrap();
+        insert(
+            &conn,
+            &make_memory("c", "alphaone/eng/platform", Tier::Long, 5),
+        )
+        .unwrap();
+        insert(
+            &conn,
+            &make_memory("d", "alphaone/eng/platform", Tier::Long, 5),
+        )
+        .unwrap();
+        insert(&conn, &make_memory("e", "alphaone/sales", Tier::Long, 5)).unwrap();
+
+        let tax = get_taxonomy(&conn, None, 8, 1000).unwrap();
+        assert_eq!(tax.total_count, 5);
+        assert_eq!(tax.tree.subtree_count, 5);
+        assert_eq!(tax.tree.children.len(), 1);
+
+        let alphaone = &tax.tree.children[0];
+        assert_eq!(alphaone.name, "alphaone");
+        assert_eq!(alphaone.namespace, "alphaone");
+        assert_eq!(alphaone.count, 1); // memory "a" lives at exactly "alphaone"
+        assert_eq!(alphaone.subtree_count, 5);
+        assert_eq!(alphaone.children.len(), 2);
+
+        let eng = alphaone.children.iter().find(|c| c.name == "eng").unwrap();
+        assert_eq!(eng.namespace, "alphaone/eng");
+        assert_eq!(eng.count, 1);
+        assert_eq!(eng.subtree_count, 3);
+        let platform = &eng.children[0];
+        assert_eq!(platform.name, "platform");
+        assert_eq!(platform.namespace, "alphaone/eng/platform");
+        assert_eq!(platform.count, 2);
+        assert_eq!(platform.subtree_count, 2);
+        assert!(platform.children.is_empty());
+    }
+
+    #[test]
+    fn taxonomy_prefix_scopes_subtree() {
+        let conn = test_db();
+        insert(&conn, &make_memory("a", "alphaone/eng", Tier::Long, 5)).unwrap();
+        insert(
+            &conn,
+            &make_memory("b", "alphaone/eng/platform", Tier::Long, 5),
+        )
+        .unwrap();
+        insert(&conn, &make_memory("c", "alphaone/sales", Tier::Long, 5)).unwrap();
+        // Sibling that happens to share a string prefix — must NOT bleed in.
+        insert(&conn, &make_memory("d", "alphaone-sibling", Tier::Long, 5)).unwrap();
+        insert(&conn, &make_memory("e", "other", Tier::Long, 5)).unwrap();
+
+        let tax = get_taxonomy(&conn, Some("alphaone/eng"), 8, 1000).unwrap();
+        assert_eq!(tax.total_count, 2);
+        assert_eq!(tax.tree.namespace, "alphaone/eng");
+        assert_eq!(tax.tree.name, "eng");
+        assert_eq!(tax.tree.count, 1);
+        assert_eq!(tax.tree.subtree_count, 2);
+        assert_eq!(tax.tree.children.len(), 1);
+        assert_eq!(tax.tree.children[0].name, "platform");
+        assert_eq!(tax.tree.children[0].count, 1);
+    }
+
+    #[test]
+    fn taxonomy_depth_clamps_but_preserves_subtree_counts() {
+        let conn = test_db();
+        insert(
+            &conn,
+            &make_memory("a", "alphaone/eng/platform/db", Tier::Long, 5),
+        )
+        .unwrap();
+        insert(
+            &conn,
+            &make_memory("b", "alphaone/eng/platform/api", Tier::Long, 5),
+        )
+        .unwrap();
+
+        let tax = get_taxonomy(&conn, None, 2, 1000).unwrap();
+        assert_eq!(tax.total_count, 2);
+        let alphaone = &tax.tree.children[0];
+        let eng = &alphaone.children[0];
+        // Depth=2 below the empty prefix means we descend exactly two
+        // levels (alphaone → eng); deeper segments are folded into
+        // `eng.subtree_count` without rendering child nodes.
+        assert!(eng.children.is_empty());
+        assert_eq!(eng.subtree_count, 2);
+        assert_eq!(eng.count, 0); // nothing at exactly "alphaone/eng"
+    }
+
+    #[test]
+    fn taxonomy_excludes_expired_memories() {
+        // Mirror of `list_namespaces` semantics — expired rows must not
+        // count toward either the tree or `total_count`.
+        let conn = test_db();
+        let mut alive = make_memory("alive", "alpha", Tier::Long, 5);
+        let mut dead = make_memory("dead", "alpha", Tier::Short, 5);
+        // Force the short-tier memory's expiry into the past.
+        dead.expires_at = Some("2000-01-01T00:00:00Z".to_string());
+        alive.expires_at = None;
+        insert(&conn, &alive).unwrap();
+        insert(&conn, &dead).unwrap();
+
+        let tax = get_taxonomy(&conn, None, 8, 1000).unwrap();
+        assert_eq!(tax.total_count, 1);
+        assert_eq!(tax.tree.children.len(), 1);
+        assert_eq!(tax.tree.children[0].count, 1);
+    }
+
+    #[test]
+    fn taxonomy_truncates_at_limit_but_total_stays_honest() {
+        let conn = test_db();
+        for ns in ["aa", "bb", "cc", "dd", "ee"] {
+            insert(&conn, &make_memory("m", ns, Tier::Long, 5)).unwrap();
+        }
+        let tax = get_taxonomy(&conn, None, 8, 2).unwrap();
+        // Limit drops 3 namespaces from the walk; total_count must
+        // still see all 5 memories so renderers can warn the user.
+        assert_eq!(tax.total_count, 5);
+        assert!(tax.truncated);
+        assert_eq!(tax.tree.children.len(), 2);
+    }
+
+    #[test]
     fn forget_by_namespace() {
         let conn = test_db();
         insert(&conn, &make_memory("A", "delete-me", Tier::Long, 5)).unwrap();
@@ -3963,6 +5130,169 @@ mod tests {
         assert!((got[0] - 0.1).abs() < 1e-6);
     }
 
+    // -- Pillar 2 / Stream D — memory_check_duplicate -------------------
+
+    fn insert_with_embedding(
+        conn: &Connection,
+        title: &str,
+        ns: &str,
+        embedding: &[f32],
+    ) -> String {
+        let mem = make_memory(title, ns, Tier::Long, 5);
+        let id = insert(conn, &mem).unwrap();
+        set_embedding(conn, &id, embedding).unwrap();
+        id
+    }
+
+    #[test]
+    fn check_duplicate_empty_db_returns_no_match() {
+        let conn = test_db();
+        let q = vec![1.0_f32, 0.0, 0.0];
+        let r = check_duplicate(&conn, &q, None, 0.85).unwrap();
+        assert!(!r.is_duplicate);
+        assert!(r.nearest.is_none());
+        assert_eq!(r.candidates_scanned, 0);
+    }
+
+    #[test]
+    fn check_duplicate_finds_highest_cosine_match() {
+        let conn = test_db();
+        // a = [1,0,0]; b = [0,1,0]; c = [0.99,0.01,0]. Query = [1,0,0]
+        // expects `c` (cos ~0.9999) > `a` (cos =1.0 actually).
+        // Use distinct vectors: a=[1,0,0] cos 1.0, b=[0.7,0.7,0] cos 0.707,
+        // c=[0,1,0] cos 0.0. Best should be `a`.
+        let id_a = insert_with_embedding(&conn, "alpha", "ns", &[1.0, 0.0, 0.0]);
+        let _id_b = insert_with_embedding(&conn, "beta", "ns", &[0.7, 0.7, 0.0]);
+        let _id_c = insert_with_embedding(&conn, "gamma", "ns", &[0.0, 1.0, 0.0]);
+
+        let q = vec![1.0_f32, 0.0, 0.0];
+        let r = check_duplicate(&conn, &q, None, 0.85).unwrap();
+        let nearest = r.nearest.expect("expected a nearest match");
+        assert_eq!(nearest.id, id_a);
+        assert!(nearest.similarity > 0.99);
+        assert_eq!(r.candidates_scanned, 3);
+        assert!(r.is_duplicate);
+        assert!((r.threshold - 0.85).abs() < 1e-6);
+    }
+
+    #[test]
+    fn check_duplicate_below_threshold_not_flagged_but_returns_nearest() {
+        let conn = test_db();
+        let id_b = insert_with_embedding(&conn, "beta", "ns", &[0.7, 0.7, 0.0]);
+
+        // Cosine([1,0,0], [0.7,0.7,0]) ~ 0.707 — below default 0.85.
+        let q = vec![1.0_f32, 0.0, 0.0];
+        let r = check_duplicate(&conn, &q, None, 0.85).unwrap();
+        let nearest = r
+            .nearest
+            .expect("nearest must surface even when below threshold");
+        assert_eq!(nearest.id, id_b);
+        assert!(!r.is_duplicate);
+    }
+
+    #[test]
+    fn check_duplicate_threshold_clamped_to_floor() {
+        let conn = test_db();
+        // Caller passes a permissive 0.0; the response threshold must
+        // be clamped to DUPLICATE_THRESHOLD_MIN so unrelated content
+        // can't be dressed as a merge candidate.
+        let _ = insert_with_embedding(&conn, "x", "ns", &[1.0, 0.0, 0.0]);
+        let q = vec![0.0_f32, 1.0, 0.0]; // orthogonal — cosine 0.0
+        let r = check_duplicate(&conn, &q, None, 0.0).unwrap();
+        assert!((r.threshold - DUPLICATE_THRESHOLD_MIN).abs() < 1e-6);
+        assert!(!r.is_duplicate);
+    }
+
+    #[test]
+    fn check_duplicate_namespace_filter_isolates_scan() {
+        let conn = test_db();
+        let _hit_in_other_ns = insert_with_embedding(&conn, "x", "other", &[1.0, 0.0, 0.0]);
+        let id_target = insert_with_embedding(&conn, "y", "ns", &[0.6, 0.8, 0.0]);
+
+        let q = vec![1.0_f32, 0.0, 0.0];
+        let r = check_duplicate(&conn, &q, Some("ns"), 0.85).unwrap();
+        assert_eq!(r.candidates_scanned, 1);
+        assert_eq!(r.nearest.expect("namespace filter ignored").id, id_target);
+    }
+
+    #[test]
+    fn check_duplicate_skips_expired_rows() {
+        let conn = test_db();
+        // Short-tier memory with a backdated `expires_at` is past the
+        // live-row gate and must not be a candidate.
+        let mut mem = make_memory("expired", "ns", Tier::Short, 5);
+        mem.expires_at = Some((chrono::Utc::now() - chrono::Duration::seconds(60)).to_rfc3339());
+        let id = insert(&conn, &mem).unwrap();
+        set_embedding(&conn, &id, &[1.0, 0.0, 0.0]).unwrap();
+
+        let q = vec![1.0_f32, 0.0, 0.0];
+        let r = check_duplicate(&conn, &q, None, 0.85).unwrap();
+        assert_eq!(r.candidates_scanned, 0);
+        assert!(r.nearest.is_none());
+    }
+
+    #[test]
+    fn check_duplicate_skips_unembedded_rows() {
+        let conn = test_db();
+        // One memory with an embedding, one without — only the embedded
+        // row should appear in `candidates_scanned`.
+        let id_embedded = insert_with_embedding(&conn, "with-emb", "ns", &[1.0, 0.0, 0.0]);
+        let mem = make_memory("no-emb", "ns", Tier::Long, 5);
+        let _ = insert(&conn, &mem).unwrap();
+
+        let q = vec![1.0_f32, 0.0, 0.0];
+        let r = check_duplicate(&conn, &q, None, 0.85).unwrap();
+        assert_eq!(r.candidates_scanned, 1);
+        assert_eq!(r.nearest.expect("embedded match").id, id_embedded);
+    }
+
+    #[test]
+    fn check_duplicate_skips_blob_with_non_multiple_of_4_length() {
+        // Regression: pre-fix, an embedding blob whose length was not
+        // a multiple of 4 would silently drop a trailing partial chunk
+        // via chunks_exact and compute cosine against a shorter
+        // candidate vector — producing a misleading score. The bounds
+        // check now skips the row entirely.
+        let conn = test_db();
+        let mem = make_memory("malformed-blob", "ns", Tier::Long, 5);
+        let id = insert(&conn, &mem).unwrap();
+        // Write a 7-byte blob (1 short of 8 = 2 f32s) directly to
+        // sqlite, bypassing set_embedding which only takes &[f32].
+        conn.execute(
+            "UPDATE memories SET embedding = ?1 WHERE id = ?2",
+            params![&[0u8; 7][..], &id],
+        )
+        .unwrap();
+
+        let q = vec![1.0_f32, 0.0];
+        let r = check_duplicate(&conn, &q, None, 0.85).unwrap();
+        assert_eq!(
+            r.candidates_scanned, 0,
+            "malformed blob must be skipped, not silently truncated"
+        );
+        assert!(r.nearest.is_none());
+    }
+
+    #[test]
+    fn check_duplicate_skips_blob_with_dimension_mismatch() {
+        // Regression: a blob with a valid length (multiple of 4) but
+        // wrong dimension vs the query embedding must NOT be scored;
+        // cosine_similarity zips and would silently truncate to the
+        // shorter input, producing a wrong similarity.
+        let conn = test_db();
+        // Insert a memory with a 3-dim embedding via the normal path.
+        let _id = insert_with_embedding(&conn, "different-dim", "ns", &[1.0, 0.0, 0.0]);
+
+        // Query with a 4-dim embedding — different from the candidate.
+        let q = vec![1.0_f32, 0.0, 0.0, 0.0];
+        let r = check_duplicate(&conn, &q, None, 0.85).unwrap();
+        assert_eq!(
+            r.candidates_scanned, 0,
+            "dimension-mismatched candidate must be skipped"
+        );
+        assert!(r.nearest.is_none());
+    }
+
     #[test]
     fn get_unembedded_returns_memoryless() {
         let conn = test_db();
@@ -3983,9 +5313,9 @@ mod tests {
     fn sanitize_fts_strips_operators_and_quotes() {
         // FTS5 special chars: " * ^ { } ( ) : - | are stripped
         let sanitized = sanitize_fts_query("test* \"injection\" (drop)", true);
-        assert!(!sanitized.contains("*"));
-        assert!(!sanitized.contains("("));
-        assert!(!sanitized.contains(")"));
+        assert!(!sanitized.contains('*'));
+        assert!(!sanitized.contains('('));
+        assert!(!sanitized.contains(')'));
         // Standalone boolean operators are removed
         let sanitized2 = sanitize_fts_query("hello AND world OR NOT NEAR test", true);
         assert!(sanitized2.contains("hello"));
@@ -4639,5 +5969,1318 @@ mod tests {
         let purged = auto_purge_archive(&conn, Some(7)).unwrap();
         assert_eq!(purged, 1);
         assert!(list_archived(&conn, None, 10, 0).unwrap().is_empty());
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Schema v15 (v0.6.3 Stream B) — temporal-validity KG migration.
+    // ─────────────────────────────────────────────────────────────────
+
+    fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap();
+        let cols: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        cols.iter().any(|c| c == column)
+    }
+
+    fn index_exists(conn: &Connection, name: &str) -> bool {
+        conn.query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1",
+            params![name],
+            |r| r.get::<_, i64>(0),
+        )
+        .is_ok()
+    }
+
+    #[test]
+    fn schema_v15_memory_links_has_temporal_columns() {
+        let conn = test_db();
+        assert!(column_exists(&conn, "memory_links", "valid_from"));
+        assert!(column_exists(&conn, "memory_links", "valid_until"));
+        assert!(column_exists(&conn, "memory_links", "observed_by"));
+        assert!(column_exists(&conn, "memory_links", "signature"));
+    }
+
+    #[test]
+    fn schema_v15_memory_links_temporal_indexes_exist() {
+        let conn = test_db();
+        assert!(index_exists(&conn, "idx_links_temporal_src"));
+        assert!(index_exists(&conn, "idx_links_temporal_tgt"));
+        assert!(index_exists(&conn, "idx_links_relation"));
+    }
+
+    #[test]
+    fn schema_v15_entity_aliases_table_exists() {
+        let conn = test_db();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM entity_aliases", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+        assert!(index_exists(&conn, "idx_entity_aliases_alias"));
+    }
+
+    #[test]
+    fn schema_v15_entity_aliases_primary_key_unique() {
+        let conn = test_db();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO entity_aliases (entity_id, alias, created_at) VALUES (?1, ?2, ?3)",
+            params!["e1", "Alpha", &now],
+        )
+        .unwrap();
+        let dup = conn.execute(
+            "INSERT INTO entity_aliases (entity_id, alias, created_at) VALUES (?1, ?2, ?3)",
+            params!["e1", "Alpha", &now],
+        );
+        assert!(dup.is_err(), "expected PK uniqueness violation");
+    }
+
+    // -- Pillar 2 / Stream B — entity_register / entity_get_by_alias ------
+
+    #[test]
+    fn entity_register_creates_new_entity_with_aliases() {
+        let conn = test_db();
+        let aliases = vec!["pa".to_string(), "Project A".to_string()];
+        let reg = entity_register(
+            &conn,
+            "Project Alpha",
+            "projects/alpha",
+            &aliases,
+            &serde_json::json!({}),
+            Some("test-agent"),
+        )
+        .unwrap();
+        assert!(reg.created, "first registration must be created=true");
+        assert_eq!(reg.canonical_name, "Project Alpha");
+        assert_eq!(reg.namespace, "projects/alpha");
+        // Aliases inserted in one call share a created_at; the
+        // secondary `alias ASC` sort orders 'P' before 'p'.
+        assert_eq!(reg.aliases, vec!["Project A".to_string(), "pa".to_string()]);
+
+        let m = get(&conn, &reg.entity_id).unwrap().unwrap();
+        assert_eq!(m.title, "Project Alpha");
+        assert_eq!(m.tier.rank(), Tier::Long.rank());
+        assert!(m.tags.contains(&"entity".to_string()));
+        assert_eq!(m.metadata["kind"], "entity");
+        assert_eq!(m.metadata["agent_id"], "test-agent");
+    }
+
+    #[test]
+    fn entity_register_reuses_existing_and_merges_aliases() {
+        let conn = test_db();
+        let first = entity_register(
+            &conn,
+            "Project Alpha",
+            "projects/alpha",
+            &["pa".to_string()],
+            &serde_json::json!({}),
+            Some("a1"),
+        )
+        .unwrap();
+        let second = entity_register(
+            &conn,
+            "Project Alpha",
+            "projects/alpha",
+            &["pa".to_string(), "alpha".to_string()],
+            &serde_json::json!({}),
+            Some("a2"),
+        )
+        .unwrap();
+        assert!(first.created);
+        assert!(!second.created, "second call must reuse the entity");
+        assert_eq!(first.entity_id, second.entity_id);
+        assert_eq!(second.aliases, vec!["pa".to_string(), "alpha".to_string()]);
+    }
+
+    #[test]
+    fn entity_register_errors_on_collision_with_non_entity_memory() {
+        let conn = test_db();
+        let mem = make_memory("Conflict", "projects/alpha", Tier::Long, 5);
+        insert(&conn, &mem).unwrap();
+        let err = entity_register(
+            &conn,
+            "Conflict",
+            "projects/alpha",
+            &[],
+            &serde_json::json!({}),
+            None,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("non-entity memory"),
+            "expected collision error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn entity_register_skips_blank_aliases() {
+        let conn = test_db();
+        let reg = entity_register(
+            &conn,
+            "Trim Test",
+            "test",
+            &[String::new(), "   ".to_string(), "ok".to_string()],
+            &serde_json::json!({}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(reg.aliases, vec!["ok".to_string()]);
+    }
+
+    #[test]
+    fn entity_register_preserves_caller_metadata_keys() {
+        let conn = test_db();
+        let extra = serde_json::json!({"team": "platform", "kind": "ignored"});
+        let reg = entity_register(&conn, "Service X", "svc", &[], &extra, None).unwrap();
+        let m = get(&conn, &reg.entity_id).unwrap().unwrap();
+        assert_eq!(m.metadata["team"], "platform");
+        // Caller's `kind` is overwritten — entity records must always
+        // carry kind=entity for the resolver to find them.
+        assert_eq!(m.metadata["kind"], "entity");
+    }
+
+    #[test]
+    fn entity_get_by_alias_returns_record_with_full_alias_set() {
+        let conn = test_db();
+        let reg = entity_register(
+            &conn,
+            "Project Alpha",
+            "projects/alpha",
+            &["pa".to_string(), "alpha".to_string()],
+            &serde_json::json!({}),
+            None,
+        )
+        .unwrap();
+        let got = entity_get_by_alias(&conn, "pa", None).unwrap().unwrap();
+        assert_eq!(got.entity_id, reg.entity_id);
+        assert_eq!(got.canonical_name, "Project Alpha");
+        assert_eq!(got.namespace, "projects/alpha");
+        // Same-batch aliases share a created_at; alphabetical
+        // tiebreak puts "alpha" before "pa".
+        assert_eq!(got.aliases, vec!["alpha".to_string(), "pa".to_string()]);
+    }
+
+    #[test]
+    fn entity_get_by_alias_returns_none_for_unknown_alias() {
+        let conn = test_db();
+        let got = entity_get_by_alias(&conn, "missing", None).unwrap();
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn entity_get_by_alias_filters_by_namespace() {
+        let conn = test_db();
+        entity_register(
+            &conn,
+            "Acme",
+            "ns_a",
+            &["a".to_string()],
+            &serde_json::json!({}),
+            None,
+        )
+        .unwrap();
+        entity_register(
+            &conn,
+            "Acme Corp",
+            "ns_b",
+            &["a".to_string()],
+            &serde_json::json!({}),
+            None,
+        )
+        .unwrap();
+        let in_a = entity_get_by_alias(&conn, "a", Some("ns_a"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(in_a.namespace, "ns_a");
+        assert_eq!(in_a.canonical_name, "Acme");
+        let in_b = entity_get_by_alias(&conn, "a", Some("ns_b"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(in_b.namespace, "ns_b");
+        assert_eq!(in_b.canonical_name, "Acme Corp");
+    }
+
+    #[test]
+    fn entity_get_by_alias_without_namespace_picks_most_recent() {
+        let conn = test_db();
+        // Older entity created first.
+        entity_register(
+            &conn,
+            "Older",
+            "ns_old",
+            &["dup".to_string()],
+            &serde_json::json!({}),
+            None,
+        )
+        .unwrap();
+        // Sleep just enough to guarantee a strictly later created_at.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        entity_register(
+            &conn,
+            "Newer",
+            "ns_new",
+            &["dup".to_string()],
+            &serde_json::json!({}),
+            None,
+        )
+        .unwrap();
+        let got = entity_get_by_alias(&conn, "dup", None).unwrap().unwrap();
+        assert_eq!(got.canonical_name, "Newer");
+        assert_eq!(got.namespace, "ns_new");
+    }
+
+    #[test]
+    fn entity_get_by_alias_ignores_non_entity_memory_with_matching_alias() {
+        let conn = test_db();
+        // Insert a regular (non-entity) memory and a stray
+        // entity_aliases row pointing at it. The resolver must skip
+        // it because `kind != 'entity'`.
+        let mut mem = make_memory("Decoy", "test", Tier::Long, 5);
+        mem.metadata = serde_json::json!({});
+        let mid = insert(&conn, &mem).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO entity_aliases (entity_id, alias, created_at) VALUES (?1, ?2, ?3)",
+            params![&mid, "decoy", &now],
+        )
+        .unwrap();
+        let got = entity_get_by_alias(&conn, "decoy", None).unwrap();
+        assert!(got.is_none(), "non-entity memories must not resolve");
+    }
+
+    #[test]
+    fn entity_register_idempotent_aliases_are_deduped() {
+        let conn = test_db();
+        let reg = entity_register(
+            &conn,
+            "Dedup",
+            "test",
+            &["x".to_string(), "x".to_string(), "y".to_string()],
+            &serde_json::json!({}),
+            None,
+        )
+        .unwrap();
+        // INSERT OR IGNORE collapses the duplicate "x".
+        assert_eq!(reg.aliases.len(), 2);
+        assert!(reg.aliases.contains(&"x".to_string()));
+        assert!(reg.aliases.contains(&"y".to_string()));
+    }
+
+    // -- Pillar 2 / Stream C — kg_timeline ---------------------------------
+
+    /// Insert a link with an explicit `valid_from` so timeline tests can
+    /// pin event ordering without relying on wall-clock spread.
+    fn insert_link_at(
+        conn: &Connection,
+        source_id: &str,
+        target_id: &str,
+        relation: &str,
+        valid_from: &str,
+    ) {
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO memory_links (source_id, target_id, relation, created_at, valid_from) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![source_id, target_id, relation, now, valid_from],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn create_link_populates_valid_from_for_new_rows() {
+        let conn = test_db();
+        let src = make_memory("kg-src", "test", Tier::Long, 5);
+        let tgt = make_memory("kg-tgt", "test", Tier::Long, 5);
+        insert(&conn, &src).unwrap();
+        insert(&conn, &tgt).unwrap();
+        create_link(&conn, &src.id, &tgt.id, "related_to").unwrap();
+        let valid_from: Option<String> = conn
+            .query_row(
+                "SELECT valid_from FROM memory_links WHERE source_id = ?1",
+                params![&src.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            valid_from.is_some(),
+            "create_link must populate valid_from so kg_timeline can see new links"
+        );
+    }
+
+    #[test]
+    fn kg_timeline_returns_events_ordered_by_valid_from_ascending() {
+        let conn = test_db();
+        let src = make_memory("alpha", "kg/projects/alpha", Tier::Long, 5);
+        let s1 = make_memory("kickoff", "kg/projects/alpha", Tier::Long, 5);
+        let s2 = make_memory("design phase", "kg/projects/alpha", Tier::Long, 5);
+        let s3 = make_memory("implementation", "kg/projects/alpha", Tier::Long, 5);
+        insert(&conn, &src).unwrap();
+        insert(&conn, &s1).unwrap();
+        insert(&conn, &s2).unwrap();
+        insert(&conn, &s3).unwrap();
+
+        // Insert in a deliberately-shuffled order so ORDER BY isn't
+        // a happy accident of insertion order.
+        insert_link_at(
+            &conn,
+            &src.id,
+            &s2.id,
+            "supersedes",
+            "2026-02-03T00:00:00+00:00",
+        );
+        insert_link_at(
+            &conn,
+            &src.id,
+            &s1.id,
+            "related_to",
+            "2026-01-15T00:00:00+00:00",
+        );
+        insert_link_at(
+            &conn,
+            &src.id,
+            &s3.id,
+            "supersedes",
+            "2026-03-22T00:00:00+00:00",
+        );
+
+        let events = kg_timeline(&conn, &src.id, None, None, None).unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].target_id, s1.id);
+        assert_eq!(events[1].target_id, s2.id);
+        assert_eq!(events[2].target_id, s3.id);
+        assert_eq!(events[0].title, "kickoff");
+        assert_eq!(events[1].relation, "supersedes");
+        assert_eq!(events[0].target_namespace, "kg/projects/alpha");
+    }
+
+    #[test]
+    fn kg_timeline_filters_by_since_inclusive() {
+        let conn = test_db();
+        let src = make_memory("e", "ns", Tier::Long, 5);
+        let t1 = make_memory("e1", "ns", Tier::Long, 5);
+        let t2 = make_memory("e2", "ns", Tier::Long, 5);
+        insert(&conn, &src).unwrap();
+        insert(&conn, &t1).unwrap();
+        insert(&conn, &t2).unwrap();
+        insert_link_at(&conn, &src.id, &t1.id, "rel", "2026-01-01T00:00:00+00:00");
+        insert_link_at(&conn, &src.id, &t2.id, "rel", "2026-03-01T00:00:00+00:00");
+
+        let events = kg_timeline(
+            &conn,
+            &src.id,
+            Some("2026-02-01T00:00:00+00:00"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].target_id, t2.id);
+
+        // Boundary: since == valid_from should match (inclusive).
+        let on_boundary = kg_timeline(
+            &conn,
+            &src.id,
+            Some("2026-03-01T00:00:00+00:00"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(on_boundary.len(), 1);
+    }
+
+    #[test]
+    fn kg_timeline_filters_by_until_inclusive() {
+        let conn = test_db();
+        let src = make_memory("e", "ns", Tier::Long, 5);
+        let t1 = make_memory("e1", "ns", Tier::Long, 5);
+        let t2 = make_memory("e2", "ns", Tier::Long, 5);
+        insert(&conn, &src).unwrap();
+        insert(&conn, &t1).unwrap();
+        insert(&conn, &t2).unwrap();
+        insert_link_at(&conn, &src.id, &t1.id, "rel", "2026-01-01T00:00:00+00:00");
+        insert_link_at(&conn, &src.id, &t2.id, "rel", "2026-03-01T00:00:00+00:00");
+
+        let events = kg_timeline(
+            &conn,
+            &src.id,
+            None,
+            Some("2026-02-01T00:00:00+00:00"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].target_id, t1.id);
+    }
+
+    #[test]
+    fn kg_timeline_skips_links_with_null_valid_from() {
+        let conn = test_db();
+        let src = make_memory("s", "ns", Tier::Long, 5);
+        let t1 = make_memory("t1", "ns", Tier::Long, 5);
+        let t2 = make_memory("t2", "ns", Tier::Long, 5);
+        insert(&conn, &src).unwrap();
+        insert(&conn, &t1).unwrap();
+        insert(&conn, &t2).unwrap();
+        // Direct insert with NULL valid_from to simulate an external
+        // writer that bypassed `create_link`.
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO memory_links (source_id, target_id, relation, created_at, valid_from) \
+             VALUES (?1, ?2, 'rel', ?3, NULL)",
+            params![&src.id, &t1.id, &now],
+        )
+        .unwrap();
+        insert_link_at(&conn, &src.id, &t2.id, "rel", "2026-01-01T00:00:00+00:00");
+
+        let events = kg_timeline(&conn, &src.id, None, None, None).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].target_id, t2.id);
+    }
+
+    #[test]
+    fn kg_timeline_excludes_links_where_source_is_target() {
+        // The query is anchored on `source_id`; inbound edges (where the
+        // entity is the target) are intentionally NOT part of the
+        // timeline. This guards against accidentally widening the
+        // contract to a bidirectional view.
+        let conn = test_db();
+        let entity = make_memory("entity", "ns", Tier::Long, 5);
+        let other = make_memory("other", "ns", Tier::Long, 5);
+        insert(&conn, &entity).unwrap();
+        insert(&conn, &other).unwrap();
+        insert_link_at(
+            &conn,
+            &other.id,
+            &entity.id,
+            "rel",
+            "2026-01-01T00:00:00+00:00",
+        );
+        let events = kg_timeline(&conn, &entity.id, None, None, None).unwrap();
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn kg_timeline_limit_clamped_to_max() {
+        let conn = test_db();
+        let src = make_memory("s", "ns", Tier::Long, 5);
+        insert(&conn, &src).unwrap();
+        for i in 0..5 {
+            let t = make_memory(&format!("t{i}"), "ns", Tier::Long, 5);
+            insert(&conn, &t).unwrap();
+            insert_link_at(
+                &conn,
+                &src.id,
+                &t.id,
+                "rel",
+                &format!("2026-01-0{}T00:00:00+00:00", i + 1),
+            );
+        }
+        // Caller passes a wildly oversized limit — should be clamped
+        // to KG_TIMELINE_MAX_LIMIT (i.e. accepted, not errored), and
+        // since the row count is small, should return all 5.
+        let events = kg_timeline(&conn, &src.id, None, None, Some(usize::MAX)).unwrap();
+        assert_eq!(events.len(), 5);
+
+        // Caller passes 0 — clamp to 1.
+        let one = kg_timeline(&conn, &src.id, None, None, Some(0)).unwrap();
+        assert_eq!(one.len(), 1);
+    }
+
+    #[test]
+    fn kg_timeline_carries_observed_by_and_valid_until() {
+        let conn = test_db();
+        let src = make_memory("s", "ns", Tier::Long, 5);
+        let t = make_memory("t", "ns", Tier::Long, 5);
+        insert(&conn, &src).unwrap();
+        insert(&conn, &t).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO memory_links (source_id, target_id, relation, created_at, valid_from, valid_until, observed_by) \
+             VALUES (?1, ?2, 'supersedes', ?3, '2026-01-01T00:00:00+00:00', '2026-12-31T23:59:59+00:00', 'agent-pm-1')",
+            params![&src.id, &t.id, &now],
+        )
+        .unwrap();
+        let events = kg_timeline(&conn, &src.id, None, None, None).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].observed_by.as_deref(), Some("agent-pm-1"));
+        assert_eq!(
+            events[0].valid_until.as_deref(),
+            Some("2026-12-31T23:59:59+00:00")
+        );
+    }
+
+    #[test]
+    fn kg_timeline_empty_for_unknown_source() {
+        let conn = test_db();
+        let events = kg_timeline(&conn, "nonexistent-id", None, None, None).unwrap();
+        assert!(events.is_empty());
+    }
+
+    // -- Pillar 2 / Stream C — kg_invalidate -------------------------------
+
+    #[test]
+    fn invalidate_link_sets_valid_until_to_provided_timestamp() {
+        let conn = test_db();
+        let src = make_memory("inv-s", "test", Tier::Long, 5);
+        let tgt = make_memory("inv-t", "test", Tier::Long, 5);
+        insert(&conn, &src).unwrap();
+        insert(&conn, &tgt).unwrap();
+        create_link(&conn, &src.id, &tgt.id, "related_to").unwrap();
+        let stamp = "2026-12-31T23:59:59+00:00";
+        let res = invalidate_link(&conn, &src.id, &tgt.id, "related_to", Some(stamp))
+            .unwrap()
+            .expect("link must exist");
+        assert_eq!(res.valid_until, stamp);
+        assert!(res.previous_valid_until.is_none());
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT valid_until FROM memory_links \
+                 WHERE source_id = ?1 AND target_id = ?2 AND relation = ?3",
+                params![&src.id, &tgt.id, "related_to"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some(stamp));
+    }
+
+    #[test]
+    fn invalidate_link_defaults_to_now_when_no_timestamp_provided() {
+        let conn = test_db();
+        let src = make_memory("inv-s", "test", Tier::Long, 5);
+        let tgt = make_memory("inv-t", "test", Tier::Long, 5);
+        insert(&conn, &src).unwrap();
+        insert(&conn, &tgt).unwrap();
+        create_link(&conn, &src.id, &tgt.id, "related_to").unwrap();
+        let res = invalidate_link(&conn, &src.id, &tgt.id, "related_to", None)
+            .unwrap()
+            .expect("link must exist");
+        // The default is wall-clock now; assert it parses as RFC3339 and
+        // is within a small window of the test's "now" (allow 60s skew
+        // to accommodate slow runners).
+        let parsed = chrono::DateTime::parse_from_rfc3339(&res.valid_until)
+            .expect("default valid_until must be RFC3339");
+        let now = chrono::Utc::now();
+        let drift = now.signed_duration_since(parsed.with_timezone(&chrono::Utc));
+        assert!(
+            drift.num_seconds().abs() < 60,
+            "default valid_until {} should be near now {now}",
+            res.valid_until
+        );
+    }
+
+    #[test]
+    fn invalidate_link_returns_none_for_unknown_triple() {
+        let conn = test_db();
+        // No memories or links created.
+        let res = invalidate_link(&conn, "missing-src", "missing-tgt", "related_to", None).unwrap();
+        assert!(res.is_none());
+    }
+
+    #[test]
+    fn invalidate_link_returns_none_when_relation_does_not_match() {
+        // Link exists for ("related_to") but caller asks for ("supersedes").
+        let conn = test_db();
+        let src = make_memory("inv-s", "test", Tier::Long, 5);
+        let tgt = make_memory("inv-t", "test", Tier::Long, 5);
+        insert(&conn, &src).unwrap();
+        insert(&conn, &tgt).unwrap();
+        create_link(&conn, &src.id, &tgt.id, "related_to").unwrap();
+        let res = invalidate_link(&conn, &src.id, &tgt.id, "supersedes", None).unwrap();
+        assert!(res.is_none(), "must not match across relation values");
+    }
+
+    #[test]
+    fn invalidate_link_overwrites_existing_valid_until_and_reports_prior() {
+        let conn = test_db();
+        let src = make_memory("inv-s", "test", Tier::Long, 5);
+        let tgt = make_memory("inv-t", "test", Tier::Long, 5);
+        insert(&conn, &src).unwrap();
+        insert(&conn, &tgt).unwrap();
+        create_link(&conn, &src.id, &tgt.id, "related_to").unwrap();
+        let first = "2026-06-01T00:00:00+00:00";
+        let second = "2026-12-01T00:00:00+00:00";
+        let r1 = invalidate_link(&conn, &src.id, &tgt.id, "related_to", Some(first))
+            .unwrap()
+            .unwrap();
+        assert!(r1.previous_valid_until.is_none());
+        let r2 = invalidate_link(&conn, &src.id, &tgt.id, "related_to", Some(second))
+            .unwrap()
+            .unwrap();
+        assert_eq!(r2.previous_valid_until.as_deref(), Some(first));
+        assert_eq!(r2.valid_until, second);
+    }
+
+    #[test]
+    fn invalidate_link_distinguishes_relation_when_multiple_links_share_endpoints() {
+        // Two links between the same pair, different relations. Invalidating
+        // one must not affect the other.
+        let conn = test_db();
+        let src = make_memory("inv-s", "test", Tier::Long, 5);
+        let tgt = make_memory("inv-t", "test", Tier::Long, 5);
+        insert(&conn, &src).unwrap();
+        insert(&conn, &tgt).unwrap();
+        create_link(&conn, &src.id, &tgt.id, "related_to").unwrap();
+        create_link(&conn, &src.id, &tgt.id, "supersedes").unwrap();
+        let stamp = "2026-07-15T12:00:00+00:00";
+        invalidate_link(&conn, &src.id, &tgt.id, "related_to", Some(stamp))
+            .unwrap()
+            .unwrap();
+        let related: Option<String> = conn
+            .query_row(
+                "SELECT valid_until FROM memory_links \
+                 WHERE source_id = ?1 AND target_id = ?2 AND relation = 'related_to'",
+                params![&src.id, &tgt.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let supers: Option<String> = conn
+            .query_row(
+                "SELECT valid_until FROM memory_links \
+                 WHERE source_id = ?1 AND target_id = ?2 AND relation = 'supersedes'",
+                params![&src.id, &tgt.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(related.as_deref(), Some(stamp));
+        assert!(
+            supers.is_none(),
+            "the sibling 'supersedes' link must remain valid"
+        );
+    }
+
+    #[test]
+    fn invalidate_link_preserves_other_columns() {
+        // valid_from, observed_by, created_at, signature must not be
+        // touched by the invalidate UPDATE.
+        let conn = test_db();
+        let src = make_memory("inv-s", "test", Tier::Long, 5);
+        let tgt = make_memory("inv-t", "test", Tier::Long, 5);
+        insert(&conn, &src).unwrap();
+        insert(&conn, &tgt).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO memory_links \
+             (source_id, target_id, relation, created_at, valid_from, observed_by) \
+             VALUES (?1, ?2, 'related_to', ?3, '2026-01-01T00:00:00+00:00', 'agent-x')",
+            params![&src.id, &tgt.id, &now],
+        )
+        .unwrap();
+        invalidate_link(
+            &conn,
+            &src.id,
+            &tgt.id,
+            "related_to",
+            Some("2026-12-31T23:59:59+00:00"),
+        )
+        .unwrap()
+        .unwrap();
+        let (vf, ob, ca): (Option<String>, Option<String>, String) = conn
+            .query_row(
+                "SELECT valid_from, observed_by, created_at FROM memory_links \
+                 WHERE source_id = ?1 AND target_id = ?2 AND relation = 'related_to'",
+                params![&src.id, &tgt.id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(vf.as_deref(), Some("2026-01-01T00:00:00+00:00"));
+        assert_eq!(ob.as_deref(), Some("agent-x"));
+        assert_eq!(ca, now);
+    }
+
+    // -- Pillar 2 / Stream C — kg_query (depth=1) ---------------------------
+
+    /// Insert a link with explicit `temporal/observed_by` columns so the
+    /// `kg_query` filter tests can pin behavior without relying on
+    /// wall-clock spread.
+    fn insert_link_full(
+        conn: &Connection,
+        source_id: &str,
+        target_id: &str,
+        relation: &str,
+        valid_from: Option<&str>,
+        valid_until: Option<&str>,
+        observed_by: Option<&str>,
+    ) {
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO memory_links \
+             (source_id, target_id, relation, created_at, valid_from, valid_until, observed_by) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                source_id,
+                target_id,
+                relation,
+                now,
+                valid_from,
+                valid_until,
+                observed_by
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn kg_query_returns_outbound_neighbors_at_depth_1() {
+        let conn = test_db();
+        let src = make_memory("alpha", "kg/projects/alpha", Tier::Long, 5);
+        let n1 = make_memory("kickoff", "kg/projects/alpha", Tier::Long, 5);
+        let n2 = make_memory("design", "kg/projects/alpha", Tier::Long, 5);
+        insert(&conn, &src).unwrap();
+        insert(&conn, &n1).unwrap();
+        insert(&conn, &n2).unwrap();
+        insert_link_full(
+            &conn,
+            &src.id,
+            &n1.id,
+            "related_to",
+            Some("2026-01-15T00:00:00+00:00"),
+            None,
+            Some("agent-1"),
+        );
+        insert_link_full(
+            &conn,
+            &src.id,
+            &n2.id,
+            "supersedes",
+            Some("2026-02-03T00:00:00+00:00"),
+            None,
+            Some("agent-2"),
+        );
+
+        let nodes = kg_query(&conn, &src.id, 1, None, None, None).unwrap();
+        assert_eq!(nodes.len(), 2);
+        // Ordered by COALESCE(valid_from, created_at) ASC.
+        assert_eq!(nodes[0].target_id, n1.id);
+        assert_eq!(nodes[1].target_id, n2.id);
+        assert_eq!(nodes[0].title, "kickoff");
+        assert_eq!(nodes[0].relation, "related_to");
+        assert_eq!(nodes[0].observed_by.as_deref(), Some("agent-1"));
+        assert_eq!(nodes[0].depth, 1);
+        assert_eq!(nodes[0].path, format!("{}->{}", src.id, n1.id));
+        assert_eq!(nodes[0].target_namespace, "kg/projects/alpha");
+    }
+
+    #[test]
+    fn kg_query_filters_by_valid_at_window() {
+        let conn = test_db();
+        let src = make_memory("e", "ns", Tier::Long, 5);
+        let t1 = make_memory("e1", "ns", Tier::Long, 5);
+        let t2 = make_memory("e2", "ns", Tier::Long, 5);
+        insert(&conn, &src).unwrap();
+        insert(&conn, &t1).unwrap();
+        insert(&conn, &t2).unwrap();
+        // t1 valid 2026-01-01 → 2026-02-01; t2 valid from 2026-03-01.
+        insert_link_full(
+            &conn,
+            &src.id,
+            &t1.id,
+            "related_to",
+            Some("2026-01-01T00:00:00+00:00"),
+            Some("2026-02-01T00:00:00+00:00"),
+            None,
+        );
+        insert_link_full(
+            &conn,
+            &src.id,
+            &t2.id,
+            "related_to",
+            Some("2026-03-01T00:00:00+00:00"),
+            None,
+            None,
+        );
+
+        // At 2026-01-15 only t1 is valid.
+        let n_jan = kg_query(
+            &conn,
+            &src.id,
+            1,
+            Some("2026-01-15T00:00:00+00:00"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(n_jan.len(), 1);
+        assert_eq!(n_jan[0].target_id, t1.id);
+
+        // At 2026-02-15 the first link is closed, the second hasn't
+        // started yet — empty.
+        let n_feb = kg_query(
+            &conn,
+            &src.id,
+            1,
+            Some("2026-02-15T00:00:00+00:00"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(n_feb.is_empty());
+
+        // At 2026-04-01 only t2 is valid.
+        let n_apr = kg_query(
+            &conn,
+            &src.id,
+            1,
+            Some("2026-04-01T00:00:00+00:00"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(n_apr.len(), 1);
+        assert_eq!(n_apr[0].target_id, t2.id);
+    }
+
+    #[test]
+    fn kg_query_skips_null_valid_from_when_valid_at_filter_active() {
+        let conn = test_db();
+        let src = make_memory("s", "ns", Tier::Long, 5);
+        let t = make_memory("t", "ns", Tier::Long, 5);
+        insert(&conn, &src).unwrap();
+        insert(&conn, &t).unwrap();
+        // Link with NULL valid_from — must be invisible to a temporally
+        // scoped query (we cannot tell if it was valid at any point).
+        insert_link_full(&conn, &src.id, &t.id, "related_to", None, None, None);
+
+        let with_filter = kg_query(
+            &conn,
+            &src.id,
+            1,
+            Some("2026-01-15T00:00:00+00:00"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(with_filter.is_empty());
+
+        // Without the filter, the same link IS returned.
+        let without = kg_query(&conn, &src.id, 1, None, None, None).unwrap();
+        assert_eq!(without.len(), 1);
+        assert_eq!(without[0].target_id, t.id);
+    }
+
+    #[test]
+    fn kg_query_filters_by_allowed_agents() {
+        let conn = test_db();
+        let src = make_memory("s", "ns", Tier::Long, 5);
+        let t1 = make_memory("t1", "ns", Tier::Long, 5);
+        let t2 = make_memory("t2", "ns", Tier::Long, 5);
+        let t3 = make_memory("t3", "ns", Tier::Long, 5);
+        insert(&conn, &src).unwrap();
+        insert(&conn, &t1).unwrap();
+        insert(&conn, &t2).unwrap();
+        insert(&conn, &t3).unwrap();
+        insert_link_full(
+            &conn,
+            &src.id,
+            &t1.id,
+            "related_to",
+            Some("2026-01-01T00:00:00+00:00"),
+            None,
+            Some("agent-a"),
+        );
+        insert_link_full(
+            &conn,
+            &src.id,
+            &t2.id,
+            "related_to",
+            Some("2026-01-02T00:00:00+00:00"),
+            None,
+            Some("agent-b"),
+        );
+        // Link with NULL observed_by must be excluded once the agent
+        // filter is active (`NULL IN (...)` is NULL/false in SQLite).
+        insert_link_full(
+            &conn,
+            &src.id,
+            &t3.id,
+            "related_to",
+            Some("2026-01-03T00:00:00+00:00"),
+            None,
+            None,
+        );
+
+        let allow_a = vec!["agent-a".to_string()];
+        let only_a = kg_query(&conn, &src.id, 1, None, Some(&allow_a), None).unwrap();
+        assert_eq!(only_a.len(), 1);
+        assert_eq!(only_a[0].target_id, t1.id);
+
+        let allow_both = vec!["agent-a".to_string(), "agent-b".to_string()];
+        let both = kg_query(&conn, &src.id, 1, None, Some(&allow_both), None).unwrap();
+        assert_eq!(both.len(), 2);
+    }
+
+    #[test]
+    fn kg_query_empty_allowed_agents_returns_zero_rows() {
+        let conn = test_db();
+        let src = make_memory("s", "ns", Tier::Long, 5);
+        let t = make_memory("t", "ns", Tier::Long, 5);
+        insert(&conn, &src).unwrap();
+        insert(&conn, &t).unwrap();
+        insert_link_full(
+            &conn,
+            &src.id,
+            &t.id,
+            "related_to",
+            Some("2026-01-01T00:00:00+00:00"),
+            None,
+            Some("agent-a"),
+        );
+
+        // Sanity: no filter returns the link.
+        let unfiltered = kg_query(&conn, &src.id, 1, None, None, None).unwrap();
+        assert_eq!(unfiltered.len(), 1);
+
+        // Empty allowlist == "no agents trusted" — must return zero
+        // rows, not silently fall through to the unfiltered path.
+        let empty: Vec<String> = Vec::new();
+        let none = kg_query(&conn, &src.id, 1, None, Some(&empty), None).unwrap();
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn kg_query_rejects_max_depth_zero() {
+        let conn = test_db();
+        let src = make_memory("s", "ns", Tier::Long, 5);
+        insert(&conn, &src).unwrap();
+        let err = kg_query(&conn, &src.id, 0, None, None, None).unwrap_err();
+        assert!(err.to_string().contains("max_depth"));
+    }
+
+    #[test]
+    fn kg_query_rejects_unsupported_max_depth() {
+        // The recursive-CTE slice supports depth 1..=5; passing 6+ must
+        // produce an explicit error so callers learn they hit the
+        // ceiling rather than receiving a partial graph.
+        let conn = test_db();
+        let src = make_memory("s", "ns", Tier::Long, 5);
+        insert(&conn, &src).unwrap();
+        let err = kg_query(
+            &conn,
+            &src.id,
+            KG_QUERY_MAX_SUPPORTED_DEPTH + 1,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains(&format!("max_depth={}", KG_QUERY_MAX_SUPPORTED_DEPTH + 1)));
+        assert!(msg.contains(&format!("supported depth={KG_QUERY_MAX_SUPPORTED_DEPTH}")));
+    }
+
+    #[test]
+    fn kg_query_traverses_multiple_hops() {
+        // src -> mid -> leaf. depth=2 must return both hops, with
+        // depth/path reflecting the chain.
+        let conn = test_db();
+        let src = make_memory("src", "ns", Tier::Long, 5);
+        let mid = make_memory("mid", "ns", Tier::Long, 5);
+        let leaf = make_memory("leaf", "ns", Tier::Long, 5);
+        insert(&conn, &src).unwrap();
+        insert(&conn, &mid).unwrap();
+        insert(&conn, &leaf).unwrap();
+        insert_link_full(
+            &conn,
+            &src.id,
+            &mid.id,
+            "related_to",
+            Some("2026-01-01T00:00:00+00:00"),
+            None,
+            Some("agent-x"),
+        );
+        insert_link_full(
+            &conn,
+            &mid.id,
+            &leaf.id,
+            "supersedes",
+            Some("2026-01-02T00:00:00+00:00"),
+            None,
+            Some("agent-x"),
+        );
+
+        // depth=1 sees only mid.
+        let d1 = kg_query(&conn, &src.id, 1, None, None, None).unwrap();
+        assert_eq!(d1.len(), 1);
+        assert_eq!(d1[0].target_id, mid.id);
+        assert_eq!(d1[0].depth, 1);
+
+        // depth=2 sees both, ordered shallow-first.
+        let d2 = kg_query(&conn, &src.id, 2, None, None, None).unwrap();
+        assert_eq!(d2.len(), 2);
+        assert_eq!(d2[0].target_id, mid.id);
+        assert_eq!(d2[0].depth, 1);
+        assert_eq!(d2[0].path, format!("{}->{}", src.id, mid.id));
+        assert_eq!(d2[1].target_id, leaf.id);
+        assert_eq!(d2[1].depth, 2);
+        assert_eq!(d2[1].relation, "supersedes");
+        assert_eq!(d2[1].path, format!("{}->{}->{}", src.id, mid.id, leaf.id));
+    }
+
+    #[test]
+    fn kg_query_multi_hop_respects_valid_at_per_hop() {
+        // src -> mid valid 2026-01..02; mid -> leaf valid 2026-04+.
+        // At valid_at=2026-01-15 the second hop is not yet valid, so
+        // only mid is returned; at valid_at=2026-04-15 the first hop is
+        // closed, so both are filtered out.
+        let conn = test_db();
+        let src = make_memory("s", "ns", Tier::Long, 5);
+        let mid = make_memory("m", "ns", Tier::Long, 5);
+        let leaf = make_memory("l", "ns", Tier::Long, 5);
+        insert(&conn, &src).unwrap();
+        insert(&conn, &mid).unwrap();
+        insert(&conn, &leaf).unwrap();
+        insert_link_full(
+            &conn,
+            &src.id,
+            &mid.id,
+            "related_to",
+            Some("2026-01-01T00:00:00+00:00"),
+            Some("2026-02-01T00:00:00+00:00"),
+            None,
+        );
+        insert_link_full(
+            &conn,
+            &mid.id,
+            &leaf.id,
+            "related_to",
+            Some("2026-04-01T00:00:00+00:00"),
+            None,
+            None,
+        );
+
+        let mid_only = kg_query(
+            &conn,
+            &src.id,
+            3,
+            Some("2026-01-15T00:00:00+00:00"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(mid_only.len(), 1);
+        assert_eq!(mid_only[0].target_id, mid.id);
+
+        let neither = kg_query(
+            &conn,
+            &src.id,
+            3,
+            Some("2026-04-15T00:00:00+00:00"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(neither.is_empty());
+    }
+
+    #[test]
+    fn kg_query_detects_cycles() {
+        // a -> b -> c -> a forms a cycle. Even with max_depth=5, the
+        // traversal must stop revisiting nodes that are already on the
+        // path; the result lists each reachable node at most once.
+        let conn = test_db();
+        let a = make_memory("a", "ns", Tier::Long, 5);
+        let b = make_memory("b", "ns", Tier::Long, 5);
+        let c = make_memory("c", "ns", Tier::Long, 5);
+        insert(&conn, &a).unwrap();
+        insert(&conn, &b).unwrap();
+        insert(&conn, &c).unwrap();
+        insert_link_full(
+            &conn,
+            &a.id,
+            &b.id,
+            "related_to",
+            Some("2026-01-01T00:00:00+00:00"),
+            None,
+            None,
+        );
+        insert_link_full(
+            &conn,
+            &b.id,
+            &c.id,
+            "related_to",
+            Some("2026-01-02T00:00:00+00:00"),
+            None,
+            None,
+        );
+        insert_link_full(
+            &conn,
+            &c.id,
+            &a.id,
+            "related_to",
+            Some("2026-01-03T00:00:00+00:00"),
+            None,
+            None,
+        );
+
+        let nodes = kg_query(&conn, &a.id, 5, None, None, None).unwrap();
+        // Expect b at depth 1 and c at depth 2; the cycle back to a is
+        // pruned. (The c->a edge could in principle surface a again at
+        // depth 3, but only if a is not on its own path — and the
+        // anchor seeds path with `a->b`, so a IS on every descendant
+        // path through b/c.)
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0].target_id, b.id);
+        assert_eq!(nodes[0].depth, 1);
+        assert_eq!(nodes[1].target_id, c.id);
+        assert_eq!(nodes[1].depth, 2);
+    }
+
+    #[test]
+    fn kg_query_multi_hop_filters_by_allowed_agents_per_hop() {
+        // src -> mid (agent-a), mid -> leaf (agent-b). With allow=[a]
+        // only the first hop survives; with allow=[a,b] both surface.
+        let conn = test_db();
+        let src = make_memory("s", "ns", Tier::Long, 5);
+        let mid = make_memory("m", "ns", Tier::Long, 5);
+        let leaf = make_memory("l", "ns", Tier::Long, 5);
+        insert(&conn, &src).unwrap();
+        insert(&conn, &mid).unwrap();
+        insert(&conn, &leaf).unwrap();
+        insert_link_full(
+            &conn,
+            &src.id,
+            &mid.id,
+            "related_to",
+            Some("2026-01-01T00:00:00+00:00"),
+            None,
+            Some("agent-a"),
+        );
+        insert_link_full(
+            &conn,
+            &mid.id,
+            &leaf.id,
+            "related_to",
+            Some("2026-01-02T00:00:00+00:00"),
+            None,
+            Some("agent-b"),
+        );
+
+        let allow_a = vec!["agent-a".to_string()];
+        let only_first = kg_query(&conn, &src.id, 3, None, Some(&allow_a), None).unwrap();
+        assert_eq!(only_first.len(), 1);
+        assert_eq!(only_first[0].target_id, mid.id);
+
+        let allow_both = vec!["agent-a".to_string(), "agent-b".to_string()];
+        let both = kg_query(&conn, &src.id, 3, None, Some(&allow_both), None).unwrap();
+        assert_eq!(both.len(), 2);
+        assert_eq!(both[1].target_id, leaf.id);
+        assert_eq!(both[1].depth, 2);
+    }
+
+    #[test]
+    fn kg_query_limit_clamped_to_max() {
+        let conn = test_db();
+        let src = make_memory("s", "ns", Tier::Long, 5);
+        insert(&conn, &src).unwrap();
+        for i in 0..3 {
+            let t = make_memory(&format!("t{i}"), "ns", Tier::Long, 5);
+            insert(&conn, &t).unwrap();
+            insert_link_full(
+                &conn,
+                &src.id,
+                &t.id,
+                "related_to",
+                Some(&format!("2026-01-{:02}T00:00:00+00:00", i + 1)),
+                None,
+                None,
+            );
+        }
+
+        // limit=usize::MAX clamps to KG_QUERY_MAX_LIMIT (1000),
+        // which is bigger than our 3 rows — all returned.
+        let all = kg_query(&conn, &src.id, 1, None, None, Some(usize::MAX)).unwrap();
+        assert_eq!(all.len(), 3);
+
+        // limit=0 clamps up to 1.
+        let one = kg_query(&conn, &src.id, 1, None, None, Some(0)).unwrap();
+        assert_eq!(one.len(), 1);
+    }
+
+    #[test]
+    fn kg_query_empty_for_unknown_source() {
+        let conn = test_db();
+        let nodes = kg_query(&conn, "no-such-id", 1, None, None, None).unwrap();
+        assert!(nodes.is_empty());
+    }
+
+    #[test]
+    fn schema_v15_existing_links_get_valid_from_backfilled() {
+        // Simulate a v14 database with one link, then re-run the
+        // v15 migration and assert valid_from was backfilled to the
+        // source memory's created_at. We do this by opening a fresh
+        // db (which is at v15), inserting a link with NULL valid_from,
+        // rolling schema_version back to 14, and re-opening to force
+        // the v15 block to re-execute the backfill UPDATE.
+        let path = std::env::temp_dir().join(format!(
+            "ai_memory_v15_backfill_{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        {
+            let conn = open(&path).unwrap();
+            let src = make_memory("src", "test", Tier::Long, 5);
+            let tgt = make_memory("tgt", "test", Tier::Long, 5);
+            insert(&conn, &src).unwrap();
+            insert(&conn, &tgt).unwrap();
+            // Insert a link directly with NULL valid_from to mimic
+            // pre-migration state.
+            conn.execute(
+                "INSERT INTO memory_links (source_id, target_id, relation, created_at, valid_from) \
+                 VALUES (?1, ?2, 'related_to', ?3, NULL)",
+                params![&src.id, &tgt.id, &chrono::Utc::now().to_rfc3339()],
+            )
+            .unwrap();
+            // Roll schema back to v14 and re-run migrate via re-open.
+            conn.execute("DELETE FROM schema_version", []).unwrap();
+            conn.execute("INSERT INTO schema_version (version) VALUES (14)", [])
+                .unwrap();
+        }
+
+        let conn2 = open(&path).unwrap();
+        let backfilled: Option<String> = conn2
+            .query_row("SELECT valid_from FROM memory_links LIMIT 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(
+            backfilled.is_some(),
+            "expected valid_from to be backfilled, got NULL"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn namespace_prefix_query_index_available() {
+        let conn = test_db();
+        // SQLite's default BINARY collation supports prefix-matching LIKE queries
+        // with the idx_memories_namespace index. Verify the index exists and a
+        // simple prefix query can execute (EXPLAIN QUERY PLAN output varies by
+        // SQLite version and query planner heuristics, so we just check that the
+        // query completes without error).
+        let result: Option<String> = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_memories_namespace'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            Some("idx_memories_namespace".to_string()),
+            "idx_memories_namespace index should exist"
+        );
+
+        // Execute a prefix LIKE query to ensure it compiles and runs
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE namespace LIKE 'test/%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
     }
 }

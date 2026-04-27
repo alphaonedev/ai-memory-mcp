@@ -187,6 +187,8 @@ impl TierConfig {
         let has_llm = self.llm_model.is_some();
 
         Capabilities {
+            // Capabilities schema v2 — see `Capabilities` doc comment.
+            schema_version: "2".to_string(),
             tier: self.tier.as_str().to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             features: CapabilityFeatures {
@@ -218,6 +220,22 @@ impl TierConfig {
                     "none".to_string()
                 },
             },
+            // v2 dynamic blocks — start at zero-state defaults. The MCP
+            // and HTTP `handle_capabilities` wrappers overwrite these
+            // with live counts when they have a `&Connection` handle.
+            permissions: CapabilityPermissions {
+                mode: "ask".to_string(),
+                active_rules: 0,
+                rule_summary: Vec::new(),
+            },
+            hooks: CapabilityHooks::default(),
+            compaction: CapabilityCompaction::default(),
+            approval: CapabilityApproval {
+                subscribers: 0,
+                pending_requests: 0,
+                default_timeout_seconds: 30,
+            },
+            transcripts: CapabilityTranscripts::default(),
         }
     }
 }
@@ -227,12 +245,43 @@ impl TierConfig {
 // ---------------------------------------------------------------------------
 
 /// Top-level capabilities report for a running instance.
+///
+/// Schema versions:
+/// - v1 (implicit, pre-v0.6.3.1): `tier`, `version`, `features`, `models`
+/// - v2 (v0.6.3 / arch-enhancement-spec §7): adds `schema_version` plus
+///   `permissions`, `hooks`, `compaction`, `approval`, `transcripts` blocks.
+///   v1 fields preserved at the same paths — old clients reading by name
+///   continue to work.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Capabilities {
+    /// Schema-version discriminator. Always `"2"` since v0.6.3.
+    pub schema_version: String,
     pub tier: String,
     pub version: String,
     pub features: CapabilityFeatures,
     pub models: CapabilityModels,
+
+    /// Active permission/governance rules. Pre-v0.7 reports the count of
+    /// namespaces that have a `metadata.governance` policy attached to
+    /// their standard memory; the underlying permission system itself
+    /// is v0.7 work.
+    pub permissions: CapabilityPermissions,
+
+    /// Registered hooks. Pre-v0.7 reports webhook subscriptions as a
+    /// proxy (hook system itself is v0.7 Bucket 0).
+    pub hooks: CapabilityHooks,
+
+    /// Compaction state. v0.8 work — pre-v0.8 reports `enabled: false`.
+    pub compaction: CapabilityCompaction,
+
+    /// Approval API state. Reports the live count of pending actions
+    /// from the existing `pending_actions` table; subscriber count is
+    /// v0.7 work.
+    pub approval: CapabilityApproval,
+
+    /// Sidechain-transcript state. v0.7 Bucket 1.7 work — pre-v0.7
+    /// reports `enabled: false`.
+    pub transcripts: CapabilityTranscripts,
 }
 
 /// Boolean feature flags exposed in the capabilities report.
@@ -271,6 +320,71 @@ pub struct CapabilityModels {
     pub embedding_dim: usize,
     pub llm: String,
     pub cross_encoder: String,
+}
+
+/// Permissions block (capabilities schema v2). Pre-v0.7 reports a live
+/// count of namespace standards carrying a `metadata.governance` policy;
+/// the full permission system lands in v0.7 (arch-enhancement-spec §3).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CapabilityPermissions {
+    /// Enforcement mode. `"ask"` = current default (governance gate runs
+    /// on store/delete/promote and may return Pending). `"off"` would
+    /// disable enforcement; not yet wired.
+    pub mode: String,
+    /// Number of namespace standards whose `metadata.governance` is
+    /// non-null. Counts policies, not memories.
+    pub active_rules: usize,
+    /// Per-namespace summary; empty pre-v0.7.
+    #[serde(default)]
+    pub rule_summary: Vec<String>,
+}
+
+/// Hook-pipeline block (capabilities schema v2). Pre-v0.7 reports webhook
+/// subscriptions as the closest analogue. The full hook pipeline lands in
+/// v0.7 Bucket 0 (arch-enhancement-spec §2).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CapabilityHooks {
+    /// Number of registered hook subscribers (proxy: webhook subscriptions).
+    pub registered_count: usize,
+    /// Per-event registration map; empty pre-v0.7.
+    #[serde(default)]
+    pub by_event: std::collections::BTreeMap<String, usize>,
+}
+
+/// Compaction block (capabilities schema v2). v0.8 Pillar 2.5 work —
+/// pre-v0.8 reports `enabled: false` and the rest as `None`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CapabilityCompaction {
+    pub enabled: bool,
+    #[serde(default)]
+    pub interval_minutes: Option<u64>,
+    #[serde(default)]
+    pub last_run_at: Option<String>,
+    #[serde(default)]
+    pub last_run_stats: Option<serde_json::Value>,
+}
+
+/// Approval-API block (capabilities schema v2). `pending_requests`
+/// counts the existing `pending_actions` table (live signal). Subscriber
+/// reporting is v0.7 work.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CapabilityApproval {
+    /// Number of agents/humans subscribed to approval-decision events.
+    /// 0 pre-v0.7.
+    pub subscribers: usize,
+    /// Live count of `pending_actions` with status='pending'.
+    pub pending_requests: usize,
+    /// Default approval-request timeout. 30s for the v0.6.3 patch.
+    pub default_timeout_seconds: u64,
+}
+
+/// Sidechain-transcript block (capabilities schema v2). v0.7 Bucket 1.7
+/// work — pre-v0.7 reports `enabled: false`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CapabilityTranscripts {
+    pub enabled: bool,
+    pub total_count: usize,
+    pub total_size_mb: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -778,6 +892,54 @@ mod tests {
         assert!(json.contains("gemma4:e2b"));
     }
 
+    /// v0.6.3 (capabilities schema v2 — arch-enhancement-spec §7).
+    /// Round-trip the new struct through serde_json and assert every
+    /// new top-level block is present with the documented zero-state.
+    #[test]
+    fn capabilities_v2_zero_state_round_trip() {
+        let caps = FeatureTier::Keyword.config().capabilities();
+        let val: serde_json::Value = serde_json::to_value(&caps).unwrap();
+
+        assert_eq!(val["schema_version"], "2");
+
+        // permissions zero-state: mode="ask", active_rules=0, empty summary
+        assert_eq!(val["permissions"]["mode"], "ask");
+        assert_eq!(val["permissions"]["active_rules"], 0);
+        assert!(
+            val["permissions"]["rule_summary"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+
+        // hooks zero-state: 0 registered, empty by_event map
+        assert_eq!(val["hooks"]["registered_count"], 0);
+        assert!(val["hooks"]["by_event"].as_object().unwrap().is_empty());
+
+        // compaction zero-state: disabled
+        assert_eq!(val["compaction"]["enabled"], false);
+        assert!(val["compaction"]["interval_minutes"].is_null());
+        assert!(val["compaction"]["last_run_at"].is_null());
+        assert!(val["compaction"]["last_run_stats"].is_null());
+
+        // approval zero-state: 0 subscribers, 0 pending, 30s timeout
+        assert_eq!(val["approval"]["subscribers"], 0);
+        assert_eq!(val["approval"]["pending_requests"], 0);
+        assert_eq!(val["approval"]["default_timeout_seconds"], 30);
+
+        // transcripts zero-state: disabled
+        assert_eq!(val["transcripts"]["enabled"], false);
+        assert_eq!(val["transcripts"]["total_count"], 0);
+        assert_eq!(val["transcripts"]["total_size_mb"], 0);
+
+        // Round-trip back to a typed Capabilities and confirm field
+        // identity (proves Deserialize works for all 5 new structs).
+        let restored: Capabilities = serde_json::from_value(val).unwrap();
+        assert_eq!(restored.schema_version, "2");
+        assert_eq!(restored.permissions.mode, "ask");
+        assert_eq!(restored.approval.default_timeout_seconds, 30);
+    }
+
     #[test]
     fn config_default_is_empty() {
         let cfg = AppConfig::default();
@@ -982,17 +1144,221 @@ mod tests {
 
     #[test]
     fn scoring_roundtrip_through_toml() {
-        let toml_src = r#"
+        let toml_src = r"
 [scoring]
 half_life_days_short = 5.0
 half_life_days_mid = 25.0
 legacy_scoring = false
-"#;
+";
         let cfg: AppConfig = toml::from_str(toml_src).expect("parses");
         let s = cfg.effective_scoring();
         assert!((s.half_life_days_short - 5.0).abs() < f64::EPSILON);
         assert!((s.half_life_days_mid - 25.0).abs() < f64::EPSILON);
         // Unset long defaults.
         assert!((s.half_life_days_long - 365.0).abs() < f64::EPSILON);
+    }
+
+    // ---- Wave 3 (Closer T) tests for uncovered effective_* helpers
+    // and write_default_if_missing. ----
+
+    #[test]
+    fn effective_tier_cli_overrides_config() {
+        let cfg = AppConfig {
+            tier: Some("smart".to_string()),
+            ..AppConfig::default()
+        };
+        // CLI flag wins over config.
+        assert_eq!(
+            cfg.effective_tier(Some("autonomous")),
+            FeatureTier::Autonomous
+        );
+        // No CLI flag → config used.
+        assert_eq!(cfg.effective_tier(None), FeatureTier::Smart);
+    }
+
+    #[test]
+    fn effective_tier_unknown_falls_back_to_semantic() {
+        let cfg = AppConfig::default();
+        assert_eq!(
+            cfg.effective_tier(Some("invalid-tier")),
+            FeatureTier::Semantic
+        );
+        // No CLI, no config → default semantic.
+        assert_eq!(cfg.effective_tier(None), FeatureTier::Semantic);
+    }
+
+    #[test]
+    fn effective_db_cli_path_wins_when_non_default() {
+        let cfg = AppConfig {
+            db: Some("/from/config.db".to_string()),
+            ..AppConfig::default()
+        };
+        let cli_path = Path::new("/from/cli.db");
+        assert_eq!(cfg.effective_db(cli_path), PathBuf::from("/from/cli.db"));
+    }
+
+    #[test]
+    fn effective_db_falls_back_to_config_when_cli_default() {
+        let cfg = AppConfig {
+            db: Some("/from/config.db".to_string()),
+            ..AppConfig::default()
+        };
+        // The CLI default is "ai-memory.db" — config wins for that case.
+        assert_eq!(
+            cfg.effective_db(Path::new("ai-memory.db")),
+            PathBuf::from("/from/config.db")
+        );
+    }
+
+    #[test]
+    fn effective_db_falls_back_to_cli_when_no_config() {
+        let cfg = AppConfig::default();
+        let cli_path = Path::new("ai-memory.db");
+        assert_eq!(cfg.effective_db(cli_path), PathBuf::from("ai-memory.db"));
+    }
+
+    #[test]
+    fn effective_ollama_url_default_when_unset() {
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.effective_ollama_url(), "http://localhost:11434");
+    }
+
+    #[test]
+    fn effective_ollama_url_uses_configured_value() {
+        let cfg = AppConfig {
+            ollama_url: Some("http://my-host:9999".to_string()),
+            ..AppConfig::default()
+        };
+        assert_eq!(cfg.effective_ollama_url(), "http://my-host:9999");
+    }
+
+    #[test]
+    fn effective_embed_url_falls_back_to_ollama_url() {
+        let cfg = AppConfig {
+            ollama_url: Some("http://ollama:11434".to_string()),
+            ..AppConfig::default()
+        };
+        // No embed_url → fall back to ollama_url.
+        assert_eq!(cfg.effective_embed_url(), "http://ollama:11434");
+    }
+
+    #[test]
+    fn effective_embed_url_uses_dedicated_value_when_set() {
+        let cfg = AppConfig {
+            ollama_url: Some("http://ollama:11434".to_string()),
+            embed_url: Some("http://embed:8080".to_string()),
+            ..AppConfig::default()
+        };
+        // Dedicated embed_url wins.
+        assert_eq!(cfg.effective_embed_url(), "http://embed:8080");
+    }
+
+    #[test]
+    fn effective_embed_url_uses_default_when_neither_set() {
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.effective_embed_url(), "http://localhost:11434");
+    }
+
+    #[test]
+    fn effective_archive_on_gc_default_is_true() {
+        let cfg = AppConfig::default();
+        assert!(cfg.effective_archive_on_gc());
+    }
+
+    #[test]
+    fn effective_archive_on_gc_respects_explicit_false() {
+        let cfg = AppConfig {
+            archive_on_gc: Some(false),
+            ..AppConfig::default()
+        };
+        assert!(!cfg.effective_archive_on_gc());
+    }
+
+    #[test]
+    fn effective_autonomous_hooks_default_is_false() {
+        // SAFETY: clear env so this test is deterministic; tests run with
+        // --test-threads=1 in CI for env-based tests, but we stay
+        // defensive and set+unset locally.
+        // SAFETY: env mutation is acceptable here because we set then unset.
+        unsafe { std::env::remove_var("AI_MEMORY_AUTONOMOUS_HOOKS") };
+        let cfg = AppConfig::default();
+        assert!(!cfg.effective_autonomous_hooks());
+    }
+
+    #[test]
+    fn effective_autonomous_hooks_config_value_used_when_env_unset() {
+        unsafe { std::env::remove_var("AI_MEMORY_AUTONOMOUS_HOOKS") };
+        let cfg = AppConfig {
+            autonomous_hooks: Some(true),
+            ..AppConfig::default()
+        };
+        assert!(cfg.effective_autonomous_hooks());
+    }
+
+    #[test]
+    fn effective_anonymize_default_falls_back_to_config() {
+        unsafe { std::env::remove_var("AI_MEMORY_ANONYMIZE") };
+        let cfg = AppConfig::default();
+        assert!(!cfg.effective_anonymize_default());
+    }
+
+    #[test]
+    fn write_default_if_missing_creates_file_then_noops() {
+        // Use a temp dir as $HOME so we don't clobber a real config.
+        let tmp = tempfile::tempdir().unwrap();
+        // SAFETY: env mutation is contained; we restore at end.
+        unsafe { std::env::set_var("HOME", tmp.path()) };
+        // First call writes the file.
+        AppConfig::write_default_if_missing();
+        let expected = AppConfig::config_path().unwrap();
+        assert!(expected.exists(), "config not written at {expected:?}");
+        let original = std::fs::read_to_string(&expected).unwrap();
+        assert!(original.contains("ai-memory configuration"));
+        // Second call must NOT overwrite (idempotent).
+        std::fs::write(&expected, "# user-edited\n").unwrap();
+        AppConfig::write_default_if_missing();
+        let after = std::fs::read_to_string(&expected).unwrap();
+        assert_eq!(after, "# user-edited\n");
+    }
+
+    #[test]
+    fn config_path_returns_some_when_home_set() {
+        // SAFETY: env mutation contained to this test.
+        unsafe { std::env::set_var("HOME", "/some/home") };
+        let path = AppConfig::config_path().unwrap();
+        assert!(path.starts_with("/some/home"));
+    }
+
+    #[test]
+    fn load_from_returns_default_for_missing_file() {
+        // Non-existent path → default config.
+        let cfg = AppConfig::load_from(Path::new("/non/existent/path.toml"));
+        assert!(cfg.tier.is_none());
+        assert!(cfg.db.is_none());
+    }
+
+    #[test]
+    fn load_from_returns_default_for_unparseable_toml() {
+        // Garbage TOML → load_from prints a warning and returns default.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "this is not [valid toml]]]").unwrap();
+        let cfg = AppConfig::load_from(tmp.path());
+        assert!(cfg.tier.is_none());
+    }
+
+    #[test]
+    fn load_from_parses_valid_toml() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            r#"
+                tier = "smart"
+                db = "/disk.db"
+            "#,
+        )
+        .unwrap();
+        let cfg = AppConfig::load_from(tmp.path());
+        assert_eq!(cfg.tier.as_deref(), Some("smart"));
+        assert_eq!(cfg.db.as_deref(), Some("/disk.db"));
     }
 }

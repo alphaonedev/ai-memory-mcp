@@ -5,7 +5,296 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — v0.6.3 (Patch 3)
+## [v0.6.4] — 2026-04-27 — Docker-only patch on top of v0.6.3
+
+Single-fix patch release. v0.6.3 published successfully to crates.io,
+Homebrew, Ubuntu PPA, and Fedora COPR; the Docker GHCR build failed
+at compile time because the `Dockerfile` build context did not include
+the `migrations/` directory. v0.6.3 introduced new `include_str!`
+references to `migrations/sqlite/0010_v063_hierarchy_kg.sql` (Streams
+A-C schema v15) — the gap was pre-existing in the Dockerfile but
+v0.6.2 did not surface it (no new migrations).
+
+### Fixed
+
+- **Dockerfile** — added `COPY migrations/ migrations/` to the build
+  stage so cargo build can resolve the v0.6.3 schema migration file
+  references at compile time. Restores Docker GHCR publishing.
+
+### Carries forward from v0.6.3
+
+All v0.6.3 features + validation evidence carry forward unchanged.
+See `[v0.6.3]` section below for the full grand-slam feature set,
+1 600 unit tests at 93.08% line coverage, ship-gate 4-phase pass,
+a2a-gate 48-scenario pass, and live test-hub evidence at
+<https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/>.
+
+## [v0.6.3] — 2026-04-27 — STRUCTURED MEMORY + PERFORMANCE
+
+The grand-slam release. Hierarchical namespace taxonomy + temporal-validity
+knowledge graph + entity registry + duplicate detection + bench tool with
+public p95 budgets — six streams (A through F) shipped together. Plus
+post-rc1 capabilities schema v2 (additive `schema_version="2"` + 5 new
+top-level blocks for hooks/permissions/compaction/approval/transcripts
+introspection) and a CI coverage gate locking in 93.05% baseline.
+
+**Validation evidence:**
+
+- 1 600 lib tests pass; line coverage **93.08%** (gate floor 92%)
+- Ship-gate campaign run #25007261531 — 4 phases green in 14m wall
+  (Phase 1 functional · Phase 2 multi-agent W=2/N=3 · Phase 3 v0.6.2→v0.6.3
+  migration · Phase 4 chaos 50 cycles kill_primary_mid_write)
+- A2A-gate campaign run #25007946890 — 48 scenarios green in 28m wall
+  (35 v0.6.0 baseline + 4 auto-append + 9 new for v0.6.3:
+  capabilities_v2_schema, taxonomy_walk, kg_query_temporal, kg_timeline,
+  entity_aliases, check_duplicate, lifecycle_end_to_end, sqlcipher_at_rest,
+  autonomous_tier_suite). Cell: ironclaw-mtls.
+
+Live evidence:
+<https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/>
+
+### Added
+
+- **Capabilities schema v2 — `memory_capabilities` introspection extension
+  (arch-enhancement-spec §7)**. The capabilities report (MCP
+  `memory_capabilities` + HTTP `GET /api/v1/capabilities`) gains a
+  `schema_version: "2"` discriminator and five new top-level blocks:
+  `permissions`, `hooks`, `compaction`, `approval`, `transcripts`. Pre-v0.7
+  the `permissions.active_rules` field reflects a live count of namespace
+  standards carrying `metadata.governance` (transparent passthrough; the
+  full permission system is v0.7 work — arch-spec §3); `hooks.registered_count`
+  reflects the live `subscriptions` table count (proxy for hook subscribers
+  pre-v0.7 Bucket 0); `approval.pending_requests` reflects the live count
+  of `pending_actions` rows with `status='pending'`. `compaction.enabled`
+  and `transcripts.enabled` report `false` until v0.8 / v0.7-Bucket-1.7 land
+  the underlying systems. **All v1 fields preserved at the same top-level
+  paths** — older clients reading `tier`, `version`, `features`, `models`
+  by name continue to work without modification. New tests:
+  `mcp::tests::mcp_capabilities_v2_schema_includes_all_blocks`,
+  `mcp::tests::mcp_capabilities_v2_backwards_compatible`,
+  `mcp::tests::mcp_capabilities_pending_requests_reflects_db`,
+  `handlers::tests::http_capabilities_v2_schema_includes_all_blocks`,
+  `config::tests::capabilities_v2_zero_state_round_trip`. New helpers:
+  `db::count_active_governance_rules`, `db::count_subscriptions`,
+  `db::count_pending_actions_by_status`. Pure additive — no migration,
+  no behavior change to any existing tool.
+
+- **Hierarchical namespace taxonomy (Pillar 1 / Stream A)** — new
+  `memory_get_taxonomy` MCP tool plus REST mirror at
+  `GET /api/v1/taxonomy`. Walks live (non-expired) memories grouped by
+  `namespace`, splits on `/`, and folds them into a `TaxonomyNode` tree.
+  Each node carries `count` (memories at exactly this namespace) and
+  `subtree_count` (count plus every descendant the depth limit allowed
+  us to expand); the response envelope adds `total_count` (an
+  independent aggregation that stays honest even when `limit` drops
+  rows from the walk) and a `truncated` flag. Parameters:
+  `namespace_prefix` (optional, accepts trailing `/`),
+  `depth` (default 8 = `MAX_NAMESPACE_DEPTH`, clamped),
+  `limit` (default 1000, hard ceiling 10000 — densest namespaces win
+  when truncated). Closes the "flat blob" perception gap from charter
+  §"The Demo That Sells It" (charter lines 218–230) and unblocks the
+  taxonomy demo CLI surface deferred to a later iteration. Charter
+  §"Stream A — Hierarchy", lines 320–326.
+
+- **Temporal-validity KG schema (Stream B foundation)** — SQLite schema
+  bumps to v15 (`src/db.rs::migrate`). `memory_links` gains four nullable
+  temporal columns — `valid_from`, `valid_until`, `observed_by` (TEXT),
+  and `signature` (BLOB; placeholder for v0.7 attested identity). On
+  upgrade, existing links are backfilled: `valid_from` is set to the
+  source memory's `created_at` (charter pre-flight default — defensive
+  null avoidance). Three temporal indexes are created for the upcoming
+  recursive-CTE traversal in `memory_kg_query` / `memory_kg_timeline`:
+  `idx_links_temporal_src` (source_id, valid_from, valid_until),
+  `idx_links_temporal_tgt` (target_id, valid_from, valid_until), and
+  `idx_links_relation` (relation, valid_from). New `entity_aliases`
+  side table (entity_id, alias, created_at; PK on entity_id+alias)
+  with `idx_entity_aliases_alias` lookup index unblocks the upcoming
+  Stream C entity-registry tools. The Postgres declarative schema
+  (`src/store/postgres_schema.sql`) is mirrored for fresh-init parity;
+  existing PG installs do not auto-gain the new columns since the PG
+  store layer is still WIP (an explicit ALTER migration lands when
+  `link()` is wired up there). Pure additive — no existing query
+  breaks. Charter §"Critical Schema Reference", lines 686–723.
+
+- **Entity registry (Pillar 2 / Stream B)** — `memory_entity_register`
+  + `memory_entity_get_by_alias` MCP tools (count 38 → 40) plus the
+  matching HTTP surface (`POST /api/v1/entities`,
+  `GET /api/v1/entities/by_alias`, with 201 / 200 / 409 status
+  discipline and `X-Agent-Id` honoured). Entities are long-tier
+  memories tagged `entity` with `metadata.kind = "entity"`; aliases
+  live in the v15 `entity_aliases` side table. Registration is
+  idempotent on `(canonical_name, namespace)` — re-registering reuses
+  the entity_id and merges new aliases via `INSERT OR IGNORE`. A
+  non-entity memory occupying the same `(title, namespace)` returns a
+  hard error rather than letting the upsert path silently overwrite
+  unrelated content. Resolver returns the most-recently-created
+  entity when no namespace filter is supplied; ignores stray
+  `entity_aliases` rows that point at non-entity memories. Builds on
+  the v15 schema (#384). Charter §"Stream B — KG Schema + Entity
+  Model", lines 369–375.
+
+- **`memory_kg_timeline` (Pillar 2 / Stream C)** — entity-anchored
+  chronological view powering the `ai-memory kg-timeline` headline
+  demo. `db::kg_timeline()` queries `memory_links` ordered by
+  `valid_from ASC` (tie-break `created_at`) with optional inclusive
+  `since` / `until` filters; limit clamps to `[1, 1000]`, default
+  200. `db::create_link()` now stamps `valid_from = created_at` on
+  every insert so newly created links are visible to the timeline
+  without a later sweep, closing the forward gap left by the v15
+  backfill of legacy rows. `memory_kg_timeline` MCP tool (count
+  40 → 41) plus `GET /api/v1/kg/timeline?source_id=…&since=…
+  &until=…&limit=…`. Returns `KgTimelineEvent` carrying `target_id`,
+  `relation`, validity window, `observed_by`, and the target's
+  `title` / `namespace`. Charter §"Stream C — KG Query Layer",
+  lines 377–383.
+
+- **`memory_kg_invalidate` (Pillar 2 / Stream C)** — second tool of
+  the KG-traversal triplet. Marks a KG link as superseded by setting
+  its `valid_until` column so a contradicting fact can invalidate
+  the prior assertion without deleting the row, preserving the
+  timeline. The link is identified by its composite key
+  `(source_id, target_id, relation)` since `memory_links` has no
+  separate id; `valid_until` defaults to wall-clock now when
+  omitted. `db::invalidate_link()` returns
+  `Option<InvalidateResult>` — `None` when the triple does not
+  match, `Some` with the value now stored and `previous_valid_until`
+  so callers can distinguish a fresh supersession from an idempotent
+  retry. `memory_kg_invalidate` MCP tool (count 41 → 42) plus HTTP.
+  Schema does not yet carry an audit column for the supersession
+  `reason`; that arrives with v0.7 attestation. Charter §"Stream C —
+  KG Query Layer", lines 377–383.
+
+- **`memory_kg_query` depth=1 (Pillar 2 / Stream C)** — outbound
+  "expand neighbors" first slice. `memory_kg_query` MCP tool (count
+  42 → 43) plus HTTP. `db::kg_query()` ships with constants
+  `KG_QUERY_DEFAULT_LIMIT = 200`, `KG_QUERY_MAX_LIMIT = 1000`, and
+  `KG_QUERY_MAX_SUPPORTED_DEPTH = 1`; callers passing `max_depth=2`
+  get a clean error rather than a silent truncation, so the API
+  contract is stable from day one — the recursive-CTE multi-hop
+  follow-up just lifts the ceiling without changing the surface.
+  Filters per the charter spec: `valid_at` (RFC3339, only links
+  valid at that instant); `allowed_agents` (only links observed by
+  an agent in the set; **empty list returns zero rows by design** —
+  callers signaling "no agents trusted" must get an empty traversal,
+  not the unfiltered fallback); `limit` clamped to `[1, 1000]`.
+  Charter §"Stream C — KG Query Layer", lines 377–383.
+
+- **`memory_kg_query` depth 2..=5 (Pillar 2 / Stream C)** — lifts
+  `KG_QUERY_MAX_SUPPORTED_DEPTH` from 1 to 5, matching the published
+  `memory_kg_query (depth ≤ 5)` 250 ms p95 / 500 ms p99 budget in
+  `PERFORMANCE.md`. Replaces the depth=1 JOIN with a recursive CTE
+  that re-applies the temporal / agent filter on every hop and
+  prunes cycles via the accumulated `path`; each row's `depth` +
+  `path` now reflect the actual chain (e.g. depth=2 →
+  `src->mid->target`). API contract is unchanged — depth=1 collapses
+  to the original time-ordered single-hop result, and the
+  over-ceiling MCP/HTTP error path (422 with `max_depth=N exceeds
+  supported depth=5`) is preserved. Closes the Stream C
+  `memory_kg_query` slice; traversals at depth 2..=5 are now correct
+  under temporal-validity and observed-by filtering. Charter
+  §"Stream C — KG Query Layer", lines 377–383.
+
+- **`memory_check_duplicate` (Pillar 2 / Stream D)** — pre-write
+  near-duplicate check across DB / MCP / HTTP. `db::check_duplicate`
+  performs a cosine scan over live embedded memories with the
+  threshold clamped at `DUPLICATE_THRESHOLD_MIN = 0.5` (so permissive
+  callers can't dress unrelated content as a merge candidate) and
+  default `DUPLICATE_THRESHOLD_DEFAULT = 0.85` (tuned for the
+  MiniLM-L6-v2 embedder — near-paraphrases land ≥ 0.88, loosely
+  related content sits well below). `memory_check_duplicate` MCP
+  tool (count 37 → 38) returns the nearest-neighbor cosine, the
+  above-threshold boolean, and an optional `suggested_merge` target.
+  HTTP `POST /api/v1/check_duplicate` mirrors the MCP surface and
+  embeds *before* taking the DB lock (issue #219 pattern). Charter
+  §"Stream D — Duplicate Check", lines 384–386.
+
+- **`ai-memory bench` scaffold (Pillar 3 / Stream E)** — first slice
+  of perf instrumentation. New CLI subcommand + `src/bench.rs`
+  runner so operators (and the `bench.yml` CI guard / Stream F) can
+  verify the published `PERFORMANCE.md` budgets. Covers the three
+  embedding-free hot-path operations: `memory_store` (no embedding)
+  / 20 ms p95, `memory_search` (FTS5) / 100 ms p95, and
+  `memory_recall` (hot, depth=1) / 50 ms p95. Each invocation seeds
+  a disposable `:memory:` SQLite DB so the operator's main DB is
+  untouched. Reports p50 / p95 / p99 in either a human table or
+  `--json`. Exit code is non-zero when any p95 exceeds its target
+  by more than the documented 10% tolerance — so the same binary
+  slots into the CI guard once Stream F lands. `PERFORMANCE.md`
+  status table now distinguishes "scaffold landed" from "Stream E
+  follow-up" so partial coverage isn't silent. Charter §"Stream E —
+  Performance Instrumentation", lines 388–393.
+
+- **Performance budgets published** — new `PERFORMANCE.md` at the repo
+  root carries the authoritative p95/p99 latency contract for every
+  hot-path operation (verbatim from the v0.6.3 grand-slam charter):
+  `memory_session_start` hook, `memory_recall` hot/cold,
+  `memory_store` with/without embedding, `memory_search`,
+  `memory_check_duplicate`, `memory_kg_query` (depth ≤ 3 / ≤ 5),
+  `memory_kg_timeline`, `memory_get_taxonomy`, `curator cycle`, and
+  `federation ack`. Documents the **>10% p95 breach fails CI**
+  threshold (p99 informational until the v0.6.3 soak window closes),
+  the Apple M4 / 32 GB / NVMe SSD reference hardware baseline (with a
+  note on Linux x86_64 CI parity), and a status table flagging the
+  bench tool (Stream E) and `bench.yml` workflow (Stream F) as still
+  in-flight. Closes Pillar 3 / Stream F doc deliverable from the
+  v0.6.3 charter.
+
+- **`bench.yml` CI guard (Pillar 3 / Stream F)** — new
+  `.github/workflows/bench.yml` runs `ai-memory bench` on every pull
+  request and trunk push (`main`, `develop`, `release/**`) plus on
+  manual `workflow_dispatch`. The job builds the release binary on
+  `ubuntu-latest` (the latency reference per `PERFORMANCE.md`),
+  streams the bench table into the workflow run summary, and uploads
+  a `bench-results` artifact (`bench-results.json` +
+  `bench-table.txt`) for downstream tooling. The `ai-memory bench`
+  binary already exits non-zero when any operation's measured p95
+  exceeds its target by more than the published 10% tolerance, so
+  the workflow fails on regression without additional gating logic.
+  Closes the last Stream F deliverable from charter §"Stream F —
+  Performance Budgets + CI Guard"; budgets are now continuously
+  enforced against trunk and PRs.
+
+- **`ai-memory bench` KG depth=3 + depth=5 coverage (Pillar 3 / Stream E)**
+  — `memory_kg_query` is now exercised at the deepest hop of both
+  documented budget buckets: depth=3 against the "depth ≤ 3" 100 ms
+  p95 row and depth=5 against the "depth ≤ 5" 250 ms tail-case row in
+  `PERFORMANCE.md`. The runner seeds a second in-process fixture (50
+  chains × 5 hops each = 300 memories + 250 links) so the recursive
+  CTE actually traverses three / five hops per query rather than
+  collapsing to a single hop on the existing fan-out fixture. Local M4
+  measurements: depth=3 p95 ~0.6 ms, depth=5 p95 ~0.7 ms — both PASS,
+  both well inside the 10% tolerance enforced by `bench.yml`. No new
+  dependencies. Completes the KG half of Stream E; embedding-bound
+  paths still need a fixture decision and remain tracked separately.
+
+- **`ai-memory bench` KG coverage (Pillar 3 / Stream E)** —
+  `memory_kg_query` (depth=1) and `memory_kg_timeline` are now driven
+  by the `bench` subcommand against the same in-memory disposable
+  SQLite database used by the embedding-free operations. The runner
+  seeds an in-process KG fixture (50 source memories × 4 outbound
+  links each, every link `valid_from`-stamped so `kg_timeline` sees
+  them) and reports p50/p95/p99 against the 100 ms p95 budgets
+  published in `PERFORMANCE.md`. Local M4 measurements: `kg_query`
+  p95 ~0.7 ms, `kg_timeline` p95 ~0.1 ms — both PASS, both well
+  inside the 10% tolerance enforced by the `bench.yml` CI guard.
+  No new dependencies. Closes the KG half of the iter-0017 follow-up
+  ask; embedding-bound paths still need a fixture decision and are
+  tracked separately.
+
+- **Per-tool MCP tracing spans (Pillar 3 / Stream E)** — every
+  `tools/call` dispatch now runs inside an `info`-level
+  `mcp_tool_call` span carrying the tool name and JSON-RPC id. After
+  the handler returns, an `ok` event records `elapsed_ms`; an
+  `Err` outcome emits a `warn` event with the error message so
+  on-call dashboards can alert on per-tool error rate. The MCP server
+  entrypoint (`run_mcp_server`) installs a `tracing_subscriber::fmt`
+  subscriber pinned to `stderr` (stdio JSON-RPC owns stdout) honoring
+  `RUST_LOG`; `try_init` makes it a no-op when another command in the
+  same process already initialised tracing. Foundation for the v0.6.3
+  charter §"Stream E — Performance Instrumentation" ask;
+  paired with the `ai-memory bench` scaffold to give exporters
+  per-tool latency attribution against the published `PERFORMANCE.md`
+  budgets.
 
 ### Fixed
 
@@ -20,6 +309,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tolerance. Encountered in the a2a-gate mTLS matrix; the gate-side
   generator fix in `ai-memory-ai2ai-gate#35` already worked around it for
   v0.6.2 — this is the parser-side resolution.
+
+### Changed
+
+- **CI coverage gate — fail-under 92%**. The `coverage` job in
+  `.github/workflows/ci.yml` now invokes `cargo llvm-cov` with
+  `--fail-under-lines 92`, locking in the v0.6.3 baseline of 93.05%
+  with a 1% absorb buffer. PRs that drop total line coverage below
+  92% will fail the gate. Per-module floors (`handlers.rs`, `db.rs`,
+  `federation.rs`, `mcp.rs`, `governance.rs` ≥90%) are tracked in the
+  v0.7 assertion table for follow-up enforcement.
+
+### Tests
+
+- **[#401]** RAII `ChildGuard` fixes mTLS test daemon-leak on assert
+  panic.
+  `tests/integration.rs::test_serve_mtls_fingerprint_allowlist_accepts_only_known_peer`
+  was leaking `target/debug/ai-memory … serve` child processes
+  whenever any of its 4 asserts panicked between spawn and the
+  manual `kill()` at the bottom — `std::process::Child` has no
+  kill-on-drop on Unix. Adds a generic `ChildGuard { child:
+  Option<Child>, cleanup_paths: Vec<PathBuf> }` alongside the
+  existing `DaemonGuard`, with an unwind-safe `Drop` that kills,
+  reaps, and unlinks; refactors the mTLS test to wrap both spawned
+  children. End-user impact is zero (production `serve` deployments
+  via systemd / launchd / Docker reap children correctly), but the
+  campaign runner had been accumulating ~28 GB of orphaned daemons
+  across 7 reparented PIDs during the v0.6.3 dev sprint.
 
 ## [v0.6.2] — 2026-04-24 — A2A-CERTIFIED
 
