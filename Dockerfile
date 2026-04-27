@@ -13,6 +13,12 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
 COPY benches/ benches/
+# v0.6.3 added include_str! references to migration SQL files
+# (Streams A-C schema v15: migrations/sqlite/0010_v063_hierarchy_kg.sql).
+# Without the migrations/ directory in the build context, cargo build
+# fails at compile time. Pre-existing Dockerfile gap that v0.6.2 did
+# not surface (no new migrations).
+COPY migrations/ migrations/
 
 RUN cargo build --release && strip target/release/ai-memory
 
