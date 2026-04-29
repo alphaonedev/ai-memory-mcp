@@ -15,8 +15,17 @@ name: Bench
 on:
   pull_request:
     branches: [main, develop, "release/**"]
+    # Bench is advisory (not in required-status-checks). Trigger-level
+    # paths-ignore is safe here and saves a full release build (~6-8 min)
+    # on every docs-only PR.
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
   push:
     branches: [main, develop, "release/**"]
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
   workflow_dispatch:
 
 permissions:
