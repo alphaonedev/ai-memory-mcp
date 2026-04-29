@@ -68,6 +68,19 @@ const config: Config = {
         {to: '/docs/user/quickstart', label: 'User', position: 'left'},
         {to: '/docs/admin/deployment', label: 'Admin', position: 'left'},
         {to: '/docs/developer/architecture', label: 'Developer', position: 'left'},
+        {
+          type: 'dropdown',
+          label: 'Architectures',
+          position: 'left',
+          items: [
+            {label: 'Overview & comparison', to: '/docs/architectures/'},
+            {label: 'T1 — Single node, single agent', to: '/docs/architectures/t1-single-node-single-agent'},
+            {label: 'T2 — Single node, many agents', to: '/docs/architectures/t2-single-node-many-agents'},
+            {label: 'T3 — Multi-node cluster', to: '/docs/architectures/t3-multi-node-cluster'},
+            {label: 'T4 — Data-center swarm', to: '/docs/architectures/t4-data-center-swarm'},
+            {label: 'T5 — Global hive', to: '/docs/architectures/t5-global-hive'},
+          ],
+        },
         {to: '/docs/changelog', label: 'Changelog', position: 'left'},
         {
           href: 'https://github.com/alphaonedev/ai-memory-mcp',

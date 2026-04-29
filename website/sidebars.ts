@@ -59,6 +59,21 @@ const sidebars: SidebarsConfig = {
     },
   ],
   changelogSidebar: ['changelog'],
+  architecturesSidebar: [
+    {
+      type: 'category',
+      label: 'Architectures',
+      collapsed: false,
+      items: [
+        'architectures/index',
+        'architectures/t1-single-node-single-agent',
+        'architectures/t2-single-node-many-agents',
+        'architectures/t3-multi-node-cluster',
+        'architectures/t4-data-center-swarm',
+        'architectures/t5-global-hive',
+      ],
+    },
+  ],
 };
 
 export default sidebars;
