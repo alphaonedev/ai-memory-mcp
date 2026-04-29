@@ -11,8 +11,79 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Classify the diff so docs-only PRs can short-circuit the heavy Rust
+  # matrix instead of waiting ~12 min for Windows. Required status checks
+  # are still satisfied because the matrix jobs keep their names AND
+  # complete with status SUCCESS — they just no-op on docs-only diffs.
+  classify:
+    name: Classify changes
+    runs-on: ubuntu-latest
+    outputs:
+      docs_only: ${{ steps.cls.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@v5
+        with: { fetch-depth: 2 }
+      - id: cls
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            base="${{ github.event.before }}"
+          else
+            base=""
+          fi
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ] || ! git rev-parse "$base" >/dev/null 2>&1; then
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::cannot resolve base commit ($base) — running full pipeline"
+            exit 0
+          fi
+          changed=$(git diff --name-only "$base" HEAD)
+          if [ -z "$changed" ]; then
+            echo "docs_only=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::no diff vs base — treating as docs-only no-op"
+            exit 0
+          fi
+          # docs-only iff every changed file matches docs/** OR *.md anywhere
+          if echo "$changed" | grep -qvE '^(docs/|.*\.md$)'; then
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::code changes detected — running full pipeline"
+          else
+            echo "docs_only=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::docs-only diff — skipping Rust pipeline"
+          fi
+          echo "--- Changed files ($(echo "$changed" | wc -l) files) ---"
+          echo "$changed"
+
+  # Fast lint job — fmt + clippy on ubuntu only. Toolchain-portable, no
+  # need to run on macOS/Windows where it just duplicates work and burns
+  # ~3 min per platform. Advisory (not in required-status-checks) so
+  # safe to skip entirely on docs-only diffs at the job level.
+  lint:
+    name: Lint (fmt + clippy)
+    needs: classify
+    if: needs.classify.outputs.docs_only != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy -- -D warnings -D clippy::all -D clippy::pedantic
+
+  # Cross-platform correctness matrix. These job names are required by
+  # branch protection on main/develop/release/**, so the jobs MUST run
+  # and complete SUCCESS even on docs-only PRs. Per-step `if:` makes the
+  # heavy work skip on docs-only diffs while the job still returns green
+  # in <30 seconds.
   check:
     name: Check (${{ matrix.os }})
+    needs: classify
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -21,31 +92,31 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: docs-only short-circuit
+        if: needs.classify.outputs.docs_only == 'true'
+        run: echo "::notice::docs-only PR — ${{ matrix.os }} matrix is a no-op"
+
       - name: Install Rust stable
+        if: needs.classify.outputs.docs_only != 'true'
         uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
-
-      - name: Check formatting
-        run: cargo fmt --check
-
-      - name: Clippy
-        run: cargo clippy -- -D warnings -D clippy::all -D clippy::pedantic
+        if: needs.classify.outputs.docs_only != 'true'
 
       - name: Run tests
+        if: needs.classify.outputs.docs_only != 'true'
         env:
           AI_MEMORY_NO_CONFIG: "1"
         run: cargo test
 
       - name: Security audit
-        if: matrix.os == 'ubuntu-latest'
+        if: needs.classify.outputs.docs_only != 'true' && matrix.os == 'ubuntu-latest'
         run: |
           cargo install cargo-audit --locked
           cargo audit
 
       - name: Build release
+        if: needs.classify.outputs.docs_only != 'true'
         run: cargo build --release
 
   release:
@@ -285,10 +356,10 @@ jobs:
           git push
 
   # v0.6.5 — Dockerfile-build smoke. Runs on EVERY push to main / develop /
-  # release/** AND on EVERY PR. Builds the Docker image; does NOT push to
-  # GHCR. Catches Dockerfile drift (missing COPY of new files referenced
-  # by include_str!, glibc mismatch from build/runtime base drift, etc.)
-  # BEFORE we cut a release tag.
+  # release/** AND on EVERY PR that touches code. Builds the Docker image;
+  # does NOT push to GHCR. Catches Dockerfile drift (missing COPY of new
+  # files referenced by include_str!, glibc mismatch from build/runtime
+  # base drift, etc.) BEFORE we cut a release tag.
   #
   # Retrospective: v0.6.3 added include_str! refs to migrations/sqlite/
   # but the Dockerfile didn't COPY migrations/. v0.6.4's image built
@@ -296,11 +367,15 @@ jobs:
   # runtime (glibc 2.36) — built but failed at runtime with
   # "version GLIBC_2.39 not found". Both bugs were caught at release
   # time, not PR time. This job closes that gap.
+  #
+  # Skipped on docs-only PRs — a Dockerfile build can't possibly differ
+  # when only /docs/ or *.md changed.
   dockerfile-validate:
     name: Dockerfile build (no push)
+    needs: classify
     runs-on: ubuntu-latest
     # Skip on tag pushes — the docker job below handles those (with push).
-    if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+    if: ${{ !startsWith(github.ref, 'refs/tags/v') && needs.classify.outputs.docs_only != 'true' }}
     steps:
       - uses: actions/checkout@v5
 
@@ -506,8 +581,12 @@ jobs:
         run: |
           copr-cli build alpha-one-ai/ai-memory ~/rpmbuild/SRPMS/ai-memory-*.src.rpm
 
+  # Coverage is advisory (not in required-status-checks) so we can safely
+  # skip the whole job on docs-only PRs.
   coverage:
     name: Code Coverage
+    needs: classify
+    if: needs.classify.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -524,7 +603,8 @@ jobs:
       # (`CheckSameSize::<i8, u16>::VALID`) under its source-based
       # instrumentation. llvm-cov uses LLVM-native source-based instrumentation
       # which doesn't hit the bug, and matches the canonical local measurement
-      # command the coverage campaign used (93.05% headline number).
+      # command the coverage campaign used (93.08% headline number per
+      # docs/evidence.html).
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
@@ -540,7 +620,7 @@ jobs:
           cargo llvm-cov report --summary-only | tee coverage/summary.txt
 
       # v0.6.3 coverage gate — fail-under 92% lines.
-      # Locks in the v0.6.3 baseline of 93.05% with a 1% absorb buffer so
+      # Locks in the v0.6.3 baseline of 93.08% with a 1% absorb buffer so
       # routine churn doesn't trip the gate but a regression of >1% does.
       # Per-module floors for hot modules (handlers, db, federation, mcp,
       # governance) are tracked in the v0.7 assertion table; this is the
