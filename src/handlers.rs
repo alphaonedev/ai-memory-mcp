@@ -288,6 +288,22 @@ pub async fn create_memory(
                 }
             });
 
+    // v0.6.3.1 P2 (G6) — resolve `on_conflict` policy. HTTP defaults to
+    // 'error' (no legacy v1 backward-compat to honor); callers that want
+    // the v0.6.3 silent-merge behaviour must pass on_conflict='merge'.
+    let on_conflict_mode = body.on_conflict.as_deref().unwrap_or("error");
+    if !matches!(on_conflict_mode, "error" | "merge" | "version") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!(
+                    "invalid on_conflict '{on_conflict_mode}' (expected error|merge|version)"
+                )
+            })),
+        )
+            .into_response();
+    }
+
     let now = Utc::now();
     let lock = state.lock().await;
     let expires_at = body.expires_at.or_else(|| {
@@ -295,11 +311,57 @@ pub async fn create_memory(
             .or(lock.2.ttl_for_tier(&body.tier))
             .map(|s| (now + Duration::seconds(s)).to_rfc3339())
     });
+
+    // v0.6.3.1 P2 (G6) — apply the conflict policy before building the
+    // canonical row. Mirror MCP handle_store: 'error' returns 409 with a
+    // typed payload; 'version' rewrites the title to a free suffix;
+    // 'merge' falls through to db::insert which keeps the legacy
+    // INSERT...ON CONFLICT upsert.
+    let resolved_title = match on_conflict_mode {
+        "error" => match db::find_by_title_namespace(&lock.0, &body.title, &body.namespace) {
+            Ok(Some(existing_id)) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "code": "CONFLICT",
+                        "error": format!(
+                            "memory with title '{}' already exists in namespace '{}'",
+                            body.title, body.namespace
+                        ),
+                        "existing_id": existing_id,
+                    })),
+                )
+                    .into_response();
+            }
+            Ok(None) => body.title.clone(),
+            Err(e) => {
+                tracing::error!("on_conflict lookup failed: {e}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "conflict check failed"})),
+                )
+                    .into_response();
+            }
+        },
+        "version" => match db::next_versioned_title(&lock.0, &body.title, &body.namespace) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!("on_conflict=version failed: {e}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "could not pick a versioned title"})),
+                )
+                    .into_response();
+            }
+        },
+        _ => body.title.clone(),
+    };
+
     let mem = Memory {
         id: Uuid::new_v4().to_string(),
         tier: body.tier,
         namespace: body.namespace,
-        title: body.title,
+        title: resolved_title,
         content: body.content,
         tags: body.tags,
         priority: body.priority.clamp(1, 10),
@@ -3914,7 +3976,10 @@ fn resolve_caller_agent_id(
 
 // --- /api/v1/capabilities (GET) -------------------------------------------
 
-pub async fn get_capabilities(State(app): State<AppState>) -> impl IntoResponse {
+pub async fn get_capabilities(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
     // Mirrors `mcp::handle_capabilities_with_conn`. Reranker state isn't
     // tracked on the HTTP AppState (HTTP daemons that wire a cross-encoder
     // record it via the tier config's `cross_encoder` flag, which is
@@ -3932,6 +3997,16 @@ pub async fn get_capabilities(State(app): State<AppState>) -> impl IntoResponse 
     // dynamic blocks (active_rules, registered_count, pending_requests)
     // can be filled from live counts. Each query is a single COUNT(*) so
     // the lock window stays sub-millisecond.
+    //
+    // v0.6.3.1 (P1 honesty patch): honour the `Accept-Capabilities`
+    // header. `v1` returns the legacy pre-v0.6.3.1 shape; anything else
+    // (including absent) returns v2.
+    let accept = headers
+        .get("accept-capabilities")
+        .and_then(|v| v.to_str().ok())
+        .map_or(crate::mcp::CapabilitiesAccept::V2, |raw| {
+            crate::mcp::CapabilitiesAccept::parse(raw)
+        });
     let embedder_loaded = app.embedder.as_ref().is_some();
     let lock = app.db.lock().await;
     let conn = &lock.0;
@@ -3940,6 +4015,7 @@ pub async fn get_capabilities(State(app): State<AppState>) -> impl IntoResponse 
         None,
         embedder_loaded,
         Some(conn),
+        accept,
     );
     drop(lock);
     match result {
@@ -12909,9 +12985,9 @@ mod tests {
         assert_eq!(v["features"]["query_expansion"], false);
     }
 
-    /// v0.6.3 (capabilities schema v2 — arch-enhancement-spec §7).
+    /// v0.6.3.1 (capabilities schema v2 — P1 honesty patch).
     /// HTTP surface mirrors the MCP shape: every new top-level block is
-    /// present and `schema_version="2"`.
+    /// present, `schema_version="2"`, and dropped fields are absent.
     #[tokio::test]
     async fn http_capabilities_v2_schema_includes_all_blocks() {
         let state = test_state();
@@ -12935,24 +13011,42 @@ mod tests {
 
         assert_eq!(v["schema_version"], "2");
 
+        // permissions: mode=advisory (P1), active_rules live, no rule_summary
         assert!(v["permissions"].is_object());
-        assert_eq!(v["permissions"]["mode"], "ask");
+        assert_eq!(v["permissions"]["mode"], "advisory");
         assert!(v["permissions"]["active_rules"].is_number());
-        assert!(v["permissions"]["rule_summary"].is_array());
+        assert!(v["permissions"].get("rule_summary").is_none());
+        // v0.6.3.1 (P4, audit G1): inheritance posture surfaced.
+        assert_eq!(v["permissions"]["inheritance"], "enforced");
 
+        // hooks: registered_count live, no by_event
         assert!(v["hooks"].is_object());
         assert!(v["hooks"]["registered_count"].is_number());
-        assert!(v["hooks"]["by_event"].is_object());
+        assert!(v["hooks"].get("by_event").is_none());
 
+        // compaction: planned-feature shape
         assert!(v["compaction"].is_object());
+        assert_eq!(v["compaction"]["planned"], true);
         assert_eq!(v["compaction"]["enabled"], false);
+        assert_eq!(v["compaction"]["version"], "v0.8+");
 
+        // approval: pending_requests live, no subscribers/timeout
         assert!(v["approval"].is_object());
         assert!(v["approval"]["pending_requests"].is_number());
-        assert_eq!(v["approval"]["default_timeout_seconds"], 30);
+        assert!(v["approval"].get("subscribers").is_none());
+        assert!(v["approval"].get("default_timeout_seconds").is_none());
 
+        // transcripts: planned-feature shape
         assert!(v["transcripts"].is_object());
+        assert_eq!(v["transcripts"]["planned"], true);
         assert_eq!(v["transcripts"]["enabled"], false);
+
+        // P1: live recall/reranker mode tags present (default tier
+        // here is keyword with no embedder → disabled / off).
+        assert_eq!(v["features"]["recall_mode_active"], "disabled");
+        assert_eq!(v["features"]["reranker_active"], "off");
+        // memory_reflection reshaped to a planned object
+        assert_eq!(v["features"]["memory_reflection"]["planned"], true);
     }
 
     #[tokio::test]
