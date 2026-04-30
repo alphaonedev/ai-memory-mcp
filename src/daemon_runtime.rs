@@ -57,6 +57,7 @@ use crate::cli::consolidate::{AutoConsolidateArgs, ConsolidateArgs};
 use crate::cli::crud::{DeleteArgs, GetArgs, ListArgs};
 use crate::cli::curator::CuratorArgs;
 use crate::cli::forget::ForgetArgs;
+use crate::cli::install::InstallArgs;
 use crate::cli::io::{ImportArgs, MineArgs};
 use crate::cli::link::{LinkArgs, ResolveArgs};
 use crate::cli::promote::PromoteArgs;
@@ -228,6 +229,13 @@ pub enum Command {
     /// Read-only, fast, never blocks. With `--quiet` (recommended for
     /// hooks) a missing DB exits 0 with empty stdout.
     Boot(BootArgs),
+    /// Issue #487 PR-2/3: wire `ai-memory boot` and the `ai-memory-mcp`
+    /// server into AI agents' config files (Claude Code SessionStart hook,
+    /// Cursor / Cline / Continue / Windsurf / OpenClaw MCP config). Default
+    /// is `--dry-run` (prints the diff, writes nothing). Pass `--apply` to
+    /// commit. Pass `--uninstall --apply` to remove a previously-installed
+    /// managed block.
+    Install(InstallArgs),
 }
 
 /// Arguments for the `doctor` subcommand. Lives next to `Cli` so clap
@@ -713,6 +721,17 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
             let mut se = stderr.lock();
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::boot::run(&db_path, &a, &mut out)
+        }
+        Command::Install(a) => {
+            // Issue #487 PR-2/3. Read-only filesystem op against the agent's
+            // config file (NOT the ai-memory DB). Default is dry-run; --apply
+            // is opt-in and writes a backup before mutating anything.
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::install::run(&a, &mut out)
         }
     };
 

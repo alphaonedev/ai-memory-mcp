@@ -74,21 +74,28 @@ proper session-start hook (see issue #487 cross-files).
 
 ## Per-agent recipes
 
-| File | Agent | Category | Status |
-|---|---|---|---|
-| [`claude-code.md`](claude-code.md) | Claude Code (CLI, Mac/Win desktop, IDE) | 1 (hook) | reference recipe |
-| [`cursor.md`](cursor.md) | Cursor | 2 (MCP + rules) | recipe |
-| [`cline.md`](cline.md) | Cline (VS Code extension) | 2 (MCP + custom instructions) | recipe |
-| [`continue.md`](continue.md) | Continue (VS Code / JetBrains) | 2 (MCP + systemMessage) | recipe |
-| [`windsurf.md`](windsurf.md) | Windsurf (Codeium) | 2 (MCP + rules) | recipe |
-| [`openclaw.md`](openclaw.md) | OpenClaw CLI | 2 (MCP + system message) | recipe |
-| [`codex-cli.md`](codex-cli.md) | OpenAI Codex CLI | 3 (programmatic) | recipe |
-| [`claude-agent-sdk.md`](claude-agent-sdk.md) | Claude Agent SDK | 3 (programmatic) | recipe (TS + Python) |
-| [`openai-apps-sdk.md`](openai-apps-sdk.md) | OpenAI Apps SDK / Assistants / Responses | 3 (programmatic) | recipe |
-| [`grok-and-xai.md`](grok-and-xai.md) | xAI Grok | 3 (programmatic) | recipe |
-| [`local-models.md`](local-models.md) | Hermes, Llama, Mistral, etc. via LM Studio / Ollama / vLLM | 3 (programmatic) | recipe |
-| [`platforms.md`](platforms.md) | macOS / Linux / Windows / WSL / Docker / BSD platform notes | n/a | reference |
-| [`global-claude-md-template.md`](global-claude-md-template.md) | `~/.claude/CLAUDE.md` belt-and-suspenders snippet | 1 fallback | reference |
+The **Installer** column tracks `ai-memory install <agent>` support
+(issue #487 PR-2/3). `yes` means a one-line `ai-memory install <agent>
+--apply` writes the recipe's MCP / hook config block directly. Where
+the column reads `yes (--config)`, the agent's canonical config path
+isn't auto-discoverable yet — pass `--config <path>` explicitly. See
+each recipe's "Quick install" section for the exact invocation.
+
+| File | Agent | Category | Installer | Status |
+|---|---|---|---|---|
+| [`claude-code.md`](claude-code.md) | Claude Code (CLI, Mac/Win desktop, IDE) | 1 (hook) | yes | reference recipe |
+| [`cursor.md`](cursor.md) | Cursor | 2 (MCP + rules) | yes | recipe |
+| [`cline.md`](cline.md) | Cline (VS Code extension) | 2 (MCP + custom instructions) | yes (--config) | recipe |
+| [`continue.md`](continue.md) | Continue (VS Code / JetBrains) | 2 (MCP + systemMessage) | yes | recipe |
+| [`windsurf.md`](windsurf.md) | Windsurf (Codeium) | 2 (MCP + rules) | yes | recipe |
+| [`openclaw.md`](openclaw.md) | OpenClaw CLI | 2 (MCP + system message) | yes (--config) | recipe |
+| [`codex-cli.md`](codex-cli.md) | OpenAI Codex CLI | 3 (programmatic) | n/a (programmatic) | recipe |
+| [`claude-agent-sdk.md`](claude-agent-sdk.md) | Claude Agent SDK | 3 (programmatic) | n/a (programmatic) | recipe (TS + Python) |
+| [`openai-apps-sdk.md`](openai-apps-sdk.md) | OpenAI Apps SDK / Assistants / Responses | 3 (programmatic) | n/a (programmatic) | recipe |
+| [`grok-and-xai.md`](grok-and-xai.md) | xAI Grok | 3 (programmatic) | n/a (programmatic) | recipe |
+| [`local-models.md`](local-models.md) | Hermes, Llama, Mistral, etc. via LM Studio / Ollama / vLLM | 3 (programmatic) | n/a (programmatic) | recipe |
+| [`platforms.md`](platforms.md) | macOS / Linux / Windows / WSL / Docker / BSD platform notes | n/a | n/a | reference |
+| [`global-claude-md-template.md`](global-claude-md-template.md) | `~/.claude/CLAUDE.md` belt-and-suspenders snippet | 1 fallback | n/a | reference |
 
 ## Failure modes (any recipe)
 
