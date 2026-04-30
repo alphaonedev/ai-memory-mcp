@@ -4181,6 +4181,7 @@ pub async fn subscribe(
                 namespace_filter: namespace_filter.as_deref(),
                 agent_filter: agent_filter.as_deref(),
                 created_by: Some(&caller),
+                event_types: None,
             },
         )
         .map_err(|e| e.to_string())?;
@@ -10775,6 +10776,7 @@ mod tests {
                     namespace_filter: None,
                     agent_filter: None,
                     created_by: Some("alice"),
+                    event_types: None,
                 },
             )
             .unwrap()
@@ -10850,6 +10852,7 @@ mod tests {
                     namespace_filter: Some("demo"),
                     agent_filter: Some("alice"),
                     created_by: Some("alice"),
+                    event_types: None,
                 },
             )
             .unwrap();
@@ -10928,6 +10931,7 @@ mod tests {
                     namespace_filter: Some("ns1"),
                     agent_filter: Some("alice"),
                     created_by: Some("alice"),
+                    event_types: None,
                 },
             )
             .unwrap();
@@ -10940,6 +10944,7 @@ mod tests {
                     namespace_filter: Some("ns2"),
                     agent_filter: Some("bob"),
                     created_by: Some("bob"),
+                    event_types: None,
                 },
             )
             .unwrap();
@@ -10994,6 +10999,7 @@ mod tests {
                     namespace_filter: Some("ns1"),
                     agent_filter: Some("alice"),
                     created_by: Some("alice"),
+                    event_types: None,
                 },
             )
             .unwrap();
@@ -11006,6 +11012,7 @@ mod tests {
                     namespace_filter: Some("ns2"),
                     agent_filter: Some("bob"),
                     created_by: Some("bob"),
+                    event_types: None,
                 },
             )
             .unwrap();
