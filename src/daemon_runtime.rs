@@ -65,6 +65,7 @@ use crate::cli::search::SearchArgs;
 use crate::cli::store::StoreArgs;
 use crate::cli::sync::{SyncArgs, SyncDaemonArgs};
 use crate::cli::update::UpdateArgs;
+use crate::cli::wrap::WrapArgs;
 use crate::config::{AppConfig, FeatureTier};
 use crate::embeddings::Embedder;
 use crate::handlers::{ApiKeyState, AppState, Db};
@@ -228,6 +229,14 @@ pub enum Command {
     /// Read-only, fast, never blocks. With `--quiet` (recommended for
     /// hooks) a missing DB exits 0 with empty stdout.
     Boot(BootArgs),
+    /// Issue #487 PR-6: cross-platform Rust replacement for the bash /
+    /// PowerShell wrappers PR-1 shipped in the integration recipes. Runs
+    /// `ai-memory boot` in-process, builds a system message, then spawns
+    /// the named agent CLI with the system message delivered via the
+    /// strategy chosen by `default_strategy(<agent>)` (or an explicit
+    /// `--system-flag` / `--system-env` / `--message-file-flag`
+    /// override). Exit code is propagated from the wrapped agent.
+    Wrap(WrapArgs),
 }
 
 /// Arguments for the `doctor` subcommand. Lives next to `Cli` so clap
@@ -713,6 +722,29 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
             let mut se = stderr.lock();
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::boot::run(&db_path, &a, &mut out)
+        }
+        Command::Wrap(a) => {
+            // Issue #487 PR-6. Pure-Rust cross-platform replacement for
+            // the bash / PowerShell wrappers PR-1 shipped in the
+            // integration recipes. Runs boot in-process, builds the
+            // system message, spawns the wrapped agent, and propagates
+            // the agent's exit code via std::process::exit.
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            let code = cli::wrap::run(&db_path, &a, &mut out)?;
+            // Drop the locks/output before exit so any pending writes
+            // get flushed by the OS on process teardown.
+            drop(out);
+            drop(so);
+            drop(se);
+            if code == 0 {
+                Ok(())
+            } else {
+                std::process::exit(code);
+            }
         }
     };
 

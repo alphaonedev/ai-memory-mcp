@@ -100,22 +100,35 @@ Or use the binary name alone if it's on `%PATH%`:
 
 (Claude Code expands `%USERPROFILE%` before passing to the hook.)
 
-### 3. PowerShell wrapper for the programmatic recipes
+### 3. No PowerShell wrapper needed — use `ai-memory wrap`
 
-The `bash` snippets in
-[`codex-cli.md`](codex-cli.md), [`claude-agent-sdk.md`](claude-agent-sdk.md),
-etc. need PowerShell equivalents. Pattern:
+Earlier PRs in issue #487 shipped both bash and PowerShell wrapper
+snippets in [`codex-cli.md`](codex-cli.md),
+[`claude-agent-sdk.md`](claude-agent-sdk.md), etc. **PR-6 lands
+`ai-memory wrap` as a cross-platform replacement** for those shell
+wrappers: a single Rust subcommand that runs the same code path on
+Windows, Linux, macOS, Docker, and Kubernetes. No bash, no
+PowerShell, no `chmod +x`, no `Set-ExecutionPolicy` shenanigans.
 
 ```powershell
-$bootContext = & ai-memory boot --quiet --limit 10 --format text 2>$null
-if ($LASTEXITCODE -eq 0 -and $bootContext) {
-    $systemMessage = "You are a helpful assistant.`n`n## Recent context (ai-memory)`n$bootContext"
-} else {
-    $systemMessage = "You are a helpful assistant."
-}
+# Native Windows — no shell wrapper required.
+ai-memory wrap codex -- chat --model gpt-5
 ```
 
-(Same pattern works on Windows + Linux + macOS PowerShell 7+.)
+`ai-memory wrap`:
+
+- Calls `ai-memory boot` in-process (no subprocess hop, no shell
+  argument-parsing differences between cmd / PowerShell / bash).
+- Spawns the wrapped agent CLI with stdio inherited and the system
+  message delivered via the strategy chosen by
+  `default_strategy(<agent>)` (or an explicit `--system-flag` /
+  `--system-env` / `--message-file-flag` override).
+- Propagates the agent's exit code, so PowerShell scripts that
+  branch on `$LASTEXITCODE` still work.
+
+If you have an existing PowerShell wrapper from a prior PR, drop it
+and replace with `ai-memory wrap` — same behavior, cross-platform,
+no shell-quoting hazards.
 
 ## WSL2 specifics
 
