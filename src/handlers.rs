@@ -12947,6 +12947,8 @@ mod tests {
         assert_eq!(v["permissions"]["mode"], "advisory");
         assert!(v["permissions"]["active_rules"].is_number());
         assert!(v["permissions"].get("rule_summary").is_none());
+        // v0.6.3.1 (P4, audit G1): inheritance posture surfaced.
+        assert_eq!(v["permissions"]["inheritance"], "enforced");
 
         // hooks: registered_count live, no by_event
         assert!(v["hooks"].is_object());

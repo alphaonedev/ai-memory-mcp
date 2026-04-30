@@ -257,6 +257,11 @@ impl TierConfig {
             permissions: CapabilityPermissions {
                 mode: "advisory".to_string(),
                 active_rules: 0,
+                // v0.6.3.1 (P4, G1): chain-walking enforcement landed
+                // in this release. Surface "enforced" so consumers can
+                // distinguish a governed deployment from the historical
+                // "display_only" posture.
+                inheritance: Some("enforced".to_string()),
             },
             hooks: CapabilityHooks::default(),
             compaction: CapabilityCompaction::planned(),
@@ -473,6 +478,18 @@ pub struct CapabilityPermissions {
     pub active_rules: usize,
     // P1 honesty patch: `rule_summary` was always empty — no per-rule
     // serializer existed. Dropped from the v2 wire schema.
+
+    /// v0.6.3.1 (P4, audit G1): governance-inheritance posture.
+    /// `"enforced"` = `resolve_governance_policy` walks the namespace
+    /// chain leaf-first and returns the most-specific policy (with
+    /// `inherit: false` short-circuiting). Pre-v0.6.3.1 was
+    /// `"display_only"` — the UI surfaced the chain but the gate
+    /// consulted only the leaf, leaving children of governed parents
+    /// completely ungoverned. The field is `Option<String>` so older
+    /// capabilities responses (without the field) round-trip cleanly
+    /// via `#[serde(default)]`.
+    #[serde(default)]
+    pub inheritance: Option<String>,
 }
 
 /// Hook-pipeline block (capabilities schema v2). Pre-v0.7 reports webhook
@@ -1202,6 +1219,8 @@ mod tests {
             val["permissions"].get("rule_summary").is_none(),
             "v2 honesty patch drops `permissions.rule_summary` (no per-rule serializer)"
         );
+        // v0.6.3.1 (P4, audit G1): inheritance posture surfaced.
+        assert_eq!(val["permissions"]["inheritance"], "enforced");
 
         // hooks zero-state: 0 registered. `by_event` dropped from v2.
         assert_eq!(val["hooks"]["registered_count"], 0);
