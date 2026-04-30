@@ -28,6 +28,7 @@ pub mod forget;
 pub mod gc;
 pub mod governance;
 pub mod helpers;
+pub mod install;
 pub mod io;
 pub mod io_writer;
 pub mod link;
@@ -39,6 +40,7 @@ pub mod shell;
 pub mod store;
 pub mod sync;
 pub mod update;
+pub mod wrap;
 
 #[cfg(test)]
 pub mod test_utils;
