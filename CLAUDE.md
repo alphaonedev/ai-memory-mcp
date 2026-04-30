@@ -44,6 +44,28 @@ cargo bench --bench recall
 
 `AI_MEMORY_NO_CONFIG=1` prevents loading user config which may trigger embedder/LLM initialization during tests.
 
+## Dogfooding release branches
+
+Every `release/v0.6.x.y` branch should be dogfooded by the maintainer for at least 24h before tag-cut so any migration / capability / wire-format regression surfaces in real use, not just CI. The script that does this on this node:
+
+```bash
+scripts/dogfood-rebuild.sh
+```
+
+What it does (idempotent — safe to re-run after every commit):
+1. `cargo build --release`
+2. Backs up the live MCP DB to `/tmp/ai-memory-dogfood-test-<ts>.db`
+3. Dry-runs migrations against the backup (proves v17→v18→v19 etc. round-trip cleanly on real data)
+4. Re-points `/opt/homebrew/bin/ai-memory` → `target/release/ai-memory` (via `brew unlink` + symlink)
+5. Lists running MCP processes that need a Claude Code restart to pick up the new binary
+
+What it does NOT do:
+- Touch the live DB (migrations only run when an actual ai-memory process opens it on the next MCP restart)
+- Kill the running MCP (would self-DOS the in-flight Claude Code session)
+- Bump `Cargo.toml` version (that's a tag-cut concern)
+
+Reverting to the brew-managed binary: `brew link --overwrite ai-memory`.
+
 ## Architecture
 
 **ai-memory** is a Rust-based persistent memory system exposing three interfaces over a shared SQLite database layer:
