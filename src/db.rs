@@ -1223,43 +1223,176 @@ fn apply_proximity_boost(scored: Vec<(Memory, f64)>, agent_ns: &str) -> Vec<(Mem
     boosted
 }
 
-/// Task 1.11 — rough token estimate for a memory. Uses the "~4 chars per
-/// token" heuristic on `title + content`. Deliberately byte-length-based:
-/// fast, deterministic, and correct enough for budget gating.
+/// Phase P6 (R1) — count tokens in `text` using OpenAI's `cl100k_base`
+/// BPE encoding. This is the de-facto standard for Claude / GPT context
+/// budgeting and is shipped with `tiktoken-rs` (the BPE table is embedded
+/// in the crate, ~1.7 MB, so the count is offline-deterministic across
+/// all hosts). The encoder is built lazily and cached process-wide via
+/// `OnceLock` — `cl100k_base()` itself parses the embedded table on every
+/// call, which adds a few ms; we pay that cost once.
+///
+/// Returns the token count. On the (vanishingly rare) cl100k_base init
+/// failure, falls back to the prior `len/4` byte heuristic so a budget
+/// request never hard-errors.
 #[must_use]
-pub fn estimate_memory_tokens(mem: &Memory) -> usize {
-    (mem.title.len() + mem.content.len()) / 4
+pub fn count_tokens_cl100k(text: &str) -> usize {
+    use std::sync::OnceLock;
+    static BPE: OnceLock<Option<tiktoken_rs::CoreBPE>> = OnceLock::new();
+    let bpe = BPE.get_or_init(|| tiktoken_rs::cl100k_base().ok());
+    if let Some(bpe) = bpe.as_ref() {
+        bpe.encode_with_special_tokens(text).len()
+    } else {
+        // Defensive fallback — should never trigger in practice because
+        // the BPE table is bundled in the crate, but we never want a
+        // budget call to fail because of tokenizer init.
+        text.len() / 4
+    }
 }
 
-/// Task 1.11 — truncate a scored recall list to fit within an optional
-/// token budget. Iterates in rank order; stops at the first memory whose
-/// inclusion would exceed the budget. Returns `(truncated, tokens_used)`.
-/// When `budget_tokens` is `None` the list is returned untouched, still
-/// with an accurate `tokens_used` tally so callers can surface it in
-/// response metadata.
+/// Phase P6 — token cost of a memory's `content` only (not title), per
+/// the R1 spec which budgets against the LLM context window. Title and
+/// metadata are caller-side ornament; `content` is what gets stuffed
+/// into the prompt.
+#[must_use]
+pub fn count_memory_tokens(mem: &Memory) -> usize {
+    count_tokens_cl100k(&mem.content)
+}
+
+/// Phase P6 — kept for backward compatibility with the Task 1.11 byte-
+/// heuristic surface. New code should use `count_memory_tokens`. The
+/// returned value is now BPE-accurate (cl100k_base) rather than the
+/// prior `len/4` estimate, so callers reading this through the public
+/// API get the more accurate value automatically.
+#[must_use]
+pub fn estimate_memory_tokens(mem: &Memory) -> usize {
+    count_memory_tokens(mem)
+}
+
+/// Phase P6 — outcome of applying a token budget to a ranked recall
+/// list. Carries everything `mcp::handle_recall` needs to populate the
+/// new RecallMeta block (`budget_tokens_used`, `budget_tokens_remaining`,
+/// `memories_dropped`, `budget_overflow`).
+#[derive(Debug, Clone)]
+pub struct BudgetOutcome {
+    /// Cumulative cl100k_base token count of the returned content.
+    pub tokens_used: usize,
+    /// `budget - tokens_used`, saturating at 0. `None` when no budget set.
+    pub tokens_remaining: Option<usize>,
+    /// How many candidates the budget cut from the ranked list.
+    pub memories_dropped: usize,
+    /// True iff the highest-ranked memory alone exceeded the budget and
+    /// was returned anyway (R1 guarantee: at least one memory if any
+    /// matched). Always false when no budget is set.
+    pub budget_overflow: bool,
+}
+
+/// Phase P6 (R1) — context-budget greedy fill. Iterates over scored
+/// candidates in rank order; stops at the first memory whose inclusion
+/// would exceed the budget — UNLESS the output is still empty, in
+/// which case the highest-ranked memory is returned anyway with
+/// `budget_overflow = true`. This preserves the R1 guarantee that a
+/// successful recall always returns at least one result when any
+/// matched, even if the user supplied an unrealistically tight budget.
+///
+/// When `budget_tokens` is `None`, every candidate is returned and the
+/// `tokens_used` tally falls back to the cheap byte-heuristic (`len/4`)
+/// — running cl100k_base on every recall regardless of caller intent
+/// would impose ~200 ms cold-start (BPE table parse) and several ms per
+/// memory on the hot path. The heuristic is byte-exact-deterministic,
+/// honoring the prior Task 1.11 contract for "observe the cost without
+/// enforcing it". When `budget_tokens` is `Some(_)`, the BPE-accurate
+/// cl100k count is used because the caller cares enough about the
+/// number to enforce on it. When `budget_tokens` is `Some(0)`, **zero
+/// memories are returned** with `budget_overflow = false` — the spec
+/// semantics for "no budget at all, please" (R1 §6 acceptance #3).
 #[must_use]
 pub fn apply_token_budget(
     scored: Vec<(Memory, f64)>,
     budget_tokens: Option<usize>,
-) -> (Vec<(Memory, f64)>, usize) {
+) -> (Vec<(Memory, f64)>, BudgetOutcome) {
+    let total_candidates = scored.len();
+
+    // Phase P6 — explicit `0` budget short-circuits to an empty result.
+    // Per the R1 acceptance test `budget_tokens_zero_returns_zero_memories`,
+    // this is a deliberate no-op fill (overflow is *false* — the user
+    // said "give me nothing").
+    if budget_tokens == Some(0) {
+        return (
+            Vec::new(),
+            BudgetOutcome {
+                tokens_used: 0,
+                tokens_remaining: Some(0),
+                memories_dropped: total_candidates,
+                budget_overflow: false,
+            },
+        );
+    }
+
+    // No-budget fast path: skip cl100k entirely. The byte heuristic is
+    // a few ns vs. the BPE encoder's couple-of-µs per memory plus the
+    // one-shot ~200 ms init. Bench harness benchmarks recall with
+    // `budget_tokens=None`; this keeps the hot path cl100k-free.
+    if budget_tokens.is_none() {
+        let mut used: usize = 0;
+        let mut out: Vec<(Memory, f64)> = Vec::with_capacity(scored.len());
+        for (mem, score) in scored {
+            used = used.saturating_add(mem.content.len() / 4);
+            out.push((mem, score));
+        }
+        return (
+            out,
+            BudgetOutcome {
+                tokens_used: used,
+                tokens_remaining: None,
+                memories_dropped: 0,
+                budget_overflow: false,
+            },
+        );
+    }
+
+    // Budget path — caller asked for enforcement, so spend the tokens
+    // for accurate cl100k accounting.
     let mut used: usize = 0;
-    let mut out = Vec::with_capacity(scored.len());
+    let mut out: Vec<(Memory, f64)> = Vec::with_capacity(scored.len());
+    let mut overflow = false;
+
     for (mem, score) in scored {
-        let cost = estimate_memory_tokens(&mem);
+        let cost = count_memory_tokens(&mem);
         if let Some(budget) = budget_tokens
             && used.saturating_add(cost) > budget
         {
+            // R1 always-return-at-least-one guarantee: if we've collected
+            // nothing yet, take the top-ranked memory and flag overflow.
+            if out.is_empty() {
+                used = used.saturating_add(cost);
+                out.push((mem, score));
+                overflow = true;
+            }
             break;
         }
         used = used.saturating_add(cost);
         out.push((mem, score));
     }
-    (out, used)
+
+    let dropped = total_candidates.saturating_sub(out.len());
+    let tokens_remaining = budget_tokens.map(|b| b.saturating_sub(used));
+    (
+        out,
+        BudgetOutcome {
+            tokens_used: used,
+            tokens_remaining,
+            memories_dropped: dropped,
+            budget_overflow: overflow,
+        },
+    )
 }
 
 /// Recall — fuzzy OR search + touch + auto-promote + TTL extension.
 /// Task 1.11: after ranking, applies optional `budget_tokens` cap.
-/// Returns `(truncated_list, tokens_used)`.
+/// Phase P6: returns the full `BudgetOutcome` (tokens_used,
+/// tokens_remaining, memories_dropped, budget_overflow) instead of just
+/// the prior bare `tokens_used`. Callers that only need `tokens_used`
+/// read `outcome.tokens_used`.
 #[allow(clippy::too_many_arguments)]
 pub fn recall(
     conn: &Connection,
@@ -1273,7 +1406,7 @@ pub fn recall(
     mid_extend: i64,
     as_agent: Option<&str>,
     budget_tokens: Option<usize>,
-) -> Result<(Vec<(Memory, f64)>, usize)> {
+) -> Result<(Vec<(Memory, f64)>, BudgetOutcome)> {
     let now = Utc::now().to_rfc3339();
     let fts_query = sanitize_fts_query(context, true);
     let (vis_p, vis_t, vis_u, vis_o) = compute_visibility_prefixes(as_agent);
@@ -1340,8 +1473,9 @@ pub fn recall(
         results
     };
 
-    // Task 1.11: apply optional token budget in rank order (AFTER proximity).
-    let (budgeted, tokens_used) = apply_token_budget(boosted, budget_tokens);
+    // Task 1.11 / Phase P6: apply optional token budget in rank order
+    // (AFTER proximity). Returns BudgetOutcome with all R1 meta fields.
+    let (budgeted, outcome) = apply_token_budget(boosted, budget_tokens);
 
     // Touch all recalled memories that SURVIVED the budget cut — no sense
     // bumping access counts on memories the caller will never see.
@@ -1350,7 +1484,7 @@ pub fn recall(
             tracing::warn!("touch failed for memory {}: {}", &mem.id, e);
         }
     }
-    Ok((budgeted, tokens_used))
+    Ok((budgeted, outcome))
 }
 
 /// Task 1.7 — vertical memory promotion.
@@ -3211,7 +3345,7 @@ pub fn recall_hybrid(
     as_agent: Option<&str>,
     budget_tokens: Option<usize>,
     scoring: &crate::config::ResolvedScoring,
-) -> Result<(Vec<(Memory, f64)>, usize)> {
+) -> Result<(Vec<(Memory, f64)>, BudgetOutcome)> {
     let now = Utc::now().to_rfc3339();
     let fts_query = sanitize_fts_query(context, true);
     let prefixes = compute_visibility_prefixes(as_agent);
@@ -3488,8 +3622,9 @@ pub fn recall_hybrid(
         results
     };
 
-    // Task 1.11: apply token budget in rank order (AFTER proximity).
-    let (budgeted, tokens_used) = apply_token_budget(boosted, budget_tokens);
+    // Task 1.11 / Phase P6: apply token budget in rank order (AFTER
+    // proximity). Returns BudgetOutcome with all R1 meta fields.
+    let (budgeted, outcome) = apply_token_budget(boosted, budget_tokens);
 
     // Touch surviving memories only.
     for (mem, _) in &budgeted {
@@ -3498,7 +3633,7 @@ pub fn recall_hybrid(
         }
     }
 
-    Ok((budgeted, tokens_used))
+    Ok((budgeted, outcome))
 }
 
 /// Checkpoint WAL for clean shutdown.
