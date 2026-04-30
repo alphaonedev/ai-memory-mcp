@@ -170,7 +170,12 @@ CREATE TABLE IF NOT EXISTS schema_version (
 );
 ";
 
-const CURRENT_SCHEMA_VERSION: i64 = 17;
+// v17 = v0.6.3.1 (P4, audit G1) governance.inherit backfill.
+// v18 = v0.6.3.1 (P2, audit G4/G5/G13) data-integrity hardening:
+//       embedding_dim guard, archive lossless, magic-byte header.
+// v19 = v0.6.3.1 (P5, audit G9) webhook event-types column +
+//       per-subscriber filter.
+const CURRENT_SCHEMA_VERSION: i64 = 19;
 
 pub fn open(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path).context("failed to open database")?;
@@ -223,11 +228,19 @@ fn apply_sqlcipher_key(_conn: &Connection) -> Result<()> {
 }
 
 const MIGRATION_V15_SQLITE: &str = include_str!("../migrations/sqlite/0010_v063_hierarchy_kg.sql");
-// v0.6.3.1 P5 / G9 — webhook event-types column. SQLite cannot
-// `ALTER TABLE ADD COLUMN IF NOT EXISTS`, so the ADD COLUMN itself is
-// done inline below with a column-existence probe; this batch carries
-// the idempotent index on `event_types`.
-const MIGRATION_V17_SQLITE: &str =
+// v0.6.3.1 (P4, audit G1): backfill `metadata.governance.inherit = true`
+// on existing policies so downstream readers and SQL-side dashboards
+// see a consistent shape after upgrade. Idempotent.
+const MIGRATION_V17_SQLITE: &str = include_str!("../migrations/sqlite/0012_governance_inherit.sql");
+// v0.6.3.1 (P2, audit G4/G5/G13): data-integrity hardening. ALTER TABLEs
+// emitted from Rust because SQLite has no `ADD COLUMN IF NOT EXISTS`;
+// the SQL file holds idempotent backfills + indexes.
+const MIGRATION_V18_SQLITE: &str =
+    include_str!("../migrations/sqlite/0011_v0631_data_integrity.sql");
+// v0.6.3.1 (P5, audit G9): webhook event-types column + per-subscriber
+// filter index. ADD COLUMN done inline (SQLite has no `ADD COLUMN IF NOT
+// EXISTS`); SQL file holds the idempotent index batch.
+const MIGRATION_V19_SQLITE: &str =
     include_str!("../migrations/sqlite/0013_webhook_event_types.sql");
 
 #[allow(clippy::too_many_lines)]
@@ -588,6 +601,82 @@ fn migrate(conn: &Connection) -> Result<()> {
         }
 
         if version < 17 {
+            // v0.6.3.1 (P4, audit G1): backfill `metadata.governance.inherit = true`
+            // on existing namespace standards so the inheritance-enforcement
+            // patch (resolve_governance_policy walking the chain leaf-first)
+            // sees an explicit, physically-present field on legacy rows.
+            // The field deserializes as `true` via #[serde(default)] either
+            // way; the backfill keeps replication payloads, JSON-extract
+            // dashboards, and operator inspect output consistent. Idempotent.
+            conn.execute_batch(MIGRATION_V17_SQLITE)?;
+        }
+
+        if version < 18 {
+            // v0.6.3.1 Phase P2 — Data-integrity hardening (G4, G5, G13).
+            // See REMEDIATIONv0631 §"Phase P2".
+            //
+            // The DDL itself lives in migrations/sqlite/0011_v0631_data_integrity.sql.
+            // ALTER TABLE ADD COLUMN statements are emitted here because SQLite
+            // cannot do `ADD COLUMN IF NOT EXISTS`; the SQL file holds the
+            // backfill UPDATE statements and the new indexes.
+            //
+            // memories.embedding_dim — declared dimension of the stored embedding.
+            // Backfill below infers from `length(embedding)/4` (legacy LE-f32
+            // payloads have no header so length is exactly 4n; v18+ writes
+            // happen after commit, so the 4n-only inference here is safe).
+            let has_embedding_dim = conn
+                .prepare("SELECT embedding_dim FROM memories LIMIT 0")
+                .is_ok();
+            if !has_embedding_dim {
+                conn.execute("ALTER TABLE memories ADD COLUMN embedding_dim INTEGER", [])?;
+            }
+
+            // archived_memories — preserve embedding + original tier/expiry on
+            // archive (G5). Pre-v18 archive rows have lost this metadata
+            // permanently; the SQL backfill below fills `original_tier='long'`
+            // so restore_archived treats them as permanent on first restore.
+            let has_archive_embedding = conn
+                .prepare("SELECT embedding FROM archived_memories LIMIT 0")
+                .is_ok();
+            if !has_archive_embedding {
+                conn.execute(
+                    "ALTER TABLE archived_memories ADD COLUMN embedding BLOB",
+                    [],
+                )?;
+            }
+            let has_archive_embedding_dim = conn
+                .prepare("SELECT embedding_dim FROM archived_memories LIMIT 0")
+                .is_ok();
+            if !has_archive_embedding_dim {
+                conn.execute(
+                    "ALTER TABLE archived_memories ADD COLUMN embedding_dim INTEGER",
+                    [],
+                )?;
+            }
+            let has_original_tier = conn
+                .prepare("SELECT original_tier FROM archived_memories LIMIT 0")
+                .is_ok();
+            if !has_original_tier {
+                conn.execute(
+                    "ALTER TABLE archived_memories ADD COLUMN original_tier TEXT",
+                    [],
+                )?;
+            }
+            let has_original_expires_at = conn
+                .prepare("SELECT original_expires_at FROM archived_memories LIMIT 0")
+                .is_ok();
+            if !has_original_expires_at {
+                conn.execute(
+                    "ALTER TABLE archived_memories ADD COLUMN original_expires_at TEXT",
+                    [],
+                )?;
+            }
+
+            // Backfill + indexes — UPDATE/INDEX statements are idempotent.
+            conn.execute_batch(MIGRATION_V18_SQLITE)?;
+        }
+
+        if version < 19 {
             // v0.6.3.1 P5 / G9 — webhook event coverage. Adds an
             // `event_types` JSON-encoded array column to `subscriptions`
             // so callers can opt into a narrow, structured event filter
@@ -598,8 +687,7 @@ fn migrate(conn: &Connection) -> Result<()> {
             //
             // Backward compat: existing rows keep `events = '*'` and have
             // `event_types = NULL` — the matcher continues to treat them
-            // as all-events subscribers. The DDL itself lives in
-            // migrations/sqlite/0013_webhook_event_types.sql.
+            // as all-events subscribers.
             let has_event_types = conn
                 .prepare("SELECT event_types FROM subscriptions LIMIT 0")
                 .is_ok();
@@ -607,7 +695,7 @@ fn migrate(conn: &Connection) -> Result<()> {
                 conn.execute("ALTER TABLE subscriptions ADD COLUMN event_types TEXT", [])?;
             }
             // Idempotent index from the migration file.
-            conn.execute_batch(MIGRATION_V17_SQLITE)?;
+            conn.execute_batch(MIGRATION_V19_SQLITE)?;
         }
 
         conn.execute("DELETE FROM schema_version", [])?;
@@ -934,14 +1022,19 @@ pub fn archive_memory(conn: &Connection, id: &str, reason: Option<&str>) -> Resu
         if !exists {
             return Ok(false);
         }
+        // v0.6.3.1 P2 (G5) — copy embedding + embedding_dim into the archive
+        // and capture original tier + expires_at so restore_archived can
+        // round-trip the row instead of resetting to long/permanent.
         conn.execute(
             "INSERT OR REPLACE INTO archived_memories
              (id, tier, namespace, title, content, tags, priority, confidence,
               source, access_count, created_at, updated_at, last_accessed_at,
-              expires_at, archived_at, archive_reason, metadata)
+              expires_at, archived_at, archive_reason, metadata,
+              embedding, embedding_dim, original_tier, original_expires_at)
              SELECT id, tier, namespace, title, content, tags, priority, confidence,
                     source, access_count, created_at, updated_at, last_accessed_at,
-                    expires_at, ?1, ?2, metadata
+                    expires_at, ?1, ?2, metadata,
+                    embedding, embedding_dim, tier, expires_at
              FROM memories WHERE id = ?3",
             params![now, reason, id],
         )?;
@@ -1020,14 +1113,17 @@ pub fn forget(
         if let Some(pat) = pattern {
             let fts_query = sanitize_fts_query(pat, true);
             let tier_str = tier.map(|t| t.as_str().to_string());
+            // v0.6.3.1 P2 (G5) — preserve embedding + tier + expiry on forget-archive.
             conn.execute(
                 "INSERT OR REPLACE INTO archived_memories
                  (id, tier, namespace, title, content, tags, priority, confidence,
                   source, access_count, created_at, updated_at, last_accessed_at,
-                  expires_at, archived_at, archive_reason)
+                  expires_at, archived_at, archive_reason,
+                  embedding, embedding_dim, original_tier, original_expires_at)
                  SELECT id, tier, namespace, title, content, tags, priority, confidence,
                         source, access_count, created_at, updated_at, last_accessed_at,
-                        expires_at, ?4, 'forget'
+                        expires_at, ?4, 'forget',
+                        embedding, embedding_dim, tier, expires_at
                  FROM memories WHERE rowid IN (
                     SELECT m.rowid FROM memories_fts fts
                     JOIN memories m ON m.rowid = fts.rowid
@@ -1043,10 +1139,12 @@ pub fn forget(
                 "INSERT OR REPLACE INTO archived_memories
                  (id, tier, namespace, title, content, tags, priority, confidence,
                   source, access_count, created_at, updated_at, last_accessed_at,
-                  expires_at, archived_at, archive_reason)
+                  expires_at, archived_at, archive_reason,
+                  embedding, embedding_dim, original_tier, original_expires_at)
                  SELECT id, tier, namespace, title, content, tags, priority, confidence,
                         source, access_count, created_at, updated_at, last_accessed_at,
-                        expires_at, ?3, 'forget'
+                        expires_at, ?3, 'forget',
+                        embedding, embedding_dim, tier, expires_at
                  FROM memories WHERE (?1 IS NULL OR namespace = ?1) AND (?2 IS NULL OR tier = ?2)",
                 params![namespace, tier_str, now],
             )?;
@@ -1290,6 +1388,48 @@ pub fn apply_token_budget(
 /// Task 1.11: after ranking, applies optional `budget_tokens` cap.
 /// Returns `(truncated_list, tokens_used)`.
 #[allow(clippy::too_many_arguments)]
+/// v0.6.3.1 (P3): keyword-only recall with retrieval-stage telemetry.
+///
+/// Identical to [`recall`] but additionally returns a [`crate::models::RecallTelemetry`]
+/// describing the FTS5 candidate count (HNSW count is always 0 for this
+/// path — no semantic stage runs). MCP `handle_recall` uses this to build
+/// the `meta` block; [`recall`] is preserved as a thin wrapper for
+/// existing callers (HTTP handlers, CLI, bench).
+#[allow(clippy::too_many_arguments)]
+pub fn recall_with_telemetry(
+    conn: &Connection,
+    context: &str,
+    namespace: Option<&str>,
+    limit: usize,
+    tags_filter: Option<&str>,
+    since: Option<&str>,
+    until: Option<&str>,
+    short_extend: i64,
+    mid_extend: i64,
+    as_agent: Option<&str>,
+    budget_tokens: Option<usize>,
+) -> Result<(Vec<(Memory, f64)>, usize, crate::models::RecallTelemetry)> {
+    let (results, tokens_used) = recall(
+        conn,
+        context,
+        namespace,
+        limit,
+        tags_filter,
+        since,
+        until,
+        short_extend,
+        mid_extend,
+        as_agent,
+        budget_tokens,
+    )?;
+    let telemetry = crate::models::RecallTelemetry {
+        fts_candidates: results.len(),
+        hnsw_candidates: 0,
+        blend_weight_avg: 0.0,
+    };
+    Ok((results, tokens_used, telemetry))
+}
+
 pub fn recall(
     conn: &Connection,
     context: &str,
@@ -1443,6 +1583,61 @@ pub fn promote_to_namespace(
     // short-circuits on self-link (impossible here — distinct IDs).
     create_link(conn, &actual_id, source_id, "derived_from")?;
     Ok(actual_id)
+}
+
+/// v0.6.3.1 P2 (G6) — quick existence check for `(title, namespace)`. Used by
+/// `on_conflict='error'` callers to short-circuit before the full upsert
+/// machinery runs. Returns the existing row id if there is one.
+///
+/// # Errors
+///
+/// Returns the underlying SQLite error.
+pub fn find_by_title_namespace(
+    conn: &Connection,
+    title: &str,
+    namespace: &str,
+) -> Result<Option<String>> {
+    let id: Option<String> = conn
+        .query_row(
+            "SELECT id FROM memories WHERE title = ?1 AND namespace = ?2 LIMIT 1",
+            params![title, namespace],
+            |r| r.get(0),
+        )
+        .ok();
+    Ok(id)
+}
+
+/// v0.6.3.1 P2 (G6) — pick a title that does not collide with an existing
+/// `(title, namespace)` row by appending `(2)`, `(3)`, ... up to a hard cap.
+/// The first available suffix wins. Used by `on_conflict='version'`.
+///
+/// The cap (`MAX_VERSION_SUFFIX`) prevents an infinite loop in pathological
+/// cases (e.g. an attacker spamming the same title in a loop). Once the cap
+/// is hit, the caller falls back to error mode.
+const MAX_VERSION_SUFFIX: u32 = 1024;
+
+/// # Errors
+///
+/// Returns the underlying SQLite error or an error if no free suffix is
+/// found within `MAX_VERSION_SUFFIX` attempts.
+pub fn next_versioned_title(
+    conn: &Connection,
+    base_title: &str,
+    namespace: &str,
+) -> Result<String> {
+    if find_by_title_namespace(conn, base_title, namespace)?.is_none() {
+        return Ok(base_title.to_string());
+    }
+    for n in 2..=MAX_VERSION_SUFFIX {
+        let candidate = format!("{base_title} ({n})");
+        if find_by_title_namespace(conn, &candidate, namespace)?.is_none() {
+            return Ok(candidate);
+        }
+    }
+    anyhow::bail!(
+        "could not find a free versioned title for '{base_title}' in namespace '{namespace}' \
+         within {MAX_VERSION_SUFFIX} attempts"
+    )
 }
 
 /// Detect potential contradictions: memories in same namespace with similar titles.
@@ -2028,23 +2223,21 @@ pub fn check_duplicate(
         if bytes.is_empty() {
             continue;
         }
-        // Skip blobs whose length is not a multiple of 4 (corrupted /
-        // truncated embedding column). chunks_exact silently drops a
-        // trailing partial chunk; we explicitly bail on the row so a
-        // bad blob doesn't compute against a shorter candidate vector
-        // (which would produce a wrong cosine score).
-        if !bytes.len().is_multiple_of(4) {
-            tracing::warn!(
-                memory_id = %id,
-                blob_len = bytes.len(),
-                "skipping duplicate-check candidate with malformed embedding length"
-            );
-            continue;
-        }
-        let candidate: Vec<f32> = bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
+        // v0.6.3.1 P2 — magic-byte aware decode. Malformed payloads
+        // (anything other than headed-LE or legacy-LE) are skipped with
+        // telemetry so a corrupted row can't poison duplicate detection.
+        let candidate = match crate::embeddings::decode_embedding_blob(&bytes) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    memory_id = %id,
+                    blob_len = bytes.len(),
+                    error = %e,
+                    "skipping duplicate-check candidate with malformed embedding"
+                );
+                continue;
+            }
+        };
         // Vectors of mismatched dimension would compute against a
         // truncated query (Embedder::cosine_similarity zips). Skip
         // rather than report a misleading similarity score.
@@ -2803,6 +2996,15 @@ pub fn stats(conn: &Connection, db_path: &Path) -> Result<Stats> {
         .query_row("SELECT COUNT(*) FROM memory_links", [], |r| r.get(0))
         .unwrap_or(0);
     let db_size_bytes = std::fs::metadata(db_path).map_or(0, |m| m.len());
+    // v0.6.3.1 P2 (G4) — surface mixed-dim corruption to operators. Best-effort:
+    // any error here returns 0 rather than failing the stats endpoint.
+    let dim_violations = dim_violations(conn).unwrap_or(0);
+
+    // v0.6.3.1 (P3, G2): cumulative HNSW eviction count is process-local
+    // state — read from the static counter in src/hnsw.rs. Surfacing it in
+    // `stats` lets `memory_stats` callers and `ai-memory doctor` (P7) flag
+    // operators who are sustaining at the index cap.
+    let index_evictions_total = crate::hnsw::index_evictions_total();
 
     Ok(Stats {
         total,
@@ -2811,6 +3013,8 @@ pub fn stats(conn: &Connection, db_path: &Path) -> Result<Stats> {
         expiring_soon,
         links_count,
         db_size_bytes,
+        dim_violations,
+        index_evictions_total,
     })
 }
 
@@ -2844,14 +3048,17 @@ pub fn gc(conn: &Connection, archive: bool) -> Result<usize> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let result = (|| -> Result<usize> {
         if archive {
+            // v0.6.3.1 P2 (G5) — preserve embedding + tier + expiry on GC archive.
             conn.execute(
                 "INSERT OR REPLACE INTO archived_memories
                  (id, tier, namespace, title, content, tags, priority, confidence,
                   source, access_count, created_at, updated_at, last_accessed_at,
-                  expires_at, archived_at, archive_reason, metadata)
+                  expires_at, archived_at, archive_reason, metadata,
+                  embedding, embedding_dim, original_tier, original_expires_at)
                  SELECT id, tier, namespace, title, content, tags, priority, confidence,
                         source, access_count, created_at, updated_at, last_accessed_at,
-                        expires_at, ?1, 'ttl_expired', metadata
+                        expires_at, ?1, 'ttl_expired', metadata,
+                        embedding, embedding_dim, tier, expires_at
                  FROM memories
                  WHERE expires_at IS NOT NULL AND expires_at < ?1",
                 params![now],
@@ -2988,12 +3195,20 @@ pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
             )?;
         }
 
+        // v0.6.3.1 P2 (G5) — preserve original tier + expires_at + embedding
+        // on restore. Pre-v17 rows lost this metadata permanently; the
+        // migration backfills `original_tier='long'` so they still restore
+        // as permanent (the prior behavior — no regression for legacy data).
+        // Live writes from v0.6.3.1 onward round-trip the original tier.
         conn.execute(
             "INSERT INTO memories
              (id, tier, namespace, title, content, tags, priority, confidence,
-              source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata)
-             SELECT id, 'long', namespace, title, content, tags, priority, confidence,
-                    source, access_count, created_at, ?1, last_accessed_at, NULL, metadata
+              source, access_count, created_at, updated_at, last_accessed_at,
+              expires_at, metadata, embedding, embedding_dim)
+             SELECT id, COALESCE(original_tier, 'long'), namespace, title, content,
+                    tags, priority, confidence, source, access_count, created_at,
+                    ?1, last_accessed_at, original_expires_at, metadata,
+                    embedding, embedding_dim
              FROM archived_memories WHERE id = ?2",
             params![now, id],
         )?;
@@ -3148,18 +3363,146 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
 
 // --- Embedding support ---
 
+/// v0.6.3.1 P2 (G4): error returned by `set_embedding` when a write would
+/// introduce a new embedding dimensionality into a namespace that has already
+/// established one via an earlier write. Surfaced as a typed error so the
+/// MCP/HTTP handlers can map it to a 409 Conflict rather than letting cosine
+/// silently return 0.0 on every subsequent recall.
+#[derive(Debug)]
+pub struct EmbeddingDimMismatch {
+    pub namespace: String,
+    pub established: usize,
+    pub attempted: usize,
+}
+
+impl std::fmt::Display for EmbeddingDimMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "embedding dim mismatch in namespace '{}': established {}-dim, refused {}-dim write",
+            self.namespace, self.established, self.attempted
+        )
+    }
+}
+
+impl std::error::Error for EmbeddingDimMismatch {}
+
+/// Lookup the embedding dimensionality already established for `namespace`.
+/// Returns `Ok(None)` when no row in that namespace has an embedding yet.
+///
+/// # Errors
+///
+/// Returns the underlying SQLite error.
+pub fn namespace_embedding_dim(conn: &Connection, namespace: &str) -> Result<Option<usize>> {
+    // Use the v17 idx_memories_ns_dim partial index.
+    let dim: Option<i64> = conn
+        .query_row(
+            "SELECT embedding_dim FROM memories \
+             WHERE namespace = ?1 AND embedding_dim IS NOT NULL \
+             LIMIT 1",
+            params![namespace],
+            |r| r.get(0),
+        )
+        .ok();
+    Ok(dim.and_then(|d| usize::try_from(d).ok()))
+}
+
+/// Count rows whose stored `embedding_dim` does not match what the BLOB
+/// contains (or where the column is missing while a BLOB exists). Surfaced
+/// in `Stats::dim_violations` and consumed by P7 doctor.
+///
+/// # Errors
+///
+/// Returns the underlying SQLite error.
+pub fn dim_violations(conn: &Connection) -> Result<u64> {
+    // The expression `length(embedding)` returns the BLOB length; we map
+    // legacy (no-header) payloads to `length/4` and headed (v17+) payloads
+    // to `(length-1)/4` because length parity tells us which form is on
+    // disk. Both forms must match the declared `embedding_dim` column.
+    let n: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memories \
+             WHERE embedding IS NOT NULL \
+               AND length(embedding) >= 4 \
+               AND ( \
+                   embedding_dim IS NULL \
+                   OR ( \
+                       (length(embedding) % 4 = 0 AND embedding_dim != length(embedding)/4) \
+                       OR (length(embedding) % 4 = 1 AND embedding_dim != (length(embedding)-1)/4) \
+                       OR (length(embedding) % 4 NOT IN (0,1)) \
+                   ) \
+               )",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    Ok(u64::try_from(n).unwrap_or(0))
+}
+
 /// Store an embedding vector for a memory.
+///
+/// v0.6.3.1 P2 — writes are now headed with the magic byte (`encode_embedding_blob`)
+/// and the namespace's first established dim is enforced. A dim mismatch
+/// returns a typed [`EmbeddingDimMismatch`] surfaced as a 409 by the handler
+/// layer. The same call also persists `embedding_dim` so future stats /
+/// doctor passes don't re-derive from BLOB length.
+///
+/// # Errors
+///
+/// Returns [`EmbeddingDimMismatch`] (boxed via anyhow) when the embedding's
+/// dimensionality differs from what the namespace established, or the
+/// underlying SQLite error on failure.
 pub fn set_embedding(conn: &Connection, id: &str, embedding: &[f32]) -> Result<()> {
-    let bytes: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
+    // Resolve namespace + check the dim invariant before mutating.
+    let namespace: Option<String> = conn
+        .query_row(
+            "SELECT namespace FROM memories WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .ok();
+    let attempted = embedding.len();
+    if attempted == 0 {
+        // Empty embeddings are a degenerate case — earlier code accepted
+        // them; preserve that to avoid breaking legacy tests but skip the
+        // dim check.
+        let bytes = crate::embeddings::encode_embedding_blob(embedding);
+        conn.execute(
+            "UPDATE memories SET embedding = ?1, embedding_dim = NULL WHERE id = ?2",
+            params![bytes, id],
+        )?;
+        return Ok(());
+    }
+    if let Some(ref ns) = namespace
+        && let Some(established) = namespace_embedding_dim(conn, ns)?
+        && established != attempted
+    {
+        return Err(EmbeddingDimMismatch {
+            namespace: ns.clone(),
+            established,
+            attempted,
+        }
+        .into());
+    }
+    let bytes = crate::embeddings::encode_embedding_blob(embedding);
+    let dim_i64 = i64::try_from(attempted).unwrap_or(i64::MAX);
     conn.execute(
-        "UPDATE memories SET embedding = ?1 WHERE id = ?2",
-        params![bytes, id],
+        "UPDATE memories SET embedding = ?1, embedding_dim = ?2 WHERE id = ?3",
+        params![bytes, dim_i64, id],
     )?;
     Ok(())
 }
 
 /// Load an embedding vector for a memory. Returns None if not set.
-#[allow(clippy::unnecessary_wraps)]
+///
+/// v0.6.3.1 P2 — tolerant of legacy unheaded payloads (raw LE f32, length
+/// `4n`) and v17 headed payloads (`0x01` + `4n` bytes). Anything else returns
+/// an error so the caller can surface a typed corruption signal.
+///
+/// # Errors
+///
+/// Returns [`EmbeddingFormatError`](crate::embeddings::EmbeddingFormatError)
+/// when the on-disk BLOB is malformed.
 pub fn get_embedding(conn: &Connection, id: &str) -> Result<Option<Vec<f32>>> {
     let result: Option<Vec<u8>> = conn
         .query_row(
@@ -3170,10 +3513,7 @@ pub fn get_embedding(conn: &Connection, id: &str) -> Result<Option<Vec<f32>>> {
         .ok();
     match result {
         Some(bytes) if !bytes.is_empty() => {
-            let floats: Vec<f32> = bytes
-                .chunks_exact(4)
-                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-                .collect();
+            let floats = crate::embeddings::decode_embedding_blob(&bytes)?;
             Ok(Some(floats))
         }
         _ => Ok(None),
@@ -3196,6 +3536,11 @@ pub fn get_unembedded_ids(conn: &Connection) -> Result<Vec<(String, String, Stri
 }
 
 /// Get all stored embeddings as (id, embedding) pairs for building the HNSW index.
+///
+/// v0.6.3.1 P2 — uses the magic-byte tolerant decoder. Rows whose BLOB is
+/// malformed are logged and skipped (the alternative — bailing the entire
+/// HNSW build — would take the whole semantic-search surface offline for one
+/// corrupt row).
 pub fn get_all_embeddings(conn: &Connection) -> Result<Vec<(String, Vec<f32>)>> {
     let mut stmt =
         conn.prepare("SELECT id, embedding FROM memories WHERE embedding IS NOT NULL")?;
@@ -3210,11 +3555,16 @@ pub fn get_all_embeddings(conn: &Connection) -> Result<Vec<(String, Vec<f32>)>> 
         if bytes.is_empty() {
             continue;
         }
-        let floats: Vec<f32> = bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
-        entries.push((id, floats));
+        match crate::embeddings::decode_embedding_blob(&bytes) {
+            Ok(floats) => entries.push((id, floats)),
+            Err(e) => {
+                tracing::warn!(
+                    memory_id = %id,
+                    error = %e,
+                    "skipping memory with malformed embedding BLOB during HNSW build"
+                );
+            }
+        }
     }
     Ok(entries)
 }
@@ -3224,7 +3574,12 @@ pub fn get_all_embeddings(conn: &Connection) -> Result<Vec<(String, Vec<f32>)>> 
 /// When an HNSW `vector_index` is provided, uses approximate nearest-neighbor
 /// search instead of scanning all embeddings linearly.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_lines)]
+/// v0.6.3.1 (P3): hybrid recall preserving the existing 2-tuple return
+/// shape for HTTP / CLI / bench callers. Delegates to
+/// [`recall_hybrid_with_telemetry`] and discards the telemetry. Kept so
+/// the dozen-plus call sites need no churn for a feature only MCP
+/// `handle_recall` consumes.
+#[allow(clippy::too_many_arguments)]
 pub fn recall_hybrid(
     conn: &Connection,
     context: &str,
@@ -3241,6 +3596,54 @@ pub fn recall_hybrid(
     budget_tokens: Option<usize>,
     scoring: &crate::config::ResolvedScoring,
 ) -> Result<(Vec<(Memory, f64)>, usize)> {
+    let (results, tokens, _telemetry) = recall_hybrid_with_telemetry(
+        conn,
+        context,
+        query_embedding,
+        namespace,
+        limit,
+        tags_filter,
+        since,
+        until,
+        vector_index,
+        short_extend,
+        mid_extend,
+        as_agent,
+        budget_tokens,
+        scoring,
+    )?;
+    Ok((results, tokens))
+}
+
+/// v0.6.3.1 (P3): hybrid recall reporting per-stage candidate counts and
+/// the average semantic blend weight. MCP `handle_recall` uses the
+/// telemetry to populate the `meta` block (closes audit gaps G2/G8/G11).
+///
+/// The retrieval logic is unchanged — anti-goal of this phase is "do not
+/// change recall scoring or fusion logic." Counters are computed in
+/// place: `fts_candidates` is the pre-fusion FTS5 row count,
+/// `hnsw_candidates` is the pre-fusion HNSW (or linear-scan) hit count
+/// admitted past the 0.2 cosine gate, `blend_weight_avg` is the mean
+/// `semantic_weight` across the *returned* set (not the full candidate
+/// pool — operators care about what made it out).
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
+pub fn recall_hybrid_with_telemetry(
+    conn: &Connection,
+    context: &str,
+    query_embedding: &[f32],
+    namespace: Option<&str>,
+    limit: usize,
+    tags_filter: Option<&str>,
+    since: Option<&str>,
+    until: Option<&str>,
+    vector_index: Option<&crate::hnsw::VectorIndex>,
+    short_extend: i64,
+    mid_extend: i64,
+    as_agent: Option<&str>,
+    budget_tokens: Option<usize>,
+    scoring: &crate::config::ResolvedScoring,
+) -> Result<(Vec<(Memory, f64)>, usize, crate::models::RecallTelemetry)> {
     let now = Utc::now().to_rfc3339();
     let fts_query = sanitize_fts_query(context, true);
     let prefixes = compute_visibility_prefixes(as_agent);
@@ -3337,6 +3740,13 @@ pub fn recall_hybrid(
         },
     )?;
 
+    // v0.6.3.1 (P3): pre-fusion candidate-pool counters surfaced to the
+    // MCP `meta` block. Counted here at retrieval time, not after fusion,
+    // so operators see how each stage contributed even when fusion
+    // collapses the union to a smaller set.
+    let mut fts_candidates_count: usize = 0;
+    let mut hnsw_candidates_count: usize = 0;
+
     let mut max_fts_score: f64 = 1.0;
     for row in fts_rows {
         let (mem, fts_score) = row?;
@@ -3351,6 +3761,7 @@ pub fn recall_hybrid(
             ))
         });
         scored.insert(mem.id.clone(), (mem, fts_score, cosine));
+        fts_candidates_count += 1;
     }
 
     // Semantic-only candidates — use HNSW index for fast ANN if available,
@@ -3415,6 +3826,7 @@ pub fn recall_hybrid(
                     continue;
                 }
                 scored.insert(mem.id.clone(), (mem, 0.0, cosine));
+                hnsw_candidates_count += 1;
             }
         }
     } else {
@@ -3446,10 +3858,16 @@ pub fn recall_hybrid(
             if let Some(bytes) = emb_bytes
                 && !bytes.is_empty()
             {
-                let emb: Vec<f32> = bytes
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                    .collect();
+                // v0.6.3.1 P2 — tolerate legacy + headed payloads; skip
+                // (with telemetry) on malformed BLOBs so a single corrupt
+                // row can't poison the whole semantic stage.
+                let Ok(emb) = crate::embeddings::decode_embedding_blob(&bytes) else {
+                    tracing::warn!(
+                        memory_id = %mem.id,
+                        "skipping malformed embedding BLOB during semantic recall"
+                    );
+                    continue;
+                };
                 let cosine = f64::from(crate::embeddings::Embedder::cosine_similarity(
                     query_embedding,
                     &emb,
@@ -3457,6 +3875,7 @@ pub fn recall_hybrid(
                 // v0.6.2 (S18): see matching note above at the HNSW gate.
                 if cosine > 0.2 {
                     scored.insert(mem.id.clone(), (mem, 0.0, cosine));
+                    hnsw_candidates_count += 1;
                 }
             }
         }
@@ -3471,6 +3890,11 @@ pub fn recall_hybrid(
     // `legacy_scoring` config knob short-circuits the decay back to 1.0 for
     // A/B comparison and emergency regression rollback.
     let now_utc = Utc::now();
+    // v0.6.3.1 (P3): collect per-candidate semantic weight in parallel with
+    // the existing fusion pass so MCP `meta.blend_weight` reports the
+    // *applied* (not configured) weight. Wrapped in `RefCell` so the map
+    // closure can side-effect without restructuring the iterator chain.
+    let blend_weights: std::cell::RefCell<Vec<f64>> = std::cell::RefCell::new(Vec::new());
     let mut results: Vec<(Memory, f64)> = scored
         .into_values()
         .map(|(mem, fts_score, cosine)| {
@@ -3488,6 +3912,7 @@ pub fn recall_hybrid(
             } else {
                 0.50 - 0.35 * ((content_len - 500.0) / 4500.0)
             };
+            blend_weights.borrow_mut().push(semantic_weight);
             let blended = semantic_weight * cosine + (1.0 - semantic_weight) * norm_fts;
             let age_days = chrono::DateTime::parse_from_rfc3339(&mem.created_at)
                 .ok()
@@ -3527,7 +3952,28 @@ pub fn recall_hybrid(
         }
     }
 
-    Ok((budgeted, tokens_used))
+    // v0.6.3.1 (P3): summarize per-stage candidate counts and the average
+    // semantic blend weight for the MCP `meta` block. `blend_weight_avg`
+    // is the unweighted mean across the *post-fusion* candidate set so
+    // operators see the typical weight applied to what shipped, not the
+    // configured ceiling. Pre-fusion counts come from the retrieval
+    // counters (FTS / HNSW), which gives an honest picture of stage
+    // contribution even when fusion deduplicates.
+    let weights = blend_weights.into_inner();
+    let blend_weight_avg = if weights.is_empty() {
+        0.0
+    } else {
+        #[allow(clippy::cast_precision_loss)]
+        let n = weights.len() as f64;
+        weights.iter().sum::<f64>() / n
+    };
+    let telemetry = crate::models::RecallTelemetry {
+        fts_candidates: fts_candidates_count,
+        hnsw_candidates: hnsw_candidates_count,
+        blend_weight_avg,
+    };
+
+    Ok((budgeted, tokens_used, telemetry))
 }
 
 /// Checkpoint WAL for clean shutdown.
@@ -3773,20 +4219,156 @@ pub fn clear_namespace_standard(conn: &Connection, namespace: &str) -> Result<bo
 // Task 1.9 — governance enforcement + pending_actions CRUD
 // ---------------------------------------------------------------------------
 
-/// Resolve the explicit governance policy for a namespace from its standard
-/// memory's `metadata.governance`. Returns `None` when no policy is set —
-/// enforcement is **opt-in**, so namespaces without explicit policy skip
-/// every governance check (historical behavior preserved). The "default
-/// policy" (`{ write: Any, promote: Any, delete: Owner, approver: Human }`)
-/// is surfaced by `get_standard` for display purposes only; it does not
-/// gate operations.
-pub fn resolve_governance_policy(conn: &Connection, namespace: &str) -> Option<GovernancePolicy> {
+/// Build the namespace inheritance chain in **top-down** order
+/// (`["*", root, ..., leaf]`). Mirrors and replaces the historical
+/// `mcp::build_namespace_chain` so non-MCP call sites (db-layer
+/// governance enforcement, HTTP handlers, future hook pipelines) can
+/// reuse the same walk.
+///
+/// Properties (preserved from the prior MCP-only implementation):
+/// - cycle-safe (visited set + bounded by `MAX_EXPLICIT_DEPTH = 8`)
+/// - includes the global standard `*` as the most-general entry
+/// - prepends explicit `namespace_meta.parent_namespace` ancestors
+///   before the `/`-derived hierarchy, supporting flat→hierarchical
+///   linking (e.g. legacy `ai-memory` → `ai-memory-mcp`)
+///
+/// The MCP layer's display path consumes this top-down. The governance
+/// resolver in [`resolve_governance_policy`] reverses it for a
+/// leaf-first walk (most-specific wins).
+#[must_use]
+pub fn build_namespace_chain(conn: &Connection, namespace: &str) -> Vec<String> {
+    const MAX_EXPLICIT_DEPTH: usize = 8;
+    let mut chain: Vec<String> = Vec::new();
+
+    if namespace == "*" {
+        chain.push("*".to_string());
+        return chain;
+    }
+
+    // Always start with the global standard — most general.
+    chain.push("*".to_string());
+
+    // 1. /-derived ancestors. `namespace_ancestors` returns most-specific-first;
+    //    reverse for top-down (root ancestor first, then namespace itself last).
+    let mut hierarchy_chain: Vec<String> = crate::models::namespace_ancestors(namespace)
+        .into_iter()
+        .rev()
+        .collect();
+
+    // 2. If the ROOTmost of the /-chain has an explicit `namespace_meta` parent,
+    //    prepend that chain (bounded by MAX_EXPLICIT_DEPTH + cycle-safe).
+    //    Supports legacy flat namespaces (e.g. `ai-memory` → `ai-memory-mcp`).
+    if let Some(root) = hierarchy_chain.first().cloned() {
+        let mut explicit_above: Vec<String> = Vec::new();
+        let mut current = root;
+        for _ in 0..MAX_EXPLICIT_DEPTH {
+            match get_namespace_parent(conn, &current) {
+                Some(p)
+                    if p != "*"
+                        && !explicit_above.contains(&p)
+                        && !hierarchy_chain.contains(&p) =>
+                {
+                    explicit_above.push(p.clone());
+                    current = p;
+                }
+                _ => break,
+            }
+        }
+        // `explicit_above` is [immediate-explicit-parent, grandparent, ...];
+        // reverse to prepend in top-down order.
+        for p in explicit_above.into_iter().rev() {
+            chain.push(p);
+        }
+    }
+
+    // 3. Append the /-derived chain (top-down).
+    for entry in hierarchy_chain.drain(..) {
+        if !chain.contains(&entry) {
+            chain.push(entry);
+        }
+    }
+
+    chain
+}
+
+/// Read the explicit governance policy attached to a single namespace's
+/// standard memory. Does **not** walk the inheritance chain — callers
+/// that want hierarchical resolution should use
+/// [`resolve_governance_policy`] instead.
+fn read_namespace_policy(conn: &Connection, namespace: &str) -> Option<GovernancePolicy> {
     let standard_id = get_namespace_standard(conn, namespace).ok()??;
     let mem = get(conn, &standard_id).ok()??;
     match GovernancePolicy::from_metadata(&mem.metadata) {
         Some(Ok(p)) => Some(p),
         _ => None,
     }
+}
+
+/// Resolve the governance policy that gates actions in `namespace`.
+///
+/// v0.6.3.1 (P4, audit G1): walks the inheritance chain leaf-first and
+/// returns the most-specific policy. This closes the audit's
+/// highest-severity finding — prior to this fix the resolver consulted
+/// only the leaf, which left children of governed parents (e.g.
+/// `alphaone/secure/team-a` under an `Approve` policy at
+/// `alphaone/secure`) **completely ungoverned** despite the
+/// architecture page T2 promising "Hierarchical policy inheritance
+/// (default at `org/`, overridable at `org/team/`)".
+///
+/// **Walk semantics** (carefully — easy to get subtly wrong):
+///   1. Build the chain via [`build_namespace_chain`] (top-down) and
+///      reverse it so we walk leaf → root. The leaf is the namespace
+///      we were asked about; the root is the global `*` standard.
+///   2. At each level `k`, look up the policy attached to that
+///      namespace's standard memory.
+///      - If a policy **exists**, it is the most-specific match seen
+///        so far. Return it immediately. ("Most specific wins.")
+///      - If a policy **also says `inherit: false`**, this is already
+///        the same return path — we never reach the parent because
+///        we already returned.
+///   3. If level `k` has **no policy at all**, keep walking — this is
+///      the implicit-inherit branch (no policy means "I don't override
+///      my parent").
+///   4. If we walk off the top of the chain without finding a policy,
+///      return `None` (enforcement remains opt-in for namespaces with
+///      no governance configured anywhere in the chain).
+///
+/// **Where does `inherit: false` actually do work?** When the most-
+/// specific policy we hit on the walk has `inherit: false`. That
+/// policy is returned (same return point as the inherit=true case),
+/// so its rules govern the action; the false flag is what
+/// **conceptually stops** the walk above it, but the implementation
+/// stops the walk simply by virtue of having found a policy. The flag
+/// matters most as a documented contract surfaced to operators: "a
+/// policy here authoritatively replaces, not extends, what's above."
+/// The flag also flows through the queued-pending-action approver
+/// resolution so consensus/agent rules don't accidentally re-walk to
+/// a parent.
+///
+/// Cycle-safety is inherited from `build_namespace_chain`
+/// (`MAX_EXPLICIT_DEPTH = 8` + visited set). No new cache is
+/// introduced — profile-driven optimization is a v0.7 item.
+pub fn resolve_governance_policy(conn: &Connection, namespace: &str) -> Option<GovernancePolicy> {
+    // build_namespace_chain returns top-down (`["*", root, ..., leaf]`).
+    // Governance resolution wants leaf-first (most specific first), so
+    // we reverse before walking.
+    let chain = build_namespace_chain(conn, namespace);
+    for level in chain.into_iter().rev() {
+        // Most-specific match wins. Returning immediately here means
+        // an explicit policy at the leaf (or any descendant level
+        // with a policy) authoritatively overrides anything above —
+        // which is precisely the inherit=false semantic, applied
+        // implicitly. The inherit=false flag is preserved on the
+        // returned policy so callers (e.g. the pending_action
+        // approver resolver) don't accidentally re-walk to a parent.
+        if let Some(policy) = read_namespace_policy(conn, &level) {
+            return Some(policy);
+        }
+        // Implicit branch: no policy at this level → keep walking
+        // toward the root. This is the "default inherit" behavior
+        // that closes G1.
+    }
+    None
 }
 
 /// Return true if `agent_id` matches a registered agent in `_agents`.
@@ -4824,9 +5406,14 @@ mod tests {
 
     #[test]
     fn restore_archived_memory() {
+        // v0.6.3.1 P2 (G5) — restore preserves the original tier and
+        // expires_at instead of resetting to long/permanent. Pre-v17 this
+        // test asserted `is_none()` for expires_at — that was the bug
+        // being fixed.
         let conn = test_db();
         let mut mem = make_memory("Restorable", "test", Tier::Short, 5);
-        mem.expires_at = Some("2020-01-01T00:00:00+00:00".to_string());
+        let original_expiry = "2020-01-01T00:00:00+00:00".to_string();
+        mem.expires_at = Some(original_expiry.clone());
         let id = insert(&conn, &mem).unwrap();
 
         gc(&conn, true).unwrap();
@@ -4837,7 +5424,16 @@ mod tests {
 
         let got = get(&conn, &id).unwrap().unwrap();
         assert_eq!(got.title, "Restorable");
-        assert!(got.expires_at.is_none()); // restored without expiry
+        assert_eq!(
+            got.tier.as_str(),
+            "short",
+            "G5: restore must preserve the original tier"
+        );
+        assert_eq!(
+            got.expires_at,
+            Some(original_expiry),
+            "G5: restore must preserve the original expires_at"
+        );
     }
 
     #[test]
