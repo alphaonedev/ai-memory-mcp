@@ -264,6 +264,7 @@ impl TierConfig {
                 pending_requests: 0,
             },
             transcripts: CapabilityTranscripts::planned(),
+            hnsw: CapabilityHnsw::default(),
         }
     }
 }
@@ -328,6 +329,13 @@ pub struct Capabilities {
     /// Sidechain-transcript state. v0.7 Bucket 1.7 work — reports
     /// `{planned, version, enabled}` until the subsystem ships.
     pub transcripts: CapabilityTranscripts,
+
+    /// v0.6.3.1 (P3, G2): HNSW vector-index health. Defaults to a
+    /// quiet zero-state report; the MCP/HTTP capabilities wrapper
+    /// overwrites with live process counters when the index module
+    /// has run an eviction.
+    #[serde(default)]
+    pub hnsw: CapabilityHnsw,
 }
 
 /// Live recall-mode tag (P1 honesty patch). Reflects the *runtime*
@@ -575,6 +583,25 @@ fn is_zero_usize(n: &usize) -> bool {
 #[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_zero_u64(n: &u64) -> bool {
     *n == 0
+}
+
+/// HNSW vector-index health (capabilities schema v2, v0.6.3.1 P3).
+///
+/// Closes the G2 audit gap by surfacing both the cumulative oldest-eviction
+/// count and a rolling-window flag so operators can distinguish "this
+/// process has hit the cap once, long ago" from "we are currently
+/// sustained at the cap and shedding embeddings now". Both numbers are
+/// process-local — the index itself resets on restart so persistence
+/// would be misleading.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CapabilityHnsw {
+    /// Cumulative count of vectors evicted by the `MAX_ENTRIES`-cap path
+    /// since this process started.
+    pub evictions_total: u64,
+    /// True when at least one eviction has occurred in the last 60 s.
+    /// Lets dashboards alert on *active* pressure rather than only the
+    /// historical counter.
+    pub evicted_recently: bool,
 }
 
 // ---------------------------------------------------------------------------
