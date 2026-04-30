@@ -65,12 +65,49 @@ three formats:
 |---|---|---|---|
 | **1. Hook-capable** | A documented session-start hook the user can configure | Hook runs `ai-memory boot`; stdout is injected as additional context. **100% reliable.** | Claude Code |
 | **2. MCP-capable, no hook** | An MCP client and a project-rules / system-prompt file but no session-start hook | `ai-memory-mcp` registered as an MCP server **plus** a one-line directive in the agent's rules file telling the model to call `memory_session_start` first. **Best-effort** (text-directive subject to model compliance). | Cursor, Cline, Continue, Windsurf, OpenClaw |
-| **3. Programmatic only** | An SDK or raw API where the developer assembles each request | Application code shells out to `ai-memory boot --quiet --format json` and prepends the result to the system message at session/conversation start. **100% reliable when implemented.** | Codex CLI, Claude Agent SDK, OpenAI Apps SDK / Assistants API / Responses API, Grok via xAI API, Hermes / local models via LM Studio / Ollama / vLLM |
+| **3. Programmatic only** | An SDK or raw API where the developer assembles each request | Application code uses the SDK pattern (prepends `ai-memory boot` output to the system message). For the launcher case (just spawn a CLI), `ai-memory wrap <agent>` is the cross-platform Rust replacement for the bash / PowerShell wrappers earlier PRs shipped — it runs the same code path on macOS / Linux / Windows / Docker / Kubernetes. **100% reliable when implemented.** | Codex CLI, Claude Agent SDK, OpenAI Apps SDK / Assistants API / Responses API, Grok via xAI API, Hermes / local models via LM Studio / Ollama / vLLM |
 
 The bar for "100% remediated" is: every supported agent has a recipe that
 loads memory on the first turn without user prompting. Categories 1 and 3
 hit that bar today; category 2 is best-effort until upstream agents grow a
 proper session-start hook (see issue #487 cross-files).
+
+### Category 3 — `ai-memory wrap` (PR-6)
+
+PR-6 of issue #487 ships `ai-memory wrap <agent>`: a built-in
+cross-platform Rust subcommand that replaces the per-recipe bash and
+PowerShell wrappers earlier PRs shipped. The same binary runs on
+macOS / Linux / Windows / Docker / Kubernetes — no shell required.
+
+`ai-memory wrap`:
+
+1. Calls `ai-memory boot` in-process (no subprocess).
+2. Builds a system message of the form
+   `<preamble>\n\n<boot output>`.
+3. Spawns the named agent CLI with the system message delivered via
+   the strategy chosen by `default_strategy(<agent>)`:
+
+   | Agent | Strategy | Argv shape |
+   |---|---|---|
+   | `codex` / `codex-cli` | `SystemFlag` | `codex --system "<msg>" <args>` |
+   | `gemini` | `SystemFlag` | `gemini --system "<msg>" <args>` |
+   | `aider` | `MessageFile` | `aider --message-file <tempfile> <args>` |
+   | `ollama` | `SystemEnv` | `OLLAMA_SYSTEM=<msg> ollama <args>` |
+   | (anything else) | `SystemFlag` (`--system`) | fall-through default |
+
+4. Propagates the agent's exit code.
+
+Override the strategy with `--system-flag <flag>`, `--system-env <name>`,
+or `--message-file-flag <flag>` if your agent uses a different
+contract. See `ai-memory wrap --help` for the full surface.
+
+The category-3 recipes ([`codex-cli.md`](codex-cli.md),
+[`claude-agent-sdk.md`](claude-agent-sdk.md),
+[`openai-apps-sdk.md`](openai-apps-sdk.md),
+[`grok-and-xai.md`](grok-and-xai.md),
+[`local-models.md`](local-models.md)) all link to `ai-memory wrap` for
+the launcher case and keep the SDK code patterns for in-process
+integrations.
 
 ## Per-agent recipes
 
