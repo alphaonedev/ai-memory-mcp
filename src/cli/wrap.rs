@@ -237,7 +237,12 @@ fn resolve_strategy(args: &WrapArgs) -> WrapStrategy {
 /// fails. The user-facing diagnostic header is already on stdout in
 /// that case (`# ai-memory boot: warn — db unavailable …`) so the
 /// caller still sees what happened.
-fn run_boot_capture(db_path: &Path, limit: usize, budget_tokens: usize) -> String {
+fn run_boot_capture(
+    db_path: &Path,
+    limit: usize,
+    budget_tokens: usize,
+    app_config: &crate::config::AppConfig,
+) -> String {
     let mut stdout: Vec<u8> = Vec::new();
     let mut stderr: Vec<u8> = Vec::new();
     let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
@@ -251,7 +256,7 @@ fn run_boot_capture(db_path: &Path, limit: usize, budget_tokens: usize) -> Strin
         quiet: true,
         cwd: None,
     };
-    if boot::run(db_path, &args, &mut out).is_err() {
+    if boot::run(db_path, &args, app_config, &mut out).is_err() {
         // Even on hard failure (which `cli::boot::run` should never
         // hit thanks to the `--quiet` graceful path), return an empty
         // string so the agent runs unwrapped rather than getting a
@@ -378,7 +383,12 @@ fn build_command_for_strategy(
 ///   surfaces the OS-level error).
 /// - `tempfile::NamedTempFile::new()` fails when the strategy is
 ///   `MessageFile` (very rare; `/tmp` full or unwritable).
-pub fn run(db_path: &Path, args: &WrapArgs, _out: &mut CliOutput<'_>) -> Result<i32> {
+pub fn run(
+    db_path: &Path,
+    args: &WrapArgs,
+    app_config: &crate::config::AppConfig,
+    _out: &mut CliOutput<'_>,
+) -> Result<i32> {
     let strategy = resolve_strategy(args);
 
     // Boot context. `--no-boot` skips it so the agent runs unwrapped
@@ -387,7 +397,8 @@ pub fn run(db_path: &Path, args: &WrapArgs, _out: &mut CliOutput<'_>) -> Result<
     let system_msg = if args.no_boot {
         WRAP_PREAMBLE.to_string()
     } else {
-        let boot_output = run_boot_capture(db_path, args.limit, args.budget_tokens);
+        let boot_output =
+            run_boot_capture(db_path, args.limit, args.budget_tokens, app_config);
         build_system_message(&boot_output)
     };
 
@@ -634,7 +645,7 @@ mod tests {
             .parent()
             .unwrap()
             .join("nope/that/does/not/exist/db.sqlite");
-        let captured = run_boot_capture(&bad, 10, DEFAULT_WRAP_BUDGET_TOKENS);
+        let captured = run_boot_capture(&bad, 10, DEFAULT_WRAP_BUDGET_TOKENS, &crate::config::AppConfig::default());
         assert!(
             captured.contains("# ai-memory boot: warn"),
             "wrap should surface the warn header even with unreachable DB: {captured}"
@@ -687,7 +698,12 @@ mod tests {
         // depend on.
         let env = TestEnv::fresh();
         seed_memory(&env.db_path, "ns-wrap-test", "wrap-injection-canary", "x");
-        let captured = run_boot_capture(&env.db_path, 10, DEFAULT_WRAP_BUDGET_TOKENS);
+        let captured = run_boot_capture(
+            &env.db_path,
+            10,
+            DEFAULT_WRAP_BUDGET_TOKENS,
+            &crate::config::AppConfig::default(),
+        );
         // boot::run sets the namespace from auto_namespace, which won't
         // match `ns-wrap-test` unless cwd is set. The fallback path
         // should still surface SOMETHING so the captured body is
@@ -761,7 +777,7 @@ mod tests {
             // deterministic. `--system "..."` is still passed to the
             // agent — `true` ignores all argv, exits 0.
             args.no_boot = true;
-            let code = run(&db_path, &args, &mut out).unwrap();
+            let code = run(&db_path, &args, &crate::config::AppConfig::default(), &mut out).unwrap();
             assert_eq!(code, 0);
         }
         #[cfg(windows)]
@@ -774,7 +790,7 @@ mod tests {
             // no flag is added, then trailing carries `/C exit 5`.
             args.system_env = Some("WRAP_DUMMY".into());
             args.trailing = vec!["/C".into(), "exit".into(), "5".into()];
-            let code = run(&db_path, &args, &mut out).unwrap();
+            let code = run(&db_path, &args, &crate::config::AppConfig::default(), &mut out).unwrap();
             assert_eq!(code, 5);
         }
     }
@@ -819,7 +835,7 @@ mod tests {
             .parent()
             .unwrap()
             .join("__definitely_missing__/db");
-        let s = run_boot_capture(&bad, 10, DEFAULT_WRAP_BUDGET_TOKENS);
+        let s = run_boot_capture(&bad, 10, DEFAULT_WRAP_BUDGET_TOKENS, &crate::config::AppConfig::default());
         // Either the warn header or empty (both are non-panic outcomes).
         assert!(
             s.is_empty() || s.contains("# ai-memory boot:"),
