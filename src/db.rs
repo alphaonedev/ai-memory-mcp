@@ -170,7 +170,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
 );
 ";
 
-const CURRENT_SCHEMA_VERSION: i64 = 16;
+const CURRENT_SCHEMA_VERSION: i64 = 17;
 
 pub fn open(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path).context("failed to open database")?;
@@ -223,6 +223,12 @@ fn apply_sqlcipher_key(_conn: &Connection) -> Result<()> {
 }
 
 const MIGRATION_V15_SQLITE: &str = include_str!("../migrations/sqlite/0010_v063_hierarchy_kg.sql");
+// v0.6.3.1 P5 / G9 — webhook event-types column. SQLite cannot
+// `ALTER TABLE ADD COLUMN IF NOT EXISTS`, so the ADD COLUMN itself is
+// done inline below with a column-existence probe; this batch carries
+// the idempotent index on `event_types`.
+const MIGRATION_V17_SQLITE: &str =
+    include_str!("../migrations/sqlite/0013_webhook_event_types.sql");
 
 #[allow(clippy::too_many_lines)]
 fn migrate(conn: &Connection) -> Result<()> {
@@ -579,6 +585,29 @@ fn migrate(conn: &Connection) -> Result<()> {
             // peers' text_pattern_ops index is part of the same migration
             // generation.
             // No DDL needed for SQLite — index already prefix-friendly.
+        }
+
+        if version < 17 {
+            // v0.6.3.1 P5 / G9 — webhook event coverage. Adds an
+            // `event_types` JSON-encoded array column to `subscriptions`
+            // so callers can opt into a narrow, structured event filter
+            // (e.g. `["memory_store", "memory_link_created"]`). The legacy
+            // comma-separated `events` column stays as the canonical
+            // matcher at dispatch time; new structured callers populate
+            // BOTH so existing dispatch code keeps working unchanged.
+            //
+            // Backward compat: existing rows keep `events = '*'` and have
+            // `event_types = NULL` — the matcher continues to treat them
+            // as all-events subscribers. The DDL itself lives in
+            // migrations/sqlite/0013_webhook_event_types.sql.
+            let has_event_types = conn
+                .prepare("SELECT event_types FROM subscriptions LIMIT 0")
+                .is_ok();
+            if !has_event_types {
+                conn.execute("ALTER TABLE subscriptions ADD COLUMN event_types TEXT", [])?;
+            }
+            // Idempotent index from the migration file.
+            conn.execute_batch(MIGRATION_V17_SQLITE)?;
         }
 
         conn.execute("DELETE FROM schema_version", [])?;
