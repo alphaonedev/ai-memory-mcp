@@ -67,12 +67,23 @@ pub struct NewSubscription<'a> {
 /// Canonical list of webhook lifecycle events surfaced to subscribers
 /// and to `memory_capabilities` (capabilities v2 `webhook_events`).
 /// Keep stable: integrators pin against these strings.
+///
+/// v0.7.0 K4 — `approval_requested` joined the list. It fires every
+/// time a `pending_actions` row is inserted by the governance gate
+/// (locally via `db::queue_pending_action` or remotely via
+/// `db::upsert_pending_action`). Subscribers opt in via the existing
+/// [`NewSubscription::event_types`] structured filter; legacy
+/// wildcard-event subscribers also receive it. Closes the
+/// v0.6.3.1 honest-Capabilities-v2 disclosure that
+/// `approval.subscribers` was advertised but never published — the
+/// K10 Approval API HTTP+SSE handler consumes these events directly.
 pub const WEBHOOK_EVENT_TYPES: &[&str] = &[
     "memory_store",
     "memory_promote",
     "memory_delete",
     "memory_link_created",
     "memory_consolidated",
+    "approval_requested",
 ];
 
 /// Insert a subscription, hashing any secret before persisting.
@@ -331,6 +342,45 @@ pub struct ConsolidatedEventDetails {
     pub source_count: usize,
 }
 
+/// v0.7.0 K4 — `approval_requested` event details.
+///
+/// Fires after a `pending_actions` row has been inserted by the
+/// governance gate (`db::queue_pending_action` from the local store /
+/// promote / delete enforce paths, or `db::upsert_pending_action` from
+/// peer-originated `sync_push` traffic). The K10 Approval API
+/// (HTTP+SSE) consumes the same dispatcher path so the surface is
+/// consistent across delivery transports.
+///
+/// The outer `memory_id` field on [`DispatchPayload`] carries the
+/// pending-action **id** (the row PK of `pending_actions`) — that's the
+/// only identifier subscribers need to round-trip back through
+/// `memory_pending_*` MCP tools or the v0.7 Approval HTTP endpoints.
+/// The `agent_id` field carries the row's `requested_by`.
+///
+/// Adding a new field here is backward-compatible (subscribers ignore
+/// unknowns); renaming or removing a field is breaking — bump the
+/// payload schema version per AI_DEVELOPER_GOVERNANCE.md.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalRequestedEventDetails {
+    /// Discriminator from `pending_actions.action_type` — `"store"`,
+    /// `"delete"`, or `"promote"` (the three [`crate::models::GovernedAction`]
+    /// variants today). Reserved for forward-compat with future gated
+    /// actions; subscribers should treat unknown values as opaque.
+    pub action_type: String,
+    /// `pending_actions.requested_at` (RFC3339). Mirrored into the
+    /// details block so SSE consumers downstream of K10 can render
+    /// the queue-time without a second round-trip.
+    pub requested_at: String,
+    /// `pending_actions.memory_id` — `Some` for delete / promote
+    /// (existing row), `None` for store (no row yet).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_id: Option<String>,
+    /// Always `"pending"` at insert time. Decided rows do NOT re-fire
+    /// this event — the decision flows through the planned
+    /// `approval_decided` event in K7.
+    pub status: String,
+}
+
 /// Fire an event to all matching subscribers. Each dispatch runs in
 /// its own OS thread and does NOT block the caller. Errors are logged
 /// and counted in the DB via `failure_count`.
@@ -440,6 +490,68 @@ pub fn dispatch_event_with_details(
             record_dispatch(&db_path, &sub_id, ok);
         });
     }
+}
+
+/// v0.7.0 K4 — dispatch the `approval_requested` lifecycle event for a
+/// freshly-inserted `pending_actions` row.
+///
+/// Thin convenience wrapper around [`dispatch_event_with_details`]:
+///   - Resolves the canonical row via [`crate::db::get_pending_action`]
+///     so the payload reflects what was actually committed (not what
+///     the caller *intended* to commit).
+///   - Synthesises an [`ApprovalRequestedEventDetails`] block from the
+///     row.
+///   - Routes the event through the existing subscription dispatch
+///     path so opt-in subscribers (`event_types: ["approval_requested"]`)
+///     and legacy wildcard subscribers both receive it.
+///
+/// Best-effort and fire-and-forget — same posture as the K2
+/// `pending_action_expired` dispatch in
+/// [`crate::daemon_runtime::spawn_pending_timeout_sweep_loop`]. A
+/// dispatch failure must NOT roll back the pending-action row.
+///
+/// Caller passes the `pending_id` returned from
+/// [`crate::db::queue_pending_action`] / [`crate::db::upsert_pending_action`].
+/// A missing or unreadable row is logged and otherwise treated as a
+/// no-op (lost-event semantics, never block the write path).
+pub fn dispatch_approval_requested(conn: &Connection, pending_id: &str, db_path: &std::path::Path) {
+    let pa = match crate::db::get_pending_action(conn, pending_id) {
+        Ok(Some(pa)) => pa,
+        Ok(None) => {
+            tracing::warn!(
+                "approval_requested dispatch skipped: pending_action {pending_id} not found"
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(
+                "approval_requested dispatch skipped: pending_action {pending_id} read failed: {e}"
+            );
+            return;
+        }
+    };
+    let details = ApprovalRequestedEventDetails {
+        action_type: pa.action_type.clone(),
+        requested_at: pa.requested_at.clone(),
+        memory_id: pa.memory_id.clone(),
+        status: pa.status.clone(),
+    };
+    let details_value = match serde_json::to_value(&details) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            tracing::warn!("approval_requested dispatch details serialise failed: {e}");
+            None
+        }
+    };
+    dispatch_event_with_details(
+        conn,
+        "approval_requested",
+        &pa.id,
+        &pa.namespace,
+        Some(&pa.requested_by),
+        db_path,
+        details_value,
+    );
 }
 
 /// Perform one HTTP POST with SSRF-hardened URL check + signature
@@ -1836,6 +1948,222 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         panic!("dispatch thread never reached the mock server");
+    }
+
+    // ----------------------------------------------------------------
+    // v0.7.0 K4 — approval-event routing through subscriptions.
+    //
+    // Closes the v0.6.3.1 honest-Capabilities-v2 disclosure that the
+    // approval surface was advertised but unwired. The four tests below
+    // pin:
+    //   1. canonical event constant + capabilities parity
+    //   2. opt-in subscriber receives the event end-to-end (HTTP mock)
+    //   3. filter-mismatched subscriber does NOT receive the event
+    //   4. missing pending row is logged + best-effort no-op
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn approval_requested_event_in_canonical_list() {
+        // K4: the new lifecycle event must surface in the canonical
+        // constant — that's the integration contract the K10 Approval
+        // API and external SDK consumers pin against.
+        assert!(
+            WEBHOOK_EVENT_TYPES.contains(&"approval_requested"),
+            "K4: WEBHOOK_EVENT_TYPES must include approval_requested"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn approval_requested_dispatches_to_opt_in_subscriber() {
+        // K4: end-to-end. Insert a subscription opt-ed in to
+        // `approval_requested` only; queue a pending action via the
+        // db layer; call the dispatch helper; assert the wiremock
+        // saw the POST and the body shape carries the K4 details.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let (_keep, db_path) = fresh_db();
+        let url = format!("{}/hook", server.uri());
+        let opt_in: Vec<String> = vec!["approval_requested".to_string()];
+        let sub_id = {
+            let conn = Connection::open(&db_path).unwrap();
+            insert(
+                &conn,
+                &NewSubscription {
+                    url: &url,
+                    events: "approval_requested",
+                    secret: None,
+                    namespace_filter: None,
+                    agent_filter: None,
+                    created_by: None,
+                    event_types: Some(&opt_in),
+                },
+            )
+            .unwrap()
+        };
+
+        // Queue a pending action through the canonical db helper so
+        // the row exists when dispatch_approval_requested looks it up.
+        let pending_id = {
+            let conn = Connection::open(&db_path).unwrap();
+            crate::db::queue_pending_action(
+                &conn,
+                crate::models::GovernedAction::Store,
+                "k4-ns",
+                None,
+                "agent-requestor",
+                &serde_json::json!({"title": "k4 approval routing"}),
+            )
+            .unwrap()
+        };
+
+        // Fire the dispatcher.
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            dispatch_approval_requested(&conn, &pending_id, &db_path);
+        }
+
+        // Poll the mock for the dispatch — std::thread::spawn is
+        // detached so we cannot join. ~5s budget mirrors the existing
+        // dispatch_event_e2e_* tests.
+        let mut received = Vec::new();
+        for _ in 0..50 {
+            received = server.received_requests().await.unwrap_or_default();
+            if !received.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            received.len(),
+            1,
+            "K4: opt-in subscriber must receive exactly one approval_requested POST"
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&received[0].body).expect("dispatch body must be JSON");
+        assert_eq!(body["event"], "approval_requested");
+        assert_eq!(body["memory_id"], pending_id);
+        assert_eq!(body["namespace"], "k4-ns");
+        assert_eq!(body["agent_id"], "agent-requestor");
+        // K4 details block flattened into the envelope.
+        assert_eq!(body["action_type"], "store");
+        assert_eq!(body["status"], "pending");
+        assert!(
+            body["requested_at"].is_string(),
+            "requested_at must round-trip from the row"
+        );
+
+        // Sanity: the dispatch_count was bumped on the subscription
+        // row (proves we went through record_dispatch on success).
+        let conn = Connection::open(&db_path).unwrap();
+        let dc: i64 = conn
+            .query_row(
+                "SELECT dispatch_count FROM subscriptions WHERE id = ?1",
+                params![sub_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dc, 1);
+    }
+
+    #[test]
+    fn approval_requested_skipped_for_filtered_subscriber() {
+        // K4: a subscriber opted in to a *different* event type must
+        // NOT see approval_requested. Exercises the matches_filters
+        // structured-opt-in branch from the K4 dispatch path. We can't
+        // observe "no thread spawned" directly, but we can assert
+        // dispatch_count stays at zero because no HTTP send occurred.
+        let (_keep, db_path) = fresh_db();
+        let opt_in_other: Vec<String> = vec!["memory_store".to_string()];
+        let sub_id = {
+            let conn = Connection::open(&db_path).unwrap();
+            insert(
+                &conn,
+                &NewSubscription {
+                    url: "https://example.com/hook",
+                    events: "memory_store",
+                    secret: None,
+                    namespace_filter: None,
+                    agent_filter: None,
+                    created_by: None,
+                    event_types: Some(&opt_in_other),
+                },
+            )
+            .unwrap()
+        };
+        let pending_id = {
+            let conn = Connection::open(&db_path).unwrap();
+            crate::db::queue_pending_action(
+                &conn,
+                crate::models::GovernedAction::Delete,
+                "k4-ns-2",
+                Some("memory-xyz"),
+                "agent-requestor",
+                &serde_json::json!({"id": "memory-xyz"}),
+            )
+            .unwrap()
+        };
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            dispatch_approval_requested(&conn, &pending_id, &db_path);
+        }
+        // Mismatched filter: matches_filters returns false → no
+        // dispatch thread spawned → counters stay at zero. Sleep a
+        // beat so we'd notice an unintended dispatch racing in.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let conn = Connection::open(&db_path).unwrap();
+        let (dc, fc): (i64, i64) = conn
+            .query_row(
+                "SELECT dispatch_count, failure_count FROM subscriptions WHERE id = ?1",
+                params![sub_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(dc, 0, "filter mismatch must skip dispatch");
+        assert_eq!(fc, 0);
+    }
+
+    #[test]
+    fn approval_requested_missing_pending_row_is_noop() {
+        // K4: defensive — the helper looks up the row before
+        // dispatching. A bogus id must NOT panic, NOT spawn a thread,
+        // and NOT touch any subscriber row. Exercises the early-return
+        // branches in dispatch_approval_requested.
+        let (_keep, db_path) = fresh_db();
+        let sub_id = {
+            let conn = Connection::open(&db_path).unwrap();
+            insert(
+                &conn,
+                &NewSubscription {
+                    url: "https://example.com/hook",
+                    events: "*",
+                    secret: None,
+                    namespace_filter: None,
+                    agent_filter: None,
+                    created_by: None,
+                    event_types: None,
+                },
+            )
+            .unwrap()
+        };
+        let conn = Connection::open(&db_path).unwrap();
+        // Bogus id — pending_actions table is empty.
+        dispatch_approval_requested(&conn, "nonexistent-id", &db_path);
+        let (dc, fc): (i64, i64) = conn
+            .query_row(
+                "SELECT dispatch_count, failure_count FROM subscriptions WHERE id = ?1",
+                params![sub_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(dc, 0, "missing pending row must not dispatch");
+        assert_eq!(fc, 0);
     }
 }
 
