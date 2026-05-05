@@ -1449,6 +1449,21 @@ pub async fn bootstrap_serve(
     // so a malformed keypair file doesn't take down the daemon.
     let active_keypair = load_active_keypair_for_serve();
 
+    // v0.7.0 B3 — pre-compute the family-descriptor embedding cache
+    // before moving the embedder into the AppState's Arc<Option<...>>.
+    // When the embedder is unavailable (keyword tier or model load
+    // failure), `precompute_family_embeddings` returns an empty Vec
+    // and boot continues; B2's `memory_smart_load` falls back to a
+    // non-embedding path in that case. See AppState::family_embeddings
+    // for the runtime contract.
+    let family_embeddings = AppState::precompute_family_embeddings(embedder.as_ref());
+    if !family_embeddings.is_empty() {
+        tracing::info!(
+            "B3: pre-computed {} family-descriptor embeddings",
+            family_embeddings.len(),
+        );
+    }
+
     let app_state = AppState {
         db: db_state.clone(),
         embedder: Arc::new(embedder),
@@ -1459,6 +1474,7 @@ pub async fn bootstrap_serve(
         profile: Arc::new(resolved_profile),
         mcp_config: Arc::new(mcp_config_for_http),
         active_keypair: Arc::new(active_keypair),
+        family_embeddings: Arc::new(family_embeddings),
     };
 
     // Automatic GC.
@@ -2163,6 +2179,7 @@ mod tests {
             profile: Arc::new(crate::profile::Profile::core()),
             mcp_config: Arc::new(None),
             active_keypair: Arc::new(None),
+            family_embeddings: Arc::new(Vec::new()),
         }
     }
 
