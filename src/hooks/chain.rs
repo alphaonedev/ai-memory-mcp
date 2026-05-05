@@ -68,11 +68,26 @@
 // chain semantics ("we couldn't run the gate, refuse the request").
 // G7+ will wire this onto the actual API surface.
 //
+// # G6 — per-event-class deadline (this PR)
+//
+// `HookChain::fire` now computes a *chain* deadline at entry:
+// `chain_deadline = Instant::now() + class_deadline_for_event(event)`.
+// Before each hook fires, the chain derives the per-hook budget as
+// `min(chain_remaining, hook.timeout_ms)` and clones a shrunk
+// `HookConfig` into a one-off executor for that fire (the executor
+// honours `HookConfig.timeout_ms` already; the chain only needs to
+// shrink the knob). If the chain deadline has *already* passed
+// before a hook fires, that hook is skipped, the chain bumps
+// `timeouts::record_timeout_violation()`, and continues fail-open
+// `Allow` per `FailMode::Open`. A `FailMode::Closed` hook that
+// runs out of chain budget converts to a chain-level `Deny` with
+// reason `chain class deadline exhausted` and code 504 — the HTTP
+// "gateway timeout" status, which mirrors the chain semantics
+// ("we couldn't run the gate, refuse the request as if upstream
+// timed out").
+//
 // # Out of scope
 //
-// * G6 per-event-class deadlines — the chain honours each hook's
-//   own `timeout_ms` (via the executor) but does not yet bound the
-//   *whole-chain* wall clock. G6 lands that.
 // * Wiring at the actual memory operation points (`db::insert`,
 //   `db::recall`, …) — that's G7+.
 // * `dispatch_event` / subscription integration is a thin
@@ -81,6 +96,7 @@
 //   epic.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use serde_json::{Map, Value};
 
@@ -88,6 +104,7 @@ use super::config::{FailMode, HookConfig};
 use super::decision::{HookDecision, is_pre_event};
 use super::events::{HookEvent, MemoryDelta};
 use super::executor::ExecutorRegistry;
+use super::timeouts::{class_deadline_for_event, per_hook_budget_ms, record_timeout_violation};
 
 // ---------------------------------------------------------------------------
 // AskUserPrompt — operator-surface queue entry
@@ -255,6 +272,13 @@ impl HookChain {
         let mut modified = false;
         let mut askuser_queue: Vec<AskUserPrompt> = Vec::new();
 
+        // G6: stamp a chain-wide wall-clock ceiling at entry. Every
+        // hook in the loop below has its per-hook timeout shrunk to
+        // `min(chain_remaining, hook.timeout_ms)` so the *whole*
+        // chain cannot blow the recall / write / index / transcript
+        // budget the epic pins.
+        let chain_deadline = Instant::now() + class_deadline_for_event(event);
+
         // Snapshot executor handles before the await loop so we hand
         // them out by `Arc<dyn HookExecutor>` and don't re-borrow the
         // registry across the await boundary. (Holding `&mut registry`
@@ -266,10 +290,85 @@ impl HookChain {
             .collect();
 
         for (cfg, executor) in prepared {
-            let fire_result = executor.fire(event, current_payload.clone()).await;
+            // G6: derive the per-hook budget from what's left of the
+            // chain deadline. `None` means the deadline already
+            // passed — record a violation, treat the remaining hooks
+            // per `fail_mode` (Open ⇒ Allow, Closed ⇒ Deny 504).
+            let Some(budget_ms) =
+                per_hook_budget_ms(chain_deadline, Instant::now(), cfg.timeout_ms)
+            else {
+                record_timeout_violation();
+                match cfg.fail_mode {
+                    FailMode::Open => {
+                        tracing::warn!(
+                            command = %cfg.command.display(),
+                            event = ?event,
+                            "hooks: chain class deadline exhausted before hook fire; \
+                             fail_mode=open, treating as Allow"
+                        );
+                        continue;
+                    }
+                    FailMode::Closed => {
+                        tracing::warn!(
+                            command = %cfg.command.display(),
+                            event = ?event,
+                            "hooks: chain class deadline exhausted before hook fire; \
+                             fail_mode=closed, denying"
+                        );
+                        return ChainResult::Deny {
+                            reason: format!(
+                                "hook {} skipped under fail_mode=closed: chain class deadline exhausted",
+                                cfg.command.display()
+                            ),
+                            code: 504,
+                        };
+                    }
+                }
+            };
+
+            // G6: enforce the (possibly-shrunk) per-hook budget at
+            // the chain layer. The executor itself already honours
+            // its configured `timeout_ms`, but the chain's view of
+            // "remaining wall clock" can be tighter than that knob;
+            // wrapping the fire here is what guarantees the class
+            // ceiling holds even when ten hooks each carry a 1s
+            // hook_timeout_ms but the class budget is 2s.
+            let per_hook_deadline = std::time::Duration::from_millis(u64::from(budget_ms));
+            let raced = tokio::time::timeout(
+                per_hook_deadline,
+                executor.fire(event, current_payload.clone()),
+            )
+            .await;
+
+            let fire_result = match raced {
+                Ok(inner) => inner,
+                Err(_elapsed) => {
+                    // Treat a chain-level timeout the same way the
+                    // executor's own Timeout would surface — a single
+                    // ExecutorError::Timeout, routed through fail_mode.
+                    // The Err(Timeout) arm below records the violation
+                    // (one record per trip — the executor's `timeout_ms`
+                    // and our chain wrapper are racing on the *smaller*
+                    // of the two, only one ever fires, no double-count).
+                    Err(super::executor::ExecutorError::Timeout {
+                        ms: u64::from(budget_ms),
+                    })
+                }
+            };
+
             let decision = match fire_result {
                 Ok(d) => d.degrade_modify_for_post_event(event),
                 Err(e) => {
+                    // G6: a Timeout from the executor counts as a
+                    // violation too. The executor enforces
+                    // `cfg.timeout_ms` and the chain wrapper
+                    // enforces `min(chain_remaining, cfg.timeout_ms)`
+                    // — only the smaller of the two ever fires on a
+                    // given hook, so the two record paths are
+                    // mutually exclusive (no double-count).
+                    if matches!(e, super::executor::ExecutorError::Timeout { .. }) {
+                        record_timeout_violation();
+                    }
                     // Crash handling per `fail_mode`.
                     match cfg.fail_mode {
                         FailMode::Open => {

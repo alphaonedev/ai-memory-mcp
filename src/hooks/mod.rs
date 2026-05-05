@@ -25,6 +25,7 @@ pub mod config;
 pub mod decision;
 pub mod events;
 pub mod executor;
+pub mod timeouts;
 
 // G2 lifted `HookEvent` out of `config.rs` into `events.rs` and
 // attached payload structs to every variant. The re-export keeps
@@ -46,4 +47,12 @@ pub use decision::{DecisionParseError, HookDecision, ModifyPayload, is_pre_event
 // caller to know the `executor::` submodule path.
 pub use executor::{
     DaemonExecutor, ExecExecutor, ExecutorError, ExecutorMetrics, ExecutorRegistry, HookExecutor,
+};
+// G6 — per-event-class hard timeouts. Re-exports the budget table
+// + violation counter so the doctor surface and the chain runner
+// can both reach for the canonical type without a deeper import.
+pub use timeouts::{
+    EventClass, INDEX_CLASS_DEADLINE_MS, READ_CLASS_DEADLINE_MS, TRANSCRIPT_CLASS_DEADLINE_MS,
+    WRITE_CLASS_DEADLINE_MS, class_deadline, class_deadline_for_event, event_class,
+    per_hook_budget_ms, record_timeout_violation, timeout_violations_total,
 };
