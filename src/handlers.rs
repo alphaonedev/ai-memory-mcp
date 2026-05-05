@@ -430,6 +430,14 @@ pub async fn create_memory(
                 // approve / reject / list it. Load the canonical row we
                 // just inserted and broadcast before responding.
                 let pending_row = db::get_pending_action(&lock.0, &pending_id).ok().flatten();
+                // v0.7.0 K4 — fire the `approval_requested` webhook
+                // event through the existing subscription dispatcher so
+                // K10's Approval API HTTP+SSE handler picks it up. Done
+                // BEFORE the lock drops so the subscriber list query has
+                // a connection; the actual HTTP POSTs spawn detached
+                // threads (fire-and-forget). Best-effort: a dispatch
+                // failure must not roll back the pending row.
+                crate::subscriptions::dispatch_approval_requested(&lock.0, &pending_id, &lock.1);
                 let namespace = mem.namespace.clone();
                 drop(lock);
                 if let (Some(pa), Some(fed)) = (pending_row.as_ref(), app.federation.as_ref()) {
@@ -1174,6 +1182,10 @@ pub async fn delete_memory(
                 // v0.6.2 (S34): fan out the new pending delete row so peers
                 // see consistent governance queue state.
                 let pending_row = db::get_pending_action(&lock.0, &pending_id).ok().flatten();
+                // v0.7.0 K4 — surface the new row through the
+                // subscription dispatcher (`approval_requested`). See
+                // the store-side companion call for rationale.
+                crate::subscriptions::dispatch_approval_requested(&lock.0, &pending_id, &lock.1);
                 let target_id = target.id.clone();
                 drop(lock);
                 if let (Some(pa), Some(fed)) = (pending_row.as_ref(), app.federation.as_ref()) {
@@ -1376,6 +1388,10 @@ pub async fn promote_memory(
             Ok(GovernanceDecision::Pending(pending_id)) => {
                 // v0.6.2 (S34): fan out the new pending promote row too.
                 let pending_row = db::get_pending_action(&lock.0, &pending_id).ok().flatten();
+                // v0.7.0 K4 — surface the new row through the
+                // subscription dispatcher (`approval_requested`). See
+                // the store-side companion call for rationale.
+                crate::subscriptions::dispatch_approval_requested(&lock.0, &pending_id, &lock.1);
                 let target_id = target.id.clone();
                 drop(lock);
                 if let (Some(pa), Some(fed)) = (pending_row.as_ref(), app.federation.as_ref()) {
@@ -3898,7 +3914,21 @@ pub async fn sync_push(
             continue;
         }
         match db::upsert_pending_action(&lock.0, pa) {
-            Ok(()) => pendings_applied += 1,
+            Ok(()) => {
+                pendings_applied += 1;
+                // v0.7.0 K4 — peer-originated pending rows fire the
+                // `approval_requested` event on this peer too so local
+                // approval-API subscribers get a uniform view of the
+                // queue regardless of which node minted the row.
+                // `upsert_*` is idempotent (`ON CONFLICT(id) DO UPDATE`)
+                // — replays of the same row currently re-fire the
+                // event; that's the documented K4 behaviour and matches
+                // the existing `pending_action_expired` semantics. K7
+                // (subscription reliability) layers DLQ + dedup on top.
+                if pa.status == "pending" {
+                    crate::subscriptions::dispatch_approval_requested(&lock.0, &pa.id, &lock.1);
+                }
+            }
             Err(e) => {
                 tracing::warn!("sync_push: upsert_pending_action failed for {}: {e}", pa.id);
                 skipped += 1;
