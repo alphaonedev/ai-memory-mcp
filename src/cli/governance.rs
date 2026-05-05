@@ -112,6 +112,16 @@ pub fn enforce(
             Ok(GovernanceOutcome::Deny)
         }
         GovernanceDecision::Pending(pending_id) => {
+            // v0.7.0 K4 — the CLI path does NOT dispatch the
+            // `approval_requested` webhook event today. The HTTP and
+            // MCP enforce sites (handlers.rs, mcp.rs) do; the CLI is
+            // used for ops / scripted governance and the typical
+            // Approval-API consumer is the K10 HTTP+SSE handler, which
+            // mostly sees rows minted by HTTP/MCP traffic. Wiring the
+            // CLI path requires threading `db_path` through this
+            // function and its many callers — out of scope for K4.
+            // Tracked for a follow-up; the K10 surface remains correct
+            // because HTTP/MCP rows DO fire the event.
             if json_out {
                 let mut payload_obj = serde_json::json!({
                     "status": "pending",

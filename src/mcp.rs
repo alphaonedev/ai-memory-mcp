@@ -1206,6 +1206,13 @@ fn handle_store(
                 return Err(format!("store denied by governance: {reason}"));
             }
             GovernanceDecision::Pending(pending_id) => {
+                // v0.7.0 K4 — surface the new pending row through the
+                // subscription dispatcher so K10's Approval API sees a
+                // uniform stream of `approval_requested` events
+                // regardless of which transport (MCP / HTTP) created
+                // the row. Best-effort, fire-and-forget: a dispatch
+                // failure must not roll back the pending row.
+                crate::subscriptions::dispatch_approval_requested(conn, &pending_id, db_path);
                 return Ok(json!({
                     "status": "pending",
                     "pending_id": pending_id,
@@ -2799,6 +2806,8 @@ fn handle_delete(
                 return Err(format!("delete denied by governance: {reason}"));
             }
             GovernanceDecision::Pending(pending_id) => {
+                // v0.7.0 K4 — see the store-side companion call.
+                crate::subscriptions::dispatch_approval_requested(conn, &pending_id, db_path);
                 return Ok(json!({
                     "status": "pending",
                     "pending_id": pending_id,
@@ -2911,6 +2920,8 @@ fn handle_promote(
                 return Err(format!("promote denied by governance: {reason}"));
             }
             GovernanceDecision::Pending(pending_id) => {
+                // v0.7.0 K4 — see the store-side companion call.
+                crate::subscriptions::dispatch_approval_requested(conn, &pending_id, db_path);
                 return Ok(json!({
                     "status": "pending",
                     "pending_id": pending_id,

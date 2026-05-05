@@ -580,6 +580,12 @@ impl Default for CapabilityHooks {
 /// `subscriptions.rs` (the surface that uses it at runtime); this
 /// helper exists so `serde(default = …)` and `CapabilityHooks::default`
 /// can fill the field without a cross-module dep on `subscriptions`.
+///
+/// v0.7.0 K4 — `approval_requested` joined the canonical list. The
+/// `webhook_events` capability surface is the integration contract
+/// for K10's Approval API HTTP+SSE handler; surfacing the event type
+/// here closes the v0.6.3.1 honest-disclosure that the
+/// `approval.subscribers` field was advertised but unwired.
 fn default_webhook_events() -> Vec<String> {
     vec![
         "memory_store".to_string(),
@@ -587,6 +593,7 @@ fn default_webhook_events() -> Vec<String> {
         "memory_delete".to_string(),
         "memory_link_created".to_string(),
         "memory_consolidated".to_string(),
+        "approval_requested".to_string(),
     ]
 }
 
@@ -2422,16 +2429,21 @@ mod tests {
             "v2 drops hooks.by_event (no event registry)"
         );
         // P5 (G9): webhook_events must always surface the canonical
-        // five lifecycle events so integrators can pin a subscribe
-        // filter against them.
+        // lifecycle events so integrators can pin a subscribe filter
+        // against them.
+        //
+        // v0.7.0 K4 — `approval_requested` joined the list (six total).
+        // Closes the v0.6.3.1 honest-Capabilities-v2 disclosure that
+        // `approval.subscribers` was advertised but unwired.
         let events = val["hooks"]["webhook_events"].as_array().unwrap();
-        assert_eq!(events.len(), 5);
+        assert_eq!(events.len(), 6);
         for expected in [
             "memory_store",
             "memory_promote",
             "memory_delete",
             "memory_link_created",
             "memory_consolidated",
+            "approval_requested",
         ] {
             assert!(
                 events.iter().any(|v| v.as_str() == Some(expected)),
