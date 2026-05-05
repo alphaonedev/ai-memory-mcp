@@ -302,16 +302,45 @@ impl ExecExecutor {
             reason: format!("envelope encode: {e}"),
         })?;
 
-        let child = Command::new(&self.config.command)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|source| ExecutorError::Spawn {
-                command: self.config.command.display().to_string(),
-                source,
-            })?;
+        // Linux ETXTBSY ("Text file busy") fires when exec() races
+        // with another process that still holds the file open for
+        // write — even a recently-closed-and-fsynced writer can leave
+        // a brief window where the kernel's writer-count is non-zero.
+        // We retry up to 5 times with a tiny backoff; if it persists,
+        // surface the original error so an operator-side issue
+        // (write-locked file, NFS quirk, etc.) is still visible.
+        let mut last_err: Option<io::Error> = None;
+        let mut child = None;
+        for attempt in 0..5 {
+            match Command::new(&self.config.command)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+            {
+                Ok(c) => {
+                    child = Some(c);
+                    break;
+                }
+                Err(e) if e.raw_os_error() == Some(26) => {
+                    // ETXTBSY — back off briefly and retry.
+                    last_err = Some(e);
+                    tokio::time::sleep(Duration::from_millis(5 * (attempt + 1))).await;
+                    continue;
+                }
+                Err(e) => {
+                    return Err(ExecutorError::Spawn {
+                        command: self.config.command.display().to_string(),
+                        source: e,
+                    });
+                }
+            }
+        }
+        let child = child.ok_or_else(|| ExecutorError::Spawn {
+            command: self.config.command.display().to_string(),
+            source: last_err.unwrap_or_else(|| io::Error::other("ETXTBSY retries exhausted")),
+        })?;
 
         let started = Instant::now();
         let deadline = Duration::from_millis(u64::from(self.config.timeout_ms));
@@ -702,6 +731,7 @@ mod tests {
             mode,
             enabled: true,
             namespace: "*".into(),
+            fail_mode: crate::hooks::config::FailMode::Open,
         }
     }
 
