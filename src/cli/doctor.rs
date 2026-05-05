@@ -347,6 +347,13 @@ pub fn run_hooks(args: HooksReportArgs, out: &mut CliOutput<'_>) -> Result<i32> 
                     "mean_latency_us": 0,
                 },
             })).collect::<Vec<_>>(),
+            // G6 — process-wide chain-deadline trip count. Bumped
+            // by `HookChain::fire` every time a class deadline
+            // expired (either before a hook even ran, or because
+            // the chain-shrunk per-hook timeout fired). Surfaced
+            // here so operators can spot a chronically over-budget
+            // chain without grepping logs.
+            "timeout_violations": crate::hooks::timeouts::timeout_violations_total(),
             "note": "metrics placeholders until G7-G11 wires the executor into the daemon",
         });
         writeln!(out.stdout, "{}", serde_json::to_string_pretty(&payload)?)?;
@@ -408,6 +415,11 @@ fn render_hooks_human_with(
         )?;
     }
     writeln!(out.stdout)?;
+    writeln!(
+        out.stdout,
+        "  Chain class-deadline violations: {}",
+        crate::hooks::timeouts::timeout_violations_total()
+    )?;
     writeln!(
         out.stdout,
         "  note: live metrics land when G7-G11 wires the executor into the daemon."
