@@ -68,6 +68,14 @@ pub fn tool_sizes() -> &'static [ToolSize] {
 /// stripped (per [`crate::mcp::trim_optional_params`]); only required
 /// params + the C4 keep-list (`namespace`, `format`) remain. This is
 /// what an MCP host pays per request on the default code path.
+///
+/// v0.7 C2 rebase note (2026-05-06): the wire payload also strips the
+/// per-tool `docs` field (long-form prose) and per-property
+/// `description` strings via [`crate::mcp::strip_docs_from_tools`],
+/// so this table mirrors that double-strip. Keeping the model in
+/// lockstep with `tool_definitions_for_profile` is the only way the
+/// `trimmed_full_profile_total_tokens()` reading agrees with the C5
+/// budget gate (`tests/c2_tool_docs_field.rs::c2_tools_list_token_budget_is_under_3500`).
 pub fn trimmed_tool_sizes() -> &'static [ToolSize] {
     static TABLE: OnceLock<Vec<ToolSize>> = OnceLock::new();
     TABLE.get_or_init(|| compute_table(true)).as_slice()
@@ -107,13 +115,24 @@ fn compute_table(trimmed: bool) -> Vec<ToolSize> {
     let bpe = bpe();
     let mut defs = crate::mcp::tool_definitions();
     if trimmed {
+        // v0.7 C4 — drop optional inputSchema properties (keep required +
+        // C4 allow-list).
         crate::mcp::trim_optional_params(&mut defs);
     }
-    let tools = defs
+    let mut tools = defs
         .get("tools")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    if trimmed {
+        // v0.7 C2 rebase — also drop the per-tool `docs` field and the
+        // per-property `description` prose, matching the bare
+        // `tools/list` payload produced by
+        // `crate::mcp::tool_definitions_for_profile`. Without this the
+        // trimmed total double-counts the long-form prose that the wire
+        // never actually carries on the default path.
+        crate::mcp::strip_docs_from_tools(&mut tools);
+    }
 
     tools
         .into_iter()
@@ -244,18 +263,24 @@ mod tests {
     /// v0.7 C4 acceptance gate: the trimmed `tools/list` payload (the
     /// shape an MCP host actually receives by default) must be
     /// materially smaller than the verbose ceiling AND must save at
-    /// least ~30% of the bytes the host used to pay. Concrete
-    /// measurement on the v0.7 C4 baseline (51 tools): verbose ≈ 7416
-    /// tokens, trimmed ≈ 4545 tokens (~39% saved). The bound is set
-    /// at ≤ 5_000 so a few prose-heavy required-param descriptions
-    /// can grow before this trips, but tight enough that doubling the
-    /// keep-list lands red.
+    /// least ~30% of the bytes the host used to pay. Original v0.7 C4
+    /// baseline (pre-C2): verbose ≈ 7416 tokens, trimmed ≈ 4545
+    /// tokens (~39% saved). After the v0.7 C2 rebase (2026-05-06)
+    /// added per-tool `docs` strings and the trim model in
+    /// `compute_table(true)` was extended to also call
+    /// `strip_docs_from_tools` — matching what
+    /// `tool_definitions_for_profile` ships on the wire — the verbose
+    /// ceiling rises (docs is now part of the source of truth) while
+    /// the trimmed figure shrinks (docs + per-property prose is
+    /// dropped on the wire). The pinned C5 budget gate
+    /// (`tests/c2_tool_docs_field.rs::c2_tools_list_token_budget_is_under_3500`)
+    /// keeps the wire payload itself ≤ 3500 cl100k tokens, so the
+    /// per-tool sum here lands well under the 5_000 soft ceiling.
     ///
-    /// The aspirational ~2500-token target from the v0.7 C4 spec lives
-    /// further down the C-track (per-property descriptions, prompt
-    /// rewrites). C4 alone shrinks the optional-param surface; the
-    /// remaining bytes are required-param description prose, which is
-    /// load-bearing for tool-use accuracy.
+    /// The bound is set at ≤ 5_000 so a few prose-heavy required-param
+    /// descriptions can grow before this trips, but tight enough that
+    /// doubling the keep-list lands red. The aspirational ~2500-token
+    /// target from the v0.7 C4 spec lives further down the C-track.
     #[test]
     fn trimmed_full_profile_total_under_c4_target() {
         let trimmed = trimmed_full_profile_total_tokens();
