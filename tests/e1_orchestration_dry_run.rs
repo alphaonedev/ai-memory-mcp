@@ -1,6 +1,12 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+// E1's t0-orchestrate.sh is a bash script. Windows runners don't ship
+// bash by default, so the dry-run harness check only runs on Unix. The
+// orchestrator itself works on any platform with a bash interpreter
+// (WSL/Git-Bash); CI just doesn't validate that path.
+#![cfg(unix)]
+
 //! v0.7.0 task E1 — minimal harness check on `scripts/t0-orchestrate.sh`.
 //!
 //! The orchestrator is an out-of-band script that fans the Discovery
