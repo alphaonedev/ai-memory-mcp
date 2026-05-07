@@ -5443,11 +5443,45 @@ fn verify_approval_hmac(
     let canonical = format!("{timestamp}.{method}.{pending_id}.{body_str}");
     let key_hash = crate::subscriptions::sha256_hex(&secret);
     let expected = crate::subscriptions::hmac_sha256_hex(&key_hash, &canonical);
-    if constant_time_eq(expected.as_bytes(), sig_hex.as_bytes()) {
-        Ok(())
-    } else {
-        Err(StatusCode::UNAUTHORIZED)
+    if !constant_time_eq(expected.as_bytes(), sig_hex.as_bytes()) {
+        return Err(StatusCode::UNAUTHORIZED);
     }
+    // P2 (#628 agent-4): nonce-cache enforces single-use within the
+    // 300s window. Without this, a captured signature could be
+    // replayed N times against the same row before the timestamp
+    // staled out — rendering the row-already-decided check the only
+    // line of defence. The cache keys on the signature hex itself
+    // (which already commits to ts + method + path + body + secret),
+    // so any change to any field produces a new key.
+    if !record_hmac_nonce(sig_hex, ts_secs) {
+        tracing::warn!(
+            "K10 approval rejected: signature replay (sig={}…)",
+            &sig_hex[..16.min(sig_hex.len())]
+        );
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(())
+}
+
+/// Process-wide replay cache for verified K10 HMAC signatures. Entries
+/// expire after `APPROVAL_HMAC_MAX_AGE_SECS * 2` (twice the legitimate
+/// window — safe upper bound including future-skew tolerance).
+fn record_hmac_nonce(sig_hex: &str, ts_secs: i64) -> bool {
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<std::sync::Mutex<HashMap<String, i64>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut guard = cache.lock().unwrap_or_else(|p| p.into_inner());
+    let now = Utc::now().timestamp();
+    let ttl = APPROVAL_HMAC_MAX_AGE_SECS.saturating_mul(2);
+    // Opportunistic eviction. The cache is bounded by traffic × ttl,
+    // typically < 10K entries even on a busy daemon — cheap to scan.
+    guard.retain(|_, t| now.saturating_sub(*t) < ttl);
+    if guard.contains_key(sig_hex) {
+        return false;
+    }
+    guard.insert(sig_hex.to_string(), ts_secs);
+    true
 }
 
 /// `POST /api/v1/approvals/{pending_id}` — K10's HMAC-gated approval

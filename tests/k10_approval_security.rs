@@ -204,6 +204,50 @@ async fn hmac_replay_rejected() {
     set_active_hooks_hmac_secret(None);
 }
 
+/// In-window replay: even with a fresh timestamp, the same signature
+/// MUST NOT verify a second time. Pins the P2 nonce-cache fix
+/// (#628 agent-4) — without it, a captured signature could be
+/// replayed N times within the 300s window.
+#[tokio::test]
+async fn hmac_in_window_replay_rejected() {
+    let _g = K10_SECURITY_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    set_active_hooks_hmac_secret(Some("k10-nonce-secret".to_string()));
+    let (router, db) = build_router_with_db();
+    let pending_id = seed_pending_delete_row(&db, "scratch", "alice").await;
+
+    let body = json!({"decision": "approve", "remember": "once"}).to_string();
+    let now_ts = chrono::Utc::now().timestamp().to_string();
+    let sig = sign("k10-nonce-secret", &now_ts, &pending_id, &body);
+
+    let make_req = || {
+        Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/approvals/{pending_id}"))
+            .header("content-type", "application/json")
+            .header("x-ai-memory-timestamp", &now_ts)
+            .header("x-ai-memory-signature", sig.clone())
+            .header("x-agent-id", "operator-1")
+            .body(Body::from(body.clone()))
+            .unwrap()
+    };
+    // First fire — accepted (or 4xx for row-already-decided, but not 401).
+    let first = router.clone().oneshot(make_req()).await.unwrap();
+    assert_ne!(
+        first.status(),
+        StatusCode::UNAUTHORIZED,
+        "first fire of fresh signature must NOT be 401 (got {})",
+        first.status()
+    );
+    // Second fire of the same signature — MUST be 401 from the nonce cache.
+    let second = router.clone().oneshot(make_req()).await.unwrap();
+    assert_eq!(
+        second.status(),
+        StatusCode::UNAUTHORIZED,
+        "in-window replay of identical signature must be 401 (P2 nonce cache)"
+    );
+    set_active_hooks_hmac_secret(None);
+}
+
 /// A correctly signed approval whose timestamp lies inside the
 /// allowed window MUST still succeed. Pins the positive control so
 /// the replay-window fix doesn't regress the happy path.
