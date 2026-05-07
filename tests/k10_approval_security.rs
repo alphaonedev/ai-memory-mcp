@@ -331,6 +331,35 @@ async fn sse_anonymous_subscriber_sees_nothing() {
     );
 }
 
+/// Security regression test (#628 P1, agent-4 finding): a client
+/// passing `X-Agent-Id: host:anything` MUST NOT see every tenant's
+/// events. The historical `host:` prefix bypass let any client past
+/// `api_key_auth` claim host-process privilege; `host:` is reserved
+/// for server-side fallback identifiers and must be rejected as
+/// self-asserted input.
+#[tokio::test]
+async fn sse_host_prefix_subscriber_sees_nothing() {
+    let _g = K10_SECURITY_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let evt = ai_memory::approvals::ApprovalEvent::ApprovalRequested {
+        pending_id: "pa-host-bypass".into(),
+        action_type: "store".into(),
+        namespace: "alice/scratch".into(),
+        requested_by: "alice".into(),
+        requested_at: chrono::Utc::now().to_rfc3339(),
+    };
+    for malicious in &[
+        "host:foo:pid-1-deadbeef",
+        "host:",
+        "host:legitimate-looking",
+        "host:any-tenant-anywhere",
+    ] {
+        assert!(
+            !ai_memory::handlers::sse_event_visible_to(malicious, &evt),
+            "host:-prefixed subscriber `{malicious}` must NOT see cross-tenant events"
+        );
+    }
+}
+
 /// End-to-end SSE check: stand up two HTTP subscribers, each with
 /// their own `X-Agent-Id`, fire two pending rows (one per agent),
 /// and assert the SSE bytes each subscriber reads contain only
