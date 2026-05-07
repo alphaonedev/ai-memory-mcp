@@ -595,10 +595,16 @@ fn zstd_compress(input: &[u8]) -> Result<Vec<u8>> {
 /// row id (the caller does not pass it in here — the surrounding
 /// [`fetch`] caller logs the id alongside the bubbled error).
 fn zstd_decompress(input: &[u8]) -> Result<Vec<u8>> {
+    // P3 (#628 agent-3 follow-up): cap is now config-driven via
+    // `[transcripts] max_decompressed_bytes`, falling back to the
+    // compiled default `MAX_DECOMPRESSED_BYTES` when unset.
+    let cap_bytes = crate::config::active_max_decompressed_bytes();
     // Cap the initial allocation too — a blob whose compressed size
     // alone is enormous is itself a smell, but `with_capacity` on a
     // hostile input shouldn't reserve gigabytes upfront either.
-    let init_cap = std::cmp::min(input.len() * 4, MAX_DECOMPRESSED_BYTES);
+    // P3 minor: `saturating_mul` so a 32-bit usize doesn't overflow on
+    // a 1 GB compressed input.
+    let init_cap = std::cmp::min(input.len().saturating_mul(4), cap_bytes);
     let mut out = Vec::with_capacity(init_cap);
     let mut decoder = zstd::stream::read::Decoder::new(input)?;
     // 64 KiB read window — large enough to amortise syscall overhead
@@ -610,16 +616,16 @@ fn zstd_decompress(input: &[u8]) -> Result<Vec<u8>> {
         if n == 0 {
             break;
         }
-        if out.len().saturating_add(n) > MAX_DECOMPRESSED_BYTES {
+        if out.len().saturating_add(n) > cap_bytes {
             tracing::warn!(
                 target: "transcripts.bomb",
-                cap_bytes = MAX_DECOMPRESSED_BYTES,
+                cap_bytes,
                 so_far = out.len(),
                 "rejecting transcript: decompressed size would exceed cap"
             );
             return Err(anyhow!(
                 "transcript decompression exceeded {} byte cap (decompression bomb defence)",
-                MAX_DECOMPRESSED_BYTES
+                cap_bytes
             ));
         }
         out.extend_from_slice(&buf[..n]);
@@ -959,6 +965,7 @@ mod tests {
             default_ttl_secs: Some(3600),
             archive_grace_secs: Some(3600),
             namespaces: None,
+            max_decompressed_bytes: None,
         }
     }
 
@@ -1107,6 +1114,7 @@ mod tests {
             default_ttl_secs: Some(3600),
             archive_grace_secs: Some(3600),
             namespaces: Some(ns_table),
+            max_decompressed_bytes: None,
         };
 
         // Two rows, two namespaces, both 2 h old.
@@ -1144,6 +1152,7 @@ mod tests {
             default_ttl_secs: Some(86_400 * 30), // 30 days global
             archive_grace_secs: Some(86_400 * 7),
             namespaces: Some(ns_table),
+            max_decompressed_bytes: None,
         };
 
         // 5-min-old row in ephemeral/scratch — past the 60s pattern TTL,
