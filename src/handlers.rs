@@ -5630,8 +5630,20 @@ pub fn sse_event_visible_to(
     if subscriber_agent.is_empty() {
         return false;
     }
+    // Security (#628 P1, agent-4 finding): the prior `host:` prefix
+    // bypass let any client passing `X-Agent-Id: host:anything` see
+    // every tenant's events. `host:` is meant to be the *server-side*
+    // fallback identifier from `identity::resolve_agent_id` — it is
+    // never a legitimate self-asserted subscriber agent_id. The
+    // `approvals_sse` handler now rejects `host:`-prefixed values at
+    // the handshake; this defence-in-depth check ensures the
+    // visibility predicate cannot leak cross-tenant even if a future
+    // refactor admits `host:` past the handshake gate. Operators who
+    // need a privileged "see all events" subscription must add an
+    // explicit K9 `Allow` rule for their administrative agent_id +
+    // namespace pattern.
     if subscriber_agent.starts_with("host:") {
-        return true;
+        return false;
     }
     let event_agent = event.tenant_agent_id();
     if !event_agent.is_empty() && event_agent == subscriber_agent {
@@ -5686,9 +5698,20 @@ pub async fn approvals_sse(
     // is impractical on a long-lived GET stream with an empty body).
     // An unidentified subscriber gets an empty agent_id and
     // `sse_event_visible_to` refuses all events (fail-closed).
+    //
+    // Security (#628 P1, agent-4 finding): reject self-asserted
+    // `host:`-prefixed agent_ids. `host:` is the server-side fallback
+    // produced by `identity::resolve_agent_id` when no agent_id is
+    // supplied; it must never be accepted from an external client
+    // (which would otherwise gain a privilege-escalation path through
+    // the historical `host:` bypass in `sse_event_visible_to`). A
+    // client passing `X-Agent-Id: host:…` is treated as anonymous
+    // (empty subscriber_agent → fail-closed).
     let subscriber_agent = headers
         .get("x-agent-id")
         .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.starts_with("host:"))
         .unwrap_or("")
         .to_string();
 
