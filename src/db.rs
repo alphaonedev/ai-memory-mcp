@@ -2899,6 +2899,140 @@ pub fn check_duplicate(
     })
 }
 
+/// Canonical hash used by [`check_duplicate_with_text`] to detect
+/// byte-identical `title + content` pairs even when the embedding
+/// pipeline (lower-casing, prefix tagging, etc.) prevents the cosine
+/// similarity from saturating at 1.0.
+///
+/// The input is the *exact* text the MCP/HTTP layer hands to the
+/// embedder — `format!("{title} {content}")` — and we hash its raw
+/// UTF-8 bytes with no normalization. Lower-casing or whitespace
+/// stripping at this layer would re-introduce the very ambiguity we
+/// are trying to short-circuit (two semantically-identical strings
+/// hashing to the same value but being substantively different in,
+/// e.g., a code snippet that differs only in whitespace).
+///
+/// SHA-256 is the same primitive the audit/subscriptions/signed-events
+/// layers already use, so callers don't have to reach for a new
+/// dependency.
+#[must_use]
+pub fn canonical_content_hash(text: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    hasher.finalize().into()
+}
+
+/// v0.7.0 F18 — exact-match-aware nearest-neighbor duplicate check.
+///
+/// Wraps [`check_duplicate`] with a SHA-256 short-circuit on the raw
+/// `query_text` so byte-identical content scores `similarity = 1.0`
+/// even when the embedding pipeline (Nomic prefixes, casing, whitespace
+/// normalization) would otherwise cap cosine similarity at ~0.92 for
+/// the same string. Round-2 evidence: storing content `C` and then
+/// asking `check_duplicate` about `C` returned similarity 0.92 because
+/// the stored embedding was prefixed with `search_document:` while the
+/// query embedding got `search_query:` — mismatched prefixes prevent
+/// cosine from saturating at 1.0.
+///
+/// Algorithm:
+/// 1. Compute `H_query = SHA-256(query_text)`.
+/// 2. For each live, namespace-matching candidate, compute
+///    `H_row = SHA-256(format!("{row.title} {row.content}"))` and
+///    compare. The first match wins and is returned with
+///    `similarity = 1.0`, `is_duplicate = true`.
+/// 3. If no hash match is found, fall through to embedding-based
+///    cosine similarity (i.e. delegate to [`check_duplicate`]).
+///
+/// The hash compare is computed per call (no schema migration); it
+/// scales linearly in the candidate pool, but so does the existing
+/// embedding loop, so worst-case asymptotics are unchanged. A future
+/// `content_hash` column on `memories` would make this O(1) per
+/// candidate via an index — flagged for a separate migration PR.
+///
+/// `query_text` MUST be the exact string used to produce
+/// `query_embedding` (typically `format!("{title} {content}")`).
+/// Passing a different string is not a correctness bug — the function
+/// just falls through to the embedding-similarity path — but it
+/// defeats the point of the short-circuit.
+pub fn check_duplicate_with_text(
+    conn: &Connection,
+    query_embedding: &[f32],
+    query_text: &str,
+    namespace: Option<&str>,
+    threshold: f32,
+) -> Result<DuplicateCheck> {
+    let effective_threshold = threshold.max(DUPLICATE_THRESHOLD_MIN);
+    let now = Utc::now().to_rfc3339();
+    let query_hash = canonical_content_hash(query_text);
+
+    // Pull (id, title, namespace, content) for the live candidate pool.
+    // We keep the same gates as `check_duplicate` (live row, optional
+    // namespace) but do NOT require a non-NULL embedding here — an
+    // identical row with a missing embedding is still a valid exact-
+    // match short-circuit candidate.
+    let rows: Vec<(String, String, String, String)> = if let Some(ns) = namespace {
+        let mut stmt = conn.prepare(
+            "SELECT id, title, namespace, content FROM memories
+             WHERE (expires_at IS NULL OR expires_at > ?1)
+               AND namespace = ?2",
+        )?;
+        let mapped = stmt.query_map(params![now, ns], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        mapped.collect::<rusqlite::Result<Vec<_>>>()?
+    } else {
+        let mut stmt = conn.prepare(
+            "SELECT id, title, namespace, content FROM memories
+             WHERE (expires_at IS NULL OR expires_at > ?1)",
+        )?;
+        let mapped = stmt.query_map(params![now], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        mapped.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    // Phase 1 — SHA-256 exact-match short-circuit. We hash the same
+    // `format!("{title} {content}")` shape the MCP/HTTP layers use to
+    // build the embedding text so an identical store-then-check sequence
+    // surfaces as similarity=1.0 even when the embedding pipeline would
+    // otherwise cap at ~0.92 due to prefix asymmetry.
+    for (id, title, ns, content) in &rows {
+        let row_text = format!("{title} {content}");
+        let row_hash = canonical_content_hash(&row_text);
+        if row_hash == query_hash {
+            return Ok(DuplicateCheck {
+                is_duplicate: true,
+                threshold: effective_threshold,
+                nearest: Some(DuplicateMatch {
+                    id: id.clone(),
+                    title: title.clone(),
+                    namespace: ns.clone(),
+                    similarity: 1.0,
+                }),
+                // We scanned every row through the hash compare to find
+                // the match — report that, not just the first one.
+                candidates_scanned: rows.len(),
+            });
+        }
+    }
+
+    // Phase 2 — no hash match; fall back to the embedding-based
+    // nearest-neighbor scan so callers still get the "closest existing
+    // memory was X at similarity Y" signal on near-but-not-exact hits.
+    check_duplicate(conn, query_embedding, namespace, threshold)
+}
+
 /// Register an entity (canonical name + aliases) under a namespace
 /// (Pillar 2 / Stream B).
 ///
@@ -3589,6 +3723,13 @@ pub const FIND_PATHS_MAX_LIMIT: usize = 50;
 /// Distinct from [`KG_QUERY_MAX_SUPPORTED_DEPTH`] because path
 /// enumeration is more expensive than reachability — we can afford a
 /// slightly deeper budget for the BFS but not by much.
+///
+/// **Cap = 7.** Asking for more is rejected with an error that names
+/// this constant explicitly so callers see exactly which knob to file
+/// against. Contact maintainers to raise this bound *after* benchmarking
+/// the new ceiling on a representative KG; the BFS is `O(d * |E|)` per
+/// hop with a `json_each` cycle check, and depth-8+ has not been load-
+/// tested as of v0.7.0.
 pub const FIND_PATHS_MAX_DEPTH: usize = 7;
 
 /// Default depth used when the caller omits `max_depth`. Mirrors the
@@ -3604,17 +3745,39 @@ pub const FIND_PATHS_DEFAULT_DEPTH: usize = 4;
 /// candidate prefix; rows that reach `target_id` are projected out as
 /// completed paths.
 ///
-/// Treated as undirected: we traverse `memory_links` in both directions
-/// at every hop. The KG corpus uses directional links to model temporal
-/// ordering of an assertion (`source → target`), but path queries are
-/// asking "are these two memories connected via *any* relation chain?",
-/// which requires the symmetric closure. The CTE achieves that by
-/// `UNION ALL` over the original edge and the reverse edge at each hop.
+/// # Directionality contract (v0.7.0)
 ///
-/// `max_depth` defaults to [`FIND_PATHS_DEFAULT_DEPTH`] and is clamped
-/// at [`FIND_PATHS_MAX_DEPTH`]; passing a larger value yields an
-/// explicit error rather than silent truncation. `max_results`
-/// defaults to [`FIND_PATHS_DEFAULT_LIMIT`] and is clamped at
+/// **`find_paths` is UNDIRECTED** (UNION of forward + reverse edges at
+/// every hop) — **`kg_query` is DIRECTED** (forward edges only, by
+/// design). The two tools answer different questions and are not
+/// interchangeable:
+///
+/// - `find_paths(a, b)` — *are these two memories connected through any
+///   relation chain?* Symmetric closure: `find_paths(a, b)` and
+///   `find_paths(b, a)` return the same path set (modulo reversal).
+/// - `kg_query(start, depth)` — *what does the directed `source →
+///   target` subgraph rooted at `start` look like at depth ≤ N?*
+///   `kg_query(b, …)` will not surface `a → b`.
+///
+/// **`include_invalidated` is honored identically** by both tools: when
+/// `false` (default), edges whose `valid_until` lies in the past are
+/// excluded from the traversal; when `true`, the full historical link
+/// graph is walked. The flag's semantics do not change with directionality.
+///
+/// The KG corpus uses directional links to model temporal ordering of an
+/// assertion (`source → target`), so path queries — which are "are these
+/// two memories connected via *any* relation chain?" — apply the
+/// symmetric closure here via `UNION ALL` over the original edge and the
+/// reverse edge at each hop.
+///
+/// # Limits
+///
+/// `max_depth` defaults to [`FIND_PATHS_DEFAULT_DEPTH`] and is hard-
+/// capped at [`FIND_PATHS_MAX_DEPTH`] (= 7); passing a larger value
+/// yields an explicit error rather than silent truncation. The error
+/// message names `FIND_PATHS_MAX_DEPTH` so operators can grep the
+/// codebase for the single tunable knob. `max_results` defaults to
+/// [`FIND_PATHS_DEFAULT_LIMIT`] and is clamped at
 /// [`FIND_PATHS_MAX_LIMIT`]; passing a larger value collapses to the
 /// ceiling without error (paths beyond the cap are dropped, the
 /// shortest paths win on the `ORDER BY`).
@@ -3637,7 +3800,9 @@ pub fn find_paths(
         anyhow::bail!("max_depth must be >= 1");
     }
     if depth > FIND_PATHS_MAX_DEPTH {
-        anyhow::bail!("max_depth={depth} exceeds supported depth={FIND_PATHS_MAX_DEPTH}");
+        anyhow::bail!(
+            "max_depth={depth} exceeds supported depth={FIND_PATHS_MAX_DEPTH} (FIND_PATHS_MAX_DEPTH); contact maintainers to raise this bound after benchmarking"
+        );
     }
     let cap = max_results
         .unwrap_or(FIND_PATHS_DEFAULT_LIMIT)
