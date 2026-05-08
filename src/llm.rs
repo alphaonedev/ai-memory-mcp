@@ -139,10 +139,7 @@ impl OllamaClient {
     /// long; if poisoned, treat as closed (fail open) so a poisoned mutex
     /// can never wedge the LLM path entirely.
     fn breaker_is_open(&self) -> bool {
-        self.breaker
-            .lock()
-            .map(|b| b.is_open())
-            .unwrap_or(false)
+        self.breaker.lock().map(|b| b.is_open()).unwrap_or(false)
     }
 
     fn note_failure(&self) {
@@ -389,9 +386,7 @@ impl OllamaClient {
             Ok(r) => r,
             Err(e) => {
                 self.note_failure();
-                return Err(
-                    anyhow::Error::new(e).context("Failed to send embed request to Ollama"),
-                );
+                return Err(anyhow::Error::new(e).context("Failed to send embed request to Ollama"));
             }
         };
 
@@ -408,9 +403,7 @@ impl OllamaClient {
             Ok(b) => b,
             Err(e) => {
                 self.note_failure();
-                return Err(
-                    anyhow::Error::new(e).context("Failed to parse Ollama embed response"),
-                );
+                return Err(anyhow::Error::new(e).context("Failed to parse Ollama embed response"));
             }
         };
 
