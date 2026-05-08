@@ -61,8 +61,15 @@ fn find_paths_max_depth_over_cap_names_constant_in_error() {
     let a = seed(&conn, "a");
     let b = seed(&conn, "b");
 
-    let err = db::find_paths(&conn, &a, &b, Some(db::FIND_PATHS_MAX_DEPTH + 1), None, false)
-        .expect_err("max_depth above cap must error");
+    let err = db::find_paths(
+        &conn,
+        &a,
+        &b,
+        Some(db::FIND_PATHS_MAX_DEPTH + 1),
+        None,
+        false,
+    )
+    .expect_err("max_depth above cap must error");
     let msg = err.to_string();
     assert!(
         msg.contains("FIND_PATHS_MAX_DEPTH"),
