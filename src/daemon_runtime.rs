@@ -1745,6 +1745,60 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
 
     let bootstrap = bootstrap_serve(&db_path, &args, app_config).await?;
 
+    // Round-2 F12 — auto-generate the daemon's signing keypair if one
+    // does not already exist. Idempotent: a daemon restart never
+    // overwrites an existing keypair (which would silently invalidate
+    // every prior signed link). The well-known `daemon` agent_id is
+    // used as the stable label; operators can rotate via the existing
+    // `ai-memory identity generate` CLI.
+    //
+    // Failure here is non-fatal: link signing simply stays disabled and
+    // the operator sees the warning in the banner below.
+    let keypair_outcome = match crate::identity::keypair::default_key_dir() {
+        Ok(dir) => {
+            // The `[identity].disabled` config field is not yet wired in
+            // v0.7.0; pass `false` so the helper auto-generates unless
+            // the operator pre-staged a keypair. A future config field
+            // can opt out without changing this call site.
+            match crate::identity::keypair::ensure_keypair("daemon", &dir, false) {
+                Ok(o) => Some(o),
+                Err(e) => {
+                    tracing::warn!("identity: keypair auto-gen failed: {e}");
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!("identity: could not resolve key dir: {e}");
+            None
+        }
+    };
+
+    // Round-2 F8 — startup banner. Surfaces the effective permissions
+    // mode (and the v0.7.0 enforce-default migration warning when the
+    // operator has no `[permissions]` block in config) plus the F12
+    // keypair-autogen result.
+    let banner_inputs = crate::cli::serve_banner::BannerInputs {
+        configured_permissions_mode: app_config.permissions.as_ref().map(|p| p.mode),
+        auto_generated_keypair_path: keypair_outcome.as_ref().and_then(|o| match o {
+            crate::identity::keypair::EnsureOutcome::Generated { pub_path } => {
+                Some(pub_path.display().to_string())
+            }
+            _ => None,
+        }),
+        identity_disabled: matches!(
+            keypair_outcome,
+            Some(crate::identity::keypair::EnsureOutcome::SkippedDisabled)
+        ),
+    };
+    for line in crate::cli::serve_banner::compose_banner(&banner_inputs) {
+        if line.is_warn() {
+            tracing::warn!("{}", line.message());
+        } else {
+            tracing::info!("{}", line.message());
+        }
+    }
+
     let addr = format!("{}:{}", args.host, args.port);
     tracing::info!("database: {}", db_path.display());
 
