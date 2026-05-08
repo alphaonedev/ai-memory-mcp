@@ -3113,7 +3113,11 @@ fn handle_check_duplicate(
     let text = format!("{title} {content}");
     let query_embedding = emb.embed(&text).map_err(|e| e.to_string())?;
 
-    let check = db::check_duplicate(conn, &query_embedding, namespace, threshold)
+    // Round-2 F18 — short-circuit on raw-content hash equality before
+    // falling through to embedding cosine similarity. Catches byte-
+    // identical duplicates that the embedding pipeline would otherwise
+    // cap at ~0.92 due to nomic prefix normalisation.
+    let check = db::check_duplicate_with_text(conn, &query_embedding, &text, namespace, threshold)
         .map_err(|e| e.to_string())?;
 
     // Round similarity to 3 decimals at the response edge — keeps the

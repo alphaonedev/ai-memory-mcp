@@ -2549,7 +2549,16 @@ pub async fn check_duplicate(
     };
 
     let lock = app.db.lock().await;
-    let check = match db::check_duplicate(&lock.0, &query_embedding, namespace, threshold) {
+    // Round-2 F18 — short-circuit on raw-content hash equality before
+    // falling through to embedding cosine similarity (parity with MCP
+    // path).
+    let check = match db::check_duplicate_with_text(
+        &lock.0,
+        &query_embedding,
+        &embedding_text,
+        namespace,
+        threshold,
+    ) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!("handler error: {e}");
