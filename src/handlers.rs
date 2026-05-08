@@ -3,13 +3,13 @@
 
 use axum::{
     Json,
-    extract::{FromRef, Path, Query, Request, State},
+    extract::{FromRef, FromRequest, Path, Query, Request, State, rejection::JsonRejection},
     http::{HeaderMap, StatusCode},
     middleware::Next,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
 };
 use chrono::{Duration, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
@@ -239,6 +239,129 @@ impl FromRef<AppState> for Db {
 
 const MAX_BULK_SIZE: usize = 1000;
 
+// ---------------------------------------------------------------------------
+// v0.7.0 Round-2 F9 — JSON body extractor that returns 400 (not axum's
+// default 422) for missing/malformed fields, with a sanitized response
+// envelope `{ "error": "...", "fields": ["..."] }` so callers can switch
+// on the field name without parsing a free-form serde message.
+// ---------------------------------------------------------------------------
+
+/// Wrapping extractor that delegates to `axum::Json<T>` but rewrites
+/// every rejection to `400 Bad Request` with a structured body shaped
+/// like the rest of the daemon's error envelopes
+/// (`{"error": ..., "fields": [...]}`).
+///
+/// Applied to the HTTP store path so a body missing `content` (or any
+/// other required field) returns 400 + a field-name hint instead of
+/// axum's default 422 Unprocessable Entity. The 422 default leaks the
+/// raw serde error string ("Failed to deserialize the JSON body...
+/// missing field `content` at line 1 column 14"), which forces clients
+/// into substring matching on a non-stable diagnostic message; the
+/// `fields` array is the structured replacement.
+pub struct JsonOrBadRequest<T>(pub T);
+
+impl<S, T> FromRequest<S> for JsonOrBadRequest<T>
+where
+    S: Send + Sync,
+    T: DeserializeOwned,
+    Json<T>: FromRequest<S, Rejection = JsonRejection>,
+{
+    type Rejection = Response;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        match Json::<T>::from_request(req, state).await {
+            Ok(Json(value)) => Ok(Self(value)),
+            Err(rej) => Err(json_rejection_to_400(&rej)),
+        }
+    }
+}
+
+/// Convert an axum `JsonRejection` into a `400 Bad Request` response
+/// with the daemon's standard `{"error": ..., "fields": [...]}` shape.
+/// The `fields` array best-effort-extracts missing field names from
+/// the underlying serde error message; on parse failure it is left
+/// empty so callers can still rely on the envelope shape.
+fn json_rejection_to_400(rej: &JsonRejection) -> Response {
+    let raw_msg = rej.body_text();
+    // serde_json's "missing field" diagnostic: `missing field \`<name>\``.
+    // We extract the backtick-quoted identifier and surface it both as
+    // a sanitized human message and as the structured `fields` array.
+    let fields = extract_missing_fields(&raw_msg);
+    let error_msg = if let Some(first) = fields.first() {
+        format!("missing required field: {first}")
+    } else {
+        // Generic malformed-body fallback (syntax error, type error,
+        // etc.). Sanitized to avoid leaking the raw serde diagnostic
+        // (which can include positional info from the request body).
+        match rej {
+            JsonRejection::JsonSyntaxError(_) => "malformed JSON body".to_string(),
+            JsonRejection::MissingJsonContentType(_) => {
+                "expected Content-Type: application/json".to_string()
+            }
+            _ => "invalid request body".to_string(),
+        }
+    };
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": error_msg,
+            "fields": fields,
+        })),
+    )
+        .into_response()
+}
+
+/// Best-effort scan of a serde-error message for `missing field
+/// \`<name>\`` occurrences. Returns the de-duplicated list of field
+/// names in order of appearance. When no match is found (e.g. a type
+/// error or syntax error) the returned vector is empty so the caller
+/// falls back to the generic "invalid request body" message.
+fn extract_missing_fields(msg: &str) -> Vec<String> {
+    let needle = "missing field `";
+    let mut out: Vec<String> = Vec::new();
+    let mut rest = msg;
+    while let Some(idx) = rest.find(needle) {
+        let after = &rest[idx + needle.len()..];
+        if let Some(end) = after.find('`') {
+            let name = &after[..end];
+            // Light validation — reject anything that doesn't look like
+            // a serde field identifier so a hostile body cannot smuggle
+            // arbitrary content into the response envelope.
+            if !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                && !out.iter().any(|existing| existing == name)
+            {
+                out.push(name.to_string());
+            }
+            rest = &after[end + 1..];
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// v0.7.0 Round-2 F10 — embed-status surface for the HTTP store path.
+//
+// When the embedder times out / refuses oversized content / otherwise
+// fails to produce a vector, the row still commits (correct — embeddings
+// are an enhancement layer, not a write-path gate) but the HTTP response
+// must surface that fact so the caller can tell semantic recall will
+// silently miss this memory until a re-index. Prior to F10 the daemon
+// returned 201 with no signal whatsoever.
+//
+// The canonical [`crate::embeddings::EmbedStatus`] enum + the
+// [`crate::embeddings::Embedder::embed_with_status`] producer were
+// landed by Fix-Agent α (Round-2 F6); the HTTP wiring below is the
+// F10 consumer side that turns the producer's signal into a response
+// field on non-`Indexed` outcomes.
+// ---------------------------------------------------------------------------
+
+use crate::embeddings::EmbedStatus;
+
 /// v0.6.2 (S40): maximum number of per-row `broadcast_store_quorum` fanouts
 /// in flight at once during `bulk_create`. Replaces the prior sequential
 /// for-loop (which paid 100ms × N rows of wall time and blew past the
@@ -400,7 +523,7 @@ pub async fn prometheus_metrics(State(state): State<Db>) -> impl IntoResponse {
 pub async fn create_memory(
     State(app): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<CreateMemory>,
+    JsonOrBadRequest(body): JsonOrBadRequest<CreateMemory>,
 ) -> impl IntoResponse {
     let state = app.db.clone();
     if let Err(e) = validate::validate_create(&body) {
@@ -446,18 +569,21 @@ pub async fn create_memory(
     // Issue #219: generate the embedding BEFORE taking the DB lock. Embedding
     // (MiniLM ONNX / nomic via Ollama) is 10-200ms of work we do not want
     // holding the single `Mutex<Connection>` on a multi-agent daemon.
+    //
+    // v0.7.0 Round-2 F10 — call α's `Embedder::embed_with_status` so we
+    // capture the success/skip/fail outcome alongside the vector. The
+    // success-path response stays silent on `Indexed`; non-`Indexed`
+    // outcomes are surfaced as `embed_status` on the response body so
+    // the caller can tell semantic recall will miss this row until a
+    // re-index. Keyword-only deployments (embedder=None) report
+    // `Indexed` so the response shape is unchanged on nodes where the
+    // semantic layer is intentionally absent.
     let embedding_text = format!("{} {}", body.title, body.content);
-    let embedding: Option<Vec<f32>> =
-        app.embedder
-            .as_ref()
-            .as_ref()
-            .and_then(|emb| match emb.embed(&embedding_text) {
-                Ok(v) => Some(v),
-                Err(e) => {
-                    tracing::warn!("embedding generation failed: {e}");
-                    None
-                }
-            });
+    let (embedding, embed_status): (Option<Vec<f32>>, EmbedStatus) =
+        match app.embedder.as_ref().as_ref() {
+            None => (None, EmbedStatus::Indexed),
+            Some(emb) => emb.embed_with_status(&embedding_text),
+        };
 
     // v0.6.3.1 P2 (G6) — resolve `on_conflict` policy. HTTP defaults to
     // 'error' (no legacy v1 backward-compat to honor); callers that want
@@ -645,6 +771,64 @@ pub async fn create_memory(
         .map(|c| c.id.clone())
         .collect();
 
+    // v0.7.0 Round-2 F7 — per-agent quota gate. Round-1 evidence: 500
+    // HTTP stores from a single agent_id incremented zero rows in
+    // `agent_quotas` while the same agent's MCP-side stamp incremented
+    // correctly. The MCP store path (src/mcp.rs:1691) calls
+    // `quotas::check_and_record` ahead of `db::insert` and refunds on
+    // insert failure; mirror that here so the HTTP path is no longer a
+    // quota-bypass surface. Bytes counted = (title + content +
+    // serialized metadata) — same shape the MCP path uses so cross-
+    // path totals stay coherent.
+    let quota_agent_id = mem
+        .metadata
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let payload_bytes = i64::try_from(
+        mem.title.len()
+            + mem.content.len()
+            + serde_json::to_string(&mem.metadata)
+                .map(|s| s.len())
+                .unwrap_or(0),
+    )
+    .unwrap_or(i64::MAX);
+    let quota_op = crate::quotas::QuotaOp::Memory {
+        bytes: payload_bytes,
+    };
+    if !quota_agent_id.is_empty() {
+        if let Err(e) = crate::quotas::check_and_record(&lock.0, &quota_agent_id, quota_op) {
+            // Map QuotaCheckError to the same wire shape the rest of
+            // the daemon uses for quota breaches: 429 with a
+            // `code: "QUOTA_EXCEEDED"` envelope so callers can switch
+            // on the limit name. Substrate errors bubble up as 500
+            // because the row was never written.
+            return match e {
+                crate::quotas::QuotaCheckError::Quota(qe) => (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(json!({
+                        "code": "QUOTA_EXCEEDED",
+                        "error": qe.to_string(),
+                        "limit": qe.limit.as_str(),
+                        "current": qe.current,
+                        "max": qe.max,
+                        "agent_id": qe.agent_id,
+                    })),
+                )
+                    .into_response(),
+                crate::quotas::QuotaCheckError::Sql(se) => {
+                    tracing::error!("quota substrate error: {se}");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": "quota check failed"})),
+                    )
+                        .into_response()
+                }
+            };
+        }
+    }
+
     match db::insert(&lock.0, &mem) {
         Ok(actual_id) => {
             // Issue #219: persist the embedding and warm the HNSW index so
@@ -702,6 +886,22 @@ pub async fn create_memory(
             if !contradiction_ids.is_empty() {
                 response["potential_contradictions"] = json!(contradiction_ids);
             }
+            // v0.7.0 Round-2 F10 — surface embed_status to the caller
+            // when α's `embed_with_status` reported anything other than
+            // `Indexed` (skipped: oversized content / empty body, or
+            // failed: embedder timeout, ollama unreachable, model load
+            // failure, …). Indexed is intentionally NOT surfaced so
+            // the existing response shape is unchanged for the common
+            // case; the skip/fail signal is a positive presence marker
+            // rather than a free-form enum every client has to switch
+            // on.
+            if embed_status.is_degraded() {
+                response["embed_status"] = json!(embed_status.as_str());
+                let reason = embed_status.reason();
+                if !reason.is_empty() {
+                    response["embed_status_reason"] = json!(reason);
+                }
+            }
             // v0.7 federation: fan out to peers when --quorum-writes is
             // configured. The local commit already landed; if quorum
             // is not met we return 503 but we do NOT roll back the
@@ -741,6 +941,20 @@ pub async fn create_memory(
             (StatusCode::CREATED, Json(response)).into_response()
         }
         Err(e) => {
+            // v0.7.0 Round-2 F7 — insert failed AFTER we committed the
+            // quota counter; refund so the agent's quota reflects only
+            // successful stores (mirrors the MCP path at
+            // src/mcp.rs:1706). Refund is best-effort — a refund
+            // failure is logged but does not change the response.
+            if !quota_agent_id.is_empty() {
+                if let Err(re) = crate::quotas::refund_op(&lock.0, &quota_agent_id, quota_op) {
+                    tracing::warn!(
+                        "quota refund_op failed for agent {}: {}",
+                        &quota_agent_id,
+                        re
+                    );
+                }
+            }
             tracing::error!("handler error: {e}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -7205,6 +7419,11 @@ mod tests {
 
     #[tokio::test]
     async fn create_memory_rejects_missing_required_fields() {
+        // v0.7.0 Round-2 F9 — POST `/api/v1/memories` with a required
+        // field absent now returns 400 BAD_REQUEST + a structured
+        // `{"error", "fields"}` envelope instead of axum's default 422
+        // UNPROCESSABLE_ENTITY (which leaked the raw serde diagnostic
+        // and gave callers no stable hook to switch on).
         let state = test_state();
         let app = Router::new()
             .route("/api/v1/memories", axum_post(create_memory))
@@ -7233,7 +7452,23 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            payload.get("error").and_then(|v| v.as_str()).is_some(),
+            "F9: response must include sanitized `error` field"
+        );
+        let fields = payload
+            .get("fields")
+            .and_then(|v| v.as_array())
+            .expect("F9: response must include `fields` array");
+        assert!(
+            fields.iter().any(|v| v.as_str() == Some("title")),
+            "F9: `fields` must name the missing required field (`title`)"
+        );
     }
 
     #[tokio::test]
@@ -7332,7 +7567,12 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        // v0.7.0 Round-2 F9 — JsonOrBadRequest folds every JSON
+        // extractor rejection (missing field, type error, syntax
+        // error) into a unified 400 BAD_REQUEST envelope. Pre-F9
+        // axum surfaced 422 UNPROCESSABLE_ENTITY for type errors
+        // specifically; post-F9 the wire is 400 for the whole class.
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
