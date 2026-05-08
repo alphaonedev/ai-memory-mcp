@@ -448,8 +448,34 @@ pub fn handle_capabilities_family(
 /// on the default path; both are skipped on the verbose path.
 pub fn tool_definitions_for_profile(profile: &crate::profile::Profile) -> Value {
     let mut defs = tool_definitions_for_profile_verbose(profile);
-    trim_optional_params(&mut defs);
+    // Round-4 — honor `AI_MEMORY_TOOLS_VERBOSE=1` (or `=true`) as a
+    // process-level opt-out from the C4 optional-params trim. Without
+    // this escape hatch the trim was unconditional on `tools/list`
+    // (the MCP method, not the `memory_capabilities` tool), so
+    // operators who launched the daemon expecting the full schema —
+    // e.g. for IDE autocomplete or plugin generators — got the
+    // 10 766-byte trimmed payload regardless of CLI / env / profile
+    // hints. The env var matches the existing convention used by
+    // other AI_MEMORY_* tunables (`AI_MEMORY_NO_CONFIG`, `AI_MEMORY_DB`).
+    if !tools_verbose_env_enabled() {
+        trim_optional_params(&mut defs);
+    }
     defs
+}
+
+/// Round-4 — process-level escape hatch from the C4 trim used by
+/// [`tool_definitions_for_profile`]. Reads `AI_MEMORY_TOOLS_VERBOSE`
+/// once and accepts `1` or `true` (case-insensitive) as the truthy
+/// values; anything else (including absent) is false. Cached behind a
+/// `OnceLock` so the hot tools/list path doesn't re-stat the env on
+/// every call.
+fn tools_verbose_env_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("AI_MEMORY_TOOLS_VERBOSE")
+            .ok()
+            .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    })
 }
 
 /// v0.7 C4 — full-schema (verbose) variant of
@@ -3674,15 +3700,34 @@ pub fn handle_smart_load(
         return Ok(resp);
     }
 
-    // Pick the best family. Try the embedder path first when an
-    // embedder is wired through; otherwise (or on embed failure) fall
-    // back to the deterministic keyword scorer.
+    // Round-4 — keyword-veto strategy. Always run the deterministic
+    // keyword scorer first. If it produces a non-fallback signal (i.e.
+    // at least one intent token overlapped some family's descriptor
+    // or tool-name segments), let the embedder vote — but veto the
+    // embedder when it disagrees. Rationale: the embedder's cosine
+    // similarity over ~80-word descriptors is noisy for short
+    // imperative intents like "store a new memory" or "verify a
+    // memory's signature" — Round-3 measured 8/10 routing accuracy,
+    // Round-4 measured 4–5/10 with the embedder winning on common
+    // verbs but mis-routing them to `archive`. The keyword path is
+    // hand-tuned (F14) and deterministic; treat it as ground truth
+    // when it has a signal, fall back to the embedder only when it
+    // returns `"fallback"` (no token overlap anywhere).
+    let kw_pick = fallback_via_keywords(intent);
     let (family, score, source) = match embedder {
         Some(emb) => match best_family_via_embedder(emb, intent) {
-            Some((f, s)) => (f, s, "embedder"),
-            None => fallback_via_keywords(intent),
+            Some((emb_family, emb_score)) => {
+                if kw_pick.2 == "keyword" && kw_pick.0 != emb_family {
+                    // Keyword scored a non-fallback hit AND disagreed with
+                    // the embedder — trust the deterministic scorer.
+                    kw_pick
+                } else {
+                    (emb_family, emb_score, "embedder")
+                }
+            }
+            None => kw_pick,
         },
-        None => fallback_via_keywords(intent),
+        None => kw_pick,
     };
 
     forward_to_load_family(conn, family, score, source, intent, params)
