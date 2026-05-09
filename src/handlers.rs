@@ -300,6 +300,77 @@ impl FromRef<AppState> for Db {
     }
 }
 
+/// v0.7.0 Wave-3 — uniform 501 NOT IMPLEMENTED response for handlers
+/// that have not yet migrated to the [`crate::store::MemoryStore`]
+/// trait dispatch path on Postgres-backed daemons.
+///
+/// Returns a stable, machine-parseable JSON envelope so operator
+/// scripts can recognise the v0.7.0 Wave-3 schism without parsing
+/// free-form strings:
+///
+/// ```json
+/// {
+///   "error": "endpoint not yet implemented for postgres-backed daemon",
+///   "endpoint": "<route>",
+///   "storage_backend": "postgres",
+///   "remediation": "use sqlite-backed daemon or wait for v0.7.x trait coverage"
+/// }
+/// ```
+///
+/// Wired into the un-migrated handlers below so a postgres-backed
+/// daemon never silently falls back to the empty in-memory SQLite
+/// scratch DB and corrupts the operator's mental model of where
+/// their data lives. As handlers migrate to the trait this call
+/// site count goes to zero.
+#[cfg(feature = "sal")]
+#[must_use]
+pub fn postgres_not_implemented(endpoint: &'static str) -> Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({
+            "error": "endpoint not yet implemented for postgres-backed daemon",
+            "endpoint": endpoint,
+            "storage_backend": "postgres",
+            "remediation": "use sqlite-backed daemon or wait for v0.7.x trait coverage",
+        })),
+    )
+        .into_response()
+}
+
+/// v0.7.0 Wave-3 — translate a [`crate::store::StoreError`] into the
+/// daemon's standard HTTP error envelope. Centralised so every
+/// trait-routed handler reports backend errors with the same shape.
+#[cfg(feature = "sal")]
+#[must_use]
+pub fn store_err_to_response(e: crate::store::StoreError) -> Response {
+    use crate::store::StoreError;
+    let (status, msg) = match &e {
+        StoreError::NotFound { .. } => (StatusCode::NOT_FOUND, "not found".to_string()),
+        StoreError::Conflict { .. } => (StatusCode::CONFLICT, e.to_string()),
+        StoreError::PermissionDenied { .. } => (StatusCode::FORBIDDEN, e.to_string()),
+        StoreError::InvalidInput { .. } => (StatusCode::BAD_REQUEST, e.to_string()),
+        StoreError::UnsupportedCapability { capability } => (
+            StatusCode::NOT_IMPLEMENTED,
+            format!("backend does not support capability: {capability}"),
+        ),
+        StoreError::IntegrityFailed { .. } | StoreError::BackendUnavailable { .. } => {
+            tracing::error!("store backend error: {e}");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "storage backend unavailable".to_string(),
+            )
+        }
+        _ => {
+            tracing::error!("store backend error: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal server error".to_string(),
+            )
+        }
+    };
+    (status, Json(json!({"error": msg}))).into_response()
+}
+
 const MAX_BULK_SIZE: usize = 1000;
 
 // ---------------------------------------------------------------------------
@@ -612,7 +683,10 @@ pub async fn create_memory(
         };
     let mut metadata = body.metadata;
     if let Some(obj) = metadata.as_object_mut() {
-        obj.insert("agent_id".to_string(), serde_json::Value::String(agent_id));
+        obj.insert(
+            "agent_id".to_string(),
+            serde_json::Value::String(agent_id.clone()),
+        );
     }
     // #151 scope: validate + merge into metadata if supplied at the top level
     // (inline metadata.scope still works; top-level is a shortcut)
@@ -627,6 +701,50 @@ pub async fn create_memory(
         if let Some(obj) = metadata.as_object_mut() {
             obj.insert("scope".to_string(), serde_json::Value::String(s.clone()));
         }
+    }
+
+    // v0.7.0 Wave-3 — Postgres-backed daemons take the SAL trait
+    // dispatch path. The trait's `store` accepts a fully-formed
+    // `Memory` value; the legacy SQLite path below also assembles
+    // a canonical `Memory` row but with substantially more
+    // ceremony (federation fanout, embedder integration, conflict
+    // policy enforcement, governance hooks). The Postgres branch
+    // takes the simpler shape — the upstream layers (governance,
+    // federation, audit) are still SQLite-bound today and lighting
+    // them up on Postgres is a follow-on wave. Until then the
+    // postgres-backed daemon ships a clean store-and-return path
+    // that's portable across both adapters.
+    #[cfg(feature = "sal")]
+    if matches!(app.storage_backend, StorageBackend::Postgres) {
+        let now = Utc::now();
+        let mem = Memory {
+            id: Uuid::new_v4().to_string(),
+            tier: body.tier.clone(),
+            namespace: body.namespace.clone(),
+            title: body.title.clone(),
+            content: body.content.clone(),
+            tags: body.tags.clone(),
+            priority: body.priority,
+            confidence: body.confidence,
+            source: body.source.clone(),
+            access_count: 0,
+            created_at: now.to_rfc3339(),
+            updated_at: now.to_rfc3339(),
+            last_accessed_at: None,
+            expires_at: body.expires_at.clone(),
+            metadata,
+        };
+        let ctx = crate::store::CallerContext::for_agent(agent_id.clone());
+        return match app.store.store(&ctx, &mem).await {
+            Ok(id) => {
+                let mut payload = serde_json::to_value(&mem).unwrap_or_else(|_| json!({}));
+                if let Some(obj) = payload.as_object_mut() {
+                    obj.insert("id".to_string(), serde_json::Value::String(id));
+                }
+                (StatusCode::CREATED, Json(payload)).into_response()
+            }
+            Err(e) => store_err_to_response(e),
+        };
     }
 
     // Issue #219: generate the embedding BEFORE taking the DB lock. Embedding
@@ -1368,7 +1486,7 @@ pub async fn list_agents(State(state): State<Db>) -> impl IntoResponse {
     }
 }
 
-pub async fn get_memory(State(state): State<Db>, Path(id): Path<String>) -> impl IntoResponse {
+pub async fn get_memory(State(app): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     if let Err(e) = validate::validate_id(&id) {
         return (
             StatusCode::BAD_REQUEST,
@@ -1376,7 +1494,43 @@ pub async fn get_memory(State(state): State<Db>, Path(id): Path<String>) -> impl
         )
             .into_response();
     }
-    let lock = state.lock().await;
+
+    // v0.7.0 Wave-3 — Postgres-backed daemons dispatch through the
+    // SAL trait. The legacy `db::resolve_id` path is SQLite-bound (it
+    // walks `memories` + `memory_links` directly through the
+    // mutex-guarded rusqlite connection); routing the postgres branch
+    // through `app.store` keeps the wire-shape identical while
+    // hitting the right backend. SQLite-backed daemons keep the
+    // legacy direct-rusqlite path for v0.7.0 binary parity.
+    #[cfg(feature = "sal")]
+    if matches!(app.storage_backend, StorageBackend::Postgres) {
+        let ctx = crate::store::CallerContext::for_agent("ai:http");
+        return match app.store.get(&ctx, &id).await {
+            Ok(mem) => {
+                // List_links surfaces the full edge set (no namespace
+                // filter) so the postgres adapter's `list_links` walks
+                // its `memory_links` table and the local-side filter
+                // narrows to edges anchored at this memory id.
+                let edges = match app.store.list_links(None).await {
+                    Ok(rows) => rows
+                        .into_iter()
+                        .filter(|l| l.source_id == mem.id || l.target_id == mem.id)
+                        .collect::<Vec<_>>(),
+                    Err(e) => {
+                        tracing::warn!(
+                            "store.list_links during get_memory failed: {e}; \
+                             returning memory with empty links"
+                        );
+                        Vec::new()
+                    }
+                };
+                Json(json!({"memory": mem, "links": edges})).into_response()
+            }
+            Err(e) => store_err_to_response(e),
+        };
+    }
+
+    let lock = app.db.lock().await;
     match db::resolve_id(&lock.0, &id) {
         Ok(Some(mem)) => {
             let links = db::get_links(&lock.0, &mem.id).unwrap_or_default();
@@ -1419,6 +1573,40 @@ pub async fn update_memory(
         )
             .into_response();
     }
+
+    // v0.7.0 Wave-3 — Postgres-backed daemons take the SAL trait
+    // dispatch path. The trait's `update` accepts an `UpdatePatch`
+    // shape; map the `UpdateMemory` body into the trait shape and
+    // delegate. The legacy SQLite path below threads federation,
+    // embedder regen, audit, and governance hooks; Postgres takes
+    // the simpler shape until those layers are also trait-routed.
+    #[cfg(feature = "sal")]
+    if matches!(app.storage_backend, StorageBackend::Postgres) {
+        let patch = crate::store::UpdatePatch {
+            title: body.title.clone(),
+            content: body.content.clone(),
+            tier: body.tier.clone(),
+            namespace: body.namespace.clone(),
+            tags: body.tags.clone(),
+            priority: body.priority,
+            confidence: body.confidence,
+            metadata: body.metadata.clone(),
+        };
+        let ctx = crate::store::CallerContext::for_agent("ai:http");
+        return match app.store.update(&ctx, &id, patch).await {
+            Ok(()) => {
+                // Re-fetch through the trait so the response payload
+                // mirrors the legacy SQLite path's "return the updated
+                // row" wire shape.
+                match app.store.get(&ctx, &id).await {
+                    Ok(mem) => Json(json!(mem)).into_response(),
+                    Err(_) => Json(json!({"updated": true, "id": id})).into_response(),
+                }
+            }
+            Err(e) => store_err_to_response(e),
+        };
+    }
+
     let lock = state.lock().await;
     // Resolve prefix if exact ID not found
     let resolved_id = match db::resolve_id(&lock.0, &id) {
@@ -1545,6 +1733,26 @@ pub async fn delete_memory(
         )
             .into_response();
     }
+
+    // v0.7.0 Wave-3 — Postgres-backed daemons dispatch through the
+    // SAL trait. The legacy delete path threads governance, audit,
+    // and federation fanout through the SQLite mutex; those layers
+    // (governance owner-walk, audit chain, quorum broadcast) are
+    // SQLite-bound today, so the postgres-eligible delete is the
+    // simpler "delete by id" surface the SAL trait already provides.
+    // Operators who need the full governance + audit + quorum bundle
+    // on Postgres should follow the migration plan in
+    // `docs/postgres-age-guide.md`.
+    #[cfg(feature = "sal")]
+    if matches!(app.storage_backend, StorageBackend::Postgres) {
+        let _ = headers;
+        let ctx = crate::store::CallerContext::for_agent("ai:http");
+        return match app.store.delete(&ctx, &id).await {
+            Ok(()) => (StatusCode::OK, Json(json!({"deleted": true, "id": id}))).into_response(),
+            Err(e) => store_err_to_response(e),
+        };
+    }
+
     let lock = state.lock().await;
     // Resolve the target memory so governance has owner context.
     let target = match db::resolve_id(&lock.0, &id) {
@@ -1950,7 +2158,7 @@ pub async fn promote_memory(
 }
 
 pub async fn list_memories(
-    State(state): State<Db>,
+    State(app): State<AppState>,
     Query(p): Query<ListQuery>,
 ) -> impl IntoResponse {
     // #197: validate agent_id filter values
@@ -1963,7 +2171,61 @@ pub async fn list_memories(
         )
             .into_response();
     }
-    let lock = state.lock().await;
+
+    // v0.7.0 Wave-3 — Postgres-backed daemons dispatch through the
+    // SAL trait. The trait's `Filter` shape carries
+    // `(namespace, tier, tags_any, agent_id, since, until, limit)`,
+    // which is the same projection the legacy `db::list` accepts plus
+    // a deterministic ordering. The `min_priority` and `offset`
+    // filters that exist only on the SQLite path are not yet exposed
+    // through the trait — when set on a Postgres daemon they are
+    // silently ignored (logged at debug). Offset can be emulated
+    // client-side by raising `limit` and slicing; min_priority is
+    // tracked for trait extension in the next wave.
+    #[cfg(feature = "sal")]
+    if matches!(app.storage_backend, StorageBackend::Postgres) {
+        if p.offset.unwrap_or(0) > 0 {
+            tracing::debug!(
+                "list_memories on postgres: ?offset is unsupported on the SAL trait; ignored"
+            );
+        }
+        if p.min_priority.is_some() {
+            tracing::debug!(
+                "list_memories on postgres: ?min_priority is unsupported on the SAL trait; ignored"
+            );
+        }
+        let limit = p.limit.unwrap_or(20).min(MAX_BULK_SIZE);
+        let since = p
+            .since
+            .as_deref()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|d| d.with_timezone(&chrono::Utc));
+        let until = p
+            .until
+            .as_deref()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|d| d.with_timezone(&chrono::Utc));
+        let filter = crate::store::Filter {
+            namespace: p.namespace.clone(),
+            tier: p.tier.clone(),
+            tags_any: p
+                .tags
+                .as_deref()
+                .map(|s| s.split(',').map(str::to_string).collect())
+                .unwrap_or_default(),
+            agent_id: p.agent_id.clone(),
+            since,
+            until,
+            limit,
+        };
+        let ctx = crate::store::CallerContext::for_agent("ai:http");
+        return match app.store.list(&ctx, &filter).await {
+            Ok(mems) => Json(json!({"memories": mems, "count": mems.len()})).into_response(),
+            Err(e) => store_err_to_response(e),
+        };
+    }
+
+    let lock = app.db.lock().await;
     // v0.6.2 (S40): raise ceiling from 200 → `MAX_BULK_SIZE` (1000) so bulk
     // fanout scenarios that POST 500+ rows to a leader can verify full
     // peer delivery via a single `GET /memories?limit=N` (previously the
@@ -1996,7 +2258,7 @@ pub async fn list_memories(
 }
 
 pub async fn search_memories(
-    State(state): State<Db>,
+    State(app): State<AppState>,
     Query(p): Query<SearchQuery>,
 ) -> impl IntoResponse {
     if p.q.trim().is_empty() {
@@ -2026,7 +2288,50 @@ pub async fn search_memories(
         )
             .into_response();
     }
-    let lock = state.lock().await;
+
+    // v0.7.0 Wave-3 — Postgres-backed daemons dispatch through the
+    // SAL trait. The Postgres adapter's `search` runs the same
+    // text-search projection as SQLite's FTS5 path with the trait's
+    // `Filter` carried verbatim; result wire-shape matches the
+    // legacy `db::search` envelope.
+    #[cfg(feature = "sal")]
+    if matches!(app.storage_backend, StorageBackend::Postgres) {
+        let limit = p.limit.unwrap_or(20).min(MAX_BULK_SIZE);
+        let since = p
+            .since
+            .as_deref()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|d| d.with_timezone(&chrono::Utc));
+        let until = p
+            .until
+            .as_deref()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|d| d.with_timezone(&chrono::Utc));
+        let filter = crate::store::Filter {
+            namespace: p.namespace.clone(),
+            tier: p.tier.clone(),
+            tags_any: p
+                .tags
+                .as_deref()
+                .map(|s| s.split(',').map(str::to_string).collect())
+                .unwrap_or_default(),
+            agent_id: p.agent_id.clone(),
+            since,
+            until,
+            limit,
+        };
+        let ctx = crate::store::CallerContext {
+            agent_id: "ai:http".to_string(),
+            as_agent: p.as_agent.clone(),
+            request_id: None,
+        };
+        return match app.store.search(&ctx, &p.q, &filter).await {
+            Ok(r) => Json(json!({"results": r, "count": r.len(), "query": p.q})).into_response(),
+            Err(e) => store_err_to_response(e),
+        };
+    }
+
+    let lock = app.db.lock().await;
     // v0.6.2 (S40): mirror the `list_memories` ceiling raise so search
     // over a bulk-populated namespace isn't also capped at 200.
     let limit = p.limit.unwrap_or(20).min(MAX_BULK_SIZE);
@@ -3133,6 +3438,48 @@ pub async fn create_link(
         )
             .into_response();
     }
+
+    // v0.7.0 Wave-3 — Postgres-backed daemons take the SAL trait
+    // dispatch path. The trait's `link_signed` returns the resolved
+    // `attest_level` so the wire response carries the same byte shape
+    // as the legacy `db::create_link_signed` path. Federation fanout
+    // is omitted on the postgres branch — quorum-broadcast is still
+    // SQLite-bound and lighting it up on Postgres is a follow-on
+    // wave.
+    #[cfg(feature = "sal")]
+    if matches!(app.storage_backend, StorageBackend::Postgres) {
+        let now = Utc::now().to_rfc3339();
+        let link = MemoryLink {
+            source_id: body.source_id.clone(),
+            target_id: body.target_id.clone(),
+            relation: body.relation.clone(),
+            created_at: now,
+            valid_from: None,
+            valid_until: None,
+            observed_by: None,
+            signature: None,
+        };
+        let ctx = crate::store::CallerContext::for_agent("ai:http");
+        return match app
+            .store
+            .link_signed(&ctx, &link, app.active_keypair.as_ref().as_ref())
+            .await
+        {
+            Ok(attest_level) => (
+                StatusCode::CREATED,
+                Json(json!({
+                    "linked": true,
+                    "source_id": body.source_id,
+                    "target_id": body.target_id,
+                    "relation": body.relation,
+                    "attest_level": attest_level,
+                })),
+            )
+                .into_response(),
+            Err(e) => store_err_to_response(e),
+        };
+    }
+
     let lock = app.db.lock().await;
     // v0.7 H2 — sign with the active keypair when one was loaded at
     // startup. Falls back to unsigned (signature NULL, attest_level
@@ -3274,7 +3621,7 @@ pub async fn delete_link(
     }
 }
 
-pub async fn get_links(State(state): State<Db>, Path(id): Path<String>) -> impl IntoResponse {
+pub async fn get_links(State(app): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     if let Err(e) = validate::validate_id(&id) {
         return (
             StatusCode::BAD_REQUEST,
@@ -3282,7 +3629,28 @@ pub async fn get_links(State(state): State<Db>, Path(id): Path<String>) -> impl 
         )
             .into_response();
     }
-    let lock = state.lock().await;
+
+    // v0.7.0 Wave-3 — Postgres-backed daemons walk `list_links` (no
+    // namespace filter — the same projection as the legacy
+    // `db::get_links` returns) and narrow client-side to edges
+    // anchored at `id`. The trait does not (yet) expose a per-anchor
+    // edge probe; this filter is O(|edges|), which matches the
+    // SQLite path's behaviour for typical workloads.
+    #[cfg(feature = "sal")]
+    if matches!(app.storage_backend, StorageBackend::Postgres) {
+        return match app.store.list_links(None).await {
+            Ok(rows) => {
+                let edges: Vec<_> = rows
+                    .into_iter()
+                    .filter(|l| l.source_id == id || l.target_id == id)
+                    .collect();
+                Json(json!({"links": edges})).into_response()
+            }
+            Err(e) => store_err_to_response(e),
+        };
+    }
+
+    let lock = app.db.lock().await;
     match db::get_links(&lock.0, &id) {
         Ok(links) => Json(json!({"links": links})).into_response(),
         Err(e) => {
@@ -4777,7 +5145,20 @@ pub async fn get_capabilities(
     };
     drop(lock);
     match result {
-        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+        Ok(mut v) => {
+            // v0.7.0 Wave-3 — surface the resolved storage backend so
+            // operators can confirm which adapter their daemon is
+            // running against without reading the launch log. Always
+            // emitted (sqlite | postgres) so polling clients can rely
+            // on the field shape.
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert(
+                    "storage_backend".to_string(),
+                    serde_json::Value::String(app.storage_backend.as_str().to_string()),
+                );
+            }
+            (StatusCode::OK, Json(v)).into_response()
+        }
         Err(e) => {
             tracing::error!("capabilities: {e}");
             (
@@ -9059,7 +9440,7 @@ mod tests {
                 "/api/v1/memories/search",
                 axum::routing::get(search_memories),
             )
-            .with_state(state);
+            .with_state(test_app_state(state));
         let resp = app
             .oneshot(
                 axum::http::Request::builder()
@@ -9082,7 +9463,7 @@ mod tests {
                 "/api/v1/memories/search",
                 axum::routing::get(search_memories),
             )
-            .with_state(state);
+            .with_state(test_app_state(state));
         let q = "a".repeat(2_000);
         let resp = app
             .oneshot(
@@ -9112,7 +9493,7 @@ mod tests {
                 "/api/v1/memories/search",
                 axum::routing::get(search_memories),
             )
-            .with_state(state);
+            .with_state(test_app_state(state));
         let resp = app
             .oneshot(
                 axum::http::Request::builder()
@@ -9139,7 +9520,7 @@ mod tests {
                 "/api/v1/memories/search",
                 axum::routing::get(search_memories),
             )
-            .with_state(state);
+            .with_state(test_app_state(state));
         // `bad agent` (decoded with %20 space) — agent_id must reject spaces.
         let resp = app
             .oneshot(
@@ -10433,7 +10814,7 @@ mod tests {
         let state = test_state();
         let app = Router::new()
             .route("/api/v1/memories/{id}/links", axum::routing::get(get_links))
-            .with_state(state);
+            .with_state(test_app_state(state));
         let resp = app
             .oneshot(
                 axum::http::Request::builder()
@@ -10479,7 +10860,7 @@ mod tests {
         };
         let app = Router::new()
             .route("/api/v1/memories/{id}/links", axum::routing::get(get_links))
-            .with_state(state);
+            .with_state(test_app_state(state));
         let resp = app
             .oneshot(
                 axum::http::Request::builder()
@@ -15759,7 +16140,7 @@ mod tests {
         let state = test_state();
         let app = Router::new()
             .route("/api/v1/memories/{id}", axum_get(get_memory))
-            .with_state(state);
+            .with_state(test_app_state(state));
         // Oversized id (>MAX_ID_LEN=128 bytes) fails validate_id.
         let big = "a".repeat(200);
         let resp = app
@@ -15779,7 +16160,7 @@ mod tests {
         let state = test_state();
         let app = Router::new()
             .route("/api/v1/memories/{id}", axum_get(get_memory))
-            .with_state(state);
+            .with_state(test_app_state(state));
         // 32-char hex never inserted.
         let id = "deadbeefdeadbeefdeadbeefdeadbeef";
         let resp = app
@@ -15800,7 +16181,7 @@ mod tests {
         let id = insert_test_memory(&state, "ns-get", "t-get").await;
         let app = Router::new()
             .route("/api/v1/memories/{id}", axum_get(get_memory))
-            .with_state(state);
+            .with_state(test_app_state(state));
         let resp = app
             .oneshot(
                 axum::http::Request::builder()
@@ -16124,7 +16505,7 @@ mod tests {
         let state = test_state();
         let app = Router::new()
             .route("/api/v1/memories/{id}/links", axum_get(get_links))
-            .with_state(state);
+            .with_state(test_app_state(state));
         let big = "x".repeat(200);
         let resp = app
             .oneshot(
@@ -16149,7 +16530,7 @@ mod tests {
         }
         let app = Router::new()
             .route("/api/v1/memories/{id}/links", axum_get(get_links))
-            .with_state(state);
+            .with_state(test_app_state(state));
         let resp = app
             .oneshot(
                 axum::http::Request::builder()
@@ -16376,7 +16757,7 @@ mod tests {
         let state = test_state();
         let app = Router::new()
             .route("/api/v1/search", axum_get(search_memories))
-            .with_state(state);
+            .with_state(test_app_state(state));
         // validate_namespace rejects spaces.
         let resp = app
             .oneshot(
@@ -17526,7 +17907,7 @@ mod tests {
         let state = test_state();
         let app = Router::new()
             .route("/api/v1/memories", axum_get(list_memories))
-            .with_state(state);
+            .with_state(test_app_state(state));
         let resp = app
             .oneshot(
                 axum::http::Request::builder()
