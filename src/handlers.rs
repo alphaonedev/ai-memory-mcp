@@ -2863,7 +2863,11 @@ pub async fn recall_memories_get(
 ) -> impl IntoResponse {
     // Accept either `context` (canonical) or `query` (cert harness
     // alias — S79 uses `?query=…`). Cert oracles continue to work.
-    let ctx = p.context.clone().or_else(|| p.query.clone()).unwrap_or_default();
+    let ctx = p
+        .context
+        .clone()
+        .or_else(|| p.query.clone())
+        .unwrap_or_default();
     if ctx.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -3627,10 +3631,8 @@ pub async fn get_taxonomy(
         // Build by ensuring every ancestor node exists (own_count = 0
         // for synthesised intermediates), then accumulating subtree
         // counts bottom-up via stable iteration.
-        let mut nodes: std::collections::BTreeMap<
-            String,
-            (usize /* own */, usize /* subtree */),
-        > = std::collections::BTreeMap::new();
+        let mut nodes: std::collections::BTreeMap<String, (usize /* own */, usize /* subtree */)> =
+            std::collections::BTreeMap::new();
         for (ns, cnt) in &pairs {
             let cnt_us = usize::try_from(*cnt).unwrap_or(0);
             // Ensure each prefix-segment ancestor exists (above prefix_owned
@@ -4065,10 +4067,7 @@ pub async fn entity_register(
                     .into_iter()
                     .find(|m| {
                         m.title == body.canonical_name
-                            && m.metadata
-                                .get("kind")
-                                .and_then(|v| v.as_str())
-                                == Some("entity")
+                            && m.metadata.get("kind").and_then(|v| v.as_str()) == Some("entity")
                     })
                     .and_then(|m| {
                         m.metadata
@@ -7239,9 +7238,7 @@ pub async fn get_inbox(
                         // treated as unread, mirroring the SQLite
                         // contract.
                         if q.unread_only.unwrap_or(false) {
-                            m.metadata
-                                .get("read")
-                                .and_then(serde_json::Value::as_bool)
+                            m.metadata.get("read").and_then(serde_json::Value::as_bool)
                                 != Some(true)
                         } else {
                             true
@@ -7638,9 +7635,7 @@ pub async fn list_subscriptions(
     // round-trips through the persistent store.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        let ctx = crate::store::CallerContext::for_agent(
-            q.agent_id.as_deref().unwrap_or("daemon"),
-        );
+        let ctx = crate::store::CallerContext::for_agent(q.agent_id.as_deref().unwrap_or("daemon"));
         // When `agent_id` is supplied, scope to `_subscriptions/<aid>`;
         // otherwise scan every `_subscriptions/...` namespace via
         // `taxonomy_namespaces` + per-namespace listing.
