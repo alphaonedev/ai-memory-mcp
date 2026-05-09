@@ -10,12 +10,12 @@
 //!   through the SAL trait; archive-on-forget moves rows correctly.
 //! - Phase 14 (consolidate): merging multiple sources into one preserves
 //!   `consolidated_from_agents` provenance.
-//! - Phase 15 (detect_contradictions): pairwise heuristic on postgres.
+//! - Phase 15 (`detect_contradictions`): pairwise heuristic on postgres.
 //! - Phase 16 (notify): cross-agent inbox push lands the memory under
 //!   `_inbox/<target>` with `metadata.target_agent_id`.
 //! - Phase 17 (gc): forced gc cycle deletes expired rows.
 //! - Phase 18 (import/export): bulk import + export round-trip.
-//! - Phase 19 (archive write paths): restore + purge + archive_by_ids.
+//! - Phase 19 (archive write paths): restore + purge + `archive_by_ids`.
 //! - Phase 20 (governance): inheritance-chain walk on writes blocks
 //!   non-owner stores under `governance.write = "owner"`; consensus
 //!   approvals require N registered voters.
@@ -349,7 +349,7 @@ async fn notify_lands_in_target_inbox_via_sal() {
 // Phase 17 — gc
 // ===================================================================
 
-/// Forced gc cycle on a clean database returns expired_deleted=0.
+/// Forced gc cycle on a clean database returns `expired_deleted=0`.
 #[tokio::test(flavor = "multi_thread")]
 async fn gc_clean_db_returns_zero_via_sal() {
     let Some(url) = postgres_url() else {
@@ -375,7 +375,7 @@ async fn gc_clean_db_returns_zero_via_sal() {
 // Phase 18 — import/export
 // ===================================================================
 
-/// Export returns memories + links + count + exported_at.
+/// Export returns memories + links + count + `exported_at`.
 #[tokio::test(flavor = "multi_thread")]
 async fn export_returns_full_envelope_via_sal() {
     let Some(url) = postgres_url() else {
@@ -509,7 +509,7 @@ async fn restore_missing_id_returns_404_via_sal() {
 // Phase 20 — full governance pipeline
 // ===================================================================
 
-/// approve_pending against an unknown id returns 404 Rejected.
+/// `approve_pending` against an unknown id returns 404 Rejected.
 #[tokio::test(flavor = "multi_thread")]
 async fn approve_unknown_pending_id_rejected_via_sal() {
     let Some(url) = postgres_url() else {
