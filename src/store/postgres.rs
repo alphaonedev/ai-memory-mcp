@@ -4445,25 +4445,32 @@ impl MemoryStore for PostgresStore {
             super::GovernedAction::Promote => &policy.promote,
         };
 
-        // Resolve the namespace owner for the Store path so the
-        // `Owner`-level check can compare against the standard memory's
-        // agent_id. For Delete/Promote the memory's own owner is used
-        // (the caller passes it in via `memory_owner`).
+        // v0.7.0 Wave-3 Continuation 4 (Bucket C / S60+S80) — resolve
+        // the namespace owner via the inheritance chain. Walks leaf→root
+        // (matching `resolve_governance_policy`) so a write to
+        // `parent/sub/deep` finds the standard pinned at `parent`. The
+        // F1/F8 sqlite fix (commit history) layered the chain walk on
+        // the sqlite path; this lights the same posture up on postgres.
         let ns_owner = if matches!(action, super::GovernedAction::Store) {
-            self.resolve_governance_policy(namespace).await?;
-            // Read the standard memory's agent_id directly from
-            // namespace_meta + memories.
-            let row: Option<(Option<String>,)> = sqlx::query_as(
-                "SELECT m.metadata->>'agent_id' AS agent_id \
-                 FROM namespace_meta nm \
-                 JOIN memories m ON m.id = nm.standard_id \
-                 WHERE nm.namespace = $1",
-            )
-            .bind(namespace)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| to_store_err("namespace_owner lookup", e))?;
-            row.and_then(|(o,)| o)
+            let chain = self.build_namespace_chain(namespace).await?;
+            let mut found: Option<String> = None;
+            for ns in chain.into_iter().rev() {
+                let row: Option<(Option<String>,)> = sqlx::query_as(
+                    "SELECT m.metadata->>'agent_id' AS agent_id \
+                     FROM namespace_meta nm \
+                     JOIN memories m ON m.id = nm.standard_id \
+                     WHERE nm.namespace = $1",
+                )
+                .bind(&ns)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| to_store_err("namespace_owner chain lookup", e))?;
+                if let Some((Some(o),)) = row {
+                    found = Some(o);
+                    break;
+                }
+            }
+            found
         } else {
             None
         };
