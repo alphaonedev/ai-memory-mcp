@@ -74,6 +74,14 @@ fn free_port() -> u16 {
 }
 
 async fn build_postgres_app_state(url: &str) -> AppState {
+    // Match the production daemon's posture: `permissions.mode = enforce`
+    // is the v0.7.0 default. Without this, the test in-process daemon
+    // boots in Advisory mode (the static OnceLock fallback) and Bucket C
+    // governance scenarios silently pass through Allow.
+    ai_memory::config::override_active_permissions_mode_for_test(
+        ai_memory::config::PermissionsMode::Enforce,
+    );
+
     let conn = ai_memory::db::open(std::path::Path::new(":memory:")).expect("scratch sqlite");
     let path = std::path::PathBuf::from(":memory:");
     let db: Db = Arc::new(Mutex::new((conn, path, ResolvedTtl::default(), true)));
