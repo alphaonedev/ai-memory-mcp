@@ -924,6 +924,30 @@ pub async fn create_memory(
         let ctx = crate::store::CallerContext::for_agent(agent_id.clone());
         return match app.store.store(&ctx, &mem).await {
             Ok(id) => {
+                // v0.7.0 Wave-3 Continuation 2 Phase 9 — audit emit on
+                // postgres write. The audit module is file-based with no
+                // SQLite coupling, so the emit chains through the same
+                // hash + sequence ladder as a sqlite-backed write. The
+                // F2 fix (cross-restart sequence persistence) lights up
+                // for postgres-backed daemons through this path.
+                if crate::audit::is_enabled() {
+                    let scope = mem
+                        .metadata
+                        .get("scope")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    crate::audit::emit(crate::audit::EventBuilder::new(
+                        crate::audit::AuditAction::Store,
+                        crate::audit::actor(agent_id.clone(), "http_body", scope.clone()),
+                        crate::audit::target_memory(
+                            id.clone(),
+                            mem.namespace.clone(),
+                            Some(mem.title.clone()),
+                            Some(mem.tier.to_string()),
+                            scope,
+                        ),
+                    ));
+                }
                 let mut payload = serde_json::to_value(&mem).unwrap_or_else(|_| json!({}));
                 if let Some(obj) = payload.as_object_mut() {
                     obj.insert("id".to_string(), serde_json::Value::String(id));
@@ -1997,10 +2021,35 @@ pub async fn delete_memory(
     // `docs/postgres-age-guide.md`.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        let _ = headers;
-        let ctx = crate::store::CallerContext::for_agent("ai:http");
+        // Resolve the target memory before delete so the audit emit
+        // captures namespace + title metadata (Phase 9 — audit emit
+        // parity on postgres).
+        let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+        let agent_id = crate::identity::resolve_http_agent_id(None, header_agent_id)
+            .unwrap_or_else(|_| "ai:http".to_string());
+        let ctx = crate::store::CallerContext::for_agent(agent_id.clone());
+        let target = app.store.get(&ctx, &id).await.ok();
         return match app.store.delete(&ctx, &id).await {
-            Ok(()) => (StatusCode::OK, Json(json!({"deleted": true, "id": id}))).into_response(),
+            Ok(()) => {
+                if crate::audit::is_enabled() {
+                    let (namespace, title, tier) = target
+                        .as_ref()
+                        .map(|m| {
+                            (
+                                m.namespace.clone(),
+                                Some(m.title.clone()),
+                                Some(m.tier.to_string()),
+                            )
+                        })
+                        .unwrap_or_else(|| (String::new(), None, None));
+                    crate::audit::emit(crate::audit::EventBuilder::new(
+                        crate::audit::AuditAction::Delete,
+                        crate::audit::actor(agent_id, "http_header", None),
+                        crate::audit::target_memory(id.clone(), namespace, title, tier, None),
+                    ));
+                }
+                (StatusCode::OK, Json(json!({"deleted": true, "id": id}))).into_response()
+            }
             Err(e) => store_err_to_response(e),
         };
     }
@@ -4128,17 +4177,32 @@ pub async fn create_link(
             .link_signed(&ctx, &link, app.active_keypair.as_ref().as_ref())
             .await
         {
-            Ok(attest_level) => (
-                StatusCode::CREATED,
-                Json(json!({
-                    "linked": true,
-                    "source_id": body.source_id,
-                    "target_id": body.target_id,
-                    "relation": body.relation,
-                    "attest_level": attest_level,
-                })),
-            )
-                .into_response(),
+            Ok(attest_level) => {
+                if crate::audit::is_enabled() {
+                    crate::audit::emit(crate::audit::EventBuilder::new(
+                        crate::audit::AuditAction::Link,
+                        crate::audit::actor("ai:http", "http_body", None),
+                        crate::audit::target_memory(
+                            body.source_id.clone(),
+                            String::new(),
+                            Some(format!("{} -> {}", body.target_id, body.relation)),
+                            None,
+                            None,
+                        ),
+                    ));
+                }
+                (
+                    StatusCode::CREATED,
+                    Json(json!({
+                        "linked": true,
+                        "source_id": body.source_id,
+                        "target_id": body.target_id,
+                        "relation": body.relation,
+                        "attest_level": attest_level,
+                    })),
+                )
+                    .into_response()
+            }
             Err(e) => store_err_to_response(e),
         };
     }
