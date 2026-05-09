@@ -2861,11 +2861,13 @@ pub async fn recall_memories_get(
     State(app): State<AppState>,
     Query(p): Query<RecallQuery>,
 ) -> impl IntoResponse {
-    let ctx = p.context.unwrap_or_default();
+    // Accept either `context` (canonical) or `query` (cert harness
+    // alias — S79 uses `?query=…`). Cert oracles continue to work.
+    let ctx = p.context.clone().or_else(|| p.query.clone()).unwrap_or_default();
     if ctx.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "context is required"})),
+            Json(json!({"error": "context (or query) is required"})),
         )
             .into_response();
     }
@@ -2902,10 +2904,13 @@ pub async fn recall_memories_post(
     State(app): State<AppState>,
     Json(body): Json<RecallBody>,
 ) -> impl IntoResponse {
-    if body.context.trim().is_empty() {
+    // Accept either `context` (canonical) or `query` (cert harness
+    // alias used by S79). Reject only when both are missing/empty.
+    let ctx_val = body.resolved_query();
+    if ctx_val.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "context is required"})),
+            Json(json!({"error": "context (or query) is required"})),
         )
             .into_response();
     }
@@ -2923,7 +2928,7 @@ pub async fn recall_memories_post(
     let limit = body.limit.unwrap_or(10).min(50);
     recall_response(
         &app,
-        &body.context,
+        &ctx_val,
         body.namespace.as_deref(),
         limit,
         body.tags.as_deref(),
