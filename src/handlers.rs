@@ -420,8 +420,29 @@ pub fn postgres_endpoint_supported(method: &axum::http::Method, path: &str) -> b
         ("DELETE", p) if namespace_standard_delete_path(p) => true,
         ("POST", "/api/v1/namespaces") => true,
         ("DELETE", "/api/v1/namespaces") => true,
+        // Wave-3 Continuation 3 — lifecycle write paths (Phase 13/14/16/17/18/19).
+        ("POST", "/api/v1/forget") => true,
+        ("POST", "/api/v1/consolidate") => true,
+        ("GET", "/api/v1/contradictions") => true,
+        ("POST", "/api/v1/notify") => true,
+        ("POST", "/api/v1/gc") => true,
+        ("POST", "/api/v1/import") => true,
+        ("GET", "/api/v1/export") => true,
+        ("POST", "/api/v1/archive") => true,
+        ("DELETE", "/api/v1/archive") => true,
+        ("POST", "/api/v1/archive/purge") => true,
+        ("POST", p) if archive_restore_path(p) => true,
         _ => false,
     }
+}
+
+/// Path matcher for `/api/v1/archive/{id}/restore`.
+#[cfg(feature = "sal")]
+fn archive_restore_path(p: &str) -> bool {
+    let Some(rest) = p.strip_prefix("/api/v1/archive/") else {
+        return false;
+    };
+    rest.ends_with("/restore") && rest.split('/').count() == 2
 }
 
 /// Path matcher for `/api/v1/pending/{id}/approve|reject`.
@@ -3032,10 +3053,36 @@ async fn recall_response(
 }
 
 pub async fn forget_memories(
-    State(state): State<Db>,
+    State(app): State<AppState>,
     Json(body): Json<ForgetQuery>,
 ) -> impl IntoResponse {
-    let lock = state.lock().await;
+    // v0.7.0 Wave-3 Continuation 3 (Phase 13) — route through SAL trait
+    // on postgres-backed daemons. Sqlite-backed daemons keep the legacy
+    // `db::forget` free-function path verbatim.
+    #[cfg(feature = "sal")]
+    if matches!(app.storage_backend, StorageBackend::Postgres) {
+        let archive_flag = {
+            let lock = app.db.lock().await;
+            lock.3
+        };
+        let ctx = crate::store::CallerContext::for_agent("http");
+        return match app
+            .store
+            .forget(
+                &ctx,
+                body.namespace.as_deref(),
+                body.pattern.as_deref(),
+                body.tier.as_ref(),
+                archive_flag,
+            )
+            .await
+        {
+            Ok(n) => Json(json!({"deleted": n})).into_response(),
+            Err(e) => store_err_to_response(e),
+        };
+    }
+
+    let lock = app.db.lock().await;
     match db::forget(
         &lock.0,
         body.namespace.as_deref(),
@@ -12300,7 +12347,7 @@ mod tests {
         }
         let app = Router::new()
             .route("/api/v1/forget", axum_post(forget_memories))
-            .with_state(state);
+            .with_state(test_app_state(state));
         let body = serde_json::json!({"namespace": "forget-target"});
         let resp = app
             .oneshot(
@@ -13355,7 +13402,7 @@ mod tests {
         let state = test_state();
         let app = Router::new()
             .route("/api/v1/forget", axum_post(forget_memories))
-            .with_state(state);
+            .with_state(test_app_state(state));
         let body = serde_json::json!({});
         let resp = app
             .oneshot(
@@ -13405,7 +13452,7 @@ mod tests {
         }
         let app = Router::new()
             .route("/api/v1/forget", axum_post(forget_memories))
-            .with_state(state);
+            .with_state(test_app_state(state));
         let body = serde_json::json!({"pattern": "delete-me"});
         let resp = app
             .oneshot(
@@ -13457,7 +13504,7 @@ mod tests {
         }
         let app = Router::new()
             .route("/api/v1/forget", axum_post(forget_memories))
-            .with_state(state);
+            .with_state(test_app_state(state));
         let body = serde_json::json!({"tier": "short"});
         let resp = app
             .oneshot(
@@ -13516,7 +13563,7 @@ mod tests {
         }
         let app = Router::new()
             .route("/api/v1/forget", axum_post(forget_memories))
-            .with_state(state);
+            .with_state(test_app_state(state));
         let body = serde_json::json!({
             "namespace": "h8a-forget-and",
             "pattern": "purge"
@@ -13547,7 +13594,7 @@ mod tests {
         let state = test_state();
         let app = Router::new()
             .route("/api/v1/forget", axum_post(forget_memories))
-            .with_state(state);
+            .with_state(test_app_state(state));
         let resp = app
             .oneshot(
                 axum::http::Request::builder()
@@ -13573,7 +13620,7 @@ mod tests {
         }
         let app = Router::new()
             .route("/api/v1/forget", axum_post(forget_memories))
-            .with_state(state.clone());
+            .with_state(test_app_state(state.clone()));
         let body = serde_json::json!({"namespace": "h8a-forget-empty"});
         let resp = app
             .oneshot(
@@ -18146,7 +18193,7 @@ mod tests {
         let state = test_state();
         let app = Router::new()
             .route("/api/v1/forget", axum_post(forget_memories))
-            .with_state(state);
+            .with_state(test_app_state(state));
         let body = serde_json::json!({"namespace": "no-such-ns"});
         let resp = app
             .oneshot(

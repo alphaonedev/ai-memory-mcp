@@ -723,6 +723,155 @@ pub trait MemoryStore: Send + Sync {
             capability: "GOVERNANCE_GET_STANDARD".to_string(),
         })
     }
+
+    // ==================================================================
+    // v0.7.0 Wave-3 Continuation 3 — lifecycle write paths
+    // (Phase 13/14/16/17/18/19).
+    //
+    // These trait methods cover the remaining sqlite-only HTTP endpoints
+    // so postgres-backed daemons can serve them without falling through
+    // to the 501 envelope. Default implementations return
+    // `UnsupportedCapability`; both adapters override.
+    // ==================================================================
+
+    /// Forget memories matching a (namespace, pattern, tier) filter.
+    /// Returns the count deleted. When `archive` is true, matching rows
+    /// are inserted into the archive table with `archive_reason='forget'`
+    /// before deletion. At least one of namespace/pattern/tier must be
+    /// non-None — adapters return `InvalidInput` otherwise.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    async fn forget(
+        &self,
+        _ctx: &CallerContext,
+        _namespace: Option<&str>,
+        _pattern: Option<&str>,
+        _tier: Option<&Tier>,
+        _archive: bool,
+    ) -> StoreResult<usize> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "FORGET".to_string(),
+        })
+    }
+
+    /// Consolidate a set of memory ids into a single new memory. Returns
+    /// the new memory's id. Adapters MUST:
+    /// 1. Verify all source ids exist (else `NotFound`).
+    /// 2. Merge tags (de-duplicated, sorted) + metadata (skipping
+    ///    `agent_id` to avoid forgery).
+    /// 3. Take `max(priority)` across sources; `sum(access_count)`.
+    /// 4. Stamp `consolidator_agent_id` as the new `metadata.agent_id`.
+    /// 5. Preserve original authors in `metadata.consolidated_from_agents`.
+    /// 6. Record source ids in `metadata.derived_from`.
+    /// 7. Delete the source rows.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    async fn consolidate(
+        &self,
+        _ctx: &CallerContext,
+        _ids: &[String],
+        _title: &str,
+        _summary: &str,
+        _namespace: &str,
+        _tier: &Tier,
+        _source: &str,
+        _consolidator_agent_id: &str,
+    ) -> StoreResult<String> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "CONSOLIDATE".to_string(),
+        })
+    }
+
+    /// Run a GC cycle: delete (or archive-then-delete) all memories
+    /// whose `expires_at` is in the past. Returns the count deleted.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    async fn run_gc(&self, _archive: bool) -> StoreResult<usize> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "GC".to_string(),
+        })
+    }
+
+    /// Restore an archived memory back to the live `memories` table.
+    /// Returns true iff a row was restored. Adapters MUST:
+    /// 1. Return Ok(false) when no archive row matches.
+    /// 2. Reject (Conflict) when the id already exists in active memories.
+    /// 3. Restore with `original_tier` / `original_expires_at` / embedding.
+    /// 4. Delete the archive row.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    async fn archive_restore(&self, _ctx: &CallerContext, _id: &str) -> StoreResult<bool> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ARCHIVE_RESTORE".to_string(),
+        })
+    }
+
+    /// Purge archived rows older than `older_than_days`. When `None`,
+    /// purge ALL archived rows (operator-confirmed full wipe). Returns
+    /// the count purged.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    async fn archive_purge(&self, _older_than_days: Option<i64>) -> StoreResult<usize> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ARCHIVE_PURGE".to_string(),
+        })
+    }
+
+    /// Soft-archive a set of memory ids. Returns the count moved into
+    /// the archive table. Adapters MUST stamp `archive_reason` (defaults
+    /// to `"manual"` when None) and preserve the original tier + expiry.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    async fn archive_by_ids(
+        &self,
+        _ctx: &CallerContext,
+        _ids: &[String],
+        _reason: Option<&str>,
+    ) -> StoreResult<usize> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ARCHIVE_BY_IDS".to_string(),
+        })
+    }
+
+    /// Export all live memories. Returns the full row set in stable
+    /// (id ascending) order; adapters MAY cap at a sane upper bound and
+    /// surface that via the response envelope.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    async fn export_memories(&self) -> StoreResult<Vec<Memory>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "EXPORT".to_string(),
+        })
+    }
+
+    /// Export all links. Returns the full link set in deterministic
+    /// `(source_id, target_id, relation)` order.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    async fn export_links(&self) -> StoreResult<Vec<MemoryLink>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "EXPORT_LINKS".to_string(),
+        })
+    }
+
+    /// Notify a target agent. Stamps a memory in the `_inbox` namespace
+    /// with the supplied payload + `metadata.target_agent_id =
+    /// target_agent`. Returns the new memory's id.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    async fn notify(
+        &self,
+        _ctx: &CallerContext,
+        _target_agent: &str,
+        _title: &str,
+        _payload: &str,
+        _priority: Option<i32>,
+        _tier: Option<&Tier>,
+    ) -> StoreResult<String> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "NOTIFY".to_string(),
+        })
+    }
 }
 
 /// Partial-update payload. `None` means "leave this field alone" —

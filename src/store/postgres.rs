@@ -3740,6 +3740,465 @@ impl MemoryStore for PostgresStore {
 
         self.store(ctx, &mem).await.map(|_| ())
     }
+
+    // v0.7.0 Wave-3 Continuation 3 — lifecycle write paths on postgres.
+
+    async fn forget(
+        &self,
+        _ctx: &CallerContext,
+        namespace: Option<&str>,
+        pattern: Option<&str>,
+        tier: Option<&Tier>,
+        archive: bool,
+    ) -> StoreResult<usize> {
+        if namespace.is_none() && pattern.is_none() && tier.is_none() {
+            return Err(StoreError::InvalidInput {
+                detail: "at least one of namespace, pattern, or tier is required".to_string(),
+            });
+        }
+        // Postgres uses ILIKE for the pattern match (no FTS5 here); the
+        // sqlite path uses an FTS query. Both are case-insensitive
+        // substring/token matches against title+content; we land on
+        // ILIKE over title || ' ' || content so the wire contract
+        // ("forget anything matching this string") is preserved.
+        let tier_str = tier.map(|t| t.as_str().to_string());
+        let pattern_like = pattern.map(|p| format!("%{p}%"));
+        let now = chrono::Utc::now().to_rfc3339();
+
+        if archive {
+            // Insert matching rows into archived_memories before deletion.
+            sqlx::query(
+                "INSERT INTO archived_memories (
+                    id, tier, namespace, title, content, tags, priority, confidence,
+                    source, access_count, created_at, updated_at, last_accessed_at,
+                    expires_at, archived_at, archive_reason, metadata,
+                    embedding, embedding_dim, original_tier, original_expires_at
+                )
+                SELECT id, tier, namespace, title, content, tags, priority, confidence,
+                       source, access_count, created_at, updated_at, last_accessed_at,
+                       expires_at, $4::timestamptz, 'forget', metadata,
+                       embedding, embedding_dim, tier, expires_at
+                FROM memories
+                WHERE ($1::text IS NULL OR namespace = $1)
+                  AND ($2::text IS NULL OR tier = $2)
+                  AND ($3::text IS NULL
+                       OR title ILIKE $3
+                       OR content ILIKE $3)
+                ON CONFLICT (id) DO UPDATE SET
+                    archived_at = EXCLUDED.archived_at,
+                    archive_reason = EXCLUDED.archive_reason",
+            )
+            .bind(namespace)
+            .bind(tier_str.as_deref())
+            .bind(pattern_like.as_deref())
+            .bind(parse_rfc3339_required(&now)?)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| to_store_err("forget archive copy", e))?;
+        }
+
+        let res = sqlx::query(
+            "DELETE FROM memories
+             WHERE ($1::text IS NULL OR namespace = $1)
+               AND ($2::text IS NULL OR tier = $2)
+               AND ($3::text IS NULL
+                    OR title ILIKE $3
+                    OR content ILIKE $3)",
+        )
+        .bind(namespace)
+        .bind(tier_str.as_deref())
+        .bind(pattern_like.as_deref())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| to_store_err("forget delete", e))?;
+
+        Ok(usize::try_from(res.rows_affected()).unwrap_or(0))
+    }
+
+    async fn consolidate(
+        &self,
+        _ctx: &CallerContext,
+        ids: &[String],
+        title: &str,
+        summary: &str,
+        namespace: &str,
+        tier: &Tier,
+        source: &str,
+        consolidator_agent_id: &str,
+    ) -> StoreResult<String> {
+        if ids.is_empty() {
+            return Err(StoreError::InvalidInput {
+                detail: "consolidate requires at least one source id".to_string(),
+            });
+        }
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin consolidate tx", e))?;
+
+        // Fetch source rows in one query, ordered by the input.
+        let mut max_priority: i32 = 5;
+        let mut all_tags: Vec<String> = Vec::new();
+        let mut total_access: i64 = 0;
+        let mut merged_metadata = serde_json::Map::new();
+        let mut source_agent_ids: Vec<String> = Vec::new();
+
+        for id in ids {
+            use sqlx::Row;
+            let row = sqlx::query(
+                "SELECT tags, priority, access_count, metadata FROM memories WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("consolidate fetch source", e))?;
+            let Some(row) = row else {
+                return Err(StoreError::NotFound { id: id.clone() });
+            };
+            let priority: i32 = row.try_get("priority").unwrap_or(5);
+            max_priority = max_priority.max(priority);
+            let access_count: i64 = row.try_get("access_count").unwrap_or(0);
+            total_access = total_access.saturating_add(access_count);
+            let tags_json: serde_json::Value = row.try_get("tags").unwrap_or(serde_json::json!([]));
+            if let Some(arr) = tags_json.as_array() {
+                for t in arr {
+                    if let Some(s) = t.as_str() {
+                        all_tags.push(s.to_string());
+                    }
+                }
+            }
+            let metadata: serde_json::Value =
+                row.try_get("metadata").unwrap_or(serde_json::json!({}));
+            if let serde_json::Value::Object(map) = metadata {
+                for (k, v) in map {
+                    if k == "agent_id" {
+                        if let serde_json::Value::String(aid) = &v
+                            && !source_agent_ids.contains(aid)
+                        {
+                            source_agent_ids.push(aid.clone());
+                        }
+                        continue;
+                    }
+                    merged_metadata.insert(k, v);
+                }
+            }
+        }
+
+        all_tags.sort();
+        all_tags.dedup();
+
+        merged_metadata.insert(
+            "derived_from".to_string(),
+            serde_json::Value::Array(
+                ids.iter()
+                    .map(|id| serde_json::Value::String(id.clone()))
+                    .collect(),
+            ),
+        );
+        merged_metadata.insert(
+            "agent_id".to_string(),
+            serde_json::Value::String(consolidator_agent_id.to_string()),
+        );
+        if !source_agent_ids.is_empty() {
+            merged_metadata.insert(
+                "consolidated_from_agents".to_string(),
+                serde_json::Value::Array(
+                    source_agent_ids
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
+            );
+        }
+        let merged_metadata_value = serde_json::Value::Object(merged_metadata);
+
+        let new_id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now();
+        let tags_value =
+            serde_json::to_value(&all_tags).map_err(|e| StoreError::IntegrityFailed {
+                detail: format!("serialize consolidated tags: {e}"),
+            })?;
+
+        sqlx::query(
+            "INSERT INTO memories (
+                id, tier, namespace, title, content, tags, priority, confidence,
+                source, access_count, created_at, updated_at, metadata
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, 1.0, $8, $9, $10, $10, $11)",
+        )
+        .bind(&new_id)
+        .bind(tier.as_str())
+        .bind(namespace)
+        .bind(title)
+        .bind(summary)
+        .bind(&tags_value)
+        .bind(max_priority)
+        .bind(source)
+        .bind(total_access)
+        .bind(now)
+        .bind(&merged_metadata_value)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("consolidate insert", e))?;
+
+        // Delete source rows.
+        for id in ids {
+            sqlx::query("DELETE FROM memories WHERE id = $1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("consolidate delete source", e))?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("consolidate commit", e))?;
+        Ok(new_id)
+    }
+
+    async fn run_gc(&self, archive: bool) -> StoreResult<usize> {
+        let now = chrono::Utc::now();
+        if archive {
+            sqlx::query(
+                "INSERT INTO archived_memories (
+                    id, tier, namespace, title, content, tags, priority, confidence,
+                    source, access_count, created_at, updated_at, last_accessed_at,
+                    expires_at, archived_at, archive_reason, metadata,
+                    embedding, embedding_dim, original_tier, original_expires_at
+                )
+                SELECT id, tier, namespace, title, content, tags, priority, confidence,
+                       source, access_count, created_at, updated_at, last_accessed_at,
+                       expires_at, $1::timestamptz, 'ttl_expired', metadata,
+                       embedding, embedding_dim, tier, expires_at
+                FROM memories
+                WHERE expires_at IS NOT NULL AND expires_at < $1
+                ON CONFLICT (id) DO UPDATE SET
+                    archived_at = EXCLUDED.archived_at,
+                    archive_reason = EXCLUDED.archive_reason",
+            )
+            .bind(now)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| to_store_err("gc archive copy", e))?;
+        }
+
+        let res =
+            sqlx::query("DELETE FROM memories WHERE expires_at IS NOT NULL AND expires_at < $1")
+                .bind(now)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| to_store_err("gc delete", e))?;
+
+        // Best-effort cleanup of namespace_meta dangling references.
+        let _ = sqlx::query(
+            "DELETE FROM namespace_meta \
+             WHERE standard_id NOT IN (SELECT id FROM memories)",
+        )
+        .execute(&self.pool)
+        .await;
+
+        Ok(usize::try_from(res.rows_affected()).unwrap_or(0))
+    }
+
+    async fn archive_restore(&self, _ctx: &CallerContext, id: &str) -> StoreResult<bool> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin archive_restore tx", e))?;
+
+        let exists: Option<(String,)> =
+            sqlx::query_as("SELECT id FROM archived_memories WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("archive_restore lookup", e))?;
+        if exists.is_none() {
+            return Ok(false);
+        }
+
+        // Reject if the id is already in active memories.
+        let active: Option<(String,)> = sqlx::query_as("SELECT id FROM memories WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("archive_restore active lookup", e))?;
+        if active.is_some() {
+            return Err(StoreError::Conflict { id: id.to_string() });
+        }
+
+        let now = chrono::Utc::now();
+        sqlx::query(
+            "INSERT INTO memories (
+                id, tier, namespace, title, content, tags, priority, confidence,
+                source, access_count, created_at, updated_at, last_accessed_at,
+                expires_at, metadata, embedding, embedding_dim
+            )
+            SELECT id, COALESCE(original_tier, 'long'), namespace, title, content,
+                   tags, priority, confidence, source, access_count, created_at,
+                   $1::timestamptz, last_accessed_at, original_expires_at, metadata,
+                   embedding, embedding_dim
+            FROM archived_memories WHERE id = $2",
+        )
+        .bind(now)
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("archive_restore insert", e))?;
+
+        sqlx::query("DELETE FROM archived_memories WHERE id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("archive_restore delete", e))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("archive_restore commit", e))?;
+        Ok(true)
+    }
+
+    async fn archive_purge(&self, older_than_days: Option<i64>) -> StoreResult<usize> {
+        let res = match older_than_days {
+            Some(days) if days < 0 => {
+                return Err(StoreError::InvalidInput {
+                    detail: format!("older_than_days must be non-negative (got {days})"),
+                });
+            }
+            Some(days) => {
+                let cutoff = chrono::Utc::now() - chrono::Duration::days(days);
+                sqlx::query("DELETE FROM archived_memories WHERE archived_at < $1")
+                    .bind(cutoff)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(|e| to_store_err("archive_purge", e))?
+            }
+            None => sqlx::query("DELETE FROM archived_memories")
+                .execute(&self.pool)
+                .await
+                .map_err(|e| to_store_err("archive_purge all", e))?,
+        };
+        Ok(usize::try_from(res.rows_affected()).unwrap_or(0))
+    }
+
+    async fn archive_by_ids(
+        &self,
+        _ctx: &CallerContext,
+        ids: &[String],
+        reason: Option<&str>,
+    ) -> StoreResult<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let mut moved = 0usize;
+        let now = chrono::Utc::now();
+        let archive_reason = reason.unwrap_or("manual");
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin archive_by_ids tx", e))?;
+
+        for id in ids {
+            // Probe existence first so we can return an accurate count.
+            let exists: Option<(String,)> = sqlx::query_as("SELECT id FROM memories WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("archive_by_ids exists", e))?;
+            if exists.is_none() {
+                continue;
+            }
+            sqlx::query(
+                "INSERT INTO archived_memories (
+                    id, tier, namespace, title, content, tags, priority, confidence,
+                    source, access_count, created_at, updated_at, last_accessed_at,
+                    expires_at, archived_at, archive_reason, metadata,
+                    embedding, embedding_dim, original_tier, original_expires_at
+                )
+                SELECT id, tier, namespace, title, content, tags, priority, confidence,
+                       source, access_count, created_at, updated_at, last_accessed_at,
+                       expires_at, $1::timestamptz, $2::text, metadata,
+                       embedding, embedding_dim, tier, expires_at
+                FROM memories WHERE id = $3
+                ON CONFLICT (id) DO UPDATE SET
+                    archived_at = EXCLUDED.archived_at,
+                    archive_reason = EXCLUDED.archive_reason",
+            )
+            .bind(now)
+            .bind(archive_reason)
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("archive_by_ids insert", e))?;
+            sqlx::query("DELETE FROM memories WHERE id = $1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("archive_by_ids delete", e))?;
+            moved += 1;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("archive_by_ids commit", e))?;
+        Ok(moved)
+    }
+
+    async fn export_memories(&self) -> StoreResult<Vec<Memory>> {
+        // Reuse the existing list path with an unbounded filter — postgres
+        // adapter's `list` already projects the full Memory shape and the
+        // ATOMIC_MULTI_WRITE-class semantics make a snapshot read safe.
+        let ctx = CallerContext::for_agent("export");
+        let filter = Filter {
+            limit: 100_000,
+            ..Filter::default()
+        };
+        self.list(&ctx, &filter).await
+    }
+
+    async fn export_links(&self) -> StoreResult<Vec<MemoryLink>> {
+        // Delegate to the existing `list_links` trait method (no
+        // namespace filter ⇒ full graph).
+        self.list_links(None).await
+    }
+
+    async fn notify(
+        &self,
+        ctx: &CallerContext,
+        target_agent: &str,
+        title: &str,
+        payload: &str,
+        priority: Option<i32>,
+        tier: Option<&Tier>,
+    ) -> StoreResult<String> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let resolved_tier = tier.cloned().unwrap_or(Tier::Short);
+        let priority = priority.unwrap_or(5);
+        let metadata = serde_json::json!({
+            "agent_id": &ctx.agent_id,
+            "target_agent_id": target_agent,
+            "notify": true,
+        });
+        let mem = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: resolved_tier,
+            namespace: format!("_inbox/{target_agent}"),
+            title: title.to_string(),
+            content: payload.to_string(),
+            tags: vec!["notify".to_string()],
+            priority,
+            confidence: 1.0,
+            source: "notify".to_string(),
+            access_count: 0,
+            created_at: now.clone(),
+            updated_at: now,
+            last_accessed_at: None,
+            expires_at: None,
+            metadata,
+        };
+        self.store(ctx, &mem).await
+    }
 }
 
 // ----------------------------------------------------------------------
