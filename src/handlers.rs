@@ -3802,21 +3802,84 @@ pub async fn check_duplicate(
     }
     let threshold = body.threshold.unwrap_or(db::DUPLICATE_THRESHOLD_DEFAULT);
 
-    // v0.7.0 Wave-3 Continuation — postgres-backed daemons surface a
-    // "no duplicate found" envelope (with a structured note) when the
-    // semantic similarity scan is not wired through the SAL surface
-    // yet. The wire envelope matches the SQLite path's no-match shape
-    // so existing clients are not surprised.
+    // v0.7.0 Wave-3 Continuation 4 (Bucket E / S48) — postgres-backed
+    // daemons now perform an exact-content sweep through the SAL
+    // `list` projection. When an embedder is loaded the call also
+    // computes the query embedding and hands it to
+    // `recall_hybrid`; the highest-cosine match becomes the nearest
+    // candidate. Without an embedder the fallback walks the
+    // namespace via `list` and surfaces any row whose
+    // `(title, content)` tuple matches exactly (the same content-hash
+    // short-circuit `db::check_duplicate_with_text` uses on sqlite,
+    // before the embedding pass).
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
+        let ctx = crate::store::CallerContext::for_agent("daemon");
+        let filter = crate::store::Filter {
+            namespace: namespace.map(str::to_string),
+            limit: 1000,
+            ..Default::default()
+        };
+        let mut nearest: Option<(crate::models::Memory, f64)> = None;
+        let mut scanned = 0_u64;
+        // Exact-content sweep first — cheap, deterministic, no embed.
+        match app.store.list(&ctx, &filter).await {
+            Ok(rows) => {
+                for m in rows {
+                    scanned += 1;
+                    if m.content == body.content && m.title == body.title {
+                        nearest = Some((m, 1.0));
+                        break;
+                    }
+                }
+            }
+            Err(e) => return store_err_to_response(e),
+        }
+        // If exact match didn't surface, optionally try embedding-based
+        // hybrid recall with the title+content as the query.
+        if nearest.is_none()
+            && let Some(emb) = app.embedder.as_ref().as_ref()
+        {
+            let embedding_text = format!("{} {}", body.title, body.content);
+            if let Ok(qe) = emb.embed(&embedding_text) {
+                let recall_filter = crate::store::Filter {
+                    namespace: namespace.map(str::to_string),
+                    limit: 5,
+                    ..Default::default()
+                };
+                if let Ok(scored_pairs) = app
+                    .store
+                    .recall_hybrid(&ctx, &embedding_text, Some(&qe), &recall_filter)
+                    .await
+                {
+                    if let Some((m, s)) = scored_pairs.into_iter().next() {
+                        nearest = Some((m, s));
+                    }
+                }
+                drop(qe);
+            }
+        }
+        let (is_duplicate, near_json) = if let Some((m, score)) = nearest {
+            let is_dup = score >= f64::from(threshold);
+            (
+                is_dup,
+                json!({
+                    "id": m.id,
+                    "title": m.title,
+                    "namespace": m.namespace,
+                    "score": score,
+                }),
+            )
+        } else {
+            (false, serde_json::Value::Null)
+        };
         return Json(json!({
-            "is_duplicate": false,
+            "is_duplicate": is_duplicate,
             "threshold": threshold,
-            "nearest": null,
-            "suggested_merge": null,
-            "candidates_scanned": 0,
+            "nearest": near_json,
+            "suggested_merge": is_duplicate,
+            "candidates_scanned": scanned,
             "storage_backend": "postgres",
-            "note": "semantic duplicate detection is sqlite-only in v0.7.0",
         }))
         .into_response();
     }
