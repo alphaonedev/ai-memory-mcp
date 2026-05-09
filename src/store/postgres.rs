@@ -53,9 +53,13 @@ use sqlx::{PgPool, Row};
 
 use super::{
     CallerContext, Capabilities, Filter, KgBackend, KgInvalidateRow, KgQueryRow, KgTimelineRow,
-    MemoryStore, StoreError, StoreResult, UpdatePatch, VerifyReport,
+    MemoryStore, StoreError, StoreResult, UpdatePatch, VerifyFilter, VerifyLinkReport,
+    VerifyReport,
 };
 use crate::models::{AgentRegistration, Memory, MemoryLink, Tier};
+use crate::quotas::{
+    DEFAULT_MAX_LINKS_PER_DAY, DEFAULT_MAX_MEMORIES_PER_DAY, DEFAULT_MAX_STORAGE_BYTES, QuotaStatus,
+};
 
 /// Bootstrap schema run at adapter init — idempotent via IF NOT EXISTS.
 const INIT_SCHEMA: &str = include_str!("postgres_schema.sql");
@@ -4765,6 +4769,273 @@ impl MemoryStore for PostgresStore {
         }
         Ok(decision)
     }
+
+    // -----------------------------------------------------------------
+    // v0.7.0 Wave-3 Continuation 6 — quota + verify-link parity.
+    // -----------------------------------------------------------------
+
+    async fn quota_status(&self, agent_id: &str) -> StoreResult<QuotaStatus> {
+        // Auto-insert a default row when none exists, then read it back.
+        // Mirrors the SQLite `quotas::ensure_row` posture so the wire
+        // shape is byte-identical across backends.
+        let now = Utc::now();
+        sqlx::query(
+            "INSERT INTO agent_quotas (
+                agent_id, max_memories_per_day, max_storage_bytes, max_links_per_day,
+                current_memories_today, current_storage_bytes, current_links_today,
+                day_started_at, created_at, updated_at
+            ) VALUES ($1, $2, $3, $4, 0, 0, 0, $5, $5, $5)
+            ON CONFLICT (agent_id) DO NOTHING",
+        )
+        .bind(agent_id)
+        .bind(DEFAULT_MAX_MEMORIES_PER_DAY)
+        .bind(DEFAULT_MAX_STORAGE_BYTES)
+        .bind(DEFAULT_MAX_LINKS_PER_DAY)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| to_store_err("ensure agent_quotas row", e))?;
+
+        let row = sqlx::query(
+            "SELECT agent_id, max_memories_per_day, max_storage_bytes, max_links_per_day,
+                    current_memories_today, current_storage_bytes, current_links_today,
+                    day_started_at, created_at, updated_at
+             FROM agent_quotas WHERE agent_id = $1",
+        )
+        .bind(agent_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| to_store_err("read agent_quotas row", e))?;
+
+        Ok(row_to_quota_status(&row)?)
+    }
+
+    async fn quota_status_list(&self) -> StoreResult<Vec<QuotaStatus>> {
+        let rows = sqlx::query(
+            "SELECT agent_id, max_memories_per_day, max_storage_bytes, max_links_per_day,
+                    current_memories_today, current_storage_bytes, current_links_today,
+                    day_started_at, created_at, updated_at
+             FROM agent_quotas ORDER BY agent_id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| to_store_err("list agent_quotas rows", e))?;
+
+        rows.iter().map(row_to_quota_status).collect()
+    }
+
+    async fn verify_link(&self, filter: VerifyFilter) -> StoreResult<VerifyLinkReport> {
+        if filter.source_id.is_none() && filter.link_id.is_none() {
+            return Err(StoreError::InvalidInput {
+                detail: "verify_link requires either source_id or link_id".to_string(),
+            });
+        }
+        // Resolve the (source, target?, relation?) triple identically
+        // to the SQLite path so the wire shape is stable.
+        let (source_id, target_id, relation_filter) = if let Some(link_id) =
+            filter.link_id.as_deref()
+        {
+            let parts: Vec<&str> = link_id.split('|').collect();
+            if parts.len() != 3 {
+                return Err(StoreError::InvalidInput {
+                    detail: format!(
+                        "link_id must be canonical source_id|target_id|relation triple, got {link_id}"
+                    ),
+                });
+            }
+            (
+                parts[0].to_string(),
+                Some(parts[1].to_string()),
+                Some(parts[2].to_string()),
+            )
+        } else {
+            (filter.source_id.unwrap_or_default(), filter.target_id, None)
+        };
+
+        let row_opt = match (target_id.as_deref(), relation_filter.as_deref()) {
+            (Some(t), Some(r)) => sqlx::query(
+                "SELECT source_id, target_id, relation, valid_from, valid_until, \
+                        observed_by, signature, attest_level
+                 FROM memory_links \
+                 WHERE source_id = $1 AND target_id = $2 AND relation = $3 \
+                 LIMIT 1",
+            )
+            .bind(&source_id)
+            .bind(t)
+            .bind(r)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| to_store_err("verify_link select", e))?,
+            (Some(t), None) => sqlx::query(
+                "SELECT source_id, target_id, relation, valid_from, valid_until, \
+                        observed_by, signature, attest_level
+                 FROM memory_links \
+                 WHERE source_id = $1 AND target_id = $2 \
+                 ORDER BY created_at ASC LIMIT 1",
+            )
+            .bind(&source_id)
+            .bind(t)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| to_store_err("verify_link select", e))?,
+            (None, _) => sqlx::query(
+                "SELECT source_id, target_id, relation, valid_from, valid_until, \
+                        observed_by, signature, attest_level
+                 FROM memory_links \
+                 WHERE source_id = $1 \
+                 ORDER BY created_at ASC LIMIT 1",
+            )
+            .bind(&source_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| to_store_err("verify_link select", e))?,
+        };
+
+        let Some(row) = row_opt else {
+            return Err(StoreError::NotFound {
+                id: format!(
+                    "link {source_id} -> {} {}",
+                    target_id.as_deref().unwrap_or("?"),
+                    relation_filter.as_deref().unwrap_or("?")
+                ),
+            });
+        };
+
+        let src: String = row
+            .try_get("source_id")
+            .map_err(|e| to_store_err("read source_id", e))?;
+        let tgt: String = row
+            .try_get("target_id")
+            .map_err(|e| to_store_err("read target_id", e))?;
+        let rel: String = row
+            .try_get("relation")
+            .map_err(|e| to_store_err("read relation", e))?;
+        let vf: Option<DateTime<Utc>> = row
+            .try_get("valid_from")
+            .map_err(|e| to_store_err("read valid_from", e))?;
+        let vu: Option<DateTime<Utc>> = row
+            .try_get("valid_until")
+            .map_err(|e| to_store_err("read valid_until", e))?;
+        let obs: Option<String> = row
+            .try_get("observed_by")
+            .map_err(|e| to_store_err("read observed_by", e))?;
+        let sig: Option<Vec<u8>> = row
+            .try_get("signature")
+            .map_err(|e| to_store_err("read signature", e))?;
+        let attest: Option<String> = row
+            .try_get("attest_level")
+            .map_err(|e| to_store_err("read attest_level", e))?;
+
+        let attest_level = attest.unwrap_or_else(|| "unsigned".to_string());
+        let signature_present = sig.is_some();
+        let mut findings: Vec<String> = Vec::new();
+
+        let vf_str = vf.map(|t| t.to_rfc3339());
+        let vu_str = vu.map(|t| t.to_rfc3339());
+
+        let verified = if signature_present {
+            let observed = obs.as_deref().unwrap_or("");
+            match crate::identity::verify::lookup_peer_public_key(observed) {
+                None => {
+                    findings.push(format!(
+                        "signature present but no enrolled public key for observed_by={observed}"
+                    ));
+                    false
+                }
+                Some(pubkey) => {
+                    let signable = crate::identity::sign::SignableLink {
+                        src_id: &src,
+                        dst_id: &tgt,
+                        relation: &rel,
+                        observed_by: obs.as_deref(),
+                        valid_from: vf_str.as_deref(),
+                        valid_until: vu_str.as_deref(),
+                    };
+                    let sig_bytes = sig.as_deref().unwrap_or(&[]);
+                    match crate::identity::verify::verify(&pubkey, &signable, sig_bytes) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            findings.push(format!("signature verify failed: {e}"));
+                            false
+                        }
+                    }
+                }
+            }
+        } else {
+            true
+        };
+
+        Ok(VerifyLinkReport {
+            source_id: src,
+            target_id: tgt,
+            relation: rel,
+            verified,
+            attest_level,
+            signature_present,
+            observed_by: obs,
+            findings,
+        })
+    }
+
+    async fn find_paths(
+        &self,
+        source_id: &str,
+        target_id: &str,
+        max_depth: Option<usize>,
+        max_results: Option<usize>,
+    ) -> StoreResult<Vec<Vec<String>>> {
+        // Inherent `PostgresStore::find_paths` already routes AGE vs CTE
+        // off `self.kg_backend`; the trait method just forwards.
+        PostgresStore::find_paths(self, source_id, target_id, max_depth, max_results).await
+    }
+}
+
+/// v0.7.0 Continuation 6 — adapter row-to-`QuotaStatus` projection.
+/// Lifted to a free function so both `quota_status` and
+/// `quota_status_list` can reuse the same shape.
+fn row_to_quota_status(row: &sqlx::postgres::PgRow) -> StoreResult<QuotaStatus> {
+    let agent_id: String = row
+        .try_get("agent_id")
+        .map_err(|e| to_store_err("read quota agent_id", e))?;
+    let max_memories_per_day: i64 = row
+        .try_get("max_memories_per_day")
+        .map_err(|e| to_store_err("read max_memories_per_day", e))?;
+    let max_storage_bytes: i64 = row
+        .try_get("max_storage_bytes")
+        .map_err(|e| to_store_err("read max_storage_bytes", e))?;
+    let max_links_per_day: i64 = row
+        .try_get("max_links_per_day")
+        .map_err(|e| to_store_err("read max_links_per_day", e))?;
+    let current_memories_today: i64 = row
+        .try_get("current_memories_today")
+        .map_err(|e| to_store_err("read current_memories_today", e))?;
+    let current_storage_bytes: i64 = row
+        .try_get("current_storage_bytes")
+        .map_err(|e| to_store_err("read current_storage_bytes", e))?;
+    let current_links_today: i64 = row
+        .try_get("current_links_today")
+        .map_err(|e| to_store_err("read current_links_today", e))?;
+    let day_started_at: DateTime<Utc> = row
+        .try_get("day_started_at")
+        .map_err(|e| to_store_err("read day_started_at", e))?;
+    let created_at: DateTime<Utc> = row
+        .try_get("created_at")
+        .map_err(|e| to_store_err("read created_at", e))?;
+    let updated_at: DateTime<Utc> = row
+        .try_get("updated_at")
+        .map_err(|e| to_store_err("read updated_at", e))?;
+    Ok(QuotaStatus {
+        agent_id,
+        max_memories_per_day,
+        max_storage_bytes,
+        max_links_per_day,
+        current_memories_today,
+        current_storage_bytes,
+        current_links_today,
+        day_started_at: day_started_at.to_rfc3339(),
+        created_at: created_at.to_rfc3339(),
+        updated_at: updated_at.to_rfc3339(),
+    })
 }
 
 // ----------------------------------------------------------------------

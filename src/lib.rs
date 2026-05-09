@@ -177,6 +177,12 @@ pub fn build_router(
         .route("/api/v1/kg/invalidate", post(handlers::kg_invalidate))
         // Pillar 2 / Stream C — KG outbound traversal.
         .route("/api/v1/kg/query", post(handlers::kg_query))
+        // v0.7.0 Continuation 6 — KG path enumeration (S65).
+        .route("/api/v1/kg/find_paths", post(handlers::kg_find_paths))
+        // v0.7.0 Continuation 6 — link signature verification (S52).
+        .route("/api/v1/links/verify", post(handlers::verify_link_handler))
+        // v0.7.0 Continuation 6 — per-agent quota status (S61).
+        .route("/api/v1/quota/status", post(handlers::quota_status_handler))
         .route("/api/v1/stats", get(handlers::get_stats))
         .route("/api/v1/gc", post(handlers::run_gc))
         .route("/api/v1/export", get(handlers::export_memories))
