@@ -230,7 +230,6 @@ identically on sqlite and postgres:
 | HTTP method | Path | SAL dispatch |
 |---|---|---|
 | `POST` | `/api/v1/memories/bulk` | streams each row through `MemoryStore::store` |
-| `GET` | `/api/v1/recall` and `POST /api/v1/recall` | `MemoryStore::search` (keyword fallback; mode=keyword) |
 | `GET` | `/api/v1/agents` | projects `_agents` namespace via `MemoryStore::list` |
 | `POST` | `/api/v1/agents` | `MemoryStore::register_agent` |
 | `GET` | `/api/v1/namespaces` | aggregates from `MemoryStore::list` |
@@ -248,6 +247,40 @@ identically on sqlite and postgres:
 | `GET` | `/api/v1/subscriptions` | empty list with structured note |
 | `POST` | `/api/v1/check_duplicate` | structured no-match envelope (semantic scan is sqlite-only) |
 
+### Wave-3 Continuation 2 (Phase 8 + 9 + 10 + 11)
+
+The four critical surfaces gated for v0.7.0 land here. After
+Continuation 2, postgres-backed daemons run as first-class peers in
+federation, fire the same audit chain as sqlite, run the full
+hybrid recall pipeline, and accept governance write paths.
+
+| HTTP method | Path | SAL dispatch |
+|---|---|---|
+| `POST` | `/api/v1/sync/push` | per-row `MemoryStore::apply_remote_memory` / `apply_remote_link` / `apply_remote_deletion`. Heterogeneous federation (sqlite ↔ postgres) round-trips. |
+| `GET` | `/api/v1/sync/since` | `MemoryStore::list_memories_updated_since` |
+| `GET` | `/api/v1/recall` and `POST /api/v1/recall` | `MemoryStore::recall_hybrid` (FTS + pgvector cosine + adaptive blend; mode=hybrid when embedder loaded). Touch ops fire via `MemoryStore::touch_after_recall`. |
+| `POST` | `/api/v1/pending/{id}/approve` | `MemoryStore::pending_decide(approve=true)` + audit emit. Structural status transition only — full consensus walk remains sqlite-only. |
+| `POST` | `/api/v1/pending/{id}/reject` | `MemoryStore::pending_decide(approve=false)` + audit emit. |
+| `POST` | `/api/v1/namespaces/{ns}/standard` and `POST /api/v1/namespaces` | auto-seeds placeholder via `MemoryStore::store`, then `MemoryStore::set_namespace_standard` |
+| `DELETE` | `/api/v1/namespaces/{ns}/standard` and `DELETE /api/v1/namespaces` | `MemoryStore::clear_namespace_standard` |
+
+The audit module is file-based with no SQLite coupling, so
+`ai-memory audit verify --audit-dir <path>` works on a
+postgres-backed daemon's log unchanged. The F2 fix
+(cross-restart sequence persistence via the chain-tail walk in
+`audit::init`) lights up for postgres through the new emit sites
+in `create_memory` / `delete_memory` / `create_link` /
+`approve_pending` / `reject_pending` / `sync_push`.
+
+The full hybrid recall pipeline mirrors `db::recall_hybrid` (sqlite
+path) over pgvector + tsvector + ts_rank: 6-factor FTS sub-score
+(priority \* 0.5 + min(access_count, 50) \* 0.1 + confidence \* 2.0
++ tier_bonus + recency_factor), 0.2 cosine gate, adaptive blend
+(`semantic_weight = 0.50` for ≤500 chars, lerp to `0.15` at ≥5000
+chars), atomic touch ops (++access_count + TTL extension +
+mid→long auto-promotion at 5 accesses + ++priority every 10
+accesses).
+
 ### Postgres route gate
 
 Wave-3 Continuation also installs a route-gate middleware at the
@@ -262,19 +295,28 @@ pass-through.
 
 ### What still returns 501 on postgres
 
-- Federation: `POST /api/v1/sync/push`, `GET /api/v1/sync/since`
-  (federation transport is sqlite-bound — postgres deployments use
-  the postgres native replication path, not HTTP fanout).
-- Governance write paths: `POST /api/v1/pending/{id}/approve`,
-  `POST /api/v1/pending/{id}/reject`, namespace-standard write paths.
-- Audit chain emit + tamper validation.
-- The full multi-stage recall pipeline (semantic+FTS adaptive blend,
-  HNSW, reranker, touch ops). Keyword recall via `search` is wired;
-  the hybrid pipeline + adaptive blend is not.
+After Wave-3 Continuation 2 the residual unsupported surface is a
+small, documented list of subsystems whose underlying tables /
+state machines are not yet trait-covered. Operators who need any of
+the below today should pin to `--store-url sqlite://` for v0.7.0; a
+follow-on track will port them.
+
 - `POST /api/v1/forget`, `POST /api/v1/consolidate`,
   `GET /api/v1/contradictions`, `POST /api/v1/notify`,
   `POST /api/v1/gc`, `POST /api/v1/import`, `GET /api/v1/export`,
   archive write/restore/purge, semantic duplicate detection.
+- The FULL governance pipeline on postgres: consensus +
+  approver_type policy walks read several tables not yet
+  trait-covered. `pending_decide` (structural status transition)
+  works through the trait; the full multi-vote consensus + the
+  inheritance-chain `enforce_governance` walk that fires on store /
+  delete write paths remain sqlite-only.
+- Federation subcollections that ride sqlite-only tables: pendings,
+  pending_decisions, archives, restores, namespace_meta_clears.
+  Memories / deletions / links round-trip through the trait;
+  these subcollections surface as `unsupported_on_postgres` in the
+  `sync_push` response envelope so heterogeneous fed degrades
+  honestly instead of silently dropping rows.
 
 The startup log emits a banner the moment `--store-url postgres://...`
 resolves so operators see the schism without trial-and-error:
@@ -286,11 +328,15 @@ Implemented. See docs/postgres-age-guide.md for the supported
 endpoint inventory.
 ```
 
-Postgres-backed deployments that need full coverage today (full
-recall pipeline, federation, audit, governance write paths) should
-run the sqlite-backed daemon (the historical default). Schema
-parity at v28 means a future `migrate sqlite → postgres` carries
-every row across cleanly when the remaining handlers land.
+After Wave-3 Continuation 2, postgres-backed deployments DO have
+first-class coverage of the federation transport, the full hybrid
+recall pipeline, the audit chain, and the governance write paths.
+The remaining sqlite-only surfaces (forget / consolidate /
+contradictions / notify / gc / import / export / archive write
+paths / full consensus walk) are documented above and surface as
+501 with structured envelopes — there is no silent fallback on
+postgres for any endpoint. Schema parity at v28 means a future
+`migrate sqlite → postgres` carries every row across cleanly.
 
 The recall **score breakdown** is the same 6-factor formula on both
 backends:
@@ -409,7 +455,13 @@ parity test is the gate that prevents it.
 | Recall 6-factor scoring (SAL `search`) | ✓ | ✓ (Wave 1 Stream A) |
 | `kg_query` / `kg_timeline` / `kg_invalidate` / `find_paths` | CTE | AGE Cypher (CTE fallback) — sqlite-bound HTTP handlers in v0.7.0; trait routing in v0.7.x |
 | HTTP CRUD on SAL trait (Wave-3 subset) | ✓ | ✓ (8 endpoints — see table above) |
-| HTTP recall/KG/governance/federation handlers | ✓ | sqlite-bound, 501 on postgres (v0.7.x scope) |
+| HTTP read paths (agents/stats/namespaces/taxonomy/archive/entities/inbox/subs) | ✓ | ✓ (Wave-3 Continuation — Phase 4 + 5) |
+| HTTP KG handlers (kg_query/kg_timeline/kg_invalidate) | ✓ | ✓ (Wave-3 Continuation — Phase 5) |
+| HTTP federation push/pull (sync/push, sync/since) | ✓ | ✓ (Wave-3 Continuation 2 — Phase 8) |
+| HTTP audit chain emit + cross-restart sequence persistence | ✓ | ✓ (Wave-3 Continuation 2 — Phase 9) |
+| HTTP full hybrid recall pipeline (FTS + pgvector + adaptive blend + touch) | ✓ | ✓ (Wave-3 Continuation 2 — Phase 10) |
+| HTTP governance write paths (pending decide, namespace standard) | ✓ | ✓ structural (Wave-3 Continuation 2 — Phase 11) — full consensus walk remains sqlite-only |
+| HTTP forget/consolidate/notify/gc/import/export/archive write paths | ✓ | sqlite-only, 501 on postgres (post-v0.7.0 scope) |
 | Migration tool both directions | ✓ | ✓ |
 | `schema-init` CLI | n/a (auto-create) | ✓ (Wave 1 Stream B) |
 | `--store-url <URL>` flag on `serve` | ✓ (sqlite://) | ✓ (postgres://, postgresql://) |
