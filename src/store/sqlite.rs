@@ -13,7 +13,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::db;
-use crate::models::{AgentRegistration, Memory, MemoryLink};
+use crate::models::{AgentRegistration, Memory, MemoryLink, Tier};
 
 use super::{
     BoxBackendError, CallerContext, Capabilities, Filter, MemoryStore, StoreError, StoreResult,
@@ -435,6 +435,136 @@ impl MemoryStore for SqliteStore {
             Some(Err(e)) => Err(box_err(e)),
             None => Ok(None),
         }
+    }
+
+    // v0.7.0 Wave-3 Continuation 3 — lifecycle write paths for sqlite.
+    // Delegates to the legacy `db::*` free functions so behaviour is
+    // byte-identical to the pre-Wave-3 sqlite path.
+
+    async fn forget(
+        &self,
+        _ctx: &CallerContext,
+        namespace: Option<&str>,
+        pattern: Option<&str>,
+        tier: Option<&Tier>,
+        archive: bool,
+    ) -> StoreResult<usize> {
+        if namespace.is_none() && pattern.is_none() && tier.is_none() {
+            return Err(StoreError::InvalidInput {
+                detail: "at least one of namespace, pattern, or tier is required".to_string(),
+            });
+        }
+        let conn = self.state.lock().await;
+        db::forget(&conn, namespace, pattern, tier, archive).map_err(box_err)
+    }
+
+    async fn consolidate(
+        &self,
+        _ctx: &CallerContext,
+        ids: &[String],
+        title: &str,
+        summary: &str,
+        namespace: &str,
+        tier: &Tier,
+        source: &str,
+        consolidator_agent_id: &str,
+    ) -> StoreResult<String> {
+        let conn = self.state.lock().await;
+        db::consolidate(
+            &conn,
+            ids,
+            title,
+            summary,
+            namespace,
+            tier,
+            source,
+            consolidator_agent_id,
+        )
+        .map_err(box_err)
+    }
+
+    async fn run_gc(&self, archive: bool) -> StoreResult<usize> {
+        let conn = self.state.lock().await;
+        db::gc(&conn, archive).map_err(box_err)
+    }
+
+    async fn archive_restore(&self, _ctx: &CallerContext, id: &str) -> StoreResult<bool> {
+        let conn = self.state.lock().await;
+        db::restore_archived(&conn, id).map_err(box_err)
+    }
+
+    async fn archive_purge(&self, older_than_days: Option<i64>) -> StoreResult<usize> {
+        let conn = self.state.lock().await;
+        db::purge_archive(&conn, older_than_days).map_err(box_err)
+    }
+
+    async fn archive_by_ids(
+        &self,
+        _ctx: &CallerContext,
+        ids: &[String],
+        reason: Option<&str>,
+    ) -> StoreResult<usize> {
+        let conn = self.state.lock().await;
+        let mut moved = 0usize;
+        for id in ids {
+            match db::archive_memory(&conn, id, reason) {
+                Ok(true) => moved += 1,
+                Ok(false) => {}
+                Err(e) => return Err(box_err(e)),
+            }
+        }
+        Ok(moved)
+    }
+
+    async fn export_memories(&self) -> StoreResult<Vec<Memory>> {
+        let conn = self.state.lock().await;
+        db::export_all(&conn).map_err(box_err)
+    }
+
+    async fn export_links(&self) -> StoreResult<Vec<MemoryLink>> {
+        let conn = self.state.lock().await;
+        db::export_links(&conn).map_err(box_err)
+    }
+
+    async fn notify(
+        &self,
+        ctx: &CallerContext,
+        target_agent: &str,
+        title: &str,
+        payload: &str,
+        priority: Option<i32>,
+        tier: Option<&Tier>,
+    ) -> StoreResult<String> {
+        // Compose the notify memory using the same shape as
+        // `mcp::handle_notify`: a memory in `_inbox/<target_agent>` with
+        // `metadata.target_agent_id` set so subsequent inbox pulls find it.
+        let now = chrono::Utc::now().to_rfc3339();
+        let resolved_tier = tier.cloned().unwrap_or(Tier::Short);
+        let priority = priority.unwrap_or(5);
+        let metadata = serde_json::json!({
+            "agent_id": &ctx.agent_id,
+            "target_agent_id": target_agent,
+            "notify": true,
+        });
+        let mem = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: resolved_tier,
+            namespace: format!("_inbox/{target_agent}"),
+            title: title.to_string(),
+            content: payload.to_string(),
+            tags: vec!["notify".to_string()],
+            priority,
+            confidence: 1.0,
+            source: "notify".to_string(),
+            access_count: 0,
+            created_at: now.clone(),
+            updated_at: now,
+            last_accessed_at: None,
+            expires_at: None,
+            metadata,
+        };
+        let conn = self.state.lock().await;
+        db::insert(&conn, &mem).map_err(box_err)
     }
 }
 
