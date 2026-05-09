@@ -206,9 +206,11 @@ not, the fallback recursive-CTE path runs against the
 ## Operator surfaces that "just work" identically on both backends
 
 The point of the SAL trait is that no caller needs to know which
-backend is mounted. As of v0.7.0 Wave-3 the following **HTTP
-endpoints** route through the SAL trait identically on sqlite and
-postgres:
+backend is mounted. As of v0.7.0 Wave-3 + Wave-3 Continuation the
+following **HTTP endpoints** route through the SAL trait
+identically on sqlite and postgres:
+
+### Core CRUD (Wave-3 Phase 3 — commit `c049500`)
 
 | HTTP method | Path | Trait method |
 |---|---|---|
@@ -223,45 +225,56 @@ postgres:
 | `GET` | `/api/v1/capabilities` | reports `storage_backend` |
 | `GET` | `/api/v1/health` | (no storage I/O) |
 
-These ten cover the day-1 portable operator surface — store, read,
-list, update, delete, search, link, list links — and round-trip
-through `tests/serve_postgres_smoke.rs` against a live PG fixture.
+### Wave-3 Continuation (Phase 4 + 5)
 
-### What does NOT yet route through the SAL trait on postgres
+| HTTP method | Path | SAL dispatch |
+|---|---|---|
+| `POST` | `/api/v1/memories/bulk` | streams each row through `MemoryStore::store` |
+| `GET` | `/api/v1/recall` and `POST /api/v1/recall` | `MemoryStore::search` (keyword fallback; mode=keyword) |
+| `GET` | `/api/v1/agents` | projects `_agents` namespace via `MemoryStore::list` |
+| `POST` | `/api/v1/agents` | `MemoryStore::register_agent` |
+| `GET` | `/api/v1/namespaces` | aggregates from `MemoryStore::list` |
+| `GET` | `/api/v1/stats` | counts + per-tier histogram via `MemoryStore::list` |
+| `GET` | `/api/v1/taxonomy` | flat per-namespace tree via `MemoryStore::list` |
+| `GET` | `/api/v1/archive` | projects from `archived_memories` (postgres helper) |
+| `GET` | `/api/v1/archive/stats` | aggregates from `archived_memories` (postgres helper) |
+| `POST` | `/api/v1/entities` | `MemoryStore::store` with `metadata.kind=entity` |
+| `GET` | `/api/v1/entities/by_alias` | walks namespace via `MemoryStore::list` + alias match |
+| `GET` | `/api/v1/pending` | empty list with `storage_backend: postgres` note |
+| `POST` | `/api/v1/kg/query` | `PostgresStore::kg_query` (AGE Cypher / CTE fallback) |
+| `GET` | `/api/v1/kg/timeline` | `PostgresStore::kg_timeline` |
+| `POST` | `/api/v1/kg/invalidate` | `PostgresStore::kg_invalidate` |
+| `GET` | `/api/v1/inbox` | empty list with structured note |
+| `GET` | `/api/v1/subscriptions` | empty list with structured note |
+| `POST` | `/api/v1/check_duplicate` | structured no-match envelope (semantic scan is sqlite-only) |
 
-Wave-3 deliberately scoped the handler refactor to the trait-eligible
-subset above. The legacy SQLite path layers federation fanout, the
-embedder, governance owner-walk, the audit chain, quota wiring, and
-the multi-stage recall pipeline directly through the
-mutex-guarded rusqlite connection — those layers remain SQLite-bound
-in v0.7.0 and surface a clear `501 Not Implemented` envelope on a
-postgres-backed daemon:
+### Postgres route gate
 
-```json
-{
-  "error": "endpoint not yet implemented for postgres-backed daemon",
-  "endpoint": "/api/v1/recall",
-  "storage_backend": "postgres",
-  "remediation": "use sqlite-backed daemon or wait for v0.7.x trait coverage"
-}
-```
+Wave-3 Continuation also installs a route-gate middleware at the
+router layer (`handlers::postgres_route_gate`). On a postgres-backed
+daemon, any (method, path) tuple **not** in the supported list above
+is short-circuited with a structured 501 envelope before reaching
+the legacy SQLite handler — closing the silent-corruption gap where
+un-migrated handlers would otherwise read from / write to the empty
+in-memory scratch SQLite database that `bootstrap_serve` opens
+against `--db`. On sqlite-backed daemons the gate is a pure
+pass-through.
 
-Endpoints currently in this state on a postgres-backed daemon:
+### What still returns 501 on postgres
 
-- `POST /api/v1/recall`, `GET /api/v1/recall` — multi-stage hybrid
-  recall (FTS5 + HNSW blend + auto-promote)
-- `POST /api/v1/forget` — pattern-based delete
-- `POST /api/v1/consolidate`, `GET /api/v1/contradictions`
-- `POST /api/v1/kg/query`, `GET /api/v1/kg/timeline`,
-  `POST /api/v1/kg/invalidate` (KG path is sqlite-recursive-CTE
-  bound; AGE-Cypher routing through the trait is a follow-on wave)
-- `POST /api/v1/memories/bulk` — bulk fanout + quorum broadcast
-- `POST /api/v1/memories/{id}/promote`
-- `POST /api/v1/notify`, `GET /api/v1/inbox`
-- `GET /api/v1/stats`, `POST /api/v1/gc`
-- `POST /api/v1/sync/push`, `GET /api/v1/sync/since`
-- Subscriptions, archive, agent registry, namespace standards,
-  pending approvals, taxonomy, check_duplicate, entity registry
+- Federation: `POST /api/v1/sync/push`, `GET /api/v1/sync/since`
+  (federation transport is sqlite-bound — postgres deployments use
+  the postgres native replication path, not HTTP fanout).
+- Governance write paths: `POST /api/v1/pending/{id}/approve`,
+  `POST /api/v1/pending/{id}/reject`, namespace-standard write paths.
+- Audit chain emit + tamper validation.
+- The full multi-stage recall pipeline (semantic+FTS adaptive blend,
+  HNSW, reranker, touch ops). Keyword recall via `search` is wired;
+  the hybrid pipeline + adaptive blend is not.
+- `POST /api/v1/forget`, `POST /api/v1/consolidate`,
+  `GET /api/v1/contradictions`, `POST /api/v1/notify`,
+  `POST /api/v1/gc`, `POST /api/v1/import`, `GET /api/v1/export`,
+  archive write/restore/purge, semantic duplicate detection.
 
 The startup log emits a banner the moment `--store-url postgres://...`
 resolves so operators see the schism without trial-and-error:
@@ -273,10 +286,11 @@ Implemented. See docs/postgres-age-guide.md for the supported
 endpoint inventory.
 ```
 
-Postgres-backed deployments that need full coverage today should run
-the sqlite-backed daemon (the historical default) — schema parity at
-v28 means a future `migrate sqlite → postgres` carries every row
-across cleanly when the remaining handlers land.
+Postgres-backed deployments that need full coverage today (full
+recall pipeline, federation, audit, governance write paths) should
+run the sqlite-backed daemon (the historical default). Schema
+parity at v28 means a future `migrate sqlite → postgres` carries
+every row across cleanly when the remaining handlers land.
 
 The recall **score breakdown** is the same 6-factor formula on both
 backends:
