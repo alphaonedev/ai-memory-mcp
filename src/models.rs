@@ -306,6 +306,11 @@ pub struct ListQuery {
 #[derive(Debug, Deserialize)]
 pub struct RecallQuery {
     pub context: Option<String>,
+    /// `query` alias for `context` — the cert harness (S79) uses
+    /// `?query=…`. Both forms route to the same code path; `context`
+    /// wins when both are supplied.
+    #[serde(default)]
+    pub query: Option<String>,
     #[serde(default)]
     pub namespace: Option<String>,
     #[serde(default = "default_recall_limit")]
@@ -333,7 +338,13 @@ fn default_recall_limit() -> Option<usize> {
 
 #[derive(Debug, Deserialize)]
 pub struct RecallBody {
-    pub context: String,
+    /// Recall context. Accepts either `context` (canonical) or `query`
+    /// (cert harness alias used by S79). At least one must be present
+    /// and non-empty.
+    #[serde(default)]
+    pub context: Option<String>,
+    #[serde(default)]
+    pub query: Option<String>,
     #[serde(default)]
     pub namespace: Option<String>,
     #[serde(default = "default_recall_limit")]
@@ -350,6 +361,21 @@ pub struct RecallBody {
     /// Task 1.11 — context-budget-aware recall.
     #[serde(default)]
     pub budget_tokens: Option<usize>,
+}
+
+impl RecallBody {
+    /// Resolve the recall query string from either `context` or `query`.
+    /// Returns the trimmed value, or an empty string when both are absent
+    /// — the caller is expected to reject empty.
+    #[must_use]
+    pub fn resolved_query(&self) -> String {
+        self.context
+            .as_deref()
+            .or(self.query.as_deref())
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    }
 }
 
 #[derive(Debug, Deserialize)]
