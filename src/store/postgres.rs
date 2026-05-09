@@ -1395,11 +1395,17 @@ impl PostgresStore {
         validate_depth(max_depth)?;
 
         let depth_cap = i32::try_from(max_depth).unwrap_or(i32::MAX);
+        // v0.7.0 Wave-3 Continuation 5 — filter out invalidated edges
+        // (`valid_until` set in the past) so `as_of=now` queries
+        // only see currently-valid edges. Mirrors S45's expectation:
+        // an edge with `valid_until <= NOW()` should not appear in
+        // a `now`-window kg_query.
         let sql = "WITH RECURSIVE traversal(target_id, relation, depth, path) AS (
                 SELECT ml.target_id, ml.relation, 1,
                        ml.source_id || '->' || ml.target_id
                 FROM memory_links ml
                 WHERE ml.source_id = $1
+                  AND (ml.valid_until IS NULL OR ml.valid_until > NOW())
                 UNION ALL
                 SELECT ml.target_id, ml.relation, t.depth + 1,
                        t.path || '->' || ml.target_id
@@ -1408,6 +1414,7 @@ impl PostgresStore {
                 WHERE t.depth < $2
                   AND position(('->' || ml.target_id) IN t.path) = 0
                   AND position((ml.target_id || '->') IN t.path) = 0
+                  AND (ml.valid_until IS NULL OR ml.valid_until > NOW())
             )
             SELECT target_id, relation, depth, path
             FROM traversal
@@ -2807,6 +2814,95 @@ impl MemoryStore for PostgresStore {
         .map_err(|e| to_store_err("insert memory", e))?
         .try_get::<String, _>("id")
         .map_err(|e| to_store_err("read returned id", e))
+    }
+
+    async fn store_with_embedding(
+        &self,
+        _ctx: &CallerContext,
+        memory: &Memory,
+        embedding: Option<&[f32]>,
+    ) -> StoreResult<String> {
+        // Same upsert contract as `store` but additionally writes the
+        // pgvector `embedding` column when a vector is supplied. This
+        // is the load-bearing path for semantic recall on postgres —
+        // without an embedding column the `recall_hybrid` cosine
+        // search filters out every row (`WHERE embedding IS NOT NULL`).
+        let created_at = parse_rfc3339_required(&memory.created_at)?;
+        let updated_at = parse_rfc3339_required(&memory.updated_at)?;
+        let last_accessed_at = parse_rfc3339_opt(memory.last_accessed_at.as_deref());
+        let expires_at = parse_rfc3339_opt(memory.expires_at.as_deref());
+        let tags_json =
+            serde_json::to_value(&memory.tags).map_err(|e| StoreError::IntegrityFailed {
+                detail: format!("serialize tags: {e}"),
+            })?;
+        let emb_pgvec = embedding.map(|v| pgvector::Vector::from(v.to_vec()));
+
+        sqlx::query(
+            "INSERT INTO memories (
+                id, tier, namespace, title, content, tags, priority, confidence,
+                source, access_count, created_at, updated_at, last_accessed_at,
+                expires_at, metadata, embedding
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+            ON CONFLICT (title, namespace) DO UPDATE SET
+                content = EXCLUDED.content,
+                tier = CASE
+                    WHEN tier_rank(EXCLUDED.tier) >= tier_rank(memories.tier)
+                        THEN EXCLUDED.tier
+                    ELSE memories.tier
+                END,
+                tags = EXCLUDED.tags,
+                priority = EXCLUDED.priority,
+                confidence = EXCLUDED.confidence,
+                updated_at = EXCLUDED.updated_at,
+                metadata = CASE
+                    WHEN memories.metadata ? 'agent_id'
+                        THEN jsonb_set(
+                            EXCLUDED.metadata,
+                            '{agent_id}',
+                            memories.metadata -> 'agent_id'
+                        )
+                    ELSE EXCLUDED.metadata
+                END,
+                embedding = COALESCE(EXCLUDED.embedding, memories.embedding)
+            RETURNING id",
+        )
+        .bind(&memory.id)
+        .bind(memory.tier.as_str())
+        .bind(&memory.namespace)
+        .bind(&memory.title)
+        .bind(&memory.content)
+        .bind(&tags_json)
+        .bind(memory.priority)
+        .bind(memory.confidence)
+        .bind(&memory.source)
+        .bind(memory.access_count)
+        .bind(created_at)
+        .bind(updated_at)
+        .bind(last_accessed_at)
+        .bind(expires_at)
+        .bind(&memory.metadata)
+        .bind(emb_pgvec)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| to_store_err("insert memory_with_embedding", e))?
+        .try_get::<String, _>("id")
+        .map_err(|e| to_store_err("read returned id", e))
+    }
+
+    async fn update_embedding(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+        embedding: Option<&[f32]>,
+    ) -> StoreResult<()> {
+        let emb_pgvec = embedding.map(|v| pgvector::Vector::from(v.to_vec()));
+        sqlx::query("UPDATE memories SET embedding = $2 WHERE id = $1")
+            .bind(id)
+            .bind(emb_pgvec)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| to_store_err("update_embedding", e))?;
+        Ok(())
     }
 
     async fn get(&self, _ctx: &CallerContext, id: &str) -> StoreResult<Memory> {
@@ -4683,6 +4779,26 @@ pub async fn taxonomy_namespaces_via_store(
     pg.taxonomy_namespaces(prefix).await
 }
 
+/// List pending governance actions for postgres-backed daemons.
+///
+/// Surfaces rows from the `pending_actions` table filtered by
+/// optional `status` (`pending` / `approved` / `rejected`) and
+/// optional `namespace` (S34's per-namespace queue view).
+///
+/// # Errors
+///
+/// Returns [`StoreError::BackendUnavailable`] when the underlying
+/// adapter is not a [`PostgresStore`] or when the SQL query fails.
+pub async fn list_pending_actions_via_store(
+    store: &std::sync::Arc<dyn MemoryStore>,
+    status: Option<&str>,
+    namespace: Option<&str>,
+    limit: usize,
+) -> StoreResult<Vec<serde_json::Value>> {
+    let pg = downcast_postgres(store)?;
+    pg.list_pending_actions(status, namespace, limit).await
+}
+
 fn downcast_postgres(store: &std::sync::Arc<dyn MemoryStore>) -> StoreResult<&PostgresStore> {
     // Trait objects don't expose downcast directly; we rely on the fact
     // that the daemon only constructs a `PostgresStore` when the
@@ -4825,6 +4941,76 @@ impl PostgresStore {
             let ns: String = r.try_get("namespace").unwrap_or_default();
             let cnt: i64 = r.try_get("cnt").unwrap_or(0);
             out.push((ns, cnt));
+        }
+        Ok(out)
+    }
+
+    /// List pending governance actions filtered by optional status
+    /// + namespace. Mirrors the sqlite `db::list_pending_actions`
+    /// wire shape but projects directly from the postgres
+    /// `pending_actions` table; on a fresh schema-init the row set
+    /// is empty and the handler returns `count=0` cleanly.
+    pub async fn list_pending_actions(
+        &self,
+        status: Option<&str>,
+        namespace: Option<&str>,
+        limit: usize,
+    ) -> StoreResult<Vec<serde_json::Value>> {
+        use sqlx::Row;
+        let limit_i: i64 = limit.clamp(1, 1000).try_into().unwrap_or(100);
+        let rows = sqlx::query(
+            "SELECT id, action_type, memory_id, namespace, payload, requested_by, \
+                    requested_at, status, decided_by, decided_at, approvals, \
+                    default_timeout_seconds, expired_at, decision_reason \
+             FROM pending_actions \
+             WHERE ($1::text IS NULL OR status = $1) \
+               AND ($2::text IS NULL OR namespace = $2) \
+             ORDER BY requested_at DESC \
+             LIMIT $3",
+        )
+        .bind(status)
+        .bind(namespace)
+        .bind(limit_i)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| to_store_err("list_pending_actions", e))?;
+        let mut out: Vec<serde_json::Value> = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let id: String = r.try_get("id").unwrap_or_default();
+            let action_type: String = r.try_get("action_type").unwrap_or_default();
+            let memory_id: Option<String> = r.try_get("memory_id").ok();
+            let ns: String = r.try_get("namespace").unwrap_or_default();
+            let payload: serde_json::Value =
+                r.try_get("payload").unwrap_or(serde_json::Value::Null);
+            let requested_by: String = r.try_get("requested_by").unwrap_or_default();
+            let requested_at: chrono::DateTime<chrono::Utc> = r
+                .try_get("requested_at")
+                .unwrap_or_else(|_| chrono::Utc::now());
+            let status_v: String = r.try_get("status").unwrap_or_default();
+            let decided_by: Option<String> = r.try_get("decided_by").ok();
+            let decided_at: Option<chrono::DateTime<chrono::Utc>> = r.try_get("decided_at").ok();
+            let approvals: serde_json::Value = r
+                .try_get("approvals")
+                .unwrap_or(serde_json::Value::Array(Vec::new()));
+            let default_timeout_seconds: Option<i64> = r.try_get("default_timeout_seconds").ok();
+            let expired_at: Option<chrono::DateTime<chrono::Utc>> = r.try_get("expired_at").ok();
+            let decision_reason: Option<String> = r.try_get("decision_reason").ok();
+            out.push(serde_json::json!({
+                "id": id,
+                "action_type": action_type,
+                "memory_id": memory_id,
+                "namespace": ns,
+                "payload": payload,
+                "requested_by": requested_by,
+                "requested_at": requested_at.to_rfc3339(),
+                "status": status_v,
+                "decided_by": decided_by,
+                "decided_at": decided_at.map(|t| t.to_rfc3339()),
+                "approvals": approvals,
+                "default_timeout_seconds": default_timeout_seconds,
+                "expired_at": expired_at.map(|t| t.to_rfc3339()),
+                "decision_reason": decision_reason,
+            }));
         }
         Ok(out)
     }
