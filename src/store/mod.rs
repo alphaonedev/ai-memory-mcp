@@ -343,6 +343,39 @@ pub trait MemoryStore: Send + Sync {
     /// client-supplied value.
     async fn store(&self, ctx: &CallerContext, memory: &Memory) -> StoreResult<String>;
 
+    /// Store a memory together with its pre-computed embedding vector.
+    /// v0.7.0 Wave-3 Continuation 5 — semantic recall on postgres-
+    /// backed daemons relies on `memories.embedding` being populated
+    /// at write time; the SQLite path does the same via
+    /// `db::insert_with_embedding`. Adapters that don't have a vector
+    /// column (sqlite — embeddings live in a separate side-table)
+    /// fall back to plain `store` and ignore the vector; the
+    /// PostgresStore overrides this to bind the vector into the
+    /// INSERT. Default implementation forwards to `store`.
+    async fn store_with_embedding(
+        &self,
+        ctx: &CallerContext,
+        memory: &Memory,
+        _embedding: Option<&[f32]>,
+    ) -> StoreResult<String> {
+        self.store(ctx, memory).await
+    }
+
+    /// Set or clear the embedding column for an existing memory.
+    /// v0.7.0 Wave-3 Continuation 5 — federation receivers re-embed
+    /// peer-pushed memories via this path so `recall_hybrid` can find
+    /// them. Default implementation is a no-op for adapters that
+    /// don't store embeddings inline (sqlite — embeddings live in a
+    /// side table).
+    async fn update_embedding(
+        &self,
+        _ctx: &CallerContext,
+        _id: &str,
+        _embedding: Option<&[f32]>,
+    ) -> StoreResult<()> {
+        Ok(())
+    }
+
     /// Fetch a memory by id. Returns `NotFound` when the memory does
     /// not exist OR when the caller lacks read permission (the trait
     /// deliberately does not leak existence; adapters must fold

@@ -976,6 +976,19 @@ pub async fn create_memory(
         };
         let ctx = crate::store::CallerContext::for_agent(agent_id.clone());
 
+        // v0.7.0 Wave-3 Continuation 5 (S18 / semantic recall) —
+        // compute the embedding before the SAL store call so the
+        // postgres `embedding` column lands populated. Without this,
+        // `recall_hybrid` filters every row out via
+        // `WHERE embedding IS NOT NULL` and semantic queries return 0
+        // results. Mirrors the SQLite path (handlers.rs ~L1093) where
+        // the embedding is generated outside the DB lock.
+        let embedding_text = format!("{} {}", mem.title, mem.content);
+        let embedding: Option<Vec<f32>> = match app.embedder.as_ref().as_ref() {
+            None => None,
+            Some(emb) => emb.embed(&embedding_text).ok(),
+        };
+
         // v0.7.0 Wave-3 Continuation 3 (Phase 20) — governance walk on
         // writes. The postgres branch now enforces the same inheritance
         // chain + approver_type policy as the sqlite path. When the
@@ -1019,7 +1032,11 @@ pub async fn create_memory(
             Err(e) => return store_err_to_response(e),
         }
 
-        return match app.store.store(&ctx, &mem).await {
+        return match app
+            .store
+            .store_with_embedding(&ctx, &mem, embedding.as_deref())
+            .await
+        {
             Ok(id) => {
                 // v0.7.0 Wave-3 Continuation 2 Phase 9 — audit emit on
                 // postgres write. The audit module is file-based with no
@@ -1545,6 +1562,9 @@ pub async fn register_agent(
 pub struct PendingListQuery {
     #[serde(default)]
     pub status: Option<String>,
+    /// Optional namespace filter — S34 uses `?namespace=...&limit=50`.
+    #[serde(default)]
+    pub namespace: Option<String>,
     #[serde(default = "default_pending_limit")]
     pub limit: Option<usize>,
 }
@@ -1560,24 +1580,30 @@ pub async fn list_pending(
 ) -> impl IntoResponse {
     let limit = p.limit.unwrap_or(100).min(1000);
 
-    // v0.7.0 Wave-3 Continuation — postgres-backed daemons route through
-    // the SAL `list_pending_actions` trait method. Postgres adapter
-    // returns an empty list with `UnsupportedCapability` semantics for
-    // pre-execution governance gating; the wire shape matches sqlite's
-    // empty-list response so clients see zero pending actions on a fresh
-    // postgres deployment rather than a 501.
-    #[cfg(feature = "sal")]
+    // v0.7.0 Wave-3 Continuation 5 — postgres-backed daemons read
+    // from the `pending_actions` table directly. The full governance
+    // pipeline (Phase 20 / Cont 4 chain walk) writes pending rows on
+    // both backends; this list path lights them up on the read side
+    // so S34's "bob lists pending → approve/reject → charlie sees
+    // approved" round-trip works end-to-end on postgres.
+    #[cfg(feature = "sal-postgres")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        // No pending governance gating exists on postgres until F1
-        // governance lands on the Postgres adapter; return an empty list
-        // with the same wire shape so clients can iterate.
-        return Json(json!({
-            "count": 0,
-            "pending": Vec::<serde_json::Value>::new(),
-            "storage_backend": "postgres",
-            "note": "pending_actions governance is sqlite-only in v0.7.0",
-        }))
-        .into_response();
+        return match crate::store::postgres::list_pending_actions_via_store(
+            &app.store,
+            p.status.as_deref(),
+            p.namespace.as_deref(),
+            limit,
+        )
+        .await
+        {
+            Ok(items) => Json(json!({
+                "count": items.len(),
+                "pending": items,
+                "storage_backend": "postgres",
+            }))
+            .into_response(),
+            Err(e) => store_err_to_response(e),
+        };
     }
 
     let lock = app.db.lock().await;
@@ -4605,7 +4631,19 @@ pub async fn kg_invalidate(
 /// defaults to 1 and is bounded by `KG_QUERY_MAX_SUPPORTED_DEPTH`.
 #[derive(Debug, Deserialize)]
 pub struct KgQueryBody {
-    pub source_id: String,
+    /// Canonical name. Aliased by `from` (S82's wire shape).
+    #[serde(default)]
+    pub source_id: Option<String>,
+    /// `from` alias for `source_id` — the cert harness S82 uses
+    /// `{from, to, max_depth, rel_types}`.
+    #[serde(default)]
+    pub from: Option<String>,
+    /// Optional target id — when present the query is interpreted as
+    /// a find-path between (`source_id`, `to`); kg_query's existing
+    /// surface ignores it but accepting it keeps the wire shape
+    /// flexible for the cert harness.
+    #[serde(default)]
+    pub to: Option<String>,
     pub max_depth: Option<usize>,
     pub valid_at: Option<String>,
     pub allowed_agents: Option<Vec<String>>,
@@ -4616,6 +4654,11 @@ pub struct KgQueryBody {
     /// `true` to traverse the full historical link graph.
     #[serde(default)]
     pub include_invalidated: bool,
+    /// Optional relation-type filter — accepted for forward-compat
+    /// with the find_paths shape; unused on the current trait
+    /// surface (CTE walks `:related_to` only).
+    #[serde(default)]
+    pub rel_types: Option<Vec<String>>,
 }
 
 /// `POST /api/v1/kg/query` — REST mirror of the MCP `memory_kg_query`
@@ -4628,7 +4671,15 @@ pub async fn kg_query(
     State(app): State<AppState>,
     Json(body): Json<KgQueryBody>,
 ) -> impl IntoResponse {
-    if let Err(e) = validate::validate_id(&body.source_id) {
+    // S82's wire shape sends `from` instead of `source_id`; resolve
+    // the canonical id from either field with `source_id` taking
+    // precedence when both are supplied.
+    let source_id = body
+        .source_id
+        .clone()
+        .or_else(|| body.from.clone())
+        .unwrap_or_default();
+    if let Err(e) = validate::validate_id(&source_id) {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": format!("invalid source_id: {e}")})),
@@ -4676,14 +4727,14 @@ pub async fn kg_query(
     // recursive-CTE wire shape.
     #[cfg(feature = "sal-postgres")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        return match crate::store::postgres::kg_query_via_store(
-            &app.store,
-            &body.source_id,
-            max_depth,
-        )
-        .await
+        return match crate::store::postgres::kg_query_via_store(&app.store, &source_id, max_depth)
+            .await
         {
             Ok(nodes) => {
+                // S82's wire shape — when `to` is supplied, project a
+                // single-path `paths` array of node-id chains so the
+                // find-paths style consumer can read the result back
+                // without a separate `find_paths` route.
                 let memories_json: Vec<serde_json::Value> = nodes
                     .iter()
                     .map(|n| {
@@ -4695,9 +4746,27 @@ pub async fn kg_query(
                         })
                     })
                     .collect();
-                let paths_json: Vec<&str> = nodes.iter().map(|n| n.path.as_str()).collect();
+                let mut paths_json: Vec<serde_json::Value> = Vec::new();
+                if let Some(target) = body.to.as_deref() {
+                    // Find the first traversal path that ends at `target`
+                    // and project the chain as a list of node ids.
+                    for n in &nodes {
+                        if n.target_id == target {
+                            let chain: Vec<String> =
+                                n.path.split("->").map(str::to_string).collect();
+                            paths_json.push(serde_json::Value::Array(
+                                chain.into_iter().map(serde_json::Value::String).collect(),
+                            ));
+                            break;
+                        }
+                    }
+                } else {
+                    for n in &nodes {
+                        paths_json.push(serde_json::Value::String(n.path.clone()));
+                    }
+                }
                 Json(json!({
-                    "source_id": body.source_id,
+                    "source_id": source_id,
                     "max_depth": max_depth,
                     "memories": memories_json,
                     "paths": paths_json,
@@ -4723,7 +4792,7 @@ pub async fn kg_query(
     let lock = app.db.lock().await;
     match db::kg_query(
         &lock.0,
-        &body.source_id,
+        &source_id,
         max_depth,
         valid_at,
         allowed_agents.as_deref(),
@@ -4749,7 +4818,7 @@ pub async fn kg_query(
                 .collect();
             let paths_json: Vec<&str> = nodes.iter().map(|n| n.path.as_str()).collect();
             Json(json!({
-                "source_id": body.source_id,
+                "source_id": source_id,
                 "max_depth": max_depth,
                 "memories": memories_json,
                 "paths": paths_json,
@@ -6131,8 +6200,24 @@ async fn sync_push_via_store(app: AppState, _headers: HeaderMap, body: SyncPushB
             continue;
         }
         match app.store.apply_remote_memory(&ctx, mem).await {
-            Ok(_id) => {
+            Ok(applied_id) => {
                 applied += 1;
+                // v0.7.0 Wave-3 Continuation 5 (S18+S79 federation
+                // semantic recall) — re-embed the incoming memory on
+                // the receiver so the postgres `embedding` column
+                // lands populated. Federation wire shape doesn't
+                // carry the vector; without this step semantic recall
+                // queries against a peer that received the memory
+                // through sync_push would surface empty.
+                if let Some(emb) = app.embedder.as_ref().as_ref() {
+                    let embedding_text = format!("{} {}", mem.title, mem.content);
+                    if let Ok(vector) = emb.embed(&embedding_text) {
+                        let _ = app
+                            .store
+                            .update_embedding(&ctx, &applied_id, Some(&vector))
+                            .await;
+                    }
+                }
                 // F2 audit-chain emit: every accepted federation push
                 // chains through the same audit log as a local Store.
                 // Phase-9 wiring — file-based audit module is backend-
@@ -7623,6 +7708,83 @@ pub async fn unsubscribe(
     headers: HeaderMap,
     Query(q): Query<UnsubscribeQuery>,
 ) -> impl IntoResponse {
+    // v0.7.0 Wave-3 Continuation 5 (Bucket B / S33) — postgres-backed
+    // daemons resolve subscriptions through the SAL `_subscriptions/
+    // <agent_id>` namespace mirror that `subscribe` / `list_subscriptions`
+    // write into. Both lookup-by-id and lookup-by-(agent_id, namespace)
+    // resolve through the same memory-row index. Without this branch
+    // the handler reaches into the scratch sqlite db which contains no
+    // subscription rows on a postgres-backed daemon.
+    #[cfg(feature = "sal")]
+    if matches!(app.storage_backend, StorageBackend::Postgres) {
+        let caller = match resolve_caller_agent_id(None, &headers, q.agent_id.as_deref()) {
+            Ok(id) => id,
+            Err(e) => {
+                return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response();
+            }
+        };
+        let ctx = crate::store::CallerContext::for_agent(&caller);
+
+        // Lookup the subscription memory-id via the persistent index.
+        let target_id: Option<String> = if let Some(id) = q.id.clone() {
+            Some(id)
+        } else {
+            let Some(ns) = q.namespace.clone() else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": "id or (agent_id, namespace) required"})),
+                )
+                    .into_response();
+            };
+            let sub_ns = format!("_subscriptions/{caller}");
+            let filter = crate::store::Filter {
+                namespace: Some(sub_ns),
+                limit: 1000,
+                ..Default::default()
+            };
+            match app.store.list(&ctx, &filter).await {
+                Ok(rows) => rows
+                    .into_iter()
+                    .find(|m| {
+                        m.metadata.get("namespace_filter").and_then(|v| v.as_str())
+                            == Some(ns.as_str())
+                    })
+                    .map(|m| {
+                        m.metadata
+                            .get("subscription_id")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                            .unwrap_or(m.id)
+                    }),
+                Err(e) => return store_err_to_response(e),
+            }
+        };
+        return match target_id {
+            Some(id) => match app.store.delete(&ctx, &id).await {
+                Ok(()) => (
+                    StatusCode::OK,
+                    Json(json!({"id": id, "removed": true, "storage_backend": "postgres"})),
+                )
+                    .into_response(),
+                Err(crate::store::StoreError::NotFound { .. }) => (
+                    StatusCode::OK,
+                    Json(json!({"id": id, "removed": false, "storage_backend": "postgres"})),
+                )
+                    .into_response(),
+                Err(e) => store_err_to_response(e),
+            },
+            None => (
+                StatusCode::OK,
+                Json(json!({
+                    "id": "",
+                    "removed": false,
+                    "storage_backend": "postgres",
+                })),
+            )
+                .into_response(),
+        };
+    }
+
     // Prefer explicit id. If absent, dispatch by (agent_id, namespace) for
     // S33 — find the first matching row from list() and delete it.
     if let Some(id) = q.id.clone() {
@@ -8206,49 +8368,101 @@ pub async fn get_namespace_standard_qs(
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         let ctx = crate::store::CallerContext::for_agent("ai:http");
-        let inherit = q.inherit.unwrap_or(true);
-        // Walk leaf→root if inherit is set; else single lookup.
-        let chain: Vec<String> = if inherit {
-            // Build the namespace chain by trimming `/segment` until
-            // empty. This avoids needing a postgres-side recursive CTE
-            // for the simple inheritance walk and matches the SQLite
-            // semantics layered by `db::resolve_namespace_standard`.
+        let inherit = q.inherit.unwrap_or(false);
+        // Build chain leaf → root (most-specific first) by trimming
+        // `/segment` until empty. The chain matches the SQLite
+        // semantics in `db::resolve_namespace_standard` for the
+        // simple namespace-hierarchy case.
+        let mut chain: Vec<String> = vec![ns.clone()];
+        if inherit {
             let mut cur = ns.clone();
-            let mut out = vec![cur.clone()];
             while let Some(pos) = cur.rfind('/') {
                 cur.truncate(pos);
                 if cur.is_empty() {
                     break;
                 }
-                out.push(cur.clone());
+                chain.push(cur.clone());
             }
-            out
-        } else {
-            vec![ns.clone()]
-        };
-        for candidate in chain {
-            match app.store.get_namespace_standard(&ctx, &candidate).await {
-                Ok(Some((standard_id, parent))) => {
-                    return (
-                        StatusCode::OK,
-                        Json(json!({
-                            "namespace": ns,
-                            "resolved_namespace": candidate,
+        }
+
+        if inherit {
+            // S35 contract — return the FULL chain of standards from
+            // leaf → root so the caller sees both child and parent
+            // rules layered into one view. Mirrors the sqlite
+            // `handle_namespace_get_standard` inherit branch which
+            // returns `chain` + `standards` arrays.
+            let mut standards: Vec<serde_json::Value> = Vec::new();
+            for candidate in &chain {
+                if let Ok(Some((standard_id, parent))) =
+                    app.store.get_namespace_standard(&ctx, candidate).await
+                {
+                    // Pull the standard memory body so the caller can
+                    // see governance + content layered through.
+                    let mem_doc = match app.store.get(&ctx, &standard_id).await {
+                        Ok(m) => json!({
+                            "namespace": candidate,
+                            "standard_id": standard_id,
+                            "id": standard_id,
+                            "title": m.title,
+                            "content": m.content,
+                            "priority": m.priority,
+                            "parent_namespace": parent,
+                            "governance": m.metadata.get("governance").cloned()
+                                .unwrap_or(serde_json::Value::Null),
+                        }),
+                        Err(_) => json!({
+                            "namespace": candidate,
                             "standard_id": standard_id,
                             "id": standard_id,
                             "parent_namespace": parent,
-                            "storage_backend": "postgres",
-                        })),
-                    )
-                        .into_response();
+                        }),
+                    };
+                    standards.push(mem_doc);
                 }
-                Ok(None) => continue,
-                Err(e) => return store_err_to_response(e),
             }
+            // Pick the closest (leaf-most) entry as the resolved
+            // standard for the response root level so existing
+            // single-standard consumers still see the expected
+            // `standard_id`.
+            let closest = standards.first().cloned().unwrap_or(json!({}));
+            return (
+                StatusCode::OK,
+                Json(json!({
+                    "namespace": ns,
+                    "chain": chain,
+                    "standards": standards,
+                    "resolved_namespace": closest.get("namespace").cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                    "standard_id": closest.get("standard_id").cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                    "id": closest.get("id").cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                    "parent_namespace": closest.get("parent_namespace").cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                    "storage_backend": "postgres",
+                })),
+            )
+                .into_response();
         }
-        // No standard anywhere on the chain — return 200 with null
-        // standard_id so callers can distinguish "no standard" from
-        // "lookup failed".
+        // Non-inherit form — single exact-match lookup.
+        match app.store.get_namespace_standard(&ctx, &ns).await {
+            Ok(Some((standard_id, parent))) => {
+                return (
+                    StatusCode::OK,
+                    Json(json!({
+                        "namespace": ns,
+                        "resolved_namespace": ns,
+                        "standard_id": standard_id,
+                        "id": standard_id,
+                        "parent_namespace": parent,
+                        "storage_backend": "postgres",
+                    })),
+                )
+                    .into_response();
+            }
+            Ok(None) => {}
+            Err(e) => return store_err_to_response(e),
+        }
         return (
             StatusCode::OK,
             Json(json!({
