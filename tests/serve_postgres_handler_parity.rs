@@ -491,8 +491,14 @@ async fn bucket_c_namespace_meta_propagation() {
     let client = reqwest::Client::new();
     let parent_ns = format!("bucket-c-meta-{}", &uuid::Uuid::new_v4().to_string()[..8]);
 
-    let standard_id =
-        store_memory(&client, &base, &parent_ns, "standard", "the standard memory").await;
+    let standard_id = store_memory(
+        &client,
+        &base,
+        &parent_ns,
+        "standard",
+        "the standard memory",
+    )
+    .await;
     let resp = client
         .post(format!("{base}/api/v1/namespaces"))
         .json(&json!({
@@ -830,10 +836,7 @@ async fn bucket_f_link_signing_observed_by() {
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
     let client = reqwest::Client::new();
-    let ns = format!(
-        "bucket-f-signed-{}",
-        &uuid::Uuid::new_v4().to_string()[..8]
-    );
+    let ns = format!("bucket-f-signed-{}", &uuid::Uuid::new_v4().to_string()[..8]);
     let a = store_memory(&client, &base, &ns, "src", "source").await;
     let b = store_memory(&client, &base, &ns, "tgt", "target").await;
 
