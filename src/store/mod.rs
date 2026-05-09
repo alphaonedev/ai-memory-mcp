@@ -58,6 +58,7 @@ use bitflags::bitflags;
 use serde::{Deserialize, Serialize};
 
 use crate::models::{AgentRegistration, Memory, MemoryLink, Tier};
+use crate::quotas::QuotaStatus;
 
 /// Knowledge-graph backend resolved at adapter init.
 ///
@@ -1017,6 +1018,73 @@ pub trait MemoryStore: Send + Sync {
     ) -> StoreResult<crate::models::GovernanceDecision> {
         Ok(crate::models::GovernanceDecision::Allow)
     }
+
+    // ==================================================================
+    // v0.7.0 Wave-3 Continuation 6 — quota + verify-link parity.
+    //
+    // The three trait methods below close the F7 cert-harness gaps for
+    // S52 (link verify), S61 (quota status), and S65 (find-paths over
+    // HTTP). All three adapters implement; the default returns
+    // `UnsupportedCapability` so backends that haven't wired them yet
+    // fail loudly rather than silently no-op.
+    // ==================================================================
+
+    /// Read the agent's quota row, auto-inserting a default row when
+    /// none exists. Mirrors `crate::quotas::get_status` on the SQLite
+    /// path but operates against the adapter-specific `agent_quotas`
+    /// table so postgres-backed daemons surface the same wire shape
+    /// without falling through to the empty `app.db` scratch
+    /// connection.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    async fn quota_status(&self, _agent_id: &str) -> StoreResult<QuotaStatus> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "QUOTA_STATUS".to_string(),
+        })
+    }
+
+    /// List every quota row in the substrate, sorted ascending by
+    /// `agent_id`. Operator-facing surface that backs `quota_status`'s
+    /// "no agent_id supplied" path.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    async fn quota_status_list(&self) -> StoreResult<Vec<QuotaStatus>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "QUOTA_STATUS_LIST".to_string(),
+        })
+    }
+
+    /// Verify a single link by `(source_id, target_id?)` or by
+    /// `link_id`. Returns the resolved [`VerifyLinkReport`] including
+    /// `verified`, `attest_level`, `signature_present`, and
+    /// `observed_by`. Returns [`StoreError::NotFound`] when the filter
+    /// resolves no row, and [`StoreError::InvalidInput`] when the
+    /// filter does not specify either a `source_id` or a `link_id`.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    async fn verify_link(&self, _filter: VerifyFilter) -> StoreResult<VerifyLinkReport> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "VERIFY_LINK".to_string(),
+        })
+    }
+
+    /// v0.7 J7 / Continuation 6 — enumerate up to `max_results` paths
+    /// between two memories, bounded by `max_depth`. Mirrors the
+    /// adapter-specific `find_paths` call but lifted to the trait
+    /// surface so handlers can stay backend-blind.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    async fn find_paths(
+        &self,
+        _source_id: &str,
+        _target_id: &str,
+        _max_depth: Option<usize>,
+        _max_results: Option<usize>,
+    ) -> StoreResult<Vec<Vec<String>>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "FIND_PATHS".to_string(),
+        })
+    }
 }
 
 /// v0.7.0 Wave-3 Continuation 3 (Phase 20) — action class threaded
@@ -1102,6 +1170,68 @@ pub struct VerifyReport {
     /// True iff the adapter performed a real cryptographic signature
     /// verification. Always false pre-Task-1.4.
     pub signature_verified: bool,
+}
+
+/// v0.7.0 Continuation 6 — filter shape for [`MemoryStore::verify_link`].
+///
+/// Mirrors the wire shape of `POST /api/v1/links/verify`: callers can
+/// scope the verify by `(source_id, target_id)` (the canonical link
+/// composite key minus relation, which is rarely known up-front), or by
+/// the rowid-style `link_id` when the cert harness already has it. At
+/// least one of `(source_id, target_id)` OR `link_id` MUST be set —
+/// adapters return [`StoreError::InvalidInput`] otherwise.
+///
+/// `target_id` is optional even when `source_id` is set: an unset
+/// `target_id` requests the first outbound link from `source_id`,
+/// matching the cert harness's "verify a link this memory authored"
+/// posture.
+#[derive(Debug, Clone, Default)]
+pub struct VerifyFilter {
+    /// Source memory id. Required unless `link_id` is set.
+    pub source_id: Option<String>,
+    /// Target memory id. Optional when `source_id` is set — the adapter
+    /// resolves the first outbound link from `source_id`.
+    pub target_id: Option<String>,
+    /// Internal link rowid. When set, takes precedence over
+    /// `(source_id, target_id)`. Format is adapter-specific.
+    pub link_id: Option<String>,
+}
+
+/// v0.7.0 Continuation 6 — report produced by [`MemoryStore::verify_link`].
+///
+/// Wire shape mirrors what the cert harness expects from
+/// `POST /api/v1/links/verify`: `{verified, attest_level,
+/// signature_present, observed_by}`. `verified` is `true` iff the link
+/// row was found AND, when a signature is present, the adapter ran a
+/// real cryptographic verify against the enrolled peer public key.
+/// `attest_level` is the link's stored level (`unsigned` |
+/// `self_signed` | `peer_attested`) — same vocabulary as the SQLite
+/// `db::create_link_signed` write path. `signature_present` is `true`
+/// when the link carries a signature blob; `observed_by` is the agent
+/// id that signed (or `None` for unsigned).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerifyLinkReport {
+    /// Source memory id of the link that was verified.
+    pub source_id: String,
+    /// Target memory id of the link that was verified.
+    pub target_id: String,
+    /// Relation tag (e.g. `"related_to"`).
+    pub relation: String,
+    /// True when the link exists AND, if a signature is present, the
+    /// signature verifies against the enrolled peer key. False when the
+    /// link is missing OR the signature is present but does not verify.
+    pub verified: bool,
+    /// Attest level stored on the row: `unsigned` | `self_signed` |
+    /// `peer_attested`.
+    pub attest_level: String,
+    /// True when the row carries a signature blob.
+    pub signature_present: bool,
+    /// Agent id that signed the row, or `None` for unsigned links.
+    pub observed_by: Option<String>,
+    /// Diagnostic findings — non-fatal observations populated by the
+    /// adapter (e.g. "signature blob present but no enrolled peer key
+    /// for observed_by"). Empty on a clean verify.
+    pub findings: Vec<String>,
 }
 
 #[cfg(test)]

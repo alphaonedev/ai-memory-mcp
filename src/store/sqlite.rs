@@ -10,6 +10,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use rusqlite::OptionalExtension;
 use tokio::sync::Mutex;
 
 use crate::db;
@@ -17,8 +18,9 @@ use crate::models::{AgentRegistration, Memory, MemoryLink, Tier};
 
 use super::{
     BoxBackendError, CallerContext, Capabilities, Filter, MemoryStore, StoreError, StoreResult,
-    Transaction, UpdatePatch, VerifyReport,
+    Transaction, UpdatePatch, VerifyFilter, VerifyLinkReport, VerifyReport,
 };
+use crate::quotas::{self, QuotaStatus};
 
 /// SAL adapter over the existing bundled-SQLite storage. Holds an
 /// `Arc<Mutex<Connection>>` matching the HTTP daemon's shared state so
@@ -589,6 +591,220 @@ impl MemoryStore for SqliteStore {
             payload,
         )
         .map_err(box_err)
+    }
+
+    // -------- v0.7.0 Wave-3 Continuation 6 — quota + verify-link ---------
+
+    async fn quota_status(&self, agent_id: &str) -> StoreResult<QuotaStatus> {
+        let conn = self.state.lock().await;
+        quotas::get_status(&conn, agent_id).map_err(box_err)
+    }
+
+    async fn quota_status_list(&self) -> StoreResult<Vec<QuotaStatus>> {
+        let conn = self.state.lock().await;
+        quotas::list_status(&conn).map_err(box_err)
+    }
+
+    async fn verify_link(&self, filter: VerifyFilter) -> StoreResult<VerifyLinkReport> {
+        // Filter shape: at least one of `(source_id, target_id)` OR
+        // `link_id` must be set. `link_id` on the SQLite path is the
+        // canonical `source_id|target_id|relation` triple — SQLite has
+        // no separate rowid surface for links (composite PK). Postgres
+        // honors the same convention so the wire shape is stable.
+        if filter.source_id.is_none() && filter.link_id.is_none() {
+            return Err(StoreError::InvalidInput {
+                detail: "verify_link requires either source_id or link_id".to_string(),
+            });
+        }
+
+        // Resolve the (source, target, relation) triple from either
+        // axis. `link_id` of form "src|tgt|rel" wins; otherwise read
+        // (source, target?) and resolve the first outbound link from
+        // source when target is unset.
+        let (source_id, target_id, relation_filter) = if let Some(link_id) =
+            filter.link_id.as_deref()
+        {
+            let parts: Vec<&str> = link_id.split('|').collect();
+            if parts.len() != 3 {
+                return Err(StoreError::InvalidInput {
+                    detail: format!(
+                        "link_id must be canonical source_id|target_id|relation triple, got {link_id}"
+                    ),
+                });
+            }
+            (
+                parts[0].to_string(),
+                Some(parts[1].to_string()),
+                Some(parts[2].to_string()),
+            )
+        } else {
+            (filter.source_id.unwrap_or_default(), filter.target_id, None)
+        };
+
+        let conn = self.state.lock().await;
+
+        // Build the WHERE clause for resolving the first matching row.
+        let row: Option<(
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<Vec<u8>>,
+            Option<String>,
+        )> = match (target_id.as_deref(), relation_filter.as_deref()) {
+            (Some(t), Some(r)) => conn
+                .query_row(
+                    "SELECT source_id, target_id, relation, valid_from, valid_until, \
+                            observed_by, signature, attest_level
+                     FROM memory_links \
+                     WHERE source_id = ?1 AND target_id = ?2 AND relation = ?3 \
+                     LIMIT 1",
+                    rusqlite::params![source_id, t, r],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, Option<String>>(3)?,
+                            r.get::<_, Option<String>>(4)?,
+                            r.get::<_, Option<String>>(5)?,
+                            r.get::<_, Option<Vec<u8>>>(6)?,
+                            r.get::<_, Option<String>>(7)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(box_err)?,
+            (Some(t), None) => conn
+                .query_row(
+                    "SELECT source_id, target_id, relation, valid_from, valid_until, \
+                            observed_by, signature, attest_level
+                     FROM memory_links \
+                     WHERE source_id = ?1 AND target_id = ?2 \
+                     ORDER BY created_at ASC LIMIT 1",
+                    rusqlite::params![source_id, t],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, Option<String>>(3)?,
+                            r.get::<_, Option<String>>(4)?,
+                            r.get::<_, Option<String>>(5)?,
+                            r.get::<_, Option<Vec<u8>>>(6)?,
+                            r.get::<_, Option<String>>(7)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(box_err)?,
+            (None, _) => conn
+                .query_row(
+                    "SELECT source_id, target_id, relation, valid_from, valid_until, \
+                            observed_by, signature, attest_level
+                     FROM memory_links \
+                     WHERE source_id = ?1 \
+                     ORDER BY created_at ASC LIMIT 1",
+                    rusqlite::params![source_id],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, Option<String>>(3)?,
+                            r.get::<_, Option<String>>(4)?,
+                            r.get::<_, Option<String>>(5)?,
+                            r.get::<_, Option<Vec<u8>>>(6)?,
+                            r.get::<_, Option<String>>(7)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(box_err)?,
+        };
+
+        let Some((src, tgt, rel, vf, vu, obs, sig, attest)) = row else {
+            return Err(StoreError::NotFound {
+                id: format!(
+                    "link {source_id} -> {} {}",
+                    target_id.as_deref().unwrap_or("?"),
+                    relation_filter.as_deref().unwrap_or("?")
+                ),
+            });
+        };
+
+        let attest_level = attest.unwrap_or_else(|| "unsigned".to_string());
+        let signature_present = sig.is_some();
+        let mut findings: Vec<String> = Vec::new();
+
+        // Cryptographic verify path: when a signature blob is present,
+        // try to look up the enrolled peer key and re-verify the
+        // canonical CBOR. Failure to look up the key is a finding (not
+        // an error) — the row stays `verified=true` if the structural
+        // check passed, with a finding noting the gap. This matches
+        // `sync_push`'s defensive accept-and-flag posture.
+        let verified = if signature_present {
+            let observed = obs.as_deref().unwrap_or("");
+            match crate::identity::verify::lookup_peer_public_key(observed) {
+                None => {
+                    findings.push(format!(
+                        "signature present but no enrolled public key for observed_by={observed}"
+                    ));
+                    // Without a key we cannot verify — surface false
+                    // here so callers don't treat the row as trusted.
+                    false
+                }
+                Some(pubkey) => {
+                    let signable = crate::identity::sign::SignableLink {
+                        src_id: &src,
+                        dst_id: &tgt,
+                        relation: &rel,
+                        observed_by: obs.as_deref(),
+                        valid_from: vf.as_deref(),
+                        valid_until: vu.as_deref(),
+                    };
+                    let sig_bytes = sig.as_deref().unwrap_or(&[]);
+                    match crate::identity::verify::verify(&pubkey, &signable, sig_bytes) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            findings.push(format!("signature verify failed: {e}"));
+                            false
+                        }
+                    }
+                }
+            }
+        } else {
+            // Unsigned link: structurally-valid rows pass verify with
+            // `signature_verified=false`. The cert harness reads
+            // `attest_level=unsigned` to decide whether to trust.
+            true
+        };
+
+        Ok(VerifyLinkReport {
+            source_id: src,
+            target_id: tgt,
+            relation: rel,
+            verified,
+            attest_level,
+            signature_present,
+            observed_by: obs,
+            findings,
+        })
+    }
+
+    async fn find_paths(
+        &self,
+        source_id: &str,
+        target_id: &str,
+        max_depth: Option<usize>,
+        max_results: Option<usize>,
+    ) -> StoreResult<Vec<Vec<String>>> {
+        let conn = self.state.lock().await;
+        // SQLite's find_paths defaults to current-view (excludes
+        // invalidated edges) — match the trait/HTTP contract.
+        db::find_paths(&conn, source_id, target_id, max_depth, max_results, false).map_err(box_err)
     }
 
     async fn notify(

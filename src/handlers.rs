@@ -394,6 +394,10 @@ pub fn postgres_endpoint_supported(method: &axum::http::Method, path: &str) -> b
         ("POST", "/api/v1/kg/query")
         | ("GET", "/api/v1/kg/timeline")
         | ("POST", "/api/v1/kg/invalidate") => true,
+        // Continuation 6 — three new HTTP endpoints (S52, S61, S65).
+        ("POST", "/api/v1/kg/find_paths")
+        | ("POST", "/api/v1/links/verify")
+        | ("POST", "/api/v1/quota/status") => true,
         // Wave-3 continuation — entity registry.
         ("POST", "/api/v1/entities") | ("GET", "/api/v1/entities/by_alias") => true,
         // Wave-3 continuation — stats (basic count).
@@ -4632,6 +4636,296 @@ pub async fn kg_invalidate(
             )
                 .into_response()
         }
+    }
+}
+
+// ============================================================================
+// v0.7.0 Wave-3 Continuation 6 — three REST endpoints closing F7 cert-harness
+// gaps (S52 `links/verify`, S61 `quota/status`, S65 `kg/find_paths`).
+// ============================================================================
+
+/// JSON body for `POST /api/v1/quota/status`.
+///
+/// `agent_id` is required when the caller wants a single-agent
+/// snapshot; omitting it returns the full table (operator surface).
+/// `namespace` is accepted for forward-compat — quotas today are
+/// agent-scoped, but the wire shape leaves room for namespace-scoped
+/// caps in a future wave.
+#[derive(Debug, Deserialize)]
+pub struct QuotaStatusBody {
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub namespace: Option<String>,
+}
+
+/// `POST /api/v1/quota/status` — read the agent's quota row, or the
+/// full table when `agent_id` is omitted. Returns the canonical
+/// `QuotaStatus` JSON projection.
+///
+/// Dispatches via `app.store.quota_status(agent_id)` so postgres-backed
+/// daemons read from the postgres `agent_quotas` table rather than the
+/// scratch sqlite connection.
+pub async fn quota_status_handler(
+    State(app): State<AppState>,
+    Json(body): Json<QuotaStatusBody>,
+) -> impl IntoResponse {
+    if let Some(agent_id) = body.agent_id.as_deref() {
+        if let Err(e) = validate::validate_agent_id(agent_id) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("invalid agent_id: {e}")})),
+            )
+                .into_response();
+        }
+
+        // Postgres-backed daemons MUST take the SAL trait dispatch — the
+        // scratch sqlite connection at `app.db` has no `agent_quotas`
+        // rows.
+        #[cfg(feature = "sal")]
+        if matches!(app.storage_backend, StorageBackend::Postgres) {
+            return match app.store.quota_status(agent_id).await {
+                Ok(status) => Json(json!(status)).into_response(),
+                Err(e) => store_err_to_response(e),
+            };
+        }
+
+        let lock = app.db.lock().await;
+        return match crate::quotas::get_status(&lock.0, agent_id) {
+            Ok(status) => Json(json!(status)).into_response(),
+            Err(e) => {
+                tracing::error!("quota_status handler error: {e}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "internal server error"})),
+                )
+                    .into_response()
+            }
+        };
+    }
+
+    // No agent_id supplied — operator-facing list path.
+    #[cfg(feature = "sal")]
+    if matches!(app.storage_backend, StorageBackend::Postgres) {
+        return match app.store.quota_status_list().await {
+            Ok(rows) => Json(json!({"quotas": rows, "count": rows.len()})).into_response(),
+            Err(e) => store_err_to_response(e),
+        };
+    }
+
+    let lock = app.db.lock().await;
+    match crate::quotas::list_status(&lock.0) {
+        Ok(rows) => {
+            let count = rows.len();
+            Json(json!({"quotas": rows, "count": count})).into_response()
+        }
+        Err(e) => {
+            tracing::error!("quota_status list handler error: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "internal server error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// JSON body for `POST /api/v1/kg/find_paths`.
+///
+/// `source_id` + `target_id` are required. `max_depth` defaults to the
+/// adapter's `FIND_PATHS_DEFAULT_DEPTH`; `max_results` clamps the
+/// returned path count.
+#[derive(Debug, Deserialize)]
+pub struct FindPathsBody {
+    pub source_id: String,
+    pub target_id: String,
+    #[serde(default)]
+    pub max_depth: Option<usize>,
+    #[serde(default)]
+    pub max_results: Option<usize>,
+}
+
+/// `POST /api/v1/kg/find_paths` — enumerate up to N paths between two
+/// memories. Wraps the SAL [`MemoryStore::find_paths`] surface so both
+/// SQLite (recursive CTE) and Postgres (AGE Cypher / CTE fallback)
+/// dispatch through the same handler.
+///
+/// Wire shape: `{paths: [[id, id, ...], ...], count}`. Each inner
+/// array is the chain of memory ids from `source_id` to `target_id`,
+/// inclusive.
+pub async fn kg_find_paths(
+    State(app): State<AppState>,
+    Json(body): Json<FindPathsBody>,
+) -> impl IntoResponse {
+    if let Err(e) = validate::validate_id(&body.source_id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("invalid source_id: {e}")})),
+        )
+            .into_response();
+    }
+    if let Err(e) = validate::validate_id(&body.target_id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("invalid target_id: {e}")})),
+        )
+            .into_response();
+    }
+
+    #[cfg(feature = "sal")]
+    {
+        return match app
+            .store
+            .find_paths(
+                &body.source_id,
+                &body.target_id,
+                body.max_depth,
+                body.max_results,
+            )
+            .await
+        {
+            Ok(paths) => {
+                if crate::audit::is_enabled() {
+                    crate::audit::emit(crate::audit::EventBuilder::new(
+                        crate::audit::AuditAction::Recall,
+                        crate::audit::actor("ai:http", "http_body", None),
+                        crate::audit::target_memory(
+                            body.source_id.clone(),
+                            String::new(),
+                            Some(format!("find_paths -> {}", body.target_id)),
+                            None,
+                            None,
+                        ),
+                    ));
+                }
+                let count = paths.len();
+                Json(json!({
+                    "paths": paths,
+                    "count": count,
+                    "source_id": body.source_id,
+                    "target_id": body.target_id,
+                }))
+                .into_response()
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("max_depth") || msg.contains("depth") {
+                    return (
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        Json(json!({"error": msg})),
+                    )
+                        .into_response();
+                }
+                store_err_to_response(e)
+            }
+        };
+    }
+
+    #[cfg(not(feature = "sal"))]
+    {
+        let _ = app;
+        let _ = body;
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({"error": "find_paths requires --features sal"})),
+        )
+            .into_response()
+    }
+}
+
+/// JSON body for `POST /api/v1/links/verify`.
+///
+/// Either `source_id` (with optional `target_id`) OR `link_id` MUST be
+/// supplied. `link_id` on every adapter is the canonical
+/// `source_id|target_id|relation` triple — the trait does not expose a
+/// rowid surface for links.
+#[derive(Debug, Deserialize)]
+pub struct VerifyLinkBody {
+    #[serde(default)]
+    pub source_id: Option<String>,
+    #[serde(default)]
+    pub target_id: Option<String>,
+    #[serde(default)]
+    pub link_id: Option<String>,
+}
+
+/// `POST /api/v1/links/verify` — re-verify a stored link's signature
+/// (when present) and project the resolved attest level. Wire shape:
+/// `{verified, attest_level, signature_present, observed_by, source_id,
+/// target_id, relation, findings}`.
+pub async fn verify_link_handler(
+    State(app): State<AppState>,
+    Json(body): Json<VerifyLinkBody>,
+) -> impl IntoResponse {
+    if body.source_id.is_none() && body.link_id.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "verify_link requires either source_id or link_id",
+                "fields": ["source_id", "link_id"],
+            })),
+        )
+            .into_response();
+    }
+    if let Some(s) = body.source_id.as_deref()
+        && let Err(e) = validate::validate_id(s)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("invalid source_id: {e}")})),
+        )
+            .into_response();
+    }
+    if let Some(t) = body.target_id.as_deref()
+        && let Err(e) = validate::validate_id(t)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("invalid target_id: {e}")})),
+        )
+            .into_response();
+    }
+
+    #[cfg(feature = "sal")]
+    {
+        let filter = crate::store::VerifyFilter {
+            source_id: body.source_id.clone(),
+            target_id: body.target_id.clone(),
+            link_id: body.link_id.clone(),
+        };
+        return match app.store.verify_link(filter).await {
+            Ok(report) => {
+                if crate::audit::is_enabled() {
+                    crate::audit::emit(crate::audit::EventBuilder::new(
+                        crate::audit::AuditAction::Link,
+                        crate::audit::actor("ai:http", "http_body", None),
+                        crate::audit::target_memory(
+                            report.source_id.clone(),
+                            String::new(),
+                            Some(format!(
+                                "verify -> {} {}",
+                                report.target_id, report.relation
+                            )),
+                            None,
+                            None,
+                        ),
+                    ));
+                }
+                Json(json!(report)).into_response()
+            }
+            Err(e) => store_err_to_response(e),
+        };
+    }
+
+    #[cfg(not(feature = "sal"))]
+    {
+        let _ = app;
+        let _ = body;
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({"error": "verify_link requires --features sal"})),
+        )
+            .into_response()
     }
 }
 

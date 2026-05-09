@@ -970,3 +970,303 @@ async fn state_flake_memory_promote() {
     shutdown.notify_one();
     let _ = handle.await;
 }
+
+// ============================================================================
+// Continuation 6 — three new REST endpoints (S52, S61, S65)
+// ============================================================================
+
+/// S61: `POST /api/v1/quota/status` returns a populated `QuotaStatus`
+/// row keyed on the supplied `agent_id` even on a postgres-backed
+/// daemon (which does NOT have a sqlite `agent_quotas` row to fall
+/// back on). Auto-inserts the default row on first call.
+#[tokio::test(flavor = "multi_thread")]
+async fn cont6_quota_status_postgres() {
+    let Some(url) = postgres_url() else {
+        eprintln!("skipping cont6_quota_status_postgres");
+        return;
+    };
+    let (base, shutdown, handle) = spawn_daemon(&url).await;
+    let client = reqwest::Client::new();
+    let agent = format!("cont6-quota-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+
+    let resp = client
+        .post(format!("{base}/api/v1/quota/status"))
+        .json(&json!({"agent_id": agent}))
+        .send()
+        .await
+        .expect("quota POST");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let v: Value = resp.json().await.expect("body");
+    assert_eq!(v["agent_id"], agent);
+    assert_eq!(
+        v["max_memories_per_day"], 1000,
+        "default daily memory cap must be 1000"
+    );
+    assert_eq!(
+        v["max_storage_bytes"], 104_857_600,
+        "default storage cap must be 100 MiB"
+    );
+    assert_eq!(v["max_links_per_day"], 5000);
+    assert_eq!(v["current_memories_today"], 0);
+
+    // Second call: same row, idempotent.
+    let resp = client
+        .post(format!("{base}/api/v1/quota/status"))
+        .json(&json!({"agent_id": agent}))
+        .send()
+        .await
+        .expect("quota POST 2");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let v2: Value = resp.json().await.expect("body 2");
+    assert_eq!(v2["agent_id"], agent);
+
+    shutdown.notify_one();
+    let _ = handle.await;
+}
+
+/// S61: omitting `agent_id` returns the full table — the operator
+/// surface backing the MCP `memory_quota_status` "no id" path.
+#[tokio::test(flavor = "multi_thread")]
+async fn cont6_quota_status_list_postgres() {
+    let Some(url) = postgres_url() else {
+        eprintln!("skipping cont6_quota_status_list_postgres");
+        return;
+    };
+    let (base, shutdown, handle) = spawn_daemon(&url).await;
+    let client = reqwest::Client::new();
+    let agent = format!("cont6-quota-list-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    // Auto-insert one row first.
+    client
+        .post(format!("{base}/api/v1/quota/status"))
+        .json(&json!({"agent_id": agent}))
+        .send()
+        .await
+        .expect("quota POST");
+
+    let resp = client
+        .post(format!("{base}/api/v1/quota/status"))
+        .json(&json!({}))
+        .send()
+        .await
+        .expect("quota list POST");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let v: Value = resp.json().await.expect("body");
+    let arr = v["quotas"].as_array().expect("quotas array");
+    assert!(
+        arr.iter().any(|r| r["agent_id"] == agent),
+        "list must include the auto-inserted agent {agent}; got {arr:?}"
+    );
+
+    shutdown.notify_one();
+    let _ = handle.await;
+}
+
+/// S61: invalid `agent_id` -> 400.
+#[tokio::test(flavor = "multi_thread")]
+async fn cont6_quota_status_rejects_invalid_agent() {
+    let Some(url) = postgres_url() else {
+        eprintln!("skipping cont6_quota_status_rejects_invalid_agent");
+        return;
+    };
+    let (base, shutdown, handle) = spawn_daemon(&url).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{base}/api/v1/quota/status"))
+        // whitespace + control chars are rejected by validate_agent_id.
+        .json(&json!({"agent_id": "bad agent id"}))
+        .send()
+        .await
+        .expect("quota POST");
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    shutdown.notify_one();
+    let _ = handle.await;
+}
+
+/// S65: `POST /api/v1/kg/find_paths` over a 4-hop chain returns at
+/// least one path of length >=2 (start + 4 intermediate + end is not
+/// guaranteed to exist as a single path on every adapter; the contract
+/// is "non-empty, includes both endpoints").
+#[tokio::test(flavor = "multi_thread")]
+async fn cont6_find_paths_returns_chain() {
+    let Some(url) = postgres_url() else {
+        eprintln!("skipping cont6_find_paths_returns_chain");
+        return;
+    };
+    let (base, shutdown, handle) = spawn_daemon(&url).await;
+    let client = reqwest::Client::new();
+    let ns = format!("cont6-paths-{}", uuid::Uuid::new_v4());
+
+    // Build A -> B -> C -> D chain.
+    let mut ids = Vec::new();
+    for label in ["A", "B", "C", "D"] {
+        ids.push(store_memory(&client, &base, &ns, label, &format!("node {label}")).await);
+    }
+    for w in ids.windows(2) {
+        let resp = client
+            .post(format!("{base}/api/v1/links"))
+            .json(&json!({
+                "source_id": w[0],
+                "target_id": w[1],
+                "relation": "related_to",
+            }))
+            .send()
+            .await
+            .expect("link POST");
+        assert!(resp.status().is_success(), "link must succeed");
+    }
+
+    let resp = client
+        .post(format!("{base}/api/v1/kg/find_paths"))
+        .json(&json!({
+            "source_id": ids[0],
+            "target_id": ids[3],
+            "max_depth": 5,
+        }))
+        .send()
+        .await
+        .expect("find_paths POST");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "find_paths must return 200 on postgres-backed daemon"
+    );
+    let v: Value = resp.json().await.expect("body");
+    let paths = v["paths"].as_array().expect("paths array");
+    assert!(!paths.is_empty(), "find_paths must return at least one path");
+    let first = paths[0].as_array().expect("inner path array");
+    let endpoints: Vec<&str> = first.iter().filter_map(|x| x.as_str()).collect();
+    assert!(
+        endpoints.first().map(|s| s == &ids[0]).unwrap_or(false),
+        "first node of the path must be the source: {endpoints:?}"
+    );
+    assert!(
+        endpoints.last().map(|s| s == &ids[3]).unwrap_or(false),
+        "last node of the path must be the target: {endpoints:?}"
+    );
+
+    shutdown.notify_one();
+    let _ = handle.await;
+}
+
+/// S65: invalid `source_id` -> 400.
+#[tokio::test(flavor = "multi_thread")]
+async fn cont6_find_paths_rejects_invalid_id() {
+    let Some(url) = postgres_url() else {
+        eprintln!("skipping cont6_find_paths_rejects_invalid_id");
+        return;
+    };
+    let (base, shutdown, handle) = spawn_daemon(&url).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{base}/api/v1/kg/find_paths"))
+        .json(&json!({
+            "source_id": "bad id with space",
+            "target_id": "another bad",
+        }))
+        .send()
+        .await
+        .expect("find_paths POST");
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    shutdown.notify_one();
+    let _ = handle.await;
+}
+
+/// S52: `POST /api/v1/links/verify` for an unsigned link projects
+/// `attest_level=unsigned`, `verified=true`, `signature_present=false`.
+#[tokio::test(flavor = "multi_thread")]
+async fn cont6_verify_link_unsigned() {
+    let Some(url) = postgres_url() else {
+        eprintln!("skipping cont6_verify_link_unsigned");
+        return;
+    };
+    let (base, shutdown, handle) = spawn_daemon(&url).await;
+    let client = reqwest::Client::new();
+    let ns = format!("cont6-verify-{}", uuid::Uuid::new_v4());
+
+    let src = store_memory(&client, &base, &ns, "src", "source memory").await;
+    let tgt = store_memory(&client, &base, &ns, "tgt", "target memory").await;
+    let resp = client
+        .post(format!("{base}/api/v1/links"))
+        .json(&json!({
+            "source_id": src,
+            "target_id": tgt,
+            "relation": "related_to",
+        }))
+        .send()
+        .await
+        .expect("link POST");
+    assert!(resp.status().is_success(), "link create must succeed");
+
+    let resp = client
+        .post(format!("{base}/api/v1/links/verify"))
+        .json(&json!({
+            "source_id": src,
+            "target_id": tgt,
+        }))
+        .send()
+        .await
+        .expect("verify POST");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let v: Value = resp.json().await.expect("body");
+    assert_eq!(v["source_id"], src);
+    assert_eq!(v["target_id"], tgt);
+    assert_eq!(v["relation"], "related_to");
+    assert_eq!(v["attest_level"], "unsigned");
+    assert_eq!(v["signature_present"], false);
+    assert_eq!(
+        v["verified"], true,
+        "structurally-valid unsigned link must verify clean"
+    );
+
+    shutdown.notify_one();
+    let _ = handle.await;
+}
+
+/// S52: missing both `source_id` and `link_id` -> 400.
+#[tokio::test(flavor = "multi_thread")]
+async fn cont6_verify_link_rejects_empty_filter() {
+    let Some(url) = postgres_url() else {
+        eprintln!("skipping cont6_verify_link_rejects_empty_filter");
+        return;
+    };
+    let (base, shutdown, handle) = spawn_daemon(&url).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{base}/api/v1/links/verify"))
+        .json(&json!({}))
+        .send()
+        .await
+        .expect("verify POST");
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    shutdown.notify_one();
+    let _ = handle.await;
+}
+
+/// S52: missing link -> 404.
+#[tokio::test(flavor = "multi_thread")]
+async fn cont6_verify_link_missing_returns_not_found() {
+    let Some(url) = postgres_url() else {
+        eprintln!("skipping cont6_verify_link_missing_returns_not_found");
+        return;
+    };
+    let (base, shutdown, handle) = spawn_daemon(&url).await;
+    let client = reqwest::Client::new();
+    let bogus_src = uuid::Uuid::new_v4().to_string();
+    let bogus_tgt = uuid::Uuid::new_v4().to_string();
+    let resp = client
+        .post(format!("{base}/api/v1/links/verify"))
+        .json(&json!({
+            "source_id": bogus_src,
+            "target_id": bogus_tgt,
+        }))
+        .send()
+        .await
+        .expect("verify POST");
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+
+    shutdown.notify_one();
+    let _ = handle.await;
+}
