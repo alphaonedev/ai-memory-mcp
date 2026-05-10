@@ -2279,22 +2279,35 @@ impl PostgresStore {
         // — the AGE projection stores edges in declared direction but
         // the path query treats them as undirected, the same contract
         // as the CTE branch.
+        //
+        // `properties(n).id` rather than `n.id` because AGE's
+        // `convert_cypher_to_subquery` analyzer rejects bare property
+        // accesses on list-comprehension iteration variables with
+        // `could not find properties for n`. Wrapping through
+        // `properties()` produces an agtype map and pulls the `.id`
+        // out of it — the wire shape is identical
+        // (`["id1","id2",...]`) and the rewrite is parser-only.
         let cypher = format!(
             "MATCH p = (a)-[*..{depth}]-(b) \
              WHERE a.id = $start_id AND b.id = $target_id \
-             RETURN [n IN nodes(p) | n.id] AS path \
+             RETURN [n IN nodes(p) | properties(n).id] AS path \
              ORDER BY length(p) ASC \
              LIMIT {cap}"
         );
 
-        // Inline the params dict — see `age_params_literal`.
-        let params_lit = age_params_literal(&[("start_id", source_id), ("target_id", target_id)]);
+        // v0.7.0.1 G2 — bind the params dict as an `agtype`-typed
+        // parameter through sqlx (`$1`) rather than inlining it as a
+        // SQL literal. AGE 1.5.0's `convert_cypher_to_subquery`
+        // analyzer rejects ANY non-Param node at the third-argument
+        // position; the literal form previously here surfaces as a
+        // 503 from `POST /api/v1/kg/find_paths` (HALT R1b S65).
+        let params = age_params_jsonb(&[("start_id", source_id), ("target_id", target_id)]);
         let sql = format!(
-            "SELECT path FROM cypher('memory_graph', $$ {cypher} $$, {params_lit}) AS \
-             (path agtype)"
+            "SELECT path FROM cypher('memory_graph', $$ {cypher} $$, $1) AS (path agtype)"
         );
 
         let rows = sqlx::query(&sql)
+            .bind(Agtype(params))
             .fetch_all(&mut *tx)
             .await
             .map_err(|e| to_store_err("cypher find_paths", e))?;
@@ -2304,18 +2317,20 @@ impl PostgresStore {
             .map_err(|e| to_store_err("commit AGE tx", e))?;
 
         // AGE returns each `path` cell as agtype text shaped like
-        // `["id1","id2",...]`. We parse it as JSON since AGE arrays of
-        // strings are JSON-compatible — the same trick the rest of
-        // this module uses for scalars.
+        // `["id1","id2",...]`. Decode through the [`Agtype`] wrapper so
+        // sqlx's binary-protocol path strips the version byte; the
+        // resulting string is JSON and parses into `Vec<String>`
+        // directly because AGE arrays of strings are JSON-compatible.
         rows.iter()
             .map(|r| {
-                let raw: String = r
-                    .try_get::<String, _>("path")
+                let raw: Agtype = r
+                    .try_get::<Agtype, _>("path")
                     .map_err(|e| to_store_err("read path", e))?;
-                let parsed: Vec<String> =
-                    serde_json::from_str(&raw).map_err(|e| StoreError::IntegrityFailed {
-                        detail: format!("non-JSON AGE path: {raw}: {e}"),
-                    })?;
+                let parsed: Vec<String> = serde_json::from_str(&raw.0).map_err(|e| {
+                    StoreError::IntegrityFailed {
+                        detail: format!("non-JSON AGE path: {}: {e}", raw.0),
+                    }
+                })?;
                 Ok(parsed)
             })
             .collect()
@@ -2702,6 +2717,102 @@ fn age_params_literal(pairs: &[(&str, &str)]) -> String {
     // SQL-escape single quotes by doubling them.
     let escaped = json.replace('\'', "''");
     format!("'{escaped}'::agtype")
+}
+
+/// v0.7.0.1 G2 — sqlx-bindable wrapper for AGE's `agtype` parameter
+/// type.
+///
+/// The cypher() set-returning function's third argument is a `cstring`
+/// at the catalog level but AGE 1.5.0's `convert_cypher_to_subquery`
+/// analyzer rejects ANY non-`Param` node there: literals
+/// (`'…'::agtype`), casts (`$1::agtype`), and scalar subqueries all
+/// fail with `third argument of cypher function must be a parameter`.
+///
+/// PostgreSQL's prepared-statement parameter inference DOES resolve a
+/// bare `$N` to `agtype` from the function signature when the caller
+/// declares the parameter as untyped (`unknown` OID `705`). sqlx's
+/// default `String` encoder declares the parameter as `text`, which
+/// overrides inference and re-introduces the literal-cast shape.
+///
+/// This wrapper carries a JSON-encoded params dictionary and binds
+/// itself with the `agtype` type oid name so PostgreSQL ships the
+/// parameter as the correct type without needing a SQL-side cast at
+/// the cypher() call site. The on-wire format for `agtype` text is
+/// the same JSON shape AGE accepts inline (e.g. `{"start_id":"…"}`).
+struct Agtype(String);
+
+impl sqlx::Type<sqlx::Postgres> for Agtype {
+    fn type_info() -> sqlx::postgres::PgTypeInfo {
+        sqlx::postgres::PgTypeInfo::with_name("agtype")
+    }
+    fn compatible(_ty: &sqlx::postgres::PgTypeInfo) -> bool {
+        true
+    }
+}
+
+impl<'q> sqlx::Encode<'q, sqlx::Postgres> for Agtype {
+    fn encode_by_ref(
+        &self,
+        buf: &mut sqlx::postgres::PgArgumentBuffer,
+    ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
+        // sqlx 0.8 sends every parameter in PostgreSQL's binary
+        // (`Bind`) format. AGE's `agtype_recv` (binary input) expects:
+        //
+        //   ┌────────────┬─────────────────────────────────┐
+        //   │ version u8 │ JSON-text payload (no NUL term) │
+        //   └────────────┴─────────────────────────────────┘
+        //
+        // where `version == 1`. Sending just the JSON bytes makes AGE
+        // interpret the first byte (`{` == 0x7B == 123) as a version
+        // number and fail with `unsupported agtype version number 123`
+        // — see `src/backend/utils/adt/agtype.c::agtype_recv` in the
+        // PG16/v1.5.0 AGE branch.
+        buf.push(1);
+        buf.extend_from_slice(self.0.as_bytes());
+        Ok(sqlx::encode::IsNull::No)
+    }
+}
+
+impl<'r> sqlx::Decode<'r, sqlx::Postgres> for Agtype {
+    fn decode(
+        value: sqlx::postgres::PgValueRef<'r>,
+    ) -> Result<Self, sqlx::error::BoxDynError> {
+        // Mirror of the encoder: AGE ships agtype values back as
+        // version byte (0x01) followed by the JSON-compatible text
+        // payload in binary mode, or just the text in text mode.
+        match value.format() {
+            sqlx::postgres::PgValueFormat::Binary => {
+                let bytes = value.as_bytes()?;
+                if bytes.is_empty() {
+                    return Err("empty agtype payload".into());
+                }
+                let version = bytes[0];
+                if version != 1 {
+                    return Err(format!("unsupported agtype version: {version}").into());
+                }
+                let text = std::str::from_utf8(&bytes[1..])?.to_string();
+                Ok(Agtype(text))
+            }
+            sqlx::postgres::PgValueFormat::Text => {
+                let text = value.as_str()?.to_string();
+                Ok(Agtype(text))
+            }
+        }
+    }
+}
+
+/// v0.7.0.1 G2 — render an AGE params dict as a JSON string compatible
+/// with agtype's text input format. Pair-driven so callers don't drag
+/// `serde_json::Value` into the call site.
+fn age_params_jsonb(pairs: &[(&str, &str)]) -> String {
+    let mut map = serde_json::Map::with_capacity(pairs.len());
+    for (k, v) in pairs {
+        map.insert(
+            (*k).to_string(),
+            serde_json::Value::String((*v).to_string()),
+        );
+    }
+    serde_json::Value::Object(map).to_string()
 }
 
 /// from sqlx; the AGE branch needs this helper to mirror the same
