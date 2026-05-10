@@ -82,8 +82,8 @@ fn ephemeral_keypair() -> (
         std::env::set_var("AI_MEMORY_KEY_DIR", dir.path());
     }
 
-    let kp = ai_memory::identity::keypair::generate("ai:g3-test")
-        .expect("generate ed25519 keypair");
+    let kp =
+        ai_memory::identity::keypair::generate("ai:g3-test").expect("generate ed25519 keypair");
     ai_memory::identity::keypair::save(&kp, dir.path()).expect("persist keypair");
     (kp, dir)
 }

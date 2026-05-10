@@ -2302,9 +2302,8 @@ impl PostgresStore {
         // position; the literal form previously here surfaces as a
         // 503 from `POST /api/v1/kg/find_paths` (HALT R1b S65).
         let params = age_params_jsonb(&[("start_id", source_id), ("target_id", target_id)]);
-        let sql = format!(
-            "SELECT path FROM cypher('memory_graph', $$ {cypher} $$, $1) AS (path agtype)"
-        );
+        let sql =
+            format!("SELECT path FROM cypher('memory_graph', $$ {cypher} $$, $1) AS (path agtype)");
 
         let rows = sqlx::query(&sql)
             .bind(Agtype(params))
@@ -2326,11 +2325,10 @@ impl PostgresStore {
                 let raw: Agtype = r
                     .try_get::<Agtype, _>("path")
                     .map_err(|e| to_store_err("read path", e))?;
-                let parsed: Vec<String> = serde_json::from_str(&raw.0).map_err(|e| {
-                    StoreError::IntegrityFailed {
+                let parsed: Vec<String> =
+                    serde_json::from_str(&raw.0).map_err(|e| StoreError::IntegrityFailed {
                         detail: format!("non-JSON AGE path: {}: {e}", raw.0),
-                    }
-                })?;
+                    })?;
                 Ok(parsed)
             })
             .collect()
@@ -2789,9 +2787,7 @@ impl<'q> sqlx::Encode<'q, sqlx::Postgres> for Agtype {
 }
 
 impl<'r> sqlx::Decode<'r, sqlx::Postgres> for Agtype {
-    fn decode(
-        value: sqlx::postgres::PgValueRef<'r>,
-    ) -> Result<Self, sqlx::error::BoxDynError> {
+    fn decode(value: sqlx::postgres::PgValueRef<'r>) -> Result<Self, sqlx::error::BoxDynError> {
         // Mirror of the encoder: AGE ships agtype values back as
         // version byte (0x01) followed by the JSON-compatible text
         // payload in binary mode, or just the text in text mode.
