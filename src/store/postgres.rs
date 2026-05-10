@@ -3039,21 +3039,52 @@ async fn project_link_into_age(
     // load lag, permission blip on `pg_extension`) still ends up
     // with a populated projection on first link write rather than
     // silently dropping every subsequent MERGE on the floor.
-    // `create_graph` is idempotent at the SQL level: AGE returns
-    // "graph 'memory_graph' already exists" (SQLSTATE 42P07) which
-    // we collapse to a clean Ok. Upgrades the live HTTP path's
-    // `POST /api/v1/links` from "depends on connect-time bootstrap
-    // succeeding" to "self-heals every write" (HALT R1 v4 S65 — the
-    // live cert droplets surfaced 22 SQL link rows alongside 0 AGE
-    // nodes, consistent with a connect-time bootstrap that didn't
-    // land).
-    if let Err(e) = sqlx::query("SELECT create_graph('memory_graph')")
+    //
+    // We wrap `create_graph` in a SAVEPOINT so a duplicate-graph
+    // error (the steady-state case once the projection exists)
+    // doesn't abort the outer link-write transaction. PostgreSQL
+    // marks any explicit transaction as failed on the first error
+    // and rejects every subsequent statement until ROLLBACK; the
+    // SAVEPOINT lets us roll back JUST the create_graph and keep
+    // the outer tx writable for the upcoming MERGE statements.
+    // Upgrades the live HTTP path's `POST /api/v1/links` from
+    // "depends on connect-time bootstrap succeeding" to "self-heals
+    // every write" (HALT R1 v4 S65 — the live cert droplets surfaced
+    // 22 SQL link rows alongside 0 AGE nodes, consistent with a
+    // connect-time bootstrap that didn't land).
+    sqlx::query("SAVEPOINT bootstrap_memory_graph")
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| to_store_err("savepoint bootstrap_memory_graph", e))?;
+    match sqlx::query("SELECT create_graph('memory_graph')")
         .execute(&mut **tx)
         .await
     {
-        let msg = e.to_string();
-        if !msg.contains("already exists") {
-            return Err(to_store_err("create_graph memory_graph (project_link)", e));
+        Ok(_) => {
+            sqlx::query("RELEASE SAVEPOINT bootstrap_memory_graph")
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| to_store_err("release savepoint bootstrap_memory_graph", e))?;
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            // Roll the outer tx back to the savepoint regardless of
+            // the failure mode — without this the link write aborts
+            // wholesale. Steady-state ("already exists") collapses
+            // to a clean Ok; any other failure surfaces as a typed
+            // error after the rollback so the link write 503s rather
+            // than silently committing the SQL row alone.
+            sqlx::query("ROLLBACK TO SAVEPOINT bootstrap_memory_graph")
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| to_store_err("rollback savepoint bootstrap_memory_graph", err))?;
+            sqlx::query("RELEASE SAVEPOINT bootstrap_memory_graph")
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| to_store_err("release savepoint bootstrap_memory_graph", err))?;
+            if !msg.contains("already exists") {
+                return Err(to_store_err("create_graph memory_graph (project_link)", e));
+            }
         }
     }
 
