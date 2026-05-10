@@ -239,8 +239,7 @@ async fn bootstrap_and_project_chain(url: &str, ids: &[String]) {
 
     for id in ids {
         let cypher = "MERGE (n {id: $id}) RETURN n";
-        let sql =
-            format!("SELECT * FROM cypher('memory_graph', $$ {cypher} $$, $1) AS (n agtype)");
+        let sql = format!("SELECT * FROM cypher('memory_graph', $$ {cypher} $$, $1) AS (n agtype)");
         let params = json!({ "id": id }).to_string();
         sqlx::query(&sql)
             .bind(Agtype(params))
@@ -250,12 +249,10 @@ async fn bootstrap_and_project_chain(url: &str, ids: &[String]) {
     }
 
     for w in ids.windows(2) {
-        let cypher =
-            "MATCH (a {id: $src}), (b {id: $dst}) \
+        let cypher = "MATCH (a {id: $src}), (b {id: $dst}) \
              MERGE (a)-[r:related_to {relation: 'related_to'}]->(b) \
              RETURN r";
-        let sql =
-            format!("SELECT * FROM cypher('memory_graph', $$ {cypher} $$, $1) AS (r agtype)");
+        let sql = format!("SELECT * FROM cypher('memory_graph', $$ {cypher} $$, $1) AS (r agtype)");
         let params = json!({ "src": w[0], "dst": w[1] }).to_string();
         sqlx::query(&sql)
             .bind(Agtype(params))
@@ -358,9 +355,7 @@ async fn g2_postgres_find_paths_age_returns_200_with_paths() {
          function must be a parameter`."
     );
 
-    let paths = body["paths"]
-        .as_array()
-        .expect("paths must be an array");
+    let paths = body["paths"].as_array().expect("paths must be an array");
     assert!(
         !paths.is_empty(),
         "G2: find_paths must surface at least one path through the \
