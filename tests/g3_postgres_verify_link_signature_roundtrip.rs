@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+// clippy allows (test scaffolding): pedantic lints with no behavioral impact.
+#![allow(clippy::await_holding_lock, clippy::doc_markdown)]
 //! v0.7.0.1 G3 — postgres `verify_link` must verify the signature of a
 //! link that was just signed by the same daemon's keypair.
 //!
@@ -63,21 +65,38 @@ fn free_port() -> u16 {
     listener.local_addr().expect("local_addr").port()
 }
 
+/// M9 — process-wide guard around `AI_MEMORY_KEY_DIR` mutation. The CI
+/// postgres lane runs with `--test-threads=1` but this lock keeps the
+/// guarantee local: a developer running `cargo test --features
+/// sal-postgres g3_postgres_` on a fast box can still parallelise this
+/// file's tests, and any future test added to this file inherits the
+/// same serialization for free.
+fn env_var_lock() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::{Mutex, OnceLock};
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Synthesize a fresh Ed25519 keypair for this test invocation, save
 /// the public material into a tempdir registered as `AI_MEMORY_KEY_DIR`
 /// so the verify path can look the peer up via
 /// `lookup_peer_public_key`. Returns the keypair (with private half) +
 /// the tempdir handle (must outlive the test body).
+///
+/// Caller MUST hold `env_var_lock()` before invoking this helper —
+/// otherwise the `set_var` below races every other concurrent reader.
 fn ephemeral_keypair() -> (
     ai_memory::identity::keypair::AgentKeypair,
     tempfile::TempDir,
 ) {
     let dir = tempfile::TempDir::new().expect("keys tempdir");
 
-    // SAFETY: env var write is process-global; no concurrent test in
-    // this file mutates AI_MEMORY_KEY_DIR. The serial-test discipline
-    // for cross-file mutation is enforced by the test runner using
-    // --test-threads=1 in the postgres-backed CI lane.
+    // SAFETY: caller acquired `env_var_lock` before invoking. The
+    // serial-test discipline for cross-file mutation is still enforced
+    // by `--test-threads=1` on the postgres-backed CI lane; this
+    // in-file mutex defends against intra-file parallel runs.
     unsafe {
         std::env::set_var("AI_MEMORY_KEY_DIR", dir.path());
     }
@@ -113,6 +132,14 @@ async fn build_postgres_app_state(
         family_embeddings: Arc::new(RwLock::new(Some(Vec::new()))),
         storage_backend: StorageBackend::Postgres,
         store,
+        llm: Arc::new(None),
+        auto_tag_model: Arc::new(None),
+        llm_call_timeout: std::time::Duration::from_secs(30),
+        replay_cache: std::sync::Arc::new(ai_memory::identity::replay::ReplayCache::default()),
+
+        verify_require_nonce: false,
+        autonomous_hooks: false,
+        recall_scope: Arc::new(None),
     }
 }
 
@@ -242,6 +269,10 @@ async fn g3_postgres_verify_link_signed_returns_verified_true() {
         return;
     };
 
+    // M9 — acquire env_var_lock for the duration of the test so the
+    // `AI_MEMORY_KEY_DIR` mutation in `ephemeral_keypair` cannot race
+    // any sibling test added to this file.
+    let _env_g = env_var_lock();
     let (kp, _keys_keep) = ephemeral_keypair();
     let (base, shutdown, handle) = spawn_daemon(&url, kp.clone()).await;
     let client = reqwest::Client::new();

@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+// clippy allows (test scaffolding): pedantic lints with no behavioral impact.
+#![allow(clippy::too_many_lines)]
 //! v0.7.0.1 G4 follow-up — confirm both the **unsigned** trait method
 //! `MemoryStore::link` and the live HTTP `POST /api/v1/links` path
 //! project link writes into the AGE `memory_graph` projection on
@@ -290,6 +292,14 @@ async fn g4_unsigned_http_link_projects_into_age() {
         family_embeddings: Arc::new(RwLock::new(Some(Vec::new()))),
         storage_backend: StorageBackend::Postgres,
         store,
+        llm: Arc::new(None),
+        auto_tag_model: Arc::new(None),
+        llm_call_timeout: std::time::Duration::from_secs(30),
+        replay_cache: std::sync::Arc::new(ai_memory::identity::replay::ReplayCache::default()),
+
+        verify_require_nonce: false,
+        autonomous_hooks: false,
+        recall_scope: Arc::new(None),
     };
 
     let port = free_port();

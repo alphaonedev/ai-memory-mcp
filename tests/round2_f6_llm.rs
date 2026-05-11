@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+// clippy allows (test scaffolding): pedantic lints with no behavioral impact.
+#![allow(clippy::doc_markdown, clippy::manual_let_else)]
 //! Round-2 F6 — LLM dispatch deadlock + silent recall degradation.
 //!
 //! These tests pin the four behaviours the campaign brief calls out:

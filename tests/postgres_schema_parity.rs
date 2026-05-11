@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+// clippy allows (test scaffolding): pedantic lints with no behavioral impact.
+#![allow(clippy::doc_markdown)]
 //! `Postgres` ↔ `SQLite` schema parity test.
 //!
 //! Asserts that the `Postgres` adapter (`PostgresStore`) reaches the same
@@ -48,6 +50,14 @@ use sqlx::postgres::PgPoolOptions;
 /// `SQLite` side without the corresponding `Postgres` port will trip
 /// this test.
 const SQLITE_CURRENT_VERSION: i64 = 28;
+
+/// `Postgres` `CURRENT_SCHEMA_VERSION` — tracks
+/// `src/store/postgres.rs::CURRENT_SCHEMA_VERSION`. Diverges from the
+/// SQLite ladder for postgres-only steps:
+///   - v29: in-place `vector(N)` conversion (no SQLite analogue).
+///   - v30: `memories_metadata_is_object` CHECK (M15; SQLite metadata
+///     column has no `jsonb_typeof` equivalent).
+const POSTGRES_CURRENT_VERSION: i64 = 30;
 
 /// Returns Some(url) when the live-PG fixture is configured, None otherwise.
 fn postgres_url() -> Option<String> {
@@ -126,12 +136,26 @@ async fn schema_versions_match_across_adapters() {
         .expect("read schema_version");
 
     let pg_version_i64 = i64::from(pg_version.expect("schema_version row must exist"));
-    assert_eq!(
-        pg_version_i64, SQLITE_CURRENT_VERSION,
-        "Postgres schema_version ({pg_version_i64}) must match \
+    // Postgres is allowed to land postgres-only ladder steps (v29
+    // in-place vector(N) conversion, v30 M15 metadata-CHECK) so the
+    // floor is the SQLite version, the ceiling is the Postgres
+    // version. Both bounds re-trip the assertion when either side
+    // drifts.
+    assert!(
+        pg_version_i64 >= SQLITE_CURRENT_VERSION,
+        "Postgres schema_version ({pg_version_i64}) must be at least the \
          SQLite CURRENT_SCHEMA_VERSION ({SQLITE_CURRENT_VERSION}). \
          If you bumped the SQLite ladder, port the corresponding \
          migrate_vN function to src/store/postgres.rs."
+    );
+    assert_eq!(
+        pg_version_i64, POSTGRES_CURRENT_VERSION,
+        "Postgres schema_version ({pg_version_i64}) must match the \
+         Postgres CURRENT_SCHEMA_VERSION ({POSTGRES_CURRENT_VERSION}). \
+         A drift here means a Postgres-only ladder step (e.g. v29 \
+         in-place vector(N), v30 M15 metadata CHECK) didn't run, \
+         or the constant was bumped without the corresponding \
+         migrate_vN function."
     );
 }
 
