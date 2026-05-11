@@ -594,7 +594,7 @@ pub fn tool_definitions() -> Value {
             {
                 "name": "memory_recall",
                 "description": "Recall memories relevant to a context (ranked).",
-                "docs": "Recall memories relevant to a context. Uses fuzzy OR matching, ranks by relevance + priority + access frequency + tier. Optional context-budget-aware mode (`budget_tokens`, Phase P6 R1) returns the highest-ranked memories whose cumulative cl100k_base content tokens fit in N, with an always-return-at-least-one guarantee. Optional `context_tokens` biases the query embedding 70/30 toward recent conversation (v0.6.0.0). Default response format is `toon_compact` (~79% smaller than JSON).",
+                "docs": "Recall memories relevant to a context. Uses fuzzy OR matching, ranks by relevance + priority + access frequency + tier. Optional context-budget-aware mode (`budget_tokens`, Phase P6 R1) returns the highest-ranked memories whose cumulative cl100k_base content tokens fit in N, with an always-return-at-least-one guarantee. Optional `context_tokens` biases the query embedding 70/30 toward recent conversation (v0.6.0.0). v0.7.0 (issue #518) — pass `session_default=true` to splice the operator-configured `[agents.defaults.recall_scope]` defaults (namespace / since / tier / limit) for any filter field not explicitly set; resolution is explicit args > recall_scope > compiled defaults. Default response format is `toon_compact` (~79% smaller than JSON).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -607,6 +607,7 @@ pub fn tool_definitions() -> Value {
                         "as_agent": {"type": "string", "description": "Querying agent's namespace position (Task 1.5). Enables scope-based visibility filtering — results include private memories at this namespace, team/unit/org memories at ancestor subtrees, and collective memories globally."},
                         "budget_tokens": {"type": "integer", "minimum": 0, "description": "Phase P6 (R1) — context-budget-aware recall. Return the highest-ranked memories whose cumulative content tokens (deterministic cl100k_base BPE; matches Claude/GPT context accounting) fit in N. If the top-ranked memory alone exceeds the budget, it is returned anyway with meta.budget_overflow=true (R1 always-return-at-least-one guarantee). budget_tokens=0 returns zero memories with overflow=false. Response meta block: budget_tokens_used, budget_tokens_remaining, memories_dropped, budget_overflow."},
                         "context_tokens": {"type": "array", "items": {"type": "string"}, "description": "v0.6.0.0 contextual recall — recent conversation tokens used to bias the query embedding at 70/30 (primary/context). Pulls results toward memories that match both the explicit query and nearby conversation topics."},
+                        "session_default": {"type": "boolean", "default": false, "description": "When true, splice defaults from [agents.defaults.recall_scope] in config.toml for any filter field not explicitly set. Resolution: explicit args > recall_scope > compiled defaults."},
                         "format": {"type": "string", "enum": ["json", "toon", "toon_compact"], "default": "toon_compact", "description": "Response format. Default 'toon_compact' saves 79% tokens vs JSON. 'toon' includes timestamps. 'json' for structured parsing."}
                     },
                     "required": ["context"]
@@ -1456,6 +1457,80 @@ fn default_on_conflict_for_client(mcp_client: Option<&str>) -> OnConflict {
     OnConflict::Merge
 }
 
+/// Forward an MCP write call to a local HTTP daemon so the daemon's
+/// federation fanout coordinator (`broadcast_store_quorum` / `broadcast_link_quorum`
+/// / `broadcast_delete_quorum`) takes over replication. Closes the
+/// MCP-stdio-vs-federation gap surfaced by a2a-gate v0.6.0 r6 (#318).
+///
+/// Returns the daemon's JSON body on 2xx, or a structured error string
+/// that the MCP layer surfaces as a JSON-RPC `result.error`. On 5xx /
+/// transport failure the caller gets a clear message naming the
+/// forward URL so operators can distinguish "fanout daemon down"
+/// from "quorum not met".
+fn forward_to_http(
+    method: reqwest::Method,
+    url: &str,
+    body: Option<&Value>,
+    extra_headers: &[(&str, String)],
+) -> Result<Value, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("federation_forward: build client: {e}"))?;
+    let mut req = client.request(method, url);
+    for (k, v) in extra_headers {
+        req = req.header(*k, v);
+    }
+    if let Some(b) = body {
+        req = req.json(b);
+    }
+    let resp = req
+        .send()
+        .map_err(|e| format!("federation_forward: POST {url}: {e}"))?;
+    let status = resp.status();
+    let text = resp
+        .text()
+        .map_err(|e| format!("federation_forward: read body from {url}: {e}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "federation_forward: {url} returned {status}: {text}"
+        ));
+    }
+    serde_json::from_str::<Value>(&text)
+        .map_err(|e| format!("federation_forward: parse body from {url}: {e} (raw: {text})"))
+}
+
+/// MCP `memory_store` → HTTP `POST {forward_url}/api/v1/memories`.
+/// Translates the MCP params (which mirror the HTTP request body field
+/// names verbatim, with the exception of how `metadata.agent_id` is
+/// surfaced) into the HTTP daemon's `CreateMemoryRequest` shape, then
+/// reshapes the 201 response into the MCP `memory_store` envelope
+/// callers expect (`{id, tier, title, namespace, agent_id, ...}`).
+fn forward_store_to_http(
+    forward_url: &str,
+    params: &Value,
+    mcp_client: Option<&str>,
+) -> Result<Value, String> {
+    let url = format!("{}/api/v1/memories", forward_url.trim_end_matches('/'));
+
+    // Resolve agent_id with the same precedence chain the local path
+    // uses, then surface it as an X-Agent-Id header (the HTTP handler's
+    // canonical resolution channel for daemon-mode multi-tenancy).
+    let explicit_agent_id = params["agent_id"]
+        .as_str()
+        .or_else(|| params["metadata"]["agent_id"].as_str());
+    let agent_id = crate::identity::resolve_agent_id(explicit_agent_id, mcp_client)
+        .map_err(|e| e.to_string())?;
+
+    // The HTTP request body mirrors the MCP params; pass them through
+    // and let the HTTP handler do all validation, governance, quota,
+    // dedup, embedding, audit, and federation broadcast.
+    let body = params.clone();
+    let headers: &[(&str, String)] = &[("X-Agent-Id", agent_id)];
+
+    forward_to_http(reqwest::Method::POST, &url, Some(&body), headers)
+}
+
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::too_many_arguments)]
 fn handle_store(
@@ -1468,7 +1543,17 @@ fn handle_store(
     resolved_ttl: &crate::config::ResolvedTtl,
     autonomous_hooks: bool,
     mcp_client: Option<&str>,
+    federation_forward_url: Option<&str>,
 ) -> Result<Value, String> {
+    // v0.7.0 (issue #318) — when operators have configured a federation
+    // forward URL, every MCP write routes through the local HTTP daemon
+    // so its `broadcast_store_quorum` fanout runs. Direct-SQLite path
+    // below is the legacy single-node behaviour, preserved as default
+    // for environments without a sibling `ai-memory serve` process.
+    if let Some(url) = federation_forward_url {
+        return forward_store_to_http(url, params, mcp_client);
+    }
+
     let title = params["title"].as_str().ok_or("title is required")?;
     let content = params["content"].as_str().ok_or("content is required")?;
     let tier_str = params["tier"].as_str().unwrap_or("mid");
@@ -1823,7 +1908,7 @@ fn handle_store(
     if hooks_skipped_reason.is_none()
         && let Some(llm_client) = llm
     {
-        match llm_client.auto_tag(&mem.title, &mem.content) {
+        match llm_client.auto_tag(&mem.title, &mem.content, None) {
             Ok(tags) => {
                 auto_tags = tags.into_iter().take(8).collect();
             }
@@ -2022,6 +2107,9 @@ pub async fn handle_recall_with_pre_recall_hook(
     resolved_scoring: &crate::config::ResolvedScoring,
     chain: &crate::hooks::HookChain,
     registry: &mut crate::hooks::ExecutorRegistry,
+    // v0.7.0 (issue #518) — recall scope defaults; forwarded
+    // unchanged to `handle_recall`.
+    recall_scope: Option<&crate::config::RecallScope>,
 ) -> Result<Value, String> {
     // Resolve the (query, namespace, k) triple once so the hook
     // sees exactly what the recall would see.
@@ -2089,6 +2177,7 @@ pub async fn handle_recall_with_pre_recall_hook(
         archive_on_gc,
         resolved_ttl,
         resolved_scoring,
+        recall_scope,
     )
 }
 
@@ -2103,6 +2192,12 @@ pub fn handle_recall(
     archive_on_gc: bool,
     resolved_ttl: &crate::config::ResolvedTtl,
     resolved_scoring: &crate::config::ResolvedScoring,
+    // v0.7.0 (issue #518) — operator-configured recall defaults.
+    // When `session_default=true` is set on the request AND a given
+    // filter axis is absent, the corresponding `recall_scope` field
+    // is spliced into the request before the storage call. `None`
+    // keeps v0.6.x recall semantics exactly.
+    recall_scope: Option<&crate::config::RecallScope>,
 ) -> Result<Value, String> {
     // Helper: serialize scored memories with score field (#95)
     fn scored_memories(results: Vec<(Memory, f64)>) -> Vec<Value> {
@@ -2123,10 +2218,43 @@ pub fn handle_recall(
 
     let _ = db::gc_if_needed(conn, archive_on_gc);
     let context = params["context"].as_str().ok_or("context is required")?;
-    let namespace = params["namespace"].as_str();
-    let limit = usize::try_from(params["limit"].as_u64().unwrap_or(10)).unwrap_or(usize::MAX);
+    // v0.7.0 (issue #518) — when the caller passed
+    // `session_default=true` AND a given filter axis is absent,
+    // splice in the corresponding `[agents.defaults.recall_scope]`
+    // value. Explicit args always win. Sqlite recall does not
+    // expose a `tier` filter on the legacy `db::recall` /
+    // `db::recall_hybrid` paths, so the `tier` axis is plumbed but
+    // not consumed on this branch (the postgres SAL handler in
+    // `handlers.rs::recall_response` applies it via
+    // `Filter.tier`).
+    let session_default = params["session_default"].as_bool().unwrap_or(false);
+    let scope = if session_default { recall_scope } else { None };
+    // Compute owned defaults so they outlive the parse step.
+    let scope_namespace: Option<String> = scope
+        .and_then(|s| s.namespaces.as_ref())
+        .and_then(|v| v.first())
+        .cloned();
+    let scope_since: Option<String> = scope.and_then(|s| {
+        s.since.as_deref().and_then(|d| {
+            crate::config::parse_duration_string(d).map(|dur| {
+                let cutoff = chrono::Utc::now() - dur;
+                cutoff.to_rfc3339()
+            })
+        })
+    });
+    let explicit_namespace = params["namespace"].as_str();
+    let explicit_since = params["since"].as_str();
+    let namespace: Option<&str> = explicit_namespace.or(scope_namespace.as_deref());
+    let explicit_limit_raw = params["limit"].as_u64();
+    let limit = if let Some(v) = explicit_limit_raw {
+        usize::try_from(v).unwrap_or(usize::MAX)
+    } else if let Some(v) = scope.and_then(|s| s.limit) {
+        usize::try_from(v).unwrap_or(usize::MAX)
+    } else {
+        10
+    };
     let tags = params["tags"].as_str();
-    let since = params["since"].as_str();
+    let since: Option<&str> = explicit_since.or(scope_since.as_deref());
     let until = params["until"].as_str();
     // #151 visibility
     let as_agent = params["as_agent"].as_str();
@@ -2992,7 +3120,7 @@ fn handle_auto_tag(
         .map_err(|e| e.to_string())?
         .ok_or("memory not found")?;
     let tags = llm
-        .auto_tag(&mem.title, &mem.content)
+        .auto_tag(&mem.title, &mem.content, None)
         .map_err(|e| e.to_string())?;
     // Apply tags to the memory
     let mut all_tags = mem.tags.clone();
@@ -6033,6 +6161,17 @@ fn handle_request(
     // both signal). `None` when no `initialize` has been observed yet
     // — the field is omitted from the wire on that fall-through.
     harness: Option<&crate::harness::Harness>,
+    // v0.7.0 (#318) — when `Some`, all MCP write tools forward to the
+    // local HTTP daemon at this base URL so its federation fanout
+    // coordinator runs. `None` keeps the legacy direct-SQLite path
+    // (single-node MCP deployments without a sibling `serve` daemon).
+    federation_forward_url: Option<&str>,
+    // v0.7.0 (issue #518) — `[agents.defaults.recall_scope]`
+    // resolved from the running daemon's `AppConfig`. `Some` enables
+    // `session_default=true` callers to splice these defaults into
+    // their `memory_recall` request before the storage call. `None`
+    // (single-tenant default) preserves v0.6.x recall semantics.
+    recall_scope: Option<&crate::config::RecallScope>,
 ) -> RpcResponse {
     let id = req.id.clone().unwrap_or(Value::Null);
 
@@ -6133,6 +6272,7 @@ fn handle_request(
                     resolved_ttl,
                     autonomous_hooks,
                     mcp_client,
+                    federation_forward_url,
                 ),
                 "memory_recall" => handle_recall(
                     conn,
@@ -6143,6 +6283,7 @@ fn handle_request(
                     archive_on_gc,
                     resolved_ttl,
                     resolved_scoring,
+                    recall_scope,
                 ),
                 "memory_search" => handle_search(conn, arguments),
                 "memory_list" => handle_list(conn, arguments),
@@ -6766,6 +6907,7 @@ pub fn run_mcp_server(
         let resolved_scoring = app_config.effective_scoring();
         let archive_on_gc = app_config.effective_archive_on_gc();
         let autonomous_hooks = app_config.effective_autonomous_hooks();
+        let resolved_recall_scope = app_config.effective_recall_scope();
         let resp = handle_request(
             &conn,
             db_path,
@@ -6784,6 +6926,8 @@ pub fn run_mcp_server(
             app_config.mcp.as_ref(),
             active_keypair.as_ref(),
             detected_harness.as_ref(),
+            app_config.mcp_federation_forward_url.as_deref(),
+            resolved_recall_scope,
         );
         let out = serde_json::to_string(&resp)?;
         writeln!(stdout, "{out}")?;
@@ -7272,6 +7416,31 @@ mod tests {
         assert_eq!(format_schema["default"], "toon_compact");
     }
 
+    /// v0.7.0 (issue #518) — pin the `memory_recall` tool schema for
+    /// the new `session_default` boolean. Default must be `false` so
+    /// existing callers see zero behaviour change; the description
+    /// must mention `[agents.defaults.recall_scope]` so clients
+    /// discover the splice contract through `tools/list`.
+    #[test]
+    fn tool_definitions_recall_advertises_session_default_issue_518() {
+        let defs = tool_definitions();
+        let tools = defs["tools"].as_array().unwrap();
+        let recall = tools
+            .iter()
+            .find(|t| t["name"] == "memory_recall")
+            .expect("memory_recall tool must be defined");
+        let props = &recall["inputSchema"]["properties"];
+        let session_default = &props["session_default"];
+        assert_eq!(session_default["type"], "boolean");
+        assert_eq!(session_default["default"], false);
+        assert!(
+            session_default["description"]
+                .as_str()
+                .is_some_and(|d| d.contains("agents.defaults.recall_scope")),
+            "session_default description must mention [agents.defaults.recall_scope] — got {session_default:?}"
+        );
+    }
+
     #[test]
     fn prompt_definitions_returns_2() {
         let defs = prompt_definitions();
@@ -7434,6 +7603,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // federation_forward_url (#318)
+                None, // recall_scope (#518)
             );
             assert!(resp.error.is_none(), "expected ok rpc response");
         });
@@ -7488,6 +7659,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // federation_forward_url (#318)
+                None, // recall_scope (#518)
             );
             // Handler errs are returned as ok_response with isError=true,
             // not RpcError, by design (the JSON-RPC layer is reserved for
@@ -7846,6 +8019,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // federation_forward_url (#318)
+                None, // recall_scope (#518)
             );
             assert!(
                 resp.error.is_none(),
@@ -7886,6 +8061,8 @@ mod tests {
                     None,
                     None,
                     None,
+                    None, // federation_forward_url (#318)
+                    None, // recall_scope (#518)
                 );
 
                 // Missing required args should produce an error response (handler returns Err)
@@ -7943,6 +8120,8 @@ mod tests {
             None,
             None,
             None,
+            None, // federation_forward_url (#318)
+            None, // recall_scope (#518)
         )
     }
 
@@ -8299,6 +8478,8 @@ mod tests {
             None,
             Some(&kp),
             None,
+            None, // federation_forward_url (#318)
+            None, // recall_scope (#518)
         );
         assert!(resp.error.is_none(), "MCP error: {:?}", resp.error);
         let text = resp.result.unwrap()["content"][0]["text"]

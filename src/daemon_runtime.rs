@@ -1166,7 +1166,40 @@ pub fn apply_anonymize_default(app_config: &AppConfig) {
 /// shapes — the bug at issue #322 was a direct consequence.
 pub async fn build_embedder(feature_tier: FeatureTier, app_config: &AppConfig) -> Option<Embedder> {
     let tier_config = feature_tier.config();
-    let Some(emb_model) = tier_config.embedding_model else {
+    // L2 fix: honor the documented top-level `embedding_model` override
+    // before falling back to the tier preset. Resolution order:
+    //   1. `AppConfig.embedding_model` override (if parseable)
+    //   2. Tier-preset `embedding_model` (existing behavior)
+    //   3. Disabled (keyword-only)
+    // A parse failure on the override degrades to the tier preset rather
+    // than disabling embeddings outright — the operator only mistyped a
+    // pin, they didn't ask for keyword-only.
+    let preset = tier_config.embedding_model;
+    let preset_label = preset
+        .map(|m| m.hf_model_id().to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let resolved = match app_config.embedding_model.as_deref() {
+        Some(raw) => match raw.parse::<crate::config::EmbeddingModel>() {
+            Ok(model) => {
+                tracing::info!(
+                    "embedder: using app_config override {} (tier-preset would have been {})",
+                    model.hf_model_id(),
+                    preset_label
+                );
+                Some(model)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "embedder: ignoring invalid app_config.embedding_model={raw:?} ({e}); \
+                     falling back to tier-preset {}",
+                    preset_label
+                );
+                preset
+            }
+        },
+        None => preset,
+    };
+    let Some(emb_model) = resolved else {
         tracing::info!(
             "embedder disabled — tier={} keyword-only (FTS5); semantic recall not wired",
             feature_tier.as_str()
@@ -1217,6 +1250,69 @@ pub async fn build_embedder(feature_tier: FeatureTier, app_config: &AppConfig) -
                  will be NO-OPS. Check network egress to HuggingFace Hub + available \
                  memory for model weights. To force keyword-only explicitly (silences \
                  this error), set `tier = \"keyword\"` in config.toml.",
+                feature_tier.as_str()
+            );
+            None
+        }
+    }
+}
+
+/// v0.7.0 L5 — construct the LLM [`OllamaClient`] for autonomy-hook
+/// capable feature tiers (`smart` / `autonomous`). Returns `None` for
+/// the `keyword` / `semantic` tiers (no `llm_model` declared in the
+/// [`TierConfig`]) and on Ollama unreachability (caller degrades to
+/// non-LLM behaviour). On failure the diagnostic is emitted via
+/// `tracing::warn!` so operators see it in `journalctl` without
+/// killing the daemon — autonomy hooks are best-effort and the
+/// store path must keep working when Ollama is offline.
+///
+/// Mirrors [`build_embedder`]'s shape (spawn_blocking around the
+/// blocking `reqwest::blocking::Client::builder` chain Ollama uses)
+/// because the LLM client also internally spins a sync HTTP client
+/// that would panic if constructed directly in an async context.
+pub async fn build_llm_client(
+    feature_tier: FeatureTier,
+    app_config: &AppConfig,
+) -> Option<llm::OllamaClient> {
+    let tier_config = feature_tier.config();
+    let Some(llm_model) = tier_config.llm_model else {
+        tracing::debug!(
+            "llm client disabled — tier={} has no llm_model; auto_tag hook will be a no-op",
+            feature_tier.as_str()
+        );
+        return None;
+    };
+    // Honour an explicit operator override (`llm_model = "..."` in
+    // config.toml) when set; otherwise fall back to the compiled
+    // tier-default Ollama tag (e.g. `gemma4:e2b`).
+    let model_id = app_config
+        .llm_model
+        .clone()
+        .unwrap_or_else(|| llm_model.ollama_model_id().to_string());
+    let ollama_url = app_config.effective_ollama_url().to_string();
+    let build = match tokio::task::spawn_blocking(move || {
+        llm::OllamaClient::new_with_url(&ollama_url, &model_id)
+    })
+    .await
+    {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!("L5: build_llm_client spawn_blocking join failed: {e}");
+            return None;
+        }
+    };
+    match build {
+        Ok(client) => {
+            tracing::info!(
+                "L5: llm client ready — tier={} model={} — auto_tag hook armed for HTTP create_memory",
+                feature_tier.as_str(),
+                llm_model.ollama_model_id(),
+            );
+            Some(client)
+        }
+        Err(e) => {
+            tracing::warn!(
+                "L5: llm client init failed (tier={}); auto_tag hook will be a no-op: {e}",
                 feature_tier.as_str()
             );
             None
@@ -1565,6 +1661,11 @@ pub struct ServeBootstrap {
     /// Read by [`serve`] when composing the F8/F12 startup banner so
     /// operators see whether a fresh key was created on first boot.
     pub daemon_keypair_outcome: Option<crate::identity::keypair::EnsureOutcome>,
+    /// v0.7.0 H7 (round-2) — resolved per-request HTTP timeout. The
+    /// `serve` path passes this to [`crate::build_router_with_timeout`]
+    /// so the timeout middleware is wired with the operator's
+    /// `request_timeout_secs` (default 60 s).
+    pub request_timeout: std::time::Duration,
 }
 
 /// v0.7.0 Wave-3 — resolve a [`MemoryStore`] handle from the operator's
@@ -1608,6 +1709,7 @@ pub struct ServeBootstrap {
 async fn build_store_handle(
     store_url: Option<&str>,
     db_path: &Path,
+    postgres_statement_timeout_secs: Option<u64>,
 ) -> Result<(
     crate::handlers::StorageBackend,
     Arc<dyn crate::store::MemoryStore>,
@@ -1620,15 +1722,22 @@ async fn build_store_handle(
             if lowered.starts_with("postgres://") || lowered.starts_with("postgresql://") {
                 #[cfg(feature = "sal-postgres")]
                 {
-                    tracing::info!("Wave-3: opening Postgres SAL store at {url}");
-                    let store = crate::store::postgres::PostgresStore::connect(url)
-                        .await
-                        .context("connect postgres adapter")?;
+                    let timeout = postgres_statement_timeout_secs
+                        .unwrap_or(crate::store::postgres::DEFAULT_STATEMENT_TIMEOUT_SECS);
+                    tracing::info!(
+                        "Wave-3: opening Postgres SAL store at {url} \
+                         (statement_timeout={timeout}s)"
+                    );
+                    let store =
+                        crate::store::postgres::PostgresStore::connect_with_timeout(url, timeout)
+                            .await
+                            .context("connect postgres adapter")?;
                     Ok((StorageBackend::Postgres, Arc::new(store)))
                 }
                 #[cfg(not(feature = "sal-postgres"))]
                 {
                     let _ = url;
+                    let _ = postgres_statement_timeout_secs;
                     anyhow::bail!(
                         "--store-url postgres:// requires the binary to be built with \
                          --features sal-postgres; this binary was built with --features sal only"
@@ -1652,6 +1761,7 @@ async fn build_store_handle(
             }
         }
         None => {
+            let _ = postgres_statement_timeout_secs;
             tracing::debug!("Wave-3: --store-url absent; opening SQLite SAL store at --db path");
             let store = crate::store::sqlite::SqliteStore::open(db_path)
                 .map_err(|e| anyhow::anyhow!("open sqlite adapter: {e}"))?;
@@ -1681,6 +1791,15 @@ pub async fn bootstrap_serve(
     let tier_config = feature_tier.config();
     let embedder = build_embedder(feature_tier, app_config).await;
     let vector_index = build_vector_index(&conn, embedder.is_some());
+
+    // v0.7.0 L5 — build the LLM client for autonomy-hook capable tiers
+    // (smart/autonomous). The HTTP `create_memory` handler reaches for
+    // `app.llm` to call `auto_tag` (mirroring MCP `handle_store` at
+    // `src/mcp.rs:1823-1833`). When the configured tier has no
+    // `llm_model` (keyword/semantic) or the Ollama endpoint is
+    // unreachable, the client stays `None` and the hook silently
+    // degrades to operator-supplied tags only.
+    let llm = build_llm_client(feature_tier, app_config).await;
 
     let db_state: Db = Arc::new(Mutex::new((
         conn,
@@ -1714,14 +1833,18 @@ pub async fn bootstrap_serve(
         );
         // v0.6.0.1 (#320) — post-partition catchup poller. Closes the gap
         // where a rejoining node only sees post-resume writes.
+        //
+        // v0.7.0 M3 — the catchup loop now plumbs the SAL store handle
+        // through (instead of `db::insert_if_newer`) so postgres-backed
+        // daemons route peer pushes to postgres. The actual spawn is
+        // deferred until after `build_store_handle` resolves the
+        // `Arc<dyn MemoryStore>` — see the post-store-build block below.
         if args.catchup_interval_secs > 0 {
-            let interval = std::time::Duration::from_secs(args.catchup_interval_secs);
             tracing::info!(
                 "catchup loop enabled: polling {} peer(s) every {}s",
                 fed.peer_count(),
                 args.catchup_interval_secs,
             );
-            federation::spawn_catchup_loop(fed.clone(), db_state.clone(), interval);
         } else {
             tracing::info!("catchup loop disabled (--catchup-interval-secs=0)");
         }
@@ -1790,7 +1913,33 @@ pub async fn bootstrap_serve(
         let cache = family_embeddings.clone();
         let embedder_for_task = embedder_arc.clone();
         task_handles.push(tokio::spawn(async move {
+            // ----------------------------------------------------------------
+            // H1 (v0.7.0 round-2) — lock-discipline for the family-embedding
+            // precompute:
+            //
+            //   1. The slow `Embedder::embed(descriptor)` calls run inside a
+            //      `spawn_blocking` closure that holds NO lock on
+            //      `family_embeddings`. Each (Family, Vec<f32>) pair is
+            //      collected into a local `Vec` owned by the blocking task.
+            //   2. Only AFTER the entire batch is computed do we take
+            //      `family_embeddings.write().await` exactly ONCE to swap
+            //      the populated `Some(Vec)` into the cache.
+            //
+            // Why: the prior shape that acquired the write lock before each
+            // embed call would have parked every concurrent `try_read()`
+            // reader for the duration of an ML inference round trip — up
+            // to seconds on a cold runner. Concurrent recall handlers that
+            // call `AppState::best_family_match` would be forced into the
+            // no-cache fallback even when the embedder was fully operational.
+            //
+            // The two-phase shape below is the canonical "compute outside,
+            // commit inside" lock pattern: readers see either `None`
+            // (precompute not yet finished) or the fully-populated
+            // `Some(Vec)` — never a half-built vector.
+            // ----------------------------------------------------------------
             let computed = tokio::task::spawn_blocking(move || {
+                // No lock held during embed calls — pairs are accumulated
+                // into a local Vec returned to the async caller below.
                 AppState::precompute_family_embeddings(embedder_for_task.as_ref().as_ref())
             })
             .await
@@ -1808,6 +1957,9 @@ pub async fn bootstrap_serve(
                     computed.len(),
                 );
             }
+            // Single-shot commit: write lock acquired ONCE here and
+            // released immediately after the swap. No embedder calls run
+            // under this lock.
             *cache.write().await = Some(computed);
         }));
     } else {
@@ -1832,11 +1984,39 @@ pub async fn bootstrap_serve(
     // entirely — the daemon stays a pure SQLite-on-disk deployment with
     // zero behavioural drift versus pre-Wave-3.
     #[cfg(feature = "sal")]
-    let (storage_backend, store_handle) = build_store_handle(args.store_url.as_deref(), db_path)
-        .await
-        .context("build SAL store handle")?;
+    let (storage_backend, store_handle) = build_store_handle(
+        args.store_url.as_deref(),
+        db_path,
+        app_config.postgres_statement_timeout_secs,
+    )
+    .await
+    .context("build SAL store handle")?;
     #[cfg(not(feature = "sal"))]
     let storage_backend = crate::handlers::StorageBackend::Sqlite;
+
+    // v0.7.0 M3 — spawn the federation catchup loop now that the SAL
+    // store handle has resolved. The loop dispatches each peer-pulled
+    // memory through `store.apply_remote_memory` (postgres-aware) on
+    // `--features sal` builds; legacy builds fall back to the
+    // `db::insert_if_newer` sqlite path.
+    if let Some(ref fed) = federation
+        && args.catchup_interval_secs > 0
+    {
+        let interval = std::time::Duration::from_secs(args.catchup_interval_secs);
+        #[cfg(feature = "sal")]
+        {
+            federation::spawn_catchup_loop_with_store(
+                fed.clone(),
+                db_state.clone(),
+                Some(store_handle.clone()),
+                interval,
+            );
+        }
+        #[cfg(not(feature = "sal"))]
+        {
+            federation::spawn_catchup_loop(fed.clone(), db_state.clone(), interval);
+        }
+    }
 
     if matches!(storage_backend, crate::handlers::StorageBackend::Postgres) {
         tracing::warn!(
@@ -1860,6 +2040,26 @@ pub async fn bootstrap_serve(
         storage_backend,
         #[cfg(feature = "sal")]
         store: store_handle,
+        llm: Arc::new(llm),
+        // v0.7.0 L15 — dedicated auto_tag model from config.toml.
+        auto_tag_model: Arc::new(app_config.auto_tag_model.clone()),
+        // v0.7.0 H8 (round-2) — per-LLM-call timeout (default 30s).
+        llm_call_timeout: Duration::from_secs(app_config.effective_llm_call_timeout_secs()),
+        // v0.7.0 H5 (round-2) — fresh per-process replay cache + the
+        // resolved `[verify] require_nonce` toggle. Default `false`
+        // preserves verify-anytime semantics for unmigrated clients;
+        // operators opt into strict mode via `config.toml`.
+        replay_cache: Arc::new(crate::identity::replay::ReplayCache::new()),
+        verify_require_nonce: app_config.verify.as_ref().is_some_and(|v| v.require_nonce),
+        // v0.7.0 (issue #519) — resolved autonomous_hooks flag for the
+        // HTTP create_memory path's proactive conflict-detection
+        // helper. Falls back to false when unset (preserves v0.6.x
+        // post-hoc-only contradiction surface).
+        autonomous_hooks: app_config.effective_autonomous_hooks(),
+        // v0.7.0 (issue #518) — resolved recall_scope defaults from
+        // `[agents.defaults.recall_scope]`. None preserves v0.6.x
+        // recall semantics (no splice on session_default=true).
+        recall_scope: Arc::new(app_config.effective_recall_scope().cloned()),
     };
 
     // Automatic GC.
@@ -1935,6 +2135,8 @@ pub async fn bootstrap_serve(
         archive_max_days: app_config.archive_max_days,
         task_handles,
         daemon_keypair_outcome,
+        // H7 (v0.7.0 round-2) — per-request HTTP timeout (default 60s).
+        request_timeout: Duration::from_secs(app_config.effective_request_timeout_secs()),
     })
 }
 
@@ -2029,7 +2231,11 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
             );
             tls::load_rustls_config(cert, key).await?
         };
-        let app = build_router(bootstrap.app_state, bootstrap.api_key_state);
+        let app = crate::build_router_with_timeout(
+            bootstrap.api_key_state,
+            bootstrap.app_state,
+            bootstrap.request_timeout,
+        );
         tracing::info!("ai-memory listening on https://{addr}");
         let socket_addr: std::net::SocketAddr = addr.parse()?;
         // axum-server doesn't have a direct graceful-shutdown on the
@@ -2062,10 +2268,11 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
         // the integration tests drive in-process. Production threads its
         // WAL-checkpoint-on-shutdown future in directly so the cleanup
         // semantic is preserved verbatim.
-        serve_http_with_shutdown_future(
+        serve_http_with_shutdown_future_and_timeout(
             &addr,
             bootstrap.api_key_state,
             bootstrap.app_state,
+            bootstrap.request_timeout,
             shutdown,
         )
         .await?;
@@ -2243,7 +2450,30 @@ pub async fn serve_http_with_shutdown_future<F>(
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    let app = crate::build_router(api_key_state, app_state);
+    serve_http_with_shutdown_future_and_timeout(
+        addr,
+        api_key_state,
+        app_state,
+        Duration::from_secs(crate::config::DEFAULT_REQUEST_TIMEOUT_SECS),
+        shutdown,
+    )
+    .await
+}
+
+/// v0.7.0 H7 (round-2) — variant of [`serve_http_with_shutdown_future`]
+/// that accepts an explicit per-request timeout. Used by tests to
+/// drive the slow-POST edge directly.
+pub async fn serve_http_with_shutdown_future_and_timeout<F>(
+    addr: &str,
+    api_key_state: ApiKeyState,
+    app_state: AppState,
+    request_timeout: Duration,
+    shutdown: F,
+) -> Result<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let app = crate::build_router_with_timeout(api_key_state, app_state, request_timeout);
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("bind {addr}"))?;
@@ -2615,6 +2845,13 @@ mod tests {
                     .expect("open SqliteStore for keyword_app_state");
                 Arc::new(s)
             },
+            llm: Arc::new(None),
+            auto_tag_model: Arc::new(None),
+            llm_call_timeout: Duration::from_secs(crate::config::DEFAULT_LLM_CALL_TIMEOUT_SECS),
+            replay_cache: Arc::new(crate::identity::replay::ReplayCache::new()),
+            verify_require_nonce: false,
+            autonomous_hooks: false,
+            recall_scope: Arc::new(None),
         }
     }
 

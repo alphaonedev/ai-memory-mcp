@@ -337,21 +337,99 @@ impl OllamaClient {
         Ok(response.trim().to_string())
     }
 
-    /// Generates suggested tags for a memory.
-    pub fn auto_tag(&self, title: &str, content: &str) -> Result<Vec<String>> {
+    /// Generate up to 8 lowercase semantic tags for a memory.
+    ///
+    /// `model_override` (L15): when `Some`, uses that model instead of `self.model`.
+    /// Auto_tag is a short structured-output task; using gemma3:4b (12 tokens
+    /// avg) is dramatically faster than Gemma 4 with its 400+ token thinking
+    /// output. See bench data in docs/plan-c-cert.md.
+    ///
+    /// `num_predict` is hard-capped at 64 tokens regardless of model — defense
+    /// in depth against unbounded chain-of-thought emissions on any model.
+    pub fn auto_tag(
+        &self,
+        title: &str,
+        content: &str,
+        model_override: Option<&str>,
+    ) -> Result<Vec<String>> {
+        let model = model_override.unwrap_or(&self.model);
         let prompt = AUTO_TAG_PROMPT
             .replace("{title}", title)
             .replace("{content}", content);
-
-        let response = self.generate(&prompt, None)?;
-
+        let body = json!({
+            "model": model,
+            "prompt": prompt,
+            "stream": false,
+            "options": {"num_predict": 64}
+        });
+        let response = self.generate_with_body(&body)?;
         let tags: Vec<String> = response
             .lines()
             .map(|line| line.trim().to_lowercase())
-            .filter(|line| !line.is_empty())
+            .filter(|line| !line.is_empty() && line.len() <= 64)
+            .take(8)
             .collect();
-
         Ok(tags)
+    }
+
+    /// v0.7.0 L15 — issue a `/api/generate` call with a fully-formed JSON
+    /// body. Used by [`OllamaClient::auto_tag`] so the caller can stamp the
+    /// model name + an `options.num_predict` ceiling per-call without going
+    /// through the broader [`OllamaClient::generate`] chat-surface plumbing.
+    ///
+    /// The same circuit-breaker guard the rest of the client uses applies
+    /// here — a series of failures fast-fails subsequent calls until the
+    /// cooldown elapses, so a dead Ollama can't peg the auto_tag path on
+    /// the per-call 30s timeout.
+    fn generate_with_body(&self, body: &Value) -> Result<String> {
+        if self.breaker_is_open() {
+            return Err(anyhow!(
+                "Failed to send generate request: circuit breaker open \
+                 (last failure within {}s); ollama at {} is not responding",
+                CIRCUIT_BREAKER_COOLDOWN.as_secs(),
+                self.base_url,
+            ));
+        }
+        let url = format!("{}/api/generate", self.base_url);
+        let resp = match self
+            .client
+            .post(&url)
+            .timeout(GENERATE_TIMEOUT)
+            .json(body)
+            .send()
+        {
+            Ok(r) => r,
+            Err(e) => {
+                self.note_failure();
+                return Err(anyhow::Error::new(e).context("Failed to send generate request"));
+            }
+        };
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            if status.is_server_error() {
+                self.note_failure();
+            }
+            let text = resp.text().unwrap_or_default();
+            return Err(anyhow!("Generate failed ({status}): {text}"));
+        }
+
+        let parsed: Value = match resp.json() {
+            Ok(v) => v,
+            Err(e) => {
+                self.note_failure();
+                return Err(anyhow::Error::new(e).context("Failed to parse generate response"));
+            }
+        };
+
+        // Ollama /api/generate returns {"response": "..."}.
+        let response_text = parsed["response"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Missing 'response' field in generate output"))?
+            .to_string();
+
+        self.note_success();
+        Ok(response_text)
     }
 
     /// Generate an embedding vector via Ollama's /api/embed endpoint.
@@ -689,7 +767,16 @@ pub mod test_support {
         }
 
         /// Mock `auto_tag` — handles special characters and error modes.
-        pub fn auto_tag(&self, title: &str, _content: &str) -> Result<Vec<String>> {
+        ///
+        /// L15: signature mirrors the real client and accepts an optional
+        /// `model_override`; the mock ignores it (no upstream call is
+        /// made) but the parameter must be accepted for callsite parity.
+        pub fn auto_tag(
+            &self,
+            title: &str,
+            _content: &str,
+            _model_override: Option<&str>,
+        ) -> Result<Vec<String>> {
             if let Some(failure) = self.should_fail() {
                 return Err(match failure {
                     MockFailure::Timeout => {
@@ -852,7 +939,7 @@ mod mock_tests {
     fn test_mock_auto_tag() {
         let client =
             MockOllamaClient::new_with_url("http://localhost:11434", "test-model").unwrap();
-        let result = client.auto_tag("Test Title", "test content");
+        let result = client.auto_tag("Test Title", "test content", None);
         assert!(result.is_ok());
         let tags = result.unwrap();
         assert!(!tags.is_empty());
@@ -1089,7 +1176,7 @@ mod mock_tests {
     fn test_mock_auto_tag_handles_special_characters() {
         let client =
             MockOllamaClient::new_with_url("http://localhost:11434", "test-model").unwrap();
-        let result = client.auto_tag("Title @#$%", "content");
+        let result = client.auto_tag("Title @#$%", "content", None);
         assert!(result.is_ok());
     }
 
@@ -1101,7 +1188,7 @@ mod mock_tests {
             super::test_support::MockFailure::Timeout,
         )
         .unwrap();
-        let result = client.auto_tag("Test", "content");
+        let result = client.auto_tag("Test", "content", None);
         assert!(result.is_err());
     }
 
@@ -1669,13 +1756,13 @@ mod wiremock_tests {
     async fn test_auto_tag_returns_parsed_tags() {
         let server = MockServer::start().await;
         mount_tags_ok(&server, json!({"models": []})).await;
-        // The auto_tag prompt asks for "one per line, lowercase". The
-        // module also lowercases each line itself so we verify casing
-        // is normalised by sending mixed case.
+        // L15: auto_tag now uses /api/generate (not /api/chat) with a
+        // num_predict cap. The module also lowercases each line itself so
+        // we verify casing is normalised by sending mixed case.
         Mock::given(method("POST"))
-            .and(path("/api/chat"))
+            .and(path("/api/generate"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"content": "Tag1\nTAG2\ntag3"},
+                "response": "Tag1\nTAG2\ntag3",
             })))
             .mount(&server)
             .await;
@@ -1683,7 +1770,7 @@ mod wiremock_tests {
         let uri = server.uri();
         let tags = tokio::task::spawn_blocking(move || {
             let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
-            client.auto_tag("Title", "content")
+            client.auto_tag("Title", "content", None)
         })
         .await
         .unwrap();
@@ -1787,5 +1874,75 @@ mod wiremock_tests {
         .await
         .unwrap();
         assert!(r.is_ok());
+    }
+
+    // ---------------- L15 — auto_tag model override + num_predict cap ------
+
+    /// v0.7.0 L15 — when the caller passes `Some(model)` as the third
+    /// argument, the outbound /api/generate body MUST stamp that model
+    /// (not the client's configured `self.model`). Closes the
+    /// NHI-D-autotag-empty finding: the daemon must be able to route
+    /// short-structured calls to a fast tag-friendly model independent
+    /// of the reasoning-tier `llm_model`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn auto_tag_model_override_takes_precedence_l15() {
+        let server = MockServer::start().await;
+        mount_tags_ok(&server, json!({"models": []})).await;
+        // body_partial_json asserts the model field; if `auto_tag`
+        // forgot to honour the override, this matcher misses and
+        // wiremock returns 404 → the call fails.
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .and(body_partial_json(json!({"model": "gemma3:4b"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "response": "alpha\nbeta\ngamma",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let uri = server.uri();
+        let tags = tokio::task::spawn_blocking(move || {
+            // Construct the client with a *different* model so the override
+            // is the only path that produces a "gemma3:4b" body field.
+            let client = OllamaClient::new_with_url(&uri, "gemma4:e2b").unwrap();
+            client.auto_tag("Title", "content", Some("gemma3:4b"))
+        })
+        .await
+        .unwrap();
+        let tags = tags.expect("auto_tag with override should succeed");
+        assert_eq!(
+            tags,
+            vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()]
+        );
+    }
+
+    /// v0.7.0 L15 — the outbound body MUST carry `options.num_predict = 64`
+    /// regardless of model. This is the hard ceiling that defends against
+    /// chain-of-thought blowups on any future model (the L14 root cause
+    /// was Gemma 4 thinking-mode emitting 400+ tokens for a 5-tag list).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn auto_tag_num_predict_cap_in_body_l15() {
+        let server = MockServer::start().await;
+        mount_tags_ok(&server, json!({"models": []})).await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .and(body_partial_json(json!({"options": {"num_predict": 64}})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "response": "one\ntwo",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let uri = server.uri();
+        let tags = tokio::task::spawn_blocking(move || {
+            let client = OllamaClient::new_with_url(&uri, "any-model").unwrap();
+            client.auto_tag("Title", "content", None)
+        })
+        .await
+        .unwrap();
+        let tags = tags.expect("auto_tag should succeed");
+        assert_eq!(tags, vec!["one".to_string(), "two".to_string()]);
     }
 }

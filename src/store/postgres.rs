@@ -86,13 +86,78 @@ const INIT_SCHEMA: &str = include_str!("postgres_schema.sql");
 /// v27 — A2A correlation IDs + DLQ (`subscription_events`,
 ///       `subscription_dlq`) (K6).
 /// v28 — `agent_quotas` per-agent rate + storage caps (K8).
-const CURRENT_SCHEMA_VERSION: i32 = 28;
+/// v29 — In-place `vector(N)` conversion helper + parameterised
+///       `embedding` column dim. Connect-time migration is a no-op
+///       stamp pass; the actual `vector(384) → vector(768)` (or
+///       similar) conversion only runs when the operator explicitly
+///       invokes `ai-memory schema-init --embedding-dim <N>` with a
+///       value that differs from the current column declaration. The
+///       conversion is destructive on the embedding column (rows have
+///       their `embedding` NULLed and the HNSW indexes dropped +
+///       recreated) — re-embedding is required after the migration.
+/// v30 — `memories_metadata_is_object` CHECK constraint (M15). The
+///       `scope_idx` / `agent_id_idx` generated columns extract via
+///       `->>` which silently returns NULL for non-object metadata
+///       (array / scalar / NULL); the CHECK rejects malformed
+///       metadata at the write boundary instead of degrading to
+///       null-scope rows.
+const CURRENT_SCHEMA_VERSION: i32 = 30;
+
+/// Default embedding column dimension used when the caller doesn't pass
+/// `--embedding-dim` to `ai-memory schema-init`. Matches the v0.7.0
+/// baseline schema (`MiniLmL6V2` embedder = 384). Operators upgrading
+/// to a 768-dim embedder (`nomic_embed_v15`) must pass the matching
+/// `--embedding-dim 768` flag.
+pub const DEFAULT_EMBEDDING_DIM: u32 = 384;
+
+/// Supported embedding column dimensions. Mirrors the values returned
+/// by `EmbeddingModel::dim()` for the two compiled-in embedders
+/// (MiniLmL6V2 = 384, NomicEmbedV15 = 768). The migration helper
+/// rejects any other value with a clear error so an operator typo
+/// doesn't leave the schema in an unusable state.
+const SUPPORTED_EMBEDDING_DIMS: &[i32] = &[384, 768];
+
+/// Placeholder substituted in `postgres_schema.sql` at connect time.
+/// The schema file embeds `vector({EMBEDDING_DIM})` everywhere a
+/// dim-bearing column is declared (currently `memories.embedding` and
+/// `archived_memories.embedding`); [`PostgresStore::connect_with_dim`]
+/// runs a single `str::replace` over the bundled template before
+/// executing.
+const EMBEDDING_DIM_PLACEHOLDER: &str = "{EMBEDDING_DIM}";
+
+/// Substitute the embedding-dim placeholder in the bundled schema
+/// template. Pulled out as a free function so the unit test can exercise
+/// it without a running Postgres. Returns a fresh `String` — callers
+/// pass the result straight to `sqlx::raw_sql`.
+#[must_use]
+pub fn render_schema_sql(template: &str, dim: u32) -> String {
+    template.replace(EMBEDDING_DIM_PLACEHOLDER, &dim.to_string())
+}
 
 /// Default connection pool settings. Tuned for a mid-range ai-memory
 /// daemon — adjust via `PostgresStore::with_pool_options` when wiring
 /// a larger deployment.
 const DEFAULT_MAX_CONNECTIONS: u32 = 16;
 const DEFAULT_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// v0.7.0 M4 — default connection-level `statement_timeout` (seconds)
+/// applied to every postgres connection in the pool. 30s bounds the
+/// outer envelope of any single query so a pathological `pg_sleep(60)`,
+/// a runaway recursive CTE, or an unbounded sequential scan cannot
+/// wedge a connection for the whole pool. Operators with intentionally
+/// long maintenance queries from the daemon (`schema-init
+/// --embedding-dim`, the AGE seed) override via
+/// `AppConfig::postgres_statement_timeout_secs`. Setting the value to
+/// 0 disables the limit (postgres `SET` semantics).
+pub const DEFAULT_STATEMENT_TIMEOUT_SECS: u64 = 30;
+
+/// v0.7.0 M4 companion — paired `lock_timeout` (seconds). Lock waits
+/// over this threshold abort with `lock_not_available` instead of
+/// blocking forever behind a DDL or a long-running competing txn. 5s
+/// is the standard "I'd rather fail fast than hang" envelope; operators
+/// can disable it by setting `postgres_statement_timeout_secs = 0`,
+/// which also drops the lock_timeout.
+pub const DEFAULT_LOCK_TIMEOUT_SECS: u64 = 5;
 
 /// `PostgresStore` — sqlx + pgvector backend. Owns a connection pool.
 #[derive(Clone)]
@@ -110,20 +175,113 @@ impl PostgresStore {
     /// Connect using a Postgres URL (e.g. `postgres://user:pass@host:5432/db`).
     /// Runs the bootstrap schema on the first connection acquired.
     ///
+    /// Bootstraps with [`DEFAULT_EMBEDDING_DIM`] (= 384). Use
+    /// [`Self::connect_with_dim`] when initializing a fresh schema for
+    /// a 768-dim embedder (`nomic_embed_v15`) — passing the dim here
+    /// makes the `vector(N)` column declarations match the embedder
+    /// from the very first write.
+    ///
     /// # Errors
     ///
     /// Returns `StoreError::BackendUnavailable` if the connection
     /// cannot be established or the schema bootstrap fails.
     pub async fn connect(url: &str) -> StoreResult<Self> {
+        Self::connect_with_dim(url, DEFAULT_EMBEDDING_DIM).await
+    }
+
+    /// Connect with an explicit `statement_timeout` (seconds). Mirrors
+    /// [`Self::connect`] but lets callers override the default 30s
+    /// safety envelope — typically driven from
+    /// `AppConfig::postgres_statement_timeout_secs`. Setting `secs = 0`
+    /// disables the timeout (matches postgres `SET` semantics).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::connect`].
+    pub async fn connect_with_timeout(url: &str, secs: u64) -> StoreResult<Self> {
+        Self::connect_with_dim_and_timeout(url, DEFAULT_EMBEDDING_DIM, secs).await
+    }
+
+    /// Connect using a Postgres URL with an explicit embedding column
+    /// dimension. Substitutes `{EMBEDDING_DIM}` in the bundled
+    /// `postgres_schema.sql` before executing so a fresh init lands
+    /// the right `vector(N)` declaration.
+    ///
+    /// For an existing schema, this call does NOT alter pre-declared
+    /// `vector(M)` columns — the operator must invoke the explicit
+    /// `migrate_embedding_dim` helper (typically via
+    /// `ai-memory schema-init --embedding-dim N`) to perform the
+    /// destructive in-place conversion. Calling `connect_with_dim`
+    /// against a mismatched schema emits a WARN and falls back to the
+    /// existing dim for the lifetime of the pool.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::BackendUnavailable` if the connection
+    /// cannot be established, `StoreError::InvalidInput` if `dim` is
+    /// not one of the supported values, or schema-bootstrap failures
+    /// bubble up unchanged.
+    pub async fn connect_with_dim(url: &str, dim: u32) -> StoreResult<Self> {
+        Self::connect_with_dim_and_timeout(url, dim, DEFAULT_STATEMENT_TIMEOUT_SECS).await
+    }
+
+    /// Connect with an explicit embedding dim and `statement_timeout`
+    /// (seconds). The fully-parameterised entry point — both
+    /// [`Self::connect`] and [`Self::connect_with_dim`] delegate here.
+    /// See M4/M7 in `src/store/postgres.rs::DEFAULT_STATEMENT_TIMEOUT_SECS`
+    /// for the rationale on the safety envelope.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::connect_with_dim`].
+    pub async fn connect_with_dim_and_timeout(
+        url: &str,
+        dim: u32,
+        statement_timeout_secs: u64,
+    ) -> StoreResult<Self> {
+        if !SUPPORTED_EMBEDDING_DIMS.contains(&i32::try_from(dim).unwrap_or(-1)) {
+            return Err(StoreError::InvalidInput {
+                detail: format!(
+                    "unsupported embedding dim {dim}: expected one of {SUPPORTED_EMBEDDING_DIMS:?}"
+                ),
+            });
+        }
+
         let options: PgConnectOptions =
             url.parse()
                 .map_err(|e: sqlx::Error| StoreError::BackendUnavailable {
                     backend: "postgres".to_string(),
                     detail: format!("parse url: {e}"),
                 })?;
+        // v0.7.0 M4/M7 — `after_connect` hook fires the moment a new
+        // connection is acquired. We use it to apply per-session
+        // `statement_timeout` + `lock_timeout` so a runaway query
+        // cannot wedge the pool indefinitely. `secs = 0` is the
+        // postgres-native "disabled" sentinel; we skip the SET in
+        // that case to keep the wire silent for operators who
+        // explicitly opted out of the safety envelope.
+        let stmt_secs = statement_timeout_secs;
+        let lock_secs = if stmt_secs == 0 {
+            0
+        } else {
+            DEFAULT_LOCK_TIMEOUT_SECS
+        };
         let pool = PgPoolOptions::new()
             .max_connections(DEFAULT_MAX_CONNECTIONS)
             .acquire_timeout(DEFAULT_ACQUIRE_TIMEOUT)
+            .after_connect(move |conn, _meta| {
+                Box::pin(async move {
+                    use sqlx::Executor;
+                    if stmt_secs == 0 {
+                        return Ok(());
+                    }
+                    let stmt_ms = stmt_secs.saturating_mul(1000);
+                    let lock_ms = lock_secs.saturating_mul(1000);
+                    let sql =
+                        format!("SET statement_timeout = {stmt_ms}; SET lock_timeout = {lock_ms};");
+                    conn.execute(sql.as_str()).await.map(|_| ())
+                })
+            })
             .connect_with(options)
             .await
             .map_err(|e| StoreError::BackendUnavailable {
@@ -131,14 +289,18 @@ impl PostgresStore {
                 detail: format!("connect: {e}"),
             })?;
 
-        // Bootstrap schema — idempotent.
-        sqlx::raw_sql(INIT_SCHEMA)
-            .execute(&pool)
-            .await
-            .map_err(|e| StoreError::BackendUnavailable {
+        // Bootstrap schema — idempotent. The bundled template uses
+        // `vector({EMBEDDING_DIM})` for the two vector columns; we
+        // substitute the caller's chosen dim here. CREATE TABLE IF NOT
+        // EXISTS means the dim only "takes" on first init; subsequent
+        // calls against an already-populated schema are no-ops.
+        let init_sql = render_schema_sql(INIT_SCHEMA, dim);
+        sqlx::raw_sql(&init_sql).execute(&pool).await.map_err(|e| {
+            StoreError::BackendUnavailable {
                 backend: "postgres".to_string(),
                 detail: format!("init schema: {e}"),
-            })?;
+            }
+        })?;
 
         // Sanity-check pgvector version. We support 0.7.x–0.8.x; older
         // versions have HNSW behaviour differences we haven't tested
@@ -161,12 +323,14 @@ impl PostgresStore {
             );
         }
 
-        // Sanity-check that the embedding column dimension matches the
-        // default embedder (MiniLmL6V2 = 384). If a deployment has
-        // configured a different model (e.g. NomicEmbedV15 = 768), the
-        // table must be recreated with the matching vector(N) — we log
-        // a WARN here so operators notice before writes start failing.
-        // (#304 nit.)
+        // Sanity-check that the embedding column dimension matches
+        // what the caller requested at connect time. A mismatch means
+        // an existing schema was created with a different dim (e.g.
+        // operator switched from `MiniLmL6V2` to `NomicEmbedV15` but
+        // didn't run `ai-memory schema-init --embedding-dim 768`); we
+        // log a WARN here so the operator notices before writes start
+        // failing on a dim-mismatch insert. (#304 nit; v0.7.0 L3 made
+        // the comparand parameterisable.)
         let typmod: Option<(i32,)> = sqlx::query_as(
             "SELECT atttypmod FROM pg_attribute a
              JOIN pg_class c ON c.oid = a.attrelid
@@ -176,13 +340,15 @@ impl PostgresStore {
         .await
         .ok()
         .flatten();
+        let expected_dim = i32::try_from(dim).unwrap_or(384);
         if let Some((typmod,)) = typmod
-            && typmod != 384
+            && typmod != expected_dim
         {
             tracing::warn!(
                 target = "store::postgres",
                 dim = typmod,
-                "memories.embedding column dimension is not 384; recreate with matching vector(N) for your embedder"
+                expected = expected_dim,
+                "memories.embedding column dimension ({typmod}) does not match the requested embedder dim ({expected_dim}); run `ai-memory schema-init --store-url <url> --embedding-dim {expected_dim}` to convert in place"
             );
         }
 
@@ -313,8 +479,289 @@ impl PostgresStore {
         if current_version < 28 {
             self.migrate_v28().await?;
         }
+        if current_version < 29 {
+            // v29 connect-time pass: stamp the version once the
+            // schema is conformant. The actual `vector(N)` conversion
+            // is operator-initiated via `ai-memory schema-init
+            // --embedding-dim <N>`; this no-op pass just records that
+            // the daemon understands v29 semantics.
+            self.migrate_v29_stamp().await?;
+        }
+        if current_version < 30 {
+            self.migrate_v30().await?;
+        }
 
         Ok(())
+    }
+
+    /// v30 — `memories_metadata_is_object` CHECK constraint (M15).
+    ///
+    /// The `scope_idx` and `agent_id_idx` generated columns project from
+    /// `metadata` via `->>`; that operator silently returns NULL for
+    /// any non-object JSONB (array, scalar, or NULL), which masks
+    /// governance/scope-routing misconfiguration as "no scope" rows.
+    /// The CHECK constraint closes that gap so a malformed metadata
+    /// payload is rejected at the write boundary.
+    ///
+    /// Idempotent: ADD CONSTRAINT IF NOT EXISTS would be cleaner but
+    /// Postgres < 14 doesn't grok that syntax; we probe pg_constraint
+    /// first and add only on miss. A pre-flight scan refuses to add the
+    /// constraint when existing rows would violate it so the operator
+    /// gets a clear error rather than a half-applied migration.
+    async fn migrate_v30(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v30 tx", e))?;
+
+        // Probe whether the constraint already exists (fresh-schema
+        // installs inherit it inline from postgres_schema.sql).
+        let exists: Option<(String,)> = sqlx::query_as(
+            "SELECT conname FROM pg_constraint
+              WHERE conname = 'memories_metadata_is_object'
+                AND conrelid = 'memories'::regclass",
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("probe memories_metadata_is_object", e))?;
+
+        if exists.is_none() {
+            // Pre-flight: reject the migration if any row would violate
+            // the invariant. v0.6.x writes always stamp metadata as an
+            // object so this should always be 0 in practice.
+            let bad_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM memories \
+                 WHERE jsonb_typeof(metadata) IS DISTINCT FROM 'object'",
+            )
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("count non-object metadata rows", e))?;
+
+            if bad_count > 0 {
+                return Err(StoreError::IntegrityFailed {
+                    detail: format!(
+                        "v30 migration aborted: {bad_count} memories have non-object metadata; \
+                         repair them before re-running"
+                    ),
+                });
+            }
+
+            sqlx::query(
+                "ALTER TABLE memories \
+                 ADD CONSTRAINT memories_metadata_is_object \
+                 CHECK (jsonb_typeof(metadata) = 'object') NOT VALID",
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("add memories_metadata_is_object constraint", e))?;
+
+            sqlx::query("ALTER TABLE memories VALIDATE CONSTRAINT memories_metadata_is_object")
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("validate memories_metadata_is_object constraint", e))?;
+        }
+
+        record_schema_version(&mut tx, 30).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v30 migration", e))?;
+
+        tracing::info!(
+            target = "store::postgres",
+            "schema migration v30 applied (memories_metadata_is_object CHECK)"
+        );
+        Ok(())
+    }
+
+    /// v29 connect-time no-op pass.
+    ///
+    /// The actual `vector(N)` column conversion is destructive (rows
+    /// have their embedding NULLed, HNSW indexes are dropped + recreated)
+    /// and therefore MUST be operator-initiated rather than firing
+    /// implicitly on daemon startup. The connect-time pass here just
+    /// records that we've reached v29 once the bookkeeping is in place;
+    /// the explicit conversion lives at
+    /// [`Self::migrate_embedding_dim`].
+    async fn migrate_v29_stamp(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v29 stamp tx", e))?;
+
+        record_schema_version(&mut tx, 29).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v29 stamp", e))?;
+
+        tracing::info!(
+            target = "store::postgres",
+            "schema migration v29 stamped (operator-initiated vector(N) conversion available via ai-memory schema-init --embedding-dim)"
+        );
+        Ok(())
+    }
+
+    /// Read the current dimension of `memories.embedding`. Returns
+    /// `None` when the column is missing (which should not happen
+    /// post-bootstrap) or the type isn't `vector(N)`.
+    ///
+    /// pgvector encodes the declared dim in `pg_attribute.atttypmod`;
+    /// the value matches what `format_type(atttypid, atttypmod)` would
+    /// surface as `vector(N)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::BackendUnavailable` if the catalog probe
+    /// fails (connection issue, etc.).
+    pub async fn current_embedding_dim(&self) -> StoreResult<Option<i32>> {
+        let row: Option<(i32,)> = sqlx::query_as(
+            "SELECT atttypmod FROM pg_attribute a
+             JOIN pg_class c ON c.oid = a.attrelid
+             WHERE c.relname = 'memories' AND a.attname = 'embedding'",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| to_store_err("read memories.embedding atttypmod", e))?;
+        Ok(row.map(|(t,)| t))
+    }
+
+    /// Operator-initiated `vector(N)` conversion. Destructive on the
+    /// embedding column: rows have their `embedding` NULLed (vectors
+    /// cannot be reprojected dim-to-dim), the HNSW indexes on both
+    /// `memories.embedding` and `archived_memories.embedding` are
+    /// dropped and recreated, and the column is `ALTER COLUMN ... TYPE
+    /// vector(<target_dim>)`'d. The caller is responsible for
+    /// re-running embeddings after the conversion.
+    ///
+    /// Idempotent: when the column is already `vector(target_dim)` the
+    /// call is a no-op and returns `Ok(false)` (no change). On a real
+    /// conversion it returns `Ok(true)`.
+    ///
+    /// The whole operation runs in a single transaction so a mid-way
+    /// failure leaves the schema untouched.
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::InvalidInput` when `target_dim` is not one of the
+    ///   supported values (`SUPPORTED_EMBEDDING_DIMS`).
+    /// - `StoreError::BackendUnavailable` on any SQL failure during
+    ///   the conversion.
+    pub async fn migrate_embedding_dim(&self, target_dim: u32) -> StoreResult<bool> {
+        let target_i32 = i32::try_from(target_dim).map_err(|_| StoreError::InvalidInput {
+            detail: format!("target_dim {target_dim} out of i32 range"),
+        })?;
+        if !SUPPORTED_EMBEDDING_DIMS.contains(&target_i32) {
+            return Err(StoreError::InvalidInput {
+                detail: format!(
+                    "unsupported target embedding dim {target_dim}: expected one of {SUPPORTED_EMBEDDING_DIMS:?}"
+                ),
+            });
+        }
+
+        let current = self.current_embedding_dim().await?;
+        if let Some(cur) = current
+            && cur == target_i32
+        {
+            tracing::info!(
+                target = "store::postgres",
+                dim = target_i32,
+                "v29 embedding-dim migration: column already vector({target_i32}); no-op"
+            );
+            return Ok(false);
+        }
+
+        tracing::warn!(
+            target = "store::postgres",
+            current = ?current,
+            target = target_i32,
+            "v29 embedding-dim migration: converting memories.embedding + archived_memories.embedding; existing embeddings will be NULLed — operators MUST re-run embeddings after this conversion completes"
+        );
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v29 conversion tx", e))?;
+
+        // Drop the HNSW indexes that pin the column type. ALTER COLUMN
+        // TYPE on a vector column fails while the HNSW index references
+        // it; we drop here and recreate below. The named index from
+        // postgres_schema.sql is `memories_embedding_hnsw`; the archive
+        // table doesn't carry an HNSW index in the baseline schema but
+        // we issue `IF EXISTS` to tolerate operator-added indexes too.
+        sqlx::query("DROP INDEX IF EXISTS memories_embedding_hnsw")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("drop memories_embedding_hnsw", e))?;
+        sqlx::query("DROP INDEX IF EXISTS archived_memories_embedding_hnsw")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("drop archived_memories_embedding_hnsw", e))?;
+
+        // NULL existing embeddings. Cross-dim reprojection isn't
+        // mathematically meaningful (a 384-d vector and a 768-d vector
+        // from two different models live in different spaces); the
+        // operator MUST re-embed after the migration. We don't TRUNCATE
+        // because the memory rows themselves remain valid — only the
+        // vector column is invalidated.
+        sqlx::query("UPDATE memories SET embedding = NULL WHERE embedding IS NOT NULL")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("null memories.embedding", e))?;
+        sqlx::query("UPDATE archived_memories SET embedding = NULL WHERE embedding IS NOT NULL")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("null archived_memories.embedding", e))?;
+
+        // Alter the column types. pgvector's type allows ALTER COLUMN
+        // TYPE between two `vector(N)` declarations even when rows are
+        // present (because we just NULLed them above). The `USING NULL`
+        // cast is required when there might be non-NULL rows; we add
+        // it defensively even though the UPDATE above ensures none.
+        let alter_memories = format!(
+            "ALTER TABLE memories ALTER COLUMN embedding TYPE vector({target_dim}) USING NULL"
+        );
+        sqlx::query(&alter_memories)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("alter memories.embedding type", e))?;
+
+        let alter_archived = format!(
+            "ALTER TABLE archived_memories ALTER COLUMN embedding TYPE vector({target_dim}) USING NULL"
+        );
+        sqlx::query(&alter_archived)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("alter archived_memories.embedding type", e))?;
+
+        // Recreate the HNSW index on the live table. The archived
+        // table is intentionally NOT given an HNSW index (matches the
+        // baseline schema — archive recall is rare and a covering
+        // index would bloat write-time cost).
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS memories_embedding_hnsw ON memories
+             USING hnsw (embedding vector_cosine_ops)",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("recreate memories_embedding_hnsw", e))?;
+
+        record_schema_version(&mut tx, 29).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v29 conversion", e))?;
+
+        tracing::warn!(
+            target = "store::postgres",
+            target_dim = target_i32,
+            "v29 embedding-dim migration committed; re-run embeddings (e.g. via memory_store with the matching embedder configured)"
+        );
+
+        Ok(true)
     }
 
     /// v0.7.0 H2 — Add `attest_level` TEXT column to `memory_links`.
@@ -580,34 +1027,51 @@ impl PostgresStore {
             .await
             .map_err(|e| to_store_err("begin v18 tx", e))?;
 
+        // Read the current dim of `memories.embedding` so we add the
+        // archive-side column at the same dim. The bootstrap schema
+        // has already run by the time we reach here, so this column
+        // exists with whatever dim the operator chose at connect time.
+        // Falls back to DEFAULT_EMBEDDING_DIM if the probe comes back
+        // empty (defensive — should never happen in practice).
+        let existing_dim: Option<(i32,)> = sqlx::query_as(
+            "SELECT atttypmod FROM pg_attribute a
+             JOIN pg_class c ON c.oid = a.attrelid
+             WHERE c.relname = 'memories' AND a.attname = 'embedding'",
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("read memories.embedding dim in v18", e))?;
+        let dim_for_archive = existing_dim.map_or(DEFAULT_EMBEDDING_DIM, |(d,)| {
+            u32::try_from(d).unwrap_or(DEFAULT_EMBEDDING_DIM)
+        });
+        let archive_embedding_ddl =
+            format!("ALTER TABLE archived_memories ADD COLUMN embedding vector({dim_for_archive})");
+
         for (table, column, ddl) in [
             (
                 "memories",
                 "embedding_dim",
-                "ALTER TABLE memories ADD COLUMN embedding_dim INTEGER",
+                "ALTER TABLE memories ADD COLUMN embedding_dim INTEGER".to_string(),
             ),
-            (
-                "archived_memories",
-                "embedding",
-                "ALTER TABLE archived_memories ADD COLUMN embedding vector(384)",
-            ),
+            ("archived_memories", "embedding", archive_embedding_ddl),
             (
                 "archived_memories",
                 "embedding_dim",
-                "ALTER TABLE archived_memories ADD COLUMN embedding_dim INTEGER",
+                "ALTER TABLE archived_memories ADD COLUMN embedding_dim INTEGER".to_string(),
             ),
             (
                 "archived_memories",
                 "original_tier",
-                "ALTER TABLE archived_memories ADD COLUMN original_tier TEXT",
+                "ALTER TABLE archived_memories ADD COLUMN original_tier TEXT".to_string(),
             ),
             (
                 "archived_memories",
                 "original_expires_at",
-                "ALTER TABLE archived_memories ADD COLUMN original_expires_at TIMESTAMPTZ",
+                "ALTER TABLE archived_memories ADD COLUMN original_expires_at TIMESTAMPTZ"
+                    .to_string(),
             ),
         ] {
-            add_column_if_missing(&mut tx, table, column, ddl).await?;
+            add_column_if_missing(&mut tx, table, column, &ddl).await?;
         }
 
         // G5 backfill — pre-existing archive rows have lost original
@@ -2676,6 +3140,67 @@ async fn record_schema_version(
     Ok(())
 }
 
+/// v0.7.0 H10 — transaction-bound twin of
+/// [`PostgresStore::build_namespace_chain`]. Reads every
+/// `namespace_meta.parent_namespace` lookup through the supplied tx so
+/// the chain walk shares a snapshot with the downstream policy lookup +
+/// pending_actions INSERT. Logic identical to the trait method — the
+/// only delta is `fetch_optional(&mut *tx)` instead of `&self.pool`.
+async fn build_namespace_chain_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    namespace: &str,
+) -> StoreResult<Vec<String>> {
+    const MAX_EXPLICIT_DEPTH: usize = 8;
+    let mut chain: Vec<String> = Vec::new();
+
+    if namespace == "*" {
+        chain.push("*".to_string());
+        return Ok(chain);
+    }
+    chain.push("*".to_string());
+
+    let mut hierarchy_chain: Vec<String> = crate::models::namespace_ancestors(namespace)
+        .into_iter()
+        .rev()
+        .collect();
+
+    if let Some(root) = hierarchy_chain.first().cloned() {
+        let mut explicit_above: Vec<String> = Vec::new();
+        let mut current = root;
+        for _ in 0..MAX_EXPLICIT_DEPTH {
+            let row: Option<(Option<String>,)> =
+                sqlx::query_as("SELECT parent_namespace FROM namespace_meta WHERE namespace = $1")
+                    .bind(&current)
+                    .fetch_optional(&mut **tx)
+                    .await
+                    .map_err(|e| to_store_err("build_namespace_chain_in_tx parent lookup", e))?;
+            let next = row.and_then(|(p,)| p);
+            match next {
+                Some(p)
+                    if p != "*"
+                        && !explicit_above.contains(&p)
+                        && !hierarchy_chain.contains(&p) =>
+                {
+                    explicit_above.push(p.clone());
+                    current = p;
+                }
+                _ => break,
+            }
+        }
+        for p in explicit_above.into_iter().rev() {
+            if !chain.contains(&p) {
+                chain.push(p);
+            }
+        }
+    }
+    for entry in hierarchy_chain.drain(..) {
+        if !chain.contains(&entry) {
+            chain.push(entry);
+        }
+    }
+    Ok(chain)
+}
+
 /// Maximum traversal depth supported by [`PostgresStore::kg_query`].
 ///
 /// Mirrors `crate::db::KG_QUERY_MAX_SUPPORTED_DEPTH` (the SQLite path)
@@ -4707,11 +5232,46 @@ impl MemoryStore for PostgresStore {
                 detail: format!("serialize consolidated tags: {e}"),
             })?;
 
-        sqlx::query(
+        // Plan C R4 / R5 cert finding: the prior implementation was a plain
+        // INSERT that exploded with `duplicate key value violates unique
+        // constraint "memories_title_ns_uidx"` when an operator re-ran a
+        // consolidate at the same (title, namespace) — common during
+        // repeat cert runs against the same persistent postgres database.
+        // The scenario reads `consolidated_id` out of the response, so we
+        // must always return a real id; ON CONFLICT (title, namespace) DO
+        // UPDATE re-uses the existing row's id and updates the content +
+        // tags + metadata in place, matching the upsert contract of every
+        // other insert site in this adapter. `RETURNING id` yields the
+        // existing id on update so the caller sees a single canonical
+        // memory at that (title, namespace).
+        let inserted_id: String = sqlx::query_scalar(
             "INSERT INTO memories (
                 id, tier, namespace, title, content, tags, priority, confidence,
                 source, access_count, created_at, updated_at, metadata
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, 1.0, $8, $9, $10, $10, $11)",
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, 1.0, $8, $9, $10, $10, $11)
+            ON CONFLICT (title, namespace) DO UPDATE SET
+                tier = CASE
+                    WHEN tier_rank(EXCLUDED.tier) >= tier_rank(memories.tier)
+                        THEN EXCLUDED.tier
+                    ELSE memories.tier
+                END,
+                content = EXCLUDED.content,
+                tags = EXCLUDED.tags,
+                priority = EXCLUDED.priority,
+                confidence = EXCLUDED.confidence,
+                source = EXCLUDED.source,
+                access_count = EXCLUDED.access_count,
+                updated_at = EXCLUDED.updated_at,
+                metadata = CASE
+                    WHEN memories.metadata ? 'agent_id'
+                        THEN jsonb_set(
+                            EXCLUDED.metadata,
+                            '{agent_id}',
+                            memories.metadata -> 'agent_id'
+                        )
+                    ELSE EXCLUDED.metadata
+                END
+            RETURNING id",
         )
         .bind(&new_id)
         .bind(tier.as_str())
@@ -4724,12 +5284,26 @@ impl MemoryStore for PostgresStore {
         .bind(total_access)
         .bind(now)
         .bind(&merged_metadata_value)
-        .execute(&mut *tx)
+        .fetch_one(&mut *tx)
         .await
-        .map_err(|e| to_store_err("consolidate insert", e))?;
+        .map_err(|e| to_store_err("consolidate upsert", e))?;
+        let new_id = inserted_id;
 
         // Delete source rows.
+        //
+        // Plan C R6 cert finding: when the UPSERT branch resolves a
+        // `(title, namespace)` conflict it returns the EXISTING row's
+        // id (RETURNING id). Some callers (S5 cert harness) re-include
+        // the prior consolidated row in `ids` — they fetched every
+        // memory in the namespace and the prior consolidation result
+        // is one of them. If we delete every id in `ids` indiscriminately,
+        // we delete the row we just upserted into and leave the caller
+        // with a 201-but-vanished memory. Skip the deletion for the
+        // upserted-into row; only the genuine source rows go away.
         for id in ids {
+            if id == &new_id {
+                continue;
+            }
             sqlx::query("DELETE FROM memories WHERE id = $1")
                 .bind(id)
                 .execute(&mut *tx)
@@ -5290,8 +5864,54 @@ impl MemoryStore for PostgresStore {
             return Ok(GovernanceDecision::Allow);
         }
 
-        // Resolve the policy via the leaf-first walk we just landed.
-        let Some(policy) = self.resolve_governance_policy(namespace).await? else {
+        // v0.7.0 H10 — open a SERIALIZABLE-equivalent transaction up-front
+        // so every policy lookup AND the conditional pending_actions
+        // INSERT ride a single connection. Pre-fix, the policy resolve
+        // ran on connection A while the INSERT ran on connection B —
+        // under concurrent governance writes the resolve and the INSERT
+        // could observe different snapshots of namespace_meta /
+        // pending_actions, producing a Pending decision whose row never
+        // landed in the audit table.
+        //
+        // The transaction wraps the same surface area the sqlite path
+        // serializes under its single rusqlite connection mutex, closing
+        // the race without ratcheting backend-wide isolation level.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin enforce_governance_action tx", e))?;
+
+        // Resolve the policy via the leaf-first walk — inline here so
+        // every namespace_meta + memories.metadata read shares the same
+        // tx snapshot as the INSERT below.
+        let chain = build_namespace_chain_in_tx(&mut tx, namespace).await?;
+        let mut resolved_policy: Option<crate::models::GovernancePolicy> = None;
+        for ns in chain.iter().rev() {
+            let row: Option<(Option<String>,)> =
+                sqlx::query_as("SELECT standard_id FROM namespace_meta WHERE namespace = $1")
+                    .bind(ns)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| to_store_err("resolve_governance_policy lookup (tx)", e))?;
+            let Some((Some(standard_id),)) = row else {
+                continue;
+            };
+            let meta: Option<(serde_json::Value,)> =
+                sqlx::query_as("SELECT metadata FROM memories WHERE id = $1")
+                    .bind(&standard_id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| to_store_err("read governance standard metadata", e))?;
+            if let Some((m,)) = meta
+                && let Some(Ok(p)) = crate::models::GovernancePolicy::from_metadata(&m)
+            {
+                resolved_policy = Some(p);
+                break;
+            }
+        }
+        let Some(policy) = resolved_policy else {
+            // No policy in the chain → Allow. Drop the tx (no writes).
             return Ok(GovernanceDecision::Allow);
         };
         let level = match action {
@@ -5302,24 +5922,20 @@ impl MemoryStore for PostgresStore {
 
         // v0.7.0 Wave-3 Continuation 4 (Bucket C / S60+S80) — resolve
         // the namespace owner via the inheritance chain. Walks leaf→root
-        // (matching `resolve_governance_policy`) so a write to
-        // `parent/sub/deep` finds the standard pinned at `parent`. The
-        // F1/F8 sqlite fix (commit history) layered the chain walk on
-        // the sqlite path; this lights the same posture up on postgres.
+        // under the same tx snapshot as the policy lookup above.
         let ns_owner = if matches!(action, super::GovernedAction::Store) {
-            let chain = self.build_namespace_chain(namespace).await?;
             let mut found: Option<String> = None;
-            for ns in chain.into_iter().rev() {
+            for ns in chain.iter().rev() {
                 let row: Option<(Option<String>,)> = sqlx::query_as(
                     "SELECT m.metadata->>'agent_id' AS agent_id \
                      FROM namespace_meta nm \
                      JOIN memories m ON m.id = nm.standard_id \
                      WHERE nm.namespace = $1",
                 )
-                .bind(&ns)
-                .fetch_optional(&self.pool)
+                .bind(ns)
+                .fetch_optional(&mut *tx)
                 .await
-                .map_err(|e| to_store_err("namespace_owner chain lookup", e))?;
+                .map_err(|e| to_store_err("namespace_owner chain lookup (tx)", e))?;
                 if let Some((Some(o),)) = row {
                     found = Some(o);
                     break;
@@ -5328,6 +5944,23 @@ impl MemoryStore for PostgresStore {
             found
         } else {
             None
+        };
+
+        // Inline is_registered_agent under the same tx — the existing
+        // helper takes &self.pool; we reproduce its single-row probe.
+        let registered_agent_check = if matches!(level, GovernanceLevel::Registered) {
+            use crate::models::AGENTS_NAMESPACE;
+            let title = format!("agent:{agent_id}");
+            let row: Option<(String,)> =
+                sqlx::query_as("SELECT id FROM memories WHERE namespace = $1 AND title = $2")
+                    .bind(AGENTS_NAMESPACE)
+                    .bind(&title)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| to_store_err("is_registered_agent (tx)", e))?;
+            row.is_some()
+        } else {
+            false
         };
 
         // Evaluate the level. Same rules as the sqlite path:
@@ -5339,7 +5972,7 @@ impl MemoryStore for PostgresStore {
         let decision = match level {
             GovernanceLevel::Any => GovernanceDecision::Allow,
             GovernanceLevel::Registered => {
-                if self.is_registered_agent(agent_id).await? {
+                if registered_agent_check {
                     GovernanceDecision::Allow
                 } else {
                     GovernanceDecision::Deny(format!(
@@ -5374,10 +6007,12 @@ impl MemoryStore for PostgresStore {
         };
 
         if mode == PermissionsMode::Advisory {
+            // Drop the tx (no writes); advisory mode is read-only.
             return Ok(GovernanceDecision::Allow);
         }
 
-        // Enforce mode — Pending queues a pending_actions row.
+        // Enforce mode — Pending queues a pending_actions row inside
+        // the same tx so the audit trail is atomic with the decision.
         if let GovernanceDecision::Pending(_) = decision {
             let pending_id = uuid::Uuid::new_v4().to_string();
             let now = chrono::Utc::now();
@@ -5398,11 +6033,19 @@ impl MemoryStore for PostgresStore {
             .bind(payload)
             .bind(agent_id)
             .bind(now)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
-            .map_err(|e| to_store_err("queue_pending_action", e))?;
+            .map_err(|e| to_store_err("queue_pending_action (tx)", e))?;
+            tx.commit()
+                .await
+                .map_err(|e| to_store_err("commit enforce_governance_action tx", e))?;
             return Ok(GovernanceDecision::Pending(pending_id));
         }
+        // Allow / Deny: no write, but commit the (read-only) tx so the
+        // connection is returned cleanly to the pool.
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit enforce_governance_action tx (read-only)", e))?;
         Ok(decision)
     }
 
@@ -6129,6 +6772,75 @@ mod tests {
         // Verify the schema_version table is created for migration tracking.
         assert!(INIT_SCHEMA.contains("CREATE TABLE IF NOT EXISTS schema_version"));
         assert!(INIT_SCHEMA.contains("version    INTEGER PRIMARY KEY"));
+    }
+
+    // ------------------------------------------------------------------
+    // v0.7.0 L3 — `vector(N)` template substitution.
+    //
+    // The bundled `postgres_schema.sql` uses `vector({EMBEDDING_DIM})`
+    // as a placeholder for the embedding-column dim. `render_schema_sql`
+    // is the single substitution point invoked by `connect_with_dim`.
+    // These tests verify the placeholder lives in the template AND
+    // that the substitution leaves no stray placeholders behind.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn schema_template_carries_embedding_dim_placeholder() {
+        // The schema file must hold the placeholder verbatim — otherwise
+        // substitution becomes a silent no-op.
+        assert!(
+            INIT_SCHEMA.contains(EMBEDDING_DIM_PLACEHOLDER),
+            "postgres_schema.sql must contain {EMBEDDING_DIM_PLACEHOLDER}"
+        );
+        // And it must NOT contain a hardcoded `vector(384)` /
+        // `vector(768)` outside the placeholder — the template is the
+        // single source of truth for column dim.
+        assert!(
+            !INIT_SCHEMA.contains("vector(384)"),
+            "postgres_schema.sql must not contain hardcoded vector(384)"
+        );
+        assert!(
+            !INIT_SCHEMA.contains("vector(768)"),
+            "postgres_schema.sql must not contain hardcoded vector(768)"
+        );
+    }
+
+    #[test]
+    fn render_schema_sql_substitutes_768() {
+        let rendered = render_schema_sql(INIT_SCHEMA, 768);
+        assert!(rendered.contains("vector(768)"), "missing vector(768)");
+        assert!(!rendered.contains("vector(384)"), "stray vector(384)");
+        assert!(
+            !rendered.contains(EMBEDDING_DIM_PLACEHOLDER),
+            "placeholder not substituted: {rendered}"
+        );
+    }
+
+    #[test]
+    fn render_schema_sql_substitutes_384() {
+        let rendered = render_schema_sql(INIT_SCHEMA, 384);
+        assert!(rendered.contains("vector(384)"), "missing vector(384)");
+        assert!(
+            !rendered.contains(EMBEDDING_DIM_PLACEHOLDER),
+            "placeholder not substituted: {rendered}"
+        );
+    }
+
+    #[test]
+    fn render_schema_sql_handles_arbitrary_dim() {
+        // The rendering helper itself doesn't gate on supported dims —
+        // the gate lives in `connect_with_dim` / `migrate_embedding_dim`.
+        // This test just verifies the substitution is purely textual.
+        let rendered = render_schema_sql("vector({EMBEDDING_DIM})", 1024);
+        assert_eq!(rendered, "vector(1024)");
+    }
+
+    #[test]
+    fn supported_embedding_dims_match_compiled_embedders() {
+        // `SUPPORTED_EMBEDDING_DIMS` MUST mirror the values returned
+        // by `EmbeddingModel::dim()` (config.rs). If either side gains
+        // a new embedder we want the test to catch the drift.
+        assert_eq!(SUPPORTED_EMBEDDING_DIMS, &[384, 768]);
     }
 
     // ------------------------------------------------------------------
@@ -7028,16 +7740,21 @@ mod tests {
 
     #[test]
     fn current_schema_version_matches_sqlite_ladder() {
-        // Pin the parity invariant: Postgres MUST track the SQLite
-        // CURRENT_SCHEMA_VERSION (28 as of v0.7.0). A future bump on
-        // either side without the corresponding port re-trips this
-        // assertion before the migration runner gets a chance to
-        // write a partial schema to disk.
-        assert_eq!(CURRENT_SCHEMA_VERSION, 28);
+        // Pin the parity invariant: Postgres tracks the SQLite
+        // CURRENT_SCHEMA_VERSION except for the postgres-only ladder
+        // steps below. v29 is Postgres-only (in-place `vector(N)`
+        // conversion helper); v30 is Postgres-only too (M15 —
+        // `memories_metadata_is_object` CHECK; SQLite doesn't carry an
+        // analogue because the SQLite metadata column has no JSON
+        // type-checking primitive equivalent to `jsonb_typeof`). A
+        // future bump on either side without the corresponding port
+        // re-trips this assertion before the migration runner gets a
+        // chance to write a partial schema to disk.
+        assert_eq!(CURRENT_SCHEMA_VERSION, 30);
     }
 
     #[tokio::test]
-    async fn live_migration_reaches_v28() {
+    async fn live_migration_reaches_current_schema_version() {
         let Some(url) = postgres_url() else {
             eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
             return;
@@ -7051,12 +7768,12 @@ mod tests {
         assert_eq!(
             stamped,
             Some(CURRENT_SCHEMA_VERSION),
-            "schema_version must reach CURRENT_SCHEMA_VERSION (28)"
+            "schema_version must reach CURRENT_SCHEMA_VERSION"
         );
     }
 
     #[tokio::test]
-    async fn live_migration_v17_to_v28_is_idempotent() {
+    async fn live_migration_v17_to_current_is_idempotent() {
         // Run migrate() twice and assert the schema_version is stable;
         // the IF NOT EXISTS DDL + column-existence guards mean every
         // migrate_vN must be a no-op on a populated database.
