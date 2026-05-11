@@ -650,9 +650,13 @@ mod tests {
 
     #[test]
     fn default_key_dir_ends_in_ai_memory_keys() {
-        // SAFETY: single-threaded test block; no concurrent env::var
-        // mutations. The H4 env-var override (`AI_MEMORY_KEY_DIR`) is
-        // scrubbed up-front so this test asserts the *fallback* path.
+        // M9 — `default_key_dir_honours_env_override` flips the same
+        // `AI_MEMORY_KEY_DIR` key. Acquire the shared lock so the two
+        // tests cannot interleave under `cargo test --jobs N`.
+        let _g = key_dir_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: env mutation serialised by `_g`. The H4 env-var
+        // override (`AI_MEMORY_KEY_DIR`) is scrubbed up-front so this
+        // test asserts the *fallback* path.
         unsafe {
             std::env::remove_var("AI_MEMORY_KEY_DIR");
         }

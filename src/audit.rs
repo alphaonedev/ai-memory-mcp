@@ -345,6 +345,17 @@ pub fn shutdown_for_test() {
 /// **F2 (v0.7.0 round-2-fixes):** the return tuple is consumed by
 /// [`init`] to seed both `last_hash` (chain continuity) AND the
 /// per-process `SEQUENCE` counter (monotonicity across restarts).
+///
+/// **M14 (v0.7.0 round-2-fixes):** while walking the file we also
+/// surface out-of-order sequence numbers via `tracing::warn!`. A line
+/// with sequence N followed by a later line with sequence < N is
+/// presumptive corruption — could be a partial replay, a manual edit,
+/// or a clock skew on a multi-writer host. We do NOT refuse to start:
+/// the hash chain is the authoritative tamper signal and the operator
+/// may have intentional gaps from `audit truncate` (off-spec but
+/// possible). The WARN goes to journalctl + SIEM where a human can
+/// triage. The exact pair of `(prior_seq, this_seq)` is included so
+/// the operator can grep the file for the offending line.
 fn read_chain_tail(path: &Path) -> Result<Option<(String, u64)>> {
     if !path.exists() {
         return Ok(None);
@@ -352,12 +363,34 @@ fn read_chain_tail(path: &Path) -> Result<Option<(String, u64)>> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
     let mut last: Option<(String, u64)> = None;
+    let mut prior_seq: Option<u64> = None;
     for line in reader.lines() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
         }
         if let Ok(ev) = serde_json::from_str::<AuditEvent>(&line) {
+            // M14: surface out-of-order seqnums. A higher prior_seq
+            // followed by a lower this_seq is the corruption signal —
+            // equal seqnums are *also* a violation (duplicate emit),
+            // so we warn on `<=` not `<`. The first record establishes
+            // the baseline (prior_seq = None) and never trips here.
+            if let Some(prev) = prior_seq
+                && prev >= ev.sequence
+            {
+                tracing::warn!(
+                    target: "ai_memory::audit",
+                    prior_seq = prev,
+                    this_seq = ev.sequence,
+                    path = %path.display(),
+                    "audit: out-of-order sequence number detected on init scan \
+                     (prior {prev} >= this {this}). Hash-chain integrity is the \
+                     authoritative tamper signal; verify with `ai-memory audit verify`.",
+                    prev = prev,
+                    this = ev.sequence
+                );
+            }
+            prior_seq = Some(ev.sequence);
             last = Some((ev.self_hash, ev.sequence));
         }
     }
@@ -1336,6 +1369,113 @@ mod tests {
         let last = body.lines().filter(|l| !l.is_empty()).last().unwrap();
         let parsed: AuditEvent = serde_json::from_str(last).unwrap();
         assert_eq!(parsed.prev_hash, CHAIN_HEAD_PREV_HASH);
+        super::shutdown_for_test();
+    }
+
+    /// M14 (v0.7.0 round-2-fixes): init must surface out-of-order
+    /// sequence numbers via `tracing::warn!` without refusing to
+    /// start. We hand-craft an audit log with two lines whose sequence
+    /// numbers are intentionally swapped (line 1 → seq=2, line 2 →
+    /// seq=1), point `init` at it, and assert (a) init succeeds and
+    /// (b) a WARN was observed describing the out-of-order pair.
+    #[test]
+    fn audit_init_warns_on_out_of_order_sequence() {
+        let _g = sink_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("audit.log");
+
+        // Compose two minimal AuditEvent lines with swapped seqs. We
+        // construct via the public struct + serde so this stays
+        // forward-compatible if a future schema bumps `schema_version`.
+        let make_event = |seq: u64| AuditEvent {
+            schema_version: SCHEMA_VERSION,
+            timestamp: "2026-05-10T00:00:00Z".to_string(),
+            sequence: seq,
+            actor: AuditActor {
+                agent_id: "ai:test".to_string(),
+                scope: None,
+                synthesis_source: "explicit".to_string(),
+            },
+            action: AuditAction::Store,
+            target: AuditTarget {
+                memory_id: format!("m-seq-{seq}"),
+                namespace: "ns".to_string(),
+                title: None,
+                tier: None,
+                scope: None,
+            },
+            outcome: AuditOutcome::Allow,
+            auth: None,
+            session_id: None,
+            request_id: None,
+            error: None,
+            prev_hash: CHAIN_HEAD_PREV_HASH.to_string(),
+            self_hash: format!("{seq:064x}"),
+        };
+
+        let line_a = serde_json::to_string(&make_event(2)).unwrap();
+        let line_b = serde_json::to_string(&make_event(1)).unwrap();
+        std::fs::write(&path, format!("{line_a}\n{line_b}\n")).unwrap();
+
+        // Capture WARN output via a per-call subscriber.
+        #[derive(Clone, Default)]
+        struct WarnSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for WarnSink {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for WarnSink {
+            type Writer = WarnSink;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+        let sink = WarnSink::default();
+        let buf = sink.0.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(sink)
+            .without_time()
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            super::init(&path, true, false)
+                .expect("M14: init must succeed despite out-of-order seqs");
+        });
+        let captured = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            captured.contains("out-of-order sequence"),
+            "M14: expected out-of-order WARN, got: {captured:?}"
+        );
+        // The exact pair must be reported so an operator can grep.
+        assert!(
+            captured.contains("prior 2"),
+            "M14: WARN must include prior sequence (=2), got: {captured:?}"
+        );
+        assert!(
+            captured.contains("this 1"),
+            "M14: WARN must include this sequence (=1), got: {captured:?}"
+        );
+
+        // init must have populated the sink (no refusal) — emitting
+        // an event after init still works.
+        super::emit(EventBuilder::new(
+            AuditAction::Store,
+            actor("ai:writer", "explicit", None),
+            target_memory("m-after-warn", "ns", None, None, None),
+        ));
+        let body = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<_> = body.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(
+            lines.len(),
+            3,
+            "M14: init must accept the file and emit must still work"
+        );
         super::shutdown_for_test();
     }
 

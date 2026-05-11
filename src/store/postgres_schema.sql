@@ -69,7 +69,13 @@ CREATE TABLE IF NOT EXISTS memories (
     last_accessed_at  TIMESTAMPTZ,
     expires_at        TIMESTAMPTZ,
     metadata          JSONB NOT NULL DEFAULT '{}'::jsonb,
-    embedding         vector(384),
+    -- v0.7.0 L3 — `vector({EMBEDDING_DIM})` is a templated literal
+    -- substituted at adapter init time. Defaults to dim 384
+    -- (MiniLM-L6-v2) when the caller doesn't specify; operators using
+    -- `nomic_embed_v15` pass `--embedding-dim 768` via `ai-memory
+    -- schema-init`. The substitution is a single
+    -- `str::replace("{EMBEDDING_DIM}", ...)` in `PostgresStore::connect`.
+    embedding         vector({EMBEDDING_DIM}),
     -- v0.6.3.1 P2 / G4 — declared embedding dimension. Lets the
     -- daemon refuse a write whose vector dimension disagrees with
     -- the column declaration without falling back to byte-length
@@ -86,7 +92,15 @@ CREATE TABLE IF NOT EXISTS memories (
     -- json-extract scans. Mirrors SQLite migration v14.
     agent_id_idx      TEXT GENERATED ALWAYS AS (
         metadata ->> 'agent_id'
-    ) STORED
+    ) STORED,
+    -- v0.7.0 M15 — schema v30: enforce that metadata is a JSON object.
+    -- The two generated columns above silently project NULL when
+    -- metadata is anything else (array / scalar / NULL), which masks
+    -- governance / scope-routing misconfiguration. The CHECK rejects
+    -- the malformed row at the write boundary instead. Fresh schemas
+    -- carry this inline; existing schemas pick it up via migrate_v30().
+    CONSTRAINT memories_metadata_is_object
+        CHECK (jsonb_typeof(metadata) = 'object')
 );
 
 -- v0.6.0 blocker #294 fix: upsert contract is `(title, namespace)`.
@@ -208,8 +222,9 @@ CREATE TABLE IF NOT EXISTS archived_memories (
     -- v0.6.3.1 P2 / G5 — preserve embedding + original tier/expiry
     -- across archive→restore so a restored row is byte-identical to
     -- the live row that was archived. Mirrors SQLite migration
-    -- 0011_v0631_data_integrity.
-    embedding           vector(384),
+    -- 0011_v0631_data_integrity. Templated dim — see comment on
+    -- `memories.embedding` above.
+    embedding           vector({EMBEDDING_DIM}),
     embedding_dim       INTEGER,
     original_tier       TEXT,
     original_expires_at TIMESTAMPTZ

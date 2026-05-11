@@ -92,6 +92,23 @@ pub struct SchemaInitArgs {
     /// CI logs and operator scripts.
     #[arg(long, default_value_t = false)]
     pub json: bool,
+    /// Embedding column dimension. Must match the dim of the embedder
+    /// the daemon will use (`mini_lm_l6_v2` = 384, `nomic_embed_v15` =
+    /// 768). Default: 384 (matches the v0.7.0 baseline schema and the
+    /// semantic-tier preset).
+    ///
+    /// For Postgres targets, a fresh schema is initialised with
+    /// `vector(<dim>)` columns directly, and an existing schema whose
+    /// `memories.embedding` column dim differs from `--embedding-dim`
+    /// is converted in place via the v29 helper: HNSW indexes are
+    /// dropped + recreated, existing embedding values are NULLed
+    /// (cross-dim reprojection isn't well-defined), and the column
+    /// type is altered. Re-embedding is required after a conversion.
+    ///
+    /// For SQLite targets the flag is a no-op (SQLite stores
+    /// embeddings as opaque BLOBs without a column-level dim).
+    #[arg(long, default_value_t = 384)]
+    pub embedding_dim: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -134,6 +151,23 @@ pub struct SchemaInitReport {
     /// installed (which is the common case) or the target is
     /// SQLite. Never aborts the verb on its own.
     pub age_projection_created: bool,
+    /// Embedding column dimension as it sits in the schema after the
+    /// verb returns. For Postgres targets this is read from
+    /// `pg_attribute.atttypmod` post-init; for SQLite (which has no
+    /// column-level vector dim) this echoes the `--embedding-dim`
+    /// flag value as a metadata-only hint to downstream tools.
+    /// `None` if the column couldn't be probed (defensive — should
+    /// not happen on a successful init).
+    #[serde(default)]
+    pub embedding_dim: Option<i32>,
+    /// `true` when this verb invocation triggered an in-place
+    /// `vector(N) → vector(M)` conversion (Postgres v29 migration).
+    /// `false` when the schema was already at the requested dim
+    /// (idempotent no-op) or the target was SQLite. When `true` the
+    /// operator MUST re-run embeddings on the affected memories —
+    /// the destructive conversion NULLs them on the way through.
+    #[serde(default)]
+    pub embedding_dim_migrated: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -153,21 +187,28 @@ pub struct SchemaInitReport {
 ///   underlying adapter with their original error chain so operators
 ///   can diagnose missing extensions, bad credentials, etc.
 pub async fn run(args: &SchemaInitArgs, out: &mut CliOutput<'_>) -> Result<()> {
-    // Open via the same factory `migrate` uses — this triggers
-    // INIT_SCHEMA execution as a side effect on both backends.
-    let _store = migrate::open_store(&args.store_url)
-        .await
-        .with_context(|| format!("open store at {}", args.store_url))?;
-
     // Enumerate per-backend. We dispatch on URL scheme rather than
     // on the SAL Capabilities bits because the enumeration queries
     // are inherently backend-specific (sqlite_master vs pg_catalog).
+    //
+    // The Postgres branch uses the dim-aware `connect_with_dim`
+    // factory directly so a fresh schema lands at the requested dim
+    // (vs the SQLite branch which has no column-level dim). For
+    // SQLite we go through the standard `open_store` path which
+    // triggers INIT_SCHEMA as a side effect.
     let report = if is_sqlite_url(&args.store_url) {
-        enumerate_sqlite(&args.store_url)?
+        let _store = migrate::open_store(&args.store_url)
+            .await
+            .with_context(|| format!("open store at {}", args.store_url))?;
+        let mut r = enumerate_sqlite(&args.store_url)?;
+        // SQLite has no column-level vector dim — echo the flag
+        // value as a metadata hint for downstream tools.
+        r.embedding_dim = Some(i32::try_from(args.embedding_dim).unwrap_or(384));
+        r
     } else if is_postgres_url(&args.store_url) {
         #[cfg(feature = "sal-postgres")]
         {
-            enumerate_postgres(&args.store_url).await?
+            init_and_enumerate_postgres(&args.store_url, args.embedding_dim).await?
         }
         #[cfg(not(feature = "sal-postgres"))]
         {
@@ -250,6 +291,11 @@ fn enumerate_sqlite(url: &str) -> Result<SchemaInitReport> {
         extensions: Vec::new(),
         schema_version,
         age_projection_created: false,
+        // SQLite has no column-level vector dim; the caller in `run`
+        // overwrites this with the `--embedding-dim` flag value as a
+        // metadata hint for downstream tooling.
+        embedding_dim: None,
+        embedding_dim_migrated: false,
     })
 }
 
@@ -310,6 +356,50 @@ fn read_schema_version_sqlite(conn: &rusqlite::Connection) -> Result<i64> {
 // ---------------------------------------------------------------------------
 // Postgres enumeration
 // ---------------------------------------------------------------------------
+
+/// Postgres orchestration: bootstrap the schema at the requested
+/// embedding dim, run the v29 in-place conversion if the live column
+/// dim differs from the requested dim, then enumerate the resulting
+/// catalog. Pulled into its own function so the dispatcher in `run`
+/// stays linear.
+///
+/// The bootstrap call is `PostgresStore::connect_with_dim`, which
+/// substitutes `{EMBEDDING_DIM}` in `postgres_schema.sql` before
+/// executing. For an existing schema with a different dim,
+/// `connect_with_dim` emits a WARN but does NOT auto-convert — the
+/// destructive conversion runs only via the explicit
+/// `migrate_embedding_dim` call below.
+#[cfg(feature = "sal-postgres")]
+async fn init_and_enumerate_postgres(url: &str, dim: u32) -> Result<SchemaInitReport> {
+    use crate::store::postgres::PostgresStore;
+
+    // Bootstrap at the requested dim. CREATE TABLE IF NOT EXISTS in
+    // the schema file means this is a no-op for the columns when
+    // the table already exists; the in-place conversion below
+    // handles the alter case.
+    let store = PostgresStore::connect_with_dim(url, dim)
+        .await
+        .with_context(|| format!("open store at {url} with embedding dim {dim}"))?;
+
+    // Run the v29 conversion if the live column dim differs from
+    // what the caller requested. Returns `true` if a real conversion
+    // happened (destructive — embeddings NULLed); `false` if the
+    // schema was already at the right dim (idempotent no-op).
+    let migrated = store
+        .migrate_embedding_dim(dim)
+        .await
+        .with_context(|| format!("migrate embedding dim to {dim}"))?;
+
+    // Enumerate via a fresh pool (matches the existing pattern).
+    let mut report = enumerate_postgres(url).await?;
+
+    // Read the post-conversion column dim straight from the catalog
+    // so the report reflects ground truth (not the requested value).
+    report.embedding_dim = store.current_embedding_dim().await.ok().flatten();
+    report.embedding_dim_migrated = migrated;
+
+    Ok(report)
+}
 
 #[cfg(feature = "sal-postgres")]
 async fn enumerate_postgres(url: &str) -> Result<SchemaInitReport> {
@@ -423,6 +513,12 @@ async fn enumerate_postgres(url: &str) -> Result<SchemaInitReport> {
         extensions,
         schema_version,
         age_projection_created,
+        // These two get filled in by `init_and_enumerate_postgres`
+        // after the v29 conversion check. Defaulting here keeps
+        // `enumerate_postgres` reusable for callers (e.g. tests) that
+        // don't need the conversion machinery.
+        embedding_dim: None,
+        embedding_dim_migrated: false,
     })
 }
 
@@ -504,6 +600,20 @@ fn render_human(report: &SchemaInitReport, out: &mut CliOutput<'_>) -> Result<()
         report.extensions.join(", ")
     )?;
     writeln!(out.stdout, "  schema_version: {}", report.schema_version)?;
+    match report.embedding_dim {
+        Some(d) => {
+            writeln!(out.stdout, "  embedding_dim:  {d}")?;
+        }
+        None => {
+            writeln!(out.stdout, "  embedding_dim:  (unknown)")?;
+        }
+    }
+    if report.embedding_dim_migrated {
+        writeln!(
+            out.stdout,
+            "  embedding_dim_migrated: yes (existing embeddings NULLed — re-embed required)"
+        )?;
+    }
     if report.kind == "postgres" {
         writeln!(
             out.stdout,
@@ -560,6 +670,7 @@ mod tests {
         let args = SchemaInitArgs {
             store_url: url.clone(),
             json: true,
+            embedding_dim: 384,
         };
         run(&args, &mut out).await.expect("schema-init sqlite");
 
@@ -589,6 +700,129 @@ mod tests {
         assert!(v["extensions"].as_array().unwrap().is_empty());
         assert!(v["functions"].as_array().unwrap().is_empty());
         assert_eq!(v["age_projection_created"], false);
+        // v0.7.0 L3 — the report carries the resolved embedding_dim
+        // (SQLite echoes the flag value as a metadata hint).
+        assert_eq!(
+            v["embedding_dim"].as_i64().unwrap(),
+            384,
+            "embedding_dim should be 384 from the flag default: {v}"
+        );
+        assert_eq!(
+            v["embedding_dim_migrated"], false,
+            "SQLite never reports a vector(N) migration: {v}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_sqlite_carries_explicit_embedding_dim() {
+        // v0.7.0 L3 — operator-provided dim is echoed into the report
+        // even on SQLite where the column has no dim of its own.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_string_lossy().to_string();
+        let url = format!("sqlite://{path}");
+
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+
+        let args = SchemaInitArgs {
+            store_url: url.clone(),
+            json: true,
+            embedding_dim: 768,
+        };
+        run(&args, &mut out).await.expect("schema-init sqlite 768");
+
+        let raw = String::from_utf8(stdout).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).expect("parseable JSON");
+        assert_eq!(
+            v["embedding_dim"].as_i64().unwrap(),
+            768,
+            "operator-provided dim must round-trip into report: {v}"
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // v0.7.0 L3 — Postgres in-place `vector(N)` conversion.
+    //
+    // This integration test requires a running Postgres with pgvector
+    // installed. Set `AI_MEMORY_TEST_POSTGRES_URL` to the connection
+    // string and run with `--features sal-postgres --ignored`:
+    //
+    //   docker compose -f packaging/docker-compose.postgres.yml up -d
+    //   AI_MEMORY_TEST_POSTGRES_URL=postgres://ai_memory:dev_password@localhost:5433/ai_memory \
+    //     AI_MEMORY_NO_CONFIG=1 cargo test \
+    //     --features sal-postgres \
+    //     schema_init_postgres_embedding_dim_conversion \
+    //     -- --ignored --nocapture
+    //
+    // The test (1) inits at 384, (2) verifies dim=384, (3) runs
+    // schema-init with embedding_dim=768, (4) verifies dim=768 and
+    // embedding_dim_migrated=true, (5) re-runs at 768 to confirm
+    // idempotence (embedding_dim_migrated=false).
+    // ----------------------------------------------------------------
+
+    #[cfg(feature = "sal-postgres")]
+    #[tokio::test]
+    #[ignore = "requires running postgres; see comment above for the recipe"]
+    async fn schema_init_postgres_embedding_dim_conversion() {
+        let url = std::env::var("AI_MEMORY_TEST_POSTGRES_URL")
+            .expect("AI_MEMORY_TEST_POSTGRES_URL must be set");
+
+        // Step 1 — init at the default 384 dim.
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+        let args = SchemaInitArgs {
+            store_url: url.clone(),
+            json: true,
+            embedding_dim: 384,
+        };
+        run(&args, &mut out).await.expect("schema-init 384");
+        let raw = String::from_utf8(stdout).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).expect("parseable JSON");
+        assert_eq!(v["embedding_dim"].as_i64(), Some(384), "initial dim: {v}");
+
+        // Step 2 — re-run at 768; expect conversion + WARN.
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+        let args = SchemaInitArgs {
+            store_url: url.clone(),
+            json: true,
+            embedding_dim: 768,
+        };
+        run(&args, &mut out).await.expect("schema-init 768");
+        let raw = String::from_utf8(stdout).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).expect("parseable JSON");
+        assert_eq!(
+            v["embedding_dim"].as_i64(),
+            Some(768),
+            "post-conversion: {v}"
+        );
+        assert_eq!(
+            v["embedding_dim_migrated"], true,
+            "conversion should be flagged: {v}"
+        );
+
+        // Step 3 — re-run at 768 again; expect idempotent no-op.
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+        let args = SchemaInitArgs {
+            store_url: url,
+            json: true,
+            embedding_dim: 768,
+        };
+        run(&args, &mut out)
+            .await
+            .expect("schema-init 768 idempotent");
+        let raw = String::from_utf8(stdout).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).expect("parseable JSON");
+        assert_eq!(v["embedding_dim"].as_i64(), Some(768));
+        assert_eq!(
+            v["embedding_dim_migrated"], false,
+            "second run at same dim must be no-op: {v}"
+        );
     }
 
     #[tokio::test]
@@ -604,6 +838,7 @@ mod tests {
         let args = SchemaInitArgs {
             store_url: url.clone(),
             json: false,
+            embedding_dim: 384,
         };
         run(&args, &mut out)
             .await
@@ -634,6 +869,7 @@ mod tests {
         let args = SchemaInitArgs {
             store_url: "nosql://nope".to_string(),
             json: false,
+            embedding_dim: 384,
         };
         let err = run(&args, &mut out).await.expect_err("should reject");
         let msg = format!("{err:#}");

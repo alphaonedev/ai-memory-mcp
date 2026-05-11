@@ -2,10 +2,28 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use rusqlite::{Connection, params};
 use std::collections::HashMap;
 use std::path::Path;
+
+/// v0.7.0 H6 (round-2) — truncate a `DateTime<Utc>` to microsecond
+/// precision. Companion of the same-named helper in
+/// `store/postgres.rs:3539` (G3 fix); both ends of the link sign/verify
+/// roundtrip now collapse sub-microsecond digits BEFORE CBOR
+/// canonicalisation. PostgreSQL's `TIMESTAMPTZ` stores microseconds —
+/// the SQLite path was lossless, but a link created on SQLite and
+/// later re-verified on Postgres (or vice versa via federation) would
+/// see the canonical RFC3339 string change shape on the storage hop
+/// and break the Ed25519 signature. Truncating at write time makes the
+/// shape stable across adapters. See `store/postgres.rs:3520-3543` for
+/// the full design context.
+#[must_use]
+pub fn truncate_to_microseconds(t: DateTime<Utc>) -> DateTime<Utc> {
+    use chrono::Timelike;
+    let micros = t.nanosecond() / 1_000;
+    t.with_nanosecond(micros * 1_000).unwrap_or(t)
+}
 
 use crate::models::{
     AGENTS_NAMESPACE, AgentRegistration, Approval, ApproverType, DuplicateCheck, DuplicateMatch,
@@ -2103,7 +2121,20 @@ pub fn create_link_signed(
     // KG queries. Backfill on migration handled legacy rows; here we
     // populate it on the insert path so newly created links are
     // visible to `memory_kg_timeline` without a downstream backfill.
-    let now = Utc::now().to_rfc3339();
+    //
+    // v0.7.0 H6 (round-2): mirror the postgres G3 fix at
+    // `store/postgres.rs:3539` — truncate the timestamp to microsecond
+    // precision BEFORE we both sign over it and persist it. SQLite
+    // stores RFC3339 TEXT and round-trips losslessly so this is a
+    // no-op for SQLite reads, BUT a link created on the SQLite path
+    // and later re-verified on the postgres path (or vice versa)
+    // must commit to the same canonical RFC3339 string on both
+    // sides. Postgres's `TIMESTAMPTZ` quantises at microsecond
+    // resolution, so sub-microsecond digits silently disappear on
+    // round-trip and break the Ed25519 signature. Truncating here
+    // makes the sign/verify CBOR byte-stable across the storage
+    // boundary regardless of which adapter wrote the row originally.
+    let now = truncate_to_microseconds(Utc::now()).to_rfc3339();
 
     // v0.7 H2 — sign if we have a private key. We compute the signature
     // BEFORE issuing INSERT so a CBOR/sign failure surfaces as an
@@ -6271,7 +6302,25 @@ pub fn doctor_oldest_pending_age_secs(conn: &Connection) -> Result<Option<i64>> 
     let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(&ts) else {
         return Ok(None);
     };
-    let age = (Utc::now() - parsed.with_timezone(&Utc)).num_seconds();
+    // M11 (v0.7.0 round-2) — clamp negative ages to 0. `requested_at`
+    // is stamped by the writer's clock; on a host with skewed time
+    // (NTP slewing back, intentional misconfiguration, or VM time
+    // travel) `now - parsed` can land negative and downstream
+    // consumers (the doctor surface treats this as "age in seconds")
+    // would surface a nonsensical figure. The WARN gives operators
+    // the signal so they can investigate the clock drift instead of
+    // chasing a phantom backlog.
+    let raw_age = (Utc::now() - parsed.with_timezone(&Utc)).num_seconds();
+    let age = if raw_age < 0 {
+        tracing::warn!(
+            requested_at = %ts,
+            raw_age_seconds = raw_age,
+            "pending_actions row has future timestamp; clamping age to 0"
+        );
+        0
+    } else {
+        raw_age
+    };
     Ok(Some(age))
 }
 
@@ -8722,6 +8771,100 @@ mod tests {
         kp.public
             .verify(&payload, &sig_obj)
             .expect("persisted signature must verify against the writer's public key");
+    }
+
+    // v0.7.0 H6 (round-2) — regression: the SQLite write path must
+    // truncate `valid_from` to microsecond precision BEFORE signing
+    // and persisting, so the row a federation peer receives serialises
+    // back to the same canonical RFC3339 string regardless of the
+    // adapter that wrote it. We assert two properties:
+    //
+    // 1. The `valid_from` column NEVER contains a 9-digit fractional
+    //    second (nanoseconds), only at most 6 digits (microseconds).
+    // 2. The persisted signature verifies against canonical CBOR
+    //    derived from the same microsecond-truncated string the row
+    //    holds — i.e. the round-trip is byte-stable.
+    #[test]
+    fn h6_create_link_signed_truncates_valid_from_to_microseconds() {
+        use crate::identity::{keypair, sign as link_sign};
+        use ed25519_dalek::Verifier;
+
+        let conn = test_db();
+        let src = make_memory("h6-src", "test", Tier::Long, 5);
+        let tgt = make_memory("h6-tgt", "test", Tier::Long, 5);
+        insert(&conn, &src).unwrap();
+        insert(&conn, &tgt).unwrap();
+
+        let kp = keypair::generate("alice").unwrap();
+        let level = create_link_signed(&conn, &src.id, &tgt.id, "related_to", Some(&kp)).unwrap();
+        assert_eq!(level, "self_signed");
+
+        let (sig, valid_from): (Option<Vec<u8>>, Option<String>) = conn
+            .query_row(
+                "SELECT signature, valid_from FROM memory_links \
+                 WHERE source_id = ?1 AND target_id = ?2",
+                params![&src.id, &tgt.id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let valid_from = valid_from.expect("valid_from set on signed insert path");
+
+        // RFC3339 fractional-second precision check. The string looks
+        // like `2026-05-10T12:34:56.123456+00:00` (microsecond) or
+        // `...:56.123456789+00:00` (nanosecond). After H6, the maximum
+        // length of the fractional run must be 6.
+        if let Some(dot) = valid_from.find('.') {
+            let after = &valid_from[dot + 1..];
+            let frac_len = after.chars().take_while(|c| c.is_ascii_digit()).count();
+            assert!(
+                frac_len <= 6,
+                "H6 regression: valid_from has {frac_len}-digit fractional second; expected ≤ 6 (microseconds). Value: {valid_from}"
+            );
+        }
+
+        // Round-trip the signature against canonical CBOR computed
+        // from the EXACT string stored in the row. If the writer
+        // signed over a nanosecond-precision string but the column
+        // round-trips at microsecond precision, this verify fails —
+        // which is exactly the postgres-G3 failure mode SQLite is now
+        // immunised against.
+        let sig_bytes = sig.expect("signature persisted");
+        let signable = link_sign::SignableLink {
+            src_id: &src.id,
+            dst_id: &tgt.id,
+            relation: "related_to",
+            observed_by: Some(kp.agent_id.as_str()),
+            valid_from: Some(valid_from.as_str()),
+            valid_until: None,
+        };
+        let payload = link_sign::canonical_cbor(&signable).unwrap();
+        let mut sig_arr = [0u8; 64];
+        sig_arr.copy_from_slice(&sig_bytes);
+        let sig_obj = ed25519_dalek::Signature::from_bytes(&sig_arr);
+        kp.public.verify(&payload, &sig_obj).expect(
+            "H6 regression: signature must verify against canonical CBOR \
+             derived from the stored (microsecond-truncated) valid_from",
+        );
+    }
+
+    // v0.7.0 H6 (round-2) — pure-function test: the truncation helper
+    // itself must collapse only sub-microsecond digits and leave
+    // microsecond-aligned inputs unchanged.
+    #[test]
+    fn h6_truncate_to_microseconds_drops_nanos() {
+        use chrono::{TimeZone, Timelike};
+        let ns = Utc.with_ymd_and_hms(2026, 5, 10, 12, 34, 56).unwrap();
+        let ns = ns.with_nanosecond(123_456_789).unwrap();
+        let truncated = truncate_to_microseconds(ns);
+        // 123_456_789 ns → 123_456 µs → 123_456_000 ns.
+        assert_eq!(truncated.nanosecond(), 123_456_000);
+        // Round-trip through to_rfc3339 must produce a 6-digit
+        // fractional second (the property H6 commits to).
+        let s = truncated.to_rfc3339();
+        let dot = s.find('.').expect("fractional second present");
+        let frac = &s[dot + 1..];
+        let frac_len = frac.chars().take_while(|c| c.is_ascii_digit()).count();
+        assert_eq!(frac_len, 6, "expected exactly 6-digit fractional; got: {s}");
     }
 
     #[test]

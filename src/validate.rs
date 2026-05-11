@@ -854,10 +854,44 @@ mod tests {
 
     #[test]
     fn test_valid_relation() {
+        // v0.7.0 Wave-3 Cont 5 (commit cb92998): `validate_relation`
+        // accepts any `[a-z0-9_]+` identifier in addition to the
+        // canonical `VALID_RELATIONS` set so S82/S65 chain markers and
+        // arbitrary AGE-style edge labels round-trip through the wire.
+        // The pre-cb92998 expectation that "invented_relation" must be
+        // rejected is therefore obsolete — do not re-introduce it
+        // unless production validation is tightened back to a
+        // closed-set check. Coverage here splits into:
+        //
+        //   * canonical names — must always pass
+        //   * caller-supplied lowercase identifiers — must pass
+        //     post-cb92998
+        //   * structurally malformed input — must still fail
+        //     (uppercase, whitespace, slashes, empty)
+        //
+        // The malformed cases below are the surviving "negative"
+        // coverage the dropped `invented_relation` assertion used to
+        // anchor.
+
+        // Canonical relation names — accepted via the VALID_RELATIONS
+        // fast path.
         assert!(validate_relation("related_to").is_ok());
+        assert!(validate_relation("derived_from").is_ok());
+        assert!(validate_relation("contradicts").is_ok());
         assert!(validate_relation("supersedes").is_ok());
+
+        // Caller-supplied lowercase identifier — accepted by the
+        // post-cb92998 permissive arm. Previously rejected.
+        assert!(validate_relation("s82_chain_marker").is_ok());
+        assert!(validate_relation("invented_relation").is_ok());
+        assert!(validate_relation("mentions").is_ok());
+
+        // Structurally malformed input — still rejected.
         assert!(validate_relation("").is_err());
-        assert!(validate_relation("invented_relation").is_err());
+        assert!(validate_relation("BAD").is_err());
+        assert!(validate_relation("bad relation").is_err());
+        assert!(validate_relation("bad/relation").is_err());
+        assert!(validate_relation("bad-relation").is_err());
     }
 
     #[test]
