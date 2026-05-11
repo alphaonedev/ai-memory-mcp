@@ -8301,16 +8301,25 @@ fn build_mtls_probe_client(
     cert_path: &std::path::Path,
     key_path: &std::path::Path,
 ) -> reqwest::blocking::Client {
-    // Transitive deps pull reqwest's native-tls backend via hf-hub's
-    // default-tls feature, so the test uses `from_pkcs8_pem` (native-tls
-    // variant) for maximum cross-platform consistency. The daemon in
-    // production goes through `use_preconfigured_tls` with a rustls
-    // ClientConfig (see src/main.rs).
+    // M5 (2026-05-11): reqwest's native-tls feature was removed from
+    // [dependencies] in favor of rustls-tls only (dropped dual-TLS-stack
+    // attack surface). `from_pkcs8_pem` is native-tls-only — switched to
+    // `from_pem` which is rustls-compatible and takes cert + key concatenated.
     let cert = std::fs::read(cert_path).expect("read client cert");
     let key = std::fs::read(key_path).expect("read client key");
+    let mut pem = Vec::with_capacity(cert.len() + key.len() + 1);
+    pem.extend_from_slice(&cert);
+    if !cert.ends_with(b"\n") {
+        pem.push(b'\n');
+    }
+    pem.extend_from_slice(&key);
     let identity =
-        reqwest::Identity::from_pkcs8_pem(&cert, &key).expect("parse mTLS identity (PKCS#8 PEM)");
+        reqwest::Identity::from_pem(&pem).expect("parse mTLS identity (concatenated PEM)");
+    // M5: explicit rustls backend (the only one we link now that native-tls
+    // was dropped). Without this the Identity-vs-backend type check fails
+    // with "incompatible TLS identity type" on some platforms.
     reqwest::blocking::Client::builder()
+        .use_rustls_tls()
         .identity(identity)
         .danger_accept_invalid_certs(true)
         .timeout(std::time::Duration::from_secs(5))
@@ -8800,6 +8809,14 @@ impl OneshotDaemon {
             storage_backend: ai_memory::handlers::StorageBackend::Sqlite,
             #[cfg(feature = "sal")]
             store,
+            llm: std::sync::Arc::new(None),
+            auto_tag_model: std::sync::Arc::new(None),
+            llm_call_timeout: std::time::Duration::from_secs(30),
+            replay_cache: std::sync::Arc::new(ai_memory::identity::replay::ReplayCache::default()),
+
+            verify_require_nonce: false,
+            autonomous_hooks: false,
+            recall_scope: std::sync::Arc::new(None),
         };
         let api_key_state = ai_memory::handlers::ApiKeyState { key: None };
         let router = ai_memory::build_router(api_key_state, app_state);
@@ -12468,6 +12485,14 @@ fn build_serve_state(
         storage_backend: ai_memory::handlers::StorageBackend::Sqlite,
         #[cfg(feature = "sal")]
         store,
+        llm: std::sync::Arc::new(None),
+        auto_tag_model: std::sync::Arc::new(None),
+        llm_call_timeout: std::time::Duration::from_secs(30),
+        replay_cache: std::sync::Arc::new(ai_memory::identity::replay::ReplayCache::default()),
+
+        verify_require_nonce: false,
+        autonomous_hooks: false,
+        recall_scope: std::sync::Arc::new(None),
     };
     let api_key_state = ai_memory::handlers::ApiKeyState { key: None };
     (api_key_state, app_state)

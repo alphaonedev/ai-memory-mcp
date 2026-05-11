@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+// clippy allows (test scaffolding): pedantic lints with no behavioral impact.
+#![allow(clippy::doc_markdown)]
 //! v0.7.0.1 S75 — `/api/v1/capabilities` must surface a runtime
 //! `db_schema_version` integer (the live `MAX(version)` from the
 //! underlying store's `schema_version` table) so operators can tell at
@@ -80,6 +82,14 @@ fn build_sqlite_app_state() -> (AppState, tempfile::NamedTempFile) {
         store,
         #[cfg(not(feature = "sal"))]
         _phantom: std::marker::PhantomData,
+        llm: Arc::new(None),
+        auto_tag_model: Arc::new(None),
+        llm_call_timeout: std::time::Duration::from_secs(30),
+        replay_cache: std::sync::Arc::new(ai_memory::identity::replay::ReplayCache::default()),
+
+        verify_require_nonce: false,
+        autonomous_hooks: false,
+        recall_scope: Arc::new(None),
     };
     (state, tmp)
 }

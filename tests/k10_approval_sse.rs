@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+// clippy allows (test scaffolding): pedantic lints with no behavioral impact.
+#![allow(clippy::match_wildcard_for_single_variants)]
 //! v0.7.0 K10 — `GET /api/v1/approvals/stream` SSE endpoint.
 //!
 //! The endpoint subscribes to the process-wide approval bus
@@ -97,6 +99,7 @@ async fn dispatch_approval_requested_fans_out_on_bus() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn http_sse_endpoint_emits_event_to_attached_client() {
     use axum::body::Body;
     use axum::http::Request;
@@ -134,6 +137,14 @@ async fn http_sse_endpoint_emits_event_to_attached_client() {
         storage_backend: ai_memory::handlers::StorageBackend::Sqlite,
         #[cfg(feature = "sal")]
         store,
+        llm: std::sync::Arc::new(None),
+        auto_tag_model: std::sync::Arc::new(None),
+        llm_call_timeout: std::time::Duration::from_secs(30),
+        replay_cache: std::sync::Arc::new(ai_memory::identity::replay::ReplayCache::default()),
+
+        verify_require_nonce: false,
+        autonomous_hooks: false,
+        recall_scope: std::sync::Arc::new(None),
     };
     let api_key_state = ai_memory::handlers::ApiKeyState { key: None };
     let router = ai_memory::build_router(api_key_state, app_state);
