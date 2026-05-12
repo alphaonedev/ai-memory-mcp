@@ -8842,8 +8842,10 @@ mod tests {
         assert_eq!(val["transcripts"]["version"], "v0.7+");
 
         // memory_reflection: planned-feature object (was bool in v1).
-        assert_eq!(val["features"]["memory_reflection"]["planned"], true);
-        assert_eq!(val["features"]["memory_reflection"]["enabled"], false);
+        // v0.7.0 recursive-learning (issue #655) Tasks 1-6 shipped the
+        // primitive, so the flag is `planned=false, enabled=true`.
+        assert_eq!(val["features"]["memory_reflection"]["planned"], false);
+        assert_eq!(val["features"]["memory_reflection"]["enabled"], true);
 
         // Live runtime overlays: keyword-tier daemon with no embedder
         // and no reranker → disabled / off.
