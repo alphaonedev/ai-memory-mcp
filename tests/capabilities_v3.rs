@@ -177,13 +177,15 @@ fn cap_v3_summary_core_profile_counts_and_names_recovery_paths() {
     // visible memory tools = 7 (the bootstrap is plumbing, not a
     // memory tool). Total memory tools = 51 - 1 = 50.
     assert!(
-        summary.starts_with("7 of 50 memory tools"),
-        "core profile summary should open with \"7 of 50 memory tools\" (Round-2 F13); got: {summary}"
+        summary.starts_with("7 of 51 memory tools"),
+        "core profile summary should open with \"7 of 51 memory tools\" (Round-2 F13; \
+         v0.7.0 Task 4/8 added memory_reflect to Family::Power, bumping the \
+         substantive total from 50 to 51); got: {summary}"
     );
     assert!(summary.contains("(core)"), "must label the profile as core");
     assert!(
-        summary.contains("43 are listed in this manifest"),
-        "core profile must report 43 unloaded (50 - 7); got: {summary}"
+        summary.contains("44 are listed in this manifest"),
+        "core profile must report 44 unloaded (51 - 7); got: {summary}"
     );
 
     // Three named recovery paths must all appear (verbatim names — these
@@ -212,14 +214,17 @@ fn cap_v3_summary_core_profile_counts_and_names_recovery_paths() {
 fn cap_v3_summary_full_profile_reports_all_visible() {
     let summary = build_capabilities_summary(&Profile::full());
 
-    // Round-2 F13 — summary aligns with describe_to_user's "all 50
+    // Round-2 F13 — summary aligns with describe_to_user's "all 51
     // memory tools" phrasing. Full profile loads every family
-    // (visible = 50 substantive memory tools; the
+    // (visible = 51 substantive memory tools; the
     // `memory_capabilities` bootstrap is excluded from the count to
-    // match the user-facing string).
+    // match the user-facing string). v0.7.0 Task 4/8 added
+    // `memory_reflect` to Family::Power, bumping the substantive
+    // total from 50 to 51.
     assert!(
-        summary.starts_with("50 of 50 memory tools"),
-        "full profile summary should open with \"50 of 50 memory tools\" (Round-2 F13); got: {summary}"
+        summary.starts_with("51 of 51 memory tools"),
+        "full profile summary should open with \"51 of 51 memory tools\" (Round-2 F13; \
+         v0.7.0 Task 4/8 added memory_reflect); got: {summary}"
     );
     assert!(summary.contains("(full)"));
     assert!(
@@ -245,12 +250,13 @@ fn cap_v3_summary_graph_profile_counts() {
     // Graph profile = 7 core (v0.7 B1+B2) + 11 graph (v0.7 J7) = 18
     // memory tools. Total = 50 (51 - bootstrap).
     assert!(
-        summary.starts_with("18 of 50 memory tools"),
+        summary.starts_with("18 of 51 memory tools"),
         "graph profile = 7 core (v0.7 B1+B2) + 11 graph (v0.7 J7) = 18 memory tools \
-         (Round-2 F13: bootstrap excluded); got: {summary}"
+         (Round-2 F13: bootstrap excluded; v0.7.0 Task 4/8 added memory_reflect to \
+         Family::Power, bumping the substantive total from 50 to 51); got: {summary}"
     );
     assert!(summary.contains("(graph)"));
-    assert!(summary.contains("32 are listed in this manifest"));
+    assert!(summary.contains("33 are listed in this manifest"));
 }
 
 // ---------------------------------------------------------------------------
@@ -357,8 +363,9 @@ fn cap_v3_describe_core_profile_is_plain_english_with_loaded_names() {
     // gained `memory_smart_load`), and to 51 in v0.7 K8 (Family::Power
     // gained `memory_quota_status`).
     assert!(
-        describe.contains("43 more"),
-        "core profile must report 43 unloaded; got: {describe}"
+        describe.contains("44 more"),
+        "core profile must report 44 unloaded (51 - 7); v0.7.0 Task 4/8 \
+         added memory_reflect bumping the substantive total to 51; got: {describe}"
     );
     // Sample of unloaded tools is plain (no memory_ prefix). The first
     // four unloaded under core are lifecycle's update/delete/forget/gc.
@@ -381,7 +388,7 @@ fn cap_v3_describe_core_profile_is_plain_english_with_loaded_names() {
 }
 
 // ---------------------------------------------------------------------------
-// A2: to_describe_to_user on `full` profile reports all 50 tools loaded
+// A2: to_describe_to_user on `full` profile reports all 51 tools loaded
 // (ALWAYS_ON_TOOLS bootstrap is excluded from the user-facing count) and
 // uses the "nothing more to load" closing form rather than the recovery
 // hint. (Bumped from 42 to 43 in v0.7.0 I4 — Family::Graph gained
@@ -397,7 +404,7 @@ fn cap_v3_describe_core_profile_is_plain_english_with_loaded_names() {
 fn cap_v3_describe_full_profile_uses_nothing_more_form() {
     let describe = build_capabilities_describe_to_user(&Profile::full());
 
-    // 50 = 51 total - 1 always-on bootstrap excluded from describe.
+    // 51 = 52 total - 1 always-on bootstrap excluded from describe.
     // Bumped from 42 to 43 in v0.7.0 I4 (Family::Graph gained
     // `memory_replay`); 43 to 44 in v0.7 H4 (Family::Graph gained
     // `memory_verify`); 44 to 45 in v0.7 B1 (Family::Core gained
@@ -405,9 +412,11 @@ fn cap_v3_describe_full_profile_uses_nothing_more_form() {
     // gained `memory_subscription_replay` + `memory_subscription_dlq_list`);
     // 47 to 48 in v0.7 J7 (Family::Graph gained `memory_find_paths`);
     // 48 to 49 in v0.7 B2 (Family::Core gained `memory_smart_load`);
-    // 49 to 50 in v0.7 K8 (Family::Power gained `memory_quota_status`).
+    // 49 to 50 in v0.7 K8 (Family::Power gained `memory_quota_status`);
+    // 50 to 51 in v0.7.0 recursive-learning Task 4/8 (Family::Power
+    // gained `memory_reflect`).
     assert!(
-        describe.starts_with("I can directly use all 50 memory tools right now ("),
+        describe.starts_with("I can directly use all 51 memory tools right now ("),
         "full profile describe must open with all-loaded form; got: {describe}"
     );
     assert!(describe.contains("Nothing more to load"));
@@ -430,7 +439,7 @@ fn cap_v3_describe_graph_profile_uses_preview_ellipsis() {
     );
     // Preview is the first 5 of the 18 loaded — the first 5 core tools.
     assert!(describe.contains("(store, recall, list, get, search, ...)"));
-    assert!(describe.contains("32 more"));
+    assert!(describe.contains("33 more"));
 }
 
 // ---------------------------------------------------------------------------

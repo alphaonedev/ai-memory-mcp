@@ -19429,8 +19429,12 @@ mod tests {
         // here is keyword with no embedder → disabled / off).
         assert_eq!(v["features"]["recall_mode_active"], "disabled");
         assert_eq!(v["features"]["reranker_active"], "off");
-        // memory_reflection reshaped to a planned object
-        assert_eq!(v["features"]["memory_reflection"]["planned"], true);
+        // memory_reflection reshaped to a planned object. v0.7.0
+        // recursive-learning (issue #655) Tasks 1-6 shipped the
+        // primitive, so the flag now reports `planned=false,
+        // enabled=true`.
+        assert_eq!(v["features"]["memory_reflection"]["planned"], false);
+        assert_eq!(v["features"]["memory_reflection"]["enabled"], true);
     }
 
     #[tokio::test]

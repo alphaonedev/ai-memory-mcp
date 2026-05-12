@@ -229,10 +229,18 @@ impl TierConfig {
                 auto_tagging: has_llm,
                 contradiction_analysis: has_llm,
                 cross_encoder_reranking: self.cross_encoder,
-                // Honesty patch: planned-not-implemented. The flag was
-                // previously a `bool` whose `true` value implied a wired
-                // feature that does not exist in this build.
-                memory_reflection: PlannedFeature::planned("v0.7+"),
+                // v0.7.0 recursive-learning (issue #655): the primitive
+                // shipped — Tasks 1-6 landed on
+                // `feat/v0.7.0-recursive-learning`. Flag is enabled and
+                // pinned to the shipping version `v0.7.0`. (Pre-ship,
+                // this was `PlannedFeature::planned("v0.7+")` to keep
+                // the v2 honesty contract honest while the substrate
+                // primitive was on the roadmap.)
+                memory_reflection: PlannedFeature {
+                    planned: false,
+                    version: "v0.7.0".to_string(),
+                    enabled: true,
+                },
                 // Default false — the HTTP/MCP capabilities handler
                 // overwrites this with the live runtime state when it
                 // has access to the embedder handle.
@@ -469,29 +477,59 @@ pub struct CapabilityFeatures {
     pub auto_tagging: bool,
     pub contradiction_analysis: bool,
     pub cross_encoder_reranking: bool,
-    /// Memory-reflection (v0.7+): planned-feature object. Was a `bool`
-    /// before the P1 honesty patch; an object now so operators can tell
-    /// "feature exists but disabled" apart from "feature not in this
-    /// build".
+    /// Memory-reflection (v0.7.0): planned-feature object. Was a
+    /// `bool` before the v0.6.3.1 P1 honesty patch; an object now so
+    /// operators can tell "feature exists but disabled" apart from
+    /// "feature not in this build".
     ///
-    /// **v0.7.0 recursive-learning honesty pass (Task 8/8, issue #655).**
-    /// Tasks 1-4 of the recursive-learning add-on shipped the
-    /// underlying primitive — `memory_reflect` MCP tool (Task 4/8,
-    /// commit `3dc76f3`), substrate-side `db::reflect` /
-    /// `PostgresStore::reflect`, `reflects_on` link relation (Task 3/8,
-    /// commit `b51a3f3`), namespace-governance cap field (Task 2/8,
-    /// commit `630a6db`), `Memory::reflection_depth` column (Task 1/8,
-    /// commit `f5d8a9e`). The flag is *still* surfaced as
-    /// `PlannedFeature::planned("v0.7+")` here pending the Tasks 5+6
-    /// follow-up sweep that re-runs the full mcp.rs + config.rs
-    /// capabilities test cluster so the flip from `planned=true,
-    /// enabled=false` → `planned=false, enabled=true` lands together
-    /// with the matching test updates. TODO(#655 Task 8 batch-2):
-    /// flip to `PlannedFeature { planned: false, version: "v0.7.0",
-    /// enabled: true }` once the sibling agent's Task 5+6 commits
-    /// merge — that batch also adds `hooks.events` entries for
-    /// `pre_reflect` / `post_reflect` so the capabilities surface
-    /// gains its full recursive-learning shape in one pass.
+    /// **v0.7.0 recursive-learning ship (issue #655).** The flag is
+    /// `{ planned: false, version: "v0.7.0", enabled: true }` because
+    /// the underlying primitive landed across Tasks 1-6 on
+    /// `feat/v0.7.0-recursive-learning`:
+    ///
+    /// - **Column** (Task 1/8, commit `f5d8a9e`) —
+    ///   `memories.reflection_depth INTEGER NOT NULL DEFAULT 0`
+    ///   on SQLite (schema v29) and Postgres (`CURRENT_SCHEMA_VERSION 31`).
+    ///   `Memory::reflection_depth: i32` with `#[serde(default)]` for
+    ///   wire-compat with pre-v0.7.0 federation peers.
+    /// - **Governance field** (Task 2/8, commit `630a6db`) —
+    ///   `GovernancePolicy.max_reflection_depth: Option<u32>` (per
+    ///   namespace, JSON metadata, no schema bump). Accessor
+    ///   `effective_max_reflection_depth() -> u32` returns the compiled
+    ///   default `3` when unset; `Some(0)` is the documented
+    ///   kill-switch.
+    /// - **Relation** (Task 3/8, commit `b51a3f3`) — `reflects_on`
+    ///   joins the canonical `VALID_RELATIONS` set; directionality
+    ///   matches `derived_from` (reflection is `source_id`, original
+    ///   is `target_id`); `db::find_paths` walks it without further
+    ///   work.
+    /// - **MCP tool** (Task 4/8, commit `3dc76f3`) — `memory_reflect`
+    ///   (`Family::Power`, tool count 51 → 52). Atomic insert of a
+    ///   reflection memory + N `reflects_on` link writes inside a
+    ///   single `BEGIN IMMEDIATE` / `COMMIT` transaction. Postgres
+    ///   parity via inherent `PostgresStore::reflect`.
+    /// - **Error variant** (Task 4/8) — `MemoryError::ReflectionDepthExceeded
+    ///   { attempted: u32, cap: u32, namespace: String }` →
+    ///   HTTP `409 CONFLICT`, code `REFLECTION_DEPTH_EXCEEDED`.
+    /// - **Hook events** (Task 6/8, commit `fbf093c`) —
+    ///   `HookEvent::PreReflect` (decision-class, `EventClass::Write`,
+    ///   5s deadline, fires before the depth-cap check, `Deny`
+    ///   vetoes via `ReflectError::HookVeto`) +
+    ///   `HookEvent::PostReflect` (notify-class, `EventClass::Write`,
+    ///   5s deadline, fires after `COMMIT`). Pipeline event count
+    ///   21 → 23.
+    /// - **Audit chain** (Task 5/8, commit `c61a05b`) — every
+    ///   depth-cap refusal appends a `reflection.depth_exceeded` row
+    ///   to the append-only `signed_events` audit table under a
+    ///   canonical-CBOR payload + SHA-256 `payload_hash` +
+    ///   `attest_level = "unsigned"`. Content body is deliberately
+    ///   omitted (PII guarantee); hook vetoes are NOT audited by this
+    ///   row (caller-policy refusals carry their own provenance).
+    ///
+    /// The v1 wire-shape projection collapses this object back to a
+    /// single `bool` (via `Capabilities::to_v1`), so pre-v0.6.3.1
+    /// clients that pinned the v1 schema continue to see the same
+    /// boolean field at the same path (and now read `true`).
     pub memory_reflection: PlannedFeature,
     /// v0.6.2 (S18): runtime-observed embedder state. `semantic_search`
     /// above reflects *configured* capability (derived from the tier's
@@ -3132,13 +3170,15 @@ mod tests {
         assert!(cfg.cross_encoder);
         let caps = cfg.capabilities();
         assert!(caps.features.cross_encoder_reranking);
-        // P1 honesty patch: memory_reflection is a planned-feature
-        // object now. Even on the autonomous tier the underlying
-        // subsystem is roadmap (v0.7+), so `planned == true` and
-        // `enabled == false` regardless of tier.
-        assert!(caps.features.memory_reflection.planned);
-        assert!(!caps.features.memory_reflection.enabled);
-        assert_eq!(caps.features.memory_reflection.version, "v0.7+");
+        // v0.7.0 recursive-learning (issue #655): Tasks 1-6 shipped
+        // the primitive, so the planned-feature object is now
+        // `planned=false, enabled=true, version="v0.7.0"`. The
+        // pre-v0.6.3.1 honesty contract still uses the
+        // `PlannedFeature` shape so the v1 bool projection
+        // collapses cleanly back to `true`.
+        assert!(!caps.features.memory_reflection.planned);
+        assert!(caps.features.memory_reflection.enabled);
+        assert_eq!(caps.features.memory_reflection.version, "v0.7.0");
     }
 
     #[test]
@@ -3251,10 +3291,13 @@ mod tests {
         assert_eq!(val["transcripts"]["enabled"], false);
         assert_eq!(val["transcripts"]["version"], "v0.7+");
 
-        // memory_reflection: planned-feature object (was bool)
-        assert_eq!(val["features"]["memory_reflection"]["planned"], true);
-        assert_eq!(val["features"]["memory_reflection"]["enabled"], false);
-        assert_eq!(val["features"]["memory_reflection"]["version"], "v0.7+");
+        // memory_reflection: planned-feature object (was bool).
+        // v0.7.0 recursive-learning (issue #655) Tasks 1-6 shipped the
+        // primitive, so the flag is `planned=false, enabled=true,
+        // version="v0.7.0"`.
+        assert_eq!(val["features"]["memory_reflection"]["planned"], false);
+        assert_eq!(val["features"]["memory_reflection"]["enabled"], true);
+        assert_eq!(val["features"]["memory_reflection"]["version"], "v0.7.0");
 
         // Runtime-state defaults are conservative — they get overlaid
         // at the handler boundary based on the live embedder + reranker
@@ -3332,11 +3375,12 @@ mod tests {
         assert!(val["features"].is_object());
         assert!(val["models"].is_object());
 
-        // v1 features.memory_reflection collapses to a bool — autonomous
-        // tier had cross_encoder + has_llm but the planned object's
-        // `enabled = false`, so the v1 bool is `false`.
+        // v1 features.memory_reflection collapses to a bool. v0.7.0
+        // recursive-learning (issue #655) Tasks 1-6 shipped the
+        // primitive, so the v2 planned-feature object now has
+        // `enabled = true` and the v1 bool projection is `true`.
         assert!(val["features"]["memory_reflection"].is_boolean());
-        assert_eq!(val["features"]["memory_reflection"], false);
+        assert_eq!(val["features"]["memory_reflection"], true);
 
         // v1 features carry no recall_mode_active / reranker_active
         assert!(val["features"].get("recall_mode_active").is_none());
