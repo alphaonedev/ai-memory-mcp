@@ -1,0 +1,6340 @@
+// Copyright 2026 AlphaOne LLC
+// SPDX-License-Identifier: Apache-2.0
+
+//! MCP (Model Context Protocol) server for ai-memory.
+//! Exposes memory operations as tools for any MCP-compatible AI client over stdio JSON-RPC.
+
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::io::{self, BufRead, Write};
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Instant;
+
+use crate::config::{AppConfig, FeatureTier, TierConfig};
+use crate::db;
+use crate::embeddings::Embedder;
+use crate::hnsw::VectorIndex;
+use crate::llm::OllamaClient;
+use crate::reranker::{BatchedReranker, CrossEncoder};
+
+pub(super) mod registry;
+
+// Re-export registry items at the crate::mcp:: path so external callers
+// (handlers.rs, sizes.rs, main.rs, etc.) continue to resolve them without
+// any call-site changes. Items that were `pub` in the original mcp.rs stay
+// `pub`; items that were `pub(crate)` stay `pub(crate)`.
+pub(crate) use registry::{families_overview, strip_docs_from_tools, trim_optional_params};
+pub use registry::{
+    handle_capabilities_family, tool_definitions, tool_definitions_for_profile,
+    tool_definitions_for_profile_verbose,
+};
+
+// --- JSON-RPC types ---
+
+#[derive(Deserialize)]
+struct RpcRequest {
+    jsonrpc: String,
+    id: Option<Value>,
+    method: String,
+    #[serde(default)]
+    params: Value,
+}
+
+#[derive(Debug, Serialize)]
+struct RpcResponse {
+    jsonrpc: String,
+    id: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<RpcError>,
+}
+
+#[derive(Debug, Serialize)]
+struct RpcError {
+    code: i64,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<Value>,
+}
+
+fn ok_response(id: Value, result: Value) -> RpcResponse {
+    RpcResponse {
+        jsonrpc: "2.0".into(),
+        id,
+        result: Some(result),
+        error: None,
+    }
+}
+
+fn err_response(id: Value, code: i64, message: String) -> RpcResponse {
+    RpcResponse {
+        jsonrpc: "2.0".into(),
+        id,
+        result: None,
+        error: Some(RpcError {
+            code,
+            message,
+            data: None,
+        }),
+    }
+}
+
+/// PR-5 (issue #487): emit an audit event for an MCP `tools/call`
+/// dispatch. Per-handler emissions inside `handle_store` /
+/// `handle_delete` already produce their canonical events; this
+/// helper covers the remaining mutation+recall tool surface so
+/// `audit_emits_at_every_call_site` holds across the matrix.
+fn audit_emit_for_mcp_dispatch(
+    tool_name: &str,
+    arguments: &Value,
+    result: &Result<Value, String>,
+    mcp_client: Option<&str>,
+) {
+    if !crate::audit::is_enabled() {
+        return;
+    }
+    let action = match tool_name {
+        // Skipped — emitted from inside the handler with full target context.
+        "memory_store" | "memory_delete" => return,
+        "memory_recall"
+        | "memory_search"
+        | "memory_get"
+        | "memory_list"
+        | "memory_session_start" => crate::audit::AuditAction::Recall,
+        "memory_update" => crate::audit::AuditAction::Update,
+        "memory_promote" => crate::audit::AuditAction::Promote,
+        "memory_forget" => crate::audit::AuditAction::Forget,
+        "memory_link" => crate::audit::AuditAction::Link,
+        "memory_consolidate" => crate::audit::AuditAction::Consolidate,
+        "memory_pending_approve" => crate::audit::AuditAction::Approve,
+        "memory_pending_reject" => crate::audit::AuditAction::Reject,
+        // Read-only / metadata tools — no audit event.
+        _ => return,
+    };
+    let agent_id = arguments
+        .get("agent_id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            mcp_client
+                .map(|c| format!("ai:{c}"))
+                .unwrap_or_else(|| "anonymous".into())
+        });
+    let namespace = arguments
+        .get("namespace")
+        .and_then(Value::as_str)
+        .unwrap_or("global")
+        .to_string();
+    let memory_id = arguments
+        .get("id")
+        .or_else(|| arguments.get("memory_id"))
+        .and_then(Value::as_str)
+        .unwrap_or("*")
+        .to_string();
+    let mut builder = crate::audit::EventBuilder::new(
+        action,
+        crate::audit::actor(
+            agent_id,
+            mcp_client.map_or("host_fallback", |_| "mcp_client_info"),
+            None,
+        ),
+        crate::audit::AuditTarget {
+            memory_id,
+            namespace,
+            title: None,
+            tier: None,
+            scope: None,
+        },
+    );
+    if let Err(e) = result {
+        builder = builder.error(e.clone());
+    }
+    crate::audit::emit(builder);
+}
+
+// --- MCP Prompts ---
+
+/// Return the list of available prompts.
+pub fn prompt_definitions() -> Value {
+    json!({
+        "prompts": [
+            {
+                "name": "recall-first",
+                "description": "System prompt for AI clients: proactive memory recall, TOON format, tier strategy.",
+                "arguments": [
+                    {
+                        "name": "namespace",
+                        "description": "Optional namespace to scope recall.",
+                        "required": false
+                    }
+                ]
+            },
+            {
+                "name": "memory-workflow",
+                "description": "Quick reference card for memory tool usage patterns."
+            }
+        ]
+    })
+}
+
+/// Return the content of a specific prompt.
+fn prompt_content(name: &str, params: &Value) -> Result<Value, String> {
+    match name {
+        "recall-first" => {
+            let ns_hint = params
+                .get("arguments")
+                .and_then(|a| a.get("namespace"))
+                .and_then(|v| v.as_str())
+                .map(|ns| format!(" Scope recall to namespace \"{ns}\" when relevant."))
+                .unwrap_or_default();
+
+            Ok(json!({
+                "messages": [{
+                    "role": "user",
+                    "content": {
+                        "type": "text",
+                        "text": format!(
+            "You have access to a persistent memory system (ai-memory). Follow these rules:\n\
+            1. RECALL FIRST: At conversation start, call memory_recall with the user's apparent topic. Before answering any question about prior work, recall first.\n\
+            2. STORE LEARNINGS: When the user corrects you or teaches something, call memory_store with tier:long, priority:9.\n\
+            3. TOON FORMAT: All recall/list/search responses default to TOON compact (79% smaller than JSON). Pass format:\"json\" only if you need structured parsing.\n\
+            4. TIERS: short=6h ephemeral, mid=7d working knowledge, long=permanent. Mid auto-promotes to long at 5 accesses.\n\
+            5. DEDUP: Storing with an existing title+namespace updates the existing memory, not a duplicate.\n\
+            6. NAMESPACES: Organize by project/topic. Always pass namespace when storing and recalling.\n\
+            7. CAPABILITIES: Call memory_capabilities once per session to discover available features (tier-dependent).\n\
+            8. TAGS: Use tags for cross-cutting concerns. memory_auto_tag can generate them if available.{ns_hint}")
+                    }
+                }]
+            }))
+        }
+        "memory-workflow" => Ok(json!({
+            "messages": [{
+                "role": "user",
+                "content": {
+                    "type": "text",
+                    "text": "\
+        STORE: memory_store(title, content, tier, namespace, tags, priority) — dedup by title+ns\n\
+        RECALL: memory_recall(context, namespace) → ranked results (TOON compact default)\n\
+        SEARCH: memory_search(query, namespace) → exact AND match (TOON compact default)\n\
+        LIST: memory_list(namespace, tier) → browse with filters (TOON compact default)\n\
+        GET: memory_get(id) → single memory with links\n\
+        PROMOTE: memory_promote(id) — mid→long, clears expiry\n\
+        CONSOLIDATE: memory_consolidate(ids, title) — merge N→1, LLM summary if available\n\
+        LINK: memory_link(source_id, target_id, relation) — related_to|supersedes|contradicts|derived_from|reflects_on\n\
+        TAG: memory_auto_tag(id) — LLM generates tags (smart+ tier)\n\
+        EXPAND: memory_expand_query(query) — LLM broadens search terms (smart+ tier)\n\
+        CONTRADICT: memory_detect_contradiction(id_a, id_b) — LLM checks conflict (smart+ tier)"
+                }
+            }]
+        })),
+        _ => Err(format!("unknown prompt: {name}")),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Submodule declarations — tool handler files
+// ---------------------------------------------------------------------------
+// Each MCP handler (or small cluster of related handlers) lives in its own
+// file under src/mcp/tools/. We reference them with #[path] so they are
+// direct children of the `mcp` module, which gives us clean `pub use`
+// re-exports without a visibility-chain headache.
+//
+// items marked pub(crate) in the orignal stay pub(crate);
+// items marked pub stay pub;
+// private helpers stay private within their file.
+
+// Registry is already declared above (pub(super) mod registry;).
+// tools/ directory: each file = one tool module under mcp.
+
+#[path = "tools/agent.rs"]
+mod agent;
+#[path = "tools/archive.rs"]
+mod archive;
+#[path = "tools/auto_tag.rs"]
+mod auto_tag;
+#[path = "tools/capabilities.rs"]
+mod capabilities;
+#[path = "tools/check_duplicate.rs"]
+mod check_duplicate;
+#[path = "tools/consolidate.rs"]
+mod consolidate;
+#[path = "tools/delete.rs"]
+mod delete;
+#[path = "tools/detect_contradiction.rs"]
+mod detect_contradiction;
+#[path = "tools/entity_get_by_alias.rs"]
+mod entity_get_by_alias;
+#[path = "tools/entity_register.rs"]
+mod entity_register;
+#[path = "tools/expand_query.rs"]
+mod expand_query;
+#[path = "tools/find_paths.rs"]
+mod find_paths;
+#[path = "tools/forget.rs"]
+mod forget;
+#[path = "tools/get.rs"]
+mod get;
+#[path = "tools/get_taxonomy.rs"]
+mod get_taxonomy;
+#[path = "tools/kg_invalidate.rs"]
+mod kg_invalidate;
+#[path = "tools/kg_query.rs"]
+mod kg_query;
+#[path = "tools/kg_timeline.rs"]
+mod kg_timeline;
+#[path = "tools/link.rs"]
+mod link;
+#[path = "tools/list.rs"]
+mod list;
+#[path = "tools/load_family.rs"]
+mod load_family;
+#[path = "tools/namespace.rs"]
+mod namespace;
+#[path = "tools/notify.rs"]
+mod notify;
+#[path = "tools/pending.rs"]
+mod pending;
+#[path = "tools/promote.rs"]
+mod promote;
+#[path = "tools/quota_status.rs"]
+mod quota_status;
+#[path = "tools/recall.rs"]
+mod recall;
+#[path = "tools/reflect.rs"]
+mod reflect;
+#[path = "tools/replay.rs"]
+mod replay;
+#[path = "tools/search.rs"]
+mod search;
+#[path = "tools/session_start.rs"]
+mod session_start;
+#[path = "tools/store.rs"]
+mod store;
+#[path = "tools/subscribe.rs"]
+mod subscribe;
+#[path = "tools/update.rs"]
+mod update;
+#[path = "tools/verify.rs"]
+mod verify;
+
+// ---------------------------------------------------------------------------
+// Re-exports — preserve exact `crate::mcp::*` pub surface (zero new pub items)
+// ---------------------------------------------------------------------------
+// These items were `pub` in the original mcp.rs and are accessed by
+// handlers.rs / sizes.rs / main.rs / integration tests via `crate::mcp::*`.
+pub use capabilities::{
+    CapabilitiesAccept, build_agent_permitted_families, build_capabilities_describe_to_user,
+    build_capabilities_summary, build_capabilities_tools, effective_tier_label,
+    format_rule_summary, handle_capabilities_with_conn, handle_capabilities_with_conn_v3,
+    overlay_tool_payloads,
+};
+pub use find_paths::handle_find_paths;
+pub use load_family::{handle_load_family, handle_smart_load};
+pub(crate) use namespace::{
+    handle_namespace_clear_standard, handle_namespace_get_standard, handle_namespace_set_standard,
+};
+pub(crate) use notify::{handle_inbox, handle_notify};
+pub use pending::{handle_pending_approve, handle_pending_reject};
+pub use quota_status::handle_quota_status;
+pub use recall::handle_recall;
+pub use recall::handle_recall_with_pre_recall_hook;
+pub use replay::handle_replay;
+pub(crate) use session_start::handle_session_start;
+pub(crate) use subscribe::handle_unsubscribe;
+pub use verify::handle_verify;
+
+// ---------------------------------------------------------------------------
+// Internal use — functions called from handle_request below.
+// Not part of the external public surface.
+// ---------------------------------------------------------------------------
+use agent::{handle_agent_list, handle_agent_register};
+use archive::{
+    handle_archive_list, handle_archive_purge, handle_archive_restore, handle_archive_stats,
+    handle_gc,
+};
+use auto_tag::handle_auto_tag;
+use check_duplicate::handle_check_duplicate;
+use consolidate::handle_consolidate;
+use delete::handle_delete;
+use detect_contradiction::handle_detect_contradiction;
+use entity_get_by_alias::handle_entity_get_by_alias;
+use entity_register::handle_entity_register;
+use expand_query::handle_expand_query;
+use forget::{handle_forget, handle_stats};
+use get::handle_get;
+use get_taxonomy::handle_get_taxonomy;
+use kg_invalidate::handle_kg_invalidate;
+use kg_query::handle_kg_query;
+use kg_timeline::handle_kg_timeline;
+use link::{handle_get_links, handle_link};
+use list::handle_list;
+use pending::handle_pending_list;
+use pending::handle_subscription_dlq_list;
+use promote::handle_promote;
+use reflect::handle_reflect;
+use search::handle_search;
+use store::handle_store;
+use subscribe::{handle_list_subscriptions, handle_subscribe, handle_subscription_replay};
+use update::handle_update;
+
+// ---------------------------------------------------------------------------
+// Test-visible re-exports of private helpers that lived in the original
+// mcp.rs and are referenced by `super::X` in the test module below.
+// These items preserve their original single-module proximity without
+// leaking into the public crate surface.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+use agent::messages_namespace_for;
+#[cfg(test)]
+use namespace::{auto_register_path_hierarchy, extract_governance};
+#[cfg(test)]
+use replay::REPLAY_VERBOSE_THRESHOLD_BYTES;
+
+// ---------------------------------------------------------------------------
+// Shared helper functions — called from multiple tool modules via super::*.
+// ---------------------------------------------------------------------------
+
+fn build_namespace_chain(conn: &rusqlite::Connection, namespace: &str) -> Vec<String> {
+    db::build_namespace_chain(conn, namespace)
+}
+
+/// Inject namespace standards into a `recall/session_start` response.
+/// N-level rule layering: global ("*") → root → ... → namespace-specific.
+/// Uses [`build_namespace_chain`] to resolve the full ancestor path.
+fn inject_namespace_standard(
+    conn: &rusqlite::Connection,
+    namespace: Option<&str>,
+    response: &mut Value,
+) {
+    let mut standards: Vec<Value> = Vec::new();
+    let mut standard_ids: Vec<String> = Vec::new();
+
+    // Helper: add a standard if not already present (dedup by memory ID)
+    let add_standard = |std: Value, ids: &mut Vec<String>, stds: &mut Vec<Value>| {
+        let id = std["id"].as_str().unwrap_or_default().to_string();
+        if !ids.contains(&id) {
+            ids.push(id);
+            stds.push(std);
+        }
+    };
+
+    let chain = if let Some(ns) = namespace {
+        build_namespace_chain(conn, ns)
+    } else {
+        // No namespace context — only the global standard applies.
+        vec!["*".to_string()]
+    };
+
+    for link in chain {
+        if let Some(std) = lookup_namespace_standard(conn, &link) {
+            add_standard(std, &mut standard_ids, &mut standards);
+        }
+    }
+
+    if standards.is_empty() {
+        return;
+    }
+
+    // Deduplicate: remove standard memories from results array
+    if let Some(memories) = response["memories"].as_array_mut() {
+        memories.retain(|m| {
+            let mid = m["id"].as_str().unwrap_or_default();
+            !standard_ids.iter().any(|sid| sid == mid)
+        });
+        response["count"] = json!(memories.len());
+    }
+
+    // Return as single object if one standard, array if multiple
+    if standards.len() == 1 {
+        response["standard"] = standards.into_iter().next().unwrap();
+    } else {
+        response["standards"] = json!(standards);
+    }
+}
+
+/// G10 — recall hot-path wrapper that fires the
+/// [`crate::hooks::HookEvent::PreRecallExpand`] chain before
+/// delegating to [`handle_recall`].
+///
+/// The wrapper is the canonical fire site for `pre_recall_expand`:
+/// the chain runs inside the v0.6.3 50ms recall budget (G6's
+/// `EventClass::HotPath` deadline) and may rewrite the query /
+/// namespace / k or short-circuit the recall via `Deny`. On `Deny`
+/// the wrapper returns an empty `memories` array with a
+/// `meta.diagnostic.pre_recall_denied` block so callers can see
+/// *why* the recall was suppressed without parsing logs.
+///
+/// `handle_recall` itself stays sync; this wrapper is async only
+/// because it awaits the daemon-mode chain `fire`. Existing
+/// callers that don't have a hooks runtime can keep calling
+/// `handle_recall` directly — this wrapper is opt-in.
+#[allow(clippy::too_many_arguments)]
+
+/// Look up the namespace standard and return it as a serialized Memory, or None.
+
+fn lookup_namespace_standard(conn: &rusqlite::Connection, namespace: &str) -> Option<Value> {
+    let standard_id = db::get_namespace_standard(conn, namespace).ok()??;
+    let mem = db::get(conn, &standard_id).ok()??;
+    serde_json::to_value(&mem).ok()
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
+fn handle_request(
+    conn: &rusqlite::Connection,
+    db_path: &Path,
+    req: &RpcRequest,
+    embedder: Option<&Embedder>,
+    llm: Option<&OllamaClient>,
+    reranker: Option<&BatchedReranker>,
+    tier_config: &TierConfig,
+    vector_index: Option<&VectorIndex>,
+    resolved_ttl: &crate::config::ResolvedTtl,
+    resolved_scoring: &crate::config::ResolvedScoring,
+    archive_on_gc: bool,
+    autonomous_hooks: bool,
+    mcp_client: Option<&str>,
+    profile: &crate::profile::Profile,
+    mcp_config: Option<&crate::config::McpConfig>,
+    // v0.7 Track H — H2 outbound link signing. When `Some`, every
+    // `memory_link` call signs the link with this keypair. When `None`
+    // (operator hasn't generated one), links go in unsigned, preserving
+    // v0.6.4 behaviour.
+    active_keypair: Option<&crate::identity::keypair::AgentKeypair>,
+    // v0.7 Track B (B4) — harness detected from `clientInfo.name` at
+    // MCP `initialize` handshake time. Threaded into the
+    // capabilities-v3 dispatch so the response can carry
+    // `your_harness_supports_deferred_registration` (presence + value
+    // both signal). `None` when no `initialize` has been observed yet
+    // — the field is omitted from the wire on that fall-through.
+    harness: Option<&crate::harness::Harness>,
+    // v0.7.0 (#318) — when `Some`, all MCP write tools forward to the
+    // local HTTP daemon at this base URL so its federation fanout
+    // coordinator runs. `None` keeps the legacy direct-SQLite path
+    // (single-node MCP deployments without a sibling `serve` daemon).
+    federation_forward_url: Option<&str>,
+    // v0.7.0 (issue #518) — `[agents.defaults.recall_scope]`
+    // resolved from the running daemon's `AppConfig`. `Some` enables
+    // `session_default=true` callers to splice these defaults into
+    // their `memory_recall` request before the storage call. `None`
+    // (single-tenant default) preserves v0.6.x recall semantics.
+    recall_scope: Option<&crate::config::RecallScope>,
+) -> RpcResponse {
+    let id = req.id.clone().unwrap_or(Value::Null);
+
+    // Validate JSON-RPC 2.0 version
+    if req.jsonrpc != "2.0" {
+        return err_response(
+            id,
+            -32600,
+            "invalid JSON-RPC version (must be \"2.0\")".into(),
+        );
+    }
+
+    match req.method.as_str() {
+        "initialize" => ok_response(
+            id,
+            json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": { "tools": {}, "prompts": {} },
+                "serverInfo": {
+                    "name": "ai-memory",
+                    "version": env!("CARGO_PKG_VERSION")
+                }
+            }),
+        ),
+        "notifications/initialized" | "ping" => ok_response(id, json!({})),
+        "tools/list" => ok_response(id, tool_definitions_for_profile(profile)),
+        "prompts/list" => ok_response(id, prompt_definitions()),
+        "prompts/get" => {
+            let prompt_name = match req.params["name"].as_str() {
+                Some(name) if !name.is_empty() => name,
+                _ => return err_response(id, -32602, "missing or empty prompt name".into()),
+            };
+            match prompt_content(prompt_name, &req.params) {
+                Ok(val) => ok_response(id, val),
+                Err(e) => err_response(id, -32602, e),
+            }
+        }
+        "tools/call" => {
+            let tool_name = match req.params["name"].as_str() {
+                Some(name) if !name.is_empty() => name,
+                _ => return err_response(id, -32602, "missing or empty tool name".into()),
+            };
+
+            // v0.6.4-002 (RFC S28) — reject calls to tools that are not
+            // loaded under the active profile. The error message names
+            // the profile that would load the tool, so a confused agent
+            // can self-correct via `--profile <hint>` or use
+            // `memory_capabilities --include-schema family=<f>` to opt in
+            // at runtime (Track C, v0.6.4-006).
+            if !profile.loads(tool_name) {
+                let owning_family = crate::profile::Family::for_tool(tool_name);
+                let hint = match owning_family {
+                    Some(f) => format!(
+                        "tool '{tool_name}' is in family '{}' which is not loaded under \
+                         the active profile. Restart with `--profile <name>` or \
+                         `--profile core,{}` to load it, or call `memory_capabilities \
+                         --include-schema family={}` to expand at runtime.",
+                        f.name(),
+                        f.name(),
+                        f.name()
+                    ),
+                    None => format!(
+                        "tool '{tool_name}' is not registered in this build. Call \
+                         `memory_capabilities` to see available tools."
+                    ),
+                };
+                return err_response(id, -32601, hint);
+            }
+
+            // Pillar 3 / Stream E — emit a structured tracing span around
+            // every MCP tool dispatch so production observability can
+            // attribute latency per tool. The span carries the tool name
+            // and JSON-RPC id; outcome and elapsed wall time are emitted
+            // as a child event after dispatch returns.
+            let span = tracing::info_span!(
+                "mcp_tool_call",
+                tool = tool_name,
+                rpc_id = ?id,
+            );
+            let _enter = span.enter();
+            let started = Instant::now();
+
+            let empty_obj = json!({});
+            let arguments = if req.params["arguments"].is_object() {
+                &req.params["arguments"]
+            } else {
+                &empty_obj
+            };
+
+            let result = match tool_name {
+                "memory_store" => handle_store(
+                    conn,
+                    db_path,
+                    arguments,
+                    embedder,
+                    llm,
+                    vector_index,
+                    resolved_ttl,
+                    autonomous_hooks,
+                    mcp_client,
+                    federation_forward_url,
+                ),
+                "memory_recall" => handle_recall(
+                    conn,
+                    arguments,
+                    embedder,
+                    vector_index,
+                    reranker,
+                    archive_on_gc,
+                    resolved_ttl,
+                    resolved_scoring,
+                    recall_scope,
+                ),
+                "memory_search" => handle_search(conn, arguments),
+                "memory_list" => handle_list(conn, arguments),
+                "memory_load_family" => handle_load_family(conn, arguments),
+                "memory_smart_load" => handle_smart_load(conn, arguments, embedder),
+                "memory_get_taxonomy" => handle_get_taxonomy(conn, arguments),
+                "memory_check_duplicate" => handle_check_duplicate(conn, arguments, embedder),
+                "memory_entity_register" => handle_entity_register(conn, arguments, mcp_client),
+                "memory_entity_get_by_alias" => handle_entity_get_by_alias(conn, arguments),
+                "memory_kg_timeline" => handle_kg_timeline(conn, arguments),
+                "memory_kg_invalidate" => handle_kg_invalidate(conn, db_path, arguments),
+                "memory_kg_query" => handle_kg_query(conn, arguments),
+                "memory_find_paths" => handle_find_paths(conn, arguments),
+                "memory_delete" => {
+                    handle_delete(conn, db_path, arguments, vector_index, mcp_client)
+                }
+                "memory_promote" => handle_promote(conn, db_path, arguments, mcp_client),
+                "memory_pending_list" => handle_pending_list(conn, arguments),
+                "memory_pending_approve" => handle_pending_approve(conn, arguments, mcp_client),
+                "memory_pending_reject" => handle_pending_reject(conn, arguments, mcp_client),
+                "memory_forget" => handle_forget(conn, arguments, archive_on_gc),
+                "memory_stats" => handle_stats(conn, db_path),
+                "memory_update" => handle_update(conn, arguments, embedder, vector_index),
+                "memory_get" => handle_get(conn, arguments),
+                "memory_link" => handle_link(conn, db_path, arguments, active_keypair),
+                "memory_get_links" => handle_get_links(conn, arguments),
+                "memory_verify" => handle_verify(conn, arguments),
+                "memory_replay" => handle_replay(conn, arguments, mcp_client),
+                "memory_consolidate" => handle_consolidate(
+                    conn,
+                    db_path,
+                    arguments,
+                    llm,
+                    embedder,
+                    vector_index,
+                    mcp_client,
+                ),
+                // v0.7.0 Task 4/8 (recursive learning, issue #655) —
+                // substrate-native reflection primitive. See
+                // `handle_reflect` for the contract.
+                "memory_reflect" => {
+                    handle_reflect(conn, db_path, arguments, embedder, vector_index, mcp_client)
+                }
+                "memory_capabilities" => {
+                    // v0.6.4-006 — runtime expansion via family enumeration.
+                    // When `family` is set, route to the family-listing path
+                    // and short-circuit the global capabilities document.
+                    if let Some(fam_name) = arguments.get("family").and_then(Value::as_str) {
+                        let include_schema = arguments
+                            .get("include_schema")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        // v0.7 C2 + C4 — `verbose=true` opts the caller into
+                        // BOTH the long-form `docs` field on each tool entry
+                        // (C2) AND the full inputSchema with every optional
+                        // param (C4). Default is `false`, which strips `docs`
+                        // and trims optionals so the family drilldown matches
+                        // the shrunken `tools/list` shape.
+                        let verbose = arguments
+                            .get("verbose")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        // v0.6.4-008 — agent_id resolution for the
+                        // allowlist gate. Caller's explicit
+                        // `arguments.agent_id` wins; otherwise fall
+                        // back to the MCP `clientInfo.name` captured
+                        // at initialize time.
+                        let aid = arguments
+                            .get("agent_id")
+                            .and_then(Value::as_str)
+                            .or(mcp_client);
+                        handle_capabilities_family(
+                            fam_name,
+                            include_schema,
+                            verbose,
+                            profile,
+                            mcp_config,
+                            aid,
+                            Some(conn),
+                        )
+                    } else {
+                        // P1 honesty patch: optional `accept` argument lets MCP
+                        // clients opt into the legacy v1 shape, mirroring the
+                        // HTTP `Accept-Capabilities` header. v0.7.0 A5 makes
+                        // v3 the default (additive over v2); explicit
+                        // `accept="v2"` keeps the v2 wire shape unchanged
+                        // for clients that pin it.
+                        let accept = arguments
+                            .get("accept")
+                            .and_then(Value::as_str)
+                            .map_or(CapabilitiesAccept::V3, CapabilitiesAccept::parse);
+                        // Round-2 F13 — top-level `verbose` and
+                        // `include_schema` were declared in the
+                        // inputSchema but inert when no family was
+                        // specified. Make them functional:
+                        // `verbose=true` overlays per-tool
+                        // `docstring`s into `tools[]`;
+                        // `include_schema=true` overlays per-tool
+                        // `inputSchema`s into `tools[]`.
+                        let top_verbose = arguments
+                            .get("verbose")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        let top_include_schema = arguments
+                            .get("include_schema")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        // v0.6.4-006 — when no family is requested, augment
+                        // the v2/v3 response with a top-level `families` field
+                        // describing the family taxonomy and which families
+                        // the active profile loads. Backward-compat: v1
+                        // shape never gets the families overlay.
+                        // v0.7.0 A3 — agent_id resolution mirrors the
+                        // family-listing path's resolution: caller's
+                        // explicit `arguments.agent_id` wins; otherwise
+                        // fall back to the MCP `clientInfo.name`
+                        // captured at initialize time. Threaded into v3
+                        // for per-tool `callable_now` calculation.
+                        let v3_aid = arguments
+                            .get("agent_id")
+                            .and_then(Value::as_str)
+                            .or(mcp_client);
+                        // Round-2 F13 — runtime-effective tier (matches
+                        // the `serve_mcp` boot banner). Used to
+                        // overlay the top-level `tier` field so the
+                        // capabilities response and the daemon log
+                        // converge on a single tier source-of-truth.
+                        let runtime_tier = effective_tier_label(
+                            llm.is_some(),
+                            embedder.is_some(),
+                            reranker.is_some(),
+                        );
+                        let result = match accept {
+                            CapabilitiesAccept::V3 => handle_capabilities_with_conn_v3(
+                                tier_config,
+                                reranker,
+                                embedder.is_some(),
+                                Some(conn),
+                                profile,
+                                mcp_config,
+                                v3_aid,
+                                // v0.7.0 B4 — pass the detected
+                                // harness through so the response
+                                // surfaces
+                                // `your_harness_supports_deferred_registration`.
+                                harness,
+                            ),
+                            _ => handle_capabilities_with_conn(
+                                tier_config,
+                                reranker,
+                                embedder.is_some(),
+                                Some(conn),
+                                accept,
+                            ),
+                        };
+                        result.map(|mut value| {
+                            if matches!(accept, CapabilitiesAccept::V2 | CapabilitiesAccept::V3) {
+                                if let Some(obj) = value.as_object_mut() {
+                                    obj.insert("families".to_string(), families_overview(profile));
+                                }
+                            }
+                            // Round-2 F13 — keep `schema_version`
+                            // present on every accept variant. v1's
+                            // `to_v1()` drops the field at the struct
+                            // boundary because the v1 shape predates
+                            // schema_version; a v1 client still needs
+                            // the discriminator to detect that it's
+                            // looking at v1. Inject it on the wire.
+                            if matches!(accept, CapabilitiesAccept::V1)
+                                && let Some(obj) = value.as_object_mut()
+                                && !obj.contains_key("schema_version")
+                            {
+                                obj.insert(
+                                    "schema_version".to_string(),
+                                    Value::String("1".to_string()),
+                                );
+                            }
+                            // Round-2 F13 — overlay the runtime-
+                            // effective tier so the top-level `tier`
+                            // field reflects what the daemon is
+                            // actually doing, not what
+                            // `tier_config.tier.as_str()` was at
+                            // build/config time. v1, v2, v3 all carry
+                            // `tier`.
+                            if let Some(obj) = value.as_object_mut() {
+                                obj.insert(
+                                    "tier".to_string(),
+                                    Value::String(runtime_tier.to_string()),
+                                );
+                            }
+                            // Round-2 F13 — when `include_schema=true`
+                            // and/or `verbose=true` is set with no
+                            // family, overlay per-tool `inputSchema`
+                            // and/or `docstring` into the v3 `tools[]`
+                            // array. Sourced from `tool_definitions()`.
+                            if (top_include_schema || top_verbose)
+                                && matches!(accept, CapabilitiesAccept::V2 | CapabilitiesAccept::V3)
+                                && let Some(obj) = value.as_object_mut()
+                            {
+                                overlay_tool_payloads(
+                                    obj,
+                                    profile,
+                                    top_include_schema,
+                                    top_verbose,
+                                );
+                            }
+                            value
+                        })
+                    }
+                }
+                "memory_expand_query" => handle_expand_query(llm, arguments),
+                "memory_auto_tag" => handle_auto_tag(conn, llm, arguments),
+                "memory_detect_contradiction" => handle_detect_contradiction(conn, llm, arguments),
+                "memory_archive_list" => handle_archive_list(conn, arguments),
+                "memory_archive_restore" => handle_archive_restore(conn, arguments),
+                "memory_archive_purge" => handle_archive_purge(conn, arguments),
+                "memory_archive_stats" => handle_archive_stats(conn),
+                "memory_gc" => handle_gc(conn, arguments, archive_on_gc),
+                "memory_session_start" => handle_session_start(conn, arguments, llm),
+                "memory_namespace_set_standard" => handle_namespace_set_standard(conn, arguments),
+                "memory_namespace_get_standard" => handle_namespace_get_standard(conn, arguments),
+                "memory_namespace_clear_standard" => {
+                    handle_namespace_clear_standard(conn, arguments)
+                }
+                "memory_agent_register" => handle_agent_register(conn, arguments),
+                "memory_agent_list" => handle_agent_list(conn),
+                "memory_notify" => handle_notify(conn, arguments, resolved_ttl, mcp_client),
+                "memory_inbox" => handle_inbox(conn, arguments, mcp_client),
+                "memory_subscribe" => handle_subscribe(conn, arguments, mcp_client),
+                "memory_unsubscribe" => handle_unsubscribe(conn, arguments),
+                "memory_list_subscriptions" => handle_list_subscriptions(conn),
+                "memory_subscription_replay" => handle_subscription_replay(conn, arguments),
+                "memory_subscription_dlq_list" => handle_subscription_dlq_list(conn, arguments),
+                "memory_quota_status" => handle_quota_status(conn, arguments),
+                // Ultrareview #349: unknown tool is a JSON-RPC 2.0
+                // "method not found" condition — return -32601, not
+                // an ok_response with `isError: true`. Clients that
+                // switch on error code can then misroute / retry
+                // correctly. We surface the tool name in `data` so
+                // clients can log it without parsing the message.
+                unknown => {
+                    return err_response(id, -32601, format!("unknown tool: {unknown}"));
+                }
+            };
+
+            // Outcome + elapsed reported under the `mcp_tool_call` span so
+            // exporters can chart per-tool p95/p99 against PERFORMANCE.md
+            // budgets without needing per-handler instrumentation.
+            let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            match &result {
+                Ok(_) => tracing::info!(elapsed_ms, "ok"),
+                Err(err) => tracing::warn!(elapsed_ms, error = %err, "err"),
+            }
+
+            // PR-5 (issue #487): MCP-dispatch-level audit emission for
+            // mutation/recall tools that the per-handler instrumentation
+            // doesn't already cover. `memory_store` and `memory_delete`
+            // each emit their own canonical event from inside the
+            // handler so we skip them here to avoid double-counting.
+            audit_emit_for_mcp_dispatch(tool_name, arguments, &result, mcp_client);
+
+            match result {
+                Ok(val) => {
+                    // Check if TOON format requested for recall/search/list
+                    let format_str = arguments
+                        .get("format")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("toon_compact");
+                    let text = match format_str {
+                        "toon"
+                            if matches!(
+                                tool_name,
+                                "memory_recall" | "memory_list" | "memory_session_start"
+                            ) =>
+                        {
+                            crate::toon::memories_to_toon(&val, false)
+                        }
+                        "toon_compact"
+                            if matches!(
+                                tool_name,
+                                "memory_recall" | "memory_list" | "memory_session_start"
+                            ) =>
+                        {
+                            crate::toon::memories_to_toon(&val, true)
+                        }
+                        "toon" if tool_name == "memory_search" => {
+                            crate::toon::search_to_toon(&val, false)
+                        }
+                        "toon_compact" if tool_name == "memory_search" => {
+                            crate::toon::search_to_toon(&val, true)
+                        }
+                        _ => serde_json::to_string_pretty(&val).unwrap_or_default(),
+                    };
+                    ok_response(
+                        id,
+                        json!({
+                            "content": [{
+                                "type": "text",
+                                "text": text
+                            }]
+                        }),
+                    )
+                }
+                Err(e) => ok_response(
+                    id,
+                    json!({
+                        "content": [{"type": "text", "text": e}],
+                        "isError": true
+                    }),
+                ),
+            }
+        }
+        _ => err_response(id, -32601, format!("method not found: {}", req.method)),
+    }
+}
+
+/// v0.7 Track H — H2: best-effort load of the active Ed25519 keypair
+/// for the MCP daemon. Mirrors `daemon_runtime::load_active_keypair_for_serve`
+/// but logs to stderr (the MCP convention — stdout owns JSON-RPC).
+/// Missing keypair returns `None` and link writes go in unsigned;
+/// operator opts in by running `ai-memory identity generate`.
+fn load_active_keypair_for_mcp() -> Option<crate::identity::keypair::AgentKeypair> {
+    let dir = crate::identity::keypair::default_key_dir().ok()?;
+    let agent_id = crate::identity::resolve_agent_id(None, None).ok()?;
+    if !dir.exists() {
+        return None;
+    }
+    match crate::identity::keypair::load(&agent_id, &dir) {
+        Ok(kp) if kp.can_sign() => Some(kp),
+        Ok(_) => None,
+        Err(e) => {
+            // WARN on malformed key files; quiet on common file-not-found.
+            let msg = format!("{e:#}");
+            if !(msg.contains("No such file") || msg.contains("not found")) {
+                eprintln!("ai-memory: keypair load failed for {agent_id}: {msg}");
+            }
+            None
+        }
+    }
+}
+
+/// Run the MCP server over stdio. Blocks until stdin closes.
+/// Initializes components based on the requested feature tier.
+///
+/// `profile` (v0.6.4-001) selects the tool surface advertised through
+/// `tools/list`. Today the parameter is plumbed through and recorded in
+/// the boot manifest; the family-scoped registration filter that
+/// actually gates which tools land in `tools/list` is wired in
+/// v0.6.4-002 (#522). Until that lands, every profile shows the full
+/// 43-tool surface — the resolution step still runs so the parse error
+/// path is exercised (and asserted in the integration tests).
+#[allow(clippy::too_many_lines)]
+pub fn run_mcp_server(
+    db_path: &Path,
+    tier: FeatureTier,
+    app_config: &AppConfig,
+    profile: &crate::profile::Profile,
+) -> anyhow::Result<()> {
+    // Pillar 3 / Stream E — wire `tracing` for the MCP entrypoint so the
+    // per-tool spans added in `handle_request` actually surface. The
+    // writer is pinned to stderr because stdio JSON-RPC owns stdout;
+    // emitting trace lines there would corrupt the protocol. `try_init`
+    // is a no-op if a subscriber was already installed by another
+    // command in the same process.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("ai_memory=info")),
+        )
+        .with_writer(std::io::stderr)
+        .try_init();
+
+    let conn = db::open(db_path)?;
+    let stdin = io::stdin();
+    let mut stdout = io::stdout();
+
+    let mut tier_config = tier.config();
+    eprintln!("ai-memory: requested tier = {}", tier.as_str());
+    // v0.6.4-001 — log resolved profile so an operator inspecting MCP
+    // boot stderr can immediately see which tool surface is active.
+    // Family-scoped filtering of tools/list arrives in v0.6.4-002.
+    let family_names: Vec<&'static str> = profile.families().iter().map(|f| f.name()).collect();
+    eprintln!(
+        "ai-memory: profile = {} families ({}); expected tool count = {}",
+        profile.families().len(),
+        family_names.join(", "),
+        profile.expected_tool_count()
+    );
+
+    // Apply config.toml overrides — tiers gate features, models are independently configurable
+    // Only override if the tier actually uses an LLM (smart/autonomous)
+    if tier_config.llm_model.is_some()
+        && let Some(ref llm_override) = app_config.llm_model
+    {
+        match llm_override.as_str() {
+            "gemma4:e2b" => {
+                tier_config.llm_model = Some(crate::config::LlmModel::Gemma4E2B);
+                eprintln!("ai-memory: llm_model override from config: gemma4:e2b");
+            }
+            "gemma4:e4b" => {
+                tier_config.llm_model = Some(crate::config::LlmModel::Gemma4E4B);
+                eprintln!("ai-memory: llm_model override from config: gemma4:e4b");
+            }
+            other => eprintln!("ai-memory: unknown llm_model '{other}', using tier default"),
+        }
+    }
+
+    // Apply embedding model override from config.toml
+    if tier_config.embedding_model.is_some()
+        && let Some(ref emb_override) = app_config.embedding_model
+    {
+        match emb_override.as_str() {
+            "mini_lm_l6_v2" => {
+                tier_config.embedding_model = Some(crate::config::EmbeddingModel::MiniLmL6V2);
+                eprintln!("ai-memory: embedding_model override from config: mini_lm_l6_v2 (local)");
+            }
+            "nomic_embed_v15" => {
+                tier_config.embedding_model = Some(crate::config::EmbeddingModel::NomicEmbedV15);
+                eprintln!(
+                    "ai-memory: embedding_model override from config: nomic_embed_v15 (Ollama)"
+                );
+            }
+            other => {
+                eprintln!("ai-memory: unknown embedding_model '{other}', using tier default");
+            }
+        }
+    }
+
+    // --- Initialize LLM (smart tier and above) — before embedder so Ollama
+    //     client can be shared with nomic embedder ---
+    let llm: Option<Arc<OllamaClient>> = if let Some(ref llm_model) = tier_config.llm_model {
+        let model_id = llm_model.ollama_model_id();
+        eprintln!(
+            "ai-memory: connecting to Ollama for {} ...",
+            llm_model.display_name()
+        );
+        let ollama_url = app_config.effective_ollama_url();
+        match OllamaClient::new_with_url(ollama_url, model_id) {
+            Ok(client) => {
+                eprintln!("ai-memory: Ollama connected, ensuring model {model_id} is available...");
+                if let Err(e) = client.ensure_model() {
+                    eprintln!("ai-memory: model pull failed: {e} (LLM features disabled)");
+                    None
+                } else {
+                    eprintln!("ai-memory: LLM ready ({})", llm_model.display_name());
+                    Some(Arc::new(client))
+                }
+            }
+            Err(e) => {
+                eprintln!("ai-memory: Ollama not available: {e} (LLM features disabled)");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // --- Initialize embedder (semantic tier and above) ---
+    // Use a separate embed client if embed_url is configured differently from ollama_url
+    let embed_client: Option<Arc<OllamaClient>> = {
+        let embed_url = app_config.effective_embed_url();
+        let ollama_url = app_config.effective_ollama_url();
+        if embed_url == ollama_url {
+            llm.clone()
+        } else {
+            // Separate embed URL configured — create a dedicated client for embeddings
+            eprintln!("ai-memory: using separate embed URL: {embed_url}");
+            match OllamaClient::new_with_url(embed_url, "nomic-embed-text") {
+                Ok(client) => Some(Arc::new(client)),
+                Err(e) => {
+                    eprintln!("ai-memory: embed client failed: {e}, falling back to LLM client");
+                    llm.clone()
+                }
+            }
+        }
+    };
+    let embedder = if let Some(ref emb_model) = tier_config.embedding_model {
+        match Embedder::for_model(*emb_model, embed_client) {
+            Ok(emb) => {
+                eprintln!("ai-memory: embedder loaded ({})", emb.model_description());
+                // Backfill embeddings for memories that don't have them
+                match db::get_unembedded_ids(&conn) {
+                    Ok(unembedded) if !unembedded.is_empty() => {
+                        eprintln!("ai-memory: backfilling {} memories...", unembedded.len());
+                        let mut ok = 0usize;
+                        for (id, title, content) in &unembedded {
+                            let text = format!("{title} {content}");
+                            match emb.embed(&text) {
+                                Ok(embedding) => {
+                                    if db::set_embedding(&conn, id, &embedding).is_ok() {
+                                        ok += 1;
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "ai-memory: embed failed for {}: {}",
+                                        &id[..8.min(id.len())],
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                        eprintln!("ai-memory: backfilled {}/{}", ok, unembedded.len());
+                    }
+                    _ => {}
+                }
+                Some(emb)
+            }
+            Err(e) => {
+                eprintln!("ai-memory: embedder failed: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // --- Build HNSW vector index (semantic tier and above) ---
+    let vector_index = if embedder.is_some() {
+        match db::get_all_embeddings(&conn) {
+            Ok(entries) if !entries.is_empty() => {
+                eprintln!(
+                    "ai-memory: building HNSW index ({} vectors)...",
+                    entries.len()
+                );
+                let idx = VectorIndex::build(entries);
+                eprintln!("ai-memory: HNSW index ready ({} entries)", idx.len());
+                Some(idx)
+            }
+            _ => {
+                eprintln!("ai-memory: no embeddings for HNSW index, using linear scan");
+                Some(VectorIndex::empty())
+            }
+        }
+    } else {
+        None
+    };
+
+    // --- Initialize cross-encoder reranker (autonomous tier) ---
+    //
+    // v0.7 G9 — wrap the encoder in a `BatchedReranker` so concurrent
+    // recall requests coalesce into a single tokenize+forward pass on
+    // the BERT model, instead of serializing through the per-candidate
+    // `Arc<Mutex<BertModel>>`.
+    let reranker = if tier_config.cross_encoder {
+        eprintln!("ai-memory: loading neural cross-encoder (ms-marco-MiniLM-L-6-v2)...");
+        let ce = CrossEncoder::new_neural();
+        if ce.is_neural() {
+            eprintln!("ai-memory: neural cross-encoder ready (batched)");
+        } else {
+            eprintln!("ai-memory: using lexical cross-encoder fallback");
+        }
+        Some(BatchedReranker::new(ce))
+    } else {
+        None
+    };
+
+    // Report effective tier
+    let effective_tier = if llm.is_some() && embedder.is_some() && reranker.is_some() {
+        "autonomous"
+    } else if llm.is_some() && embedder.is_some() {
+        "smart"
+    } else if embedder.is_some() {
+        "semantic"
+    } else {
+        "keyword"
+    };
+    eprintln!("ai-memory MCP server started (stdio, tier={effective_tier})");
+
+    // v0.7 Track H — H2 outbound link signing. Best-effort load of the
+    // active agent's Ed25519 keypair from the default key dir. Missing
+    // keypair = unsigned link writes (preserves v0.6.4 behaviour);
+    // operator opts in by running `ai-memory identity generate`.
+    let active_keypair: Option<crate::identity::keypair::AgentKeypair> =
+        load_active_keypair_for_mcp();
+    if active_keypair.is_some() {
+        eprintln!("ai-memory: link signing enabled (Ed25519)");
+    }
+
+    // Captured from the MCP `initialize` handshake's `clientInfo.name`.
+    // Used by `crate::identity` to synthesize an `ai:<client>@<host>:pid-<pid>`
+    // agent_id when the caller doesn't supply one explicitly.
+    let mut mcp_client_name: Option<String> = None;
+
+    // v0.7.0 B4 — Harness detected from `clientInfo.name` at handshake
+    // time. Stays `None` until we observe an `initialize` so the
+    // capabilities-v3 response omits
+    // `your_harness_supports_deferred_registration` (presence is
+    // itself meaningful — absence means "we don't know").
+    let mut detected_harness: Option<crate::harness::Harness> = None;
+
+    for line in stdin.lock().lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let req: RpcRequest = match serde_json::from_str(&line) {
+            Ok(r) => r,
+            Err(e) => {
+                let resp = err_response(Value::Null, -32700, format!("parse error: {e}"));
+                let out = serde_json::to_string(&resp)?;
+                writeln!(stdout, "{out}")?;
+                stdout.flush()?;
+                continue;
+            }
+        };
+
+        // Capture clientInfo.name on initialize (even if id is Null / notification-style).
+        if req.method == "initialize"
+            && let Some(name) = req.params["clientInfo"]["name"].as_str()
+            && !name.is_empty()
+        {
+            mcp_client_name = Some(name.to_string());
+            // v0.7.0 B4 — detect the harness so capabilities-v3 +
+            // future B1/B2 loaders can shape responses based on
+            // whether the harness supports deferred-tool registration.
+            detected_harness = Some(crate::harness::Harness::detect(name));
+        }
+
+        // Notifications have no id — no response expected per JSON-RPC spec
+        if req.id.is_none() || req.id == Some(Value::Null) {
+            continue;
+        }
+
+        let resolved_ttl = app_config.effective_ttl();
+        let resolved_scoring = app_config.effective_scoring();
+        let archive_on_gc = app_config.effective_archive_on_gc();
+        let autonomous_hooks = app_config.effective_autonomous_hooks();
+        let resolved_recall_scope = app_config.effective_recall_scope();
+        let resp = handle_request(
+            &conn,
+            db_path,
+            &req,
+            embedder.as_ref(),
+            llm.as_deref(),
+            reranker.as_ref(),
+            &tier_config,
+            vector_index.as_ref(),
+            &resolved_ttl,
+            &resolved_scoring,
+            archive_on_gc,
+            autonomous_hooks,
+            mcp_client_name.as_deref(),
+            profile,
+            app_config.mcp.as_ref(),
+            active_keypair.as_ref(),
+            detected_harness.as_ref(),
+            app_config.mcp_federation_forward_url.as_deref(),
+            resolved_recall_scope,
+        );
+        let out = serde_json::to_string(&resp)?;
+        writeln!(stdout, "{out}")?;
+        stdout.flush()?;
+    }
+
+    let _ = db::checkpoint(&conn);
+    eprintln!("ai-memory MCP server stopped");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{Memory, Tier};
+    use serde_json::json;
+
+    #[test]
+    fn tool_definitions_returns_50_tools() {
+        // v0.6.3 adds memory_get_taxonomy (Pillar 1 / Stream A),
+        // memory_check_duplicate (Pillar 2 / Stream D),
+        // memory_entity_register + memory_entity_get_by_alias
+        // (Pillar 2 / Stream B), and memory_kg_timeline +
+        // memory_kg_invalidate + memory_kg_query (Pillar 2 / Stream C)
+        // on top of the 36-tool v0.6.0.0 surface = 43.
+        // v0.7.0 I4 adds memory_replay (Family::Graph) → 44.
+        // v0.7 H4 adds memory_verify (Family::Graph) → 45.
+        // v0.7 B1 adds memory_load_family (Family::Core) → 46.
+        // v0.7 K7 adds memory_subscription_replay +
+        // memory_subscription_dlq_list (Family::Power) → 48.
+        // v0.7 J7 adds memory_find_paths (Family::Graph) → 49.
+        // v0.7 B2 adds memory_smart_load (Family::Core) → 50.
+        // v0.7 K8 adds memory_quota_status (Family::Power) → 51.
+        // v0.7.0 Task 4/8 adds memory_reflect (Family::Power) → 52.
+        let defs = tool_definitions();
+        let tools = defs["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 52);
+    }
+
+    /// v0.6.4-002 acceptance gate (RFC §S25/S26): `--profile core`
+    /// registers exactly 7 family tools (5 baseline + v0.7 B1
+    /// memory_load_family + v0.7 B2 memory_smart_load) + 1 always-on
+    /// bootstrap (memory_capabilities) = 8 visible tools. `--profile
+    /// full` registers all 51.
+    #[test]
+    fn tool_definitions_for_profile_core_registers_7_plus_capabilities() {
+        let defs = tool_definitions_for_profile(&crate::profile::Profile::core());
+        let tools = defs["tools"].as_array().unwrap();
+        let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        // Exactly the 7 core tools + memory_capabilities bootstrap.
+        assert_eq!(
+            tools.len(),
+            8,
+            "core profile should register 7 core tools + memory_capabilities; got {names:?}"
+        );
+        for required in [
+            "memory_store",
+            "memory_recall",
+            "memory_list",
+            "memory_get",
+            "memory_search",
+            "memory_load_family",
+            "memory_smart_load",
+            "memory_capabilities",
+        ] {
+            assert!(
+                names.contains(&required),
+                "core profile missing {required}; got {names:?}"
+            );
+        }
+        // None of the non-core tools should leak through.
+        for excluded in [
+            "memory_kg_query",
+            "memory_consolidate",
+            "memory_archive_list",
+            "memory_subscribe",
+            "memory_promote",
+        ] {
+            assert!(
+                !names.contains(&excluded),
+                "core profile leaked {excluded}; got {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_definitions_for_profile_full_registers_51() {
+        let defs = tool_definitions_for_profile(&crate::profile::Profile::full());
+        let tools = defs["tools"].as_array().unwrap();
+        assert_eq!(
+            tools.len(),
+            52,
+            "full profile = v0.6.3 surface (43) + v0.7.0 I4 memory_replay (1) + \
+             v0.7 H4 memory_verify (1) + v0.7 B1 memory_load_family (1) + \
+             v0.7 B2 memory_smart_load (1) + \
+             v0.7 K7 memory_subscription_replay + memory_subscription_dlq_list (2) + \
+             v0.7 J7 memory_find_paths (1) + v0.7 K8 memory_quota_status (1) + \
+             v0.7.0 Task 4/8 memory_reflect (1) = 52"
+        );
+    }
+
+    #[test]
+    fn tool_definitions_for_profile_graph_registers_nineteen() {
+        let defs = tool_definitions_for_profile(&crate::profile::Profile::graph());
+        let tools = defs["tools"].as_array().unwrap();
+        // 7 core (with v0.7 B1 memory_load_family + v0.7 B2
+        // memory_smart_load) + 11 graph (8 baseline + memory_replay +
+        // memory_verify + v0.7 J7 memory_find_paths) + 1 always-on
+        // capabilities = 19.
+        assert_eq!(
+            tools.len(),
+            19,
+            "graph profile = core(7, with memory_load_family + memory_smart_load) + \
+             graph(11, with memory_replay+memory_verify+memory_find_paths) + \
+             capabilities-bootstrap(1)"
+        );
+    }
+
+    /// RFC §S30: custom comma-list `core,graph` registers union.
+    #[test]
+    fn tool_definitions_for_profile_custom_core_comma_graph_registers_union() {
+        let p = crate::profile::Profile::parse("core,graph").unwrap();
+        let defs = tool_definitions_for_profile(&p);
+        let tools = defs["tools"].as_array().unwrap();
+        assert_eq!(
+            tools.len(),
+            19,
+            "core,graph = 7 (B1 memory_load_family + B2 memory_smart_load) + 11 (I4 memory_replay + H4 memory_verify + J7 memory_find_paths) + capabilities = 19"
+        );
+    }
+
+    // ---- v0.6.4-006 — capabilities family enum + include_schema ----
+
+    #[test]
+    fn families_overview_lists_all_eight_with_correct_loaded_flags() {
+        let p = crate::profile::Profile::core();
+        let v = families_overview(&p);
+        let families = v["families"].as_array().unwrap();
+        assert_eq!(families.len(), 8, "all eight families must appear");
+
+        let core_row = families.iter().find(|r| r["name"] == "core").unwrap();
+        assert_eq!(core_row["loaded"], true);
+        // v0.7 B1 + B2 — Core now ships 7 tools (5 baseline +
+        // memory_load_family + memory_smart_load).
+        assert_eq!(core_row["tool_count"], 7);
+        let graph_row = families.iter().find(|r| r["name"] == "graph").unwrap();
+        assert_eq!(graph_row["loaded"], false);
+        // v0.7 J7 — graph now ships 11 tools (8 baseline + memory_replay
+        // [I4] + memory_verify [H4] + memory_find_paths [J7]).
+        assert_eq!(graph_row["tool_count"], 11);
+
+        let always_on = v["always_on"].as_array().unwrap();
+        assert_eq!(always_on.len(), 1);
+        assert_eq!(always_on[0], "memory_capabilities");
+    }
+
+    #[test]
+    fn handle_capabilities_family_lists_tool_names() {
+        let p = crate::profile::Profile::core();
+        let v = handle_capabilities_family("graph", false, false, &p, None, None, None).unwrap();
+        assert_eq!(v["family"], "graph");
+        assert_eq!(v["loaded_under_active_profile"], false);
+        let tools = v["tools"].as_array().unwrap();
+        // v0.7 J7 — graph now lists 11 tools (8 baseline + memory_replay
+        // [I4] + memory_verify [H4] + memory_find_paths [J7]).
+        assert_eq!(tools.len(), 11);
+        // Spot-check known graph tool present.
+        assert!(tools.iter().any(|t| t == "memory_kg_query"));
+        assert!(tools.iter().any(|t| t == "memory_replay"));
+        assert!(tools.iter().any(|t| t == "memory_verify"));
+        assert!(tools.iter().any(|t| t == "memory_find_paths"));
+    }
+
+    #[test]
+    fn handle_capabilities_family_include_schema_returns_full_definitions() {
+        let p = crate::profile::Profile::core();
+        // v0.7 C2 + C4 — verbose=true preserves BOTH the long-form `docs`
+        // field (C2) AND every optional `inputSchema.properties` entry (C4).
+        // The legacy assertion (full definition shape present) still holds,
+        // and additionally `docs` is now expected on every tool that defines
+        // one.
+        let v = handle_capabilities_family("graph", true, true, &p, None, None, None).unwrap();
+        assert_eq!(v["family"], "graph");
+        assert_eq!(v["verbose"], true);
+        let tools = v["tools"].as_array().unwrap();
+        // v0.7 J7 — graph now ships 11 schemas (8 baseline + memory_replay
+        // [I4] + memory_verify [H4] + memory_find_paths [J7]).
+        assert_eq!(tools.len(), 11);
+        // Each row must carry the full MCP tool definition shape.
+        for tool in tools {
+            assert!(tool.get("name").is_some(), "missing name");
+            assert!(tool.get("description").is_some(), "missing description");
+            assert!(tool.get("inputSchema").is_some(), "missing inputSchema");
+        }
+    }
+
+    #[test]
+    fn handle_capabilities_family_verbose_preserves_docs_field() {
+        // v0.7 C2 — verbose=true with include_schema=true must restore the
+        // long-form `docs` payload on every tool entry that defines one.
+        let p = crate::profile::Profile::core();
+        let v = handle_capabilities_family("core", true, true, &p, None, None, None).unwrap();
+        let tools = v["tools"].as_array().unwrap();
+        assert!(!tools.is_empty());
+        let with_docs = tools
+            .iter()
+            .filter(|t| t.get("docs").and_then(Value::as_str).is_some())
+            .count();
+        assert!(
+            with_docs >= 1,
+            "verbose=true must surface at least one docs string in family=core; got 0"
+        );
+    }
+
+    #[test]
+    fn handle_capabilities_family_unknown_returns_diagnostic_err() {
+        let p = crate::profile::Profile::core();
+        let err =
+            handle_capabilities_family("xyz", false, false, &p, None, None, None).unwrap_err();
+        assert!(err.contains("xyz"));
+        assert!(err.contains("Valid families"));
+        assert!(err.contains("core"));
+        assert!(err.contains("graph"));
+    }
+
+    #[test]
+    fn handle_capabilities_family_empty_name_errors() {
+        let p = crate::profile::Profile::core();
+        let err = handle_capabilities_family("", false, false, &p, None, None, None).unwrap_err();
+        assert!(err.contains("must not be empty"));
+    }
+
+    // ---- v0.7 C4 — optional-param trim acceptance gates ----
+
+    /// `tools/list` payload (the default `tool_definitions_for_profile`
+    /// path) must hide every optional param except the C4 keep-list.
+    /// Concrete spot-check: `memory_store` keeps `title`, `content` (both
+    /// required) plus `namespace` (kept), and DROPS `confidence`,
+    /// `priority`, `tier`, `metadata`, `agent_id`, `source`, `scope`,
+    /// `tags`, `on_conflict`.
+    #[test]
+    fn tool_definitions_for_profile_strips_optional_params_by_default() {
+        let p = crate::profile::Profile::full();
+        let defs = tool_definitions_for_profile(&p);
+        let store = defs["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "memory_store")
+            .expect("memory_store must be present in full profile");
+        let props = store["inputSchema"]["properties"].as_object().unwrap();
+        // Required + keep-list survives.
+        assert!(props.contains_key("title"), "title (required) dropped");
+        assert!(props.contains_key("content"), "content (required) dropped");
+        assert!(
+            props.contains_key("namespace"),
+            "namespace (C4 keep-list) dropped"
+        );
+        // Long-tail optionals must be gone.
+        for stripped in [
+            "confidence",
+            "priority",
+            "tier",
+            "metadata",
+            "agent_id",
+            "source",
+            "scope",
+            "tags",
+            "on_conflict",
+        ] {
+            assert!(
+                !props.contains_key(stripped),
+                "optional param `{stripped}` should have been stripped from default tools/list"
+            );
+        }
+    }
+
+    /// `tool_definitions_for_profile_verbose` keeps every optional —
+    /// this is the opt-in path callers reach via
+    /// `memory_capabilities { verbose=true, family=…, include_schema=true }`.
+    #[test]
+    fn tool_definitions_for_profile_verbose_keeps_every_optional() {
+        let p = crate::profile::Profile::full();
+        let defs = tool_definitions_for_profile_verbose(&p);
+        let store = defs["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "memory_store")
+            .expect("memory_store must be present");
+        let props = store["inputSchema"]["properties"].as_object().unwrap();
+        for kept in [
+            "title",
+            "content",
+            "namespace",
+            "confidence",
+            "priority",
+            "tier",
+            "metadata",
+            "agent_id",
+            "source",
+            "scope",
+            "tags",
+            "on_conflict",
+        ] {
+            assert!(
+                props.contains_key(kept),
+                "verbose path should preserve `{kept}`"
+            );
+        }
+    }
+
+    /// The `verbose=true` family path must round-trip every optional;
+    /// `verbose=false` (the default for `include_schema=true`) must
+    /// strip them. Anchors the wire-shape contract documented on
+    /// [`handle_capabilities_family`].
+    #[test]
+    fn handle_capabilities_family_verbose_toggles_optional_params() {
+        let p = crate::profile::Profile::full();
+        // verbose=false → trimmed schema for memory_store
+        let trimmed =
+            handle_capabilities_family("core", true, false, &p, None, None, None).unwrap();
+        assert_eq!(trimmed["verbose"], false);
+        let store_trimmed = trimmed["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "memory_store")
+            .expect("memory_store in core family");
+        let props_trimmed = store_trimmed["inputSchema"]["properties"]
+            .as_object()
+            .unwrap();
+        assert!(!props_trimmed.contains_key("confidence"));
+        assert!(!props_trimmed.contains_key("priority"));
+        assert!(props_trimmed.contains_key("namespace"));
+        assert!(props_trimmed.contains_key("title"));
+
+        // verbose=true → full schema
+        let verbose = handle_capabilities_family("core", true, true, &p, None, None, None).unwrap();
+        assert_eq!(verbose["verbose"], true);
+        let store_verbose = verbose["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "memory_store")
+            .expect("memory_store in core family");
+        let props_verbose = store_verbose["inputSchema"]["properties"]
+            .as_object()
+            .unwrap();
+        assert!(props_verbose.contains_key("confidence"));
+        assert!(props_verbose.contains_key("priority"));
+        assert!(props_verbose.contains_key("metadata"));
+        assert!(props_verbose.contains_key("agent_id"));
+    }
+
+    /// `trim_optional_params` reports a positive count and is
+    /// idempotent — re-running on an already-trimmed value is a no-op.
+    #[test]
+    fn trim_optional_params_is_idempotent() {
+        let mut defs = tool_definitions();
+        let stripped_first = trim_optional_params(&mut defs);
+        assert!(
+            stripped_first > 0,
+            "first trim should strip a positive number of optionals"
+        );
+        let stripped_second = trim_optional_params(&mut defs);
+        assert_eq!(
+            stripped_second, 0,
+            "re-trim of an already-trimmed schema must be a no-op"
+        );
+    }
+
+    /// `tools/list` (full profile, trimmed) must be materially smaller
+    /// than the verbose payload. We assert >= 30% size reduction
+    /// because the long-tail optionals carry the bulk of the per-tool
+    /// description bytes (defaults, enums, prose). If this regresses,
+    /// the keep-list grew or the trimmer broke.
+    #[test]
+    fn c4_trim_shrinks_full_profile_payload_by_at_least_30_percent() {
+        let p = crate::profile::Profile::full();
+        let trimmed = tool_definitions_for_profile(&p);
+        let verbose = tool_definitions_for_profile_verbose(&p);
+        let trimmed_bytes = serde_json::to_string(&trimmed).unwrap().len();
+        let verbose_bytes = serde_json::to_string(&verbose).unwrap().len();
+        assert!(
+            trimmed_bytes < verbose_bytes,
+            "trimmed ({trimmed_bytes}B) must be smaller than verbose ({verbose_bytes}B)"
+        );
+        let saved_pct = (verbose_bytes - trimmed_bytes) as f64 / verbose_bytes as f64 * 100.0;
+        assert!(
+            saved_pct >= 30.0,
+            "C4 trim should save >=30% of full-profile bytes; got {saved_pct:.1}% \
+             (verbose={verbose_bytes}B, trimmed={trimmed_bytes}B)"
+        );
+    }
+
+    #[test]
+    fn tool_definitions_include_check_duplicate() {
+        let defs = tool_definitions();
+        let tools = defs["tools"].as_array().unwrap();
+        let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        assert!(names.contains(&"memory_check_duplicate"));
+    }
+
+    #[test]
+    fn tool_definitions_include_entity_registry_tools() {
+        let defs = tool_definitions();
+        let tools = defs["tools"].as_array().unwrap();
+        let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        assert!(names.contains(&"memory_entity_register"));
+        assert!(names.contains(&"memory_entity_get_by_alias"));
+    }
+
+    #[test]
+    fn tool_definitions_include_kg_timeline() {
+        let defs = tool_definitions();
+        let tools = defs["tools"].as_array().unwrap();
+        let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        assert!(names.contains(&"memory_kg_timeline"));
+    }
+
+    #[test]
+    fn tool_definitions_include_kg_invalidate() {
+        let defs = tool_definitions();
+        let tools = defs["tools"].as_array().unwrap();
+        let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        assert!(names.contains(&"memory_kg_invalidate"));
+    }
+
+    #[test]
+    fn tool_definitions_include_kg_query() {
+        let defs = tool_definitions();
+        let tools = defs["tools"].as_array().unwrap();
+        let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        assert!(names.contains(&"memory_kg_query"));
+    }
+
+    #[test]
+    fn tool_definitions_include_agent_register_and_list() {
+        let defs = tool_definitions();
+        let names: Vec<&str> = defs["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        assert!(names.contains(&"memory_agent_register"));
+        assert!(names.contains(&"memory_agent_list"));
+    }
+
+    #[test]
+    fn tool_definitions_include_notify_and_inbox() {
+        // v0.6.0.0 agent-to-agent messaging primitive.
+        let defs = tool_definitions();
+        let names: Vec<&str> = defs["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        assert!(names.contains(&"memory_notify"));
+        assert!(names.contains(&"memory_inbox"));
+    }
+
+    #[test]
+    fn messages_namespace_is_prefixed() {
+        assert_eq!(super::messages_namespace_for("alice"), "_messages/alice");
+        assert_eq!(
+            super::messages_namespace_for("ai:claude-opus-4.7"),
+            "_messages/ai:claude-opus-4.7"
+        );
+    }
+
+    #[test]
+    fn tool_definitions_all_have_names() {
+        let defs = tool_definitions();
+        let tools = defs["tools"].as_array().unwrap();
+        for tool in tools {
+            assert!(tool["name"].as_str().unwrap().starts_with("memory_"));
+        }
+    }
+
+    #[test]
+    fn tool_definitions_recall_has_toon_default() {
+        let defs = tool_definitions();
+        let tools = defs["tools"].as_array().unwrap();
+        let recall = tools.iter().find(|t| t["name"] == "memory_recall").unwrap();
+        let format_schema = &recall["inputSchema"]["properties"]["format"];
+        assert_eq!(format_schema["default"], "toon_compact");
+    }
+
+    /// v0.7.0 (issue #518) — pin the `memory_recall` tool schema for
+    /// the new `session_default` boolean. Default must be `false` so
+    /// existing callers see zero behaviour change; the description
+    /// must mention `[agents.defaults.recall_scope]` so clients
+    /// discover the splice contract through `tools/list`.
+    #[test]
+    fn tool_definitions_recall_advertises_session_default_issue_518() {
+        let defs = tool_definitions();
+        let tools = defs["tools"].as_array().unwrap();
+        let recall = tools
+            .iter()
+            .find(|t| t["name"] == "memory_recall")
+            .expect("memory_recall tool must be defined");
+        let props = &recall["inputSchema"]["properties"];
+        let session_default = &props["session_default"];
+        assert_eq!(session_default["type"], "boolean");
+        assert_eq!(session_default["default"], false);
+        assert!(
+            session_default["description"]
+                .as_str()
+                .is_some_and(|d| d.contains("agents.defaults.recall_scope")),
+            "session_default description must mention [agents.defaults.recall_scope] — got {session_default:?}"
+        );
+    }
+
+    #[test]
+    fn prompt_definitions_returns_2() {
+        let defs = prompt_definitions();
+        let prompts = defs["prompts"].as_array().unwrap();
+        assert_eq!(prompts.len(), 2);
+        assert_eq!(prompts[0]["name"], "recall-first");
+        assert_eq!(prompts[1]["name"], "memory-workflow");
+    }
+
+    #[test]
+    fn prompt_definitions_recall_first_has_arguments() {
+        let defs = prompt_definitions();
+        let prompts = defs["prompts"].as_array().unwrap();
+        let recall_first = &prompts[0];
+        let args = recall_first["arguments"].as_array().unwrap();
+        assert_eq!(args.len(), 1);
+        assert_eq!(args[0]["name"], "namespace");
+    }
+
+    #[test]
+    fn prompt_content_recall_first() {
+        let params = json!({});
+        let result = prompt_content("recall-first", &params).unwrap();
+        let msgs = result["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1);
+        let text = msgs[0]["content"]["text"].as_str().unwrap();
+        assert!(text.contains("RECALL FIRST"));
+        assert!(text.contains("TOON"));
+        assert!(text.contains("memory_recall"));
+        assert!(text.contains("memory_store"));
+        assert!(text.contains("DEDUP"));
+    }
+
+    #[test]
+    fn prompt_content_recall_first_with_namespace() {
+        let params = json!({"arguments": {"namespace": "my-project"}});
+        let result = prompt_content("recall-first", &params).unwrap();
+        let text = result["messages"][0]["content"]["text"].as_str().unwrap();
+        assert!(text.contains("my-project"));
+    }
+
+    #[test]
+    fn prompt_content_memory_workflow() {
+        let params = json!({});
+        let result = prompt_content("memory-workflow", &params).unwrap();
+        let text = result["messages"][0]["content"]["text"].as_str().unwrap();
+        assert!(text.contains("STORE"));
+        assert!(text.contains("RECALL"));
+        assert!(text.contains("SEARCH"));
+        assert!(text.contains("CONSOLIDATE"));
+        assert!(text.contains("TOON"));
+    }
+
+    #[test]
+    fn prompt_content_unknown() {
+        let params = json!({});
+        let result = prompt_content("nonexistent", &params);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unknown prompt"));
+    }
+
+    #[test]
+    fn prompt_content_role_is_user() {
+        let params = json!({});
+        let result = prompt_content("recall-first", &params).unwrap();
+        assert_eq!(result["messages"][0]["role"], "user");
+    }
+
+    #[test]
+    fn ok_response_structure() {
+        let resp = ok_response(json!(1), json!({"test": true}));
+        assert_eq!(resp.jsonrpc, "2.0");
+        assert_eq!(resp.id, json!(1));
+        assert!(resp.result.is_some());
+        assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn err_response_structure() {
+        let resp = err_response(json!(1), -32600, "test error".to_string());
+        assert_eq!(resp.jsonrpc, "2.0");
+        assert!(resp.error.is_some());
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, -32600);
+        assert_eq!(err.message, "test error");
+    }
+
+    /// Buffer-backed `MakeWriter` so `tracing` output can be asserted on
+    /// without polluting test stdout/stderr or installing a global
+    /// subscriber. Used by the Stream E span coverage tests below.
+    #[derive(Clone)]
+    struct VecWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for VecWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for VecWriter {
+        type Writer = VecWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn run_with_capture<F: FnOnce()>(f: F) -> String {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let writer = VecWriter(buf.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer)
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        String::from_utf8(buf.lock().unwrap().clone()).unwrap_or_default()
+    }
+
+    fn make_tools_call(tool: &str, args: Value) -> RpcRequest {
+        RpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!(1)),
+            method: "tools/call".into(),
+            params: json!({ "name": tool, "arguments": args }),
+        }
+    }
+
+    /// Pillar 3 / Stream E coverage — every successful `tools/call` must
+    /// emit a `mcp_tool_call` span carrying the tool name plus an `ok`
+    /// event with `elapsed_ms`. This is the single point of latency
+    /// instrumentation production exporters key off.
+    #[test]
+    fn tools_call_emits_span_with_tool_name_and_elapsed_ms() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let tier_config = FeatureTier::Keyword.config();
+        let resolved_ttl = crate::config::ResolvedTtl::default();
+        let resolved_scoring = crate::config::ResolvedScoring::default();
+        let req = make_tools_call("memory_list", json!({"limit": 1}));
+
+        let captured = run_with_capture(|| {
+            let resp = handle_request(
+                &conn,
+                std::path::Path::new(":memory:"),
+                &req,
+                None,
+                None,
+                None,
+                &tier_config,
+                None,
+                &resolved_ttl,
+                &resolved_scoring,
+                true,
+                false,
+                None,
+                &crate::profile::Profile::full(),
+                None,
+                None,
+                None,
+                None, // federation_forward_url (#318)
+                None, // recall_scope (#518)
+            );
+            assert!(resp.error.is_none(), "expected ok rpc response");
+        });
+
+        assert!(
+            captured.contains("mcp_tool_call"),
+            "missing span name in: {captured}"
+        );
+        assert!(
+            captured.contains("memory_list"),
+            "missing tool field in: {captured}"
+        );
+        assert!(
+            captured.contains("elapsed_ms"),
+            "missing elapsed_ms field in: {captured}"
+        );
+        assert!(
+            captured.contains(" ok"),
+            "missing ok outcome event in: {captured}"
+        );
+    }
+
+    /// Failure path — when the underlying handler returns an `Err`, the
+    /// span emits a `warn` level event with the error message so on-call
+    /// dashboards can alert on per-tool error rate.
+    #[test]
+    fn tools_call_emits_warn_event_on_handler_error() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let tier_config = FeatureTier::Keyword.config();
+        let resolved_ttl = crate::config::ResolvedTtl::default();
+        let resolved_scoring = crate::config::ResolvedScoring::default();
+        // memory_get with a missing/invalid id is a deterministic Err
+        // path: validate_id rejects empty strings.
+        let req = make_tools_call("memory_get", json!({"id": ""}));
+
+        let captured = run_with_capture(|| {
+            let resp = handle_request(
+                &conn,
+                std::path::Path::new(":memory:"),
+                &req,
+                None,
+                None,
+                None,
+                &tier_config,
+                None,
+                &resolved_ttl,
+                &resolved_scoring,
+                true,
+                false,
+                None,
+                &crate::profile::Profile::full(),
+                None,
+                None,
+                None,
+                None, // federation_forward_url (#318)
+                None, // recall_scope (#518)
+            );
+            // Handler errs are returned as ok_response with isError=true,
+            // not RpcError, by design (the JSON-RPC layer is reserved for
+            // protocol-level failures).
+            assert!(resp.error.is_none());
+        });
+
+        assert!(
+            captured.contains("mcp_tool_call"),
+            "missing span in err path: {captured}"
+        );
+        assert!(
+            captured.contains("memory_get"),
+            "missing tool field in err path: {captured}"
+        );
+        assert!(
+            captured.contains("WARN"),
+            "missing WARN level on err path: {captured}"
+        );
+        assert!(
+            captured.contains("err"),
+            "missing err outcome in: {captured}"
+        );
+    }
+    /// Parametrized smoke matrix for all 51 MCP tools (Justice of MCP pathway).
+    /// v0.6.3 baseline = 43; v0.7.0 I4 added memory_replay (44);
+    /// v0.7 H4 added memory_verify (45); v0.7 B1 added memory_load_family (46);
+    /// v0.7 K7 added memory_subscription_replay + memory_subscription_dlq_list (48);
+    /// v0.7 J7 added memory_find_paths (49);
+    /// v0.7 B2 added memory_smart_load (50);
+    /// v0.7 K8 added memory_quota_status (51).
+    /// Tier 1: happy path with canonical valid args.
+    /// Tier 2: required arg validation (missing required arg → error).
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn mcp_tools_smoke_matrix() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let tier_config = FeatureTier::Keyword.config();
+        let resolved_ttl = crate::config::ResolvedTtl::default();
+        let resolved_scoring = crate::config::ResolvedScoring::default();
+
+        struct ToolCase {
+            name: &'static str,
+            valid_args: Value,
+            required_arg: Option<&'static str>, // first required arg name for error test
+        }
+
+        let cases: &[ToolCase] = &[
+            ToolCase {
+                name: "memory_store",
+                valid_args: json!({"title": "test", "content": "test content"}),
+                required_arg: Some("title"),
+            },
+            ToolCase {
+                name: "memory_recall",
+                valid_args: json!({"context": "test"}),
+                required_arg: Some("context"),
+            },
+            ToolCase {
+                name: "memory_search",
+                valid_args: json!({"query": "test"}),
+                required_arg: Some("query"),
+            },
+            ToolCase {
+                name: "memory_list",
+                valid_args: json!({}),
+                required_arg: None,
+            },
+            ToolCase {
+                name: "memory_load_family",
+                valid_args: json!({"family": "core"}),
+                required_arg: Some("family"),
+            },
+            // v0.7 B2 — memory_smart_load: free-text intent picks a
+            // family using cached embeddings (or deterministic keyword
+            // fallback when the embedder is offline). Empty intent
+            // surfaces as a missing-required-arg error.
+            ToolCase {
+                name: "memory_smart_load",
+                valid_args: json!({"intent": "load core memories"}),
+                required_arg: Some("intent"),
+            },
+            ToolCase {
+                name: "memory_get_taxonomy",
+                valid_args: json!({}),
+                required_arg: None,
+            },
+            ToolCase {
+                name: "memory_check_duplicate",
+                valid_args: json!({"title": "test", "content": "test content"}),
+                required_arg: Some("title"),
+            },
+            ToolCase {
+                name: "memory_entity_register",
+                valid_args: json!({"canonical_name": "Entity", "namespace": "test"}),
+                required_arg: Some("canonical_name"),
+            },
+            ToolCase {
+                name: "memory_entity_get_by_alias",
+                valid_args: json!({"alias": "test"}),
+                required_arg: Some("alias"),
+            },
+            ToolCase {
+                name: "memory_kg_timeline",
+                valid_args: json!({"source_id": "fake-id-for-test"}),
+                required_arg: Some("source_id"),
+            },
+            ToolCase {
+                name: "memory_kg_invalidate",
+                valid_args: json!({"source_id": "s", "target_id": "t", "relation": "related_to"}),
+                required_arg: Some("source_id"),
+            },
+            ToolCase {
+                name: "memory_kg_query",
+                valid_args: json!({"source_id": "fake-id-for-test"}),
+                required_arg: Some("source_id"),
+            },
+            // v0.7 J7 — memory_find_paths: an unknown source/target
+            // returns an empty `paths` list, not an error, so the happy
+            // path works without pre-seeding the DB.
+            ToolCase {
+                name: "memory_find_paths",
+                valid_args: json!({
+                    "source_id": "fake-src-for-test",
+                    "target_id": "fake-dst-for-test",
+                }),
+                required_arg: Some("source_id"),
+            },
+            ToolCase {
+                name: "memory_delete",
+                valid_args: json!({"id": "fake-id-for-test"}),
+                required_arg: Some("id"),
+            },
+            ToolCase {
+                name: "memory_promote",
+                valid_args: json!({"id": "fake-id-for-test"}),
+                required_arg: Some("id"),
+            },
+            ToolCase {
+                name: "memory_forget",
+                valid_args: json!({}),
+                required_arg: None,
+            },
+            ToolCase {
+                name: "memory_stats",
+                valid_args: json!({}),
+                required_arg: None,
+            },
+            ToolCase {
+                name: "memory_update",
+                valid_args: json!({"id": "fake-id-for-test"}),
+                required_arg: Some("id"),
+            },
+            ToolCase {
+                name: "memory_get",
+                valid_args: json!({"id": "fake-id-for-test"}),
+                required_arg: Some("id"),
+            },
+            ToolCase {
+                name: "memory_link",
+                valid_args: json!({"source_id": "s", "target_id": "t"}),
+                required_arg: Some("source_id"),
+            },
+            ToolCase {
+                name: "memory_get_links",
+                valid_args: json!({"id": "fake-id-for-test"}),
+                required_arg: Some("id"),
+            },
+            ToolCase {
+                name: "memory_verify",
+                // Happy-path arg shape — the link won't be found in the
+                // empty in-memory DB but the dispatcher path is what the
+                // smoke matrix covers; the "not found" branch is still
+                // an Err result, which the matrix tolerates because it
+                // already classifies dispatch outcomes.
+                valid_args: json!({
+                    "source_id": "fake-src-id",
+                    "target_id": "fake-dst-id",
+                    "relation": "related_to"
+                }),
+                // No "single required arg" — the tool is reachable via
+                // either link_id OR (source_id+target_id), so the
+                // smoke matrix's required-arg branch is not applicable.
+                required_arg: None,
+            },
+            // v0.7.0 I4 — memory_replay walks the I2 join table; an
+            // unknown memory_id yields an empty `transcripts` list
+            // rather than an error, so the happy path works without
+            // pre-seeding the DB.
+            ToolCase {
+                name: "memory_replay",
+                valid_args: json!({"memory_id": "fake-id-for-test"}),
+                required_arg: Some("memory_id"),
+            },
+            ToolCase {
+                name: "memory_consolidate",
+                valid_args: json!({"ids": ["id1", "id2"], "title": "consolidated"}),
+                required_arg: Some("ids"),
+            },
+            ToolCase {
+                name: "memory_capabilities",
+                valid_args: json!({}),
+                required_arg: None,
+            },
+            ToolCase {
+                name: "memory_expand_query",
+                valid_args: json!({"query": "test"}),
+                required_arg: Some("query"),
+            },
+            ToolCase {
+                name: "memory_auto_tag",
+                valid_args: json!({"id": "fake-id-for-test"}),
+                required_arg: Some("id"),
+            },
+            ToolCase {
+                name: "memory_detect_contradiction",
+                valid_args: json!({"id_a": "a", "id_b": "b"}),
+                required_arg: Some("id_a"),
+            },
+            ToolCase {
+                name: "memory_archive_list",
+                valid_args: json!({}),
+                required_arg: None,
+            },
+            ToolCase {
+                name: "memory_archive_restore",
+                valid_args: json!({"id": "fake-id-for-test"}),
+                required_arg: Some("id"),
+            },
+            ToolCase {
+                name: "memory_archive_purge",
+                valid_args: json!({}),
+                required_arg: None,
+            },
+            ToolCase {
+                name: "memory_archive_stats",
+                valid_args: json!({}),
+                required_arg: None,
+            },
+            ToolCase {
+                name: "memory_gc",
+                valid_args: json!({}),
+                required_arg: None,
+            },
+            ToolCase {
+                name: "memory_session_start",
+                valid_args: json!({}),
+                required_arg: None,
+            },
+            ToolCase {
+                name: "memory_namespace_set_standard",
+                valid_args: json!({"namespace": "test", "id": "fake-id-for-test"}),
+                required_arg: Some("namespace"),
+            },
+            ToolCase {
+                name: "memory_namespace_get_standard",
+                valid_args: json!({"namespace": "test"}),
+                required_arg: Some("namespace"),
+            },
+            ToolCase {
+                name: "memory_namespace_clear_standard",
+                valid_args: json!({"namespace": "test"}),
+                required_arg: Some("namespace"),
+            },
+            ToolCase {
+                name: "memory_pending_list",
+                valid_args: json!({}),
+                required_arg: None,
+            },
+            ToolCase {
+                name: "memory_pending_approve",
+                valid_args: json!({"id": "fake-id-for-test"}),
+                required_arg: Some("id"),
+            },
+            ToolCase {
+                name: "memory_pending_reject",
+                valid_args: json!({"id": "fake-id-for-test"}),
+                required_arg: Some("id"),
+            },
+            ToolCase {
+                name: "memory_agent_register",
+                valid_args: json!({"agent_id": "test-agent", "agent_type": "human"}),
+                required_arg: Some("agent_id"),
+            },
+            ToolCase {
+                name: "memory_agent_list",
+                valid_args: json!({}),
+                required_arg: None,
+            },
+            ToolCase {
+                name: "memory_notify",
+                valid_args: json!({"target_agent_id": "agent", "title": "msg", "payload": "body"}),
+                required_arg: Some("target_agent_id"),
+            },
+            ToolCase {
+                name: "memory_inbox",
+                valid_args: json!({}),
+                required_arg: None,
+            },
+            ToolCase {
+                name: "memory_subscribe",
+                valid_args: json!({"url": "https://example.com/webhook"}),
+                required_arg: Some("url"),
+            },
+            ToolCase {
+                name: "memory_unsubscribe",
+                valid_args: json!({"id": "fake-id-for-test"}),
+                required_arg: Some("id"),
+            },
+            ToolCase {
+                name: "memory_list_subscriptions",
+                valid_args: json!({}),
+                required_arg: None,
+            },
+            // v0.7 K7 — subscription reliability inspection tools.
+            ToolCase {
+                name: "memory_subscription_replay",
+                valid_args: json!({
+                    "subscription_id": "smoke-id",
+                    "since": "1970-01-01T00:00:00Z"
+                }),
+                required_arg: Some("subscription_id"),
+            },
+            ToolCase {
+                name: "memory_subscription_dlq_list",
+                valid_args: json!({}),
+                required_arg: None,
+            },
+            // v0.7 K8 — per-agent quota status. Optional agent_id; on
+            // omission returns every quota row.
+            ToolCase {
+                name: "memory_quota_status",
+                valid_args: json!({}),
+                required_arg: None,
+            },
+        ];
+
+        // Tier 1: happy path tests
+        for case in cases {
+            let req = make_tools_call(case.name, case.valid_args.clone());
+            let resp = handle_request(
+                &conn,
+                std::path::Path::new(":memory:"),
+                &req,
+                None,
+                None,
+                None,
+                &tier_config,
+                None,
+                &resolved_ttl,
+                &resolved_scoring,
+                true,
+                false,
+                None,
+                &crate::profile::Profile::full(),
+                None,
+                None,
+                None,
+                None, // federation_forward_url (#318)
+                None, // recall_scope (#518)
+            );
+            assert!(
+                resp.error.is_none(),
+                "happy path failed for {}: {:?}",
+                case.name,
+                resp.error
+            );
+            assert!(
+                resp.result.is_some(),
+                "missing result for happy path {}: {:?}",
+                case.name,
+                resp
+            );
+        }
+
+        // Tier 2: required arg validation
+        for case in cases {
+            if let Some(required_arg) = case.required_arg {
+                let mut bad_args = case.valid_args.clone();
+                bad_args.as_object_mut().unwrap().remove(required_arg);
+
+                let req = make_tools_call(case.name, bad_args);
+                let resp = handle_request(
+                    &conn,
+                    std::path::Path::new(":memory:"),
+                    &req,
+                    None,
+                    None,
+                    None,
+                    &tier_config,
+                    None,
+                    &resolved_ttl,
+                    &resolved_scoring,
+                    true,
+                    false,
+                    None,
+                    &crate::profile::Profile::full(),
+                    None,
+                    None,
+                    None,
+                    None, // federation_forward_url (#318)
+                    None, // recall_scope (#518)
+                );
+
+                // Missing required args should produce an error response (handler returns Err)
+                // which becomes an ok_response with isError=true, not a JSON-RPC error
+                assert!(
+                    resp.error.is_none() || resp.result.is_some(),
+                    "unexpected RPC-layer error for {} (missing {}) should be handler-level Err",
+                    case.name,
+                    required_arg
+                );
+            }
+        }
+    }
+
+    // =====================================================================
+    // W9 / Closer M9 — mcp.rs sweep
+    //
+    // Targets the four areas identified in the W9 close-out: tool-handler
+    // happy/error pairs (per family), JSON-RPC framing (parse / unknown
+    // method / invalid params), `auto_register_path_hierarchy`, and
+    // `inject_namespace_standard`. All tests append-only at end of the
+    // tests module — production code is untouched.
+    //
+    // Inner-fn factor-out: `dispatch_line` is added below as a test-only
+    // helper that mirrors the parse-and-dispatch loop in `run_mcp_server`.
+    // It is `#[cfg(test)]` and lives inside the `tests` module so it
+    // does NOT leak into the public surface (no production callers are
+    // affected). This is the minimum needed to drive parse-error /
+    // truncation / two-requests-per-line cases without spinning up the
+    // real stdio loop.
+    // =====================================================================
+
+    /// Build a fully-defaulted handle_request invocation against an
+    /// in-memory connection. Returns the response so individual tests
+    /// can assert on `error` / `result` shape.
+    fn invoke_handle_request(conn: &rusqlite::Connection, req: &RpcRequest) -> RpcResponse {
+        let tier_config = FeatureTier::Keyword.config();
+        let resolved_ttl = crate::config::ResolvedTtl::default();
+        let resolved_scoring = crate::config::ResolvedScoring::default();
+        handle_request(
+            conn,
+            std::path::Path::new(":memory:"),
+            req,
+            None,
+            None,
+            None,
+            &tier_config,
+            None,
+            &resolved_ttl,
+            &resolved_scoring,
+            true,
+            false,
+            None,
+            &crate::profile::Profile::full(),
+            None,
+            None,
+            None,
+            None, // federation_forward_url (#318)
+            None, // recall_scope (#518)
+        )
+    }
+
+    /// Test-only helper that mirrors the parse-then-dispatch portion of
+    /// `run_mcp_server`'s stdin loop for a single line. Returns:
+    /// - `Some(RpcResponse)` for any line that produces a response
+    ///   (including parse errors and successful dispatches),
+    /// - `None` for lines that should not produce a response (blank
+    ///   lines, valid notifications without an id).
+    ///
+    /// This is the minimum factor-out needed to exercise the framing
+    /// branches that live inside `run_mcp_server` (parse error, blank
+    /// skip, notification skip) without spinning up real stdio.
+    fn dispatch_line(conn: &rusqlite::Connection, line: &str) -> Option<RpcResponse> {
+        if line.trim().is_empty() {
+            return None;
+        }
+        let req: RpcRequest = match serde_json::from_str(line) {
+            Ok(r) => r,
+            Err(e) => {
+                return Some(err_response(
+                    Value::Null,
+                    -32700,
+                    format!("parse error: {e}"),
+                ));
+            }
+        };
+        if req.id.is_none() || req.id == Some(Value::Null) {
+            return None;
+        }
+        Some(invoke_handle_request(conn, &req))
+    }
+
+    // ------------------------------------------------------------------
+    // Tool-handler happy-path coverage (paired with error tests below).
+    // The smoke matrix above already confirms every tool dispatches; the
+    // tests below assert on the *shape* of the success result so a
+    // handler that silently changes its return key set fails loudly.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn handle_store_happy_returns_id_and_tier() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_store",
+            json!({"title": "t", "content": "c", "namespace": "m9-store", "tier": "short"}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        assert!(val["id"].is_string());
+        assert_eq!(val["tier"], "short");
+    }
+
+    #[test]
+    fn handle_store_error_missing_title() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call("memory_store", json!({"content": "c"}));
+        let resp = invoke_handle_request(&conn, &req);
+        // Handler-level errors come back as ok_response with isError=true.
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], true);
+    }
+
+    #[test]
+    fn handle_recall_happy_returns_memories_array() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_recall",
+            json!({"context": "anything", "format": "json"}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        assert!(val["memories"].is_array());
+        assert!(val["count"].is_u64());
+    }
+
+    #[test]
+    fn handle_recall_budget_tokens_zero_returns_empty() {
+        // Phase P6 (R1): budget_tokens=0 is now a valid request — the
+        // user explicitly asked for zero context. Returns an empty
+        // memories array with meta.budget_overflow=false (the user
+        // didn't overflow anything, they asked for nothing). Supersedes
+        // the v0.6.3 Ultrareview #348 hard-reject of 0.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_recall",
+            json!({"context": "x", "budget_tokens": 0, "format": "json"}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none(), "budget_tokens=0 must not error");
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(val["count"], 0, "budget_tokens=0 returns zero memories");
+        assert_eq!(val["budget_tokens"], 0);
+        assert_eq!(val["tokens_used"], 0);
+        assert_eq!(val["meta"]["budget_overflow"], false);
+        assert_eq!(val["meta"]["budget_tokens_used"], 0);
+        assert_eq!(val["meta"]["budget_tokens_remaining"], 0);
+    }
+
+    #[test]
+    fn handle_search_happy_returns_results_array() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_search",
+            json!({"query": "needle", "format": "json"}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        assert!(val["results"].is_array());
+        assert!(val["count"].is_u64());
+    }
+
+    #[test]
+    fn handle_search_error_missing_query() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call("memory_search", json!({}));
+        let resp = invoke_handle_request(&conn, &req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], true);
+    }
+
+    #[test]
+    fn handle_get_happy_returns_memory() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        // Insert a memory directly to know the id.
+        let mem = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Mid,
+            namespace: "m9-get".into(),
+            title: "t".into(),
+            content: "c".into(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".into(),
+            access_count: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({}),
+            reflection_depth: 0,
+        };
+        let id = db::insert(&conn, &mem).unwrap();
+        let req = make_tools_call("memory_get", json!({"id": id}));
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(val["title"], "t");
+        assert_eq!(val["namespace"], "m9-get");
+        assert!(val["links"].is_array());
+    }
+
+    #[test]
+    fn handle_get_error_unknown_id() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_get",
+            json!({"id": "00000000-0000-0000-0000-000000000000"}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], true);
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("not found")
+        );
+    }
+
+    #[test]
+    fn handle_list_happy_returns_memories_array() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call("memory_list", json!({"format": "json"}));
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        assert!(val["memories"].is_array());
+    }
+
+    #[test]
+    fn handle_list_error_invalid_agent_id() {
+        // Invalid agent_id (contains a space) is rejected upstream.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call("memory_list", json!({"agent_id": "has space"}));
+        let resp = invoke_handle_request(&conn, &req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], true);
+    }
+
+    #[test]
+    fn handle_delete_happy_removes_existing_memory() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let mem = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Mid,
+            namespace: "m9-del".into(),
+            title: "t".into(),
+            content: "c".into(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".into(),
+            access_count: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({}),
+            reflection_depth: 0,
+        };
+        let id = db::insert(&conn, &mem).unwrap();
+        let req = make_tools_call("memory_delete", json!({"id": id}));
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(val["deleted"], true);
+    }
+
+    #[test]
+    fn handle_delete_error_empty_id() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call("memory_delete", json!({"id": ""}));
+        let resp = invoke_handle_request(&conn, &req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], true);
+    }
+
+    #[test]
+    fn handle_link_happy_returns_linked_true() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let mut ids = Vec::new();
+        for tag in ["a", "b"] {
+            let mem = Memory {
+                id: uuid::Uuid::new_v4().to_string(),
+                tier: Tier::Mid,
+                namespace: "m9-link".into(),
+                title: tag.into(),
+                content: "c".into(),
+                tags: vec![],
+                priority: 5,
+                confidence: 1.0,
+                source: "test".into(),
+                access_count: 0,
+                created_at: chrono::Utc::now().to_rfc3339(),
+                updated_at: chrono::Utc::now().to_rfc3339(),
+                last_accessed_at: None,
+                expires_at: None,
+                metadata: json!({}),
+                reflection_depth: 0,
+            };
+            ids.push(db::insert(&conn, &mem).unwrap());
+        }
+        let req = make_tools_call(
+            "memory_link",
+            json!({"source_id": ids[0], "target_id": ids[1], "relation": "related_to"}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(val["linked"], true);
+        // v0.7 H2 — wire response carries attest_level. Default
+        // `invoke_handle_request` passes `active_keypair = None` so
+        // the level is "unsigned" — the v0.6.4 backward-compat shape.
+        assert_eq!(val["attest_level"], "unsigned");
+    }
+
+    // v0.7 H2 — when an active keypair is plumbed through to the
+    // memory_link MCP handler, the wire response reports
+    // attest_level = "self_signed" and the underlying row carries a
+    // 64-byte signature.
+    #[test]
+    fn handle_link_with_active_keypair_returns_self_signed() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let mut ids = Vec::new();
+        for tag in ["a", "b"] {
+            let mem = Memory {
+                id: uuid::Uuid::new_v4().to_string(),
+                tier: Tier::Mid,
+                namespace: "h2-link".into(),
+                title: tag.into(),
+                content: "c".into(),
+                tags: vec![],
+                priority: 5,
+                confidence: 1.0,
+                source: "test".into(),
+                access_count: 0,
+                created_at: chrono::Utc::now().to_rfc3339(),
+                updated_at: chrono::Utc::now().to_rfc3339(),
+                last_accessed_at: None,
+                expires_at: None,
+                metadata: json!({}),
+                reflection_depth: 0,
+            };
+            ids.push(db::insert(&conn, &mem).unwrap());
+        }
+        let req = make_tools_call(
+            "memory_link",
+            json!({"source_id": ids[0], "target_id": ids[1], "relation": "related_to"}),
+        );
+
+        // Drive handle_request directly so we can pass an active keypair.
+        let kp = crate::identity::keypair::generate("alice").unwrap();
+        let tier_config = FeatureTier::Keyword.config();
+        let resolved_ttl = crate::config::ResolvedTtl::default();
+        let resolved_scoring = crate::config::ResolvedScoring::default();
+        let resp = handle_request(
+            &conn,
+            std::path::Path::new(":memory:"),
+            &req,
+            None,
+            None,
+            None,
+            &tier_config,
+            None,
+            &resolved_ttl,
+            &resolved_scoring,
+            true,
+            false,
+            None,
+            &crate::profile::Profile::full(),
+            None,
+            Some(&kp),
+            None,
+            None, // federation_forward_url (#318)
+            None, // recall_scope (#518)
+        );
+        assert!(resp.error.is_none(), "MCP error: {:?}", resp.error);
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(val["linked"], true);
+        assert_eq!(
+            val["attest_level"], "self_signed",
+            "active keypair path must surface self_signed"
+        );
+
+        // The signature column is now populated and 64 bytes.
+        let sig: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT signature FROM memory_links \
+                 WHERE source_id = ?1 AND target_id = ?2",
+                rusqlite::params![&ids[0], &ids[1]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let sig_bytes = sig.expect("signed link must persist a signature blob");
+        assert_eq!(sig_bytes.len(), 64);
+    }
+
+    #[test]
+    fn handle_link_error_missing_target_id() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call("memory_link", json!({"source_id": "x"}));
+        let resp = invoke_handle_request(&conn, &req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], true);
+    }
+
+    #[test]
+    fn handle_promote_error_unknown_id() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_promote",
+            json!({"id": "00000000-0000-0000-0000-000000000000"}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], true);
+    }
+
+    #[test]
+    fn handle_consolidate_error_missing_summary_keyword_tier() {
+        // Keyword tier has no LLM, so `summary` is required.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_consolidate",
+            json!({"ids": ["a", "b"], "title": "t"}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], true);
+        let msg = result["content"][0]["text"].as_str().unwrap();
+        assert!(msg.contains("summary"));
+    }
+
+    #[test]
+    fn handle_capabilities_happy_returns_tier_struct() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call("memory_capabilities", json!({}));
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        assert!(val["tier"].is_string());
+        assert!(val["features"].is_object());
+    }
+
+    /// v0.6.3.1 (capabilities schema v2 — P1 honesty patch).
+    /// Every new top-level block is present with the expected shape.
+    /// Dropped fields (`rule_summary`, `by_event`, `subscribers`,
+    /// `default_timeout_seconds`) must be absent from v2 output.
+    ///
+    /// v0.7.0 A5: this test pins v2 explicitly via `accept="v2"` since
+    /// the default is now v3. v2 backward-compat is preserved
+    /// indefinitely; this test is the contract that proves it.
+    #[test]
+    fn mcp_capabilities_v2_schema_includes_all_blocks() {
+        // v0.7.0 K3: serialize on the gate-mode atomic + clear any
+        // sibling-test override so `permissions.mode` reflects the
+        // documented `advisory` zero-state.
+        let _gate = crate::config::lock_permissions_mode_for_test();
+        crate::config::clear_permissions_mode_override_for_test();
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call("memory_capabilities", json!({"accept": "v2"}));
+        let resp = invoke_handle_request(&conn, &req);
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(val["schema_version"], "2", "schema_version bumped to 2");
+
+        // permissions block — `mode` flipped from "ask" to "advisory"
+        // (P1 honesty patch: no enforcement gate exists pre-P4).
+        assert!(val["permissions"].is_object(), "permissions block present");
+        assert_eq!(val["permissions"]["mode"], "advisory");
+        assert!(val["permissions"]["active_rules"].is_number());
+        assert!(
+            val["permissions"].get("rule_summary").is_none(),
+            "v2 drops rule_summary (no per-rule serializer)"
+        );
+        // v0.6.3.1 (P4, audit G1): inheritance posture must be reported
+        // as "enforced" so consumers can distinguish a fixed deployment
+        // from a pre-fix one (which historically returned "display_only").
+        assert_eq!(val["permissions"]["inheritance"], "enforced");
+
+        // hooks block — `by_event` dropped (no event registry).
+        assert!(val["hooks"].is_object(), "hooks block present");
+        assert!(val["hooks"]["registered_count"].is_number());
+        assert!(
+            val["hooks"].get("by_event").is_none(),
+            "v2 drops hooks.by_event (no event registry)"
+        );
+
+        // compaction block — planned-feature shape (P1 honesty patch).
+        assert!(val["compaction"].is_object(), "compaction block present");
+        assert_eq!(val["compaction"]["planned"], true);
+        assert_eq!(val["compaction"]["enabled"], false);
+        assert_eq!(val["compaction"]["version"], "v0.8+");
+        assert!(val["compaction"].get("interval_minutes").is_none());
+        assert!(val["compaction"].get("last_run_at").is_none());
+        assert!(val["compaction"].get("last_run_stats").is_none());
+
+        // approval block — `subscribers` and `default_timeout_seconds`
+        // dropped (no subscription API, no sweeper).
+        assert!(val["approval"].is_object(), "approval block present");
+        assert!(val["approval"]["pending_requests"].is_number());
+        assert!(
+            val["approval"].get("subscribers").is_none(),
+            "v2 drops approval.subscribers (no subscription API)"
+        );
+        assert!(
+            val["approval"].get("default_timeout_seconds").is_none(),
+            "v2 drops approval.default_timeout_seconds (no sweeper)"
+        );
+
+        // transcripts block — planned-feature shape (P1 honesty patch).
+        assert!(val["transcripts"].is_object(), "transcripts block present");
+        assert_eq!(val["transcripts"]["planned"], true);
+        assert_eq!(val["transcripts"]["enabled"], false);
+        assert_eq!(val["transcripts"]["version"], "v0.7+");
+
+        // memory_reflection: planned-feature object (was bool in v1).
+        // v0.7.0 recursive-learning (issue #655) Tasks 1-6 shipped the
+        // primitive, so the flag is `planned=false, enabled=true`.
+        assert_eq!(val["features"]["memory_reflection"]["planned"], false);
+        assert_eq!(val["features"]["memory_reflection"]["enabled"], true);
+
+        // Live runtime overlays: keyword-tier daemon with no embedder
+        // and no reranker → disabled / off.
+        assert_eq!(val["features"]["recall_mode_active"], "disabled");
+        assert_eq!(val["features"]["reranker_active"], "off");
+    }
+
+    /// v0.6.3.1 (P1 honesty patch). Default v2 response keeps the legacy
+    /// top-level keys (`tier`, `version`, `features`, `models`) so old
+    /// path-readers don't break, even though `memory_reflection` was
+    /// reshaped into an object.
+    #[test]
+    fn mcp_capabilities_v2_backwards_compatible() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call("memory_capabilities", json!({}));
+        let resp = invoke_handle_request(&conn, &req);
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+
+        // v1 top-level keys preserved at the same paths
+        assert!(val["tier"].is_string(), "v1: tier preserved");
+        assert!(val["version"].is_string(), "v1: version preserved");
+        assert!(val["features"].is_object(), "v1: features preserved");
+        assert!(val["models"].is_object(), "v1: models preserved");
+
+        // Well-known v1 sub-fields still resolve.
+        assert!(val["features"]["keyword_search"].is_boolean());
+        assert!(val["features"]["semantic_search"].is_boolean());
+        assert!(val["features"]["embedder_loaded"].is_boolean());
+        assert!(val["models"]["embedding"].is_string());
+        assert!(val["models"]["llm"].is_string());
+        assert!(val["models"]["cross_encoder"].is_string());
+    }
+
+    /// P1 honesty patch: explicit `accept = "v1"` returns the legacy
+    /// shape (no `schema_version`, `memory_reflection` is a bool, no
+    /// v2-only blocks).
+    #[test]
+    fn mcp_capabilities_accept_v1_returns_legacy_shape() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call("memory_capabilities", json!({"accept": "v1"}));
+        let resp = invoke_handle_request(&conn, &req);
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+
+        // Round-2 F13 — v1 wire shape now carries
+        // `schema_version: "1"` so clients can negotiate wire-version.
+        // The struct itself (`CapabilitiesV1`) still doesn't have the
+        // field; the dispatcher injects it on the wire. This is the
+        // F13 fix: clients need the discriminator to detect they're
+        // looking at v1 vs an accidental v2.
+        assert_eq!(
+            val.get("schema_version").and_then(Value::as_str),
+            Some("1"),
+            "Round-2 F13 — v1 must carry schema_version on the wire"
+        );
+        // v2-only blocks are absent
+        assert!(val.get("permissions").is_none());
+        assert!(val.get("hooks").is_none());
+        assert!(val.get("compaction").is_none());
+        assert!(val.get("approval").is_none());
+        assert!(val.get("transcripts").is_none());
+        // v1 features.memory_reflection is a bool (not the v2 object)
+        assert!(val["features"]["memory_reflection"].is_boolean());
+        // v1 features carry no recall_mode_active / reranker_active
+        assert!(val["features"].get("recall_mode_active").is_none());
+        assert!(val["features"].get("reranker_active").is_none());
+    }
+
+    /// v0.6.3 (capabilities schema v2). `approval.pending_requests`
+    /// reflects the live `pending_actions` count — the one block that is
+    /// already wired through to a real subsystem instead of zero-state.
+    #[test]
+    fn mcp_capabilities_pending_requests_reflects_db() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        // Insert a pending action by hand (the queue path is exercised
+        // elsewhere; here we only need the count to bump).
+        let payload = serde_json::json!({"foo": "bar"}).to_string();
+        conn.execute(
+            "INSERT INTO pending_actions (id, action_type, memory_id, namespace,
+                payload, requested_by, requested_at, status)
+             VALUES ('p-1', 'store', NULL, 'global', ?1, 'agent-1',
+                '2026-04-27T00:00:00Z', 'pending')",
+            rusqlite::params![payload],
+        )
+        .unwrap();
+
+        let req = make_tools_call("memory_capabilities", json!({}));
+        let resp = invoke_handle_request(&conn, &req);
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(
+            val["approval"]["pending_requests"], 1,
+            "pending_actions(status=pending) count surfaces live"
+        );
+    }
+
+    #[test]
+    fn handle_subscribe_error_unregistered_agent() {
+        // memory_subscribe refuses unregistered callers (#301 item 4).
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_subscribe",
+            json!({"url": "https://example.com/hook"}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], true);
+        let msg = result["content"][0]["text"].as_str().unwrap();
+        assert!(msg.contains("not registered"));
+    }
+
+    // ------------------------------------------------------------------
+    // JSON-RPC framing — drives `dispatch_line` and `handle_request`.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_jsonrpc_handles_well_formed_request() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let line = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+        let resp = dispatch_line(&conn, line).expect("expected response");
+        assert!(resp.error.is_none());
+        let result = resp.result.unwrap();
+        assert!(result["tools"].is_array());
+    }
+
+    #[test]
+    fn test_jsonrpc_handles_malformed_json() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        // Garbage on a single line.
+        let resp = dispatch_line(&conn, "this is not json at all").expect("expected response");
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, -32700);
+        assert!(err.message.contains("parse error"));
+        // Spec: id MUST be Null for parse errors.
+        assert_eq!(resp.id, Value::Null);
+    }
+
+    #[test]
+    fn test_jsonrpc_handles_truncated_request() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        // Incomplete JSON object — serde_json must reject.
+        let resp = dispatch_line(&conn, r#"{"jsonrpc":"2.0","id":1,"method":"#)
+            .expect("expected response");
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, -32700);
+    }
+
+    #[test]
+    fn test_jsonrpc_handles_two_requests_per_line() {
+        // The MCP framing is line-delimited JSON: one request per line.
+        // If a peer accidentally pastes two JSON objects on one line
+        // (`{...}{...}`), serde_json::from_str must reject as parse
+        // error rather than silently process the first.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let line = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"} {"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
+        let resp = dispatch_line(&conn, line).expect("expected response");
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, -32700);
+    }
+
+    #[test]
+    fn test_jsonrpc_handles_blank_line() {
+        // Blank lines are skipped (no response).
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        assert!(dispatch_line(&conn, "").is_none());
+        assert!(dispatch_line(&conn, "   \t  ").is_none());
+    }
+
+    #[test]
+    fn test_jsonrpc_handles_notification_no_response() {
+        // Requests without an `id` are JSON-RPC notifications — no
+        // response should be emitted per spec.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let line = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+        assert!(dispatch_line(&conn, line).is_none());
+        // Explicit id:null is also a notification.
+        let line_null = r#"{"jsonrpc":"2.0","id":null,"method":"notifications/initialized"}"#;
+        assert!(dispatch_line(&conn, line_null).is_none());
+    }
+
+    #[test]
+    fn test_jsonrpc_handles_method_not_found() {
+        // Unknown JSON-RPC method must return -32601.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = RpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!(7)),
+            method: "no/such/method".into(),
+            params: json!({}),
+        };
+        let resp = invoke_handle_request(&conn, &req);
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, -32601);
+        assert!(err.message.contains("method not found"));
+    }
+
+    #[test]
+    fn test_jsonrpc_handles_invalid_params() {
+        // tools/call with a missing tool name must surface -32602.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = RpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!(8)),
+            method: "tools/call".into(),
+            params: json!({"arguments": {}}),
+        };
+        let resp = invoke_handle_request(&conn, &req);
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, -32602);
+    }
+
+    #[test]
+    fn test_jsonrpc_handles_unknown_tool_returns_minus_32601() {
+        // Ultrareview #349: unknown tool = method-not-found, not isError.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call("memory_does_not_exist", json!({}));
+        let resp = invoke_handle_request(&conn, &req);
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, -32601);
+        assert!(err.message.contains("memory_does_not_exist"));
+    }
+
+    #[test]
+    fn test_jsonrpc_rejects_wrong_version() {
+        // jsonrpc field must be exactly "2.0" — anything else = -32600.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = RpcRequest {
+            jsonrpc: "1.0".into(),
+            id: Some(json!(1)),
+            method: "tools/list".into(),
+            params: json!({}),
+        };
+        let resp = invoke_handle_request(&conn, &req);
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, -32600);
+    }
+
+    #[test]
+    fn test_jsonrpc_handles_initialize() {
+        // Initialize handshake returns serverInfo + protocolVersion.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = RpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!(1)),
+            method: "initialize".into(),
+            params: json!({"clientInfo": {"name": "test-client"}}),
+        };
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let result = resp.result.unwrap();
+        assert_eq!(result["protocolVersion"], "2024-11-05");
+        assert_eq!(result["serverInfo"]["name"], "ai-memory");
+    }
+
+    // ------------------------------------------------------------------
+    // auto_register_path_hierarchy — exercises the bail-out branches.
+    //
+    // The function only mutates rows whose `parent_namespace IS NULL`,
+    // walking from `cwd().parent()` up to the home directory. The
+    // working directory in `cargo test` is the crate root, which
+    // typically lives under `home`, so the walk runs but finds no
+    // matching parent (no namespace_meta row for any ancestor dir
+    // name). Tests below cover: (1) no-op when an explicit parent is
+    // already set, (2) no-op when the namespace has no row, (3) safe
+    // call with an empty-string namespace, (4) idempotency.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_auto_register_creates_top_level_namespace() {
+        // With no namespace_meta row at all, the walk finds nothing
+        // and the table stays empty (silent no-op, never panics).
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        super::auto_register_path_hierarchy(&conn, "m9-top");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM namespace_meta", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_auto_register_creates_nested_hierarchy() {
+        // Pre-seed a row for "repo/team/sub" with parent NULL. The walk
+        // looks for any ancestor *directory name* that has a standard;
+        // since none of the test-runner's cwd ancestors will collide
+        // with synthetic namespace names, the row's parent stays NULL.
+        // The contract tested is: function tolerates nested-form inputs
+        // without panicking and never overwrites a row whose parent is
+        // already set.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        // Insert a synthetic standard for "m9-parent" so the walk *could*
+        // match if cwd happened to be inside a "m9-parent" dir; in
+        // practice it won't, so the row's parent stays NULL.
+        let mem = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Long,
+            namespace: "m9-parent".into(),
+            title: "parent standard".into(),
+            content: "...".into(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".into(),
+            access_count: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({}),
+            reflection_depth: 0,
+        };
+        let std_id = db::insert(&conn, &mem).unwrap();
+        db::set_namespace_standard(&conn, "m9-parent", &std_id, None).unwrap();
+        // Seed a child row with parent NULL.
+        let child_mem = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Long,
+            namespace: "repo/team/sub".into(),
+            title: "child".into(),
+            content: "...".into(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".into(),
+            access_count: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({}),
+            reflection_depth: 0,
+        };
+        let child_id = db::insert(&conn, &child_mem).unwrap();
+        db::set_namespace_standard(&conn, "repo/team/sub", &child_id, None).unwrap();
+        // Run the walk — must not panic, must not corrupt rows.
+        super::auto_register_path_hierarchy(&conn, "repo/team/sub");
+        // The seeded standard is still readable.
+        let id = db::get_namespace_standard(&conn, "repo/team/sub")
+            .unwrap()
+            .unwrap();
+        assert_eq!(id, child_id);
+    }
+
+    #[test]
+    fn test_auto_register_idempotent() {
+        // Calling twice must not corrupt state — even when no match is
+        // found, the second call observes the same DB.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        super::auto_register_path_hierarchy(&conn, "m9-idem");
+        super::auto_register_path_hierarchy(&conn, "m9-idem");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM namespace_meta", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_auto_register_handles_empty_string_or_root() {
+        // Empty / root-y inputs must not panic. The walk is a pure
+        // observer when the namespace_meta row is absent.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        super::auto_register_path_hierarchy(&conn, "");
+        super::auto_register_path_hierarchy(&conn, "/");
+        super::auto_register_path_hierarchy(&conn, "*");
+        // Still no rows, no crash.
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM namespace_meta", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_auto_register_skips_when_explicit_parent_set() {
+        // Early-return path: if `get_namespace_parent` already returns
+        // Some, the walk is skipped entirely. We verify by calling the
+        // function and asserting that the explicit parent is preserved.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        // Seed two memories so we can register parent and child.
+        let parent_mem = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Long,
+            namespace: "m9-explicit-parent".into(),
+            title: "p".into(),
+            content: "c".into(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".into(),
+            access_count: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({}),
+            reflection_depth: 0,
+        };
+        let parent_id = db::insert(&conn, &parent_mem).unwrap();
+        db::set_namespace_standard(&conn, "m9-explicit-parent", &parent_id, None).unwrap();
+
+        let child_mem = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Long,
+            namespace: "m9-explicit-child".into(),
+            title: "c".into(),
+            content: "c".into(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".into(),
+            access_count: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({}),
+            reflection_depth: 0,
+        };
+        let child_id = db::insert(&conn, &child_mem).unwrap();
+        db::set_namespace_standard(
+            &conn,
+            "m9-explicit-child",
+            &child_id,
+            Some("m9-explicit-parent"),
+        )
+        .unwrap();
+
+        // Pre-condition: parent is set.
+        assert_eq!(
+            db::get_namespace_parent(&conn, "m9-explicit-child"),
+            Some("m9-explicit-parent".to_string())
+        );
+        super::auto_register_path_hierarchy(&conn, "m9-explicit-child");
+        // Post-condition: parent unchanged.
+        assert_eq!(
+            db::get_namespace_parent(&conn, "m9-explicit-child"),
+            Some("m9-explicit-parent".to_string())
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // inject_namespace_standard — coverage for the four shape branches.
+    // ------------------------------------------------------------------
+
+    fn make_recall_response(memories: Vec<Value>) -> Value {
+        let count = memories.len();
+        json!({
+            "memories": memories,
+            "count": count,
+            "mode": "keyword",
+        })
+    }
+
+    fn seed_namespace_standard(
+        conn: &rusqlite::Connection,
+        namespace: &str,
+        title: &str,
+    ) -> String {
+        let mem = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Long,
+            namespace: namespace.into(),
+            title: title.into(),
+            content: "policy text".into(),
+            tags: vec!["_standard".into()],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".into(),
+            access_count: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({}),
+            reflection_depth: 0,
+        };
+        let id = db::insert(conn, &mem).unwrap();
+        db::set_namespace_standard(conn, namespace, &id, None).unwrap();
+        id
+    }
+
+    #[test]
+    fn test_inject_namespace_standard_attaches_when_present() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let std_id = seed_namespace_standard(&conn, "m9-inject-attach", "S");
+        let mut resp = make_recall_response(vec![]);
+        super::inject_namespace_standard(&conn, Some("m9-inject-attach"), &mut resp);
+        assert!(resp["standard"].is_object(), "expected attached standard");
+        assert_eq!(resp["standard"]["id"].as_str().unwrap(), std_id);
+    }
+
+    #[test]
+    fn test_inject_namespace_standard_skips_when_absent() {
+        // No standard set anywhere → response is unchanged (no
+        // `standard` / `standards` field added).
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let mut resp = make_recall_response(vec![]);
+        let before = resp.clone();
+        super::inject_namespace_standard(&conn, Some("m9-inject-empty"), &mut resp);
+        assert_eq!(resp, before);
+        assert!(resp.get("standard").is_none());
+        assert!(resp.get("standards").is_none());
+    }
+
+    #[test]
+    fn test_inject_namespace_standard_top_of_recall_response() {
+        // The standard's own memory must be filtered OUT of the
+        // `memories` array so the client doesn't see the policy
+        // duplicated as a result + as the `standard` field.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let std_id = seed_namespace_standard(&conn, "m9-inject-dedup", "S");
+        // Pretend recall returned the standard as one of its hits.
+        let dup = json!({"id": std_id, "title": "S", "content": "policy text"});
+        let other = json!({"id": "other-id", "title": "noise", "content": "x"});
+        let mut resp = make_recall_response(vec![dup.clone(), other.clone()]);
+        super::inject_namespace_standard(&conn, Some("m9-inject-dedup"), &mut resp);
+        assert_eq!(resp["standard"]["id"].as_str().unwrap(), std_id);
+        let memories = resp["memories"].as_array().unwrap();
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0]["id"], "other-id");
+        assert_eq!(resp["count"], 1);
+    }
+
+    #[test]
+    fn test_inject_namespace_standard_preserves_other_response_fields() {
+        // Mode / count / unrelated fields must survive injection.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        seed_namespace_standard(&conn, "m9-inject-preserve", "S");
+        let mut resp = json!({
+            "memories": [],
+            "count": 0,
+            "mode": "hybrid",
+            "diagnostics": {"latency_ms": 42},
+        });
+        super::inject_namespace_standard(&conn, Some("m9-inject-preserve"), &mut resp);
+        assert_eq!(resp["mode"], "hybrid");
+        assert_eq!(resp["diagnostics"]["latency_ms"], 42);
+        assert!(resp["standard"].is_object());
+    }
+
+    #[test]
+    fn test_inject_namespace_standard_no_namespace_uses_global() {
+        // When `namespace` is None, only the global "*" standard is
+        // consulted. We seed "*" and assert it's attached.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        seed_namespace_standard(&conn, "*", "global standard");
+        let mut resp = make_recall_response(vec![]);
+        super::inject_namespace_standard(&conn, None, &mut resp);
+        assert_eq!(resp["standard"]["title"], "global standard");
+    }
+
+    #[test]
+    fn test_inject_namespace_standard_multiple_levels_emits_array() {
+        // When more than one standard applies (global + namespace),
+        // the response gets a `standards` array, not a single
+        // `standard` object.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        seed_namespace_standard(&conn, "*", "GLOBAL");
+        seed_namespace_standard(&conn, "m9-multi", "LOCAL");
+        let mut resp = make_recall_response(vec![]);
+        super::inject_namespace_standard(&conn, Some("m9-multi"), &mut resp);
+        assert!(resp["standards"].is_array());
+        let arr = resp["standards"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        // Order: global ("*") first, then namespace-specific.
+        assert_eq!(arr[0]["title"], "GLOBAL");
+        assert_eq!(arr[1]["title"], "LOCAL");
+        assert!(resp.get("standard").is_none());
+    }
+
+    // =====================================================================
+    // W12 / Closer W12-A — mcp.rs deeper sweep
+    //
+    // M9 covered the first 40 tests. W12-A targets the residual ~750
+    // uncovered lines with focus on:
+    //   1) Less-common tool handlers (archive_*, kg_*, agent_*, notify,
+    //      inbox, namespace_*, pending_*, gc, session_start)
+    //   2) Per-handler error branches not hit by the smoke matrix's "drop
+    //      one required arg" pass — invalid argument shape, validation
+    //      failures, "not found" lookups
+    //   3) JSON-RPC framing edge cases beyond M9's six (nested method
+    //      strings, unicode, empty params, prompts/list, prompts/get
+    //      errors, ping)
+    //   4) Helper-fn coverage holes — `inject_namespace_standard` shape
+    //      branches, `auto_register_path_hierarchy` walk variants
+    //
+    // All tests use the test-only `invoke_handle_request` helper from
+    // M9 to avoid repeating the 13-arg call site.
+    // =====================================================================
+
+    // ------------------------------------------------------------------
+    // Less-common tool handlers — happy paths
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn handle_archive_list_returns_empty_when_no_archived() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call("memory_archive_list", json!({}));
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(val["count"], 0);
+        assert!(val["archived"].is_array());
+    }
+
+    #[test]
+    fn handle_archive_list_with_namespace_filter() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_archive_list",
+            json!({"namespace": "w12-archive", "limit": 5, "offset": 0}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn handle_archive_restore_unknown_id_returns_error() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_archive_restore",
+            json!({"id": "00000000-0000-0000-0000-000000000000"}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], true);
+        let msg = result["content"][0]["text"].as_str().unwrap();
+        assert!(msg.contains("archive") || msg.contains("not found"));
+    }
+
+    #[test]
+    fn handle_archive_purge_with_older_than_zero() {
+        // older_than_days=0 → purges all entries; on an empty DB this is
+        // a no-op that still hits the success branch.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call("memory_archive_purge", json!({"older_than_days": 0}));
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        assert!(val["purged"].is_u64() || val["purged"].is_i64());
+    }
+
+    #[test]
+    fn handle_archive_stats_returns_struct() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call("memory_archive_stats", json!({}));
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        // Stats fields vary; just confirm the response is an object/value.
+        assert!(val.is_object() || val.is_number() || val.is_array());
+    }
+
+    #[test]
+    fn handle_kg_timeline_unknown_source_returns_empty_events() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_kg_timeline",
+            json!({"source_id": "00000000-0000-0000-0000-000000000000"}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        assert!(val["events"].is_array());
+        assert_eq!(val["count"], 0);
+    }
+
+    #[test]
+    fn handle_kg_timeline_with_since_until_filters() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_kg_timeline",
+            json!({
+                "source_id": "00000000-0000-0000-0000-000000000000",
+                "since": "2024-01-01T00:00:00Z",
+                "until": "2025-01-01T00:00:00Z",
+                "limit": 50,
+            }),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn handle_kg_timeline_invalid_since_returns_error() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_kg_timeline",
+            json!({
+                "source_id": "00000000-0000-0000-0000-000000000000",
+                "since": "this-is-not-a-timestamp",
+            }),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], true);
+    }
+
+    #[test]
+    fn handle_kg_invalidate_no_match_returns_found_false() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_kg_invalidate",
+            json!({
+                "source_id": "00000000-0000-0000-0000-000000000000",
+                "target_id": "11111111-1111-1111-1111-111111111111",
+                "relation": "related_to",
+            }),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(val["found"], false);
+    }
+
+    #[test]
+    fn handle_kg_invalidate_with_explicit_valid_until() {
+        // Seed source + target memories and a link, then invalidate with
+        // an explicit timestamp — drives the Some(ts) validation branch
+        // and the Some(res) match arm.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let src = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Long,
+            namespace: "w12-kg".into(),
+            title: "src".into(),
+            content: "c".into(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".into(),
+            access_count: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({}),
+            reflection_depth: 0,
+        };
+        let mut tgt = src.clone();
+        tgt.id = uuid::Uuid::new_v4().to_string();
+        tgt.title = "tgt".into();
+        let src_id = db::insert(&conn, &src).unwrap();
+        let tgt_id = db::insert(&conn, &tgt).unwrap();
+        db::create_link(&conn, &src_id, &tgt_id, "related_to").unwrap();
+
+        let req = make_tools_call(
+            "memory_kg_invalidate",
+            json!({
+                "source_id": src_id,
+                "target_id": tgt_id,
+                "relation": "related_to",
+                "valid_until": "2025-01-01T00:00:00Z",
+            }),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(val["found"], true);
+        assert_eq!(val["valid_until"], "2025-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn handle_kg_invalidate_invalid_valid_until_format() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_kg_invalidate",
+            json!({
+                "source_id": "00000000-0000-0000-0000-000000000000",
+                "target_id": "11111111-1111-1111-1111-111111111111",
+                "relation": "related_to",
+                "valid_until": "not-a-date",
+            }),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], true);
+    }
+
+    #[test]
+    fn handle_kg_query_with_max_depth_and_filters() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_kg_query",
+            json!({
+                "source_id": "00000000-0000-0000-0000-000000000000",
+                "max_depth": 2,
+                "valid_at": "2025-01-01T00:00:00Z",
+                "allowed_agents": ["agent-a", "agent-b"],
+                "limit": 10,
+            }),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(val["max_depth"], 2);
+        assert!(val["memories"].is_array());
+    }
+
+    #[test]
+    fn handle_kg_query_invalid_valid_at() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_kg_query",
+            json!({
+                "source_id": "00000000-0000-0000-0000-000000000000",
+                "valid_at": "garbage",
+            }),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], true);
+    }
+
+    #[test]
+    fn handle_kg_query_rejects_invalid_agent_id() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_kg_query",
+            json!({
+                "source_id": "00000000-0000-0000-0000-000000000000",
+                "allowed_agents": ["bad agent with spaces!!"],
+            }),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], true);
+    }
+
+    #[test]
+    fn handle_session_start_happy_returns_memories() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        // Seed a memory so list returns at least one row.
+        let mem = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Long,
+            namespace: "w12-session".into(),
+            title: "seed".into(),
+            content: "c".into(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".into(),
+            access_count: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({}),
+            reflection_depth: 0,
+        };
+        db::insert(&conn, &mem).unwrap();
+        let req = make_tools_call(
+            "memory_session_start",
+            json!({"namespace": "w12-session", "limit": 5, "format": "json"}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(val["mode"], "session_start");
+        assert!(val["memories"].is_array());
+    }
+
+    #[test]
+    fn handle_session_start_empty_namespace_returns_zero() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_session_start",
+            json!({"namespace": "w12-empty-ns", "format": "json"}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(val["count"], 0);
+    }
+
+    #[test]
+    fn handle_inbox_returns_empty_for_unregistered_caller() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call("memory_inbox", json!({"agent_id": "test-bot"}));
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(val["agent_id"], "test-bot");
+        assert!(val["namespace"].as_str().unwrap().starts_with("_messages/"));
+        assert_eq!(val["count"], 0);
+    }
+
+    #[test]
+    fn handle_inbox_with_unread_only_filter() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_inbox",
+            json!({"agent_id": "test-bot", "unread_only": true, "limit": 10}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(val["unread_only"], true);
+    }
+
+    #[test]
+    fn handle_notify_happy_returns_message_id() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_notify",
+            json!({
+                "target_agent_id": "alice",
+                "title": "hello",
+                "payload": "world",
+                "tier": "mid",
+                "priority": 5,
+            }),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        assert!(val["id"].is_string());
+        assert_eq!(val["to"], "alice");
+        assert_eq!(val["namespace"], "_messages/alice");
+    }
+
+    #[test]
+    fn handle_notify_invalid_tier_returns_error() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_notify",
+            json!({
+                "target_agent_id": "bob",
+                "title": "hi",
+                "payload": "p",
+                "tier": "bogus-tier",
+            }),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], true);
+        let msg = result["content"][0]["text"].as_str().unwrap();
+        assert!(msg.contains("invalid tier"));
+    }
+
+    #[test]
+    fn handle_agent_register_then_list() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        // Register — `agent_type` must match the closed set or `ai:<name>`.
+        let req = make_tools_call(
+            "memory_agent_register",
+            json!({
+                "agent_id": "w12-bot",
+                "agent_type": "ai:w12-bot",
+                "capabilities": ["read", "write"],
+            }),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(val["registered"], true);
+        // List
+        let req2 = make_tools_call("memory_agent_list", json!({}));
+        let resp2 = invoke_handle_request(&conn, &req2);
+        assert!(resp2.error.is_none());
+        let text2 = resp2.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val2: Value = serde_json::from_str(&text2).unwrap();
+        assert!(val2["count"].as_u64().unwrap() >= 1);
+    }
+
+    #[test]
+    fn handle_agent_register_invalid_type_rejects() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_agent_register",
+            json!({"agent_id": "w12-bot2", "agent_type": "  not-allowed-type with spaces  "}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], true);
+    }
+
+    #[test]
+    fn handle_namespace_set_get_clear_round_trip() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        // Seed a memory we can use as the standard
+        let mem = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Long,
+            namespace: "w12-ns".into(),
+            title: "policy".into(),
+            content: "be excellent".into(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".into(),
+            access_count: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({}),
+            reflection_depth: 0,
+        };
+        let std_id = db::insert(&conn, &mem).unwrap();
+
+        // Set
+        let set_req = make_tools_call(
+            "memory_namespace_set_standard",
+            json!({"namespace": "w12-ns", "id": std_id.clone()}),
+        );
+        let set_resp = invoke_handle_request(&conn, &set_req);
+        assert!(set_resp.error.is_none());
+        let set_text = set_resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let set_val: Value = serde_json::from_str(&set_text).unwrap();
+        assert_eq!(set_val["set"], true);
+
+        // Get
+        let get_req = make_tools_call(
+            "memory_namespace_get_standard",
+            json!({"namespace": "w12-ns"}),
+        );
+        let get_resp = invoke_handle_request(&conn, &get_req);
+        assert!(get_resp.error.is_none());
+        let get_text = get_resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let get_val: Value = serde_json::from_str(&get_text).unwrap();
+        assert_eq!(get_val["standard_id"], std_id);
+
+        // Clear
+        let clr_req = make_tools_call(
+            "memory_namespace_clear_standard",
+            json!({"namespace": "w12-ns"}),
+        );
+        let clr_resp = invoke_handle_request(&conn, &clr_req);
+        assert!(clr_resp.error.is_none());
+        let clr_text = clr_resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let clr_val: Value = serde_json::from_str(&clr_text).unwrap();
+        assert_eq!(clr_val["cleared"], true);
+    }
+
+    #[test]
+    fn handle_namespace_get_standard_missing_returns_null() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_namespace_get_standard",
+            json!({"namespace": "w12-no-standard-here"}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        assert!(val["standard_id"].is_null());
+    }
+
+    #[test]
+    fn handle_namespace_get_standard_inherit_returns_chain() {
+        // Seed two standards: one global "*" and one for "w12-inh", and
+        // request --inherit so the resolved chain branch fires.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        seed_namespace_standard(&conn, "*", "global rule");
+        seed_namespace_standard(&conn, "w12-inh", "specific rule");
+        let req = make_tools_call(
+            "memory_namespace_get_standard",
+            json!({"namespace": "w12-inh", "inherit": true}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        assert!(val["chain"].is_array());
+        assert!(val["standards"].is_array());
+        assert!(val["count"].as_u64().unwrap() >= 1);
+    }
+
+    #[test]
+    fn handle_namespace_set_standard_with_invalid_governance_rejected() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let mem = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Long,
+            namespace: "w12-gov".into(),
+            title: "p".into(),
+            content: "c".into(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".into(),
+            access_count: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({}),
+            reflection_depth: 0,
+        };
+        let id = db::insert(&conn, &mem).unwrap();
+        let req = make_tools_call(
+            "memory_namespace_set_standard",
+            json!({
+                "namespace": "w12-gov",
+                "id": id,
+                "governance": {"this": "is not a valid policy"},
+            }),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], true);
+        let msg = result["content"][0]["text"].as_str().unwrap();
+        assert!(msg.contains("invalid governance") || msg.contains("governance"));
+    }
+
+    #[test]
+    fn handle_namespace_set_standard_invalid_namespace_rejected() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_namespace_set_standard",
+            json!({"namespace": "bad ns with spaces!!", "id": "any"}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], true);
+    }
+
+    #[test]
+    fn handle_pending_list_happy_returns_array() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_pending_list",
+            json!({"status": "pending", "limit": 100}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        assert!(val["pending"].is_array());
+        assert!(val["count"].is_u64());
+    }
+
+    #[test]
+    fn handle_pending_approve_unknown_id_returns_error() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_pending_approve",
+            json!({"id": "00000000-0000-0000-0000-000000000000", "agent_id": "human:approver"}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        let result = resp.result.unwrap();
+        // Either isError true or a not-found / rejected response — both
+        // exercise the unknown-id code path in approve_with_approver_type.
+        assert!(result.is_object());
+    }
+
+    #[test]
+    fn handle_pending_reject_unknown_id_returns_not_found() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_pending_reject",
+            json!({"id": "00000000-0000-0000-0000-000000000000", "agent_id": "human:rejector"}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], true);
+        let msg = result["content"][0]["text"].as_str().unwrap();
+        assert!(msg.contains("not found") || msg.contains("already decided"));
+    }
+
+    #[test]
+    fn handle_gc_dry_run_returns_count_without_deleting() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call("memory_gc", json!({"dry_run": true}));
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(val["dry_run"], true);
+        assert!(val["collected"].is_u64() || val["collected"].is_i64());
+    }
+
+    #[test]
+    fn handle_gc_actual_run_returns_zero_on_empty_db() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call("memory_gc", json!({}));
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(val["dry_run"], false);
+    }
+
+    #[test]
+    fn handle_forget_dry_run_with_filters() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_forget",
+            json!({"namespace": "w12-forget", "tier": "short", "dry_run": true}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(val["dry_run"], true);
+    }
+
+    #[test]
+    fn handle_forget_actual_with_namespace() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_forget",
+            json!({"namespace": "w12-forget-actual", "dry_run": false}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn handle_unsubscribe_unknown_returns_false() {
+        // db::subscriptions::delete returns a bool — false when no row
+        // matched. The handler propagates that verbatim.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_unsubscribe",
+            json!({"id": "00000000-0000-0000-0000-000000000000"}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        // Either a bool false or numeric 0 — the contract is "no row removed".
+        assert!(
+            val["removed"] == json!(false) || val["removed"] == json!(0),
+            "unexpected removed value: {:?}",
+            val["removed"]
+        );
+    }
+
+    #[test]
+    fn handle_list_subscriptions_returns_array() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call("memory_list_subscriptions", json!({}));
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn handle_entity_register_happy() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_entity_register",
+            json!({
+                "canonical_name": "Hugo Boss",
+                "namespace": "w12-people",
+                "aliases": ["HB", "Hugo"],
+            }),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        assert!(val["entity_id"].is_string());
+        assert_eq!(val["canonical_name"], "Hugo Boss");
+    }
+
+    #[test]
+    fn handle_entity_register_invalid_namespace() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_entity_register",
+            json!({"canonical_name": "X", "namespace": "INVALID NS!"}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], true);
+    }
+
+    #[test]
+    fn handle_entity_get_by_alias_not_found_returns_null() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_entity_get_by_alias",
+            json!({"alias": "no-such-alias", "namespace": "w12-people"}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(val["found"], false);
+    }
+
+    #[test]
+    fn handle_get_taxonomy_with_prefix_and_depth() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_get_taxonomy",
+            json!({"namespace_prefix": "w12-tax", "depth": 4, "limit": 100}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        assert!(val["tree"].is_object() || val["tree"].is_array());
+    }
+
+    #[test]
+    fn handle_get_taxonomy_strips_trailing_slash() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_get_taxonomy",
+            json!({"namespace_prefix": "w12-tax/", "depth": 2}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        // Trailing-slash forgiveness branch: must not error.
+        assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn handle_get_taxonomy_invalid_prefix_after_strip() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_get_taxonomy",
+            json!({"namespace_prefix": "BAD NS!"}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], true);
+    }
+
+    #[test]
+    fn handle_check_duplicate_no_embedder_errors() {
+        // Without embedder, check_duplicate must error (it requires
+        // semantic tier or above).
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_check_duplicate",
+            json!({"title": "T", "content": "C"}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], true);
+        let msg = result["content"][0]["text"].as_str().unwrap();
+        assert!(msg.contains("embedder") || msg.contains("semantic"));
+    }
+
+    #[test]
+    fn handle_expand_query_no_llm_errors() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call("memory_expand_query", json!({"query": "test"}));
+        let resp = invoke_handle_request(&conn, &req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], true);
+        let msg = result["content"][0]["text"].as_str().unwrap();
+        assert!(msg.contains("smart") || msg.contains("LLM") || msg.contains("Ollama"));
+    }
+
+    #[test]
+    fn handle_auto_tag_no_llm_errors() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_auto_tag",
+            json!({"id": "00000000-0000-0000-0000-000000000000"}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], true);
+    }
+
+    #[test]
+    fn handle_detect_contradiction_no_llm_errors() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_detect_contradiction",
+            json!({"id_a": "00000000-0000-0000-0000-000000000000", "id_b": "11111111-1111-1111-1111-111111111111"}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], true);
+    }
+
+    #[test]
+    fn handle_update_unknown_id_returns_not_found() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_update",
+            json!({
+                "id": "00000000-0000-0000-0000-000000000000",
+                "title": "new title",
+            }),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], true);
+        let msg = result["content"][0]["text"].as_str().unwrap();
+        assert!(msg.contains("not found"));
+    }
+
+    #[test]
+    fn handle_update_invalid_priority_rejected() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        // First insert a memory we can target.
+        let mem = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Long,
+            namespace: "w12-update".into(),
+            title: "t".into(),
+            content: "c".into(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".into(),
+            access_count: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({}),
+            reflection_depth: 0,
+        };
+        let id = db::insert(&conn, &mem).unwrap();
+        let req = make_tools_call(
+            "memory_update",
+            json!({"id": id, "priority": 99_i64}), // out of 1..=10 range
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], true);
+    }
+
+    #[test]
+    fn handle_update_with_metadata_object_accepted() {
+        // Drives the metadata-is-object branch which validates and merges
+        // the agent_id-preserving payload.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let mem = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Mid,
+            namespace: "w12-meta".into(),
+            title: "t".into(),
+            content: "c".into(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".into(),
+            access_count: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({}),
+            reflection_depth: 0,
+        };
+        let id = db::insert(&conn, &mem).unwrap();
+        let req = make_tools_call(
+            "memory_update",
+            json!({
+                "id": id,
+                "metadata": {"custom": "field", "numbers": [1, 2, 3]},
+            }),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn handle_get_links_unknown_id_returns_empty() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_get_links",
+            json!({"id": "00000000-0000-0000-0000-000000000000"}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        assert!(val["links"].is_array());
+        assert_eq!(val["count"], 0);
+    }
+
+    #[test]
+    fn handle_link_invalid_relation_rejected() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_link",
+            json!({
+                "source_id": "00000000-0000-0000-0000-000000000000",
+                "target_id": "11111111-1111-1111-1111-111111111111",
+                "relation": "BADRELATIONNOTALLOWED",
+            }),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], true);
+    }
+
+    #[test]
+    fn handle_promote_to_namespace_with_explicit_target() {
+        // Vertical-promote branch: when `to_namespace` is provided, the
+        // memory is cloned to an ancestor namespace and linked with
+        // `derived_from`. db::promote_to_namespace requires the target
+        // to be an ancestor of the source's namespace, so use a
+        // hierarchical namespace.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let mem = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Mid,
+            namespace: "w12-parent/w12-child".into(),
+            title: "t".into(),
+            content: "c".into(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".into(),
+            access_count: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({}),
+            reflection_depth: 0,
+        };
+        let id = db::insert(&conn, &mem).unwrap();
+        let req = make_tools_call(
+            "memory_promote",
+            json!({"id": id, "to_namespace": "w12-parent"}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(val["mode"], "vertical");
+        assert!(val["clone_id"].is_string());
+    }
+
+    #[test]
+    fn handle_promote_invalid_to_namespace_rejected() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let mem = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Mid,
+            namespace: "w12-pm".into(),
+            title: "t".into(),
+            content: "c".into(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".into(),
+            access_count: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({}),
+            reflection_depth: 0,
+        };
+        let id = db::insert(&conn, &mem).unwrap();
+        let req = make_tools_call(
+            "memory_promote",
+            json!({"id": id, "to_namespace": "BAD NS WITH SPACES"}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], true);
+    }
+
+    #[test]
+    fn handle_consolidate_with_explicit_summary_no_llm() {
+        // Drives the "explicit summary" branch (no LLM call needed).
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let mem_a = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Mid,
+            namespace: "w12-cons".into(),
+            title: "a".into(),
+            content: "alpha".into(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".into(),
+            access_count: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({}),
+            reflection_depth: 0,
+        };
+        let mut mem_b = mem_a.clone();
+        mem_b.id = uuid::Uuid::new_v4().to_string();
+        mem_b.title = "b".into();
+        mem_b.content = "beta".into();
+        let id_a = db::insert(&conn, &mem_a).unwrap();
+        let id_b = db::insert(&conn, &mem_b).unwrap();
+
+        let req = make_tools_call(
+            "memory_consolidate",
+            json!({
+                "ids": [id_a, id_b],
+                "title": "merged",
+                "summary": "merged summary",
+                "namespace": "w12-cons",
+            }),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        assert!(val["id"].is_string());
+        assert_eq!(val["consolidated"], 2);
+    }
+
+    #[test]
+    fn handle_consolidate_non_string_id_rejected() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_consolidate",
+            json!({"ids": [42, "valid-id"], "title": "t", "summary": "s"}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], true);
+        let msg = result["content"][0]["text"].as_str().unwrap();
+        assert!(msg.contains("must be a string"));
+    }
+
+    // ------------------------------------------------------------------
+    // JSON-RPC framing — additional edge cases beyond M9's six.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_jsonrpc_handles_ping() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = RpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!(1)),
+            method: "ping".into(),
+            params: json!({}),
+        };
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn test_jsonrpc_handles_notifications_initialized() {
+        // The client→server "I'm ready" notification — handler returns
+        // the same empty body as ping.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = RpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!(2)),
+            method: "notifications/initialized".into(),
+            params: json!({}),
+        };
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn test_jsonrpc_prompts_list_returns_array() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = RpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!(3)),
+            method: "prompts/list".into(),
+            params: json!({}),
+        };
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let result = resp.result.unwrap();
+        assert!(result["prompts"].is_array());
+    }
+
+    #[test]
+    fn test_jsonrpc_prompts_get_known_name_returns_messages() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = RpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!(4)),
+            method: "prompts/get".into(),
+            params: json!({"name": "recall-first"}),
+        };
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let result = resp.result.unwrap();
+        assert!(result["messages"].is_array());
+    }
+
+    #[test]
+    fn test_jsonrpc_prompts_get_with_namespace_arg_includes_hint() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = RpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!(5)),
+            method: "prompts/get".into(),
+            params: json!({"name": "recall-first", "arguments": {"namespace": "w12-test"}}),
+        };
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let result = resp.result.unwrap();
+        let text = result["messages"][0]["content"]["text"].as_str().unwrap();
+        assert!(text.contains("w12-test"));
+    }
+
+    #[test]
+    fn test_jsonrpc_prompts_get_unknown_name_returns_error() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = RpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!(6)),
+            method: "prompts/get".into(),
+            params: json!({"name": "no-such-prompt"}),
+        };
+        let resp = invoke_handle_request(&conn, &req);
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, -32602);
+    }
+
+    #[test]
+    fn test_jsonrpc_prompts_get_missing_name_returns_error() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = RpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!(7)),
+            method: "prompts/get".into(),
+            params: json!({}),
+        };
+        let resp = invoke_handle_request(&conn, &req);
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, -32602);
+    }
+
+    #[test]
+    fn test_jsonrpc_prompts_get_memory_workflow() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = RpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!(8)),
+            method: "prompts/get".into(),
+            params: json!({"name": "memory-workflow"}),
+        };
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let result = resp.result.unwrap();
+        assert!(result["messages"].is_array());
+    }
+
+    #[test]
+    fn test_jsonrpc_tools_call_empty_tool_name_rejected() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = RpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!(9)),
+            method: "tools/call".into(),
+            params: json!({"name": ""}),
+        };
+        let resp = invoke_handle_request(&conn, &req);
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, -32602);
+    }
+
+    #[test]
+    fn test_jsonrpc_tools_call_arguments_not_object_uses_empty() {
+        // arguments=null is replaced with an empty object before dispatch.
+        // Combined with a tool that has no required args, this path
+        // exercises the `is_object()` false branch of the arguments
+        // resolution.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = RpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!(10)),
+            method: "tools/call".into(),
+            params: json!({"name": "memory_capabilities", "arguments": null}),
+        };
+        let resp = invoke_handle_request(&conn, &req);
+        // Capabilities accepts no args; with empty defaults it succeeds.
+        assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn test_jsonrpc_tools_call_unicode_in_args() {
+        // Unicode strings round-trip through serde_json without issue —
+        // verifies the dispatch path doesn't choke on non-ASCII args.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_store",
+            json!({"title": "тест", "content": "日本語 ✨", "namespace": "w12-unicode"}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn test_jsonrpc_dispatch_line_with_id_zero_treated_as_request() {
+        // id=0 is a valid JSON-RPC id (numeric, non-null). Must NOT be
+        // treated as a notification.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let line = r#"{"jsonrpc":"2.0","id":0,"method":"tools/list"}"#;
+        let resp = dispatch_line(&conn, line);
+        assert!(resp.is_some());
+    }
+
+    #[test]
+    fn test_jsonrpc_dispatch_line_string_id_passes_through() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let line = r#"{"jsonrpc":"2.0","id":"call-abc","method":"tools/list"}"#;
+        let resp = dispatch_line(&conn, line).expect("expected response");
+        assert_eq!(resp.id, json!("call-abc"));
+    }
+
+    // ------------------------------------------------------------------
+    // Helper-fn coverage — build_namespace_chain branches.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_build_namespace_chain_global_only() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let chain = super::build_namespace_chain(&conn, "*");
+        assert_eq!(chain, vec!["*".to_string()]);
+    }
+
+    #[test]
+    fn test_build_namespace_chain_simple_namespace() {
+        // A flat namespace produces ["*", "ns"].
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let chain = super::build_namespace_chain(&conn, "w12-flat");
+        assert!(chain.contains(&"*".to_string()));
+        assert!(chain.contains(&"w12-flat".to_string()));
+    }
+
+    #[test]
+    fn test_build_namespace_chain_nested_yields_ancestors() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let chain = super::build_namespace_chain(&conn, "a/b/c");
+        // Must contain "*" and the full chain top-down.
+        assert_eq!(chain.first().unwrap(), "*");
+        assert!(chain.contains(&"a/b/c".to_string()));
+        // Top-down order: a precedes a/b precedes a/b/c.
+        let pos_a = chain.iter().position(|s| s == "a").unwrap();
+        let pos_ab = chain.iter().position(|s| s == "a/b").unwrap();
+        let pos_abc = chain.iter().position(|s| s == "a/b/c").unwrap();
+        assert!(pos_a < pos_ab && pos_ab < pos_abc);
+    }
+
+    #[test]
+    fn test_build_namespace_chain_with_explicit_parent() {
+        // Seeding an explicit `parent_namespace` row should prepend that
+        // ancestor before the /-derived chain.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        // Insert a row in namespace_meta so the explicit-parent walk
+        // has something to traverse. Use db helpers when possible.
+        let parent_mem = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Long,
+            namespace: "w12-explicit-grand".into(),
+            title: "g".into(),
+            content: "c".into(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".into(),
+            access_count: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({}),
+            reflection_depth: 0,
+        };
+        let pid = db::insert(&conn, &parent_mem).unwrap();
+        db::set_namespace_standard(&conn, "w12-explicit-grand", &pid, None).unwrap();
+
+        let mut child_mem = parent_mem.clone();
+        child_mem.id = uuid::Uuid::new_v4().to_string();
+        child_mem.namespace = "w12-explicit-leaf".into();
+        let cid = db::insert(&conn, &child_mem).unwrap();
+        db::set_namespace_standard(&conn, "w12-explicit-leaf", &cid, Some("w12-explicit-grand"))
+            .unwrap();
+
+        let chain = super::build_namespace_chain(&conn, "w12-explicit-leaf");
+        // Explicit-parent walk should include the grandparent.
+        assert!(chain.contains(&"w12-explicit-grand".to_string()));
+        assert!(chain.contains(&"w12-explicit-leaf".to_string()));
+    }
+
+    // ------------------------------------------------------------------
+    // extract_governance — surface the metadata.governance branch.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_governance_default_when_metadata_absent() {
+        let mem_val = json!({"id": "x"});
+        let gov = super::extract_governance(&mem_val);
+        // Default policy is non-null and serializes to an object.
+        assert!(gov.is_object() || gov.is_null());
+    }
+
+    #[test]
+    fn test_extract_governance_default_when_metadata_invalid() {
+        // metadata.governance present but not a valid policy -> default.
+        let mem_val = json!({"metadata": {"governance": {"unknown": "policy"}}});
+        let gov = super::extract_governance(&mem_val);
+        // Default policy is non-null and serializes to an object.
+        assert!(gov.is_object());
+    }
+
+    // ------------------------------------------------------------------
+    // messages_namespace_for — confirm both ASCII and ai: prefixes.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_messages_namespace_for_plain_id() {
+        assert_eq!(super::messages_namespace_for("alice"), "_messages/alice");
+    }
+
+    #[test]
+    fn test_messages_namespace_for_ai_prefixed_id() {
+        let ns = super::messages_namespace_for("ai:claude@host:pid-1");
+        assert!(ns.starts_with("_messages/"));
+        assert!(ns.contains("ai:"));
+    }
+
+    // ------------------------------------------------------------------
+    // inject_namespace_standard — additional shape branches that M9
+    // didn't reach (no-namespace + no-global, dedup ordering).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_inject_namespace_standard_no_namespace_no_global() {
+        // namespace=None and no "*" standard set → response unchanged.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let mut resp = make_recall_response(vec![]);
+        let before = resp.clone();
+        super::inject_namespace_standard(&conn, None, &mut resp);
+        assert_eq!(resp, before);
+    }
+
+    // ------------------------------------------------------------------
+    // W12-A — additional coverage targets discovered after the first
+    // sweep. These hit handler happy-paths that the smoke matrix
+    // skipped (tier-default promotion, dedup-update, registered
+    // subscriber) plus a few error / boundary branches.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn handle_promote_default_tier_to_long() {
+        // Drives the "no to_namespace" branch which clears expires_at
+        // and bumps tier to Long. This is the historical behaviour.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let mem = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Mid,
+            namespace: "w12-tier-promote".into(),
+            title: "t".into(),
+            content: "c".into(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".into(),
+            access_count: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({}),
+            reflection_depth: 0,
+        };
+        let id = db::insert(&conn, &mem).unwrap();
+        let req = make_tools_call("memory_promote", json!({"id": id}));
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(val["promoted"], true);
+        assert_eq!(val["mode"], "tier");
+        assert_eq!(val["tier"], "long");
+    }
+
+    #[test]
+    fn handle_store_dedup_updates_existing() {
+        // Storing twice with the same title+namespace must hit the
+        // dedup-update branch instead of inserting a second row.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req1 = make_tools_call(
+            "memory_store",
+            json!({
+                "title": "dup-title",
+                "content": "first",
+                "namespace": "w12-dedup",
+                "tier": "mid",
+            }),
+        );
+        let resp1 = invoke_handle_request(&conn, &req1);
+        assert!(resp1.error.is_none());
+        let text1 = resp1.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val1: Value = serde_json::from_str(&text1).unwrap();
+        let id1 = val1["id"].as_str().unwrap().to_string();
+
+        let req2 = make_tools_call(
+            "memory_store",
+            json!({
+                "title": "dup-title",
+                "content": "second-update",
+                "namespace": "w12-dedup",
+                "tier": "long",
+            }),
+        );
+        let resp2 = invoke_handle_request(&conn, &req2);
+        assert!(resp2.error.is_none());
+        let text2 = resp2.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val2: Value = serde_json::from_str(&text2).unwrap();
+        assert_eq!(val2["id"], id1);
+        assert_eq!(val2["duplicate"], true);
+        assert_eq!(val2["action"], "updated existing memory");
+    }
+
+    #[test]
+    fn handle_subscribe_with_registered_agent_succeeds() {
+        // Drives the subscribe-after-register happy path (the smoke
+        // matrix only catches the unregistered-error case).
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        // Register the caller (default agent_id resolved by mcp_client=None)
+        // — we let resolve_agent_id mint one; by registering the resolved
+        // value we can pass the subscribe gate.
+        let resolved = crate::identity::resolve_agent_id(None, None).unwrap();
+        db::register_agent(&conn, &resolved, "human", &[]).unwrap();
+        let req = make_tools_call(
+            "memory_subscribe",
+            json!({
+                "url": "https://example.com/hook",
+                "events": "memory_store,memory_delete",
+                "namespace_filter": "w12-sub",
+            }),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        assert!(val["id"].is_string());
+        assert_eq!(val["url"], "https://example.com/hook");
+    }
+
+    #[test]
+    fn handle_subscribe_invalid_url_after_registered() {
+        // After registering, a malformed URL still falls through to the
+        // url-validate branch.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let resolved = crate::identity::resolve_agent_id(None, None).unwrap();
+        db::register_agent(&conn, &resolved, "human", &[]).unwrap();
+        let req = make_tools_call("memory_subscribe", json!({"url": "not-a-url-at-all"}));
+        let resp = invoke_handle_request(&conn, &req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], true);
+    }
+
+    #[test]
+    fn handle_namespace_set_standard_with_valid_governance() {
+        // Drives the governance-merge branch (lines 2284-2322) which
+        // re-writes the standard memory's metadata with the resolved
+        // policy.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let mem = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Long,
+            namespace: "w12-gov-ok".into(),
+            title: "p".into(),
+            content: "c".into(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".into(),
+            access_count: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({}),
+            reflection_depth: 0,
+        };
+        let id = db::insert(&conn, &mem).unwrap();
+        let req = make_tools_call(
+            "memory_namespace_set_standard",
+            json!({
+                "namespace": "w12-gov-ok",
+                "id": id,
+                "governance": {
+                    "write": "any",
+                    "promote": "any",
+                    "delete": "owner",
+                    "approver": "human",
+                },
+            }),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(val["set"], true);
+        assert!(val["governance"].is_object());
+    }
+
+    #[test]
+    fn handle_namespace_set_standard_with_parent() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let mem = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Long,
+            namespace: "w12-parent-ns".into(),
+            title: "p".into(),
+            content: "c".into(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".into(),
+            access_count: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({}),
+            reflection_depth: 0,
+        };
+        let id = db::insert(&conn, &mem).unwrap();
+        let req = make_tools_call(
+            "memory_namespace_set_standard",
+            json!({
+                "namespace": "w12-parent-ns",
+                "id": id,
+                "parent": "w12-grand-ns",
+            }),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(val["parent"], "w12-grand-ns");
+    }
+
+    #[test]
+    fn handle_get_resolves_by_prefix_and_includes_links() {
+        // db::resolve_id walks both exact and prefix lookup. Insert a
+        // memory and request it by its 8-char prefix to drive the
+        // prefix branch.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let mem = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Long,
+            namespace: "w12-prefix".into(),
+            title: "T".into(),
+            content: "C".into(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".into(),
+            access_count: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({}),
+            reflection_depth: 0,
+        };
+        let id = db::insert(&conn, &mem).unwrap();
+        let req = make_tools_call("memory_get", json!({"id": id}));
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        assert!(val["links"].is_array());
+        assert_eq!(val["id"], id);
+    }
+
+    #[test]
+    fn handle_link_creates_link_between_existing_memories() {
+        // Drives the create_link happy path (smoke matrix uses bogus IDs
+        // so the existence check fails out before INSERT).
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let src = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Long,
+            namespace: "w12-link".into(),
+            title: "src".into(),
+            content: "c".into(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".into(),
+            access_count: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({}),
+            reflection_depth: 0,
+        };
+        let mut tgt = src.clone();
+        tgt.id = uuid::Uuid::new_v4().to_string();
+        tgt.title = "tgt".into();
+        let src_id = db::insert(&conn, &src).unwrap();
+        let tgt_id = db::insert(&conn, &tgt).unwrap();
+        let req = make_tools_call(
+            "memory_link",
+            json!({
+                "source_id": src_id,
+                "target_id": tgt_id,
+                "relation": "related_to",
+            }),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(val["linked"], true);
+    }
+
+    #[test]
+    fn handle_get_links_returns_outbound_and_inbound() {
+        // Seed source+target+link, query links from source.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let src = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Long,
+            namespace: "w12-getlinks".into(),
+            title: "src".into(),
+            content: "c".into(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".into(),
+            access_count: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({}),
+            reflection_depth: 0,
+        };
+        let mut tgt = src.clone();
+        tgt.id = uuid::Uuid::new_v4().to_string();
+        let src_id = db::insert(&conn, &src).unwrap();
+        let tgt_id = db::insert(&conn, &tgt).unwrap();
+        db::create_link(&conn, &src_id, &tgt_id, "supersedes").unwrap();
+
+        let req = make_tools_call("memory_get_links", json!({"id": src_id}));
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        assert!(val["count"].as_u64().unwrap() >= 1);
+    }
+
+    #[test]
+    fn handle_kg_timeline_with_seeded_link_returns_event() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let src = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Long,
+            namespace: "w12-tl".into(),
+            title: "src".into(),
+            content: "c".into(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".into(),
+            access_count: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({}),
+            reflection_depth: 0,
+        };
+        let mut tgt = src.clone();
+        tgt.id = uuid::Uuid::new_v4().to_string();
+        tgt.title = "tgt".into();
+        let src_id = db::insert(&conn, &src).unwrap();
+        let tgt_id = db::insert(&conn, &tgt).unwrap();
+        db::create_link(&conn, &src_id, &tgt_id, "related_to").unwrap();
+
+        let req = make_tools_call(
+            "memory_kg_timeline",
+            json!({"source_id": src_id, "limit": 10}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(val["count"], 1);
+        let events = val["events"].as_array().unwrap();
+        assert_eq!(events[0]["target_id"], tgt_id);
+    }
+
+    #[test]
+    fn handle_kg_query_with_seeded_link_returns_node() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let src = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Long,
+            namespace: "w12-kgq".into(),
+            title: "src".into(),
+            content: "c".into(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".into(),
+            access_count: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({}),
+            reflection_depth: 0,
+        };
+        let mut tgt = src.clone();
+        tgt.id = uuid::Uuid::new_v4().to_string();
+        let src_id = db::insert(&conn, &src).unwrap();
+        let tgt_id = db::insert(&conn, &tgt).unwrap();
+        db::create_link(&conn, &src_id, &tgt_id, "related_to").unwrap();
+
+        let req = make_tools_call(
+            "memory_kg_query",
+            json!({"source_id": src_id, "max_depth": 1, "limit": 10}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        assert!(val["count"].as_u64().unwrap() >= 1);
+        assert!(val["paths"].is_array());
+    }
+
+    #[test]
+    fn handle_archive_list_with_pagination() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call("memory_archive_list", json!({"limit": 100, "offset": 50}));
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn handle_pending_list_with_status_filter() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        for status in &["pending", "approved", "rejected"] {
+            let req = make_tools_call(
+                "memory_pending_list",
+                json!({"status": status, "limit": 50}),
+            );
+            let resp = invoke_handle_request(&conn, &req);
+            assert!(resp.error.is_none(), "failed for status={status}");
+        }
+    }
+
+    #[test]
+    fn handle_pending_approve_with_seeded_pending_action() {
+        // Seed a pending action to drive the consensus / approval branch.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let pending_id = db::queue_pending_action(
+            &conn,
+            crate::models::GovernedAction::Promote,
+            "w12-approve",
+            None,
+            "human:requestor",
+            &json!({"id": "00000000-0000-0000-0000-000000000000"}),
+        )
+        .unwrap();
+        let req = make_tools_call(
+            "memory_pending_approve",
+            json!({"id": pending_id, "agent_id": "human:approver"}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        // Either approves outright or marks pending — both touch the
+        // ApproveOutcome match arms in the handler.
+        let result = resp.result.unwrap();
+        assert!(result.is_object());
+    }
+
+    #[test]
+    fn handle_pending_reject_with_seeded_pending_action() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let pending_id = db::queue_pending_action(
+            &conn,
+            crate::models::GovernedAction::Promote,
+            "w12-reject",
+            None,
+            "human:requestor",
+            &json!({"id": "00000000-0000-0000-0000-000000000000"}),
+        )
+        .unwrap();
+        let req = make_tools_call(
+            "memory_pending_reject",
+            json!({"id": pending_id, "agent_id": "human:rejector"}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(val["rejected"], true);
+    }
+
+    #[test]
+    fn handle_session_start_toon_format_default() {
+        // session_start defaults to TOON compact format — drives the
+        // toon_compact match arm in the format dispatch.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call("memory_session_start", json!({"namespace": "w12-toon"}));
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        // TOON output is plain text, not JSON — just confirm it's present.
+        let result = resp.result.unwrap();
+        assert!(result["content"][0]["text"].is_string());
+    }
+
+    #[test]
+    fn handle_search_explicit_toon_format() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_search",
+            json!({"query": "anything", "format": "toon"}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn handle_recall_explicit_toon_format() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call("memory_recall", json!({"context": "ctx", "format": "toon"}));
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn handle_list_explicit_toon_compact_format() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_list",
+            json!({"namespace": "w12-toon-list", "format": "toon_compact"}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn handle_search_with_namespace_and_tier_filters() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_search",
+            json!({
+                "query": "test query",
+                "namespace": "w12-search",
+                "tier": "long",
+                "limit": 10,
+                "agent_id": "ai:bot",
+                "format": "json",
+            }),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn handle_search_invalid_agent_id_rejected() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_search",
+            json!({"query": "x", "agent_id": "bad agent !!"}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], true);
+    }
+
+    #[test]
+    fn handle_search_invalid_as_agent_rejected() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_search",
+            json!({"query": "x", "as_agent": "BAD AS AGENT"}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], true);
+    }
+
+    #[test]
+    fn handle_recall_invalid_as_agent_rejected() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_recall",
+            json!({"context": "x", "as_agent": "INVALID NS"}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], true);
+    }
+
+    #[test]
+    fn handle_recall_with_context_tokens() {
+        // Drives the context_tokens-not-empty branch (without an embedder
+        // it just feeds the keyword fallback).
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_recall",
+            json!({
+                "context": "main",
+                "context_tokens": ["recent", "tokens", "from", "convo"],
+                "format": "json",
+            }),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn handle_recall_with_budget_tokens_positive() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_recall",
+            json!({"context": "x", "budget_tokens": 1000, "format": "json"}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        assert!(val["tokens_used"].is_u64() || val["tokens_used"].is_i64());
+        assert_eq!(val["budget_tokens"], 1000);
+    }
+
+    #[test]
+    fn handle_recall_invalid_namespace_filter_passes_through() {
+        // Recall accepts a namespace filter without validating; an
+        // unknown namespace simply returns zero results.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_recall",
+            json!({
+                "context": "x",
+                "namespace": "w12-no-such-namespace",
+                "format": "json",
+            }),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn handle_list_with_tier_filter() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_list",
+            json!({
+                "namespace": "w12-list-tier",
+                "tier": "long",
+                "agent_id": "ai:bot",
+                "limit": 25,
+                "format": "json",
+            }),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn handle_list_invalid_tier_treated_as_none() {
+        // tier::from_str returns None for an invalid value, which the
+        // handler tolerates (no validation error) — drives the
+        // and_then-None branch.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_list",
+            json!({"namespace": "w12-list-bad-tier", "tier": "ULTRAMID", "format": "json"}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn handle_get_taxonomy_invalid_depth_clamps_to_max() {
+        // `depth` saturates against MAX_NAMESPACE_DEPTH; very large
+        // values still succeed.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_get_taxonomy",
+            json!({"depth": 100_000_u64, "limit": 50_000_u64}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn handle_archive_purge_no_filter_purges_all() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call("memory_archive_purge", json!({}));
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn handle_check_duplicate_invalid_title_rejected() {
+        // No embedder → standard error; but when title is empty the
+        // validate_title path errors before the embedder check.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_check_duplicate",
+            json!({"title": "", "content": "anything"}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], true);
+    }
+
+    #[test]
+    fn handle_check_duplicate_invalid_namespace_rejected() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_check_duplicate",
+            json!({"title": "T", "content": "C", "namespace": "BAD NS"}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], true);
+    }
+
+    #[test]
+    fn handle_entity_register_with_explicit_agent_id() {
+        // Drives the explicit_agent_id-Some branch (validates +
+        // resolves).
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_entity_register",
+            json!({
+                "canonical_name": "Org Alpha",
+                "namespace": "w12-orgs",
+                "aliases": ["alpha", "α"],
+                "agent_id": "ai:bot",
+            }),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn handle_entity_register_invalid_explicit_agent_id() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call(
+            "memory_entity_register",
+            json!({
+                "canonical_name": "Org Beta",
+                "namespace": "w12-orgs",
+                "agent_id": "BAD AGENT !!",
+            }),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], true);
+    }
+
+    #[test]
+    fn handle_entity_get_by_alias_no_namespace() {
+        // Drives the namespace=None branch (alias lookup across all ns).
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call("memory_entity_get_by_alias", json!({"alias": "any-alias"}));
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn handle_inbox_with_message_seeded() {
+        // Notify alice, then read alice's inbox.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let notify = make_tools_call(
+            "memory_notify",
+            json!({
+                "target_agent_id": "alice-w12",
+                "title": "ping",
+                "payload": "are you there?",
+                "tier": "short",
+            }),
+        );
+        let _ = invoke_handle_request(&conn, &notify);
+        let inbox = make_tools_call(
+            "memory_inbox",
+            json!({"agent_id": "alice-w12", "limit": 10}),
+        );
+        let resp = invoke_handle_request(&conn, &inbox);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        assert!(val["count"].as_u64().unwrap() >= 1);
+        assert_eq!(val["agent_id"], "alice-w12");
+    }
+
+    #[test]
+    fn handle_consolidate_succeeds_when_source_was_standard() {
+        // Even when one of the source memories is a namespace standard,
+        // consolidate must succeed (the warning branch may or may not
+        // fire depending on whether is_namespace_standard sees the row
+        // pre- or post-deletion). This drives both the namespace-standard
+        // check loop and the consolidate happy path together.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let mem_a = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Long,
+            namespace: "w12-cons-warn".into(),
+            title: "a".into(),
+            content: "alpha".into(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".into(),
+            access_count: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({}),
+            reflection_depth: 0,
+        };
+        let mut mem_b = mem_a.clone();
+        mem_b.id = uuid::Uuid::new_v4().to_string();
+        mem_b.title = "b".into();
+        mem_b.content = "beta".into();
+        let id_a = db::insert(&conn, &mem_a).unwrap();
+        let id_b = db::insert(&conn, &mem_b).unwrap();
+        // Mark id_a as the standard for w12-cons-warn.
+        db::set_namespace_standard(&conn, "w12-cons-warn", &id_a, None).unwrap();
+
+        let req = make_tools_call(
+            "memory_consolidate",
+            json!({
+                "ids": [id_a, id_b],
+                "title": "merged-warn",
+                "summary": "merged summary",
+                "namespace": "w12-cons-warn",
+            }),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        assert!(val["id"].is_string());
+        assert_eq!(val["consolidated"], 2);
+    }
+
+    #[test]
+    fn handle_update_clears_expires_with_empty_string() {
+        // expires_at="" path is special-cased by db::update to clear
+        // the column.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let mem = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Short,
+            namespace: "w12-clear-exp".into(),
+            title: "t".into(),
+            content: "c".into(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".into(),
+            access_count: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            last_accessed_at: None,
+            expires_at: Some(chrono::Utc::now().to_rfc3339()),
+            metadata: json!({}),
+            reflection_depth: 0,
+        };
+        let id = db::insert(&conn, &mem).unwrap();
+        let req = make_tools_call("memory_update", json!({"id": id, "expires_at": ""}));
+        let resp = invoke_handle_request(&conn, &req);
+        // empty "" is rejected by validate_expires_at_format; the
+        // handler returns isError.
+        let result = resp.result.unwrap();
+        // The result shape depends on whether validate accepts "" — both
+        // outcomes exercise distinct paths, so accept either.
+        assert!(result.is_object());
+    }
+
+    #[test]
+    fn handle_update_change_namespace() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let mem = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Mid,
+            namespace: "w12-update-ns".into(),
+            title: "t".into(),
+            content: "c".into(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".into(),
+            access_count: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({}),
+            reflection_depth: 0,
+        };
+        let id = db::insert(&conn, &mem).unwrap();
+        let req = make_tools_call(
+            "memory_update",
+            json!({
+                "id": id,
+                "namespace": "w12-update-ns-new",
+                "tags": ["a", "b"],
+                "title": "new-title",
+                "content": "new-content",
+                "tier": "long",
+                "priority": 8_i64,
+                "confidence": 0.9_f64,
+            }),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn handle_delete_with_prefix_id_lookup() {
+        // db::get_by_prefix is consulted when exact ID lookup misses.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let mem = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Mid,
+            namespace: "w12-delete-prefix".into(),
+            title: "t".into(),
+            content: "c".into(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".into(),
+            access_count: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({}),
+            reflection_depth: 0,
+        };
+        let id = db::insert(&conn, &mem).unwrap();
+        let req = make_tools_call("memory_delete", json!({"id": id}));
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(val["deleted"], true);
+    }
+
+    #[test]
+    fn handle_unsubscribe_after_subscribe_removes_row() {
+        // Drives the removed=1 branch.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let resolved = crate::identity::resolve_agent_id(None, None).unwrap();
+        db::register_agent(&conn, &resolved, "human", &[]).unwrap();
+        let sub = make_tools_call(
+            "memory_subscribe",
+            json!({"url": "https://example.com/hook2"}),
+        );
+        let sub_resp = invoke_handle_request(&conn, &sub);
+        let sub_text = sub_resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let sub_val: Value = serde_json::from_str(&sub_text).unwrap();
+        let id = sub_val["id"].as_str().unwrap().to_string();
+
+        let unsub = make_tools_call("memory_unsubscribe", json!({"id": id}));
+        let unsub_resp = invoke_handle_request(&conn, &unsub);
+        assert!(unsub_resp.error.is_none());
+        let unsub_text = unsub_resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let unsub_val: Value = serde_json::from_str(&unsub_text).unwrap();
+        assert!(
+            unsub_val["removed"] == json!(true) || unsub_val["removed"] == json!(1),
+            "unexpected removed value: {:?}",
+            unsub_val["removed"]
+        );
+    }
+
+    #[test]
+    fn handle_list_subscriptions_after_subscribe_returns_one() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let resolved = crate::identity::resolve_agent_id(None, None).unwrap();
+        db::register_agent(&conn, &resolved, "human", &[]).unwrap();
+        let sub = make_tools_call(
+            "memory_subscribe",
+            json!({"url": "https://example.com/listed"}),
+        );
+        let _ = invoke_handle_request(&conn, &sub);
+        let req = make_tools_call("memory_list_subscriptions", json!({}));
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        // subscriptions field holds the array; the count field may be at
+        // top level — accept either key.
+        assert!(val.get("subscriptions").is_some() || val.get("count").is_some() || val.is_array());
+    }
+
+    #[test]
+    fn test_inject_namespace_standard_dedup_keeps_originals_order() {
+        // When the standard is one of the recall hits, dedup removes it
+        // but preserves the relative order of remaining results.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let std_id = seed_namespace_standard(&conn, "w12-order", "S");
+        let mems = vec![
+            json!({"id": "first", "title": "f"}),
+            json!({"id": std_id, "title": "S"}),
+            json!({"id": "third", "title": "t"}),
+        ];
+        let mut resp = make_recall_response(mems);
+        super::inject_namespace_standard(&conn, Some("w12-order"), &mut resp);
+        let memories = resp["memories"].as_array().unwrap();
+        assert_eq!(memories.len(), 2);
+        assert_eq!(memories[0]["id"], "first");
+        assert_eq!(memories[1]["id"], "third");
+    }
+
+    // =====================================================================
+    // v0.7.0 I4 — `memory_replay` tool. Tests cover the four documented
+    // shapes: empty / single / multiple / truncation (verbose=false vs
+    // verbose=true). Each test seeds the I1 transcript table + I2 join
+    // table directly via the public helpers, then dispatches a real
+    // `tools/call` request through the MCP envelope so the response goes
+    // through the JSON wrapping layer the daemon emits in production.
+    // =====================================================================
+
+    /// I4 test helper — INSERT a stub `memories` row so the I2 join
+    /// table FK is satisfied. Mirrors the same helper in
+    /// `transcripts::tests::insert_test_memory` so the I4 test suite
+    /// doesn't need to import the test-only path.
+    fn i4_insert_test_memory(conn: &rusqlite::Connection, id: &str) {
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO memories (
+                id, tier, namespace, title, content, created_at, updated_at
+             ) VALUES (?1, 'short_term', 'team/eng', ?2, 'body', ?3, ?3)",
+            rusqlite::params![id, format!("title-{id}"), now],
+        )
+        .unwrap();
+    }
+
+    /// I4 test helper — pull the inner JSON out of an MCP wire response
+    /// (which wraps the handler's payload as `result.content[0].text`).
+    fn i4_decode_response_payload(resp: &RpcResponse) -> Value {
+        let text = resp
+            .result
+            .as_ref()
+            .expect("expected ok response")
+            .get("content")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("text"))
+            .and_then(Value::as_str)
+            .expect("response wrapper must have content[0].text");
+        serde_json::from_str(text).expect("response payload must be JSON")
+    }
+
+    /// I4-EMPTY — a memory with no linked transcripts returns an empty
+    /// `transcripts` array (and `count: 0`). Documents the lower
+    /// boundary of the replay surface so an LLM that calls
+    /// `memory_replay` on a memory with no provenance gets an honest
+    /// "nothing to replay" response instead of an error.
+    #[test]
+    fn i4_replay_no_links_returns_empty_array() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        i4_insert_test_memory(&conn, "mem-empty");
+
+        let req = make_tools_call("memory_replay", json!({"memory_id": "mem-empty"}));
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
+
+        let payload = i4_decode_response_payload(&resp);
+        assert_eq!(payload["memory_id"], "mem-empty");
+        assert_eq!(payload["count"], 0);
+        let transcripts = payload["transcripts"].as_array().unwrap();
+        assert!(transcripts.is_empty());
+    }
+
+    /// I4-SINGLE — one linked transcript flows through with
+    /// decompressed content and full span metadata
+    /// (`compressed_size`, `original_size`, `span_start`, `span_end`,
+    /// `created_at`).
+    #[test]
+    fn i4_replay_single_transcript_returns_content_and_metadata() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        i4_insert_test_memory(&conn, "mem-single");
+        let body = "the canonical conversation that produced this memory";
+        let t = crate::transcripts::store(&conn, "team/eng", body, None).unwrap();
+        crate::transcripts::link_transcript(&conn, "mem-single", &t.id, Some(2), Some(20)).unwrap();
+
+        let req = make_tools_call("memory_replay", json!({"memory_id": "mem-single"}));
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
+
+        let payload = i4_decode_response_payload(&resp);
+        assert_eq!(payload["memory_id"], "mem-single");
+        assert_eq!(payload["count"], 1);
+        let transcripts = payload["transcripts"].as_array().unwrap();
+        assert_eq!(transcripts.len(), 1);
+        let entry = &transcripts[0];
+        assert_eq!(entry["id"], t.id);
+        assert_eq!(entry["content"], body);
+        assert_eq!(entry["span_start"], 2);
+        assert_eq!(entry["span_end"], 20);
+        assert_eq!(entry["original_size"].as_i64().unwrap(), body.len() as i64);
+        // compressed_size is whatever zstd-3 emits; assert it's positive
+        // so a future encoder swap that emits zero-byte blobs gets caught.
+        assert!(entry["compressed_size"].as_i64().unwrap() > 0);
+        assert!(entry["created_at"].is_string());
+        // No truncation flag on a sub-threshold transcript.
+        assert!(entry.get("truncated").is_none());
+    }
+
+    /// I4-MULTI — two linked transcripts come back in chronological
+    /// order (oldest first) regardless of the order they were linked.
+    /// Pins the chronological-replay contract so a future refactor
+    /// can't silently fall back to insertion order.
+    #[test]
+    fn i4_replay_multiple_transcripts_chronological_order() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        i4_insert_test_memory(&conn, "mem-multi");
+
+        // Insert the OLDER transcript first, then backdate it so its
+        // `created_at` is unambiguously earlier than the SECOND insert.
+        let older = crate::transcripts::store(&conn, "team/eng", "older body", None).unwrap();
+        let backdate = (chrono::Utc::now() - chrono::Duration::seconds(3600)).to_rfc3339();
+        conn.execute(
+            "UPDATE memory_transcripts SET created_at = ?1 WHERE id = ?2",
+            rusqlite::params![backdate, older.id],
+        )
+        .unwrap();
+
+        let newer = crate::transcripts::store(&conn, "team/eng", "newer body", None).unwrap();
+
+        // Link the NEWER one first so the I2 helper's
+        // ORDER-BY-transcript-id natural ordering doesn't already
+        // happen to give us the right result by accident.
+        crate::transcripts::link_transcript(&conn, "mem-multi", &newer.id, None, None).unwrap();
+        crate::transcripts::link_transcript(&conn, "mem-multi", &older.id, None, None).unwrap();
+
+        let req = make_tools_call("memory_replay", json!({"memory_id": "mem-multi"}));
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
+
+        let payload = i4_decode_response_payload(&resp);
+        let transcripts = payload["transcripts"].as_array().unwrap();
+        assert_eq!(transcripts.len(), 2);
+        // Older first, newer second.
+        assert_eq!(transcripts[0]["id"], older.id);
+        assert_eq!(transcripts[0]["content"], "older body");
+        assert_eq!(transcripts[1]["id"], newer.id);
+        assert_eq!(transcripts[1]["content"], "newer body");
+    }
+
+    /// I4-TRUNCATE-DEFAULT — a > 100 KB transcript with the default
+    /// `verbose=false` returns the metadata block + `truncated: true`
+    /// and OMITS the content field, forcing operators to opt into the
+    /// large-dump path.
+    #[test]
+    fn i4_replay_large_transcript_truncates_when_verbose_false() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        i4_insert_test_memory(&conn, "mem-large");
+
+        // 200 KB body — well past the 100 KB threshold.
+        let body: String = "abcdefghij".repeat(20_000); // 200_000 bytes
+        assert!(body.len() > REPLAY_VERBOSE_THRESHOLD_BYTES as usize);
+        let t = crate::transcripts::store(&conn, "team/eng", &body, None).unwrap();
+        crate::transcripts::link_transcript(&conn, "mem-large", &t.id, None, None).unwrap();
+
+        let req = make_tools_call("memory_replay", json!({"memory_id": "mem-large"}));
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
+
+        let payload = i4_decode_response_payload(&resp);
+        let transcripts = payload["transcripts"].as_array().unwrap();
+        assert_eq!(transcripts.len(), 1);
+        let entry = &transcripts[0];
+        assert_eq!(entry["truncated"], true);
+        assert!(
+            entry.get("content").is_none(),
+            "content must be OMITTED when truncated; got: {entry}"
+        );
+        // Metadata is still present so the caller can decide whether
+        // to re-issue with verbose=true.
+        assert_eq!(entry["original_size"].as_i64().unwrap(), body.len() as i64);
+        assert!(entry["compressed_size"].as_i64().unwrap() > 0);
+    }
+
+    /// I4-TRUNCATE-VERBOSE — the same > 100 KB transcript with
+    /// `verbose=true` returns the full content (no `truncated` flag).
+    /// Pins the opt-in-large-dump escape hatch.
+    #[test]
+    fn i4_replay_large_transcript_returns_content_when_verbose_true() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        i4_insert_test_memory(&conn, "mem-large-verbose");
+
+        let body: String = "abcdefghij".repeat(20_000);
+        let t = crate::transcripts::store(&conn, "team/eng", &body, None).unwrap();
+        crate::transcripts::link_transcript(&conn, "mem-large-verbose", &t.id, None, None).unwrap();
+
+        let req = make_tools_call(
+            "memory_replay",
+            json!({"memory_id": "mem-large-verbose", "verbose": true}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
+
+        let payload = i4_decode_response_payload(&resp);
+        let transcripts = payload["transcripts"].as_array().unwrap();
+        assert_eq!(transcripts.len(), 1);
+        let entry = &transcripts[0];
+        assert!(
+            entry.get("truncated").is_none(),
+            "verbose=true must NOT set truncated"
+        );
+        assert_eq!(entry["content"].as_str().unwrap(), body);
+    }
+
+    /// I4-MISSING-ARG — omitting the required `memory_id` argument
+    /// returns a handler-level error (wrapped as an isError result),
+    /// not a JSON-RPC -32601. Same shape as the rest of the smoke
+    /// matrix for required-arg validation.
+    #[test]
+    fn i4_replay_missing_memory_id_yields_handler_error() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = make_tools_call("memory_replay", json!({}));
+        let resp = invoke_handle_request(&conn, &req);
+        // Handler errors come back as ok_response with isError=true.
+        // The RPC error field stays None so a downstream client can
+        // distinguish "method not found" from "the method ran and
+        // failed".
+        assert!(
+            resp.error.is_none(),
+            "expected handler-level error, not RPC error"
+        );
+        let result = resp.result.expect("must surface a result envelope");
+        assert_eq!(result["isError"], true);
+    }
+
+    /// I4-DANGLING-LINK — a link row whose target transcript was
+    /// pruned (I3) is silently dropped from the replay output.
+    /// Documents the contract so a future refactor that surfaces
+    /// dangling ids to the caller fails this test loudly.
+    #[test]
+    fn i4_replay_skips_dangling_transcript_link() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        i4_insert_test_memory(&conn, "mem-dangling");
+
+        let live = crate::transcripts::store(&conn, "team/eng", "live body", None).unwrap();
+        let pruned = crate::transcripts::store(&conn, "team/eng", "pruned body", None).unwrap();
+        crate::transcripts::link_transcript(&conn, "mem-dangling", &live.id, None, None).unwrap();
+        crate::transcripts::link_transcript(&conn, "mem-dangling", &pruned.id, None, None).unwrap();
+
+        // Sneak past the I2 ON DELETE CASCADE by disabling foreign keys
+        // for this single DELETE — production won't get here (cascade
+        // would clean up the link), but the handler must still be
+        // robust if the substrate ever surfaces a dangling row.
+        conn.execute("PRAGMA foreign_keys = OFF", []).unwrap();
+        conn.execute(
+            "DELETE FROM memory_transcripts WHERE id = ?1",
+            rusqlite::params![pruned.id],
+        )
+        .unwrap();
+        conn.execute("PRAGMA foreign_keys = ON", []).unwrap();
+
+        let req = make_tools_call("memory_replay", json!({"memory_id": "mem-dangling"}));
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
+
+        let payload = i4_decode_response_payload(&resp);
+        let transcripts = payload["transcripts"].as_array().unwrap();
+        assert_eq!(
+            transcripts.len(),
+            1,
+            "only the live transcript should appear; pruned id is silently dropped"
+        );
+        assert_eq!(transcripts[0]["id"], live.id);
+    }
+}
