@@ -281,11 +281,58 @@ reflects on them at depth=1, recursively reflects up to depth=3
 (the default cap), and demonstrates the refusal at depth=4 with a
 clear `REFLECTION_DEPTH_EXCEEDED` verdict block.
 
-<!-- TASK 5+6 SECTION: sibling agent will add the `signed_events`
-     `reflection.depth_exceeded` audit-row description (Task 5/8) and
-     the `pre_reflect` / `post_reflect` hook-events surface (Task 6/8)
-     here. The Task-8 batch-2 capabilities sweep adds the matching
-     entries to capabilities JSON and tools list. -->
+#### Cryptographic provenance for cap refusals (Task 5/8)
+
+Every `memory_reflect` call that would exceed the namespace's resolved
+`max_reflection_depth` now appends a row to the append-only
+`signed_events` audit table before the cap refusal propagates back to
+the caller. The row carries `event_type = "reflection.depth_exceeded"`
+and a canonical-CBOR (RFC 8949 §4.2.1) payload binding
+`(agent_id, attempted, cap, namespace, source_ids, proposed_title,
+created_at)` under a SHA-256 `payload_hash`. The row is written with
+`attest_level = "unsigned"` (the substrate refusal is the operation
+being audited; per-event Ed25519 signing of refusal records is a
+separate Track-H Bucket-1.5 line item). The reflection's content body
+is deliberately omitted from the payload — only enumerable provenance
+fields are part of the signed bytes, so PII the caller may have placed
+in `content` never enters the audit chain. Audit-write failures are
+best-effort: logged at `WARN` (`target = "signed_events"`) but the
+substrate cap refusal still propagates so the wire contract stays
+unchanged for callers. ([commit `c61a05b`](https://github.com/alphaonedev/ai-memory-mcp/commit/c61a05b).)
+
+#### Hook integration (Task 6/8)
+
+The Track-G hook pipeline grows from 21 to 23 events with two new
+`HookEvent` variants:
+
+- **`pre_reflect`** — decision-class hook, `EventClass::Write`, 5-second
+  deadline budget. Fires inside `db::reflect_with_hooks` step 4, BEFORE
+  the depth-cap check evaluates and BEFORE the write transaction opens.
+  A handler returning `Deny { reason, code }` short-circuits the
+  reflection and propagates as
+  `ReflectError::HookVeto`
+  (`"REFLECTION_HOOK_VETO (code=<N>): <reason>"`) — distinct from the
+  Task 5 cap refusal on the wire so callers can tell substrate-policy
+  refusals apart from caller-policy refusals.
+- **`post_reflect`** — notify-class hook, `EventClass::Write`, 5-second
+  deadline budget. Fires inside `db::reflect_with_hooks` step 7, AFTER
+  `COMMIT` succeeds. Post-handlers read the fully-durable reflection
+  memory and its `reflects_on` links via the same connection — useful
+  for notification fan-out, federation push, audit-side-channel sinks,
+  and the v0.8.0 reflection-pass curator's bookkeeping path. Notify
+  handlers cannot veto; return values are ignored beyond logging.
+
+The pipeline event count is `21 → 23`, not `20 → 22` — the G10 hot-path
+`pre_recall_expand` event had already raised the floor from 20 to 21
+before Task 6 landed. Hook vetoes do **not** emit the Task 5
+`reflection.depth_exceeded` audit row: caller-policy refusals carry
+their own provenance via the hook's own audit channel, and conflating
+them with substrate-cap refusals would dilute the audit signal. The
+MCP-side wire-in of `hooks.toml` → `ReflectHooks` is deferred to G7+;
+the v0.7.0 `memory_reflect` MCP handler ships an unreachable
+`HookVeto` arm against that bridge so the wire surface is forward-
+compatible without yet emitting hook events from the production
+handler. ([commit `fbf093c`](https://github.com/alphaonedev/ai-memory-mcp/commit/fbf093c).)
 
 ### Quality
 
