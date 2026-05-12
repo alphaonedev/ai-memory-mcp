@@ -955,6 +955,23 @@ pub struct GovernancePolicy {
     /// to preserve the architecturally-promised semantics.
     #[serde(default = "default_inherit")]
     pub inherit: bool,
+    /// v0.7.0 recursive-learning Task 2/8 (issue #655): per-namespace
+    /// substrate-side cap on `Memory::reflection_depth` at the
+    /// `memory_reflect` MCP write path (enforcement lands in Task 5/8).
+    /// `None` → no override, fall back to the compiled default exposed
+    /// by [`Self::effective_max_reflection_depth`]. `Some(0)` is the
+    /// disable-all-reflections sentinel (see accessor doc-comment).
+    /// Persisted inside the existing namespace standard's
+    /// `metadata.governance` JSON blob; no SQL schema migration is
+    /// required because the column is already a `TEXT`/`JSONB`
+    /// payload on both SQLite and Postgres. Pre-v0.7.0 rows that
+    /// omit this key deserialize as `None` via `#[serde(default)]`,
+    /// and `skip_serializing_if` keeps the absent shape on the wire
+    /// for fresh policies — matching how `NamespaceMetaEntry::parent_namespace`
+    /// stays absent on the wire to keep replication / federation
+    /// payloads byte-identical for legacy peers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_reflection_depth: Option<u32>,
 }
 
 fn default_promote_level() -> GovernanceLevel {
@@ -983,6 +1000,10 @@ impl Default for GovernancePolicy {
             delete: default_delete_level(),
             approver: default_approver(),
             inherit: default_inherit(),
+            // v0.7.0 Task 2/8: `None` means "no per-namespace override",
+            // and `effective_max_reflection_depth` resolves to the
+            // compiled default of 3.
+            max_reflection_depth: None,
         }
     }
 }
@@ -1015,7 +1036,40 @@ impl GovernancePolicy {
             delete: default_delete_level(),
             approver: default_approver(),
             inherit: default_inherit(),
+            // v0.7.0 Task 2/8: managed-namespace bootstrap leaves
+            // `max_reflection_depth` unset so operators get the
+            // compiled-in default (3) until they explicitly override.
+            max_reflection_depth: None,
         }
+    }
+
+    /// v0.7.0 recursive-learning Task 2/8 (issue #655): resolve the
+    /// per-namespace reflection-depth cap. Returns the operator's
+    /// override when present, otherwise the compiled-in default of
+    /// `3`.
+    ///
+    /// **Why 3?** Bounds recursion (reflection-on-reflection-on-…)
+    /// without strangling the legitimate "reflection-on-reflection"
+    /// chains the v0.8.0 Pillar 2.5 curator mode will lean on.
+    /// Operators who want a different global default should change
+    /// the constant in this accessor; per-namespace overrides should
+    /// stay in the JSON metadata blob.
+    ///
+    /// **`Some(0)` disables reflection entirely.** Task 5/8 enforces
+    /// the rule `proposed_reflection_depth >= cap → refuse`, so a
+    /// cap of `0` refuses every reflection (no depth `>= 0` passes
+    /// the comparison). This is the documented kill-switch for a
+    /// namespace that should never accept reflection writes.
+    ///
+    /// Ancestor inheritance is **not** walked here — that's the job
+    /// of `db::resolve_governance_policy` (and the equivalent store
+    /// trait method), which returns the most-specific policy via the
+    /// leaf-first namespace chain walk. Callers at the
+    /// `memory_reflect` MCP write path resolve the policy first,
+    /// then call this accessor on the result.
+    #[must_use]
+    pub fn effective_max_reflection_depth(&self) -> u32 {
+        self.max_reflection_depth.unwrap_or(3)
     }
 }
 
@@ -1483,6 +1537,7 @@ mod tests {
             delete: GovernanceLevel::Owner,
             approver: ApproverType::Agent("maintainer".to_string()),
             inherit: true,
+            max_reflection_depth: None,
         };
         let json = serde_json::to_string(&p).unwrap();
         let back: GovernancePolicy = serde_json::from_str(&json).unwrap();

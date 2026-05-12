@@ -1008,6 +1008,7 @@ fn cap_v3_k5_rule_summary_single_policy_carries_one_entry() {
         delete: GovernanceLevel::Owner,
         approver: ApproverType::Human,
         inherit: true,
+        max_reflection_depth: None,
     };
     seed_governance_policy(&conn, "team", &policy);
 
@@ -1078,6 +1079,7 @@ fn cap_v3_k5_rule_summary_multiple_policies_lex_ordered() {
         delete: GovernanceLevel::Owner,
         approver: ApproverType::Agent("maintainer".to_string()),
         inherit: false,
+        max_reflection_depth: None,
     };
     let alpha = GovernancePolicy {
         write: GovernanceLevel::Any,
@@ -1085,6 +1087,7 @@ fn cap_v3_k5_rule_summary_multiple_policies_lex_ordered() {
         delete: GovernanceLevel::Owner,
         approver: ApproverType::Consensus(3),
         inherit: true,
+        max_reflection_depth: None,
     };
     let middle = GovernancePolicy::default();
     seed_governance_policy(&conn, "zeta", &zeta);

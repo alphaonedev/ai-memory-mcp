@@ -547,6 +547,7 @@ mod tests {
             delete: GovernanceLevel::Approve,
             approver: ApproverType::Human,
             inherit: true,
+            max_reflection_depth: None,
         };
         let conn = db::open(&db).unwrap();
         let now = chrono::Utc::now().to_rfc3339();

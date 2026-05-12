@@ -9403,6 +9403,7 @@ mod tests {
             delete: GovernanceLevel::Owner,
             approver: ApproverType::Human,
             inherit: true,
+            max_reflection_depth: None,
         };
 
         let now = chrono::Utc::now().to_rfc3339();
@@ -9527,6 +9528,7 @@ mod tests {
             delete: GovernanceLevel::Owner,
             approver: ApproverType::Human,
             inherit: false,
+            max_reflection_depth: None,
         };
         let now = chrono::Utc::now().to_rfc3339();
         let mut metadata = default_metadata();

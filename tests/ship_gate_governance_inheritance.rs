@@ -91,6 +91,7 @@ fn approve_write_policy() -> GovernancePolicy {
         delete: GovernanceLevel::Owner,
         approver: ApproverType::Human,
         inherit: true,
+        max_reflection_depth: None,
     }
 }
 
@@ -101,6 +102,7 @@ fn any_policy_no_inherit() -> GovernancePolicy {
         delete: GovernanceLevel::Owner,
         approver: ApproverType::Human,
         inherit: false,
+        max_reflection_depth: None,
     }
 }
 

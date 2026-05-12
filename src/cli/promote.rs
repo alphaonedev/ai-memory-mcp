@@ -180,6 +180,7 @@ mod tests {
             delete: GovernanceLevel::Owner,
             approver: ApproverType::Human,
             inherit: true,
+            max_reflection_depth: None,
         };
         let conn = db::open(db_path).unwrap();
         let now = chrono::Utc::now().to_rfc3339();

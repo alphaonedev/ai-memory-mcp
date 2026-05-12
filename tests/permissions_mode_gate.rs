@@ -83,6 +83,7 @@ fn approve_write_policy() -> GovernancePolicy {
         delete: GovernanceLevel::Owner,
         approver: ApproverType::Human,
         inherit: true,
+        max_reflection_depth: None,
     }
 }
 

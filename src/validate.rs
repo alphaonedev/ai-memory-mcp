@@ -796,6 +796,7 @@ mod tests {
             delete: GovernanceLevel::Owner,
             approver: ApproverType::Consensus(0),
             inherit: true,
+            max_reflection_depth: None,
         };
         assert!(validate_governance_policy(&p).is_err());
     }
@@ -809,6 +810,7 @@ mod tests {
             delete: GovernanceLevel::Owner,
             approver: ApproverType::Agent("has space".to_string()),
             inherit: true,
+            max_reflection_depth: None,
         };
         assert!(validate_governance_policy(&bad).is_err());
 
@@ -818,6 +820,7 @@ mod tests {
             delete: GovernanceLevel::Owner,
             approver: ApproverType::Agent("alice".to_string()),
             inherit: true,
+            max_reflection_depth: None,
         };
         assert!(validate_governance_policy(&good).is_ok());
     }
