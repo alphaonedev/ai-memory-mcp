@@ -259,6 +259,7 @@ mod tests {
             delete: GovernanceLevel::Owner,
             approver: ApproverType::Human,
             inherit: true,
+            max_reflection_depth: None,
         };
         seed_governance_policy(&db_path, "gov-ns", policy, "alice");
         let conn = db::open(&db_path).unwrap();
@@ -296,6 +297,7 @@ mod tests {
             delete: GovernanceLevel::Approve,
             approver: ApproverType::Human,
             inherit: true,
+            max_reflection_depth: None,
         };
         seed_governance_policy(&db_path, "gov-ns", policy, "alice");
         let conn = db::open(&db_path).unwrap();
@@ -338,6 +340,7 @@ mod tests {
             delete: GovernanceLevel::Owner,
             approver: ApproverType::Human,
             inherit: true,
+            max_reflection_depth: None,
         };
         seed_governance_policy(&db_path, "gov-ns", policy, "alice");
         let conn = db::open(&db_path).unwrap();
@@ -379,6 +382,7 @@ mod tests {
             delete: GovernanceLevel::Owner,
             approver: ApproverType::Human,
             inherit: true,
+            max_reflection_depth: None,
         };
         seed_governance_policy(&db_path, "gov-ns", policy, "alice");
         let conn = db::open(&db_path).unwrap();
@@ -417,6 +421,7 @@ mod tests {
             delete: GovernanceLevel::Owner,
             approver: ApproverType::Human,
             inherit: true,
+            max_reflection_depth: None,
         };
         seed_governance_policy(&db_path, "gov-ns", policy, "alice");
         let conn = db::open(&db_path).unwrap();
