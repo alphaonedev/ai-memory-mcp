@@ -469,10 +469,29 @@ pub struct CapabilityFeatures {
     pub auto_tagging: bool,
     pub contradiction_analysis: bool,
     pub cross_encoder_reranking: bool,
-    /// Memory-reflection (v0.7+): planned, not yet implemented.
-    /// Was a `bool` before the P1 honesty patch; an object now so
-    /// operators can tell "feature exists but disabled" apart from
-    /// "feature not in this build".
+    /// Memory-reflection (v0.7+): planned-feature object. Was a `bool`
+    /// before the P1 honesty patch; an object now so operators can tell
+    /// "feature exists but disabled" apart from "feature not in this
+    /// build".
+    ///
+    /// **v0.7.0 recursive-learning honesty pass (Task 8/8, issue #655).**
+    /// Tasks 1-4 of the recursive-learning add-on shipped the
+    /// underlying primitive — `memory_reflect` MCP tool (Task 4/8,
+    /// commit `3dc76f3`), substrate-side `db::reflect` /
+    /// `PostgresStore::reflect`, `reflects_on` link relation (Task 3/8,
+    /// commit `b51a3f3`), namespace-governance cap field (Task 2/8,
+    /// commit `630a6db`), `Memory::reflection_depth` column (Task 1/8,
+    /// commit `f5d8a9e`). The flag is *still* surfaced as
+    /// `PlannedFeature::planned("v0.7+")` here pending the Tasks 5+6
+    /// follow-up sweep that re-runs the full mcp.rs + config.rs
+    /// capabilities test cluster so the flip from `planned=true,
+    /// enabled=false` → `planned=false, enabled=true` lands together
+    /// with the matching test updates. TODO(#655 Task 8 batch-2):
+    /// flip to `PlannedFeature { planned: false, version: "v0.7.0",
+    /// enabled: true }` once the sibling agent's Task 5+6 commits
+    /// merge — that batch also adds `hooks.events` entries for
+    /// `pre_reflect` / `post_reflect` so the capabilities surface
+    /// gains its full recursive-learning shape in one pass.
     pub memory_reflection: PlannedFeature,
     /// v0.6.2 (S18): runtime-observed embedder state. `semantic_search`
     /// above reflects *configured* capability (derived from the tier's
