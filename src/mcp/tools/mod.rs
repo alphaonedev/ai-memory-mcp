@@ -40,6 +40,12 @@ pub(super) mod quota_status;
 pub(super) mod pending;
 pub(super) mod archive;
 pub(super) mod session_start;
+// v0.7.0 L1-5 — Agent Skills ingestion substrate (Pillar 1.5).
+pub(super) mod skill_register;
+pub(super) mod skill_list;
+pub(super) mod skill_get;
+pub(super) mod skill_resource;
+pub(super) mod skill_export;
 
 // Re-export all handler functions and types to make them accessible from
 // the parent `mcp` module (super) without requiring callers to know the
@@ -107,4 +113,9 @@ pub(super) use self::{
     archive::handle_archive_stats,
     archive::handle_gc,
     session_start::handle_session_start,
+    skill_register::handle_skill_register,
+    skill_list::handle_skill_list,
+    skill_get::handle_skill_get,
+    skill_resource::handle_skill_resource,
+    skill_export::handle_skill_export,
 };

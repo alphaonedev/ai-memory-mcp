@@ -318,6 +318,17 @@ mod subscribe;
 mod update;
 #[path = "tools/verify.rs"]
 mod verify;
+// v0.7.0 L1-5 — Agent Skills ingestion substrate (Pillar 1.5).
+#[path = "tools/skill_export.rs"]
+mod skill_export;
+#[path = "tools/skill_get.rs"]
+mod skill_get;
+#[path = "tools/skill_list.rs"]
+mod skill_list;
+#[path = "tools/skill_register.rs"]
+mod skill_register;
+#[path = "tools/skill_resource.rs"]
+mod skill_resource;
 
 // ---------------------------------------------------------------------------
 // Re-exports — preserve exact `crate::mcp::*` pub surface (zero new pub items)
@@ -375,6 +386,11 @@ use pending::handle_subscription_dlq_list;
 use promote::handle_promote;
 use reflect::handle_reflect;
 use search::handle_search;
+use skill_export::handle_skill_export;
+use skill_get::handle_skill_get;
+use skill_list::handle_skill_list;
+use skill_register::handle_skill_register;
+use skill_resource::handle_skill_resource;
 use store::handle_store;
 use subscribe::{handle_list_subscriptions, handle_subscribe, handle_subscription_replay};
 use update::handle_update;
@@ -869,6 +885,12 @@ fn handle_request(
                 "memory_subscription_replay" => handle_subscription_replay(conn, arguments),
                 "memory_subscription_dlq_list" => handle_subscription_dlq_list(conn, arguments),
                 "memory_quota_status" => handle_quota_status(conn, arguments),
+                // v0.7.0 L1-5 — Agent Skills ingestion substrate (Pillar 1.5).
+                "memory_skill_register" => handle_skill_register(conn, arguments, active_keypair),
+                "memory_skill_list" => handle_skill_list(conn, arguments),
+                "memory_skill_get" => handle_skill_get(conn, arguments),
+                "memory_skill_resource" => handle_skill_resource(conn, arguments),
+                "memory_skill_export" => handle_skill_export(conn, arguments, active_keypair),
                 // Ultrareview #349: unknown tool is a JSON-RPC 2.0
                 // "method not found" condition — return -32601, not
                 // an ok_response with `isError: true`. Clients that
@@ -1319,9 +1341,10 @@ mod tests {
         // v0.7 B2 adds memory_smart_load (Family::Core) → 50.
         // v0.7 K8 adds memory_quota_status (Family::Power) → 51.
         // v0.7.0 Task 4/8 adds memory_reflect (Family::Power) → 52.
+        // v0.7.0 L1-5 adds 5 memory_skill_* tools (Family::Other) → 57.
         let defs = tool_definitions();
         let tools = defs["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 52);
+        assert_eq!(tools.len(), 57);
     }
 
     /// v0.6.4-002 acceptance gate (RFC §S25/S26): `--profile core`
@@ -1376,13 +1399,14 @@ mod tests {
         let tools = defs["tools"].as_array().unwrap();
         assert_eq!(
             tools.len(),
-            52,
+            57,
             "full profile = v0.6.3 surface (43) + v0.7.0 I4 memory_replay (1) + \
              v0.7 H4 memory_verify (1) + v0.7 B1 memory_load_family (1) + \
              v0.7 B2 memory_smart_load (1) + \
              v0.7 K7 memory_subscription_replay + memory_subscription_dlq_list (2) + \
              v0.7 J7 memory_find_paths (1) + v0.7 K8 memory_quota_status (1) + \
-             v0.7.0 Task 4/8 memory_reflect (1) = 52"
+             v0.7.0 Task 4/8 memory_reflect (1) + \
+             v0.7.0 L1-5 5×memory_skill_* (5) = 57"
         );
     }
 
