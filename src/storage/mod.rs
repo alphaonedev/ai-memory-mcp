@@ -369,15 +369,24 @@ pub fn insert_with_conflict(conn: &Connection, mem: &Memory, mode: ConflictMode)
             }
             let tags_json = serde_json::to_string(&mem.tags)?;
             let metadata_json = serde_json::to_string(&mem.metadata)?;
+            // v0.7.0 L1-1 wave merge — include the `memory_kind` column.
+            // This INSERT path was added by the fix-campaign R1-M3
+            // (ConflictMode::Error refuses duplicates) and originally
+            // omitted the new L1-1 column because L1-1 was authored
+            // against the pre-fix-campaign storage layer. Without
+            // memory_kind here, a `db::reflect` call (which uses
+            // `insert_with_conflict(.., ConflictMode::Error)`) loses
+            // its `MemoryKind::Reflection` typing and the stored row
+            // falls back to the column DEFAULT 'observation'.
             let actual_id: String = conn.query_row(
-                "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
                  RETURNING id",
                 params![
                     mem.id, mem.tier.as_str(), mem.namespace, mem.title, mem.content,
                     tags_json, mem.priority, mem.confidence, mem.source, mem.access_count,
                     mem.created_at, mem.updated_at, mem.last_accessed_at, mem.expires_at,
-                    metadata_json, mem.reflection_depth,
+                    metadata_json, mem.reflection_depth, mem.memory_kind.as_str(),
                 ],
                 |r| r.get(0),
             ).map_err(|e| {
