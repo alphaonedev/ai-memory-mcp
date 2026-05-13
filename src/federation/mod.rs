@@ -103,6 +103,7 @@ mod tests {
             expires_at: None,
             metadata: serde_json::json!({"agent_id":"ai:test"}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         }
     }
 
@@ -1320,6 +1321,7 @@ mod tests {
             expires_at: None,
             metadata: serde_json::json!({"agent_id":"ai:peer-0"}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         }
     }
 

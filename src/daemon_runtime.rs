@@ -70,6 +70,7 @@ use crate::cli::search::SearchArgs;
 use crate::cli::store::StoreArgs;
 use crate::cli::sync::{SyncArgs, SyncDaemonArgs};
 use crate::cli::update::UpdateArgs;
+use crate::cli::verify::VerifyChainArgs;
 use crate::cli::wrap::WrapArgs;
 use crate::config::{AppConfig, FeatureTier};
 use crate::embeddings::Embedder;
@@ -322,6 +323,12 @@ pub enum Command {
     /// PATH` to write the rendered block to a file (or merge in-place
     /// when `PATH` matches the loaded config).
     Governance(GovernanceCliArgs),
+    /// v0.7.0 L1-3 — external verifier for reflection chains
+    /// (procurement-grade audit tool). Walks `reflects_on` edges
+    /// backward from `<memory_id>` to depth 0, verifies each
+    /// Ed25519 signature, and emits a structured chain-integrity
+    /// report. Exit 0 if fully verified; non-zero otherwise.
+    VerifyReflectionChain(VerifyChainArgs),
 }
 
 /// `ai-memory governance` parent argument struct.
@@ -1091,6 +1098,17 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
                 GovernanceAction::MigrateToPermissions(args) => {
                     cli::governance_migrate::run(args, &mut out)
                 }
+            }
+        }
+        Command::VerifyReflectionChain(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            match cli::verify::run(&db_path, &a, &mut out)? {
+                0 => Ok(()),
+                code => std::process::exit(code),
             }
         }
     };
@@ -3571,6 +3589,7 @@ mod tests {
             expires_at: None,
             metadata: crate::models::default_metadata(),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         let id = db::insert(&conn, &mem).unwrap();
         db::set_embedding(&conn, &id, &[1.0, 0.0, 0.0]).unwrap();
@@ -3613,6 +3632,7 @@ mod tests {
             expires_at: Some(past),
             metadata: crate::models::default_metadata(),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         db::insert(&conn, &mem).unwrap();
         drop(conn);

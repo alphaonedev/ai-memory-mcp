@@ -104,6 +104,7 @@ mod tests {
             expires_at: None,
             metadata: serde_json::json!({"agent_id": "ai:test"}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         let id = db::insert(&conn, &mem).expect("insert");
         let out = handle_reflection_origin(&conn, &json!({"memory_id": id})).unwrap();

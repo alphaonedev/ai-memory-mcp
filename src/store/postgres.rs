@@ -3146,6 +3146,13 @@ impl PostgresStore {
         // (column missing on a freshly-restored backup, for instance) by
         // falling back to 0, which matches the SQL-side `DEFAULT 0`.
         let reflection_depth: i32 = row.try_get("reflection_depth").unwrap_or(0);
+        // L1-1 — read the Postgres-side memory_kind column. Falls back to
+        // Observation on pre-v30 rows and on any unrecognised value.
+        let memory_kind: crate::models::MemoryKind = row
+            .try_get::<String, _>("memory_kind")
+            .ok()
+            .and_then(|s| crate::models::MemoryKind::from_str(&s))
+            .unwrap_or_default();
 
         Ok(Memory {
             id: row.try_get("id").map_err(|e| to_store_err("read id", e))?,
@@ -3178,6 +3185,7 @@ impl PostgresStore {
             expires_at: expires_at.map(|t| t.to_rfc3339()),
             metadata,
             reflection_depth,
+            memory_kind,
         })
     }
 
@@ -3391,8 +3399,8 @@ impl PostgresStore {
             "INSERT INTO memories (
                 id, tier, namespace, title, content, tags, priority, confidence,
                 source, access_count, created_at, updated_at, last_accessed_at,
-                expires_at, metadata, reflection_depth
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NULL, NULL, $13, $14)
+                expires_at, metadata, reflection_depth, memory_kind
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NULL, NULL, $13, $14, $15)
             ON CONFLICT (title, namespace) DO UPDATE SET
                 content = EXCLUDED.content,
                 tier = CASE
@@ -3413,7 +3421,9 @@ impl PostgresStore {
                         )
                     ELSE EXCLUDED.metadata
                 END,
-                reflection_depth = GREATEST(memories.reflection_depth, EXCLUDED.reflection_depth)
+                reflection_depth = GREATEST(memories.reflection_depth, EXCLUDED.reflection_depth),
+                memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
+                                   ELSE EXCLUDED.memory_kind END
             RETURNING id",
         )
         .bind(&new_id)
@@ -3430,6 +3440,7 @@ impl PostgresStore {
         .bind(created_at_dt)
         .bind(&metadata_value)
         .bind(new_depth_i32)
+        .bind("reflection")
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| ReflectError::Database(format!("insert reflection memory: {e}")))?
@@ -4382,8 +4393,8 @@ impl MemoryStore for PostgresStore {
             "INSERT INTO memories (
                 id, tier, namespace, title, content, tags, priority, confidence,
                 source, access_count, created_at, updated_at, last_accessed_at,
-                expires_at, metadata, reflection_depth
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+                expires_at, metadata, reflection_depth, memory_kind
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
             ON CONFLICT (title, namespace) DO UPDATE SET
                 content = EXCLUDED.content,
                 tier = CASE
@@ -4407,7 +4418,10 @@ impl MemoryStore for PostgresStore {
                 -- v0.7.0 Task 1/8 — recursion depth takes max on upsert so a
                 -- newer reflection at higher depth doesn't lose its provenance
                 -- signal when re-stored at the same (title, namespace).
-                reflection_depth = GREATEST(memories.reflection_depth, EXCLUDED.reflection_depth)
+                reflection_depth = GREATEST(memories.reflection_depth, EXCLUDED.reflection_depth),
+                -- L1-1 — kind is sticky: once Reflection, always Reflection.
+                memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
+                                   ELSE EXCLUDED.memory_kind END
             RETURNING id",
         )
         .bind(&memory.id)
@@ -4426,6 +4440,7 @@ impl MemoryStore for PostgresStore {
         .bind(expires_at)
         .bind(&memory.metadata)
         .bind(memory.reflection_depth)
+        .bind(memory.memory_kind.as_str())
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| to_store_err("insert memory", e))?
@@ -4478,8 +4493,8 @@ impl MemoryStore for PostgresStore {
             "INSERT INTO memories (
                 id, tier, namespace, title, content, tags, priority, confidence,
                 source, access_count, created_at, updated_at, last_accessed_at,
-                expires_at, metadata, reflection_depth, embedding
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+                expires_at, metadata, reflection_depth, memory_kind, embedding
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
             ON CONFLICT (title, namespace) DO UPDATE SET
                 content = EXCLUDED.content,
                 tier = CASE
@@ -4502,6 +4517,9 @@ impl MemoryStore for PostgresStore {
                 END,
                 -- v0.7.0 Task 1/8 — recursion depth takes max on upsert.
                 reflection_depth = GREATEST(memories.reflection_depth, EXCLUDED.reflection_depth),
+                -- L1-1 — kind is sticky.
+                memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
+                                   ELSE EXCLUDED.memory_kind END,
                 embedding = COALESCE(EXCLUDED.embedding, memories.embedding)
             RETURNING id",
         )
@@ -4521,6 +4539,7 @@ impl MemoryStore for PostgresStore {
         .bind(expires_at)
         .bind(&memory.metadata)
         .bind(memory.reflection_depth)
+        .bind(memory.memory_kind.as_str())
         .bind(emb_pgvec)
         .fetch_one(&mut *tx)
         .await
@@ -4932,8 +4951,8 @@ impl MemoryStore for PostgresStore {
             "INSERT INTO memories (
                 id, tier, namespace, title, content, tags, priority, confidence,
                 source, access_count, created_at, updated_at, last_accessed_at,
-                expires_at, metadata, reflection_depth
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+                expires_at, metadata, reflection_depth, memory_kind
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
             ON CONFLICT (title, namespace) DO UPDATE SET
                 content = CASE
                     WHEN EXCLUDED.updated_at > memories.updated_at
@@ -4981,7 +5000,10 @@ impl MemoryStore for PostgresStore {
                 END,
                 -- v0.7.0 Task 1/8 — recursion depth takes max so the reflection
                 -- signal isn't lost on newer-wins federation merges.
-                reflection_depth = GREATEST(memories.reflection_depth, EXCLUDED.reflection_depth)
+                reflection_depth = GREATEST(memories.reflection_depth, EXCLUDED.reflection_depth),
+                -- L1-1 — kind is sticky across federation merges.
+                memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
+                                   ELSE EXCLUDED.memory_kind END
             RETURNING id",
         )
         .bind(&memory.id)
@@ -5000,6 +5022,7 @@ impl MemoryStore for PostgresStore {
         .bind(expires_at)
         .bind(&memory.metadata)
         .bind(memory.reflection_depth)
+        .bind(memory.memory_kind.as_str())
         .fetch_one(&self.pool)
         .await
         .map_err(|e| to_store_err("apply_remote_memory upsert", e))?;
@@ -5544,6 +5567,7 @@ impl MemoryStore for PostgresStore {
             expires_at: None,
             metadata,
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
 
         self.store(ctx, &mem).await.map(|_| ())
@@ -6058,6 +6082,7 @@ impl MemoryStore for PostgresStore {
             expires_at: None,
             metadata,
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         self.store(ctx, &mem).await
     }
@@ -7967,6 +7992,7 @@ mod tests {
             expires_at: None,
             metadata: serde_json::json!({"agent_id":"ai:sal-test"}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         }
     }
 

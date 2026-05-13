@@ -507,6 +507,7 @@ mod tests {
             expires_at: None,
             metadata: default_metadata(),
             reflection_depth: 0,
+            memory_kind: MemoryKind::Observation,
         };
         let json = serde_json::to_string(&m).unwrap();
         let back: Memory = serde_json::from_str(&json).unwrap();

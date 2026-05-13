@@ -71,6 +71,7 @@ fn make_memory(namespace: &str, title: &str, reflection_depth: i32) -> Memory {
         expires_at: None,
         metadata: serde_json::json!({"agent_id": "test-agent-task7"}),
         reflection_depth,
+        memory_kind: ai_memory::models::MemoryKind::Observation,
     }
 }
 
@@ -127,6 +128,7 @@ fn seed_policy(conn: &Connection, namespace: &str, policy: &GovernancePolicy) {
         expires_at: None,
         metadata,
         reflection_depth: 0,
+        memory_kind: ai_memory::models::MemoryKind::Observation,
     };
     let standard_id = db::insert(conn, &standard).unwrap();
     db::set_namespace_standard(conn, namespace, &standard_id, None).unwrap();

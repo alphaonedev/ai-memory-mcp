@@ -318,6 +318,9 @@ impl TierConfig {
             // the live tag from `PostgresStore::kg_backend()` once
             // J2 wires the SAL into AppState.
             kg_backend: None,
+            // L1-1 — always static for v0.7.0; Goal/Plan/Step/Decision
+            // land in L1-6/v0.8.0.
+            memory_kinds: default_memory_kinds(),
         }
     }
 }
@@ -402,6 +405,17 @@ pub struct Capabilities {
     /// so v1 / v2 clients that don't know the field round-trip cleanly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kg_backend: Option<String>,
+
+    /// L1-1 (v0.7.0) — the set of typed memory kinds this binary
+    /// supports.  Always `["observation", "reflection"]` for v0.7.0;
+    /// Goal/Plan/Step/Decision land in L1-6/v0.8.0.  Callers that want
+    /// to enumerate valid values for a `memory_kind` filter should
+    /// consult this field rather than hardcoding the list.
+    ///
+    /// `#[serde(default)]` keeps older capabilities consumers that
+    /// don't know the field from breaking.
+    #[serde(default = "default_memory_kinds")]
+    pub memory_kinds: Vec<String>,
 }
 
 /// Live recall-mode tag (P1 honesty patch). Reflects the *runtime*
@@ -554,6 +568,11 @@ pub struct CapabilityFeatures {
     /// Reflects the live `CrossEncoder` variant. See [`RerankerMode`].
     #[serde(default = "default_reranker_mode")]
     pub reranker_active: RerankerMode,
+}
+
+/// L1-1 default: the two typed memory kinds shipping in v0.7.0.
+fn default_memory_kinds() -> Vec<String> {
+    vec!["observation".to_string(), "reflection".to_string()]
 }
 
 fn default_recall_mode() -> RecallMode {
@@ -917,6 +936,8 @@ impl Capabilities {
             // None when no SAL adapter is wired (every pre-J2 build);
             // `Some("age" | "cte")` once the SAL handle is threaded.
             kg_backend: self.kg_backend.clone(),
+            // L1-1 — propagate the memory-kind set verbatim.
+            memory_kinds: self.memory_kinds.clone(),
         }
     }
 }
@@ -1055,6 +1076,12 @@ pub struct CapabilitiesV3 {
     /// that don't know the field round-trip cleanly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kg_backend: Option<String>,
+
+    /// L1-1 (v0.7.0) — typed memory-kind set. Forwarded from the v2
+    /// projection's `memory_kinds` field. Always
+    /// `["observation", "reflection"]` for v0.7.0.
+    #[serde(default = "default_memory_kinds")]
+    pub memory_kinds: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------

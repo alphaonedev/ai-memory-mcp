@@ -95,6 +95,7 @@ fn make_memory(namespace: &str, title: &str, reflection_depth: i32) -> Memory {
         expires_at: None,
         metadata: serde_json::json!({"agent_id": "test-agent-task6"}),
         reflection_depth,
+        memory_kind: ai_memory::models::MemoryKind::Observation,
     }
 }
 

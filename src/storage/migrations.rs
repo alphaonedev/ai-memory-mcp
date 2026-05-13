@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 30).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 31).
 
 use anyhow::Result;
 use rusqlite::{Connection, params};
@@ -33,7 +33,13 @@ CREATE TABLE IF NOT EXISTS memories (
     -- substrate-native reflection recursion tree. `0` for caller-minted
     -- memories (and any pre-v0.7.0 row); positive for synthesised
     -- reflections. Mirrors `models::Memory::reflection_depth`.
-    reflection_depth INTEGER NOT NULL DEFAULT 0
+    reflection_depth INTEGER NOT NULL DEFAULT 0,
+    -- v0.7.0 L1-1 (typed MemoryKind, schema v30) — first-class kind
+    -- discriminator. `observation` for all caller-minted memories (and
+    -- any pre-v30 row); `reflection` for memories minted by
+    -- `memory_reflect` or the curator reflection pass.
+    -- Mirrors `models::MemoryKind`.
+    memory_kind TEXT NOT NULL DEFAULT 'observation'
 );
 
 CREATE INDEX IF NOT EXISTS idx_memories_tier ON memories(tier);
@@ -151,7 +157,16 @@ CREATE INDEX IF NOT EXISTS idx_audit_log_event_type
 //       land at `enabled=0`; operator activates with `ai-memory rules
 //       enable <id> --sign`. CREATE TABLE IF NOT EXISTS + INSERT OR
 //       IGNORE on seed — fully idempotent.
-const CURRENT_SCHEMA_VERSION: i64 = 30;
+// v31 = v0.7.0 L1-1 (typed MemoryKind::Reflection enum) —
+//       `memories.memory_kind TEXT NOT NULL DEFAULT 'observation'` column.
+//       First-class typed kind discriminator; `Observation` (default) for all
+//       pre-v31 rows, `Reflection` for memories minted by `memory_reflect` or
+//       the curator reflection pass. ALTER TABLE emitted from Rust; the SQL
+//       file holds the idempotent backfill (metadata.type='reflection' →
+//       memory_kind='reflection') plus the supporting index. Originally
+//       authored as v30 on l1/typed-memorykind; renumbered to v31 during
+//       the L1 wave merge after substrate-rules (issue #691) took v30.
+const CURRENT_SCHEMA_VERSION: i64 = 31;
 
 const MIGRATION_V15_SQLITE: &str =
     include_str!("../../migrations/sqlite/0010_v063_hierarchy_kg.sql");
@@ -239,6 +254,15 @@ const MIGRATION_V28_SQLITE: &str =
 // idempotent.
 const MIGRATION_V30_SQLITE: &str =
     include_str!("../../migrations/sqlite/0024_v07_governance_rules.sql");
+// v0.7.0 L1-1 — typed MemoryKind::Reflection enum. Adds the
+// `memories.memory_kind TEXT NOT NULL DEFAULT 'observation'` column.
+// ALTER TABLE done inline (SQLite has no `ADD COLUMN IF NOT EXISTS`);
+// the SQL file holds the idempotent backfill UPDATE (metadata.type =
+// 'reflection' → memory_kind = 'reflection') and the supporting index.
+// Renumbered from v30 → v31 during the L1 wave merge after
+// substrate-rules took v30. File name kept stable to preserve the
+// historical record of the L1-1 patch.
+const MIGRATION_V31_SQLITE: &str = include_str!("../../migrations/sqlite/0025_v07_memory_kind.sql");
 
 // COVERAGE: per-version ALTER/CREATE branches inside this function
 // are guarded by `has_X` column-existence probes and `IF NOT EXISTS`
@@ -878,6 +902,24 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             // (operator activates after test-fleet audit).
             conn.execute_batch(MIGRATION_V30_SQLITE)?;
         }
+        if version < 31 {
+            // v0.7.0 L1-1 — typed MemoryKind::Reflection enum. Adds the
+            // `memories.memory_kind TEXT NOT NULL DEFAULT 'observation'`
+            // column. ALTER TABLE done inline (SQLite has no `ADD COLUMN
+            // IF NOT EXISTS`); the SQL file holds the idempotent backfill
+            // UPDATE and the supporting index on the new column.
+            let has_memory_kind = conn
+                .prepare("SELECT memory_kind FROM memories LIMIT 0")
+                .is_ok();
+            if !has_memory_kind {
+                conn.execute(
+                    "ALTER TABLE memories ADD COLUMN memory_kind TEXT NOT NULL DEFAULT 'observation'",
+                    [],
+                )?;
+            }
+            // Backfill + index — fully idempotent.
+            conn.execute_batch(MIGRATION_V31_SQLITE)?;
+        }
 
         conn.execute("DELETE FROM schema_version", [])?;
         conn.execute(
@@ -952,12 +994,12 @@ mod tests {
 
     #[test]
     fn current_schema_version_matches_module_docstring() {
-        // The module docstring advertises 30; bumping the constant
+        // The module docstring advertises 31; bumping the constant
         // without updating the docstring is a documented foot-gun.
         // We pin the relationship so a future bump is loud.
         assert_eq!(
-            CURRENT_SCHEMA_VERSION, 30,
-            "module docstring advertises 30; bump the docstring when this number changes"
+            CURRENT_SCHEMA_VERSION, 31,
+            "module docstring advertises 31; bump the docstring when this number changes"
         );
     }
 

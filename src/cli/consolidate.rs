@@ -385,6 +385,7 @@ mod tests {
             expires_at: None,
             metadata,
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         db::insert(&conn, &mem).expect("db::insert")
     }

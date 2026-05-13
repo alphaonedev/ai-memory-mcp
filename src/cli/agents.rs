@@ -720,6 +720,7 @@ mod tests {
             expires_at: None,
             metadata,
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         let id = db::insert(&conn, &mem).expect("db::insert standard");
         db::set_namespace_standard(&conn, namespace, &id, None).expect("set_namespace_standard");

@@ -42,6 +42,7 @@ fn reflection(id: &str, depth: i32, namespace: &str) -> Memory {
         expires_at: None,
         metadata: serde_json::json!({"agent_id": "ai:source"}),
         reflection_depth: depth,
+        memory_kind: ai_memory::models::MemoryKind::Observation,
     }
 }
 

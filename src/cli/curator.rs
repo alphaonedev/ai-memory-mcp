@@ -440,6 +440,7 @@ mod tests {
             expires_at: None,
             metadata,
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         db::insert(&conn, &mem).expect("db::insert")
     }
@@ -479,6 +480,7 @@ mod tests {
                 expires_at: None,
                 metadata,
                 reflection_depth: 0,
+                memory_kind: crate::models::MemoryKind::Observation,
             };
             db::insert(&conn, &mem).unwrap()
         };
@@ -545,6 +547,7 @@ mod tests {
                 expires_at: None,
                 metadata: metadata.clone(),
                 reflection_depth: 0,
+                memory_kind: crate::models::MemoryKind::Observation,
             };
             let m2 = crate::models::Memory {
                 id: uuid::Uuid::new_v4().to_string(),
@@ -563,6 +566,7 @@ mod tests {
                 expires_at: None,
                 metadata,
                 reflection_depth: 0,
+                memory_kind: crate::models::MemoryKind::Observation,
             };
             t1 = db::insert(&conn, &m1).unwrap();
             t2 = db::insert(&conn, &m2).unwrap();
@@ -627,6 +631,7 @@ mod tests {
                 expires_at: None,
                 metadata,
                 reflection_depth: 0,
+                memory_kind: crate::models::MemoryKind::Observation,
             };
             target = db::insert(&conn, &mem).unwrap();
         }
@@ -661,6 +666,7 @@ mod tests {
                 expires_at: None,
                 metadata,
                 reflection_depth: 0,
+                memory_kind: crate::models::MemoryKind::Observation,
             };
             entry_id = db::insert(&conn, &mem).unwrap();
         }
