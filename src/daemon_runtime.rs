@@ -3522,6 +3522,7 @@ mod tests {
             expires_at: None,
             metadata: crate::models::default_metadata(),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         let id = db::insert(&conn, &mem).unwrap();
         db::set_embedding(&conn, &id, &[1.0, 0.0, 0.0]).unwrap();
@@ -3564,6 +3565,7 @@ mod tests {
             expires_at: Some(past),
             metadata: crate::models::default_metadata(),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         db::insert(&conn, &mem).unwrap();
         drop(conn);

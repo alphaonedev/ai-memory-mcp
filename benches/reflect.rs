@@ -63,6 +63,7 @@ fn make_memory(namespace: &str, title: &str) -> Memory {
         expires_at: None,
         metadata: serde_json::json!({"agent_id": "bench-agent"}),
         reflection_depth: 0,
+        memory_kind: crate::models::MemoryKind::Observation,
     }
 }
 

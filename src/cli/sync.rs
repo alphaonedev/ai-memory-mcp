@@ -578,6 +578,7 @@ mod tests {
             expires_at: None,
             metadata: serde_json::json!({"agent_id": "remote-agent"}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         restamp_agent_id(&mut mem, "local-agent");
         assert_eq!(mem.metadata["agent_id"].as_str().unwrap(), "local-agent");
@@ -606,6 +607,7 @@ mod tests {
             expires_at: None,
             metadata: serde_json::json!({"agent_id": "same-agent"}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         restamp_agent_id(&mut mem, "same-agent");
         assert_eq!(mem.metadata["agent_id"].as_str().unwrap(), "same-agent");
@@ -832,6 +834,7 @@ mod tests {
             expires_at: None,
             metadata: serde_json::json!({}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         db::insert(&conn, &mem).unwrap();
         drop(conn);
@@ -864,6 +867,7 @@ mod tests {
             expires_at: None,
             metadata: serde_json::json!({}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         restamp_agent_id(&mut mem, "caller-agent");
         assert_eq!(mem.metadata["agent_id"].as_str().unwrap(), "caller-agent");

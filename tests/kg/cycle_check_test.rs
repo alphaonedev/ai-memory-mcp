@@ -54,6 +54,7 @@ fn insert(conn: &Connection, id: &str) -> String {
         expires_at: None,
         metadata: serde_json::json!({"agent_id": "test-agent-l1-2"}),
         reflection_depth: 0,
+        memory_kind: ai_memory::models::MemoryKind::Observation,
     };
     db::insert(conn, &mem).expect("insert memory")
 }

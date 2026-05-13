@@ -526,6 +526,7 @@ async fn insert_fixture(
             // KG traversal benchmark targets the same shape it would in
             // production.
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         store.store(&ctx, &mem).await?;
     }

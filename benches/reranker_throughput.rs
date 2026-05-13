@@ -66,6 +66,7 @@ fn make_memory(i: usize) -> Memory {
         // mint depth-0 (caller-equivalent) memories so the reranker
         // sees the same shape it would in production.
         reflection_depth: 0,
+        memory_kind: crate::models::MemoryKind::Observation,
     }
 }
 

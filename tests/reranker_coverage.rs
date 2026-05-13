@@ -43,6 +43,7 @@ fn make_memory(title: &str, content: &str) -> Memory {
         expires_at: None,
         metadata: serde_json::json!({}),
         reflection_depth: 0,
+        memory_kind: ai_memory::models::MemoryKind::Observation,
     }
 }
 

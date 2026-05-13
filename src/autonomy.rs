@@ -502,6 +502,7 @@ fn persist_rollback_entry(conn: &Connection, entry: &RollbackEntry) -> Result<()
             "action": entry.action_tag(),
         }),
         reflection_depth: 0,
+        memory_kind: crate::models::MemoryKind::Observation,
     };
     db::insert(conn, &mem)?;
     Ok(())
@@ -548,6 +549,7 @@ pub fn persist_self_report(
         expires_at: None,
         metadata: serde_json::json!({"agent_id": "ai:curator"}),
         reflection_depth: 0,
+        memory_kind: crate::models::MemoryKind::Observation,
     };
     db::insert(conn, &mem)?;
     Ok(())
@@ -718,6 +720,7 @@ mod tests {
             expires_at: None,
             metadata: serde_json::json!({"agent_id":"ai:test"}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         }
     }
 

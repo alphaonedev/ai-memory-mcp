@@ -33,7 +33,13 @@ CREATE TABLE IF NOT EXISTS memories (
     -- substrate-native reflection recursion tree. `0` for caller-minted
     -- memories (and any pre-v0.7.0 row); positive for synthesised
     -- reflections. Mirrors `models::Memory::reflection_depth`.
-    reflection_depth INTEGER NOT NULL DEFAULT 0
+    reflection_depth INTEGER NOT NULL DEFAULT 0,
+    -- v0.7.0 L1-1 (typed MemoryKind, schema v30) — first-class kind
+    -- discriminator. `observation` for all caller-minted memories (and
+    -- any pre-v30 row); `reflection` for memories minted by
+    -- `memory_reflect` or the curator reflection pass.
+    -- Mirrors `models::MemoryKind`.
+    memory_kind TEXT NOT NULL DEFAULT 'observation'
 );
 
 CREATE INDEX IF NOT EXISTS idx_memories_tier ON memories(tier);
@@ -146,7 +152,14 @@ CREATE INDEX IF NOT EXISTS idx_audit_log_event_type
 //       rows. ALTER TABLE emitted from Rust (SQLite has no `ADD COLUMN
 //       IF NOT EXISTS`); fresh-schema installs pick it up inline from
 //       the `SCHEMA` constant above.
-const CURRENT_SCHEMA_VERSION: i64 = 29;
+// v30 = v0.7.0 L1-1 (typed MemoryKind::Reflection enum) —
+//       `memories.memory_kind TEXT NOT NULL DEFAULT 'observation'` column.
+//       First-class typed kind discriminator; `Observation` (default) for all
+//       pre-v30 rows, `Reflection` for memories minted by `memory_reflect` or
+//       the curator reflection pass. ALTER TABLE emitted from Rust; the SQL
+//       file holds the idempotent backfill (metadata.type='reflection' →
+//       memory_kind='reflection') plus the supporting index.
+const CURRENT_SCHEMA_VERSION: i64 = 30;
 
 const MIGRATION_V15_SQLITE: &str =
     include_str!("../../migrations/sqlite/0010_v063_hierarchy_kg.sql");
@@ -224,6 +237,12 @@ const MIGRATION_V27_SQLITE: &str =
 // call returns a `QUOTA_EXCEEDED` diagnostic naming the limit hit.
 const MIGRATION_V28_SQLITE: &str =
     include_str!("../../migrations/sqlite/0022_v07_agent_quotas.sql");
+// v0.7.0 L1-1 — typed MemoryKind::Reflection enum. Adds the
+// `memories.memory_kind TEXT NOT NULL DEFAULT 'observation'` column.
+// ALTER TABLE done inline (SQLite has no `ADD COLUMN IF NOT EXISTS`);
+// the SQL file holds the idempotent backfill UPDATE (metadata.type =
+// 'reflection' → memory_kind = 'reflection') and the supporting index.
+const MIGRATION_V30_SQLITE: &str = include_str!("../../migrations/sqlite/0023_v07_memory_kind.sql");
 
 #[allow(clippy::too_many_lines)]
 pub(super) fn migrate(conn: &Connection) -> Result<()> {
@@ -816,6 +835,24 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
                     [],
                 )?;
             }
+        }
+        if version < 30 {
+            // v0.7.0 L1-1 — typed MemoryKind::Reflection enum. Adds the
+            // `memories.memory_kind TEXT NOT NULL DEFAULT 'observation'`
+            // column. ALTER TABLE done inline (SQLite has no `ADD COLUMN
+            // IF NOT EXISTS`); the SQL file holds the idempotent backfill
+            // UPDATE and the supporting index on the new column.
+            let has_memory_kind = conn
+                .prepare("SELECT memory_kind FROM memories LIMIT 0")
+                .is_ok();
+            if !has_memory_kind {
+                conn.execute(
+                    "ALTER TABLE memories ADD COLUMN memory_kind TEXT NOT NULL DEFAULT 'observation'",
+                    [],
+                )?;
+            }
+            // Backfill + index — fully idempotent.
+            conn.execute_batch(MIGRATION_V30_SQLITE)?;
         }
 
         conn.execute("DELETE FROM schema_version", [])?;
