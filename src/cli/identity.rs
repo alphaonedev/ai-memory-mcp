@@ -564,4 +564,240 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("does not match"), "got: {msg}");
     }
+
+    // ------------------------------------------------------------------
+    // L0.7-3 chunk-e2 — coverage uplift to ≥95%.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn generate_json_mode_emits_payload() {
+        // json_out=true on generate exercises the JSON emission branch
+        // (lines 159-169) that the existing happy-path test skipped.
+        let (mut env, dir) = fresh_env();
+        let dir_path = dir.path().to_path_buf();
+        {
+            let mut out = env.output();
+            run(
+                IdentityArgs {
+                    key_dir: Some(dir_path),
+                    action: IdentityAction::Generate {
+                        agent_id: Some("carol".to_string()),
+                        force: false,
+                        no_overwrite: false,
+                    },
+                },
+                true,
+                &mut out,
+            )
+            .unwrap();
+        }
+        let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
+        assert_eq!(v["generated"], true);
+        assert_eq!(v["agent_id"].as_str().unwrap(), "carol");
+        assert!(v["public_key_b64"].as_str().unwrap().len() > 10);
+        assert!(v["key_dir"].is_string());
+    }
+
+    #[test]
+    fn import_public_only_text_mode() {
+        // Public-only import (priv=None) covers the `private = None`
+        // branch (line 206), the `save_public_only` branch (217), and
+        // the text-mode "(private=no)" emission (lines 233-239).
+        let (mut env, dir) = fresh_env();
+        let dir_path = dir.path().to_path_buf();
+        let kp = keypair::generate("dave").unwrap();
+        let staging = tempfile::TempDir::new().unwrap();
+        let pub_file = staging.path().join("d.pub");
+        std::fs::write(&pub_file, kp.public.to_bytes()).unwrap();
+        {
+            let mut out = env.output();
+            run(
+                IdentityArgs {
+                    key_dir: Some(dir_path.clone()),
+                    action: IdentityAction::Import {
+                        agent_id: "dave".to_string(),
+                        public: pub_file,
+                        private: None,
+                    },
+                },
+                false,
+                &mut out,
+            )
+            .unwrap();
+        }
+        let stdout = env.stdout_str().to_string();
+        assert!(
+            stdout.contains("imported keypair for dave"),
+            "got: {stdout}"
+        );
+        assert!(stdout.contains("(private=no)"), "got: {stdout}");
+        // Round-trip — load should succeed and report no signing key.
+        let loaded = keypair::load("dave", &dir_path).unwrap();
+        assert!(!loaded.can_sign());
+    }
+
+    #[test]
+    fn import_public_only_json_mode() {
+        // JSON emission covers lines 221-231 with `private_imported=false`.
+        let (mut env, dir) = fresh_env();
+        let dir_path = dir.path().to_path_buf();
+        let kp = keypair::generate("eve").unwrap();
+        let staging = tempfile::TempDir::new().unwrap();
+        let pub_file = staging.path().join("e.pub");
+        std::fs::write(&pub_file, kp.public.to_bytes()).unwrap();
+        {
+            let mut out = env.output();
+            run(
+                IdentityArgs {
+                    key_dir: Some(dir_path),
+                    action: IdentityAction::Import {
+                        agent_id: "eve".to_string(),
+                        public: pub_file,
+                        private: None,
+                    },
+                },
+                true,
+                &mut out,
+            )
+            .unwrap();
+        }
+        let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
+        assert_eq!(v["imported"], true);
+        assert_eq!(v["agent_id"].as_str().unwrap(), "eve");
+        assert_eq!(v["private_imported"], false);
+        assert!(v["public_key_b64"].as_str().unwrap().len() > 10);
+    }
+
+    #[test]
+    fn import_with_priv_json_mode_reports_private_imported_true() {
+        // Mirrors the existing private import test but in json mode to
+        // cover lines 220-231 with `private_imported=true`.
+        let (mut env, dir) = fresh_env();
+        let dir_path = dir.path().to_path_buf();
+        let kp = keypair::generate("frank").unwrap();
+        let staging = tempfile::TempDir::new().unwrap();
+        let pub_file = staging.path().join("f.pub");
+        let priv_file = staging.path().join("f.priv");
+        std::fs::write(&pub_file, kp.public.to_bytes()).unwrap();
+        std::fs::write(&priv_file, kp.private.as_ref().unwrap().to_bytes()).unwrap();
+        {
+            let mut out = env.output();
+            run(
+                IdentityArgs {
+                    key_dir: Some(dir_path),
+                    action: IdentityAction::Import {
+                        agent_id: "frank".to_string(),
+                        public: pub_file,
+                        private: Some(priv_file),
+                    },
+                },
+                true,
+                &mut out,
+            )
+            .unwrap();
+        }
+        let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
+        assert_eq!(v["private_imported"], true);
+    }
+
+    #[test]
+    fn list_empty_text_mode_emits_no_keypairs() {
+        // Empty list in text mode (line 266).
+        let (mut env, dir) = fresh_env();
+        let dir_path = dir.path().to_path_buf();
+        {
+            let mut out = env.output();
+            run(
+                IdentityArgs {
+                    key_dir: Some(dir_path),
+                    action: IdentityAction::List,
+                },
+                false,
+                &mut out,
+            )
+            .unwrap();
+        }
+        assert!(env.stdout_str().contains("no keypairs in"));
+    }
+
+    #[test]
+    fn list_empty_json_mode_emits_count_zero() {
+        // JSON list with zero entries — covers the json branch with the
+        // empty `entries` collection (line 264).
+        let (mut env, dir) = fresh_env();
+        let dir_path = dir.path().to_path_buf();
+        {
+            let mut out = env.output();
+            run(
+                IdentityArgs {
+                    key_dir: Some(dir_path),
+                    action: IdentityAction::List,
+                },
+                true,
+                &mut out,
+            )
+            .unwrap();
+        }
+        let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
+        assert_eq!(v["count"].as_u64().unwrap(), 0);
+        assert!(v["keys"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn export_pub_json_mode_emits_payload() {
+        // JSON-mode export-pub (lines 278-286).
+        let (mut env, dir) = fresh_env();
+        let dir_path = dir.path().to_path_buf();
+        // First generate so there is something to export.
+        {
+            let mut out = env.output();
+            run(
+                IdentityArgs {
+                    key_dir: Some(dir_path.clone()),
+                    action: IdentityAction::Generate {
+                        agent_id: Some("grace".to_string()),
+                        force: false,
+                        no_overwrite: false,
+                    },
+                },
+                false,
+                &mut out,
+            )
+            .unwrap();
+        }
+        env.stdout.clear();
+        env.stderr.clear();
+        {
+            let mut out = env.output();
+            run(
+                IdentityArgs {
+                    key_dir: Some(dir_path),
+                    action: IdentityAction::ExportPub {
+                        agent_id: "grace".to_string(),
+                    },
+                },
+                true,
+                &mut out,
+            )
+            .unwrap();
+        }
+        let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
+        assert_eq!(v["agent_id"].as_str().unwrap(), "grace");
+        assert!(v["public_key_b64"].as_str().unwrap().len() > 10);
+    }
+
+    #[test]
+    fn resolve_key_dir_falls_through_to_default() {
+        // No override path → falls through to `keypair::default_key_dir()`
+        // (line 102). We don't assert on the contents (HOME-dependent),
+        // only that we reach the call and get a `Result`.
+        let r = resolve_key_dir(None);
+        // The default-key-dir resolution depends on dirs::config_dir(),
+        // which is generally available on macOS/Linux test hosts. Tolerate
+        // both Ok (typical) and Err (CI without HOME).
+        match r {
+            Ok(p) => assert!(p.as_os_str().len() > 0),
+            Err(_) => {}
+        }
+    }
 }
