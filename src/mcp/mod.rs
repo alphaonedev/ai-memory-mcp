@@ -304,6 +304,8 @@ mod quota_status;
 mod recall;
 #[path = "tools/reflect.rs"]
 mod reflect;
+#[path = "tools/reflection_origin.rs"]
+mod reflection_origin;
 #[path = "tools/replay.rs"]
 mod replay;
 #[path = "tools/search.rs"]
@@ -374,6 +376,7 @@ use pending::handle_pending_list;
 use pending::handle_subscription_dlq_list;
 use promote::handle_promote;
 use reflect::handle_reflect;
+use reflection_origin::handle_reflection_origin;
 use search::handle_search;
 use store::handle_store;
 use subscribe::{handle_list_subscriptions, handle_subscribe, handle_subscription_replay};
@@ -869,6 +872,8 @@ fn handle_request(
                 "memory_subscription_replay" => handle_subscription_replay(conn, arguments),
                 "memory_subscription_dlq_list" => handle_subscription_dlq_list(conn, arguments),
                 "memory_quota_status" => handle_quota_status(conn, arguments),
+                // v0.7.0 L2-2 (S6-M1) — cross-peer reflection provenance.
+                "memory_reflection_origin" => handle_reflection_origin(conn, arguments),
                 // Ultrareview #349: unknown tool is a JSON-RPC 2.0
                 // "method not found" condition — return -32601, not
                 // an ok_response with `isError: true`. Clients that
@@ -1319,9 +1324,10 @@ mod tests {
         // v0.7 B2 adds memory_smart_load (Family::Core) → 50.
         // v0.7 K8 adds memory_quota_status (Family::Power) → 51.
         // v0.7.0 Task 4/8 adds memory_reflect (Family::Power) → 52.
+        // v0.7.0 L2-2 adds memory_reflection_origin (Family::Power) → 53.
         let defs = tool_definitions();
         let tools = defs["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 52);
+        assert_eq!(tools.len(), 53);
     }
 
     /// v0.6.4-002 acceptance gate (RFC §S25/S26): `--profile core`
@@ -1376,13 +1382,14 @@ mod tests {
         let tools = defs["tools"].as_array().unwrap();
         assert_eq!(
             tools.len(),
-            52,
+            53,
             "full profile = v0.6.3 surface (43) + v0.7.0 I4 memory_replay (1) + \
              v0.7 H4 memory_verify (1) + v0.7 B1 memory_load_family (1) + \
              v0.7 B2 memory_smart_load (1) + \
              v0.7 K7 memory_subscription_replay + memory_subscription_dlq_list (2) + \
              v0.7 J7 memory_find_paths (1) + v0.7 K8 memory_quota_status (1) + \
-             v0.7.0 Task 4/8 memory_reflect (1) = 52"
+             v0.7.0 Task 4/8 memory_reflect (1) + \
+             v0.7.0 L2-2 memory_reflection_origin (1) = 53"
         );
     }
 

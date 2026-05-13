@@ -412,6 +412,45 @@ pub async fn build_rustls_client_config(
 /// `ServerCertVerifier` that accepts any peer certificate. Safe ONLY when
 /// paired with a strong reverse authentication channel — in our case the
 /// peer's `--mtls-allowlist` fingerprint-pins our client cert.
+///
+/// # v0.7.0 S6-LOW1 — threat model and compensating control
+///
+/// This verifier is intentionally permissive on the SERVER cert and is
+/// the documented compensating-with-mTLS control for issue #224. The
+/// security argument has three legs that must all hold for the
+/// resulting channel to remain trustworthy:
+///
+/// 1. **Client cert is the actual authn primitive.** The peer
+///    fingerprint-pins our client cert via `--mtls-allowlist`. A
+///    misbehaving server cannot complete the TLS handshake unless our
+///    client cert's SHA-256 is on its allowlist; an attacker who has
+///    spoofed DNS but lacks our client key is filtered at the peer's
+///    `ClientCertVerifier`.
+/// 2. **Sync traffic is single-purpose.** The federation channel only
+///    carries `/api/v1/sync/push` + `/api/v1/sync/since` payloads. The
+///    receiver still validates every memory through
+///    `validate::validate_memory`, signs/verifies every link through
+///    the H3 verify path, and gates every write through the per-agent
+///    quota (S6-M2). A man-in-the-middle would gain nothing by
+///    impersonating a server we'd already authenticate ourselves to.
+/// 3. **Pinning server certs is a v0.8.0 refinement.** Layer-2b
+///    server-cert pinning lands when the `--peer-fingerprint` flag is
+///    added (tracked in #224 follow-up). At that point this verifier
+///    is replaced with a fingerprint allowlist-checking variant. Until
+///    then, operators are explicitly informed via the operator runbook
+///    (`docs/runbook/federation-tls.md`) that:
+///       - both peers MUST set `--mtls-allowlist` to fingerprint-pin
+///         each other's CLIENT cert,
+///       - server-cert presentation is not currently authenticated
+///         beyond TLS handshake completion,
+///       - any deployment that exposes the federation port to a
+///         hostile network MUST front the daemon with a reverse proxy
+///         that performs server-side cert pinning.
+///
+/// **Do not use this verifier outside the federation sync-daemon
+/// path.** The MCP / CLI / HTTP-app paths use the default rustls
+/// verifier with platform roots. Removing the `Dangerous` prefix from
+/// the type name would obscure the trade-off and is rejected.
 #[derive(Debug)]
 pub struct DangerousAnyServerVerifier;
 

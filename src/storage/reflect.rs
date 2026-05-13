@@ -388,6 +388,33 @@ pub fn reflect_with_hooks(
     // hook's own decision record (if any), so they are deliberately
     // NOT emitted here.
     if new_depth_u32 > cap {
+        // v0.7.0 L2-2 — cross-peer enforcement. If any source carries a
+        // `reflection_origin.peer_origin` stamp (it was imported via
+        // federation `sync_push`), surface the originating peer in the
+        // refusal so operators see the cross-peer provenance — not just
+        // "depth exceeded". Local cap is enforced regardless of source
+        // origin (territorial sovereignty), but the message distinguishes
+        // "remote reflection at depth N, local depth limit M" from a
+        // purely local cap breach.
+        let cross_peer_refusal =
+            crate::federation::reflection_bookkeeping::enforce_local_cap_on_derived(
+                new_depth_u32,
+                cap,
+                &sources,
+            );
+        if let Err(ref r) = cross_peer_refusal
+            && r.imported_peer.is_some()
+        {
+            tracing::warn!(
+                target: "federation::reflection_bookkeeping",
+                peer = ?r.imported_peer,
+                attempted = new_depth_u32,
+                local_cap = cap,
+                namespace = %target_namespace,
+                "L2-2: refusing derived reflection: {}",
+                r,
+            );
+        }
         emit_reflection_depth_exceeded_audit(
             conn,
             &input.agent_id,
