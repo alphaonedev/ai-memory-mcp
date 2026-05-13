@@ -640,6 +640,25 @@ pub struct CapabilityHooks {
     /// callers do not have to handle a missing field.
     #[serde(default = "default_webhook_events")]
     pub webhook_events: Vec<String>,
+    /// v0.7.0 L1-7: total number of distinct `HookEvent` variants the
+    /// pipeline supports.  Populated from the compile-time constant
+    /// [`HOOK_EVENTS_COUNT`] so operators and integrations can verify
+    /// they are running against the expected pipeline version without
+    /// enumerating the enum.
+    ///
+    /// History: G2 shipped 20; G10 added the 21st; Task 6/8 added
+    /// the 22nd + 23rd; L1-7 adds the 24th + 25th → total **25**.
+    #[serde(default = "default_hook_events_count")]
+    pub hook_events_count: usize,
+}
+
+/// Compile-time count of `HookEvent` variants.  Updated here when new
+/// variants land; the corresponding enum exhaustiveness check in
+/// `src/hooks/timeouts.rs` enforces the count at test time.
+pub const HOOK_EVENTS_COUNT: usize = 25;
+
+fn default_hook_events_count() -> usize {
+    HOOK_EVENTS_COUNT
 }
 
 impl Default for CapabilityHooks {
@@ -647,6 +666,7 @@ impl Default for CapabilityHooks {
         Self {
             registered_count: 0,
             webhook_events: default_webhook_events(),
+            hook_events_count: HOOK_EVENTS_COUNT,
         }
     }
 }

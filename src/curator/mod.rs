@@ -33,7 +33,10 @@
 //! - `reflection_pass` — empty placeholder for Layer 2 Task L2-1.
 
 pub(crate) mod candidates;
+pub(crate) mod cluster;
+pub(crate) mod compaction;
 pub(crate) mod persist;
+pub(crate) mod pipeline;
 pub(crate) mod reflection_pass;
 
 use anyhow::Result;
@@ -66,6 +69,38 @@ pub const DEFAULT_MAX_OPS_PER_CYCLE: usize = 100;
 /// matches the synchronous hook threshold in `src/mcp.rs`.
 pub const MIN_CONTENT_LEN: usize = 50;
 
+/// Per-namespace compaction configuration.
+///
+/// Defaults to `enabled = false` to match ROADMAP2 §7.5: compaction is
+/// opt-in because it depends on the Ollama LLM being available at
+/// consolidation time.  Operators enable it per-namespace in
+/// `ai-memory.toml` once they have confirmed Ollama is reachable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactionConfig {
+    /// When `false` (the default), the compaction pipeline skips this
+    /// namespace entirely.  Set to `true` to opt in.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Cosine similarity threshold for cluster formation.
+    /// Passed through to [`crate::curator::cluster::CosineClustering`].
+    /// Defaults to `0.75` when omitted.
+    #[serde(default = "default_cosine_threshold")]
+    pub cosine_threshold: f32,
+}
+
+fn default_cosine_threshold() -> f32 {
+    crate::curator::cluster::DEFAULT_COSINE_THRESHOLD
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cosine_threshold: default_cosine_threshold(),
+        }
+    }
+}
+
 /// Curator configuration (surfaced to CLI + config file).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CuratorConfig {
@@ -80,6 +115,10 @@ pub struct CuratorConfig {
     pub include_namespaces: Vec<String>,
     /// Namespaces to skip. Exact match. Always also skips `_`-prefixed.
     pub exclude_namespaces: Vec<String>,
+    /// Per-namespace compaction configuration.  Defaults to
+    /// `enabled = false` per ROADMAP2 §7.5 (opt-in due to Ollama dep).
+    #[serde(default)]
+    pub compaction: CompactionConfig,
 }
 
 impl Default for CuratorConfig {
@@ -90,6 +129,7 @@ impl Default for CuratorConfig {
             dry_run: false,
             include_namespaces: Vec::new(),
             exclude_namespaces: Vec::new(),
+            compaction: CompactionConfig::default(),
         }
     }
 }
@@ -731,6 +771,7 @@ mod tests {
             dry_run: true, // Don't actually touch the DB on write
             include_namespaces: vec![],
             exclude_namespaces: vec![],
+            ..CuratorConfig::default()
         };
 
         // Shutdown flag starts false; the daemon will run until this is set.
@@ -1486,6 +1527,7 @@ fn priority_feedback_caps_at_priority_10() {
         dry_run: false,
         include_namespaces: vec![],
         exclude_namespaces: vec![],
+        ..CuratorConfig::default()
     };
     // If priority feedback caps at 10, max_ops_per_cycle * 4 should fit.
     let cap = cfg.max_ops_per_cycle.saturating_mul(4);

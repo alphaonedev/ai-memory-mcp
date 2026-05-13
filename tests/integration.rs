@@ -12694,6 +12694,7 @@ async fn test_daemon_cmd_curator_daemon_cycles_then_terminates() {
         dry_run: true,
         include_namespaces: Vec::new(),
         exclude_namespaces: Vec::new(),
+        ..ai_memory::curator::CuratorConfig::default()
     };
     let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
     let shutdown_for_daemon = shutdown.clone();
