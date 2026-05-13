@@ -235,6 +235,33 @@ short-circuit, and explicit timeout configuration.
 - Phase 1 functional cell exercises the chain under real Tokio
   multi-threaded runtime with the recall + store hook families wired.
 
+#### `src/hooks/recall.rs` — pre_recall_expand hot-path wiring (LIB-ONLY CEILING)
+
+`apply_pre_recall_expand` is a thin G10 helper that fires the
+`PreRecallExpand` chain on the recall hot path. The four `ChainResult`
+match arms (`Allow`, `ModifiedAllow`, `Deny`, `AskUser`) require a
+constructed `HookChain` with at least one configured hook plus an
+`ExecutorRegistry` with a registered daemon-mode executor — that
+machinery lives behind the integration-test fleet, not unit tests.
+
+Lib-only measurement is therefore capped at ~83% (run-to-run variance
+between 82.80% and 83.87% observed at L0.7-7 baseline vs §16
+re-measurement on the same source; nothing in `src/hooks/recall.rs`
+changed between the two commits). Threshold pinned to 82% per
+`floor(measured - 0.5)` discipline with measurement-variance headroom.
+
+**Ship-gate compensation**:
+
+- `tests/hooks_timeout_budget.rs` exercises `HookChain::fire` with
+  real configured hooks across the four `ChainResult` arms.
+- Phase 1 functional cell drives `apply_pre_recall_expand` through
+  the recall MCP tool with real daemon-mode hooks wired.
+
+**v0.8.0 raise target**: 92% (Tier C). Requires either (a) integration
+coverage roll-up that includes the `tests/hooks_*` fleet in the
+per-module measurement, or (b) lib-internal mock `ExecutorRegistry`
+that returns synthetic `ChainResult`s for each arm.
+
 #### `src/reranker.rs` — hybrid recall blender (STRUCTURAL CEILING)
 
 The blender ingests scored results from FTS5 + HNSW + (optionally) the
