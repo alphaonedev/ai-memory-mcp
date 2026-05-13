@@ -80,8 +80,11 @@ fn t0_describe_to_user_core_profile_canonical_phrasing() {
     // so the preview now overflows the 5-name cap (ends in ", ...").
     // memory_reflect lives in Family::Power, so it grows the "more"
     // bucket from 43 to 44 without changing the loaded count of 7.
+    // v0.7.0 L2-2 (S6-M1) — Family::Power gained
+    // `memory_reflection_origin` (53 total). Not loaded under core, so
+    // the "more" bucket grows from 44 to 45.
     let expected = "I can directly use 7 memory tools right now \
-                    (store, recall, list, get, search, ...). 44 more \
+                    (store, recall, list, get, search, ...). 45 more \
                     (update, delete, forget, gc, etc.) are available on demand — \
                     I can load them if you ask for something that needs them, \
                     or you can restart the server with a different profile.";
@@ -115,7 +118,11 @@ fn t0_describe_to_user_full_profile_canonical_phrasing() {
         .as_str()
         .expect("describe present");
 
-    let expected = "I can directly use all 51 memory tools right now \
+    // v0.7.0 L2-2 (S6-M1) — Family::Power gained
+    // `memory_reflection_origin` → 52 visible (the "all 52" form
+    // excludes the always-on `memory_capabilities` bootstrap from the
+    // 53-tool total).
+    let expected = "I can directly use all 52 memory tools right now \
                     (store, recall, list, get, search, ...). Nothing more to load — \
                     the full memory surface is already active.";
 
@@ -148,8 +155,11 @@ fn t0_describe_to_user_graph_profile_canonical_phrasing() {
         .as_str()
         .expect("describe present");
 
+    // v0.7.0 L2-2 (S6-M1) — Family::Power gained
+    // `memory_reflection_origin` (not loaded under graph), so the
+    // "more" count grows from 33 to 34.
     let expected = "I can directly use 18 memory tools right now \
-                    (store, recall, list, get, search, ...). 33 more \
+                    (store, recall, list, get, search, ...). 34 more \
                     (update, delete, forget, gc, etc.) are available on demand — \
                     I can load them if you ask for something that needs them, \
                     or you can restart the server with a different profile.";

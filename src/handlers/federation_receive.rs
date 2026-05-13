@@ -27,6 +27,103 @@ use super::{AppState, StorageBackend};
 // resume-on-interrupt, and per-peer auth tokens are v0.8.0 targets.
 // ---------------------------------------------------------------------------
 
+/// v0.7.0 S6-LOW2 — log a warning when the sender's claimed wall-clock
+/// is more than this many seconds ahead of the receiver's. Threshold is
+/// deliberately permissive: ~1 minute of skew is normal for hosts with
+/// NTP drift after a sleep cycle. Anything beyond that is operator-
+/// signal that the cluster's clocks need attention.
+const CLOCK_SKEW_WARN_THRESHOLD_SECS: i64 = 60;
+
+/// v0.7.0 S6-LOW2 — observability-only clock-skew check. Compares the
+/// sender's reported wall-clock (or the highest entry in
+/// `sender_clock.entries` when the wall-clock field is absent) against
+/// the receiver's `chrono::Utc::now()`. When the delta exceeds
+/// [`CLOCK_SKEW_WARN_THRESHOLD_SECS`] in either direction, emits a
+/// `tracing::warn!` so operators can spot a misconfigured peer. NEVER
+/// rejects the push — federation must be tolerant of clock drift; the
+/// log is the entire enforcement surface.
+fn check_sender_clock_skew(sender_agent_id: &str, body: &SyncPushBody) {
+    let sender_ts_str: Option<&str> = body
+        .sender_wall_clock
+        .as_deref()
+        .or_else(|| body.sender_clock.entries.values().max().map(String::as_str));
+    let Some(ts_str) = sender_ts_str else {
+        return; // No clock signal at all → nothing to compare.
+    };
+    let Ok(sender_at) = chrono::DateTime::parse_from_rfc3339(ts_str) else {
+        tracing::debug!(
+            sender = %sender_agent_id,
+            sender_ts = %ts_str,
+            "sync_push: sender clock not RFC3339; skipping skew check"
+        );
+        return;
+    };
+    let now = chrono::Utc::now();
+    let skew_secs = sender_at
+        .with_timezone(&chrono::Utc)
+        .signed_duration_since(now)
+        .num_seconds();
+    if skew_secs.abs() > CLOCK_SKEW_WARN_THRESHOLD_SECS {
+        tracing::warn!(
+            target: "federation::clock_skew",
+            sender = %sender_agent_id,
+            skew_secs,
+            sender_ts = %ts_str,
+            receiver_ts = %now.to_rfc3339(),
+            "sync_push: sender_clock skew exceeds {CLOCK_SKEW_WARN_THRESHOLD_SECS}s threshold \
+             (observability-only; push accepted)",
+        );
+    }
+}
+
+/// v0.7.0 S6-M2 — per-agent quota gate for federation receive. Closes
+/// the F7 gap (#639) where mTLS-authenticated peers could push past
+/// the local `agent_quotas` storage caps that would have blocked an
+/// equivalent HTTP `POST /memories` from the same identity.
+///
+/// `attribute_agent` is the identity the substrate will charge for the
+/// row. Resolution precedence (mTLS-attested first; falls back to the
+/// claim chain when no cert peeking is available):
+///   1. `mem.metadata.agent_id` — the original author of the row
+///      (NHI provenance preserved across federation). This is what
+///      `quota_status` reports against, so charging this id makes the
+///      receiver-side quota a true mirror of the originator's daily
+///      budget. A misbehaving peer cannot substitute another agent's
+///      id without crashing the upstream signature check (H3).
+///   2. `sender_agent_id` — substrate identity of the peer that
+///      delivered the row. Used when the row carries no
+///      `metadata.agent_id` (legacy / unauthored federation push).
+///
+/// Returns `Ok(())` on a clean check + record (counters incremented),
+/// `Err(QuotaError)` on a refusal. The caller renders the refusal as
+/// `429 Too Many Requests` with an `X-Quota-Reset-At` header.
+fn attribute_agent_for_quota(sender_agent_id: &str, mem: &Memory) -> String {
+    mem.metadata
+        .get("agent_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| sender_agent_id.to_string())
+}
+
+/// v0.7.0 S6-M2 — compute the next UTC midnight in RFC3339, used as
+/// the `X-Quota-Reset-At` header value when a federation receive is
+/// refused for hitting `memories_per_day` or `links_per_day`. Storage
+/// caps reset on midnight UTC via `quotas::reset_daily`. The header
+/// matches the HTTP POST refusal surface so clients have one timer
+/// to consult regardless of which entry point hit the cap.
+fn next_utc_midnight() -> String {
+    use chrono::{Duration, Timelike};
+    let now = chrono::Utc::now();
+    let next = now
+        .with_hour(0)
+        .and_then(|t| t.with_minute(0))
+        .and_then(|t| t.with_second(0))
+        .and_then(|t| t.with_nanosecond(0))
+        .map(|midnight_today| midnight_today + Duration::days(1))
+        .unwrap_or_else(|| now + Duration::days(1));
+    next.to_rfc3339()
+}
+
 /// Request body for `POST /api/v1/sync/push`.
 #[derive(Deserialize)]
 pub struct SyncPushBody {
@@ -34,12 +131,19 @@ pub struct SyncPushBody {
     /// `sync_state` for vector clock advancement. Treated as identity
     /// only (not attestation) — same NHI model as every other write.
     pub sender_agent_id: String,
-    /// Vector clock the sender had at push time. Foundation accepts it
-    /// and stores the latest-seen timestamp; full clock reconciliation
-    /// lands with Task 3a.1.
+    /// Vector clock the sender had at push time. v0.7.0 S6-LOW2: now
+    /// consulted for observability-only clock-skew detection — the
+    /// receiver logs a `tracing::warn!` when the sender's latest
+    /// claimed observation is >60s ahead of the receiver's wall clock.
+    /// Full clock reconciliation (CRDT-lite merge) lands with Task 3a.1.
     #[serde(default)]
-    #[allow(dead_code)] // Consumed by Task 3a.1 CRDT-lite; shipped now for wire compat.
     pub sender_clock: crate::models::VectorClock,
+    /// v0.7.0 S6-LOW2 — sender's wall-clock RFC3339 timestamp at push
+    /// time. Optional: when absent, skew detection falls back to the
+    /// highest timestamp in `sender_clock.entries`. Observability-only;
+    /// never enforced.
+    #[serde(default)]
+    pub sender_wall_clock: Option<String>,
     /// Memories the sender is offering. Applied via the existing
     /// timestamp-aware merge (`insert_if_newer`).
     pub memories: Vec<Memory>,
@@ -165,6 +269,12 @@ async fn sync_push_via_store(app: AppState, _headers: HeaderMap, body: SyncPushB
     let mut links_applied = 0usize;
     let mut latest_seen: Option<String> = None;
     let mut unsupported_on_postgres = 0usize;
+    let mut quota_refused = 0usize;
+    let mut first_quota_refusal: Option<crate::quotas::QuotaError> = None;
+
+    // v0.7.0 S6-LOW2 — observability-only sender_clock skew detection
+    // (parity with the sqlite path).
+    check_sender_clock_skew(&body.sender_agent_id, &body);
 
     // ---- memories ----------------------------------------------------
     for mem in &body.memories {
@@ -183,7 +293,87 @@ async fn sync_push_via_store(app: AppState, _headers: HeaderMap, body: SyncPushB
             noop += 1;
             continue;
         }
-        match app.store.apply_remote_memory(&ctx, mem).await {
+        // v0.7.0 S6-M2 — per-agent quota gate. `agent_quotas` lives on
+        // the SQLite metadata DB even on postgres-backed daemons
+        // (Wave-3 hasn't migrated the row to the SAL trait yet), so
+        // the postgres path consults the same `app.db` connection the
+        // sqlite path uses. F7 closure (#639) — federation receive
+        // never bypasses the cap that the equivalent HTTP POST sees.
+        let attribute_agent = attribute_agent_for_quota(&body.sender_agent_id, mem);
+        let bytes_estimate =
+            i64::try_from(mem.title.len() + mem.content.len() + mem.metadata.to_string().len())
+                .unwrap_or(i64::MAX);
+        {
+            let conn = app.db.lock().await;
+            match crate::quotas::check_and_record(
+                &conn.0,
+                &attribute_agent,
+                crate::quotas::QuotaOp::Memory {
+                    bytes: bytes_estimate,
+                },
+            ) {
+                Ok(()) => {}
+                Err(crate::quotas::QuotaCheckError::Quota(q)) => {
+                    tracing::warn!(
+                        target: "federation::quota",
+                        peer = %body.sender_agent_id,
+                        attribute_agent = %attribute_agent,
+                        limit = q.limit.as_str(),
+                        current = q.current,
+                        max = q.max,
+                        "sync_push (postgres): per-agent quota exceeded"
+                    );
+                    let _ = crate::signed_events::append_signed_event(
+                        &conn.0,
+                        &crate::signed_events::SignedEvent {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            agent_id: attribute_agent.clone(),
+                            event_type: "federation.quota_refused".to_string(),
+                            payload_hash: crate::signed_events::payload_hash(
+                                format!(
+                                    "peer={} agent={} limit={} current={} max={}",
+                                    body.sender_agent_id,
+                                    attribute_agent,
+                                    q.limit.as_str(),
+                                    q.current,
+                                    q.max,
+                                )
+                                .as_bytes(),
+                            ),
+                            signature: None,
+                            attest_level: "unsigned".to_string(),
+                            timestamp: chrono::Utc::now().to_rfc3339(),
+                        },
+                    );
+                    quota_refused += 1;
+                    if first_quota_refusal.is_none() {
+                        first_quota_refusal = Some(q);
+                    }
+                    drop(conn);
+                    break;
+                }
+                Err(crate::quotas::QuotaCheckError::Sql(e)) => {
+                    tracing::warn!(
+                        "sync_push (postgres): quota substrate read failed for {}: {e}",
+                        attribute_agent
+                    );
+                    skipped += 1;
+                    continue;
+                }
+            }
+        }
+        // v0.7.0 L2-2 — reflection origin stamping (postgres parity).
+        // Use the compiled-default cap on postgres because
+        // `resolve_governance_policy` is sqlite-only today; the stamp
+        // still carries `peer_origin` + `original_depth` which is the
+        // load-bearing provenance.
+        let local_cap = crate::models::GovernancePolicy::default().effective_max_reflection_depth();
+        let to_insert = crate::federation::reflection_bookkeeping::stamp_reflection_origin(
+            mem,
+            &body.sender_agent_id,
+            local_cap,
+        );
+        match app.store.apply_remote_memory(&ctx, &to_insert).await {
             Ok(applied_id) => {
                 applied += 1;
                 // v0.7.0 Wave-3 Continuation 5 (S18+S79 federation
@@ -229,10 +419,46 @@ async fn sync_push_via_store(app: AppState, _headers: HeaderMap, body: SyncPushB
                 }
             }
             Err(e) => {
+                // Refund the quota we charged so a downstream write
+                // failure doesn't leak counters (saturating; safe).
+                {
+                    let conn = app.db.lock().await;
+                    let _ = crate::quotas::refund_op(
+                        &conn.0,
+                        &attribute_agent,
+                        crate::quotas::QuotaOp::Memory {
+                            bytes: bytes_estimate,
+                        },
+                    );
+                }
                 tracing::warn!("sync_push: apply_remote_memory failed for {}: {e}", mem.id);
                 skipped += 1;
             }
         }
+    }
+
+    // v0.7.0 S6-M2 — quota refusal short-circuit (postgres path).
+    if let Some(q) = first_quota_refusal.take() {
+        let reset_at = next_utc_midnight();
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [
+                ("x-quota-reset-at", reset_at.as_str()),
+                ("x-quota-limit", q.limit.as_str()),
+            ],
+            Json(json!({
+                "error": "QUOTA_EXCEEDED",
+                "limit": q.limit.as_str(),
+                "current": q.current,
+                "max": q.max,
+                "agent_id": q.agent_id,
+                "applied_before_refusal": applied,
+                "quota_refused": quota_refused,
+                "reset_at": reset_at,
+                "storage_backend": "postgres",
+            })),
+        )
+            .into_response();
     }
 
     // ---- deletions ---------------------------------------------------
@@ -339,6 +565,7 @@ async fn sync_push_via_store(app: AppState, _headers: HeaderMap, body: SyncPushB
             "links_applied": links_applied,
             "noop": noop,
             "skipped": skipped,
+            "quota_refused": quota_refused,
             "unsupported_on_postgres": unsupported_on_postgres,
             "dry_run": body.dry_run,
             "receiver_agent_id": body.sender_agent_id,
@@ -476,6 +703,11 @@ pub async fn sync_push(
         }
     };
 
+    // v0.7.0 S6-LOW2 — observability-only sender_clock skew detection.
+    // Logs a warn when the sender's clock claim is >60s out from ours;
+    // does not gate the push. Federation must be tolerant of drift.
+    check_sender_clock_skew(&body.sender_agent_id, &body);
+
     let lock = state.lock().await;
     let mut applied = 0usize;
     let mut noop = 0usize;
@@ -484,6 +716,15 @@ pub async fn sync_push(
     let mut archived = 0usize;
     let mut restored = 0usize;
     let mut latest_seen: Option<String> = None;
+    // v0.7.0 S6-M2 — federation quota refusals. Counted alongside
+    // `skipped` so the existing response envelope shape doesn't change,
+    // and surfaced as a distinct field so an operator can tell the
+    // difference between "peer pushed garbage" and "peer overran its
+    // daily cap". The first quota refusal also short-circuits the
+    // whole memory loop with a 429 response (matches the HTTP POST
+    // store refusal: callers MUST back off, not just skip the offender).
+    let mut quota_refused = 0usize;
+    let mut first_quota_refusal: Option<crate::quotas::QuotaError> = None;
 
     // v0.6.0.1 (#322): peers that apply a synced memory must also refresh
     // their embedding + HNSW index so downstream semantic recall surfaces
@@ -511,16 +752,146 @@ pub async fn sync_push(
             noop += 1;
             continue;
         }
-        match db::insert_if_newer(&lock.0, mem) {
+        // v0.7.0 S6-M2 — per-agent quota gate. F7 (#639) closed this
+        // on the HTTP POST store path but federation receive was a
+        // back-door bypass: an mTLS peer could push N memories per
+        // second past the local `agent_quotas.max_memories_per_day`
+        // ceiling because `insert_if_newer` is the substrate-level
+        // upsert and doesn't consult quotas. Charge each accepted
+        // memory against the original author's quota row so the cap
+        // is a true cluster-wide budget. On refusal: emit a signed
+        // refusal event (for the cryptographic audit chain) and
+        // short-circuit the loop with `quota_refused`; the outer
+        // handler renders 429 + X-Quota-Reset-At so callers back off.
+        let attribute_agent = attribute_agent_for_quota(&body.sender_agent_id, mem);
+        let bytes_estimate =
+            i64::try_from(mem.title.len() + mem.content.len() + mem.metadata.to_string().len())
+                .unwrap_or(i64::MAX);
+        match crate::quotas::check_and_record(
+            &lock.0,
+            &attribute_agent,
+            crate::quotas::QuotaOp::Memory {
+                bytes: bytes_estimate,
+            },
+        ) {
+            Ok(()) => {}
+            Err(crate::quotas::QuotaCheckError::Quota(q)) => {
+                tracing::warn!(
+                    target: "federation::quota",
+                    peer = %body.sender_agent_id,
+                    attribute_agent = %attribute_agent,
+                    limit = q.limit.as_str(),
+                    current = q.current,
+                    max = q.max,
+                    "sync_push: per-agent quota exceeded; refusing federation push"
+                );
+                // Emit a signed audit event so the refusal lands in the
+                // tamper-evident chain alongside the F7-equivalent HTTP
+                // POST refusal. Best-effort: audit-write failure is
+                // logged but does not change the refusal control flow.
+                let _ = crate::signed_events::append_signed_event(
+                    &lock.0,
+                    &crate::signed_events::SignedEvent {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        agent_id: attribute_agent.clone(),
+                        event_type: "federation.quota_refused".to_string(),
+                        payload_hash: crate::signed_events::payload_hash(
+                            format!(
+                                "peer={} agent={} limit={} current={} max={}",
+                                body.sender_agent_id,
+                                attribute_agent,
+                                q.limit.as_str(),
+                                q.current,
+                                q.max,
+                            )
+                            .as_bytes(),
+                        ),
+                        signature: None,
+                        attest_level: "unsigned".to_string(),
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                    },
+                );
+                quota_refused += 1;
+                if first_quota_refusal.is_none() {
+                    first_quota_refusal = Some(q);
+                }
+                // Short-circuit: any further memories in this push
+                // would only deepen the cap breach. The remainder of
+                // the loop posture (skipping the rest) matches the
+                // HTTP POST bulk-create refusal — first cap hit
+                // returns 429 with the remaining batch unprocessed.
+                break;
+            }
+            Err(crate::quotas::QuotaCheckError::Sql(e)) => {
+                tracing::warn!(
+                    "sync_push: quota substrate read failed for {}: {e}",
+                    attribute_agent
+                );
+                skipped += 1;
+                continue;
+            }
+        }
+        // v0.7.0 L2-2 (S6-M1) — stamp `metadata.reflection_origin` on
+        // inbound reflection rows before the insert. The stamped copy
+        // carries `peer_origin`, `original_depth`, and the receiver's
+        // local cap at arrival time; the substrate row preserves the
+        // original `reflection_depth` so derived-write cap enforcement
+        // (storage::reflect) sees the same value the source peer saw.
+        // Non-reflection rows (depth == 0) pass through unchanged.
+        let cap_for_namespace = crate::storage::resolve_governance_policy(&lock.0, &mem.namespace)
+            .unwrap_or_else(crate::models::GovernancePolicy::default)
+            .effective_max_reflection_depth();
+        let to_insert = crate::federation::reflection_bookkeeping::stamp_reflection_origin(
+            mem,
+            &body.sender_agent_id,
+            cap_for_namespace,
+        );
+        match db::insert_if_newer(&lock.0, &to_insert) {
             Ok(actual_id) => {
                 applied += 1;
                 embedding_refresh.push((actual_id, format!("{} {}", mem.title, mem.content)));
             }
             Err(e) => {
+                // Best-effort refund so a downstream insert failure
+                // doesn't leak quota counters. `refund_op` saturates at
+                // zero so a buggy double-refund cannot poison the row.
+                let _ = crate::quotas::refund_op(
+                    &lock.0,
+                    &attribute_agent,
+                    crate::quotas::QuotaOp::Memory {
+                        bytes: bytes_estimate,
+                    },
+                );
                 tracing::warn!("sync_push: insert_if_newer failed for {}: {e}", mem.id);
                 skipped += 1;
             }
         }
+    }
+
+    // v0.7.0 S6-M2 — quota refusal short-circuit. The first refusal in
+    // the loop produces a 429 with X-Quota-Reset-At so callers back off
+    // (matches the HTTP POST store refusal envelope from F7 / #639).
+    if let Some(q) = first_quota_refusal.take() {
+        drop(lock);
+        let reset_at = next_utc_midnight();
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [
+                ("x-quota-reset-at", reset_at.as_str()),
+                ("x-quota-limit", q.limit.as_str()),
+            ],
+            Json(json!({
+                "error": "QUOTA_EXCEEDED",
+                "limit": q.limit.as_str(),
+                "current": q.current,
+                "max": q.max,
+                "agent_id": q.agent_id,
+                "applied_before_refusal": applied,
+                "quota_refused": quota_refused,
+                "reset_at": reset_at,
+            })),
+        )
+            .into_response();
     }
 
     // Process deletions (v0.6.0.1 — scenario 10 fanout). Invalid ids are
@@ -886,6 +1257,7 @@ pub async fn sync_push(
             "namespace_meta_cleared": namespace_meta_cleared,
             "noop": noop,
             "skipped": skipped,
+            "quota_refused": quota_refused,
             "dry_run": body.dry_run,
             "receiver_agent_id": local_agent_id,
             "receiver_clock": receiver_clock,
