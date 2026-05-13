@@ -802,7 +802,8 @@ pub fn tool_definitions() -> Value {
                         "priority": {"type": "integer", "minimum": 1, "maximum": 10, "default": 5},
                         "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": 1.0},
                         "agent_id": {"type": "string", "description": "Agent identifier for the reflection writer. Defaults to the NHI-hardened resolution chain when omitted (matches memory_store)."},
-                        "metadata": {"type": "object", "description": "Free-form metadata; merged with system-generated reflection_metadata fields. Caller-supplied keys win on collision."}
+                        "metadata": {"type": "object", "description": "Free-form metadata; merged with system-generated reflection_metadata fields. Caller-supplied keys win on collision."},
+                        "supersedes": {"type": "string", "description": "L1-6 — memory id this reflection supersedes. Refused for Goal targets (§16.2)."}
                     },
                     "required": ["source_ids", "title", "content"]
                 }

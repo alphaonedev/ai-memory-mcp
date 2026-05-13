@@ -1351,6 +1351,39 @@ pub fn create_link_signed(
     if !target_exists {
         anyhow::bail!("target memory not found: {target_id}");
     }
+    // v0.7.0 L1-6 — SAL-layer defence-in-depth for Boundary §16.2.
+    //
+    // The MCP `memory_link` handler in `mcp::tools::link.rs` is the
+    // canonical surface for the refusal (it emits a signed_events
+    // audit row and a typed `SupersedesGoalRefused` error).  This
+    // SAL-level check exists to catch non-MCP callers (HTTP REST,
+    // federation `sync_push`, CLI `link resolve`, future SAL clients)
+    // that would otherwise bypass the MCP-layer gate.  The MCP path
+    // is unaffected — the MCP refusal already short-circuits before
+    // reaching this function.
+    //
+    // No audit row is emitted from this layer to avoid duplicate
+    // entries on the MCP path; the SAL refusal raises a plain
+    // anyhow error that the HTTP/CLI surface translates to a 409.
+    if relation == "supersedes" {
+        let (src_kind, tgt_kind) = read_link_kinds(conn, source_id, target_id);
+        let src_ns = read_link_source_namespace(conn, source_id);
+        let policy = src_ns
+            .as_deref()
+            .map(|ns| resolve_typed_cognition_policy_sal(conn, ns))
+            .unwrap_or_default();
+
+        if let Err(refusal) = crate::governance::typed_cognition::validate_supersede_kinds(
+            source_id, target_id, src_kind, tgt_kind, policy,
+        ) {
+            anyhow::bail!(
+                "[SUPERSEDES_GOAL_REFUSED] {}: {} → {}",
+                refusal.reason,
+                source_id,
+                target_id
+            );
+        }
+    }
     // Schema v15 (Pillar 2 / Stream B) added `valid_from` for temporal
     // KG queries. Backfill on migration handled legacy rows; here we
     // populate it on the insert path so newly created links are
@@ -4747,6 +4780,62 @@ pub fn resolve_governance_policy(conn: &Connection, namespace: &str) -> Option<G
         // that closes G1.
     }
     None
+}
+
+/// v0.7.0 L1-6 — fetch both endpoints' `memory_kind` for a supersede
+/// edge.  Falls back to `MemoryKind::Observation` on any read failure
+/// so a corrupt-metadata row is treated as out-of-scope (the L1-6 gate
+/// only fires on `Reflection → Goal`; defaulting to `Observation`
+/// means an unreadable row never trips the substrate refusal).
+fn read_link_kinds(
+    conn: &Connection,
+    source_id: &str,
+    target_id: &str,
+) -> (crate::models::MemoryKind, crate::models::MemoryKind) {
+    let src_kind = get(conn, source_id)
+        .ok()
+        .flatten()
+        .map(|m| m.memory_kind)
+        .unwrap_or_default();
+    let tgt_kind = get(conn, target_id)
+        .ok()
+        .flatten()
+        .map(|m| m.memory_kind)
+        .unwrap_or_default();
+    (src_kind, tgt_kind)
+}
+
+/// v0.7.0 L1-6 — resolve the source memory's namespace (or `None` when
+/// the row is missing) so the SAL layer can resolve the per-namespace
+/// typed-cognition policy.
+fn read_link_source_namespace(conn: &Connection, source_id: &str) -> Option<String> {
+    get(conn, source_id).ok().flatten().map(|m| m.namespace)
+}
+
+/// v0.7.0 L1-6 — SAL-internal version of the typed-cognition policy
+/// resolver.  Walks the namespace chain leaf-first and returns the
+/// policy from the first namespace standard with a governance blob.
+/// Falls back to the default policy when no standard exists in the
+/// chain.  Returns the default on any SQL error so a transient read
+/// failure cannot silently disable the substrate boundary.
+fn resolve_typed_cognition_policy_sal(
+    conn: &Connection,
+    namespace: &str,
+) -> crate::governance::typed_cognition::TypedCognitionPolicy {
+    use crate::governance::typed_cognition::TypedCognitionPolicy;
+    let chain = build_namespace_chain(conn, namespace);
+    for level in chain.into_iter().rev() {
+        let standard_id = match get_namespace_standard(conn, &level) {
+            Ok(Some(id)) => id,
+            _ => continue,
+        };
+        let mem = match get(conn, &standard_id) {
+            Ok(Some(m)) => m,
+            _ => continue,
+        };
+        return TypedCognitionPolicy::from_metadata(&mem.metadata);
+    }
+    TypedCognitionPolicy::default()
 }
 
 /// v0.7.0 L1-8 — read `governance.require_approval_above_depth` from the

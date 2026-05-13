@@ -318,8 +318,8 @@ impl TierConfig {
             // the live tag from `PostgresStore::kg_backend()` once
             // J2 wires the SAL into AppState.
             kg_backend: None,
-            // L1-1 — always static for v0.7.0; Goal/Plan/Step/Decision
-            // land in L1-6/v0.8.0.
+            // L1-1 + L1-6 — static for v0.7.0; Plan/Step/Decision land
+            // in v0.8.0.
             memory_kinds: default_memory_kinds(),
         }
     }
@@ -406,11 +406,11 @@ pub struct Capabilities {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kg_backend: Option<String>,
 
-    /// L1-1 (v0.7.0) — the set of typed memory kinds this binary
-    /// supports.  Always `["observation", "reflection"]` for v0.7.0;
-    /// Goal/Plan/Step/Decision land in L1-6/v0.8.0.  Callers that want
-    /// to enumerate valid values for a `memory_kind` filter should
-    /// consult this field rather than hardcoding the list.
+    /// L1-1 + L1-6 (v0.7.0) — the set of typed memory kinds this
+    /// binary supports.  Always `["observation", "reflection", "goal"]`
+    /// for v0.7.0; Plan/Step/Decision land in v0.8.0.  Callers that
+    /// want to enumerate valid values for a `memory_kind` filter
+    /// should consult this field rather than hardcoding the list.
     ///
     /// `#[serde(default)]` keeps older capabilities consumers that
     /// don't know the field from breaking.
@@ -570,9 +570,15 @@ pub struct CapabilityFeatures {
     pub reranker_active: RerankerMode,
 }
 
-/// L1-1 default: the two typed memory kinds shipping in v0.7.0.
+/// L1-1 + L1-6 default: the three typed memory kinds shipping in
+/// v0.7.0.  `goal` was added by L1-6 (Pillar 2 typed cognition
+/// minimum slice); Plan/Step/Decision land in v0.8.0.
 fn default_memory_kinds() -> Vec<String> {
-    vec!["observation".to_string(), "reflection".to_string()]
+    vec![
+        "observation".to_string(),
+        "reflection".to_string(),
+        "goal".to_string(),
+    ]
 }
 
 fn default_recall_mode() -> RecallMode {

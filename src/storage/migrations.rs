@@ -159,7 +159,13 @@ CREATE INDEX IF NOT EXISTS idx_audit_log_event_type
 //       the curator reflection pass. ALTER TABLE emitted from Rust; the SQL
 //       file holds the idempotent backfill (metadata.type='reflection' →
 //       memory_kind='reflection') plus the supporting index.
-const CURRENT_SCHEMA_VERSION: i64 = 30;
+//   v31 — L1-6 (v0.7.0): extends the L1-1 enum closed-set to include
+//       `goal`.  SQL-side enforcement uses BEFORE INSERT / BEFORE UPDATE
+//       triggers (SQLite cannot add a CHECK constraint without rebuilding
+//       the table; the triggers reject any non-canonical wire value).
+//       The Rust-side `MemoryKind::from_str` remains the canonical typed
+//       gate; the trigger is defence-in-depth.
+const CURRENT_SCHEMA_VERSION: i64 = 31;
 
 const MIGRATION_V15_SQLITE: &str =
     include_str!("../../migrations/sqlite/0010_v063_hierarchy_kg.sql");
@@ -243,6 +249,15 @@ const MIGRATION_V28_SQLITE: &str =
 // the SQL file holds the idempotent backfill UPDATE (metadata.type =
 // 'reflection' → memory_kind = 'reflection') and the supporting index.
 const MIGRATION_V30_SQLITE: &str = include_str!("../../migrations/sqlite/0023_v07_memory_kind.sql");
+// v0.7.0 L1-6 — Goal MemoryKind variant. Adds BEFORE INSERT / BEFORE
+// UPDATE trigger guards that pin the closed set
+// `{observation, reflection, goal}` at the SQL layer so a wire-level
+// shim (HTTP body, postgres replication peer) cannot smuggle in an
+// unrecognised value.  The Rust-side `MemoryKind::from_str` is the
+// canonical typed gate; this SQL is defence-in-depth.  Idempotent:
+// CREATE TRIGGER IF NOT EXISTS no-ops on a partially-stamped DB.
+const MIGRATION_V31_SQLITE: &str =
+    include_str!("../../migrations/sqlite/0024_v07_memory_kind_goal.sql");
 
 #[allow(clippy::too_many_lines)]
 pub(super) fn migrate(conn: &Connection) -> Result<()> {
@@ -853,6 +868,16 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
             }
             // Backfill + index — fully idempotent.
             conn.execute_batch(MIGRATION_V30_SQLITE)?;
+        }
+        if version < 31 {
+            // v0.7.0 L1-6 — Goal MemoryKind variant. Idempotent
+            // `CREATE TRIGGER IF NOT EXISTS` guards reject any wire
+            // value outside the closed set
+            // `{observation, reflection, goal}`.  Cannot fold into v30
+            // because SQLite has no `ALTER TABLE ... ADD CONSTRAINT`
+            // and rebuilding `memories` to add a CHECK constraint is
+            // too invasive (FTS triggers, FK targets, indexes).
+            conn.execute_batch(MIGRATION_V31_SQLITE)?;
         }
 
         conn.execute("DELETE FROM schema_version", [])?;

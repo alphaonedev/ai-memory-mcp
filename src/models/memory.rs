@@ -7,18 +7,29 @@ use serde_json::Value;
 use super::default_metadata;
 
 /// L1-1 (v0.7.0) — typed memory-kind discriminator stored in the
-/// `memories.memory_kind` column (schema v30).
+/// `memories.memory_kind` column (schema v30, extended to v31 by L1-6).
 ///
-/// Only `Observation` and `Reflection` exist in v0.7.0. Goal/Plan/Step/
-/// Decision are scoped to L1-6/v0.8.0 and MUST NOT be added here yet.
+/// v0.7.0 ships three variants:
+///   * [`Self::Observation`] — default for every pre-v30 row and for
+///     new inserts that omit the field.
+///   * [`Self::Reflection`] — set by `memory_reflect` / the curator
+///     reflection pass.
+///   * [`Self::Goal`] — L1-6 (Pillar 2 typed cognition). Goal memories
+///     represent agent-authored intent; Boundary §16.2 makes them the
+///     ONE substrate-protected kind — reflections may not autonomously
+///     supersede them (see `validate_supersede_kinds`).
+///
+/// Plan/Step/Decision are scoped to v0.8.0 (Pillar 2 full ladder) and
+/// MUST NOT be added here yet.
 ///
 /// `Observation` is the default for every memory created before v30 (the
 /// `DEFAULT 'observation'` SQL column handles the backfill contract for
 /// rows that pre-date the migration; new inserts that omit the field also
 /// land at `Observation`). `Reflection` is set by the `memory_reflect`
 /// write path in addition to the existing `metadata.type='reflection'`
-/// back-compat marker.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// back-compat marker.  `Goal` is set by callers explicitly (the
+/// substrate does not auto-classify Goal memories).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryKind {
     /// Default — a direct observation or note from the caller.
@@ -26,6 +37,10 @@ pub enum MemoryKind {
     /// A memory synthesised by the reflection pass over lower-depth
     /// peers (set by `memory_reflect` and the curator reflection pass).
     Reflection,
+    /// L1-6 (v0.7.0) — agent-authored intent / goal. Substrate-
+    /// protected by Boundary §16.2: a `Reflection` may NOT autonomously
+    /// supersede a `Goal` (see `crate::governance::typed_cognition`).
+    Goal,
 }
 
 impl MemoryKind {
@@ -35,17 +50,19 @@ impl MemoryKind {
         match self {
             Self::Observation => "observation",
             Self::Reflection => "reflection",
+            Self::Goal => "goal",
         }
     }
 
     /// Parse the column-wire string. Returns `None` on unrecognised values
     /// so callers can fall back to `Observation` (forward-compat with
-    /// L1-6 variants that land in a newer DB on an older binary).
+    /// post-L1-6 variants that land in a newer DB on an older binary).
     #[must_use]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "observation" => Some(Self::Observation),
             "reflection" => Some(Self::Reflection),
+            "goal" => Some(Self::Goal),
             _ => None,
         }
     }

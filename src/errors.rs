@@ -47,6 +47,21 @@ pub enum MemoryError {
         target: String,
         cycle_path: Vec<String>,
     },
+    /// v0.7.0 L1-6 — substrate boundary §16.2 refusal.  Emitted when a
+    /// `Reflection` memory attempts to `supersede` a `Goal` memory.
+    /// Boundary §16.2 ("no autonomous goal modification") is enforced
+    /// by the substrate as of v0.7.0 (was policy-only across earlier
+    /// cuts); a refusal here is the canonical substrate-level signal
+    /// that the operation was rejected.
+    ///
+    /// Wire shape (HTTP): `409 CONFLICT` with code
+    /// `SUPERSEDES_GOAL_REFUSED`.  The MCP surface uses the same
+    /// message string and emits a `signed_events` audit row with
+    /// `event_type = "supersede_goal_refused"`.
+    SupersedesGoalRefused {
+        source: String,
+        target: String,
+    },
 }
 
 impl MemoryError {
@@ -58,6 +73,7 @@ impl MemoryError {
             Self::Conflict(_) => "CONFLICT",
             Self::ReflectionDepthExceeded { .. } => "REFLECTION_DEPTH_EXCEEDED",
             Self::ReflectionCycleDetected { .. } => "REFLECTION_CYCLE_DETECTED",
+            Self::SupersedesGoalRefused { .. } => "SUPERSEDES_GOAL_REFUSED",
         }
     }
 
@@ -71,7 +87,8 @@ impl MemoryError {
             // the rest of governance-style refusals.
             Self::Conflict(_)
             | Self::ReflectionDepthExceeded { .. }
-            | Self::ReflectionCycleDetected { .. } => StatusCode::CONFLICT,
+            | Self::ReflectionCycleDetected { .. }
+            | Self::SupersedesGoalRefused { .. } => StatusCode::CONFLICT,
         }
     }
 
@@ -96,6 +113,12 @@ impl MemoryError {
             } => format!(
                 "adding reflects_on edge {source} → {target} would create a cycle: {}",
                 cycle_path.join(" → ")
+            ),
+            Self::SupersedesGoalRefused { source, target } => format!(
+                "substrate boundary §16.2 — reflection→goal supersede refused: \
+                 reflection {source} cannot supersede goal {target} \
+                 ({reason})",
+                reason = crate::governance::typed_cognition::SupersedesGoalRefusal::REASON,
             ),
         }
     }

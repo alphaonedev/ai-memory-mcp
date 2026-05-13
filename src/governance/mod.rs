@@ -37,6 +37,13 @@ use crate::config::{PermissionsMode, active_permissions_mode};
 use crate::hooks::decision::HookDecision;
 use crate::hooks::events::MemoryDelta;
 
+// v0.7.0 L1-6 — Pillar 2 typed-cognition substrate boundary
+// (Boundary §16.2).  Co-located inside the governance module so the
+// `Reflection → Goal` supersede gate composes with the rest of the K9
+// pipeline (rules + mode + hooks) at every callsite.  See
+// [`typed_cognition::validate_supersede_kinds`] for the gate itself.
+pub mod typed_cognition;
+
 // ---------------------------------------------------------------------------
 // Op tag — the five gated operations
 // ---------------------------------------------------------------------------

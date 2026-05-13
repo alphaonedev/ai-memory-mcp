@@ -10,6 +10,12 @@ use std::path::Path;
 /// Relation string for the recursive-learning reflection edge.
 const REFLECTS_ON: &str = "reflects_on";
 
+/// v0.7.0 L1-6 — relation string for the supersede edge.  When a write
+/// names this relation the handler consults
+/// [`crate::governance::typed_cognition::validate_supersede_kinds`]
+/// to enforce Boundary §16.2 (no reflection→goal supersede).
+const SUPERSEDES: &str = "supersedes";
+
 pub(super) fn handle_link(
     conn: &rusqlite::Connection,
     db_path: &Path,
@@ -125,6 +131,85 @@ pub(super) fn handle_link(
         }
     }
 
+    // v0.7.0 L1-6 — substrate boundary §16.2 enforcement.
+    //
+    // When the caller asks for `relation = supersedes`, we fetch both
+    // memories' typed kinds and refuse a `Reflection → Goal` shape per
+    // Boundary §16.2 ("no autonomous goal modification").  The check
+    // is namespace-aware: the per-namespace
+    // `governance.refuse_supersede_goal` flag can disable the gate
+    // (defaults to `true`), but disabling it still emits a
+    // high-severity WARN from `validate_supersede_kinds`.
+    //
+    // Refusal raises a typed `SupersedesGoalRefused` error AND appends
+    // a `signed_events` row with `event_type = "supersede_goal_refused"`
+    // so the audit chain captures the rejected decision.  The check
+    // runs BEFORE the quota gate so a denied caller is not charged.
+    if relation == SUPERSEDES {
+        use crate::governance::typed_cognition::{TypedCognitionPolicy, validate_supersede_kinds};
+
+        let source_mem = db::get(conn, source_id).ok().flatten();
+        let target_mem = db::get(conn, target_id).ok().flatten();
+
+        if let (Some(src), Some(tgt)) = (source_mem.as_ref(), target_mem.as_ref()) {
+            // Resolve the typed-cognition policy from the source
+            // memory's namespace standard.  We use the source ns
+            // because Boundary §16.2 governs the *writer* of the
+            // supersede edge (the reflection-author's namespace);
+            // mirrors the K9 link-permission convention above.
+            let policy = resolve_typed_cognition_policy(conn, &src.namespace)
+                .unwrap_or_else(TypedCognitionPolicy::default);
+
+            if let Err(refusal) = validate_supersede_kinds(
+                source_id,
+                target_id,
+                src.memory_kind,
+                tgt.memory_kind,
+                policy,
+            ) {
+                // Audit-chain obligation: emit a signed_events row
+                // tagged with the canonical refusal event_type.
+                let refusal_payload = serde_json::json!({
+                    "event": "supersede_goal_refused",
+                    "source_id": source_id,
+                    "target_id": target_id,
+                    "source_kind": refusal.source_kind.as_str(),
+                    "target_kind": refusal.target_kind.as_str(),
+                    "reason": refusal.reason,
+                });
+                let cbor_bytes = refusal_payload.to_string().into_bytes();
+                let audit_event = crate::signed_events::SignedEvent {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    agent_id: params["agent_id"]
+                        .as_str()
+                        .unwrap_or("anonymous")
+                        .to_string(),
+                    event_type: "supersede_goal_refused".to_string(),
+                    payload_hash: crate::signed_events::payload_hash(&cbor_bytes),
+                    signature: None,
+                    attest_level: "unsigned".to_string(),
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                };
+                if let Err(e) = crate::signed_events::append_signed_event(conn, &audit_event) {
+                    tracing::warn!(
+                        target: "signed_events",
+                        source_id, target_id,
+                        "failed to append supersede_goal_refused audit row: {e}"
+                    );
+                }
+
+                let err = crate::errors::MemoryError::SupersedesGoalRefused {
+                    source: source_id.to_string(),
+                    target: target_id.to_string(),
+                };
+                return Err(err.message());
+            }
+        }
+        // If either memory was unresolvable, fall through; the FK guard
+        // in `create_link_signed` below will surface the missing-row
+        // error, which is the more actionable failure mode.
+    }
+
     // v0.7 K8 — per-agent quota gate. The link is charged against the
     // SOURCE memory's owner so a single agent fanning out links from
     // their own memories pays for them. If we can't resolve the owner
@@ -210,6 +295,45 @@ pub(super) fn handle_link(
         // "unsigned" when no keypair was loaded.
         "attest_level": attest_level,
     }))
+}
+
+/// v0.7.0 L1-6 — resolve the typed-cognition policy for a namespace by
+/// walking the leaf-first chain and reading
+/// `metadata.governance.refuse_supersede_goal` from the first
+/// namespace standard that has a governance blob.  Returns `None` only
+/// when an internal SQL probe fails; callers fall back to
+/// [`crate::governance::typed_cognition::TypedCognitionPolicy::default`]
+/// (substrate-enforced refusal).
+///
+/// Free function, not a `GovernancePolicy` field — same rationale as
+/// `resolve_require_approval_above_depth` in the storage layer:
+/// adding a required field to [`crate::models::GovernancePolicy`]
+/// forces every struct literal to update, which is unnecessary churn.
+fn resolve_typed_cognition_policy(
+    conn: &rusqlite::Connection,
+    namespace: &str,
+) -> Option<crate::governance::typed_cognition::TypedCognitionPolicy> {
+    use crate::governance::typed_cognition::TypedCognitionPolicy;
+
+    let chain = db::build_namespace_chain(conn, namespace);
+    for level in chain.into_iter().rev() {
+        let standard_id = match db::get_namespace_standard(conn, &level) {
+            Ok(Some(id)) => id,
+            _ => continue,
+        };
+        let mem = match db::get(conn, &standard_id) {
+            Ok(Some(m)) => m,
+            _ => continue,
+        };
+        // A namespace standard exists at this level — extract the
+        // policy.  Operators that want the default (substrate-enforced
+        // refusal) simply omit the key; the from_metadata helper
+        // returns the default in that case.
+        return Some(TypedCognitionPolicy::from_metadata(&mem.metadata));
+    }
+    // No standard anywhere in the chain — caller falls back to the
+    // default policy.
+    Some(TypedCognitionPolicy::default())
 }
 
 pub(super) fn handle_get_links(

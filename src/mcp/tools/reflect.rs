@@ -10,6 +10,32 @@ use crate::models::{GovernedAction, Tier};
 use serde_json::{Value, json};
 use std::path::Path;
 
+/// v0.7.0 L1-6 — resolve the typed-cognition policy for a namespace
+/// when the `memory_reflect` tool's `supersedes` parameter is set.
+/// Mirrors the link.rs helper of the same name; duplicated rather
+/// than centralised because the two modules already share no other
+/// helpers and the function body is small.
+fn resolve_typed_cognition_policy_for_reflect(
+    conn: &rusqlite::Connection,
+    namespace: &str,
+) -> Option<crate::governance::typed_cognition::TypedCognitionPolicy> {
+    use crate::governance::typed_cognition::TypedCognitionPolicy;
+
+    let chain = db::build_namespace_chain(conn, namespace);
+    for level in chain.into_iter().rev() {
+        let standard_id = match db::get_namespace_standard(conn, &level) {
+            Ok(Some(id)) => id,
+            _ => continue,
+        };
+        let mem = match db::get(conn, &standard_id) {
+            Ok(Some(m)) => m,
+            _ => continue,
+        };
+        return Some(TypedCognitionPolicy::from_metadata(&mem.metadata));
+    }
+    Some(TypedCognitionPolicy::default())
+}
+
 /// v0.7.0 recursive-learning Task 4/8 (issue #655) — handler for the
 /// `memory_reflect` MCP tool.
 ///
@@ -72,6 +98,87 @@ pub(super) fn handle_reflect(
     } else {
         serde_json::json!({})
     };
+
+    // v0.7.0 L1-6 — optional `supersedes` parameter.  When present, the
+    // new reflection memory is expected to supersede the named target.
+    // We refuse BEFORE the atomic reflect transaction when the target
+    // is a `Goal` memory per Boundary §16.2 (no autonomous goal
+    // modification); the substrate-level link refusal in
+    // `mcp/tools/link.rs` covers the post-write supersede path, but
+    // catching it here prevents the daemon from writing a reflection
+    // that would immediately fail at the supersede-edge write — the
+    // playbook §2.6 acceptance criterion.
+    let supersedes_target: Option<String> = params["supersedes"].as_str().map(str::to_string);
+
+    if let Some(ref target_id) = supersedes_target {
+        use crate::governance::typed_cognition::{TypedCognitionPolicy, validate_supersede_kinds};
+
+        // Look up the target memory's typed kind.  Source kind for a
+        // reflect call is always `Reflection` because the new memory
+        // IS the reflection — we don't need a substrate lookup for
+        // it.
+        let target_mem = db::get(conn, target_id).map_err(|e| e.to_string())?;
+        let Some(target_mem) = target_mem else {
+            return Err(format!("supersedes target memory not found: {target_id}"));
+        };
+
+        // Resolve the policy from the target's namespace because the
+        // refusal protects the *goal* being acted upon.  If the
+        // caller's request resolves to a different namespace than the
+        // goal, the goal's namespace policy still governs whether the
+        // override applies.
+        let policy = resolve_typed_cognition_policy_for_reflect(conn, &target_mem.namespace)
+            .unwrap_or_else(TypedCognitionPolicy::default);
+
+        // The proposed source memory is the reflection we're about to
+        // write — by construction `MemoryKind::Reflection`.
+        if let Err(refusal) = validate_supersede_kinds(
+            "<pending-reflection>",
+            target_id,
+            crate::models::MemoryKind::Reflection,
+            target_mem.memory_kind,
+            policy,
+        ) {
+            // signed_events audit row mirrors the link.rs shape so
+            // downstream auditors see the same event_type regardless
+            // of whether the refusal raised at the reflect or link
+            // surface.
+            let refusal_payload = serde_json::json!({
+                "event": "supersede_goal_refused",
+                "source_id": "<pending-reflection>",
+                "target_id": target_id,
+                "source_kind": refusal.source_kind.as_str(),
+                "target_kind": refusal.target_kind.as_str(),
+                "reason": refusal.reason,
+                "surface": "memory_reflect",
+            });
+            let cbor_bytes = refusal_payload.to_string().into_bytes();
+            let audit_event = crate::signed_events::SignedEvent {
+                id: uuid::Uuid::new_v4().to_string(),
+                agent_id: params["agent_id"]
+                    .as_str()
+                    .unwrap_or("anonymous")
+                    .to_string(),
+                event_type: "supersede_goal_refused".to_string(),
+                payload_hash: crate::signed_events::payload_hash(&cbor_bytes),
+                signature: None,
+                attest_level: "unsigned".to_string(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+            };
+            if let Err(e) = crate::signed_events::append_signed_event(conn, &audit_event) {
+                tracing::warn!(
+                    target: "signed_events",
+                    target_id, "failed to append supersede_goal_refused audit row: {e}"
+                );
+            }
+
+            let err = crate::errors::MemoryError::SupersedesGoalRefused {
+                source: "<pending-reflection>".to_string(),
+                target: target_id.to_string(),
+            };
+            return Err(err.message());
+        }
+    }
 
     // NHI: resolve agent_id via the same precedence chain memory_store
     // uses, so the reflection memory's `metadata.agent_id` is consistent

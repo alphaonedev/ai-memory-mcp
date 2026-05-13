@@ -155,8 +155,9 @@ async fn s75_capabilities_surfaces_runtime_db_schema_version() {
 
     // 3) Value tracks the live SAL adapter's `schema_version` table.
     //    A freshly-opened SqliteStore runs every migration up to
-    //    CURRENT_SCHEMA_VERSION (30 at v0.7.0 after L1-1 added the
-    //    `memories.memory_kind` column and migration v30 backfill) on
+    //    CURRENT_SCHEMA_VERSION (31 at v0.7.0 after L1-1 added the
+    //    `memories.memory_kind` column and L1-6 added the Goal
+    //    MemoryKind variant + closed-set trigger guard) on
     //    `open`, so the live read MUST land at that value — proving the
     //    field comes from the SAL trait lookup rather than a hard-coded
     //    constant.
@@ -167,12 +168,14 @@ async fn s75_capabilities_surfaces_runtime_db_schema_version() {
          time); got {v}"
     );
     assert_eq!(
-        v, 30,
+        v, 31,
         "S75: db_schema_version must match `CURRENT_SCHEMA_VERSION` \
-         (30 at v0.7.0 — L1-1 bumped from 29 to 30 to add the typed \
-         `memories.memory_kind` column). A drift here means either \
-         the binary's migrate ladder skipped a step or the new SAL \
-         `schema_version()` lookup is reading from the wrong source."
+         (31 at v0.7.0 — L1-1 bumped from 29 to 30 to add the typed \
+         `memories.memory_kind` column; L1-6 bumped from 30 to 31 to \
+         add the Goal MemoryKind variant + closed-set trigger guard). \
+         A drift here means either the binary's migrate ladder skipped \
+         a step or the new SAL `schema_version()` lookup is reading \
+         from the wrong source."
     );
 
     // 4) The wire-format discriminator stays alongside but distinct
