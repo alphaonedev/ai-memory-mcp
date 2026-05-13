@@ -81,7 +81,7 @@ fn t0_describe_to_user_core_profile_canonical_phrasing() {
     // memory_reflect lives in Family::Power, so it grows the "more"
     // bucket from 43 to 44 without changing the loaded count of 7.
     let expected = "I can directly use 7 memory tools right now \
-                    (store, recall, list, get, search, ...). 44 more \
+                    (store, recall, list, get, search, ...). 45 more \
                     (update, delete, forget, gc, etc.) are available on demand — \
                     I can load them if you ask for something that needs them, \
                     or you can restart the server with a different profile.";
@@ -115,7 +115,7 @@ fn t0_describe_to_user_full_profile_canonical_phrasing() {
         .as_str()
         .expect("describe present");
 
-    let expected = "I can directly use all 51 memory tools right now \
+    let expected = "I can directly use all 52 memory tools right now \
                     (store, recall, list, get, search, ...). Nothing more to load — \
                     the full memory surface is already active.";
 
@@ -149,7 +149,7 @@ fn t0_describe_to_user_graph_profile_canonical_phrasing() {
         .expect("describe present");
 
     let expected = "I can directly use 18 memory tools right now \
-                    (store, recall, list, get, search, ...). 33 more \
+                    (store, recall, list, get, search, ...). 34 more \
                     (update, delete, forget, gc, etc.) are available on demand — \
                     I can load them if you ask for something that needs them, \
                     or you can restart the server with a different profile.";

@@ -412,6 +412,28 @@ pub async fn build_rustls_client_config(
 /// `ServerCertVerifier` that accepts any peer certificate. Safe ONLY when
 /// paired with a strong reverse authentication channel — in our case the
 /// peer's `--mtls-allowlist` fingerprint-pins our client cert.
+///
+/// # mTLS-compensating contract (issue #224, S6-LOW1)
+///
+/// This verifier is deliberately permissive on the server-cert leg of
+/// the TLS handshake. Trust on the federation channel is anchored on
+/// the OTHER leg: every peer in the mesh authenticates the connecting
+/// client by fingerprint via `--mtls-allowlist`. That means an attacker
+/// who tampers with the server cert presented during the handshake
+/// gains nothing — they still cannot present a valid CLIENT cert that
+/// the peer's allowlist trusts.
+///
+/// **Operator runbook note:** never enable
+/// `DangerousAnyServerVerifier` outside the mTLS-mesh case. Pairing
+/// this verifier with HTTP-only auth (api-key headers, basic auth, or
+/// trust-on-first-use) collapses the security model to "accept any
+/// peer cert AND any client" — equivalent to plaintext. The mTLS
+/// allowlist is the only thing that holds.
+///
+/// Tracking issue: <https://github.com/alphaonedev/ai-memory-mcp/issues/224>.
+/// Future hardening (server-cert pinning at the client) is tracked
+/// under the same issue but does not block v0.7.0 ship — the
+/// allowlist-fingerprint anchor is the load-bearing control today.
 #[derive(Debug)]
 pub struct DangerousAnyServerVerifier;
 

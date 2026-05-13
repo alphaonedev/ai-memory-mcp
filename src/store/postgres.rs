@@ -1809,15 +1809,35 @@ impl PostgresStore {
     /// `valid_until IS NULL OR valid_until > NOW()` filter so callers
     /// can read the full historical edge graph (S45's `as_of=past`
     /// semantics through `memory_kg_query`).
+    ///
+    /// v0.7.0 Wave-2 fix B2 (S6-M3) — dispatch on the resolved
+    /// `kg_backend`. When AGE is installed AND the caller asked for the
+    /// current view (`include_invalidated=false`), route to
+    /// [`Self::kg_query_cypher`] so the ROADMAP2 §7.4.4 "≥30% faster
+    /// at depth=5" claim is actually reachable. When the caller asked
+    /// for the historical view (`include_invalidated=true`) we fall
+    /// through to the CTE branch because `kg_query_cypher` lacks the
+    /// `valid_until` filter (the AGE property-graph projection doesn't
+    /// carry the temporal predicate today; lifting it is a follow-up
+    /// when we expand the property surface). The dual-path test
+    /// `test_age_cte_dual_path_returns_identical_results` (sal-postgres,
+    /// AGE-gated) pins the equivalence on the current view, so a future
+    /// projection extension can be validated against the same harness.
     pub async fn kg_query_with_history(
         &self,
         source_id: &str,
         max_depth: usize,
         include_invalidated: bool,
     ) -> StoreResult<Vec<KgQueryRow>> {
-        let _ = &self.kg_backend;
-        self.kg_query_cte_filtered(source_id, max_depth, include_invalidated)
-            .await
+        match (self.kg_backend, include_invalidated) {
+            // AGE present + current view → Cypher (fast path)
+            (KgBackend::Age, false) => self.kg_query_cypher(source_id, max_depth).await,
+            // AGE present + historical view, OR AGE absent → CTE
+            _ => {
+                self.kg_query_cte_filtered(source_id, max_depth, include_invalidated)
+                    .await
+            }
+        }
     }
 
     /// Cypher (Apache AGE) implementation of `kg_query`.

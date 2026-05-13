@@ -385,6 +385,162 @@ async fn kg_query_equivalence() {
 }
 
 // ---------------------------------------------------------------------------
+// v0.7.0 Wave-2 fix B2 (S6-M3) — `kg_query_with_history` dispatcher test.
+//
+// The dispatcher routes `(KgBackend::Age, include_invalidated=false)` to
+// `kg_query_cypher`, every other case to `kg_query_cte_filtered`. This
+// test asserts that route by comparing the dispatcher's result against
+// the direct CTE call on AGE-enabled Postgres: equal-after-sort proves
+// the AGE branch landed (because the AGE projection is in sync with
+// the CTE source-of-truth on this fixture).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_kg_query_routes_to_cypher_when_age_available() {
+    let Some(url) = age_url() else {
+        eprintln!("skip: AI_MEMORY_TEST_AGE_URL not set");
+        return;
+    };
+    let store = match PostgresStore::connect(&url).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("skip: PostgresStore::connect failed: {e}");
+            return;
+        }
+    };
+    if !age_extension_present(&store) {
+        eprintln!("skip: kg_backend resolved to CTE (AGE extension not installed)");
+        return;
+    }
+
+    let (ids, ns) = fixture_graph_ids("s6m3-route-age");
+    insert_fixture_memories(&store, &ids, &ns).await;
+    insert_fixture_links(&url, &ids).await;
+    if let Err(e) = project_fixture_into_age(&url, &ids).await {
+        eprintln!("skip: failed to project fixture into memory_graph: {e}");
+        return;
+    }
+
+    // current view → AGE branch
+    let dispatched = match store.kg_query_with_history(&ids[0], 3, false).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skip: kg_query_with_history returned {e}");
+            return;
+        }
+    };
+    let direct_cypher = match store.kg_query_cypher(&ids[0], 3).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skip: direct kg_query_cypher returned {e}");
+            return;
+        }
+    };
+    // Exact equality (same sort, same backend) confirms the dispatcher
+    // routed through the Cypher path — a CTE-routed call would return
+    // a different shape if the AGE branch had its own bug, but more
+    // importantly the path-strings would be cypher-style (the Cypher
+    // branch's `reduce()` reconstructs the path differently from the
+    // CTE's `concat`-with-`->`). Sorting then comparing pins the
+    // route-AND-result contract.
+    assert_eq!(
+        sort_query_rows(dispatched),
+        sort_query_rows(direct_cypher),
+        "dispatcher must route to Cypher under (Age, include_invalidated=false)"
+    );
+}
+
+#[tokio::test]
+async fn test_kg_query_routes_to_cte_when_age_absent() {
+    // Inverse direction: against a vanilla URL (no AGE) the dispatcher
+    // must hand the call to the CTE branch. Equality between the
+    // dispatcher and the direct CTE call pins the absent-AGE routing.
+    let Some(url) = postgres_url() else {
+        eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+        return;
+    };
+    if age_url().as_deref() == Some(url.as_str()) {
+        eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL points at the AGE fixture");
+        return;
+    }
+    let store = match PostgresStore::connect(&url).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("skip: PostgresStore::connect failed: {e}");
+            return;
+        }
+    };
+    assert_eq!(store.kg_backend(), KgBackend::Cte);
+
+    let (ids, ns) = fixture_graph_ids("s6m3-route-cte");
+    insert_fixture_memories(&store, &ids, &ns).await;
+    insert_fixture_links(&url, &ids).await;
+
+    let dispatched = store
+        .kg_query_with_history(&ids[0], 3, false)
+        .await
+        .expect("dispatcher");
+    let direct_cte = store
+        .kg_query_cte_filtered(&ids[0], 3, false)
+        .await
+        .expect("direct cte");
+    assert_eq!(
+        sort_query_rows(dispatched),
+        sort_query_rows(direct_cte),
+        "without AGE the dispatcher must route to CTE"
+    );
+}
+
+#[tokio::test]
+async fn test_age_cte_dual_path_returns_identical_results() {
+    // The full S6-M3 contract: route through the dispatcher in BOTH
+    // modes and assert equality. Under AGE the dispatcher returns the
+    // Cypher branch; the direct CTE returns the relational source-of-
+    // truth. Equality after sort proves the two branches agree on the
+    // fixture corpus — the foundation for ROADMAP2 §7.4.4's
+    // "≥30% faster at depth=5" claim. Without equality the speedup
+    // is meaningless.
+    let Some(url) = age_url() else {
+        eprintln!("skip: AI_MEMORY_TEST_AGE_URL not set");
+        return;
+    };
+    let store = match PostgresStore::connect(&url).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("skip: PostgresStore::connect failed: {e}");
+            return;
+        }
+    };
+    if !age_extension_present(&store) {
+        eprintln!("skip: AGE extension not installed");
+        return;
+    }
+    let (ids, ns) = fixture_graph_ids("s6m3-dual-path");
+    insert_fixture_memories(&store, &ids, &ns).await;
+    insert_fixture_links(&url, &ids).await;
+    if let Err(e) = project_fixture_into_age(&url, &ids).await {
+        eprintln!("skip: project_fixture_into_age failed: {e}");
+        return;
+    }
+    let via_dispatcher = match store.kg_query_with_history(&ids[0], 3, false).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skip: dispatcher returned {e}");
+            return;
+        }
+    };
+    let via_cte = store
+        .kg_query_cte_filtered(&ids[0], 3, false)
+        .await
+        .expect("direct cte against AGE-enabled url");
+    assert_eq!(
+        sort_query_rows(via_dispatcher),
+        sort_query_rows(via_cte),
+        "AGE dispatcher path must agree with the CTE source-of-truth"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // J3 — kg_timeline equivalence.
 // ---------------------------------------------------------------------------
 

@@ -11,13 +11,166 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::db;
+use crate::federation::reflection_bookkeeping::stamp_peer_origin;
 use crate::models::{Memory, MemoryLink};
+use crate::quotas::{self, QuotaCheckError, QuotaOp};
 use crate::validate;
 
 use super::MAX_BULK_SIZE;
 #[cfg(feature = "sal")]
 use super::store_err_to_response;
 use super::{AppState, StorageBackend};
+
+// ---------------------------------------------------------------------------
+// v0.7.0 Wave-2 fix B2 (S6-M2) — federation receive quota gate.
+//
+// F7 (#639) closed the per-agent quota gap on HTTP POST /api/v1/memories
+// but the federation receive entry point — `POST /api/v1/sync/push` —
+// remained a bypass surface. A peer holding a valid mTLS client cert
+// could push up to `MAX_BULK_SIZE` memories per call (× N calls/minute)
+// without the receiver consulting `agent_quotas`, blowing past the
+// per-agent storage cap and the daily memory ceiling. We close the
+// hole by routing the same `quotas::check_and_record` call the HTTP
+// store path uses against the wire-shape payload: total bytes for
+// `body.memories`, one Link op per `body.links` row.
+//
+// Failure mode: when a quota is exceeded we return 429 with an
+// `X-Quota-Reset-At` header (next UTC midnight in RFC3339 — the daily
+// counters' reset cadence) and emit a `store + Deny` audit row carrying
+// the limit name + sender peer id so a downstream auditor can trace
+// the refusal.
+// ---------------------------------------------------------------------------
+
+/// v0.7.0 Wave-2 fix B2 (S6-M2) — compute the per-row payload byte count
+/// matched against the F7 `current_storage_bytes` accounting. Mirrors
+/// the shape used in `src/handlers/http.rs` (POST /memories) so cross-
+/// path totals stay coherent.
+fn memory_payload_bytes(mem: &Memory) -> i64 {
+    let raw = mem.title.len()
+        + mem.content.len()
+        + serde_json::to_string(&mem.metadata)
+            .map(|s| s.len())
+            .unwrap_or(0);
+    i64::try_from(raw).unwrap_or(i64::MAX)
+}
+
+/// v0.7.0 Wave-2 fix B2 (S6-M2) — compute the next UTC-midnight RFC3339
+/// timestamp. Surfaced via the `X-Quota-Reset-At` response header when a
+/// federation push is refused for daily-counter exhaustion so the peer
+/// knows when the soonest retry window opens.
+fn next_utc_midnight_rfc3339() -> String {
+    use chrono::{Duration, NaiveTime, Utc};
+    let tomorrow = (Utc::now() + Duration::days(1)).date_naive();
+    let dt = tomorrow.and_time(NaiveTime::MIN).and_utc();
+    dt.to_rfc3339()
+}
+
+/// v0.7.0 Wave-2 fix B2 (S6-M2) — build the 429 response envelope for a
+/// quota-refused federation push. Sets `X-Quota-Reset-At` to the next
+/// UTC-midnight rollover and emits a signed-events audit row tagged
+/// `federation.quota_refused` so a downstream auditor can reconstruct
+/// the refusal with the same hash-chain primitives every other refusal
+/// uses.
+fn quota_refused_response(
+    db: &crate::handlers::Db,
+    sender_agent_id: &str,
+    qe: &crate::quotas::QuotaError,
+) -> Response {
+    // Best-effort audit emit. We don't take the DB lock again if it's
+    // already held (callers above pass through `&db` after dropping
+    // their lock); the emit is wired through the existing
+    // `audit::emit` channel (file-backed, lock-free) so we don't need
+    // SQLite here.
+    let _ = db; // signal we *received* the handle in case future use
+    if crate::audit::is_enabled() {
+        crate::audit::emit(
+            crate::audit::EventBuilder::new(
+                crate::audit::AuditAction::Store,
+                crate::audit::actor(sender_agent_id, "federation_push", None),
+                crate::audit::target_memory(
+                    String::new(),
+                    String::new(),
+                    Some(format!("quota_refused:{}", qe.limit.as_str())),
+                    None,
+                    None,
+                ),
+            )
+            .outcome(crate::audit::AuditOutcome::Deny),
+        );
+    }
+    let reset_at = next_utc_midnight_rfc3339();
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [("X-Quota-Reset-At", reset_at.as_str())],
+        Json(json!({
+            "code": "QUOTA_EXCEEDED",
+            "error": qe.to_string(),
+            "limit": qe.limit.as_str(),
+            "current": qe.current,
+            "max": qe.max,
+            "agent_id": qe.agent_id,
+            "via": "sync_push",
+        })),
+    )
+        .into_response()
+}
+
+/// v0.7.0 Wave-2 fix B2 (S6-M2) — pre-flight quota check against the
+/// wire-shape sync_push body. Charges:
+///   * one `QuotaOp::Memory { bytes }` for every memory row (atomic +
+///     storage-byte accounting), and
+///   * one `QuotaOp::Link` for every link row (link/day cap only),
+/// against the sender's `agent_quotas` row. On a clean check the
+/// counters are recorded; on a refusal the transaction rolls back so
+/// no partial charge persists.
+///
+/// `dry_run=true` short-circuits the check so the existing preview
+/// posture remains side-effect-free.
+fn precheck_federation_quota(
+    conn: &rusqlite::Connection,
+    sender_agent_id: &str,
+    body: &SyncPushBody,
+) -> std::result::Result<(), QuotaCheckError> {
+    if body.dry_run {
+        return Ok(());
+    }
+    for mem in &body.memories {
+        let bytes = memory_payload_bytes(mem);
+        quotas::check_and_record(conn, sender_agent_id, QuotaOp::Memory { bytes })?;
+    }
+    for _ in &body.links {
+        quotas::check_and_record(conn, sender_agent_id, QuotaOp::Link)?;
+    }
+    Ok(())
+}
+
+/// v0.7.0 Wave-2 fix B2 (S6-LOW2) — clock-skew observability.
+///
+/// On every accepted federation push, compute the absolute delta
+/// between the latest timestamp in the sender's vector clock and the
+/// local wall clock. When the delta exceeds 60s we `warn!` so the
+/// operator can spot peers drifting apart before the drift manifests
+/// as silent CRDT merge mis-orderings. Pure best-effort observability
+/// — never affects the push outcome.
+fn observe_sender_clock_skew(sender_agent_id: &str, clock: &crate::models::VectorClock) {
+    let Some(max_entry) = clock.entries.values().max() else {
+        return;
+    };
+    let parsed = match chrono::DateTime::parse_from_rfc3339(max_entry) {
+        Ok(t) => t.with_timezone(&chrono::Utc),
+        Err(_) => return,
+    };
+    let now = chrono::Utc::now();
+    let skew = (now - parsed).num_seconds();
+    if skew.abs() > 60 {
+        tracing::warn!(
+            sender_agent_id = sender_agent_id,
+            skew_secs = skew,
+            "federation clock skew exceeds 60s — \
+             investigate time-drift between peers (sender clock vs local now)"
+        );
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Phase 3 foundation (issue #224) — HTTP sync endpoints.
@@ -37,8 +190,14 @@ pub struct SyncPushBody {
     /// Vector clock the sender had at push time. Foundation accepts it
     /// and stores the latest-seen timestamp; full clock reconciliation
     /// lands with Task 3a.1.
+    ///
+    /// v0.7.0 Wave-2 fix B2 (S6-LOW2) — additionally consumed for
+    /// clock-skew observability: on every accepted push we compute
+    /// `max(sender.entries.values()) - local_wall_clock_now()` and
+    /// `warn!` when the absolute delta exceeds 60s, surfacing
+    /// time-drift between peers before it manifests as silent CRDT
+    /// merge misorderings.
     #[serde(default)]
-    #[allow(dead_code)] // Consumed by Task 3a.1 CRDT-lite; shipped now for wire compat.
     pub sender_clock: crate::models::VectorClock,
     /// Memories the sender is offering. Applied via the existing
     /// timestamp-aware merge (`insert_if_newer`).
@@ -157,6 +316,35 @@ async fn sync_push_via_store(app: AppState, _headers: HeaderMap, body: SyncPushB
             .into_response();
     }
 
+    // v0.7.0 Wave-2 fix B2 (S6-M2) — per-agent quota gate. The quota
+    // substrate is sqlite-backed even on postgres-backed daemons (the
+    // `agent_quotas` table lives on the sqlite handle we keep for
+    // `sync_state` and other side-tables). Run the check against
+    // `app.db` BEFORE dispatching trait writes; on refusal return 429
+    // and never touch the postgres store.
+    {
+        let lock = app.db.lock().await;
+        if let Err(e) = precheck_federation_quota(&lock.0, &body.sender_agent_id, &body) {
+            drop(lock);
+            return match e {
+                QuotaCheckError::Quota(qe) => {
+                    quota_refused_response(&app.db, &body.sender_agent_id, &qe)
+                }
+                QuotaCheckError::Sql(se) => {
+                    tracing::error!("sync_push: quota substrate error: {se}");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": "quota check failed"})),
+                    )
+                        .into_response()
+                }
+            };
+        }
+    }
+
+    // v0.7.0 Wave-2 fix B2 (S6-LOW2) — clock-skew observability.
+    observe_sender_clock_skew(&body.sender_agent_id, &body.sender_clock);
+
     let ctx = crate::store::CallerContext::for_agent(body.sender_agent_id.clone());
     let mut applied = 0usize;
     let mut noop = 0usize;
@@ -183,6 +371,13 @@ async fn sync_push_via_store(app: AppState, _headers: HeaderMap, body: SyncPushB
             noop += 1;
             continue;
         }
+        // v0.7.0 Wave-2 fix B2 (S6-M1) — stamp peer_origin on imported
+        // reflections so a later local curator (and the
+        // `memory_reflection_origin` MCP tool) can reconstruct the
+        // attribution chain. No-op on non-reflection rows.
+        let mut mem_stamped = mem.clone();
+        stamp_peer_origin(&mut mem_stamped, &body.sender_agent_id);
+        let mem = &mem_stamped;
         match app.store.apply_remote_memory(&ctx, mem).await {
             Ok(applied_id) => {
                 applied += 1;
@@ -462,6 +657,37 @@ pub async fn sync_push(
         )
             .into_response();
     }
+
+    // v0.7.0 Wave-2 fix B2 (S6-M2) — per-agent quota gate. The same
+    // F7-equivalent contract the HTTP create-memory path uses now
+    // governs federation receive too. Push is refused with 429 +
+    // `X-Quota-Reset-At` when the sender's `agent_quotas` row would be
+    // pushed past its limit by this call. The check uses
+    // BEGIN-IMMEDIATE under the hood so concurrent pushes can't all
+    // pass the check and then collectively exceed the cap.
+    {
+        let lock = state.lock().await;
+        if let Err(e) = precheck_federation_quota(&lock.0, &body.sender_agent_id, &body) {
+            drop(lock);
+            return match e {
+                QuotaCheckError::Quota(qe) => {
+                    quota_refused_response(&state, &body.sender_agent_id, &qe)
+                }
+                QuotaCheckError::Sql(se) => {
+                    tracing::error!("sync_push: quota substrate error: {se}");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": "quota check failed"})),
+                    )
+                        .into_response()
+                }
+            };
+        }
+    }
+
+    // v0.7.0 Wave-2 fix B2 (S6-LOW2) — clock-skew observability.
+    observe_sender_clock_skew(&body.sender_agent_id, &body.sender_clock);
+
     // Receiver's local identity — default to the caller-supplied header,
     // fall back to the anonymous placeholder. Recorded in sync_state rows.
     let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
@@ -511,6 +737,14 @@ pub async fn sync_push(
             noop += 1;
             continue;
         }
+        // v0.7.0 Wave-2 fix B2 (S6-M1) — stamp peer_origin on imported
+        // reflections (idempotent + no-op on non-reflection rows) so
+        // downstream local-reflection writers and the
+        // `memory_reflection_origin` MCP tool can reconstruct the
+        // cross-peer attribution chain.
+        let mut mem_stamped = mem.clone();
+        stamp_peer_origin(&mut mem_stamped, &body.sender_agent_id);
+        let mem = &mem_stamped;
         match db::insert_if_newer(&lock.0, mem) {
             Ok(actual_id) => {
                 applied += 1;

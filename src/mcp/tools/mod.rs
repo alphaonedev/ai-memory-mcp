@@ -39,6 +39,7 @@ pub(super) mod subscribe;
 pub(super) mod quota_status;
 pub(super) mod pending;
 pub(super) mod archive;
+pub(super) mod reflection_origin;
 pub(super) mod session_start;
 
 // Re-export all handler functions and types to make them accessible from
@@ -98,6 +99,7 @@ pub(super) use self::{
     subscribe::handle_subscription_replay,
     subscribe::handle_subscription_dlq_list,
     quota_status::handle_quota_status,
+    reflection_origin::handle_reflection_origin,
     pending::handle_pending_list,
     pending::handle_pending_approve,
     pending::handle_pending_reject,

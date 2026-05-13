@@ -1196,6 +1196,18 @@ pub fn tool_definitions() -> Value {
                         "agent_id": {"type": "string", "description": "Optional — restrict to one agent. When omitted, returns every quota row."}
                     }
                 }
+            },
+            {
+                "name": "memory_reflection_origin",
+                "description": "Report cross-peer reflection provenance for one memory.",
+                "docs": "v0.7.0 Wave-2 fix B2 (S6-M1, L2-2) — return the `metadata.peer_origin` block stamped at federation-receive time on imported reflection memories, plus the local depth-at-arrival snapshot. Use this to reconstruct cross-peer attribution: which peer minted the reflection, what depth it carried on the source peer, and what the receiver row's `reflection_depth` is locally. Locally-minted memories return `peer_origin: null` + `original_depth: null`; both fields are populated for memories that arrived via `/api/v1/sync/push` from a remote peer.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "memory_id": {"type": "string", "description": "Memory id to look up. Must match an existing row."}
+                    },
+                    "required": ["memory_id"]
+                }
             }
         ]
     })
