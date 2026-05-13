@@ -878,4 +878,139 @@ mod tests {
             "expected unrecognised-scheme error, got: {msg}"
         );
     }
+
+    // ----------------------------------------------------------------
+    // L0.7-3 chunk-e2 — coverage uplift for the Postgres dispatch.
+    //
+    // The full Postgres init/enumerate happy paths require a running
+    // Postgres + pgvector (see `schema_init_postgres_embedding_dim_conversion`
+    // which is `#[ignore]`d for that reason). The tests below cover the
+    // dispatch and the early connect-error branches by pointing the
+    // verb at an unreachable port — every code path before
+    // `PostgresStore::connect_with_dim`'s connect call is exercised.
+    // ----------------------------------------------------------------
+
+    #[cfg(feature = "sal-postgres")]
+    #[tokio::test]
+    async fn run_postgres_url_dispatches_to_init_and_enumerate() {
+        // Drives the `is_postgres_url` branch (line 208) and
+        // `init_and_enumerate_postgres` (line 211, 373-382). The
+        // connect to a non-routable port times out / errors quickly.
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+
+        let args = SchemaInitArgs {
+            store_url: "postgres://nobody:nope@127.0.0.1:1/no_db".to_string(),
+            json: true,
+            embedding_dim: 384,
+        };
+        let err = run(&args, &mut out)
+            .await
+            .expect_err("should fail to connect");
+        let msg = format!("{err:#}");
+        // Either the connect-error or the dim-aware open wrapper surfaces.
+        assert!(
+            msg.contains("open store at") || msg.contains("connect") || msg.contains("postgres"),
+            "got: {msg}"
+        );
+    }
+
+    #[cfg(feature = "sal-postgres")]
+    #[tokio::test]
+    async fn run_postgresql_alias_url_dispatches_to_init_and_enumerate() {
+        // Same branch via the `postgresql://` alias.
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+
+        let args = SchemaInitArgs {
+            store_url: "postgresql://nobody:nope@127.0.0.1:1/x".to_string(),
+            json: false,
+            embedding_dim: 384,
+        };
+        assert!(run(&args, &mut out).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn render_human_includes_extension_list_and_embedding_dim_lines() {
+        // Drives the human-render code path for a synthetic report with
+        // populated extensions + non-None embedding_dim + a flagged
+        // dim migration + a postgres kind so the age_projection line
+        // also fires. Lines 591-626.
+        let report = SchemaInitReport {
+            url: "synthetic://test".to_string(),
+            kind: "postgres".to_string(),
+            tables: vec!["memories".to_string()],
+            views: vec![],
+            functions: vec!["fts_update".to_string()],
+            indices: vec!["idx_memories_ns".to_string()],
+            extensions: vec!["pgvector".to_string(), "age".to_string()],
+            schema_version: 29,
+            age_projection_created: true,
+            embedding_dim: Some(768),
+            embedding_dim_migrated: true,
+        };
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+        render_human(&report, &mut out).unwrap();
+        let s = String::from_utf8(stdout).unwrap();
+        assert!(s.contains("schema initialized at synthetic://test"));
+        assert!(s.contains("pgvector, age"));
+        assert!(s.contains("embedding_dim:  768"));
+        assert!(s.contains("embedding_dim_migrated: yes"));
+        assert!(s.contains("age_projection: created"));
+    }
+
+    #[tokio::test]
+    async fn render_human_emits_unknown_when_embedding_dim_absent() {
+        // Drives the `None` branch of `match report.embedding_dim`
+        // (line 607) plus the "skipped" path for age_projection.
+        let report = SchemaInitReport {
+            url: "synthetic://test".to_string(),
+            kind: "postgres".to_string(),
+            tables: vec![],
+            views: vec![],
+            functions: vec![],
+            indices: vec![],
+            extensions: vec![],
+            schema_version: 1,
+            age_projection_created: false,
+            embedding_dim: None,
+            embedding_dim_migrated: false,
+        };
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+        render_human(&report, &mut out).unwrap();
+        let s = String::from_utf8(stdout).unwrap();
+        assert!(s.contains("embedding_dim:  (unknown)"));
+        assert!(s.contains("age_projection: skipped"));
+    }
+
+    #[tokio::test]
+    async fn render_human_no_age_line_for_sqlite_kind() {
+        // The age_projection footer fires only for `kind == "postgres"`
+        // (line 617). SQLite should skip it.
+        let report = SchemaInitReport {
+            url: "sqlite:///tmp/x.db".to_string(),
+            kind: "sqlite".to_string(),
+            tables: vec![],
+            views: vec![],
+            functions: vec![],
+            indices: vec![],
+            extensions: vec![],
+            schema_version: 7,
+            age_projection_created: false,
+            embedding_dim: Some(384),
+            embedding_dim_migrated: false,
+        };
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+        render_human(&report, &mut out).unwrap();
+        let s = String::from_utf8(stdout).unwrap();
+        assert!(!s.contains("age_projection"));
+    }
 }

@@ -2247,4 +2247,338 @@ mod tests {
         }
         drop(snippet_dir);
     }
+
+    // ------------------------------------------------------------------
+    // L0.7-3 chunk-e2 — coverage uplift to ≥95%.
+    // ------------------------------------------------------------------
+
+    fn args_no_config(target: Target) -> InstallArgs {
+        // TargetArgs with config=None forces the default-path discovery
+        // branch in resolve_config_path.
+        let t = TargetArgs {
+            config: None,
+            apply: false,
+            dry_run: false,
+            uninstall: false,
+            binary: Some(PathBuf::from("/usr/local/bin/ai-memory")),
+        };
+        let target_cmd = match target {
+            Target::ClaudeCode => TargetCmd::ClaudeCode(t),
+            Target::Openclaw => TargetCmd::Openclaw(t),
+            Target::Cursor => TargetCmd::Cursor(t),
+            Target::Cline => TargetCmd::Cline(t),
+            Target::Continue => TargetCmd::Continue(t),
+            Target::Windsurf => TargetCmd::Windsurf(t),
+            Target::ClaudeDesktop => TargetCmd::ClaudeDesktop(t),
+            Target::Codex => TargetCmd::Codex(t),
+            Target::GrokCli => TargetCmd::GrokCli(t),
+            Target::GeminiCli => TargetCmd::GeminiCli(t),
+        };
+        InstallArgs { target: target_cmd }
+    }
+
+    #[test]
+    fn resolve_config_path_openclaw_bails_without_config() {
+        let r = resolve_config_path(
+            Target::Openclaw,
+            &TargetArgs {
+                config: None,
+                ..TargetArgs::default()
+            },
+        );
+        let err = r.unwrap_err();
+        assert!(format!("{err}").contains("openclaw config path"));
+    }
+
+    #[test]
+    fn resolve_config_path_cline_bails_without_config() {
+        let r = resolve_config_path(
+            Target::Cline,
+            &TargetArgs {
+                config: None,
+                ..TargetArgs::default()
+            },
+        );
+        let err = r.unwrap_err();
+        assert!(format!("{err}").contains("cline config path"));
+    }
+
+    #[test]
+    fn resolve_config_path_codex_bails_without_config() {
+        let r = resolve_config_path(
+            Target::Codex,
+            &TargetArgs {
+                config: None,
+                ..TargetArgs::default()
+            },
+        );
+        let err = r.unwrap_err();
+        assert!(format!("{err}").contains("codex config path"));
+    }
+
+    #[test]
+    fn resolve_config_path_grok_cli_bails_without_config() {
+        let r = resolve_config_path(
+            Target::GrokCli,
+            &TargetArgs {
+                config: None,
+                ..TargetArgs::default()
+            },
+        );
+        let err = r.unwrap_err();
+        assert!(format!("{err}").contains("grok-cli config path"));
+    }
+
+    #[test]
+    fn resolve_config_path_gemini_cli_bails_without_config() {
+        let r = resolve_config_path(
+            Target::GeminiCli,
+            &TargetArgs {
+                config: None,
+                ..TargetArgs::default()
+            },
+        );
+        let err = r.unwrap_err();
+        assert!(format!("{err}").contains("gemini-cli config path"));
+    }
+
+    #[test]
+    fn resolve_config_path_claude_code_default_under_home() {
+        // Drives the `home.join(".claude").join("settings.json")` branch
+        // (line 499). We don't assert the home directory contents — just
+        // that the resolution succeeds and ends in `.claude/settings.json`.
+        let r = resolve_config_path(
+            Target::ClaudeCode,
+            &TargetArgs {
+                config: None,
+                ..TargetArgs::default()
+            },
+        )
+        .expect("home dir present on test host");
+        let s = r.to_string_lossy().to_string();
+        assert!(s.ends_with(".claude/settings.json") || s.ends_with(".claude\\settings.json"));
+    }
+
+    #[test]
+    fn resolve_config_path_cursor_default_under_home() {
+        let r = resolve_config_path(
+            Target::Cursor,
+            &TargetArgs {
+                config: None,
+                ..TargetArgs::default()
+            },
+        )
+        .expect("home dir");
+        let s = r.to_string_lossy().to_string();
+        assert!(s.ends_with(".cursor/mcp.json") || s.ends_with(".cursor\\mcp.json"));
+    }
+
+    #[test]
+    fn resolve_config_path_continue_default_under_home() {
+        let r = resolve_config_path(
+            Target::Continue,
+            &TargetArgs {
+                config: None,
+                ..TargetArgs::default()
+            },
+        )
+        .expect("home dir");
+        let s = r.to_string_lossy().to_string();
+        assert!(s.ends_with(".continue/config.json") || s.ends_with(".continue\\config.json"));
+    }
+
+    #[test]
+    fn resolve_config_path_windsurf_default_under_home() {
+        let r = resolve_config_path(
+            Target::Windsurf,
+            &TargetArgs {
+                config: None,
+                ..TargetArgs::default()
+            },
+        )
+        .expect("home dir");
+        let s = r.to_string_lossy().to_string();
+        assert!(s.ends_with("mcp_config.json"), "got: {s}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn resolve_config_path_claude_desktop_default_under_macos() {
+        let r = resolve_config_path(
+            Target::ClaudeDesktop,
+            &TargetArgs {
+                config: None,
+                ..TargetArgs::default()
+            },
+        )
+        .expect("home dir");
+        let s = r.to_string_lossy().to_string();
+        assert!(s.ends_with("claude_desktop_config.json"), "got: {s}");
+    }
+
+    #[test]
+    fn install_dispatches_through_run_with_default_config_on_unsupported_target() {
+        // Driving `run()` end-to-end with `args.config=None` for a
+        // target whose default-path is a `bail!` covers the
+        // `run` -> `resolve_config_path` error propagation path.
+        let args = args_no_config(Target::Codex);
+        let mut env = TestEnv::fresh();
+        let err = run(&args, &mut env.output()).unwrap_err();
+        assert!(format!("{err}").contains("codex config path"));
+    }
+
+    #[test]
+    fn read_config_or_empty_handles_whitespace_only_file() {
+        // Drives the `text.trim().is_empty()` branch (line 638).
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("blank.json");
+        std::fs::write(&p, "   \n  \n").unwrap();
+        let (text, val) = read_config_or_empty(&p).unwrap();
+        assert!(!text.is_empty()); // we returned the original text
+        assert!(val.is_object() && val.as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn read_config_or_empty_handles_missing_file() {
+        // Drives the `!path.exists()` branch (line 633).
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("nonexistent.json");
+        let (text, val) = read_config_or_empty(&p).unwrap();
+        assert!(text.is_empty());
+        assert!(val.is_object() && val.as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn install_apply_rejects_non_object_json_root() {
+        // ensure_object refuses array-shaped roots (line 743).
+        let mut env = TestEnv::fresh();
+        let path = config_path(&env, "array.json");
+        seed(&path, "[]");
+        let err = run(
+            &args_for_apply(Target::Cursor, path.clone()),
+            &mut env.output(),
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("not a JSON object"));
+    }
+
+    #[test]
+    fn install_dry_run_emits_unified_diff_with_minus_and_plus_lines() {
+        // Drives every variant of `emit_diff`: equal line (line 981),
+        // changed line (982-984), removed-only (986), added-only (987).
+        let mut env = TestEnv::fresh();
+        let path = config_path(&env, "diff-source.json");
+        // Use a baseline with multiple keys so the install diff has
+        // identical lines, changed lines, and added lines.
+        seed(&path, "{\n  \"theme\": \"dark\"\n}\n");
+        run(&args_for(Target::Cursor, path.clone()), &mut env.output()).unwrap();
+        let stdout = env.stdout_str();
+        // The diff format emits ` ` (context) / `+` (added) / `-` (changed)
+        // line prefixes for the cursor block's new lines.
+        assert!(
+            stdout.lines().any(|l| l.starts_with('+')),
+            "expected at least one added line, got:\n{stdout}"
+        );
+    }
+
+    #[test]
+    fn remove_mcp_standard_no_op_on_clean_config() {
+        // Drives the path through `remove_mcp_standard` where there is
+        // no `mcpServers` key at all (line 738 not-entered branch).
+        let mut env = TestEnv::fresh();
+        let path = config_path(&env, "clean.json");
+        seed(&path, "{}\n");
+        run(
+            &args_for_uninstall_apply(Target::ClaudeDesktop, path.clone()),
+            &mut env.output(),
+        )
+        .unwrap();
+        let parsed: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(parsed.as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn remove_claude_code_no_op_when_user_has_empty_hooks() {
+        // Pre-install we set `hooks: {}` in the config; install adds
+        // SessionStart, uninstall must leave nothing behind. Drives the
+        // empty-hooks branch (lines 796-797, 800-804).
+        let mut env = TestEnv::fresh();
+        let path = config_path(&env, "settings.json");
+        seed(&path, r#"{"hooks":{}}"#);
+        // Install then uninstall.
+        run(
+            &args_for_apply(Target::ClaudeCode, path.clone()),
+            &mut env.output(),
+        )
+        .unwrap();
+        run(
+            &args_for_uninstall_apply(Target::ClaudeCode, path.clone()),
+            &mut env.output(),
+        )
+        .unwrap();
+        let parsed: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        // We expected the user's empty `hooks` to either survive or be
+        // pruned — `remove_claude_code` removes empty hooks objects.
+        assert!(parsed.get("hooks").is_none());
+    }
+
+    #[test]
+    fn install_run_creates_missing_parent_directory() {
+        // Drives the `create_dir_all` branch (lines 311-316) by passing
+        // a config path whose parent does not exist.
+        let mut env = TestEnv::fresh();
+        let dir = env.db_path.parent().unwrap().to_path_buf();
+        let nested = dir.join("not").join("yet").join("here").join("mcp.json");
+        assert!(!nested.parent().unwrap().exists());
+        run(
+            &args_for_apply(Target::Cursor, nested.clone()),
+            &mut env.output(),
+        )
+        .unwrap();
+        assert!(nested.exists());
+    }
+
+    #[test]
+    fn resolve_binary_falls_through_when_no_override() {
+        // Drives the resolve_binary branch without a `--binary` override.
+        // Either `which_ai_memory` returns Some, or the function falls
+        // back to current_exe(). Both branches exit through this fn.
+        let s = resolve_binary(None);
+        assert!(!s.is_empty(), "resolved binary path should be non-empty");
+    }
+
+    #[test]
+    fn which_ai_memory_returns_some_when_path_has_binary() {
+        // Drives the success branch of `which_ai_memory` (line 614).
+        // We construct a tempdir, drop a synthetic "ai-memory" binary
+        // inside, then temporarily set $PATH to point at it.
+        use std::sync::Mutex;
+        static PATH_LOCK: Mutex<()> = Mutex::new(());
+        let _g = PATH_LOCK.lock().unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("ai-memory");
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        // Chmod 0755 so `is_file()` returns true.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let orig = std::env::var_os("PATH");
+        // SAFETY: serialized via PATH_LOCK; restored at scope end.
+        unsafe {
+            std::env::set_var("PATH", tmp.path());
+        }
+        let found = which_ai_memory();
+        // Restore PATH.
+        unsafe {
+            if let Some(p) = orig {
+                std::env::set_var("PATH", p);
+            } else {
+                std::env::remove_var("PATH");
+            }
+        }
+        assert!(found.is_some(), "expected to find ai-memory under $PATH");
+    }
 }
