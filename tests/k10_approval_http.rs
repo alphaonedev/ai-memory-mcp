@@ -110,6 +110,7 @@ async fn seed_pending_row_via_db(
         expires_at: None,
         metadata: serde_json::json!({}),
         reflection_depth: 0,
+        memory_kind: ai_memory::models::MemoryKind::Observation,
     };
     let mem_id = ai_memory::db::insert(&lock.0, &mem).expect("insert memory");
     let payload = json!({"reason": "k10-test"});

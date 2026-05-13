@@ -149,6 +149,7 @@ fn cmd_forget_proceeds_with_confirm_global() {
             expires_at: None,
             metadata: serde_json::json!({}),
             reflection_depth: 0,
+            memory_kind: ai_memory::models::MemoryKind::Observation,
         };
         db::insert(&conn, &m).unwrap();
     }

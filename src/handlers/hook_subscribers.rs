@@ -413,6 +413,7 @@ pub async fn subscribe(
             expires_at: None,
             metadata,
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         let ctx = crate::store::CallerContext::for_agent(&caller);
         return match app.store.store(&ctx, &mem).await {
@@ -934,6 +935,7 @@ async fn set_namespace_standard_inner(
                     expires_at: None,
                     metadata,
                     reflection_depth: 0,
+                    memory_kind: crate::models::MemoryKind::Observation,
                 };
                 match app.store.store(&ctx, &placeholder).await {
                     Ok(id) => id,
@@ -1058,6 +1060,7 @@ async fn set_namespace_standard_inner(
                 expires_at: None,
                 metadata: serde_json::json!({"agent_id": "system"}),
                 reflection_depth: 0,
+                memory_kind: crate::models::MemoryKind::Observation,
             };
             match db::insert(&lock.0, &placeholder) {
                 Ok(id) => id,

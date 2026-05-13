@@ -841,6 +841,7 @@ mod tests {
             expires_at: None,
             metadata: serde_json::json!({}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         }
     }
 
@@ -1387,6 +1388,7 @@ mod tests {
                     expires_at: None,
                     metadata: serde_json::json!({}),
                     reflection_depth: 0,
+                    memory_kind: crate::models::MemoryKind::Observation,
                 },
                 0.6,
             ),
@@ -1408,6 +1410,7 @@ mod tests {
                     expires_at: None,
                     metadata: serde_json::json!({}),
                     reflection_depth: 0,
+                    memory_kind: crate::models::MemoryKind::Observation,
                 },
                 0.4,
             ),
@@ -1529,6 +1532,7 @@ mod mock_tests {
             expires_at: None,
             metadata: serde_json::json!({}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         }
     }
 

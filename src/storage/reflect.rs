@@ -13,7 +13,7 @@ use anyhow::Context;
 use chrono::Utc;
 use rusqlite::Connection;
 
-use crate::models::{GovernancePolicy, Memory, Tier};
+use crate::models::{GovernancePolicy, Memory, MemoryKind, Tier};
 
 use super::{create_link, get, insert, resolve_governance_policy};
 
@@ -450,6 +450,11 @@ pub fn reflect_with_hooks(
         expires_at: None,
         metadata: metadata_value,
         reflection_depth: new_depth_i32,
+        // L1-1: reflection memories are always typed as Reflection,
+        // regardless of what the caller passes in metadata.type (the
+        // back-compat path). This is the first-class typed counterpart
+        // to the metadata.type = 'reflection' splice above.
+        memory_kind: MemoryKind::Reflection,
     };
 
     // Atomic boundary: insert the reflection row + N `reflects_on`

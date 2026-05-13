@@ -58,6 +58,7 @@ pub(crate) fn handle_notify(
         expires_at,
         metadata,
         reflection_depth: 0,
+        memory_kind: crate::models::MemoryKind::Observation,
     };
     let actual_id = db::insert(conn, &mem).map_err(|e| e.to_string())?;
 

@@ -278,6 +278,7 @@ pub(super) fn handle_store(
         expires_at,
         metadata,
         reflection_depth: 0,
+        memory_kind: crate::models::MemoryKind::Observation,
     };
 
     // v0.7.0 K9 — unified permission pipeline. The K9 evaluator

@@ -968,6 +968,7 @@ fn seed_governance_policy(
         expires_at: None,
         metadata,
         reflection_depth: 0,
+        memory_kind: ai_memory::models::MemoryKind::Observation,
     };
     let standard_id = ai_memory::db::insert(conn, &standard).unwrap();
     ai_memory::db::set_namespace_standard(conn, namespace, &standard_id, None).unwrap();

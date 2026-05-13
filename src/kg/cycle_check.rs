@@ -212,6 +212,7 @@ mod tests {
             expires_at: None,
             metadata: serde_json::json!({"agent_id": "test-agent"}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         crate::db::insert(conn, &mem).expect("insert memory");
     }

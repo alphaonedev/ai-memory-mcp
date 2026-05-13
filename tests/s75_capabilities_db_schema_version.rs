@@ -155,10 +155,11 @@ async fn s75_capabilities_surfaces_runtime_db_schema_version() {
 
     // 3) Value tracks the live SAL adapter's `schema_version` table.
     //    A freshly-opened SqliteStore runs every migration up to
-    //    CURRENT_SCHEMA_VERSION (29 at v0.7.0 after recursive-learning
-    //    Task 1/8 added `memories.reflection_depth`) on `open`, so the
-    //    live read MUST land at that value — proving the field comes
-    //    from the SAL trait lookup rather than a hard-coded constant.
+    //    CURRENT_SCHEMA_VERSION (30 at v0.7.0 after L1-1 added the
+    //    `memories.memory_kind` column and migration v30 backfill) on
+    //    `open`, so the live read MUST land at that value — proving the
+    //    field comes from the SAL trait lookup rather than a hard-coded
+    //    constant.
     assert!(
         v >= 1,
         "S75: db_schema_version must be a positive integer for a \
@@ -166,12 +167,12 @@ async fn s75_capabilities_surfaces_runtime_db_schema_version() {
          time); got {v}"
     );
     assert_eq!(
-        v, 29,
+        v, 30,
         "S75: db_schema_version must match `CURRENT_SCHEMA_VERSION` \
-         (29 at v0.7.0 — recursive-learning Task 1/8 bumped from 28 \
-         to 29 to add `memories.reflection_depth`). A drift here means \
-         either the binary's migrate ladder skipped a step or the new \
-         SAL `schema_version()` lookup is reading from the wrong source."
+         (30 at v0.7.0 — L1-1 bumped from 29 to 30 to add the typed \
+         `memories.memory_kind` column). A drift here means either \
+         the binary's migrate ladder skipped a step or the new SAL \
+         `schema_version()` lookup is reading from the wrong source."
     );
 
     // 4) The wire-format discriminator stays alongside but distinct
