@@ -2808,6 +2808,7 @@ pub async fn run_curator_daemon_with_primitives(
         dry_run,
         include_namespaces,
         exclude_namespaces,
+        compaction: crate::curator::CompactionConfig::default(),
     };
     let llm: Option<Arc<crate::llm::OllamaClient>> =
         ollama_model.and_then(|m| crate::llm::OllamaClient::new(&m).ok().map(Arc::new));

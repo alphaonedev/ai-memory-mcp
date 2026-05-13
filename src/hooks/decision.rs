@@ -386,6 +386,9 @@ pub fn is_pre_event(event: HookEvent) -> bool {
             // check so a Deny veto refuses the reflection BEFORE the
             // substrate evaluates `effective_max_reflection_depth()`.
             | HookEvent::PreReflect
+            // v0.7.0 L1-7: pre_compaction fires before the cluster is
+            // processed by a CompactionPass — Deny aborts the cluster.
+            | HookEvent::PreCompaction
     )
 }
 
@@ -660,7 +663,7 @@ mod tests {
     #[test]
     fn is_pre_event_classifies_all_variants() {
         // Pre- variants (G10 added PreRecallExpand; v0.7.0 Task 6/8
-        // added PreReflect).
+        // added PreReflect; L1-7 added PreCompaction).
         for ev in [
             HookEvent::PreStore,
             HookEvent::PreRecall,
@@ -674,10 +677,12 @@ mod tests {
             HookEvent::PreTranscriptStore,
             HookEvent::PreRecallExpand,
             HookEvent::PreReflect,
+            HookEvent::PreCompaction,
         ] {
             assert!(is_pre_event(ev), "expected {ev:?} to be a pre- event");
         }
-        // Post- + on- variants (v0.7.0 Task 6/8 added PostReflect).
+        // Post- + on- variants (v0.7.0 Task 6/8 added PostReflect;
+        // L1-7 added OnCompactionRollback — notify-only).
         for ev in [
             HookEvent::PostStore,
             HookEvent::PostRecall,
@@ -690,6 +695,7 @@ mod tests {
             HookEvent::OnIndexEviction,
             HookEvent::PostTranscriptStore,
             HookEvent::PostReflect,
+            HookEvent::OnCompactionRollback,
         ] {
             assert!(!is_pre_event(ev), "expected {ev:?} to be a post-/on- event");
         }

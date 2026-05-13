@@ -130,9 +130,9 @@ pub const HOT_PATH_CLASS_DEADLINE_MS: u64 = 50;
 // event_class — the canonical mapping
 // ---------------------------------------------------------------------------
 
-/// Map a [`HookEvent`] to its [`EventClass`]. Total over the 23
+/// Map a [`HookEvent`] to its [`EventClass`]. Total over the 25
 /// variants — the compiler's exhaustiveness check enforces the table
-/// stays in sync if a 24th event ever lands.
+/// stays in sync if a 26th event ever lands.
 #[must_use]
 pub fn event_class(event: HookEvent) -> EventClass {
     match event {
@@ -154,7 +154,11 @@ pub fn event_class(event: HookEvent) -> EventClass {
         // path (the substrate inserts the new reflection memory +
         // N reflects_on links inside a single transaction).
         | HookEvent::PreReflect
-        | HookEvent::PostReflect => EventClass::Write,
+        | HookEvent::PostReflect
+        // v0.7.0 L1-7: compaction pipeline events are write-class
+        // (the pass may delete source rows and insert a summary).
+        | HookEvent::PreCompaction
+        | HookEvent::OnCompactionRollback => EventClass::Write,
         // Reads: query path. Hot.
         HookEvent::PreRecall
         | HookEvent::PostRecall
@@ -286,14 +290,15 @@ mod tests {
     use super::*;
 
     /// Every `HookEvent` variant must classify into exactly one
-    /// `EventClass`. Table-driven so adding a 24th variant without
+    /// `EventClass`. Table-driven so adding a 26th variant without
     /// updating the mapping fails this test (the compiler also
     /// flags the missing arm in `event_class`, but the assertion
     /// surface here is what an operator reading the test reads).
     #[test]
-    fn event_class_table_covers_all_23_variants() {
+    fn event_class_table_covers_all_25_variants() {
         let table = [
-            // Write — 15 variants (Task 6/8 added pre_reflect + post_reflect).
+            // Write — 17 variants (Task 6/8 added pre_reflect + post_reflect;
+            // L1-7 added pre_compaction + on_compaction_rollback).
             (HookEvent::PreStore, EventClass::Write),
             (HookEvent::PostStore, EventClass::Write),
             (HookEvent::PreDelete, EventClass::Write),
@@ -309,6 +314,8 @@ mod tests {
             (HookEvent::PreArchive, EventClass::Write),
             (HookEvent::PreReflect, EventClass::Write),
             (HookEvent::PostReflect, EventClass::Write),
+            (HookEvent::PreCompaction, EventClass::Write),
+            (HookEvent::OnCompactionRollback, EventClass::Write),
             // Read — 4 variants.
             (HookEvent::PreRecall, EventClass::Read),
             (HookEvent::PostRecall, EventClass::Read),
@@ -325,8 +332,8 @@ mod tests {
 
         assert_eq!(
             table.len(),
-            23,
-            "v0.7.0 Task 6/8 mapping must cover exactly the 23 HookEvent variants"
+            25,
+            "v0.7.0 L1-7 mapping must cover exactly the 25 HookEvent variants"
         );
         for (event, expected) in table {
             assert_eq!(
