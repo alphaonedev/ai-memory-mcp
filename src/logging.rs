@@ -330,4 +330,39 @@ mod tests {
         let msg = format!("{err}");
         assert!(msg.contains("world-writable"), "got: {msg}");
     }
+
+    // -----------------------------------------------------------------
+    // L0.7-2 Tier A — try_init second-call debug path + default-cfg
+    // pass-through (`enabled = None` -> disabled)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn init_file_logging_second_call_does_not_panic() {
+        let _g = subscriber_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = LoggingConfig {
+            enabled: Some(true),
+            path: Some(tmp.path().to_string_lossy().into_owned()),
+            rotation: Some("never".to_string()),
+            ..Default::default()
+        };
+        // First call sets up the global subscriber (or no-ops if a
+        // prior test already grabbed it). Second call's try_init must
+        // fail-soft via the debug! arm without panicking.
+        let _first = init_file_logging(&cfg);
+        let second = init_file_logging(&cfg).expect("second init must not error");
+        assert!(
+            second.is_some(),
+            "second init still returns Some(guard); try_init failure goes to debug! not Err"
+        );
+    }
+
+    #[test]
+    fn init_file_logging_default_enabled_field_is_off() {
+        // LoggingConfig::default() has `enabled: None` -> treated as
+        // disabled by unwrap_or(false). Exercises the early-return arm.
+        let cfg = LoggingConfig::default();
+        let guard = init_file_logging(&cfg).expect("disabled returns Ok(None)");
+        assert!(guard.is_none());
+    }
 }
