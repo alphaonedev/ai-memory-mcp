@@ -175,17 +175,19 @@ fn cap_v3_summary_core_profile_counts_and_names_recovery_paths() {
     // "{n_loaded} memory tool{s}" phrasing. Core profile loads
     // `Family::Core` (7 tools) and does NOT load `Family::Meta`, so
     // visible memory tools = 7 (the bootstrap is plumbing, not a
-    // memory tool). Total memory tools = 51 - 1 = 50.
+    // memory tool). Total memory tools = 56 - 1 = 55 (55 substantive;
+    // bumped to 56 total in v0.7.0 L1-5 — Family::Other gained 5
+    // memory_skill_* tools).
     assert!(
-        summary.starts_with("7 of 51 memory tools"),
-        "core profile summary should open with \"7 of 51 memory tools\" (Round-2 F13; \
-         v0.7.0 Task 4/8 added memory_reflect to Family::Power, bumping the \
-         substantive total from 50 to 51); got: {summary}"
+        summary.starts_with("7 of 56 memory tools"),
+        "core profile summary should open with \"7 of 56 memory tools\" (Round-2 F13; \
+         v0.7.0 L1-5 added 5 memory_skill_* tools to Family::Other, bumping the \
+         substantive total from 51 to 56); got: {summary}"
     );
     assert!(summary.contains("(core)"), "must label the profile as core");
     assert!(
-        summary.contains("44 are listed in this manifest"),
-        "core profile must report 44 unloaded (51 - 7); got: {summary}"
+        summary.contains("49 are listed in this manifest"),
+        "core profile must report 49 unloaded (56 - 7); got: {summary}"
     );
 
     // Three named recovery paths must all appear (verbatim names — these
@@ -214,17 +216,17 @@ fn cap_v3_summary_core_profile_counts_and_names_recovery_paths() {
 fn cap_v3_summary_full_profile_reports_all_visible() {
     let summary = build_capabilities_summary(&Profile::full());
 
-    // Round-2 F13 — summary aligns with describe_to_user's "all 51
+    // Round-2 F13 — summary aligns with describe_to_user's "all 56
     // memory tools" phrasing. Full profile loads every family
-    // (visible = 51 substantive memory tools; the
+    // (visible = 56 substantive memory tools; the
     // `memory_capabilities` bootstrap is excluded from the count to
-    // match the user-facing string). v0.7.0 Task 4/8 added
-    // `memory_reflect` to Family::Power, bumping the substantive
-    // total from 50 to 51.
+    // match the user-facing string). v0.7.0 L1-5 added
+    // 5 memory_skill_* tools to Family::Other, bumping the substantive
+    // total from 51 to 56.
     assert!(
-        summary.starts_with("51 of 51 memory tools"),
-        "full profile summary should open with \"51 of 51 memory tools\" (Round-2 F13; \
-         v0.7.0 Task 4/8 added memory_reflect); got: {summary}"
+        summary.starts_with("56 of 56 memory tools"),
+        "full profile summary should open with \"56 of 56 memory tools\" (Round-2 F13; \
+         v0.7.0 L1-5 added 5 memory_skill_* tools); got: {summary}"
     );
     assert!(summary.contains("(full)"));
     assert!(
@@ -248,15 +250,16 @@ fn cap_v3_summary_graph_profile_counts() {
     let summary = build_capabilities_summary(&Profile::graph());
     // Round-2 F13 — summary uses substantive "memory tool" count.
     // Graph profile = 7 core (v0.7 B1+B2) + 11 graph (v0.7 J7) = 18
-    // memory tools. Total = 50 (51 - bootstrap).
+    // memory tools. Total = 55 (56 - bootstrap; v0.7.0 L1-5 added 5
+    // memory_skill_* tools to Family::Other, bumping total from 51 to 56).
     assert!(
-        summary.starts_with("18 of 51 memory tools"),
+        summary.starts_with("18 of 56 memory tools"),
         "graph profile = 7 core (v0.7 B1+B2) + 11 graph (v0.7 J7) = 18 memory tools \
-         (Round-2 F13: bootstrap excluded; v0.7.0 Task 4/8 added memory_reflect to \
-         Family::Power, bumping the substantive total from 50 to 51); got: {summary}"
+         (Round-2 F13: bootstrap excluded; v0.7.0 L1-5 added 5 memory_skill_* tools \
+         to Family::Other, bumping the substantive total from 51 to 56); got: {summary}"
     );
     assert!(summary.contains("(graph)"));
-    assert!(summary.contains("33 are listed in this manifest"));
+    assert!(summary.contains("38 are listed in this manifest"));
 }
 
 // ---------------------------------------------------------------------------
@@ -350,22 +353,15 @@ fn cap_v3_describe_core_profile_is_plain_english_with_loaded_names() {
     // memory_ prefix STRIPPED (no MCP jargon for end users), followed
     // by ", ..." since core now ships 7 tools (v0.7 B1 + B2).
     assert!(describe.contains("(store, recall, list, get, search, ...)"));
-    // Reports the unloaded count. 43 = 50 user-relevant tools − 7
-    // core. (50 = 51 total tools − 1 always-on bootstrap.) The
+    // Reports the unloaded count. 49 = 55 user-relevant tools − 7
+    // core. (55 = 56 total tools − 1 always-on bootstrap.) The
     // bootstrap (`memory_capabilities`) is excluded from both sides
-    // for honest user-facing counting. Total bumped to 44 in v0.7.0
-    // I4 (Family::Graph gained `memory_replay`), to 45 in v0.7 H4
-    // (Family::Graph gained `memory_verify`), to 46 in v0.7 B1
-    // (Family::Core gained `memory_load_family`), to 48 in v0.7
-    // K7 (Family::Power gained `memory_subscription_replay` +
-    // `memory_subscription_dlq_list`), to 49 in v0.7 J7 (Family::Graph
-    // gained `memory_find_paths`), to 50 in v0.7 B2 (Family::Core
-    // gained `memory_smart_load`), and to 51 in v0.7 K8 (Family::Power
-    // gained `memory_quota_status`).
+    // for honest user-facing counting. Total bumped to 56 in v0.7.0
+    // L1-5 (Family::Other gained 5 memory_skill_* tools).
     assert!(
-        describe.contains("44 more"),
-        "core profile must report 44 unloaded (51 - 7); v0.7.0 Task 4/8 \
-         added memory_reflect bumping the substantive total to 51; got: {describe}"
+        describe.contains("49 more"),
+        "core profile must report 49 unloaded (56 - 7); v0.7.0 L1-5 \
+         added 5 memory_skill_* tools bumping the substantive total to 56; got: {describe}"
     );
     // Sample of unloaded tools is plain (no memory_ prefix). The first
     // four unloaded under core are lifecycle's update/delete/forget/gc.
@@ -404,19 +400,12 @@ fn cap_v3_describe_core_profile_is_plain_english_with_loaded_names() {
 fn cap_v3_describe_full_profile_uses_nothing_more_form() {
     let describe = build_capabilities_describe_to_user(&Profile::full());
 
-    // 51 = 52 total - 1 always-on bootstrap excluded from describe.
-    // Bumped from 42 to 43 in v0.7.0 I4 (Family::Graph gained
-    // `memory_replay`); 43 to 44 in v0.7 H4 (Family::Graph gained
-    // `memory_verify`); 44 to 45 in v0.7 B1 (Family::Core gained
-    // `memory_load_family`); 45 to 47 in v0.7 K7 (Family::Power
-    // gained `memory_subscription_replay` + `memory_subscription_dlq_list`);
-    // 47 to 48 in v0.7 J7 (Family::Graph gained `memory_find_paths`);
-    // 48 to 49 in v0.7 B2 (Family::Core gained `memory_smart_load`);
-    // 49 to 50 in v0.7 K8 (Family::Power gained `memory_quota_status`);
-    // 50 to 51 in v0.7.0 recursive-learning Task 4/8 (Family::Power
-    // gained `memory_reflect`).
+    // 56 = 57 total - 1 always-on bootstrap excluded from describe.
+    // Bumped from 51 to 56 in v0.7.0 L1-5 (Family::Other gained
+    // 5 memory_skill_* tools: memory_skill_register, memory_skill_list,
+    // memory_skill_get, memory_skill_resource, memory_skill_export).
     assert!(
-        describe.starts_with("I can directly use all 51 memory tools right now ("),
+        describe.starts_with("I can directly use all 56 memory tools right now ("),
         "full profile describe must open with all-loaded form; got: {describe}"
     );
     assert!(describe.contains("Nothing more to load"));
@@ -439,7 +428,7 @@ fn cap_v3_describe_graph_profile_uses_preview_ellipsis() {
     );
     // Preview is the first 5 of the 18 loaded — the first 5 core tools.
     assert!(describe.contains("(store, recall, list, get, search, ...)"));
-    assert!(describe.contains("33 more"));
+    assert!(describe.contains("38 more"));
 }
 
 // ---------------------------------------------------------------------------
@@ -595,16 +584,12 @@ fn cap_v3_a3_allowlist_on_agent_denied_callable_now_false() {
 
 // ---------------------------------------------------------------------------
 // A3 — the v3 response surfaces the `tools` array at the top level
-// with one entry per registered tool (51 + always-on bootstrap counted
-// once = 51, since the bootstrap already lives in Family::Meta).
-// (Bumped from 43 to 44 in v0.7.0 I4 — Family::Graph gained
-// `memory_replay`; 44 to 45 in v0.7 H4 — Family::Graph gained
-// `memory_verify`; 45 to 46 in v0.7 B1 — Family::Core gained
-// `memory_load_family`; 46 to 48 in v0.7 K7 — Family::Power gained
-// `memory_subscription_replay` + `memory_subscription_dlq_list`;
-// 48 to 49 in v0.7 J7 — Family::Graph gained `memory_find_paths`;
-// 49 to 50 in v0.7 B2 — Family::Core gained `memory_smart_load`;
-// 50 to 51 in v0.7 K8 — Family::Power gained `memory_quota_status`.)
+// with one entry per registered tool (56 + always-on bootstrap counted
+// once = 57, since the bootstrap already lives in Family::Meta).
+// (Bumped from 51 to 52 in v0.7.0 Task 4/8 — Family::Power gained
+// `memory_reflect`; 52 to 57 in v0.7.0 L1-5 — Family::Other gained
+// 5 memory_skill_* tools: memory_skill_register, memory_skill_list,
+// memory_skill_get, memory_skill_resource, memory_skill_export.)
 // ---------------------------------------------------------------------------
 #[test]
 fn cap_v3_response_carries_tools_array_with_51_entries() {
@@ -627,13 +612,14 @@ fn cap_v3_response_carries_tools_array_with_51_entries() {
         .expect("top-level tools must be present and an array under v3");
     assert_eq!(
         tools.len(),
-        52,
-        "v3 must surface all 52 tools regardless of profile (v0.7.0 I4 added \
+        57,
+        "v3 must surface all 57 tools regardless of profile (v0.7.0 I4 added \
          memory_replay; v0.7 H4 added memory_verify; v0.7 B1 added \
          memory_load_family; v0.7 B2 added memory_smart_load; v0.7 K7 added \
          memory_subscription_replay + memory_subscription_dlq_list; v0.7 J7 \
          added memory_find_paths; v0.7 K8 added memory_quota_status; v0.7.0 \
-         Task 4/8 added memory_reflect); got {}",
+         Task 4/8 added memory_reflect; v0.7.0 L1-5 added 5 memory_skill_* \
+         tools); got {}",
         tools.len()
     );
 

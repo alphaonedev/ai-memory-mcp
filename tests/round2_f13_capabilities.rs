@@ -77,17 +77,17 @@ fn f13_summary_and_describe_to_user_agree_on_count_full_profile() {
     let summary = build_capabilities_summary(&Profile::full());
     let describe = build_capabilities_describe_to_user(&Profile::full());
 
-    // Both must report "51" for the full profile (substantive memory
+    // Both must report "56" for the full profile (substantive memory
     // tools, excluding the always-on `memory_capabilities` bootstrap).
-    // v0.7.0 Task 4/8 added `memory_reflect` to Family::Power, bumping
-    // the substantive total from 50 to 51.
+    // v0.7.0 L1-5 added 5 memory_skill_* tools to Family::Other,
+    // bumping the substantive total from 51 to 56.
     assert!(
-        summary.contains("51 of 51 memory tools"),
-        "summary must report 51 of 51 memory tools; got: {summary}"
+        summary.contains("56 of 56 memory tools"),
+        "summary must report 56 of 56 memory tools; got: {summary}"
     );
     assert!(
-        describe.contains("all 51 memory tools"),
-        "describe_to_user must report all 51 memory tools; got: {describe}"
+        describe.contains("all 56 memory tools"),
+        "describe_to_user must report all 56 memory tools; got: {describe}"
     );
 }
 
@@ -97,12 +97,12 @@ fn f13_summary_and_describe_to_user_agree_on_count_core_profile() {
     let describe = build_capabilities_describe_to_user(&Profile::core());
 
     // Core profile loads `Family::Core` (7 tools). Bootstrap excluded.
-    // Total memory tools = 51 (52 - bootstrap). v0.7.0 Task 4/8 added
-    // `memory_reflect` to Family::Power, bumping the substantive total
-    // from 50 to 51.
+    // Total memory tools = 56 (57 - bootstrap). v0.7.0 L1-5 added
+    // 5 memory_skill_* tools to Family::Other, bumping the substantive
+    // total from 51 to 56.
     assert!(
-        summary.contains("7 of 51 memory tools"),
-        "summary must report 7 of 51 memory tools; got: {summary}"
+        summary.contains("7 of 56 memory tools"),
+        "summary must report 7 of 56 memory tools; got: {summary}"
     );
     assert!(
         describe.contains("7 memory tools"),
