@@ -42,7 +42,7 @@ fn fresh_conn() -> rusqlite::Connection {
     conn
 }
 
-/// Replicate one rule from peer_a to peer_b by reading the row and
+/// Replicate one rule from `peer_a` to `peer_b` by reading the row and
 /// re-inserting. Mirrors the shape an A2A subscription dispatcher
 /// would do — read source state, INSERT OR IGNORE on destination.
 fn replicate_rule(peer_a: &rusqlite::Connection, peer_b: &rusqlite::Connection, id: &str) {

@@ -197,10 +197,10 @@ fn transcript_class_deadline_is_5_seconds_via_public_api() {
 // real `ExecutorRegistry` and `chain.fire` integration; these tests
 // exercise both with subprocess hooks.
 
-/// Real subprocess hook returning Modify -> chain reports ModifiedAllow.
+/// Real subprocess hook returning Modify -> chain reports `ModifiedAllow`.
 /// Exercises the registry, the chain.fire integration, and the
-/// post_event Modify-degrade path (which leaves Modify intact for
-/// PreStore — a pre-event).
+/// `post_event` Modify-degrade path (which leaves Modify intact for
+/// `PreStore` — a pre-event).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn chain_fire_real_executor_modify_yields_modified_allow() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -254,7 +254,7 @@ printf '%s\n' '{"action":"deny","reason":"policy","code":403}'
     }
 }
 
-/// Real subprocess hook returning AskUser -> chain.fire surfaces it.
+/// Real subprocess hook returning `AskUser` -> chain.fire surfaces it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn chain_fire_real_executor_askuser_surfaces() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -283,10 +283,10 @@ printf '%s\n' '{"action":"ask_user","prompt":"promote?","options":["yes","no"],"
     }
 }
 
-/// Slow hook + FailMode::Closed: chain.fire returns Deny code 503.
-/// Exercises the FailMode::Closed branch in chain.fire's error
+/// Slow hook + `FailMode::Closed`: chain.fire returns Deny code 503.
+/// Exercises the `FailMode::Closed` branch in chain.fire's error
 /// handler — a key gap not exercised by the existing tests (which
-/// use FailMode::Open).
+/// use `FailMode::Open`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn chain_fire_fail_closed_yields_deny_503_on_timeout() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -328,9 +328,9 @@ printf '%s\n' '{"action":"allow"}'
     }
 }
 
-/// Spawn failure under FailMode::Open: chain.fire degrades to Allow.
+/// Spawn failure under `FailMode::Open`: chain.fire degrades to Allow.
 /// Exercises the spawn-error path through the chain.fire's error
-/// handler when the executor surfaces a non-Timeout ExecutorError.
+/// handler when the executor surfaces a non-Timeout `ExecutorError`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn chain_fire_spawn_error_fail_open_becomes_allow() {
     // Use a non-existent path to force a Spawn error from the
@@ -357,7 +357,7 @@ async fn chain_fire_spawn_error_fail_open_becomes_allow() {
     );
 }
 
-/// Spawn failure under FailMode::Closed: chain.fire returns Deny 503.
+/// Spawn failure under `FailMode::Closed`: chain.fire returns Deny 503.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn chain_fire_spawn_error_fail_closed_yields_deny_503() {
     let cfg = HookConfig {
@@ -387,7 +387,7 @@ async fn chain_fire_spawn_error_fail_closed_yields_deny_503() {
     }
 }
 
-/// Single hook returning Modify with EVERY MemoryDelta field set.
+/// Single hook returning Modify with EVERY `MemoryDelta` field set.
 /// Covers each `incoming.X.is_some()` branch in chain.rs's
 /// `merge_delta_into` (lines 681-709) which the existing tests don't
 /// reach (they only touch tags/priority/title).
@@ -426,7 +426,7 @@ printf '%s\n' '{"action":"modify","delta":{"tier":"long","namespace":"team/secur
 }
 
 /// Multi-hook chain: 3 hooks, first Modify, second Modify, third Allow.
-/// Exercises the chain's accumulated_delta merge + the registry's
+/// Exercises the chain's `accumulated_delta` merge + the registry's
 /// per-hook caching across multiple fires within a single chain.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn chain_fire_multi_hook_accumulated_modify() {
@@ -478,7 +478,7 @@ printf '%s\n' '{"action":"allow"}'
 }
 
 /// `dispatch_event_with_hooks` on a pre-event where the chain Denies
-/// must NOT call the subscription_dispatch closure. Closes the Deny
+/// must NOT call the `subscription_dispatch` closure. Closes the Deny
 /// branch in chain.rs lines 510-513.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dispatch_event_pre_with_chain_deny_skips_subscription() {

@@ -454,11 +454,11 @@ async fn exec_mode_nonzero_exit_surfaces_child_exit_error() {
     let script = write_script(
         &dir,
         "bad_exit.sh",
-        r#"#!/bin/sh
+        r"#!/bin/sh
 cat >/dev/null
 printf 'failure diagnostic\n' >&2
 exit 42
-"#,
+",
     );
     let exec = ExecExecutor::new(cfg_for(script, HookMode::Exec, 2_000));
     let r = exec.fire(HookEvent::PostStore, json!({})).await;
@@ -534,11 +534,11 @@ async fn daemon_mode_child_eof_on_first_fire_surfaces_child_exit() {
     let script = write_script(
         &dir,
         "eof_on_first.sh",
-        r#"#!/bin/sh
+        r"#!/bin/sh
 read -r _line
 # exit without writing anything to stdout
 exit 0
-"#,
+",
     );
     let exec = DaemonExecutor::new(cfg_for(script, HookMode::Daemon, 1_000));
     let r = exec.fire(HookEvent::PostStore, json!({})).await;
@@ -629,18 +629,20 @@ async fn daemon_mode_unavailable_after_spawn_failures() {
     // connect_with_backoff propagating the last spawn error) or
     // DaemonUnavailable (if backoff exhausted without surfacing one).
     match r {
-        Err(ai_memory::hooks::ExecutorError::Spawn { .. })
-        | Err(ai_memory::hooks::ExecutorError::DaemonUnavailable { .. }) => {}
+        Err(
+            ai_memory::hooks::ExecutorError::Spawn { .. }
+            | ai_memory::hooks::ExecutorError::DaemonUnavailable { .. },
+        ) => {}
         other => panic!("expected Spawn/DaemonUnavailable, got {other:?}"),
     }
 }
 
 /// Verifies `ExecutorRegistry::is_empty` + `len` round trip and
 /// the `Default` impl produces an empty registry — closes the
-/// is_empty/Default branches.
+/// `is_empty/Default` branches.
 #[test]
 fn registry_default_is_empty() {
-    let reg: ExecutorRegistry = Default::default();
+    let reg = ExecutorRegistry::default();
     assert!(reg.is_empty());
     assert_eq!(reg.len(), 0);
 }
@@ -668,7 +670,7 @@ fn executor_error_display_child_exit_signaled() {
 fn executor_error_source_chain() {
     use ai_memory::hooks::ExecutorError;
     use std::error::Error;
-    let io_err = ExecutorError::Io(std::io::Error::new(std::io::ErrorKind::Other, "boom"));
+    let io_err = ExecutorError::Io(std::io::Error::other("boom"));
     assert!(
         io_err.source().is_some(),
         "Io variant must surface inner source"

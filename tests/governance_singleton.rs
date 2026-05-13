@@ -1,7 +1,7 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
-//! Singleton property: 100 concurrent check_agent_action calls
+//! Singleton property: 100 concurrent `check_agent_action` calls
 //! against the same rule set return consistent decisions. Pins the
 //! invariant that the engine has no hidden mutable state that could
 //! produce divergent answers under contention.
