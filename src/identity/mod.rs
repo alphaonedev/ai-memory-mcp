@@ -414,4 +414,113 @@ mod tests {
         assert!(merged.is_object());
         assert_eq!(merged["agent_id"], "alice");
     }
+
+    // -----------------------------------------------------------------
+    // L0.7-2 Tier A — ENV_ANONYMIZE truthy/falsy + env-var fallback
+    // + anonymize-forced default
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn anonymize_default_enabled_truthy_variants() {
+        let _g = env_var_lock();
+        for v in ["1", "true", "yes", "on", "TRUE", " yes ", "On", "YES"] {
+            // SAFETY: env mutation serialised via env_var_lock guard.
+            unsafe {
+                std::env::set_var(ENV_ANONYMIZE, v);
+            }
+            assert!(
+                anonymize_default_enabled(),
+                "value {v:?} must be truthy"
+            );
+        }
+        // SAFETY: env mutation serialised.
+        unsafe {
+            std::env::remove_var(ENV_ANONYMIZE);
+        }
+    }
+
+    #[test]
+    fn anonymize_default_enabled_falsy_variants() {
+        let _g = env_var_lock();
+        for v in ["0", "false", "no", "off", "", "garbage"] {
+            // SAFETY: env mutation serialised via env_var_lock guard.
+            unsafe {
+                std::env::set_var(ENV_ANONYMIZE, v);
+            }
+            assert!(
+                !anonymize_default_enabled(),
+                "value {v:?} must be falsy"
+            );
+        }
+        // SAFETY: env mutation serialised.
+        unsafe {
+            std::env::remove_var(ENV_ANONYMIZE);
+        }
+    }
+
+    #[test]
+    fn anonymize_default_enabled_unset_is_falsy() {
+        let _g = env_var_lock();
+        // SAFETY: env mutation serialised.
+        unsafe {
+            std::env::remove_var(ENV_ANONYMIZE);
+        }
+        assert!(!anonymize_default_enabled());
+    }
+
+    #[test]
+    fn resolve_uses_env_agent_id_when_no_explicit_no_mcp() {
+        let _g = env_var_lock();
+        // SAFETY: env mutation serialised.
+        unsafe {
+            std::env::set_var(ENV_AGENT_ID, "env-alice");
+        }
+        let id = resolve_agent_id(None, None).unwrap();
+        assert_eq!(id, "env-alice");
+        // SAFETY: env mutation serialised.
+        unsafe {
+            std::env::remove_var(ENV_AGENT_ID);
+        }
+    }
+
+    #[test]
+    fn resolve_anonymize_forces_anonymous_prefix() {
+        let _g = env_var_lock();
+        // SAFETY: env mutation serialised.
+        unsafe {
+            std::env::remove_var(ENV_AGENT_ID);
+            std::env::set_var(ENV_ANONYMIZE, "1");
+        }
+        let id = resolve_agent_id(None, None).unwrap();
+        assert!(
+            id.starts_with("anonymous:"),
+            "AI_MEMORY_ANONYMIZE=1 must skip host: default, got: {id}"
+        );
+        // SAFETY: env mutation serialised.
+        unsafe {
+            std::env::remove_var(ENV_ANONYMIZE);
+        }
+    }
+
+    #[test]
+    fn resolve_empty_env_falls_through() {
+        // Empty env var should be treated as "not set" and continue
+        // down the precedence chain.
+        let _g = env_var_lock();
+        // SAFETY: env mutation serialised.
+        unsafe {
+            std::env::set_var(ENV_AGENT_ID, "");
+        }
+        let id = resolve_agent_id(None, None).unwrap();
+        assert!(
+            id.starts_with("host:")
+                || id.starts_with("anonymous:")
+                || id.starts_with("ai:"),
+            "empty env must fall through to host/anonymous default, got: {id}"
+        );
+        // SAFETY: env mutation serialised.
+        unsafe {
+            std::env::remove_var(ENV_AGENT_ID);
+        }
+    }
 }
