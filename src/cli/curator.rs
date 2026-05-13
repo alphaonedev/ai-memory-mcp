@@ -108,6 +108,7 @@ pub async fn run(
         dry_run: args.dry_run,
         include_namespaces: args.include_namespaces.clone(),
         exclude_namespaces: args.exclude_namespaces.clone(),
+        compaction: curator::CompactionConfig::default(),
     };
 
     let feature_tier = app_config.effective_tier(None);

@@ -187,6 +187,31 @@ pub enum HookEvent {
     /// Layers on top of the existing `memory_store` webhook event the
     /// MCP handler dispatches — both fire on a successful reflect.
     PostReflect,
+    /// v0.7.0 L1-7 compaction pipeline — fires BEFORE a compaction
+    /// pass (consolidation, reflection, …) processes a cluster.
+    /// **Decision-class** hook: handlers may Allow (default), Modify
+    /// (rewrite the cluster's candidate id list), Deny (abort the
+    /// cluster — no summarise, no persist, no verify), or AskUser.
+    /// Payload: [`CompactionDelta`] (writable — the candidate id list
+    /// and the pass name).  Classified as
+    /// [`crate::hooks::EventClass::Write`].
+    ///
+    /// Wires here at `src/curator/compaction.rs` (before
+    /// `ConsolidationPass::summarize` is called for each cluster).
+    PreCompaction,
+    /// v0.7.0 L1-7 compaction pipeline — fires when the verify step
+    /// of a compaction pass fails.  **Notify-class** hook: handlers
+    /// cannot veto; their return value is ignored beyond logging.
+    /// Payload: [`CompactionRollbackEvent`] (read-only — names the
+    /// summary id and pass that failed).
+    ///
+    /// NOTE: actual rollback (re-inserting source rows, invalidating
+    /// the summary) is deferred to v0.8.0 Pillar 2.5 (issue #664).
+    /// This hook fires NOW so integrations can detect and report
+    /// verify failures; the rollback mechanics ship later.
+    ///
+    /// Classified as [`crate::hooks::EventClass::Write`].
+    OnCompactionRollback,
 }
 
 // ---------------------------------------------------------------------------
@@ -566,6 +591,43 @@ pub struct ReflectResult {
 }
 
 // ---------------------------------------------------------------------------
+// Compaction payloads (v0.7.0 L1-7)
+// ---------------------------------------------------------------------------
+
+/// Writable delta for [`HookEvent::PreCompaction`]. Names the compaction
+/// pass and the candidate memory ids it is about to operate on.  A hook
+/// may shrink (or veto via `HookDecision::Deny`) the candidate set before
+/// the pass summarises.
+///
+/// `pass_name` matches [`crate::curator::pipeline::CompactionPass::name`]
+/// so a hook can filter by strategy (`"consolidation"`, `"reflection"`, …).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactionDelta {
+    /// Name of the compaction pass (e.g. `"consolidation"`).
+    pub pass_name: String,
+    /// Memory ids in the cluster about to be compacted.  A hook may
+    /// return a `Modify` delta with a shorter list to reduce the cluster.
+    pub candidate_ids: Vec<String>,
+    /// Namespace all candidates share.
+    pub namespace: String,
+}
+
+/// Read-only payload for [`HookEvent::OnCompactionRollback`]. Carries
+/// enough context for an observability hook to log, page, or re-index
+/// without re-querying the database.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactionRollbackEvent {
+    /// Name of the compaction pass that failed the verify step.
+    pub pass_name: String,
+    /// Id of the summary memory whose verify step failed.
+    pub summary_id: String,
+    /// Namespace the cluster belonged to.
+    pub namespace: String,
+    /// Human-readable description of the verify failure.
+    pub reason: String,
+}
+
+// ---------------------------------------------------------------------------
 // Transcript payloads (I-track interop)
 // ---------------------------------------------------------------------------
 
@@ -664,17 +726,24 @@ mod tests {
             (HookEvent::PreRecallExpand, "\"pre_recall_expand\""),
             (HookEvent::PreReflect, "\"pre_reflect\""),
             (HookEvent::PostReflect, "\"post_reflect\""),
+            // v0.7.0 L1-7: compaction pipeline events (24th + 25th).
+            (HookEvent::PreCompaction, "\"pre_compaction\""),
+            (
+                HookEvent::OnCompactionRollback,
+                "\"on_compaction_rollback\"",
+            ),
         ];
 
-        // Pin the count at the type boundary so adding a 24th
+        // Pin the count at the type boundary so adding a 26th
         // variant without updating the table fails this test. G2
         // shipped 20; G10 added the 21st (`pre_recall_expand`);
         // v0.7.0 recursive-learning Task 6/8 added the 22nd +
-        // 23rd (`pre_reflect`, `post_reflect`).
+        // 23rd (`pre_reflect`, `post_reflect`); L1-7 adds the
+        // 24th + 25th (`pre_compaction`, `on_compaction_rollback`).
         assert_eq!(
             table.len(),
-            23,
-            "Task 6/8 raises the count from 21 to 23 (adds pre_reflect + post_reflect)"
+            25,
+            "L1-7 raises the count from 23 to 25 (adds pre_compaction + on_compaction_rollback)"
         );
 
         for (variant, expected_json) in table {
