@@ -59,6 +59,19 @@
 //! artifact and (b) regression-gate behaviour at process exit, neither
 //! of which Criterion's bench_function shape gives us cleanly.
 
+// Bench-only file. Percentile math casts u128 nanosecond samples to
+// f64 for human-readable reporting; the main function body is the
+// orchestration of the whole bench harness (setup + warm-up + sample
+// + report + gate-check) and exceeds the default `too_many_lines`
+// threshold by design.
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::too_many_lines,
+    clippy::doc_markdown
+)]
+
 use std::path::PathBuf;
 #[cfg(feature = "sal-postgres")]
 use std::time::Instant;
