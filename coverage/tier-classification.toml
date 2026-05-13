@@ -40,7 +40,10 @@ modules = [
     "storage/migrations.rs",  # current  86.6%, gap  11.4%
     "toon.rs",  # current  99.1% (above target)
     "transcripts/mod.rs",  # current 100.0% (above target)
-    "transcripts/replay.rs",  # current   0.0%, gap  98.0%
+    # transcripts/replay.rs RECLASSIFIED Tier A -> Tier F 2026-05-13
+    # (L0.5.5-3 placeholder for L2-4 transcript replay reflection union;
+    # symmetric with federation/reflection_bookkeeping.rs already in tier_F.
+    # See _v070_grand_slam/layer_0_7/bugs_surfaced/1a2a5a8a.)
     "transcripts/storage.rs",  # current  94.7%, gap   3.3%
     "validate.rs",  # current  97.0%, gap   1.0%
 ]
@@ -173,6 +176,7 @@ modules = [
 target_line_coverage_pct = 0
 modules = [
     "federation/reflection_bookkeeping.rs",  # current   0.0% (above target)
+    "transcripts/replay.rs",  # current   0.0% (above target — L0.5.5-3 placeholder for L2-4; reclassified 2026-05-13)
     "lib.rs",  # current  95.2% (above target)
     "main.rs",  # current  94.3% (above target)
 ]

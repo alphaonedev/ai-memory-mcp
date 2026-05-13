@@ -12,7 +12,7 @@ Source: L0.7-1 baseline at HEAD bfe9650.
 
 | Module | Tier | Target | Current | Gap | L0.7 sub-task |
 |--------|------|--------|---------|-----|---------------|
-| transcripts/replay.rs | A | 98% | 0.0% | 98.0% | L0.7-2 |
+| ~~transcripts/replay.rs~~ | ~~A~~ → **F** | — | 0.0% | — | **deferred to L2-4** (L0.5.5-3 placeholder; reclassified 2026-05-13, see bugs_surfaced 1a2a5a8a) |
 | mcp/tools/reflect.rs | B | 95% | 0.0% | 95.0% | L0.7-3 |
 | store/postgres.rs | E | 90% | 13.9% | 76.1% | L0.7-6 |
 | mcp/tools/auto_tag.rs | D | 85% | 18.4% | 66.6% | L0.7-5 |
