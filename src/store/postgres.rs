@@ -1815,9 +1815,30 @@ impl PostgresStore {
         max_depth: usize,
         include_invalidated: bool,
     ) -> StoreResult<Vec<KgQueryRow>> {
-        let _ = &self.kg_backend;
-        self.kg_query_cte_filtered(source_id, max_depth, include_invalidated)
-            .await
+        // v0.7.0 S6-M3 — AGE Cypher dispatcher. Routes on the
+        // `kg_backend` resolved at `connect()` time (J1 substrate
+        // probe). The AGE path delivers the ~30% speed-up advertised
+        // in ROADMAP2 §7.4.4; the CTE path is the universal fallback
+        // for vanilla Postgres deployments. Dual-path test discipline
+        // (#648) requires identical KgQueryRow outputs from both
+        // branches — `tests/postgres_kg_age_cte_parity.rs` pins that
+        // contract.
+        //
+        // `include_invalidated=true` lifts the historical filter; the
+        // Cypher branch doesn't expose that switch yet (#681) so we
+        // fall back to the CTE for historical queries even when AGE
+        // is available. AGE's coverage is the "current view" hot
+        // path — historical traversal is a smaller niche and lives on
+        // the CTE.
+        match self.kg_backend {
+            KgBackend::Age if !include_invalidated => {
+                self.kg_query_cypher(source_id, max_depth).await
+            }
+            _ => {
+                self.kg_query_cte_filtered(source_id, max_depth, include_invalidated)
+                    .await
+            }
+        }
     }
 
     /// Cypher (Apache AGE) implementation of `kg_query`.
@@ -2071,11 +2092,19 @@ impl PostgresStore {
         until: Option<&str>,
         limit: Option<usize>,
     ) -> StoreResult<Vec<KgTimelineRow>> {
-        // v0.7.0 Wave-3 Continuation 5 — same posture as `kg_query`:
-        // always use the CTE implementation against the relational
-        // source-of-truth. See `kg_query` for the AGE-vs-CTE rationale.
-        let _ = &self.kg_backend;
-        self.kg_timeline_cte(source_id, since, until, limit).await
+        // v0.7.0 S6-M3 — AGE Cypher dispatcher. Routes on the
+        // resolved `kg_backend` so the AGE-installed deployments get
+        // the property-graph-path speedup while vanilla Postgres
+        // deployments keep the relational CTE. The dual-path
+        // discipline (#648) holds for the timeline shape too —
+        // `tests/postgres_kg_age_cte_parity.rs` exercises both.
+        match self.kg_backend {
+            KgBackend::Age => {
+                self.kg_timeline_cypher(source_id, since, until, limit)
+                    .await
+            }
+            KgBackend::Cte => self.kg_timeline_cte(source_id, since, until, limit).await,
+        }
     }
 
     /// Cypher (Apache AGE) implementation of `kg_timeline`.
@@ -2401,13 +2430,22 @@ impl PostgresStore {
         relation: &str,
         valid_until: Option<&str>,
     ) -> StoreResult<KgInvalidateRow> {
-        // v0.7.0 Wave-3 Continuation 5 — same posture as `kg_query`
-        // and `kg_timeline`: always use the CTE implementation against
-        // the relational `memory_links` source-of-truth. See `kg_query`
-        // for the AGE-vs-CTE rationale.
-        let _ = &self.kg_backend;
-        self.kg_invalidate_cte(source_id, target_id, relation, valid_until)
-            .await
+        // v0.7.0 S6-M3 — AGE Cypher dispatcher. Same dual-path
+        // discipline as `kg_query` / `kg_timeline`. When AGE is
+        // available we set the `valid_until` property through Cypher
+        // so the property-graph projection stays in sync with
+        // `memory_links`; otherwise we update the relational table
+        // directly.
+        match self.kg_backend {
+            KgBackend::Age => {
+                self.kg_invalidate_cypher(source_id, target_id, relation, valid_until)
+                    .await
+            }
+            KgBackend::Cte => {
+                self.kg_invalidate_cte(source_id, target_id, relation, valid_until)
+                    .await
+            }
+        }
     }
 
     /// Cypher (Apache AGE) implementation of `kg_invalidate`.

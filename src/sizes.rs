@@ -190,13 +190,14 @@ mod tests {
     fn table_has_51_entries_matching_tool_definitions_count() {
         let n = tool_sizes().len();
         assert_eq!(
-            n, 52,
-            "expected exactly 52 tools (v0.6.3.1 baseline 43 + v0.7.0 I4 \
+            n, 53,
+            "expected exactly 53 tools (v0.6.3.1 baseline 43 + v0.7.0 I4 \
              `memory_replay` + v0.7 H4 `memory_verify` + v0.7 B1 \
              `memory_load_family` + v0.7 B2 `memory_smart_load` + v0.7 K7 \
              `memory_subscription_replay` + `memory_subscription_dlq_list` \
              + v0.7 J7 `memory_find_paths` + v0.7 K8 `memory_quota_status` \
-             + v0.7.0 Task 4/8 `memory_reflect`, source-anchored at \
+             + v0.7.0 Task 4/8 `memory_reflect` + v0.7.0 L2-2 \
+             `memory_reflection_origin`, source-anchored at \
              src/mcp.rs::tool_definitions); got {n}. If the count changed, \
              update the family map and this assertion together."
         );
@@ -239,11 +240,12 @@ mod tests {
     fn full_profile_total_in_honest_measured_range() {
         let total = full_profile_total_tokens();
         assert!(
-            (5_000..=10_000).contains(&total),
+            (5_000..=11_000).contains(&total),
             "full-profile total {total} tokens is outside the measured \
-             cl100k_base range (5K–10K, source-of-truth incl. v0.7 C2 \
-             `docs` fields). If the schema grew, update the public \
-             claim in RFC/README/roadmap and adjust this bound."
+             cl100k_base range (5K–11K, source-of-truth incl. v0.7 C2 \
+             `docs` fields + v0.7.0 L2-2 memory_reflection_origin). If \
+             the schema grew, update the public claim in RFC/README/roadmap \
+             and adjust this bound."
         );
     }
 

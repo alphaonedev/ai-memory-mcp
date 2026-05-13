@@ -31,6 +31,7 @@ pub(super) mod link;
 pub(super) mod verify;
 pub(super) mod replay;
 pub(super) mod reflect;
+pub(super) mod reflection_origin;
 pub(super) mod consolidate;
 pub(super) mod namespace;
 pub(super) mod agent;
@@ -84,6 +85,7 @@ pub(super) use self::{
     verify::handle_verify,
     replay::handle_replay,
     reflect::handle_reflect,
+    reflection_origin::handle_reflection_origin,
     consolidate::handle_consolidate,
     namespace::handle_namespace_set_standard,
     namespace::handle_namespace_get_standard,

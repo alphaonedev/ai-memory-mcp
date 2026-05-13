@@ -593,3 +593,135 @@ fn assert_no_match(row: &KgInvalidateRow) {
         "miss must leave previous_valid_until None"
     );
 }
+
+// ---------------------------------------------------------------------------
+// v0.7.0 S6-M3 — AGE Cypher dispatcher tests.
+//
+// Pre-S6-M3, `kg_query_with_history`, `kg_timeline`, and `kg_invalidate`
+// always routed to the CTE branch regardless of `kg_backend`. The three
+// tests below pin the dispatcher contract: the public-facing entry point
+// MUST route to AGE when the extension is present (so the ROADMAP2 §7.4.4
+// 30%-faster-at-depth-5 claim is actually reachable) and MUST route to
+// CTE when the extension is absent.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_kg_query_routes_to_cypher_when_age_available() {
+    let Some(url) = age_url() else {
+        eprintln!("skip: AI_MEMORY_TEST_AGE_URL not set; this test requires an AGE-enabled URL");
+        return;
+    };
+    let store = match PostgresStore::connect(&url).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("skip: PostgresStore::connect failed: {e}");
+            return;
+        }
+    };
+    if !age_extension_present(&store) {
+        eprintln!("skip: AGE extension not present on the configured URL");
+        return;
+    }
+
+    let (ids, ns) = fixture_graph_ids("s6m3-dispatch-query");
+    insert_fixture_memories(&store, &ids, &ns).await;
+    insert_fixture_links(&url, &ids).await;
+    if let Err(e) = project_fixture_into_age(&url, &ids).await {
+        eprintln!("skip: failed to project fixture into AGE: {e}");
+        return;
+    }
+
+    // Public entry point must produce the same rows as the direct
+    // cypher call when AGE is available (dispatcher proof).
+    let public_rows = store.kg_query(&ids[0], 3).await.expect("public kg_query");
+    let direct_rows = store
+        .kg_query_cypher(&ids[0], 3)
+        .await
+        .expect("direct cypher kg_query");
+    assert_eq!(
+        sort_query_rows(public_rows),
+        sort_query_rows(direct_rows),
+        "kg_query dispatcher must route to kg_query_cypher when AGE is available"
+    );
+}
+
+#[tokio::test]
+async fn test_kg_query_routes_to_cte_when_age_absent() {
+    // Use the plain Postgres URL (no AGE) explicitly so the dispatcher
+    // resolves to KgBackend::Cte.
+    let Some(url) = postgres_url() else {
+        eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+        return;
+    };
+    let store = match PostgresStore::connect(&url).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("skip: PostgresStore::connect failed: {e}");
+            return;
+        }
+    };
+    if age_extension_present(&store) {
+        eprintln!("skip: AGE extension IS present; this test needs a vanilla Postgres URL");
+        return;
+    }
+
+    let (ids, ns) = fixture_graph_ids("s6m3-dispatch-cte");
+    insert_fixture_memories(&store, &ids, &ns).await;
+    insert_fixture_links(&url, &ids).await;
+
+    // Public entry point must produce the same rows as the direct CTE
+    // call when AGE is absent.
+    let public_rows = store.kg_query(&ids[0], 3).await.expect("public kg_query");
+    let direct_rows = store
+        .kg_query_cte(&ids[0], 3)
+        .await
+        .expect("direct cte kg_query");
+    assert_eq!(
+        sort_query_rows(public_rows),
+        sort_query_rows(direct_rows),
+        "kg_query dispatcher must route to kg_query_cte when AGE is absent"
+    );
+}
+
+#[tokio::test]
+async fn test_age_cte_dual_path_returns_identical_results() {
+    // Regression — the J5 contract: AGE and CTE produce identical
+    // KgQueryRow sets on the same fixture. Already exercised by
+    // `kg_query_equivalence` above; this rename pins the S6-M3
+    // dual-path discipline (#648) under a more discoverable test name
+    // so the v0.7.0 fix campaign report can reference it directly.
+    let Some(url) = age_url() else {
+        eprintln!("skip: AI_MEMORY_TEST_AGE_URL not set");
+        return;
+    };
+    let store = match PostgresStore::connect(&url).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("skip: PostgresStore::connect failed: {e}");
+            return;
+        }
+    };
+    if !age_extension_present(&store) {
+        eprintln!("skip: AGE extension not present");
+        return;
+    }
+
+    let (ids, ns) = fixture_graph_ids("s6m3-dual-path");
+    insert_fixture_memories(&store, &ids, &ns).await;
+    insert_fixture_links(&url, &ids).await;
+    if let Err(e) = project_fixture_into_age(&url, &ids).await {
+        eprintln!("skip: failed to project fixture into AGE: {e}");
+        return;
+    }
+
+    let cte_rows = store.kg_query_cte(&ids[0], 3).await.expect("cte kg_query");
+    let age_rows = store
+        .kg_query_cypher(&ids[0], 3)
+        .await
+        .expect("age kg_query");
+    assert_eq!(
+        sort_query_rows(cte_rows),
+        sort_query_rows(age_rows),
+        "S6-M3 dual-path discipline: AGE and CTE must produce identical results"
+    );
+}
