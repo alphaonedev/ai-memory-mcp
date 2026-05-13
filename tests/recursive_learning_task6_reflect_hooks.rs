@@ -608,7 +608,7 @@ fn hook_event_count_grows_to_23_with_pre_and_post_reflect() {
 /// never exercise (every caller uses `::empty()` explicitly).
 #[test]
 fn reflect_hooks_default_matches_empty() {
-    let d: ReflectHooks = Default::default();
+    let d = ReflectHooks::default();
     assert!(d.pre_reflect.is_none());
     assert!(d.post_reflect.is_none());
 }
@@ -729,7 +729,7 @@ fn reflect_each_validation_failure_surfaces_validation_error() {
 
     // (5) Bad source_ids entry — empty string fails validate_id.
     let mut bad_id = base_input();
-    bad_id.source_ids = vec!["".to_string()];
+    bad_id.source_ids = vec![String::new()];
     match db::reflect(&conn, &bad_id) {
         Err(ReflectError::Validation(_)) => {}
         other => panic!("invalid source id expected Validation, got {other:?}"),
@@ -737,7 +737,7 @@ fn reflect_each_validation_failure_surfaces_validation_error() {
 
     // (6) Bad namespace.
     let mut bad_ns = base_input();
-    bad_ns.namespace = Some("".to_string());
+    bad_ns.namespace = Some(String::new());
     match db::reflect(&conn, &bad_ns) {
         Err(ReflectError::Validation(_)) => {}
         other => panic!("empty namespace expected Validation, got {other:?}"),

@@ -4,8 +4,8 @@
 //! Integration tests for the substrate-level agent-action rules
 //! engine (issue #691). Covers:
 //!
-//! * Every [`AgentAction`] matcher type (Bash / FilesystemWrite /
-//!   NetworkRequest / ProcessSpawn / Custom)
+//! * Every [`AgentAction`] matcher type (Bash / `FilesystemWrite` /
+//!   `NetworkRequest` / `ProcessSpawn` / Custom)
 //! * Decision routing (first-refusal wins; warn-without-refuse)
 //! * `signed_events` row emission on every check (the audit chain)
 //!

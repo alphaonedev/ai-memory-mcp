@@ -341,7 +341,7 @@ async fn empty_chain_skips_marshal_and_returns_allow() {
 // independently of the wire path.
 // ---------------------------------------------------------------------------
 
-/// Build a HookConfig for a subprocess hook targeting `event`. The
+/// Build a `HookConfig` for a subprocess hook targeting `event`. The
 /// command path is filled in by the caller after writing the script.
 fn make_hook_cfg(command: PathBuf, event: HookEvent, mode: HookMode) -> HookConfig {
     HookConfig {
@@ -363,7 +363,7 @@ fn make_hook_cfg(command: PathBuf, event: HookEvent, mode: HookMode) -> HookConf
 /// `MemoryDelta::priority` as the new `k`, per the documented
 /// `apply_pre_recall_expand` contract.
 ///
-/// Uses daemon mode + warm-up to make the 50ms HotPath budget reachable
+/// Uses daemon mode + warm-up to make the 50ms `HotPath` budget reachable
 /// (cold-spawn of an exec-mode script on CI can take 30-100ms, blowing
 /// the budget; a warm daemon fire takes <1ms after the initial spawn).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -407,16 +407,18 @@ done
             // still blow the 50ms budget — the chain code path is
             // exercised either way (Allow is the fail-open arm).
         }
-        other => panic!("unexpected outcome: {other:?}"),
+        other @ PreRecallOutcome::Denied { .. } => {
+            panic!("unexpected outcome: {other:?}")
+        }
     }
 }
 
 /// `apply_pre_recall_expand` with a Deny-returning hook must produce
 /// `PreRecallOutcome::Denied` with the reason+code round-tripped from
-/// the hook script. We use HookEvent::PostStore here (Write class,
-/// 5s budget) to escape the 50ms HotPath ceiling that cold-spawn
+/// the hook script. We use `HookEvent::PostStore` here (Write class,
+/// 5s budget) to escape the 50ms `HotPath` ceiling that cold-spawn
 /// would race against — the helper's mapping logic from
-/// ChainResult::Deny to PreRecallOutcome::Denied is what we're
+/// `ChainResult::Deny` to `PreRecallOutcome::Denied` is what we're
 /// pinning, not the event-class plumbing (covered by other tests).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_pre_recall_expand_deny_short_circuits() {
@@ -496,9 +498,9 @@ printf '%s\n' '{"action":"allow"}'
 }
 
 /// `apply_pre_recall_expand` with an AskUser-returning hook must
-/// degrade to Allow (the helper documents AskUser is incompatible
+/// degrade to Allow (the helper documents `AskUser` is incompatible
 /// with the hot path). Drive via a real subprocess hook that emits
-/// AskUser so the chain.fire path through apply_pre_recall_expand
+/// `AskUser` so the chain.fire path through `apply_pre_recall_expand`
 /// resolves the AskUser->Allow degradation arm directly.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_pre_recall_expand_askuser_degrades_to_allow_in_helper() {
@@ -558,13 +560,15 @@ done
         PreRecallOutcome::Allow => {
             // Cold-spawn race acceptable on slow CI.
         }
-        other => panic!("unexpected outcome: {other:?}"),
+        other @ PreRecallOutcome::Denied { .. } => {
+            panic!("unexpected outcome: {other:?}")
+        }
     }
 }
 
 /// `apply_pre_recall_expand` Deny path: a daemon hook returning Deny
 /// must surface as `PreRecallOutcome::Denied` through the helper.
-/// Closes the ChainResult::Deny -> PreRecallOutcome::Denied mapping
+/// Closes the `ChainResult::Deny` -> `PreRecallOutcome::Denied` mapping
 /// (line 185 in recall.rs).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_pre_recall_expand_deny_via_daemon_surfaces_denied() {
@@ -598,12 +602,14 @@ done
             // Cold-spawn race acceptable on slow CI — the chain
             // body is still exercised either way.
         }
-        other => panic!("unexpected outcome: {other:?}"),
+        other @ PreRecallOutcome::Modified { .. } => {
+            panic!("unexpected outcome: {other:?}")
+        }
     }
 }
 
-/// `apply_pre_recall_expand` AskUser degradation: a daemon hook
-/// returning AskUser must surface as `PreRecallOutcome::Allow` via
+/// `apply_pre_recall_expand` `AskUser` degradation: a daemon hook
+/// returning `AskUser` must surface as `PreRecallOutcome::Allow` via
 /// the helper's hot-path degradation (recall.rs lines 186-195).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_pre_recall_expand_askuser_degrades_via_daemon() {
@@ -725,5 +731,5 @@ async fn outcome_modified_with_overflow_priority_falls_back_to_original_k() {
         _ => original_k,
     };
     // i32::MAX is 2147483647 which fits in u32, so we get that value.
-    assert_eq!(new_k, 2147483647u32);
+    assert_eq!(new_k, 2_147_483_647_u32);
 }

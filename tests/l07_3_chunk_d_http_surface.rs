@@ -167,7 +167,7 @@ async fn delete_uri(router: &axum::Router, uri: &str) -> (StatusCode, Value) {
         .unwrap();
     let resp = router.clone().oneshot(req).await.unwrap();
     let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), 1 * 1024 * 1024)
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
         .await
         .unwrap();
     let parsed: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
@@ -183,7 +183,7 @@ async fn put_json(router: &axum::Router, uri: &str, body: Value) -> (StatusCode,
         .unwrap();
     let resp = router.clone().oneshot(req).await.unwrap();
     let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), 1 * 1024 * 1024)
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
         .await
         .unwrap();
     let parsed: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);

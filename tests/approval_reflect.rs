@@ -78,9 +78,14 @@ fn reflect_input(source_ids: Vec<String>, namespace: Option<&str>, title: &str) 
 }
 
 /// Persist a namespace standard with the supplied raw governance JSON.
-/// Uses a serde_json::Value for the governance blob so the test can
-/// include keys unknown to the GovernancePolicy struct (such as
+/// Uses a `serde_json::Value` for the governance blob so the test can
+/// include keys unknown to the `GovernancePolicy` struct (such as
 /// `require_approval_above_depth`).
+// Carry-forward to v0.7.1: by-value `governance` parameter was flagged
+// `clippy::needless_pass_by_value`. Helper is consumed once per test and
+// rewriting to `&Value` would require touching every call site for no
+// semantic gain. Tracked as part of the v0.7.1 test-helper cleanup.
+#[allow(clippy::needless_pass_by_value)]
 fn seed_governance_json(
     conn: &rusqlite::Connection,
     namespace: &str,

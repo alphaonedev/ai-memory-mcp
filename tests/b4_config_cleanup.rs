@@ -29,7 +29,7 @@
 //!    `src/mcp/mod.rs` which would have aborted under the pre-fix
 //!    code path.
 //!
-//! 4. **R2-LOW session_start namespace validation**: every MCP entry
+//! 4. **R2-LOW `session_start` namespace validation**: every MCP entry
 //!    point that accepts a `namespace` argument must run
 //!    `validate::validate_namespace`. The validator's reject-on-space
 //!    contract is pinned here; the handler-level assertion (that
@@ -201,7 +201,7 @@ fn test_priority_overflow_clamps_not_panics() {
     assert_eq!(clamped_in, 7, "in-range values must pass through unchanged");
 }
 
-/// The storage-side lerp clamp: `usize` content lengths > i32::MAX
+/// The storage-side lerp clamp: `usize` content lengths > `i32::MAX`
 /// must not panic. The scoring impact is nil because the lerp
 /// saturates at 5000 chars anyway.
 #[test]
@@ -219,7 +219,7 @@ fn test_content_len_overflow_clamps_not_panics() {
 // ---------------------------------------------------------------------------
 
 /// Sanity: the validator itself rejects a space-containing namespace
-/// — pins the precondition the session_start fix relies on so a
+/// — pins the precondition the `session_start` fix relies on so a
 /// future relaxation of `validate_namespace` would surface here.
 #[test]
 fn test_session_start_validates_namespace_via_validator() {
