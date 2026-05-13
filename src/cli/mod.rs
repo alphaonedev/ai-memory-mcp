@@ -49,6 +49,7 @@ pub mod shell;
 pub mod store;
 pub mod sync;
 pub mod update;
+pub mod verify;
 pub mod wrap;
 
 #[cfg(test)]

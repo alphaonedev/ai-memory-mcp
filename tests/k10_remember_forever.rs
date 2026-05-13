@@ -73,6 +73,7 @@ async fn mcp_pending_approve_with_forever_records_rule() {
         expires_at: None,
         metadata: serde_json::json!({}),
         reflection_depth: 0,
+        memory_kind: ai_memory::models::MemoryKind::Observation,
     };
     let mem_id = ai_memory::db::insert(&conn, &mem).expect("insert memory");
     let payload = json!({"reason": "k10-forever"});

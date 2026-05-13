@@ -314,6 +314,7 @@ pub fn mine(
             expires_at,
             metadata,
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
 
         match db::insert(&conn, &mem) {

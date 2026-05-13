@@ -957,6 +957,7 @@ limit = 25
             expires_at: None,
             metadata: crate::models::default_metadata(),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         if let Some(obj) = mem.metadata.as_object_mut() {
             obj.insert("agent_id".to_string(), serde_json::json!("t"));

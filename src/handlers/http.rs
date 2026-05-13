@@ -422,6 +422,7 @@ pub async fn create_memory(
             expires_at: body.expires_at.clone(),
             metadata,
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         let ctx = crate::store::CallerContext::for_agent(agent_id.clone());
 
@@ -666,6 +667,7 @@ pub async fn create_memory(
         expires_at,
         metadata,
         reflection_depth: 0,
+        memory_kind: crate::models::MemoryKind::Observation,
     };
 
     // Task 1.9: governance enforcement (store-side).
@@ -3873,6 +3875,7 @@ pub async fn entity_register(
             expires_at: None,
             metadata,
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         let created = prior_aliases.is_empty();
         return match app.store.store(&ctx, &mem).await {
@@ -6240,6 +6243,7 @@ pub async fn bulk_create(
                 expires_at,
                 metadata: body.metadata,
                 reflection_depth: 0,
+                memory_kind: crate::models::MemoryKind::Observation,
             };
             match app.store.store(&ctx, &mem).await {
                 Ok(_) => created += 1,
@@ -6284,6 +6288,7 @@ pub async fn bulk_create(
                 expires_at,
                 metadata: body.metadata,
                 reflection_depth: 0,
+                memory_kind: crate::models::MemoryKind::Observation,
             };
             match db::insert(&lock.0, &mem) {
                 Ok(_) => created_mems.push(mem),

@@ -60,6 +60,7 @@ mod tests {
             expires_at: None,
             metadata: json!({"agent_id": "ai:test"}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         }
     }
 

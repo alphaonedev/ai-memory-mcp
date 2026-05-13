@@ -2731,6 +2731,7 @@ mod tests {
             expires_at: None,
             metadata: json!({}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         let id = db::insert(&conn, &mem).unwrap();
         let req = make_tools_call("memory_get", json!({"id": id}));
@@ -2808,6 +2809,7 @@ mod tests {
             expires_at: None,
             metadata: json!({}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         let id = db::insert(&conn, &mem).unwrap();
         let req = make_tools_call("memory_delete", json!({"id": id}));
@@ -2852,6 +2854,7 @@ mod tests {
                 expires_at: None,
                 metadata: json!({}),
                 reflection_depth: 0,
+                memory_kind: crate::models::MemoryKind::Observation,
             };
             ids.push(db::insert(&conn, &mem).unwrap());
         }
@@ -2899,6 +2902,7 @@ mod tests {
                 expires_at: None,
                 metadata: json!({}),
                 reflection_depth: 0,
+                memory_kind: crate::models::MemoryKind::Observation,
             };
             ids.push(db::insert(&conn, &mem).unwrap());
         }
@@ -3412,6 +3416,7 @@ mod tests {
             expires_at: None,
             metadata: json!({}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         let std_id = db::insert(&conn, &mem).unwrap();
         db::set_namespace_standard(&conn, "m9-parent", &std_id, None).unwrap();
@@ -3433,6 +3438,7 @@ mod tests {
             expires_at: None,
             metadata: json!({}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         let child_id = db::insert(&conn, &child_mem).unwrap();
         db::set_namespace_standard(&conn, "repo/team/sub", &child_id, None).unwrap();
@@ -3497,6 +3503,7 @@ mod tests {
             expires_at: None,
             metadata: json!({}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         let parent_id = db::insert(&conn, &parent_mem).unwrap();
         db::set_namespace_standard(&conn, "m9-explicit-parent", &parent_id, None).unwrap();
@@ -3518,6 +3525,7 @@ mod tests {
             expires_at: None,
             metadata: json!({}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         let child_id = db::insert(&conn, &child_mem).unwrap();
         db::set_namespace_standard(
@@ -3576,6 +3584,7 @@ mod tests {
             expires_at: None,
             metadata: json!({}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         let id = db::insert(conn, &mem).unwrap();
         db::set_namespace_standard(conn, namespace, &id, None).unwrap();
@@ -3859,6 +3868,7 @@ mod tests {
             expires_at: None,
             metadata: json!({}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         let mut tgt = src.clone();
         tgt.id = uuid::Uuid::new_v4().to_string();
@@ -3979,6 +3989,7 @@ mod tests {
             expires_at: None,
             metadata: json!({}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         db::insert(&conn, &mem).unwrap();
         let req = make_tools_call(
@@ -4192,6 +4203,7 @@ mod tests {
             expires_at: None,
             metadata: json!({}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         let std_id = db::insert(&conn, &mem).unwrap();
 
@@ -4298,6 +4310,7 @@ mod tests {
             expires_at: None,
             metadata: json!({}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         let id = db::insert(&conn, &mem).unwrap();
         let req = make_tools_call(
@@ -4643,6 +4656,7 @@ mod tests {
             expires_at: None,
             metadata: json!({}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         let id = db::insert(&conn, &mem).unwrap();
         let req = make_tools_call(
@@ -4676,6 +4690,7 @@ mod tests {
             expires_at: None,
             metadata: json!({}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         let id = db::insert(&conn, &mem).unwrap();
         let req = make_tools_call(
@@ -4748,6 +4763,7 @@ mod tests {
             expires_at: None,
             metadata: json!({}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         let id = db::insert(&conn, &mem).unwrap();
         let req = make_tools_call(
@@ -4785,6 +4801,7 @@ mod tests {
             expires_at: None,
             metadata: json!({}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         let id = db::insert(&conn, &mem).unwrap();
         let req = make_tools_call(
@@ -4817,6 +4834,7 @@ mod tests {
             expires_at: None,
             metadata: json!({}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         let mut mem_b = mem_a.clone();
         mem_b.id = uuid::Uuid::new_v4().to_string();
@@ -5101,6 +5119,7 @@ mod tests {
             expires_at: None,
             metadata: json!({}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         let pid = db::insert(&conn, &parent_mem).unwrap();
         db::set_namespace_standard(&conn, "w12-explicit-grand", &pid, None).unwrap();
@@ -5199,6 +5218,7 @@ mod tests {
             expires_at: None,
             metadata: json!({}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         let id = db::insert(&conn, &mem).unwrap();
         let req = make_tools_call("memory_promote", json!({"id": id}));
@@ -5331,6 +5351,7 @@ mod tests {
             expires_at: None,
             metadata: json!({}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         let id = db::insert(&conn, &mem).unwrap();
         let req = make_tools_call(
@@ -5377,6 +5398,7 @@ mod tests {
             expires_at: None,
             metadata: json!({}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         let id = db::insert(&conn, &mem).unwrap();
         let req = make_tools_call(
@@ -5420,6 +5442,7 @@ mod tests {
             expires_at: None,
             metadata: json!({}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         let id = db::insert(&conn, &mem).unwrap();
         let req = make_tools_call("memory_get", json!({"id": id}));
@@ -5456,6 +5479,7 @@ mod tests {
             expires_at: None,
             metadata: json!({}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         let mut tgt = src.clone();
         tgt.id = uuid::Uuid::new_v4().to_string();
@@ -5501,6 +5525,7 @@ mod tests {
             expires_at: None,
             metadata: json!({}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         let mut tgt = src.clone();
         tgt.id = uuid::Uuid::new_v4().to_string();
@@ -5539,6 +5564,7 @@ mod tests {
             expires_at: None,
             metadata: json!({}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         let mut tgt = src.clone();
         tgt.id = uuid::Uuid::new_v4().to_string();
@@ -5583,6 +5609,7 @@ mod tests {
             expires_at: None,
             metadata: json!({}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         let mut tgt = src.clone();
         tgt.id = uuid::Uuid::new_v4().to_string();
@@ -6000,6 +6027,7 @@ mod tests {
             expires_at: None,
             metadata: json!({}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         let mut mem_b = mem_a.clone();
         mem_b.id = uuid::Uuid::new_v4().to_string();
@@ -6052,6 +6080,7 @@ mod tests {
             expires_at: Some(chrono::Utc::now().to_rfc3339()),
             metadata: json!({}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         let id = db::insert(&conn, &mem).unwrap();
         let req = make_tools_call("memory_update", json!({"id": id, "expires_at": ""}));
@@ -6084,6 +6113,7 @@ mod tests {
             expires_at: None,
             metadata: json!({}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         let id = db::insert(&conn, &mem).unwrap();
         let req = make_tools_call(
@@ -6124,6 +6154,7 @@ mod tests {
             expires_at: None,
             metadata: json!({}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         let id = db::insert(&conn, &mem).unwrap();
         let req = make_tools_call("memory_delete", json!({"id": id}));
@@ -6517,6 +6548,7 @@ mod tests {
             expires_at: None,
             metadata: json!({"agent_id": "test-agent-reflect"}),
             reflection_depth: depth,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         db::insert(conn, &mem).unwrap()
     }
@@ -6552,6 +6584,7 @@ mod tests {
             expires_at: None,
             metadata,
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         let std_id = db::insert(conn, &standard).unwrap();
         db::set_namespace_standard(conn, namespace, &std_id, None).unwrap();
@@ -7258,6 +7291,7 @@ mod tests {
             expires_at: None,
             metadata: json!({}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         let mut tgt = src.clone();
         tgt.id = uuid::Uuid::new_v4().to_string();
@@ -7406,6 +7440,7 @@ mod tests {
             expires_at: None,
             metadata: json!({}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         let a = db::insert(&conn, &mk("a")).unwrap();
         let b = db::insert(&conn, &mk("b")).unwrap();
@@ -7504,6 +7539,7 @@ mod tests {
             expires_at: None,
             metadata: json!({}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         let id = db::insert(&conn, &mem).unwrap();
         let req = make_tools_call(
@@ -7695,6 +7731,7 @@ mod tests {
             expires_at: None,
             metadata: json!({}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         let mut tgt = src.clone();
         tgt.id = uuid::Uuid::new_v4().to_string();
@@ -7741,6 +7778,7 @@ mod tests {
             expires_at: None,
             metadata: json!({}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         let mut tgt = src.clone();
         tgt.id = uuid::Uuid::new_v4().to_string();
@@ -7799,6 +7837,7 @@ mod tests {
             expires_at: None,
             metadata: json!({}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         let mut tgt = src.clone();
         tgt.id = uuid::Uuid::new_v4().to_string();
@@ -7870,6 +7909,7 @@ mod tests {
             expires_at: None,
             metadata: json!({}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         let mut tgt = src.clone();
         tgt.id = uuid::Uuid::new_v4().to_string();
@@ -7952,6 +7992,7 @@ mod tests {
             expires_at: None,
             metadata: json!({}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         let mut tgt = src.clone();
         tgt.id = uuid::Uuid::new_v4().to_string();
@@ -8035,6 +8076,7 @@ mod tests {
             expires_at: None,
             metadata: json!({}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         let mut tgt = src.clone();
         tgt.id = uuid::Uuid::new_v4().to_string();
@@ -8133,6 +8175,7 @@ mod tests {
             expires_at: None,
             metadata: json!({"agent_id": "test-agent-chunkc"}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         db::insert(conn, &mem).unwrap()
     }
@@ -8162,6 +8205,7 @@ mod tests {
             expires_at: None,
             metadata: json!({"family": family, "agent_id": "test-agent-chunkc"}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         db::insert(conn, &mem).unwrap()
     }
@@ -9315,6 +9359,7 @@ mod tests {
             expires_at: Some(past),
             metadata: json!({"family": "core"}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         db::insert(&conn, &stale).unwrap();
         let resp = crate::mcp::handle_load_family(
@@ -9588,6 +9633,7 @@ mod tests {
                     }
                 }),
                 reflection_depth: 0,
+                memory_kind: crate::models::MemoryKind::Observation,
             };
             db::insert(&conn, &mem).unwrap()
         };
@@ -9644,6 +9690,7 @@ mod tests {
                     }
                 }),
                 reflection_depth: 0,
+                memory_kind: crate::models::MemoryKind::Observation,
             };
             db::insert(&conn, &mem).unwrap()
         };
@@ -10252,6 +10299,7 @@ mod tests {
             expires_at: Some(past),
             metadata: json!({}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         db::insert(&conn, &mem).unwrap();
         let req = make_tools_call("memory_gc", json!({"dry_run": false}));
@@ -10285,6 +10333,7 @@ mod tests {
             expires_at: Some(past),
             metadata: json!({}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         db::insert(&conn, &mem).unwrap();
         let req = make_tools_call("memory_gc", json!({"dry_run": true}));

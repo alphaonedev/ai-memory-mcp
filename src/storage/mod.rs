@@ -185,6 +185,14 @@ pub(crate) fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
         // ladder hasn't reached this DB yet) and is consistent with the
         // SQL-side `DEFAULT 0`.
         reflection_depth: row.get("reflection_depth").unwrap_or(0_i32),
+        // v0.7.0 L1-1 — schema v30 column. Falls back to `Observation` on
+        // pre-v30 rows (column absent) and on any unrecognised value from a
+        // future schema (forward-compat).
+        memory_kind: row
+            .get::<_, String>("memory_kind")
+            .ok()
+            .and_then(|s| crate::models::MemoryKind::from_str(&s))
+            .unwrap_or_default(),
     })
 }
 
@@ -199,8 +207,8 @@ pub fn insert(conn: &Connection, mem: &Memory) -> Result<String> {
     let tags_json = serde_json::to_string(&mem.tags)?;
     let metadata_json = serde_json::to_string(&mem.metadata)?;
     let actual_id: String = conn.query_row(
-        "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+        "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
          ON CONFLICT(title, namespace) DO UPDATE SET
             content = excluded.content,
             tags = excluded.tags,
@@ -227,13 +235,18 @@ pub fn insert(conn: &Connection, mem: &Memory) -> Result<String> {
             -- v0.7.0 Task 1/8 — recursion depth takes the max across upsert
             -- so a subsequent reflection at higher depth doesn't lose its
             -- provenance signal when re-stored at the same (title, namespace).
-            reflection_depth = MAX(memories.reflection_depth, excluded.reflection_depth)
+            reflection_depth = MAX(memories.reflection_depth, excluded.reflection_depth),
+            -- v0.7.0 L1-1 — kind is sticky: once Reflection, always Reflection.
+            -- An upsert of an observation onto an existing reflection row must
+            -- not downgrade the kind (reflect is not reversible by re-store).
+            memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
+                               ELSE excluded.memory_kind END
          RETURNING id",
         params![
             mem.id, mem.tier.as_str(), mem.namespace, mem.title, mem.content,
             tags_json, mem.priority, mem.confidence, mem.source, mem.access_count,
             mem.created_at, mem.updated_at, mem.last_accessed_at, mem.expires_at,
-            metadata_json, mem.reflection_depth,
+            metadata_json, mem.reflection_depth, mem.memory_kind.as_str(),
         ],
         |r| r.get(0),
     )?;
@@ -823,6 +836,31 @@ pub fn list(
         .map_err(Into::into)
 }
 
+/// L1-1 (v0.7.0) — return all non-expired memories that match the given
+/// [`crate::models::MemoryKind`]. Used by the L2-1 curator reflection pass to
+/// enumerate observation-class memories as synthesis candidates.
+///
+/// The query is deliberately minimal: no tier filter, no priority floor, no
+/// pagination. Callers that need subsetting should post-filter the returned
+/// `Vec<Memory>`. The index on `memory_kind` (added in migration v30) keeps
+/// this query O(kind-count) rather than O(table-size) on production data.
+#[allow(dead_code)] // consumed by L2-1 curator; not yet wired in this PR
+pub(crate) fn memories_by_kind(
+    conn: &Connection,
+    kind: &crate::models::MemoryKind,
+) -> Result<Vec<Memory>> {
+    let now = Utc::now().to_rfc3339();
+    let mut stmt = conn.prepare(
+        "SELECT * FROM memories
+         WHERE memory_kind = ?1
+           AND (expires_at IS NULL OR expires_at > ?2)
+         ORDER BY priority DESC, updated_at DESC",
+    )?;
+    let rows = stmt.query_map(params![kind.as_str(), now], row_to_memory)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn search(
     conn: &Connection,
@@ -1319,6 +1357,7 @@ pub fn promote_to_namespace(
         expires_at: source.expires_at.clone(),
         metadata: source.metadata.clone(),
         reflection_depth: source.reflection_depth,
+        memory_kind: source.memory_kind.clone(),
     };
     let actual_id = insert(conn, &clone)?;
     // Clone → source: derived_from. Safe to ignore if the link layer
@@ -2889,6 +2928,7 @@ pub fn entity_register(
             expires_at: None,
             metadata,
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         let id = insert(conn, &mem).context("insert entity memory")?;
         (id, true)
@@ -3712,6 +3752,7 @@ pub fn register_agent(
         expires_at: None,
         metadata,
         reflection_depth: 0,
+        memory_kind: crate::models::MemoryKind::Observation,
     };
 
     insert(conn, &mem)
@@ -4141,8 +4182,8 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
     let tags_json = serde_json::to_string(&mem.tags)?;
     let metadata_json = serde_json::to_string(&mem.metadata)?;
     let actual_id: String = conn.query_row(
-        "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+        "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
          ON CONFLICT(title, namespace) DO UPDATE SET
             content = CASE WHEN excluded.updated_at > memories.updated_at
                              OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
@@ -4181,13 +4222,18 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
             END,
             -- v0.7.0 Task 1/8 — recursion depth takes max so the reflection
             -- signal isn't lost on newer-wins federation merges.
-            reflection_depth = MAX(memories.reflection_depth, excluded.reflection_depth)
+            reflection_depth = MAX(memories.reflection_depth, excluded.reflection_depth),
+            -- v0.7.0 L1-1 — kind is sticky across federation merges: a
+            -- reflection row must not be downgraded to observation by a
+            -- newer-wins merge from a peer that doesn't know about the kind.
+            memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
+                               ELSE excluded.memory_kind END
          RETURNING id",
         params![
             mem.id, mem.tier.as_str(), mem.namespace, mem.title, mem.content,
             tags_json, mem.priority, mem.confidence, mem.source, mem.access_count,
             mem.created_at, mem.updated_at, mem.last_accessed_at, mem.expires_at,
-            metadata_json, mem.reflection_depth,
+            metadata_json, mem.reflection_depth, mem.memory_kind.as_str(),
         ],
         |r| r.get(0),
     )?;
@@ -6659,6 +6705,155 @@ pub fn doctor_max_sync_skew_secs(conn: &Connection) -> Result<Option<i64>> {
     Ok(max_skew)
 }
 
+// ---------------------------------------------------------------------------
+// L1-4 — Reflection-depth telemetry for `ai-memory doctor`.
+// ---------------------------------------------------------------------------
+
+/// One namespace's reflection-depth distribution row returned by
+/// [`doctor_reflection_depth_distribution`].
+///
+/// The four depth buckets mirror the default `max_reflection_depth=3`
+/// cap: depth 0 (direct memories), depth 1, depth 2, depth 3+. Depth
+/// 3+ is collapsed into a single counter because depths beyond the cap
+/// are impossible to store under standard policy; the bucket exists so
+/// future schemas with raised caps still produce a non-zero column.
+pub struct ReflectionDepthRow {
+    pub namespace: String,
+    pub depth0: i64,
+    pub depth1: i64,
+    pub depth2: i64,
+    pub depth3_plus: i64,
+    pub avg_depth: f64,
+    pub max_depth: i64,
+    pub total: i64,
+}
+
+/// Depth distribution across all namespaces that hold at least one
+/// memory with `reflection_depth > 0`, plus the `_global_` aggregate.
+///
+/// Uses a single GROUP BY pass so the query is a single indexed scan
+/// over `memories.reflection_depth`. A fresh DB (all rows at depth 0)
+/// returns an empty `Vec` — the caller (doctor) renders that as
+/// "no reflections observed".
+///
+/// # Errors
+///
+/// Returns `Err` only on hard SQLite failures (e.g. the `memories`
+/// table does not exist yet — pre-migration schemas).
+pub fn doctor_reflection_depth_distribution(conn: &Connection) -> Result<Vec<ReflectionDepthRow>> {
+    // Aggregate per namespace, only namespaces that contain at least
+    // one reflected memory (depth > 0). The doctor renders a global
+    // summary from the returned rows; the SQL avoids a second pass by
+    // letting the caller roll up the namespace rows.
+    let mut stmt = conn.prepare(
+        "SELECT
+             namespace,
+             SUM(CASE WHEN reflection_depth = 0 THEN 1 ELSE 0 END),
+             SUM(CASE WHEN reflection_depth = 1 THEN 1 ELSE 0 END),
+             SUM(CASE WHEN reflection_depth = 2 THEN 1 ELSE 0 END),
+             SUM(CASE WHEN reflection_depth >= 3 THEN 1 ELSE 0 END),
+             AVG(CAST(reflection_depth AS REAL)),
+             MAX(reflection_depth),
+             COUNT(*)
+         FROM memories
+         GROUP BY namespace
+         HAVING MAX(reflection_depth) > 0
+         ORDER BY namespace",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(ReflectionDepthRow {
+            namespace: r.get(0)?,
+            depth0: r.get(1)?,
+            depth1: r.get(2)?,
+            depth2: r.get(3)?,
+            depth3_plus: r.get(4)?,
+            avg_depth: r.get(5)?,
+            max_depth: r.get(6)?,
+            total: r.get(7)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Count of `reflection.depth_exceeded` audit events in `signed_events`
+/// within a given look-back window.
+///
+/// `since_rfc3339` is an RFC 3339 timestamp; only events with
+/// `timestamp >= since_rfc3339` are counted. Pass the epoch
+/// (`"1970-01-01T00:00:00Z"`) to count all-time.
+///
+/// Returns `0` when the `signed_events` table does not exist (pre-H5
+/// schemas) rather than propagating the error, matching the pattern
+/// in other doctor helpers.
+///
+/// # Errors
+///
+/// Returns `Err` only on hard query failures (table exists but query
+/// is malformed — should not happen in practice).
+pub fn doctor_reflection_depth_exceeded_count(
+    conn: &Connection,
+    since_rfc3339: &str,
+) -> Result<i64> {
+    let n: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM signed_events
+             WHERE event_type = 'reflection.depth_exceeded'
+               AND timestamp >= ?1",
+            params![since_rfc3339],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    Ok(n)
+}
+
+/// Reflection totals per namespace: memories created in the last 24h,
+/// 7d, and all-time that have `reflection_depth > 0`.
+///
+/// Returns one tuple `(ns, last_24h, last_7d, all_time)` per
+/// namespace that has at least one reflected memory. Namespaces with
+/// no reflections are omitted; the caller renders "no reflections" for
+/// the global summary.
+///
+/// # Errors
+///
+/// Returns `Err` on hard SQLite failures.
+pub fn doctor_reflection_totals_by_namespace(
+    conn: &Connection,
+) -> Result<Vec<(String, i64, i64, i64)>> {
+    let now = Utc::now();
+    let cutoff_24h = (now - chrono::Duration::hours(24)).to_rfc3339();
+    let cutoff_7d = (now - chrono::Duration::days(7)).to_rfc3339();
+
+    let mut stmt = conn.prepare(
+        "SELECT
+             namespace,
+             SUM(CASE WHEN created_at >= ?1 THEN 1 ELSE 0 END),
+             SUM(CASE WHEN created_at >= ?2 THEN 1 ELSE 0 END),
+             COUNT(*)
+         FROM memories
+         WHERE reflection_depth > 0
+         GROUP BY namespace
+         ORDER BY namespace",
+    )?;
+    let rows = stmt.query_map(params![cutoff_24h, cutoff_7d], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, i64>(2)?,
+            r.get::<_, i64>(3)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6689,6 +6884,7 @@ mod tests {
                 .map(|s| (chrono::Utc::now() + chrono::Duration::seconds(s)).to_rfc3339()),
             metadata: serde_json::json!({}),
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         }
     }
 
@@ -9729,6 +9925,7 @@ mod tests {
             expires_at: None,
             metadata,
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         let standard_id = insert(&conn, &standard).unwrap();
         set_namespace_standard(&conn, parent_ns, &standard_id, None).unwrap();
@@ -9853,6 +10050,7 @@ mod tests {
             expires_at: None,
             metadata,
             reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
         };
         let standard_id = insert(&conn, &standard).unwrap();
         set_namespace_standard(&conn, parent_ns, &standard_id, None).unwrap();
@@ -11415,6 +11613,286 @@ mod tests {
         assert_eq!(
             count, 1,
             "link row must have committed despite audit failure"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // L1-1 (v0.7.0) — MemoryKind typed enum + migration v31 tests
+    //
+    // Migration v31 (memory_kind) was originally authored as v30 on
+    // l1/typed-memorykind; renumbered during the L1 wave merge after
+    // substrate-rules (issue #691) took v30. The backfill SQL is unchanged.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Migration v31 backfill: a row with `memory_kind='observation'` and
+    /// `metadata.type='reflection'` should be updated to
+    /// `memory_kind='reflection'` by the backfill SQL in the migration.
+    #[test]
+    fn l1_1_migration_backfill_sets_reflection_kind() {
+        let conn = test_db();
+        let now = chrono::Utc::now().to_rfc3339();
+        let id = uuid::Uuid::new_v4().to_string();
+        // Insert a row that looks like a pre-v31 reflection: memory_kind
+        // defaults to 'observation' (the old schema had no such column)
+        // but metadata.type = 'reflection' signals it was produced by
+        // memory_reflect.
+        conn.execute(
+            "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, \
+             confidence, source, access_count, created_at, updated_at, metadata, \
+             reflection_depth, memory_kind) \
+             VALUES (?1,'mid','ns','backfill-test','content','[]',5,1.0,'test',0,?2,?2,?3,0,'observation')",
+            rusqlite::params![id, now, r#"{"type":"reflection"}"#],
+        )
+        .unwrap();
+
+        // Confirm the row starts with memory_kind='observation'.
+        let before: String = conn
+            .query_row(
+                "SELECT memory_kind FROM memories WHERE id = ?1",
+                [&id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(before, "observation");
+
+        // Run the backfill SQL (same logic as migration v31).
+        conn.execute(
+            "UPDATE memories SET memory_kind = 'reflection' \
+             WHERE memory_kind = 'observation' \
+               AND json_valid(metadata) \
+               AND json_extract(metadata, '$.type') = 'reflection'",
+            [],
+        )
+        .unwrap();
+
+        let after: String = conn
+            .query_row(
+                "SELECT memory_kind FROM memories WHERE id = ?1",
+                [&id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            after, "reflection",
+            "backfill must upgrade metadata.type=reflection rows to memory_kind=reflection"
+        );
+    }
+
+    /// Backfill must NOT touch rows where `metadata.type` is absent or is
+    /// something other than `'reflection'`.
+    #[test]
+    fn l1_1_migration_backfill_leaves_non_reflection_rows_alone() {
+        let conn = test_db();
+        let now = chrono::Utc::now().to_rfc3339();
+        let id = uuid::Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, \
+             confidence, source, access_count, created_at, updated_at, metadata, \
+             reflection_depth, memory_kind) \
+             VALUES (?1,'mid','ns','obs-test','content','[]',5,1.0,'test',0,?2,?2,'{}',0,'observation')",
+            rusqlite::params![id, now],
+        )
+        .unwrap();
+
+        conn.execute(
+            "UPDATE memories SET memory_kind = 'reflection' \
+             WHERE memory_kind = 'observation' \
+               AND json_valid(metadata) \
+               AND json_extract(metadata, '$.type') = 'reflection'",
+            [],
+        )
+        .unwrap();
+
+        let after: String = conn
+            .query_row(
+                "SELECT memory_kind FROM memories WHERE id = ?1",
+                [&id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            after, "observation",
+            "backfill must not change rows without metadata.type=reflection"
+        );
+    }
+
+    /// `memories_by_kind(Observation)` returns only observation memories;
+    /// `memories_by_kind(Reflection)` returns only reflection memories.
+    #[test]
+    fn l1_1_memories_by_kind_returns_correct_subset() {
+        let conn = test_db();
+
+        // Insert one observation and one reflection memory.
+        let obs = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Long,
+            namespace: "kind-ns".to_string(),
+            title: "obs-memory".to_string(),
+            content: "observation content".to_string(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".to_string(),
+            access_count: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: serde_json::json!({}),
+            reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
+        };
+        let ref_mem = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Long,
+            namespace: "kind-ns".to_string(),
+            title: "ref-memory".to_string(),
+            content: "reflection content".to_string(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".to_string(),
+            access_count: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: serde_json::json!({}),
+            reflection_depth: 1,
+            memory_kind: crate::models::MemoryKind::Reflection,
+        };
+
+        insert(&conn, &obs).unwrap();
+        insert(&conn, &ref_mem).unwrap();
+
+        let obs_rows = memories_by_kind(&conn, &crate::models::MemoryKind::Observation).unwrap();
+        let ref_rows = memories_by_kind(&conn, &crate::models::MemoryKind::Reflection).unwrap();
+
+        assert!(
+            obs_rows
+                .iter()
+                .all(|m| m.memory_kind == crate::models::MemoryKind::Observation),
+            "memories_by_kind(Observation) must return only Observation memories"
+        );
+        assert!(
+            ref_rows
+                .iter()
+                .all(|m| m.memory_kind == crate::models::MemoryKind::Reflection),
+            "memories_by_kind(Reflection) must return only Reflection memories"
+        );
+        // The inserted observation must appear in obs_rows.
+        assert!(
+            obs_rows.iter().any(|m| m.title == "obs-memory"),
+            "obs-memory must be in Observation results"
+        );
+        // The inserted reflection must appear in ref_rows.
+        assert!(
+            ref_rows.iter().any(|m| m.title == "ref-memory"),
+            "ref-memory must be in Reflection results"
+        );
+        // Cross-check: obs memory must NOT be in reflection results.
+        assert!(
+            !ref_rows.iter().any(|m| m.title == "obs-memory"),
+            "obs-memory must not appear in Reflection results"
+        );
+    }
+
+    /// Inserting a memory with `memory_kind=Reflection` and then reading it
+    /// back via `get()` must preserve the `Reflection` variant.
+    #[test]
+    fn l1_1_memory_kind_roundtrips_through_insert_get() {
+        let conn = test_db();
+        let mem = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Long,
+            namespace: "roundtrip-ns".to_string(),
+            title: "kind-roundtrip".to_string(),
+            content: "roundtrip content".to_string(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".to_string(),
+            access_count: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: serde_json::json!({}),
+            reflection_depth: 1,
+            memory_kind: crate::models::MemoryKind::Reflection,
+        };
+        let id = insert(&conn, &mem).unwrap();
+        let got = get(&conn, &id)
+            .unwrap()
+            .expect("inserted memory must be found");
+        assert_eq!(
+            got.memory_kind,
+            crate::models::MemoryKind::Reflection,
+            "memory_kind=Reflection must roundtrip through insert→get"
+        );
+    }
+
+    /// The upsert sticky-field logic: if a row already has
+    /// `memory_kind='reflection'`, a subsequent upsert with
+    /// `memory_kind='observation'` must NOT overwrite it.
+    #[test]
+    fn l1_1_upsert_preserves_reflection_kind() {
+        let conn = test_db();
+        let now = chrono::Utc::now().to_rfc3339();
+        let id = uuid::Uuid::new_v4().to_string();
+
+        // First insert: Reflection.
+        let mem_reflection = Memory {
+            id: id.clone(),
+            tier: Tier::Long,
+            namespace: "sticky-ns".to_string(),
+            title: "sticky-title".to_string(),
+            content: "original content".to_string(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".to_string(),
+            access_count: 0,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: serde_json::json!({}),
+            reflection_depth: 1,
+            memory_kind: crate::models::MemoryKind::Reflection,
+        };
+        insert(&conn, &mem_reflection).unwrap();
+
+        // Second upsert: Observation (same title+namespace → triggers ON CONFLICT).
+        let mem_obs = Memory {
+            id: uuid::Uuid::new_v4().to_string(), // different id, same title+ns
+            tier: Tier::Long,
+            namespace: "sticky-ns".to_string(),
+            title: "sticky-title".to_string(),
+            content: "updated content".to_string(),
+            tags: vec![],
+            priority: 6,
+            confidence: 1.0,
+            source: "test".to_string(),
+            access_count: 0,
+            created_at: now.clone(),
+            updated_at: now,
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: serde_json::json!({}),
+            reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
+        };
+        insert(&conn, &mem_obs).unwrap();
+
+        // The row must still be Reflection (sticky field wins).
+        let got = get(&conn, &id)
+            .unwrap()
+            .expect("original memory must still exist");
+        assert_eq!(
+            got.memory_kind,
+            crate::models::MemoryKind::Reflection,
+            "upsert with Observation must not overwrite an existing Reflection kind"
         );
     }
 }

@@ -6,6 +6,63 @@ use serde_json::Value;
 
 use super::default_metadata;
 
+/// L1-1 (v0.7.0) — typed memory-kind discriminator stored in the
+/// `memories.memory_kind` column (schema v30).
+///
+/// Only `Observation` and `Reflection` exist in v0.7.0. Goal/Plan/Step/
+/// Decision are scoped to L1-6/v0.8.0 and MUST NOT be added here yet.
+///
+/// `Observation` is the default for every memory created before v30 (the
+/// `DEFAULT 'observation'` SQL column handles the backfill contract for
+/// rows that pre-date the migration; new inserts that omit the field also
+/// land at `Observation`). `Reflection` is set by the `memory_reflect`
+/// write path in addition to the existing `metadata.type='reflection'`
+/// back-compat marker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryKind {
+    /// Default — a direct observation or note from the caller.
+    Observation,
+    /// A memory synthesised by the reflection pass over lower-depth
+    /// peers (set by `memory_reflect` and the curator reflection pass).
+    Reflection,
+}
+
+impl MemoryKind {
+    /// Column-wire string (matches the SQL `DEFAULT 'observation'` value).
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Observation => "observation",
+            Self::Reflection => "reflection",
+        }
+    }
+
+    /// Parse the column-wire string. Returns `None` on unrecognised values
+    /// so callers can fall back to `Observation` (forward-compat with
+    /// L1-6 variants that land in a newer DB on an older binary).
+    #[must_use]
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "observation" => Some(Self::Observation),
+            "reflection" => Some(Self::Reflection),
+            _ => None,
+        }
+    }
+}
+
+impl Default for MemoryKind {
+    fn default() -> Self {
+        Self::Observation
+    }
+}
+
+impl std::fmt::Display for MemoryKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Memory tier — mirrors human memory systems.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -91,6 +148,15 @@ pub struct Memory {
     /// `DEFAULT 0` on the column added in schema v29 (SQLite) / v31 (Postgres).
     #[serde(default)]
     pub reflection_depth: i32,
+    /// L1-1 (v0.7.0) — typed memory-kind discriminator.  Stored in
+    /// `memories.memory_kind TEXT NOT NULL DEFAULT 'observation'` (schema v30).
+    /// `Observation` for every pre-v30 row (SQL default); `Reflection` for
+    /// memories minted by `memory_reflect` or the curator reflection pass.
+    ///
+    /// `#[serde(default)]` ensures round-trips with pre-v30 federation peers
+    /// that don't yet emit the field.
+    #[serde(default)]
+    pub memory_kind: MemoryKind,
 }
 
 impl Default for Memory {
@@ -116,6 +182,7 @@ impl Default for Memory {
             expires_at: None,
             metadata: default_metadata(),
             reflection_depth: 0,
+            memory_kind: MemoryKind::Observation,
         }
     }
 }

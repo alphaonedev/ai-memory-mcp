@@ -149,6 +149,7 @@ pub fn run(
         expires_at,
         metadata,
         reflection_depth: 0,
+        memory_kind: crate::models::MemoryKind::Observation,
     };
 
     // W5b/C5: governance enforcement routes through `cli::governance::enforce`
