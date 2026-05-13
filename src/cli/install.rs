@@ -474,15 +474,25 @@ fn test_default_snippet_dir() -> PathBuf {
 /// Write the system-prompt snippet for `target` to disk and return the
 /// path. Creates parent directories as needed; overwrites any existing
 /// file (snippet bodies are deterministic, so this is idempotent).
-fn write_system_prompt_snippet(target: Target) -> Result<PathBuf> {
-    let dir = snippet_base_dir()?;
-    std::fs::create_dir_all(&dir)
+///
+/// Production callers use [`write_system_prompt_snippet`] which resolves
+/// the base dir via [`snippet_base_dir`] (env var + cfg(test) fallback);
+/// tests should pass an explicit `dir` to [`write_system_prompt_snippet_to`]
+/// to avoid the global env-var dance that historically flaked under
+/// `--test-threads > 1`.
+fn write_system_prompt_snippet_to(target: Target, dir: &std::path::Path) -> Result<PathBuf> {
+    std::fs::create_dir_all(dir)
         .with_context(|| format!("creating snippet directory {}", dir.display()))?;
     let path = dir.join(format!("system-prompt-{}.md", target.name()));
     let body = snippet_body(target);
     std::fs::write(&path, body)
         .with_context(|| format!("writing snippet to {}", path.display()))?;
     Ok(path)
+}
+
+fn write_system_prompt_snippet(target: Target) -> Result<PathBuf> {
+    let dir = snippet_base_dir()?;
+    write_system_prompt_snippet_to(target, &dir)
 }
 
 // ---------------------------------------------------------------------------
@@ -2005,24 +2015,18 @@ mod tests {
     /// to inspect after the helper returns; the OS sweeps `/tmp` on
     /// reboot.
     fn emit_snippet_isolated(target: Target) -> (PathBuf, String) {
-        let _g = snippet_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        // Uses the dir-parameterised helper so the test does NOT touch
+        // the process-global `AI_MEMORY_SYSTEM_PROMPT_DIR` env var.
+        // Eliminates the `snippet_env_lock` cross-test race that flaked
+        // `snippet_every_target_emits_under_budget` under
+        // `--test-threads > 1` (§16 12-gate sweep observation,
+        // 2026-05-13, v0.7.1-fold).
         let tmp = tempfile::tempdir().expect("tempdir");
         let tmp_path = tmp.path().to_path_buf();
-        // SAFETY: env-var mutation is serialised by `snippet_env_lock`
-        // for the duration of this helper.
-        unsafe {
-            std::env::set_var("AI_MEMORY_SYSTEM_PROMPT_DIR", &tmp_path);
-        }
-        let snippet_path = write_system_prompt_snippet(target).expect("snippet write");
+        let snippet_path =
+            write_system_prompt_snippet_to(target, &tmp_path).expect("snippet write");
         let body = fs::read_to_string(&snippet_path).expect("read snippet");
-        // SAFETY: see above — still inside the lock guard's scope.
-        unsafe {
-            std::env::remove_var("AI_MEMORY_SYSTEM_PROMPT_DIR");
-        }
-        // Leak the TempDir handle so the snippet file outlives this
-        // helper — callers may re-check `path.exists()`. OS sweeps
-        // `/tmp` on reboot.
-        std::mem::forget(tmp);
+        std::mem::forget(tmp); // path must outlive caller
         (snippet_path, body)
     }
 
@@ -2125,7 +2129,12 @@ mod tests {
         // silently eats their context window. If you trip this
         // assertion, trim the offending bullet — do NOT bump the
         // budget without a spec change.
-        let _g = snippet_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        // Uses the dir-parameterised helper so each target gets its own
+        // tempdir without touching the process-global
+        // `AI_MEMORY_SYSTEM_PROMPT_DIR` env var. Eliminates the
+        // `snippet_env_lock` cross-test race that flaked this assertion
+        // under `--test-threads > 1` (§16 12-gate sweep observation,
+        // 2026-05-13, v0.7.1-fold).
         for target in [
             Target::ClaudeCode,
             Target::Openclaw,
@@ -2140,16 +2149,9 @@ mod tests {
         ] {
             let tmp = tempfile::tempdir().expect("tempdir");
             let tmp_path = tmp.path().to_path_buf();
-            // SAFETY: env mutation serialised by the outer
-            // `snippet_env_lock` guard for the full iteration.
-            unsafe {
-                std::env::set_var("AI_MEMORY_SYSTEM_PROMPT_DIR", &tmp_path);
-            }
-            let snippet_path = write_system_prompt_snippet(target).expect("snippet write");
+            let snippet_path =
+                write_system_prompt_snippet_to(target, &tmp_path).expect("snippet write");
             let body = fs::read_to_string(&snippet_path).expect("read snippet");
-            unsafe {
-                std::env::remove_var("AI_MEMORY_SYSTEM_PROMPT_DIR");
-            }
             std::mem::forget(tmp);
             assert!(
                 snippet_path.exists(),
