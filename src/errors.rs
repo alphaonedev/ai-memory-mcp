@@ -253,4 +253,67 @@ mod tests {
         let resp = err.into_response();
         assert_eq!(resp.status(), StatusCode::CONFLICT);
     }
+
+    // -----------------------------------------------------------------
+    // L0.7-2 Tier A — ReflectionDepthExceeded variant coverage
+    // (Layer 0 Task 4/8 added the variant; no tests followed)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn reflection_depth_exceeded_code() {
+        let err = MemoryError::ReflectionDepthExceeded {
+            attempted: 4,
+            cap: 3,
+            namespace: "ns/x".into(),
+        };
+        assert_eq!(err.code(), "REFLECTION_DEPTH_EXCEEDED");
+    }
+
+    #[test]
+    fn reflection_depth_exceeded_status_is_conflict() {
+        let err = MemoryError::ReflectionDepthExceeded {
+            attempted: 5,
+            cap: 3,
+            namespace: "ns/y".into(),
+        };
+        assert_eq!(err.status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn reflection_depth_exceeded_message_contains_triple() {
+        let err = MemoryError::ReflectionDepthExceeded {
+            attempted: 7,
+            cap: 3,
+            namespace: "ai-memory/research".into(),
+        };
+        let msg = err.message();
+        assert!(msg.contains("7"));
+        assert!(msg.contains("3"));
+        assert!(msg.contains("ai-memory/research"));
+        assert!(msg.contains("max_reflection_depth"));
+    }
+
+    #[test]
+    fn reflection_depth_exceeded_display() {
+        let err = MemoryError::ReflectionDepthExceeded {
+            attempted: 4,
+            cap: 3,
+            namespace: "ns".into(),
+        };
+        let s = format!("{err}");
+        assert!(s.contains("REFLECTION_DEPTH_EXCEEDED"));
+        assert!(s.contains("max_reflection_depth"));
+    }
+
+    #[test]
+    fn reflection_depth_exceeded_into_response_is_conflict() {
+        use axum::response::IntoResponse;
+        let err = MemoryError::ReflectionDepthExceeded {
+            attempted: 4,
+            cap: 3,
+            namespace: "ns".into(),
+        };
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
 }

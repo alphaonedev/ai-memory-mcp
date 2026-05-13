@@ -317,6 +317,69 @@ mod tests {
         assert_ne!(h, payload_hash(b"hello worle"));
     }
 
+    // -----------------------------------------------------------------
+    // L0.7-2 Tier A — error paths + empty / boundary coverage
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn append_duplicate_id_returns_error() {
+        let conn = fresh_db();
+        let mut a = fixture("alice", "memory_link.created");
+        append_signed_event(&conn, &a).expect("first append ok");
+        // Re-use the exact same id — the PRIMARY KEY on `id` rejects
+        // the second INSERT, exercising the .context("append signed_event")
+        // error path.
+        a.timestamp = Utc::now().to_rfc3339();
+        let err = append_signed_event(&conn, &a)
+            .expect_err("second append with same id must fail");
+        assert!(
+            format!("{err:?}").contains("append signed_event")
+                || format!("{err:#}").contains("append signed_event"),
+            "anyhow context should include the 'append signed_event' tag, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn list_signed_events_empty_db_returns_empty() {
+        let conn = fresh_db();
+        let alice = list_signed_events(&conn, Some("alice"), 10, 0).expect("list ok");
+        let all = list_signed_events(&conn, None, 10, 0).expect("list ok");
+        assert!(alice.is_empty());
+        assert!(all.is_empty());
+    }
+
+    #[test]
+    fn list_signed_events_offset_past_end_returns_empty() {
+        let conn = fresh_db();
+        append_signed_event(&conn, &fixture("alice", "memory_link.created")).unwrap();
+        let beyond = list_signed_events(&conn, Some("alice"), 10, 100).expect("list ok");
+        assert!(beyond.is_empty());
+    }
+
+    #[test]
+    fn list_signed_events_no_agent_filter_returns_all_agents() {
+        let conn = fresh_db();
+        append_signed_event(&conn, &fixture("alice", "memory_link.created")).unwrap();
+        append_signed_event(&conn, &fixture("bob", "memory_link.created")).unwrap();
+        append_signed_event(&conn, &fixture("carol", "memory_link.created")).unwrap();
+        let all = list_signed_events(&conn, None, 10, 0).expect("list ok");
+        let agents: std::collections::HashSet<&str> =
+            all.iter().map(|e| e.agent_id.as_str()).collect();
+        assert_eq!(agents.len(), 3);
+    }
+
+    #[test]
+    fn payload_hash_known_vector() {
+        // SHA-256 of the empty input must be the well-known constant
+        // e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855.
+        let h = payload_hash(b"");
+        let hex: String = h.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
     /// Append-only invariant: there's no public function to UPDATE
     /// or DELETE rows from `signed_events`, and no `UPDATE
     /// signed_events` / `DELETE FROM signed_events` SQL string
