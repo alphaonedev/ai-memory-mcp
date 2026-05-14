@@ -1358,4 +1358,136 @@ mod tests {
         files.insert("a".repeat(101), b"x".to_vec());
         assert!(pack_to_vec(&files).is_err());
     }
+
+    #[test]
+    fn hex_to_bytes_rejects_invalid_pair() {
+        let err = hex_to_bytes("zz").unwrap_err();
+        assert!(format!("{err:#}").contains("invalid hex pair"));
+    }
+
+    #[test]
+    fn hex_sha256_stable_for_same_input() {
+        let a = hex_sha256(b"hello world");
+        let b = hex_sha256(b"hello world");
+        assert_eq!(a, b);
+        // Known fixed property: 64 hex chars
+        assert_eq!(a.len(), 64);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn read_octal_size_parses_padded_field() {
+        let mut field = [0u8; 12];
+        write_octal(&mut field, 256, 11);
+        let parsed = read_octal_size(&field).unwrap();
+        assert_eq!(parsed, 256);
+    }
+
+    #[test]
+    fn read_octal_size_empty_returns_zero() {
+        let field = [0u8; 12];
+        // All zeros after octal write of 0 produces "00000000000\0".
+        let parsed = read_octal_size(&field).unwrap();
+        assert_eq!(parsed, 0);
+    }
+
+    #[test]
+    fn read_octal_size_garbage_returns_error_or_zero() {
+        // Field starts with non-digit garbage — trim removes it, empty -> 0.
+        let field = b"  \0\0\0\0\0\0\0\0\0\0";
+        let parsed = read_octal_size(field).unwrap();
+        assert_eq!(parsed, 0);
+    }
+
+    #[test]
+    fn ustar_pack_unpack_empty_files_map() {
+        let files: BundleFiles = BTreeMap::new();
+        let bytes = pack_to_vec(&files).unwrap();
+        let parsed = read_ustar(&bytes).unwrap();
+        assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn ustar_pack_unpack_handles_block_aligned_body() {
+        let mut files = BundleFiles::new();
+        // Exactly 512 bytes — no padding inside record.
+        files.insert("aligned.bin".to_string(), vec![b'A'; 512]);
+        let bytes = pack_to_vec(&files).unwrap();
+        let parsed = read_ustar(&bytes).unwrap();
+        assert_eq!(parsed.get("aligned.bin").unwrap().len(), 512);
+    }
+
+    #[test]
+    fn read_ustar_stops_on_zero_block() {
+        // Empty zero block at the start -> empty map.
+        let bytes = vec![0u8; 1024];
+        let parsed = read_ustar(&bytes).unwrap();
+        assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn canonical_signed_bytes_excludes_signature_fields() {
+        // canonical_signed_bytes must not include `signer_agent_id` or
+        // `signature` so re-signing produces the same canonical input.
+        let mut m1 = Manifest {
+            schema_version: 1,
+            memory_id: "abc".into(),
+            generated_at: "2026-01-01T00:00:00Z".into(),
+            include_reflections: true,
+            include_transcripts: false,
+            files: vec![ManifestFile {
+                path: "a.json".into(),
+                size: 5,
+                sha256: "ff".into(),
+            }],
+            signer_agent_id: None,
+            signature: None,
+        };
+        let bytes_unsigned = canonical_signed_bytes(&m1);
+        m1.signer_agent_id = Some("alice".into());
+        m1.signature = Some("0xdead".into());
+        let bytes_signed = canonical_signed_bytes(&m1);
+        assert_eq!(
+            bytes_unsigned, bytes_signed,
+            "signer fields must not affect canonical signed bytes"
+        );
+    }
+
+    #[test]
+    fn bytes_to_hex_empty_returns_empty_string() {
+        assert_eq!(bytes_to_hex(&[]), "");
+    }
+
+    #[test]
+    fn hex_to_bytes_empty_returns_empty_vec() {
+        let v = hex_to_bytes("").unwrap();
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn write_octal_zero_value_is_padded() {
+        let mut field = [0u8; 8];
+        write_octal(&mut field, 0, 7);
+        assert_eq!(&field[..7], b"0000000");
+        assert_eq!(field[7], 0);
+    }
+
+    #[test]
+    fn read_ustar_truncated_body_rejected() {
+        // Build a single-file archive and truncate it mid-body.
+        let mut files = BundleFiles::new();
+        files.insert("x.txt".to_string(), b"hello".to_vec());
+        let bytes = pack_to_vec(&files).unwrap();
+        // Truncate at 520 bytes (just past header, body is incomplete).
+        let truncated = &bytes[..516];
+        let err = read_ustar(truncated).unwrap_err();
+        let s = format!("{err}");
+        assert!(s.contains("extends beyond"));
+    }
+
+    #[test]
+    fn verify_returns_error_for_missing_bundle_path() {
+        let p = std::path::Path::new("/this/does/not/exist/bundle.tar");
+        assert!(verify(p).is_err());
+    }
 }
