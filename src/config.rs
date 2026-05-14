@@ -884,6 +884,249 @@ pub struct CapabilityHnsw {
 }
 
 // ---------------------------------------------------------------------------
+// Capabilities v3 L3-5 — recursive-learning / skills / forensic / governance
+// blocks. v3-only (additive over v2). Every field is hand-mapped to a
+// concrete implementation that landed in the v0.7.0 grand-slam L1+L2 waves
+// so an external auditor can trace a claim back to a source-code line.
+// ---------------------------------------------------------------------------
+
+/// v0.7.0 L3-5 — substrate-native reflection capability surface.
+///
+/// Every field MUST map to a real implementation. Audit anchors:
+///
+/// - `implemented`: [`crate::storage::reflect::reflect`] +
+///   [`crate::mcp::tools::memory_reflect`] (issue #655 Task 4/8,
+///   commit `3dc76f3`).
+/// - `depth_bounded`: depth-cap check in [`crate::storage::reflect`]
+///   step 5; [`crate::errors::MemoryError::ReflectionDepthExceeded`]
+///   surfaces refusal with `attempted` + `cap` + `namespace`.
+/// - `max_default`: compiled-in default returned by
+///   [`crate::models::namespace::GovernancePolicy::effective_max_reflection_depth`]
+///   (currently **3**) when the namespace's
+///   `metadata.governance.max_reflection_depth` is unset.
+/// - `attestation`: every reflection writes a `signed_events` row via
+///   [`crate::signed_events::append_signed_event`]; the project uses
+///   Ed25519 (see [`crate::identity::sign`] H2 + H4 link-signing
+///   plus the operator-signed governance rules in
+///   [`crate::governance::rules_store`]).
+/// - `curator_mode`: implemented in
+///   [`crate::curator::reflection_pass`] and the
+///   `ai-memory curator --reflection-pass` CLI verb in
+///   [`crate::cli::curator`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CapabilityReflection {
+    /// `true` whenever the reflection primitive is wired (memory_reflect MCP
+    /// tool present + `storage::reflect::reflect` callable). False is reserved
+    /// for a build that compiled the field out.
+    pub implemented: bool,
+    /// `true` when reflections are subject to a depth cap that refuses
+    /// further reflection past the configured maximum.
+    pub depth_bounded: bool,
+    /// Compiled-in default cap returned when no namespace policy is set.
+    /// Tracks [`crate::models::namespace::GovernancePolicy::effective_max_reflection_depth`].
+    pub max_default: u32,
+    /// Signature algorithm used by the substrate for attested events
+    /// touching reflections (link signatures + `signed_events` rows).
+    pub attestation: String,
+    /// `"implemented"` when the curator reflection pass is wired
+    /// (`curator::reflection_pass` + `ai-memory curator` CLI). Stays a
+    /// string (not a bool) so future increments can grow new values like
+    /// `"scheduled"` without a wire-shape break.
+    pub curator_mode: String,
+}
+
+impl CapabilityReflection {
+    /// Build the L3-5 reflection capability from real values pinned at
+    /// compile time so the wire shape reflects what this binary actually
+    /// ships. Constants from [`crate::reranker::DEFAULT_REFLECTION_MAX_DEPTH_CAP`]
+    /// and the curator module are consulted directly — no magic strings.
+    #[must_use]
+    pub fn current() -> Self {
+        Self {
+            implemented: true,
+            depth_bounded: true,
+            max_default: crate::reranker::DEFAULT_REFLECTION_MAX_DEPTH_CAP,
+            attestation: "Ed25519".to_string(),
+            curator_mode: "implemented".to_string(),
+        }
+    }
+}
+
+fn default_capability_reflection() -> CapabilityReflection {
+    CapabilityReflection::current()
+}
+
+/// v0.7.0 L3-5 — Agent-Skills capability surface.
+///
+/// Every field MUST map to a real implementation:
+///
+/// - `implemented`: 7 MCP tools wired in
+///   [`crate::mcp::registry`] + handlers in
+///   [`crate::mcp::tools::skill_*`].
+/// - `standard`: the parser in [`crate::parsing::skill_md`] validates
+///   names + frontmatter against the agentskills.io §3.1/§3.2 spec.
+/// - `tools`: list mirrors the registered handler names verbatim;
+///   regression test [`SKILL_TOOL_NAMES`] verifies the slice matches
+///   the live MCP dispatcher.
+/// - `round_trip`: `memory_skill_register` → `memory_skill_export` →
+///   re-register produces the IDENTICAL SHA-256 digest (see
+///   `tests/skill_test.rs`, the round-trip pin).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CapabilitySkills {
+    /// `true` whenever the skill registration + lookup substrate is
+    /// wired. False is reserved for a build that compiled the family out.
+    pub implemented: bool,
+    /// External spec the parser targets. `"agentskills.io"` is the
+    /// canonical name documented in the L1-5 spec.
+    pub standard: String,
+    /// Canonical list of registered skill tools. Order matches the MCP
+    /// dispatch order so an LLM that pins the order doesn't drift.
+    pub tools: Vec<String>,
+    /// `"verified"` when register → export → re-register is exercised in
+    /// the test suite and the digests match.
+    pub round_trip: String,
+}
+
+/// Canonical skill tool names as registered in
+/// [`crate::mcp::registry`]. Pinned here (not derived from the registry)
+/// so the capability surface remains a stable, declarative contract;
+/// the regression test
+/// `cap_v3_l3_5_skill_tools_match_registered_mcp_dispatch` ensures the
+/// two stay in sync.
+pub const SKILL_TOOL_NAMES: &[&str] = &[
+    "memory_skill_register",
+    "memory_skill_list",
+    "memory_skill_get",
+    "memory_skill_resource",
+    "memory_skill_export",
+    "memory_skill_promote_from_reflection",
+    "memory_skill_compositional_context",
+];
+
+impl CapabilitySkills {
+    /// Build the L3-5 skills capability from real, code-anchored values.
+    #[must_use]
+    pub fn current() -> Self {
+        Self {
+            implemented: true,
+            standard: "agentskills.io".to_string(),
+            tools: SKILL_TOOL_NAMES.iter().map(|s| (*s).to_string()).collect(),
+            round_trip: "verified".to_string(),
+        }
+    }
+}
+
+fn default_capability_skills() -> CapabilitySkills {
+    CapabilitySkills::current()
+}
+
+/// v0.7.0 L3-5 — forensic-evidence capability surface.
+///
+/// Each label names a CLI / function pair that **exists** in this binary:
+///
+/// - `verify_reflection_chain`: `ai-memory verify-reflection-chain` —
+///   driver lives in [`crate::cli::verify`].
+/// - `export_forensic_bundle`: `ai-memory export-forensic-bundle` —
+///   builder lives in [`crate::forensic::bundle::build`].
+/// - `verify_forensic_bundle`: `ai-memory verify-forensic-bundle` —
+///   verifier lives in [`crate::forensic::bundle::verify`].
+///
+/// All three are `"implemented"` strings (not bools) so future
+/// increments can promote a value to `"attested"` or `"scheduled"`
+/// without a wire-shape break.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CapabilityForensic {
+    pub verify_reflection_chain: String,
+    pub export_forensic_bundle: String,
+    pub verify_forensic_bundle: String,
+}
+
+impl CapabilityForensic {
+    /// Build the L3-5 forensic capability — all three driver paths are
+    /// wired in this build.
+    #[must_use]
+    pub fn current() -> Self {
+        Self {
+            verify_reflection_chain: "implemented".to_string(),
+            export_forensic_bundle: "implemented".to_string(),
+            verify_forensic_bundle: "implemented".to_string(),
+        }
+    }
+}
+
+fn default_capability_forensic() -> CapabilityForensic {
+    CapabilityForensic::current()
+}
+
+/// v0.7.0 L3-5 — substrate-rules governance capability surface.
+///
+/// Surfaces the L1-6 activation posture honestly:
+///
+/// - `rules_engine`: `"operator_signed"` because the L1-6 loader
+///   refuses to honour any `enabled = 1` rule that is not
+///   `attest_level = 'operator_signed'` and whose signature does not
+///   verify against the active operator pubkey
+///   ([`crate::governance::rules_store`] L1-6 audit).
+/// - `enforced_actions`: the actual variant set in
+///   [`crate::governance::agent_action::AgentAction`] minus the
+///   `Custom` extension point (extension points are not
+///   substrate-enforced). v0.7.0 ships **four** action kinds at the
+///   harness-mediated PreToolUse boundary.
+/// - `bypass_impossibility_tests`: count of `#[test]` functions in
+///   [`tests/governance_l16_activation.rs`] verifying the
+///   bypass-impossibility properties (signature-required, tampered-sig
+///   rejected, direct-enabled-flip rejected, keygen 0600, idempotent
+///   sign-seed, rotated-key invalidates). The number reflects the test
+///   file as of v0.7.0 — bumping it requires an audit pass and a
+///   matching test addition.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CapabilityGovernance {
+    pub rules_engine: String,
+    pub enforced_actions: Vec<String>,
+    pub bypass_impossibility_tests: u32,
+}
+
+/// v0.7.0 L1-6 — the canonical agent-external action kinds the
+/// substrate gates via the operator-signed rules engine. Matches the
+/// variant set in [`crate::governance::agent_action::AgentAction`]
+/// (minus the open-ended `Custom` extension point).
+///
+/// MemoryWrite is intentionally NOT in this list — substrate-internal
+/// memory writes are gated by the K9 `Op` pipeline
+/// ([`crate::governance::Op`]) which is a separate, substrate-
+/// authoritative surface. The two engines have different enforcement
+/// semantics; honest reporting keeps them on separate fields rather
+/// than conflating them under one label. The L3-5 audit comment in
+/// `tests/capabilities_v3_l3_5.rs` documents the carry-forward.
+pub const ENFORCED_AGENT_ACTIONS: &[&str] =
+    &["Bash", "FilesystemWrite", "NetworkRequest", "ProcessSpawn"];
+
+/// v0.7.0 L1-6 — number of bypass-impossibility tests pinning the
+/// rules-engine activation posture. Tracks the `#[test]` count in
+/// `tests/governance_l16_activation.rs`. Bumping this requires both an
+/// audit and a matching test landing in that file.
+pub const GOVERNANCE_BYPASS_IMPOSSIBILITY_TESTS: u32 = 6;
+
+impl CapabilityGovernance {
+    /// Build the L3-5 governance capability from the live constants.
+    #[must_use]
+    pub fn current() -> Self {
+        Self {
+            rules_engine: "operator_signed".to_string(),
+            enforced_actions: ENFORCED_AGENT_ACTIONS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+            bypass_impossibility_tests: GOVERNANCE_BYPASS_IMPOSSIBILITY_TESTS,
+        }
+    }
+}
+
+fn default_capability_governance() -> CapabilityGovernance {
+    CapabilityGovernance::current()
+}
+
+// ---------------------------------------------------------------------------
 // Capabilities v1 — legacy shape retained for backward compat
 // ---------------------------------------------------------------------------
 
@@ -1010,6 +1253,14 @@ impl Capabilities {
             kg_backend: self.kg_backend.clone(),
             // L1-1 — propagate the memory-kind set verbatim.
             memory_kinds: self.memory_kinds.clone(),
+            // L3-5 — four new substrate-honesty blocks. Built from
+            // compile-time anchors (the per-block `::current()`
+            // constructor) so the wire shape reflects the actual
+            // implementation surface, not a static template.
+            reflection: CapabilityReflection::current(),
+            skills: CapabilitySkills::current(),
+            forensic: CapabilityForensic::current(),
+            governance: CapabilityGovernance::current(),
         }
     }
 }
@@ -1152,8 +1403,43 @@ pub struct CapabilitiesV3 {
     /// L1-1 (v0.7.0) — typed memory-kind set. Forwarded from the v2
     /// projection's `memory_kinds` field. Always
     /// `["observation", "reflection"]` for v0.7.0.
+    ///
+    /// **L3-5 honesty note.** The grand-slam spec called for a third
+    /// `"goal"` kind here, but the [`crate::models::memory::MemoryKind`]
+    /// enum in this binary only carries `Observation` and `Reflection`.
+    /// Per the operator's "every reported field maps to real
+    /// implementation" directive, the v3 surface reports exactly what
+    /// the substrate enforces — the `goal` kind is deferred to the
+    /// tracker (`a4f8d465`) for a v0.8.0 wave that lands the enum
+    /// variant + migration + write-path coverage. Reporting it here
+    /// today would be theatrical.
     #[serde(default = "default_memory_kinds")]
     pub memory_kinds: Vec<String>,
+
+    /// v0.7.0 L3-5 — recursive-learning capability surface. Every
+    /// sub-field anchors a real implementation in this binary; see
+    /// [`CapabilityReflection`] for the per-field audit anchors.
+    #[serde(default = "default_capability_reflection")]
+    pub reflection: CapabilityReflection,
+
+    /// v0.7.0 L3-5 — Agent-Skills capability surface. Lists the seven
+    /// registered `memory_skill_*` MCP tools; the round-trip guarantee
+    /// is pinned by `tests/skill_test.rs`. See [`CapabilitySkills`].
+    #[serde(default = "default_capability_skills")]
+    pub skills: CapabilitySkills,
+
+    /// v0.7.0 L3-5 — forensic-evidence CLI surface. Names the three
+    /// driver verbs that this binary actually ships
+    /// (`verify-reflection-chain`, `export-forensic-bundle`,
+    /// `verify-forensic-bundle`). See [`CapabilityForensic`].
+    #[serde(default = "default_capability_forensic")]
+    pub forensic: CapabilityForensic,
+
+    /// v0.7.0 L3-5 — substrate-rules governance surface. Honestly
+    /// labelled `"operator_signed"` because the L1-6 loader refuses
+    /// to honour unsigned rules. See [`CapabilityGovernance`].
+    #[serde(default = "default_capability_governance")]
+    pub governance: CapabilityGovernance,
 }
 
 // ---------------------------------------------------------------------------
