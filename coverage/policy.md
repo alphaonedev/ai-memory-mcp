@@ -323,6 +323,17 @@ under a Postgres daemon.
 - Phase 2 federation cell registers + invokes subscribers against a PG
   store. Phase 1 functional cell exercises sqlite branches end-to-end.
 
+**v0.7.0 ship-cascade (#700) threshold drift**: fold-A2A1.1 added
+postgres-branch federation fanout to both `notify` and `subscribe`. The
+new lines are all `#[cfg(feature = "sal")] if matches!(app.storage_backend,
+StorageBackend::Postgres)` blocks that call `fanout_or_503` (already
+unit-tested in `handlers/mod.rs`) and SAL trait methods on the documented
+PG STRUCTURAL CEILING. Measured drifted from 47.55% → 46.89% within the
+same exception class; threshold lowered from 47 → 46 to reflect the new
+structural floor (the new lines are unreachable from unit tests for the
+same reason the prior PG-branch lines are). Phase-2 federation cell
+covers the fanout path end-to-end against a live PG fixture.
+
 #### `src/handlers/federation_receive.rs` — inbound federation handler (STRUCTURAL CEILING — PG branches)
 
 Mirror of `federation/receive.rs` at the HTTP boundary: deserializes the
