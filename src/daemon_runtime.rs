@@ -155,7 +155,18 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Start the HTTP memory daemon
+    /// Start the HTTP memory daemon.
+    ///
+    /// **Tier resolution.** Unlike `mcp` / `store` / `recall`, the
+    /// `serve` subcommand does NOT accept a `--tier` flag. The
+    /// daemon's effective feature tier is resolved from the `tier`
+    /// field in `config.toml`, falling back to the compiled-in
+    /// default (`semantic`). For per-invocation tier overrides use
+    /// the `mcp` / `store` / `recall` subcommands, which expose
+    /// `--tier` directly. See `docs/ADMIN_GUIDE.md` §"Feature tiers"
+    /// and issue #703 for the rationale (a long-running daemon owns
+    /// embedder / LLM resources that are expensive to swap mid-run,
+    /// so tier is fixed at startup via configuration).
     Serve(ServeArgs),
     /// Run as an MCP (Model Context Protocol) tool server over stdio
     Mcp {
