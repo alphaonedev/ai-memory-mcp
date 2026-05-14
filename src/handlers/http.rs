@@ -5229,10 +5229,79 @@ pub async fn kg_query(
     }
 }
 
+/// v0.7.0 G-PHASE-E-1 (#706) — canonical field whitelist for the
+/// `/api/v1/links` create + delete bodies. Includes the canonical names
+/// and the S82 aliases (`from` / `to` / `rel_type`). Any field outside
+/// this set surfaces as a structured `unknown_field` 400 rather than
+/// being silently defaulted (the pre-#706 behaviour, where a typoed
+/// `link_type` would land a link with `relation = "related_to"`).
+const ALLOWED_LINK_BODY_FIELDS: &[&str] = &[
+    "source_id",
+    "from",
+    "target_id",
+    "to",
+    "relation",
+    "rel_type",
+];
+
+/// v0.7.0 G-PHASE-E-1 (#706) — closed set of relation values accepted
+/// by the SQL CHECK constraint on `memory_links.relation` (migration
+/// 0027). Used to surface a structured `invalid_relation` 400 from the
+/// HTTP handler before the INSERT crashes with a generic CHECK error.
+const ALLOWED_LINK_RELATIONS: &[&str] = &[
+    "related_to",
+    "supersedes",
+    "contradicts",
+    "derived_from",
+    "reflects_on",
+];
+
+/// Return the list of unknown fields in `raw` against
+/// [`ALLOWED_LINK_BODY_FIELDS`]. Returns `None` when every key is
+/// recognised (including the empty-body case) so callers can use
+/// `if let Some(unknown) = …` to branch cleanly into the 400 path.
+fn unknown_link_body_fields(raw: &serde_json::Value) -> Option<Vec<String>> {
+    let obj = raw.as_object()?;
+    let mut unknown: Vec<String> = obj
+        .keys()
+        .filter(|k| !ALLOWED_LINK_BODY_FIELDS.contains(&k.as_str()))
+        .cloned()
+        .collect();
+    if unknown.is_empty() {
+        None
+    } else {
+        unknown.sort();
+        Some(unknown)
+    }
+}
+
 pub async fn create_link(
     State(app): State<AppState>,
-    Json(body): Json<LinkBody>,
+    Json(raw): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    // v0.7.0 G-PHASE-E-1 (#706) — reject unknown fields with a
+    // structured 400 instead of silently defaulting `relation` to
+    // `related_to`. The canonical shape is `{source_id|from,
+    // target_id|to, relation|rel_type}`; anything else (e.g. the
+    // common-typo `link_type`) is a caller bug that previously
+    // surfaced as a silently-defaulted insert.
+    if let Some(unknown) = unknown_link_body_fields(&raw) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "unknown_field", "fields": unknown})),
+        )
+            .into_response();
+    }
+    let body: LinkBody = match serde_json::from_value(raw) {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
     // S82's wire shape uses `{from, to, rel_type}`; resolve canonical
     // (source_id, target_id, relation) from either field set.
     let (source_id, target_id, relation) = body.resolved();
@@ -5240,6 +5309,25 @@ pub async fn create_link(
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
+    // v0.7.0 G-PHASE-E-1 (#706) — the SQL-side CHECK constraint on
+    // `memory_links.relation` (migration 0027) admits only the five
+    // canonical relations. `validate_relation` is intentionally more
+    // permissive (accepts arbitrary `[a-z0-9_]+`) for forward-compat,
+    // but anything outside the canonical set will crash the INSERT
+    // with a generic CHECK violation. Pre-flight the relation against
+    // the closed set here so callers get a structured 400 instead of
+    // a generic 500.
+    if crate::models::MemoryLinkRelation::from_str(&relation).is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "invalid_relation",
+                "got": relation,
+                "allowed": ALLOWED_LINK_RELATIONS,
+            })),
         )
             .into_response();
     }
@@ -5439,8 +5527,28 @@ pub async fn create_link(
 /// create-link fanout is sufficient.
 pub async fn delete_link(
     State(app): State<AppState>,
-    Json(body): Json<LinkBody>,
+    Json(raw): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    // v0.7.0 G-PHASE-E-1 (#706) — mirror create_link: reject unknown
+    // fields with a structured 400 so caller bugs surface loudly
+    // instead of silently defaulting.
+    if let Some(unknown) = unknown_link_body_fields(&raw) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "unknown_field", "fields": unknown})),
+        )
+            .into_response();
+    }
+    let body: LinkBody = match serde_json::from_value(raw) {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
     let (source_id, target_id, relation) = body.resolved();
     if let Err(e) = validate::validate_link(&source_id, &target_id, &relation) {
         return (
