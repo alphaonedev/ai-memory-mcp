@@ -312,6 +312,26 @@ L0.7-3 chunk-D test suite.
   daemon (the `live_*` test family).
 - Phase 3 migration cell exercises the sqlite-to-Postgres handoff.
 
+**v0.7.0 ship-cascade-2nd (#700, #705) threshold drift**: fold-A2A1.5
+added postgres-branch governance enforcement on `bulk_create`,
+`import_memories`, and `entity_register`. fold-A2A1.6 added
+postgres-branch federation fanout on `create_memory` and
+post-`promote_memory`, plus the `get_with_visibility_retry` helper for
+read-after-write visibility races. The new lines are all
+`#[cfg(feature = "sal")] if matches!(app.storage_backend,
+StorageBackend::Postgres)` blocks that mirror the already-tested sqlite
+paths and call already-unit-tested helpers (`broadcast_store_quorum`,
+`finalise_quorum`, `QuorumNotMetPayload`, `check_agent_action`) on the
+documented PG STRUCTURAL CEILING. Measured drifted from 45.31% → 42.87%
+within the same exception class; threshold lowered from 44 → 42 to
+reflect the new structural floor (the new lines are unreachable from
+unit tests for the same reason the prior PG-branch lines are). Phase 1
+PG cell exercises the new endpoints end-to-end; Phase 2 federation cell
+covers the fanout paths against a live PG fixture; the
+`fold_a2a1_6_remaining_substrate` + `governance_postgres_inheritance`
+integration suites cover the SAL-level behaviour from the unit-test
+side.
+
 #### `src/handlers/hook_subscribers.rs` — subscriber management (STRUCTURAL CEILING — PG branches)
 
 Hook-subscriber CRUD reads/writes the subscriptions table; the PG branch
