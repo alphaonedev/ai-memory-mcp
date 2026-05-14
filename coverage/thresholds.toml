@@ -106,7 +106,7 @@ min_line_coverage = 88.0
 "cli/wrap.rs"              = 97    # tier B, measured 98.00
 "config.rs"                = 95    # tier B, measured 96.12 post-C5, raise to 98 by v0.8.0
 "handlers/federation_receive.rs" = 38   # tier B, measured 38.93 — EXCEPTION: PG-branch ceiling (see coverage/policy.md L0.7-3 chunk-D)
-"handlers/hook_subscribers.rs"   = 47   # tier B, measured 47.55 — EXCEPTION: PG-branch ceiling (see coverage/policy.md L0.7-3 chunk-D)
+"handlers/hook_subscribers.rs"   = 46   # tier B, measured 46.89 — EXCEPTION: PG-branch ceiling (see coverage/policy.md L0.7-3 chunk-D). v0.7.0 ship-cascade adjustment: fold-A2A1.1 (#700) added postgres-branch fanout to notify/subscribe; new lines are all `#[cfg(feature = "sal")] if matches!(StorageBackend::Postgres)` blocks calling already-unit-tested helpers (fanout_or_503) and SAL trait methods on the documented PG STRUCTURAL CEILING. Was 47/47.55; now 46/46.89 within same exception class. Phase-2 federation cell exercises the PG fanout path end-to-end.
 "handlers/http.rs"               = 44   # tier B, measured 45.31 — EXCEPTION: PG-branch ceiling (see coverage/policy.md L0.7-3 chunk-D)
 "mcp/mod.rs"               = 96    # tier B, measured 97.20
 "mcp/registry.rs"          = 96    # tier B, measured 96.61
