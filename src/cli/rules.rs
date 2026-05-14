@@ -174,6 +174,28 @@ pub enum RulesAction {
         #[arg(long)]
         force: bool,
     },
+    /// v0.7.0 L1-6 — sign every seeded rule (R001..R004 today) with
+    /// the operator key. Sets `signature = ed25519(canonical_payload)`
+    /// and `attest_level = 'operator_signed'`. `enabled` stays at 0
+    /// — the operator audits and activates manually after this runs.
+    ///
+    /// The canonical payload includes `enabled`, so a direct
+    /// `UPDATE governance_rules SET enabled = 1` after signing would
+    /// fail signature verification at load time — that is the
+    /// bypass-prevention property.
+    SignSeed {
+        /// Path to the operator private seed (32 bytes) — same shape
+        /// `rules keygen --out` writes. Defaults to
+        /// `~/.config/ai-memory/operator.key`.
+        #[arg(long, value_name = "PATH")]
+        key: Option<PathBuf>,
+        /// Override the DB path (useful for smoke tests against a
+        /// scratch sqlite file). Defaults to the same `--db` the
+        /// rest of the `rules` verbs use (the top-level `ai-memory
+        /// --db` flag).
+        #[arg(long, value_name = "PATH")]
+        db: Option<PathBuf>,
+    },
 }
 
 /// JSON envelope used by `--json` callers — keeps a stable wire shape
@@ -318,6 +340,21 @@ pub fn run(
                 "fingerprint": fingerprint,
             });
             emit_ok(json, out, "rules.keygen", &payload)?;
+            Ok(())
+        }
+        RulesAction::SignSeed { key, db } => {
+            // The top-level `--db` flag already produced `conn` above.
+            // When the operator passes `--db` on the subcommand (the
+            // L1-6 ergonomic shortcut for one-shot scripts), reopen
+            // against that path; otherwise reuse the open handle.
+            if let Some(db_path) = db {
+                let conn2 = rusqlite::Connection::open(&db_path).with_context(|| {
+                    format!("rules.sign-seed: open db at {}", db_path.display())
+                })?;
+                sign_seed_rules(&conn2, key.as_deref(), json, out)?;
+            } else {
+                sign_seed_rules(&conn, key.as_deref(), json, out)?;
+            }
             Ok(())
         }
     }
@@ -586,6 +623,73 @@ pub fn load_operator_signing_key(path: &Path) -> Result<SigningKey> {
     let mut seed = [0u8; ED25519_SEED_LEN];
     seed.copy_from_slice(&bytes);
     Ok(SigningKey::from_bytes(&seed))
+}
+
+/// L1-6 Deliverable B — sign R001..R004 (and any other rows in
+/// `governance_rules`) with the operator key. Idempotent: re-running
+/// computes the same canonical bytes → same signature → same UPDATE;
+/// a row whose `signature` already matches the freshly computed bytes
+/// is a no-op.
+///
+/// `enabled` STAYS at whatever the row already holds — operator
+/// activates manually after audit. Canonical bytes include `enabled`
+/// (see [`rules_store::canonical_bytes_for_signing`]), so a post-sign
+/// `UPDATE governance_rules SET enabled = 1` would invalidate the
+/// recorded signature: that is the bypass-prevention property the
+/// L1-6 integration tests pin.
+///
+/// Returns the number of rows that were freshly signed (excluding
+/// idempotent no-ops).
+fn sign_seed_rules(
+    conn: &rusqlite::Connection,
+    key_path: Option<&Path>,
+    json: bool,
+    out: &mut CliOutput<'_>,
+) -> Result<usize> {
+    let resolved = match key_path {
+        Some(p) => p.to_path_buf(),
+        None => resolve_operator_key_path(None)?,
+    };
+    let signing_key = load_operator_signing_key(&resolved).with_context(|| {
+        format!(
+            "rules.sign-seed: load operator key from {}",
+            resolved.display()
+        )
+    })?;
+
+    let rules = rules_store::list(conn)?;
+    let mut signed_now = 0usize;
+    let mut summary: Vec<serde_json::Value> = Vec::new();
+    for rule in rules {
+        let canonical = rules_store::canonical_bytes_for_signing(&rule)?;
+        let signature = signing_key.sign(&canonical);
+        let sig_bytes = signature.to_bytes();
+        let already_signed = matches!(
+            (rule.signature.as_deref(), rule.attest_level.as_str()),
+            (Some(existing), OPERATOR_SIGNED_LEVEL) if existing == sig_bytes.as_slice()
+        );
+        if !already_signed {
+            rules_store::update_signature(
+                conn,
+                &rule.id,
+                sig_bytes.as_slice(),
+                OPERATOR_SIGNED_LEVEL,
+            )?;
+            signed_now += 1;
+        }
+        summary.push(serde_json::json!({
+            "id": rule.id,
+            "attest_level": OPERATOR_SIGNED_LEVEL,
+            "signed_now": !already_signed,
+        }));
+    }
+
+    let payload = serde_json::json!({
+        "signed_now": signed_now,
+        "rules": summary,
+    });
+    emit_ok(json, out, "rules.sign-seed", &payload)?;
+    Ok(signed_now)
 }
 
 /// Resolve the operator key directory, honoring `--key-dir` →
@@ -1031,6 +1135,135 @@ mod tests {
         assert!(
             msg.contains("expected") || msg.contains("bytes"),
             "got: {msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // L1-6 — sign_seed_rules unit tests
+    // -----------------------------------------------------------------
+
+    /// Build a fresh in-memory rules-only schema for `sign_seed_rules`
+    /// tests. Same shape as the engine's `fresh_conn` helper in
+    /// `governance::agent_action::tests` but here we only need the
+    /// rules table (no audit chain — sign-seed is pure SQL UPDATE).
+    fn fresh_rules_conn() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE governance_rules (
+                 id TEXT PRIMARY KEY,
+                 kind TEXT NOT NULL,
+                 matcher TEXT NOT NULL,
+                 severity TEXT NOT NULL CHECK (severity IN ('refuse','warn','log')),
+                 reason TEXT NOT NULL,
+                 namespace TEXT NOT NULL DEFAULT '_global',
+                 created_by TEXT NOT NULL,
+                 created_at INTEGER NOT NULL,
+                 enabled INTEGER NOT NULL DEFAULT 1,
+                 signature BLOB,
+                 attest_level TEXT NOT NULL DEFAULT 'unsigned'
+             );",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sign_seed_rules_marks_all_rows_operator_signed() {
+        let tdir = tempfile::tempdir().unwrap();
+        let key_path = tdir.path().join("operator.key");
+        let mut stdout: Vec<u8> = Vec::new();
+        let mut stderr: Vec<u8> = Vec::new();
+        let mut out = CliOutput {
+            stdout: &mut stdout,
+            stderr: &mut stderr,
+        };
+        keygen_operator(&key_path, false, &mut out).unwrap();
+
+        let conn = fresh_rules_conn();
+        // Seed two unsigned rules to mirror the migration's R001..R004
+        // shape (enabled=false, attest_level='unsigned').
+        for id in ["R001", "R002"] {
+            rules_store::insert(
+                &conn,
+                &Rule {
+                    id: id.to_string(),
+                    kind: "filesystem_write".into(),
+                    matcher: r#"{"glob":"/tmp/**"}"#.into(),
+                    severity: "refuse".into(),
+                    reason: "test".into(),
+                    namespace: "_global".into(),
+                    created_by: "system:seed".into(),
+                    created_at: 0,
+                    enabled: false,
+                    signature: None,
+                    attest_level: "unsigned".into(),
+                },
+            )
+            .unwrap();
+        }
+
+        let signed = sign_seed_rules(&conn, Some(&key_path), true, &mut out).unwrap();
+        assert_eq!(signed, 2);
+
+        // Every row is now operator_signed with a 64-byte signature
+        // and `enabled` UNCHANGED (audit must be operator-driven).
+        for id in ["R001", "R002"] {
+            let row = rules_store::get(&conn, id).unwrap().unwrap();
+            assert_eq!(row.attest_level, "operator_signed");
+            assert_eq!(
+                row.signature.as_ref().map(Vec::len),
+                Some(ed25519_dalek::SIGNATURE_LENGTH)
+            );
+            assert!(!row.enabled, "sign-seed must NOT flip enabled");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sign_seed_rules_is_idempotent() {
+        let tdir = tempfile::tempdir().unwrap();
+        let key_path = tdir.path().join("operator.key");
+        let mut stdout: Vec<u8> = Vec::new();
+        let mut stderr: Vec<u8> = Vec::new();
+        let mut out = CliOutput {
+            stdout: &mut stdout,
+            stderr: &mut stderr,
+        };
+        keygen_operator(&key_path, false, &mut out).unwrap();
+
+        let conn = fresh_rules_conn();
+        rules_store::insert(
+            &conn,
+            &Rule {
+                id: "R001".into(),
+                kind: "filesystem_write".into(),
+                matcher: r#"{"glob":"/tmp/**"}"#.into(),
+                severity: "refuse".into(),
+                reason: "t".into(),
+                namespace: "_global".into(),
+                created_by: "system:seed".into(),
+                created_at: 0,
+                enabled: false,
+                signature: None,
+                attest_level: "unsigned".into(),
+            },
+        )
+        .unwrap();
+
+        // First call: signs 1 row.
+        let signed1 = sign_seed_rules(&conn, Some(&key_path), true, &mut out).unwrap();
+        assert_eq!(signed1, 1);
+        let sig_after_first = rules_store::get(&conn, "R001").unwrap().unwrap().signature;
+
+        // Second call: no-op because the canonical bytes + key are the
+        // same so the computed signature matches the stored one.
+        let signed2 = sign_seed_rules(&conn, Some(&key_path), true, &mut out).unwrap();
+        assert_eq!(signed2, 0);
+        let sig_after_second = rules_store::get(&conn, "R001").unwrap().unwrap().signature;
+        assert_eq!(
+            sig_after_first, sig_after_second,
+            "idempotent sign-seed must preserve the existing signature bytes"
         );
     }
 }

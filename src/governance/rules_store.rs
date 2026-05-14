@@ -217,6 +217,16 @@ pub fn update_signature(
 /// migration recomputes the bytes via a different canonicalizer
 /// without touching the CLI call sites.
 ///
+/// # Note on `enabled`
+///
+/// This historical helper (used by `ai-memory rules add --sign`)
+/// does NOT include `enabled` in the canonical payload — it pre-dates
+/// the L1-6 bypass-prevention design. Use
+/// [`canonical_bytes_for_signing`] for L1-6 sign + verify call sites;
+/// that variant commits to `enabled` so direct
+/// `UPDATE governance_rules SET enabled = 1` after signing fails
+/// verification at load time.
+///
 /// # Errors
 ///
 /// Propagates `serde_json` encoding errors.
@@ -232,6 +242,76 @@ pub fn canonical_bytes(rule: &Rule) -> Result<Vec<u8>> {
         "created_at": rule.created_at,
     });
     serde_json::to_vec(&canonical).context("rules_store::canonical_bytes: serialize")
+}
+
+/// v0.7.0 L1-6 — canonical byte encoding for the substrate-rules
+/// signing pipeline. Commits to the same row fields as
+/// [`canonical_bytes`] PLUS `enabled`. The latter is the
+/// bypass-prevention property: a direct
+/// `UPDATE governance_rules SET enabled = 1` between sign and load
+/// changes the canonical bytes → the recorded signature no longer
+/// verifies → the rule is skipped at enforcement time
+/// (no panic, audit-row logged at `error!`).
+///
+/// `created_at` is intentionally OMITTED so a re-signing pass (idempotent
+/// `ai-memory rules sign-seed` invocations) produces the same bytes
+/// regardless of whether the operator re-ran the migration that seeded
+/// `created_at = 0`. The signed property is "what the rule does", not
+/// "when the seed row landed". A future rotation-policy verb can layer
+/// timestamp commitments on top without changing this primitive.
+///
+/// # Errors
+///
+/// Propagates `serde_json` encoding errors.
+pub fn canonical_bytes_for_signing(rule: &Rule) -> Result<Vec<u8>> {
+    let canonical = serde_json::json!({
+        "id": rule.id,
+        "kind": rule.kind,
+        "matcher": rule.matcher,
+        "severity": rule.severity,
+        "reason": rule.reason,
+        "namespace": rule.namespace,
+        "created_by": rule.created_by,
+        "enabled": rule.enabled,
+    });
+    serde_json::to_vec(&canonical).context("rules_store::canonical_bytes_for_signing: serialize")
+}
+
+/// v0.7.0 L1-6 — verify the operator signature recorded on `rule`
+/// against `operator_pubkey`. Returns `Ok(())` when the signature is
+/// present, well-formed, and verifies against
+/// [`canonical_bytes_for_signing`] of the row.
+///
+/// # Errors
+///
+/// - Returns a `SignatureError` when `rule.signature` is absent.
+/// - Returns a `SignatureError` when the signature is not 64 bytes.
+/// - Returns a `SignatureError` when the Ed25519 verify call fails
+///   (tampered row, wrong operator key, or post-signing direct SQL
+///   mutation — which is exactly the bypass attempt this catches).
+pub fn verify_rule_signature(
+    rule: &Rule,
+    operator_pubkey: &ed25519_dalek::VerifyingKey,
+) -> Result<(), ed25519_dalek::SignatureError> {
+    use ed25519_dalek::{Signature, Verifier};
+
+    let Some(sig_bytes) = rule.signature.as_ref() else {
+        return Err(ed25519_dalek::SignatureError::new());
+    };
+    if sig_bytes.len() != ed25519_dalek::SIGNATURE_LENGTH {
+        return Err(ed25519_dalek::SignatureError::new());
+    }
+    let mut sig_arr = [0u8; ed25519_dalek::SIGNATURE_LENGTH];
+    sig_arr.copy_from_slice(sig_bytes);
+    let signature = Signature::from_bytes(&sig_arr);
+    // canonical_bytes_for_signing can only fail on a serde_json
+    // internal error, which does not happen for the field shapes
+    // here. Map any such failure to a verification error rather than
+    // a panic — the caller is in the load-time enforcement path and
+    // must NOT crash the daemon.
+    let canonical =
+        canonical_bytes_for_signing(rule).map_err(|_| ed25519_dalek::SignatureError::new())?;
+    operator_pubkey.verify(&canonical, &signature)
 }
 
 fn row_to_rule(row: &rusqlite::Row<'_>) -> rusqlite::Result<Rule> {
@@ -416,5 +496,119 @@ mod tests {
         let v = serde_json::to_value(&rule).unwrap();
         let back: Rule = serde_json::from_value(v).unwrap();
         assert_eq!(back, rule);
+    }
+
+    // -----------------------------------------------------------------
+    // L1-6 — canonical_bytes_for_signing + verify_rule_signature
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn canonical_bytes_for_signing_includes_enabled() {
+        let mut rule = make_rule("R1", "bash", true);
+        let bytes_enabled = canonical_bytes_for_signing(&rule).unwrap();
+        rule.enabled = false;
+        let bytes_disabled = canonical_bytes_for_signing(&rule).unwrap();
+        assert_ne!(
+            bytes_enabled, bytes_disabled,
+            "flipping `enabled` must change canonical bytes"
+        );
+        // Both encodings must literally contain the `"enabled"` field.
+        for b in [&bytes_enabled, &bytes_disabled] {
+            let s = std::str::from_utf8(b).unwrap();
+            assert!(s.contains("\"enabled\""), "missing enabled in: {s}");
+        }
+    }
+
+    #[test]
+    fn canonical_bytes_for_signing_excludes_signature_and_attest_level() {
+        let mut rule = make_rule("R1", "bash", true);
+        rule.signature = Some(vec![1, 2, 3, 4]);
+        rule.attest_level = "operator_signed".to_string();
+        let bytes = canonical_bytes_for_signing(&rule).unwrap();
+        let s = std::str::from_utf8(&bytes).unwrap();
+        assert!(!s.contains("signature"), "got: {s}");
+        assert!(!s.contains("attest_level"), "got: {s}");
+        // created_at is also excluded so a re-sign on the same row
+        // (even after a migration replay that wrote a fresh `now()`
+        // timestamp) produces stable bytes.
+        assert!(!s.contains("created_at"), "got: {s}");
+    }
+
+    #[test]
+    fn verify_rule_signature_round_trips_under_correct_key() {
+        use ed25519_dalek::Signer;
+        let mut rule = make_rule("R1", "bash", false);
+        let mut csprng = rand_core::OsRng;
+        let signing = ed25519_dalek::SigningKey::generate(&mut csprng);
+        let verifying = signing.verifying_key();
+        let canonical = canonical_bytes_for_signing(&rule).unwrap();
+        let sig = signing.sign(&canonical);
+        rule.signature = Some(sig.to_bytes().to_vec());
+        assert!(verify_rule_signature(&rule, &verifying).is_ok());
+    }
+
+    #[test]
+    fn verify_rule_signature_fails_on_enabled_flip() {
+        use ed25519_dalek::Signer;
+        let mut rule = make_rule("R1", "bash", false);
+        let mut csprng = rand_core::OsRng;
+        let signing = ed25519_dalek::SigningKey::generate(&mut csprng);
+        let verifying = signing.verifying_key();
+        let canonical = canonical_bytes_for_signing(&rule).unwrap();
+        let sig = signing.sign(&canonical);
+        rule.signature = Some(sig.to_bytes().to_vec());
+        // Now flip `enabled` after signing — verify must fail.
+        rule.enabled = true;
+        assert!(
+            verify_rule_signature(&rule, &verifying).is_err(),
+            "signature must not verify after `enabled` flip"
+        );
+    }
+
+    #[test]
+    fn verify_rule_signature_fails_on_matcher_tamper() {
+        use ed25519_dalek::Signer;
+        let mut rule = make_rule("R1", "bash", false);
+        let mut csprng = rand_core::OsRng;
+        let signing = ed25519_dalek::SigningKey::generate(&mut csprng);
+        let verifying = signing.verifying_key();
+        let canonical = canonical_bytes_for_signing(&rule).unwrap();
+        let sig = signing.sign(&canonical);
+        rule.signature = Some(sig.to_bytes().to_vec());
+        // Tamper with matcher.
+        rule.matcher = r#"{"k":"tampered"}"#.to_string();
+        assert!(verify_rule_signature(&rule, &verifying).is_err());
+    }
+
+    #[test]
+    fn verify_rule_signature_fails_under_wrong_key() {
+        use ed25519_dalek::Signer;
+        let mut rule = make_rule("R1", "bash", false);
+        let mut csprng = rand_core::OsRng;
+        let signing = ed25519_dalek::SigningKey::generate(&mut csprng);
+        let other = ed25519_dalek::SigningKey::generate(&mut csprng);
+        let canonical = canonical_bytes_for_signing(&rule).unwrap();
+        let sig = signing.sign(&canonical);
+        rule.signature = Some(sig.to_bytes().to_vec());
+        // Verify under the wrong public key.
+        assert!(verify_rule_signature(&rule, &other.verifying_key()).is_err());
+    }
+
+    #[test]
+    fn verify_rule_signature_fails_on_missing_signature() {
+        let mut csprng = rand_core::OsRng;
+        let signing = ed25519_dalek::SigningKey::generate(&mut csprng);
+        let rule = make_rule("R1", "bash", false);
+        assert!(rule.signature.is_none());
+        assert!(verify_rule_signature(&rule, &signing.verifying_key()).is_err());
+    }
+
+    #[test]
+    fn verify_rule_signature_fails_on_wrong_length_signature() {
+        let mut csprng = rand_core::OsRng;
+        let signing = ed25519_dalek::SigningKey::generate(&mut csprng);
+        let mut rule = make_rule("R1", "bash", false);
+        rule.signature = Some(vec![0u8; 8]); // not 64
+        assert!(verify_rule_signature(&rule, &signing.verifying_key()).is_err());
     }
 }
