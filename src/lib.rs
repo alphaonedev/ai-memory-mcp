@@ -63,6 +63,11 @@ pub mod mcp;
 pub mod metrics;
 pub mod mine;
 pub mod models;
+// v0.7.0 L2-3 (issue #668) — reflection invalidation propagation.
+// Notification (not cascade) when a Reflection→Reflection supersedes
+// edge lands: walks `reflects_on` edges from dependents and writes
+// notification memories into `<namespace>/_invalidations`.
+pub mod notification;
 // v0.7.0 L1-5 — SKILL.md parser and structured-document ingestion pipelines.
 pub mod parsing;
 // v0.7.0 K9 — unified permission system. Composes declarative
