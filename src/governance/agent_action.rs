@@ -1224,4 +1224,295 @@ mod tests {
         let av = serde_json::to_value(&allow).unwrap();
         assert_eq!(av["decision"], "allow");
     }
+
+    #[test]
+    fn matcher_applies_returns_false_on_kind_mismatch() {
+        let rule = Rule {
+            id: "R".into(),
+            kind: "bash".into(),
+            matcher: r#"{"command_regex":"rm"}"#.into(),
+            severity: "refuse".into(),
+            reason: "r".into(),
+            namespace: "_global".into(),
+            created_by: "test".into(),
+            created_at: 0,
+            enabled: true,
+            signature: None,
+            attest_level: "unsigned".into(),
+        };
+        let action = AgentAction::FilesystemWrite {
+            path: "/x".into(),
+            byte_estimate: None,
+        };
+        assert!(!matcher_applies(&rule, &action));
+    }
+
+    #[test]
+    fn matcher_applies_returns_false_on_malformed_matcher_json() {
+        let rule = Rule {
+            id: "R".into(),
+            kind: "bash".into(),
+            matcher: "{not valid json".into(),
+            severity: "refuse".into(),
+            reason: "r".into(),
+            namespace: "_global".into(),
+            created_by: "test".into(),
+            created_at: 0,
+            enabled: true,
+            signature: None,
+            attest_level: "unsigned".into(),
+        };
+        let action = AgentAction::Bash {
+            command: "ls".into(),
+            cwd: None,
+        };
+        assert!(!matcher_applies(&rule, &action));
+    }
+
+    #[test]
+    fn matcher_applies_bash_with_missing_field_returns_false() {
+        let rule = Rule {
+            id: "R".into(),
+            kind: "bash".into(),
+            matcher: r#"{"other_field":"x"}"#.into(),
+            severity: "refuse".into(),
+            reason: "r".into(),
+            namespace: "_global".into(),
+            created_by: "test".into(),
+            created_at: 0,
+            enabled: true,
+            signature: None,
+            attest_level: "unsigned".into(),
+        };
+        let action = AgentAction::Bash {
+            command: "ls".into(),
+            cwd: None,
+        };
+        assert!(!matcher_applies(&rule, &action));
+    }
+
+    #[test]
+    fn matcher_applies_network_request_exact_host() {
+        let rule = Rule {
+            id: "R".into(),
+            kind: "network_request".into(),
+            matcher: r#"{"host":"evil.example.com"}"#.into(),
+            severity: "refuse".into(),
+            reason: "r".into(),
+            namespace: "_global".into(),
+            created_by: "test".into(),
+            created_at: 0,
+            enabled: true,
+            signature: None,
+            attest_level: "unsigned".into(),
+        };
+        let evil = AgentAction::NetworkRequest {
+            host: "evil.example.com".into(),
+            scheme: "https".into(),
+        };
+        let good = AgentAction::NetworkRequest {
+            host: "good.example.com".into(),
+            scheme: "https".into(),
+        };
+        assert!(matcher_applies(&rule, &evil));
+        assert!(!matcher_applies(&rule, &good));
+    }
+
+    #[test]
+    fn matcher_applies_process_spawn_with_binary_only() {
+        let rule = Rule {
+            id: "R".into(),
+            kind: "process_spawn".into(),
+            matcher: r#"{"binary":"cargo"}"#.into(),
+            severity: "refuse".into(),
+            reason: "r".into(),
+            namespace: "_global".into(),
+            created_by: "test".into(),
+            created_at: 0,
+            enabled: true,
+            signature: None,
+            attest_level: "unsigned".into(),
+        };
+        let cargo = AgentAction::ProcessSpawn {
+            binary: "cargo".into(),
+            args: vec!["build".into()],
+        };
+        let other = AgentAction::ProcessSpawn {
+            binary: "ls".into(),
+            args: vec![],
+        };
+        assert!(matcher_applies(&rule, &cargo));
+        assert!(!matcher_applies(&rule, &other));
+    }
+
+    #[test]
+    fn matcher_applies_process_spawn_with_missing_binary_field() {
+        let rule = Rule {
+            id: "R".into(),
+            kind: "process_spawn".into(),
+            matcher: r#"{}"#.into(),
+            severity: "refuse".into(),
+            reason: "r".into(),
+            namespace: "_global".into(),
+            created_by: "test".into(),
+            created_at: 0,
+            enabled: true,
+            signature: None,
+            attest_level: "unsigned".into(),
+        };
+        let action = AgentAction::ProcessSpawn {
+            binary: "cargo".into(),
+            args: vec![],
+        };
+        assert!(!matcher_applies(&rule, &action));
+    }
+
+    #[test]
+    fn matcher_applies_filesystem_write_missing_glob_field() {
+        let rule = Rule {
+            id: "R".into(),
+            kind: "filesystem_write".into(),
+            matcher: r#"{"other":"x"}"#.into(),
+            severity: "refuse".into(),
+            reason: "r".into(),
+            namespace: "_global".into(),
+            created_by: "test".into(),
+            created_at: 0,
+            enabled: true,
+            signature: None,
+            attest_level: "unsigned".into(),
+        };
+        let action = AgentAction::FilesystemWrite {
+            path: "/x".into(),
+            byte_estimate: None,
+        };
+        assert!(!matcher_applies(&rule, &action));
+    }
+
+    #[test]
+    fn matcher_applies_custom_missing_kind_field() {
+        let rule = Rule {
+            id: "R".into(),
+            kind: "custom".into(),
+            matcher: r#"{}"#.into(),
+            severity: "refuse".into(),
+            reason: "r".into(),
+            namespace: "_global".into(),
+            created_by: "test".into(),
+            created_at: 0,
+            enabled: true,
+            signature: None,
+            attest_level: "unsigned".into(),
+        };
+        let action = AgentAction::Custom {
+            custom_kind: "memory_write".into(),
+            payload: serde_json::json!({}),
+        };
+        assert!(!matcher_applies(&rule, &action));
+    }
+
+    #[test]
+    fn count_matching_rules_returns_count() {
+        let conn = fresh_conn();
+        add_rule(
+            &conn,
+            "R1",
+            "bash",
+            r#"{"command_regex":"rm"}"#,
+            "refuse",
+            true,
+        );
+        add_rule(
+            &conn,
+            "R2",
+            "bash",
+            r#"{"command_regex":"rm"}"#,
+            "warn",
+            true,
+        );
+        add_rule(
+            &conn,
+            "R3",
+            "bash",
+            r#"{"command_regex":"ls"}"#,
+            "refuse",
+            true,
+        );
+        let action = AgentAction::Bash {
+            command: "rm -rf".into(),
+            cwd: None,
+        };
+        let count = count_matching_rules(&conn, &action).unwrap();
+        assert_eq!(count, 2, "two rules match 'rm', one matches 'ls'");
+    }
+
+    #[test]
+    fn count_matching_rules_zero_when_no_rules() {
+        let conn = fresh_conn();
+        let action = AgentAction::Bash {
+            command: "ls".into(),
+            cwd: None,
+        };
+        let count = count_matching_rules(&conn, &action).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn decision_matches_for_each_variant() {
+        let w = Decision::Warn {
+            rule_id: "W".into(),
+            reason: "warn".into(),
+        };
+        assert!(matches!(w, Decision::Warn { .. }));
+        let allow = Decision::Allow;
+        assert!(matches!(allow, Decision::Allow));
+        assert!(allow.is_allowed());
+        let refuse = Decision::Refuse {
+            rule_id: "R".into(),
+            reason: "no".into(),
+        };
+        assert!(refuse.is_refusal());
+    }
+
+    #[test]
+    fn severity_as_str_round_trip() {
+        for s in [Severity::Refuse, Severity::Warn, Severity::Log] {
+            let back = Severity::from_str(s.as_str()).unwrap();
+            assert_eq!(s, back);
+        }
+    }
+
+    #[test]
+    fn agent_action_serialize_round_trip_for_each_variant() {
+        let actions = [
+            AgentAction::Bash {
+                command: "ls".into(),
+                cwd: None,
+            },
+            AgentAction::FilesystemWrite {
+                path: "/tmp/x".into(),
+                byte_estimate: Some(1024),
+            },
+            AgentAction::NetworkRequest {
+                host: "h.example.com".into(),
+                scheme: "https".into(),
+            },
+            AgentAction::ProcessSpawn {
+                binary: "cargo".into(),
+                args: vec!["build".into()],
+            },
+            AgentAction::Custom {
+                custom_kind: "memory_write".into(),
+                payload: serde_json::json!({"ns": "a"}),
+            },
+        ];
+        for a in &actions {
+            let json = serde_json::to_value(a).unwrap();
+            assert!(json.is_object(), "action should serialize as object");
+            // Has discriminator field.
+            assert!(
+                json["type"].is_string() || json["kind"].is_string() || json.get("type").is_some()
+            );
+        }
+    }
 }
