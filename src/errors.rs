@@ -384,6 +384,87 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // L1-2 — ReflectionCycleDetected variant coverage
+    // (anti-self-reflection cycle check on memory_link)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn reflection_cycle_detected_code() {
+        let err = MemoryError::ReflectionCycleDetected {
+            source: "uuid-A".into(),
+            target: "uuid-B".into(),
+            cycle_path: vec!["uuid-B".into(), "uuid-C".into(), "uuid-A".into()],
+        };
+        assert_eq!(err.code(), "REFLECTION_CYCLE_DETECTED");
+    }
+
+    #[test]
+    fn reflection_cycle_detected_status_is_conflict() {
+        let err = MemoryError::ReflectionCycleDetected {
+            source: "src".into(),
+            target: "dst".into(),
+            cycle_path: vec!["dst".into(), "src".into()],
+        };
+        assert_eq!(err.status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn reflection_cycle_detected_message_contains_path() {
+        let err = MemoryError::ReflectionCycleDetected {
+            source: "uuid-A".into(),
+            target: "uuid-B".into(),
+            cycle_path: vec!["uuid-B".into(), "uuid-C".into(), "uuid-A".into()],
+        };
+        let msg = err.message();
+        assert!(
+            msg.contains("uuid-A"),
+            "expected source UUID in message, got: {msg}"
+        );
+        assert!(
+            msg.contains("uuid-B"),
+            "expected target UUID in message, got: {msg}"
+        );
+        assert!(
+            msg.contains("uuid-C"),
+            "expected cycle path intermediate in message, got: {msg}"
+        );
+        assert!(
+            msg.contains("cycle"),
+            "expected cycle context in message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn reflection_cycle_detected_display_includes_code() {
+        let err = MemoryError::ReflectionCycleDetected {
+            source: "s".into(),
+            target: "t".into(),
+            cycle_path: vec!["t".into(), "s".into()],
+        };
+        let s = format!("{err}");
+        assert!(
+            s.contains("REFLECTION_CYCLE_DETECTED"),
+            "Display should include code prefix; got: {s}"
+        );
+        assert!(
+            s.contains("cycle"),
+            "Display should describe the cycle; got: {s}"
+        );
+    }
+
+    #[test]
+    fn reflection_cycle_detected_into_response_is_conflict() {
+        use axum::response::IntoResponse;
+        let err = MemoryError::ReflectionCycleDetected {
+            source: "s".into(),
+            target: "t".into(),
+            cycle_path: vec!["t".into(), "s".into()],
+        };
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    // -----------------------------------------------------------------
     // L1-6 Deliverable E — RefusedByGovernance variant coverage
     // (storage::insert pre-write hook refusal path)
     // -----------------------------------------------------------------
