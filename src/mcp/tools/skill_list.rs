@@ -106,3 +106,189 @@ pub(super) fn handle_skill_list(conn: &Connection, params: &Value) -> Result<Val
         "skills": skills,
     }))
 }
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::params;
+
+    fn open_db() -> rusqlite::Connection {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("test.db");
+        let conn = crate::db::open(&path).expect("db::open");
+        std::mem::forget(dir);
+        conn
+    }
+
+    fn insert_skill(
+        conn: &rusqlite::Connection,
+        id: &str,
+        ns: &str,
+        name: &str,
+        description: &str,
+        created_at: i64,
+    ) {
+        let body_blob = zstd::encode_all(b"body".as_slice(), 3).unwrap();
+        let digest = vec![0u8; 32];
+        conn.execute(
+            "INSERT INTO skills (id, namespace, name, description, metadata, body_blob, digest, created_at) \
+             VALUES (?1, ?2, ?3, ?4, '{}', ?5, ?6, ?7)",
+            params![id, ns, name, description, body_blob, digest, created_at],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn empty_db_returns_empty_list() {
+        let conn = open_db();
+        let v = handle_skill_list(&conn, &json!({})).unwrap();
+        assert_eq!(v["count"], json!(0));
+        assert_eq!(v["skills"], json!([]));
+    }
+
+    #[test]
+    fn returns_only_current_non_superseded() {
+        let conn = open_db();
+        insert_skill(&conn, "id-old", "ns", "name", "old", 0);
+        insert_skill(&conn, "id-new", "ns", "name", "new", 1);
+        conn.execute(
+            "UPDATE skills SET superseded_by = 'id-new' WHERE id = 'id-old'",
+            [],
+        )
+        .unwrap();
+
+        let v = handle_skill_list(&conn, &json!({})).unwrap();
+        assert_eq!(v["count"], json!(1));
+        let arr = v["skills"].as_array().unwrap();
+        assert_eq!(arr[0]["id"], json!("id-new"));
+    }
+
+    #[test]
+    fn filters_by_namespace() {
+        let conn = open_db();
+        insert_skill(&conn, "a", "ns-a", "ska", "a", 0);
+        insert_skill(&conn, "b", "ns-b", "skb", "b", 1);
+
+        let v = handle_skill_list(&conn, &json!({"namespace": "ns-a"})).unwrap();
+        assert_eq!(v["count"], json!(1));
+        assert_eq!(v["skills"][0]["namespace"], json!("ns-a"));
+    }
+
+    #[test]
+    fn wildcard_namespace_returns_all() {
+        let conn = open_db();
+        insert_skill(&conn, "a", "ns-a", "ska", "a", 0);
+        insert_skill(&conn, "b", "ns-b", "skb", "b", 1);
+
+        let v = handle_skill_list(&conn, &json!({"namespace": "%"})).unwrap();
+        assert_eq!(v["count"], json!(2));
+    }
+
+    #[test]
+    fn no_namespace_defaults_to_wildcard() {
+        let conn = open_db();
+        insert_skill(&conn, "a", "ns-a", "ska", "a", 0);
+        insert_skill(&conn, "b", "ns-b", "skb", "b", 1);
+
+        let v = handle_skill_list(&conn, &json!({})).unwrap();
+        assert_eq!(v["count"], json!(2));
+    }
+
+    #[test]
+    fn filter_matches_name() {
+        let conn = open_db();
+        insert_skill(&conn, "a", "ns", "deploy-canary", "k8s canary deploy", 0);
+        insert_skill(&conn, "b", "ns", "audit-logs", "fetch audit logs", 1);
+
+        let v = handle_skill_list(&conn, &json!({"filter": "canary"})).unwrap();
+        assert_eq!(v["count"], json!(1));
+        assert_eq!(v["skills"][0]["id"], json!("a"));
+    }
+
+    #[test]
+    fn filter_matches_description() {
+        let conn = open_db();
+        insert_skill(&conn, "a", "ns", "x", "kubernetes deploy notes", 0);
+        insert_skill(&conn, "b", "ns", "y", "totally different", 1);
+
+        let v = handle_skill_list(&conn, &json!({"filter": "kubernetes"})).unwrap();
+        assert_eq!(v["count"], json!(1));
+    }
+
+    #[test]
+    fn filter_no_match_returns_empty() {
+        let conn = open_db();
+        insert_skill(&conn, "a", "ns", "x", "k8s", 0);
+
+        let v = handle_skill_list(&conn, &json!({"filter": "no-such-text"})).unwrap();
+        assert_eq!(v["count"], json!(0));
+    }
+
+    #[test]
+    fn includes_optional_columns_when_present() {
+        let conn = open_db();
+        let body_blob = zstd::encode_all(b"body".as_slice(), 3).unwrap();
+        let digest = vec![0xab_u8; 32];
+        let allowed_tools = serde_json::to_string(&vec!["tool1"]).unwrap();
+        let metadata = serde_json::json!({"author": "alice"}).to_string();
+        conn.execute(
+            "INSERT INTO skills (id, namespace, name, description, license, compatibility, \
+                                  allowed_tools, metadata, body_blob, digest, signing_agent, \
+                                  created_at) \
+             VALUES ('id1', 'ns', 'name', 'd', 'MIT', 'v1', ?1, ?2, ?3, ?4, 'agent:bob', 0)",
+            params![allowed_tools, metadata, body_blob, digest],
+        )
+        .unwrap();
+
+        let v = handle_skill_list(&conn, &json!({})).unwrap();
+        let entry = &v["skills"][0];
+        assert_eq!(entry["license"], json!("MIT"));
+        assert_eq!(entry["compatibility"], json!("v1"));
+        assert_eq!(entry["signing_agent"], json!("agent:bob"));
+        assert_eq!(entry["allowed_tools"], json!(["tool1"]));
+        assert_eq!(entry["metadata"]["author"], json!("alice"));
+        // digest is hex.
+        let dig = entry["digest"].as_str().unwrap();
+        assert_eq!(dig.len(), 64);
+    }
+
+    #[test]
+    fn omits_empty_metadata_object() {
+        let conn = open_db();
+        insert_skill(&conn, "a", "ns", "x", "d", 0);
+        let v = handle_skill_list(&conn, &json!({})).unwrap();
+        let entry = &v["skills"][0];
+        // metadata `{}` is omitted from the response.
+        assert!(entry.get("metadata").is_none());
+    }
+
+    #[test]
+    fn ignores_malformed_allowed_tools_json() {
+        let conn = open_db();
+        let body_blob = zstd::encode_all(b"body".as_slice(), 3).unwrap();
+        let digest = vec![0u8; 32];
+        conn.execute(
+            "INSERT INTO skills (id, namespace, name, description, allowed_tools, metadata, \
+                                  body_blob, digest, created_at) \
+             VALUES ('id1', 'ns', 'x', 'd', 'not-json', '{}', ?1, ?2, 0)",
+            params![body_blob, digest],
+        )
+        .unwrap();
+        let v = handle_skill_list(&conn, &json!({})).unwrap();
+        // allowed_tools should be absent on parse failure.
+        assert!(v["skills"][0].get("allowed_tools").is_none());
+    }
+
+    #[test]
+    fn empty_filter_string_is_no_filter() {
+        let conn = open_db();
+        insert_skill(&conn, "a", "ns", "x", "d", 0);
+        insert_skill(&conn, "b", "ns", "y", "e", 1);
+        let v = handle_skill_list(&conn, &json!({"filter": ""})).unwrap();
+        assert_eq!(v["count"], json!(2));
+    }
+}
