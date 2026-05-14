@@ -1125,10 +1125,57 @@ mod tests {
             },
             ExecutorError::Timeout { ms: 1234 },
             ExecutorError::DaemonUnavailable { attempts: 5 },
+            ExecutorError::GovernanceRefused {
+                command: "/usr/bin/cargo".into(),
+                reason: "R004: cargo forbidden on low-disk".into(),
+            },
         ];
         for e in cases {
             let s = e.to_string();
             assert!(!s.is_empty(), "Display empty for {e:?}");
         }
+    }
+
+    #[test]
+    fn executor_error_governance_refused_display_names_both_fields() {
+        // v0.7.0 (issue #691 fold-1) — pin the user-visible message
+        // shape for the PE-1 wire-point refusal so an operator-facing
+        // log line carries the command path AND the rule's authored
+        // reason (no truncation, no PII rewrite). The chain runner's
+        // cascade policy may classify on the prefix "hook spawn refused
+        // by governance" — change the wording here in lockstep.
+        let err = ExecutorError::GovernanceRefused {
+            command: "/opt/homebrew/bin/cargo".into(),
+            reason: "R004 cargo forbidden".into(),
+        };
+        let s = err.to_string();
+        assert!(
+            s.contains("/opt/homebrew/bin/cargo"),
+            "Display must surface the command path: {s}"
+        );
+        assert!(
+            s.contains("R004 cargo forbidden"),
+            "Display must surface the rule's reason: {s}"
+        );
+        assert!(
+            s.contains("refused by governance"),
+            "Display must carry the governance-refusal marker: {s}"
+        );
+    }
+
+    #[test]
+    fn executor_error_governance_refused_source_is_none() {
+        // GovernanceRefused has no underlying io error or cause —
+        // `Error::source` must return `None` so the anyhow chain
+        // doesn't accidentally show an empty "caused by:" line in
+        // operator logs. The Spawn / Io variants are the only ones
+        // that carry sources; this pins the negative case so a future
+        // refactor that adds a wrapped error here is forced to update
+        // the test explicitly.
+        let err = ExecutorError::GovernanceRefused {
+            command: "/bin/x".into(),
+            reason: "denied".into(),
+        };
+        assert!(std::error::Error::source(&err).is_none());
     }
 }
