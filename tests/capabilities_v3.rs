@@ -175,22 +175,23 @@ fn cap_v3_summary_core_profile_counts_and_names_recovery_paths() {
     // "{n_loaded} memory tool{s}" phrasing. Core profile loads
     // `Family::Core` (7 tools) and does NOT load `Family::Meta`, so
     // visible memory tools = 7 (the bootstrap is plumbing, not a
-    // memory tool). Total memory tools = 56 - 1 = 55 (55 substantive;
-    // bumped to 56 total in v0.7.0 L1-5 — Family::Other gained 5
-    // memory_skill_* tools).
+    // memory tool). Total memory tools = 61 - 1 = 60 (60 substantive;
+    // bumped via v0.7.0 L1-5 5×memory_skill_* + v0.7.0 L2-7
+    // memory_skill_compositional_context).
     assert!(
-        summary.starts_with("7 of 61 memory tools"),
-        "core profile summary should open with \"7 of 61 memory tools\" (Round-2 F13; \
+        summary.starts_with("7 of 62 memory tools"),
+        "core profile summary should open with \"7 of 62 memory tools\" (Round-2 F13; \
          v0.7.0 issue #691 added memory_check_agent_action + memory_rule_list, \
          v0.7.0 L1-5 added 5 memory_skill_* tools to Family::Other, v0.7.0 L2-3 \
-         added memory_dependents_of_invalidated to Family::Power, and v0.7.0 L2-6 \
-         added memory_skill_promote_from_reflection to Family::Other — bumping the \
-         substantive total from 52 to 61); got: {summary}"
+         added memory_dependents_of_invalidated to Family::Power, v0.7.0 L2-6 \
+         added memory_skill_promote_from_reflection to Family::Other, and v0.7.0 \
+         L2-7 added memory_skill_compositional_context to Family::Other — bumping \
+         the substantive total from 52 to 62); got: {summary}"
     );
     assert!(summary.contains("(core)"), "must label the profile as core");
     assert!(
-        summary.contains("54 are listed in this manifest"),
-        "core profile must report 54 unloaded (61 - 7); got: {summary}"
+        summary.contains("55 are listed in this manifest"),
+        "core profile must report 55 unloaded (62 - 7); got: {summary}"
     );
 
     // Three named recovery paths must all appear (verbatim names — these
@@ -227,12 +228,13 @@ fn cap_v3_summary_full_profile_reports_all_visible() {
     // 5 memory_skill_* tools to Family::Other, bumping the substantive
     // total from 51 to 56.
     assert!(
-        summary.starts_with("61 of 61 memory tools"),
-        "full profile summary should open with \"61 of 61 memory tools\" (Round-2 F13; \
+        summary.starts_with("62 of 62 memory tools"),
+        "full profile summary should open with \"62 of 62 memory tools\" (Round-2 F13; \
          v0.7.0 issue #691 added memory_check_agent_action + memory_rule_list, \
          v0.7.0 L1-5 added 5 memory_skill_* tools, v0.7.0 L2-3 added \
-         memory_dependents_of_invalidated, and v0.7.0 L2-6 added \
-         memory_skill_promote_from_reflection); got: {summary}"
+         memory_dependents_of_invalidated, v0.7.0 L2-6 added \
+         memory_skill_promote_from_reflection, and v0.7.0 L2-7 added \
+         memory_skill_compositional_context); got: {summary}"
     );
     assert!(summary.contains("(full)"));
     assert!(
@@ -259,16 +261,17 @@ fn cap_v3_summary_graph_profile_counts() {
     // memory tools. Total = 55 (56 - bootstrap; v0.7.0 L1-5 added 5
     // memory_skill_* tools to Family::Other, bumping total from 51 to 56).
     assert!(
-        summary.starts_with("18 of 61 memory tools"),
+        summary.starts_with("18 of 62 memory tools"),
         "graph profile = 7 core (v0.7 B1+B2) + 11 graph (v0.7 J7) = 18 memory tools \
          (Round-2 F13: bootstrap excluded; v0.7.0 issue #691 added two power tools, \
          v0.7.0 L1-5 added 5 memory_skill_* tools to Family::Other, v0.7.0 L2-3 \
-         added memory_dependents_of_invalidated, and v0.7.0 L2-6 added \
-         memory_skill_promote_from_reflection, bumping the substantive total from \
-         52 to 61); got: {summary}"
+         added memory_dependents_of_invalidated, v0.7.0 L2-6 added \
+         memory_skill_promote_from_reflection, and v0.7.0 L2-7 added \
+         memory_skill_compositional_context, bumping the substantive total from \
+         52 to 62); got: {summary}"
     );
     assert!(summary.contains("(graph)"));
-    assert!(summary.contains("43 are listed in this manifest"));
+    assert!(summary.contains("44 are listed in this manifest"));
 }
 
 // ---------------------------------------------------------------------------
@@ -368,12 +371,13 @@ fn cap_v3_describe_core_profile_is_plain_english_with_loaded_names() {
     // for honest user-facing counting. Total bumped to 56 in v0.7.0
     // L1-5 (Family::Other gained 5 memory_skill_* tools).
     assert!(
-        describe.contains("54 more"),
-        "core profile must report 54 unloaded (61 - 7); v0.7.0 issue #691 \
+        describe.contains("55 more"),
+        "core profile must report 55 unloaded (62 - 7); v0.7.0 issue #691 \
          added memory_check_agent_action + memory_rule_list, v0.7.0 L1-5 added \
          5 memory_skill_* tools, v0.7.0 L2-3 added \
-         memory_dependents_of_invalidated, and v0.7.0 L2-6 added \
-         memory_skill_promote_from_reflection, bumping the substantive total to 61; \
+         memory_dependents_of_invalidated, v0.7.0 L2-6 added \
+         memory_skill_promote_from_reflection, and v0.7.0 L2-7 added \
+         memory_skill_compositional_context, bumping the substantive total to 62; \
          got: {describe}"
     );
     // Sample of unloaded tools is plain (no memory_ prefix). The first
@@ -625,8 +629,8 @@ fn cap_v3_response_carries_tools_array_with_51_entries() {
         .expect("top-level tools must be present and an array under v3");
     assert_eq!(
         tools.len(),
-        61,
-        "v3 must surface all 61 tools regardless of profile (v0.7.0 I4 added \
+        63,
+        "v3 must surface all 63 tools regardless of profile (v0.7.0 I4 added \
          memory_replay; v0.7 H4 added memory_verify; v0.7 B1 added \
          memory_load_family; v0.7 B2 added memory_smart_load; v0.7 K7 added \
          memory_subscription_replay + memory_subscription_dlq_list; v0.7 J7 \
@@ -635,7 +639,8 @@ fn cap_v3_response_carries_tools_array_with_51_entries() {
          v0.7.0 L2-3 added memory_dependents_of_invalidated; \
          v0.7.0 issue #691 added memory_check_agent_action + memory_rule_list; \
          v0.7.0 L1-5 added 5 memory_skill_* tools; v0.7.0 L2-6 added \
-         memory_skill_promote_from_reflection); got {}",
+         memory_skill_promote_from_reflection; v0.7.0 L2-7 added \
+         memory_skill_compositional_context); got {}",
         tools.len()
     );
 

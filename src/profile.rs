@@ -192,8 +192,9 @@ impl Family {
             | "memory_archive_purge"
             | "memory_archive_restore"
             | "memory_archive_stats" => Some(Self::Archive),
-            // other (8 — v0.7.0 L1-5 adds 5 skill tools; v0.7.0 L2-6 adds
-            // memory_skill_promote_from_reflection — issue #671)
+            // other (9 — 2 baseline + v0.7.0 L1-5 5 skill tools +
+            // v0.7.0 L2-6 memory_skill_promote_from_reflection (#671) +
+            // v0.7.0 L2-7 memory_skill_compositional_context (#672))
             "memory_list_subscriptions"
             | "memory_notify"
             | "memory_skill_register"
@@ -201,7 +202,8 @@ impl Family {
             | "memory_skill_get"
             | "memory_skill_resource"
             | "memory_skill_export"
-            | "memory_skill_promote_from_reflection" => Some(Self::Other),
+            | "memory_skill_promote_from_reflection"
+            | "memory_skill_compositional_context" => Some(Self::Other),
             _ => None,
         }
     }
@@ -261,7 +263,9 @@ impl Family {
             // v0.7.0 L1-5 — 5 skill tools added to the Other family.
             // v0.7.0 L2-6 (issue #671) — memory_skill_promote_from_reflection
             // closes the recursive-learning loop → 8.
-            Self::Other => 8,
+            // v0.7.0 L2-7 (issue #672) — memory_skill_compositional_context
+            // composition declaration → 9.
+            Self::Other => 9,
         }
     }
 
@@ -391,6 +395,8 @@ impl Family {
                 "memory_skill_export",
                 // v0.7.0 L2-6 (issue #671) — closing the recursive-learning loop.
                 "memory_skill_promote_from_reflection",
+                // v0.7.0 L2-7 (issue #672) — reflection-skill composition.
+                "memory_skill_compositional_context",
             ],
         }
     }
@@ -663,7 +669,7 @@ mod tests {
     fn family_expected_tool_counts_sum_to_51() {
         let total: usize = Family::all().iter().map(|f| f.expected_tool_count()).sum();
         assert_eq!(
-            total, 62,
+            total, 63,
             "v0.6.3.1 baseline (43) + v0.7.0 I4 `memory_replay` + v0.7 H4 \
              `memory_verify` + v0.7 B1 `memory_load_family` + v0.7 B2 \
              `memory_smart_load` + v0.7 K7 `memory_subscription_replay` \
@@ -673,7 +679,8 @@ mod tests {
              v0.7.0 L2-3 `memory_dependents_of_invalidated` + \
              v0.7.0 issue #691 `memory_check_agent_action` + \
              `memory_rule_list` + v0.7.0 L1-5 5×skill tools + \
-             v0.7.0 L2-6 `memory_skill_promote_from_reflection` = 62. \
+             v0.7.0 L2-6 `memory_skill_promote_from_reflection` + \
+             v0.7.0 L2-7 `memory_skill_compositional_context` = 63. \
              If this drifts, update Family::expected_tool_count and the \
              family map docs together."
         );
@@ -763,7 +770,7 @@ mod tests {
     #[test]
     fn profile_full_has_fifty_one_tools() {
         let p = Profile::full();
-        // v0.7.0 L2-3 + L2-6 cascade — full surface = 43 baseline +
+        // v0.7.0 L2 cascade (L2-3 + L2-6 + L2-7) — full surface = 43 baseline +
         // memory_replay (I4) + memory_verify (H4) + memory_load_family (B1)
         // + memory_smart_load (B2) + memory_subscription_replay (K7) +
         // memory_subscription_dlq_list (K7) + memory_find_paths (J7) +
@@ -771,8 +778,8 @@ mod tests {
         // memory_reflection_origin (L2-2) + memory_dependents_of_invalidated
         // (L2-3) + memory_check_agent_action + memory_rule_list (#691) +
         // 5×memory_skill_* (L1-5) + memory_skill_promote_from_reflection
-        // (L2-6, #671) = 62.
-        assert_eq!(p.expected_tool_count(), 62);
+        // (L2-6, #671) + memory_skill_compositional_context (L2-7, #672) = 63.
+        assert_eq!(p.expected_tool_count(), 63);
 
         // The K7+K8 + Task 4/8 + L2-2 + L2-3 + #691 additions live in
         // Family::Power (operator/governance), so the `power` profile
@@ -968,10 +975,12 @@ mod tests {
             "memory_skill_export",
             // other (v0.7.0 L2-6 — issue #671: reflections become skills)
             "memory_skill_promote_from_reflection",
+            // v0.7.0 L2-7 (issue #672) — reflection-skill composition.
+            "memory_skill_compositional_context",
         ];
         assert_eq!(
             baseline.len(),
-            58,
+            59,
             "baseline list = 43 (v0.6.3.1) + 1 (v0.7.0 I4 memory_replay) + \
              1 (v0.7 H4 memory_verify) + 1 (v0.7 B1 memory_load_family) + \
              1 (v0.7 B2 memory_smart_load) + \
@@ -979,7 +988,8 @@ mod tests {
              1 (v0.7 J7 memory_find_paths) + 1 (v0.7 K8 memory_quota_status) + \
              1 (v0.7.0 Task 4/8 memory_reflect) + \
              5 (v0.7.0 L1-5 skill tools) + \
-             1 (v0.7.0 L2-6 memory_skill_promote_from_reflection) = 58"
+             1 (v0.7.0 L2-6 memory_skill_promote_from_reflection) + \
+             1 (v0.7.0 L2-7 memory_skill_compositional_context) = 59"
         );
         for name in baseline {
             assert!(
