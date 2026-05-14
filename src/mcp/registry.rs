@@ -821,6 +821,18 @@ pub fn tool_definitions() -> Value {
                 }
             },
             {
+                "name": "memory_dependents_of_invalidated",
+                "description": "List dependents flagged by the L2-3 invalidation walker.",
+                "docs": "v0.7.0 L2-3 (issue #668) — returns the set of memories whose `reflects_on` edge points at a given reflection — i.e. the dependents that are (or would be) notified when that reflection is superseded by another reflection. Pure read-only — does not trigger the walker or mutate the DB. The walker itself fires from the `memory_link` handler when a Reflection→Reflection `supersedes` edge lands: it writes one notification memory per dependent under `<dependent.namespace>/_invalidations` with `metadata.notification_kind = 'reflection_invalidation'` and the four-tuple `{dependent_id, invalidated_id, invalidating_id, timestamp}`. Notification, NOT cascade — dependents are flagged for operator/curator review, never auto-superseded. Returns `{memory_id, count, dependents: [{id, namespace}]}`. Unknown ids return an empty `dependents` array with `count = 0`.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "memory_id": {"type": "string", "description": "ID of the (potentially) invalidated reflection. Returns the inbound `reflects_on` dependents."}
+                    },
+                    "required": ["memory_id"]
+                }
+            },
+            {
                 "name": "memory_consolidate",
                 "description": "Consolidate multiple memories into one long-term summary.",
                 "docs": "Consolidate multiple memories into one long-term summary. Deletes source memories and creates derived_from links from the consolidated memory back to each source. If summary is omitted and an LLM is available (smart/autonomous tier), the summary is auto-generated. Minimum 2, maximum 100 source ids per call.",

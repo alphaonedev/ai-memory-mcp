@@ -10,6 +10,12 @@ use std::path::Path;
 /// Relation string for the recursive-learning reflection edge.
 const REFLECTS_ON: &str = "reflects_on";
 
+/// Relation string for the directed supersedes edge (winner → loser).
+/// v0.7.0 L2-3 (#668): a `supersedes` edge whose source AND target are
+/// both `MemoryKind::Reflection` triggers the invalidation-notification
+/// walker — see `crate::notification::invalidation`.
+const SUPERSEDES: &str = "supersedes";
+
 pub(super) fn handle_link(
     conn: &rusqlite::Connection,
     db_path: &Path,
@@ -207,11 +213,75 @@ pub(super) fn handle_link(
         details,
     );
 
+    // v0.7.0 L2-3 (#668) — Reflection invalidation propagation
+    // (notification, not cascade).
+    //
+    // When a `supersedes` edge lands whose source AND target are
+    // both `memory_kind = 'reflection'`, walk every memory that
+    // `reflects_on` the now-invalidated reflection (the target of
+    // the supersedes) and write one notification memory per
+    // dependent under `<dependent.namespace>/_invalidations`. The
+    // dependents are NOT auto-superseded — operators and the
+    // curator decide per-dependent. See the module-level doc in
+    // `crate::notification::invalidation` for the contract.
+    //
+    // Best-effort: a substrate error here does NOT roll back the
+    // supersedes edge (which has already committed). The walker
+    // logs and continues so a single malformed dependent row can't
+    // block the rest of the fan-out. Test coverage lives in
+    // `tests/notification.rs` and the module's `#[cfg(test)]`.
+    let mut invalidation_notified: Vec<String> = Vec::new();
+    if relation == SUPERSEDES {
+        let source_is_reflection = matches!(
+            db::get(conn, source_id)
+                .ok()
+                .flatten()
+                .map(|m| m.memory_kind),
+            Some(crate::models::MemoryKind::Reflection)
+        );
+        let target_is_reflection = matches!(
+            db::get(conn, target_id)
+                .ok()
+                .flatten()
+                .map(|m| m.memory_kind),
+            Some(crate::models::MemoryKind::Reflection)
+        );
+        if source_is_reflection && target_is_reflection {
+            let signing_agent_id = params["agent_id"]
+                .as_str()
+                .unwrap_or(event_agent_id.as_deref().unwrap_or("system"))
+                .to_string();
+            match crate::notification::invalidation::propagate_reflection_invalidation(
+                conn,
+                target_id,
+                source_id,
+                &signing_agent_id,
+            ) {
+                Ok(ids) => invalidation_notified = ids,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "notification.invalidation",
+                        invalidated_id = target_id,
+                        invalidating_id = source_id,
+                        "reflection invalidation walker failed: {e}"
+                    );
+                }
+            }
+        }
+    }
+
     Ok(json!({
         "linked": true,
         "source_id": source_id,
         "target_id": target_id,
         "relation": relation,
+        // v0.7.0 L2-3 (#668) — when this is a Reflection→Reflection
+        // supersedes edge, surfaces the list of dependent memory ids
+        // that had a `_invalidations` notification written. Empty for
+        // every other relation, and for supersedes between non-
+        // reflection memories. Callers can use this to log/UI the
+        // size of the operator-review queue this edge created.
+        "invalidation_notified": invalidation_notified,
         // v0.7 H2 — wire-level visibility into whether the link was
         // signed by an Ed25519 keypair on this writer. "self_signed"
         // when active_keypair was Some + signing succeeded;

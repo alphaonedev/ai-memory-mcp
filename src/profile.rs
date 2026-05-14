@@ -169,6 +169,11 @@ impl Family {
             | "memory_quota_status"
             | "memory_reflect"
             | "memory_reflection_origin"
+            // v0.7.0 L2-3 (issue #668) — read-side surface for the
+            // reflection invalidation propagation walker. Operator-
+            // facing inspector for the per-reflection dependent set
+            // that gets notified on Reflection→Reflection supersedes.
+            | "memory_dependents_of_invalidated"
             // v0.7.0 (issue #691) — substrate-level agent-action rules
             // engine. Both tools live in Family::Power (governance /
             // operator-facing, not data-plane). Mutation tools are
@@ -246,9 +251,10 @@ impl Family {
             // Power: 6 baseline + 2 (v0.7 K7) + 1 (v0.7 K8 quota_status) +
             // 1 (v0.7.0 Task 4/8 — memory_reflect substrate primitive) +
             // 1 (v0.7.0 L2-2 / S6-M1 — memory_reflection_origin) +
+            // 1 (v0.7.0 L2-3 / #668 — memory_dependents_of_invalidated) +
             // 2 (v0.7.0 issue #691 — memory_check_agent_action +
-            // memory_rule_list, substrate-level agent-action rules) = 13.
-            Self::Power => 13,
+            // memory_rule_list, substrate-level agent-action rules) = 14.
+            Self::Power => 14,
             Self::Archive => 4,
             // v0.7.0 L1-5 — 5 skill tools added to the Other family.
             Self::Other => 7,
@@ -347,6 +353,10 @@ impl Family {
                 // inspector. Returns peer_origin / signing_agent /
                 // original_depth / local_depth_at_arrival for a row.
                 "memory_reflection_origin",
+                // v0.7.0 L2-3 (issue #668) — invalidation propagation
+                // read-side inspector. Lists dependents flagged by
+                // the walker on Reflection→Reflection supersedes.
+                "memory_dependents_of_invalidated",
                 // v0.7.0 (issue #691) — substrate-level agent-action
                 // rules engine. Read-side surface; mutation tools are
                 // NOT registered over MCP (operator uses CLI / HTTP).
@@ -647,15 +657,16 @@ mod tests {
     fn family_expected_tool_counts_sum_to_51() {
         let total: usize = Family::all().iter().map(|f| f.expected_tool_count()).sum();
         assert_eq!(
-            total, 60,
+            total, 61,
             "v0.6.3.1 baseline (43) + v0.7.0 I4 `memory_replay` + v0.7 H4 \
              `memory_verify` + v0.7 B1 `memory_load_family` + v0.7 B2 \
              `memory_smart_load` + v0.7 K7 `memory_subscription_replay` \
              + `memory_subscription_dlq_list` + v0.7 J7 `memory_find_paths` \
              + v0.7 K8 `memory_quota_status` + v0.7.0 Task 4/8 \
              `memory_reflect` + v0.7.0 L2-2 `memory_reflection_origin` + \
+             v0.7.0 L2-3 `memory_dependents_of_invalidated` + \
              v0.7.0 issue #691 `memory_check_agent_action` + \
-             `memory_rule_list` + v0.7.0 L1-5 5×skill tools = 60. \
+             `memory_rule_list` + v0.7.0 L1-5 5×skill tools = 61. \
              If this drifts, update Family::expected_tool_count and the \
              family map docs together."
         );
@@ -736,27 +747,29 @@ mod tests {
         // v0.7 K8 — Power got memory_quota_status (+1 → 9).
         // v0.7.0 Task 4/8 — Power got memory_reflect (+1 → 10).
         // v0.7.0 L2-2 — Power got memory_reflection_origin (+1 → 11).
+        // v0.7.0 L2-3 — Power got memory_dependents_of_invalidated (+1 → 12).
         // v0.7.0 issue #691 — Power got memory_check_agent_action +
-        // memory_rule_list (+2 → 13).
-        assert_eq!(p.expected_tool_count(), 7 + 13);
+        // memory_rule_list (+2 → 14).
+        assert_eq!(p.expected_tool_count(), 7 + 14);
     }
 
     #[test]
     fn profile_full_has_fifty_one_tools() {
         let p = Profile::full();
-        // v0.7.0 L1-5 (post-#691 / L2-2) — full surface = 43 baseline +
+        // v0.7.0 L2-3 (post-#691 / L2-2) — full surface = 43 baseline +
         // memory_replay (I4) + memory_verify (H4) + memory_load_family (B1)
         // + memory_smart_load (B2) + memory_subscription_replay (K7) +
         // memory_subscription_dlq_list (K7) + memory_find_paths (J7) +
         // memory_quota_status (K8) + memory_reflect (Task 4/8) +
-        // memory_reflection_origin (L2-2) + memory_check_agent_action +
-        // memory_rule_list (#691) + 5×memory_skill_* (L1-5) = 60.
-        assert_eq!(p.expected_tool_count(), 60);
+        // memory_reflection_origin (L2-2) + memory_dependents_of_invalidated
+        // (L2-3) + memory_check_agent_action + memory_rule_list (#691) +
+        // 5×memory_skill_* (L1-5) = 61.
+        assert_eq!(p.expected_tool_count(), 61);
 
-        // The K7+K8 + Task 4/8 + L2-2 + #691 additions live in
+        // The K7+K8 + Task 4/8 + L2-2 + L2-3 + #691 additions live in
         // Family::Power (operator/governance), so the `power` profile
         // picks them up too.
-        assert_eq!(Profile::power().expected_tool_count(), 7 + 13);
+        assert_eq!(Profile::power().expected_tool_count(), 7 + 14);
     }
 
     // ---------- Profile::parse ----------

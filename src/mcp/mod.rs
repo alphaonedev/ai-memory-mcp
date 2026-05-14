@@ -320,6 +320,9 @@ mod recall;
 mod reflect;
 #[path = "tools/reflection_origin.rs"]
 mod reflection_origin;
+// v0.7.0 L2-3 (issue #668) — Reflection invalidation propagation.
+#[path = "tools/dependents_of_invalidated.rs"]
+mod dependents_of_invalidated;
 #[path = "tools/replay.rs"]
 mod replay;
 #[path = "tools/rule_list.rs"]
@@ -377,6 +380,34 @@ pub(crate) use session_start::handle_session_start;
 pub(crate) use subscribe::handle_unsubscribe;
 pub use verify::handle_verify;
 
+/// v0.7.0 L2-3 (issue #668) — test-only dispatcher into
+/// `handle_link`. Re-exports the handler at a stable
+/// `ai_memory::mcp::dispatch_handle_link_for_test` path so the
+/// `tests/notification.rs` integration test can drive the supersedes
+/// path end-to-end without re-creating the JSON-RPC wire layer. Not
+/// part of the production wire surface — the production call site
+/// is the JSON-RPC dispatch in `handle_request`.
+#[doc(hidden)]
+pub fn dispatch_handle_link_for_test(
+    conn: &rusqlite::Connection,
+    db_path: &std::path::Path,
+    params: &serde_json::Value,
+    active_keypair: Option<&crate::identity::keypair::AgentKeypair>,
+) -> Result<serde_json::Value, String> {
+    link::handle_link(conn, db_path, params, active_keypair)
+}
+
+/// v0.7.0 L2-3 (issue #668) — test-only dispatcher into
+/// `handle_dependents_of_invalidated`. Mirrors
+/// `dispatch_handle_link_for_test`'s rationale.
+#[doc(hidden)]
+pub fn dispatch_handle_dependents_for_test(
+    conn: &rusqlite::Connection,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    dependents_of_invalidated::handle_dependents_of_invalidated(conn, params)
+}
+
 /// v0.7.0 (issue #691) — accessor for the stable
 /// `governance.not_available_over_mcp` error string. Consumed by
 /// `tests/governance_immutability.rs` to pin the wire vocabulary
@@ -401,6 +432,7 @@ use auto_tag::handle_auto_tag;
 use check_duplicate::handle_check_duplicate;
 use consolidate::handle_consolidate;
 use delete::handle_delete;
+use dependents_of_invalidated::handle_dependents_of_invalidated;
 use detect_contradiction::handle_detect_contradiction;
 use entity_get_by_alias::handle_entity_get_by_alias;
 use entity_register::handle_entity_register;
@@ -925,6 +957,13 @@ fn handle_request(
                 "memory_rule_list" => handle_rule_list(conn, arguments),
                 // v0.7.0 L2-2 (S6-M1) — cross-peer reflection provenance.
                 "memory_reflection_origin" => handle_reflection_origin(conn, arguments),
+                // v0.7.0 L2-3 (issue #668) — read-side surface for the
+                // dependents of an invalidated reflection. Pure
+                // read-only — the walker itself fires from the
+                // memory_link Reflection→Reflection supersedes path.
+                "memory_dependents_of_invalidated" => {
+                    handle_dependents_of_invalidated(conn, arguments)
+                }
                 // v0.7.0 L1-5 — Agent Skills ingestion substrate (Pillar 1.5).
                 "memory_skill_register" => handle_skill_register(conn, arguments, active_keypair),
                 "memory_skill_list" => handle_skill_list(conn, arguments),
@@ -1411,9 +1450,12 @@ mod tests {
         // memory_rule_list (Family::Power) → 55. Mutation tools are
         // explicitly NOT registered over MCP.
         // v0.7.0 L1-5 adds 5 memory_skill_* tools (Family::Other) → 60.
+        // v0.7.0 L2-3 (issue #668) adds memory_dependents_of_invalidated
+        // (Family::Power) → 61. Read-side surface for the reflection
+        // invalidation propagation walker.
         let defs = tool_definitions();
         let tools = defs["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 60);
+        assert_eq!(tools.len(), 61);
     }
 
     /// v0.6.4-002 acceptance gate (RFC §S25/S26): `--profile core`
@@ -1468,7 +1510,7 @@ mod tests {
         let tools = defs["tools"].as_array().unwrap();
         assert_eq!(
             tools.len(),
-            60,
+            61,
             "full profile = v0.6.3 surface (43) + v0.7.0 I4 memory_replay (1) + \
              v0.7 H4 memory_verify (1) + v0.7 B1 memory_load_family (1) + \
              v0.7 B2 memory_smart_load (1) + \
@@ -1476,8 +1518,9 @@ mod tests {
              v0.7 J7 memory_find_paths (1) + v0.7 K8 memory_quota_status (1) + \
              v0.7.0 Task 4/8 memory_reflect (1) + \
              v0.7.0 L2-2 memory_reflection_origin (1) + \
+             v0.7.0 L2-3 memory_dependents_of_invalidated (1) + \
              v0.7.0 (issue #691) memory_check_agent_action + memory_rule_list (2) + \
-             v0.7.0 L1-5 5×memory_skill_* (5) = 60"
+             v0.7.0 L1-5 5×memory_skill_* (5) = 61"
         );
     }
 
