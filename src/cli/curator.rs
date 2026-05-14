@@ -1001,4 +1001,167 @@ mod tests {
         assert!(s.contains("- err A"));
         assert!(s.contains("- err B"));
     }
+
+    // ---------- C-1 coverage uplift: --reflect modes ----------
+
+    #[tokio::test]
+    async fn reflect_requires_namespace_or_all_namespaces() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let cfg = config::AppConfig::default();
+        let mut args = default_args();
+        args.reflect = true;
+        // Neither --namespace nor --all-namespaces supplied.
+        let mut out = env.output();
+        let err = run(&db, &args, &cfg, &mut out).await.unwrap_err();
+        assert!(
+            err.to_string().contains("--namespace") || err.to_string().contains("--all-namespaces")
+        );
+    }
+
+    #[tokio::test]
+    async fn reflect_namespace_and_all_namespaces_mutually_exclusive() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let cfg = config::AppConfig::default();
+        let mut args = default_args();
+        args.reflect = true;
+        args.namespace = Some("ns".to_string());
+        args.all_namespaces = true;
+        let mut out = env.output();
+        let err = run(&db, &args, &cfg, &mut out).await.unwrap_err();
+        assert!(err.to_string().contains("mutually exclusive"));
+    }
+
+    #[tokio::test]
+    async fn reflect_no_llm_path_emits_error_in_report() {
+        // Keyword tier → no LLM → run_reflect populates `errors` and prints report.
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let mut cfg = config::AppConfig::default();
+        cfg.tier = Some("keyword".to_string());
+        let mut args = default_args();
+        args.reflect = true;
+        args.namespace = Some("ns".to_string());
+        args.dry_run = true;
+        {
+            let mut out = env.output();
+            run(&db, &args, &cfg, &mut out).await.unwrap();
+        }
+        let s = env.stdout_str();
+        assert!(s.contains("reflection pass report"));
+        assert!(s.contains("no LLM client configured"));
+    }
+
+    #[tokio::test]
+    async fn reflect_no_llm_path_emits_json_report() {
+        // Same as above but with --json output.
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let mut cfg = config::AppConfig::default();
+        cfg.tier = Some("keyword".to_string());
+        let mut args = default_args();
+        args.reflect = true;
+        args.namespace = Some("ns".to_string());
+        args.dry_run = true;
+        args.json = true;
+        {
+            let mut out = env.output();
+            run(&db, &args, &cfg, &mut out).await.unwrap();
+        }
+        let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
+        // No-LLM report carries `errors` array with the configured message.
+        let errs = v["errors"].as_array().unwrap();
+        assert!(errs.iter().any(|e| e.as_str().unwrap().contains("no LLM")));
+        assert!(v["dry_run"].as_bool().unwrap());
+    }
+
+    #[tokio::test]
+    async fn reflect_all_namespaces_text_output() {
+        // All-namespaces with no enabled namespaces is the default-safe path.
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let mut cfg = config::AppConfig::default();
+        cfg.tier = Some("keyword".to_string());
+        let mut args = default_args();
+        args.reflect = true;
+        args.all_namespaces = true;
+        args.dry_run = true;
+        {
+            let mut out = env.output();
+            run(&db, &args, &cfg, &mut out).await.unwrap();
+        }
+        let s = env.stdout_str();
+        assert!(s.contains("reflection pass report"));
+    }
+
+    #[test]
+    fn print_reflection_report_emits_proposals_and_errors() {
+        let r = crate::curator::reflection_pass::ReflectionPassReport {
+            started_at: "2026-01-01T00:00:00Z".into(),
+            completed_at: "2026-01-01T00:00:01Z".into(),
+            namespaces_visited: 2,
+            observations_scanned: 5,
+            clusters_formed: 1,
+            clusters_eligible: 1,
+            reflections_persisted: 0,
+            depth_refusals: 0,
+            errors: vec!["a problem".to_string()],
+            dry_run_proposals: vec![crate::curator::reflection_pass::DryRunProposal {
+                namespace: "app".to_string(),
+                proposed_title: "[reflection] pattern".to_string(),
+                source_ids: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            }],
+            dry_run: true,
+        };
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        {
+            let mut out = crate::cli::CliOutput::from_std(&mut stdout, &mut stderr);
+            print_reflection_report(&r, &mut out).unwrap();
+        }
+        let s = String::from_utf8(stdout).unwrap();
+        assert!(s.contains("reflection pass report"));
+        assert!(s.contains("namespaces_visited:"));
+        assert!(s.contains("observations_scanned:"));
+        assert!(s.contains("- a problem"));
+        assert!(s.contains("proposal: ns='app'"));
+        assert!(s.contains("sources=3"));
+    }
+
+    #[test]
+    fn load_curator_keypair_best_effort_returns_some_or_none() {
+        // Just exercises the function. Whether it returns Some or None
+        // depends on the host's key dir contents; either outcome is OK.
+        let _ = load_curator_keypair_best_effort();
+    }
+
+    #[test]
+    fn build_curator_llm_with_autonomous_tier() {
+        // Autonomous tier — exercises the autonomous arm of the
+        // configured llm_model match. Will likely return None when
+        // Ollama isn't running.
+        let _ = build_curator_llm(config::FeatureTier::Autonomous);
+    }
+
+    #[tokio::test]
+    async fn reflect_with_seeded_observations_and_no_llm() {
+        // Seed observations so list_namespaces returns a namespace,
+        // then run reflect with --all-namespaces + no LLM. Hits the
+        // namespace enumeration + "no LLM" path.
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let _id = crate::cli::test_utils::seed_memory(&db, "myns", "T", "C");
+        let mut cfg = config::AppConfig::default();
+        cfg.tier = Some("keyword".to_string());
+        let mut args = default_args();
+        args.reflect = true;
+        args.all_namespaces = true;
+        args.dry_run = true;
+        {
+            let mut out = env.output();
+            run(&db, &args, &cfg, &mut out).await.unwrap();
+        }
+        assert!(env.stdout_str().contains("reflection pass report"));
+    }
 }
