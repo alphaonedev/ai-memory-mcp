@@ -92,8 +92,14 @@ fn t0_describe_to_user_core_profile_canonical_phrasing() {
     // v0.7.0 L2-3 (issue #668) — Family::Power gained
     // `memory_dependents_of_invalidated` (not loaded under core), so
     // the "more" count grows from 52 to 53.
+    // v0.7.0 L2-6 (issue #671) — Family::Other gained
+    // `memory_skill_promote_from_reflection` (not loaded under core),
+    // so the "more" count grows from 53 to 54.
+    // v0.7.0 L2-7 (issue #672) — Family::Other gained
+    // `memory_skill_compositional_context` (not loaded under core),
+    // so the "more" count grows from 54 to 55.
     let expected = "I can directly use 7 memory tools right now \
-                    (store, recall, list, get, search, ...). 53 more \
+                    (store, recall, list, get, search, ...). 55 more \
                     (update, delete, forget, gc, etc.) are available on demand — \
                     I can load them if you ask for something that needs them, \
                     or you can restart the server with a different profile.";
@@ -143,7 +149,13 @@ fn t0_describe_to_user_full_profile_canonical_phrasing() {
     // `memory_dependents_of_invalidated` → 60 visible (the "all 60"
     // form excludes the always-on `memory_capabilities` bootstrap
     // from the 61-tool total).
-    let expected = "I can directly use all 60 memory tools right now \
+    // v0.7.0 L2-6 (issue #671) — Family::Other gained
+    // `memory_skill_promote_from_reflection` → 61 visible.
+    // v0.7.0 L2-7 (issue #672) — Family::Other gained
+    // `memory_skill_compositional_context` → 62 visible (the "all 62"
+    // form excludes the always-on `memory_capabilities` bootstrap
+    // from the 63-tool total).
+    let expected = "I can directly use all 62 memory tools right now \
                     (store, recall, list, get, search, ...). Nothing more to load — \
                     the full memory surface is already active.";
 
@@ -189,8 +201,14 @@ fn t0_describe_to_user_graph_profile_canonical_phrasing() {
     // v0.7.0 L2-3 (issue #668) — Family::Power gained
     // `memory_dependents_of_invalidated` (not loaded under graph), so
     // the "more" count grows from 41 to 42.
+    // v0.7.0 L2-6 (issue #671) — Family::Other gained
+    // `memory_skill_promote_from_reflection` (not loaded under graph),
+    // so the "more" count grows from 42 to 43.
+    // v0.7.0 L2-7 (issue #672) — Family::Other gained
+    // `memory_skill_compositional_context` (not loaded under graph),
+    // so the "more" count grows from 43 to 44.
     let expected = "I can directly use 18 memory tools right now \
-                    (store, recall, list, get, search, ...). 42 more \
+                    (store, recall, list, get, search, ...). 44 more \
                     (update, delete, forget, gc, etc.) are available on demand — \
                     I can load them if you ask for something that needs them, \
                     or you can restart the server with a different profile.";

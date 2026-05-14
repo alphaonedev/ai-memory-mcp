@@ -354,6 +354,9 @@ mod skill_resource;
 // reflections become skills become reusable knowledge.
 #[path = "tools/skill_promote.rs"]
 mod skill_promote;
+// v0.7.0 L2-7 (issue #672) — reflection-skill composition declaration.
+#[path = "tools/skill_compositional_context.rs"]
+mod skill_compositional_context;
 
 // ---------------------------------------------------------------------------
 // Re-exports — preserve exact `crate::mcp::*` pub surface (zero new pub items)
@@ -462,6 +465,34 @@ use promote::handle_promote;
 use reflect::handle_reflect;
 use reflection_origin::handle_reflection_origin;
 use search::handle_search;
+use skill_compositional_context::handle_skill_compositional_context;
+
+/// v0.7.0 L2-7 (issue #672) — integration-test entry point for
+/// `memory_skill_compositional_context`. Hides the internal
+/// `pub(super)` handler symbol from integration tests while still
+/// keeping the production dispatch identical (no second copy of the
+/// routing logic, no jsonrpc envelope construction for callers that
+/// only want the tool's response). Other handlers cross the
+/// integration-test boundary via direct SQL fixtures and the
+/// capabilities harness — composing skills need the handler itself, so
+/// this shim mirrors the dispatch arm used in `handle_request`.
+///
+/// Returns the handler's `Result<Value, String>` as-is so test code can
+/// assert on both success and error shapes without having to peel a
+/// `serde_json::Value` envelope.
+///
+/// # Errors
+///
+/// Forwards the handler's error string verbatim (the only failure mode
+/// is the handler itself returning `Err` — e.g. for an unknown
+/// `skill_id`).
+#[doc(hidden)]
+pub fn skill_compositional_context_for_tests(
+    conn: &rusqlite::Connection,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    handle_skill_compositional_context(conn, params)
+}
 use skill_get::handle_skill_get;
 use skill_list::handle_skill_list;
 use skill_resource::handle_skill_resource;
@@ -988,6 +1019,10 @@ fn handle_request(
                 "memory_skill_promote_from_reflection" => {
                     handle_skill_promote_from_reflection(conn, arguments, active_keypair)
                 }
+                // v0.7.0 L2-7 (issue #672) — reflection-skill composition.
+                "memory_skill_compositional_context" => {
+                    handle_skill_compositional_context(conn, arguments)
+                }
                 // Ultrareview #349: unknown tool is a JSON-RPC 2.0
                 // "method not found" condition — return -32601, not
                 // an ok_response with `isError: true`. Clients that
@@ -1474,9 +1509,11 @@ mod tests {
         // v0.7.0 L2-6 (issue #671) adds memory_skill_promote_from_reflection
         // (Family::Other) → 62 — closes the recursive-learning loop:
         // reflections become skills become reusable knowledge.
+        // v0.7.0 L2-7 (issue #672) adds memory_skill_compositional_context
+        // (Family::Other) → 63 — reflection-skill composition declaration.
         let defs = tool_definitions();
         let tools = defs["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 62);
+        assert_eq!(tools.len(), 63);
     }
 
     /// v0.6.4-002 acceptance gate (RFC §S25/S26): `--profile core`
@@ -1531,7 +1568,7 @@ mod tests {
         let tools = defs["tools"].as_array().unwrap();
         assert_eq!(
             tools.len(),
-            62,
+            63,
             "full profile = v0.6.3 surface (43) + v0.7.0 I4 memory_replay (1) + \
              v0.7 H4 memory_verify (1) + v0.7 B1 memory_load_family (1) + \
              v0.7 B2 memory_smart_load (1) + \
@@ -1542,7 +1579,8 @@ mod tests {
              v0.7.0 L2-3 memory_dependents_of_invalidated (1) + \
              v0.7.0 (issue #691) memory_check_agent_action + memory_rule_list (2) + \
              v0.7.0 L1-5 5×memory_skill_* (5) + \
-             v0.7.0 L2-6 memory_skill_promote_from_reflection (1) = 62"
+             v0.7.0 L2-6 memory_skill_promote_from_reflection (1) + \
+             v0.7.0 L2-7 memory_skill_compositional_context (1) = 63"
         );
     }
 

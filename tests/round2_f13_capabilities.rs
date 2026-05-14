@@ -77,19 +77,21 @@ fn f13_summary_and_describe_to_user_agree_on_count_full_profile() {
     let summary = build_capabilities_summary(&Profile::full());
     let describe = build_capabilities_describe_to_user(&Profile::full());
 
-    // Both must report "60" for the full profile (substantive memory
+    // Both must report "62" for the full profile (substantive memory
     // tools, excluding the always-on `memory_capabilities` bootstrap).
     // v0.7.0 issue #691 added memory_check_agent_action + memory_rule_list,
-    // v0.7.0 L1-5 added 5 memory_skill_* tools, and v0.7.0 L2-3 added
-    // memory_dependents_of_invalidated to Family::Power — bumping the
-    // substantive total from 52 to 60.
+    // v0.7.0 L1-5 added 5 memory_skill_* tools, v0.7.0 L2-3 added
+    // memory_dependents_of_invalidated to Family::Power, v0.7.0 L2-6 added
+    // memory_skill_promote_from_reflection, and v0.7.0 L2-7 added
+    // memory_skill_compositional_context — bumping the substantive total
+    // from 52 to 62.
     assert!(
-        summary.contains("60 of 60 memory tools"),
-        "summary must report 60 of 60 memory tools; got: {summary}"
+        summary.contains("62 of 62 memory tools"),
+        "summary must report 62 of 62 memory tools; got: {summary}"
     );
     assert!(
-        describe.contains("all 60 memory tools"),
-        "describe_to_user must report all 60 memory tools; got: {describe}"
+        describe.contains("all 62 memory tools"),
+        "describe_to_user must report all 62 memory tools; got: {describe}"
     );
 }
 
@@ -99,14 +101,16 @@ fn f13_summary_and_describe_to_user_agree_on_count_core_profile() {
     let describe = build_capabilities_describe_to_user(&Profile::core());
 
     // Core profile loads `Family::Core` (7 tools). Bootstrap excluded.
-    // Total memory tools = 60 (61 - bootstrap). v0.7.0 issue #691 added
+    // Total memory tools = 62 (63 - bootstrap). v0.7.0 issue #691 added
     // memory_check_agent_action + memory_rule_list, v0.7.0 L1-5 added
-    // 5 memory_skill_* tools, and v0.7.0 L2-3 added
-    // memory_dependents_of_invalidated — bumping the substantive
-    // total from 52 to 60.
+    // 5 memory_skill_* tools, v0.7.0 L2-3 added
+    // memory_dependents_of_invalidated, v0.7.0 L2-6 added
+    // memory_skill_promote_from_reflection, and v0.7.0 L2-7 added
+    // memory_skill_compositional_context — bumping the substantive
+    // total from 52 to 62.
     assert!(
-        summary.contains("7 of 60 memory tools"),
-        "summary must report 7 of 60 memory tools; got: {summary}"
+        summary.contains("7 of 62 memory tools"),
+        "summary must report 7 of 62 memory tools; got: {summary}"
     );
     assert!(
         describe.contains("7 memory tools"),
