@@ -3033,16 +3033,17 @@ mod tests {
         // round-tripped through `POST /api/v1/links`.
         //
         // v0.7.0 fix campaign R1-M2/M4 (#690) reverses that posture at
-        // the SQL substrate: the CHECK trigger refuses any relation
+        // the SQL substrate: the CHECK clause refuses any relation
         // outside the closed set `{related_to, supersedes, contradicts,
         // derived_from, reflects_on}` — defense-in-depth matching the
-        // new typed `MemoryLinkRelation` enum. The Rust validator stays
-        // permissive (to avoid double-failing wire-shape callers with
-        // a 400 + 500), but the substrate refuses the write at INSERT
-        // time. From the HTTP caller's perspective the result is a 500
-        // when the validator says OK but the trigger fires — the test
-        // pins that outcome so a future loosening of the trigger
-        // surfaces here.
+        // typed `MemoryLinkRelation` enum.
+        //
+        // v0.7.0 G-PHASE-E-1 (#706) further hardens the HTTP path: the
+        // create-link handler now pre-flights the relation against the
+        // closed set and returns a structured 400 instead of the prior
+        // generic 500 surfaced from the CHECK violation. We pin the
+        // typed `{"error":"invalid_relation","got":...,"allowed":[...]}`
+        // shape so a future loosening on either side surfaces here.
         let state = test_state();
         let src = insert_test_memory(&state, "ns-link-relation", "src").await;
         let tgt = insert_test_memory(&state, "ns-link-relation", "tgt").await;
@@ -3054,8 +3055,8 @@ mod tests {
             "source_id": src,
             "target_id": tgt,
             // Passes `validate_relation` (lowercase identifier shape)
-            // but is NOT in the closed set, so the substrate CHECK
-            // trigger refuses the INSERT.
+            // but is NOT in the closed set; the HTTP handler refuses
+            // before reaching the SQL CHECK.
             "relation": "invalid_relation"
         });
         let resp = app
@@ -3071,9 +3072,16 @@ mod tests {
             .unwrap();
         assert_eq!(
             resp.status(),
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "off-closed-set relation must hit the R1-M2 substrate guard"
+            StatusCode::BAD_REQUEST,
+            "off-closed-set relation must surface as a structured 400 (#706)"
         );
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(v["error"], "invalid_relation");
+        assert_eq!(v["got"], "invalid_relation");
+        assert!(v["allowed"].is_array());
     }
 
     #[tokio::test]
