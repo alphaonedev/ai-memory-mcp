@@ -11,3 +11,6 @@
 
 #[path = "forensic/bundle_test.rs"]
 mod bundle_test;
+
+#[path = "forensic/wt1e_chain_test.rs"]
+mod wt1e_chain_test;
