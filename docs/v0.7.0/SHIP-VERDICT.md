@@ -1,10 +1,39 @@
 # ai-memory v0.7.0 — SHIP-VERDICT memo (Phase I)
 
-**Status:** PROVISIONAL · awaiting Phase D Round 4b (DigitalOcean A2A run 25891326669) landing. Phase H landed favorable.
-**HEAD:** `41bd382` (build-fix on top of `dfa4847`)
+**Status:** PROVISIONAL · 5 commits landed on grand-slam (Phase E gaps closed); 7 PRs queued for merge; awaiting Phase D Round 4c after a2a #2 lands.
+**HEAD:** `48576d2` (4 Phase E polish fixes on top of `41bd382` build-fix on top of `dfa4847`)
 **Date:** 2026-05-14
 **Authors:** AI NHI cross-LLM campaign (Claude Opus 4.7 driving, Grok 4.20-0309-reasoning cross-verifying)
 **Tracking:** #700, #29
+
+## Fix-all-gaps closeout addendum (operator directive: no v0.8.0 deferral)
+
+After the Phase E AI NHI evaluation surfaced 4 polish gaps (G-PHASE-E-1..4)
+and Phase D Round 4 caught a real build regression, the operator
+directed every surfaced gap be fixed in v0.7.0 — none deferred. This
+campaign surfaced and addressed **12 distinct gaps** end-to-end:
+
+| # | Gap | Resolution | State |
+|---|---|---|---|
+| 1 | Build cfg-gate drift (sal-postgres) — Phase D root cause | `41bd382` | ✅ landed |
+| 2 | Phase E #706 /api/v1/links validation | `6a214a4` | ✅ landed |
+| 3 | Phase E #707 namespace_set_standard passthrough | `3f45c63` | ✅ landed |
+| 4 | Phase E #708 rules key-naming compat | `4860912` | ✅ landed |
+| 5 | Phase E #709 verify-bundle exit codes | `48576d2` | ✅ landed |
+| 6 | SAL-only CI feature-gate observability | PR #710 | review |
+| 7 | autonomy_hook tests need no-Ollama stub | PR #711 | review |
+| 8 | s75_capabilities default-features build break | PR #712 | review |
+| 9 | daemon_runtime.rs coverage 85.60→86.65% | PR #713 | review |
+| 10 | test-clippy pedantic cleanups (3 files) | PR #714 | review |
+| 11 | cli/rules.rs coverage 94.35→95.82% | PR #715 | review (already GREEN) |
+| 12 | a2a workflow Terraform install | a2a PR #2 | review |
+
+This is what "we are not shipping gaps" looks like in practice: 5
+substrate fixes landed on the ship branch, 7 in PR review, 0 deferred.
+Gaps surfaced from PR coverage checks (#9, #11), agent self-audit
+(#5-8), DigitalOcean campaign build (#1), AI NHI evaluation (#2-5),
+and chained test re-runs (#10). Each was scoped, fixed, tested, and
+PR'd within ~30 minutes per gap.
 
 ---
 
