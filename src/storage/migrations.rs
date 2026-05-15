@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 35).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 36).
 
 use anyhow::Result;
 use rusqlite::{Connection, params};
@@ -39,7 +39,15 @@ CREATE TABLE IF NOT EXISTS memories (
     -- any pre-v30 row); `reflection` for memories minted by
     -- `memory_reflect` or the curator reflection pass.
     -- Mirrors `models::MemoryKind`.
-    memory_kind TEXT NOT NULL DEFAULT 'observation'
+    memory_kind TEXT NOT NULL DEFAULT 'observation',
+    -- v0.7.0 WT-1-A (schema v36) — substrate-level atomisation foundation.
+    -- `atomised_into` is NULL on legacy rows; positive integer on rows
+    -- that have been split into atomic peers (WT-1-B atomisation pass).
+    -- `atom_of` is NULL on non-atom rows; on atom rows it FK-points back
+    -- to the parent memory. Pure additive — no existing semantics
+    -- changes.
+    atomised_into INTEGER,
+    atom_of       TEXT REFERENCES memories(id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_memories_tier ON memories(tier);
@@ -47,6 +55,13 @@ CREATE INDEX IF NOT EXISTS idx_memories_namespace ON memories(namespace);
 CREATE INDEX IF NOT EXISTS idx_memories_priority ON memories(priority DESC);
 CREATE INDEX IF NOT EXISTS idx_memories_expires ON memories(expires_at);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_title_ns ON memories(title, namespace);
+-- v36 partial indexes on the atomisation columns. Restricted predicates
+-- keep legacy-DB index footprint at zero until WT-1-B starts minting
+-- atoms.
+CREATE INDEX IF NOT EXISTS idx_memories_atom_of
+    ON memories(atom_of) WHERE atom_of IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_memories_atomised_into
+    ON memories(atomised_into) WHERE atomised_into > 0;
 
 CREATE TABLE IF NOT EXISTS memory_links (
     source_id    TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
@@ -67,8 +82,10 @@ CREATE TABLE IF NOT EXISTS memory_links (
     PRIMARY KEY (source_id, target_id, relation),
     -- v33 (v0.7.0 v0.7.1-fold) — SQL-side CHECK constraint promoting the
     -- v23 RAISE-trigger validation to a column-level invariant. Closed
-    -- taxonomy mirrors `crate::validate::VALID_RELATIONS`.
-    CHECK (relation IN ('related_to', 'supersedes', 'contradicts', 'derived_from', 'reflects_on'))
+    -- taxonomy mirrors `crate::validate::VALID_RELATIONS`. v36 (WT-1-A)
+    -- extended the closed set with `derives_from` for atomisation
+    -- provenance edges (atom -> parent).
+    CHECK (relation IN ('related_to', 'supersedes', 'contradicts', 'derived_from', 'reflects_on', 'derives_from'))
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
@@ -225,7 +242,20 @@ CREATE INDEX IF NOT EXISTS idx_audit_log_event_type
 //       (Mermaid canvas + auto-cadence + node_id integration) will
 //       build on this plumbing. CREATE TABLE IF NOT EXISTS +
 //       CREATE INDEX IF NOT EXISTS — fully idempotent.
-const CURRENT_SCHEMA_VERSION: i64 = 35;
+// v36 = v0.7.0 WT-1-A — substrate-level atomisation foundation. Adds
+//       `memories.atomised_into INTEGER` + `memories.atom_of TEXT
+//       REFERENCES memories(id)` for the WT-1-B atomisation primitive,
+//       plus a `derives_from` extension to the `memory_links.relation`
+//       closed-taxonomy CHECK constraint. The ALTERs on `memories` are
+//       emitted from Rust (SQLite has no `ADD COLUMN IF NOT EXISTS`).
+//       The CHECK extension is a full-table-rebuild on `memory_links`
+//       (column-level CHECK can't be ALTERed on an existing column on
+//       SQLite — same dance as v33's 0027 migration). The SQL file
+//       (`0030_v07_atomisation.sql`) holds the supporting partial
+//       indexes. Pure additive on legacy data: every pre-v36 row has
+//       `atomised_into IS NULL` and `atom_of IS NULL`. The first hard
+//       prereq for WT-1-B (atomisation pass) through WT-1-G.
+const CURRENT_SCHEMA_VERSION: i64 = 36;
 
 const MIGRATION_V15_SQLITE: &str =
     include_str!("../../migrations/sqlite/0010_v063_hierarchy_kg.sql");
@@ -357,6 +387,98 @@ const MIGRATION_V34_SQLITE: &str =
 // `src/offload/mod.rs`.
 const MIGRATION_V35_SQLITE: &str =
     include_str!("../../migrations/sqlite/0029_v07_offloaded_blobs.sql");
+// v0.7.0 WT-1-A — substrate-level atomisation foundation. Adds
+// `memories.atomised_into INTEGER` + `memories.atom_of TEXT REFERENCES
+// memories(id)` plus `derives_from` extension to the closed-taxonomy
+// CHECK constraint on `memory_links.relation`. The ALTERs on
+// `memories` are emitted from Rust (SQLite has no `ADD COLUMN IF NOT
+// EXISTS`); the CHECK-constraint extension is a full-table-rebuild
+// dance (same shape as the v33 migration in 0027). The SQL file holds
+// only the supporting partial indexes; the rebuild lives in Rust so
+// the probes (column existence, table existence) can run idempotently.
+const MIGRATION_V36_SQLITE: &str = include_str!("../../migrations/sqlite/0030_v07_atomisation.sql");
+
+/// v36 (WT-1-A) — full-table-rebuild for `memory_links` that promotes
+/// the v33 closed-taxonomy CHECK constraint to include the new
+/// `derives_from` relation (atomisation provenance). The rebuild mirrors
+/// the v33 dance from `0027_v07_memory_links_relation_check.sql`:
+/// create memory_links_v36 with the extended CHECK, copy rows, drop
+/// indexes/triggers/old table, rename, recreate indexes + attest_level
+/// triggers. The CHECK clause is the only line that changes from v33.
+///
+/// This rebuild lives in Rust (not the SQL file) so the column-existence
+/// probe + `sqlite_master.sql` probe in the migrate step can stay
+/// idempotent: re-running on a partially-migrated DB detects the
+/// extended CHECK and skips the rebuild.
+const MIGRATION_V36_REBUILD_LINKS_SQL: &str = r"
+-- WT-1-A — full-table-rebuild adding 'derives_from' to the
+-- memory_links.relation CHECK clause. Identical to the v33 rebuild in
+-- 0027 except for the CHECK clause; replay-safe because the new table
+-- is named memory_links_v36 only for the duration of the rebuild.
+
+CREATE TABLE memory_links_v36 (
+    source_id    TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    target_id    TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    relation     TEXT NOT NULL DEFAULT 'related_to',
+    created_at   TEXT NOT NULL,
+    valid_from   TEXT,
+    valid_until  TEXT,
+    observed_by  TEXT,
+    signature    BLOB,
+    attest_level TEXT,
+    PRIMARY KEY (source_id, target_id, relation),
+    CHECK (relation IN ('related_to', 'supersedes', 'contradicts',
+                        'derived_from', 'reflects_on', 'derives_from'))
+);
+
+INSERT INTO memory_links_v36 (
+    source_id, target_id, relation, created_at,
+    valid_from, valid_until, observed_by, signature, attest_level
+)
+SELECT
+    source_id, target_id, relation, created_at,
+    valid_from, valid_until, observed_by, signature, attest_level
+FROM memory_links;
+
+DROP TRIGGER IF EXISTS memory_links_ck_attest_level_ins;
+DROP TRIGGER IF EXISTS memory_links_ck_attest_level_upd;
+
+DROP INDEX IF EXISTS idx_links_temporal_src;
+DROP INDEX IF EXISTS idx_links_temporal_tgt;
+DROP INDEX IF EXISTS idx_links_relation;
+DROP INDEX IF EXISTS idx_memory_links_attest_level;
+
+DROP TABLE memory_links;
+
+ALTER TABLE memory_links_v36 RENAME TO memory_links;
+
+CREATE INDEX IF NOT EXISTS idx_links_temporal_src
+    ON memory_links (source_id, valid_from, valid_until);
+CREATE INDEX IF NOT EXISTS idx_links_temporal_tgt
+    ON memory_links (target_id, valid_from, valid_until);
+CREATE INDEX IF NOT EXISTS idx_links_relation
+    ON memory_links (relation, valid_from);
+CREATE INDEX IF NOT EXISTS idx_memory_links_attest_level
+    ON memory_links (attest_level, created_at);
+
+CREATE TRIGGER IF NOT EXISTS memory_links_ck_attest_level_ins
+BEFORE INSERT ON memory_links
+FOR EACH ROW
+WHEN NEW.attest_level IS NOT NULL
+  AND NEW.attest_level NOT IN ('unsigned', 'self_signed', 'peer_attested')
+BEGIN
+    SELECT RAISE(ABORT, 'CHECK constraint failed: memory_links.attest_level must be one of unsigned/self_signed/peer_attested (or NULL for legacy rows)');
+END;
+
+CREATE TRIGGER IF NOT EXISTS memory_links_ck_attest_level_upd
+BEFORE UPDATE OF attest_level ON memory_links
+FOR EACH ROW
+WHEN NEW.attest_level IS NOT NULL
+  AND NEW.attest_level NOT IN ('unsigned', 'self_signed', 'peer_attested')
+BEGIN
+    SELECT RAISE(ABORT, 'CHECK constraint failed: memory_links.attest_level must be one of unsigned/self_signed/peer_attested (or NULL for legacy rows)');
+END;
+";
 
 // COVERAGE: per-version ALTER/CREATE branches inside this function
 // are guarded by `has_X` column-existence probes and `IF NOT EXISTS`
@@ -1098,6 +1220,85 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             conn.execute_batch(MIGRATION_V35_SQLITE)?;
         }
 
+        if version < 36 {
+            // v0.7.0 WT-1-A — substrate-level atomisation foundation.
+            //
+            // Step 1: ALTER TABLE memories ADD COLUMN for the two new
+            // nullable columns. SQLite has no `ADD COLUMN IF NOT
+            // EXISTS`, so we probe `PRAGMA table_info(memories)`
+            // first. Both columns default to NULL on legacy rows
+            // (matching the SCHEMA constant for fresh installs).
+            let mut has_atomised_into = false;
+            let mut has_atom_of = false;
+            let mut stmt = conn.prepare("PRAGMA table_info(memories)")?;
+            let cols = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            for col in cols {
+                match col?.as_str() {
+                    "atomised_into" => has_atomised_into = true,
+                    "atom_of" => has_atom_of = true,
+                    _ => {}
+                }
+            }
+            drop(stmt);
+            if !has_atomised_into {
+                conn.execute("ALTER TABLE memories ADD COLUMN atomised_into INTEGER", [])?;
+            }
+            if !has_atom_of {
+                // SQLite supports `REFERENCES <table>(<col>)` on
+                // ALTER TABLE ADD COLUMN only when the column is
+                // nullable and has no DEFAULT (both true here). The
+                // FK fires on writes after the migration completes;
+                // it cannot retroactively validate existing rows
+                // (all NULL until WT-1-B mints atoms, so the absence
+                // of retroactive validation is harmless).
+                conn.execute(
+                    "ALTER TABLE memories ADD COLUMN atom_of TEXT REFERENCES memories(id)",
+                    [],
+                )?;
+            }
+
+            // Step 2: extend the CHECK constraint on
+            // `memory_links.relation` to admit `derives_from`. SQLite
+            // does not allow modifying a column-level CHECK clause
+            // in place; full-table-rebuild same shape as the v33
+            // migration in 0027. Gated by a probe that confirms the
+            // pre-rebuild table exists (some test fixtures stamp a
+            // high schema_version without creating memory_links —
+            // skip the rebuild rather than failing the migration).
+            let memory_links_exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+                     WHERE type = 'table' AND name = 'memory_links')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(false);
+            if memory_links_exists {
+                // Probe whether the rebuild is already in place. Scan
+                // `sqlite_master.sql` for the literal 'derives_from'
+                // substring — fresh installs (v36 SCHEMA inlined) and
+                // a previous run of this migration both leave the
+                // substring present; pre-v36 deployments don't have
+                // it.
+                let existing_sql: String = conn
+                    .query_row(
+                        "SELECT sql FROM sqlite_master \
+                         WHERE type = 'table' AND name = 'memory_links'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or_default();
+                let needs_rebuild = !existing_sql.contains("derives_from");
+                if needs_rebuild {
+                    conn.execute_batch(MIGRATION_V36_REBUILD_LINKS_SQL)?;
+                }
+            }
+
+            // Step 3: supporting partial indexes from the SQL file.
+            // CREATE INDEX IF NOT EXISTS — idempotent.
+            conn.execute_batch(MIGRATION_V36_SQLITE)?;
+        }
+
         conn.execute("DELETE FROM schema_version", [])?;
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
@@ -1303,8 +1504,8 @@ mod tests {
         // other is a documented foot-gun. We pin the relationship
         // so a future bump is loud.
         assert_eq!(
-            CURRENT_SCHEMA_VERSION, 35,
-            "module docstring advertises 35; bump the docstring when this number changes"
+            CURRENT_SCHEMA_VERSION, 36,
+            "module docstring advertises 36; bump the docstring when this number changes"
         );
     }
 
@@ -1715,6 +1916,11 @@ mod tests {
         assert!(table_exists(&conn, "agent_quotas"));
         // v29
         assert!(column_exists(&conn, "memories", "reflection_depth"));
+        // v36 (WT-1-A) — atomisation foundation columns + partial indexes.
+        assert!(column_exists(&conn, "memories", "atomised_into"));
+        assert!(column_exists(&conn, "memories", "atom_of"));
+        assert!(index_exists(&conn, "idx_memories_atom_of"));
+        assert!(index_exists(&conn, "idx_memories_atomised_into"));
     }
 
     #[test]

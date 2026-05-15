@@ -106,7 +106,14 @@ CREATE TABLE IF NOT EXISTS memories (
     -- (or pre-v0.7.0) rows; positive for memories synthesised by the
     -- reflection pass over lower-depth peers. Fresh schemas carry this
     -- inline; existing schemas pick it up via migrate_v31().
-    reflection_depth  INTEGER NOT NULL DEFAULT 0
+    reflection_depth  INTEGER NOT NULL DEFAULT 0,
+    -- v0.7.0 WT-1-A (schema v35 postgres / v36 sqlite) — substrate-level
+    -- atomisation foundation. `atomised_into` is NULL on legacy rows;
+    -- positive integer on rows that have been split by the WT-1-B
+    -- atomisation pass. `atom_of` is NULL on non-atom rows; on atom
+    -- rows it FK-points back to the parent memory.
+    atomised_into     INTEGER,
+    atom_of           TEXT REFERENCES memories(id)
 );
 
 -- v0.6.0 blocker #294 fix: upsert contract is `(title, namespace)`.
@@ -138,6 +145,13 @@ CREATE INDEX IF NOT EXISTS idx_memories_embedding_dim
 CREATE INDEX IF NOT EXISTS idx_memories_ns_dim
     ON memories (namespace, embedding_dim)
     WHERE embedding_dim IS NOT NULL;
+-- v0.7.0 WT-1-A — atomisation partial indexes. Restricted predicates
+-- keep the index footprint on legacy databases at zero (every row has
+-- NULL until WT-1-B starts minting atoms).
+CREATE INDEX IF NOT EXISTS idx_memories_atom_of
+    ON memories(atom_of) WHERE atom_of IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_memories_atomised_into
+    ON memories(atomised_into) WHERE atomised_into > 0;
 
 -- Full-text search. English stemming; matches the SQLite FTS5 setup.
 CREATE INDEX IF NOT EXISTS memories_content_fts ON memories
@@ -182,8 +196,12 @@ CREATE TABLE IF NOT EXISTS memory_links (
     -- `crate::validate::VALID_RELATIONS` exactly. The constraint name is
     -- pinned so the migration (`migrations/postgres/0014_v07_memory_links_relation_check.sql`)
     -- can probe pg_constraint for it via `IF NOT EXISTS` semantics.
-    CONSTRAINT memory_links_relation_check
-        CHECK (relation IN ('related_to', 'supersedes', 'contradicts', 'derived_from', 'reflects_on'))
+    -- v0.7.0 WT-1-A (schema v35 postgres / v36 sqlite) extended the
+    -- closed set with `derives_from` for atomisation provenance edges
+    -- and re-pinned the constraint under the `_wt1a` suffix so the
+    -- 0017 migration can detect the upgraded form via pg_constraint.
+    CONSTRAINT memory_links_relation_check_wt1a
+        CHECK (relation IN ('related_to', 'supersedes', 'contradicts', 'derived_from', 'reflects_on', 'derives_from'))
 );
 
 CREATE INDEX IF NOT EXISTS memory_links_source_idx ON memory_links (source_id);

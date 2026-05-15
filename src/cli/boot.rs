@@ -83,10 +83,18 @@ pub const MIN_SUPPORTED_SCHEMA: u32 = 16;
 /// v34 from V-4 closeout (#698) which adds `prev_hash BLOB` +
 /// `sequence INTEGER` columns plus a UNIQUE INDEX on `signed_events`
 /// so the SQL substrate carries a cross-row hash chain (mirror of
-/// the JSONL property in `audit.rs`). When a DB's `schema_version`
-/// exceeds this, the binary is too old for a newer DB and we
-/// surface a warning. v0.6.3.1 (PR-9h / issue #487 PR #497 req #72).
-pub const MAX_SUPPORTED_SCHEMA: u32 = 35;
+/// the JSONL property in `audit.rs`), v35 from QW-3's context-offload
+/// substrate primitive (`offloaded_blobs` table backing the
+/// offload+deref engine v0.8.0 short-term-context-compression will
+/// build on), and v36 from WT-1-A's atomisation foundation which
+/// adds `memories.atomised_into INTEGER` + `memories.atom_of TEXT
+/// REFERENCES memories(id)` columns plus extends the
+/// `memory_links.relation` closed-taxonomy CHECK constraint with the
+/// `derives_from` variant (atomisation provenance edges). When a
+/// DB's `schema_version` exceeds this, the binary is too old for a
+/// newer DB and we surface a warning. v0.6.3.1 (PR-9h / issue #487
+/// PR #497 req #72).
+pub const MAX_SUPPORTED_SCHEMA: u32 = 36;
 
 /// Pure boundary check: `true` when `v` lies within
 /// `[MIN_SUPPORTED_SCHEMA, MAX_SUPPORTED_SCHEMA]`. Extracted so the
