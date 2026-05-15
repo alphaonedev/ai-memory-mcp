@@ -76,7 +76,9 @@ impl std::fmt::Display for AttestLevel {
 /// `#[serde(rename_all = "snake_case")]` keeps the wire shape and the
 /// `memory_links.relation` TEXT column byte-identical to the values
 /// the v0.6.x codebase already writes (`"related_to"`, `"supersedes"`,
-/// `"contradicts"`, `"derived_from"`, `"reflects_on"`). The
+/// `"contradicts"`, `"derived_from"`, `"reflects_on"`, plus the
+/// v0.7.0 WT-1-A addition `"derives_from"` — distinct from
+/// `"derived_from"` as the atomisation-provenance variant). The
 /// [`MemoryLinkRelation::from_str`] / [`MemoryLinkRelation::as_str`]
 /// helpers exist because the column is read as a `String` in many
 /// call sites that are not deserialising through serde (e.g.
@@ -96,6 +98,17 @@ pub enum MemoryLinkRelation {
     /// Source is a reflection on target (recursive-learning provenance,
     /// v0.7.0 Task 1/8).
     ReflectsOn,
+    /// Source is an atomisation derivative of target — the typed,
+    /// signable, federation-safe expression of the structural
+    /// `memories.atom_of` FK introduced in v0.7.0 WT-1-A (schema v36
+    /// sqlite / v35 postgres). Atom row -> parent memory. Participates
+    /// in `find_paths` traversal alongside the other relations.
+    /// Distinct from `DerivedFrom` (consolidation provenance):
+    /// atomisation is a finer-grained, recoverable split that emits
+    /// one `derives_from` edge per atom; consolidation merges several
+    /// memories into one and emits `derived_from` edges from the
+    /// consolidated memory back to each source.
+    DerivesFrom,
 }
 
 impl MemoryLinkRelation {
@@ -113,6 +126,7 @@ impl MemoryLinkRelation {
             "contradicts" => Some(Self::Contradicts),
             "derived_from" => Some(Self::DerivedFrom),
             "reflects_on" => Some(Self::ReflectsOn),
+            "derives_from" => Some(Self::DerivesFrom),
             _ => None,
         }
     }
@@ -128,6 +142,7 @@ impl MemoryLinkRelation {
             Self::Contradicts => "contradicts",
             Self::DerivedFrom => "derived_from",
             Self::ReflectsOn => "reflects_on",
+            Self::DerivesFrom => "derives_from",
         }
     }
 
@@ -159,7 +174,7 @@ impl std::str::FromStr for MemoryLinkRelation {
         Self::from_str(s).ok_or_else(|| {
             format!(
                 "invalid memory_link relation '{s}' (expected one of: related_to, \
-                 supersedes, contradicts, derived_from, reflects_on)"
+                 supersedes, contradicts, derived_from, reflects_on, derives_from)"
             )
         })
     }
@@ -612,6 +627,7 @@ mod tests {
             ("contradicts", MemoryLinkRelation::Contradicts),
             ("derived_from", MemoryLinkRelation::DerivedFrom),
             ("reflects_on", MemoryLinkRelation::ReflectsOn),
+            ("derives_from", MemoryLinkRelation::DerivesFrom),
         ] {
             // Disambiguate against the inherent `from_str` (which returns
             // Option) by going through the `FromStr` trait fully qualified.
