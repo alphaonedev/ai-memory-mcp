@@ -1,6 +1,15 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+// v0.7.0 SHIP CAMPAIGN — this test routes through the SAL `MemoryStore`
+// trait + `SqliteStore` adapter (both in `ai_memory::store::*`, which
+// is gated behind the `sal` feature). Under the default feature set
+// the module is configured out, so the unconditional `use` lines below
+// would fail to resolve and the workspace `cargo test` (default-feature)
+// build would break. Gate the entire file behind `sal` to match the
+// shape of the code under test. Surfaced by the fold-a2a1.7 polish
+// closeout per operator directive: no v0.8.0 deferral.
+#![cfg(feature = "sal")]
 // clippy allows (test scaffolding): pedantic lints with no behavioral impact.
 #![allow(clippy::doc_markdown)]
 //! v0.7.0.1 S75 — `/api/v1/capabilities` must surface a runtime
