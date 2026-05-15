@@ -97,6 +97,16 @@ const MIGRATION_V33_SIGNED_EVENTS_CHAIN: &str =
 const MIGRATION_V34_OFFLOADED_BLOBS: &str =
     include_str!("../../migrations/postgres/0016_v07_offloaded_blobs.sql");
 
+/// v0.7.0 WT-1-A — schema v35 (postgres) atomisation foundation.
+/// Mirrors SQLite schema v36. Adds two nullable columns on `memories`
+/// (`atomised_into INTEGER` + `atom_of TEXT REFERENCES memories(id)`)
+/// plus extends the `memory_links.relation` closed-taxonomy CHECK
+/// constraint with `derives_from` for atomisation provenance edges.
+/// Postgres supports `ADD COLUMN IF NOT EXISTS` (14+) so this is a
+/// pure idempotent DDL batch.
+const MIGRATION_V35_ATOMISATION: &str =
+    include_str!("../../migrations/postgres/0017_v07_atomisation.sql");
+
 /// Current schema version. Matches SQLite CURRENT_SCHEMA_VERSION (src/db.rs:233).
 /// Incremented on each migration step.
 ///
@@ -161,7 +171,17 @@ const MIGRATION_V34_OFFLOADED_BLOBS: &str =
 //       Mirrors SQLite schema v35. Pure idempotent CREATE TABLE IF
 //       NOT EXISTS + CREATE INDEX IF NOT EXISTS — no application-
 //       side backfill needed.
-const CURRENT_SCHEMA_VERSION: i32 = 34;
+// v35 = v0.7.0 WT-1-A — substrate-level atomisation foundation.
+//       Adds `memories.atomised_into INTEGER` + `memories.atom_of
+//       TEXT REFERENCES memories(id)` columns plus extends the
+//       `memory_links.relation` closed-taxonomy CHECK constraint
+//       with `derives_from` for atomisation provenance edges
+//       (atom -> parent). Mirrors SQLite schema v36. Postgres
+//       supports `ADD COLUMN IF NOT EXISTS` so the migration is a
+//       pure idempotent DDL batch; the constraint drop-add is gated
+//       on a pg_constraint probe so re-running is a no-op. First
+//       hard prereq for WT-1-B through WT-1-G.
+const CURRENT_SCHEMA_VERSION: i32 = 35;
 
 /// Default embedding column dimension used when the caller doesn't pass
 /// `--embedding-dim` to `ai-memory schema-init`. Matches the v0.7.0
@@ -562,6 +582,9 @@ impl PostgresStore {
         if current_version < 34 {
             self.migrate_v34().await?;
         }
+        if current_version < 35 {
+            self.migrate_v35().await?;
+        }
 
         Ok(())
     }
@@ -856,6 +879,52 @@ impl PostgresStore {
         tracing::info!(
             target = "store::postgres",
             "schema migration v34 applied (offloaded_blobs context-offload substrate)"
+        );
+        Ok(())
+    }
+
+    /// v35 — substrate-level atomisation foundation (v0.7.0 WT-1-A).
+    ///
+    /// Adds two nullable columns to `memories`:
+    ///
+    /// - `atomised_into INTEGER` — NULL on legacy rows; positive integer
+    ///   on rows that have been atomised by the WT-1-B pass.
+    /// - `atom_of TEXT REFERENCES memories(id)` — for atom rows, points
+    ///   back to the parent memory; NULL on non-atom rows.
+    ///
+    /// Also extends the `memory_links.relation` closed-taxonomy CHECK
+    /// constraint with the new `derives_from` variant (atomisation
+    /// provenance edges atom -> parent). Mirrors SQLite schema v36
+    /// (`migrations/sqlite/0030_v07_atomisation.sql`).
+    ///
+    /// Postgres-native `ADD COLUMN IF NOT EXISTS` + `DO $$ ... $$`
+    /// block in the SQL file keeps this fully idempotent. Fresh
+    /// installs inherit the columns + extended CHECK inline from
+    /// `postgres_schema.sql`; this migration only fires on a
+    /// pre-v35 Postgres deployment with pre-existing `memories` /
+    /// `memory_links` rows.
+    async fn migrate_v35(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v35 tx", e))?;
+
+        sqlx::raw_sql(MIGRATION_V35_ATOMISATION)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("apply v35 atomisation", e))?;
+
+        record_schema_version(&mut tx, 35).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v35 migration", e))?;
+
+        tracing::info!(
+            target = "store::postgres",
+            "schema migration v35 applied (memories.atomised_into + atom_of columns; \
+             memory_links.relation CHECK extended with derives_from)"
         );
         Ok(())
     }
@@ -8938,7 +9007,7 @@ mod tests {
         // future bump on either side without the corresponding port
         // re-trips this assertion before the migration runner gets a
         // chance to write a partial schema to disk.
-        assert_eq!(CURRENT_SCHEMA_VERSION, 33);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 35);
     }
 
     #[tokio::test]

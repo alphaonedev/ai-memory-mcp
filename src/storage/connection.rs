@@ -91,7 +91,7 @@ fn apply_check_constraint_triggers(conn: &Connection) -> Result<()> {
     );
     let bad_relation = count_violations(
         "SELECT COUNT(*) FROM memory_links \
-         WHERE relation NOT IN ('related_to', 'supersedes', 'contradicts', 'derived_from', 'reflects_on')",
+         WHERE relation NOT IN ('related_to', 'supersedes', 'contradicts', 'derived_from', 'reflects_on', 'derives_from')",
     );
     let bad_attest = count_violations(
         "SELECT COUNT(*) FROM memory_links \

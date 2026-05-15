@@ -74,6 +74,11 @@ const VALID_RELATIONS: &[&str] = &[
     "contradicts",
     "derived_from",
     "reflects_on",
+    // v0.7.0 WT-1-A — atomisation-provenance edge (atom -> parent). The
+    // typed, signable, federation-safe expression of the structural
+    // `memories.atom_of` FK. Distinct from `derived_from` (consolidation
+    // provenance). Mirrors `crate::models::MemoryLinkRelation::DerivesFrom`.
+    "derives_from",
 ];
 
 fn is_valid_rfc3339(s: &str) -> bool {

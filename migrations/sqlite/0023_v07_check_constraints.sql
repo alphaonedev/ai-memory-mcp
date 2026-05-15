@@ -92,20 +92,29 @@ END;
 -- Closed set must stay byte-identical to
 -- `crate::models::MemoryLinkRelation::as_str` and to the Rust
 -- validator (`crate::validate::validate_relation`).
+--
+-- v0.7.0 WT-1-A (schema v35) extended the closed set with
+-- `derives_from` (atomisation provenance edges, atom -> parent). The
+-- v33 (migration 0027) full-table-rebuild dropped these triggers and
+-- promoted the constraint to a column-level CHECK clause, but
+-- `connection::open` re-applies this SQL on every fresh open as
+-- defense-in-depth (see `apply_check_constraint_triggers`). Keep the
+-- closed set here in sync with the column-level CHECK and the
+-- Rust-side enum so taxonomy drift surfaces loudly on either side.
 CREATE TRIGGER IF NOT EXISTS memory_links_ck_relation_ins
 BEFORE INSERT ON memory_links
 FOR EACH ROW
-WHEN NEW.relation NOT IN ('related_to', 'supersedes', 'contradicts', 'derived_from', 'reflects_on')
+WHEN NEW.relation NOT IN ('related_to', 'supersedes', 'contradicts', 'derived_from', 'reflects_on', 'derives_from')
 BEGIN
-    SELECT RAISE(ABORT, 'CHECK constraint failed: memory_links.relation must be one of related_to/supersedes/contradicts/derived_from/reflects_on');
+    SELECT RAISE(ABORT, 'CHECK constraint failed: memory_links.relation must be one of related_to/supersedes/contradicts/derived_from/reflects_on/derives_from');
 END;
 
 CREATE TRIGGER IF NOT EXISTS memory_links_ck_relation_upd
 BEFORE UPDATE OF relation ON memory_links
 FOR EACH ROW
-WHEN NEW.relation NOT IN ('related_to', 'supersedes', 'contradicts', 'derived_from', 'reflects_on')
+WHEN NEW.relation NOT IN ('related_to', 'supersedes', 'contradicts', 'derived_from', 'reflects_on', 'derives_from')
 BEGIN
-    SELECT RAISE(ABORT, 'CHECK constraint failed: memory_links.relation must be one of related_to/supersedes/contradicts/derived_from/reflects_on');
+    SELECT RAISE(ABORT, 'CHECK constraint failed: memory_links.relation must be one of related_to/supersedes/contradicts/derived_from/reflects_on/derives_from');
 END;
 
 -- ---------- memory_links.attest_level ----------
