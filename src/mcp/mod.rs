@@ -9819,6 +9819,9 @@ mod tests {
                         inherit: false,
                         max_reflection_depth: None,
                         auto_export_reflections_to_filesystem: None,
+                        auto_atomise: None,
+                        auto_atomise_threshold_cl100k: None,
+                        auto_atomise_max_atom_tokens: None
                     }
                 }),
                 reflection_depth: 0,
@@ -9877,6 +9880,9 @@ mod tests {
                         inherit: false,
                         max_reflection_depth: None,
                         auto_export_reflections_to_filesystem: None,
+                        auto_atomise: None,
+                        auto_atomise_threshold_cl100k: None,
+                        auto_atomise_max_atom_tokens: None
                     }
                 }),
                 reflection_depth: 0,

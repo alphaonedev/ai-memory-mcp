@@ -624,6 +624,9 @@ mod tests {
         let policy = crate::models::GovernancePolicy {
             max_reflection_depth: Some(cap),
             auto_export_reflections_to_filesystem: None,
+            auto_atomise: None,
+            auto_atomise_threshold_cl100k: None,
+            auto_atomise_max_atom_tokens: None,
             ..crate::models::GovernancePolicy::default()
         };
         let mut metadata = default_metadata();

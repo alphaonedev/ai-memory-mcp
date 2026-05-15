@@ -121,6 +121,9 @@ fn set_cap(conn: &rusqlite::Connection, ns: &str, cap: u32) {
     let policy = ai_memory::models::GovernancePolicy {
         max_reflection_depth: Some(cap),
         auto_export_reflections_to_filesystem: None,
+        auto_atomise: None,
+        auto_atomise_threshold_cl100k: None,
+        auto_atomise_max_atom_tokens: None,
         ..ai_memory::models::GovernancePolicy::default()
     };
     let metadata = serde_json::json!({

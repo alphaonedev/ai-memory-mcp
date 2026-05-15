@@ -331,6 +331,31 @@ pub struct GovernancePolicy {
     /// peers (no payload-byte drift, no replication regressions).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_export_reflections_to_filesystem: Option<bool>,
+    /// v0.7.0 WT-1-D — when `Some(true)`, the `pre_store` substrate
+    /// hook (`AutoAtomisationHook`) deferred-enqueues a curator pass
+    /// on the stored memory if its body exceeds
+    /// `auto_atomise_threshold_cl100k`. Inherits leaf-first via the
+    /// namespace chain (same walk as every other field). `None` /
+    /// `Some(false)` keeps the substrate quiet; the operator opts in
+    /// per-namespace by setting this to `Some(true)` on the namespace
+    /// standard's `metadata.governance` blob. `skip_serializing_if`
+    /// keeps absent-on-wire for pre-WT-1-D federation peers (zero
+    /// replication drift).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_atomise: Option<bool>,
+    /// v0.7.0 WT-1-D — cl100k_base token threshold over which a
+    /// `memory_store` triggers the auto-atomisation curator pass.
+    /// `None` defers to the compiled default (500). Resolved via the
+    /// same leaf-first inheritance walk; a child `None` inherits the
+    /// nearest ancestor's explicit `Some(n)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_atomise_threshold_cl100k: Option<u32>,
+    /// v0.7.0 WT-1-D — per-atom token budget passed to the curator
+    /// when the auto-atomisation hook fires. `None` defers to the
+    /// compiled default (200, matching `AtomiserConfig::default_max_atom_tokens`).
+    /// Resolved via the same leaf-first inheritance walk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_atomise_max_atom_tokens: Option<u32>,
 }
 
 fn default_promote_level() -> GovernanceLevel {
@@ -368,6 +393,12 @@ impl Default for GovernancePolicy {
             // box; operators opt in per-namespace by setting this to
             // `Some(true)` on the namespace standard's governance blob.
             auto_export_reflections_to_filesystem: None,
+            // v0.7.0 WT-1-D: substrate defaults to NOT auto-atomising.
+            // Operators opt in per-namespace by setting this on the
+            // namespace standard's governance blob.
+            auto_atomise: None,
+            auto_atomise_threshold_cl100k: None,
+            auto_atomise_max_atom_tokens: None,
         }
     }
 }
@@ -408,6 +439,11 @@ impl GovernancePolicy {
             // managed namespaces — operators may want governance
             // enforcement WITHOUT plaintext reflections on disk.
             auto_export_reflections_to_filesystem: None,
+            // v0.7.0 WT-1-D: managed-namespace bootstrap leaves the
+            // auto-atomise knobs unset; opt-in is explicit.
+            auto_atomise: None,
+            auto_atomise_threshold_cl100k: None,
+            auto_atomise_max_atom_tokens: None,
         }
     }
 
@@ -452,6 +488,39 @@ impl GovernancePolicy {
     #[must_use]
     pub fn effective_auto_export_reflections_to_filesystem(&self) -> bool {
         self.auto_export_reflections_to_filesystem.unwrap_or(false)
+    }
+
+    /// v0.7.0 WT-1-D — resolve the auto-atomisation enable flag.
+    /// Returns `false` (substrate stays quiet) when the namespace has
+    /// no explicit override. `Some(true)` opts the namespace into the
+    /// `pre_store` substrate hook's deferred curator-pass enqueue.
+    ///
+    /// Inheritance is **not** walked here — the caller resolves the
+    /// most-specific policy via `resolve_governance_policy` and then
+    /// queries this accessor on the result, mirroring how
+    /// `effective_max_reflection_depth` is consumed.
+    #[must_use]
+    pub fn effective_auto_atomise(&self) -> bool {
+        self.auto_atomise.unwrap_or(false)
+    }
+
+    /// v0.7.0 WT-1-D — resolve the cl100k token threshold above which
+    /// the auto-atomisation hook fires. Compiled default is **500**;
+    /// matches the WT-1-D brief (memories ≤ 500 tokens are short
+    /// enough to live as a single observation).
+    #[must_use]
+    pub fn effective_auto_atomise_threshold_cl100k(&self) -> u32 {
+        self.auto_atomise_threshold_cl100k.unwrap_or(500)
+    }
+
+    /// v0.7.0 WT-1-D — resolve the per-atom token budget for the
+    /// auto-atomisation curator pass. Compiled default is **200**;
+    /// matches `AtomiserConfig::default_max_atom_tokens` so the
+    /// hook-driven path produces atoms indistinguishable from
+    /// CLI/MCP-driven atomisation.
+    #[must_use]
+    pub fn effective_auto_atomise_max_atom_tokens(&self) -> u32 {
+        self.auto_atomise_max_atom_tokens.unwrap_or(200)
     }
 }
 
