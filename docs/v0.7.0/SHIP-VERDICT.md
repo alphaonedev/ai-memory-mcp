@@ -1,7 +1,7 @@
 # ai-memory v0.7.0 — SHIP-VERDICT memo (Phase I)
 
 **Status:** FINAL · ready for tag-cut.
-**HEAD:** `<post-PR#716-merge SHA>` (security fixes on top of 7-PR cascade on top of `41bd382` build-fix on top of `dfa4847`)
+**HEAD:** `ea59288` (security fixes on top of 7-PR cascade on top of `41bd382` build-fix on top of `dfa4847`)
 **Date:** 2026-05-14
 **Authors:** AI NHI cross-LLM campaign (Claude Opus 4.7 driving, Grok 4.20-0309-reasoning cross-verifying)
 **Tracking:** #700, #29
