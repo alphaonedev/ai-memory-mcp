@@ -4005,6 +4005,9 @@ mod tests {
             memory_kind: crate::models::MemoryKind::Observation,
             entity_id: None,
             persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
         };
         let id = db::insert(&conn, &mem).unwrap();
         db::set_embedding(&conn, &id, &[1.0, 0.0, 0.0]).unwrap();
@@ -4050,6 +4053,9 @@ mod tests {
             memory_kind: crate::models::MemoryKind::Observation,
             entity_id: None,
             persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
         };
         db::insert(&conn, &mem).unwrap();
         drop(conn);

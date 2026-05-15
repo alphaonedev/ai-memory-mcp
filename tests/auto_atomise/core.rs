@@ -288,6 +288,9 @@ fn insert_memory(conn: &Connection, ns: &str, content: &str) -> Memory {
         memory_kind: MemoryKind::Observation,
         entity_id: None,
         persona_version: None,
+        citations: Vec::new(),
+        source_uri: None,
+        source_span: None,
     };
     let id = db::insert(conn, &mem).expect("insert");
     Memory { id, ..mem }
@@ -705,6 +708,9 @@ fn test_auto_atomise_refused_memory_not_atomised() {
         memory_kind: MemoryKind::Observation,
         entity_id: None,
         persona_version: None,
+        citations: Vec::new(),
+        source_uri: None,
+        source_span: None,
     };
 
     let insert_result = db::insert(&conn, &mem);
