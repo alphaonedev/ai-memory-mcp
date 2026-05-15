@@ -162,9 +162,83 @@ The `--include-atomisation-chain=false` flag drops the chain
 enrichment when an auditor only needs the canonical post-atomisation
 surface and not the historical record.
 
+## Synchronous mode
+
+v0.7.x Form 2 (issue #755, Batman framework alignment) adds an
+opt-in `AutoAtomiseMode::Synchronous` namespace policy variant. The
+default behaviour (`Deferred`, equivalent to the WT-1-D semantics
+above) remains unchanged; operators who need Batman's exact "decompose
+THEN embed" order set the policy explicitly.
+
+### Resolution table
+
+| `auto_atomise` | `auto_atomise_mode` | Effective behaviour |
+|----------------|---------------------|---------------------|
+| `None` / `false` | any              | Off (no atomisation) |
+| `Some(true)`     | `None`           | Deferred (legacy WT-1-D) |
+| `Some(true)`     | `Some(Off)`      | Off (explicit disable wins) |
+| `Some(true)`     | `Some(Deferred)` | Deferred (explicit) |
+| any              | `Some(Synchronous)` | Synchronous (Form 2 path) |
+
+### What changes in Synchronous mode
+
+When the policy resolves to `Synchronous`:
+
+1. The MCP `memory_store` handler SKIPS source embedding (line ~505
+   in `src/mcp/tools/store.rs`).
+2. `run_synchronous_auto_atomise` runs the curator pass INSIDE the
+   handler, BEFORE the response returns.
+3. Atoms are inserted as first-class memories on the standard write
+   path; each gets its normal embed-on-insert pass.
+4. The source memory is archived with `atomised_into = N` and
+   `metadata.atomisation_archived_at = <RFC3339>` BEFORE the response
+   returns — recall sees the atoms immediately, not the source blob.
+5. The response envelope carries `atomise_mode: "synchronous"` and
+   `atomise_outcome: "atomised" | "skipped_*" | "failed"` so the
+   caller can verify the substrate did what the policy asked for.
+
+### When to choose which mode
+
+| Concern | Deferred (default) | Synchronous (Form 2) |
+|---------|--------------------|----------------------|
+| `memory_store` latency | ≤ 5% overhead | curator-bound (seconds) |
+| Source visible until curator runs | Yes (as one blob) | No (atoms surface immediately) |
+| Decompose-before-embed order | No (source embedded first) | Yes |
+| Recall semantics post-write | Eventually atoms; source covers gap | Atoms only |
+| Curator-failure blast radius | Notify-class (logged) | Notify-class (logged, source still committed unembedded) |
+
+Pick `Synchronous` when an agent's next `memory_recall` MUST see
+atom-grained results without waiting for the worker thread (e.g. a
+hot batch-ingest path where the agent re-queries inside the same
+agent turn). Pick `Deferred` when `memory_store` latency matters
+more than recall freshness — the worker thread will catch up within
+a few seconds in the steady state.
+
+### Configuration
+
+Set the policy on a namespace standard's `metadata.governance` blob:
+
+```json
+{
+  "governance": {
+    "write": "any",
+    "auto_atomise_mode": "synchronous",
+    "auto_atomise_threshold_cl100k": 500,
+    "auto_atomise_max_atom_tokens": 200
+  }
+}
+```
+
+The threshold + max-atom-tokens fields are shared with the deferred
+path; the only new field on the wire is `auto_atomise_mode`. Federation
+peers running pre-Form-2 v0.7.0 deserialise the absent field as `None`
+and fall back to the legacy `auto_atomise` boolean resolution, so no
+replication drift occurs during a phased rollout.
+
 ## See also
 
 - [Cookbook recipe — basic flow](../cookbook/atomisation/01-basic-flow.sh) — hermetic end-to-end reproduction (no LLM).
 - [`tests/atomisation/`](../tests/atomisation) — acceptance suite pinning curator + engine semantics.
 - [`tests/auto_atomise/`](../tests/auto_atomise) — pre_store hook coverage (WT-1-D).
+- [`tests/form_2_synchronous_atomise.rs`](../tests/form_2_synchronous_atomise.rs) — Form 2 synchronous-mode acceptance tests (#755).
 - [`tests/wt1c_mcp_atomise.rs`](../tests/wt1c_mcp_atomise.rs) — MCP tool wire shape.
