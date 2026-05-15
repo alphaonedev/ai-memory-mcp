@@ -275,8 +275,8 @@ fn forensic_bundle_tampered_file_exits_2() {
         output: Some(bundle_path.clone()),
         include_reflections: true,
         include_transcripts: false,
-    include_atomisation_chain: true,
-            };
+        include_atomisation_chain: true,
+    };
     {
         let mut stdout = Vec::<u8>::new();
         let mut stderr = Vec::<u8>::new();
@@ -337,8 +337,8 @@ fn forensic_bundle_clean_exits_0() {
         output: Some(bundle_path.clone()),
         include_reflections: true,
         include_transcripts: false,
-    include_atomisation_chain: true,
-            };
+        include_atomisation_chain: true,
+    };
     {
         let mut stdout = Vec::<u8>::new();
         let mut stderr = Vec::<u8>::new();
