@@ -214,6 +214,9 @@ mod tests {
             inherit: true,
             max_reflection_depth: None,
             auto_export_reflections_to_filesystem: Some(true),
+            auto_atomise: None,
+            auto_atomise_threshold_cl100k: None,
+            auto_atomise_max_atom_tokens: None,
         };
         let gov_metadata = serde_json::json!({
             "agent_id": "ai:test",
