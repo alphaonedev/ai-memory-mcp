@@ -363,6 +363,9 @@ fn sg_rl_3_federation_reflection_replication_with_cross_peer_refusal() {
         inherit: true,
         max_reflection_depth: Some(2),
         auto_export_reflections_to_filesystem: None,
+        auto_atomise: None,
+        auto_atomise_threshold_cl100k: None,
+        auto_atomise_max_atom_tokens: None,
     };
     seed_policy(&conn_b, ns, &tight);
 

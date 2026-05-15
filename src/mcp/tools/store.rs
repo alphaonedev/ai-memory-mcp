@@ -614,6 +614,31 @@ pub(super) fn handle_store(
         db_path,
     );
 
+    // v0.7.0 WT-1-D — auto-atomisation pre_store substrate hook. The
+    // call resolves the namespace policy, token-counts the body, and
+    // spawns a detached worker thread when the threshold is exceeded.
+    // NEVER blocks the response: the hook returns synchronously and
+    // the curator round-trip lands on the worker thread post-commit
+    // (100ms wait for the WAL visibility window).
+    //
+    // Refused-store path: this hook is unreachable on a Deny because
+    // the governance gate above already short-circuited via Err(...)
+    // before we reached `db::insert`. The store-side governance refusal
+    // ensures a denied write never feeds the curator.
+    {
+        // Build a fresh in-flight Memory carrying the actual_id (which
+        // may differ from mem.id under merge-mode upserts). The hook
+        // re-resolves the namespace policy from the DB so it sees any
+        // ancestor inheritance, not just the local literal struct.
+        let post_mem = crate::models::Memory {
+            id: actual_id.clone(),
+            ..mem.clone()
+        };
+        let _outcome = crate::hooks::pre_store::maybe_enqueue_auto_atomise(&post_mem, &agent_id);
+        // Outcome is for telemetry only; the response shape does NOT
+        // surface it (the curator pass is fire-and-forget by design).
+    }
+
     // #196: echo the resolved agent_id
     let mut response = json!({
         "id": actual_id,
@@ -1538,6 +1563,9 @@ mod tests {
             inherit: true,
             max_reflection_depth: None,
             auto_export_reflections_to_filesystem: None,
+            auto_atomise: None,
+            auto_atomise_threshold_cl100k: None,
+            auto_atomise_max_atom_tokens: None,
         };
         let now = chrono::Utc::now().to_rfc3339();
         let mut metadata = default_metadata();

@@ -1045,6 +1045,9 @@ fn cap_v3_k5_rule_summary_single_policy_carries_one_entry() {
         inherit: true,
         max_reflection_depth: None,
         auto_export_reflections_to_filesystem: None,
+        auto_atomise: None,
+        auto_atomise_threshold_cl100k: None,
+        auto_atomise_max_atom_tokens: None,
     };
     seed_governance_policy(&conn, "team", &policy);
 
@@ -1117,6 +1120,9 @@ fn cap_v3_k5_rule_summary_multiple_policies_lex_ordered() {
         inherit: false,
         max_reflection_depth: None,
         auto_export_reflections_to_filesystem: None,
+        auto_atomise: None,
+        auto_atomise_threshold_cl100k: None,
+        auto_atomise_max_atom_tokens: None,
     };
     let alpha = GovernancePolicy {
         write: GovernanceLevel::Any,
@@ -1126,6 +1132,9 @@ fn cap_v3_k5_rule_summary_multiple_policies_lex_ordered() {
         inherit: true,
         max_reflection_depth: None,
         auto_export_reflections_to_filesystem: None,
+        auto_atomise: None,
+        auto_atomise_threshold_cl100k: None,
+        auto_atomise_max_atom_tokens: None,
     };
     let middle = GovernancePolicy::default();
     seed_governance_policy(&conn, "zeta", &zeta);

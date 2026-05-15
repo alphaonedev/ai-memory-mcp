@@ -38,6 +38,12 @@ pub mod timeouts;
 // connection on the worker thread).
 pub mod post_reflect;
 
+// v0.7.0 WT-1-D — `pre_store` substrate-side hook plug-ins
+// (auto-atomisation deferred-enqueue, future pre-commit observers).
+// Same in-substrate discipline as `post_reflect` — distinct from the
+// cross-process `HookEvent::PreStore` family in `events.rs`.
+pub mod pre_store;
+
 // G2 lifted `HookEvent` out of `config.rs` into `events.rs` and
 // attached payload structs to every variant. The re-export keeps
 // G1's `use crate::hooks::HookEvent` (and the

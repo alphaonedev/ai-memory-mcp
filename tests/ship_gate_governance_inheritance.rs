@@ -94,6 +94,9 @@ fn approve_write_policy() -> GovernancePolicy {
         inherit: true,
         max_reflection_depth: None,
         auto_export_reflections_to_filesystem: None,
+        auto_atomise: None,
+        auto_atomise_threshold_cl100k: None,
+        auto_atomise_max_atom_tokens: None,
     }
 }
 
@@ -106,6 +109,9 @@ fn any_policy_no_inherit() -> GovernancePolicy {
         inherit: false,
         max_reflection_depth: None,
         auto_export_reflections_to_filesystem: None,
+        auto_atomise: None,
+        auto_atomise_threshold_cl100k: None,
+        auto_atomise_max_atom_tokens: None,
     }
 }
 

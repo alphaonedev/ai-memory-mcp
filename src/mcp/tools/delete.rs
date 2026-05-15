@@ -429,6 +429,9 @@ mod tests {
             inherit: true,
             max_reflection_depth: None,
             auto_export_reflections_to_filesystem: None,
+            auto_atomise: None,
+            auto_atomise_threshold_cl100k: None,
+            auto_atomise_max_atom_tokens: None,
         };
         let now = chrono::Utc::now().to_rfc3339();
         let mut metadata = default_metadata();

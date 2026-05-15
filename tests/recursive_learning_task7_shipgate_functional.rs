@@ -408,6 +408,9 @@ fn cap_zero_disables_every_reflection_with_audit_row() {
         inherit: true,
         max_reflection_depth: Some(0),
         auto_export_reflections_to_filesystem: None,
+        auto_atomise: None,
+        auto_atomise_threshold_cl100k: None,
+        auto_atomise_max_atom_tokens: None,
     };
     seed_policy(&conn, "task7-disabled", &policy);
     let src = make_memory("task7-disabled", "depth0-src", 0);

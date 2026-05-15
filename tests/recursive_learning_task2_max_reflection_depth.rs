@@ -96,6 +96,9 @@ fn effective_max_reflection_depth_explicit_override_returns_value() {
         inherit: true,
         max_reflection_depth: Some(7),
         auto_export_reflections_to_filesystem: None,
+        auto_atomise: None,
+        auto_atomise_threshold_cl100k: None,
+        auto_atomise_max_atom_tokens: None,
     };
     assert_eq!(p.effective_max_reflection_depth(), 7);
 }
@@ -117,6 +120,9 @@ fn effective_max_reflection_depth_some_zero_disables_reflection() {
         inherit: true,
         max_reflection_depth: Some(0),
         auto_export_reflections_to_filesystem: None,
+        auto_atomise: None,
+        auto_atomise_threshold_cl100k: None,
+        auto_atomise_max_atom_tokens: None,
     };
     assert_eq!(
         p.effective_max_reflection_depth(),
@@ -134,6 +140,9 @@ fn effective_max_reflection_depth_some_one_returns_one() {
     let p = GovernancePolicy {
         max_reflection_depth: Some(1),
         auto_export_reflections_to_filesystem: None,
+        auto_atomise: None,
+        auto_atomise_threshold_cl100k: None,
+        auto_atomise_max_atom_tokens: None,
         ..GovernancePolicy::default()
     };
     assert_eq!(p.effective_max_reflection_depth(), 1);
@@ -149,6 +158,9 @@ fn effective_max_reflection_depth_high_override_returns_value() {
     let p = GovernancePolicy {
         max_reflection_depth: Some(255),
         auto_export_reflections_to_filesystem: None,
+        auto_atomise: None,
+        auto_atomise_threshold_cl100k: None,
+        auto_atomise_max_atom_tokens: None,
         ..GovernancePolicy::default()
     };
     assert_eq!(p.effective_max_reflection_depth(), 255);
@@ -263,6 +275,9 @@ fn serialize_policy_with_explicit_field_writes_key_on_the_wire() {
     let p = GovernancePolicy {
         max_reflection_depth: Some(0),
         auto_export_reflections_to_filesystem: None,
+        auto_atomise: None,
+        auto_atomise_threshold_cl100k: None,
+        auto_atomise_max_atom_tokens: None,
         ..GovernancePolicy::default()
     };
     let json = serde_json::to_value(&p).expect("serialize");
@@ -287,6 +302,9 @@ fn full_roundtrip_with_explicit_field() {
         inherit: true,
         max_reflection_depth: Some(4),
         auto_export_reflections_to_filesystem: None,
+        auto_atomise: None,
+        auto_atomise_threshold_cl100k: None,
+        auto_atomise_max_atom_tokens: None,
     };
     let json = serde_json::to_string(&p).expect("serialize");
     let back: GovernancePolicy = serde_json::from_str(&json).expect("deserialize");

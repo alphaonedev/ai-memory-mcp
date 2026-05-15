@@ -262,6 +262,9 @@ mod tests {
             inherit: true,
             max_reflection_depth: None,
             auto_export_reflections_to_filesystem: None,
+            auto_atomise: None,
+            auto_atomise_threshold_cl100k: None,
+            auto_atomise_max_atom_tokens: None,
         };
         seed_governance_policy(&db_path, "gov-ns", policy, "alice");
         let conn = db::open(&db_path).unwrap();
@@ -301,6 +304,9 @@ mod tests {
             inherit: true,
             max_reflection_depth: None,
             auto_export_reflections_to_filesystem: None,
+            auto_atomise: None,
+            auto_atomise_threshold_cl100k: None,
+            auto_atomise_max_atom_tokens: None,
         };
         seed_governance_policy(&db_path, "gov-ns", policy, "alice");
         let conn = db::open(&db_path).unwrap();
@@ -345,6 +351,9 @@ mod tests {
             inherit: true,
             max_reflection_depth: None,
             auto_export_reflections_to_filesystem: None,
+            auto_atomise: None,
+            auto_atomise_threshold_cl100k: None,
+            auto_atomise_max_atom_tokens: None,
         };
         seed_governance_policy(&db_path, "gov-ns", policy, "alice");
         let conn = db::open(&db_path).unwrap();
@@ -388,6 +397,9 @@ mod tests {
             inherit: true,
             max_reflection_depth: None,
             auto_export_reflections_to_filesystem: None,
+            auto_atomise: None,
+            auto_atomise_threshold_cl100k: None,
+            auto_atomise_max_atom_tokens: None,
         };
         seed_governance_policy(&db_path, "gov-ns", policy, "alice");
         let conn = db::open(&db_path).unwrap();
@@ -428,6 +440,9 @@ mod tests {
             inherit: true,
             max_reflection_depth: None,
             auto_export_reflections_to_filesystem: None,
+            auto_atomise: None,
+            auto_atomise_threshold_cl100k: None,
+            auto_atomise_max_atom_tokens: None,
         };
         seed_governance_policy(&db_path, "gov-ns", policy, "alice");
         let conn = db::open(&db_path).unwrap();

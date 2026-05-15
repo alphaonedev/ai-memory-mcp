@@ -413,6 +413,9 @@ fn cap_zero_disable_path_still_emits_audit_row() {
         inherit: true,
         max_reflection_depth: Some(0),
         auto_export_reflections_to_filesystem: None,
+        auto_atomise: None,
+        auto_atomise_threshold_cl100k: None,
+        auto_atomise_max_atom_tokens: None,
     };
     seed_policy(&conn, "task5-cap-zero", &policy);
     let src = make_memory("task5-cap-zero", "src-d0", 0);
