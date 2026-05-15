@@ -90,7 +90,9 @@ pub fn handle_command(parts: &[&str], conn: &Connection, out: &mut CliOutput<'_>
                 let _ = writeln!(out.stderr, "usage: search <query>");
                 return ShellAction::Continue;
             }
-            match db::search(conn, &q, None, None, 20, None, None, None, None, None, None, false) {
+            match db::search(
+                conn, &q, None, None, 20, None, None, None, None, None, None, false,
+            ) {
                 Ok(results) => {
                     for mem in &results {
                         let _ = writeln!(

@@ -234,14 +234,18 @@ fn archived_source_clause(include_archived: bool, table_alias: &str) -> &'static
         // Static fragment with the alias baked in — recall and
         // recall_hybrid pass `"m"`, search passes `"m"` too.
         match table_alias {
-            "m" => "AND NOT (\
+            "m" => {
+                "AND NOT (\
                 m.atomised_into IS NOT NULL AND m.atomised_into > 0 \
                 AND json_extract(m.metadata, '$.atomisation_archived_at') IS NOT NULL\
-            )",
-            "memories" => "AND NOT (\
+            )"
+            }
+            "memories" => {
+                "AND NOT (\
                 memories.atomised_into IS NOT NULL AND memories.atomised_into > 0 \
                 AND json_extract(memories.metadata, '$.atomisation_archived_at') IS NOT NULL\
-            )",
+            )"
+            }
             _ => "",
         }
     }

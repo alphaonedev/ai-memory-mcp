@@ -432,8 +432,20 @@ pub fn build_files(
     // 3) Edge envelopes — every reflects_on / supersedes / derived_from
     //    edge whose source is in `chain_ids`. WT-1-E folds in
     //    `derives_from` (atom → parent) alongside the existing
-    //    relations — see [`fetch_edges_for`].
-    let edges = fetch_edges_for(conn, &chain_ids)?;
+    //    relations — see [`fetch_edges_for`]. When the
+    //    `include_atomisation_chain` flag is unset, drop
+    //    `derives_from` edges from the output so the auditor
+    //    sees only the atom rows (the historical record stays
+    //    in the substrate; the bundle just doesn't carry it).
+    let edges_raw = fetch_edges_for(conn, &chain_ids)?;
+    let edges: Vec<_> = if args.include_atomisation_chain {
+        edges_raw
+    } else {
+        edges_raw
+            .into_iter()
+            .filter(|e| e.relation != "derives_from")
+            .collect()
+    };
     for edge in &edges {
         let bytes = serde_json::to_vec_pretty(edge).context("serialise EdgeEnvelope")?;
         // Lexicographic path so determinism survives row-order shuffling.
@@ -777,12 +789,7 @@ fn build_atomisation_envelope(
         .query_row(
             "SELECT atomised_into, atom_of FROM memories WHERE id = ?1",
             params![mem.id],
-            |r| {
-                Ok((
-                    r.get::<_, Option<i64>>(0)?,
-                    r.get::<_, Option<String>>(1)?,
-                ))
-            },
+            |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<String>>(1)?)),
         )
         .unwrap_or((None, None));
 
@@ -843,16 +850,24 @@ fn fetch_atomisation_signed_events_for(
     // derives_from edges. The atomisation_complete event's
     // `agent_id` matches the same `calling_agent_id` used by the
     // per-atom create_link_signed call.
-    let placeholders: String = chain_ids
-        .iter()
-        .enumerate()
-        .map(|(i, _)| format!("?{}", i + 1))
+    //
+    // Two disjoint placeholder ranges so the source_id and
+    // target_id INs each get their own bound slot — using the same
+    // placeholder name twice in rusqlite collapses the second bind,
+    // which leaves the OR branch unbound and rusqlite errors with
+    // "Wrong number of parameters."
+    let src_placeholders: String = (1..=chain_ids.len())
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let tgt_placeholders: String = (chain_ids.len() + 1..=chain_ids.len() * 2)
+        .map(|i| format!("?{i}"))
         .collect::<Vec<_>>()
         .join(", ");
     let agent_sql = format!(
         "SELECT DISTINCT observed_by FROM memory_links \
          WHERE relation = 'derives_from' \
-           AND (source_id IN ({placeholders}) OR target_id IN ({placeholders})) \
+           AND (source_id IN ({src_placeholders}) OR target_id IN ({tgt_placeholders})) \
            AND observed_by IS NOT NULL"
     );
     let mut agent_stmt = conn.prepare(&agent_sql)?;
