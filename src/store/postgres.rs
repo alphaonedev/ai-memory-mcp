@@ -454,13 +454,17 @@ impl PostgresStore {
                     let msg = e.to_string();
                     let is_concurrent_init = msg.contains("pg_extension_name_index")
                         || msg.contains("tuple concurrently updated")
-                        || msg.contains("duplicate key value");
+                        || msg.contains("duplicate key value")
+                        || msg.contains("deadlock detected")
+                        || msg.contains("concurrent update")
+                        || msg.contains("could not serialize access");
                     if !is_concurrent_init || attempt == 4 {
                         last_err = Some(e);
                         break;
                     }
-                    // Brief jittered backoff: 25 / 50 / 100 / 200ms.
-                    let backoff_ms = 25u64 << attempt;
+                    // Brief jittered backoff: 50 / 100 / 200 / 400ms (wider
+                    // for deadlocks which need both racers to retry).
+                    let backoff_ms = 50u64 << attempt;
                     tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
                 }
             }

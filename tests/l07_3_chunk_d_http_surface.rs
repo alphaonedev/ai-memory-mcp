@@ -985,6 +985,26 @@ async fn http_list_agents_returns_array() {
 // ---------------------------------------------------------------------------
 
 fn sign(secret: &str, timestamp: &str, body: &str) -> String {
+    // v0.7.0 release/v0.7.0 commit 99ffacc: K10 HMAC binds method + pending_id
+    // in the canonical request to close the row-substitution attack vector.
+    // Local-test wrapper delegates to sign_with_method_id with the legacy
+    // POST + zero-uuid path tests use.
+    sign_with_method_id(
+        secret,
+        timestamp,
+        "POST",
+        "00000000-0000-0000-0000-000000000000",
+        body,
+    )
+}
+
+fn sign_with_method_id(
+    secret: &str,
+    timestamp: &str,
+    method: &str,
+    pending_id: &str,
+    body: &str,
+) -> String {
     use sha2::Digest;
     use sha2::Sha256;
     fn sha256_hex(s: &str) -> String {
@@ -1027,7 +1047,7 @@ fn sign(secret: &str, timestamp: &str, body: &str) -> String {
             .collect()
     }
     let key_hash = sha256_hex(secret);
-    let canonical = format!("{timestamp}.{body}");
+    let canonical = format!("{timestamp}.{method}.{pending_id}.{body}");
     let sig = hmac_sha256_hex(&key_hash, &canonical);
     format!("sha256={sig}")
 }

@@ -36,9 +36,9 @@ use tower::ServiceExt as _;
 /// `tests/k10_approval_http.rs::K10_HTTP_LOCK`.
 static A1_HMAC_LOCK: Mutex<()> = Mutex::new(());
 
-/// Synthesise a K7-style signature for a request body. Mirrors the
-/// reference helper in `tests/k10_approval_http.rs::sign`.
-fn sign(secret: &str, timestamp: &str, body: &str) -> String {
+/// Synthesise a K10 approval signature binding method + pending_id per
+/// release/v0.7.0 commit 99ffacc. Canonical: `<ts>.<METHOD>.<pending_id>.<body>`.
+fn sign(secret: &str, timestamp: &str, method: &str, pending_id: &str, body: &str) -> String {
     use sha2::Digest;
     use sha2::Sha256;
     fn sha256_hex(s: &str) -> String {
@@ -81,7 +81,9 @@ fn sign(secret: &str, timestamp: &str, body: &str) -> String {
             .collect()
     }
     let key_hash = sha256_hex(secret);
-    let canonical = format!("{timestamp}.{body}");
+    // v0.7.0 release/v0.7.0 commit 99ffacc: K10 HMAC binds method + pending_id
+    // in the canonical request to close the row-substitution attack vector.
+    let canonical = format!("{timestamp}.{method}.{pending_id}.{body}");
     let sig = hmac_sha256_hex(&key_hash, &canonical);
     format!("sha256={sig}")
 }
@@ -228,7 +230,7 @@ async fn s5c1_approve_without_server_secret_returns_401_even_with_signature() {
 
     let body = String::new();
     let ts = chrono::Utc::now().timestamp().to_string();
-    let sig = sign("anything-no-server-secret", &ts, &body);
+    let sig = sign("anything-no-server-secret", &ts, "POST", &pid, &body);
 
     let req = Request::builder()
         .method("POST")
@@ -253,7 +255,7 @@ async fn s5c1_approve_with_valid_hmac_returns_200() {
 
     let body = String::new();
     let ts = chrono::Utc::now().timestamp().to_string();
-    let sig = sign("a1-positive-secret", &ts, &body);
+    let sig = sign("a1-positive-secret", &ts, "POST", &pid, &body);
 
     let req = Request::builder()
         .method("POST")
@@ -282,7 +284,7 @@ async fn s5c1_reject_with_valid_hmac_returns_200() {
 
     let body = String::new();
     let ts = chrono::Utc::now().timestamp().to_string();
-    let sig = sign("a1-positive-secret", &ts, &body);
+    let sig = sign("a1-positive-secret", &ts, "POST", &pid, &body);
 
     let req = Request::builder()
         .method("POST")
