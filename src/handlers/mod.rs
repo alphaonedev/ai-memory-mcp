@@ -963,6 +963,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .unwrap();
         assert!(!results.is_empty());

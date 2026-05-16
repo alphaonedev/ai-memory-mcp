@@ -404,17 +404,30 @@ impl Atomiser {
 // ---------------------------------------------------------------------------
 
 /// Read the `atomised_into` column for a memory. Returns `Ok(None)`
-/// when the column is NULL (memory has not been atomised), `Ok(Some(n))`
-/// when set, error on rusqlite failures.
+/// when the column is NULL (memory has not been atomised) OR the row
+/// does not exist, `Ok(Some(n))` when set, error on rusqlite failures
+/// other than `QueryReturnedNoRows`.
+///
+/// # Cluster-A COR-2 fix
+///
+/// Pre-fix, the body swallowed every rusqlite error via
+/// `.unwrap_or(None)`. A real failure (lock-timeout, IO error, schema
+/// drift) was indistinguishable from "row not present" — the
+/// idempotency check would fall through and the caller would proceed
+/// to re-atomise an already-atomised source. Now only the
+/// `QueryReturnedNoRows` variant maps to `Ok(None)`; every other
+/// rusqlite error propagates via `?` and surfaces as
+/// `AtomiseError::DbError`.
 fn read_atomised_into(conn: &Connection, id: &str) -> anyhow::Result<Option<i64>> {
-    let v: Option<i64> = conn
-        .query_row(
-            "SELECT atomised_into FROM memories WHERE id = ?1",
-            params![id],
-            |r| r.get(0),
-        )
-        .unwrap_or(None);
-    Ok(v)
+    match conn.query_row(
+        "SELECT atomised_into FROM memories WHERE id = ?1",
+        params![id],
+        |r| r.get::<_, Option<i64>>(0),
+    ) {
+        Ok(v) => Ok(v),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Return the ordered list of atom ids whose `atom_of` column points
@@ -662,32 +675,79 @@ fn emit_atomisation_complete_event(
 ///
 /// Strategy:
 /// 1. Search verbatim for `atom_text` in `source[cursor..]`. When
-///    found, advance the cursor to one past the start of the hit so
-///    a subsequent atom that quotes the same prefix doesn't latch
-///    onto the same offset.
+///    found, advance the cursor past the hit so a subsequent atom
+///    that quotes the same prefix doesn't latch onto the same offset.
 /// 2. When the verbatim search misses (curator paraphrased, or
-///    whitespace differs), fall back to a trimmed prefix-search
-///    (first 32 chars of the atom). Trimming whitespace + lowercasing
-///    is intentionally NOT performed — we want exact byte-offsets
-///    into the unmodified source.
-/// 3. Return `None` when both searches miss. The substrate still
+///    whitespace differs), return `None`. The substrate still
 ///    stamps `source_uri` so the lineage edge survives without the
 ///    span. This is the documented fallback contract for
 ///    curator-paraphrase atoms.
+///
+/// # UTF-8 safety
+///
+/// `cursor` is treated as a byte offset into `source_body`. The
+/// cursor MUST point at a char boundary on entry; the function
+/// advances it to the next char boundary AFTER the hit start so
+/// repeated invocations on the same body cannot land mid-codepoint.
+/// The returned span's `start` and `end` are both guaranteed to fall
+/// on char boundaries because `str::find` itself only returns
+/// codepoint-aligned offsets (a property of `str` slicing).
+///
+/// # Cluster-A COR-1 / COR-7 fix
+///
+/// Pre-fix, the cursor advanced via `start.saturating_add(1)` which
+/// could leave the cursor mid-codepoint on multi-byte text — a
+/// subsequent `source_body[*cursor..]` slice would panic at the byte
+/// boundary check. The fix walks to the next `char_indices()` entry
+/// past the hit so every advance lands on a valid boundary, and
+/// clamps `end` to `source_body.len()` defensively (verbatim
+/// `str::find` already guarantees this — the clamp is belt-and-braces
+/// against a future refactor that might pre-pad `needle`).
 fn compute_atom_span(source_body: &str, atom_text: &str, cursor: &mut usize) -> Option<SourceSpan> {
     let needle = atom_text.trim();
     if needle.is_empty() {
         return None;
     }
-    let start = if *cursor < source_body.len() {
-        source_body[*cursor..].find(needle).map(|off| *cursor + off)
+    // If the cursor has drifted mid-codepoint (shouldn't happen with the
+    // boundary-aware advance below, but defend against pathological
+    // callers passing in a stale cursor), realign DOWN to the previous
+    // boundary before slicing. `floor_char_boundary` is nightly-only;
+    // hand-roll the equivalent by walking back at most 3 bytes (UTF-8
+    // codepoints are ≤4 bytes).
+    let cursor_aligned = floor_char_boundary(source_body, *cursor);
+    let start = if cursor_aligned < source_body.len() {
+        source_body[cursor_aligned..]
+            .find(needle)
+            .map(|off| cursor_aligned + off)
     } else {
         None
     };
     let start = start.or_else(|| source_body.find(needle))?;
-    let end = start + needle.len();
-    *cursor = start.saturating_add(1);
+    let end = (start + needle.len()).min(source_body.len());
+    // Advance the cursor to the next char boundary AFTER `start` — using
+    // `char_indices()` to find the first index strictly greater than
+    // `start`. This ensures the cursor never lands mid-codepoint on
+    // multi-byte text (Café / 中文 / 🦀 etc.).
+    *cursor = source_body[start..]
+        .char_indices()
+        .nth(1)
+        .map_or(source_body.len(), |(off, _)| start + off);
     Some(SourceSpan { start, end })
+}
+
+/// Hand-rolled `str::floor_char_boundary` (the std fn is nightly-only as
+/// of 1.83). Returns the largest index `≤ index` that lies on a UTF-8
+/// char boundary in `s`. When `index >= s.len()`, returns `s.len()`
+/// (which is itself a valid boundary).
+fn floor_char_boundary(s: &str, index: usize) -> usize {
+    if index >= s.len() {
+        return s.len();
+    }
+    let mut i = index;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
 }
 
 // ---------------------------------------------------------------------------
@@ -728,5 +788,110 @@ mod tests {
             let s = format!("{e}");
             assert!(!s.is_empty());
         }
+    }
+
+    // ---- Cluster-A COR-1 / COR-7 / COV-3 — compute_atom_span tests.
+
+    #[test]
+    fn compute_atom_span_paraphrase_fallback_returns_none() {
+        // Atom text that the curator paraphrased — does not appear
+        // verbatim in the parent body. Pre-fix the fallback was a
+        // 32-char prefix search; the new contract returns `None`
+        // gracefully so the substrate stamps `source_uri` without a
+        // span. Critical: NO panic, even when the cursor was advanced
+        // by a prior successful hit on the same body.
+        let body = "The deployment manifest pins the image digest explicitly.";
+        let mut cursor = 0_usize;
+        let got = compute_atom_span(
+            body,
+            "Curator paraphrased this sentence entirely.",
+            &mut cursor,
+        );
+        assert!(
+            got.is_none(),
+            "paraphrase miss must return None, got {got:?}"
+        );
+        // Cursor unchanged on miss.
+        assert_eq!(cursor, 0);
+    }
+
+    #[test]
+    fn compute_atom_span_multibyte_utf8_stays_on_char_boundary() {
+        // Multi-byte body covering Latin-with-diacritic (Café), CJK
+        // (中文), and a 4-byte emoji (🦀). Pre-fix the cursor advance
+        // (`start.saturating_add(1)`) split codepoints and the next
+        // `source_body[*cursor..]` slice would panic. Post-fix the
+        // cursor always lands on a valid char boundary.
+        let body = "Café 中文 🦀 statement that follows the emoji.";
+        let mut cursor = 0_usize;
+
+        // First hit — the CJK substring.
+        let span = compute_atom_span(body, "中文", &mut cursor)
+            .expect("multi-byte needle should be found verbatim");
+        // Span lies on char boundaries (Rust's str::find guarantees
+        // this for verbatim matches; we re-assert as a regression pin).
+        assert!(body.is_char_boundary(span.start));
+        assert!(body.is_char_boundary(span.end));
+        assert_eq!(&body[span.start..span.end], "中文");
+
+        // Cursor must have advanced PAST `start` to the next char
+        // boundary — never mid-codepoint.
+        assert!(cursor > span.start);
+        assert!(
+            body.is_char_boundary(cursor),
+            "cursor={cursor} mid-codepoint"
+        );
+
+        // Second hit — the emoji. Critical: this slice would have
+        // panicked pre-fix because the cursor would have been
+        // mid-codepoint at byte-offset start+1 of the CJK char.
+        let span2 = compute_atom_span(body, "🦀", &mut cursor)
+            .expect("emoji needle should be found after CJK");
+        assert!(body.is_char_boundary(span2.start));
+        assert!(body.is_char_boundary(span2.end));
+        assert_eq!(&body[span2.start..span2.end], "🦀");
+
+        // Third hit — verify a verbatim ASCII sentence still works in
+        // the same pass.
+        let span3 = compute_atom_span(body, "statement that follows the emoji.", &mut cursor)
+            .expect("ascii needle should still be found");
+        assert_eq!(
+            &body[span3.start..span3.end],
+            "statement that follows the emoji."
+        );
+    }
+
+    #[test]
+    fn compute_atom_span_cursor_clamps_to_body_length() {
+        // Cursor sitting past EOL should NOT panic. The function falls
+        // through to the whole-body search.
+        let body = "short body";
+        let mut cursor = 1_000_usize;
+        let span = compute_atom_span(body, "body", &mut cursor).expect("fallback whole-body");
+        assert_eq!(&body[span.start..span.end], "body");
+    }
+
+    #[test]
+    fn compute_atom_span_stale_cursor_realigns_to_boundary() {
+        // A pathological caller passing a cursor mid-codepoint should
+        // not panic; the function realigns DOWN to the prior boundary
+        // before slicing. Regression pin for `floor_char_boundary`.
+        let body = "Café statement";
+        // The 'é' is the bytes `0xC3 0xA9` — byte offset 4 is the
+        // start of `0xA9`, mid-codepoint.
+        let mut cursor = 4_usize;
+        // Should not panic.
+        let _ = compute_atom_span(body, "statement", &mut cursor);
+    }
+
+    #[test]
+    fn floor_char_boundary_walks_back_to_codepoint_start() {
+        let s = "Café 中文";
+        // Boundary already valid.
+        assert_eq!(floor_char_boundary(s, 0), 0);
+        // Mid-codepoint (`é` starts at 3, occupies bytes 3..5).
+        assert_eq!(floor_char_boundary(s, 4), 3);
+        // Past EOL clamps to len.
+        assert_eq!(floor_char_boundary(s, 9999), s.len());
     }
 }

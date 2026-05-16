@@ -3186,6 +3186,12 @@ async fn recall_response(
             budget_tokens,
             app.scoring.as_ref(),
             false,
+            // v0.7.0 Cluster-A PERF-3 — push the prefix into SQL on
+            // both FTS and semantic branches so the partial
+            // idx_memories_source_uri index covers the lookup; the
+            // post-fetch apply_form4_recall_filters below remains for
+            // the `has_citations` axis.
+            source_uri_prefix,
         );
         drop(vi_guard);
         (r, "hybrid")
@@ -3203,6 +3209,8 @@ async fn recall_response(
             as_agent,
             budget_tokens,
             false,
+            // v0.7.0 Cluster-A PERF-3 — see hybrid branch above.
+            source_uri_prefix,
         );
         (r, "keyword")
     };

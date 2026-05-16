@@ -58,6 +58,15 @@ pub struct Metrics {
     /// non-zero rate to detect mesh-divergence drift early — before a
     /// follow-up catchup sync surfaces the gap.
     pub federation_partial_quorum_total: IntCounter,
+    /// Cluster-A COR-3 (v0.7.0): count of memory rows whose Form 4
+    /// fact-provenance JSON columns (`citations`, `source_span`,
+    /// `confidence_signals`, or pre-Form-4 `metadata`) failed to parse
+    /// and were silently defaulted by `row_to_memory`. Non-zero
+    /// indicates schema drift, writer-side corruption, or a
+    /// migration that left malformed JSON in the column. Labeled by
+    /// column name (`citations` | `source_span` | `confidence_signals`
+    /// | `metadata`).
+    pub corrupt_provenance_rows_total: IntCounterVec,
 }
 
 /// Lazily-built process-global metrics handle.
@@ -233,6 +242,19 @@ impl Metrics {
         )?;
         registry.register(Box::new(federation_partial_quorum_total.clone()))?;
 
+        // Cluster-A COR-3 (v0.7.0) — corrupt-provenance observability.
+        let corrupt_provenance_rows_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "ai_memory_corrupt_provenance_rows_total",
+                "Memory rows whose Form 4 fact-provenance JSON columns \
+                 failed to deserialise and were silently defaulted. \
+                 Non-zero indicates schema drift, writer-side corruption, \
+                 or a migration leaving malformed JSON.",
+            ),
+            &["column"],
+        )?;
+        registry.register(Box::new(corrupt_provenance_rows_total.clone()))?;
+
         Ok(Self {
             registry,
             store_total,
@@ -251,8 +273,21 @@ impl Metrics {
             federation_fanout_dropped_total,
             federation_fanout_retry_total,
             federation_partial_quorum_total,
+            corrupt_provenance_rows_total,
         })
     }
+}
+
+/// Cluster-A COR-3 (v0.7.0) — record a single corrupt-provenance row
+/// observation. `column` is the offending JSON column name
+/// (`citations` / `source_span` / `confidence_signals` / `metadata`).
+/// Pairs with a `tracing::warn!` at the call site so operators see the
+/// row id + parse error.
+pub fn record_corrupt_provenance(column: &str) {
+    registry()
+        .corrupt_provenance_rows_total
+        .with_label_values(&[column])
+        .inc();
 }
 
 /// Render the current registry state to the Prometheus text exposition

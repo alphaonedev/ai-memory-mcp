@@ -253,6 +253,7 @@ fn run_recall_hot(conn: &Connection, config: &BenchConfig) -> Result<OperationRe
             None,
             None,
             false,
+            None,
         )?;
     }
     let mut samples = Vec::with_capacity(config.iterations);
@@ -272,6 +273,7 @@ fn run_recall_hot(conn: &Connection, config: &BenchConfig) -> Result<OperationRe
             None,
             None,
             false,
+            None,
         )?;
         samples.push(start.elapsed());
     }

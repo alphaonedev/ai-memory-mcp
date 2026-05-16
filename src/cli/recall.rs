@@ -341,6 +341,7 @@ pub(crate) fn run_with_embedder(
                     args.budget_tokens,
                     &resolved_scoring,
                     args.include_archived,
+                    args.source_uri_prefix.as_deref(),
                 )?;
                 if let Some(ref ce) = reranker {
                     (ce.rerank(&args.context, results), outcome, "hybrid+rerank")
@@ -366,6 +367,7 @@ pub(crate) fn run_with_embedder(
                     args.as_agent.as_deref(),
                     args.budget_tokens,
                     args.include_archived,
+                    args.source_uri_prefix.as_deref(),
                 )?;
                 (results, outcome, "keyword")
             }
@@ -384,6 +386,7 @@ pub(crate) fn run_with_embedder(
             args.as_agent.as_deref(),
             args.budget_tokens,
             args.include_archived,
+            args.source_uri_prefix.as_deref(),
         )?;
         (results, outcome, "keyword")
     };
