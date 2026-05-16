@@ -177,8 +177,8 @@ pub enum Command {
         /// `power`, `full`, or a comma-separated custom list (e.g.,
         /// `core,graph,archive`). Default `core` (5 tools). Resolution
         /// order: this CLI flag > `AI_MEMORY_PROFILE` env > `[mcp].profile`
-        /// in config.toml > `core`. Set `--profile full` to reproduce
-        /// v0.6.3 surface 1:1 (43 tools).
+        /// in config.toml > `core`. Set `--profile full` to expose
+        /// every family (71 tools at v0.7.0 — `Profile::full().expected_tool_count()`).
         #[arg(long, env = "AI_MEMORY_PROFILE")]
         profile: Option<String>,
     },
