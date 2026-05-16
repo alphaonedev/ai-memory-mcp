@@ -63,6 +63,7 @@ pub fn handle_command(parts: &[&str], conn: &Connection, out: &mut CliOutput<'_>
                 None,
                 None,
                 false,
+                None,
             ) {
                 Ok((results, _outcome)) => {
                     for (mem, score) in &results {

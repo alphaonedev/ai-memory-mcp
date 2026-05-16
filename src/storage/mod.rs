@@ -29,7 +29,7 @@ use crate::models::{
     AGENTS_NAMESPACE, AgentRegistration, Approval, ApproverType, ConfidenceSource, DuplicateCheck,
     DuplicateMatch, GovernanceDecision, GovernanceLevel, GovernancePolicy, GovernedAction,
     MAX_NAMESPACE_DEPTH, Memory, MemoryLink, NamespaceCount, PROMOTION_THRESHOLD, PendingAction,
-    Stats, Taxonomy, TaxonomyNode, Tier, TierCount, namespace_ancestors,
+    SourceSpan, Stats, Taxonomy, TaxonomyNode, Tier, TierCount, namespace_ancestors,
 };
 
 // ---------------------------------------------------------------------------
@@ -294,6 +294,26 @@ fn visibility_clause(start: usize, table_alias: &str) -> String {
     )
 }
 
+/// v0.7.0 Form 4 / Cluster-A PERF-3 — escape SQL `LIKE` metacharacters
+/// (`%`, `_`, `\`) in a user-supplied substring so the substring matches
+/// literally when paired with `LIKE ... ESCAPE '\\'`. Used by the
+/// `source_uri LIKE 'prefix%'` filter in [`recall`] and
+/// [`recall_hybrid_with_telemetry`] to push the `--source-uri-prefix`
+/// filter into SQL.
+fn escape_like_pattern(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' | '%' | '_' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
 // v0.7.0 L0.5-3 — flat `src/db.rs` decomposed into `src/storage/`.
 // Sub-modules stay private to this module per the L0.5-1 pattern;
 // only the re-exports below form the public surface. The
@@ -327,6 +347,7 @@ pub use reflect::{
 pub(crate) use reflect::emit_reflection_depth_exceeded_audit;
 
 pub(crate) fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
+    let row_id: String = row.get("id")?;
     let tags_json: String = row.get("tags")?;
     let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
     let tier_str: String = row.get("tier")?;
@@ -335,11 +356,73 @@ pub(crate) fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
         .get::<_, String>("metadata")
         .unwrap_or_else(|_| "{}".to_string());
     let metadata: serde_json::Value = serde_json::from_str(&metadata_str).unwrap_or_else(|e| {
-        tracing::warn!("corrupt metadata in DB row, defaulting to {{}}: {e}");
+        tracing::warn!(
+            row_id = %row_id,
+            column = "metadata",
+            error = %e,
+            "corrupt metadata in DB row, defaulting to {{}}"
+        );
+        crate::metrics::record_corrupt_provenance("metadata");
         serde_json::json!({})
     });
+    // v0.7.0 Form 4 / Cluster-A COR-3 — citations JSON. Pre-fix used a
+    // bare `.ok()` chain that silently turned corrupt JSON into an empty
+    // vec with no operator signal. Now: log via `tracing::warn!` with the
+    // row id + column + parse error, bump the
+    // `corrupt_provenance_rows_total{column=...}` counter, then return
+    // the safe default.
+    let citations = match row.get::<_, String>("citations").ok() {
+        Some(s) => match serde_json::from_str::<Vec<crate::models::Citation>>(&s) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    row_id = %row_id,
+                    column = "citations",
+                    error = %e,
+                    "corrupt citations JSON in DB row, defaulting to []"
+                );
+                crate::metrics::record_corrupt_provenance("citations");
+                Vec::new()
+            }
+        },
+        None => Vec::new(),
+    };
+    let source_span: Option<SourceSpan> = row
+        .get::<_, Option<String>>("source_span")
+        .unwrap_or(None)
+        .and_then(|s| match serde_json::from_str::<SourceSpan>(&s) {
+            Ok(span) => Some(span),
+            Err(e) => {
+                tracing::warn!(
+                    row_id = %row_id,
+                    column = "source_span",
+                    error = %e,
+                    "corrupt source_span JSON in DB row, defaulting to None"
+                );
+                crate::metrics::record_corrupt_provenance("source_span");
+                None
+            }
+        });
+    let confidence_signals = row
+        .get::<_, Option<String>>("confidence_signals")
+        .unwrap_or(None)
+        .and_then(
+            |s| match serde_json::from_str::<crate::models::ConfidenceSignals>(&s) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!(
+                        row_id = %row_id,
+                        column = "confidence_signals",
+                        error = %e,
+                        "corrupt confidence_signals JSON in DB row, defaulting to None"
+                    );
+                    crate::metrics::record_corrupt_provenance("confidence_signals");
+                    None
+                }
+            },
+        );
     Ok(Memory {
-        id: row.get("id")?,
+        id: row_id,
         tier,
         namespace: row.get("namespace")?,
         title: row.get("title")?,
@@ -374,21 +457,13 @@ pub(crate) fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
         entity_id: row.get::<_, Option<String>>("entity_id").unwrap_or(None),
         persona_version: row.get::<_, Option<i32>>("persona_version").unwrap_or(None),
         // v0.7.0 Form 4 — schema v38 fact-provenance columns. `citations`
-        // is JSON-encoded with SQL DEFAULT '[]', so legacy rows resolve
-        // to an empty vec; the `.ok()` fallthrough yields the same
-        // default on a pre-v38 row that lacks the column entirely.
-        // `source_uri` is a plain TEXT column (NULL on legacy rows);
-        // `source_span` is JSON `{start,end}` (NULL on legacy rows).
-        citations: row
-            .get::<_, String>("citations")
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default(),
+        // / `source_span` corruption now logs WARN + bumps the
+        // `corrupt_provenance_rows_total` counter above so silent JSON
+        // drops surface in operator observability (Cluster-A COR-3 fix).
+        // `source_uri` is a plain TEXT column (NULL on legacy rows).
+        citations,
         source_uri: row.get::<_, Option<String>>("source_uri").unwrap_or(None),
-        source_span: row
-            .get::<_, Option<String>>("source_span")
-            .unwrap_or(None)
-            .and_then(|s| serde_json::from_str(&s).ok()),
+        source_span,
         // v0.7.0 Form 5 — schema v39 columns. Legacy rows resolve
         // to `CallerProvided` (SQL DEFAULT), NULL signals, NULL
         // decayed_at. `.ok()` fallthrough keeps the reader tolerant
@@ -399,10 +474,7 @@ pub(crate) fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
             .ok()
             .and_then(|s| crate::models::ConfidenceSource::from_str(&s))
             .unwrap_or_default(),
-        confidence_signals: row
-            .get::<_, Option<String>>("confidence_signals")
-            .unwrap_or(None)
-            .and_then(|s| serde_json::from_str(&s).ok()),
+        confidence_signals,
         confidence_decayed_at: row
             .get::<_, Option<String>>("confidence_decayed_at")
             .unwrap_or(None),
@@ -1502,6 +1574,11 @@ pub fn recall_with_telemetry(
     // archive-filter WHERE clause is dropped so forensic-export and
     // explicit auditor recall returns both atoms and sources.
     include_archived: bool,
+    // v0.7.0 Form 4 / Cluster-A PERF-3 — push `--source-uri-prefix`
+    // into the SQL WHERE so the partial `idx_memories_source_uri`
+    // index covers the lookup and excluded rows never enter the
+    // top-K. See [`recall`] for the contract.
+    source_uri_prefix: Option<&str>,
 ) -> Result<(
     Vec<(Memory, f64)>,
     BudgetOutcome,
@@ -1520,6 +1597,7 @@ pub fn recall_with_telemetry(
         as_agent,
         budget_tokens,
         include_archived,
+        source_uri_prefix,
     )?;
     let telemetry = crate::models::RecallTelemetry {
         fts_candidates: results.len(),
@@ -1544,6 +1622,16 @@ pub fn recall(
     // v0.7.0 WT-1-E — see [`recall_with_telemetry`] for the
     // archived-source exclusion contract.
     include_archived: bool,
+    // v0.7.0 Form 4 / Cluster-A PERF-3 — when `Some(prefix)`, restrict
+    // results to memories whose `source_uri` starts with `prefix`. The
+    // predicate is `source_uri LIKE 'prefix%'` so the partial
+    // `idx_memories_source_uri` index (defined in migration
+    // `0032_v07_form4_provenance.sql`) covers the scan. Pre-fix this
+    // filter ran in Rust AFTER the SQL returned, which excluded valid
+    // matches from the top-K when the substrate returned `limit` rows
+    // that subsequently filtered to fewer. `None` preserves the legacy
+    // no-filter behaviour for callers that filter post-hoc.
+    source_uri_prefix: Option<&str>,
 ) -> Result<(Vec<(Memory, f64)>, BudgetOutcome)> {
     let now = Utc::now().to_rfc3339();
     let fts_query = sanitize_fts_query(context, true);
@@ -1560,6 +1648,22 @@ pub fn recall(
     // through (include_archived=true). Composes with the existing
     // namespace, expiry, tag, time-window, and visibility filters.
     let archived_fragment = archived_source_clause(include_archived, "m");
+
+    // v0.7.0 Form 4 / Cluster-A PERF-3 — push the source-URI prefix
+    // predicate into SQL. We escape SQL LIKE metacharacters (`%`, `_`,
+    // `\`) in the supplied prefix so a caller passing e.g. `doc:abc_`
+    // matches only that literal value (not `doc:abcX`). The LIKE
+    // pattern is constructed with the bound parameter holding the
+    // already-escaped prefix + `%`; combined with the partial index
+    // on `source_uri WHERE source_uri IS NOT NULL`, SQLite picks the
+    // index for the lookup. See [`escape_like_pattern`].
+    let (source_uri_fragment, source_uri_param): (&str, Option<String>) = match source_uri_prefix {
+        Some(prefix) if !prefix.is_empty() => (
+            "AND m.source_uri LIKE ?12 ESCAPE '\\'",
+            Some(format!("{}%", escape_like_pattern(prefix))),
+        ),
+        _ => ("", None),
+    };
 
     let sql = format!(
         "SELECT m.id, m.tier, m.namespace, m.title, m.content, m.tags, m.priority,
@@ -1585,39 +1689,64 @@ pub fn recall(
            AND (?5 IS NULL OR m.created_at >= ?5)
            AND (?6 IS NULL OR m.created_at <= ?6)
            {archived_fragment}
+           {source_uri_fragment}
            {vis}
          ORDER BY score DESC
          LIMIT ?7",
         vis = visibility_clause(8, "m"),
     );
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(
-        params![
-            fts_query,
-            effective_namespace,
-            now,
-            tags_filter,
-            since,
-            until,
-            limit,
-            vis_p,
-            vis_t,
-            vis_u,
-            vis_o
-        ],
-        |row| {
-            let mem = row_to_memory(row)?;
-            // v0.7.0 Form 4 / v0.7.x Form 6 — name-based read for the
-            // trailing score column. Switched from positional `row.get`
-            // after schema v38 (citations, source_uri, source_span) and
-            // Form 6's `memory_kind`/`entity_id`/`persona_version`
-            // shifted the trailing column's index; name-based reads
-            // survive future column additions without further churn.
-            let score: f64 = row.get("score")?;
-            Ok((mem, score))
-        },
-    )?;
-    let results: Vec<(Memory, f64)> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    // Bind ?12 only when the source-URI fragment is active; SQLite
+    // errors on parameter-count mismatch.
+    let row_handler = |row: &rusqlite::Row<'_>| -> rusqlite::Result<(Memory, f64)> {
+        let mem = row_to_memory(row)?;
+        // v0.7.0 Form 4 / v0.7.x Form 6 — name-based read for the
+        // trailing score column. Switched from positional `row.get`
+        // after schema v38 (citations, source_uri, source_span) and
+        // Form 6's `memory_kind`/`entity_id`/`persona_version`
+        // shifted the trailing column's index; name-based reads
+        // survive future column additions without further churn.
+        let score: f64 = row.get("score")?;
+        Ok((mem, score))
+    };
+    let results: Vec<(Memory, f64)> = if let Some(ref uri_param) = source_uri_param {
+        let rows = stmt.query_map(
+            params![
+                fts_query,
+                effective_namespace,
+                now,
+                tags_filter,
+                since,
+                until,
+                limit,
+                vis_p,
+                vis_t,
+                vis_u,
+                vis_o,
+                uri_param,
+            ],
+            row_handler,
+        )?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    } else {
+        let rows = stmt.query_map(
+            params![
+                fts_query,
+                effective_namespace,
+                now,
+                tags_filter,
+                since,
+                until,
+                limit,
+                vis_p,
+                vis_t,
+                vis_u,
+                vis_o,
+            ],
+            row_handler,
+        )?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
 
     // Task 1.12: proximity boost when hierarchy expansion is active.
     let boosted = if let (true, Some(anchor)) = (hierarchy_active, namespace) {
@@ -4942,6 +5071,11 @@ pub fn recall_hybrid(
     // v0.7.0 WT-1-E — see [`recall_with_telemetry`] for the
     // archived-source exclusion contract.
     include_archived: bool,
+    // v0.7.0 Form 4 / Cluster-A PERF-3 — push `--source-uri-prefix`
+    // into the SQL WHERE on both the FTS and semantic branches so the
+    // partial `idx_memories_source_uri` index covers the lookup. See
+    // [`recall`] for the contract.
+    source_uri_prefix: Option<&str>,
 ) -> Result<(Vec<(Memory, f64)>, BudgetOutcome)> {
     let (results, outcome, _telemetry) = recall_hybrid_with_telemetry(
         conn,
@@ -4959,6 +5093,7 @@ pub fn recall_hybrid(
         budget_tokens,
         scoring,
         include_archived,
+        source_uri_prefix,
     )?;
     Ok((results, outcome))
 }
@@ -4995,6 +5130,11 @@ pub fn recall_hybrid_with_telemetry(
     // v0.7.0 WT-1-E — see [`recall_with_telemetry`] for the
     // archived-source exclusion contract.
     include_archived: bool,
+    // v0.7.0 Form 4 / Cluster-A PERF-3 — see [`recall`] for the
+    // contract. Pushed into both the FTS and semantic branch SQL so
+    // both pools are constrained by the partial
+    // `idx_memories_source_uri` index, not the post-fetch Rust filter.
+    source_uri_prefix: Option<&str>,
 ) -> Result<(
     Vec<(Memory, f64)>,
     BudgetOutcome,
@@ -5034,6 +5174,24 @@ pub fn recall_hybrid_with_telemetry(
     let fts_archived_fragment = archived_source_clause(include_archived, "m");
     let sem_archived_fragment = archived_source_clause(include_archived, "memories");
 
+    // v0.7.0 Form 4 / Cluster-A PERF-3 — push `source_uri_prefix` into
+    // both branches. FTS branch binds at ?12 (visibility uses ?8–?11);
+    // semantic branch binds at ?10 (visibility uses ?6–?9).
+    let source_uri_like_param: Option<String> = match source_uri_prefix {
+        Some(prefix) if !prefix.is_empty() => Some(format!("{}%", escape_like_pattern(prefix))),
+        _ => None,
+    };
+    let fts_source_uri_fragment = if source_uri_like_param.is_some() {
+        "AND m.source_uri LIKE ?12 ESCAPE '\\'"
+    } else {
+        ""
+    };
+    let sem_source_uri_fragment = if source_uri_like_param.is_some() {
+        "AND memories.source_uri LIKE ?10 ESCAPE '\\'"
+    } else {
+        ""
+    };
+
     // Step 1: Get FTS candidates (up to 3x limit to have a good pool)
     let fts_limit = (limit * 3).max(30);
     let fts_sql = format!(
@@ -5058,6 +5216,7 @@ pub fn recall_hybrid_with_telemetry(
            AND (?5 IS NULL OR m.created_at >= ?5)
            AND (?6 IS NULL OR m.created_at <= ?6)
            {fts_archived_fragment}
+           {fts_source_uri_fragment}
            {vis}
          ORDER BY fts_score DESC
          LIMIT ?7",
@@ -5079,6 +5238,7 @@ pub fn recall_hybrid_with_telemetry(
            AND (?4 IS NULL OR created_at >= ?4)
            AND (?5 IS NULL OR created_at <= ?5)
            {sem_archived_fragment}
+           {sem_source_uri_fragment}
            {vis}",
         vis = visibility_clause(6, "memories"),
     );
@@ -5087,31 +5247,51 @@ pub fn recall_hybrid_with_telemetry(
     // Collect FTS results with scores
     let mut scored: HashMap<String, (Memory, f64, f64)> = HashMap::new(); // id -> (memory, fts_score, cosine_score)
 
-    let fts_rows = fts_stmt.query_map(
-        params![
-            fts_query,
-            effective_namespace,
-            now,
-            tags_filter,
-            since,
-            until,
-            fts_limit,
-            vis_p,
-            vis_t,
-            vis_u,
-            vis_o,
-        ],
-        |row| {
-            let mem = row_to_memory(row)?;
-            // v0.7.0 Form 4 / v0.7.x Form 6 — name-based read for the
-            // trailing fts_score column. Same rationale as the other
-            // recall SELECT — schema v38 columns shifted the trailing
-            // computed column's index. Named reads survive future
-            // additive column drops.
-            let fts_score: f64 = row.get("fts_score")?;
-            Ok((mem, fts_score))
-        },
-    )?;
+    // Conditional binding: SQLite errors on parameter-count mismatch,
+    // so when source_uri_prefix is None we must NOT bind ?12.
+    let fts_row_handler = |row: &rusqlite::Row<'_>| -> rusqlite::Result<(Memory, f64)> {
+        let mem = row_to_memory(row)?;
+        let fts_score: f64 = row.get("fts_score")?;
+        Ok((mem, fts_score))
+    };
+    let fts_results: Vec<(Memory, f64)> = if let Some(ref uri_param) = source_uri_like_param {
+        let rows = fts_stmt.query_map(
+            params![
+                fts_query,
+                effective_namespace,
+                now,
+                tags_filter,
+                since,
+                until,
+                fts_limit,
+                vis_p,
+                vis_t,
+                vis_u,
+                vis_o,
+                uri_param,
+            ],
+            fts_row_handler,
+        )?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    } else {
+        let rows = fts_stmt.query_map(
+            params![
+                fts_query,
+                effective_namespace,
+                now,
+                tags_filter,
+                since,
+                until,
+                fts_limit,
+                vis_p,
+                vis_t,
+                vis_u,
+                vis_o,
+            ],
+            fts_row_handler,
+        )?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
 
     // v0.6.3.1 (P3): pre-fusion candidate-pool counters surfaced to the
     // MCP `meta` block. Counted here at retrieval time, not after fusion,
@@ -5121,8 +5301,8 @@ pub fn recall_hybrid_with_telemetry(
     let mut hnsw_candidates_count: usize = 0;
 
     let mut max_fts_score: f64 = 1.0;
-    for row in fts_rows {
-        let (mem, fts_score) = row?;
+    for row in fts_results {
+        let (mem, fts_score) = (row.0, row.1);
         if fts_score > max_fts_score {
             max_fts_score = fts_score;
         }
@@ -5208,36 +5388,75 @@ pub fn recall_hybrid_with_telemetry(
                 if !include_archived && is_archived_source(&mem) {
                     continue;
                 }
+                // v0.7.0 Form 4 / Cluster-A PERF-3 — apply
+                // source-URI-prefix filter on the HNSW branch in Rust
+                // (the HNSW index returns vector neighbours, not a
+                // SQL query — so the WHERE-clause push-down in the
+                // FTS/semantic branches doesn't reach here).
+                if let Some(prefix) = source_uri_prefix
+                    && !prefix.is_empty()
+                    && !mem
+                        .source_uri
+                        .as_deref()
+                        .is_some_and(|u| u.starts_with(prefix))
+                {
+                    continue;
+                }
                 scored.insert(mem.id.clone(), (mem, 0.0, cosine));
                 hnsw_candidates_count += 1;
             }
         }
     } else {
-        // Fallback: linear scan over all embeddings
-        let sem_rows = sem_stmt.query_map(
-            params![
-                effective_namespace,
-                now,
-                tags_filter,
-                since,
-                until,
-                vis_p,
-                vis_t,
-                vis_u,
-                vis_o
-            ],
-            |row| {
+        // Fallback: linear scan over all embeddings. Conditional
+        // binding mirrors the FTS branch — when source_uri_prefix is
+        // None we must not bind ?10.
+        let sem_row_handler =
+            |row: &rusqlite::Row<'_>| -> rusqlite::Result<(Memory, Option<Vec<u8>>)> {
                 let mem = row_to_memory(row)?;
                 // v0.7.x Form 6: bumped from 15 to 16 when `memory_kind`
                 // was inserted between `reflection_depth` and `embedding`
                 // in the SELECT list above.
                 let emb_bytes: Option<Vec<u8>> = row.get(16)?;
                 Ok((mem, emb_bytes))
-            },
-        )?;
+            };
+        let sem_results: Vec<(Memory, Option<Vec<u8>>)> =
+            if let Some(ref uri_param) = source_uri_like_param {
+                let rows = sem_stmt.query_map(
+                    params![
+                        effective_namespace,
+                        now,
+                        tags_filter,
+                        since,
+                        until,
+                        vis_p,
+                        vis_t,
+                        vis_u,
+                        vis_o,
+                        uri_param,
+                    ],
+                    sem_row_handler,
+                )?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            } else {
+                let rows = sem_stmt.query_map(
+                    params![
+                        effective_namespace,
+                        now,
+                        tags_filter,
+                        since,
+                        until,
+                        vis_p,
+                        vis_t,
+                        vis_u,
+                        vis_o,
+                    ],
+                    sem_row_handler,
+                )?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
 
-        for row in sem_rows {
-            let (mem, emb_bytes) = row?;
+        for row in sem_results {
+            let (mem, emb_bytes) = (row.0, row.1);
             if scored.contains_key(&mem.id) {
                 continue;
             }
@@ -7812,6 +8031,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .unwrap();
         assert!(!results.is_empty());
@@ -7839,6 +8059,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         );
         // May return empty or error, both acceptable
         assert!(results.is_ok() || results.is_err());
@@ -8771,6 +8992,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .unwrap();
         assert!(!results.is_empty());

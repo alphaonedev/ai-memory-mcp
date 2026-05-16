@@ -617,6 +617,51 @@ pub fn validate_source_span(span: &SourceSpan) -> Result<()> {
     Ok(())
 }
 
+/// v0.7.0 Form 4 / Cluster-A — body-aware [`SourceSpan`] validation.
+///
+/// Stricter superset of [`validate_source_span`]: in addition to the
+/// `start < end` invariant, this also requires:
+///
+/// 1. `span.end <= body.len()` — the half-open interval `[start, end)`
+///    must lie entirely within the body, so `body[span.start..span.end]`
+///    cannot panic on out-of-bounds.
+/// 2. Both `span.start` and `span.end` fall on UTF-8 char boundaries
+///    in `body`. Slicing on a non-boundary panics, which would break
+///    every downstream consumer (forensic export, CLI display, etc.).
+///
+/// Call this from validators that have the source body in hand (e.g.
+/// the atomisation writer, the citation validator on a known parent).
+/// Validators that only have the span (the bare-bones
+/// `validate_source_span` above) keep their lighter contract.
+///
+/// # Errors
+///
+/// Returns when `start >= end`, when `end > body.len()`, or when either
+/// endpoint lands mid-codepoint.
+pub fn validate_source_span_for_body(span: &SourceSpan, body: &str) -> Result<()> {
+    validate_source_span(span)?;
+    if span.end > body.len() {
+        bail!(
+            "source_span end={} exceeds body length {}",
+            span.end,
+            body.len()
+        );
+    }
+    if !body.is_char_boundary(span.start) {
+        bail!(
+            "source_span start={} is not a UTF-8 char boundary in body",
+            span.start
+        );
+    }
+    if !body.is_char_boundary(span.end) {
+        bail!(
+            "source_span end={} is not a UTF-8 char boundary in body",
+            span.end
+        );
+    }
+    Ok(())
+}
+
 /// Validate a full `CreateMemory` before insert.
 pub fn validate_create(mem: &CreateMemory) -> Result<()> {
     validate_title(&mem.title)?;

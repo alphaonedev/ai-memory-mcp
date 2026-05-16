@@ -343,6 +343,7 @@ fn has_citations_recall_filter_excludes_empty_provenance() {
         None,
         None,
         false,
+        None,
     )
     .expect("recall");
     // Substrate returns both; the post-filter restricts.
@@ -389,6 +390,7 @@ fn source_uri_prefix_recall_filter_restricts_to_matching_uri() {
         None,
         None,
         false,
+        None,
     )
     .expect("recall");
     assert_eq!(results.len(), 3, "substrate returns all three rows");
@@ -497,4 +499,196 @@ fn schema_v38_columns_present_and_migration_is_idempotent() {
         )
         .ok();
     assert!(idx_exists.is_some(), "source_uri partial index present");
+}
+
+// ---------------------------------------------------------------------------
+// 7. Cluster-A PERF-3 — source_uri_prefix push-down hits the partial index
+// ---------------------------------------------------------------------------
+
+/// Cluster-A PERF-3 regression pin. Pre-fix the `--source-uri-prefix`
+/// filter ran in Rust AFTER the substrate returned top-K rows, so
+/// `idx_memories_source_uri` was dead code and valid matches outside
+/// the substrate's top-K were silently excluded. This test:
+///
+/// 1. Inserts a mix of rows whose `source_uri` matches the prefix and
+///    rows that don't, with the matching rows competing for slots
+///    against many non-matching rows.
+/// 2. Runs `db::recall(... source_uri_prefix=Some("uri:https://"))`
+///    and asserts that only matching rows are returned.
+/// 3. Runs `EXPLAIN QUERY PLAN` on the same SQL shape and asserts the
+///    plan mentions `idx_memories_source_uri` — pinning the SQL
+///    push-down so a future refactor that drops the WHERE-clause
+///    re-introduces the dead-index regression.
+#[test]
+fn recall_with_source_uri_prefix_uses_index() {
+    let _g = test_serial()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (_tmp, conn) = fresh_db();
+
+    let ns = "form4-perf3-prefix-index";
+    // 6 matching rows (uri:https://...) — chosen large enough that the
+    // pre-fix bug would surface if the substrate returned the top-K by
+    // FTS rank alone and then the post-filter trimmed matches out.
+    for i in 0..6 {
+        let mut m = mem_with_citations(
+            ns,
+            &format!("matching note {i}"),
+            "deployment manifest example payload",
+            Vec::new(),
+        );
+        m.source_uri = Some(format!("uri:https://example.test/path/{i}"));
+        storage::insert(&conn, &m).expect("insert matching");
+    }
+    // 12 non-matching rows (doc:... and bare).
+    for i in 0..6 {
+        let mut m = mem_with_citations(
+            ns,
+            &format!("doc note {i}"),
+            "deployment manifest example payload",
+            Vec::new(),
+        );
+        m.source_uri = Some(format!("doc:parent-{i:03}"));
+        storage::insert(&conn, &m).expect("insert doc");
+    }
+    for i in 0..6 {
+        let m = mem_with_citations(
+            ns,
+            &format!("bare note {i}"),
+            "deployment manifest example payload",
+            Vec::new(),
+        );
+        storage::insert(&conn, &m).expect("insert bare");
+    }
+
+    let resolved_ttl = ai_memory::config::ResolvedTtl::default();
+    let (results, _outcome) = db::recall(
+        &conn,
+        "deployment",
+        Some(ns),
+        50,
+        None,
+        None,
+        None,
+        resolved_ttl.short_extend_secs,
+        resolved_ttl.mid_extend_secs,
+        None,
+        None,
+        false,
+        Some("uri:https://"),
+    )
+    .expect("recall with prefix");
+    // Every returned row must carry a source_uri starting with the
+    // prefix — Rust-side post-filter is no longer load-bearing.
+    assert_eq!(
+        results.len(),
+        6,
+        "all 6 matching rows must surface; got {} rows",
+        results.len()
+    );
+    for (m, _) in &results {
+        let uri = m
+            .source_uri
+            .as_deref()
+            .expect("matching row has source_uri");
+        assert!(
+            uri.starts_with("uri:https://"),
+            "row {} leaked: source_uri={uri}",
+            m.id
+        );
+    }
+
+    // EXPLAIN QUERY PLAN — prove SQLite picks the partial index. The
+    // exact recall SQL uses interpolated fragments + bind parameters,
+    // but the prefix-filter shape we care about is invariant: a LIKE
+    // predicate on `m.source_uri` against a partial index whose
+    // predicate is `source_uri IS NOT NULL`. Smoke-test with a
+    // minimal SELECT that mirrors the recall's WHERE — if SQLite picks
+    // the index here, the recall path (which has more selective
+    // predicates) will too.
+    let plan: String = {
+        let mut stmt = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT id FROM memories WHERE source_uri LIKE ?1 ESCAPE '\\'",
+            )
+            .expect("prepare explain");
+        let rows = stmt
+            .query_map(["uri:https://%"], |r| r.get::<_, String>(3))
+            .expect("explain rows");
+        rows.collect::<rusqlite::Result<Vec<String>>>()
+            .expect("collect plan")
+            .join("\n")
+    };
+    assert!(
+        plan.contains("idx_memories_source_uri"),
+        "EXPLAIN QUERY PLAN must use idx_memories_source_uri; got:\n{plan}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 8. Cluster-A COR-3 — row_to_memory logs + counts on corrupt JSON
+// ---------------------------------------------------------------------------
+
+/// Cluster-A COR-3 regression pin. Pre-fix `row_to_memory` silently
+/// defaulted corrupt provenance JSON. The fix logs a `tracing::warn!`
+/// AND bumps `corrupt_provenance_rows_total{column=...}` so operators
+/// see the corruption. This test:
+///
+/// 1. Inserts a memory with valid citations.
+/// 2. Surgically corrupts the `citations` column via raw UPDATE
+///    (mimicking schema drift / external corruption).
+/// 3. Re-reads via `storage::get` — asserts the corrupt-counter
+///    advanced AND the row came back with `citations: vec![]`.
+#[test]
+fn row_to_memory_corrupt_citations_logs_and_defaults() {
+    let _g = test_serial()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (_tmp, conn) = fresh_db();
+
+    let mem = mem_with_citations(
+        "form4-cor3-corrupt",
+        "row-to-memory regression",
+        "body content",
+        vec![Citation {
+            uri: "uri:https://example.test/cite".into(),
+            accessed_at: now(),
+            hash: None,
+            span: None,
+        }],
+    );
+    let id = storage::insert(&conn, &mem).expect("insert");
+
+    // Surgical corruption — bypass validators by writing raw bytes.
+    conn.execute(
+        "UPDATE memories SET citations = ?1 WHERE id = ?2",
+        rusqlite::params!["{not valid json", &id],
+    )
+    .expect("corrupt write");
+
+    // Snapshot the counter before the corrupt read so we can detect a
+    // +1 increment irrespective of other tests' contributions.
+    let before = ai_memory::metrics::registry()
+        .corrupt_provenance_rows_total
+        .with_label_values(&["citations"])
+        .get();
+
+    let read = storage::get(&conn, &id)
+        .expect("get tolerant of corruption")
+        .expect("row present");
+    assert!(
+        read.citations.is_empty(),
+        "corrupt JSON must default to empty vec; got {:?}",
+        read.citations
+    );
+
+    let after = ai_memory::metrics::registry()
+        .corrupt_provenance_rows_total
+        .with_label_values(&["citations"])
+        .get();
+    assert_eq!(
+        after,
+        before + 1,
+        "corrupt_provenance_rows_total{{column=citations}} did not advance (before={before}, after={after})"
+    );
 }

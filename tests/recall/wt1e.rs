@@ -200,6 +200,7 @@ fn test_recall_default_excludes_archived_sources() {
         None,
         None,
         false,
+        None,
     )
     .expect("recall pre-atomise");
     assert!(
@@ -234,6 +235,7 @@ fn test_recall_default_excludes_archived_sources() {
         None,
         None,
         /* include_archived = */ false,
+        None,
     )
     .expect("recall post-atomise");
     let returned_ids: Vec<String> = results.iter().map(|(m, _)| m.id.clone()).collect();
@@ -286,6 +288,7 @@ fn test_recall_with_include_archived_returns_both() {
         None,
         None,
         /* include_archived = */ true,
+        None,
     )
     .expect("recall include_archived");
     let returned_ids: Vec<String> = results.iter().map(|(m, _)| m.id.clone()).collect();
@@ -374,6 +377,7 @@ fn test_recall_filters_compose() {
         None,
         None,
         true,
+        None,
     )
     .expect("recall compose");
     let returned_namespaces: std::collections::HashSet<String> =
@@ -404,6 +408,7 @@ fn test_recall_filters_compose() {
         None,
         None,
         false,
+        None,
     )
     .expect("recall compose default");
     let default_ids: Vec<String> = results_default.iter().map(|(m, _)| m.id.clone()).collect();

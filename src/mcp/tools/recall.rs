@@ -415,6 +415,13 @@ pub fn handle_recall(
                     budget_tokens,
                     resolved_scoring,
                     include_archived,
+                    // v0.7.0 Cluster-A PERF-3 — push source-URI prefix
+                    // into SQL WHERE so the partial
+                    // `idx_memories_source_uri` index covers the lookup.
+                    // The post-filter call below is a no-op when the
+                    // SQL push-down already constrained the set; we
+                    // keep it for the `has_citations` axis only.
+                    source_uri_prefix.as_deref(),
                 )
                 .map_err(|e| e.to_string())?;
                 let results = crate::cli::recall::apply_form4_recall_filters(
@@ -470,6 +477,8 @@ pub fn handle_recall(
         as_agent,
         budget_tokens,
         include_archived,
+        // v0.7.0 Cluster-A PERF-3 — see hybrid branch above.
+        source_uri_prefix.as_deref(),
     )
     .map_err(|e| e.to_string())?;
     let results = crate::cli::recall::apply_form4_recall_filters(
