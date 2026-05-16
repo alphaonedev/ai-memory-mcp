@@ -424,7 +424,7 @@ handler. ([commit `fbf093c`](https://github.com/alphaonedev/ai-memory-mcp/commit
 > cross-row hash chain — `prev_hash BLOB` + `sequence INTEGER`) per the
 > v0.7.1-fold decision (`05e0cb9a`). Postgres parity is at v33 (the V-4
 > closeout maps to postgres v33 since the postgres ladder ran one step
-> behind). The MCP tool count moves from 60 → 63 over the L2 wave; the
+> behind). The MCP tool count moves from 60 → 71 over the L2 wave + Batman Forms 1-6 + 7th-form + QW-1/2/3 closeout (the +8 over the original 63 narrative cover Forms/QW/L2 additions enumerated below); the
 > full reflection narrative lives in
 > [`docs/RECURSIVE_LEARNING.md`](../RECURSIVE_LEARNING.md), the
 > Agent Skills surface in [`docs/agent-skills.md`](../agent-skills.md),
@@ -448,15 +448,26 @@ handler. ([commit `fbf093c`](https://github.com/alphaonedev/ai-memory-mcp/commit
   `CURRENT_SCHEMA_VERSION = 34`;
   [`src/store/postgres.rs`](../../src/store/postgres.rs)
   `CURRENT_SCHEMA_VERSION = 33`.)
-- **MCP tool count 60 → 63.** The L2 wave added three tools:
+- **MCP tool count 60 → 71** (post-grand-slam at HEAD `c9472c1`;
+  authoritative count from `Profile::full().expected_tool_count()` in
+  [`src/profile.rs`](../../src/profile.rs) and verified by
+  `grep -oE '"memory_[a-z_]+"' src/mcp/registry.rs | sort -u | wc -l`).
+  The L2 wave added three tools:
   `memory_dependents_of_invalidated` (L2-3 / #668),
   `memory_skill_promote_from_reflection` (L2-6 / #671), and
   `memory_skill_compositional_context` (L2-7 / #672). The L1-5
   Agent Skills substrate added 5 tools (`memory_skill_register`,
   `_list`, `_get`, `_resource`, `_export`) earlier in the grand-slam
   branch. The L2-2 federation-aware reflection coordination added
-  `memory_reflection_origin`. See [`docs/agent-skills.md`](../agent-skills.md)
-  for the per-tool wire surface.
+  `memory_reflection_origin`. The post-grand-slam Forms / QW wave
+  added a further 8: `memory_atomise` (WT-1 / Form 2), `memory_ingest_multistep`
+  (Form 3 / #756), `memory_calibrate_confidence` (Form 5 / #758),
+  `memory_check_agent_action` + `memory_rule_list` (7th-form / #691),
+  `memory_export_reflection` (QW-1), `memory_persona` +
+  `memory_persona_generate` (QW-2), `memory_offload` + `memory_deref`
+  (QW-3). See [`docs/agent-skills.md`](../agent-skills.md) for the
+  Skills per-tool wire surface; the canonical post-grand-slam
+  inventory lives in [`docs/internal/v070-feature-inventory.md`](../internal/v070-feature-inventory.md).
 
 #### L1-6 substrate rules engine (issues [#691](https://github.com/alphaonedev/ai-memory-mcp/issues/691), [#693](https://github.com/alphaonedev/ai-memory-mcp/issues/693))
 
@@ -572,6 +583,108 @@ procurement-grade evidence path. Full surface in
 - **A2A regression suite** — 76 scenarios consolidating ai2ai-gate
   v0.6.x baseline + v0.7.0 net-new + postgres+AGE substrate. Cert
   acceptance is two consecutive 100% GREEN rounds.
+
+## Post-grand-slam ship-readiness wave (2026-05-15)
+
+After the original `attested-cortex` epic landed at `fcdd2a5` (2026-05-06)
+and the Round-2 NHI sweep closed F1-F18, a final ship-readiness wave
+folded into the v0.7.0 tag rather than slipping to v0.7.1:
+
+- **Batman 6-form audit + Forms 1-6 + 7th-form closeout** (PRs
+  [#761](https://github.com/alphaonedev/ai-memory-mcp/pull/761)-
+  [#766](https://github.com/alphaonedev/ai-memory-mcp/pull/766),
+  merged 2026-05-15). The
+  [`docs/internal/batman-framework-audit.md`](../internal/batman-framework-audit.md)
+  audit at commit `53b4d39` found 0/6 forms cleanly IMPLEMENTED + 4
+  partial + 2 absent. The Forms wave closed every gap to **all 7 forms
+  IMPLEMENTED at HEAD `c9472c1`**:
+  - **Form 1 (online dedup-and-synthesis, issue [#754](https://github.com/alphaonedev/ai-memory-mcp/issues/754)).**
+    Single-batch action-emitting LLM call on `memory_store`.
+    `src/synthesis/mod.rs`. Opt back into the v0.6.x per-pair
+    classifier via `legacy_per_pair_classifier = true` on the
+    namespace standard.
+  - **Form 2 (synchronous atomise-before-embed, issue [#755](https://github.com/alphaonedev/ai-memory-mcp/issues/755)).**
+    `auto_atomise_mode = Synchronous` pre-store hook in
+    `src/hooks/pre_store/auto_atomise.rs`. New `memory_atomise` MCP
+    tool. Doc: [`docs/atomisation.md`](../atomisation.md).
+  - **Form 3 (multi-step ingest orchestrator, issue [#756](https://github.com/alphaonedev/ai-memory-mcp/issues/756)).**
+    `memory_ingest_multistep` threads deterministic helpers (Jaccard
+    overlap, FTS classifier) before prompt-cache-stable LLM stages.
+    `src/multistep_ingest/{mod,executor,helpers,pipeline,cache}.rs`.
+    Doc: [`docs/multistep-ingest.md`](../multistep-ingest.md). Cookbook:
+    [`cookbook/multistep-ingest/01-two-phase.sh`](../../cookbook/multistep-ingest/01-two-phase.sh).
+  - **Form 4 (fact provenance, issue [#757](https://github.com/alphaonedev/ai-memory-mcp/issues/757)).**
+    Citations + source-URI + atom-grain spans ride on existing
+    `memory_store` / `memory_atomise` payloads. Schema migration
+    `0032_v07_form4_provenance.sql`. Doc:
+    [`docs/provenance.md`](../provenance.md).
+  - **Form 5 (auto-confidence + shadow calibration + freshness decay,
+    issue [#758](https://github.com/alphaonedev/ai-memory-mcp/issues/758)).**
+    `memory_calibrate_confidence` MCP tool +
+    `src/confidence/{mod,calibrate,shadow,decay}.rs`. Env vars
+    `AI_MEMORY_AUTO_CONFIDENCE`, `AI_MEMORY_CONFIDENCE_SHADOW`,
+    `AI_MEMORY_CONFIDENCE_SHADOW_SAMPLE_RATE`,
+    `AI_MEMORY_CONFIDENCE_DECAY`. Schema migration
+    `0033_v07_form5_confidence_calibration.sql`. Doc:
+    [`docs/confidence-calibration.md`](../confidence-calibration.md).
+  - **Form 6 (`MemoryKind` Batman vocabulary, issue [#759](https://github.com/alphaonedev/ai-memory-mcp/issues/759)).**
+    10-variant `MemoryKind` enum (`Observation` default + 9 specific
+    variants). Optional `auto_classify_kind` pre-store hook
+    (`off | regex_only | regex_then_llm`). No CHECK constraint on
+    `memories.memory_kind` — future variants land additively. Doc:
+    [`docs/memory-kind-vocab.md`](../memory-kind-vocab.md).
+  - **7th-form (agent-EXTERNAL Layer-4 wiring, issue [#760](https://github.com/alphaonedev/ai-memory-mcp/issues/760);
+    full cover at v0.8.0 per [#697](https://github.com/alphaonedev/ai-memory-mcp/issues/697)).**
+    Option-B foundation: operator-keypair-signed seed rules
+    `R001..R004`, `memory_check_agent_action` + `memory_rule_list`
+    MCP tools, substrate `storage::insert` pre-write hook. Doc:
+    [`docs/policy-engine.md`](../policy-engine.md) +
+    [`docs/governance/agent-action-rules.md`](../governance/agent-action-rules.md).
+- **QW (Tencent quick-wins).**
+  - **QW-1** file-backed reflection chain export — `memory_export_reflection`
+    + `auto_export_reflections_to_filesystem` namespace policy.
+    Default destination `~/.ai-memory/reflections/<ns>/<id>.md`.
+    Cookbook: `cookbook/file-backed-export/`.
+  - **QW-2** persona-as-artifact — `memory_persona` + `memory_persona_generate`,
+    `MemoryKind::Persona` rows, `auto_persona_trigger_every_n_memories`
+    + `auto_export_personas_to_filesystem` namespace policy. Doc:
+    [`docs/persona.md`](../persona.md). Cookbook: `cookbook/persona/`.
+  - **QW-3** context offload primitive — `memory_offload` + `memory_deref`
+    move large tool outputs out of the agent context window into an
+    addressable blob store with a background TTL sweep. Doc:
+    [`docs/context-offload.md`](../context-offload.md). Cookbook:
+    `cookbook/context-offload/`.
+- **Reconciliation security sweep (11 late-cycle commits, merged
+  into trunk at `64528b1`).** K9 governance gate on `handle_kg_invalidate`
+  (`a41c08f`), K10 SSE `host:` prefix bypass (`7496a6e`), K10 HMAC
+  method+pending_id binding (`99ffacc`), K10 HMAC nonce single-use 300s
+  window (`a69325f`), K10 SSE lagged-event count strip (`d1f6c9f`),
+  SSRF IPv4-mapped-IPv6 + NAT64 (`3ab72dc`), `invalidate_link` BEGIN
+  IMMEDIATE wrap (`2c77537`), hooks executor secret-redaction
+  (`cbe934c`), H8 rebound-namespace `Ask` walk (`69ad41c`), I1
+  zstd-decompression cap config-driven (`26fab06`). Pinned by
+  [`tests/k10_approval_security.rs`](../../tests/k10_approval_security.rs),
+  [`tests/i1_zstd_bomb.rs`](../../tests/i1_zstd_bomb.rs),
+  [`tests/h2_invalidate_link_signed.rs`](../../tests/h2_invalidate_link_signed.rs).
+- **Default tool surface.** The original v0.6.4 narrative said
+  "5 default tools". The actual v0.7.0 `--profile core` surface is
+  **7 tools** (`memory_store`, `memory_recall`, `memory_list`,
+  `memory_get`, `memory_search`, `memory_load_family`,
+  `memory_smart_load`) per `Family::Core.expected_tool_count()` in
+  [`src/profile.rs`](../../src/profile.rs). The `memory_capabilities`
+  bootstrap remains always-on regardless of profile.
+- **Six new operator-focused docs landed alongside this wave:**
+  [`docs/hook-pipeline.md`](../hook-pipeline.md),
+  [`docs/federation.md`](../federation.md),
+  [`docs/k8-quotas.md`](../k8-quotas.md),
+  [`docs/k10-sse-approvals.md`](../k10-sse-approvals.md),
+  [`docs/sidechain-transcripts.md`](../sidechain-transcripts.md),
+  [`docs/signed-events-v4.md`](../signed-events-v4.md).
+- **Canonical feature inventory.** The full post-grand-slam feature
+  truth lives at [`docs/internal/v070-feature-inventory.md`](../internal/v070-feature-inventory.md)
+  (453 commits ahead of v0.6.4, +233,589/−23,541 lines, 71 MCP tools,
+  28 net-new since v0.6.4, 17 net-new `AI_MEMORY_*` env vars, 8 new
+  HTTP routes, 20 sqlite + 10 postgres new migrations).
 
 ## Backward compatibility
 
