@@ -80,7 +80,12 @@ pub(super) fn handle_persona(conn: &rusqlite::Connection, params: &Value) -> Res
 /// * `no reflections found for entity ...` — refuses to mint a persona
 ///   without source reflections (audit-trail invariant).
 /// * `curator synthesis failed: ...` — LLM returned an error.
-pub(super) fn handle_persona_generate(
+// Issue #809 — promoted from pub(super) to pub so the
+// model-agnostic NHI-self-persona regression test
+// (tests/issue_809_nhi_self_persona_any_agent.rs) can drive this
+// handler directly without spawning the full MCP-stdio JSON-RPC
+// envelope.
+pub fn handle_persona_generate(
     conn: &rusqlite::Connection,
     params: &Value,
     llm: Option<&dyn AutonomyLlm>,

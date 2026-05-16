@@ -565,6 +565,14 @@ use list::handle_list;
 use pending::handle_pending_list;
 use pending::handle_subscription_dlq_list;
 use persona::{handle_persona, handle_persona_generate};
+// Issue #809 — re-export handle_persona_generate as a stable pub
+// symbol so the nhi-self-persona regression test
+// (tests/issue_809_nhi_self_persona_any_agent.rs) can drive the
+// persona generator directly without going through an MCP-stdio
+// JSON-RPC envelope. The wrapper name persona_generate_call mirrors
+// the pattern used by other v0.7.x integration tests that need
+// direct handler access.
+pub use persona::handle_persona_generate as persona_generate_call;
 use promote::handle_promote;
 use reflect::handle_reflect;
 use reflection_origin::handle_reflection_origin;
