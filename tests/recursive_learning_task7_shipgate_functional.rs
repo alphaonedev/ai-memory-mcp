@@ -326,6 +326,7 @@ fn reflection_is_recall_visible_alongside_non_reflection_memories() {
         None,
         None,
         false,
+        None,
     )
     .expect("recall ok");
     let ids: Vec<String> = results.iter().map(|(m, _)| m.id.clone()).collect();

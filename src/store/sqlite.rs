@@ -366,6 +366,12 @@ impl MemoryStore for SqliteStore {
                 None,
                 &scoring,
                 false,
+                // v0.7.0 Cluster-A PERF-3 — Filter has no source-URI
+                // axis on the SAL surface today; pass `None` so the
+                // SQL push-down is inactive. The HTTP/MCP path applies
+                // the URI prefix via the dedicated argument on the
+                // direct db::recall call.
+                None,
             )
             .map_err(box_err)?;
             Ok(results)
@@ -383,6 +389,7 @@ impl MemoryStore for SqliteStore {
                 ctx.as_agent.as_deref(),
                 None,
                 false,
+                None,
             )
             .map_err(box_err)?;
             Ok(results)
