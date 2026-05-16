@@ -445,6 +445,336 @@ fn rules_enable_signed_signature_verifies_against_operator_pubkey() {
         .expect("PR #800 fix: enable-produced signature must verify against the operator pubkey");
 }
 
+// ---------------------------------------------------------------------------
+// CRACK 1 — additional namespace CLI coverage
+// ---------------------------------------------------------------------------
+
+/// `namespace set-standard --parent` writes the parent_namespace
+/// column on namespace_meta.
+#[test]
+fn namespace_set_standard_with_parent_sets_parent_column() {
+    let (_db_dir, db_path) = fresh_db();
+    let conn = db::open(&db_path).unwrap();
+
+    use ai_memory::models::{Memory, Tier};
+    use chrono::Utc;
+    let std_id = uuid::Uuid::new_v4().to_string();
+    let now = Utc::now().to_rfc3339();
+    db::insert(
+        &conn,
+        &Memory {
+            id: std_id.clone(),
+            tier: Tier::Long,
+            namespace: "child".into(),
+            title: "std".into(),
+            content: "std".into(),
+            tags: vec![],
+            priority: 10,
+            confidence: 1.0,
+            source: "test".into(),
+            access_count: 0,
+            created_at: now.clone(),
+            updated_at: now,
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({}),
+            ..Memory::default()
+        },
+    )
+    .unwrap();
+    drop(conn);
+
+    let mut stdout: Vec<u8> = Vec::new();
+    let mut stderr: Vec<u8> = Vec::new();
+    let mut out = CliOutput { stdout: &mut stdout, stderr: &mut stderr };
+    ns_cli::run(
+        &db_path,
+        ns_cli::NamespaceArgs {
+            action: ns_cli::NamespaceAction::SetStandard {
+                namespace: "child".into(),
+                id: std_id.clone(),
+                parent: Some("parent".into()),
+                governance: None,
+            },
+        },
+        true,
+        &mut out,
+    )
+    .expect("set-standard with --parent must succeed");
+
+    let conn = db::open(&db_path).unwrap();
+    let parent: Option<String> = conn
+        .query_row(
+            "SELECT parent_namespace FROM namespace_meta WHERE namespace='child'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(parent.as_deref(), Some("parent"));
+}
+
+/// Clear-standard on a namespace that was never bound returns
+/// `cleared=false` (no-op branch).
+#[test]
+fn namespace_clear_standard_unbound_returns_cleared_false() {
+    let (_db_dir, db_path) = fresh_db();
+    let mut stdout: Vec<u8> = Vec::new();
+    let mut stderr: Vec<u8> = Vec::new();
+    let mut out = CliOutput { stdout: &mut stdout, stderr: &mut stderr };
+    ns_cli::run(
+        &db_path,
+        ns_cli::NamespaceArgs {
+            action: ns_cli::NamespaceAction::ClearStandard {
+                namespace: "never-bound".into(),
+            },
+        },
+        true,
+        &mut out,
+    )
+    .unwrap();
+    let resp: Value = serde_json::from_str(String::from_utf8(stdout).unwrap().trim()).unwrap();
+    assert_eq!(resp["cleared"], json!(false));
+}
+
+/// Human-readable (non-JSON) output of `set-standard` includes the
+/// human banner with the namespace + standard_id.
+#[test]
+fn namespace_set_standard_human_output_emits_banner() {
+    let (_db_dir, db_path) = fresh_db();
+    let conn = db::open(&db_path).unwrap();
+    use ai_memory::models::{Memory, Tier};
+    use chrono::Utc;
+    let std_id = uuid::Uuid::new_v4().to_string();
+    let now = Utc::now().to_rfc3339();
+    db::insert(
+        &conn,
+        &Memory {
+            id: std_id.clone(),
+            tier: Tier::Long,
+            namespace: "human-out-ns".into(),
+            title: "std".into(),
+            content: "std".into(),
+            tags: vec![],
+            priority: 10,
+            confidence: 1.0,
+            source: "test".into(),
+            access_count: 0,
+            created_at: now.clone(),
+            updated_at: now,
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({}),
+            ..Memory::default()
+        },
+    )
+    .unwrap();
+    drop(conn);
+
+    let mut stdout: Vec<u8> = Vec::new();
+    let mut stderr: Vec<u8> = Vec::new();
+    let mut out = CliOutput { stdout: &mut stdout, stderr: &mut stderr };
+    ns_cli::run(
+        &db_path,
+        ns_cli::NamespaceArgs {
+            action: ns_cli::NamespaceAction::SetStandard {
+                namespace: "human-out-ns".into(),
+                id: std_id.clone(),
+                parent: Some("parent-ns".into()),
+                governance: None,
+            },
+        },
+        false, // json_out=false → human-readable
+        &mut out,
+    )
+    .unwrap();
+    let s = String::from_utf8(stdout).unwrap();
+    assert!(s.contains("set standard"), "human output should announce 'set standard' — got: {s}");
+    assert!(s.contains("human-out-ns"), "namespace name should appear in output — got: {s}");
+    assert!(s.contains(&std_id), "standard id should appear in output — got: {s}");
+    assert!(s.contains("parent-ns"), "parent should appear when provided — got: {s}");
+}
+
+/// `clear-standard` human-readable output for a no-op clear shows
+/// the 'no-op' branch label.
+#[test]
+fn namespace_clear_standard_human_output_says_no_op() {
+    let (_db_dir, db_path) = fresh_db();
+    let mut stdout: Vec<u8> = Vec::new();
+    let mut stderr: Vec<u8> = Vec::new();
+    let mut out = CliOutput { stdout: &mut stdout, stderr: &mut stderr };
+    ns_cli::run(
+        &db_path,
+        ns_cli::NamespaceArgs {
+            action: ns_cli::NamespaceAction::ClearStandard { namespace: "never".into() },
+        },
+        false,
+        &mut out,
+    )
+    .unwrap();
+    let s = String::from_utf8(stdout).unwrap();
+    assert!(
+        s.contains("no-op") || s.contains("no standard"),
+        "human-clear output should mark no-op — got: {s}"
+    );
+}
+
+/// batman-policy CLI accepts non-default knobs and reflects them in
+/// the emitted JSON.
+#[test]
+fn namespace_batman_policy_non_default_knobs_round_trip() {
+    let (_db_dir, db_path) = fresh_db();
+    let mut stdout: Vec<u8> = Vec::new();
+    let mut stderr: Vec<u8> = Vec::new();
+    let mut out = CliOutput { stdout: &mut stdout, stderr: &mut stderr };
+    ns_cli::run(
+        &db_path,
+        ns_cli::NamespaceArgs {
+            action: ns_cli::NamespaceAction::BatmanPolicy {
+                atomise_threshold: 4096,
+                atom_max_tokens: 1024,
+                max_reflection_depth: 7,
+                classify_mode: "regex_only".into(),
+            },
+        },
+        false,
+        &mut out,
+    )
+    .unwrap();
+    let s = String::from_utf8(stdout).unwrap();
+    let parsed: Value = serde_json::from_str(s.trim()).unwrap();
+    assert_eq!(parsed["auto_atomise_threshold_cl100k"], json!(4096));
+    assert_eq!(parsed["auto_atomise_max_atom_tokens"], json!(1024));
+    assert_eq!(parsed["max_reflection_depth"], json!(7));
+    assert_eq!(parsed["auto_classify_kind"], json!("regex_only"));
+}
+
+/// Human-readable `get-standard` output when a standard IS bound and
+/// inherit=false — covers the populated-standard branch of the human
+/// formatter (line ~204 in cli/namespace.rs).
+#[test]
+fn namespace_get_standard_human_output_with_bound_standard() {
+    let (_db_dir, db_path) = fresh_db();
+    let conn = db::open(&db_path).unwrap();
+    use ai_memory::models::{Memory, Tier};
+    use chrono::Utc;
+    let std_id = uuid::Uuid::new_v4().to_string();
+    let now = Utc::now().to_rfc3339();
+    db::insert(
+        &conn,
+        &Memory {
+            id: std_id.clone(),
+            tier: Tier::Long,
+            namespace: "bound-ns".into(),
+            title: "bound standard title".into(),
+            content: "body".into(),
+            tags: vec![],
+            priority: 10,
+            confidence: 1.0,
+            source: "test".into(),
+            access_count: 0,
+            created_at: now.clone(),
+            updated_at: now,
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({"governance": {"write":"owner","promote":"any","delete":"owner","approver":"human","inherit":true,"auto_atomise":true,"auto_atomise_mode":"synchronous","auto_classify_kind":"regex_then_llm","max_reflection_depth":3}}),
+            ..Memory::default()
+        },
+    )
+    .unwrap();
+    drop(conn);
+
+    let mut stdout: Vec<u8> = Vec::new();
+    let mut stderr: Vec<u8> = Vec::new();
+    let mut out = CliOutput { stdout: &mut stdout, stderr: &mut stderr };
+    ns_cli::run(
+        &db_path,
+        ns_cli::NamespaceArgs {
+            action: ns_cli::NamespaceAction::SetStandard {
+                namespace: "bound-ns".into(),
+                id: std_id.clone(),
+                parent: None,
+                governance: None,
+            },
+        },
+        true,
+        &mut CliOutput { stdout: &mut Vec::new(), stderr: &mut Vec::new() },
+    )
+    .unwrap();
+
+    // Now read back in human format.
+    ns_cli::run(
+        &db_path,
+        ns_cli::NamespaceArgs {
+            action: ns_cli::NamespaceAction::GetStandard {
+                namespace: "bound-ns".into(),
+                inherit: false,
+            },
+        },
+        false,
+        &mut out,
+    )
+    .unwrap();
+    let s = String::from_utf8(stdout).unwrap();
+    assert!(s.contains("bound-ns"), "namespace name in human output");
+    assert!(s.contains(&std_id), "standard id in human output");
+    assert!(s.contains("title"), "label 'title:' in human output");
+    assert!(s.contains("governance"), "governance JSON in human output");
+}
+
+/// Human-readable `get-standard --inherit` with a populated chain
+/// (covers the chain branch of the human formatter).
+#[test]
+fn namespace_get_standard_human_output_inherit_chain() {
+    let (_db_dir, db_path) = fresh_db();
+    let mut stdout: Vec<u8> = Vec::new();
+    let mut stderr: Vec<u8> = Vec::new();
+    let mut out = CliOutput { stdout: &mut stdout, stderr: &mut stderr };
+    ns_cli::run(
+        &db_path,
+        ns_cli::NamespaceArgs {
+            action: ns_cli::NamespaceAction::GetStandard {
+                namespace: "leaf/branch".into(),
+                inherit: true,
+            },
+        },
+        false,
+        &mut out,
+    )
+    .unwrap();
+    let s = String::from_utf8(stdout).unwrap();
+    assert!(s.contains("namespace:"), "human inherit output has 'namespace:' line");
+    assert!(s.contains("chain:"), "human inherit output has 'chain:' line");
+}
+
+/// `set-standard` against a memory that does NOT exist errors cleanly
+/// (substrate refuses with "memory not found").
+#[test]
+fn namespace_set_standard_nonexistent_memory_errors() {
+    let (_db_dir, db_path) = fresh_db();
+    let mut stdout: Vec<u8> = Vec::new();
+    let mut stderr: Vec<u8> = Vec::new();
+    let mut out = CliOutput { stdout: &mut stdout, stderr: &mut stderr };
+    let err = ns_cli::run(
+        &db_path,
+        ns_cli::NamespaceArgs {
+            action: ns_cli::NamespaceAction::SetStandard {
+                namespace: "x".into(),
+                id: "00000000-0000-0000-0000-000000000000".into(),
+                parent: None,
+                governance: Some(r#"{"auto_atomise":true,"auto_atomise_mode":"synchronous","write":"owner","promote":"any","delete":"owner","approver":"human","inherit":true}"#.into()),
+            },
+        },
+        true,
+        &mut out,
+    )
+    .expect_err("set-standard against missing memory must error");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("memory not found") || msg.contains("not found"),
+        "expected 'memory not found' error, got: {err}"
+    );
+}
+
 /// Parity test for the Disable verb — also signed, also must verify.
 #[test]
 fn rules_disable_signed_signature_verifies_against_operator_pubkey() {
@@ -496,6 +826,192 @@ fn rules_disable_signed_signature_verifies_against_operator_pubkey() {
     };
     rules_store::verify_rule_signature(&updated, &pubkey)
         .expect("disable signature must verify");
+}
+
+/// Parity test for the Add verb — the third site PR #801 fixed.
+/// Adding a rule via `rules add --sign` must produce a signature that
+/// `verify_rule_signature` validates. Pre-PR-#801 the Add signer also
+/// used `canonical_bytes` (no `enabled`); fix is the same as Enable.
+#[test]
+fn rules_add_signed_signature_verifies_against_operator_pubkey() {
+    let (_key_tmp, key_dir) = setup_operator_key();
+    let (_db_tmp, db_path) = fresh_db();
+
+    let mut stdout: Vec<u8> = Vec::new();
+    let mut stderr: Vec<u8> = Vec::new();
+    let mut out = CliOutput { stdout: &mut stdout, stderr: &mut stderr };
+    rules_cli::run(
+        &db_path,
+        rules_cli::RulesArgs {
+            key_dir: Some(key_dir.clone()),
+            action: rules_cli::RulesAction::Add {
+                id: "R-add-test".into(),
+                kind: "filesystem_write".into(),
+                matcher: r#"{"glob":"/tmp/add-test/**"}"#.into(),
+                severity: "refuse".into(),
+                reason: "add path canonical-bytes round-trip".into(),
+                namespace: "_global".into(),
+                disabled: false,
+                sign: true,
+            },
+        },
+        false,
+        &mut out,
+    )
+    .expect("rules add --sign must succeed");
+
+    let conn = db::open(&db_path).unwrap();
+    let rule = rules_store::get(&conn, "R-add-test").unwrap().unwrap();
+    assert!(rule.enabled, "add --disabled was false; rule should be enabled");
+    assert_eq!(rule.attest_level, "operator_signed");
+    let pubkey = {
+        use base64::Engine;
+        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(std::fs::read_to_string(key_dir.join("operator.key.pub")).unwrap().trim())
+            .unwrap();
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&raw);
+        ed25519_dalek::VerifyingKey::from_bytes(&arr).unwrap()
+    };
+    rules_store::verify_rule_signature(&rule, &pubkey)
+        .expect("PR #801 fix: add-produced signature must verify against the operator pubkey");
+}
+
+/// Gap #6 — keygen↔enable path-mismatch fallback. The operator key is
+/// placed at the PARENT of the key_dir (where `rules keygen` writes by
+/// default); `load_operator_signing_key_from_dir` must fall back to
+/// the parent so a fresh keygen → enable round-trip just works.
+#[test]
+fn rules_enable_with_operator_key_at_parent_dir_falls_back() {
+    use ed25519_dalek::SigningKey;
+    use rand_core::OsRng;
+
+    let tmp = TempDir::new().unwrap();
+    let parent_dir = tmp.path().to_path_buf();
+    let key_dir = parent_dir.join("keys");
+    std::fs::create_dir_all(&key_dir).unwrap();
+
+    // Put the key ONLY at the parent dir, NOT in keys/ — this is the
+    // exact state `ai-memory rules keygen` leaves the filesystem in.
+    let mut rng = OsRng;
+    let signing = SigningKey::generate(&mut rng);
+    let verifying = signing.verifying_key();
+    let pub_b64 = {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(verifying.to_bytes())
+    };
+    let priv_path = parent_dir.join("operator.key");
+    let pub_path = parent_dir.join("operator.key.pub");
+    std::fs::write(&priv_path, signing.to_bytes()).unwrap();
+    std::fs::write(&pub_path, pub_b64.as_bytes()).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&priv_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let (_db_tmp, db_path) = fresh_db();
+    let conn = db::open(&db_path).unwrap();
+    rules_store::insert(
+        &conn,
+        &rules_store::Rule {
+            id: "R-fallback".into(),
+            kind: "filesystem_write".into(),
+            matcher: r#"{"glob":"/tmp/fallback/**"}"#.into(),
+            severity: "refuse".into(),
+            reason: "path-fallback test".into(),
+            namespace: "_global".into(),
+            created_by: "test".into(),
+            created_at: 0,
+            enabled: false,
+            signature: None,
+            attest_level: "unsigned".into(),
+        },
+    )
+    .unwrap();
+    drop(conn);
+
+    // `--key-dir <key_dir>` points at the EMPTY keys/ dir; the fallback
+    // must reach up one level for the operator.key.
+    let mut stdout: Vec<u8> = Vec::new();
+    let mut stderr: Vec<u8> = Vec::new();
+    let mut out = CliOutput { stdout: &mut stdout, stderr: &mut stderr };
+    rules_cli::run(
+        &db_path,
+        rules_cli::RulesArgs {
+            key_dir: Some(key_dir.clone()),
+            action: rules_cli::RulesAction::Enable {
+                id: "R-fallback".into(),
+                sign: true,
+            },
+        },
+        false,
+        &mut out,
+    )
+    .expect("Gap #6 fix: enable must succeed via parent-dir fallback when key is at <key_dir>/../");
+
+    let conn = db::open(&db_path).unwrap();
+    let rule = rules_store::get(&conn, "R-fallback").unwrap().unwrap();
+    assert!(rule.enabled);
+    assert_eq!(rule.attest_level, "operator_signed");
+    rules_store::verify_rule_signature(&rule, &verifying)
+        .expect("signature from parent-dir-fallback key must verify");
+}
+
+/// Gap #6 negative test — no operator key in EITHER location yields a
+/// descriptive error that names both searched paths.
+#[test]
+fn rules_enable_with_no_operator_key_anywhere_errors_with_both_paths() {
+    let tmp = TempDir::new().unwrap();
+    let key_dir = tmp.path().join("keys-empty");
+    std::fs::create_dir_all(&key_dir).unwrap();
+
+    let (_db_tmp, db_path) = fresh_db();
+    let conn = db::open(&db_path).unwrap();
+    rules_store::insert(
+        &conn,
+        &rules_store::Rule {
+            id: "R-no-key".into(),
+            kind: "filesystem_write".into(),
+            matcher: r#"{"glob":"/tmp/no-key/**"}"#.into(),
+            severity: "refuse".into(),
+            reason: "no-key test".into(),
+            namespace: "_global".into(),
+            created_by: "test".into(),
+            created_at: 0,
+            enabled: false,
+            signature: None,
+            attest_level: "unsigned".into(),
+        },
+    )
+    .unwrap();
+    drop(conn);
+
+    let mut stdout: Vec<u8> = Vec::new();
+    let mut stderr: Vec<u8> = Vec::new();
+    let mut out = CliOutput { stdout: &mut stdout, stderr: &mut stderr };
+    let err = rules_cli::run(
+        &db_path,
+        rules_cli::RulesArgs {
+            key_dir: Some(key_dir.clone()),
+            action: rules_cli::RulesAction::Enable {
+                id: "R-no-key".into(),
+                sign: true,
+            },
+        },
+        false,
+        &mut out,
+    )
+    .expect_err("enable must refuse when no key anywhere");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("governance.no_operator_key"),
+        "expected typed error code, got: {err}"
+    );
+    assert!(
+        msg.contains("keys-empty"),
+        "error must name the key_dir searched, got: {err}"
+    );
 }
 
 /// End-to-end: enable a rule via the CLI, then `check_agent_action`
