@@ -1,6 +1,14 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+// #825: integration test functions are unavoidably long because each
+// covers an end-to-end scenario with full setup/probe/teardown. The
+// `--features sal-postgres` build path adds extra setup lines (postgres
+// concurrent-init retry shim, AGE extension probe) that push some
+// functions past the clippy::pedantic 100-line ceiling. Apply file-wide
+// rather than peppering every test fn.
+#![allow(clippy::too_many_lines)]
+
 //! v0.7.0 L1-6 Deliverable E — substrate `storage::insert` governance
 //! pre-write hook integration tests (issue #691).
 //!
