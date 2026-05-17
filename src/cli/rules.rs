@@ -2107,6 +2107,131 @@ mod tests {
         assert_sign_seed_succeeds_with_key_dir_only(&db_path, key_dir);
     }
 
+    /// #827 regression — third branch of the `key.or_else(...)` chain.
+    /// When `--key-dir <dir>` is supplied and `<dir>` contains NEITHER
+    /// `operator.key` nor `operator.priv`, `resolved_key` is `None`
+    /// and `sign_seed_rules` falls through to
+    /// `resolve_operator_key_path(None)` (the legacy
+    /// `~/.config/ai-memory/operator.key` shape). With `HOME` +
+    /// `XDG_CONFIG_HOME` pointed at an empty tempdir, that legacy
+    /// path also fails to resolve, surfacing as a load-error citing
+    /// the legacy path. The test pins that this third branch yields
+    /// a clean Err (not a panic, not an Ok), closing the
+    /// PR #820 cli/rules.rs coverage-floor breach.
+    #[cfg(unix)]
+    #[test]
+    fn run_rules_sign_seed_neither_layout_falls_through_to_legacy_path_and_errors() {
+        // Serialize HOME/XDG mutation against parallel tests in this
+        // module so we don't race other tests that read those vars.
+        static HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Snapshot prior values so we restore even on assertion panic.
+        let prev_home = std::env::var("HOME").ok();
+        let prev_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("ai-memory.db");
+        // Initialize the full schema — same shape as
+        // `fresh_env_with_operator_key` minus the keypair.
+        drop(crate::db::open(&db_path).expect("db::open"));
+
+        // `key_dir` exists but contains neither `operator.key` nor
+        // `operator.priv` — this is the load-bearing precondition that
+        // forces `resolved_key = None` and triggers the third branch.
+        let key_dir = dir.path().join("empty-keys");
+        std::fs::create_dir_all(&key_dir).expect("mkdir empty-keys");
+        assert!(
+            !key_dir.join("operator.key").exists() && !key_dir.join("operator.priv").exists(),
+            "preconditions: neither layout may exist for this branch"
+        );
+
+        // Point HOME + XDG_CONFIG_HOME at empty subdirs so
+        // `dirs::config_dir()` (the source of the legacy default path)
+        // resolves to a directory with no operator.key.
+        let fake_home = dir.path().join("fake-home");
+        let fake_xdg = dir.path().join("fake-xdg-config");
+        std::fs::create_dir_all(&fake_home).unwrap();
+        std::fs::create_dir_all(&fake_xdg).unwrap();
+        // SAFETY: env mutation is serialized by `HOME_ENV_LOCK` above.
+        unsafe {
+            std::env::set_var("HOME", &fake_home);
+            std::env::set_var("XDG_CONFIG_HOME", &fake_xdg);
+        }
+
+        // Arrange a Rule so `sign_seed_rules` has work to do; the load
+        // path fails before any row is touched, but having a row makes
+        // the test failure mode obvious if the third branch ever
+        // silently succeeds against the real `$HOME`.
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        rules_store::insert(
+            &conn,
+            &Rule {
+                id: "R-827".into(),
+                kind: "bash".into(),
+                matcher: r#"{"command_regex":"^x"}"#.into(),
+                severity: "refuse".into(),
+                reason: "t".into(),
+                namespace: "_global".into(),
+                created_by: "test".into(),
+                created_at: 0,
+                enabled: true,
+                signature: None,
+                attest_level: "unsigned".into(),
+            },
+        )
+        .unwrap();
+        drop(conn);
+
+        let args = RulesArgs {
+            key_dir: Some(key_dir),
+            action: RulesAction::SignSeed {
+                key: None, // load-bearing: NO explicit --key.
+                db: None,
+            },
+        };
+        let mut stdout: Vec<u8> = Vec::new();
+        let mut stderr: Vec<u8> = Vec::new();
+        let mut out = CliOutput {
+            stdout: &mut stdout,
+            stderr: &mut stderr,
+        };
+        let result = run(&db_path, args, true, &mut out);
+
+        // Restore env BEFORE assertions so we don't leak state on
+        // assertion panic.
+        // SAFETY: env mutation is serialized by `HOME_ENV_LOCK` above.
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match prev_xdg {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+
+        let err = result
+            .expect_err("#827: third branch must Err, not silently succeed against real $HOME");
+        let msg = format!("{err:#}");
+        // The error chain must cite the legacy `operator.key` path —
+        // that is the literal value `resolve_operator_key_path(None)`
+        // returns (`<config>/ai-memory/operator.key`). Asserting on
+        // the filename is brittle-resistant: it survives moves of the
+        // base path so long as the suffix discipline holds.
+        assert!(
+            msg.contains("operator.key"),
+            "#827: error must cite the legacy operator.key fallback path; got: {msg}"
+        );
+        assert!(
+            msg.contains("sign-seed") || msg.contains("rules.sign-seed"),
+            "#827: error must surface from the sign-seed verb; got: {msg}"
+        );
+    }
+
     #[test]
     fn resolve_key_dir_returns_override() {
         let p = std::path::PathBuf::from("/some/explicit/dir");
