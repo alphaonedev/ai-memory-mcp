@@ -14,10 +14,70 @@
 //! (`governance_sandbox_boundary.rs`), and A2A replication
 //! (`governance_a2a_rules.rs`) properties.
 
+use std::sync::Mutex;
+
 use ai_memory::governance::agent_action::{
     AgentAction, Decision, GOVERNANCE_CHECK_EVENT_TYPE, check_agent_action,
 };
 use ai_memory::governance::rules_store::{self, Rule};
+use base64::Engine;
+use ed25519_dalek::{Signer, SigningKey};
+use rand_core::OsRng;
+
+// Same pattern as `tests/governance_a2a_rules.rs`: production
+// `enforced_rule_passes` drops any rule whose `attest_level !=
+// "operator_signed"` whenever `resolve_operator_pubkey()` returns a
+// key (env var OR `~/Library/Application Support/ai-memory/operator
+// .key.pub` on macOS). Tests install their own keypair via the env
+// var so the assertions hold regardless of host state.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+struct EnvVarGuard {
+    key: &'static str,
+    prev: Option<String>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: String) -> Self {
+        let lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prev = std::env::var(key).ok();
+        // SAFETY: env mutation is serialized by `ENV_LOCK` held in `_lock`.
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self {
+            key,
+            prev,
+            _lock: lock,
+        }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        // SAFETY: env mutation is serialized by `ENV_LOCK` held in `_lock`.
+        unsafe {
+            match &self.prev {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+}
+
+/// Generate a fresh test keypair and install its verifying key in
+/// `AI_MEMORY_OPERATOR_PUBKEY`; returns the signing key + an RAII
+/// guard that restores prior env on drop.
+fn install_test_operator_key() -> (SigningKey, EnvVarGuard) {
+    let signing = SigningKey::generate(&mut OsRng);
+    let pub_b64 =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signing.verifying_key().to_bytes());
+    let guard = EnvVarGuard::set("AI_MEMORY_OPERATOR_PUBKEY", pub_b64);
+    (signing, guard)
+}
 
 fn fresh_conn() -> rusqlite::Connection {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -52,24 +112,31 @@ fn fresh_conn() -> rusqlite::Connection {
     conn
 }
 
-fn add_rule(conn: &rusqlite::Connection, id: &str, kind: &str, matcher: &str, severity: &str) {
-    rules_store::insert(
-        conn,
-        &Rule {
-            id: id.into(),
-            kind: kind.into(),
-            matcher: matcher.into(),
-            severity: severity.into(),
-            reason: format!("{id}: test refusal"),
-            namespace: "_global".into(),
-            created_by: "test".into(),
-            created_at: 0,
-            enabled: true,
-            signature: None,
-            attest_level: "unsigned".into(),
-        },
-    )
-    .unwrap();
+fn add_rule(
+    conn: &rusqlite::Connection,
+    signing: &SigningKey,
+    id: &str,
+    kind: &str,
+    matcher: &str,
+    severity: &str,
+) {
+    let mut rule = Rule {
+        id: id.into(),
+        kind: kind.into(),
+        matcher: matcher.into(),
+        severity: severity.into(),
+        reason: format!("{id}: test refusal"),
+        namespace: "_global".into(),
+        created_by: "test".into(),
+        created_at: 0,
+        enabled: true,
+        signature: None,
+        attest_level: "operator_signed".into(),
+    };
+    let canonical =
+        rules_store::canonical_bytes_for_signing(&rule).expect("canonical_bytes_for_signing");
+    rule.signature = Some(signing.sign(&canonical).to_bytes().to_vec());
+    rules_store::insert(conn, &rule).unwrap();
 }
 
 fn count_audit_rows(conn: &rusqlite::Connection) -> i64 {
@@ -83,9 +150,11 @@ fn count_audit_rows(conn: &rusqlite::Connection) -> i64 {
 
 #[test]
 fn bash_matcher_substring_match_refuses() {
+    let (signing, _env_guard) = install_test_operator_key();
     let conn = fresh_conn();
     add_rule(
         &conn,
+        &signing,
         "R-bash",
         "bash",
         r#"{"command_regex":"rm -rf /"}"#,
@@ -101,9 +170,11 @@ fn bash_matcher_substring_match_refuses() {
 
 #[test]
 fn filesystem_write_glob_match_refuses() {
+    let (signing, _env_guard) = install_test_operator_key();
     let conn = fresh_conn();
     add_rule(
         &conn,
+        &signing,
         "R001",
         "filesystem_write",
         r#"{"glob":"/tmp/**"}"#,
@@ -122,9 +193,11 @@ fn filesystem_write_glob_match_refuses() {
 
 #[test]
 fn network_request_host_match_refuses() {
+    let (signing, _env_guard) = install_test_operator_key();
     let conn = fresh_conn();
     add_rule(
         &conn,
+        &signing,
         "R-evil",
         "network_request",
         r#"{"host":"malware.example"}"#,
@@ -140,9 +213,11 @@ fn network_request_host_match_refuses() {
 
 #[test]
 fn process_spawn_binary_match_refuses() {
+    let (signing, _env_guard) = install_test_operator_key();
     let conn = fresh_conn();
     add_rule(
         &conn,
+        &signing,
         "R-cargo",
         "process_spawn",
         r#"{"binary":"cargo"}"#,
@@ -158,9 +233,11 @@ fn process_spawn_binary_match_refuses() {
 
 #[test]
 fn custom_kind_match_refuses() {
+    let (signing, _env_guard) = install_test_operator_key();
     let conn = fresh_conn();
     add_rule(
         &conn,
+        &signing,
         "R-deploy",
         "custom",
         r#"{"kind":"deploy_prod"}"#,
@@ -176,12 +253,34 @@ fn custom_kind_match_refuses() {
 
 #[test]
 fn first_refuse_short_circuits_remaining_rules() {
+    let (signing, _env_guard) = install_test_operator_key();
     let conn = fresh_conn();
     // R-A is a Warn; R-B is the first Refuse; R-C is also a Refuse.
     // The engine should return R-B's refusal, not R-C's.
-    add_rule(&conn, "R-A", "bash", r#"{"command_regex":"rm"}"#, "warn");
-    add_rule(&conn, "R-B", "bash", r#"{"command_regex":"rm"}"#, "refuse");
-    add_rule(&conn, "R-C", "bash", r#"{"command_regex":"rm"}"#, "refuse");
+    add_rule(
+        &conn,
+        &signing,
+        "R-A",
+        "bash",
+        r#"{"command_regex":"rm"}"#,
+        "warn",
+    );
+    add_rule(
+        &conn,
+        &signing,
+        "R-B",
+        "bash",
+        r#"{"command_regex":"rm"}"#,
+        "refuse",
+    );
+    add_rule(
+        &conn,
+        &signing,
+        "R-C",
+        "bash",
+        r#"{"command_regex":"rm"}"#,
+        "refuse",
+    );
     let action = AgentAction::Bash {
         command: "rm -rf /".into(),
         cwd: None,
@@ -195,8 +294,16 @@ fn first_refuse_short_circuits_remaining_rules() {
 
 #[test]
 fn warn_without_refuse_returns_warn() {
+    let (signing, _env_guard) = install_test_operator_key();
     let conn = fresh_conn();
-    add_rule(&conn, "W001", "bash", r#"{"command_regex":"sudo"}"#, "warn");
+    add_rule(
+        &conn,
+        &signing,
+        "W001",
+        "bash",
+        r#"{"command_regex":"sudo"}"#,
+        "warn",
+    );
     let action = AgentAction::Bash {
         command: "sudo apt update".into(),
         cwd: None,
@@ -220,9 +327,11 @@ fn each_check_emits_one_signed_event() {
 
 #[test]
 fn refusal_path_still_emits_signed_event() {
+    let (signing, _env_guard) = install_test_operator_key();
     let conn = fresh_conn();
     add_rule(
         &conn,
+        &signing,
         "R001",
         "filesystem_write",
         r#"{"glob":"/tmp/**"}"#,
