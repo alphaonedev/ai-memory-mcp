@@ -27,10 +27,66 @@
 //!
 //! This test pins all three.
 
+use std::path::PathBuf;
+use std::sync::Mutex;
+
 use ai_memory::governance::agent_action::{AgentAction, Decision, check_agent_action_no_audit};
 use ai_memory::governance::rules_store::{self, Rule};
+use base64::Engine;
+use ed25519_dalek::{Signer, SigningKey};
+use rand_core::OsRng;
 use rusqlite::Connection;
-use std::path::PathBuf;
+
+// Hermetic-test pattern: production `enforced_rule_passes` drops
+// `operator_signed` rules whose signature fails verification against
+// the resolved operator pubkey. Test installs its own keypair in
+// `AI_MEMORY_OPERATOR_PUBKEY` and signs the rule with the matching
+// signing key so assertions hold regardless of host state.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+struct EnvVarGuard {
+    key: &'static str,
+    prev: Option<String>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: String) -> Self {
+        let lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prev = std::env::var(key).ok();
+        // SAFETY: env mutation is serialized by `ENV_LOCK` held in `_lock`.
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self {
+            key,
+            prev,
+            _lock: lock,
+        }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        // SAFETY: env mutation is serialized by `ENV_LOCK` held in `_lock`.
+        unsafe {
+            match &self.prev {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+}
+
+fn install_test_operator_key() -> (SigningKey, EnvVarGuard) {
+    let signing = SigningKey::generate(&mut OsRng);
+    let pub_b64 =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signing.verifying_key().to_bytes());
+    let guard = EnvVarGuard::set("AI_MEMORY_OPERATOR_PUBKEY", pub_b64);
+    (signing, guard)
+}
 
 fn fresh_conn() -> Connection {
     let conn = Connection::open_in_memory().expect("open in-memory db");
@@ -154,26 +210,30 @@ fn agent_controlled_matcher_string_does_not_redirect_rule_lookup() {
     // a matcher JSON, the rules engine doesn't read memories — it
     // queries `governance_rules`. We pin that the rules engine's
     // lookup is keyed on `kind`, not on agent-supplied data.
+    let (signing, _env_guard) = install_test_operator_key();
     let conn = fresh_conn();
 
-    // Insert a fresh REFUSE rule for filesystem_write.
-    rules_store::insert(
-        &conn,
-        &Rule {
-            id: "TEST_R".into(),
-            kind: "filesystem_write".into(),
-            matcher: r#"{"glob":"/secret/**"}"#.into(),
-            severity: "refuse".into(),
-            reason: "test refusal".into(),
-            namespace: "_global".into(),
-            created_by: "test".into(),
-            created_at: 0,
-            enabled: true,
-            signature: None,
-            attest_level: "operator_signed".into(),
-        },
-    )
-    .expect("insert TEST_R");
+    // Insert a fresh REFUSE rule for filesystem_write. Signed with
+    // the in-test operator key so `enforced_rule_passes` accepts it
+    // under L1-6 (signed-rules-required when an operator pubkey
+    // resolves).
+    let mut rule = Rule {
+        id: "TEST_R".into(),
+        kind: "filesystem_write".into(),
+        matcher: r#"{"glob":"/secret/**"}"#.into(),
+        severity: "refuse".into(),
+        reason: "test refusal".into(),
+        namespace: "_global".into(),
+        created_by: "test".into(),
+        created_at: 0,
+        enabled: true,
+        signature: None,
+        attest_level: "operator_signed".into(),
+    };
+    let canonical =
+        rules_store::canonical_bytes_for_signing(&rule).expect("canonical_bytes_for_signing");
+    rule.signature = Some(signing.sign(&canonical).to_bytes().to_vec());
+    rules_store::insert(&conn, &rule).expect("insert TEST_R");
 
     // Action whose path matches the matcher → must refuse.
     let action = AgentAction::FilesystemWrite {

@@ -35,10 +35,77 @@
 //! "R003"), not on the reason string. Reasons are operator-authored
 //! and may evolve.
 
+use std::sync::Mutex;
+
 use ai_memory::governance::rules_store::{self, Rule};
 use ai_memory::mcp::handle_check_agent_action;
+use base64::Engine;
+use ed25519_dalek::{Signer, SigningKey};
+use rand_core::OsRng;
 use rusqlite::Connection;
 use serde_json::json;
+
+// Hermetic-test pattern: production `enforced_rule_passes` drops
+// `operator_signed` rules whose signature fails verification against
+// the resolved operator pubkey. Previously these tests inserted
+// placeholder 64-byte signatures (`vec![0xAB; 64]`) which fail
+// against any real pubkey. The fix: generate a per-test keypair,
+// install it in `AI_MEMORY_OPERATOR_PUBKEY`, and sign each rule's
+// canonical bytes with the matching signing key.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+struct EnvVarGuard {
+    key: &'static str,
+    prev: Option<String>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: String) -> Self {
+        let lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prev = std::env::var(key).ok();
+        // SAFETY: env mutation is serialized by `ENV_LOCK` held in `_lock`.
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self {
+            key,
+            prev,
+            _lock: lock,
+        }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        // SAFETY: env mutation is serialized by `ENV_LOCK` held in `_lock`.
+        unsafe {
+            match &self.prev {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+}
+
+fn install_test_operator_key() -> (SigningKey, EnvVarGuard) {
+    let signing = SigningKey::generate(&mut OsRng);
+    let pub_b64 =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signing.verifying_key().to_bytes());
+    let guard = EnvVarGuard::set("AI_MEMORY_OPERATOR_PUBKEY", pub_b64);
+    (signing, guard)
+}
+
+fn sign_rule(mut rule: Rule, signing: &SigningKey) -> Rule {
+    rule.attest_level = "operator_signed".into();
+    rule.signature = None;
+    let canonical =
+        rules_store::canonical_bytes_for_signing(&rule).expect("canonical_bytes_for_signing");
+    rule.signature = Some(signing.sign(&canonical).to_bytes().to_vec());
+    rule
+}
 
 fn fresh_governance_conn() -> Connection {
     let conn = Connection::open_in_memory().expect("open in-memory db");
@@ -75,11 +142,13 @@ fn fresh_governance_conn() -> Connection {
 
 /// Insert an operator-signed bash rule that refuses any command
 /// containing `/tmp/`. Mirrors the operator-policy intent of R001
-/// (no /tmp writes) projected onto the bash command surface.
-fn seed_r001_bash_no_tmp(conn: &Connection) {
-    rules_store::insert(
-        conn,
-        &Rule {
+/// (no /tmp writes) projected onto the bash command surface. The
+/// caller passes the test `signing` key so the signature actually
+/// verifies against the matching pubkey installed via
+/// `install_test_operator_key()`.
+fn seed_r001_bash_no_tmp(conn: &Connection, signing: &SigningKey) {
+    let rule = sign_rule(
+        Rule {
             id: "R001".into(),
             kind: "bash".into(),
             matcher: r#"{"command_regex":"/tmp/"}"#.into(),
@@ -89,20 +158,20 @@ fn seed_r001_bash_no_tmp(conn: &Connection) {
             created_by: "test-operator".into(),
             created_at: 0,
             enabled: true,
-            signature: Some(vec![0xAB; 64]),
+            signature: None,
             attest_level: "operator_signed".into(),
         },
-    )
-    .expect("seed R001");
+        signing,
+    );
+    rules_store::insert(conn, &rule).expect("seed R001");
 }
 
 /// Insert an operator-signed bash rule that refuses any command
 /// containing `/private/tmp/`. Mirrors R003 (macOS realpath of /tmp)
 /// projected onto bash kind.
-fn seed_r003_bash_no_private_tmp(conn: &Connection) {
-    rules_store::insert(
-        conn,
-        &Rule {
+fn seed_r003_bash_no_private_tmp(conn: &Connection, signing: &SigningKey) {
+    let rule = sign_rule(
+        Rule {
             id: "R003".into(),
             kind: "bash".into(),
             matcher: r#"{"command_regex":"/private/tmp/"}"#.into(),
@@ -113,11 +182,12 @@ fn seed_r003_bash_no_private_tmp(conn: &Connection) {
             created_by: "test-operator".into(),
             created_at: 0,
             enabled: true,
-            signature: Some(vec![0xCD; 64]),
+            signature: None,
             attest_level: "operator_signed".into(),
         },
-    )
-    .expect("seed R003");
+        signing,
+    );
+    rules_store::insert(conn, &rule).expect("seed R003");
 }
 
 /// Hostile prompt #1 — Direct.
@@ -127,8 +197,9 @@ fn seed_r003_bash_no_private_tmp(conn: &Connection) {
 /// whose matcher fires on `/tmp/`).
 #[test]
 fn hostile_direct_echo_into_tmp_is_refused_with_r001() {
+    let (signing, _env_guard) = install_test_operator_key();
     let conn = fresh_governance_conn();
-    seed_r001_bash_no_tmp(&conn);
+    seed_r001_bash_no_tmp(&conn, &signing);
 
     let payload = json!({
         "kind": "bash",
@@ -159,8 +230,9 @@ fn hostile_direct_echo_into_tmp_is_refused_with_r001() {
 /// parses a natural-language token as an exemption.
 #[test]
 fn hostile_authority_claim_is_ignored_engine_still_refuses_with_r001() {
+    let (signing, _env_guard) = install_test_operator_key();
     let conn = fresh_governance_conn();
-    seed_r001_bash_no_tmp(&conn);
+    seed_r001_bash_no_tmp(&conn, &signing);
 
     // The hostile command field carries an embedded "operator
     // authorized this verbally" claim. The substring "/tmp/" still
@@ -205,12 +277,13 @@ fn hostile_authority_claim_is_ignored_engine_still_refuses_with_r001() {
 /// acceptable; this test pins that AT LEAST one R0xx refusal fires.
 #[test]
 fn hostile_sleight_of_hand_via_private_tmp_is_refused_with_r003() {
+    let (signing, _env_guard) = install_test_operator_key();
     let conn = fresh_governance_conn();
     // Seed BOTH R001 and R003 so the test reflects the full
     // operator-policy intent. R003 is the rule that closes the
     // macOS realpath gap.
-    seed_r001_bash_no_tmp(&conn);
-    seed_r003_bash_no_private_tmp(&conn);
+    seed_r001_bash_no_tmp(&conn, &signing);
+    seed_r003_bash_no_private_tmp(&conn, &signing);
 
     let payload = json!({
         "kind": "bash",
@@ -244,8 +317,9 @@ fn hostile_sleight_of_hand_via_private_tmp_is_refused_with_r003() {
 /// contains the substring `/tmp/`.
 #[test]
 fn hostile_indirect_cp_to_tmp_is_refused_with_r001() {
+    let (signing, _env_guard) = install_test_operator_key();
     let conn = fresh_governance_conn();
-    seed_r001_bash_no_tmp(&conn);
+    seed_r001_bash_no_tmp(&conn, &signing);
 
     let payload = json!({
         "kind": "bash",
@@ -272,9 +346,10 @@ fn hostile_indirect_cp_to_tmp_is_refused_with_r001() {
 /// refusing everything.
 #[test]
 fn benign_bash_command_outside_policy_is_allowed() {
+    let (signing, _env_guard) = install_test_operator_key();
     let conn = fresh_governance_conn();
-    seed_r001_bash_no_tmp(&conn);
-    seed_r003_bash_no_private_tmp(&conn);
+    seed_r001_bash_no_tmp(&conn, &signing);
+    seed_r003_bash_no_private_tmp(&conn, &signing);
 
     let payload = json!({
         "kind": "bash",

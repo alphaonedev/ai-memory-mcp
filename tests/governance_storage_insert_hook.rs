@@ -396,39 +396,53 @@ fn wait_for_health(port: u16) -> bool {
 
 #[test]
 fn refusal_maps_to_http_403() {
+    use base64::Engine;
+    use ed25519_dalek::{Signer, SigningKey};
+    use rand_core::OsRng;
     let dir = std::env::temp_dir();
     let db_path = dir.join(format!("ai-memory-l16e-http-{}.db", uuid::Uuid::new_v4()));
     let bin = env!("CARGO_BIN_EXE_ai-memory");
+
+    // Generate a one-off operator keypair scoped to this test. The
+    // rule we seed is signed with the private half; the spawned
+    // `ai-memory serve` child runs with `AI_MEMORY_OPERATOR_PUBKEY`
+    // set to the verifying half so its `enforced_rule_passes`
+    // filter accepts the rule under L1-6 (signed-rules-required when
+    // an operator pubkey resolves). Without this, hosts that have an
+    // operator pubkey on disk silently drop unsigned in-test rules
+    // and the assertion below would mis-fire as 200 instead of 403.
+    let signing = SigningKey::generate(&mut OsRng);
+    let pub_b64 =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signing.verifying_key().to_bytes());
 
     // Seed a refuse rule into the DB. The daemon hook (installed in
     // bootstrap_serve) will consult this row on every storage::insert.
     {
         let conn = db::open(&db_path).expect("open seed db");
         let now = chrono::Utc::now().timestamp();
-        conn.execute(
-            "INSERT INTO governance_rules \
-             (id, kind, matcher, severity, reason, namespace, created_by, \
-              created_at, enabled, signature, attest_level) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10)",
-            rusqlite::params![
-                "R-http-test",
-                "custom",
-                r#"{"kind":"memory_write"}"#,
-                "refuse",
-                "L1-6 HTTP test: refused by substrate governance",
-                "_global",
-                "test",
-                now,
-                1,
-                "unsigned",
-            ],
-        )
-        .expect("seed rule");
+        let mut rule = ai_memory::governance::rules_store::Rule {
+            id: "R-http-test".into(),
+            kind: "custom".into(),
+            matcher: r#"{"kind":"memory_write"}"#.into(),
+            severity: "refuse".into(),
+            reason: "L1-6 HTTP test: refused by substrate governance".into(),
+            namespace: "_global".into(),
+            created_by: "test".into(),
+            created_at: now,
+            enabled: true,
+            signature: None,
+            attest_level: "operator_signed".into(),
+        };
+        let canonical = ai_memory::governance::rules_store::canonical_bytes_for_signing(&rule)
+            .expect("canonical_bytes_for_signing");
+        rule.signature = Some(signing.sign(&canonical).to_bytes().to_vec());
+        ai_memory::governance::rules_store::insert(&conn, &rule).expect("seed rule");
     }
 
     let port = free_port();
     let mut child = std::process::Command::new(bin)
         .env("AI_MEMORY_NO_CONFIG", "1")
+        .env("AI_MEMORY_OPERATOR_PUBKEY", &pub_b64)
         .args([
             "--db",
             db_path.to_str().unwrap(),

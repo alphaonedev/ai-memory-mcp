@@ -11,6 +11,62 @@ use std::thread;
 
 use ai_memory::governance::agent_action::{AgentAction, Decision, check_agent_action};
 use ai_memory::governance::rules_store::{self, Rule};
+use base64::Engine;
+use ed25519_dalek::{Signer, SigningKey};
+use rand_core::OsRng;
+
+// Hermetic-test pattern: production `enforced_rule_passes` drops
+// unsigned rules when an operator pubkey resolves (env or on-disk
+// `operator.key.pub`). We generate a per-test keypair and install it
+// in `AI_MEMORY_OPERATOR_PUBKEY` so the assertion below sees the
+// rule as enforced regardless of host state. Serialize the env
+// mutation via a static mutex so future tests in this file don't
+// race each other on the env var.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+struct EnvVarGuard {
+    key: &'static str,
+    prev: Option<String>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: String) -> Self {
+        let lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prev = std::env::var(key).ok();
+        // SAFETY: env mutation is serialized by `ENV_LOCK` held in `_lock`.
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self {
+            key,
+            prev,
+            _lock: lock,
+        }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        // SAFETY: env mutation is serialized by `ENV_LOCK` held in `_lock`.
+        unsafe {
+            match &self.prev {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+}
+
+fn install_test_operator_key() -> (SigningKey, EnvVarGuard) {
+    let signing = SigningKey::generate(&mut OsRng);
+    let pub_b64 =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signing.verifying_key().to_bytes());
+    let guard = EnvVarGuard::set("AI_MEMORY_OPERATOR_PUBKEY", pub_b64);
+    (signing, guard)
+}
 
 fn fresh_conn() -> rusqlite::Connection {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -47,26 +103,27 @@ fn fresh_conn() -> rusqlite::Connection {
 
 #[test]
 fn hundred_concurrent_checks_against_same_rule_return_consistent_decisions() {
+    let (signing, _env_guard) = install_test_operator_key();
     let conn = Arc::new(Mutex::new(fresh_conn()));
     {
         let c = conn.lock().unwrap();
-        rules_store::insert(
-            &c,
-            &Rule {
-                id: "R001".into(),
-                kind: "filesystem_write".into(),
-                matcher: r#"{"glob":"/tmp/**"}"#.into(),
-                severity: "refuse".into(),
-                reason: "no /tmp".into(),
-                namespace: "_global".into(),
-                created_by: "test".into(),
-                created_at: 0,
-                enabled: true,
-                signature: None,
-                attest_level: "unsigned".into(),
-            },
-        )
-        .unwrap();
+        let mut rule = Rule {
+            id: "R001".into(),
+            kind: "filesystem_write".into(),
+            matcher: r#"{"glob":"/tmp/**"}"#.into(),
+            severity: "refuse".into(),
+            reason: "no /tmp".into(),
+            namespace: "_global".into(),
+            created_by: "test".into(),
+            created_at: 0,
+            enabled: true,
+            signature: None,
+            attest_level: "operator_signed".into(),
+        };
+        let canonical =
+            rules_store::canonical_bytes_for_signing(&rule).expect("canonical_bytes_for_signing");
+        rule.signature = Some(signing.sign(&canonical).to_bytes().to_vec());
+        rules_store::insert(&c, &rule).unwrap();
     }
 
     let mut handles = Vec::new();
