@@ -275,24 +275,33 @@ v0.7.0 ships. None is skippable. All three are pre-release.
 See tasks #16 → #17 → #18 → #19 (FINAL MISSION docs+pages
 drift) for the current execution state.
 
-**Six strategic high-level lanes (operator-set 2026-05-17 pm).**
+**Six strategic high-level lanes (operator-set 2026-05-17 pm-v2).**
 The canonical lane index lives in memory
-`b1109500-c655-49f1-b9a0-76e93bc890f6` (namespace
-`_v070_strategic_tracking`). Every session boot should load it.
+`afd38b34-ffc2-4f5b-a0a5-f039e3c86bf2` (namespace
+`_v070_strategic_tracking`; supersedes earlier `b1109500-...`).
+Every session boot should load it.
 
 | # | Lane | Task |
 |---|------|------|
 | 1 | Bugs/issues — fix everything | #22 |
 | 2 | Code line coverage | #23 |
-| 3 | Full-spectrum testing (NHI + A2A 100% regression + net-new) | #24 |
+| 3 | Full-spectrum testing (NHI + A2A 100% regression + net-new + DO hive) | #24 |
 | 4 | Code refactoring (3-wave mandate) | #25 |
 | 5 | Documentation drift — 100% remediation | #26 |
 | 6 | GitHub Pages website redesign (3 audiences + 3 AI-NHI brass tacks) | #27 → issue #832 |
 
-All 6 pre-release. None skippable. Cross-lane discipline: Lane 1 is
+Lane 3 testing tracks:
+- Track A: NHI playbook P0-P11 + verdict — #7 (P0-P2 done)
+- Track B: A2A 4-domain IronClaw, 100% regression + net-new — #8
+- Track C: Postgres + Apache AGE on 192.168.50.1 — #9
+- Track D: Cross-node integration (.100 ↔ .1) — #10
+- **Track E: DO agent hive — CPU-only, recursive learning at swarm scale** — #28 → issue #833 (**operator $-approval gated**)
+
+All 6 lanes pre-release. None skippable. Cross-lane discipline: Lane 1 is
 the meta-lane (every other lane's findings land there); Lane 3
 re-runs on the Wave-3 post-refactor binary; Lane 5 final sweep is
-post-refactor; Lane 6 can run in parallel with Lane 4.
+post-refactor; Lane 6 can run in parallel with Lane 4; Track E
+captures feed Lane 6 case-study content.
 
 **Provenance.** Live memory `5d703efe-273b-4c84-8f40-ceb97b55d71e`
 in namespace `global/policies` is the canonical version of this
