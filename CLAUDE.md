@@ -311,6 +311,35 @@ in namespace `global/policies` is the canonical version of this
 directive and supersedes the earlier
 `71ecce23-611b-4984-962d-d37c4309f261`.
 
+## v0.7.0 release gate (operator-set 2026-05-17 pm-v5)
+
+**AI NHI is 100% autonomous and makes ALL decisions EXCEPT the
+v0.7.0 release tag cut.** The release gate is **100% GREEN TESTS**.
+The full checklist lives in issue #836 (`v0.7.0 RELEASE GATE`) and
+the lane-index memory. Tier summary:
+
+1. Every CI workflow on `release/v0.7.0` HEAD passes.
+2. Every queued `auto-filed-by-agent` issue resolved (no open
+   blocker).
+3. Lane 3 full-spectrum testing: Tracks A-E2 all PASS, final
+   verdict memory minted with status = SHIP.
+4. Lane 4 refactor Waves 1-3 complete with green re-validation
+   on the refactored binary.
+5. Lane 2 coverage floors met + raised on hot-path modules.
+6. Lane 5 docs drift 100% remediated.
+7. Lane 6 website redesign + 3 audience pages + 3 AI-NHI essays
+   + #835 clean A2A test pages all live.
+8. Final binary validation (24h dogfood, cargo audit clean, all
+   four gates clean on fresh checkout, release-notes + CHANGELOG
+   complete).
+
+When all 6 tiers are green, the agent posts a SHIP-RECOMMENDED
+comment on #836 + a high-priority memory in
+`_v070_release_gate`, then **stops**. Operator reviews + cuts
+the tag. Banned: surface-level exemptions, "close enough"
+quoting, bypassing via --no-verify / force-push / out-of-band
+merges, cutting the tag without explicit operator approval.
+
 ## Commit & push policy (project override of global default)
 
 > This policy **overrides** Claude Code's global default ("NEVER commit unless
