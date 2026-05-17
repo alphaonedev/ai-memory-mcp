@@ -152,12 +152,14 @@ fn test_migration_v36_applies_cleanly() {
     //   → v39 (Form 5 confidence calibration shadow table)
     //   → v40 (Cluster C signed-events DLQ, issue #767 SEC-3)
     //   → v41 (Cluster G shadow-retention denormalised column + compound index)
-    //   → v42 (Polish #781 PERF-8 auto_persona mentioned_entity_id column).
+    //   → v42 (Polish #781 PERF-8 auto_persona mentioned_entity_id column)
+    //   → v43 (Persona Signing Pipeline #813 atomicity triggers on
+    //          memory_links.(attest_level, signature)).
     // When CURRENT_SCHEMA_VERSION bumps, update this assertion in lockstep.
     assert_eq!(
-        v, 42,
-        "v36→v42: schema_version must be stamped at CURRENT_SCHEMA_VERSION \
-         (migration ladder passes through v36 on its way to v42)"
+        v, 43,
+        "v36→v43: schema_version must be stamped at CURRENT_SCHEMA_VERSION \
+         (migration ladder passes through v36 on its way to v43)"
     );
 }
 
@@ -187,11 +189,12 @@ fn test_migration_v36_idempotent() {
         )
         .expect("read v2");
 
-    // The migration ladder reaches v42 (Polish #781 PERF-8 mentioned_entity_id);
-    // pass-through v36 still exercises WT-1-A's atomisation migration.
-    // Tracks `CURRENT_SCHEMA_VERSION` in src/storage/migrations.rs.
-    assert_eq!(v1, 42);
-    assert_eq!(v1, v2, "v42: migrate is not idempotent — version drifted");
+    // The migration ladder reaches v43 (Persona Signing Pipeline #813
+    // atomicity triggers); pass-through v36 still exercises WT-1-A's
+    // atomisation migration. Tracks `CURRENT_SCHEMA_VERSION` in
+    // src/storage/migrations.rs.
+    assert_eq!(v1, 43);
+    assert_eq!(v1, v2, "v43: migrate is not idempotent — version drifted");
 
     // Columns + indexes still present after replay.
     assert!(column_exists(&conn2, "memories", "atomised_into"));
@@ -455,17 +458,19 @@ async fn test_capabilities_db_schema_version_reports_36() {
         .expect("WT-1-A: db_schema_version must be a JSON integer");
 
     assert_eq!(
-        v, 42,
-        "WT-1-A+QW-2+Form 4+Form 5+Cluster-C+Cluster-G+PERF-8: \
-         capabilities.db_schema_version must be 42 after the \
+        v, 43,
+        "WT-1-A+QW-2+Form 4+Form 5+Cluster-C+Cluster-G+PERF-8+#813: \
+         capabilities.db_schema_version must be 43 after the \
          atomisation-foundation bump (35→36), persona-as-artifact \
          bump (36→37), Form 4 source-uri provenance bump (37→38), \
          Form 5 confidence calibration bump (38→39), Cluster-C \
          signed-events DLQ bump (39→40), Cluster-G shadow-retention \
-         denormalised source column bump (40→41), and polish PERF-8 \
-         auto_persona mentioned_entity_id bump (41→42). Drift here \
-         means the migrate ladder skipped one of those steps or the \
-         SAL `schema_version()` lookup is reading the wrong source."
+         denormalised source column bump (40→41), polish PERF-8 \
+         auto_persona mentioned_entity_id bump (41→42), and Persona \
+         Signing Pipeline atomicity triggers (#813) bump (42→43). \
+         Drift here means the migrate ladder skipped one of those \
+         steps or the SAL `schema_version()` lookup is reading the \
+         wrong source."
     );
 
     shutdown.notify_one();
