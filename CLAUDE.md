@@ -408,18 +408,53 @@ Ask the operator first when ANY of these apply:
 **Pushing requires explicit operator authorization.** Each push to a shared
 remote branch is a write to an external system that may trigger CI, sync
 to a PR diff, or notify reviewers. Different blast radius from local
-commits. Default discipline:
+commits.
+
+**Operator-set scope (2026-05-17 pm-v6, memory `eb44c467-a42e-4f37-8a80-34151fe20fc3`):**
+The AI NHI agent is APPROVED to push directly to `release/v0.7.0`
+as part of normal autonomous work — fixing auto-filed-by-agent
+issues, persisting test-campaign results, docs updates, site
+updates, refactor work. The release tag cut + release publish
+remain operator-gated per the 8-tier release gate (issue #836).
+
+Default discipline:
 
 - Local commits accumulate freely under the rules above.
 - Push to `origin/<topic-branch>` (e.g., `round-2-fixes`,
-  `feat/...`) when the operator says so, or when the operator
-  authorizes the agent to push at agent's discretion for a defined
-  scope (e.g., "push everything you commit on this branch today").
+  `feat/...`) and to `origin/release/v0.7.0` are PRE-APPROVED for
+  the current v0.7.0 campaign per the operator directive above.
 - **Never force-push** without explicit operator authorization, ever.
 - **Never push to `main` directly**, even with authorization to push to
   other branches. `main` is production-tag-only.
 - **Never push to `develop`** without operator authorization specific to
   `develop`, since `develop` is the integration branch.
+- **Cutting the v0.7.0 release tag, publishing to crates.io / GHCR /
+  Homebrew / COPR, or merging `release/v0.7.0` → `main` remain
+  operator-gated** (require explicit per-action authorization, fire only
+  when the 8-tier release gate verifies 100% green).
+- Cost-spending actions (DO provisioning #833, AWS GPU burst #834) stay
+  operator-$-gated.
+
+### Sync discipline (operator emphasis 2026-05-17 pm-v6: do not lose context)
+
+Per operator: "keep everything in sync — do not lose context on keeping
+everything in sync". This is a first-class discipline. Concretely:
+
+- **Lane index ↔ CLAUDE.md ↔ live issues** must all agree. Every
+  material state change supersedes the lane-index memory AND updates
+  CLAUDE.md AND fires a task/issue update.
+- **Memory supersession chains** retain `related_to` (or future
+  `supersedes`) links so audit is reconstructable.
+- **Commit messages reference issue numbers + memory ids** — the commit
+  log itself becomes a navigable history.
+- **Task list updates fire on every status change** — no stale
+  "in_progress" rows.
+- **PR descriptions point at the issues + memories** — the PR is also
+  a navigable index, not a stub.
+
+Trailing discipline on every round: update memory → update CLAUDE.md →
+update tasks → commit → push → verify all four are aligned before the
+next change.
 
 ### Rationale
 
