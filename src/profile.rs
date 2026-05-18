@@ -448,6 +448,11 @@ impl Family {
                 // for tuning per-(namespace, source) confidence
                 // baselines.
                 "memory_calibrate_confidence",
+                // v0.7.0 (issues #224 + #311) — Phase 3 Memory Sharing &
+                // Sync RFC pulled forward per operator directive
+                // `28860423-d12c-4959-bc8b-8fa9a94a33d9`. Substrate-
+                // level point-to-point copy into `_shared/<from>→<to>/`.
+                "memory_share",
             ],
             Self::Meta => &[
                 "memory_capabilities",
@@ -747,7 +752,7 @@ mod tests {
     fn family_expected_tool_counts_sum_to_51() {
         let total: usize = Family::all().iter().map(|f| f.expected_tool_count()).sum();
         assert_eq!(
-            total, 71,
+            total, 72,
             "v0.6.3.1 baseline (43) + v0.7.0 I4 `memory_replay` + v0.7 H4 \
              `memory_verify` + v0.7 B1 `memory_load_family` + v0.7 B2 \
              `memory_smart_load` + v0.7 K7 `memory_subscription_replay` \
@@ -764,7 +769,10 @@ mod tests {
              v0.7.0 WT-1-C `memory_atomise` + \
              v0.7.0 QW-2 `memory_persona` + `memory_persona_generate` + \
              v0.7.0 Form 3 `memory_ingest_multistep` + \
-             v0.7.0 Form 5 `memory_calibrate_confidence` = 71. \
+             v0.7.0 Form 5 `memory_calibrate_confidence` + \
+             v0.7.0 issues #224 + #311 `memory_share` (Phase 3 Memory \
+             Sharing & Sync RFC pulled forward per operator directive \
+             `28860423-d12c-4959-bc8b-8fa9a94a33d9`) = 72. \
              If this drifts, update Family::expected_tool_count and the \
              family map docs together."
         );
@@ -859,7 +867,10 @@ mod tests {
         // + prompt-cache reuse, +1 → 21).
         // v0.7.0 Form 5 — Power got memory_calibrate_confidence
         // (shadow-mode-driven per-source baseline sweep, +1 → 22).
-        assert_eq!(p.expected_tool_count(), 7 + 22);
+        // v0.7.0 issues #224 + #311 — Power got memory_share (Phase 3
+        // Memory Sharing & Sync RFC pulled forward per operator directive
+        // `28860423-d12c-4959-bc8b-8fa9a94a33d9`, +1 → 23).
+        assert_eq!(p.expected_tool_count(), 7 + 23);
     }
 
     #[test]
@@ -879,8 +890,11 @@ mod tests {
         // memory_atomise (WT-1-C, Family::Power) +
         // memory_persona + memory_persona_generate (QW-2, Family::Power) +
         // memory_ingest_multistep (Form 3 / #756, Family::Power) +
-        // memory_calibrate_confidence (Form 5, Family::Power) = 71.
-        assert_eq!(p.expected_tool_count(), 71);
+        // memory_calibrate_confidence (Form 5, Family::Power) +
+        // memory_share (Phase 3 Memory Sharing & Sync RFC pulled forward
+        // per operator directive `28860423-d12c-4959-bc8b-8fa9a94a33d9`,
+        // Family::Power) = 72.
+        assert_eq!(p.expected_tool_count(), 72);
 
         // The K7+K8 + Task 4/8 + L2-2 + L2-3 + #691 + QW-1 + QW-3 follow-up
         // + WT-1-C + QW-2 + Form 3 + Form 5 additions live in Family::Power
@@ -1090,10 +1104,14 @@ mod tests {
             // v0.7.0 Form 5 (issue #758) — calibration sweep over the
             // shadow-mode observation table (Family::Power).
             "memory_calibrate_confidence",
+            // v0.7.0 (issues #224 + #311) — Phase 3 Memory Sharing &
+            // Sync RFC pulled forward per operator directive
+            // `28860423-d12c-4959-bc8b-8fa9a94a33d9`.
+            "memory_share",
         ];
         assert_eq!(
             baseline.len(),
-            65,
+            66,
             "baseline list = 43 (v0.6.3.1) + 1 (v0.7.0 I4 memory_replay) + \
              1 (v0.7 H4 memory_verify) + 1 (v0.7 B1 memory_load_family) + \
              1 (v0.7 B2 memory_smart_load) + \
@@ -1107,7 +1125,8 @@ mod tests {
              2 (v0.7.0 QW-3 follow-up memory_offload + memory_deref) + \
              1 (v0.7.0 WT-1-C memory_atomise) + \
              1 (v0.7.0 Form 3 memory_ingest_multistep) + \
-             1 (v0.7.0 Form 5 memory_calibrate_confidence) = 65"
+             1 (v0.7.0 Form 5 memory_calibrate_confidence) + \
+             1 (v0.7.0 issues #224 + #311 memory_share) = 66"
         );
         for name in baseline {
             assert!(

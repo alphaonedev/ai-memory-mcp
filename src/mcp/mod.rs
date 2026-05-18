@@ -2037,9 +2037,12 @@ mod tests {
         // v0.7.0 Form 5 (#758) adds memory_calibrate_confidence
         // (Family::Power) → 71 — shadow-mode-driven per-source
         // baseline sweep.
+        // v0.7.0 issues #224 + #311 adds memory_share (Family::Power) → 72
+        // — Phase 3 Memory Sharing & Sync RFC pulled forward per operator
+        // directive `28860423-d12c-4959-bc8b-8fa9a94a33d9`.
         let defs = tool_definitions();
         let tools = defs["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 71);
+        assert_eq!(tools.len(), 72);
     }
 
     /// v0.6.4-002 acceptance gate (RFC §S25/S26): `--profile core`

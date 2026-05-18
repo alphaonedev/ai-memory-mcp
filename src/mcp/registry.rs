@@ -1039,6 +1039,19 @@ pub fn tool_definitions() -> Value {
                 }
             },
             {
+                "name": "memory_share",
+                "description": "Share a memory with another agent (point-to-point copy into _shared/<from>→<to>/).",
+                "docs": "Issues #224 + #311 — Phase 3 Memory Sharing & Sync RFC pulled forward per operator directive `28860423-d12c-4959-bc8b-8fa9a94a33d9` (2026-05-18). MVP: point-to-point copy into the target agent's shared namespace `_shared/<from>→<to>/` with provenance metadata. v0.8 Phase 3 adds CRDT-lite merge rules, bi-directional sync, federation wire-level distribution.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "source_memory_id": {"type": "string", "description": "Memory id (full UUID or unique prefix) to share."},
+                        "target_agent_id": {"type": "string", "description": "Recipient agent id; must satisfy validate_agent_id."}
+                    },
+                    "required": ["source_memory_id", "target_agent_id"]
+                }
+            },
+            {
                 "name": "memory_calibrate_confidence",
                 "description": "Scan confidence_shadow_observations and emit per-source baselines (Form 5).",
                 "docs": "Form 5 (#758): read-only calibration sweep over shadow-mode observations (AI_MEMORY_CONFIDENCE_SHADOW=1). Returns CalibrationReport {window_days, total_observations, baselines:[{namespace, source, count, median, mean, buckets}]}. Default window 30d. Family::Power — refuses on keyword tier.",
