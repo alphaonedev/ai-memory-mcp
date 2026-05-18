@@ -79,6 +79,17 @@ pub struct VerifyArgs {
     /// Emit a JSON report instead of text.
     #[arg(long, default_value_t = false)]
     pub json: bool,
+    /// v0.7.0 #697 — verify the **forensic** governance-decision log
+    /// (Ed25519-signed, daily-rotated `forensic-<YYYY-MM-DD>.jsonl`)
+    /// from the supplied ISO date forward. Walks every file at or
+    /// after `<YYYY-MM-DD>` under the resolved forensic directory.
+    #[arg(long, value_name = "ISO_DATE")]
+    pub since: Option<String>,
+    /// v0.7.0 #697 — agent_id whose Ed25519 public key is used to
+    /// verify signatures on the forensic log. Defaults to the
+    /// resolved daemon agent_id.
+    #[arg(long, value_name = "AGENT_ID")]
+    pub forensic_agent_id: Option<String>,
 }
 
 #[derive(Args)]
@@ -192,6 +203,11 @@ fn run_verify(
     app_config: &AppConfig,
     out: &mut CliOutput<'_>,
 ) -> Result<i32> {
+    // v0.7.0 #697 — forensic verify (Ed25519-signed, daily-rotated)
+    // takes priority when `--since` is supplied.
+    if let Some(since) = args.since.as_deref() {
+        return run_forensic_verify(since, args, cli_audit_dir, app_config, out);
+    }
     let path = resolve_path(app_config, cli_audit_dir, args.path.as_deref());
     if !path.exists() {
         if args.json {
@@ -256,6 +272,116 @@ fn run_verify(
             "audit verify OK: {} line(s) verified at {}",
             report.total_lines,
             path.display()
+        )?;
+    }
+    Ok(0)
+}
+
+/// v0.7.0 #697 — forensic verify dispatch. Resolves the forensic
+/// directory (default = same as the flat audit-log dir), loads the
+/// daemon's Ed25519 public key, and walks every
+/// `forensic-<YYYY-MM-DD>.jsonl` file at or after `--since`.
+///
+/// Exit codes mirror the flat verifier: `0` chain intact (signed or
+/// unsigned), `2` at least one row failed.
+fn run_forensic_verify(
+    since: &str,
+    args: &VerifyArgs,
+    cli_audit_dir: Option<&std::path::Path>,
+    app_config: &AppConfig,
+    out: &mut CliOutput<'_>,
+) -> Result<i32> {
+    let log_path = resolve_path(app_config, cli_audit_dir, args.path.as_deref());
+    let dir = log_path
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+    let agent_id = args
+        .forensic_agent_id
+        .clone()
+        .or_else(|| crate::identity::resolve_agent_id(None, None).ok())
+        .unwrap_or_else(|| "ai-memory".to_string());
+
+    let public_key = crate::governance::audit::load_daemon_verifying_key(&agent_id).unwrap_or(None);
+
+    let report = match crate::governance::audit::verify_since(&dir, since, public_key.as_ref()) {
+        Ok(r) => r,
+        Err(e) => {
+            if args.json {
+                writeln!(
+                    out.stdout,
+                    "{}",
+                    serde_json::json!({
+                        "status": "error",
+                        "since": since,
+                        "dir": dir.display().to_string(),
+                        "error": e.to_string(),
+                    })
+                )?;
+            } else {
+                writeln!(
+                    out.stderr,
+                    "forensic verify error: {e} (dir={})",
+                    dir.display()
+                )?;
+            }
+            return Ok(2);
+        }
+    };
+
+    if let Some(failure) = &report.first_failure {
+        if args.json {
+            writeln!(
+                out.stdout,
+                "{}",
+                serde_json::json!({
+                    "status": "fail",
+                    "total_lines": report.total_lines,
+                    "unsigned_lines": report.unsigned_lines,
+                    "failure": {
+                        "file": failure.file.display().to_string(),
+                        "line_number": failure.line_number,
+                        "kind": format!("{:?}", failure.kind),
+                        "detail": failure.detail,
+                    },
+                    "since": since,
+                    "dir": dir.display().to_string(),
+                })
+            )?;
+        } else {
+            writeln!(
+                out.stderr,
+                "forensic verify FAIL at {}:{} — {:?}: {}",
+                failure.file.display(),
+                failure.line_number,
+                failure.kind,
+                failure.detail
+            )?;
+        }
+        return Ok(2);
+    }
+
+    if args.json {
+        writeln!(
+            out.stdout,
+            "{}",
+            serde_json::json!({
+                "status": "ok",
+                "total_lines": report.total_lines,
+                "unsigned_lines": report.unsigned_lines,
+                "since": since,
+                "dir": dir.display().to_string(),
+            })
+        )?;
+    } else {
+        writeln!(
+            out.stdout,
+            "forensic verify OK: {} line(s) verified since {} ({} unsigned) at {}",
+            report.total_lines,
+            since,
+            report.unsigned_lines,
+            dir.display()
         )?;
     }
     Ok(0)
@@ -420,6 +546,8 @@ mod tests {
             &VerifyArgs {
                 path: Some(p.to_string_lossy().into_owned()),
                 json: true,
+                since: None,
+                forensic_agent_id: None,
             },
             None,
             &cfg,
@@ -449,6 +577,8 @@ mod tests {
             &VerifyArgs {
                 path: Some(p.to_string_lossy().into_owned()),
                 json: true,
+                since: None,
+                forensic_agent_id: None,
             },
             None,
             &cfg,
@@ -472,6 +602,8 @@ mod tests {
             &VerifyArgs {
                 path: Some(tmp.path().join("nope.log").to_string_lossy().into_owned()),
                 json: false,
+                since: None,
+                forensic_agent_id: None,
             },
             None,
             &cfg,
@@ -546,6 +678,8 @@ mod tests {
             action: AuditAction::Verify(VerifyArgs {
                 path: Some(p.to_string_lossy().into_owned()),
                 json: true,
+                since: None,
+                forensic_agent_id: None,
             }),
             audit_dir: None,
         };
@@ -829,6 +963,8 @@ mod tests {
                 // JSON-format the missing-log response: exercises the
                 // `args.json` branch of the missing-log early return.
                 json: true,
+                since: None,
+                forensic_agent_id: None,
             },
             None,
             &cfg,
@@ -860,6 +996,8 @@ mod tests {
                 path: Some(p.to_string_lossy().into_owned()),
                 // text path: writes failure to stderr instead of stdout
                 json: false,
+                since: None,
+                forensic_agent_id: None,
             },
             None,
             &cfg,
@@ -887,6 +1025,8 @@ mod tests {
                 path: Some(p.to_string_lossy().into_owned()),
                 // text-format success path
                 json: false,
+                since: None,
+                forensic_agent_id: None,
             },
             None,
             &cfg,
