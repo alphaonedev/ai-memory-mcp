@@ -159,7 +159,7 @@ async fn federation_sync_push_round_trip_via_sal() {
             "tags": ["fed"],
             "priority": 5,
             "confidence": 1.0,
-            "source": "fed-test",
+            "source": "import",
             "access_count": 0,
             "created_at": now,
             "updated_at": now,
@@ -222,7 +222,7 @@ async fn federation_sync_push_dry_run_via_sal() {
             "tags": [],
             "priority": 5,
             "confidence": 1.0,
-            "source": "test",
+            "source": "import",
             "access_count": 0,
             "created_at": now,
             "updated_at": now,
@@ -271,7 +271,7 @@ async fn federation_sync_push_idempotent_on_duplicate() {
             "tags": [],
             "priority": 5,
             "confidence": 1.0,
-            "source": "test",
+            "source": "import",
             "access_count": 0,
             "created_at": now.clone(),
             "updated_at": now.clone(),
@@ -352,7 +352,7 @@ async fn audit_chain_persists_across_restart_on_postgres() {
                 "tags": ["audit"],
                 "priority": 5,
                 "confidence": 1.0,
-                "source": "audit-test",
+                "source": "system",
                 "metadata": {}
             }))
             .send()
@@ -385,7 +385,7 @@ async fn audit_chain_persists_across_restart_on_postgres() {
                 "tags": ["audit"],
                 "priority": 5,
                 "confidence": 1.0,
-                "source": "audit-test",
+                "source": "system",
                 "metadata": {}
             }))
             .send()
@@ -448,7 +448,7 @@ async fn recall_hybrid_pipeline_runs_on_postgres() {
                 "tags": ["recall"],
                 "priority": 5,
                 "confidence": 1.0,
-                "source": "recall-test",
+                "source": "import",
                 "metadata": {}
             }))
             .send()
