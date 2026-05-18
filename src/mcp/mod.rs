@@ -368,7 +368,7 @@ mod rule_list;
 mod search;
 #[path = "tools/session_start.rs"]
 mod session_start;
-#[path = "tools/store.rs"]
+#[path = "tools/store/mod.rs"]
 mod store;
 #[path = "tools/subscribe.rs"]
 mod subscribe;
