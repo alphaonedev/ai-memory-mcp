@@ -36,15 +36,18 @@
 //! - [`approvals`]   — v0.7.0 K10 approval API (`POST
 //!   /api/v1/approvals/{pending_id}` + SSE stream).
 
+pub mod admin;
 pub mod approvals;
 pub mod archive;
 pub mod errors;
 pub mod federation_receive;
+pub mod governance;
 pub mod hook_subscribers;
 pub mod http;
 pub mod kg;
 pub mod links;
 pub mod parity;
+pub mod power;
 pub mod skills;
 pub mod system;
 pub mod transport;
@@ -53,15 +56,18 @@ pub mod transport;
 // (router wiring in `src/lib.rs`, integration tests) can still
 // reference `handlers::<name>` without knowing which sub-module the
 // item came from. Wire compatibility is preserved verbatim.
+pub use admin::*;
 pub use approvals::*;
 pub use archive::*;
 pub use errors::*;
 pub use federation_receive::*;
+pub use governance::*;
 pub use hook_subscribers::*;
 pub use http::*;
 pub use kg::*;
 pub use links::*;
 pub(crate) use parity::*;
+pub use power::*;
 pub use skills::*;
 pub use system::*;
 pub use transport::*;
