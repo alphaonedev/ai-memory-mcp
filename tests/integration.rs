@@ -10661,6 +10661,7 @@ fn federation_cfg_for_test(
         client,
         sender_agent_id: "ai:fed-test".to_string(),
         api_key: None,
+        signing_key: None,
     }
 }
 

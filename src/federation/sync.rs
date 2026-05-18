@@ -39,6 +39,7 @@ pub(super) async fn post_once(
     expected_id: &str,
     idempotency_key: Option<&str>,
     api_key: Option<&str>,
+    signing_key: Option<&ed25519_dalek::SigningKey>,
 ) -> AckOutcome {
     // Ultrareview #346: attach an idempotency key so peers can dedupe
     // on retry. If a tokio::timeout fires locally but the HTTP POST
@@ -73,7 +74,21 @@ pub(super) async fn post_once(
             refusal.reason
         ));
     }
-    let mut req = client.post(url).json(body);
+    // v0.7.0 #791 — serialise the body ONCE so the signature input
+    // matches the wire bytes the receiver sees. Sending via
+    // `.body(bytes)` + explicit content-type bypasses reqwest's
+    // re-serialisation (which could perturb whitespace / key order
+    // across versions and break the signature).
+    let body_bytes = match serde_json::to_vec(body) {
+        Ok(b) => b,
+        Err(e) => {
+            return AckOutcome::Fail(format!("serialise body: {e}"));
+        }
+    };
+    let mut req = client
+        .post(url)
+        .header("content-type", "application/json")
+        .body(body_bytes.clone());
     if let Some(key) = idempotency_key {
         req = req.header("Idempotency-Key", key);
     }
@@ -84,6 +99,11 @@ pub(super) async fn post_once(
     // `None` means no header attached.
     if let Some(key) = api_key {
         req = req.header("x-api-key", key);
+    }
+    // v0.7.0 #791 — attach per-message Ed25519 signature header.
+    if let Some(sk) = signing_key {
+        let sig_header = crate::federation::signing::sign_body_header(sk, &body_bytes);
+        req = req.header(crate::federation::signing::SIGNATURE_HEADER, sig_header);
     }
     // v0.7.0 #238 — attach `x-peer-id` carrying the body's
     // `sender_agent_id` so the receiver's attestation step can
@@ -159,13 +179,34 @@ pub(super) async fn post_and_classify(
     expected_id: &str,
     idempotency_key: Option<&str>,
     api_key: Option<&str>,
+    signing_key: Option<&ed25519_dalek::SigningKey>,
 ) -> AckOutcome {
-    match post_once(client, url, body, expected_id, idempotency_key, api_key).await {
+    match post_once(
+        client,
+        url,
+        body,
+        expected_id,
+        idempotency_key,
+        api_key,
+        signing_key,
+    )
+    .await
+    {
         AckOutcome::Ack => AckOutcome::Ack,
         AckOutcome::IdDrift => AckOutcome::IdDrift,
         AckOutcome::Fail(first_reason) => {
             tokio::time::sleep(FANOUT_RETRY_BACKOFF).await;
-            match post_once(client, url, body, expected_id, idempotency_key, api_key).await {
+            match post_once(
+                client,
+                url,
+                body,
+                expected_id,
+                idempotency_key,
+                api_key,
+                signing_key,
+            )
+            .await
+            {
                 AckOutcome::Ack => {
                     tracing::debug!(
                         "federation: peer POST retry succeeded for {expected_id} (first attempt: {first_reason})"
@@ -225,6 +266,7 @@ pub async fn broadcast_store_quorum(
         let mem_id = mem.id.clone();
         let payload = body.clone();
         let api_key = config.api_key.clone();
+        let signing_key = config.signing_key.clone();
         joins.spawn(async move {
             let outcome = post_and_classify(
                 &client,
@@ -233,6 +275,7 @@ pub async fn broadcast_store_quorum(
                 &mem_id,
                 Some(&mem_id),
                 api_key.as_deref(),
+                signing_key.as_deref(),
             )
             .await;
             (id, outcome)
@@ -401,6 +444,7 @@ pub async fn broadcast_delete_quorum(
         let payload = body.clone();
         let target_id = id.to_string();
         let api_key = config.api_key.clone();
+        let signing_key = config.signing_key.clone();
         joins.spawn(async move {
             let outcome = post_and_classify(
                 &client,
@@ -409,6 +453,7 @@ pub async fn broadcast_delete_quorum(
                 &target_id,
                 Some(&target_id),
                 api_key.as_deref(),
+                signing_key.as_deref(),
             )
             .await;
             (peer_id, outcome)
@@ -497,6 +542,7 @@ pub async fn broadcast_archive_quorum(
         let payload = body.clone();
         let target_id = id.to_string();
         let api_key = config.api_key.clone();
+        let signing_key = config.signing_key.clone();
         joins.spawn(async move {
             let outcome = post_and_classify(
                 &client,
@@ -505,6 +551,7 @@ pub async fn broadcast_archive_quorum(
                 &target_id,
                 Some(&target_id),
                 api_key.as_deref(),
+                signing_key.as_deref(),
             )
             .await;
             (peer_id, outcome)
@@ -594,6 +641,7 @@ pub async fn broadcast_restore_quorum(
         let payload = body.clone();
         let target_id = id.to_string();
         let api_key = config.api_key.clone();
+        let signing_key = config.signing_key.clone();
         joins.spawn(async move {
             let outcome = post_and_classify(
                 &client,
@@ -602,6 +650,7 @@ pub async fn broadcast_restore_quorum(
                 &target_id,
                 Some(&target_id),
                 api_key.as_deref(),
+                signing_key.as_deref(),
             )
             .await;
             (peer_id, outcome)
@@ -686,6 +735,7 @@ pub async fn broadcast_link_quorum(
         let payload = body.clone();
         let log_id = log_id.clone();
         let api_key = config.api_key.clone();
+        let signing_key = config.signing_key.clone();
         joins.spawn(async move {
             let outcome = post_and_classify(
                 &client,
@@ -694,6 +744,7 @@ pub async fn broadcast_link_quorum(
                 &log_id,
                 Some(&log_id),
                 api_key.as_deref(),
+                signing_key.as_deref(),
             )
             .await;
             (peer_id, outcome)
@@ -778,6 +829,7 @@ pub async fn broadcast_consolidate_quorum(
         let payload = body.clone();
         let target_id = new_mem.id.clone();
         let api_key = config.api_key.clone();
+        let signing_key = config.signing_key.clone();
         joins.spawn(async move {
             let outcome = post_and_classify(
                 &client,
@@ -786,6 +838,7 @@ pub async fn broadcast_consolidate_quorum(
                 &target_id,
                 Some(&target_id),
                 api_key.as_deref(),
+                signing_key.as_deref(),
             )
             .await;
             (peer_id, outcome)
@@ -875,6 +928,7 @@ pub async fn broadcast_pending_quorum(
         let payload = body.clone();
         let target_id = pending.id.clone();
         let api_key = config.api_key.clone();
+        let signing_key = config.signing_key.clone();
         joins.spawn(async move {
             let outcome = post_and_classify(
                 &client,
@@ -883,6 +937,7 @@ pub async fn broadcast_pending_quorum(
                 &target_id,
                 Some(&target_id),
                 api_key.as_deref(),
+                signing_key.as_deref(),
             )
             .await;
             (peer_id, outcome)
@@ -971,6 +1026,7 @@ pub async fn broadcast_pending_decision_quorum(
         let payload = body.clone();
         let target_id = decision.id.clone();
         let api_key = config.api_key.clone();
+        let signing_key = config.signing_key.clone();
         joins.spawn(async move {
             let outcome = post_and_classify(
                 &client,
@@ -979,6 +1035,7 @@ pub async fn broadcast_pending_decision_quorum(
                 &target_id,
                 Some(&target_id),
                 api_key.as_deref(),
+                signing_key.as_deref(),
             )
             .await;
             (peer_id, outcome)
@@ -1069,6 +1126,7 @@ pub async fn broadcast_namespace_meta_quorum(
         let payload = body.clone();
         let target = target_id.clone();
         let api_key = config.api_key.clone();
+        let signing_key = config.signing_key.clone();
         joins.spawn(async move {
             let outcome = post_and_classify(
                 &client,
@@ -1077,6 +1135,7 @@ pub async fn broadcast_namespace_meta_quorum(
                 &target,
                 Some(&target),
                 api_key.as_deref(),
+                signing_key.as_deref(),
             )
             .await;
             (peer_id, outcome)
@@ -1171,6 +1230,7 @@ pub async fn broadcast_namespace_meta_clear_quorum(
         let payload = body.clone();
         let target = target_id.clone();
         let api_key = config.api_key.clone();
+        let signing_key = config.signing_key.clone();
         joins.spawn(async move {
             let outcome = post_and_classify(
                 &client,
@@ -1179,6 +1239,7 @@ pub async fn broadcast_namespace_meta_clear_quorum(
                 &target,
                 Some(&target),
                 api_key.as_deref(),
+                signing_key.as_deref(),
             )
             .await;
             (peer_id, outcome)
@@ -1287,12 +1348,29 @@ pub async fn bulk_catchup_push(
         let id = peer.id.clone();
         let payload = body.clone();
         let api_key = config.api_key.clone();
+        let signing_key = config.signing_key.clone();
         joins.spawn(async move {
-            let mut req = client.post(&url).json(&payload);
+            // v0.7.0 #791 — serialise once so X-Memory-Sig signs the
+            // exact wire bytes the receiver observes.
+            let body_bytes = match serde_json::to_vec(&payload) {
+                Ok(b) => b,
+                Err(e) => {
+                    return (id, Err(format!("serialise body: {e}")));
+                }
+            };
+            let mut req = client
+                .post(&url)
+                .header("content-type", "application/json")
+                .body(body_bytes.clone());
             // No Idempotency-Key on the batch — the batch is itself an
             // idempotent replay, and the peer's `insert_if_newer`
             // dedupes per row by (id, updated_at).
             req = req.header("X-Catchup", "bulk");
+            // v0.7.0 #791 — per-message Ed25519 signature header.
+            if let Some(sk) = signing_key.as_deref() {
+                let sig_header = crate::federation::signing::sign_body_header(sk, &body_bytes);
+                req = req.header(crate::federation::signing::SIGNATURE_HEADER, sig_header);
+            }
             // v0.7.0 fold-A2A1.4 (#702) — forward the operator-configured
             // `x-api-key` on the catchup batch as well. Without this, a
             // catchup against a peer that runs with api-key auth fails

@@ -142,6 +142,7 @@ fn federation_cfg_for_test(peer_urls: &[String], quorum_writes: usize) -> Federa
         // v0.7.0 fold-A2A1.4 backcompat default: this test path doesn't run
         // with api-key auth, so no outbound x-api-key header is needed.
         api_key: None,
+        signing_key: None,
     }
 }
 
