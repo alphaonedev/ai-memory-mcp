@@ -3,6 +3,7 @@
 
 use axum::{
     Json,
+    body::Bytes,
     extract::{Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
@@ -14,6 +15,7 @@ use crate::db;
 use crate::federation::peer_attestation::{
     self, AttestError, PEER_ID_HEADER, PeerAttestationConfig,
 };
+use crate::federation::signing as fed_signing;
 use crate::models::{Memory, MemoryLink};
 use crate::validate;
 
@@ -625,12 +627,144 @@ async fn sync_push_via_store(app: AppState, _headers: HeaderMap, body: SyncPushB
         .into_response()
 }
 
+/// v0.7.0 #791 — verify the `X-Memory-Sig` header against the raw
+/// body bytes the receiver observed. Returns `Some(Response)` to
+/// short-circuit with a 401 when verification is required and fails;
+/// `None` when verification passed OR the receiver is opted out via
+/// `AI_MEMORY_FED_REQUIRE_SIG=0`.
+///
+/// **Enforcement matrix** (with `AI_MEMORY_FED_REQUIRE_SIG=1`, the
+/// v0.7.0 default):
+///
+/// | sig header | key enrolled | outcome                              |
+/// |------------|--------------|--------------------------------------|
+/// | present    | yes          | verify; refuse on bad sig            |
+/// | present    | no           | refuse (cannot verify untrusted sig) |
+/// | absent     | yes          | refuse (enrolled peer must sign)     |
+/// | absent     | no           | allow + WARN (degraded permissive)   |
+///
+/// The "neither side enrolled" allow-with-warn arm keeps an
+/// unenrolled federation pair operational while the strict-deny
+/// arms fire once an operator enrols a peer key.
+/// `AI_MEMORY_FED_REQUIRE_SIG=0` bypasses every branch.
+fn verify_signature_or_reject(
+    headers: &HeaderMap,
+    body_bytes: &[u8],
+    peer_id: Option<&str>,
+) -> Option<Response> {
+    if !fed_signing::require_sig() {
+        return None;
+    }
+    let sig_header = headers
+        .get(fed_signing::SIGNATURE_HEADER)
+        .and_then(|v| v.to_str().ok());
+    let pubkey = peer_id.and_then(|pid| {
+        crate::governance::audit::load_daemon_verifying_key(pid)
+            .ok()
+            .flatten()
+    });
+
+    match (sig_header, pubkey.as_ref()) {
+        (Some(sig), Some(pk)) => {
+            if let Err(e) = fed_signing::verify_header(Some(sig), body_bytes, pk) {
+                tracing::warn!(
+                    target: "federation::signing",
+                    tag = e.tag(),
+                    peer_id = %peer_id.unwrap_or(""),
+                    "sync_push: X-Memory-Sig verification failed"
+                );
+                return Some(
+                    (
+                        StatusCode::UNAUTHORIZED,
+                        Json(json!({
+                            "error": e.tag(),
+                            "note": "AI_MEMORY_FED_REQUIRE_SIG=1 enforces per-message Ed25519 \
+                                     signatures on /sync/push; set =0 to revert to v0.6.x \
+                                     permissive",
+                        })),
+                    )
+                        .into_response(),
+                );
+            }
+            None
+        }
+        (Some(_), None) => {
+            tracing::warn!(
+                target: "federation::signing",
+                peer_id = %peer_id.unwrap_or(""),
+                "sync_push: X-Memory-Sig present but no enrolled public key for peer-id"
+            );
+            Some(
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({
+                        "error": "x_memory_sig_no_enrolled_key",
+                        "note": "AI_MEMORY_FED_REQUIRE_SIG=1 and the peer sent a signature, \
+                                 but no public key is enrolled for the peer-id; enrol via \
+                                 `ai-memory identity import` or set =0 to bypass.",
+                    })),
+                )
+                    .into_response(),
+            )
+        }
+        (None, Some(_)) => {
+            tracing::warn!(
+                target: "federation::signing",
+                peer_id = %peer_id.unwrap_or(""),
+                "sync_push: enrolled peer omitted X-Memory-Sig header"
+            );
+            Some(
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({
+                        "error": fed_signing::VerifyError::Missing.tag(),
+                        "note": "AI_MEMORY_FED_REQUIRE_SIG=1 enforces per-message Ed25519 \
+                                 signatures for enrolled peers; set =0 to revert to v0.6.x \
+                                 permissive.",
+                    })),
+                )
+                    .into_response(),
+            )
+        }
+        (None, None) => {
+            tracing::warn!(
+                target: "federation::signing",
+                peer_id = %peer_id.unwrap_or(""),
+                "sync_push: unsigned (no enrolled key for peer-id) — strict enforcement skipped"
+            );
+            None
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 pub async fn sync_push(
     State(app): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<SyncPushBody>,
+    body_bytes: Bytes,
 ) -> impl IntoResponse {
+    // v0.7.0 #791 — verify the per-message signature BEFORE
+    // deserialising the body. Keeps the verifier's input identical
+    // to the wire bytes (signer + verifier MUST agree byte-for-byte).
+    let peer_header_owned = extract_peer_id(&headers).map(str::to_string);
+    if let Some(rejection) =
+        verify_signature_or_reject(&headers, &body_bytes, peer_header_owned.as_deref())
+    {
+        return rejection;
+    }
+
+    // Deserialise the body now that the signature has been verified.
+    let body: SyncPushBody = match serde_json::from_slice(&body_bytes) {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("malformed sync_push body: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
     let state = app.db.clone();
 
     // v0.7.0 #238 — body-claimed sender_agent_id MUST attest against
@@ -639,7 +773,7 @@ pub async fn sync_push(
     // `AI_MEMORY_FED_TRUST_BODY_AGENT_ID=1`. Runs BEFORE the
     // postgres-dispatch branch so both backends share the same
     // refusal posture. See `src/federation/peer_attestation.rs`.
-    let peer_header_owned = extract_peer_id(&headers).map(str::to_string);
+    // (peer_header_owned already extracted above for signature check)
     let attest_cfg = PeerAttestationConfig::from_env();
     if !peer_attestation::trust_body_agent_id_bypass() {
         if let Err(e) = peer_attestation::attest_sender(
