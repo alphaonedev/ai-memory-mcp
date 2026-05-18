@@ -160,7 +160,7 @@ async fn seed_pending_store(
             "tags": [],
             "priority": 5,
             "confidence": 1.0,
-            "source": "test",
+            "source": "import",
             "access_count": 0,
             "created_at": now_rfc,
             "updated_at": now_rfc,

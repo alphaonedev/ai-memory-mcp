@@ -216,7 +216,7 @@ async fn stats_round_trip_via_sal() {
                 "tags": ["stats"],
                 "priority": 5,
                 "confidence": 1.0,
-                "source": "stats-test",
+                "source": "import",
                 "metadata": {}
             }))
             .send()
@@ -262,7 +262,7 @@ async fn namespaces_round_trip_via_sal() {
             "tags": [],
             "priority": 5,
             "confidence": 1.0,
-            "source": "ns-test",
+            "source": "import",
             "metadata": {}
         }))
         .send()
@@ -306,7 +306,7 @@ async fn bulk_create_round_trip_via_sal() {
                 "tags": ["bulk"],
                 "priority": 5,
                 "confidence": 1.0,
-                "source": "bulk-test",
+                "source": "import",
                 "metadata": {}
             })
         })
@@ -399,7 +399,7 @@ async fn recall_keyword_fallback_via_sal() {
             "tags": [],
             "priority": 5,
             "confidence": 1.0,
-            "source": "recall-test",
+            "source": "import",
             "metadata": {}
         }))
         .send()
@@ -454,7 +454,7 @@ async fn taxonomy_round_trip_via_sal() {
                 "tags": [],
                 "priority": 5,
                 "confidence": 1.0,
-                "source": "tax-test",
+                "source": "import",
                 "metadata": {}
             }))
             .send()
@@ -546,7 +546,7 @@ async fn kg_query_dispatches_via_sal() {
             "tags": [],
             "priority": 5,
             "confidence": 1.0,
-            "source": "kg-test",
+            "source": "import",
             "metadata": {}
         }))
         .send()
