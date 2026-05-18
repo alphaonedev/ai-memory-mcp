@@ -73,12 +73,15 @@ fn build_test_router() -> (axum::Router, NamedTempFile) {
 
 fn seed_many(path: &std::path::Path, namespace: &str, count: usize, uri: Option<&str>) {
     let conn = ai_memory::db::open(path).expect("reopen for seed");
+    // #891 followup: include source_uri tag in title so seeds with
+    // different uris don't collide on the (title, namespace) upsert key.
+    let uri_tag = uri.unwrap_or("none").replace([':', '/'], "_");
     for i in 0..count {
         let now = chrono::Utc::now().to_rfc3339();
         let mem = Memory {
             id: uuid::Uuid::new_v4().to_string(),
-            title: format!("{namespace}-{i}"),
-            content: format!("body searchable content for {namespace}-{i}"),
+            title: format!("{namespace}-{uri_tag}-{i}"),
+            content: format!("body searchable content for {namespace}-{uri_tag}-{i}"),
             namespace: namespace.to_string(),
             tier: Tier::Mid,
             created_at: now.clone(),
@@ -173,7 +176,6 @@ async fn http_search_with_unknown_source_uri_intersected_returns_empty() {
 }
 
 #[tokio::test]
-#[ignore = "blocked on issue #891 — search_memories early-returns on empty q before source_uri-only branch"]
 async fn http_search_with_source_uri_only_returns_all_rows_from_that_doc_issue_891() {
     // AC pin (blocked): \"HTTP `GET /api/v1/memories?source_uri=X`
     // query param\" per issue #889. The source_uri-only path on the
