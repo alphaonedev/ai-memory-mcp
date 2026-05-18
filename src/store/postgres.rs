@@ -634,6 +634,64 @@ impl PostgresStore {
         Ok(store)
     }
 
+    /// Issue #877 (HIGH-SEV): Connect with an explicit embedding dim and
+    /// auto-migrate the live `memories.embedding` (+ archive) column to
+    /// `vector(<dim>)` when the existing schema disagrees.
+    ///
+    /// This is the daemon-bootstrap entry point. The plain
+    /// [`Self::connect_with_dim`] would WARN and continue if the schema
+    /// was created with a different dim (e.g. a fresh container picked up
+    /// `DEFAULT_EMBEDDING_DIM` = 384 from a no-flag boot, then the
+    /// operator switched the configured embedder to `nomic_embed_v15`
+    /// (768)). The result was every HTTP POST `/api/v1/memories` rejected
+    /// at pgvector with `expected 384 dimensions, not 768` — a hard
+    /// production outage Plan-C retest surfaced.
+    ///
+    /// Behaviour:
+    /// - Connect + bootstrap exactly like [`Self::connect_with_dim_and_timeout`].
+    /// - Probe `current_embedding_dim()`. If it equals `dim`, return Ok.
+    /// - If it differs (or is missing), invoke
+    ///   [`Self::migrate_embedding_dim`] which is destructive on the
+    ///   embedding column (existing vectors are NULLed; rows themselves
+    ///   survive). Operators must re-embed after.
+    /// - The migration is gated to the supported dim set (384, 768); any
+    ///   other value bubbles `StoreError::InvalidInput` from the
+    ///   sub-call.
+    ///
+    /// Existing callers ([`Self::connect`], CLI `schema-init`) keep the
+    /// non-auto-migrate semantics so a one-shot CLI tool can't silently
+    /// destroy embeddings.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::connect_with_dim_and_timeout`], plus any error
+    /// from the in-place conversion.
+    pub async fn connect_with_dim_and_timeout_auto_migrate(
+        url: &str,
+        dim: u32,
+        statement_timeout_secs: u64,
+    ) -> StoreResult<Self> {
+        let store = Self::connect_with_dim_and_timeout(url, dim, statement_timeout_secs).await?;
+
+        let current = store.current_embedding_dim().await?;
+        let target_i32 = i32::try_from(dim).unwrap_or(384);
+        match current {
+            Some(cur) if cur == target_i32 => Ok(store),
+            _ => {
+                tracing::warn!(
+                    target = "store::postgres",
+                    current = ?current,
+                    target = target_i32,
+                    "issue #877 auto-migrate: existing memories.embedding column dim disagrees \
+                     with configured embedder dim ({target_i32}); converting in place. \
+                     Existing embeddings will be NULLed — re-embed required after this completes."
+                );
+                store.migrate_embedding_dim(dim).await?;
+                Ok(store)
+            }
+        }
+    }
+
     /// Knowledge-graph backend resolved at [`Self::connect`] time.
     ///
     /// v0.7 J1 substrate. J2-J7 dispatch on this value so the same

@@ -2069,6 +2069,14 @@ async fn build_store_handle(
     store_url: Option<&str>,
     db_path: &Path,
     postgres_statement_timeout_secs: Option<u64>,
+    // Issue #877: configured embedder dim. `None` keeps the legacy
+    // `DEFAULT_EMBEDDING_DIM` (384, MiniLM) behaviour for callers that
+    // explicitly do not load an embedder (keyword-only deployments).
+    // When `Some(dim)` is passed, the postgres adapter takes the
+    // auto-migrate path so a fresh-container schema bootstrapped at the
+    // default 384 is converted in-place to match the configured
+    // embedder's actual dimension (e.g. 768 for `nomic_embed_v15`).
+    configured_embedding_dim: Option<u32>,
 ) -> Result<(
     crate::handlers::StorageBackend,
     Arc<dyn crate::store::MemoryStore>,
@@ -2083,20 +2091,38 @@ async fn build_store_handle(
                 {
                     let timeout = postgres_statement_timeout_secs
                         .unwrap_or(crate::store::postgres::DEFAULT_STATEMENT_TIMEOUT_SECS);
-                    tracing::info!(
-                        "Wave-3: opening Postgres SAL store at {url} \
-                         (statement_timeout={timeout}s)"
-                    );
-                    let store =
+                    // Issue #877: route through the auto-migrate entry
+                    // point when the daemon resolved a configured
+                    // embedder dim. Bootstrap goes via `connect_with_dim`
+                    // so the *fresh* schema lands `vector(<dim>)` from
+                    // the very first INIT; the auto-migrate then handles
+                    // the pre-existing-schema-at-wrong-dim case.
+                    let store = if let Some(dim) = configured_embedding_dim {
+                        tracing::info!(
+                            "Wave-3 (issue #877): opening Postgres SAL store at {url} \
+                             (statement_timeout={timeout}s, embedding_dim={dim}, auto_migrate=on)"
+                        );
+                        crate::store::postgres::PostgresStore::connect_with_dim_and_timeout_auto_migrate(
+                            url, dim, timeout,
+                        )
+                        .await
+                        .context("connect postgres adapter (auto-migrate dim)")?
+                    } else {
+                        tracing::info!(
+                            "Wave-3: opening Postgres SAL store at {url} \
+                             (statement_timeout={timeout}s, no embedder configured)"
+                        );
                         crate::store::postgres::PostgresStore::connect_with_timeout(url, timeout)
                             .await
-                            .context("connect postgres adapter")?;
+                            .context("connect postgres adapter")?
+                    };
                     Ok((StorageBackend::Postgres, Arc::new(store)))
                 }
                 #[cfg(not(feature = "sal-postgres"))]
                 {
                     let _ = url;
                     let _ = postgres_statement_timeout_secs;
+                    let _ = configured_embedding_dim;
                     anyhow::bail!(
                         "--store-url postgres:// requires the binary to be built with \
                          --features sal-postgres; this binary was built with --features sal only"
@@ -2121,6 +2147,7 @@ async fn build_store_handle(
         }
         None => {
             let _ = postgres_statement_timeout_secs;
+            let _ = configured_embedding_dim;
             tracing::debug!("Wave-3: --store-url absent; opening SQLite SAL store at --db path");
             let store = crate::store::sqlite::SqliteStore::open(db_path)
                 .map_err(|e| anyhow::anyhow!("open sqlite adapter: {e}"))?;
@@ -2620,11 +2647,32 @@ pub async fn bootstrap_serve(
     // Standard builds (no `--features sal`) skip the trait wiring
     // entirely — the daemon stays a pure SQLite-on-disk deployment with
     // zero behavioural drift versus pre-Wave-3.
+    // Issue #877: resolve the configured embedder dim from the same
+    // resolution ladder `build_embedder` uses — app_config override wins,
+    // then tier preset, then None. We re-derive it here (instead of
+    // pulling from the materialised `embedder` handle) because the
+    // embedder load itself can fail (network egress to HF Hub, OOM,
+    // etc.) and we still need the *configured* dim to inform the
+    // postgres bootstrap, otherwise a transient embedder load failure
+    // would leave the schema mis-dimensioned silently. Falls back to
+    // `None` only when no embedder model is configured at all
+    // (keyword-only).
+    #[cfg(feature = "sal")]
+    let configured_embedding_dim: Option<u32> = {
+        let preset = tier_config.embedding_model;
+        let resolved = app_config
+            .embedding_model
+            .as_deref()
+            .and_then(|raw| raw.parse::<crate::config::EmbeddingModel>().ok())
+            .or(preset);
+        resolved.map(|m| u32::try_from(m.dim()).unwrap_or(384))
+    };
     #[cfg(feature = "sal")]
     let (storage_backend, store_handle) = build_store_handle(
         args.store_url.as_deref(),
         db_path,
         app_config.postgres_statement_timeout_secs,
+        configured_embedding_dim,
     )
     .await
     .context("build SAL store handle")?;
