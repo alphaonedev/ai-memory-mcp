@@ -10758,21 +10758,21 @@ mod tests {
         use crate::models::{ApproverType, GovernanceLevel, GovernancePolicy};
 
         let mut p = GovernancePolicy::default();
-        p.write = GovernanceLevel::Any;
-        p.promote = GovernanceLevel::Any;
-        p.delete = GovernanceLevel::Owner;
-        p.approver = ApproverType::Human;
-        p.inherit = true;
+        p.core.write = GovernanceLevel::Any;
+        p.core.promote = GovernanceLevel::Any;
+        p.core.delete = GovernanceLevel::Owner;
+        p.core.approver = ApproverType::Human;
+        p.core.inherit = true;
         let s = format_rule_summary("alpha/eng", &p);
         assert!(s.contains("alpha/eng"));
         assert!(s.contains("approver=human"));
         assert!(s.contains("inherit=true"));
 
-        p.approver = ApproverType::Agent("ops-bot".to_string());
+        p.core.approver = ApproverType::Agent("ops-bot".to_string());
         let s = format_rule_summary("alpha/eng", &p);
         assert!(s.contains("approver=agent:ops-bot"));
 
-        p.approver = ApproverType::Consensus(3);
+        p.core.approver = ApproverType::Consensus(3);
         let s = format_rule_summary("alpha/eng", &p);
         assert!(s.contains("approver=consensus:3"));
     }
@@ -11196,7 +11196,7 @@ mod tests {
     /// Drives lines 65-75 of promote.rs.
     #[test]
     fn chunkc_promote_governance_pending() {
-        use crate::models::{ApproverType, GovernanceLevel, GovernancePolicy};
+        use crate::models::{ApproverType, CorePolicy, GovernanceLevel, GovernancePolicy};
         let _gate = chunkc_lock_perms();
         crate::config::override_active_permissions_mode_for_test(
             crate::config::PermissionsMode::Enforce,
@@ -11221,29 +11221,18 @@ mod tests {
                 last_accessed_at: None,
                 expires_at: None,
                 metadata: json!({
-                        "governance": GovernancePolicy {
+                    "governance": GovernancePolicy {
+                        core: CorePolicy {
                             write: GovernanceLevel::Any,
                             promote: GovernanceLevel::Approve,
                             delete: GovernanceLevel::Any,
                             approver: ApproverType::Human,
                             inherit: false,
                             max_reflection_depth: None,
-                            auto_export_reflections_to_filesystem: None,
-                            auto_atomise: None,
-                            auto_atomise_threshold_cl100k: None,
-                            auto_atomise_max_atom_tokens: None,
-                            auto_atomise_max_retries: None,
-                            auto_persona_trigger_every_n_memories: None,
-                            auto_export_personas_to_filesystem: None,
-                auto_atomise_mode: None,
-                legacy_per_pair_classifier: None,
-                auto_classify_kind: None,
-                synthesis_failure_mode: None,
-                synthesis_max_deletes_per_call: None,
-                synthesis_max_candidate_chars: None,
-                multistep_max_content_chars: None,
-                        }
-                    }),
+                        },
+                        ..Default::default()
+                    }
+                }),
                 reflection_depth: 0,
                 memory_kind: crate::models::MemoryKind::Observation,
                 entity_id: None,
@@ -11273,7 +11262,7 @@ mod tests {
     /// message. Drives lines 62-63 of promote.rs.
     #[test]
     fn chunkc_promote_governance_denied() {
-        use crate::models::{ApproverType, GovernanceLevel, GovernancePolicy};
+        use crate::models::{ApproverType, CorePolicy, GovernanceLevel, GovernancePolicy};
         let _gate = chunkc_lock_perms();
         crate::config::override_active_permissions_mode_for_test(
             crate::config::PermissionsMode::Enforce,
@@ -11300,29 +11289,18 @@ mod tests {
                 last_accessed_at: None,
                 expires_at: None,
                 metadata: json!({
-                        "governance": GovernancePolicy {
+                    "governance": GovernancePolicy {
+                        core: CorePolicy {
                             write: GovernanceLevel::Any,
                             promote: GovernanceLevel::Owner,
                             delete: GovernanceLevel::Any,
                             approver: ApproverType::Agent("not-me".to_string()),
                             inherit: false,
                             max_reflection_depth: None,
-                            auto_export_reflections_to_filesystem: None,
-                            auto_atomise: None,
-                            auto_atomise_threshold_cl100k: None,
-                            auto_atomise_max_atom_tokens: None,
-                            auto_atomise_max_retries: None,
-                            auto_persona_trigger_every_n_memories: None,
-                            auto_export_personas_to_filesystem: None,
-                auto_atomise_mode: None,
-                legacy_per_pair_classifier: None,
-                auto_classify_kind: None,
-                synthesis_failure_mode: None,
-                synthesis_max_deletes_per_call: None,
-                synthesis_max_candidate_chars: None,
-                multistep_max_content_chars: None,
-                        }
-                    }),
+                        },
+                        ..Default::default()
+                    }
+                }),
                 reflection_depth: 0,
                 memory_kind: crate::models::MemoryKind::Observation,
                 entity_id: None,

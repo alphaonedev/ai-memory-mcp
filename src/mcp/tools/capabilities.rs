@@ -276,17 +276,19 @@ fn build_capabilities_overlay(
 #[must_use]
 pub fn format_rule_summary(namespace: &str, policy: &crate::models::GovernancePolicy) -> String {
     use crate::models::ApproverType;
-    let approver = match &policy.approver {
+    // #880 — `approver` / `write` / `promote` / `delete` / `inherit`
+    // live on `policy.core` after the governance decomposition.
+    let approver = match &policy.core.approver {
         ApproverType::Human => "human".to_string(),
         ApproverType::Agent(id) => format!("agent:{id}"),
         ApproverType::Consensus(n) => format!("consensus:{n}"),
     };
     format!(
         "{namespace} — write={write}, promote={promote}, delete={delete}, approver={approver}, inherit={inherit}",
-        write = policy.write.as_str(),
-        promote = policy.promote.as_str(),
-        delete = policy.delete.as_str(),
-        inherit = policy.inherit,
+        write = policy.core.write.as_str(),
+        promote = policy.core.promote.as_str(),
+        delete = policy.core.delete.as_str(),
+        inherit = policy.core.inherit,
     )
 }
 

@@ -7393,7 +7393,7 @@ impl MemoryStore for PostgresStore {
         let approver = self
             .resolve_governance_policy(&pa.namespace)
             .await?
-            .map_or(crate::models::ApproverType::Human, |p| p.approver);
+            .map_or(crate::models::ApproverType::Human, |p| p.core.approver);
 
         match approver {
             crate::models::ApproverType::Human => {
@@ -7629,12 +7629,12 @@ impl MemoryStore for PostgresStore {
             return Ok(GovernanceDecision::Allow);
         };
         let level = match action {
-            super::GovernedAction::Store => &policy.write,
-            super::GovernedAction::Delete => &policy.delete,
-            super::GovernedAction::Promote => &policy.promote,
+            super::GovernedAction::Store => &policy.core.write,
+            super::GovernedAction::Delete => &policy.core.delete,
+            super::GovernedAction::Promote => &policy.core.promote,
             // v0.7.0 L1-8: Reflect is gated by require_approval_above_depth
             // in the MCP handler; conservative fallback maps to write level.
-            super::GovernedAction::Reflect => &policy.write,
+            super::GovernedAction::Reflect => &policy.core.write,
         };
 
         // v0.7.0 Wave-3 Continuation 4 (Bucket C / S60+S80) — resolve

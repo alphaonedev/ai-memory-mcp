@@ -246,7 +246,7 @@ fn legacy_governance_json_without_max_reflection_depth_deserializes_to_default()
     let policy: GovernancePolicy =
         serde_json::from_value(legacy_json).expect("legacy governance JSON must deserialize");
     assert!(
-        policy.max_reflection_depth.is_none(),
+        policy.core.max_reflection_depth.is_none(),
         "missing field deserializes to None via #[serde(default)]"
     );
     assert_eq!(
