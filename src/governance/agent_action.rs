@@ -635,7 +635,33 @@ pub fn check_agent_action(
         .with_context(|| format!("check_agent_action: load engine for {}", action.kind()))?;
     let decision = engine.evaluate(agent_id, action);
     emit_check_event(conn, agent_id, action, &decision)?;
+    // v0.7.0 #697 — fire-and-forget forensic emit. The forensic sink
+    // is process-wide, independent of the in-flight Connection (it
+    // appends to its own file with no SQLite involvement), so there's
+    // no deadlock risk from inside the storage hook either.
+    emit_forensic_decision(agent_id, action, &decision);
     Ok(decision)
+}
+
+/// v0.7.0 #697 — translate a `(action, decision)` into the forensic
+/// log shape and emit. No-op when the forensic sink is uninitialised.
+fn emit_forensic_decision(agent_id: &str, action: &AgentAction, decision: &Decision) {
+    let (decision_str, rule_id) = match decision {
+        Decision::Allow => ("allow", String::new()),
+        Decision::Refuse { rule_id, .. } => ("refuse", rule_id.clone()),
+        Decision::Warn { rule_id, .. } => ("warn", rule_id.clone()),
+    };
+    let payload = serde_json::json!({
+        "action": action,
+        "decision_detail": decision,
+    });
+    crate::governance::audit::record_decision(
+        agent_id,
+        decision_str,
+        action.kind(),
+        &rule_id,
+        payload,
+    );
 }
 
 /// Append a `governance.check` row to `signed_events`. Helper so
@@ -708,7 +734,13 @@ pub fn check_agent_action_no_audit(conn: &Connection, action: &AgentAction) -> R
     // No agent_id is available on the read-only pre-write hook path.
     // Pass the empty string — the engine treats agent_id as opaque
     // until a future agent-scoped matcher consults it.
-    Ok(engine.evaluate("", action))
+    let decision = engine.evaluate("", action);
+    // v0.7.0 #697 — forensic emit even on the no-audit path. The
+    // forensic sink is process-wide and writes to its own file (not
+    // SQLite), so the deadlock concern that motivated `_no_audit`
+    // doesn't apply.
+    emit_forensic_decision("", action, &decision);
+    Ok(decision)
 }
 
 /// v0.7.0 Policy-Engine Item 3 — deferred-audit variant of

@@ -53,6 +53,13 @@ use crate::hooks::events::MemoryDelta;
 // `ai-memory governance install-defaults` (one-shot bulk enable)
 // or `ai-memory rules enable <id> --sign` (per-rule).
 pub mod agent_action;
+// v0.7.0 #697 — Ed25519-signed forensic audit log. Independent of the
+// file-based `audit.rs` chain (which logs memory-substrate ops);
+// `governance::audit` captures every governance DECISION (allow /
+// refuse / warn) into a daily-rotated, hash-chained, Ed25519-signed
+// `audit/forensic-<YYYY-MM-DD>.jsonl`. The `ai-memory audit verify
+// --since <ISO_DATE>` CLI walks the chain + signatures.
+pub mod audit;
 // v0.7.0 Policy-Engine Item 3 — deferred audit-log queue for
 // storage-hook refusals. Closes the cryptographic-log gap on the
 // `GOVERNANCE_PRE_WRITE` path that previously routed through
