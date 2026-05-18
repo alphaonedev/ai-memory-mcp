@@ -343,6 +343,12 @@ pub async fn approval_decide(
     // Capture the namespace + original requester from the snapshot so
     // the published `ApprovalDecided` event carries enough metadata for
     // the SSE handler's tenant filter (review #628 blocker C2).
+    //
+    // #869 audit (Category B — safe default): `pending_snapshot` is
+    // `None` when the row was decided before we could snapshot it
+    // (rare race window). Empty `String` for namespace / requested_by
+    // is a documented sentinel the SSE tenant filter treats as
+    // "no-tenant" — degrades event visibility, not correctness.
     let evt_namespace = pending_snapshot
         .as_ref()
         .map(|p| p.namespace.clone())
@@ -521,17 +527,31 @@ pub async fn approvals_sse(
                             continue;
                         }
                         let (event_name, json_value) = match &evt {
-                            crate::approvals::ApprovalEvent::ApprovalRequested { .. } => (
-                                "approval_requested",
-                                serde_json::to_value(&evt).unwrap_or_default(),
-                            ),
-                            crate::approvals::ApprovalEvent::ApprovalDecided { .. } => (
-                                "approval_decided",
-                                serde_json::to_value(&evt).unwrap_or_default(),
-                            ),
+                            crate::approvals::ApprovalEvent::ApprovalRequested { .. } => {
+                                ("approval_requested", serde_json::to_value(&evt))
+                            }
+                            crate::approvals::ApprovalEvent::ApprovalDecided { .. } => {
+                                ("approval_decided", serde_json::to_value(&evt))
+                            }
                         };
-                        let data =
-                            serde_json::to_string(&json_value).unwrap_or_else(|_| "{}".into());
+                        // #869 — silently degrading to `Value::Null`
+                        // (the prior `unwrap_or_default()`) would have
+                        // surfaced an SSE frame with an empty body that
+                        // looked indistinguishable from a malformed
+                        // event. Log + emit a typed `error` event so
+                        // subscribers can re-sync via REST instead of
+                        // mis-parsing the stream.
+                        let data = match json_value {
+                            Ok(v) => serde_json::to_string(&v).unwrap_or_else(|_| "{}".into()),
+                            Err(e) => {
+                                tracing::error!(
+                                    "approvals_sse: serialise ApprovalEvent failed: {e}"
+                                );
+                                return Poll::Ready(Some(Ok(Event::default()
+                                    .event("error")
+                                    .data(r#"{"error":"event_serialise_failed"}"#))));
+                            }
+                        };
                         return Poll::Ready(Some(Ok(Event::default()
                             .event(event_name)
                             .data(data))));

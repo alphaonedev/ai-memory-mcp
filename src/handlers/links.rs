@@ -341,6 +341,12 @@ pub async fn create_link(
         // already vetted the relation against the closed set, so a
         // parse failure here would be a bug; fall back to the default
         // rather than 500 the request.
+        // #869 audit (Category B — safe default): `validate_link` (line
+        // 317 above) already returned 400 if the relation wasn't in the
+        // closed `MemoryLinkRelation::from_str` set; reaching this site
+        // with a parse failure would be a typed-set drift bug. The
+        // `related_to` default preserves the link instead of dropping
+        // the write.
         let relation_typed =
             crate::models::MemoryLinkRelation::from_str(&relation).unwrap_or_default();
         let link = MemoryLink {
@@ -445,6 +451,9 @@ pub async fn create_link(
                 // v0.7.0 fix campaign R1-M4 — `validate_link` already
                 // gated `relation` against the closed set; the parse
                 // here cannot fail in practice.
+                // #869 audit (Category B — safe default): same posture
+                // as the postgres branch above; `validate_link` returned
+                // 400 on an unknown relation upstream of this branch.
                 let relation_typed =
                     crate::models::MemoryLinkRelation::from_str(&relation).unwrap_or_default();
                 let link = crate::models::MemoryLink {
@@ -468,13 +477,9 @@ pub async fn create_link(
                 match crate::federation::broadcast_link_quorum(fed, &link).await {
                     Ok(tracker) => {
                         if let Err(err) = crate::federation::finalise_quorum(&tracker) {
+                            // #869 — typed 503 envelope via the shared helper.
                             let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                            return (
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                [("Retry-After", "2")],
-                                Json(serde_json::to_value(&payload).unwrap_or_default()),
-                            )
-                                .into_response();
+                            return super::quorum_not_met_response(&payload);
                         }
                     }
                     Err(e) => {

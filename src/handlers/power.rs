@@ -503,6 +503,8 @@ pub async fn get_taxonomy(
         // Project the prefix-rooted tree at the requested depth. When
         // no prefix is supplied, treat the synthesized "" root as the
         // top of the world; otherwise root the tree at prefix_owned.
+        // #869 audit (Category B — safe default): empty root is the
+        // documented "no prefix" sentinel for the tree projection.
         let root_ns = prefix_owned.clone().unwrap_or_default();
         let truncated = pairs.len() > limit;
 

@@ -154,6 +154,11 @@ pub async fn entity_register(
                 ..Default::default()
             };
             match app.store.list(&ctx, &filter).await {
+                // #869 audit (Category B — safe default): a missing
+                // `aliases` field or a non-entity row collapses to
+                // empty `Vec<String>`, which is the documented
+                // "first-time registration" path (no prior aliases to
+                // union against the new ones).
                 Ok(rows) => rows
                     .into_iter()
                     .find(|m| {
@@ -396,6 +401,10 @@ pub async fn entity_get_by_alias(
                     if kind != "entity" {
                         continue;
                     }
+                    // #869 audit (Category B — safe default): an entity
+                    // with no `aliases` array collapses to empty
+                    // `Vec<String>`; the lookup falls through to the
+                    // `m.title.eq_ignore_ascii_case(alias)` branch.
                     let aliases: Vec<String> = meta
                         .get("aliases")
                         .and_then(|v| v.as_array())
@@ -855,6 +864,10 @@ pub async fn kg_query(
     // S82's wire shape sends `from` instead of `source_id`; resolve
     // the canonical id from either field with `source_id` taking
     // precedence when both are supplied.
+    //
+    // #869 audit (Category B — safe default): empty `String` flows
+    // into `validate_id` below which returns a typed 400 with the
+    // "invalid source_id" envelope.
     let source_id = body
         .source_id
         .clone()
