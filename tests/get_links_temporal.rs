@@ -89,8 +89,7 @@ fn get_links_surfaces_valid_until_after_invalidate() {
         matched_before
             .attest_level
             .as_deref()
-            .map(|s| s == "unsigned")
-            .unwrap_or(true),
+            .is_none_or(|s| s == "unsigned"),
         "pre-invalidate attest_level must be unsigned or NULL; got {:?}",
         matched_before.attest_level
     );
