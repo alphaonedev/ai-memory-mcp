@@ -280,9 +280,29 @@ async fn touch_after_recall_short_tier_extends_ttl_no_promote() {
         .expires_at
         .clone()
         .expect("short expires_at must slide forward, not clear");
-    assert!(
-        post_expires > pre_expires,
-        "short-tier TTL must slide FORWARD (1h replacement) on every touch: \
+    // Sliding-window REPLACEMENT semantics (CLAUDE.md §Recall Pipeline /
+    // Touch operations): touch sets `expires_at = now + 1h` for short
+    // tier. This REPLACES the create-time 6h backstop (which is the
+    // seeded `pre_expires` value), so on first touch the new value
+    // is EARLIER than the seed. The test must assert that the
+    // expires_at WAS UPDATED (replaced) and that the new value sits
+    // near the expected 1h-from-now anchor — not that it is greater
+    // than the seed.
+    assert_ne!(
+        pre_expires, post_expires,
+        "short-tier touch must REPLACE expires_at with the sliding 1h window: \
          pre={pre_expires} post={post_expires}"
+    );
+    let post_parsed = chrono::DateTime::parse_from_rfc3339(&post_expires)
+        .expect("post_expires parses as RFC3339")
+        .with_timezone(&chrono::Utc);
+    let now = chrono::Utc::now();
+    let delta = post_parsed - now;
+    // Per-access window is 1h. Allow ±5min tolerance for SQL
+    // round-trip latency + the few seconds between seed and touch.
+    assert!(
+        delta >= chrono::Duration::minutes(55) && delta <= chrono::Duration::minutes(65),
+        "post_expires must be ~1h from now (sliding-window contract): \
+         delta={delta:?} post={post_expires}"
     );
 }
