@@ -75,6 +75,26 @@ pub const DEFAULT_MAX_REFLECTION_SOURCES: usize = 20;
 /// when the engine is constructed without an explicit keypair (tests).
 const ANONYMOUS_CURATOR_AGENT_ID: &str = "ai:curator";
 
+/// v0.7.0 issue #848 — sentinel namespace value reported in
+/// [`PersonaError::NoReflections`] when the caller asked for the
+/// cross-namespace aggregation path and zero matching reflections
+/// existed in ANY namespace. Distinct from any real namespace string
+/// (`"global"`, `"team/alpha"`, etc.) so an operator-facing error
+/// message can distinguish "no reflections in namespace 'X'" from
+/// "no reflections anywhere in the substrate".
+pub const CROSS_NAMESPACE_SENTINEL: &str = "<any namespace>";
+
+/// v0.7.0 issue #848 — namespace-scope discriminator for
+/// [`PersonaGenerator::generate_in_scope`]. Single-namespace mode
+/// preserves the pre-#848 behaviour; `AnyTargeting(ns)` aggregates
+/// every reflection that mentions the entity across all namespaces
+/// and lands the new persona row in `ns`.
+#[derive(Debug, Clone, Copy)]
+enum PersonaScope<'a> {
+    Single(&'a str),
+    AnyTargeting(&'a str),
+}
+
 /// Static configuration for [`PersonaGenerator`].
 #[derive(Debug, Clone)]
 pub struct PersonaConfig {
@@ -239,20 +259,74 @@ impl<'a> PersonaGenerator<'a> {
         entity_id: &str,
         namespace: &str,
     ) -> std::result::Result<Persona, PersonaError> {
+        self.generate_in_scope(entity_id, PersonaScope::Single(namespace))
+    }
+
+    /// v0.7.0 issue #848 — cross-namespace persona generation.
+    ///
+    /// Equivalent to [`Self::generate`] except the source-reflection
+    /// scan is broadened to every namespace the substrate stores. The
+    /// new persona row lands in `target_namespace` (callers
+    /// typically pass `"global"` so subsequent
+    /// `memory_persona(entity_id)` reads have a deterministic
+    /// landing zone). Use this when an NHI agent has spread its
+    /// reflections across multiple namespaces (e.g.
+    /// `global/policies`, `ai-memory/v0.7.0-nhi-testing`, project
+    /// buckets) and needs a single Persona that aggregates the full
+    /// identity arc.
+    ///
+    /// # Errors
+    ///
+    /// Same envelope as [`Self::generate`]. When zero matching
+    /// reflections exist in ANY namespace, the
+    /// `NoReflections.namespace` field is the
+    /// [`CROSS_NAMESPACE_SENTINEL`] string.
+    pub fn generate_cross_namespace(
+        &self,
+        entity_id: &str,
+        target_namespace: &str,
+    ) -> std::result::Result<Persona, PersonaError> {
+        self.generate_in_scope(entity_id, PersonaScope::AnyTargeting(target_namespace))
+    }
+
+    /// Internal common path. Routes to the appropriate source loader
+    /// based on `scope`; centralises validation, version bump,
+    /// curator invocation, write, link emission, and signed-events
+    /// stamping so the single-namespace and cross-namespace entry
+    /// points stay in lockstep for free.
+    fn generate_in_scope(
+        &self,
+        entity_id: &str,
+        scope: PersonaScope<'_>,
+    ) -> std::result::Result<Persona, PersonaError> {
         validate_entity_id(entity_id)?;
+        let namespace = match scope {
+            PersonaScope::Single(ns) | PersonaScope::AnyTargeting(ns) => ns,
+        };
         validate::validate_namespace(namespace)
             .map_err(|e| PersonaError::Validation(e.to_string()))?;
 
-        let sources = load_reflections_for_entity(
-            self.conn,
-            entity_id,
-            namespace,
-            self.config.max_reflection_sources,
-        )?;
+        let sources = match scope {
+            PersonaScope::Single(ns) => load_reflections_for_entity(
+                self.conn,
+                entity_id,
+                ns,
+                self.config.max_reflection_sources,
+            )?,
+            PersonaScope::AnyTargeting(_) => load_reflections_for_entity_any_namespace(
+                self.conn,
+                entity_id,
+                self.config.max_reflection_sources,
+            )?,
+        };
         if sources.is_empty() {
+            let reported_ns = match scope {
+                PersonaScope::Single(ns) => ns.to_string(),
+                PersonaScope::AnyTargeting(_) => CROSS_NAMESPACE_SENTINEL.to_string(),
+            };
             return Err(PersonaError::NoReflections {
                 entity_id: entity_id.to_string(),
-                namespace: namespace.to_string(),
+                namespace: reported_ns,
             });
         }
 
@@ -588,6 +662,39 @@ fn load_reflections_for_entity(
             entity_id,
             i64::try_from(limit).unwrap_or(i64::MAX)
         ],
+        crate::storage::row_to_memory,
+    )?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// v0.7.0 issue #848 — cross-namespace reflection loader. Identical
+/// to [`load_reflections_for_entity`] minus the `namespace = ?`
+/// predicate so a single query aggregates every reflection that
+/// references the entity regardless of which namespace it lives in.
+/// Still rides the `idx_memories_mentioned_entity` PERF-8 index
+/// (mentioned_entity_id is the leading column). Bounded by `limit`.
+fn load_reflections_for_entity_any_namespace(
+    conn: &Connection,
+    entity_id: &str,
+    limit: usize,
+) -> Result<Vec<Memory>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, tier, namespace, title, content, tags, priority, confidence, source,
+                access_count, created_at, updated_at, last_accessed_at, expires_at,
+                metadata, COALESCE(reflection_depth, 0), COALESCE(memory_kind, 'observation'),
+                entity_id, persona_version
+         FROM memories
+         WHERE memory_kind = 'reflection'
+           AND mentioned_entity_id = ?1
+         ORDER BY priority DESC, created_at DESC
+         LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(
+        rusqlite::params![entity_id, i64::try_from(limit).unwrap_or(i64::MAX)],
         crate::storage::row_to_memory,
     )?;
     let mut out = Vec::new();
