@@ -115,3 +115,38 @@ pub(crate) fn bad_request_opaque(
     )
         .into_response()
 }
+
+/// #869 (2026-05-18) — serialise a value to `serde_json::Value` and,
+/// on failure, return a 500 envelope instead of the silent
+/// `unwrap_or_default()` that would have masked the error as
+/// `Value::Null` (or worse, an empty `{}` body paired with a 201
+/// Created envelope).
+///
+/// Returns:
+/// - `Ok(value)` — the serialised JSON value; the caller wraps it in
+///   the success status code of its choice.
+/// - `Err(response)` — a 500 response the caller MUST return verbatim;
+///   the error has already been logged at `error` level with the
+///   `context` tag so operators can diagnose the encode failure.
+///
+/// `Memory` and most response structs derive `Serialize` over owned
+/// `String`/`Vec`/`HashMap` fields and only fail on the adversarial
+/// inputs that produce non-string map keys, NaN/Inf floats, or
+/// recursion past `serde_json`'s recursion limit. For typed structs
+/// the failure is therefore vanishingly rare in production — but the
+/// silent `unwrap_or_default` returning `201 Created {}` was a true
+/// correctness bug (#869), so a typed 500 envelope is the right
+/// surface for the rare failure case.
+pub(crate) fn to_value_or_500<T: serde::Serialize + ?Sized>(
+    context: &'static str,
+    value: &T,
+) -> Result<serde_json::Value, axum::response::Response> {
+    serde_json::to_value(value).map_err(|e| {
+        tracing::error!("{context}: serialise to JSON failed: {e}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "internal server error: response serialisation failed"})),
+        )
+            .into_response()
+    })
+}

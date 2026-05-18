@@ -79,6 +79,11 @@ rustls = { version = "0.23", features = ["ring"] }
 # client cert DER. RustCrypto sha2 — same family as the HKDF we'll use
 # for Layer 3 E2E encryption (#228).
 sha2 = "0.10"
+# v0.7.0 (issue #654 MVP attestation) — hex-encode the SHA-256 of model
+# weight files for `src/inference::AttestedWeights`. Already pulled in
+# transitively via several other crates; promoted to a direct dep so
+# the attestation surface is explicit.
+hex = "0.4"
 # v0.7.0 M1 — constant-time byte comparison for mTLS fingerprint
 # allowlist membership. `subtle` is the RustCrypto ecosystem default
 # (already pulled in transitively via ed25519-dalek / sha2 / etc); we
@@ -362,3 +367,16 @@ paste = { git = "https://github.com/alphaonedev/paste", rev = "6a30252" }
 opt-level = 3
 strip = true
 lto = "thin"
+
+# v0.7.0 #873 — codify the per-function size budget so future PRs cannot
+# silently grow new god-functions past the threshold. 250 lines is the
+# discipline anchor (any tool body that needs more than 250 lines is
+# almost certainly doing too many things and should be staged into
+# helpers). The integer threshold itself lives in the sibling
+# `clippy.toml` (stable cargo's `[lints]` table doesn't accept
+# per-lint config payloads as of 1.88, see rust-lang/cargo#13310).
+# Existing offenders carry `#![allow(clippy::too_many_lines)]` at the
+# top of their containing file with a tracker reference (#866 / #871 /
+# #650 / #867); the allowance keeps CI green while the splits land.
+[lints.clippy]
+too_many_lines = { level = "warn", priority = -1 }
