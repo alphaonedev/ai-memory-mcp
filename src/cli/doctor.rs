@@ -306,7 +306,7 @@ pub fn run_tokens(args: TokensArgs, out: &mut CliOutput<'_>) -> Result<i32> {
     writeln!(out.stdout)?;
     writeln!(
         out.stdout,
-        "  Tools/list payload (v0.7 C4 trim, optionals hidden):"
+        "  Tools/list payload (v0.7 C4 + #859 trim — properties exposed, prose stripped):"
     )?;
     writeln!(
         out.stdout,
@@ -2514,16 +2514,13 @@ mod tests {
         assert_eq!(v["schema_version"], "v0.6.4-tokens-1");
         assert_eq!(v["tokenizer"], "cl100k_base");
         // Token count grows as schemas evolve. Assert the honest
-        // cl100k_base range from sizes.rs (5K-10K — v0.7 C2 widened
-        // the upper bound after adding per-tool `docs` fields to the
-        // canonical source-of-truth) rather than an exact value; the
-        // exact-figure invariant lives in
+        // cl100k_base range from sizes.rs (5K-10K post-#829 trim — see
+        // `tests/token_budget_guard.rs` for the load-bearing ceilings).
+        // The exact-figure invariant lives in
         // `sizes::tests::full_profile_total_in_honest_measured_range`.
-        // v0.7.0 L1-5 adds 5 skill tools, bumping the full-profile
-        // verbose token total past 10K. Updated upper bound to 12K.
         let total = v["full_profile_total_tokens"].as_u64().unwrap();
         assert!(
-            (5_000..=16_000).contains(&total),
+            (5_000..=10_000).contains(&total),
             "full_profile_total_tokens out of honest range: {total}"
         );
         assert!(v["active_total_tokens"].as_u64().unwrap() > 0);
