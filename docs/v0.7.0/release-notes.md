@@ -823,6 +823,72 @@ Follow [`docs/migration-v0.7.0-postgres.md`](../migration-v0.7.0-postgres.md):
 - Round-2 fixes PR: [#643](https://github.com/alphaonedev/ai-memory-mcp/pull/643)
   on `round-2-fixes`.
 
+## Post-tag follow-up batches (NHI re-run, 2026-05-17 / 2026-05-18)
+
+After the v0.7.0 tag, the NHI re-run campaign (canonical results at
+[`docs/v0.7.0/test-campaign-2026-05-18/`](test-campaign-2026-05-18/))
+surfaced a fix-batch the lane-1 meta-lane absorbed without slipping
+the tag. All items shipped in `local/install-815-816` (HEAD `875bc19`
+on 2026-05-18) and pre-merged into the v0.7.0 retag candidate:
+
+- **#857** — serve_postgres_continuation2/3 + extended test failures.
+  Bulk source-allowlist sweep + designated-approver typing + 404 vs.
+  403 contract on missing-pending-row. Commits `3f13138`, `64436d0`,
+  `4ef8217`, `7eb73fd`, `dbae41d`. **33/33 postgres tests green.**
+- **#858** — bucket_b_subscriptions_persist + cont6_find_paths handler
+  parity. AGE projection on link insert degrades to warn instead of
+  503 (the prior 503 was a substrate bug surfaced by the
+  source-allowlist tightening). Commits `6d8b13a`, `ccd05f7`,
+  `f612675`.
+- **#859** — MCP `tools/list` exposes optional property schemas for
+  NHI discovery. The verbose schema trim in #829 had stripped
+  optional-property descriptions; #859 restores them under the
+  ceiling. Surfaces `memory_update` (10 fields), `memory_link`
+  (relation enum), other tools that gained optional params during
+  v0.7.0. Commit `5ab3315`. Added 8-test regression suite
+  `tests/mcp_tools_list_schema_discovery.rs`.
+- **#860** — `memory_get_links` surfaces temporal + attest columns
+  (`valid_from`, `valid_until`, `observed_by`, `signature`,
+  `attest_level`, `signed_at`). Commit `091350c`.
+- **#861** — `memory_archive_list` preserves metadata + emits tags
+  as JSON array (was emitting the SQL-side string). Commit `091350c`.
+- **#862** — clarified "70 of 70 advertised" vs. "71 advertised
+  entries at v0.7.0" — the +1 is the always-on `memory_capabilities`
+  bootstrap; `Profile::full().expected_tool_count()` returns 71 while
+  `memory_capabilities` summary reports the 70-memory-tool count;
+  both numbers are intentional. Commit `dc07da4` (docs/index.html
+  header correction).
+- **#863** — `ai-memory governance check-action` CLI subcommand —
+  parity with the substrate `check_agent_action` MCP tool. Commit
+  `3b21228`.
+- **#864** — clarified "Family" naming: MCP tool family
+  (`Family::Core|Graph|Admin|Power`) is unrelated to `MemoryKind`
+  taxonomy (the Batman Form-6 vocabulary). Commit `7647cfe`.
+- **#829** — trim verbose tool docs from 15570 → 9507 cl100k tokens
+  (-38.9%). Verbose token budget ceiling relaxed from 5K-10K (original
+  v0.6.4 playbook) to **≤ 10000 (post-#829)**. Trimmed budget remains
+  **≤ 5000** (post-#859, raised from 3500 → 5000 to support
+  optional-property discovery). Commit `d41b8cb`. 3 CI guards added.
+- **#830** — TTL extend wording clarified across docs: per-tier
+  `*_extend_secs` is a sliding-window **REPLACEMENT**, NOT a
+  max-of-old-and-new extend. The create-time `*_ttl_secs` backstop
+  applies only until first access. Field names retained for
+  backward-compat. Pinned in CLAUDE.md §"Recall Pipeline" and the
+  ADMIN_GUIDE `[ttl]` table.
+- **#831** — MCP `memory_promote` accepts optional `target_tier`
+  parameter (`"mid"` or `"long"`). Omitting preserves the historical
+  highest-reachable-tier behavior. 3 regression tests pin the match
+  arms.
+
+**Closed documentation-labeled issues** as part of this lane-5 sweep:
+
+- **#800** — operator how-to "Activate Batman Mode" — closed on
+  the v0.7.0 ship via [`docs/batman-active-mode.md`](../batman-active-mode.md).
+- **#545** — `memory_capabilities` operational summary + per-tool
+  `callable_now` — closed on the v0.7.0 ship via capabilities-v3
+  (A1-A4 increments; `summary`, `to_describe_to_user`, `callable_now`,
+  `agent_permitted_families` all live on the v3 envelope).
+
 ## Acknowledgements
 
 The Round-2 NHI sweep was driven by a 5-agent parallel orchestration

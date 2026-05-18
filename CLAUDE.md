@@ -106,21 +106,23 @@ release-notes intro lives under `docs/v0.7.0/release-notes.md`
 
 **ai-memory** is a Rust-based persistent memory system exposing three interfaces over a shared SQLite database layer:
 
-1. **MCP Server** (`src/mcp/`) — stdio JSON-RPC 2.0 with 63 tools at full profile (5 default per v0.6.4 `--profile core`) + 2 prompts
-2. **HTTP API** (`src/handlers.rs`) — Axum REST server on port 9077, 50 endpoints at `/api/v1/`
-3. **CLI** (`src/main.rs`) — clap-based, 40 subcommands with optional `--json` output
+1. **MCP Server** (`src/mcp/`) — stdio JSON-RPC 2.0 with **71 advertised entries at `--profile full`** at v0.7.0 (70 callable "memory tools" + the always-on `memory_capabilities` bootstrap — both numbers are intentional; see issue [#862](https://github.com/alphaonedev/ai-memory-mcp/issues/862) for the disambiguation, and `Profile::full().expected_tool_count()` in `src/profile.rs` for the canonical assertion). Default `--profile core` ships **7 tools** at v0.7.0 (the original 5 + `memory_load_family` + `memory_smart_load`) plus the always-on `memory_capabilities` bootstrap. Plus 2 prompts (`recall-first`, `memory-workflow`).
+2. **HTTP API** (`src/handlers/`) — Axum REST server on port 9077, **72 `.route(...)` registrations in `src/lib.rs`** at `/api/v1/` (and the bare `/metrics` Prometheus surface). Handlers split per domain under `src/handlers/{http,federation_receive,hook_subscribers,transport}.rs` (#650 partially addressed at v0.7.0; full per-domain split tracked in #650).
+3. **CLI** (`src/main.rs` thin shim + `src/daemon_runtime.rs::Command`) — clap-based, **~50 top-level subcommands** at v0.7.0 (was 40 at v0.6.4) with optional `--json` output
 
-All three interfaces share the same database (`src/db.rs`) and validation (`src/validate.rs`) layers. Shared state is `Arc<Mutex<(Connection, PathBuf, ResolvedTtl, bool)>>` — a single SQLite connection protected by a mutex. Lock contention is the bottleneck under concurrent HTTP + MCP load.
+All three interfaces share the same storage layer (`src/storage/`) and validation (`src/validate.rs`) layers. The sqlite legacy path uses `Arc<Mutex<(Connection, PathBuf, ResolvedTtl, bool)>>` — a single SQLite connection protected by a mutex. Lock contention is the bottleneck under concurrent HTTP + MCP load. The v0.7 SAL trait (under `src/store/`) abstracts sqlite vs. postgres+AGE adapters; `ai-memory serve --store-url postgres://…` selects the postgres path.
 
 ### Key Modules
 
 | Module | Role |
 |--------|------|
-| `main.rs` | CLI parsing, daemon setup (Axum + GC scheduler), command dispatch |
-| `mcp.rs` | MCP server: stdin/stdout JSON-RPC loop, tool definitions |
-| `db.rs` | All SQLite operations: CRUD, FTS5 queries, recall scoring, GC, schema migrations |
-| `handlers.rs` | HTTP request handlers (Axum extractors), error sanitization |
-| `models.rs` | Core data structures: Memory (15 fields), MemoryLink, request/response types |
+| `main.rs` | Thin CLI shim (W6 refactor); top-level `Command` enum lives in `src/daemon_runtime.rs` |
+| `daemon_runtime.rs` | clap top-level `Command` enum (~50 subcommands), HTTP daemon `serve` bootstrap, MCP `mcp` dispatch |
+| `mcp/` | MCP server: stdin/stdout JSON-RPC loop, tool registry (`src/mcp/registry.rs`), per-tool handlers under `src/mcp/tools/` |
+| `storage/` | SAL trait + sqlite path; CRUD, FTS5 queries, recall scoring, GC, schema migrations (current `CURRENT_SCHEMA_VERSION = 43` in `src/storage/migrations.rs`) |
+| `store/` | SAL adapter implementations (sqlite + postgres + Apache AGE feature gates) |
+| `handlers/` | HTTP request handlers split per domain (`http.rs`, `federation_receive.rs`, `hook_subscribers.rs`, `transport.rs`) — Axum extractors, error sanitization |
+| `models/` | Core data structures: `Memory` (25 fields incl. v0.7.0 recursive-learning + Batman vocabulary + Form-4 provenance + Form-5 confidence-calibration columns), `MemoryLink`, request/response types |
 | `validate.rs` | Input validation for all write paths |
 | `config.rs` | Feature tier system (keyword/semantic/smart/autonomous), TTL config |
 | `reranker.rs` | Hybrid recall: blends semantic (cosine) + keyword (BM25-like FTS5) scores |
@@ -129,13 +131,25 @@ All three interfaces share the same database (`src/db.rs`) and validation (`src/
 | `llm.rs` | LLM integration via Ollama: query expansion, auto-tagging, contradiction detection |
 | `toon.rs` | TOON format: token-efficient JSON alternative (40-60% smaller) |
 | `mine.rs` | Conversation import from Claude/ChatGPT/Slack exports |
+| `governance/` | Rule engine, agent-action evaluator, signed rule storage (L1-6 substrate rules) |
+| `atomisation/` | WT-1 atomiser engine + `LlmCurator` scaffolding |
+| `multistep_ingest/` | Form 3 multi-step ingest orchestrator (two-phase deterministic + LLM) |
+| `synthesis/` | Form 1 online dedup-and-synthesis |
+| `confidence/` | Form 5 auto-confidence + shadow + decay |
+| `persona/` | QW-2 persona-as-artifact generator |
+| `offload/` | QW-3 context-offload primitive + TTL sweep |
+| `forensic/` | L2-5 forensic bundle export/verify |
+| `federation/` | Quorum sync, peer attestation, mTLS allowlist |
+| `kg/` | Knowledge-graph traversal (recursive-CTE + AGE Cypher) |
+| `subscriptions.rs` | HMAC-signed webhook dispatch (mandatory at v0.7.0 post R3-S1.HMAC; unsigned dispatch DISABLED), DLQ, replay |
+| `signed_events.rs` | Append-only audit chain with V-4 cross-row hash chain |
 | `errors.rs` | ApiError, MemoryError enum, HTTP status mapping |
 | `color.rs` | ANSI color output for CLI |
 
 ### Data Model
 
-- **Memory**: 15-field struct with id, tier (short/mid/long), namespace, title, content, tags, priority (1-10), confidence (0.0-1.0), source, metadata (JSON), timestamps
-- **MemoryLink**: Typed directional relationships (related_to, supersedes, contradicts, derived_from)
+- **Memory**: **25-field struct at v0.7.0** (was 15 at v0.6.x) — adds `reflection_depth` (Task 1/8 recursive-learning), `memory_kind` (Batman Form-6 vocabulary: Observation/Reflection/Persona/Concept/Entity/Claim/Relation/Event/Conversation/Decision), `entity_id` + `persona_version` (QW-2 persona artefact), `citations` + `source_uri` + `source_span` (Form-4 fact provenance), `confidence_source` + `confidence_signals` + `confidence_decayed_at` (Form-5 calibration). Original v0.6.x fields preserved: `id`, `tier` (short/mid/long), `namespace`, `title`, `content`, `tags`, `priority` (1-10), `confidence` (0.0-1.0), `source`, `metadata` (JSON), `access_count`, `created_at`/`updated_at`/`last_accessed_at`/`expires_at`. Canonical truth in `src/models/memory.rs`.
+- **MemoryLink**: Typed directional relationships. **Six variants at v0.7.0** (was four at v0.6.x): `related_to`, `supersedes`, `contradicts`, `derived_from`, `reflects_on` (recursive-learning Task 1/8), `derives_from` (WT-1-A atomisation — atom row → parent memory). Canonical enum in `src/models/link.rs::MemoryLinkRelation`. Each link row also carries the v0.7 temporal-validity columns (`valid_from`, `valid_until`, `observed_by`) and attestation columns (`signature`, `attest_level`, `signed_at`).
 - **Tiers**: short (6h TTL), mid (7d TTL), long (permanent). Tier transitions: automatic mid→long via touch at 5 accesses (`PROMOTION_THRESHOLD`); explicit `memory_promote` jumps to long in a single call by default (short→long or mid→long, NOT short→mid→long stepwise). The MCP tool now accepts an optional `target_tier` parameter (`"mid"` or `"long"`) for callers that want to stop at an intermediate tier; omitting it preserves the historical highest-reachable-tier behavior. Downgrades (e.g. mid→short) are never honored — `db::update` enforces tier monotonicity.
 - **Feature tiers**: keyword (FTS5 only) → semantic (MiniLM embeddings) → smart (Ollama) → autonomous (cross-encoder reranking)
 
@@ -154,7 +168,7 @@ Storing a memory with the same `(title, namespace)` updates the existing one. Ti
 
 ### Database
 
-SQLite with WAL mode, FTS5 virtual table for full-text search, schema version v7 with automated migrations. Archive table preserves GC'd memories for restoration. FTS is kept in sync via INSERT/DELETE/UPDATE triggers. GC runs every 30 minutes; expired memories are archived before deletion when `archive_on_gc=true` (default).
+SQLite with WAL mode, FTS5 virtual table for full-text search. **Current schema = v43** (constant `CURRENT_SCHEMA_VERSION` in `src/storage/migrations.rs`; postgres parity ladder ends at migration 0020). Automated migrations on first open via `current_version` → `apply_migrations`. Archive table preserves GC'd memories for restoration. FTS is kept in sync via INSERT/DELETE/UPDATE triggers. GC runs every 30 minutes; expired memories are archived before deletion when `archive_on_gc=true` (default). **Capabilities envelope `schema_version` is `"3"` at v0.7.0** (post-A5; v1/v2 still negotiable via `accept=` on `memory_capabilities` MCP / `Accept-Capabilities` HTTP header — `src/mcp/tools/capabilities.rs`).
 
 ### Environment Variables
 

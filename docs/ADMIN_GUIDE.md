@@ -254,10 +254,12 @@ At the `semantic` tier and above, ai-memory downloads a sentence-transformer mod
 | `ttl.short_ttl_secs` | Integer | `21600` (6 hours) | `0` = never expires, or positive integer | TTL for short-tier memories in seconds |
 | `ttl.mid_ttl_secs` | Integer | `604800` (7 days) | `0` = never expires, or positive integer | TTL for mid-tier memories in seconds |
 | `ttl.long_ttl_secs` | Integer | `0` (never expires) | `0` = never expires, or positive integer | TTL for long-tier memories in seconds |
-| `ttl.short_extend_secs` | Integer | `3600` (1 hour) | Non-negative integer | TTL extension on access for short-tier memories |
-| `ttl.mid_extend_secs` | Integer | `86400` (1 day) | Non-negative integer | TTL extension on access for mid-tier memories |
+| `ttl.short_extend_secs` | Integer | `3600` (1 hour) | Non-negative integer | Per-access TTL window for short-tier memories. **Sliding-window REPLACEMENT semantic** (not max-of-old-and-new extend): on every access, `expires_at = now + short_extend_secs`. The create-time `short_ttl_secs` (6h default) is only a backstop until first access. |
+| `ttl.mid_extend_secs` | Integer | `86400` (1 day) | Non-negative integer | Per-access TTL window for mid-tier memories. **Sliding-window REPLACEMENT semantic** (not extend): on every access, `expires_at = now + mid_extend_secs`. The create-time `mid_ttl_secs` (7d default) is only a backstop until first access. |
 
 > **Note:** Set any TTL to `0` to disable expiry for that tier. Values are clamped to a 10-year maximum (315,360,000 seconds). Negative extension values are clamped to 0.
+
+> **Sliding-window REPLACEMENT (CLAUDE.md prime-directive contract, issue [#830](https://github.com/alphaonedev/ai-memory-mcp/issues/830)):** the `*_extend_secs` fields are misnamed historically — the implementation does NOT take `max(old_expires_at, now + extend_secs)`. Each access REPLACES `expires_at` outright with `now + per-tier-extend_secs`. A short memory accessed every 30 minutes never expires, even though it started with a 6h backstop. The field-name "extend" is preserved for backward-compat with v0.6.x callers and config files.
 
 > **Note:** Restored memories have their `expires_at` cleared (set to NULL) and become permanent.
 
@@ -386,11 +388,11 @@ The MCP server's tool surface is selected by `--profile`. Profiles compose tool 
 
 | Profile | Advertised tools | Use when |
 |---|---|---|
-| `core` (default) | 5 + bootstrap | Eager-loading harnesses where every kilobyte of `tools/list` schema costs input tokens (Claude Desktop / Codex CLI / Grok CLI / Gemini CLI). |
+| `core` (default) | **7 + bootstrap at v0.7.0** (the original 5 + `memory_load_family` + `memory_smart_load`) | Eager-loading harnesses where every kilobyte of `tools/list` schema costs input tokens (Claude Desktop / Codex CLI / Grok CLI / Gemini CLI). |
 | `graph` | core + KG family | Agents that walk `memory_link` / `memory_get_links` / `memory_kg_query` / `memory_find_paths`. |
 | `admin` | core + governance + audit | Operator sessions doing `memory_governance_*`, `memory_audit_*`, archive purges. |
 | `power` | core + smart-tier LLM tools | Smart/autonomous tier deployments that want `memory_expand_query`, `memory_auto_tag`, `memory_detect_contradiction` always available. |
-| `full` | every family — 43 tools | Pre-v0.6.4 behavior 1:1, plus v0.7 additions. |
+| `full` | every family — **71 advertised entries at v0.7.0** (70 callable memory tools + the always-on `memory_capabilities` bootstrap; both numbers are intentional, see issue [#862](https://github.com/alphaonedev/ai-memory-mcp/issues/862)) | Pre-v0.6.4 behavior 1:1, plus v0.7 additions. Canonical count asserted by `Profile::full().expected_tool_count()` in `src/profile.rs`. |
 
 **v0.7 always-on additions:** `memory_load_family(family)` and `memory_smart_load(intent)` are advertised under every profile. They register additional families at runtime without restarting the MCP server — preferred over re-launching with a wider `--profile` for short-lived expansions. The pinned phrasings the agent sees for these recovery paths live in [`v0.7/canonical-phrasings.md`](v0.7/canonical-phrasings.md).
 
@@ -974,7 +976,7 @@ Both are cleaned up on graceful shutdown (the daemon runs `PRAGMA wal_checkpoint
 
 Maximum request body size: 50 MB.
 
-The HTTP daemon exposes **50 endpoints** under `/api/v1`:
+The HTTP daemon exposes **72 routes** at v0.7.0 (canonical count via `grep -cE "^\s*\.route\(" src/lib.rs`; the table below lists the high-traffic surfaces — see [`docs/API_REFERENCE.md`](API_REFERENCE.md) for the complete enumeration):
 
 | Method | Path | Description |
 |--------|------|-------------|
