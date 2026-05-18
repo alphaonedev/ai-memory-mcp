@@ -72,6 +72,12 @@ pub mod hooks;
 pub mod identity;
 // v0.7.0 L1-2 — knowledge-graph substrate helpers (anti-cycle check).
 pub mod kg;
+// v0.7.0 (issue #651) — pluggable inference backend trait pulled
+// forward from v0.8 RFC per operator directive
+// `28860423-d12c-4959-bc8b-8fa9a94a33d9`. Unifies the
+// `embeddings::Embed` + `llm::OllamaClient` surface behind one trait
+// so a future GPU/MTP backend (v0.8 Phase 1) drops in transparently.
+pub mod inference;
 pub mod llm;
 pub mod log_paths;
 pub mod logging;
