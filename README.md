@@ -133,7 +133,7 @@ ai-memory integrates with any AI platform that supports the **Model Context Prot
 | **OpenClaw** | MCP stdio | JSON (`mcp.servers` in config) | Fully supported |
 | **Any MCP client** | MCP stdio or HTTP | Varies | Universal |
 
-MCP is the primary integration layer. For AI platforms that do not yet support MCP natively, the **HTTP API** (50 endpoints on localhost) and the **CLI** (40 subcommands) provide universal access -- any AI, script, or automation that can make HTTP calls or run shell commands can use ai-memory.
+MCP is the primary integration layer. For AI platforms that do not yet support MCP natively, the **HTTP API** (72 routes on localhost at v0.7.0) and the **CLI** (~50 subcommands at v0.7.0) provide universal access -- any AI, script, or automation that can make HTTP calls or run shell commands can use ai-memory.
 
 ---
 
@@ -574,7 +574,7 @@ It runs as an MCP (Model Context Protocol) tool server -- a background process t
 
 Memories that keep getting accessed automatically promote from mid to long-term. Each recall extends the TTL. Priority increases with usage. The system is self-curating.
 
-Beyond MCP, ai-memory also exposes a full HTTP REST API (50 endpoints on port 9077) and a complete CLI (40 subcommands) for direct interaction, scripting, and integration with any AI platform or tool.
+Beyond MCP, ai-memory also exposes a full HTTP REST API (72 routes on port 9077 at v0.7.0) and a complete CLI (~50 subcommands at v0.7.0) for direct interaction, scripting, and integration with any AI platform or tool.
 
 ---
 
@@ -840,7 +840,7 @@ These 71 tools (full profile at v0.7.0; canonical count via `Profile::full().exp
 
 ## HTTP API
 
-50 endpoints on `127.0.0.1:9077`. Start with `ai-memory serve`.
+72 routes on `127.0.0.1:9077` at v0.7.0. Start with `ai-memory serve`. The table below shows the most commonly used REST endpoints; see [`docs/API_REFERENCE.md`](docs/API_REFERENCE.md) for the full surface (governance, federation, subscriptions, knowledge-graph, quotas, approvals SSE).
 
 > **Security:** The HTTP server binds to 127.0.0.1 with no authentication and permissive CORS. Do not expose to the network without a reverse proxy with authentication.
 
@@ -875,7 +875,7 @@ These 71 tools (full profile at v0.7.0; canonical count via `Profile::full().exp
 
 ## CLI Commands
 
-40 subcommands. Run `ai-memory <command> --help` for details on any command.
+~50 top-level subcommands at v0.7.0 (was 40 at v0.6.4). Run `ai-memory <command> --help` for details on any command, or `ai-memory --help` for the full list.
 
 | Command | Description |
 |---------|-------------|
