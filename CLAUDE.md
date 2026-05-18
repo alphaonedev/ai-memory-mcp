@@ -158,12 +158,79 @@ SQLite with WAL mode, FTS5 virtual table for full-text search, schema version v7
 
 ### Environment Variables
 
-- `AI_MEMORY_DB` — database path override
-- `AI_MEMORY_NO_CONFIG=1` — skip loading `~/.config/ai-memory/config.toml`
-- `AI_MEMORY_AGENT_ID` — default `agent_id` for memories this process writes (see §Agent Identity below)
-- `RUST_LOG` — tracing filter (e.g. `RUST_LOG=ai_memory=debug`)
+**Precedence (universal).** Every knob in the table below resolves
+through the same ladder when more than one source is present:
 
-Config precedence: CLI flags > config file > compiled defaults.
+```
+CLI flag  >  AI_MEMORY_* env var  >  config.toml field  >  compiled default
+```
+
+CLI flags are clap-parsed; for flags declared with `#[arg(env = "...")]`
+clap reads the env var ONLY when the CLI flag is absent. Vars not bound
+to a clap flag (most of the table) are read directly from the
+appropriate `effective_*` accessor at the point of use. Test-only
+vars (`AI_MEMORY_TEST_*`, `AI_MEMORY_AUTO_EXPORT_INJECT_PANIC`) are
+inert under production builds.
+
+**Classification.** `secret` = leaks credentials or override authority
+if logged or echoed; MUST NOT appear in capabilities, banners, audit
+records, or `tracing` output. `config` = operational knob, safe to
+echo. `test-only` = honored in test builds; never set in production.
+
+**Surfaces.** `CLI` = `ai-memory <subcommand>`. `daemon` = `ai-memory
+serve` (HTTP). `MCP` = `ai-memory mcp` (stdio JSON-RPC). `federation`
+= peer-to-peer sync paths. `entrypoint` = `entrypoint.plan-c.sh` boot
+script (Docker / Plan C deployments).
+
+| # | Variable | Type | Default | Surface | Class | Notes |
+|--|---|---|---|---|---|---|
+| 1 | `AI_MEMORY_DB` | path | `ai-memory.db` | CLI/daemon/MCP | config | clap `env=`; `--db` flag wins. Resolved by `effective_db`. |
+| 2 | `AI_MEMORY_DB_PASSPHRASE` | string | unset | CLI/daemon/MCP (sqlcipher build) | **secret** | Set by the CLI from `--db-passphrase-file` (mode 0400). Direct caller use leaks via `ps -E`. Never echoed. |
+| 3 | `AI_MEMORY_API_KEY` | string | unset | entrypoint (`entrypoint.plan-c.sh`, #845) | **secret** | Injected into the rendered `config.toml` top-level `api_key` field at container boot. Never read from Rust env directly. |
+| 4 | `AI_MEMORY_NO_CONFIG` | bool (`1`) | unset | all | config | Skip loading `~/.config/ai-memory/config.toml`. Required for integration tests that bring up isolated state. |
+| 5 | `AI_MEMORY_AGENT_ID` | string | synthesized | CLI/MCP (NOT daemon) | config | clap `env=`; `--agent-id` flag wins. See §Agent Identity for full resolution ladder. |
+| 6 | `AI_MEMORY_PROFILE` | string | `core` | MCP only | config | clap `env=` on `ai-memory mcp`; `--profile` flag wins. One of `core`/`graph`/`admin`/`power`/`full`/comma list. |
+| 7 | `AI_MEMORY_ANONYMIZE` | bool (`1`/`0`) | `false` | CLI/daemon/MCP | config | Overrides `[identity].anonymize_default`. Truthy = synthesize `anonymous:pid-…` fallback instead of `host:…`. |
+| 8 | `AI_MEMORY_AUTONOMOUS_HOOKS` | bool (`1`/`0`) | `false` | CLI/daemon/MCP | config | Truthy = fire `auto_tag`+`detect_contradiction` synchronously after every `memory_store`. |
+| 9 | `AI_MEMORY_BOOT_ENABLED` | bool (`1`/`0`) | `true` | CLI/daemon/MCP | config | Boot lifecycle primitive (#bootloader). Falsy disables boot-time inventory + index warm-up. |
+| 10 | `AI_MEMORY_PERMISSIONS_MODE` | enum (`enforce`/`advisory`/`off`) | `enforce` (v0.7.0 secure default) | CLI/daemon/MCP | config | K3/K9 governance gate. Overrides `[permissions].mode`. Unparseable values warn + fall through. |
+| 11 | `AI_MEMORY_ALLOW_LOOPBACK_WEBHOOKS` | bool (`1`/`true`/`yes`/`on`) | `false` | daemon | config | H11/#628 SSRF gate. Truthy permits `127.0.0.1` webhook URLs for integration tests. |
+| 12 | `AI_MEMORY_OPERATOR_PUBKEY` | base64 ed25519 | falls back to on-disk `operator.key.pub` | CLI/daemon/MCP/governance | **secret-adjacent** (override authority) | Treated as override-authority — anyone who sets it controls rule signing. Lock down host. |
+| 13 | `AI_MEMORY_KEY_DIR` | path | platform config dir + `/ai-memory/keys` | CLI/daemon/MCP | config | Override for ed25519 key storage location. Used by H4 `memory_verify` tests. |
+| 14 | `AI_MEMORY_LOG_DIR` | path | platform-default (XDG / `/var/log/ai-memory/logs`) | CLI/daemon/MCP | config | Operational log dir override; mirrors `--log-dir` flag. World-writable directories are rejected. |
+| 15 | `AI_MEMORY_AUDIT_DIR` | path | platform-default (`audit/` subdir) | CLI/daemon/MCP | config | Audit log dir override; mirrors `--audit-dir` flag. |
+| 16 | `AI_MEMORY_SYSTEM_PROMPT_DIR` | path | bundled | `ai-memory install` (CLI) | config | Override for the installed SystemPrompt template directory (`ai-memory install` writes hooks here). |
+| 17 | `AI_MEMORY_PRECOMPUTE_FAMILY_EMBEDDINGS` | bool (`1`) | unset | daemon | config | B3 daemon hot-start: truthy precomputes family-prototype embeddings during `serve` startup. |
+| 18 | `AI_MEMORY_TOOLS_VERBOSE` | bool (`1`) | unset | MCP | config | Force-on `verbose` for every `memory_capabilities` invocation (operator debug). |
+| 19 | `AI_MEMORY_AUTO_CONFIDENCE` | bool (`1`) | `false` | CLI/daemon/MCP | config | Enable auto-confidence calibration on store/touch. |
+| 20 | `AI_MEMORY_CONFIDENCE_DECAY` | bool (`1`) | `false` | CLI/daemon/MCP | config | Enable confidence decay sweep. |
+| 21 | `AI_MEMORY_CONFIDENCE_SHADOW` | bool (`1`) | `false` | CLI/daemon/MCP | config | PERF-9 shadow-mode confidence pipeline (sample-rate gated, latency observed). |
+| 22 | `AI_MEMORY_CONFIDENCE_SHADOW_SAMPLE_RATE` | float 0.0-1.0 | `0.0` | CLI/daemon/MCP | config | Fraction of touches that pay the shadow calibration cost. |
+| 23 | `AI_MEMORY_FED_PEER_ATTESTATION` | string (peer pubkey allowlist marker) | unset | federation | config | Peer-attestation enforcement marker on federated sync. |
+| 24 | `AI_MEMORY_FED_TRUST_BODY_AGENT_ID` | bool (`1`) | `false` | federation | config | Trust `body.agent_id` instead of envelope-attributed sender on federated writes. **Loosens** identity gating — set only for fully trusted peers. |
+| 25 | `AI_MEMORY_FED_SYNC_TRUST_PEER` | bool (`1`) | `false` | federation | config | Trust peer-supplied sync metadata (counter, timestamps). **Loosens** anti-replay — set only for fully trusted peers. |
+| 26 | `AI_MEMORY_AUTO_EXPORT_INJECT_PANIC` | bool (`1`) | unset | hooks (post-reflect) | **test-only** | Forces a panic inside `auto_export` to exercise the recovery path. Production deployments MUST leave unset. |
+| 27 | `AI_MEMORY_TEST_POSTGRES_URL` | conn-string | unset | tests (CLI `schema-init`, postgres store) | **test-only** | Points the Postgres backend tests at a live instance. Carries credentials — treat as **secret** when set. |
+| 28 | `AI_MEMORY_TEST_AGE_URL` | conn-string | unset | tests (Apache AGE store) | **test-only** | Same shape as `AI_MEMORY_TEST_POSTGRES_URL` for the AGE-backed graph tests. |
+| — | `RUST_LOG` | tracing filter | unset (= `info`) | all | config | Standard `tracing-subscriber` filter (e.g. `RUST_LOG=ai_memory=debug`). Not an `AI_MEMORY_*` var — listed for completeness. |
+
+**Regression tests.** Precedence + secret-classification invariants
+are pinned by `tests/config_precedence.rs`:
+
+- `test_cli_flag_overrides_env` — `--db /a.db` with `AI_MEMORY_DB=/b.db`
+  in env must resolve to `/a.db`. Tests `Cli::parse_from` directly so
+  the clap binding is verified end-to-end.
+- `test_env_overrides_config` — `AI_MEMORY_DB=/x.db` with
+  `config.toml` `db = "/y.db"`; env wins because clap merges env
+  into the same flag slot, and `effective_db` treats any non-default
+  CLI/env value as explicit operator intent.
+- `test_secret_not_in_capabilities` — `AI_MEMORY_DB_PASSPHRASE=mysecret`
+  must NOT appear anywhere in the serialised `memory_capabilities`
+  JSON (v2 schema). Hardens the no-secret-in-overlay invariant against
+  future capability-overlay refactors.
+
+If you add a new env var, update the table above AND extend
+`tests/config_precedence.rs` so the invariant is mechanically enforced.
 
 ### Agent Identity (NHI) — `metadata.agent_id`
 
