@@ -1040,8 +1040,8 @@ pub fn tool_definitions() -> Value {
             },
             {
                 "name": "memory_share",
-                "description": "Share a memory with another agent (point-to-point copy into _shared/<from>→<to>/).",
-                "docs": "Issues #224 + #311 — Phase 3 Memory Sharing & Sync RFC pulled forward per operator directive `28860423-d12c-4959-bc8b-8fa9a94a33d9` (2026-05-18). MVP: point-to-point copy into the target agent's shared namespace `_shared/<from>→<to>/` with provenance metadata. v0.8 Phase 3 adds CRDT-lite merge rules, bi-directional sync, federation wire-level distribution.",
+                "description": "Share a memory with another agent (copy into _shared/<from>→<to>/).",
+                "docs": "#224/#311 MVP: point-to-point copy into `_shared/<from>→<to>/` with provenance.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {

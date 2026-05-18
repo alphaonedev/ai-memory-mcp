@@ -214,7 +214,12 @@ impl Family {
             // orchestrator. Lives at Family::Power alongside the other
             // LLM-driven write-side tools; tier-gated to smart+ with
             // the standard tier-locked advisory on keyword.
-            | "memory_ingest_multistep" => Some(Self::Power),
+            | "memory_ingest_multistep"
+            // v0.7.0 (issues #224 + #311) — Phase 3 Memory Sharing &
+            // Sync RFC pulled forward per operator directive
+            // `28860423-d12c-4959-bc8b-8fa9a94a33d9`. Substrate-level
+            // point-to-point copy into `_shared/<from>→<to>/`.
+            | "memory_share" => Some(Self::Power),
             // meta (5)
             "memory_capabilities"
             | "memory_agent_register"
@@ -305,8 +310,11 @@ impl Family {
             // multi-step ingest orchestrator with deterministic
             // helpers + prompt-cache reuse) +
             // 1 (v0.7.0 Form 5 / issue #758 — memory_calibrate_confidence,
-            // shadow-mode-driven per-source baseline sweep) = 22.
-            Self::Power => 22,
+            // shadow-mode-driven per-source baseline sweep) +
+            // 1 (v0.7.0 issues #224 + #311 — memory_share, Phase 3 Memory
+            // Sharing & Sync RFC pulled forward per operator directive
+            // `28860423-d12c-4959-bc8b-8fa9a94a33d9`) = 23.
+            Self::Power => 23,
             Self::Archive => 4,
             // v0.7.0 L1-5 — 5 skill tools added to the Other family.
             // v0.7.0 L2-6 (issue #671) — memory_skill_promote_from_reflection
@@ -749,7 +757,7 @@ mod tests {
     }
 
     #[test]
-    fn family_expected_tool_counts_sum_to_51() {
+    fn family_expected_tool_counts_sum_to_72() {
         let total: usize = Family::all().iter().map(|f| f.expected_tool_count()).sum();
         assert_eq!(
             total, 72,
@@ -897,9 +905,10 @@ mod tests {
         assert_eq!(p.expected_tool_count(), 72);
 
         // The K7+K8 + Task 4/8 + L2-2 + L2-3 + #691 + QW-1 + QW-3 follow-up
-        // + WT-1-C + QW-2 + Form 3 + Form 5 additions live in Family::Power
-        // (operator/governance), so the `power` profile picks them up too.
-        assert_eq!(Profile::power().expected_tool_count(), 7 + 22);
+        // + WT-1-C + QW-2 + Form 3 + Form 5 + #224/#311 memory_share additions
+        // live in Family::Power (operator/governance), so the `power` profile
+        // picks them up too.
+        assert_eq!(Profile::power().expected_tool_count(), 7 + 23);
     }
 
     // ---------- Profile::parse ----------

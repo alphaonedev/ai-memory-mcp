@@ -178,10 +178,50 @@ async fn get_uri(router: &axum::Router, uri: &str) -> (StatusCode, Value) {
     (status, parsed)
 }
 
+async fn get_uri_with_agent(
+    router: &axum::Router,
+    uri: &str,
+    agent_id: &str,
+) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header("X-Agent-Id", agent_id)
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 8 * 1024 * 1024)
+        .await
+        .unwrap();
+    let parsed: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, parsed)
+}
+
 async fn delete_uri(router: &axum::Router, uri: &str) -> (StatusCode, Value) {
     let req = Request::builder()
         .method("DELETE")
         .uri(uri)
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let parsed: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, parsed)
+}
+
+async fn delete_uri_with_agent(
+    router: &axum::Router,
+    uri: &str,
+    agent_id: &str,
+) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method("DELETE")
+        .uri(uri)
+        .header("X-Agent-Id", agent_id)
         .body(Body::empty())
         .unwrap();
     let resp = router.clone().oneshot(req).await.unwrap();
@@ -1835,7 +1875,12 @@ async fn http_list_subscriptions_with_agent_filter() {
     let _g = lock_hmac();
     ai_memory::config::set_active_hooks_hmac_secret(Some("global-secret".to_string()));
     let (router, _f) = build_router_fixture();
-    let (status, _payload) = get_uri(&router, "/api/v1/subscriptions?agent_id=ai:nobody").await;
+    let (status, _payload) = get_uri_with_agent(
+        &router,
+        "/api/v1/subscriptions?agent_id=ai:nobody",
+        "ai:nobody",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     ai_memory::config::set_active_hooks_hmac_secret(None);
 }
@@ -1864,9 +1909,10 @@ async fn http_unsubscribe_by_namespace_returns_removed_false_on_miss() {
     let _g = lock_hmac();
     ai_memory::config::set_active_hooks_hmac_secret(None);
     let (router, _f) = build_router_fixture();
-    let (status, payload) = delete_uri(
+    let (status, payload) = delete_uri_with_agent(
         &router,
         "/api/v1/subscriptions?agent_id=ai:none&namespace=chunk-d/unmatched",
+        "ai:none",
     )
     .await;
     assert_eq!(status, StatusCode::OK);
