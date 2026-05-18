@@ -177,25 +177,17 @@ fn cap_v3_summary_core_profile_counts_and_names_recovery_paths() {
     // bumped via v0.7.0 L1-5 5×memory_skill_* + v0.7.0 L2-7
     // memory_skill_compositional_context).
     assert!(
-        summary.starts_with("7 of 70 memory tools"),
-        "core profile summary should open with \"7 of 70 memory tools\" (Round-2 F13; \
-         v0.7.0 issue #691 added memory_check_agent_action + memory_rule_list, \
-         v0.7.0 L1-5 added 5 memory_skill_* tools to Family::Other, v0.7.0 L2-3 \
-         added memory_dependents_of_invalidated to Family::Power, v0.7.0 L2-6 \
-         added memory_skill_promote_from_reflection to Family::Other, v0.7.0 \
-         L2-7 added memory_skill_compositional_context to Family::Other, v0.7.0 \
-         QW-1 added memory_export_reflection to Family::Power, v0.7.0 QW-3 \
-         follow-up added memory_offload + memory_deref to Family::Power, \
-         v0.7.0 WT-1-C added memory_atomise to Family::Power, v0.7.0 QW-2 \
-         added memory_persona + memory_persona_generate to Family::Power, \
-         v0.7.0 Form 3 added memory_ingest_multistep to Family::Power, and \
-         v0.7.0 Form 5 added memory_calibrate_confidence to Family::Power — \
-         bumping the substantive total from 52 to 70); got: {summary}"
+        summary.starts_with("7 of 71 memory tools"),
+        "core profile summary should open with \"7 of 71 memory tools\" (Round-2 F13; \
+         v0.7.0 issues #224 + #311 added memory_share to Family::Power, \
+         pulled forward from v0.8 Phase 3 Memory Sharing & Sync RFC per \
+         operator directive `28860423-d12c-4959-bc8b-8fa9a94a33d9` — \
+         bumping the substantive total to 71); got: {summary}"
     );
     assert!(summary.contains("(core)"), "must label the profile as core");
     assert!(
-        summary.contains("63 are listed in this manifest"),
-        "core profile must report 63 unloaded (70 - 7); got: {summary}"
+        summary.contains("64 are listed in this manifest"),
+        "core profile must report 64 unloaded (71 - 7); got: {summary}"
     );
 
     // Three named recovery paths must all appear (verbatim names — these
@@ -232,19 +224,10 @@ fn cap_v3_summary_full_profile_reports_all_visible() {
     // 5 memory_skill_* tools to Family::Other, bumping the substantive
     // total from 51 to 56.
     assert!(
-        summary.starts_with("70 of 70 memory tools"),
-        "full profile summary should open with \"70 of 70 memory tools\" (Round-2 F13; \
-         v0.7.0 issue #691 added memory_check_agent_action + memory_rule_list, \
-         v0.7.0 L1-5 added 5 memory_skill_* tools, v0.7.0 L2-3 added \
-         memory_dependents_of_invalidated, v0.7.0 L2-6 added \
-         memory_skill_promote_from_reflection, v0.7.0 L2-7 added \
-         memory_skill_compositional_context, v0.7.0 QW-1 added \
-         memory_export_reflection, v0.7.0 QW-3 follow-up added \
-         memory_offload + memory_deref, v0.7.0 WT-1-C added \
-         memory_atomise, v0.7.0 QW-2 added memory_persona + \
-         memory_persona_generate, v0.7.0 Form 3 added \
-         memory_ingest_multistep, and v0.7.0 Form 5 added \
-         memory_calibrate_confidence); got: {summary}"
+        summary.starts_with("71 of 71 memory tools"),
+        "full profile summary should open with \"71 of 71 memory tools\" (Round-2 F13; \
+         v0.7.0 issues #224 + #311 added memory_share to Family::Power, \
+         pulled forward from v0.8 Phase 3 RFC); got: {summary}"
     );
     assert!(summary.contains("(full)"));
     assert!(
@@ -271,23 +254,14 @@ fn cap_v3_summary_graph_profile_counts() {
     // memory tools. Total = 55 (56 - bootstrap; v0.7.0 L1-5 added 5
     // memory_skill_* tools to Family::Other, bumping total from 51 to 56).
     assert!(
-        summary.starts_with("18 of 70 memory tools"),
+        summary.starts_with("18 of 71 memory tools"),
         "graph profile = 7 core (v0.7 B1+B2) + 11 graph (v0.7 J7) = 18 memory tools \
-         (Round-2 F13: bootstrap excluded; v0.7.0 issue #691 added two power tools, \
-         v0.7.0 L1-5 added 5 memory_skill_* tools to Family::Other, v0.7.0 L2-3 \
-         added memory_dependents_of_invalidated, v0.7.0 L2-6 added \
-         memory_skill_promote_from_reflection, v0.7.0 L2-7 added \
-         memory_skill_compositional_context, v0.7.0 QW-1 added \
-         memory_export_reflection, v0.7.0 QW-3 follow-up added \
-         memory_offload + memory_deref to Family::Power, v0.7.0 WT-1-C \
-         added memory_atomise to Family::Power, v0.7.0 QW-2 added \
-         memory_persona + memory_persona_generate to Family::Power, \
-         v0.7.0 Form 3 added memory_ingest_multistep, and v0.7.0 Form 5 \
-         added memory_calibrate_confidence to Family::Power, bumping \
-         the substantive total from 52 to 70); got: {summary}"
+         (Round-2 F13: bootstrap excluded; v0.7.0 issues #224 + #311 added \
+         memory_share to Family::Power, pulled forward from v0.8 Phase 3 RFC, \
+         bumping the substantive total to 71); got: {summary}"
     );
     assert!(summary.contains("(graph)"));
-    assert!(summary.contains("52 are listed in this manifest"));
+    assert!(summary.contains("53 are listed in this manifest"));
 }
 
 // ---------------------------------------------------------------------------
@@ -381,26 +355,18 @@ fn cap_v3_describe_core_profile_is_plain_english_with_loaded_names() {
     // memory_ prefix STRIPPED (no MCP jargon for end users), followed
     // by ", ..." since core now ships 7 tools (v0.7 B1 + B2).
     assert!(describe.contains("(store, recall, list, get, search, ...)"));
-    // Reports the unloaded count. 49 = 55 user-relevant tools − 7
-    // core. (55 = 56 total tools − 1 always-on bootstrap.) The
+    // Reports the unloaded count. 64 = 71 user-relevant tools − 7
+    // core. (71 = 72 total tools − 1 always-on bootstrap.) The
     // bootstrap (`memory_capabilities`) is excluded from both sides
-    // for honest user-facing counting. Total bumped to 56 in v0.7.0
-    // L1-5 (Family::Other gained 5 memory_skill_* tools).
+    // for honest user-facing counting. Total bumped to 71 in v0.7.0
+    // issues #224 + #311 (Family::Power gained memory_share, pulled
+    // forward from v0.8 Phase 3 Memory Sharing & Sync RFC per operator
+    // directive `28860423-d12c-4959-bc8b-8fa9a94a33d9`).
     assert!(
-        describe.contains("63 more"),
-        "core profile must report 63 unloaded (70 - 7); v0.7.0 issue #691 \
-         added memory_check_agent_action + memory_rule_list, v0.7.0 L1-5 added \
-         5 memory_skill_* tools, v0.7.0 L2-3 added \
-         memory_dependents_of_invalidated, v0.7.0 L2-6 added \
-         memory_skill_promote_from_reflection, v0.7.0 L2-7 added \
-         memory_skill_compositional_context, v0.7.0 QW-1 added \
-         memory_export_reflection, v0.7.0 QW-3 follow-up added \
-         memory_offload + memory_deref, v0.7.0 WT-1-C added \
-         memory_atomise, v0.7.0 QW-2 added memory_persona + \
-         memory_persona_generate, v0.7.0 Form 3 added \
-         memory_ingest_multistep, and v0.7.0 Form 5 added \
-         memory_calibrate_confidence, bumping the substantive total to 70; \
-         got: {describe}"
+        describe.contains("64 more"),
+        "core profile must report 64 unloaded (71 - 7); v0.7.0 issues \
+         #224 + #311 added memory_share to Family::Power, bumping the \
+         substantive total to 71; got: {describe}"
     );
     // Sample of unloaded tools is plain (no memory_ prefix). The first
     // four unloaded under core are lifecycle's update/delete/forget/gc.
@@ -439,17 +405,12 @@ fn cap_v3_describe_core_profile_is_plain_english_with_loaded_names() {
 fn cap_v3_describe_full_profile_uses_nothing_more_form() {
     let describe = build_capabilities_describe_to_user(&Profile::full());
 
-    // 68 = 69 total - 1 always-on bootstrap excluded from describe.
-    // Bumped from 51 to 56 in v0.7.0 L1-5 (Family::Other gained
-    // 5 memory_skill_* tools); to 60 with L2-3 (memory_dependents_of_invalidated);
-    // to 61 with L2-6 (memory_skill_promote_from_reflection);
-    // to 62 with L2-7 (memory_skill_compositional_context); to 63 with QW-1
-    // (memory_export_reflection, Family::Power); to 65 with QW-3 follow-up
-    // (memory_offload + memory_deref, Family::Power); to 66 with WT-1-C
-    // (memory_atomise, Family::Power); to 68 with QW-2 (memory_persona +
-    // memory_persona_generate, Family::Power).
+    // 71 = 72 total - 1 always-on bootstrap excluded from describe.
+    // Bumped to 71 in v0.7.0 issues #224 + #311 (memory_share, Family::Power,
+    // pulled forward from v0.8 Phase 3 RFC per operator directive
+    // `28860423-d12c-4959-bc8b-8fa9a94a33d9`).
     assert!(
-        describe.starts_with("I can directly use all 70 memory tools right now ("),
+        describe.starts_with("I can directly use all 71 memory tools right now ("),
         "full profile describe must open with all-loaded form; got: {describe}"
     );
     assert!(describe.contains("Nothing more to load"));
@@ -472,15 +433,10 @@ fn cap_v3_describe_graph_profile_uses_preview_ellipsis() {
     );
     // Preview is the first 5 of the 18 loaded — the first 5 core tools.
     assert!(describe.contains("(store, recall, list, get, search, ...)"));
-    // 52 more = 70 substantive - 18 loaded. L2-3 + L2-6 + L2-7 each
-    // added one tool not loaded under graph (42 → 43 → 44); QW-1 added
-    // memory_export_reflection to Family::Power (44 → 45); QW-3 follow-up
-    // added memory_offload + memory_deref to Family::Power (45 → 47);
-    // WT-1-C added memory_atomise to Family::Power (47 → 48); QW-2 added
-    // memory_persona + memory_persona_generate to Family::Power (48 → 50);
-    // Form 3 added memory_ingest_multistep (50 → 51); Form 5 added
-    // memory_calibrate_confidence (51 → 52).
-    assert!(describe.contains("52 more"));
+    // 53 more = 71 substantive - 18 loaded. Issues #224 + #311 added
+    // memory_share to Family::Power (52 → 53), pulled forward from v0.8
+    // Phase 3 RFC.
+    assert!(describe.contains("53 more"));
 }
 
 // ---------------------------------------------------------------------------
@@ -644,7 +600,7 @@ fn cap_v3_a3_allowlist_on_agent_denied_callable_now_false() {
 // memory_skill_get, memory_skill_resource, memory_skill_export.)
 // ---------------------------------------------------------------------------
 #[test]
-fn cap_v3_response_carries_tools_array_with_51_entries() {
+fn cap_v3_response_carries_tools_array_with_72_entries() {
     let tier_config = semantic_tier();
     let conn = fresh_conn();
     let val = handle_capabilities_with_conn_v3(
@@ -664,23 +620,12 @@ fn cap_v3_response_carries_tools_array_with_51_entries() {
         .expect("top-level tools must be present and an array under v3");
     assert_eq!(
         tools.len(),
-        71,
-        "v3 must surface all 71 tools regardless of profile (v0.7.0 I4 added \
-         memory_replay; v0.7 H4 added memory_verify; v0.7 B1 added \
-         memory_load_family; v0.7 B2 added memory_smart_load; v0.7 K7 added \
-         memory_subscription_replay + memory_subscription_dlq_list; v0.7 J7 \
-         added memory_find_paths; v0.7 K8 added memory_quota_status; v0.7.0 \
-         Task 4/8 added memory_reflect; v0.7.0 L2-2 added memory_reflection_origin; \
-         v0.7.0 L2-3 added memory_dependents_of_invalidated; \
-         v0.7.0 issue #691 added memory_check_agent_action + memory_rule_list; \
-         v0.7.0 L1-5 added 5 memory_skill_* tools; v0.7.0 L2-6 added \
-         memory_skill_promote_from_reflection; v0.7.0 L2-7 added \
-         memory_skill_compositional_context; v0.7.0 QW-1 added \
-         memory_export_reflection; v0.7.0 QW-3 follow-up added \
-         memory_offload + memory_deref; v0.7.0 WT-1-C added memory_atomise; \
-         v0.7.0 QW-2 added memory_persona + memory_persona_generate; \
-         v0.7.0 Form 3 added memory_ingest_multistep; \
-         v0.7.0 Form 5 added memory_calibrate_confidence); got {}",
+        Profile::full().expected_tool_count(),
+        "v3 must surface every tool regardless of profile; canonical \
+         count is `Profile::full().expected_tool_count()` = 72 at v0.7.0 \
+         (issues #224 + #311 pulled memory_share forward from v0.8 Phase 3 \
+         Memory Sharing & Sync RFC per operator directive \
+         `28860423-d12c-4959-bc8b-8fa9a94a33d9`); got {}",
         tools.len()
     );
 
@@ -1316,7 +1261,10 @@ fn issue_545_v3_response_carries_all_four_calibration_fields() {
     .expect("v3 capabilities serialize for issue #545 acceptance");
 
     // AC3 — schema_version is "3".
-    assert_eq!(val["schema_version"], "3", "#545 AC3: schema_version must be \"3\"");
+    assert_eq!(
+        val["schema_version"], "3",
+        "#545 AC3: schema_version must be \"3\""
+    );
 
     // AC1 — top-level summary present and non-empty.
     let summary = val["summary"]

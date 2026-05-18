@@ -54,18 +54,13 @@ fn k8_quota_status_loaded_under_full_profile() {
     );
     assert_eq!(
         Profile::full().expected_tool_count(),
-        71,
-        "tool count cascade must advance to 71 with v0.7.0 L2-3 \
-         memory_dependents_of_invalidated, v0.7.0 L2-6 \
-         memory_skill_promote_from_reflection, v0.7.0 L2-7 \
-         memory_skill_compositional_context on top of v0.7.0 issue #691 \
-         memory_check_agent_action + memory_rule_list (post-L2-2), \
-         v0.7.0 L1-5 5 memory_skill_* tools, v0.7.0 QW-1 \
-         memory_export_reflection, v0.7.0 QW-3 follow-up \
-         memory_offload + memory_deref, v0.7.0 WT-1-C memory_atomise, \
-         v0.7.0 QW-2 memory_persona + memory_persona_generate, \
-         v0.7.0 Form 3 memory_ingest_multistep, and \
-         v0.7.0 Form 5 memory_calibrate_confidence"
+        72,
+        "tool count cascade must advance to 72 with v0.7.0 issues #224 \
+         + #311 memory_share (Phase 3 Memory Sharing & Sync RFC pulled \
+         forward per operator directive \
+         `28860423-d12c-4959-bc8b-8fa9a94a33d9`) on top of the prior \
+         v0.7.0 cascade (Form 5, Form 3, QW-2, WT-1-C, QW-3 follow-up, \
+         QW-1, L1-5, #691, L2-2 through L2-7)"
     );
 }
 

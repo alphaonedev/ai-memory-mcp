@@ -97,12 +97,23 @@ fn mcp_dispatch_does_not_register_rule_mutation_tools() {
     }
 
     // The two READ tools that ARE registered, as a positive control.
+    // The dispatch table now uses the `register_mcp_tool!` macro
+    // (post-refactor) rather than a flat `"name" => handler(...)` match
+    // arm; the positive control accepts either spelling.
     assert!(
-        body.contains("\"memory_check_agent_action\" => handle_check_agent_action"),
+        body.contains("\"memory_check_agent_action\" => handle_check_agent_action")
+            || body.contains(
+                "register_mcp_tool!(\n        \"memory_check_agent_action\",\n        \
+                 dispatch_memory_check_agent_action\n    )"
+            )
+            || body.contains("\"memory_check_agent_action\",")
+                && body.contains("dispatch_memory_check_agent_action"),
         "expected memory_check_agent_action read tool to be registered"
     );
     assert!(
-        body.contains("\"memory_rule_list\" => handle_rule_list"),
+        body.contains("\"memory_rule_list\" => handle_rule_list")
+            || body.contains("register_mcp_tool!(\"memory_rule_list\", dispatch_memory_rule_list)")
+            || body.contains("\"memory_rule_list\",") && body.contains("dispatch_memory_rule_list"),
         "expected memory_rule_list read tool to be registered"
     );
 }
