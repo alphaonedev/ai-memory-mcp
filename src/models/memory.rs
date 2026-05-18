@@ -839,6 +839,10 @@ pub struct UpdateMemory {
 
 #[derive(Debug, Deserialize)]
 pub struct SearchQuery {
+    /// FTS query string. v0.7.0 Provenance Gap 6 (#889/#891): may be
+    /// empty when `source_uri` is supplied (reciprocal source-only
+    /// query). Handler rejects only when BOTH are empty.
+    #[serde(default)]
     pub q: String,
     #[serde(default)]
     pub namespace: Option<String>,

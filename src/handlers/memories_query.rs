@@ -141,10 +141,16 @@ pub async fn search_memories(
     State(app): State<AppState>,
     Query(p): Query<SearchQuery>,
 ) -> impl IntoResponse {
-    if p.q.trim().is_empty() {
+    // #891: source_uri-only queries are valid (Gap 6 #889 reciprocal
+    // queries). Reject only when BOTH q and source_uri are empty.
+    let source_uri_empty = p
+        .source_uri
+        .as_deref()
+        .is_none_or(|s| s.trim().is_empty());
+    if p.q.trim().is_empty() && source_uri_empty {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "query is required"})),
+            Json(json!({"error": "query or source_uri is required"})),
         )
             .into_response();
     }
