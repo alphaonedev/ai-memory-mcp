@@ -960,12 +960,12 @@ pub fn tool_definitions() -> Value {
             {
                 "name": "memory_persona_generate",
                 "description": "Generate (or regenerate) a Persona artefact for an entity via the reflection-pass curator.",
-                "docs": "QW-2: synthesise MemoryKind::Persona from top-K Reflection memories. New row per call (persona_version bumps); one derived_from link per source reflection; persona_generated signed_events row (H5 audit). Smart+autonomous tier only.",
+                "docs": "QW-2 / #848: synthesise MemoryKind::Persona from top-K Reflection memories. Omit namespace (or pass null) for cross-namespace aggregation (#848 — persona lands in 'global'); pass a namespace string for single-namespace scope. Response includes namespace_scope=single|cross_namespace.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "entity_id": {"type": "string", "description": "Persona subject (1-128 chars)."},
-                        "namespace": {"type": "string", "description": "Default 'global'."}
+                        "namespace": {"type": ["string", "null"], "description": "Omit/null → cross-namespace (#848); string → single-namespace."}
                     },
                     "required": ["entity_id"]
                 }
