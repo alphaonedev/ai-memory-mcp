@@ -5511,8 +5511,519 @@ pub fn recall_hybrid(
 /// 0.2 cosine gate, `blend_weight_avg` is the mean `semantic_weight`
 /// across the *returned* set (not the full candidate pool — operators
 /// care about what made it out).
+// ---------------------------------------------------------------------------
+// #871 — `recall_hybrid_with_telemetry` stage helpers.
+//
+// The original function was ~508 LOC carrying query preparation,
+// FTS5 keyword retrieval, semantic (HNSW or linear-scan) retrieval,
+// adaptive blend + decay scoring, touch ops + budget application,
+// and telemetry assembly. Per the code-review verdict the function
+// is split into focused stage-helpers so each phase has a clear
+// contract and the orchestrator stays readable.
+//
+// The stages are kept inside `storage::mod` (rather than carved into
+// a sub-module) because the helpers all share access to private
+// helpers like `row_to_memory`, `sanitize_fts_query`,
+// `archived_source_clause`, etc., and the SQL is tightly tied to
+// the schema living in this module.
+//
+// Behaviour is byte-for-byte preserved: the same SQL runs, the same
+// fusion produces the same blended scores, and `touch_many` mutates
+// the same surviving set. Only the function-internal structure
+// changes.
+// ---------------------------------------------------------------------------
+
+/// Result of [`prepare_hybrid_query`] — the pre-computed SQL
+/// fragments + bind params the FTS and semantic phases need.
+struct HybridPrep<'a> {
+    fts_query: String,
+    now: String,
+    prefixes: VisibilityPrefixes,
+    fts_hierarchy_fragment: String,
+    sem_hierarchy_fragment: String,
+    effective_namespace: Option<&'a str>,
+    hierarchy_active: bool,
+    fts_archived_fragment: &'static str,
+    sem_archived_fragment: &'static str,
+    fts_source_uri_fragment: &'static str,
+    sem_source_uri_fragment: &'static str,
+    source_uri_like_param: Option<String>,
+}
+
+/// #871 stage 1 — query preparation. Sanitises the FTS5 expression,
+/// resolves namespace hierarchy expansion (`Task 1.12`), computes
+/// visibility prefixes for the `?8..?11` (FTS) / `?6..?9` (semantic)
+/// bind slots, and stamps the archived-source / source-URI-prefix
+/// SQL fragments.
+///
+/// The `'now'` timestamp is captured here so all subsequent stages
+/// see the same monotonic instant.
+fn prepare_hybrid_query<'a>(
+    context: &str,
+    namespace: Option<&'a str>,
+    as_agent: Option<&str>,
+    include_archived: bool,
+    source_uri_prefix: Option<&str>,
+) -> HybridPrep<'a> {
+    let now = Utc::now().to_rfc3339();
+    let fts_query = sanitize_fts_query(context, true);
+    let prefixes = compute_visibility_prefixes(as_agent);
+    let (fts_hierarchy_in, hierarchy_active) = hierarchy_in_clause(namespace);
+    let fts_hierarchy_fragment = fts_hierarchy_in.unwrap_or_default();
+    let sem_hierarchy_fragment = if hierarchy_active {
+        if let Some(ns) = namespace {
+            let ancestors = crate::models::namespace_ancestors(ns);
+            let quoted: Vec<String> = ancestors
+                .iter()
+                .map(|a| format!("'{}'", a.replace('\'', "''")))
+                .collect();
+            format!("AND memories.namespace IN ({})", quoted.join(","))
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+    let effective_namespace = if hierarchy_active { None } else { namespace };
+    let fts_archived_fragment = archived_source_clause(include_archived, "m");
+    let sem_archived_fragment = archived_source_clause(include_archived, "memories");
+    let source_uri_like_param: Option<String> = match source_uri_prefix {
+        Some(prefix) if !prefix.is_empty() => Some(format!("{}%", escape_like_pattern(prefix))),
+        _ => None,
+    };
+    let fts_source_uri_fragment = if source_uri_like_param.is_some() {
+        "AND m.source_uri LIKE ?12 ESCAPE '\\'"
+    } else {
+        ""
+    };
+    let sem_source_uri_fragment = if source_uri_like_param.is_some() {
+        "AND memories.source_uri LIKE ?10 ESCAPE '\\'"
+    } else {
+        ""
+    };
+    HybridPrep {
+        fts_query,
+        now,
+        prefixes,
+        fts_hierarchy_fragment,
+        sem_hierarchy_fragment,
+        effective_namespace,
+        hierarchy_active,
+        fts_archived_fragment,
+        sem_archived_fragment,
+        fts_source_uri_fragment,
+        sem_source_uri_fragment,
+        source_uri_like_param,
+    }
+}
+
+/// #871 stage 2 — FTS5 keyword phase. Builds + executes the FTS SQL
+/// with the per-row `fts_score` projection, returns the raw
+/// `(Memory, fts_score, embedding_bytes)` tuples for the fusion
+/// stage. The embedding bytes are pulled inline from the same
+/// SELECT (Cluster-F PERF-2) so the fusion stage can compute cosine
+/// without an N+1 round-trip.
+fn fts_keyword_phase(
+    conn: &Connection,
+    prep: &HybridPrep<'_>,
+    tags_filter: Option<&str>,
+    since: Option<&str>,
+    until: Option<&str>,
+    limit: usize,
+) -> Result<Vec<(Memory, f64, Option<Vec<u8>>)>> {
+    let fts_limit = (limit * 3).max(30);
+    let fts_sql = format!(
+        "SELECT m.id, m.tier, m.namespace, m.title, m.content, m.tags, m.priority,
+                m.confidence, m.source, m.access_count, m.created_at, m.updated_at,
+                m.last_accessed_at, m.expires_at, m.metadata, m.reflection_depth,
+                m.memory_kind, m.entity_id, m.persona_version,
+                m.citations, m.source_uri, m.source_span,
+                m.confidence_source, m.confidence_signals, m.confidence_decayed_at, m.embedding,
+                (fts.rank * -1) + (m.priority * 0.5) + (MIN(m.access_count, 50) * 0.1)
+                + (m.confidence * 2.0)
+                + (CASE m.tier WHEN 'long' THEN 3.0 WHEN 'mid' THEN 1.0 ELSE 0.0 END)
+                + (1.0 / (1.0 + (julianday('now') - julianday(m.updated_at)) * 0.1))
+                AS fts_score
+         FROM memories_fts fts
+         JOIN memories m ON m.rowid = fts.rowid
+         WHERE memories_fts MATCH ?1
+           AND (?2 IS NULL OR m.namespace = ?2)
+           {fts_hierarchy_fragment}
+           AND (m.expires_at IS NULL OR m.expires_at > ?3)
+           AND (?4 IS NULL OR EXISTS (SELECT 1 FROM json_each(m.tags) WHERE json_each.value = ?4))
+           AND (?5 IS NULL OR m.created_at >= ?5)
+           AND (?6 IS NULL OR m.created_at <= ?6)
+           {fts_archived_fragment}
+           {fts_source_uri_fragment}
+           {vis}
+         ORDER BY fts_score DESC
+         LIMIT ?7",
+        fts_hierarchy_fragment = prep.fts_hierarchy_fragment,
+        fts_archived_fragment = prep.fts_archived_fragment,
+        fts_source_uri_fragment = prep.fts_source_uri_fragment,
+        vis = visibility_clause(8, "m"),
+    );
+    let mut fts_stmt = conn.prepare(&fts_sql)?;
+    let fts_row_handler =
+        |row: &rusqlite::Row<'_>| -> rusqlite::Result<(Memory, f64, Option<Vec<u8>>)> {
+            let mem = row_to_memory(row)?;
+            let fts_score: f64 = row.get("fts_score")?;
+            // Index 25 = `m.embedding` (the SELECT list above places it
+            // after `confidence_decayed_at`). Pull as `Option<Vec<u8>>`
+            // so legacy rows without embeddings surface as `None`.
+            let embedding_bytes: Option<Vec<u8>> = row.get(25)?;
+            Ok((mem, fts_score, embedding_bytes))
+        };
+    let (vis_p, vis_t, vis_u, vis_o) = prep.prefixes.clone();
+    let rows: Vec<(Memory, f64, Option<Vec<u8>>)> =
+        if let Some(ref uri_param) = prep.source_uri_like_param {
+            fts_stmt
+                .query_map(
+                    params![
+                        prep.fts_query,
+                        prep.effective_namespace,
+                        prep.now,
+                        tags_filter,
+                        since,
+                        until,
+                        fts_limit,
+                        vis_p,
+                        vis_t,
+                        vis_u,
+                        vis_o,
+                        uri_param,
+                    ],
+                    fts_row_handler,
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            fts_stmt
+                .query_map(
+                    params![
+                        prep.fts_query,
+                        prep.effective_namespace,
+                        prep.now,
+                        tags_filter,
+                        since,
+                        until,
+                        fts_limit,
+                        vis_p,
+                        vis_t,
+                        vis_u,
+                        vis_o,
+                    ],
+                    fts_row_handler,
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+    Ok(rows)
+}
+
+/// #871 stage 3 — semantic phase. Two paths share the same `scored`
+/// HashMap mutation contract:
+///
+///   - HNSW path (when a `vector_index` is supplied): runs an ANN
+///     search bounded at `5×limit`, gates each hit at `cosine > 0.2`,
+///     and re-applies the FTS WHERE-clause filters in Rust because
+///     the HNSW index returns raw vector neighbours (no SQL
+///     visibility / archived-source / source-URI-prefix filter has
+///     run).
+///   - Linear-scan fallback (HNSW absent): runs the semantic SQL,
+///     decodes embedding BLOBs, applies the same `cosine > 0.2`
+///     gate, and inserts surviving rows into `scored`.
+///
+/// Returns the running `hnsw_candidates_count` for telemetry. Rows
+/// already present in `scored` (i.e. FTS-side hits) are skipped so
+/// the FTS embedding-based cosine wins (consistent with the
+/// pre-refactor behaviour).
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_lines)]
+fn semantic_phase(
+    conn: &Connection,
+    prep: &HybridPrep<'_>,
+    query_embedding: &[f32],
+    vector_index: Option<&crate::hnsw::VectorIndex>,
+    namespace: Option<&str>,
+    tags_filter: Option<&str>,
+    since: Option<&str>,
+    until: Option<&str>,
+    limit: usize,
+    include_archived: bool,
+    source_uri_prefix: Option<&str>,
+    scored: &mut HashMap<String, (Memory, f64, f64)>,
+) -> Result<usize> {
+    let mut hnsw_candidates_count: usize = 0;
+    let now = prep.now.as_str();
+    if let Some(idx) = vector_index {
+        let ann_limit = (limit * 5).max(50);
+        let hits = idx.search(query_embedding, ann_limit);
+        for hit in hits {
+            if scored.contains_key(&hit.id) {
+                continue;
+            }
+            let cosine = f64::from(1.0 - hit.distance);
+            // v0.6.2 (S18 iteration): cosine gate relaxed 0.3 → 0.2 —
+            // see the matching comment in the linear-scan branch below.
+            if cosine > 0.2
+                && let Some(mem) = get(conn, &hit.id)?
+            {
+                if let Some(ns) = namespace {
+                    if prep.hierarchy_active {
+                        let ancestors = crate::models::namespace_ancestors(ns);
+                        if !ancestors.iter().any(|a| a == &mem.namespace) {
+                            continue;
+                        }
+                    } else if mem.namespace != ns {
+                        continue;
+                    }
+                }
+                if let Some(exp) = &mem.expires_at
+                    && exp.as_str() <= now
+                {
+                    continue;
+                }
+                if let Some(tf) = tags_filter
+                    && !mem.tags.iter().any(|t| t == tf)
+                {
+                    continue;
+                }
+                if let Some(s) = since
+                    && mem.created_at.as_str() < s
+                {
+                    continue;
+                }
+                if let Some(u) = until
+                    && mem.created_at.as_str() > u
+                {
+                    continue;
+                }
+                if !is_visible(&mem, &prep.prefixes) {
+                    continue;
+                }
+                if !include_archived && is_archived_source(&mem) {
+                    continue;
+                }
+                if let Some(prefix) = source_uri_prefix
+                    && !prefix.is_empty()
+                    && !mem
+                        .source_uri
+                        .as_deref()
+                        .is_some_and(|u| u.starts_with(prefix))
+                {
+                    continue;
+                }
+                scored.insert(mem.id.clone(), (mem, 0.0, cosine));
+                hnsw_candidates_count += 1;
+            }
+        }
+        return Ok(hnsw_candidates_count);
+    }
+
+    // Fallback: linear scan over all embeddings.
+    let sem_sql = format!(
+        "SELECT id, tier, namespace, title, content, tags, priority,
+                confidence, source, access_count, created_at, updated_at,
+                last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, embedding
+         FROM memories
+         WHERE embedding IS NOT NULL
+           AND (?1 IS NULL OR namespace = ?1)
+           {sem_hierarchy_fragment}
+           AND (expires_at IS NULL OR expires_at > ?2)
+           AND (?3 IS NULL OR EXISTS (SELECT 1 FROM json_each(memories.tags) WHERE json_each.value = ?3))
+           AND (?4 IS NULL OR created_at >= ?4)
+           AND (?5 IS NULL OR created_at <= ?5)
+           {sem_archived_fragment}
+           {sem_source_uri_fragment}
+           {vis}",
+        sem_hierarchy_fragment = prep.sem_hierarchy_fragment,
+        sem_archived_fragment = prep.sem_archived_fragment,
+        sem_source_uri_fragment = prep.sem_source_uri_fragment,
+        vis = visibility_clause(6, "memories"),
+    );
+    let mut sem_stmt = conn.prepare(&sem_sql)?;
+    let sem_row_handler = |row: &rusqlite::Row<'_>| -> rusqlite::Result<(Memory, Option<Vec<u8>>)> {
+        let mem = row_to_memory(row)?;
+        // v0.7.x Form 6 — `memory_kind` was inserted between
+        // `reflection_depth` and `embedding` in the SELECT list
+        // above; `embedding` sits at zero-based index 17.
+        let emb_bytes: Option<Vec<u8>> = row.get(17)?;
+        Ok((mem, emb_bytes))
+    };
+    let (vis_p, vis_t, vis_u, vis_o) = prep.prefixes.clone();
+    let sem_results: Vec<(Memory, Option<Vec<u8>>)> =
+        if let Some(ref uri_param) = prep.source_uri_like_param {
+            sem_stmt
+                .query_map(
+                    params![
+                        prep.effective_namespace,
+                        prep.now,
+                        tags_filter,
+                        since,
+                        until,
+                        vis_p,
+                        vis_t,
+                        vis_u,
+                        vis_o,
+                        uri_param,
+                    ],
+                    sem_row_handler,
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            sem_stmt
+                .query_map(
+                    params![
+                        prep.effective_namespace,
+                        prep.now,
+                        tags_filter,
+                        since,
+                        until,
+                        vis_p,
+                        vis_t,
+                        vis_u,
+                        vis_o,
+                    ],
+                    sem_row_handler,
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+    for (mem, emb_bytes) in sem_results {
+        if scored.contains_key(&mem.id) {
+            continue;
+        }
+        if let Some(bytes) = emb_bytes
+            && !bytes.is_empty()
+        {
+            // v0.6.3.1 P2 — tolerate legacy + headed payloads; skip
+            // (with telemetry) on malformed BLOBs so a single corrupt
+            // row can't poison the whole semantic stage.
+            let Ok(emb) = crate::embeddings::decode_embedding_blob(&bytes) else {
+                tracing::warn!(
+                    memory_id = %mem.id,
+                    "skipping malformed embedding BLOB during semantic recall"
+                );
+                continue;
+            };
+            let cosine = f64::from(crate::embeddings::Embedder::cosine_similarity(
+                query_embedding,
+                &emb,
+            ));
+            if cosine > 0.2 {
+                scored.insert(mem.id.clone(), (mem, 0.0, cosine));
+                hnsw_candidates_count += 1;
+            }
+        }
+    }
+    Ok(hnsw_candidates_count)
+}
+
+/// #871 stage 4 — adaptive blend + decay.
+///
+/// Per-row: normalises `fts_score` by `max_fts_score`, lerp-derives
+/// `semantic_weight` from content length (0.50 ≤500 chars → 0.15
+/// ≥5000 chars; embeddings lose information on long text, FTS stays
+/// precise), and multiplies by the per-tier exponential decay from
+/// `scoring`. Returns the ranked (sort by blended score, truncated
+/// to `limit`) result list AND the captured per-candidate
+/// `semantic_weight` vector for telemetry.
+fn blend_and_rank(
+    scored: HashMap<String, (Memory, f64, f64)>,
+    max_fts_score: f64,
+    scoring: &crate::config::ResolvedScoring,
+    limit: usize,
+) -> (Vec<(Memory, f64)>, Vec<f64>) {
+    let now_utc = Utc::now();
+    let mut weights: Vec<f64> = Vec::new();
+    let mut results: Vec<(Memory, f64)> = scored
+        .into_values()
+        .map(|(mem, fts_score, cosine)| {
+            let norm_fts = if max_fts_score > 0.0 {
+                fts_score / max_fts_score
+            } else {
+                0.0
+            };
+            // B4 (R2-LOW) — clamp to i32::MAX instead of panicking when
+            // a memory's content is >2GB. The lerp below treats anything
+            // ≥5000 chars as the long-tail bucket regardless, so the
+            // clamp does not change scoring; it only closes a panic
+            // window a hostile import could otherwise reach.
+            let content_len = f64::from(i32::try_from(mem.content.len()).unwrap_or(i32::MAX));
+            let semantic_weight = if content_len <= 500.0 {
+                0.50
+            } else if content_len >= 5000.0 {
+                0.15
+            } else {
+                0.50 - 0.35 * ((content_len - 500.0) / 4500.0)
+            };
+            weights.push(semantic_weight);
+            let blended = semantic_weight * cosine + (1.0 - semantic_weight) * norm_fts;
+            let age_days = chrono::DateTime::parse_from_rfc3339(&mem.created_at)
+                .ok()
+                .map_or(0.0, |ts| {
+                    let secs = (now_utc - ts.with_timezone(&Utc)).num_seconds();
+                    #[allow(clippy::cast_precision_loss)]
+                    {
+                        secs as f64 / 86_400.0
+                    }
+                });
+            let decay = scoring.decay_multiplier(&mem.tier, age_days);
+            (mem, blended * decay)
+        })
+        .collect();
+    results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    results.truncate(limit);
+    (results, weights)
+}
+
+/// #871 stage 5 — post-fusion ops: proximity boost (when hierarchy
+/// expansion is active), token-budget application, and the batched
+/// `touch_many` write that bumps `access_count` + slides the per-tier
+/// expiry on every memory in the surviving set.
+fn apply_recall_post_ops(
+    conn: &Connection,
+    results: Vec<(Memory, f64)>,
+    hierarchy_active: bool,
+    namespace: Option<&str>,
+    budget_tokens: Option<usize>,
+    short_extend: i64,
+    mid_extend: i64,
+) -> (Vec<(Memory, f64)>, BudgetOutcome) {
+    let boosted = if let (true, Some(anchor)) = (hierarchy_active, namespace) {
+        apply_proximity_boost(results, anchor)
+    } else {
+        results
+    };
+    let (budgeted, outcome) = apply_token_budget(boosted, budget_tokens);
+    let touch_ids: Vec<&str> = budgeted.iter().map(|(mem, _)| mem.id.as_str()).collect();
+    if let Err(e) = touch_many(conn, &touch_ids, short_extend, mid_extend) {
+        tracing::warn!("touch_many failed for hybrid recall set: {}", e);
+    }
+    (budgeted, outcome)
+}
+
+/// #871 stage 6 — telemetry assembly. Aggregates the per-stage
+/// candidate counters and the mean `semantic_weight` across the
+/// returned set (NOT the full candidate pool — operators care about
+/// what made it out).
+fn assemble_recall_telemetry(
+    fts_candidates: usize,
+    hnsw_candidates: usize,
+    blend_weights: &[f64],
+) -> crate::models::RecallTelemetry {
+    let blend_weight_avg = if blend_weights.is_empty() {
+        0.0
+    } else {
+        #[allow(clippy::cast_precision_loss)]
+        let n = blend_weights.len() as f64;
+        blend_weights.iter().sum::<f64>() / n
+    };
+    crate::models::RecallTelemetry {
+        fts_candidates,
+        hnsw_candidates,
+        blend_weight_avg,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn recall_hybrid_with_telemetry(
     conn: &Connection,
     context: &str,
@@ -5541,188 +6052,32 @@ pub fn recall_hybrid_with_telemetry(
     BudgetOutcome,
     crate::models::RecallTelemetry,
 )> {
-    let now = Utc::now().to_rfc3339();
-    let fts_query = sanitize_fts_query(context, true);
-    let prefixes = compute_visibility_prefixes(as_agent);
-    let (vis_p, vis_t, vis_u, vis_o) = prefixes.clone();
-
-    // Task 1.12: hierarchy expansion (same logic as `recall`). Hierarchical
-    // `namespace` broadens filter to ancestor chain; flat namespaces stay
-    // exact-match.
-    let (fts_hierarchy_in, hierarchy_active) = hierarchy_in_clause(namespace);
-    let fts_hierarchy_fragment = fts_hierarchy_in.unwrap_or_default();
-    // Semantic stmt has no `m.` alias and binds at slot 1 — compute separately.
-    let sem_hierarchy_fragment = if hierarchy_active {
-        if let Some(ns) = namespace {
-            let ancestors = crate::models::namespace_ancestors(ns);
-            let quoted: Vec<String> = ancestors
-                .iter()
-                .map(|a| format!("'{}'", a.replace('\'', "''")))
-                .collect();
-            format!("AND memories.namespace IN ({})", quoted.join(","))
-        } else {
-            String::new()
-        }
-    } else {
-        String::new()
-    };
-    let effective_namespace = if hierarchy_active { None } else { namespace };
-
-    // v0.7.0 WT-1-E — archived-source exclusion (default) / pass-
-    // through. Same predicate shape used in `recall`; the FTS branch
-    // uses the `m.` alias, the semantic branch (semantic-only `SELECT
-    // FROM memories`) uses the `memories.` alias.
-    let fts_archived_fragment = archived_source_clause(include_archived, "m");
-    let sem_archived_fragment = archived_source_clause(include_archived, "memories");
-
-    // v0.7.0 Form 4 / Cluster-A PERF-3 — push `source_uri_prefix` into
-    // both branches. FTS branch binds at ?12 (visibility uses ?8–?11);
-    // semantic branch binds at ?10 (visibility uses ?6–?9).
-    let source_uri_like_param: Option<String> = match source_uri_prefix {
-        Some(prefix) if !prefix.is_empty() => Some(format!("{}%", escape_like_pattern(prefix))),
-        _ => None,
-    };
-    let fts_source_uri_fragment = if source_uri_like_param.is_some() {
-        "AND m.source_uri LIKE ?12 ESCAPE '\\'"
-    } else {
-        ""
-    };
-    let sem_source_uri_fragment = if source_uri_like_param.is_some() {
-        "AND memories.source_uri LIKE ?10 ESCAPE '\\'"
-    } else {
-        ""
-    };
-
-    // Step 1: Get FTS candidates (up to 3x limit to have a good pool)
-    let fts_limit = (limit * 3).max(30);
-    let fts_sql = format!(
-        "SELECT m.id, m.tier, m.namespace, m.title, m.content, m.tags, m.priority,
-                m.confidence, m.source, m.access_count, m.created_at, m.updated_at,
-                m.last_accessed_at, m.expires_at, m.metadata, m.reflection_depth,
-                m.memory_kind, m.entity_id, m.persona_version,
-                m.citations, m.source_uri, m.source_span,
-                m.confidence_source, m.confidence_signals, m.confidence_decayed_at, m.embedding,
-                (fts.rank * -1) + (m.priority * 0.5) + (MIN(m.access_count, 50) * 0.1)
-                + (m.confidence * 2.0)
-                + (CASE m.tier WHEN 'long' THEN 3.0 WHEN 'mid' THEN 1.0 ELSE 0.0 END)
-                + (1.0 / (1.0 + (julianday('now') - julianday(m.updated_at)) * 0.1))
-                AS fts_score
-         FROM memories_fts fts
-         JOIN memories m ON m.rowid = fts.rowid
-         WHERE memories_fts MATCH ?1
-           AND (?2 IS NULL OR m.namespace = ?2)
-           {fts_hierarchy_fragment}
-           AND (m.expires_at IS NULL OR m.expires_at > ?3)
-           AND (?4 IS NULL OR EXISTS (SELECT 1 FROM json_each(m.tags) WHERE json_each.value = ?4))
-           AND (?5 IS NULL OR m.created_at >= ?5)
-           AND (?6 IS NULL OR m.created_at <= ?6)
-           {fts_archived_fragment}
-           {fts_source_uri_fragment}
-           {vis}
-         ORDER BY fts_score DESC
-         LIMIT ?7",
-        vis = visibility_clause(8, "m"),
+    // Stage 1 — query preparation (FTS sanitisation, namespace
+    // hierarchy expansion, visibility prefixes, SQL fragments).
+    let prep = prepare_hybrid_query(
+        context,
+        namespace,
+        as_agent,
+        include_archived,
+        source_uri_prefix,
     );
-    let mut fts_stmt = conn.prepare(&fts_sql)?;
 
-    // Step 2: Get semantic candidates — all memories with embeddings
-    let sem_sql = format!(
-        "SELECT id, tier, namespace, title, content, tags, priority,
-                confidence, source, access_count, created_at, updated_at,
-                last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, embedding
-         FROM memories
-         WHERE embedding IS NOT NULL
-           AND (?1 IS NULL OR namespace = ?1)
-           {sem_hierarchy_fragment}
-           AND (expires_at IS NULL OR expires_at > ?2)
-           AND (?3 IS NULL OR EXISTS (SELECT 1 FROM json_each(memories.tags) WHERE json_each.value = ?3))
-           AND (?4 IS NULL OR created_at >= ?4)
-           AND (?5 IS NULL OR created_at <= ?5)
-           {sem_archived_fragment}
-           {sem_source_uri_fragment}
-           {vis}",
-        vis = visibility_clause(6, "memories"),
-    );
-    let mut sem_stmt = conn.prepare(&sem_sql)?;
+    // Stage 2 — FTS5 keyword phase.
+    let fts_results = fts_keyword_phase(conn, &prep, tags_filter, since, until, limit)?;
 
-    // Collect FTS results with scores
-    let mut scored: HashMap<String, (Memory, f64, f64)> = HashMap::new(); // id -> (memory, fts_score, cosine_score)
-
-    // Cluster-F PERF-2 — the FTS SELECT already pulls `m.embedding` as
-    // the 26th column (index 25). Extract the bytes inline so the
-    // result-set walk below can compute cosine WITHOUT issuing a
-    // per-row `get_embedding` query — eliminating an N+1 round-trip
-    // against the `memories` table on every hybrid recall.
-    //
-    // Conditional binding: SQLite errors on parameter-count mismatch,
-    // so when source_uri_prefix is None we must NOT bind ?12.
-    let fts_row_handler =
-        |row: &rusqlite::Row<'_>| -> rusqlite::Result<(Memory, f64, Option<Vec<u8>>)> {
-            let mem = row_to_memory(row)?;
-            let fts_score: f64 = row.get("fts_score")?;
-            // Index 25 = `m.embedding` (the SELECT list above places it
-            // after `confidence_decayed_at`). Pull as `Option<Vec<u8>>`
-            // so legacy rows without embeddings surface as `None`.
-            let embedding_bytes: Option<Vec<u8>> = row.get(25)?;
-            Ok((mem, fts_score, embedding_bytes))
-        };
-    let fts_results: Vec<(Memory, f64, Option<Vec<u8>>)> =
-        if let Some(ref uri_param) = source_uri_like_param {
-            let rows = fts_stmt.query_map(
-                params![
-                    fts_query,
-                    effective_namespace,
-                    now,
-                    tags_filter,
-                    since,
-                    until,
-                    fts_limit,
-                    vis_p,
-                    vis_t,
-                    vis_u,
-                    vis_o,
-                    uri_param,
-                ],
-                fts_row_handler,
-            )?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()?
-        } else {
-            let rows = fts_stmt.query_map(
-                params![
-                    fts_query,
-                    effective_namespace,
-                    now,
-                    tags_filter,
-                    since,
-                    until,
-                    fts_limit,
-                    vis_p,
-                    vis_t,
-                    vis_u,
-                    vis_o,
-                ],
-                fts_row_handler,
-            )?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()?
-        };
-
-    // v0.6.3.1 (P3): pre-fusion candidate-pool counters surfaced to the
-    // MCP `meta` block. Counted here at retrieval time, not after fusion,
-    // so operators see how each stage contributed even when fusion
-    // collapses the union to a smaller set.
-    let mut fts_candidates_count: usize = 0;
-    let mut hnsw_candidates_count: usize = 0;
-
+    // Fusion pool (id → (memory, fts_score, cosine_score)). FTS rows
+    // land first so their inline-fetched embedding-cosine wins; the
+    // semantic phase only inserts ids it hasn't seen.
+    let mut scored: HashMap<String, (Memory, f64, f64)> = HashMap::new();
     let mut max_fts_score: f64 = 1.0;
+    let mut fts_candidates_count: usize = 0;
     for (mem, fts_score, embedding_bytes) in fts_results {
         if fts_score > max_fts_score {
             max_fts_score = fts_score;
         }
         // Cluster-F PERF-2 — cosine from the inline-fetched embedding
-        // bytes. The bytes decoder matches the contract in
-        // `get_embedding` (v0.6.3.1 P2 magic-byte tolerant); malformed
-        // BLOBs degrade to cosine=0 + warn-log so a single corrupt row
-        // does not poison the whole recall.
+        // bytes. Malformed BLOBs degrade to cosine=0 + warn-log so a
+        // single corrupt row does not poison the whole recall.
         let cosine = match embedding_bytes {
             Some(bytes) if !bytes.is_empty() => {
                 match crate::embeddings::decode_embedding_blob(&bytes) {
@@ -5745,279 +6100,39 @@ pub fn recall_hybrid_with_telemetry(
         fts_candidates_count += 1;
     }
 
-    // Semantic-only candidates — use HNSW index for fast ANN if available,
-    // otherwise fall back to linear scan over all embeddings.
-    if let Some(idx) = vector_index {
-        // HNSW approximate nearest-neighbor search
-        let ann_limit = (limit * 5).max(50);
-        let hits = idx.search(query_embedding, ann_limit);
-        for hit in hits {
-            if scored.contains_key(&hit.id) {
-                continue;
-            }
-            let cosine = f64::from(1.0 - hit.distance);
-            // v0.6.2 (S18 iteration): cosine gate relaxed 0.3 → 0.2.
-            // Scenario-18 caught a real-world miss at the old ceiling:
-            // semantically-related pairs with varied phrasing ("morning
-            // outdoor exercise routine" vs. "brisk uphill strides along
-            // the ridge line trails") landed at 0.25-0.29 cosine and
-            // silently fell below 0.3, returning zero semantic hits.
-            // 0.2 keeps clearly-unrelated content out (random noise
-            // hovers near 0) while admitting legitimate semantic
-            // associations; the blended score + FTS component still
-            // rank relevance on the way out.
-            if cosine > 0.2
-                && let Some(mem) = get(conn, &hit.id)?
-            {
-                // Apply namespace/expiry/tag filters. Task 1.12: when
-                // hierarchy expansion is active, allow any ancestor match
-                // (namespace_ancestors gives us the set); otherwise exact.
-                if let Some(ns) = namespace {
-                    if hierarchy_active {
-                        let ancestors = crate::models::namespace_ancestors(ns);
-                        if !ancestors.iter().any(|a| a == &mem.namespace) {
-                            continue;
-                        }
-                    } else if mem.namespace != ns {
-                        continue;
-                    }
-                }
-                if let Some(exp) = &mem.expires_at
-                    && exp.as_str() <= now.as_str()
-                {
-                    continue;
-                }
-                if let Some(tf) = tags_filter
-                    && !mem.tags.iter().any(|t| t == tf)
-                {
-                    continue;
-                }
-                if let Some(s) = since
-                    && mem.created_at.as_str() < s
-                {
-                    continue;
-                }
-                if let Some(u) = until
-                    && mem.created_at.as_str() > u
-                {
-                    continue;
-                }
-                // #151 visibility filter (HNSW branch)
-                if !is_visible(&mem, &prefixes) {
-                    continue;
-                }
-                // v0.7.0 WT-1-E — archived-source exclusion. The HNSW
-                // path bypasses the FTS/semantic SQL WHERE clause, so
-                // we re-check the same predicate in Rust to keep the
-                // include_archived=false semantics consistent across
-                // retrieval branches. Looks for BOTH atomised_into>0
-                // and metadata.atomisation_archived_at, mirroring
-                // [`archived_source_clause`].
-                if !include_archived && is_archived_source(&mem) {
-                    continue;
-                }
-                // v0.7.0 Form 4 / Cluster-A PERF-3 — apply
-                // source-URI-prefix filter on the HNSW branch in Rust
-                // (the HNSW index returns vector neighbours, not a
-                // SQL query — so the WHERE-clause push-down in the
-                // FTS/semantic branches doesn't reach here).
-                if let Some(prefix) = source_uri_prefix
-                    && !prefix.is_empty()
-                    && !mem
-                        .source_uri
-                        .as_deref()
-                        .is_some_and(|u| u.starts_with(prefix))
-                {
-                    continue;
-                }
-                scored.insert(mem.id.clone(), (mem, 0.0, cosine));
-                hnsw_candidates_count += 1;
-            }
-        }
-    } else {
-        // Fallback: linear scan over all embeddings. Conditional
-        // binding mirrors the FTS branch — when source_uri_prefix is
-        // None we must not bind ?10.
-        let sem_row_handler =
-            |row: &rusqlite::Row<'_>| -> rusqlite::Result<(Memory, Option<Vec<u8>>)> {
-                let mem = row_to_memory(row)?;
-                // v0.7.x Form 6: `memory_kind` was inserted between
-                // `reflection_depth` and `embedding` in the SELECT list
-                // above. The semantic SELECT's column order is
-                // [id, tier, namespace, title, content, tags, priority,
-                //  confidence, source, access_count, created_at,
-                //  updated_at, last_accessed_at, expires_at, metadata,
-                //  reflection_depth, memory_kind, embedding] — embedding
-                // sits at zero-based index 17 (Cluster-F regression
-                // pin caught the prior `row.get(16)` reading the
-                // `memory_kind` TEXT column as `Option<Vec<u8>>`).
-                let emb_bytes: Option<Vec<u8>> = row.get(17)?;
-                Ok((mem, emb_bytes))
-            };
-        let sem_results: Vec<(Memory, Option<Vec<u8>>)> =
-            if let Some(ref uri_param) = source_uri_like_param {
-                let rows = sem_stmt.query_map(
-                    params![
-                        effective_namespace,
-                        now,
-                        tags_filter,
-                        since,
-                        until,
-                        vis_p,
-                        vis_t,
-                        vis_u,
-                        vis_o,
-                        uri_param,
-                    ],
-                    sem_row_handler,
-                )?;
-                rows.collect::<rusqlite::Result<Vec<_>>>()?
-            } else {
-                let rows = sem_stmt.query_map(
-                    params![
-                        effective_namespace,
-                        now,
-                        tags_filter,
-                        since,
-                        until,
-                        vis_p,
-                        vis_t,
-                        vis_u,
-                        vis_o,
-                    ],
-                    sem_row_handler,
-                )?;
-                rows.collect::<rusqlite::Result<Vec<_>>>()?
-            };
+    // Stage 3 — semantic phase (HNSW when available, linear-scan fallback).
+    let hnsw_candidates_count = semantic_phase(
+        conn,
+        &prep,
+        query_embedding,
+        vector_index,
+        namespace,
+        tags_filter,
+        since,
+        until,
+        limit,
+        include_archived,
+        source_uri_prefix,
+        &mut scored,
+    )?;
 
-        for row in sem_results {
-            let (mem, emb_bytes) = (row.0, row.1);
-            if scored.contains_key(&mem.id) {
-                continue;
-            }
-            if let Some(bytes) = emb_bytes
-                && !bytes.is_empty()
-            {
-                // v0.6.3.1 P2 — tolerate legacy + headed payloads; skip
-                // (with telemetry) on malformed BLOBs so a single corrupt
-                // row can't poison the whole semantic stage.
-                let Ok(emb) = crate::embeddings::decode_embedding_blob(&bytes) else {
-                    tracing::warn!(
-                        memory_id = %mem.id,
-                        "skipping malformed embedding BLOB during semantic recall"
-                    );
-                    continue;
-                };
-                let cosine = f64::from(crate::embeddings::Embedder::cosine_similarity(
-                    query_embedding,
-                    &emb,
-                ));
-                // v0.6.2 (S18): see matching note above at the HNSW gate.
-                if cosine > 0.2 {
-                    scored.insert(mem.id.clone(), (mem, 0.0, cosine));
-                    hnsw_candidates_count += 1;
-                }
-            }
-        }
-    }
+    // Stage 4 — adaptive blend + per-tier decay.
+    let (results, blend_weights) = blend_and_rank(scored, max_fts_score, scoring, limit);
 
-    // Normalize FTS scores and compute blended score.
-    // Adaptive blend: semantic weight decreases for longer content (embeddings
-    // lose information on long text; FTS stays precise).  Short memories
-    // (< 500 chars) get 50/50, long memories (> 5 000 chars) get 15/85.
-    // v0.6.0.0: multiply the blend by a per-tier exponential time-decay with
-    // half-life defaults 7 d (short) / 30 d (mid) / 365 d (long). The
-    // `legacy_scoring` config knob short-circuits the decay back to 1.0 for
-    // A/B comparison and emergency regression rollback.
-    let now_utc = Utc::now();
-    // v0.6.3.1 (P3): collect per-candidate semantic weight in parallel with
-    // the existing fusion pass so MCP `meta.blend_weight` reports the
-    // *applied* (not configured) weight. Wrapped in `RefCell` so the map
-    // closure can side-effect without restructuring the iterator chain.
-    let blend_weights: std::cell::RefCell<Vec<f64>> = std::cell::RefCell::new(Vec::new());
-    let mut results: Vec<(Memory, f64)> = scored
-        .into_values()
-        .map(|(mem, fts_score, cosine)| {
-            let norm_fts = if max_fts_score > 0.0 {
-                fts_score / max_fts_score
-            } else {
-                0.0
-            };
-            // B4 (R2-LOW) — clamp to i32::MAX instead of panicking when
-            // a memory's content is >2GB. The lerp below treats anything
-            // ≥5000 chars as the long-tail bucket regardless, so the
-            // clamp does not change scoring; it only closes a panic
-            // window a hostile import could otherwise reach.
-            let content_len = f64::from(i32::try_from(mem.content.len()).unwrap_or(i32::MAX));
-            // Lerp semantic_weight from 0.50 (≤500 chars) to 0.15 (≥5000 chars)
-            let semantic_weight = if content_len <= 500.0 {
-                0.50
-            } else if content_len >= 5000.0 {
-                0.15
-            } else {
-                0.50 - 0.35 * ((content_len - 500.0) / 4500.0)
-            };
-            blend_weights.borrow_mut().push(semantic_weight);
-            let blended = semantic_weight * cosine + (1.0 - semantic_weight) * norm_fts;
-            let age_days = chrono::DateTime::parse_from_rfc3339(&mem.created_at)
-                .ok()
-                .map_or(0.0, |ts| {
-                    let secs = (now_utc - ts.with_timezone(&Utc)).num_seconds();
-                    // Saturate at ~68 y (i32::MAX seconds). Practical: any memory
-                    // older than that decays all the way down and the exact age
-                    // doesn't matter. Precision loss here is negligible — we
-                    // only need ~hour granularity on a 1 e-9..1.0 multiplier.
-                    #[allow(clippy::cast_precision_loss)]
-                    {
-                        secs as f64 / 86_400.0
-                    }
-                });
-            let decay = scoring.decay_multiplier(&mem.tier, age_days);
-            (mem, blended * decay)
-        })
-        .collect();
+    // Stage 5 — proximity boost + token budget + batched touch.
+    let (budgeted, outcome) = apply_recall_post_ops(
+        conn,
+        results,
+        prep.hierarchy_active,
+        namespace,
+        budget_tokens,
+        short_extend,
+        mid_extend,
+    );
 
-    results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    results.truncate(limit);
-
-    // Task 1.12: proximity boost (if hierarchy expansion is active).
-    let boosted = if let (true, Some(anchor)) = (hierarchy_active, namespace) {
-        apply_proximity_boost(results, anchor)
-    } else {
-        results
-    };
-
-    // Task 1.11 / Phase P6: apply token budget in rank order (AFTER
-    // proximity). Returns BudgetOutcome with all R1 meta fields.
-    let (budgeted, outcome) = apply_token_budget(boosted, budget_tokens);
-
-    // Cluster-F PERF-6 — batched touch for the hybrid surviving set
-    // (see [`touch_many`] for the contract).
-    let touch_ids: Vec<&str> = budgeted.iter().map(|(mem, _)| mem.id.as_str()).collect();
-    if let Err(e) = touch_many(conn, &touch_ids, short_extend, mid_extend) {
-        tracing::warn!("touch_many failed for hybrid recall set: {}", e);
-    }
-
-    // v0.6.3.1 (P3): summarize per-stage candidate counts and the average
-    // semantic blend weight for the MCP `meta` block. `blend_weight_avg`
-    // is the unweighted mean across the *post-fusion* candidate set so
-    // operators see the typical weight applied to what shipped, not the
-    // configured ceiling. Pre-fusion counts come from the retrieval
-    // counters (FTS / HNSW), which gives an honest picture of stage
-    // contribution even when fusion deduplicates.
-    let weights = blend_weights.into_inner();
-    let blend_weight_avg = if weights.is_empty() {
-        0.0
-    } else {
-        #[allow(clippy::cast_precision_loss)]
-        let n = weights.len() as f64;
-        weights.iter().sum::<f64>() / n
-    };
-    let telemetry = crate::models::RecallTelemetry {
-        fts_candidates: fts_candidates_count,
-        hnsw_candidates: hnsw_candidates_count,
-        blend_weight_avg,
-    };
+    // Stage 6 — telemetry assembly.
+    let telemetry =
+        assemble_recall_telemetry(fts_candidates_count, hnsw_candidates_count, &blend_weights);
 
     Ok((budgeted, outcome, telemetry))
 }
