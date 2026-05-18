@@ -32,8 +32,8 @@ use ai_memory::config::{
 use ai_memory::db;
 use ai_memory::models::ConfidenceSource;
 use ai_memory::models::{
-    ApproverType, GovernanceDecision, GovernanceLevel, GovernancePolicy, GovernedAction, Memory,
-    Tier, default_metadata,
+    ApproverType, CorePolicy, GovernanceDecision, GovernanceLevel, GovernancePolicy,
+    GovernedAction, Memory, Tier, default_metadata,
 };
 use rusqlite::Connection;
 
@@ -88,26 +88,15 @@ fn seed_policy(
 
 fn approve_write_policy() -> GovernancePolicy {
     GovernancePolicy {
-        write: GovernanceLevel::Approve,
-        promote: GovernanceLevel::Any,
-        delete: GovernanceLevel::Owner,
-        approver: ApproverType::Human,
-        inherit: true,
-        max_reflection_depth: None,
-        auto_export_reflections_to_filesystem: None,
-        auto_atomise: None,
-        auto_atomise_threshold_cl100k: None,
-        auto_atomise_max_atom_tokens: None,
-        auto_atomise_max_retries: None,
-        auto_persona_trigger_every_n_memories: None,
-        auto_export_personas_to_filesystem: None,
-        auto_atomise_mode: None,
-        legacy_per_pair_classifier: None,
-        auto_classify_kind: None,
-        synthesis_failure_mode: None,
-        synthesis_max_deletes_per_call: None,
-        synthesis_max_candidate_chars: None,
-        multistep_max_content_chars: None,
+        core: CorePolicy {
+            write: GovernanceLevel::Approve,
+            promote: GovernanceLevel::Any,
+            delete: GovernanceLevel::Owner,
+            approver: ApproverType::Human,
+            inherit: true,
+            max_reflection_depth: None,
+        },
+        ..Default::default()
     }
 }
 

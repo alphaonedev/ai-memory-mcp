@@ -62,7 +62,7 @@
 use ai_memory::db::{self, ReflectError, ReflectInput};
 use ai_memory::models::ConfidenceSource;
 use ai_memory::models::{
-    ApproverType, GovernanceLevel, GovernancePolicy, Memory, Tier, default_metadata,
+    ApproverType, CorePolicy, GovernanceLevel, GovernancePolicy, Memory, Tier, default_metadata,
 };
 use chrono::Utc;
 use rusqlite::Connection;
@@ -288,26 +288,15 @@ fn refuses_when_depth_would_exceed_default_cap_three() {
 fn explicit_cap_one_refuses_depth_two_reflection() {
     let conn = db::open(std::path::Path::new(":memory:")).unwrap();
     let policy = GovernancePolicy {
-        write: GovernanceLevel::Any,
-        promote: GovernanceLevel::Any,
-        delete: GovernanceLevel::Owner,
-        approver: ApproverType::Human,
-        inherit: true,
-        max_reflection_depth: Some(1),
-        auto_export_reflections_to_filesystem: None,
-        auto_atomise: None,
-        auto_atomise_threshold_cl100k: None,
-        auto_atomise_max_atom_tokens: None,
-        auto_atomise_max_retries: None,
-        auto_persona_trigger_every_n_memories: None,
-        auto_export_personas_to_filesystem: None,
-        auto_atomise_mode: None,
-        legacy_per_pair_classifier: None,
-        auto_classify_kind: None,
-        synthesis_failure_mode: None,
-        synthesis_max_deletes_per_call: None,
-        synthesis_max_candidate_chars: None,
-        multistep_max_content_chars: None,
+        core: CorePolicy {
+            write: GovernanceLevel::Any,
+            promote: GovernanceLevel::Any,
+            delete: GovernanceLevel::Owner,
+            approver: ApproverType::Human,
+            inherit: true,
+            max_reflection_depth: Some(1),
+        },
+        ..Default::default()
     };
     seed_policy(&conn, "task4-cap-one", &policy);
 
@@ -343,26 +332,15 @@ fn explicit_cap_one_refuses_depth_two_reflection() {
 fn cap_zero_disables_every_reflection() {
     let conn = db::open(std::path::Path::new(":memory:")).unwrap();
     let policy = GovernancePolicy {
-        write: GovernanceLevel::Any,
-        promote: GovernanceLevel::Any,
-        delete: GovernanceLevel::Owner,
-        approver: ApproverType::Human,
-        inherit: true,
-        max_reflection_depth: Some(0),
-        auto_export_reflections_to_filesystem: None,
-        auto_atomise: None,
-        auto_atomise_threshold_cl100k: None,
-        auto_atomise_max_atom_tokens: None,
-        auto_atomise_max_retries: None,
-        auto_persona_trigger_every_n_memories: None,
-        auto_export_personas_to_filesystem: None,
-        auto_atomise_mode: None,
-        legacy_per_pair_classifier: None,
-        auto_classify_kind: None,
-        synthesis_failure_mode: None,
-        synthesis_max_deletes_per_call: None,
-        synthesis_max_candidate_chars: None,
-        multistep_max_content_chars: None,
+        core: CorePolicy {
+            write: GovernanceLevel::Any,
+            promote: GovernanceLevel::Any,
+            delete: GovernanceLevel::Owner,
+            approver: ApproverType::Human,
+            inherit: true,
+            max_reflection_depth: Some(0),
+        },
+        ..Default::default()
     };
     seed_policy(&conn, "task4-cap-zero", &policy);
 

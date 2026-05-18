@@ -313,8 +313,10 @@ pub(crate) fn handle_store(
     // `kind`. The regex pass is allocation-light and runs in tens of
     // microseconds; the optional LLM round-trip is opt-in via the
     // `RegexThenLlm` policy.
-    let auto_classify_policy =
-        db::resolve_governance_policy(conn, &mem.namespace).and_then(|p| p.auto_classify_kind);
+    // #880 — `auto_classify_kind` lives on `policy.kind_class` after
+    // the governance decomposition.
+    let auto_classify_policy = db::resolve_governance_policy(conn, &mem.namespace)
+        .and_then(|p| p.kind_class.auto_classify_kind);
     crate::hooks::pre_store::maybe_auto_classify(&mut mem, auto_classify_policy);
 
     // v0.7.0 K9 — unified permission pipeline. The K9 evaluator
@@ -2073,28 +2075,17 @@ mod tests {
         approver: crate::models::ApproverType,
         owner: &str,
     ) {
-        use crate::models::{GovernanceLevel, GovernancePolicy, default_metadata};
+        use crate::models::{CorePolicy, GovernanceLevel, GovernancePolicy, default_metadata};
         let policy = GovernancePolicy {
-            write: write_level,
-            promote: GovernanceLevel::Any,
-            delete: GovernanceLevel::Any,
-            approver,
-            inherit: true,
-            max_reflection_depth: None,
-            auto_export_reflections_to_filesystem: None,
-            auto_atomise: None,
-            auto_atomise_threshold_cl100k: None,
-            auto_atomise_max_atom_tokens: None,
-            auto_atomise_max_retries: None,
-            auto_persona_trigger_every_n_memories: None,
-            auto_export_personas_to_filesystem: None,
-            auto_atomise_mode: None,
-            legacy_per_pair_classifier: None,
-            auto_classify_kind: None,
-            synthesis_failure_mode: None,
-            synthesis_max_deletes_per_call: None,
-            synthesis_max_candidate_chars: None,
-            multistep_max_content_chars: None,
+            core: CorePolicy {
+                write: write_level,
+                promote: GovernanceLevel::Any,
+                delete: GovernanceLevel::Any,
+                approver,
+                inherit: true,
+                ..CorePolicy::default()
+            },
+            ..Default::default()
         };
         let now = chrono::Utc::now().to_rfc3339();
         let mut metadata = default_metadata();
@@ -2144,28 +2135,26 @@ mod tests {
     /// `confirmed_contradictions` metadata path. The new default
     /// routes through the synthesis batch call instead.
     fn install_legacy_classifier_policy(conn: &rusqlite::Connection, ns: &str) {
-        use crate::models::{ApproverType, GovernanceLevel, GovernancePolicy, default_metadata};
+        use crate::models::{
+            ApproverType, CorePolicy, GovernanceLevel, GovernancePolicy, SynthesisPolicy,
+            default_metadata,
+        };
         let policy = GovernancePolicy {
-            write: GovernanceLevel::Any,
-            promote: GovernanceLevel::Any,
-            delete: GovernanceLevel::Owner,
-            approver: ApproverType::Human,
-            inherit: true,
-            max_reflection_depth: None,
-            auto_export_reflections_to_filesystem: None,
-            auto_atomise: None,
-            auto_atomise_threshold_cl100k: None,
-            auto_atomise_max_atom_tokens: None,
-            auto_atomise_max_retries: None,
-            auto_persona_trigger_every_n_memories: None,
-            auto_export_personas_to_filesystem: None,
-            auto_atomise_mode: None,
-            legacy_per_pair_classifier: Some(true),
-            auto_classify_kind: None,
-            synthesis_failure_mode: None,
-            synthesis_max_deletes_per_call: None,
-            synthesis_max_candidate_chars: None,
-            multistep_max_content_chars: None,
+            core: CorePolicy {
+                write: GovernanceLevel::Any,
+                promote: GovernanceLevel::Any,
+                delete: GovernanceLevel::Owner,
+                approver: ApproverType::Human,
+                inherit: true,
+                max_reflection_depth: None,
+            },
+            synthesis: SynthesisPolicy {
+                legacy_per_pair_classifier: Some(true),
+                synthesis_failure_mode: None,
+                synthesis_max_deletes_per_call: None,
+                synthesis_max_candidate_chars: None,
+            },
+            ..Default::default()
         };
         let now = chrono::Utc::now().to_rfc3339();
         let mut metadata = default_metadata();

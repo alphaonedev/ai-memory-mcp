@@ -494,29 +494,25 @@ fn install_synthesis_policy(
     max_candidate_chars: Option<u32>,
 ) {
     use ai_memory::models::{
-        ApproverType, GovernanceLevel, GovernancePolicy, Memory, MemoryKind, Tier, default_metadata,
+        ApproverType, CorePolicy, GovernanceLevel, GovernancePolicy, Memory, MemoryKind,
+        SynthesisPolicy, Tier, default_metadata,
     };
     let policy = GovernancePolicy {
-        write: GovernanceLevel::Any,
-        promote: GovernanceLevel::Any,
-        delete: GovernanceLevel::Any,
-        approver: ApproverType::Human,
-        inherit: true,
-        max_reflection_depth: None,
-        auto_export_reflections_to_filesystem: None,
-        auto_atomise: None,
-        auto_atomise_threshold_cl100k: None,
-        auto_atomise_max_atom_tokens: None,
-        auto_atomise_max_retries: None,
-        auto_persona_trigger_every_n_memories: None,
-        auto_export_personas_to_filesystem: None,
-        auto_atomise_mode: None,
-        legacy_per_pair_classifier: None,
-        auto_classify_kind: None,
-        synthesis_failure_mode: failure_mode,
-        synthesis_max_deletes_per_call: max_deletes_per_call,
-        synthesis_max_candidate_chars: max_candidate_chars,
-        multistep_max_content_chars: None,
+        core: CorePolicy {
+            write: GovernanceLevel::Any,
+            promote: GovernanceLevel::Any,
+            delete: GovernanceLevel::Any,
+            approver: ApproverType::Human,
+            inherit: true,
+            max_reflection_depth: None,
+        },
+        synthesis: SynthesisPolicy {
+            legacy_per_pair_classifier: None,
+            synthesis_failure_mode: failure_mode,
+            synthesis_max_deletes_per_call: max_deletes_per_call,
+            synthesis_max_candidate_chars: max_candidate_chars,
+        },
+        ..Default::default()
     };
     let now = Utc::now().to_rfc3339();
     let mut metadata = default_metadata();

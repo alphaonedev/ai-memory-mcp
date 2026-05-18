@@ -6966,16 +6966,18 @@ pub fn enforce_governance(
     let Some(policy) = resolve_governance_policy(conn, namespace) else {
         return Ok(GovernanceDecision::Allow);
     };
+    // #880 — `write`/`delete`/`promote` live on `policy.core` after
+    // the governance decomposition.
     let level = match action {
-        GovernedAction::Store => &policy.write,
-        GovernedAction::Delete => &policy.delete,
-        GovernedAction::Promote => &policy.promote,
+        GovernedAction::Store => &policy.core.write,
+        GovernedAction::Delete => &policy.core.delete,
+        GovernedAction::Promote => &policy.core.promote,
         // v0.7.0 L1-8: Reflect is gated by the L1-8 approval mechanism
         // (`require_approval_above_depth`) in the MCP handler rather than
         // the standard `enforce_governance` pipeline. Map to `write`
         // as the conservative fallback so the arm compiles; in practice
         // no current callsite passes `GovernedAction::Reflect` here.
-        GovernedAction::Reflect => &policy.write,
+        GovernedAction::Reflect => &policy.core.write,
     };
     let ns_owner = if matches!(action, GovernedAction::Store) {
         namespace_owner(conn, namespace)
@@ -7375,8 +7377,10 @@ pub fn approve_with_approver_type(
     }
     // Resolve the namespace's approver type. If no policy, default to Human —
     // which accepts any approval (back-compat with 1.9 callers).
-    let approver =
-        resolve_governance_policy(conn, &pa.namespace).map_or(ApproverType::Human, |p| p.approver);
+    // #880 — `approver` lives on `policy.core` after the governance
+    // decomposition.
+    let approver = resolve_governance_policy(conn, &pa.namespace)
+        .map_or(ApproverType::Human, |p| p.core.approver);
 
     match approver {
         ApproverType::Human => {
@@ -11356,10 +11360,10 @@ mod tests {
         // under distinct agent identities. Tests ensures the helper
         // returns the documented shape.
         let policy = crate::models::GovernancePolicy::default_for_managed_namespace();
-        assert_eq!(policy.write, crate::models::GovernanceLevel::Owner);
-        assert_eq!(policy.promote, crate::models::GovernanceLevel::Any);
-        assert_eq!(policy.delete, crate::models::GovernanceLevel::Owner);
-        assert!(policy.inherit);
+        assert_eq!(policy.core.write, crate::models::GovernanceLevel::Owner);
+        assert_eq!(policy.core.promote, crate::models::GovernanceLevel::Any);
+        assert_eq!(policy.core.delete, crate::models::GovernanceLevel::Owner);
+        assert!(policy.core.inherit);
     }
 
     #[test]
@@ -11381,7 +11385,7 @@ mod tests {
 
         let resolved = resolve_governance_policy(&conn, "ns/locked")
             .expect("policy must resolve when explicitly set");
-        assert_eq!(resolved.write, crate::models::GovernanceLevel::Owner);
+        assert_eq!(resolved.core.write, crate::models::GovernanceLevel::Owner);
     }
 
     /// F1 regression (v0.7.0 round-2-fixes): when a parent namespace
@@ -11398,8 +11402,8 @@ mod tests {
             override_active_permissions_mode_for_test,
         };
         use crate::models::{
-            ApproverType, GovernanceDecision, GovernanceLevel, GovernancePolicy, GovernedAction,
-            default_metadata,
+            ApproverType, CorePolicy, GovernanceDecision, GovernanceLevel, GovernancePolicy,
+            GovernedAction, default_metadata,
         };
 
         let _gate = lock_permissions_mode_for_test();
@@ -11411,26 +11415,15 @@ mod tests {
         let parent_ns = "f1/parent";
         let owner = "ai:alice";
         let policy = GovernancePolicy {
-            write: GovernanceLevel::Owner,
-            promote: GovernanceLevel::Any,
-            delete: GovernanceLevel::Owner,
-            approver: ApproverType::Human,
-            inherit: true,
-            max_reflection_depth: None,
-            auto_export_reflections_to_filesystem: None,
-            auto_atomise: None,
-            auto_atomise_threshold_cl100k: None,
-            auto_atomise_max_atom_tokens: None,
-            auto_atomise_max_retries: None,
-            auto_persona_trigger_every_n_memories: None,
-            auto_export_personas_to_filesystem: None,
-            auto_atomise_mode: None,
-            legacy_per_pair_classifier: None,
-            auto_classify_kind: None,
-            synthesis_failure_mode: None,
-            synthesis_max_deletes_per_call: None,
-            synthesis_max_candidate_chars: None,
-            multistep_max_content_chars: None,
+            core: CorePolicy {
+                write: GovernanceLevel::Owner,
+                promote: GovernanceLevel::Any,
+                delete: GovernanceLevel::Owner,
+                approver: ApproverType::Human,
+                inherit: true,
+                max_reflection_depth: None,
+            },
+            ..Default::default()
         };
 
         let now = chrono::Utc::now().to_rfc3339();
@@ -11540,8 +11533,8 @@ mod tests {
             override_active_permissions_mode_for_test,
         };
         use crate::models::{
-            ApproverType, GovernanceDecision, GovernanceLevel, GovernancePolicy, GovernedAction,
-            default_metadata,
+            ApproverType, CorePolicy, GovernanceDecision, GovernanceLevel, GovernancePolicy,
+            GovernedAction, default_metadata,
         };
 
         let _gate = lock_permissions_mode_for_test();
@@ -11559,26 +11552,15 @@ mod tests {
         let parent_ns = "f1nb/parent";
         let owner = "ai:alice";
         let policy = GovernancePolicy {
-            write: GovernanceLevel::Owner,
-            promote: GovernanceLevel::Any,
-            delete: GovernanceLevel::Owner,
-            approver: ApproverType::Human,
-            inherit: false,
-            max_reflection_depth: None,
-            auto_export_reflections_to_filesystem: None,
-            auto_atomise: None,
-            auto_atomise_threshold_cl100k: None,
-            auto_atomise_max_atom_tokens: None,
-            auto_atomise_max_retries: None,
-            auto_persona_trigger_every_n_memories: None,
-            auto_export_personas_to_filesystem: None,
-            auto_atomise_mode: None,
-            legacy_per_pair_classifier: None,
-            auto_classify_kind: None,
-            synthesis_failure_mode: None,
-            synthesis_max_deletes_per_call: None,
-            synthesis_max_candidate_chars: None,
-            multistep_max_content_chars: None,
+            core: CorePolicy {
+                write: GovernanceLevel::Owner,
+                promote: GovernanceLevel::Any,
+                delete: GovernanceLevel::Owner,
+                approver: ApproverType::Human,
+                inherit: false,
+                max_reflection_depth: None,
+            },
+            ..Default::default()
         };
         let now = chrono::Utc::now().to_rfc3339();
         let mut metadata = default_metadata();
