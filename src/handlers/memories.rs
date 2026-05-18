@@ -75,6 +75,10 @@ pub async fn get_memory(State(app): State<AppState>, Path(id): Path<String>) -> 
     let lock = app.db.lock().await;
     match db::resolve_id(&lock.0, &id) {
         Ok(Some(mem)) => {
+            // #869 audit (Category B — safe default): a substrate
+            // failure on `get_links` is non-fatal — the memory body
+            // itself was retrieved cleanly. Empty `links` array
+            // degrades graph navigation rather than failing the GET.
             let links = db::get_links(&lock.0, &mem.id).unwrap_or_default();
             Json(json!({"memory": mem, "links": links})).into_response()
         }
@@ -233,13 +237,9 @@ pub async fn update_memory(
                 && let Ok(tracker) = crate::federation::broadcast_store_quorum(fed, m).await
                 && let Err(err) = crate::federation::finalise_quorum(&tracker)
             {
+                // #869 — typed 503 envelope via the shared helper.
                 let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    [("Retry-After", "2")],
-                    Json(serde_json::to_value(&payload).unwrap_or_default()),
-                )
-                    .into_response();
+                return super::quorum_not_met_response(&payload);
             }
             Json(json!(mem)).into_response()
         }
@@ -447,24 +447,15 @@ pub async fn delete_memory(
                     match crate::federation::broadcast_pending_quorum(fed, pa).await {
                         Ok(tracker) => {
                             if let Err(err) = crate::federation::finalise_quorum(&tracker) {
+                                // #869 — typed 503 envelope via the shared helper.
                                 let payload =
                                     crate::federation::QuorumNotMetPayload::from_err(&err);
-                                return (
-                                    StatusCode::SERVICE_UNAVAILABLE,
-                                    [("Retry-After", "2")],
-                                    Json(serde_json::to_value(&payload).unwrap_or_default()),
-                                )
-                                    .into_response();
+                                return super::quorum_not_met_response(&payload);
                             }
                         }
                         Err(err) => {
                             let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                            return (
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                [("Retry-After", "2")],
-                                Json(serde_json::to_value(&payload).unwrap_or_default()),
-                            )
-                                .into_response();
+                            return super::quorum_not_met_response(&payload);
                         }
                     }
                 }
@@ -555,13 +546,9 @@ pub async fn delete_memory(
                     crate::federation::broadcast_delete_quorum(fed, &target.id).await
                 && let Err(err) = crate::federation::finalise_quorum(&tracker)
             {
+                // #869 — typed 503 envelope via the shared helper.
                 let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    [("Retry-After", "2")],
-                    Json(serde_json::to_value(&payload).unwrap_or_default()),
-                )
-                    .into_response();
+                return super::quorum_not_met_response(&payload);
             }
             Json(json!({"deleted": true})).into_response()
         }
@@ -708,25 +695,16 @@ pub async fn promote_memory(
                         match crate::federation::broadcast_store_quorum(fed, m).await {
                             Ok(tracker) => {
                                 if let Err(err) = crate::federation::finalise_quorum(&tracker) {
+                                    // #869 — typed 503 envelope via the shared helper.
                                     let payload =
                                         crate::federation::QuorumNotMetPayload::from_err(&err);
-                                    return (
-                                        StatusCode::SERVICE_UNAVAILABLE,
-                                        [("Retry-After", "2")],
-                                        Json(serde_json::to_value(&payload).unwrap_or_default()),
-                                    )
-                                        .into_response();
+                                    return super::quorum_not_met_response(&payload);
                                 }
                             }
                             Err(err) => {
                                 let payload =
                                     crate::federation::QuorumNotMetPayload::from_err(&err);
-                                return (
-                                    StatusCode::SERVICE_UNAVAILABLE,
-                                    [("Retry-After", "2")],
-                                    Json(serde_json::to_value(&payload).unwrap_or_default()),
-                                )
-                                    .into_response();
+                                return super::quorum_not_met_response(&payload);
                             }
                         }
                     }
@@ -816,24 +794,15 @@ pub async fn promote_memory(
                     match crate::federation::broadcast_pending_quorum(fed, pa).await {
                         Ok(tracker) => {
                             if let Err(err) = crate::federation::finalise_quorum(&tracker) {
+                                // #869 — typed 503 envelope via the shared helper.
                                 let payload =
                                     crate::federation::QuorumNotMetPayload::from_err(&err);
-                                return (
-                                    StatusCode::SERVICE_UNAVAILABLE,
-                                    [("Retry-After", "2")],
-                                    Json(serde_json::to_value(&payload).unwrap_or_default()),
-                                )
-                                    .into_response();
+                                return super::quorum_not_met_response(&payload);
                             }
                         }
                         Err(err) => {
                             let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                            return (
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                [("Retry-After", "2")],
-                                Json(serde_json::to_value(&payload).unwrap_or_default()),
-                            )
-                                .into_response();
+                            return super::quorum_not_met_response(&payload);
                         }
                     }
                 }
@@ -918,13 +887,9 @@ pub async fn promote_memory(
                 && let Ok(tracker) = crate::federation::broadcast_store_quorum(fed, m).await
                 && let Err(err) = crate::federation::finalise_quorum(&tracker)
             {
+                // #869 — typed 503 envelope via the shared helper.
                 let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    [("Retry-After", "2")],
-                    Json(serde_json::to_value(&payload).unwrap_or_default()),
-                )
-                    .into_response();
+                return super::quorum_not_met_response(&payload);
             }
             Json(json!({"promoted": true, "id": resolved_id, "tier": "long"})).into_response()
         }

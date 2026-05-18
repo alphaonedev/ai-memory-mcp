@@ -14039,3 +14039,81 @@ async fn to_value_or_500_returns_500_on_encode_failure() {
         "500 body must carry the sanitised error envelope, got: {err}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #869 (2026-05-18) — `quorum_not_met_response` regression tests. Pins
+// the helper that collapsed the ~30 inline 503 + `Retry-After: 2` +
+// `Json(serde_json::to_value(&payload).unwrap_or_default())` sites
+// across the per-domain handler modules into a single typed call.
+// ---------------------------------------------------------------------------
+
+/// Pins the wire shape: status, header, body. Wire compatibility with
+/// the pre-#869 inline pattern is the load-bearing invariant — peers
+/// that switch on `error == "quorum_not_met"` must keep working.
+#[tokio::test]
+async fn quorum_not_met_response_wire_compat() {
+    use crate::federation::QuorumNotMetPayload;
+    use crate::replication::{QuorumError, QuorumFailureReason};
+
+    let err = QuorumError::QuorumNotMet {
+        got: 1,
+        needed: 2,
+        reason: QuorumFailureReason::Unreachable,
+    };
+    let payload = QuorumNotMetPayload::from_err(&err);
+    let resp = super::quorum_not_met_response(&payload);
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "503 status preserved"
+    );
+    assert_eq!(
+        resp.headers()
+            .get("Retry-After")
+            .and_then(|v| v.to_str().ok()),
+        Some("2"),
+        "Retry-After header preserved"
+    );
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["error"], "quorum_not_met");
+    assert_eq!(v["got"], 1);
+    assert_eq!(v["needed"], 2);
+    assert_eq!(v["reason"], "unreachable");
+}
+
+/// Pins the timeout-reason branch — the `InFlight` enum variant maps
+/// to `"timeout"` per the `from_err` docstring so the wire never leaks
+/// a fourth internal state to operators.
+#[tokio::test]
+async fn quorum_not_met_response_timeout_branch() {
+    use crate::federation::QuorumNotMetPayload;
+    use crate::replication::{QuorumError, QuorumFailureReason};
+
+    let err = QuorumError::QuorumNotMet {
+        got: 0,
+        needed: 3,
+        reason: QuorumFailureReason::Timeout,
+    };
+    let payload = QuorumNotMetPayload::from_err(&err);
+    let resp = super::quorum_not_met_response(&payload);
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["reason"], "timeout");
+    assert_eq!(v["got"], 0);
+    assert_eq!(v["needed"], 3);
+    // Pre-#869 a silent encode failure would have surfaced
+    // `Value::Null` as the body — the 503 envelope would have looked
+    // indistinguishable from a malformed response. This assertion
+    // mechanically pins that the body is a real object.
+    assert!(
+        v.is_object(),
+        "response body must be a typed object, got {v}"
+    );
+}

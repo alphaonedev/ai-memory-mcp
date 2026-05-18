@@ -49,6 +49,10 @@ pub async fn register_agent(
         )
             .into_response();
     }
+    // #869 audit (Category B — safe default): `capabilities` is
+    // `Option<Vec<String>>`; an absent field is semantically equivalent
+    // to "agent advertises no capabilities yet" which is exactly the
+    // empty-vec default. No serialisation involved.
     let capabilities = body.capabilities.unwrap_or_default();
     if let Err(e) = validate::validate_capabilities(&capabilities) {
         return (
@@ -144,13 +148,9 @@ pub async fn register_agent(
                 match crate::federation::broadcast_store_quorum(fed, mem).await {
                     Ok(tracker) => {
                         if let Err(err) = crate::federation::finalise_quorum(&tracker) {
+                            // #869 — typed 503 envelope via the shared helper.
                             let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                            return (
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                [("Retry-After", "2")],
-                                Json(serde_json::to_value(&payload).unwrap_or_default()),
-                            )
-                                .into_response();
+                            return super::quorum_not_met_response(&payload);
                         }
                     }
                     Err(e) => {
@@ -560,6 +560,10 @@ pub async fn import_memories(
                 }
             }
         }
+        // #869 audit (Category B — safe default): `body.links` is
+        // `Option<Vec<MemoryLink>>`; an absent field means the bulk
+        // import payload carried no links. Empty-vec default produces
+        // a zero-iteration loop, which is the documented behaviour.
         for link in body.links.unwrap_or_default() {
             if validate::validate_link(&link.source_id, &link.target_id, link.relation.as_str())
                 .is_err()
@@ -602,6 +606,8 @@ pub async fn import_memories(
             }
         }
     }
+    // #869 audit (Category B — safe default): sqlite branch mirror of
+    // the postgres-branch links loop above; same empty-vec semantics.
     for link in body.links.unwrap_or_default() {
         if validate::validate_link(&link.source_id, &link.target_id, link.relation.as_str())
             .is_err()

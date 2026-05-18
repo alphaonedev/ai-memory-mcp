@@ -167,13 +167,9 @@ pub async fn restore_archive(
         match crate::federation::broadcast_restore_quorum(fed, &id).await {
             Ok(tracker) => {
                 if let Err(err) = crate::federation::finalise_quorum(&tracker) {
+                    // #869 — typed 503 envelope via the shared helper.
                     let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                    return (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        [("Retry-After", "2")],
-                        Json(serde_json::to_value(&payload).unwrap_or_default()),
-                    )
-                        .into_response();
+                    return super::quorum_not_met_response(&payload);
                 }
             }
             Err(e) => {
@@ -365,13 +361,9 @@ pub async fn archive_by_ids(
             match crate::federation::broadcast_archive_quorum(fed, id).await {
                 Ok(tracker) => {
                     if let Err(err) = crate::federation::finalise_quorum(&tracker) {
+                        // #869 — typed 503 envelope via the shared helper.
                         let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                        return (
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            [("Retry-After", "2")],
-                            Json(serde_json::to_value(&payload).unwrap_or_default()),
-                        )
-                            .into_response();
+                        return super::quorum_not_met_response(&payload);
                     }
                 }
                 Err(e) => {

@@ -241,24 +241,15 @@ pub async fn approve_pending(
                     {
                         Ok(tracker) => {
                             if let Err(err) = crate::federation::finalise_quorum(&tracker) {
+                                // #869 — typed 503 envelope via the shared helper.
                                 let payload =
                                     crate::federation::QuorumNotMetPayload::from_err(&err);
-                                return (
-                                    StatusCode::SERVICE_UNAVAILABLE,
-                                    [("Retry-After", "2")],
-                                    Json(serde_json::to_value(&payload).unwrap_or_default()),
-                                )
-                                    .into_response();
+                                return super::quorum_not_met_response(&payload);
                             }
                         }
                         Err(err) => {
                             let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                            return (
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                [("Retry-After", "2")],
-                                Json(serde_json::to_value(&payload).unwrap_or_default()),
-                            )
-                                .into_response();
+                            return super::quorum_not_met_response(&payload);
                         }
                     }
                     // If approval produced a brand-new memory (store
@@ -405,23 +396,14 @@ pub async fn reject_pending(
                 match crate::federation::broadcast_pending_decision_quorum(fed, &decision).await {
                     Ok(tracker) => {
                         if let Err(err) = crate::federation::finalise_quorum(&tracker) {
+                            // #869 — typed 503 envelope via the shared helper.
                             let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                            return (
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                [("Retry-After", "2")],
-                                Json(serde_json::to_value(&payload).unwrap_or_default()),
-                            )
-                                .into_response();
+                            return super::quorum_not_met_response(&payload);
                         }
                     }
                     Err(err) => {
                         let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                        return (
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            [("Retry-After", "2")],
-                            Json(serde_json::to_value(&payload).unwrap_or_default()),
-                        )
-                            .into_response();
+                        return super::quorum_not_met_response(&payload);
                     }
                 }
             }

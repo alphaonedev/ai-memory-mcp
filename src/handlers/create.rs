@@ -233,6 +233,10 @@ async fn enforce_create_governance<'a>(
     axum::response::Response,
 > {
     use crate::models::{GovernanceDecision, GovernedAction};
+    // #869 audit (Category B — safe default): missing or non-string
+    // `agent_id` collapses to `""`. The governance engine treats the
+    // empty agent the same as an anonymous caller (no per-agent rules
+    // match), which is the documented fail-closed posture.
     let agent_for_gov = mem
         .metadata
         .get("agent_id")
@@ -283,23 +287,14 @@ async fn enforce_create_governance<'a>(
                 match crate::federation::broadcast_pending_quorum(fed, pa).await {
                     Ok(tracker) => {
                         if let Err(err) = crate::federation::finalise_quorum(&tracker) {
+                            // #869 — typed 503 envelope via the shared helper.
                             let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                            return Err((
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                [("Retry-After", "2")],
-                                Json(serde_json::to_value(&payload).unwrap_or_default()),
-                            )
-                                .into_response());
+                            return Err(super::quorum_not_met_response(&payload));
                         }
                     }
                     Err(err) => {
                         let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                        return Err((
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            [("Retry-After", "2")],
-                            Json(serde_json::to_value(&payload).unwrap_or_default()),
-                        )
-                            .into_response());
+                        return Err(super::quorum_not_met_response(&payload));
                     }
                 }
             }
@@ -356,6 +351,11 @@ fn insert_create_with_quota(
     // quota-bypass surface. Bytes counted = (title + content +
     // serialized metadata) — same shape the MCP path uses so cross-
     // path totals stay coherent.
+    // #869 audit (Category B — safe default): empty `quota_agent_id`
+    // is intentional sentinel — `check_and_record` only fires when the
+    // agent id is non-empty (the `if !quota_agent_id.is_empty()` guard
+    // below skips the quota call for anonymous callers, mirroring the
+    // MCP path's behaviour).
     let quota_agent_id = mem
         .metadata
         .get("agent_id")
@@ -517,6 +517,10 @@ async fn fanout_and_assemble_create_response(
         .and_then(|v| v.as_str())
         .map(str::to_string);
     // PR-5 (issue #487): security audit trail for HTTP store.
+    // #869 audit (Category B — safe default): when no agent_id was
+    // resolved at request time the audit row records the actor as
+    // `""` (the documented anonymous-actor sentinel for the audit
+    // chain). Same posture as the MCP path.
     crate::audit::emit(crate::audit::EventBuilder::new(
         crate::audit::AuditAction::Store,
         crate::audit::actor(
@@ -575,23 +579,14 @@ async fn fanout_and_assemble_create_response(
                     return (StatusCode::CREATED, Json(response)).into_response();
                 }
                 Err(err) => {
+                    // #869 — typed 503 envelope via the shared helper.
                     let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                    return (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        [("Retry-After", "2")],
-                        Json(serde_json::to_value(&payload).unwrap_or_default()),
-                    )
-                        .into_response();
+                    return super::quorum_not_met_response(&payload);
                 }
             },
             Err(err) => {
                 let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    [("Retry-After", "2")],
-                    Json(serde_json::to_value(&payload).unwrap_or_default()),
-                )
-                    .into_response();
+                return super::quorum_not_met_response(&payload);
             }
         }
     }
@@ -734,23 +729,14 @@ async fn create_memory_postgres(
                 match crate::federation::broadcast_store_quorum(fed, &mem_echo).await {
                     Ok(tracker) => {
                         if let Err(err) = crate::federation::finalise_quorum(&tracker) {
+                            // #869 — typed 503 envelope via the shared helper.
                             let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                            return (
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                [("Retry-After", "2")],
-                                Json(serde_json::to_value(&payload).unwrap_or_default()),
-                            )
-                                .into_response();
+                            return super::quorum_not_met_response(&payload);
                         }
                     }
                     Err(err) => {
                         let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                        return (
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            [("Retry-After", "2")],
-                            Json(serde_json::to_value(&payload).unwrap_or_default()),
-                        )
-                            .into_response();
+                        return super::quorum_not_met_response(&payload);
                     }
                 }
             }
@@ -901,6 +887,11 @@ pub async fn create_memory(
     };
 
     // Contradiction probe — best-effort; never fails the parent store.
+    // #869 audit (Category B — safe default): a db substrate failure
+    // here is non-fatal — empty contradictions list degrades the
+    // contradiction hint to "none found" rather than blocking the
+    // store. The proactive #519 check (below) is the load-bearing
+    // duplicate gate.
     let contradictions =
         db::find_contradictions(&lock.0, &mem.title, &mem.namespace).unwrap_or_default();
     let contradiction_ids: Vec<String> = contradictions

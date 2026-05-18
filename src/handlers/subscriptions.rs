@@ -646,6 +646,12 @@ pub async fn unsubscribe(
     let lock = app.db.lock().await;
     // Owner-scoped list — the find() below is now redundant on the
     // authorization side but still narrows by namespace_filter.
+    //
+    // #869 audit (Category B — safe default): a db substrate failure
+    // on the list query collapses to an empty `Vec`, so the
+    // subsequent `target` lookup is `None` and the handler returns
+    // 404 instead of leaking the substrate error — same posture the
+    // sanitised 4xx path uses elsewhere in this module.
     let subs = crate::subscriptions::list(&lock.0, Some(&caller)).unwrap_or_default();
     let target = subs
         .into_iter()

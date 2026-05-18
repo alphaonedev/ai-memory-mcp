@@ -85,6 +85,9 @@ pub async fn list_memories(
         let filter = crate::store::Filter {
             namespace: p.namespace.clone(),
             tier: p.tier.clone(),
+            // #869 audit (Category B — safe default): missing `tags`
+            // querystring collapses to empty `Vec<String>` which the
+            // SAL `Filter` treats as "no tag filter" — documented.
             tags_any: p
                 .tags
                 .as_deref()
@@ -187,6 +190,9 @@ pub async fn search_memories(
         let filter = crate::store::Filter {
             namespace: p.namespace.clone(),
             tier: p.tier.clone(),
+            // #869 audit (Category B — safe default): missing `tags`
+            // querystring collapses to empty `Vec<String>` which the
+            // SAL `Filter` treats as "no tag filter" — documented.
             tags_any: p
                 .tags
                 .as_deref()

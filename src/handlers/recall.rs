@@ -96,6 +96,10 @@ pub async fn recall_memories_get(
     // Accept `context` (canonical), `query` (cert harness alias —
     // S79 uses `?query=…`), or `q` (search-style alias — the parity
     // suite uses `?q=…`). Cert oracles continue to work.
+    //
+    // #869 audit (Category B — safe default): empty `String` collapses
+    // straight into the `is_empty()` guard below, which returns a typed
+    // 400 with "context (or query) is required".
     let ctx = p
         .context
         .clone()
@@ -368,14 +372,31 @@ async fn recall_response(
                 );
                 let touch_ids: Vec<String> =
                     scored_pairs.iter().map(|(m, _)| m.id.clone()).collect();
+                // #869 — `serde_json::to_value(m).unwrap_or_default()`
+                // would have surfaced a `Value::Null` row in the recall
+                // payload on a Memory-serialise failure, which the
+                // client would parse as a real memory with every field
+                // null. `filter_map` + log preserves the rest of the
+                // batch and lets operators investigate the bad row.
                 let scored: Vec<serde_json::Value> = scored_pairs
                     .iter()
-                    .map(|(m, s)| {
-                        let mut v = serde_json::to_value(m).unwrap_or_default();
-                        if let Some(obj) = v.as_object_mut() {
-                            obj.insert("score".to_string(), json!((*s * 1000.0).round() / 1000.0));
+                    .filter_map(|(m, s)| match serde_json::to_value(m) {
+                        Ok(mut v) => {
+                            if let Some(obj) = v.as_object_mut() {
+                                obj.insert(
+                                    "score".to_string(),
+                                    json!((*s * 1000.0).round() / 1000.0),
+                                );
+                            }
+                            Some(v)
                         }
-                        v
+                        Err(e) => {
+                            tracing::error!(
+                                memory_id = %m.id,
+                                "recall (postgres): serialise Memory failed, skipping row: {e}"
+                            );
+                            None
+                        }
                     })
                     .collect();
                 // Touch ops AFTER assembling the response payload so the
@@ -485,14 +506,26 @@ async fn recall_response(
             // v0.7.0 (issue #518) — per-session recency boost +
             // post-recall record on the sqlite branch.
             let r = crate::reranker::apply_session_recency_boost(r, session_id, session_tracker);
+            // #869 — same `Value::Null` masking fix as the postgres
+            // branch above; sqlite branch needs the identical
+            // filter_map + log so an encoder regression cannot silently
+            // drop fields from a recall row to look like a real null.
             let scored: Vec<serde_json::Value> = r
                 .iter()
-                .map(|(m, s)| {
-                    let mut v = serde_json::to_value(m).unwrap_or_default();
-                    if let Some(obj) = v.as_object_mut() {
-                        obj.insert("score".to_string(), json!((*s * 1000.0).round() / 1000.0));
+                .filter_map(|(m, s)| match serde_json::to_value(m) {
+                    Ok(mut v) => {
+                        if let Some(obj) = v.as_object_mut() {
+                            obj.insert("score".to_string(), json!((*s * 1000.0).round() / 1000.0));
+                        }
+                        Some(v)
                     }
-                    v
+                    Err(e) => {
+                        tracing::error!(
+                            memory_id = %m.id,
+                            "recall (sqlite): serialise Memory failed, skipping row: {e}"
+                        );
+                        None
+                    }
                 })
                 .collect();
             let mut resp = json!({
