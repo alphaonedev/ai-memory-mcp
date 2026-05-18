@@ -124,10 +124,10 @@ fn lifecycle_promote_target_tier_param_honored() {
 /// the default jump-to-long covers only the `None` arm, leaving
 /// `Some("long")` uncovered and dragging `mcp/tools/promote.rs`
 /// below its 94% per-module floor (commit 1c14957 added the
-/// target_tier match without exhaustive test coverage).
+/// `target_tier` match without exhaustive test coverage).
 ///
 /// Behavioural assertion: explicit `target_tier="long"` produces the
-/// same observable outcome as the default (tier=long, expires_at
+/// same observable outcome as the default (tier=long, `expires_at`
 /// cleared) — operators using the explicit form to be defensive
 /// against future default flips must get identical semantics today.
 #[test]
@@ -168,7 +168,7 @@ fn lifecycle_promote_target_tier_long_explicit_lands_on_long() {
 ///
 /// Pre-fix the only error coverage on this branch was the
 /// `#[cfg(test)] mod tests` unit tests which validate the early
-/// id/validator paths; the post-validate target_tier match was
+/// id/validator paths; the post-validate `target_tier` match was
 /// uncovered for this arm, contributing to the coverage gap.
 #[test]
 fn lifecycle_promote_target_tier_short_rejected_with_downgrade_message() {
