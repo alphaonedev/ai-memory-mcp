@@ -194,7 +194,7 @@ fn memory_kind_missing_field_defaults_to_observation() {
         "tags": [],
         "priority": 5,
         "confidence": 1.0,
-        "source": "test",
+        "source": "import",
         "access_count": 0,
         "created_at": "2026-01-01T00:00:00Z",
         "updated_at": "2026-01-01T00:00:00Z",
