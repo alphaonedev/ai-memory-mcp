@@ -2149,15 +2149,16 @@ pub async fn bootstrap_serve(
                 "refusing to bind to non-loopback address {host:?} without an API key: \
                  the daemon's api_key is unset (default-off auth would expose every \
                  privileged endpoint to any caller that can reach the bind address). \
-                 Either set [api] api_key in config (or --api-key on the CLI) and rebind, \
+                 Either set top-level `api_key = \"...\"` in config (or --api-key on the CLI) and rebind, \
                  or rebind to 127.0.0.1 / ::1 / localhost for a single-tenant deployment. \
-                 (v0.7.0 fix campaign S5-C1, 2026-05-13)"
+                 (v0.7.0 fix campaign S5-C1, 2026-05-13. Note: api_key is a TOP-LEVEL \
+                 AppConfig field per src/config.rs:2283; [api] subsection is silently ignored by serde.)"
             );
         }
         tracing::warn!(
             "API key NOT configured — daemon bound to loopback {host:?}. \
              Privileged endpoints (POST /memories, /links, /agents, /subscriptions) \
-             accept any local caller. Set [api] api_key for production. \
+             accept any local caller. Set top-level `api_key = \"...\"` for production. \
              /approve and /reject remain HMAC-gated regardless."
         );
     }
