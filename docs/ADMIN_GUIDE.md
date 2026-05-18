@@ -912,9 +912,58 @@ When `sync-daemon` is invoked without `--client-cert`, the underlying reqwest cl
 
 #### Any valid mTLS peer can dump the full database (issue #239)
 
-`GET /api/v1/sync/since?since=<old-ts>` paginates the entire database. By design — the trust boundary IS the mTLS cert — but the implication is that **a compromised peer cert grants access to every memory**, including `scope: private` memories from other agents' namespaces. Sync endpoints bypass the per-memory visibility filtering used by `/recall`.
+> **OPERATOR ADVISORY — mTLS certificates are full trust anchors.**
+> A compromised peer cert grants access to **every memory in the
+> database**. The sync substrate's threat model trusts the cert and
+> stops there. There is no per-memory authorization layer behind it.
 
-**Allowlist only peers you fully trust.** Per-namespace / per-scope sync filtering is a Phase 5 feature (post-v0.6.0).
+`GET /api/v1/sync/since?since=<old-ts>` (or omit `since` to start from
+the epoch) paginates the **entire database**, including:
+
+- `scope: private` memories from other agents' namespaces
+- Memories that `/recall` would have filtered for visibility
+- Memories with `agent_id` belonging to other principals
+- Operator-signed governance rules (the `governance_rules` table is
+  exposed for federation parity)
+- Reflection chains and persona artifacts
+
+This is **documented and intentional** — the trust boundary IS the
+mTLS cert. Sync endpoints deliberately bypass the per-memory
+visibility filtering used by `/recall` because federation needs the
+full row to merge correctly (CRDT-style). The implication is the
+operator must treat every entry on the `--mtls-allowlist` as a
+full-database read principal.
+
+**Required operator discipline:**
+
+1. **Allowlist only peers you fully trust at the database level.**
+   Treat each fingerprint as "this principal can read everything".
+   Do not allowlist peers operated by other tenants, other security
+   zones, or other regulatory contexts.
+2. **Compromise model: a peer cert leak == full DB leak.** Plan for
+   cert rotation if a peer host is compromised. SHA-256 fingerprints
+   are easy to rotate (`openssl x509 -outform DER | sha256sum` →
+   replace the line in the allowlist file → SIGHUP `serve`).
+3. **Per-host cert separation.** Issue a distinct client cert per
+   peer host (not a wildcard CA-signed cert that any host could
+   reissue from). This narrows the blast radius of a single host
+   compromise to that host's fingerprint.
+4. **Audit the allowlist on every deployment.** The fingerprint set
+   is the security perimeter — review it the same way you'd review a
+   firewall rule.
+5. **Cross-tenant separation requires separate databases.** If two
+   tenants need isolated memory but want federation within each
+   tenant, run two `ai-memory serve` processes on different ports
+   with non-overlapping `--mtls-allowlist` files. The sync substrate
+   does not enforce namespace-level tenancy across mTLS peers.
+
+**Roadmap to per-namespace / per-scope sync filtering.** Per-memory
+visibility filtering on `/sync/since` is a Phase 5 hub feature
+(post-v0.7.0, tracked under [#311](https://github.com/alphaonedev/ai-memory-mcp/issues/311)
+for the targeted-share variant and under [#717](https://github.com/alphaonedev/ai-memory-mcp/issues/717)
+for cert-SAN agent-id attestation). v0.7.0 ships the mTLS full-trust
+model documented above as the canonical disposition for the
+`alphaonedev/ai-memory-mcp` v0.7.0 release line.
 
 #### Body-claimed sender_agent_id is not yet attested (issue #238)
 

@@ -612,6 +612,122 @@ This policy is the project's response to two empirical failure modes:
 
 The default-flexible-commit / explicit-push split is the cleaner discipline.
 
+## Multi-agent worktree discipline (issue #856)
+
+> **Why this section exists.** During the 2026-05-17 Wave-2 Tier-A
+> parallel burst, two of seven worktree-isolated agents (Tier-A1 #849,
+> Tier-A3 #851) authored clean commits against a STALE base — a pre-
+> modularisation snapshot of `src/handlers.rs` (~17.8k lines
+> monolithic) and `src/mcp.rs` (~108 lines) that no longer exists on
+> `local/install-815-816`. Their gates were green on their respective
+> worktrees, their commits applied cleanly to their stale base — and
+> the diffs were structurally un-cherry-pickable against the current
+> modular `src/handlers/{mod,http,transport,federation_receive,
+> hook_subscribers}.rs` + `src/mcp/{mod,tools/}` layout.
+>
+> The harness itself is out-of-repo (Claude Code SDK); the in-repo
+> half is this discipline section, applied by every agent that
+> dispatches sub-agents via `isolation=worktree` or that operates
+> inside a worktree spawned by a parent agent. Issue #856 tracks the
+> harness-side fix (worktree-base pinning at spawn time).
+
+### Discipline (every parent agent that spawns worktree-isolated children)
+
+**1. Fresh-base sync at worktree creation.** Before spawning a
+worktree-isolated agent, the parent agent MUST:
+
+- Resolve the parent-repo HEAD SHA: `git rev-parse HEAD`
+- Pass the SHA explicitly to the sub-agent prompt (e.g. "you are
+  operating on base SHA `<sha>` against `local/install-815-816`")
+- Verify the sub-agent's worktree is at that SHA before it begins
+  work: `git -C <worktree> rev-parse HEAD` MUST match the resolved
+  SHA at spawn time, NOT an older fetched-remote SHA, NOT a stale
+  default-branch HEAD
+
+**2. File-layout pre-flight at worktree boot.** The sub-agent MUST,
+as its first substantive action, check the file-layout invariants
+that anchor its working scope. For Wave-2 Tier-A class work:
+
+```bash
+# Must be modular at v0.7.0:
+test -d src/handlers && test -d src/handlers/http.rs -o -f src/handlers/http.rs
+test -d src/mcp && test -d src/mcp/tools
+# Must NOT be monolithic:
+test ! -f src/handlers.rs || (echo "STALE BASE — abort" >&2 && exit 64)
+test ! -f src/mcp.rs || (echo "STALE BASE — abort" >&2 && exit 64)
+```
+
+The sub-agent halts with exit code 64 (sysexits.h `EX_USAGE`) on
+stale base and reports back to the parent so the parent can re-dispatch
+against the correct base.
+
+**3. Diff statement at commit time.** Every worktree commit message
+MUST include the base SHA the work was authored against:
+
+```
+fix(#NNN): <summary>
+
+Base: <full SHA from parent at spawn time>
+```
+
+This makes the eventual cherry-pick or merge trivially auditable.
+
+**4. Cherry-pick verification before re-dispatch.** The parent agent,
+on receiving a worktree's commits, MUST verify cherry-pickability
+before claiming the work is integrated:
+
+```bash
+git cherry-pick --no-commit <worktree-sha>
+git status   # look for structural conflicts
+git cherry-pick --abort   # if conflicts surfaced, the work is a SPEC, not a patch
+```
+
+If the cherry-pick fails on file-layout grounds, the original commits
+remain valuable as a SPEC for re-execution against the current layout
+(preserve the `worktree-agent-*` branch for reference); the work is
+re-dispatched as a fresh agent against the current HEAD.
+
+**5. Serial dispatch on file-layout transitions.** During refactor
+waves that move large amounts of code (e.g. Wave 1's `src/handlers.rs`
+→ `src/handlers/` split, the `src/mcp.rs` → `src/mcp/` split), the
+parent agent MUST serialize child dispatch until the refactor lands.
+Parallel dispatch during file-layout drift is the single highest-
+probability failure mode for worktree isolation.
+
+### Discipline (every sub-agent operating in a worktree)
+
+**1. Read CLAUDE.md and this section first.** Before any substantive
+action, the worktree-isolated sub-agent confirms it's operating
+against the expected file layout. Pre-flight at boot, not after the
+gates pass.
+
+**2. Emit the base SHA in every commit and every handoff memory.**
+The base SHA at worktree spawn becomes part of the audit trail. If
+the parent agent dispatched against the wrong base, the handoff memory
+preserves enough context for a forensic re-dispatch.
+
+**3. Refuse to cherry-pick yourself.** A worktree-isolated sub-agent
+does NOT push its commits to the parent branch. It commits to its own
+worktree branch and reports the SHA + base SHA back to the parent.
+The parent owns the cherry-pick (or re-dispatch) decision because the
+parent has the full view of concurrent worktrees.
+
+### Out-of-repo half (harness fix tracked under #856)
+
+The Claude Code SDK harness's `isolation=worktree` mode currently
+forks worktrees from an undocumented base (likely a stale remote-
+tracking branch). The harness-side fix is: when the parent agent
+calls Task/Agent with `isolation=worktree`, the harness MUST pin the
+worktree base to the EXPLICIT parent-repo HEAD at spawn time, NOT to
+any other reference. The resolved SHA SHOULD be exposed to the
+spawned sub-agent via environment variable (e.g.
+`CLAUDE_WORKTREE_BASE_SHA`) so step 2 of the in-repo discipline
+above can verify mechanically.
+
+Until the harness-side fix ships, this in-repo discipline is the
+load-bearing mitigation. Every agent that touches worktree-isolated
+dispatch in this repository follows this section.
+
 ## No agent-created files under /tmp, /var/tmp, /private/tmp, or any tmpfs (project hard rule)
 
 > This is a **project hard rule**, not a preference. It overrides any
