@@ -64,6 +64,13 @@ on:
       - '.github/workflows/batman-mode-acceptance.yml'
   push:
     branches: [main, develop, "release/**"]
+  # v0.7.0 issue #807 — nightly run against develop regardless of
+  # path filter. Catches cross-module refactors that drift the
+  # canonical-bytes shape without touching the immediate file
+  # allowlist. Mirrors the contract documented in
+  # .github/branch-protection.yml::nightly_schedule.
+  schedule:
+    - cron: "0 8 * * *"  # 08:00 UTC daily
   workflow_dispatch:
 
 env:
