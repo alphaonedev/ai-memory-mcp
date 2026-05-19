@@ -751,7 +751,10 @@ async fn federation_apply_remote_memory_round_trips_reflection_depth() {
     let tmp = tempfile::NamedTempFile::new().expect("tempfile");
     let path = tmp.path().to_path_buf();
     let store = SqliteStore::open(&path).expect("open sqlite store");
-    let ctx = CallerContext::for_agent("test-agent-task7-fed".to_string());
+    // #910 — federation catchup is operator-level (peer sync), so the
+    // test ctx uses for_admin so the SAL visibility filter doesn't
+    // drop the peer-owned row on the post-apply round-trip read.
+    let ctx = CallerContext::for_admin("test-agent-task7-fed".to_string());
 
     let now = chrono::Utc::now().to_rfc3339();
     let mem = Memory {

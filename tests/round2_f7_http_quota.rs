@@ -96,6 +96,9 @@ async fn http_store(
         .method("POST")
         .uri("/api/v1/memories")
         .header("content-type", "application/json")
+        // #907/#910 — match X-Agent-Id to body.agent_id so the spoof
+        // guard accepts the write and the SAL filter knows the owner.
+        .header("x-agent-id", agent_id)
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap();
     let resp = router.clone().oneshot(req).await.unwrap();

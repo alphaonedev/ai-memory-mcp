@@ -19,7 +19,7 @@ use crate::models::{AgentRegistration, Memory, MemoryLink, Tier};
 
 use super::{
     BoxBackendError, CallerContext, Capabilities, Filter, MemoryStore, StoreError, StoreResult,
-    Transaction, UpdatePatch, VerifyFilter, VerifyLinkReport, VerifyReport,
+    Transaction, UpdatePatch, VerifyFilter, VerifyLinkReport, VerifyReport, is_visible_to_caller,
 };
 use crate::quotas::{self, QuotaStatus};
 
@@ -92,10 +92,21 @@ impl MemoryStore for SqliteStore {
         db::insert(&conn, memory).map_err(box_err)
     }
 
-    async fn get(&self, _ctx: &CallerContext, id: &str) -> StoreResult<Memory> {
+    async fn get(&self, ctx: &CallerContext, id: &str) -> StoreResult<Memory> {
         let conn = self.state.lock().await;
         match db::get(&conn, id).map_err(box_err)? {
-            Some(mem) => Ok(mem),
+            Some(mem) => {
+                // #910 SAL-level scope=private gate — fold permission
+                // denials into NotFound so the trait does not leak
+                // existence to callers that lack read permission.
+                // Admin/migrate paths set `bypass_visibility` and read
+                // every row regardless of metadata.scope.
+                if ctx.bypass_visibility || is_visible_to_caller(&mem, ctx.effective_principal()) {
+                    Ok(mem)
+                } else {
+                    Err(StoreError::NotFound { id: id.to_string() })
+                }
+            }
             None => Err(StoreError::NotFound { id: id.to_string() }),
         }
     }
@@ -140,12 +151,12 @@ impl MemoryStore for SqliteStore {
         }
     }
 
-    async fn list(&self, _ctx: &CallerContext, filter: &Filter) -> StoreResult<Vec<Memory>> {
+    async fn list(&self, ctx: &CallerContext, filter: &Filter) -> StoreResult<Vec<Memory>> {
         let conn = self.state.lock().await;
         let tags_first = filter.tags_any.first().map(String::as_str);
         let since = filter.since.map(|d| d.to_rfc3339());
         let until = filter.until.map(|d| d.to_rfc3339());
-        db::list(
+        let rows = db::list(
             &conn,
             filter.namespace.as_deref(),
             filter.tier.as_ref(),
@@ -157,7 +168,22 @@ impl MemoryStore for SqliteStore {
             tags_first,
             filter.agent_id.as_deref(),
         )
-        .map_err(box_err)
+        .map_err(box_err)?;
+        // #910 SAL-level scope=private gate (see `is_visible_to_caller`
+        // contract on the trait). Every query path that returns Memory
+        // rows runs the result set through the canonical predicate so
+        // every caller — handler, MCP tool, federation receiver — gets
+        // the visibility-filtered set without needing a per-callsite
+        // post-filter. Admin/migrate paths set `bypass_visibility` and
+        // round-trip every row regardless of metadata.scope.
+        if ctx.bypass_visibility {
+            return Ok(rows);
+        }
+        let caller = ctx.effective_principal();
+        Ok(rows
+            .into_iter()
+            .filter(|m| is_visible_to_caller(m, caller))
+            .collect())
     }
 
     async fn search(
@@ -170,7 +196,13 @@ impl MemoryStore for SqliteStore {
         let tags_first = filter.tags_any.first().map(String::as_str);
         let since = filter.since.map(|d| d.to_rfc3339());
         let until = filter.until.map(|d| d.to_rfc3339());
-        db::search(
+        // db::search already applies the `visibility_clause` over the
+        // scope_idx generated column when `as_agent` is supplied — the
+        // post-filter below is the belt-and-suspenders mirror of the
+        // SAL-level contract so adapters with FTS paths that lack the
+        // generated column (or where the column trails the metadata
+        // update by a transaction window) still fail-closed.
+        let rows = db::search(
             &conn,
             query,
             filter.namespace.as_deref(),
@@ -184,7 +216,17 @@ impl MemoryStore for SqliteStore {
             ctx.as_agent.as_deref(),
             false,
         )
-        .map_err(box_err)
+        .map_err(box_err)?;
+        // #910 SAL-level scope=private gate — see trait docstring +
+        // `is_visible_to_caller`.
+        if ctx.bypass_visibility {
+            return Ok(rows);
+        }
+        let caller = ctx.effective_principal();
+        Ok(rows
+            .into_iter()
+            .filter(|m| is_visible_to_caller(m, caller))
+            .collect())
     }
 
     async fn verify(&self, _ctx: &CallerContext, id: &str) -> StoreResult<VerifyReport> {
@@ -319,6 +361,17 @@ impl MemoryStore for SqliteStore {
         since: Option<&str>,
         limit: usize,
     ) -> StoreResult<Vec<Memory>> {
+        // NOTE: federation catchup path — `list_memories_updated_since`
+        // is invoked over the `GET /api/v1/sync/since` peer-pull
+        // surface, NOT a tenant-facing query. The mTLS-gated peer is
+        // authenticated separately (Track Federation §H3 verify) and
+        // sync rows must round-trip with full metadata intact, so this
+        // method intentionally does NOT apply the scope=private filter.
+        // Cross-tenant visibility on the sync surface is enforced by
+        // the federation allowlist + peer-attestation gate, not by the
+        // SAL row filter. Documented at the trait level — every new
+        // query method MUST either apply the filter or document why
+        // it bypasses (admin / federation / migration export).
         let conn = self.state.lock().await;
         let capped = limit.clamp(1, 10_000);
         db::memories_updated_since(&conn, since, capped).map_err(box_err)
@@ -361,8 +414,8 @@ impl MemoryStore for SqliteStore {
         let until = filter.until.map(|d| d.to_rfc3339());
         let limit = if filter.limit == 0 { 10 } else { filter.limit };
         let scoring = crate::config::ResolvedScoring::default();
-        if let Some(qe) = query_embedding {
-            let (results, _outcome) = db::recall_hybrid(
+        let results = if let Some(qe) = query_embedding {
+            db::recall_hybrid(
                 &conn,
                 query,
                 qe,
@@ -385,10 +438,10 @@ impl MemoryStore for SqliteStore {
                 // direct db::recall call.
                 None,
             )
-            .map_err(box_err)?;
-            Ok(results)
+            .map_err(box_err)?
+            .0
         } else {
-            let (results, _outcome) = db::recall(
+            db::recall(
                 &conn,
                 query,
                 filter.namespace.as_deref(),
@@ -403,9 +456,23 @@ impl MemoryStore for SqliteStore {
                 false,
                 None,
             )
-            .map_err(box_err)?;
-            Ok(results)
+            .map_err(box_err)?
+            .0
+        };
+        // #910 SAL-level scope=private gate — see trait docstring +
+        // `is_visible_to_caller`. db::recall + db::recall_hybrid already
+        // apply the `visibility_clause` SQL fragment when `as_agent`
+        // is set; this post-filter is the belt-and-suspenders mirror
+        // of the SAL contract so callers that pass an empty `as_agent`
+        // (or rely on the trait default) still fail-closed.
+        if ctx.bypass_visibility {
+            return Ok(results);
         }
+        let caller = ctx.effective_principal();
+        Ok(results
+            .into_iter()
+            .filter(|(m, _)| is_visible_to_caller(m, caller))
+            .collect())
     }
 
     async fn touch_after_recall(&self, ids: &[String]) -> StoreResult<()> {
@@ -580,6 +647,12 @@ impl MemoryStore for SqliteStore {
     }
 
     async fn export_memories(&self) -> StoreResult<Vec<Memory>> {
+        // NOTE: operator/admin export surface — not tenant-facing.
+        // Backs the `/api/v1/admin/export` endpoint (api-key gated).
+        // Intentionally does NOT apply the scope=private filter so a
+        // full-fidelity backup round-trips every row regardless of
+        // metadata.scope. Admin-only by contract; documented at the
+        // trait level.
         let conn = self.state.lock().await;
         db::export_all(&conn).map_err(box_err)
     }
@@ -861,6 +934,7 @@ impl MemoryStore for SqliteStore {
 
     async fn find_paths(
         &self,
+        ctx: &CallerContext,
         source_id: &str,
         target_id: &str,
         max_depth: Option<usize>,
@@ -869,7 +943,38 @@ impl MemoryStore for SqliteStore {
         let conn = self.state.lock().await;
         // SQLite's find_paths defaults to current-view (excludes
         // invalidated edges) — match the trait/HTTP contract.
-        db::find_paths(&conn, source_id, target_id, max_depth, max_results, false).map_err(box_err)
+        let paths = db::find_paths(&conn, source_id, target_id, max_depth, max_results, false)
+            .map_err(box_err)?;
+        // #910 SAL-level scope=private gate (path-traversal flavour) —
+        // any path that walks through a memory the caller cannot see
+        // is dropped. Fetch each node's metadata once and cache so
+        // the filter is O(distinct-nodes), not O(path-count *
+        // path-length). Fail-closed: a node that cannot be resolved
+        // (deleted mid-traversal, or in a namespace this caller can
+        // never read) drops every path that touches it.
+        if ctx.bypass_visibility {
+            return Ok(paths);
+        }
+        let caller = ctx.effective_principal();
+        let mut visible_cache: std::collections::HashMap<String, bool> =
+            std::collections::HashMap::new();
+        let mut filtered: Vec<Vec<String>> = Vec::with_capacity(paths.len());
+        'outer: for path in paths {
+            for node in &path {
+                let entry = visible_cache.entry(node.clone()).or_insert_with(|| {
+                    match db::get(&conn, node) {
+                        Ok(Some(mem)) => is_visible_to_caller(&mem, caller),
+                        // Fail-closed: missing node ⇒ drop the path.
+                        Ok(None) | Err(_) => false,
+                    }
+                });
+                if !*entry {
+                    continue 'outer;
+                }
+            }
+            filtered.push(path);
+        }
+        Ok(filtered)
     }
 
     async fn notify(
@@ -1682,8 +1787,10 @@ mod tests {
     #[tokio::test]
     async fn find_paths_returns_empty_for_unknown_endpoints() {
         let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice");
         let paths = store
             .find_paths(
+                &ctx,
                 "88888888-8888-8888-8888-888888888888",
                 "99999999-9999-9999-9999-999999999999",
                 None,
