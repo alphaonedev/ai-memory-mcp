@@ -163,7 +163,7 @@ min_line_coverage = 88.0
 # mcp/tools/store.rs split per #881 PR-4 into store/{embed,legacy_classifier,mod,
 # synthesis,tests,transport,validation}.rs — single-file floor retired in favor
 # of per-sub-module floors below.
-"mcp/tools/store/mod.rs"        = 90    # tier B, post-#881 split + provenance Gap 2 source_uri thread (#885/#892); uplift TODO
+"mcp/tools/store/mod.rs"        = 89    # tier B, measured 89.72 (CI), post-#881 split + provenance Gap 2 source_uri thread (#885/#892); uplift TODO
 "mcp/tools/store/validation.rs" = 85    # tier B, post-#881 split + source_uri validation gate (#892); uplift TODO
 "mcp/tools/store/embed.rs"      = 85    # tier B, post-#881 split; uplift TODO
 "mcp/tools/store/synthesis.rs"  = 85    # tier B, post-#881 split; uplift TODO

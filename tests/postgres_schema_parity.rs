@@ -60,7 +60,7 @@ use common::postgres_url;
 /// bookkeeping for this parity test. The previous cross-ladder `>=`
 /// floor assertion was retired in #797 once the namespaces inverted —
 /// see the docstring of `schema_versions_match_across_adapters`.
-const POSTGRES_CURRENT_VERSION: i64 = 41;
+const POSTGRES_CURRENT_VERSION: i64 = 46;
 
 /// Open an out-of-band `sqlx` pool against the same URL the adapter
 /// uses. We deliberately bypass `PostgresStore` for the inspection
