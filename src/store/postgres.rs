@@ -173,6 +173,58 @@ const MIGRATION_V40_SHADOW_RETENTION: &str =
 const MIGRATION_V41_AUTO_PERSONA_ENTITY_ID: &str =
     include_str!("../../migrations/postgres/0023_v07_auto_persona_entity_id.sql");
 
+/// v0.7.0 Provenance Gap 1 (issue #884) — postgres v42 mirror of SQLite
+/// schema v45. Adds `memories.version BIGINT NOT NULL DEFAULT 1` so
+/// every memory row carries an optimistic-concurrency counter. The
+/// `version` column is bumped on every mutation by
+/// [`PostgresStore::update_with_expected_version`]; concurrent updates
+/// pass `expected_version` and receive a typed `VersionConflict`
+/// envelope when the stored version has drifted.
+const MIGRATION_V42_MEMORY_VERSION: &str =
+    include_str!("../../migrations/postgres/0025_v07_memory_version.sql");
+
+/// v0.7.0 Provenance Gap 2 (issue #885) — postgres v43 mirror of SQLite
+/// schema v46. Re-asserts `memories.source_uri TEXT NULL` + partial
+/// index `idx_memories_source_uri` for legacy upgrades, then backfills
+/// the column from `metadata.source_uri` and `citations[0].uri` for
+/// pre-Form-4 rows. The column itself + partial index originally
+/// shipped at postgres v37 (`0019_v07_form4_provenance.sql`); this arm
+/// covers the upgrade path for installs that pre-dated v37.
+const MIGRATION_V43_SOURCE_URI_UPGRADE: &str =
+    include_str!("../../migrations/postgres/0026_v07_source_uri_upgrade.sql");
+
+/// v0.7.0 Gap 3 (issue #886) — postgres v44 mirror of SQLite schema v47.
+/// Adds the `recall_observations` ledger keyed by
+/// `(recall_id, memory_id)`, carrying retriever / rank / score plus
+/// the consumed_at + consumed_by_memory_id columns set when a
+/// `memory_store` or `memory_link` request cites a prior `recall_id`.
+/// CASCADE-deletes alongside the referenced memory rows. Pure additive
+/// `CREATE TABLE IF NOT EXISTS` + three index `CREATE INDEX IF NOT
+/// EXISTS` statements — fully idempotent.
+const MIGRATION_V44_RECALL_OBSERVATIONS: &str =
+    include_str!("../../migrations/postgres/0027_v07_recall_observations.sql");
+
+/// v0.7.0 Provenance Gap 5 (issue #888) — postgres v45 mirror of the
+/// SQLite Gap-5 split-write surface. The `archive_reason` column has no
+/// CHECK clause so `'superseded'` lands without DDL; this arm adds two
+/// performance indexes the Gap-5 audit + lineage read paths rely on:
+/// `idx_archived_reason` for time-bounded "what got superseded in the
+/// last day" scans, and `idx_memories_metadata_superseded` for the
+/// reciprocal "find the live row that superseded archived X" lookup.
+const MIGRATION_V45_EDIT_SOURCE_ARCHIVE: &str =
+    include_str!("../../migrations/postgres/0028_v07_edit_source_archive_metadata.sql");
+
+/// v0.7.0 issue #860 — postgres v46 mirror of the SQLite Gap-7 surface.
+/// Defensive belt-and-braces `ADD COLUMN IF NOT EXISTS` on the four
+/// temporal-validity + attestation columns
+/// (`valid_from`, `valid_until`, `observed_by`, `attest_level`) on
+/// `memory_links`, all of which already ship inline in
+/// `postgres_schema.sql:283-291` for greenfield deploys. Re-asserts
+/// the matching indexes via `CREATE INDEX IF NOT EXISTS` so a legacy
+/// DB that was created before those declarations picks them up.
+const MIGRATION_V46_LINKS_TEMPORAL_COLUMNS: &str =
+    include_str!("../../migrations/postgres/0029_v07_links_temporal_columns.sql");
+
 /// Current schema version. Matches SQLite CURRENT_SCHEMA_VERSION (src/db.rs:233).
 /// Incremented on each migration step.
 ///
@@ -297,7 +349,37 @@ const MIGRATION_V41_AUTO_PERSONA_ENTITY_ID: &str =
 //       Column-name deliberately distinct from QW-2's `entity_id`
 //       (Persona-row attribution); PERF-8 reads the OPPOSITE direction
 //       (the entity an observation/reflection mentions).
-const CURRENT_SCHEMA_VERSION: i32 = 41;
+// v42 = v0.7.0 Provenance Gap 1 (issue #884) — `memories.version
+//       BIGINT NOT NULL DEFAULT 1` optimistic-concurrency counter.
+//       Mirrors SQLite schema v45. Pure additive ADD COLUMN IF NOT
+//       EXISTS — fully idempotent. The new
+//       `PostgresStore::update_with_expected_version` bumps the
+//       column atomically and refuses an update whose
+//       expected_version has drifted via the typed
+//       `VersionConflict` envelope.
+// v43 = v0.7.0 Provenance Gap 2 (issue #885) — re-asserts
+//       `memories.source_uri TEXT` + partial index
+//       `idx_memories_source_uri` for upgrade paths that pre-date
+//       the v37 Form-4 migration, then backfills the column from
+//       `metadata.source_uri` and `citations[0].uri` for pre-Form-4
+//       rows. Mirrors SQLite schema v46. Pure additive +
+//       guarded UPDATE — fully idempotent.
+// v44 = v0.7.0 Gap 3 (issue #886) — `recall_observations` ledger
+//       table keyed by (recall_id, memory_id). Mirrors SQLite
+//       schema v47. Pure additive CREATE TABLE IF NOT EXISTS +
+//       three indexes — fully idempotent.
+// v45 = v0.7.0 Provenance Gap 5 (issue #888) — append-and-archive
+//       Gap-5 support indexes (`idx_archived_reason` +
+//       `idx_memories_metadata_superseded`). No CHECK on
+//       archive_reason to expand (free-form TEXT column). Pure
+//       additive CREATE INDEX IF NOT EXISTS — fully idempotent.
+// v46 = v0.7.0 issue #860 — defensive `ADD COLUMN IF NOT EXISTS` on
+//       the four temporal-validity + attestation columns on
+//       `memory_links` (valid_from, valid_until, observed_by,
+//       attest_level). All four already ship inline in
+//       postgres_schema.sql for greenfield; this migration covers
+//       legacy upgrade paths. Pure additive — fully idempotent.
+const CURRENT_SCHEMA_VERSION: i32 = 46;
 
 /// Default embedding column dimension used when the caller doesn't pass
 /// `--embedding-dim` to `ai-memory schema-init`. Matches the v0.7.0
@@ -813,6 +895,21 @@ impl PostgresStore {
         }
         if current_version < 41 {
             self.migrate_v41().await?;
+        }
+        if current_version < 42 {
+            self.migrate_v42().await?;
+        }
+        if current_version < 43 {
+            self.migrate_v43().await?;
+        }
+        if current_version < 44 {
+            self.migrate_v44().await?;
+        }
+        if current_version < 45 {
+            self.migrate_v45().await?;
+        }
+        if current_version < 46 {
+            self.migrate_v46().await?;
         }
 
         Ok(())
@@ -1368,6 +1465,735 @@ impl PostgresStore {
         );
         Ok(())
     }
+
+    /// v0.7.0 Provenance Gap 1 (issue #884) — adds `memories.version`
+    /// optimistic-concurrency counter. Mirrors SQLite schema v45.
+    async fn migrate_v42(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v42 tx", e))?;
+
+        sqlx::raw_sql(MIGRATION_V42_MEMORY_VERSION)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("apply v42 memory_version", e))?;
+
+        record_schema_version(&mut tx, 42).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v42 migration", e))?;
+
+        tracing::info!(
+            target = "store::postgres",
+            "schema migration v42 applied (Provenance Gap 1: memories.version)"
+        );
+        Ok(())
+    }
+
+    /// v0.7.0 Provenance Gap 2 (issue #885) — re-asserts
+    /// `memories.source_uri` column + partial index for legacy upgrade
+    /// paths and backfills the column from metadata/citations. Mirrors
+    /// SQLite schema v46.
+    async fn migrate_v43(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v43 tx", e))?;
+
+        sqlx::raw_sql(MIGRATION_V43_SOURCE_URI_UPGRADE)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("apply v43 source_uri upgrade", e))?;
+
+        record_schema_version(&mut tx, 43).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v43 migration", e))?;
+
+        tracing::info!(
+            target = "store::postgres",
+            "schema migration v43 applied (Provenance Gap 2: source_uri upgrade + backfill)"
+        );
+        Ok(())
+    }
+
+    /// v0.7.0 Gap 3 (issue #886) — recall_observations ledger table.
+    /// Mirrors SQLite schema v47.
+    async fn migrate_v44(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v44 tx", e))?;
+
+        sqlx::raw_sql(MIGRATION_V44_RECALL_OBSERVATIONS)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("apply v44 recall_observations", e))?;
+
+        record_schema_version(&mut tx, 44).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v44 migration", e))?;
+
+        tracing::info!(
+            target = "store::postgres",
+            "schema migration v44 applied (Gap 3: recall_observations ledger)"
+        );
+        Ok(())
+    }
+
+    /// v0.7.0 Provenance Gap 5 (issue #888) — Gap-5 append-and-archive
+    /// support indexes.
+    async fn migrate_v45(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v45 tx", e))?;
+
+        sqlx::raw_sql(MIGRATION_V45_EDIT_SOURCE_ARCHIVE)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("apply v45 edit_source archive", e))?;
+
+        record_schema_version(&mut tx, 45).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v45 migration", e))?;
+
+        tracing::info!(
+            target = "store::postgres",
+            "schema migration v45 applied (Provenance Gap 5: archive_reason indexes)"
+        );
+        Ok(())
+    }
+
+    /// v0.7.0 issue #860 — defensive `ADD COLUMN IF NOT EXISTS` on the
+    /// four temporal-validity + attestation columns on `memory_links`.
+    async fn migrate_v46(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v46 tx", e))?;
+
+        sqlx::raw_sql(MIGRATION_V46_LINKS_TEMPORAL_COLUMNS)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("apply v46 links temporal columns", e))?;
+
+        record_schema_version(&mut tx, 46).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v46 migration", e))?;
+
+        tracing::info!(
+            target = "store::postgres",
+            "schema migration v46 applied (#860: memory_links temporal + attest columns)"
+        );
+        Ok(())
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // v0.7.0 Provenance Gap parity — postgres SAL methods (issue #894).
+    //
+    // The six methods below bring `PostgresStore` to parity with the
+    // sqlite-side `storage::` free functions for the Gap-1/2/3/5/6/7
+    // provenance closeouts. Inherent methods (not on the
+    // [`MemoryStore`] trait) so call-sites that hold an
+    // `Arc<PostgresStore>` can drive them today; the trait can be
+    // widened in a follow-up once both adapters stabilise.
+    //
+    // Sqlite reference impls:
+    //   * `storage::update_with_expected_version` (Gap 1, #884)
+    //   * `storage::update_with_archive_on_supersede` (Gap 5, #888)
+    //   * `storage::search_with_source_uri` (Gap 6, #889)
+    //   * `storage::list_by_source_uri` (Gap 6, #889)
+    //   * `observations::record_recall` + `observations::gc::prune`
+    //     (Gap 3, #886)
+    // ─────────────────────────────────────────────────────────────────
+
+    /// v0.7.0 Provenance Gap 1 (issue #884) — optimistic-concurrency
+    /// aware update. Postgres twin of
+    /// [`crate::storage::update_with_expected_version`].
+    ///
+    /// When `expected_version` is `Some(v)`, the update fails with a
+    /// typed [`crate::storage::VersionConflict`] error if the stored
+    /// row's `version` is not equal to `v`. When `None`, the legacy
+    /// last-write-wins behaviour is preserved (still bumps `version`
+    /// on success). On a successful mutation the row's `version` is
+    /// monotonically incremented; the new value is observable on the
+    /// subsequent read.
+    ///
+    /// Atomicity: the version gate is asserted inside the UPDATE
+    /// WHERE clause AND re-checked on a 0-rows-affected outcome so
+    /// a racing writer that slipped in between client read + server
+    /// update still fails CONFLICT.
+    ///
+    /// # Errors
+    ///
+    /// * [`crate::storage::VersionConflict`] — when `expected_version`
+    ///   is `Some` and the stored value has drifted.
+    /// * `StoreError::NotFound` — when no live memory matches `id`.
+    /// * `StoreError::BackendUnavailable` — on SQL failure.
+    pub async fn update_with_expected_version(
+        &self,
+        id: &str,
+        patch: UpdatePatch,
+        expected_version: Option<i64>,
+    ) -> StoreResult<i64> {
+        // Pre-read the current version so a CONFLICT carries the
+        // observed-current value in the typed error. The UPDATE
+        // re-asserts the gate atomically below.
+        let current_row: Option<(i64,)> =
+            sqlx::query_as("SELECT version FROM memories WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| to_store_err("read memories.version", e))?;
+        let Some((current,)) = current_row else {
+            return Err(StoreError::NotFound { id: id.to_string() });
+        };
+
+        // Pre-check (cheap fast-path); the atomic re-check below is
+        // the load-bearing guard.
+        if let Some(expected) = expected_version
+            && expected != current
+        {
+            return Err(StoreError::IntegrityFailed {
+                detail: format!(
+                    "VersionConflict: memory {id} expected_version={expected} but stored version={current}"
+                ),
+            });
+        }
+
+        let new_version = current + 1;
+        let rows_affected = sqlx::query(
+            "UPDATE memories SET
+                title = COALESCE($2, title),
+                content = COALESCE($3, content),
+                tier = CASE
+                    WHEN $4::TEXT IS NULL THEN tier
+                    WHEN tier_rank($4::TEXT) >= tier_rank(tier) THEN $4::TEXT
+                    ELSE tier
+                END,
+                namespace = COALESCE($5, namespace),
+                tags = COALESCE($6, tags),
+                priority = COALESCE($7, priority),
+                confidence = COALESCE($8, confidence),
+                metadata = CASE
+                    WHEN $9::JSONB IS NULL THEN metadata
+                    WHEN metadata ? 'agent_id' THEN jsonb_set(
+                        $9::JSONB, '{agent_id}', metadata -> 'agent_id'
+                    )
+                    ELSE $9::JSONB
+                END,
+                updated_at = NOW(),
+                version = version + 1
+             WHERE id = $1
+               AND ($10::BIGINT IS NULL OR version = $10::BIGINT)",
+        )
+        .bind(id)
+        .bind(patch.title)
+        .bind(patch.content)
+        .bind(patch.tier.as_ref().map(Tier::as_str))
+        .bind(patch.namespace)
+        .bind(
+            patch
+                .tags
+                .map(serde_json::to_value)
+                .transpose()
+                .map_err(|e| StoreError::IntegrityFailed {
+                    detail: format!("serialize tags patch: {e}"),
+                })?,
+        )
+        .bind(patch.priority)
+        .bind(patch.confidence)
+        .bind(patch.metadata)
+        .bind(expected_version)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| to_store_err("update_with_expected_version", e))?
+        .rows_affected();
+
+        if rows_affected == 0 {
+            // Either the row vanished or the version drifted between
+            // SELECT and UPDATE. Re-read to populate the typed error.
+            let observed: Option<(i64,)> =
+                sqlx::query_as("SELECT version FROM memories WHERE id = $1")
+                    .bind(id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|e| to_store_err("re-read version on conflict", e))?;
+            if let Some((cur,)) = observed {
+                let exp = expected_version.unwrap_or(current);
+                return Err(StoreError::IntegrityFailed {
+                    detail: format!(
+                        "VersionConflict: memory {id} expected_version={exp} but stored version={cur}"
+                    ),
+                });
+            }
+            return Err(StoreError::NotFound { id: id.to_string() });
+        }
+        Ok(new_version)
+    }
+
+    /// v0.7.0 Provenance Gap 5 (issue #888) — append-and-archive write
+    /// path. Postgres twin of
+    /// [`crate::storage::update_with_archive_on_supersede`].
+    ///
+    /// Used by the MCP `memory_update` tool when the caller passes
+    /// `edit_source` of `llm` or `hook`. Atomic: every step runs
+    /// inside a single `sqlx::Transaction` so a failure mid-way
+    /// rolls every step back.
+    ///
+    /// Sequence (mirrors mem9's split-write-path pattern):
+    /// 1. Honor the optimistic-concurrency gate (`expected_version`).
+    ///    Conflict surfaces as `IntegrityFailed` carrying the
+    ///    typed `VersionConflict` message before any mutation lands.
+    /// 2. Archive the OLD row with `archive_reason='superseded'`.
+    /// 3. Insert a NEW memory row carrying the patched fields plus
+    ///    `metadata.superseded_id` forward pointer and the
+    ///    `edit_source` provenance tag.
+    /// 4. The supersede lineage is encoded via 2 mechanisms (not 3):
+    ///    `archived_memories.archive_reason='superseded'` on OLD +
+    ///    `new_memory.metadata.superseded_id` forward pointer on NEW.
+    ///    No `memory_links` `supersedes` edge is written — the FK
+    ///    target would point at a row that has left the live
+    ///    `memories` table. See #895 for the archive-cross-ref
+    ///    follow-on.
+    ///
+    /// Returns `(archived_id, new_id)` so callers (HTTP / MCP
+    /// surfaces) can surface both in the wire response without a
+    /// second SELECT.
+    ///
+    /// # Errors
+    ///
+    /// * `IntegrityFailed` carrying a `VersionConflict` message — when
+    ///   `expected_version` is `Some` and the stored version drifted.
+    /// * `NotFound` — when no live memory matches `id`.
+    /// * `BackendUnavailable` — on SQL failure.
+    pub async fn update_with_archive_on_supersede(
+        &self,
+        id: &str,
+        patch: UpdatePatch,
+        expected_version: Option<i64>,
+        edit_source: crate::models::EditSource,
+    ) -> StoreResult<(String, String)> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin supersede tx", e))?;
+
+        // Pre-read the existing row so we can compose the NEW row from
+        // the OLD values. SELECT FOR UPDATE pins the row across the
+        // archive + insert so a concurrent writer can't race past.
+        let existing_row = sqlx::query("SELECT * FROM memories WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("select existing for supersede", e))?;
+        let Some(existing_pg) = existing_row else {
+            return Err(StoreError::NotFound { id: id.to_string() });
+        };
+
+        let existing = Self::row_to_memory(&existing_pg)?;
+
+        // Optimistic-concurrency gate against the OLD row.
+        if let Some(expected) = expected_version
+            && expected != existing.version
+        {
+            return Err(StoreError::IntegrityFailed {
+                detail: format!(
+                    "VersionConflict: memory {id} expected_version={expected} but stored version={}",
+                    existing.version
+                ),
+            });
+        }
+
+        // Compose the NEW row by overlaying the patch on the OLD row.
+        let new_id = uuid::Uuid::new_v4().to_string();
+
+        // Tier monotonicity preserved (long ≥ mid ≥ short).
+        let new_tier = match (patch.tier.as_ref(), &existing.tier) {
+            (Some(requested), existing_tier) => match (existing_tier, requested) {
+                (Tier::Long, _) => Tier::Long,
+                (Tier::Mid, Tier::Short) => Tier::Mid,
+                (_, r) => r.clone(),
+            },
+            (None, existing_tier) => existing_tier.clone(),
+        };
+
+        let new_title = patch
+            .title
+            .as_deref()
+            .unwrap_or(existing.title.as_str())
+            .to_string();
+        let new_content = patch
+            .content
+            .as_deref()
+            .unwrap_or(existing.content.as_str())
+            .to_string();
+        let new_namespace = patch
+            .namespace
+            .as_deref()
+            .unwrap_or(existing.namespace.as_str())
+            .to_string();
+        let new_tags = patch.tags.clone().unwrap_or_else(|| existing.tags.clone());
+        let new_priority = patch.priority.unwrap_or(existing.priority);
+        let new_confidence = patch.confidence.unwrap_or(existing.confidence);
+        // Stamp edit_source + superseded_id into the new row's metadata.
+        let mut new_metadata = patch
+            .metadata
+            .clone()
+            .unwrap_or_else(|| existing.metadata.clone());
+        if let serde_json::Value::Object(ref mut m) = new_metadata {
+            m.insert(
+                "edit_source".to_string(),
+                serde_json::Value::String(edit_source.as_str().to_string()),
+            );
+            m.insert(
+                "superseded_id".to_string(),
+                serde_json::Value::String(existing.id.clone()),
+            );
+        }
+
+        // Step 1: archive the OLD row with archive_reason='superseded'.
+        let archive_rows = sqlx::query(
+            "INSERT INTO archived_memories
+                (id, tier, namespace, title, content, tags, priority, confidence,
+                 source, access_count, created_at, updated_at, last_accessed_at,
+                 expires_at, archived_at, archive_reason, metadata,
+                 embedding, embedding_dim, original_tier, original_expires_at)
+             SELECT id, tier, namespace, title, content, tags, priority, confidence,
+                    source, access_count, created_at, updated_at, last_accessed_at,
+                    expires_at, NOW(), 'superseded', metadata,
+                    embedding, embedding_dim, tier, expires_at
+             FROM memories WHERE id = $1
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("archive on supersede", e))?
+        .rows_affected();
+        if archive_rows == 0 {
+            // Row vanished or the ON CONFLICT path took over — surface a
+            // typed not-found instead of silently dropping the supersede.
+            tx.rollback()
+                .await
+                .map_err(|e| to_store_err("rollback supersede", e))?;
+            return Err(StoreError::NotFound { id: id.to_string() });
+        }
+
+        // Step 2: DELETE the OLD row from the live `memories` table so
+        // the (title, namespace) UNIQUE index doesn't collide with the
+        // new INSERT.
+        sqlx::query("DELETE FROM memories WHERE id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("delete old on supersede", e))?;
+
+        // Step 3: insert the NEW row carrying the patched content.
+        // version starts at 1 (fresh row, not a continuation).
+        sqlx::query(
+            "INSERT INTO memories
+                (id, tier, namespace, title, content, tags, priority, confidence,
+                 source, access_count, created_at, updated_at, metadata, version)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 0, NOW(), NOW(), $10, 1)",
+        )
+        .bind(&new_id)
+        .bind(new_tier.as_str())
+        .bind(&new_namespace)
+        .bind(&new_title)
+        .bind(&new_content)
+        .bind(
+            serde_json::to_value(&new_tags).map_err(|e| StoreError::IntegrityFailed {
+                detail: format!("serialize tags: {e}"),
+            })?,
+        )
+        .bind(new_priority)
+        .bind(new_confidence)
+        .bind(&existing.source)
+        .bind(&new_metadata)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("insert new on supersede", e))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit supersede tx", e))?;
+
+        Ok((existing.id, new_id))
+    }
+
+    /// v0.7.0 Provenance Gap 6 (issue #889) — keyword search with
+    /// optional reciprocal `source_uri` filter. Postgres twin of
+    /// [`crate::storage::search_with_source_uri`].
+    ///
+    /// When `source_uri` is `Some(uri)`, the full-text search is
+    /// post-filtered to memories whose `source_uri` column equals the
+    /// supplied value verbatim. The partial `idx_memories_source_uri`
+    /// index (created at v37) covers the lookup, keeping it O(log N)
+    /// over the URI-keyed subspace.
+    ///
+    /// Returns up to `limit` matches ordered descending by a blended
+    /// score (text-rank + priority + recency).
+    pub async fn search_with_source_uri(
+        &self,
+        query: &str,
+        filter: &Filter,
+        source_uri: Option<&str>,
+    ) -> StoreResult<Vec<Memory>> {
+        let limit: i64 = filter.limit.clamp(1, 1000).try_into().unwrap_or(100);
+        let rows = sqlx::query(
+            "SELECT m.*,
+                    ts_rank(to_tsvector('english', m.title || ' ' || m.content),
+                            plainto_tsquery('english', $1)) AS rank
+             FROM memories m
+             WHERE to_tsvector('english', m.title || ' ' || m.content)
+                   @@ plainto_tsquery('english', $1)
+               AND ($2::text IS NULL OR m.namespace = $2)
+               AND ($3::text IS NULL OR m.tier = $3)
+               AND (m.expires_at IS NULL OR m.expires_at > NOW())
+               AND ($4::timestamptz IS NULL OR m.created_at >= $4)
+               AND ($5::timestamptz IS NULL OR m.created_at <= $5)
+               AND ($6::text IS NULL OR m.source_uri = $6)
+             ORDER BY rank DESC,
+                      m.priority DESC,
+                      m.updated_at DESC
+             LIMIT $7",
+        )
+        .bind(query)
+        .bind(filter.namespace.as_ref())
+        .bind(filter.tier.as_ref().map(Tier::as_str))
+        .bind(filter.since)
+        .bind(filter.until)
+        .bind(source_uri)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| to_store_err("search_with_source_uri", e))?;
+
+        rows.iter().map(Self::row_to_memory).collect()
+    }
+
+    /// v0.7.0 Provenance Gap 6 (issue #889) — list every memory
+    /// carrying the supplied `source_uri`. Postgres twin of
+    /// [`crate::storage::list_by_source_uri`].
+    ///
+    /// Bypasses the FTS layer so callers that want the full reciprocal
+    /// set ("every memory from this document") don't need to type a
+    /// query. Hits the partial `idx_memories_source_uri` index
+    /// directly. Pure read.
+    pub async fn list_by_source_uri(
+        &self,
+        source_uri: &str,
+        namespace: Option<&str>,
+        limit: Option<usize>,
+    ) -> StoreResult<Vec<Memory>> {
+        let cap_usize = limit.unwrap_or(200).min(1000);
+        let cap: i64 = i64::try_from(cap_usize).unwrap_or(200);
+        let rows = sqlx::query(
+            "SELECT m.* FROM memories m
+              WHERE m.source_uri = $1
+                AND ($2::text IS NULL OR m.namespace = $2)
+              ORDER BY m.created_at ASC
+              LIMIT $3",
+        )
+        .bind(source_uri)
+        .bind(namespace)
+        .bind(cap)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| to_store_err("list_by_source_uri", e))?;
+
+        rows.iter().map(Self::row_to_memory).collect()
+    }
+
+    /// v0.7.0 Gap 3 (issue #886) — insert one or more
+    /// `recall_observations` rows under a single `recall_id`. Postgres
+    /// twin of [`crate::observations::record_recall`].
+    ///
+    /// Idempotent via `ON CONFLICT (recall_id, memory_id) DO NOTHING`
+    /// — replaying the same recall is a no-op rather than a
+    /// constraint violation.
+    ///
+    /// `candidates` is a slice of `(memory_id, retriever, rank, score)`
+    /// tuples. Returns the number of rows actually inserted (excludes
+    /// ON CONFLICT no-ops).
+    pub async fn recall_observation_insert(
+        &self,
+        recall_id: &str,
+        candidates: &[(String, String, i64, f64)],
+    ) -> StoreResult<usize> {
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin recall_observation tx", e))?;
+        let mut written: usize = 0;
+        for (memory_id, retriever, rank, score) in candidates {
+            let n = sqlx::query(
+                "INSERT INTO recall_observations
+                    (recall_id, memory_id, retriever, rank, score)
+                 VALUES ($1, $2, $3, $4, $5)
+                 ON CONFLICT (recall_id, memory_id) DO NOTHING",
+            )
+            .bind(recall_id)
+            .bind(memory_id)
+            .bind(retriever)
+            .bind(rank)
+            .bind(score)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("insert recall_observation", e))?
+            .rows_affected();
+            written += usize::try_from(n).unwrap_or(0);
+        }
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit recall_observation tx", e))?;
+        Ok(written)
+    }
+
+    /// v0.7.0 Gap 3 (issue #886) — TTL-based prune of the
+    /// `recall_observations` ledger. Postgres twin of
+    /// [`crate::observations::gc::prune`].
+    ///
+    /// Deletes every row whose `observed_at` is older than `ttl_days`
+    /// days. Returns the count of rows pruned. Safe to invoke
+    /// concurrently with `recall_observation_insert`.
+    pub async fn recall_observation_gc(&self, ttl_days: i64) -> StoreResult<usize> {
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(ttl_days.max(1));
+        let n = sqlx::query("DELETE FROM recall_observations WHERE observed_at < $1")
+            .bind(cutoff)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| to_store_err("recall_observation_gc", e))?
+            .rows_affected();
+        Ok(usize::try_from(n).unwrap_or(0))
+    }
+
+    /// v0.7.0 issue #860 — Postgres twin of
+    /// [`crate::storage::get_links`] expanded to surface the four
+    /// temporal-validity + attestation columns
+    /// (`valid_from`, `valid_until`, `observed_by`, `attest_level`)
+    /// the `memory_get_links` MCP tool's docstring promises.
+    ///
+    /// Returns every link row where `id` is either source OR target,
+    /// projecting the full row shape so the read path matches the
+    /// SQLite contract byte-for-byte.
+    pub async fn get_links(&self, id: &str) -> StoreResult<Vec<MemoryLink>> {
+        let rows = sqlx::query(
+            "SELECT source_id, target_id, relation, created_at,
+                    valid_from, valid_until, observed_by, attest_level
+             FROM memory_links
+             WHERE source_id = $1 OR target_id = $1
+             ORDER BY source_id, target_id, relation",
+        )
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| to_store_err("get_links", e))?;
+
+        rows.iter()
+            .map(|r| {
+                let created_at: DateTime<Utc> = r
+                    .try_get("created_at")
+                    .map_err(|e| to_store_err("read created_at", e))?;
+                let valid_from: Option<DateTime<Utc>> = r
+                    .try_get("valid_from")
+                    .map_err(|e| to_store_err("read valid_from", e))?;
+                let valid_until: Option<DateTime<Utc>> = r
+                    .try_get("valid_until")
+                    .map_err(|e| to_store_err("read valid_until", e))?;
+                let observed_by: Option<String> = r
+                    .try_get("observed_by")
+                    .map_err(|e| to_store_err("read observed_by", e))?;
+                let attest_level: Option<String> = r
+                    .try_get("attest_level")
+                    .map_err(|e| to_store_err("read attest_level", e))?;
+                let relation_str: String = r
+                    .try_get("relation")
+                    .map_err(|e| to_store_err("read relation", e))?;
+                Ok(MemoryLink {
+                    source_id: r
+                        .try_get("source_id")
+                        .map_err(|e| to_store_err("read source_id", e))?,
+                    target_id: r
+                        .try_get("target_id")
+                        .map_err(|e| to_store_err("read target_id", e))?,
+                    relation: crate::models::MemoryLinkRelation::from_str(&relation_str)
+                        .unwrap_or_default(),
+                    created_at: created_at.to_rfc3339(),
+                    // `signature` is intentionally NOT surfaced through
+                    // the get_links read path — that bytes-on-the-wire
+                    // surface is the verifier's concern
+                    // (`LinkVerifyRecord`), and exposing it here would
+                    // force the JSON response to carry a base64 blob
+                    // every existing caller would have to ignore.
+                    signature: None,
+                    valid_from: valid_from.map(|t| t.to_rfc3339()),
+                    valid_until: valid_until.map(|t| t.to_rfc3339()),
+                    observed_by,
+                    attest_level,
+                })
+            })
+            .collect()
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // AGE Cypher templates for Gap-5 / Gap-7 (issue #894 PG+AGE parity).
+    //
+    // These constants bind the canonical Cypher snippets a future AGE
+    // runner will switch on when the operator network constraint lifts
+    // (Track C/D: 192.168.50.100 ↔ 192.168.1.50 routing). They are
+    // intentionally NOT executed by this build — the v0.7.0 PG path's
+    // `kg_backend` probes for AGE at connect time and falls back to
+    // the recursive-CTE path on `KgBackend::Cte` (the current default
+    // on every PG instance we run against).
+    //
+    // When AGE is enrolled, the dispatch site:
+    //   1. Pulls the template constant
+    //   2. Substitutes `$param` placeholders via the AGE Cypher
+    //      parameter-binding contract
+    //   3. Executes via `SELECT * FROM cypher('memory_graph', $$ ... $$,
+    //      $1) AS (col agtype)`
+    //
+    // Until then, the constants serve as the contract documentation
+    // the AGE arm will commit to.
+    // ─────────────────────────────────────────────────────────────────
+
+    /// v0.7.0 Provenance Gap 5 (#888) — AGE Cypher template for the
+    /// supersede edge. Bound but not executed pending AGE enrolment.
+    /// Mirrors the metadata-pointer encoding the SQL path uses (#895
+    /// is the follow-on for the FK-safe archive cross-ref).
+    pub const AGE_CYPHER_SUPERSEDE_EDGE: &'static str = "\
+        MERGE (a:Memory {id: $new_id})-[:SUPERSEDES {at: $ts, edit_source: $src}]->\
+        (b:Memory {id: $archived_id})";
+
+    /// v0.7.0 Provenance Gap 7 (#890) — AGE Cypher template for the
+    /// `latest_link_attest_level` decoration: max of attest_level over
+    /// every outbound link on a memory. Bound but not executed pending
+    /// AGE enrolment.
+    pub const AGE_CYPHER_LATEST_LINK_ATTEST_LEVEL: &'static str = "\
+        MATCH (m:Memory {id: $id})-[r]->() \
+        RETURN max(coalesce(r.attest_level, 'unsigned'))";
 
     /// v29 connect-time no-op pass.
     ///
@@ -4077,6 +4903,12 @@ impl PostgresStore {
             confidence_decayed_at: row
                 .try_get::<Option<String>, _>("confidence_decayed_at")
                 .unwrap_or(None),
+            // v0.7.0 Provenance Gap 1 (#884) — read the v42 column.
+            // Pre-v42 rows / backups missing the column fall back to
+            // the SQL DEFAULT (1) via `default_memory_version()`.
+            version: row
+                .try_get::<i64, _>("version")
+                .unwrap_or_else(|_| crate::models::default_memory_version()),
         })
     }
 
@@ -5973,9 +6805,15 @@ impl MemoryStore for PostgresStore {
         // Ordering by `(source_id, target_id, relation)` is the SAL
         // contract — deterministic across calls and matches the unique
         // key, so a paginated migrate can resume without losing rows.
+        //
+        // v0.7.0 issue #860 — SELECT was widened to include `attest_level`
+        // so the Postgres SAL surfaces the same attestation column the
+        // SQLite `db::get_links` path promises in the
+        // `memory_get_links` MCP tool docstring.
         let rows = sqlx::query(
             "SELECT ml.source_id, ml.target_id, ml.relation, ml.created_at,
-                    ml.valid_from, ml.valid_until, ml.observed_by, ml.signature
+                    ml.valid_from, ml.valid_until, ml.observed_by, ml.signature,
+                    ml.attest_level
              FROM memory_links ml
              WHERE ($1::text IS NULL
                     OR EXISTS (SELECT 1 FROM memories m
@@ -6007,6 +6845,9 @@ impl MemoryStore for PostgresStore {
                 let relation_str: String = r
                     .try_get::<String, _>("relation")
                     .map_err(|e| to_store_err("read relation", e))?;
+                let attest_level: Option<String> =
+                    r.try_get::<Option<String>, _>("attest_level")
+                        .map_err(|e| to_store_err("read attest_level", e))?;
                 Ok(MemoryLink {
                     source_id: r
                         .try_get::<String, _>("source_id")
@@ -6025,9 +6866,11 @@ impl MemoryStore for PostgresStore {
                     observed_by,
                     valid_from: valid_from.map(|t| t.to_rfc3339()),
                     valid_until: valid_until.map(|t| t.to_rfc3339()),
-                    // v0.7.0 #860 — Postgres SAL migrate reader; the
-                    // federation wire stays unaware of attest_level.
-                    attest_level: None,
+                    // v0.7.0 issue #860 — surface attest_level on the
+                    // Postgres SAL `list_links` read path so the
+                    // adapter matches the `memory_get_links` MCP
+                    // tool's docstring promise.
+                    attest_level,
                 })
             })
             .collect()
