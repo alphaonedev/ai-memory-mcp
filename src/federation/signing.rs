@@ -208,7 +208,9 @@ mod tests {
 
     #[test]
     fn require_sig_defaults_to_true() {
-        let _g = require_sig_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _g = require_sig_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::remove_var(REQUIRE_SIG_ENV);
         }
@@ -217,7 +219,9 @@ mod tests {
 
     #[test]
     fn require_sig_false_when_zero() {
-        let _g = require_sig_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _g = require_sig_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::set_var(REQUIRE_SIG_ENV, "0");
         }
