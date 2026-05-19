@@ -557,7 +557,7 @@ pub fn tool_definitions() -> Value {
                         "metadata": {"type": "object", "description": "JSON metadata", "default": {}},
                         "agent_id": {"type": "string", "description": "NHI agent_id; synthesized if omitted."},
                         "scope": {"type": "string", "enum": ["private", "team", "unit", "org", "collective"], "description": "Task 1.5 visibility. Default private."},
-                        "on_conflict": {"type": "string", "enum": ["error", "merge", "version"], "description": "P2/G6 (title,namespace) collision: error (v2 default), merge (v1 default), version (suffix '(N)')."},
+                        "on_conflict": {"type": "string", "enum": ["error", "merge", "version"], "description": "P2/G6 (title,ns) collision: error=v2 default; merge=v1; version='(N)'."},
                         "kind": {"type": "string", "enum": ["observation", "reflection", "persona", "concept", "entity", "claim", "relation", "event", "conversation", "decision"], "description": "Form 6 (#759) memory-kind. Default observation."},
                         "force": {"type": "boolean", "default": false, "description": "#519 bypass proactive contradiction detection."},
                         "source_uri": {"type": "string", "description": "#885 Source URI (doc:/uri:/file:); indexed for #889."}
@@ -579,7 +579,7 @@ pub fn tool_definitions() -> Value {
                         "since": {"type": "string", "description": "RFC3339 lower bound on created_at"},
                         "until": {"type": "string", "description": "RFC3339 upper bound on created_at"},
                         "as_agent": {"type": "string", "description": "Task 1.5 querying-agent position for scope visibility."},
-                        "budget_tokens": {"type": "integer", "minimum": 0, "description": "P6/R1 content-token cap (cl100k). 0=empty. Top result kept; meta.budget_overflow=true."},
+                        "budget_tokens": {"type": "integer", "minimum": 0, "description": "P6/R1 cl100k content cap. 0=empty; top kept (meta.budget_overflow=true)."},
                         "context_tokens": {"type": "array", "items": {"type": "string"}, "description": "Recent conversation tokens; biases query embedding 70/30 (v0.6.0.0)."},
                         "session_default": {"type": "boolean", "default": false, "description": "Splice [agents.defaults.recall_scope]. explicit > scope > defaults."},
                         "session_id": {"type": "string", "description": "#518 session id; +0.05 rerank boost for in-session ring (cap 50)."},
@@ -591,7 +591,7 @@ pub fn tool_definitions() -> Value {
                                 {"type": "array", "items": {"type": "string", "enum": ["observation", "reflection", "persona", "concept", "entity", "claim", "relation", "event", "conversation", "decision"]}},
                                 {"type": "string"}
                             ],
-                            "description": "Form 6 (#759) kind filter. Array or CSV. OR within kinds; AND across. 'all'/omit = no filter."
+                            "description": "Form 6 (#759) kind filter. Array/CSV. OR within; AND across."
                         },
                         "confidence_tier": {"type": "string", "enum": ["confirmed", "likely", "ambiguous"], "description": "Gap 4 (#887) tier filter."},
                         "verbose_provenance": {"type": "boolean", "default": true, "description": "Gap 7 (#890): per-row provenance decoration."},
@@ -930,7 +930,8 @@ pub fn tool_definitions() -> Value {
                     "properties": {
                         "memory_id": {"type": "string", "description": "Memory ID."},
                         "verbose": {"type": "boolean", "default": false, "description": "I4: when false, >100KB transcripts truncated=true."},
-                        "depth": {"type": ["integer", "null"], "minimum": 0, "default": null, "description": "L2-4 reflects_on hops. null=full, 0=self, N=self+N."}
+                        "depth": {"type": ["integer", "null"], "minimum": 0, "default": null, "description": "L2-4 reflects_on hops. null=full, 0=self, N=self+N."},
+                        "agent_id": {"type": "string", "description": "#912 perm gate."}
                     },
                     "required": ["memory_id"]
                 }
@@ -1238,7 +1239,7 @@ pub fn tool_definitions() -> Value {
                         "parent": {"type": "string", "description": "Inherit-from namespace."},
                         "governance": {
                             "type": "object",
-                            "description": "Task 1.8 policy in metadata.governance. Enforced by Task 1.9; approver types by 1.10.",
+                            "description": "Task 1.8 policy in metadata.governance.",
                             "properties": {
                                 "write":    {"type": "string", "enum": ["any", "registered", "owner", "approve"]},
                                 "promote":  {"type": "string", "enum": ["any", "registered", "owner", "approve"]},
@@ -1394,7 +1395,8 @@ pub fn tool_definitions() -> Value {
                         "events": {"type": "string", "default": "*", "description": "Comma-list or *. Events: memory_store, memory_delete, memory_promote."},
                         "secret": {"type": "string", "description": "HMAC secret. Omit for unsigned."},
                         "namespace_filter": {"type": "string", "description": "Exact namespace match."},
-                        "agent_filter": {"type": "string", "description": "agent_id filter."}
+                        "agent_filter": {"type": "string", "description": "agent_id filter."},
+                        "event_types": {"type": "array", "items": {"type": "string"}, "description": "#912 event-type subset."}
                     },
                     "required": ["url"]
                 }

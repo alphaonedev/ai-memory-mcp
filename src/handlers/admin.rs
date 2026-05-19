@@ -38,6 +38,7 @@ use super::store_err_to_response;
 
 pub async fn register_agent(
     State(app): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<RegisterAgentBody>,
 ) -> impl IntoResponse {
     if let Err(e) = validate::validate_agent_id(&body.agent_id) {
@@ -66,6 +67,30 @@ pub async fn register_agent(
         )
             .into_response();
     }
+
+    // #911 (security-medium / SOC2, 2026-05-19) — admin action audit.
+    // `register_agent` and `archive_purge` are admin-class state-changing
+    // surfaces whose forensic-chain entry was previously silent. The
+    // caller agent_id is resolved via the X-Agent-Id header (the same
+    // primitive `resolve_http_agent_id` other handlers use); when no
+    // header is provided we record the synthesized `anonymous:req-…`
+    // actor so the chain entry pins the unattested call. Emitted
+    // BEFORE any storage write to preserve the audit trail even if
+    // the storage layer fails downstream.
+    let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+    let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
+        .unwrap_or_else(|_| "anonymous:invalid".to_string());
+    crate::governance::audit::record_decision(
+        &caller,
+        "allow",
+        "register_agent",
+        "",
+        json!({
+            "new_agent_id": body.agent_id,
+            "agent_type": body.agent_type,
+            "capabilities": capabilities,
+        }),
+    );
 
     // v0.7.0 Wave-3 Continuation 3 — postgres-backed daemons route the
     // agent-registration write through `app.store` so the row lands in

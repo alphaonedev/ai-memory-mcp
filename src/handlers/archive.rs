@@ -19,7 +19,7 @@
 use axum::{
     Json,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
 use serde::Deserialize;
@@ -190,8 +190,27 @@ pub struct PurgeQuery {
 
 pub async fn purge_archive(
     State(app): State<AppState>,
+    headers: HeaderMap,
     Query(q): Query<PurgeQuery>,
 ) -> impl IntoResponse {
+    // #911 (security-medium / SOC2, 2026-05-19) — admin action audit.
+    // `archive_purge` permanently deletes archived memories; SOC2-grade
+    // deployments must prove "who deleted what when". Forensic-chain
+    // entry is emitted BEFORE the destructive write so the audit trail
+    // captures the intent even if the storage layer errors.
+    let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+    let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
+        .unwrap_or_else(|_| "anonymous:invalid".to_string());
+    crate::governance::audit::record_decision(
+        &caller,
+        "allow",
+        "archive_purge",
+        "",
+        json!({
+            "older_than_days": q.older_than_days,
+        }),
+    );
+
     // v0.7.0 Wave-3 Continuation 3 (Phase 19) — postgres-backed daemons
     // route through the SAL trait. Wire shape preserved: `{purged}`.
     #[cfg(feature = "sal")]
