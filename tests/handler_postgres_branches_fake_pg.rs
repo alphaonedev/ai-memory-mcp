@@ -284,9 +284,15 @@ async fn pg_get_memory_after_create_roundtrip() {
         "source": "user",
         "metadata": {},
     });
-    let (_status, v) = post_json(&router, "/api/v1/memories", body).await;
+    // #910 SAL-level visibility — anonymous callers get a fresh
+    // `anonymous:req-<uuid>` per request, so the GET caller cannot
+    // see the POST caller's scope=private row. Use a stable
+    // X-Agent-Id across both legs so the create-then-get round-trip
+    // sees the same principal.
+    let (_status, v) = post_json_as(&router, "/api/v1/memories", body, "pg-roundtrip").await;
     let id = v["id"].as_str().expect("id").to_string();
-    let (status, got) = get_uri(&router, &format!("/api/v1/memories/{id}")).await;
+    let (status, got) =
+        get_uri_as(&router, &format!("/api/v1/memories/{id}"), "pg-roundtrip").await;
     assert_eq!(status, StatusCode::OK, "{got}");
     // The pg path's get_memory returns `{memory: ..., links: ...}` so the
     // id is nested under `memory`.
@@ -388,12 +394,16 @@ async fn pg_promote_memory_after_create() {
         "source": "user",
         "metadata": {},
     });
-    let (_status, v) = post_json(&router, "/api/v1/memories", body).await;
+    // #910 SAL-level visibility — keep the same caller across both
+    // legs so the promote handler's pre-fetch (`store.get`) sees the
+    // row it just created.
+    let (_status, v) = post_json_as(&router, "/api/v1/memories", body, "pg-promote").await;
     let id = v["id"].as_str().unwrap().to_string();
-    let (status, got) = post_json(
+    let (status, got) = post_json_as(
         &router,
         &format!("/api/v1/memories/{id}/promote"),
         json!({}),
+        "pg-promote",
     )
     .await;
     assert!(status == StatusCode::OK, "pg promote: {status} body={got}");

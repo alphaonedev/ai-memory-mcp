@@ -737,6 +737,7 @@ pub struct FindPathsBody {
 /// inclusive.
 pub async fn kg_find_paths(
     State(app): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<FindPathsBody>,
 ) -> impl IntoResponse {
     if let Err(e) = validate::validate_id(&body.source_id) {
@@ -754,11 +755,29 @@ pub async fn kg_find_paths(
             .into_response();
     }
 
+    // #910 SAL-level — resolve the caller so the trait method's
+    // visibility filter (path-traversal flavour) sees the right
+    // principal. Header-only authentication on this POST surface;
+    // anonymous callers get a per-request `anonymous:req-…` id.
+    let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+    let caller = match crate::identity::resolve_http_agent_id(None, header_agent_id) {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("invalid agent_id: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
     #[cfg(feature = "sal")]
     {
+        let ctx = crate::store::CallerContext::for_agent(&caller);
         return match app
             .store
             .find_paths(
+                &ctx,
                 &body.source_id,
                 &body.target_id,
                 body.max_depth,
@@ -807,6 +826,7 @@ pub async fn kg_find_paths(
     {
         let _ = app;
         let _ = body;
+        let _ = caller;
         (
             StatusCode::NOT_IMPLEMENTED,
             Json(json!({"error": "find_paths requires --features sal"})),

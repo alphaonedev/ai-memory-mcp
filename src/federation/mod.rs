@@ -1360,7 +1360,16 @@ mod tests {
             updated_at: updated_at.to_string(),
             last_accessed_at: None,
             expires_at: None,
-            metadata: serde_json::json!({"agent_id":"ai:peer-0"}),
+            // #910 — mark scope=collective so the test's post-catchup
+            // `store.get(&CallerContext::for_agent("test"), ...)` round-
+            // trip doesn't trip the SAL-level scope=private filter.
+            // Real-world catchup uses `for_admin` and bypasses the
+            // filter; the test fixtures need `scope=collective` to
+            // round-trip via tenant-scoped reads.
+            metadata: serde_json::json!({
+                "agent_id": "ai:peer-0",
+                "scope": "collective",
+            }),
             reflection_depth: 0,
             memory_kind: crate::models::MemoryKind::Observation,
             entity_id: None,

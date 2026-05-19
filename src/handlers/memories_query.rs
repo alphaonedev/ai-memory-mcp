@@ -293,6 +293,8 @@ pub async fn search_memories(
             agent_id: "ai:http".to_string(),
             as_agent: p.as_agent.clone(),
             request_id: None,
+            // #910 — tenant-facing path; never bypass the visibility filter.
+            bypass_visibility: false,
         };
         return match app.store.search(&ctx, &p.q, &filter).await {
             Ok(r) => Json(json!({"results": r, "count": r.len(), "query": p.q})).into_response(),
@@ -461,6 +463,7 @@ pub async fn forget_memories(
 
 pub async fn bulk_create(
     State(app): State<AppState>,
+    headers: HeaderMap,
     Json(bodies): Json<Vec<CreateMemory>>,
 ) -> impl IntoResponse {
     if bodies.len() > MAX_BULK_SIZE {
@@ -471,6 +474,16 @@ pub async fn bulk_create(
             .into_response();
     }
     let now = Utc::now();
+
+    // #910 SAL-level — resolve the caller so the per-row metadata
+    // stamp matches the authenticated principal. Pre-#910 the bulk
+    // path stored `body.metadata` verbatim, so rows landed with no
+    // agent_id and the subsequent list/get round-trip via the
+    // scope=private filter dropped every one of them. Header-only
+    // authentication; anonymous callers stamp `anonymous:req-<uuid>`.
+    let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+    let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
+        .unwrap_or_else(|_| format!("anonymous:req-{}", uuid::Uuid::new_v4()));
 
     // v0.7.0 Wave-3 Continuation — postgres-backed daemons stream each
     // row through `app.store.store(...)`. Federation fanout below stays
@@ -498,6 +511,16 @@ pub async fn bulk_create(
                 body.ttl_secs
                     .map(|s| (now + Duration::seconds(s)).to_rfc3339())
             });
+            // #910 — stamp metadata.agent_id from the resolved caller
+            // so the SAL visibility filter recognises the row as
+            // owned by the writer on later get/list/recall.
+            let mut metadata_stamped = body.metadata;
+            if let Some(obj) = metadata_stamped.as_object_mut() {
+                obj.insert(
+                    "agent_id".to_string(),
+                    serde_json::Value::String(caller.clone()),
+                );
+            }
             let mem = Memory {
                 id: Uuid::new_v4().to_string(),
                 tier: body.tier,
@@ -513,7 +536,7 @@ pub async fn bulk_create(
                 updated_at: now.to_rfc3339(),
                 last_accessed_at: None,
                 expires_at,
-                metadata: body.metadata,
+                metadata: metadata_stamped,
                 reflection_depth: 0,
                 memory_kind: crate::models::MemoryKind::Observation,
                 entity_id: None,
@@ -618,6 +641,15 @@ pub async fn bulk_create(
                     .or(lock.2.ttl_for_tier(&body.tier))
                     .map(|s| (now + Duration::seconds(s)).to_rfc3339())
             });
+            // #910 — stamp metadata.agent_id from the resolved caller
+            // (sqlite branch mirror of the postgres branch above).
+            let mut metadata_stamped = body.metadata;
+            if let Some(obj) = metadata_stamped.as_object_mut() {
+                obj.insert(
+                    "agent_id".to_string(),
+                    serde_json::Value::String(caller.clone()),
+                );
+            }
             let mem = Memory {
                 id: Uuid::new_v4().to_string(),
                 tier: body.tier,
@@ -633,7 +665,7 @@ pub async fn bulk_create(
                 updated_at: now.to_rfc3339(),
                 last_accessed_at: None,
                 expires_at,
-                metadata: body.metadata,
+                metadata: metadata_stamped,
                 reflection_depth: 0,
                 memory_kind: crate::models::MemoryKind::Observation,
                 entity_id: None,

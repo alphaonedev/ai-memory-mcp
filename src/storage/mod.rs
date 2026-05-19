@@ -5082,6 +5082,13 @@ pub fn register_agent(
         "capabilities": caps_json,
         "registered_at": registered_at,
         "last_seen_at": now,
+        // #910 (SAL-level enforcement) — agent-registration rows live
+        // in the `_agents` namespace and are a public roster: every
+        // agent has a legitimate need to know which other agents are
+        // registered (consensus voting, peer attestation, etc.). Stamp
+        // scope=collective so the SAL visibility filter doesn't drop
+        // them on cross-agent reads.
+        "scope": "collective",
     });
 
     let content = serde_json::to_string(&metadata)

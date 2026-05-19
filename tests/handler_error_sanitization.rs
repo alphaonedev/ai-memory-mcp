@@ -311,6 +311,11 @@ async fn notify_with_invalid_tier_returns_sanitized_error() {
         .method("POST")
         .uri("/api/v1/notify")
         .header("content-type", "application/json")
+        // #901 spoof guard requires the body agent_id to match the
+        // X-Agent-Id header — supply the same value so the test
+        // exercises the #851 invalid-tier sanitization path it was
+        // written for, not the #901 short-circuit.
+        .header("x-agent-id", "leak-probe")
         .body(Body::from(body.to_string()))
         .unwrap();
     let (status, body) = run_request(router, req).await;

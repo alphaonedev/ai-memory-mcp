@@ -55,7 +55,7 @@ use sqlx::{PgPool, Row};
 use super::{
     CallerContext, Capabilities, Filter, KgBackend, KgInvalidateRow, KgQueryRow, KgTimelineRow,
     MemoryStore, StoreError, StoreResult, UpdatePatch, VerifyFilter, VerifyLinkReport,
-    VerifyReport,
+    VerifyReport, is_visible_to_caller,
 };
 use crate::models::{AgentRegistration, Memory, MemoryLink, Tier};
 use crate::quotas::{
@@ -6651,14 +6651,25 @@ impl MemoryStore for PostgresStore {
         Ok(())
     }
 
-    async fn get(&self, _ctx: &CallerContext, id: &str) -> StoreResult<Memory> {
+    async fn get(&self, ctx: &CallerContext, id: &str) -> StoreResult<Memory> {
         let row = sqlx::query("SELECT * FROM memories WHERE id = $1")
             .bind(id)
             .fetch_optional(&self.pool)
             .await
             .map_err(|e| to_store_err("select by id", e))?;
         match row {
-            Some(r) => Self::row_to_memory(&r),
+            Some(r) => {
+                let mem = Self::row_to_memory(&r)?;
+                // #910 SAL-level scope=private gate — fold permission
+                // denials into NotFound so the trait does not leak
+                // existence to callers that lack read permission.
+                // Admin/migrate paths set `bypass_visibility`.
+                if ctx.bypass_visibility || is_visible_to_caller(&mem, ctx.effective_principal()) {
+                    Ok(mem)
+                } else {
+                    Err(StoreError::NotFound { id: id.to_string() })
+                }
+            }
             None => Err(StoreError::NotFound { id: id.to_string() }),
         }
     }
@@ -6749,8 +6760,25 @@ impl MemoryStore for PostgresStore {
         }
     }
 
-    async fn list(&self, _ctx: &CallerContext, filter: &Filter) -> StoreResult<Vec<Memory>> {
+    async fn list(&self, ctx: &CallerContext, filter: &Filter) -> StoreResult<Vec<Memory>> {
         let limit: i64 = filter.limit.clamp(1, 1000).try_into().unwrap_or(100);
+        // #910 SAL-level scope=private gate — push the visibility
+        // predicate into SQL so the row filter runs server-side and
+        // the result-set size scales with what the caller can see,
+        // not what exists. `metadata->>'scope'` defaults to 'private'
+        // when missing (matches the CLAUDE.md NHI contract +
+        // SQLite's COALESCE-to-'private' generated column).
+        //
+        // Admin/migrate paths set `bypass_visibility`; we pass NULL
+        // as the visibility-bypass sentinel which short-circuits the
+        // `(scope <> 'private' OR agent_id = caller)` test via the
+        // leading `$7 IS NULL` clause.
+        let caller = ctx.effective_principal();
+        let caller_opt: Option<&str> = if ctx.bypass_visibility {
+            None
+        } else {
+            Some(caller)
+        };
         let rows = sqlx::query(
             "SELECT * FROM memories
              WHERE ($1::text IS NULL OR namespace = $1)
@@ -6758,6 +6786,12 @@ impl MemoryStore for PostgresStore {
                AND (expires_at IS NULL OR expires_at > NOW())
                AND ($3::timestamptz IS NULL OR created_at >= $3)
                AND ($4::timestamptz IS NULL OR created_at <= $4)
+               AND (
+                   $6::text IS NULL
+                   OR COALESCE(metadata->>'scope', 'private') <> 'private'
+                   OR metadata->>'agent_id' = $6
+                   OR metadata->>'target_agent_id' = $6
+               )
              ORDER BY priority DESC, updated_at DESC
              LIMIT $5",
         )
@@ -6766,20 +6800,36 @@ impl MemoryStore for PostgresStore {
         .bind(filter.since)
         .bind(filter.until)
         .bind(limit)
+        .bind(caller_opt)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| to_store_err("list", e))?;
 
-        rows.iter().map(Self::row_to_memory).collect()
+        // Belt-and-suspenders: re-apply the predicate in-process so a
+        // hypothetical SQL drift between the WHERE clause above and
+        // the canonical Rust predicate cannot widen the visibility
+        // window. Costs O(returned-rows); negligible.
+        let mems: Vec<Memory> = rows
+            .iter()
+            .map(Self::row_to_memory)
+            .collect::<StoreResult<Vec<_>>>()?;
+        if ctx.bypass_visibility {
+            return Ok(mems);
+        }
+        Ok(mems
+            .into_iter()
+            .filter(|m| is_visible_to_caller(m, caller))
+            .collect())
     }
 
     async fn search(
         &self,
-        _ctx: &CallerContext,
+        ctx: &CallerContext,
         query: &str,
         filter: &Filter,
     ) -> StoreResult<Vec<Memory>> {
         let limit: i64 = filter.limit.clamp(1, 1000).try_into().unwrap_or(100);
+        let caller = ctx.effective_principal();
         // Adapter parity with SQLite (#302 item 3): threads the full
         // Filter (namespace, tier, tags_any, agent_id) into the query.
         // Prior implementation ignored `tags_any` and `agent_id` so
@@ -6828,6 +6878,14 @@ impl MemoryStore for PostgresStore {
         // diverges from sqlite's FTS5 `OR` contract — see
         // `build_or_tsquery` for the sanitization rules.
         let or_tsquery = build_or_tsquery(query);
+        // #910 SAL-level scope=private gate — push the visibility
+        // predicate into SQL via `$7` (caller principal). Admin paths
+        // pass NULL to bypass.
+        let caller_opt: Option<&str> = if ctx.bypass_visibility {
+            None
+        } else {
+            Some(caller)
+        };
         let rows = sqlx::query(
             "SELECT *,
                     ts_rank(
@@ -6852,6 +6910,12 @@ impl MemoryStore for PostgresStore {
                AND ($4::text IS NULL OR tags @> to_jsonb(ARRAY[$4]))
                AND ($5::text IS NULL OR metadata ->> 'agent_id' = $5)
                AND (expires_at IS NULL OR expires_at > NOW())
+               AND (
+                   $7::text IS NULL
+                   OR COALESCE(metadata->>'scope', 'private') <> 'private'
+                   OR metadata->>'agent_id' = $7
+                   OR metadata->>'target_agent_id' = $7
+               )
              ORDER BY rank DESC, priority DESC
              LIMIT $6",
         )
@@ -6861,11 +6925,23 @@ impl MemoryStore for PostgresStore {
         .bind(tags_first)
         .bind(filter.agent_id.as_ref())
         .bind(limit)
+        .bind(caller_opt)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| to_store_err("search", e))?;
 
-        rows.iter().map(Self::row_to_memory).collect()
+        // Belt-and-suspenders: re-apply the predicate in-process.
+        let mems: Vec<Memory> = rows
+            .iter()
+            .map(Self::row_to_memory)
+            .collect::<StoreResult<Vec<_>>>()?;
+        if ctx.bypass_visibility {
+            return Ok(mems);
+        }
+        Ok(mems
+            .into_iter()
+            .filter(|m| is_visible_to_caller(m, caller))
+            .collect())
     }
 
     async fn verify(&self, _ctx: &CallerContext, id: &str) -> StoreResult<VerifyReport> {
@@ -7232,6 +7308,15 @@ impl MemoryStore for PostgresStore {
         // the empty bucket, pulling mean Jaccard@5 below the 0.20
         // floor (HALT v0.7.0 R1 S79).
         let or_tsquery = build_or_tsquery(query);
+        // #910 SAL-level scope=private gate — caller principal for the
+        // visibility predicate pushed into both FTS + semantic SQL.
+        // Admin paths pass NULL to bypass.
+        let caller = ctx.effective_principal();
+        let caller_opt: Option<&str> = if ctx.bypass_visibility {
+            None
+        } else {
+            Some(caller)
+        };
         // FTS candidates with the existing 6-factor blend baked into
         // `rank` (see search() above). Also surfaces content_len so
         // the trait-side adaptive blend can compute semantic_weight
@@ -7263,6 +7348,12 @@ impl MemoryStore for PostgresStore {
                AND ($6::timestamptz IS NULL OR created_at >= $6)
                AND ($7::timestamptz IS NULL OR created_at <= $7)
                AND (expires_at IS NULL OR expires_at > NOW())
+               AND (
+                   $9::text IS NULL
+                   OR COALESCE(metadata->>'scope', 'private') <> 'private'
+                   OR metadata->>'agent_id' = $9
+                   OR metadata->>'target_agent_id' = $9
+               )
              ORDER BY fts_score DESC
              LIMIT $8",
         )
@@ -7274,6 +7365,7 @@ impl MemoryStore for PostgresStore {
         .bind(filter.since)
         .bind(filter.until)
         .bind(fts_pool)
+        .bind(caller_opt)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| to_store_err("recall_hybrid fts pool", e))?;
@@ -7305,6 +7397,7 @@ impl MemoryStore for PostgresStore {
         if let Some(qe) = query_embedding {
             let ann_pool: i64 = (limit_eff * 5).max(50);
             let qvec = pgvector::Vector::from(qe.to_vec());
+            // #910 SAL-level scope=private gate via $9.
             let sem_rows = sqlx::query(
                 "SELECT *, (1.0 - (embedding <=> $1)) AS cosine_sim,
                           octet_length(content) AS content_len
@@ -7318,6 +7411,11 @@ impl MemoryStore for PostgresStore {
                    AND ($7::timestamptz IS NULL OR created_at <= $7)
                    AND (expires_at IS NULL OR expires_at > NOW())
                    AND (1.0 - (embedding <=> $1)) > 0.2
+                   AND (
+                       $9::text IS NULL
+                       OR COALESCE(metadata->>'scope', 'private') <> 'private'
+                       OR metadata->>'agent_id' = $9
+                   )
                  ORDER BY embedding <=> $1
                  LIMIT $8",
             )
@@ -7329,6 +7427,7 @@ impl MemoryStore for PostgresStore {
             .bind(filter.since)
             .bind(filter.until)
             .bind(ann_pool)
+            .bind(caller_opt)
             .fetch_all(&self.pool)
             .await
             .map_err(|e| to_store_err("recall_hybrid semantic pool", e))?;
@@ -7379,6 +7478,13 @@ impl MemoryStore for PostgresStore {
             .collect();
 
         results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // Belt-and-suspenders: drop any row that slipped past the SQL
+        // predicate (defense-in-depth against SQL drift). Filter then
+        // truncate so the limit reflects what the caller can actually
+        // see.
+        if !ctx.bypass_visibility {
+            results.retain(|(m, _)| is_visible_to_caller(m, caller));
+        }
         results.truncate(filter.limit.max(1));
         Ok(results)
     }
@@ -7649,6 +7755,9 @@ impl MemoryStore for PostgresStore {
             "capabilities": agent.capabilities,
             "registered_at": registered_at,
             "last_seen_at": now_rfc,
+            // #910 (SAL-level enforcement) — agent-registration rows
+            // are a public roster. Mirrors the sqlite path's stamp.
+            "scope": "collective",
         });
 
         let content =
@@ -8943,14 +9052,72 @@ impl MemoryStore for PostgresStore {
 
     async fn find_paths(
         &self,
+        ctx: &CallerContext,
         source_id: &str,
         target_id: &str,
         max_depth: Option<usize>,
         max_results: Option<usize>,
     ) -> StoreResult<Vec<Vec<String>>> {
         // Inherent `PostgresStore::find_paths` already routes AGE vs CTE
-        // off `self.kg_backend`; the trait method just forwards.
-        PostgresStore::find_paths(self, source_id, target_id, max_depth, max_results).await
+        // off `self.kg_backend`; the trait method forwards then applies
+        // the #910 SAL-level visibility filter (path-traversal
+        // flavour). Any path whose node set touches a scope=private
+        // memory the caller does not own is dropped. Fail-closed: a
+        // node that cannot be resolved drops every path that touches
+        // it.
+        let paths =
+            PostgresStore::find_paths(self, source_id, target_id, max_depth, max_results).await?;
+        if ctx.bypass_visibility {
+            return Ok(paths);
+        }
+        let caller = ctx.effective_principal();
+        let mut visible_cache: std::collections::HashMap<String, bool> =
+            std::collections::HashMap::new();
+        let mut filtered: Vec<Vec<String>> = Vec::with_capacity(paths.len());
+        'outer: for path in paths {
+            for node in &path {
+                // Cache hit avoids round-trips for the diamond /
+                // re-visit-node case common in graph-walks.
+                let visible = if let Some(v) = visible_cache.get(node) {
+                    *v
+                } else {
+                    let row = sqlx::query("SELECT metadata FROM memories WHERE id = $1")
+                        .bind(node)
+                        .fetch_optional(&self.pool)
+                        .await
+                        .map_err(|e| to_store_err("find_paths visibility fetch", e))?;
+                    let v = match row {
+                        Some(r) => {
+                            let meta: serde_json::Value = r
+                                .try_get("metadata")
+                                .map_err(|e| to_store_err("read metadata", e))?;
+                            let scope = meta
+                                .get("scope")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("private");
+                            if scope != "private" {
+                                true
+                            } else {
+                                let owner = meta
+                                    .get("agent_id")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("");
+                                owner == caller
+                            }
+                        }
+                        // Fail-closed: missing node ⇒ drop the path.
+                        None => false,
+                    };
+                    visible_cache.insert(node.clone(), v);
+                    v
+                };
+                if !visible {
+                    continue 'outer;
+                }
+            }
+            filtered.push(path);
+        }
+        Ok(filtered)
     }
 }
 

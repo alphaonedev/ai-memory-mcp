@@ -28,7 +28,11 @@ use super::StorageBackend;
 #[cfg(feature = "sal")]
 use super::store_err_to_response;
 
-pub async fn get_memory(State(app): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
+pub async fn get_memory(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
     if let Err(e) = validate::validate_id(&id) {
         return (
             StatusCode::BAD_REQUEST,
@@ -36,6 +40,14 @@ pub async fn get_memory(State(app): State<AppState>, Path(id): Path<String>) -> 
         )
             .into_response();
     }
+
+    // #910 SAL-level — resolve the caller from `X-Agent-Id` so the
+    // SAL `get` filter has a known principal. Header-only auth on
+    // this GET surface; anonymous callers get a per-request
+    // `anonymous:req-…` id and see only non-private rows.
+    let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+    let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
+        .unwrap_or_else(|_| format!("anonymous:req-{}", uuid::Uuid::new_v4()));
 
     // v0.7.0 Wave-3 — Postgres-backed daemons dispatch through the
     // SAL trait. The legacy `db::resolve_id` path is SQLite-bound (it
@@ -46,7 +58,7 @@ pub async fn get_memory(State(app): State<AppState>, Path(id): Path<String>) -> 
     // legacy direct-rusqlite path for v0.7.0 binary parity.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        let ctx = crate::store::CallerContext::for_agent("ai:http");
+        let ctx = crate::store::CallerContext::for_agent(&caller);
         return match app.store.get(&ctx, &id).await {
             Ok(mem) => {
                 // List_links surfaces the full edge set (no namespace
