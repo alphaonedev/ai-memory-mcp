@@ -776,7 +776,9 @@ pub fn tool_definitions() -> Value {
                         "valid_at": {"type": "string", "description": "RFC3339; keep links valid at instant. Omit to skip temporal filter."},
                         "allowed_agents": {"type": "array", "items": {"type": "string"}, "description": "Observed-by allowlist. Empty array = zero rows."},
                         "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 200, "description": "Cap across all depths [1,1000]."},
-                        "include_invalidated": {"type": "boolean", "default": false, "description": "When true, traverse historically-invalidated edges."}
+                        "include_invalidated": {"type": "boolean", "default": false, "description": "When true, traverse historically-invalidated edges."},
+                        "by_source_uri": {"type": "string", "description": "#889 reciprocal: traverse by source_uri instead of source_id."},
+                        "namespace": {"type": "string", "description": "Restrict traversal to this namespace."}
                     },
                     "required": ["source_id"]
                 }
@@ -862,7 +864,7 @@ pub fn tool_definitions() -> Value {
                         "metadata": {"type": "object", "description": "JSON metadata."},
                         "expected_version": {"type": "integer", "description": "#884 If-Match; mismatch → 409 envelope."},
                         "edit_source": {"type": "string", "enum": ["human", "llm", "hook"], "default": "human", "description": "#888 'human'=in-place; 'llm'/'hook'=archive+supersede."},
-                        "source_uri": {"type": "string", "description": "#885 update source_uri."}
+                        "source_uri": {"type": "string", "description": "#885/#906 update source_uri (doc rename / URI scheme migration / bad-data correction)."}
                     },
                     "required": ["id"]
                 }
@@ -1027,7 +1029,8 @@ pub fn tool_definitions() -> Value {
                         "ids": {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 100, "description": "Source ids (2-100)."},
                         "title": {"type": "string", "description": "Consolidated title."},
                         "summary": {"type": "string", "description": "Optional summary; LLM auto-generates at smart/autonomous tier."},
-                        "namespace": {"type": "string", "default": "global"}
+                        "namespace": {"type": "string", "default": "global"},
+                        "agent_id": {"type": "string", "description": "#908 agent identity for consolidator attribution."}
                     },
                     "required": ["ids", "title"]
                 }
