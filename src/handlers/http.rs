@@ -323,3 +323,266 @@ pub struct ConflictReport {
     /// field reserves the wire shape so callers can branch on it now.
     pub suggested_merge: Option<String>,
 }
+
+// v0.7.0 issue #897 — Coverage regression on the post-Wave-1-split
+// `src/handlers/http.rs` shim. Path-A test additions: directly
+// exercise the gate ladders + sqlite-branch traversal of the three
+// helpers that live in this file (`maybe_auto_tag`,
+// `maybe_detect_conflicts`, `fetch_namespace_candidates`). The
+// `#[cfg(test)]` gating keeps these out of the production binary
+// — pure test addition, no production behavior change.
+#[cfg(test)]
+#[allow(clippy::too_many_lines)]
+mod cov897_tests {
+    use super::{
+        AUTO_TAG_MIN_CONTENT_LEN, ConflictReport, fetch_namespace_candidates, maybe_auto_tag,
+        maybe_detect_conflicts,
+    };
+    use crate::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
+    use crate::handlers::{AppState, Db, StorageBackend};
+    use crate::models::{Memory, Tier};
+    use chrono::Utc;
+    use std::sync::Arc;
+    use tokio::sync::{Mutex, RwLock};
+    use uuid::Uuid;
+
+    fn build_app(tier: FeatureTier, autonomous: bool) -> (AppState, tempfile::NamedTempFile) {
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let path = tmp.path().to_path_buf();
+        let _ = crate::db::open(&path).expect("db::open");
+        let conn = crate::db::open(&path).expect("reopen");
+        let db: Db = Arc::new(Mutex::new((
+            conn,
+            path.clone(),
+            ResolvedTtl::default(),
+            true,
+        )));
+        #[cfg(feature = "sal")]
+        let store: Arc<dyn crate::store::MemoryStore> =
+            Arc::new(crate::store::sqlite::SqliteStore::open(&path).expect("open SqliteStore"));
+        let app = AppState {
+            db,
+            embedder: Arc::new(None),
+            vector_index: Arc::new(Mutex::new(None)),
+            federation: Arc::new(None),
+            tier_config: Arc::new(tier.config()),
+            scoring: Arc::new(ResolvedScoring::default()),
+            profile: Arc::new(crate::profile::Profile::core()),
+            mcp_config: Arc::new(None),
+            active_keypair: Arc::new(None),
+            family_embeddings: Arc::new(RwLock::new(Some(Vec::new()))),
+            storage_backend: StorageBackend::Sqlite,
+            #[cfg(feature = "sal")]
+            store,
+            llm: Arc::new(None),
+            auto_tag_model: Arc::new(None),
+            llm_call_timeout: std::time::Duration::from_secs(30),
+            replay_cache: Arc::new(crate::identity::replay::ReplayCache::default()),
+            verify_require_nonce: false,
+            autonomous_hooks: autonomous,
+            recall_scope: Arc::new(None),
+            deferred_audit_queue: Arc::new(None),
+        };
+        (app, tmp)
+    }
+
+    fn seed_memory(app: &AppState, namespace: &str, title: &str, content: &str) {
+        let now = Utc::now().to_rfc3339();
+        let mem = Memory {
+            id: Uuid::new_v4().to_string(),
+            title: title.to_string(),
+            content: content.to_string(),
+            namespace: namespace.to_string(),
+            tier: Tier::Mid,
+            created_at: now.clone(),
+            updated_at: now,
+            ..Default::default()
+        };
+        let lock = app.db.try_lock().expect("uncontended lock for seed");
+        crate::db::insert(&lock.0, &mem).expect("insert");
+    }
+
+    // ---- maybe_auto_tag: the llm-arc fast-path on a Smart-tier app -----
+    //
+    // The lib-tier `maybe_auto_tag_gate_matrix_l5` test already covers
+    // the operator-tags / short-content / internal-namespace / no-llm-
+    // model branches. This case completes the gate ladder: Smart tier
+    // sets `tier_config.llm_model = Some(...)`, the caller passes
+    // permissive args (long content, no tags, public namespace), but
+    // `app.llm = Arc::new(None)` — so the function must short-circuit
+    // at the `llm_arc.is_none()` check rather than fall through to
+    // the spawn_blocking path.
+    #[tokio::test]
+    async fn cov897_maybe_auto_tag_smart_tier_no_llm_arc_short_circuits() {
+        let (app, _tmp) = build_app(FeatureTier::Smart, false);
+        let r = maybe_auto_tag(
+            &app,
+            "title",
+            &"x".repeat(AUTO_TAG_MIN_CONTENT_LEN + 10),
+            &[],
+            "public-ns",
+        )
+        .await;
+        assert!(
+            r.is_empty(),
+            "Smart tier + llm=None must short-circuit, got {r:?}"
+        );
+    }
+
+    // ---- maybe_detect_conflicts: full gate-ladder coverage -------------
+
+    #[tokio::test]
+    async fn cov897_detect_conflicts_disabled_by_default_returns_empty() {
+        // autonomous_hooks=false + no per-request override → disabled.
+        let (app, _tmp) = build_app(FeatureTier::Smart, false);
+        let r = maybe_detect_conflicts(
+            &app,
+            "t",
+            &"x".repeat(AUTO_TAG_MIN_CONTENT_LEN + 10),
+            "ns",
+            None,
+        )
+        .await;
+        assert!(r.is_empty(), "disabled-by-config returns empty");
+    }
+
+    #[tokio::test]
+    async fn cov897_detect_conflicts_request_override_false_forces_off() {
+        // autonomous_hooks=true would normally enable; request override
+        // Some(false) must force-off.
+        let (app, _tmp) = build_app(FeatureTier::Smart, true);
+        let r = maybe_detect_conflicts(
+            &app,
+            "t",
+            &"x".repeat(AUTO_TAG_MIN_CONTENT_LEN + 10),
+            "ns",
+            Some(false),
+        )
+        .await;
+        assert!(r.is_empty(), "override=Some(false) returns empty");
+    }
+
+    #[tokio::test]
+    async fn cov897_detect_conflicts_short_content_returns_empty() {
+        // Override forces enabled, but content is below 50 chars.
+        let (app, _tmp) = build_app(FeatureTier::Smart, false);
+        let r = maybe_detect_conflicts(&app, "t", "short", "ns", Some(true)).await;
+        assert!(r.is_empty(), "short content returns empty");
+    }
+
+    #[tokio::test]
+    async fn cov897_detect_conflicts_internal_namespace_returns_empty() {
+        let (app, _tmp) = build_app(FeatureTier::Smart, false);
+        let r = maybe_detect_conflicts(
+            &app,
+            "t",
+            &"x".repeat(AUTO_TAG_MIN_CONTENT_LEN + 10),
+            "_internal",
+            Some(true),
+        )
+        .await;
+        assert!(r.is_empty(), "internal namespace returns empty");
+    }
+
+    #[tokio::test]
+    async fn cov897_detect_conflicts_no_llm_model_returns_empty() {
+        // Keyword tier has `llm_model = None` — gate ladder line 199.
+        let (app, _tmp) = build_app(FeatureTier::Keyword, false);
+        let r = maybe_detect_conflicts(
+            &app,
+            "t",
+            &"x".repeat(AUTO_TAG_MIN_CONTENT_LEN + 10),
+            "ns",
+            Some(true),
+        )
+        .await;
+        assert!(r.is_empty(), "no llm_model returns empty");
+    }
+
+    #[tokio::test]
+    async fn cov897_detect_conflicts_smart_tier_no_llm_arc_returns_empty() {
+        // Smart tier has llm_model=Some, but app.llm=None → line 204-206.
+        let (app, _tmp) = build_app(FeatureTier::Smart, false);
+        let r = maybe_detect_conflicts(
+            &app,
+            "t",
+            &"x".repeat(AUTO_TAG_MIN_CONTENT_LEN + 10),
+            "ns",
+            Some(true),
+        )
+        .await;
+        assert!(r.is_empty(), "Smart tier + llm=None returns empty");
+    }
+
+    // ---- fetch_namespace_candidates: sqlite-branch traversal -----------
+
+    #[tokio::test]
+    async fn cov897_fetch_candidates_empty_namespace_returns_empty() {
+        // Empty DB → empty candidate set; exercises the sqlite branch
+        // (lines 291-310) cleanly without hitting any candidates.
+        let (app, _tmp) = build_app(FeatureTier::Keyword, false);
+        let out = fetch_namespace_candidates(&app, "empty-ns", "new-title", 8)
+            .await
+            .expect("sqlite list succeeds on empty db");
+        assert!(out.is_empty(), "empty namespace returns no candidates");
+    }
+
+    #[tokio::test]
+    async fn cov897_fetch_candidates_filters_byte_equal_title() {
+        // Seed three rows in `ns-cand`; the function must return rows
+        // whose title is NOT byte-equal to `new_title`. With three
+        // seeded titles ["alpha", "beta", "gamma"] and new_title="beta"
+        // we expect exactly ["alpha", "gamma"].
+        let (app, _tmp) = build_app(FeatureTier::Keyword, false);
+        seed_memory(&app, "ns-cand", "alpha", "content-alpha");
+        seed_memory(&app, "ns-cand", "beta", "content-beta");
+        seed_memory(&app, "ns-cand", "gamma", "content-gamma");
+        let out = fetch_namespace_candidates(&app, "ns-cand", "beta", 8)
+            .await
+            .expect("sqlite list succeeds");
+        let titles: Vec<&str> = out.iter().map(|(_, t, _)| t.as_str()).collect();
+        assert_eq!(out.len(), 2, "filters byte-equal title, got {titles:?}");
+        assert!(titles.contains(&"alpha"), "alpha present in {titles:?}");
+        assert!(titles.contains(&"gamma"), "gamma present in {titles:?}");
+        assert!(!titles.contains(&"beta"), "beta filtered from {titles:?}");
+    }
+
+    #[tokio::test]
+    async fn cov897_fetch_candidates_honors_limit() {
+        // Seed 5 rows; ask for limit=2 — internal cap is limit+1=3
+        // candidates pulled, then post-filter `.take(limit)`. With a
+        // distinct new_title (no byte-equal match), `.take(2)` yields
+        // exactly 2 rows.
+        let (app, _tmp) = build_app(FeatureTier::Keyword, false);
+        for i in 0..5 {
+            seed_memory(
+                &app,
+                "ns-limit",
+                &format!("title-{i}"),
+                &format!("content-{i}"),
+            );
+        }
+        let out = fetch_namespace_candidates(&app, "ns-limit", "no-match", 2)
+            .await
+            .expect("sqlite list succeeds");
+        assert_eq!(out.len(), 2, "limit honored");
+    }
+
+    // ---- ConflictReport: pinned wire shape -----------------------------
+    //
+    // The struct lands in the create_memory response envelope under
+    // `conflicts: [...]`; pin its serialized shape so a future refactor
+    // doesn't silently rename a wire field.
+    #[test]
+    fn cov897_conflict_report_serializes_to_pinned_wire_shape() {
+        let r = ConflictReport {
+            id: "mem-id-123".to_string(),
+            title: "conflicting title".to_string(),
+            suggested_merge: None,
+        };
+        let v = serde_json::to_value(&r).expect("serialize");
+        assert_eq!(v["id"], "mem-id-123");
+        assert_eq!(v["title"], "conflicting title");
+        assert!(v["suggested_merge"].is_null(), "None ⇒ null on the wire");
+    }
+}
