@@ -25,6 +25,8 @@ use crate::validate;
 
 use super::AppState;
 use super::federation_receive::{SyncSinceQuery, extract_peer_id};
+#[cfg(feature = "sal")]
+use super::{StorageBackend, store_err_to_response};
 
 pub async fn sync_since(
     State(app): State<AppState>,

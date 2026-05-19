@@ -11,6 +11,8 @@
 #![allow(clippy::too_many_lines)]
 
 use crate::db;
+#[cfg(feature = "sal")]
+use crate::models::Memory;
 
 use super::AppState;
 #[cfg(feature = "sal")]
@@ -44,7 +46,7 @@ const AUTO_TAG_MAX_TAGS: usize = 8;
 /// (e.g. backend down, integrity failure) returns immediately
 /// without retry — those are not visibility-race symptoms.
 #[cfg(feature = "sal")]
-async fn get_with_visibility_retry(
+pub(super) async fn get_with_visibility_retry(
     store: &dyn crate::store::MemoryStore,
     ctx: &crate::store::CallerContext,
     id: &str,

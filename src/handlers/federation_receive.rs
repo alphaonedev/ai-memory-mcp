@@ -25,8 +25,6 @@ use super::StorageBackend;
 #[cfg(feature = "sal")]
 use super::federation_signing_check::sync_push_via_store;
 use super::federation_signing_check::verify_signature_or_reject;
-#[cfg(feature = "sal")]
-use super::store_err_to_response;
 
 /// v0.7.0 federation security — extract the peer's self-claimed
 /// `x-peer-id` header. Lowercase form per HTTP/2 wire convention;
