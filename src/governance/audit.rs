@@ -681,6 +681,405 @@ mod tests {
     /// test's `init` would still recover (the file-level isolation
     /// belt-and-suspenders). This gives us a mechanical pin on both
     /// the bleed vector AND the defensive recovery.
+    // ------------------------------------------------------------------
+    // Coverage-uplift block (2026-05-19): verify_since failure modes,
+    // helper-fn error paths, key loaders, file_date / parse_iso_date
+    // edge cases. The original suite covers happy path + tamper +
+    // unsigned + disabled-noop; this block covers each VerifyFailureKind
+    // arm plus the helper functions' error-context bodies.
+    // ------------------------------------------------------------------
+
+    fn write_forensic_file(dir: &Path, date: &str, body: &str) -> PathBuf {
+        let path = dir.join(format!(
+            "{FORENSIC_FILE_PREFIX}{date}{FORENSIC_FILE_SUFFIX}"
+        ));
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[test]
+    fn verify_since_parse_failure_first() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        // Write malformed JSON line.
+        write_forensic_file(tmp.path(), &today, "{not-json\n");
+        let report = verify_since(tmp.path(), &today, None).expect("verify ran");
+        let f = report.first_failure.expect("parse failure surfaces");
+        assert!(
+            matches!(f.kind, VerifyFailureKind::Parse),
+            "expected Parse, got {:?}",
+            f.kind
+        );
+        assert_eq!(f.line_number, 1);
+        assert!(f.detail.contains("malformed JSON"));
+    }
+
+    #[test]
+    fn verify_since_chain_break_when_prev_hash_mismatched() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        // A row whose prev_hash is bogus (no genuine chain ancestor).
+        // No key required since sig is empty.
+        let row = serde_json::json!({
+            "ts": Utc::now().to_rfc3339(),
+            "actor": "ai:t",
+            "decision": "allow",
+            "kind": "bash",
+            "rule_id": "R001",
+            "payload": {},
+            "prev_hash": "deadbeef-not-the-real-head",
+            "sig": ""
+        });
+        let body = format!("{}\n", serde_json::to_string(&row).unwrap());
+        write_forensic_file(tmp.path(), &today, &body);
+        let report = verify_since(tmp.path(), &today, None).expect("verify ran");
+        let f = report.first_failure.expect("chain break surfaces");
+        assert!(
+            matches!(f.kind, VerifyFailureKind::ChainBreak),
+            "expected ChainBreak, got {:?}",
+            f.kind
+        );
+        assert!(f.detail.contains("prev_hash mismatch"));
+    }
+
+    #[test]
+    fn verify_since_signature_base64_decode_failure() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        let key = fresh_key();
+        let pubkey = key.verifying_key();
+        // Row claims sig present but value is not valid base64.
+        let row = serde_json::json!({
+            "ts": Utc::now().to_rfc3339(),
+            "actor": "ai:t",
+            "decision": "allow",
+            "kind": "bash",
+            "rule_id": "R001",
+            "payload": {},
+            "prev_hash": CHAIN_HEAD_PREV_HASH,
+            "sig": "@@@NOT_BASE64@@@"
+        });
+        let body = format!("{}\n", serde_json::to_string(&row).unwrap());
+        write_forensic_file(tmp.path(), &today, &body);
+        let report = verify_since(tmp.path(), &today, Some(&pubkey)).expect("verify ran");
+        let f = report.first_failure.expect("signature failure surfaces");
+        assert!(
+            matches!(f.kind, VerifyFailureKind::Signature),
+            "expected Signature, got {:?}",
+            f.kind
+        );
+        assert!(f.detail.contains("base64 decode failed"));
+    }
+
+    #[test]
+    fn verify_since_signature_wrong_byte_length() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        let key = fresh_key();
+        let pubkey = key.verifying_key();
+        // sig decodes to 4 bytes (not 64) — exercises the length arm.
+        let sig_short = B64.encode([1u8, 2, 3, 4]);
+        let row = serde_json::json!({
+            "ts": Utc::now().to_rfc3339(),
+            "actor": "ai:t",
+            "decision": "allow",
+            "kind": "bash",
+            "rule_id": "R001",
+            "payload": {},
+            "prev_hash": CHAIN_HEAD_PREV_HASH,
+            "sig": sig_short
+        });
+        let body = format!("{}\n", serde_json::to_string(&row).unwrap());
+        write_forensic_file(tmp.path(), &today, &body);
+        let report = verify_since(tmp.path(), &today, Some(&pubkey)).expect("verify ran");
+        let f = report.first_failure.expect("signature failure surfaces");
+        assert!(matches!(f.kind, VerifyFailureKind::Signature));
+        assert!(
+            f.detail.contains("signature has") && f.detail.contains("expected 64"),
+            "got: {}",
+            f.detail
+        );
+    }
+
+    #[test]
+    fn verify_since_signature_verify_failure_for_wrong_key() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        // Init + record signed under key A, then verify with key B's
+        // public — the per-row Ed25519 verify call returns Err.
+        let key_a = fresh_key();
+        let key_b = fresh_key();
+        let pub_b = key_b.verifying_key();
+        fresh_init(tmp.path(), Some(key_a));
+        record_decision("ai:t", "allow", "bash", "R001", serde_json::json!({}));
+        shutdown();
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        let report = verify_since(tmp.path(), &today, Some(&pub_b)).expect("verify ran");
+        let f = report.first_failure.expect("verify failure surfaces");
+        assert!(matches!(f.kind, VerifyFailureKind::Signature));
+        assert!(
+            f.detail.contains("signature verify failed"),
+            "got: {}",
+            f.detail
+        );
+    }
+
+    #[test]
+    fn verify_since_walks_pre_cutoff_files_to_seed_chain_head() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        // Place a SIGNED file dated 2026-01-01 (well before cutoff) so
+        // the "for file in &files; if date >= cutoff break" loop walks
+        // through it AND updates prev_hash from its contents (lines
+        // 310-325). Then a current-date file builds on that chain.
+        let key = fresh_key();
+        let pubkey = key.verifying_key();
+
+        // Build the old file's first row anchored to CHAIN_HEAD_PREV_HASH.
+        let old_row_unsigned_canonical = ForensicDecision {
+            ts: "2026-01-01T00:00:00.000Z".to_string(),
+            actor: "ai:old".into(),
+            decision: "allow".into(),
+            kind: "bash".into(),
+            rule_id: "R001".into(),
+            payload: serde_json::json!({}),
+            prev_hash: CHAIN_HEAD_PREV_HASH.to_string(),
+            sig: String::new(),
+        };
+        let canonical = old_row_unsigned_canonical.canonical_bytes();
+        let sig: Signature = key.sign(&canonical);
+        let mut old_row = old_row_unsigned_canonical;
+        old_row.sig = B64.encode(sig.to_bytes());
+        let old_hash = old_row.self_hash();
+        let old_body = format!("{}\n", serde_json::to_string(&old_row).unwrap());
+        write_forensic_file(tmp.path(), "2026-01-01", &old_body);
+
+        // Re-init with same key and same dir; sink reads chain tail from
+        // the existing file so subsequent records chain off of old_hash.
+        fresh_init(tmp.path(), Some(key));
+        record_decision("ai:new", "allow", "bash", "R001", serde_json::json!({}));
+        shutdown();
+
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        let report = verify_since(tmp.path(), &today, Some(&pubkey)).expect("verify");
+        assert!(report.first_failure.is_none(), "{:?}", report);
+        // Only the new file's row is counted (the old one is pre-cutoff
+        // but its hash seeded the chain head for the new file).
+        assert_eq!(report.total_lines, 1);
+        // Sanity: chain tail used by fresh_init matched old_hash so the
+        // new row's prev_hash points at it.
+        let _ = old_hash;
+    }
+
+    #[test]
+    fn verify_since_blank_lines_ignored() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        // Pure blank file → 0 rows, no failure.
+        write_forensic_file(tmp.path(), &today, "\n\n\n");
+        let report = verify_since(tmp.path(), &today, None).expect("verify ran");
+        assert!(report.first_failure.is_none());
+        assert_eq!(report.total_lines, 0);
+    }
+
+    #[test]
+    fn verify_since_rejects_unparseable_date() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let err = verify_since(tmp.path(), "not-a-date", None).expect_err("expected parse err");
+        assert!(err.to_string().contains("parsing --since"));
+    }
+
+    #[test]
+    fn verify_since_returns_empty_report_when_dir_does_not_exist() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        // Use a child dir that was never created — list_forensic_files
+        // returns Ok(vec![]) (lines 247-249 branch).
+        let nonexistent = tmp.path().join("never-created");
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        let report = verify_since(&nonexistent, &today, None).expect("verify ran");
+        assert!(report.first_failure.is_none());
+        assert_eq!(report.total_lines, 0);
+    }
+
+    #[test]
+    fn file_date_errors_for_unrecognised_filename_shape() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        // Files whose name doesn't match the forensic-YYYY-MM-DD.jsonl
+        // shape are filtered out by list_forensic_files (line 259
+        // starts_with + ends_with check), so they don't reach file_date.
+        // We DIRECTLY call file_date to drive its error arm.
+        let bad = tmp.path().join("not-forensic.txt");
+        let err = file_date(&bad).expect_err("filename mismatch surfaces");
+        let chain = format!("{err}");
+        assert!(
+            chain.contains("not in forensic-YYYY-MM-DD.jsonl shape"),
+            "got: {chain}"
+        );
+    }
+
+    #[test]
+    fn list_forensic_files_skips_non_matching_names() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        // Write 3 unrelated files + 1 valid forensic file.
+        std::fs::write(tmp.path().join("README.md"), "x").unwrap();
+        std::fs::write(tmp.path().join("forensic-not-a-date.jsonl"), "x").unwrap();
+        std::fs::write(tmp.path().join("foo.jsonl"), "x").unwrap();
+        write_forensic_file(tmp.path(), "2026-02-15", "");
+        let files = list_forensic_files(tmp.path()).unwrap();
+        // Only the forensic-YYYY-MM-DD.jsonl shaped name matches the
+        // prefix+suffix guard. The "forensic-not-a-date.jsonl" file
+        // ALSO matches starts_with+ends_with (since both literal prefix
+        // and suffix are present); list_forensic_files lets it through
+        // and file_date is the gate that rejects the malformed date.
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "forensic-2026-02-15.jsonl"),
+            "good file present: {names:?}"
+        );
+        assert!(!names.iter().any(|n| n == "README.md"));
+        assert!(!names.iter().any(|n| n == "foo.jsonl"));
+    }
+
+    #[test]
+    fn parse_iso_date_edge_cases() {
+        // Valid leap-day.
+        assert!(parse_iso_date("2024-02-29").is_ok());
+        // Invalid month.
+        assert!(parse_iso_date("2026-13-01").is_err());
+        // Empty string.
+        assert!(parse_iso_date("").is_err());
+        // Reasonable date encoded compactly.
+        let code = parse_iso_date("2026-05-19").unwrap();
+        assert_eq!(code, 20260519);
+    }
+
+    #[test]
+    fn read_chain_tail_returns_none_for_empty_dir() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        assert!(read_chain_tail(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn read_chain_tail_returns_last_hash_after_record() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        fresh_init(tmp.path(), None);
+        record_decision("ai:t", "allow", "bash", "R001", serde_json::json!({}));
+        shutdown();
+        let tail = read_chain_tail(tmp.path()).expect("tail present after record");
+        assert!(!tail.is_empty());
+        assert_ne!(tail, CHAIN_HEAD_PREV_HASH);
+    }
+
+    #[test]
+    fn is_enabled_reflects_sink_state() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        shutdown();
+        assert!(!is_enabled(), "sink starts disabled after shutdown");
+        let tmp = TempDir::new().unwrap();
+        fresh_init(tmp.path(), None);
+        assert!(is_enabled(), "init flips is_enabled to true");
+        shutdown();
+        assert!(!is_enabled(), "shutdown flips it back");
+    }
+
+    #[test]
+    fn load_daemon_signing_key_returns_none_when_dir_missing() {
+        // Force KEY_DIR override to a nonexistent path so the early-out
+        // (line 461-463) fires.
+        let tmp = TempDir::new().unwrap();
+        let nonexistent = tmp.path().join("never-created");
+        let _g = crate::identity::keypair::key_dir_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var("AI_MEMORY_KEY_DIR").ok();
+        // SAFETY: process-wide env mutation; serialised behind the
+        // keypair module's env lock so concurrent tests do not observe
+        // a half-written override.
+        unsafe {
+            std::env::set_var("AI_MEMORY_KEY_DIR", &nonexistent);
+        }
+        let res = load_daemon_signing_key("ai:nobody");
+        if let Some(p) = prior {
+            unsafe {
+                std::env::set_var("AI_MEMORY_KEY_DIR", p);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("AI_MEMORY_KEY_DIR");
+            }
+        }
+        let got = res.expect("non-existent dir returns Ok(None)");
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn load_daemon_verifying_key_returns_none_when_dir_missing() {
+        let tmp = TempDir::new().unwrap();
+        let nonexistent = tmp.path().join("never-created");
+        let _g = crate::identity::keypair::key_dir_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var("AI_MEMORY_KEY_DIR").ok();
+        unsafe {
+            std::env::set_var("AI_MEMORY_KEY_DIR", &nonexistent);
+        }
+        let res = load_daemon_verifying_key("ai:nobody");
+        if let Some(p) = prior {
+            unsafe {
+                std::env::set_var("AI_MEMORY_KEY_DIR", p);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("AI_MEMORY_KEY_DIR");
+            }
+        }
+        let got = res.expect("non-existent dir returns Ok(None)");
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn load_daemon_keys_return_none_when_no_keypair_for_agent() {
+        // Real key-dir exists (tempdir) but does NOT have a keypair for
+        // the requested agent — the inner load(_,_) returns Err and the
+        // function converts to Ok(None) (lines 464-467, 481-484).
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path()).unwrap();
+        let _g = crate::identity::keypair::key_dir_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var("AI_MEMORY_KEY_DIR").ok();
+        unsafe {
+            std::env::set_var("AI_MEMORY_KEY_DIR", tmp.path());
+        }
+        let sk = load_daemon_signing_key("ai:no-keypair-on-disk");
+        let vk = load_daemon_verifying_key("ai:no-keypair-on-disk");
+        if let Some(p) = prior {
+            unsafe {
+                std::env::set_var("AI_MEMORY_KEY_DIR", p);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("AI_MEMORY_KEY_DIR");
+            }
+        }
+        assert!(sk.expect("Ok").is_none());
+        assert!(vk.expect("Ok").is_none());
+    }
+
     #[test]
     fn cross_thread_bleed_is_reproducible_without_lock_then_recovered_by_fresh_init() {
         let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());

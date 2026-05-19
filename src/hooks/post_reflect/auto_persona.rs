@@ -636,6 +636,135 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------------------------
+    // Coverage-uplift block (2026-05-19): cadence-zero early-out,
+    // build_post_reflect_hook closure activation, entity-missing skip,
+    // export-disabled (no fs write), generator error path.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn run_auto_persona_skips_when_cadence_is_zero() {
+        let (conn, _dir, db_path) = fresh_db();
+        // Cadence of 0 still produces a Some(0) policy value via
+        // PersonaPolicy.auto_persona_trigger_every_n_memories — exercise
+        // the `if cadence == 0` early-out (line 178-180).
+        enable_cadence(&conn, "team/alpha", 0, false);
+        let id = seed_reflection(&conn, "team/alpha", "obs", "body", Some("alice"));
+        let cfg = AutoPersonaConfig::default();
+        let llm = StubLlm;
+        run_auto_persona(&db_path, &id, "team/alpha", &cfg, &llm, None).unwrap();
+        let cnt: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE memory_kind = 'persona'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cnt, 0);
+    }
+
+    #[test]
+    fn run_auto_persona_skips_when_no_resolvable_entity() {
+        let (conn, _dir, db_path) = fresh_db();
+        enable_cadence(&conn, "team/alpha", 1, false);
+        // Reflection without metadata.entity_id and without [entity:X]
+        // marker — resolve_entity_id returns None (lines 184-189).
+        let id = seed_reflection(&conn, "team/alpha", "plain title", "body", None);
+        let cfg = AutoPersonaConfig::default();
+        let llm = StubLlm;
+        run_auto_persona(&db_path, &id, "team/alpha", &cfg, &llm, None).unwrap();
+        let cnt: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE memory_kind = 'persona'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cnt, 0);
+    }
+
+    #[test]
+    fn run_auto_persona_does_not_write_file_when_export_disabled() {
+        // Distinguishes from `run_auto_persona_writes_file_when_export_enabled`
+        // — when the policy's auto_export_personas_to_filesystem is
+        // None/false the if-arm at line 209-211 is skipped.
+        let (conn, dir, db_path) = fresh_db();
+        enable_cadence(&conn, "team/alpha", 1, false); // export=false
+        let id = seed_reflection(&conn, "team/alpha", "obs", "body", Some("alice"));
+        let out = dir.path().join("personas-no-export");
+        let cfg = AutoPersonaConfig {
+            out_dir: out.clone(),
+        };
+        let llm = StubLlm;
+        run_auto_persona(&db_path, &id, "team/alpha", &cfg, &llm, None).unwrap();
+        // Persona row WAS minted (cadence matches), but no file was
+        // exported.
+        let cnt: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE memory_kind = 'persona'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cnt, 1, "persona row minted");
+        assert!(!out.exists() || std::fs::read_dir(&out).map_or(true, |i| i.count() == 0));
+    }
+
+    #[test]
+    fn build_post_reflect_hook_invokes_closure_and_returns_callback() {
+        // Smoke-test the build_post_reflect_hook closure plumbing
+        // (lines 102-130). Constructs the hook, invokes the callback
+        // with a synthetic ReflectOutcome whose namespace has no
+        // policy seeded — the spawned worker logs + swallows the
+        // no-op, but the closure ITSELF executes (covering the
+        // outer arc-clone + thread::spawn lines).
+        let (_conn, _dir, db_path) = fresh_db();
+        let cfg = AutoPersonaConfig::default();
+        let llm: Arc<StubLlm> = Arc::new(StubLlm);
+        let hooks = build_post_reflect_hook(db_path.clone(), cfg, llm, None);
+        // The hook bundle returns with post_reflect Some(_).
+        let cb = hooks.post_reflect.as_ref().expect("post_reflect set");
+        let outcome = ReflectOutcome {
+            id: "synthetic-id".to_string(),
+            reflection_depth: 1,
+            reflects_on: vec![],
+            namespace: "team/alpha".to_string(),
+        };
+        // Fire the callback; the spawned worker may panic-swallow if
+        // the synthetic id has no matching row, but the callback's
+        // own body (the arc clones + thread::spawn boundary) runs.
+        cb(&outcome);
+        // Give the worker a moment to attempt its read; this is
+        // observability-only and the test passes regardless of the
+        // worker's outcome.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        // Active keypair plumbed through is None per the hook builder.
+        assert!(hooks.active_keypair.is_none());
+    }
+
+    #[test]
+    fn auto_persona_config_default_for_home_returns_personas_subdir() {
+        let cfg = AutoPersonaConfig::default_for_home();
+        // The path always ends with the `personas` segment.
+        let last = cfg
+            .out_dir
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        assert_eq!(last, "personas");
+    }
+
+    #[test]
+    fn run_auto_persona_open_error_propagates() {
+        // Pass a path under a non-existent directory so db::open fails
+        // (line 173). The error bubbles up rather than no-op'ing.
+        let bogus = PathBuf::from("/nonexistent-host-path-zz/auto-persona.db");
+        let cfg = AutoPersonaConfig::default();
+        let llm = StubLlm;
+        let res = run_auto_persona(&bogus, "any-id", "team/alpha", &cfg, &llm, None);
+        assert!(res.is_err(), "expected open failure");
+    }
+
     /// v0.7.0 polish PERF-8 (issue #781) — title-marker fallback. When
     /// no structured `metadata.entity_id` is present, the extractor
     /// scans the title for `[entity:X]` and populates the indexed
