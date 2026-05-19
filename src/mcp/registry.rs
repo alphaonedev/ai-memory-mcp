@@ -557,9 +557,10 @@ pub fn tool_definitions() -> Value {
                         "metadata": {"type": "object", "description": "JSON metadata", "default": {}},
                         "agent_id": {"type": "string", "description": "NHI agent_id; synthesized if omitted."},
                         "scope": {"type": "string", "enum": ["private", "team", "unit", "org", "collective"], "description": "Task 1.5 visibility. Default private."},
-                        "on_conflict": {"type": "string", "enum": ["error", "merge", "version"], "description": "P2/G6 collision policy on (title, namespace). error=CONFLICT (v2 default), merge=update in place (v1 default), version=append '(N)' suffix."},
+                        "on_conflict": {"type": "string", "enum": ["error", "merge", "version"], "description": "P2/G6 (title,namespace) collision: error (v2 default), merge (v1 default), version (suffix '(N)')."},
                         "kind": {"type": "string", "enum": ["observation", "reflection", "persona", "concept", "entity", "claim", "relation", "event", "conversation", "decision"], "description": "Form 6 (#759) memory-kind. Default observation."},
-                        "force": {"type": "boolean", "default": false, "description": "#519 bypass proactive contradiction detection (>=0.95 cosine + contradiction → CONFLICT unless force=true)."}
+                        "force": {"type": "boolean", "default": false, "description": "#519 bypass proactive contradiction detection."},
+                        "source_uri": {"type": "string", "description": "#885 Source URI (doc:/uri:/file:); indexed for #889."}
                     },
                     "required": ["title", "content"]
                 }
@@ -578,10 +579,10 @@ pub fn tool_definitions() -> Value {
                         "since": {"type": "string", "description": "RFC3339 lower bound on created_at"},
                         "until": {"type": "string", "description": "RFC3339 upper bound on created_at"},
                         "as_agent": {"type": "string", "description": "Task 1.5 querying-agent position for scope visibility."},
-                        "budget_tokens": {"type": "integer", "minimum": 0, "description": "P6/R1 cumulative content-token cap (cl100k). 0=empty. Top result returned even if oversized (meta.budget_overflow=true)."},
+                        "budget_tokens": {"type": "integer", "minimum": 0, "description": "P6/R1 content-token cap (cl100k). 0=empty. Top result kept; meta.budget_overflow=true."},
                         "context_tokens": {"type": "array", "items": {"type": "string"}, "description": "Recent conversation tokens; biases query embedding 70/30 (v0.6.0.0)."},
-                        "session_default": {"type": "boolean", "default": false, "description": "Splice [agents.defaults.recall_scope] for unset fields. Resolution: explicit > recall_scope > defaults."},
-                        "session_id": {"type": "string", "description": "#518 session id; +0.05 rerank boost for candidates in session's recently-accessed ring (cap 50, FIFO)."},
+                        "session_default": {"type": "boolean", "default": false, "description": "Splice [agents.defaults.recall_scope]. explicit > scope > defaults."},
+                        "session_id": {"type": "string", "description": "#518 session id; +0.05 rerank boost for in-session ring (cap 50)."},
                         "include_archived": {"type": "boolean", "default": false, "description": "WT-1-E: include atomised sources alongside atoms."},
                         "has_citations": {"type": "boolean", "default": false, "description": "Form 4 (#757): require non-empty citations array."},
                         "source_uri_prefix": {"type": "string", "description": "Form 4 (#757): restrict by source_uri prefix (e.g. 'doc:', 'uri:https://')."},
@@ -590,7 +591,7 @@ pub fn tool_definitions() -> Value {
                                 {"type": "array", "items": {"type": "string", "enum": ["observation", "reflection", "persona", "concept", "entity", "claim", "relation", "event", "conversation", "decision"]}},
                                 {"type": "string"}
                             ],
-                            "description": "Form 6 (#759) kind filter. Array or comma-string. OR within kinds; AND with other filters. 'all'/omit = no filter. Unknown tokens dropped."
+                            "description": "Form 6 (#759) kind filter. Array or CSV. OR within kinds; AND across. 'all'/omit = no filter."
                         },
                         "confidence_tier": {"type": "string", "enum": ["confirmed", "likely", "ambiguous"], "description": "Gap 4 (#887) tier filter."},
                         "verbose_provenance": {"type": "boolean", "default": true, "description": "Gap 7 (#890): per-row provenance decoration."},
@@ -858,7 +859,10 @@ pub fn tool_definitions() -> Value {
                         "priority": {"type": "integer", "minimum": 1, "maximum": 10},
                         "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
                         "expires_at": {"type": "string", "description": "RFC3339 or null to clear."},
-                        "metadata": {"type": "object", "description": "JSON metadata."}
+                        "metadata": {"type": "object", "description": "JSON metadata."},
+                        "expected_version": {"type": "integer", "description": "#884 If-Match; mismatch → 409 envelope."},
+                        "edit_source": {"type": "string", "enum": ["human", "llm", "hook"], "default": "human", "description": "#888 'human'=in-place; 'llm'/'hook'=archive+supersede."},
+                        "source_uri": {"type": "string", "description": "#885 update source_uri."}
                     },
                     "required": ["id"]
                 }
@@ -924,7 +928,7 @@ pub fn tool_definitions() -> Value {
                     "properties": {
                         "memory_id": {"type": "string", "description": "Memory ID."},
                         "verbose": {"type": "boolean", "default": false, "description": "I4: when false, >100KB transcripts truncated=true."},
-                        "depth": {"type": ["integer", "null"], "minimum": 0, "default": null, "description": "L2-4: reflects_on walk cap. null=full, 0=self only, N>=1=self+N hops. Ignored for non-reflection memories."}
+                        "depth": {"type": ["integer", "null"], "minimum": 0, "default": null, "description": "L2-4 reflects_on hops. null=full, 0=self, N=self+N."}
                     },
                     "required": ["memory_id"]
                 }
@@ -1331,7 +1335,7 @@ pub fn tool_definitions() -> Value {
                         // (alnum/_-.) up to 64 chars.
                         "agent_type": {
                             "type": "string",
-                            "description": "Curated: human, system, ai:claude-opus-4.6, ai:claude-opus-4.7, ai:codex-5.4, ai:grok-4.2. Open-form: any ai:<name> (alnum/_-., <=64). Outside curated + ai: => 400."
+                            "description": "Curated: human, system, ai:claude-opus-4.6/4.7, ai:codex-5.4, ai:grok-4.2. Open-form: any ai:<name>."
                         },
                         "capabilities": {"type": "array", "items": {"type": "string"}, "default": [], "description": "Capability tags."}
                     },
