@@ -100,13 +100,15 @@ pub(super) async fn post_once(
     if let Some(key) = api_key {
         req = req.header("x-api-key", key);
     }
-    // v0.7.0 #791 — attach per-message Ed25519 signature header. The
-    // receiver verifies against the peer's enrolled public key when
-    // `AI_MEMORY_FED_REQUIRE_SIG=1` (v0.7.0 default). Unsigned posts
-    // remain valid on receivers running with the env knob set to `0`.
+    // v0.7.0 #791 + #922 — Ed25519 signature header + nonce header
+    // bound into signature input so byte-for-byte replays are refused.
     if let Some(sk) = signing_key {
-        let sig_header = crate::federation::signing::sign_body_header(sk, &body_bytes);
-        req = req.header(crate::federation::signing::SIGNATURE_HEADER, sig_header);
+        let nonce = uuid::Uuid::new_v4().to_string();
+        let sig_header =
+            crate::federation::signing::sign_body_with_nonce_header(sk, &body_bytes, &nonce);
+        req = req
+            .header(crate::federation::signing::SIGNATURE_HEADER, sig_header)
+            .header(crate::federation::signing::NONCE_HEADER, nonce);
     }
     // v0.7.0 #238 — attach `x-peer-id` carrying the body's
     // `sender_agent_id` so the receiver's attestation step can
@@ -1369,10 +1371,17 @@ pub async fn bulk_catchup_push(
             // idempotent replay, and the peer's `insert_if_newer`
             // dedupes per row by (id, updated_at).
             req = req.header("X-Catchup", "bulk");
-            // v0.7.0 #791 — per-message Ed25519 signature header.
+            // v0.7.0 #791 + #922 — signature + nonce header.
             if let Some(sk) = signing_key.as_deref() {
-                let sig_header = crate::federation::signing::sign_body_header(sk, &body_bytes);
-                req = req.header(crate::federation::signing::SIGNATURE_HEADER, sig_header);
+                let nonce = uuid::Uuid::new_v4().to_string();
+                let sig_header = crate::federation::signing::sign_body_with_nonce_header(
+                    sk,
+                    &body_bytes,
+                    &nonce,
+                );
+                req = req
+                    .header(crate::federation::signing::SIGNATURE_HEADER, sig_header)
+                    .header(crate::federation::signing::NONCE_HEADER, nonce);
             }
             // v0.7.0 fold-A2A1.4 (#702) — forward the operator-configured
             // `x-api-key` on the catchup batch as well. Without this, a

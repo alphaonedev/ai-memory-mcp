@@ -340,6 +340,7 @@ fn test_app_state(db: Db) -> AppState {
         ),
         replay_cache: Arc::new(crate::identity::replay::ReplayCache::new()),
         verify_require_nonce: false,
+        federation_nonce_cache: Arc::new(crate::identity::replay::FederationNonceCache::new()),
         autonomous_hooks: false,
         recall_scope: Arc::new(None),
         // v0.7.0 Policy-Engine Item 3 — tests don't spawn the
@@ -1040,6 +1041,9 @@ async fn http_bulk_create_fans_out_with_federation() {
         replay_cache: std::sync::Arc::new(crate::identity::replay::ReplayCache::default()),
 
         verify_require_nonce: false,
+        federation_nonce_cache: std::sync::Arc::new(
+            crate::identity::replay::FederationNonceCache::default(),
+        ),
         autonomous_hooks: false,
         recall_scope: Arc::new(None),
         deferred_audit_queue: Arc::new(None),
@@ -9564,6 +9568,7 @@ fn h8d_app_state_with_fed(db: Db, peer_urls: Vec<String>, w: usize, timeout_ms: 
         ),
         replay_cache: Arc::new(crate::identity::replay::ReplayCache::new()),
         verify_require_nonce: false,
+        federation_nonce_cache: Arc::new(crate::identity::replay::FederationNonceCache::new()),
         autonomous_hooks: false,
         recall_scope: Arc::new(None),
         deferred_audit_queue: Arc::new(None),

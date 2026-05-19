@@ -178,10 +178,10 @@ pub enum Command {
         /// `core,graph,archive`). Default `core` (5 tools). Resolution
         /// order: this CLI flag > `AI_MEMORY_PROFILE` env > `[mcp].profile`
         /// in config.toml > `core`. Set `--profile full` to expose
-        /// every family (71 advertised entries at v0.7.0 — 70 callable
+        /// every family (73 advertised entries at v0.7.0 — 72 callable
         /// "memory tools" + the always-on `memory_capabilities` bootstrap;
-        /// `Profile::full().expected_tool_count()` returns 71, while
-        /// `memory_capabilities` summary reports the 70-memory-tool count
+        /// `Profile::full().expected_tool_count()` returns 73, while
+        /// `memory_capabilities` summary reports the 72-memory-tool count
         /// — both numbers are intentional, the +1 is the always-on entry).
         #[arg(long, env = "AI_MEMORY_PROFILE")]
         profile: Option<String>,
@@ -2736,6 +2736,7 @@ pub async fn bootstrap_serve(
         // operators opt into strict mode via `config.toml`.
         replay_cache: Arc::new(crate::identity::replay::ReplayCache::new()),
         verify_require_nonce: app_config.verify.as_ref().is_some_and(|v| v.require_nonce),
+        federation_nonce_cache: Arc::new(crate::identity::replay::FederationNonceCache::new()),
         // v0.7.0 (issue #519) — resolved autonomous_hooks flag for the
         // HTTP create_memory path's proactive conflict-detection
         // helper. Falls back to false when unset (preserves v0.6.x
@@ -3607,6 +3608,7 @@ mod tests {
             llm_call_timeout: Duration::from_secs(crate::config::DEFAULT_LLM_CALL_TIMEOUT_SECS),
             replay_cache: Arc::new(crate::identity::replay::ReplayCache::new()),
             verify_require_nonce: false,
+            federation_nonce_cache: Arc::new(crate::identity::replay::FederationNonceCache::new()),
             autonomous_hooks: false,
             recall_scope: Arc::new(None),
             deferred_audit_queue: Arc::new(None),

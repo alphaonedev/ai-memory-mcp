@@ -32,14 +32,38 @@ pub const SIGNATURE_HEADER: &str = "x-memory-sig";
 /// invalid signatures get rejected with 401. Default at v0.7.0 = ON.
 pub const REQUIRE_SIG_ENV: &str = "AI_MEMORY_FED_REQUIRE_SIG";
 
+/// v0.7.0 #922 — HTTP header carrying the per-message nonce.
+pub const NONCE_HEADER: &str = "x-memory-nonce";
+
+/// v0.7.0 #922 — domain separator between body and nonce.
+const NONCE_DOMAIN_SEP: u8 = 0x00;
+
+/// v0.7.0 #922 — env var; default = ON.
+pub const REQUIRE_NONCE_ENV: &str = "AI_MEMORY_FED_REQUIRE_NONCE";
+
 /// Algorithm prefix on the header value.
 pub const ED25519_PREFIX: &str = "ed25519=";
 
 /// Produce the `X-Memory-Sig` header value for `body` signed by
 /// `key`. Format: `ed25519=<base64-standard-padded>`.
+///
+/// Legacy v0.7.0 #791 variant — body-only. New call sites prefer
+/// [`sign_body_with_nonce_header`].
 #[must_use]
 pub fn sign_body_header(key: &SigningKey, body: &[u8]) -> String {
     let sig: Signature = key.sign(body);
+    let b64 = B64.encode(sig.to_bytes());
+    format!("{ED25519_PREFIX}{b64}")
+}
+
+/// v0.7.0 #922 — sign `body || 0x00 || nonce`.
+#[must_use]
+pub fn sign_body_with_nonce_header(key: &SigningKey, body: &[u8], nonce: &str) -> String {
+    let mut input = Vec::with_capacity(body.len() + 1 + nonce.len());
+    input.extend_from_slice(body);
+    input.push(NONCE_DOMAIN_SEP);
+    input.extend_from_slice(nonce.as_bytes());
+    let sig: Signature = key.sign(&input);
     let b64 = B64.encode(sig.to_bytes());
     format!("{ED25519_PREFIX}{b64}")
 }
@@ -56,6 +80,10 @@ pub enum VerifyError {
     Malformed,
     /// Cryptographic verification failed.
     BadSignature,
+    /// v0.7.0 #922 — `(peer_id, nonce)` seen before.
+    ReplayedNonce,
+    /// v0.7.0 #922 — `X-Memory-Nonce` header absent under strict mode.
+    NonceMissing,
 }
 
 impl VerifyError {
@@ -67,6 +95,8 @@ impl VerifyError {
             Self::UnknownAlgorithm => "x_memory_sig_unknown_algorithm",
             Self::Malformed => "x_memory_sig_malformed",
             Self::BadSignature => "x_memory_sig_bad_signature",
+            Self::ReplayedNonce => "x_memory_nonce_replay",
+            Self::NonceMissing => "x_memory_nonce_missing",
         }
     }
 }
@@ -111,12 +141,55 @@ pub fn verify_header(
         .map_err(|_| VerifyError::BadSignature)
 }
 
-/// Whether the receiver enforces signature verification. Default
-/// `true` at v0.7.0 — operators can opt out via
-/// `AI_MEMORY_FED_REQUIRE_SIG=0`.
+/// v0.7.0 #922 — verify the signature against `body || 0x00 || nonce`.
+///
+/// # Errors
+/// - `Missing` if `header` is `None`.
+/// - `UnknownAlgorithm` if the prefix isn't `ed25519=`.
+/// - `Malformed` on base64 decode error or wrong sig length.
+/// - `BadSignature` on Ed25519 verification failure.
+pub fn verify_header_with_nonce(
+    header: Option<&str>,
+    body: &[u8],
+    nonce: &str,
+    pubkey: &VerifyingKey,
+) -> Result<(), VerifyError> {
+    let raw = header.ok_or(VerifyError::Missing)?;
+    let primary = raw.split(';').next().unwrap_or(raw).trim();
+    let b64 = primary
+        .strip_prefix(ED25519_PREFIX)
+        .ok_or(VerifyError::UnknownAlgorithm)?;
+    let bytes = B64
+        .decode(b64.as_bytes())
+        .map_err(|_| VerifyError::Malformed)?;
+    if bytes.len() != 64 {
+        return Err(VerifyError::Malformed);
+    }
+    let mut sig_arr = [0u8; 64];
+    sig_arr.copy_from_slice(&bytes);
+    let sig = Signature::from_bytes(&sig_arr);
+    let mut input = Vec::with_capacity(body.len() + 1 + nonce.len());
+    input.extend_from_slice(body);
+    input.push(NONCE_DOMAIN_SEP);
+    input.extend_from_slice(nonce.as_bytes());
+    pubkey
+        .verify(&input, &sig)
+        .map_err(|_| VerifyError::BadSignature)
+}
+
+/// Whether the receiver enforces signature verification.
 #[must_use]
 pub fn require_sig() -> bool {
     match std::env::var(REQUIRE_SIG_ENV) {
+        Ok(v) => v != "0",
+        Err(_) => true,
+    }
+}
+
+/// v0.7.0 #922 — whether the receiver enforces per-message nonce freshness.
+#[must_use]
+pub fn require_nonce() -> bool {
+    match std::env::var(REQUIRE_NONCE_ENV) {
         Ok(v) => v != "0",
         Err(_) => true,
     }

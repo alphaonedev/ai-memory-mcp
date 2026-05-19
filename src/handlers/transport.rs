@@ -206,6 +206,9 @@ pub struct AppState {
     /// `config.toml`.
     pub verify_require_nonce: bool,
 
+    /// v0.7.0 #922 — per-peer LRU keyed on `(peer_id, X-Memory-Nonce)`.
+    pub federation_nonce_cache: Arc<crate::identity::replay::FederationNonceCache>,
+
     /// v0.7.0 (issue #519) — resolved `autonomous_hooks` flag (from
     /// config.toml + `AI_MEMORY_AUTONOMOUS_HOOKS` env). Consulted by
     /// the HTTP `create_memory` path's [`maybe_detect_conflicts`]

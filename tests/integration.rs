@@ -8904,6 +8904,7 @@ impl OneshotDaemon {
             replay_cache: std::sync::Arc::new(ai_memory::identity::replay::ReplayCache::default()),
 
             verify_require_nonce: false,
+            federation_nonce_cache: std::sync::Arc::new(ai_memory::identity::replay::FederationNonceCache::default()),
             autonomous_hooks: false,
             recall_scope: std::sync::Arc::new(None),
             deferred_audit_queue: std::sync::Arc::new(None),
@@ -12677,6 +12678,7 @@ fn build_serve_state(
         replay_cache: std::sync::Arc::new(ai_memory::identity::replay::ReplayCache::default()),
 
         verify_require_nonce: false,
+        federation_nonce_cache: std::sync::Arc::new(ai_memory::identity::replay::FederationNonceCache::default()),
         autonomous_hooks: false,
         recall_scope: std::sync::Arc::new(None),
         deferred_audit_queue: std::sync::Arc::new(None),
