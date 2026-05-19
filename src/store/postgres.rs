@@ -225,6 +225,15 @@ const MIGRATION_V45_EDIT_SOURCE_ARCHIVE: &str =
 const MIGRATION_V46_LINKS_TEMPORAL_COLUMNS: &str =
     include_str!("../../migrations/postgres/0029_v07_links_temporal_columns.sql");
 
+/// v47 — Persona signing atomicity CHECK constraint on `memory_links`
+/// (sqlite parity via `migrations/sqlite/0037_v07_persona_signing_atomicity.sql`).
+/// Closes #902: the file existed at `0024_v07_persona_signing_atomicity.sql`
+/// but was orphaned (never registered in the ladder). Without it, postgres
+/// accepts `attest_level IN ('self_signed','peer_attested')` rows with NULL
+/// or wrong-length signature; sqlite correctly rejects.
+const MIGRATION_V47_PERSONA_SIGNING_ATOMICITY: &str =
+    include_str!("../../migrations/postgres/0024_v07_persona_signing_atomicity.sql");
+
 /// Current schema version. Matches SQLite CURRENT_SCHEMA_VERSION (src/db.rs:233).
 /// Incremented on each migration step.
 ///
@@ -379,7 +388,7 @@ const MIGRATION_V46_LINKS_TEMPORAL_COLUMNS: &str =
 //       attest_level). All four already ship inline in
 //       postgres_schema.sql for greenfield; this migration covers
 //       legacy upgrade paths. Pure additive — fully idempotent.
-const CURRENT_SCHEMA_VERSION: i32 = 46;
+const CURRENT_SCHEMA_VERSION: i32 = 47;
 
 /// Default embedding column dimension used when the caller doesn't pass
 /// `--embedding-dim` to `ai-memory schema-init`. Matches the v0.7.0
@@ -910,6 +919,9 @@ impl PostgresStore {
         }
         if current_version < 46 {
             self.migrate_v46().await?;
+        }
+        if current_version < 47 {
+            self.migrate_v47().await?;
         }
 
         Ok(())
@@ -1599,6 +1611,36 @@ impl PostgresStore {
         tracing::info!(
             target = "store::postgres",
             "schema migration v46 applied (#860: memory_links temporal + attest columns)"
+        );
+        Ok(())
+    }
+
+    /// v47 — Apply the orphaned persona-signing-atomicity CHECK constraint
+    /// on `memory_links` (#902). Sqlite parity is migration
+    /// `0037_v07_persona_signing_atomicity.sql`. The SQL backfills phantom
+    /// rows to `attest_level='unsigned'` BEFORE adding the CHECK so legacy
+    /// DBs don't trip constraint creation.
+    async fn migrate_v47(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v47 tx", e))?;
+
+        sqlx::raw_sql(MIGRATION_V47_PERSONA_SIGNING_ATOMICITY)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("apply v47 persona signing atomicity", e))?;
+
+        record_schema_version(&mut tx, 47).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v47 migration", e))?;
+
+        tracing::info!(
+            target = "store::postgres",
+            "schema migration v47 applied (#902: memory_links attest+signature atomic CHECK)"
         );
         Ok(())
     }
@@ -10467,11 +10509,12 @@ mod tests {
         //   v44 = recall_observations table (Gap 3 #886)
         //   v45 = edit_source archive metadata + lookup indexes (Gap 5 #888)
         //   v46 = memory_links temporal columns (Gap 7 / #860)
+        //   v47 = memory_links persona-signing atomicity CHECK (#902)
         //
         // A future bump on either side without the corresponding port
         // re-trips this assertion before the migration runner gets a
         // chance to write a partial schema to disk.
-        assert_eq!(CURRENT_SCHEMA_VERSION, 46);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 47);
     }
 
     #[tokio::test]
