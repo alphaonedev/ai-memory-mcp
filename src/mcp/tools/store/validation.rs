@@ -200,6 +200,14 @@ pub(super) fn parse_and_build_memory(
         .as_str()
         .and_then(crate::models::MemoryKind::from_str);
 
+    let source_uri = match params["source_uri"].as_str().map(str::trim) {
+        Some(s) if !s.is_empty() => {
+            crate::validate::validate_source_uri(s).map_err(|e| e.to_string())?;
+            Some(s.to_string())
+        }
+        _ => None,
+    };
+
     let mem = Memory {
         id: uuid::Uuid::new_v4().to_string(),
         tier,
@@ -221,7 +229,7 @@ pub(super) fn parse_and_build_memory(
         entity_id: None,
         persona_version: None,
         citations: Vec::new(),
-        source_uri: None,
+        source_uri,
         source_span: None,
         confidence_source: ConfidenceSource::CallerProvided,
         confidence_signals: None,
