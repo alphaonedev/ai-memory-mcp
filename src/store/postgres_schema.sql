@@ -166,7 +166,15 @@ CREATE TABLE IF NOT EXISTS memories (
     -- direction (the entity a non-persona row mentions). Fresh
     -- schemas carry this inline; existing schemas pick it up via
     -- migrate_v41().
-    mentioned_entity_id   TEXT
+    mentioned_entity_id   TEXT,
+    -- v0.7.0 Provenance Gap 1 (schema v42 postgres / v45 sqlite, issue
+    -- #884) — optimistic-concurrency counter. Bumped on every mutation
+    -- by `PostgresStore::update_with_expected_version`; concurrent
+    -- updates pass `expected_version` and receive a typed
+    -- `VersionConflict` envelope when the stored version has drifted.
+    -- Fresh schemas carry this inline; existing schemas pick it up via
+    -- migrate_v42().
+    version               BIGINT NOT NULL DEFAULT 1
 );
 
 -- v0.6.0 blocker #294 fix: upsert contract is `(title, namespace)`.
@@ -672,6 +680,36 @@ CREATE TABLE IF NOT EXISTS agent_quotas (
 -- mirrors the SQLite rationale for the same redundant index.
 CREATE INDEX IF NOT EXISTS idx_agent_quotas_agent_id
     ON agent_quotas (agent_id);
+
+-- ─────────────────────────────────────────────────────────────────────
+-- recall_observations — v0.7.0 Gap 3 (issue #886, schema v44 postgres /
+-- v47 sqlite) — append-only ledger keyed by `(recall_id, memory_id)`
+-- carrying retriever / rank / score plus the consumed_at +
+-- consumed_by_memory_id columns that flip TRUE when a downstream
+-- `memory_store` or `memory_link` request cites a prior recall_id.
+-- Mirrors `migrations/sqlite/0038_v07_recall_observations.sql`. Fresh
+-- schemas carry this inline; existing schemas pick it up via
+-- migrate_v44().
+-- ─────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS recall_observations (
+    recall_id              TEXT        NOT NULL,
+    memory_id              TEXT        NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    retriever              TEXT        NOT NULL,
+    rank                   BIGINT      NOT NULL,
+    score                  DOUBLE PRECISION NOT NULL,
+    consumed               BOOLEAN     NOT NULL DEFAULT FALSE,
+    observed_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    consumed_at            TIMESTAMPTZ NULL,
+    consumed_by_memory_id  TEXT        NULL REFERENCES memories(id) ON DELETE CASCADE,
+    PRIMARY KEY (recall_id, memory_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_recall_observations_recall_id
+    ON recall_observations(recall_id);
+CREATE INDEX IF NOT EXISTS idx_recall_observations_memory_id
+    ON recall_observations(memory_id);
+CREATE INDEX IF NOT EXISTS idx_recall_observations_observed_at
+    ON recall_observations(observed_at);
 
 -- ─────────────────────────────────────────────────────────────────────
 -- F6 Gap 1 (v0.7.0) — SAL knowledge-graph SQL views.
