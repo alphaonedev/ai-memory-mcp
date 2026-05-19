@@ -195,8 +195,20 @@ mod tests {
         assert!(verify_header(Some(&header_with_suffix), body, &pubkey).is_ok());
     }
 
+    /// `REQUIRE_SIG_ENV` is a PROCESS-WIDE env var; the two tests below
+    /// touch it concurrently when libtest runs them on different threads,
+    /// producing flaky failures (`require_sig_defaults_to_true` returning
+    /// false because the other test still has the var set to "0"). This
+    /// per-test mutex serialises the env-var manipulation so the two
+    /// tests cannot race.
+    fn require_sig_env_lock() -> &'static std::sync::Mutex<()> {
+        static M: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        M.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
     #[test]
     fn require_sig_defaults_to_true() {
+        let _g = require_sig_env_lock().lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::remove_var(REQUIRE_SIG_ENV);
         }
@@ -205,6 +217,7 @@ mod tests {
 
     #[test]
     fn require_sig_false_when_zero() {
+        let _g = require_sig_env_lock().lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::set_var(REQUIRE_SIG_ENV, "0");
         }
