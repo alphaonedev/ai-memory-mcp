@@ -484,17 +484,61 @@ pub fn load_daemon_verifying_key(agent_id: &str) -> Result<Option<VerifyingKey>>
     }
 }
 
+// ---------------------------------------------------------------------------
+// Cross-module test-isolation lock (#899 root-cause fix)
+// ---------------------------------------------------------------------------
+//
+// The forensic [`SINK`] is a process-wide `OnceLock<Mutex<Option<…>>>`.
+// `record_decision` writes to it WITHOUT any per-test scoping — it
+// uses whichever `dir` the most recent `init()` call configured.
+//
+// That makes the sink shared mutable state between every test in the
+// `cargo test --lib` binary that reaches it. There are three classes
+// of caller in the lib's test set:
+//
+// 1. `governance::audit::tests::*` — direct callers of `init` /
+//    `record_decision` / `shutdown`. These hold [`forensic_sink_test_lock`]
+//    via the module-private alias.
+// 2. `governance::agent_action::tests::*` — INDIRECT callers via
+//    `check_agent_action(...) → emit_forensic_decision(...) → record_decision(...)`
+//    (see `agent_action.rs:642, 745`). 17 of 43 tests in that module
+//    invoke `check_agent_action`, and prior to #899 NONE held the
+//    shared lock.
+// 3. `mcp::tools::check_agent_action::tests::*` — INDIRECT callers via
+//    `handle_check_agent_action → check_agent_action → record_decision`.
+//    Same risk profile.
+//
+// With cargo's default parallel test runner, a class-1 test could
+// `init(tmp_A)` and start recording while a class-2 or class-3 test
+// in another thread fires `check_agent_action` and emits into
+// `tmp_A` — bleeding `actor="agent:t"` rows into the class-1 test's
+// expected count. On Windows the thread scheduler interleaves the
+// race more often than on macOS/Linux, surfacing as a Windows-only
+// flake: `record_then_verify_signed_chain` counted 5 records
+// (3 own + 2 bled from `tampering_detected_by_verify`'s
+// agent_action-adjacent path) instead of 3 (#899).
+//
+// The fix: expose this lock as `pub(crate)` so the two indirect
+// caller sites (`agent_action::tests`, `mcp::tools::check_agent_action::tests`)
+// can acquire it before any test that fires `check_agent_action`.
+// The defensive `fresh_init` tempdir-clear remains as
+// belt-and-suspenders — even if a future caller forgets the lock,
+// the file-level isolation still holds.
+#[cfg(test)]
+pub(crate) fn forensic_sink_test_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use rand_core::OsRng;
-    use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
 
-    fn test_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+    fn test_lock() -> &'static std::sync::Mutex<()> {
+        forensic_sink_test_lock()
     }
 
     fn fresh_key() -> SigningKey {
@@ -597,5 +641,105 @@ mod tests {
         shutdown();
         record_decision("ai:t", "allow", "bash", "R001", serde_json::json!({}));
         assert!(!is_enabled());
+    }
+
+    /// Regression test for #899 — cross-test forensic-sink bleed.
+    ///
+    /// Reproduces the Windows-flake scenario:
+    /// 1. Test A holds [`test_lock`], inits the sink at `tmp_A`,
+    ///    starts writing.
+    /// 2. A background thread fires `record_decision` mid-stream
+    ///    (simulating an `agent_action::tests::*` that doesn't
+    ///    acquire the lock and is firing `check_agent_action ->
+    ///    emit_forensic_decision -> record_decision`).
+    /// 3. Test A finishes and asserts exactly 3 records.
+    ///
+    /// Without the lock guarantee, the background thread's
+    /// `record_decision` would land in `tmp_A`'s file. With the lock
+    /// guarantee enforced (sibling test modules acquire
+    /// [`forensic_sink_test_lock`]), this test demonstrates the
+    /// PROPERTY we want: while the lock is held by test A, no other
+    /// in-process thread can land a record in tmp_A through the live
+    /// sink.
+    ///
+    /// The mechanism we assert: this test's background thread does
+    /// NOT acquire the lock, and to keep the property holding the
+    /// test asserts that `record_decision` from the background
+    /// thread is observable in the same `tmp_A` file (proving the
+    /// bleed is real when callers ignore the lock), THEN asserts
+    /// that the defensive `fresh_init` tempdir-clear at the next
+    /// test's `init` would still recover (the file-level isolation
+    /// belt-and-suspenders). This gives us a mechanical pin on both
+    /// the bleed vector AND the defensive recovery.
+    #[test]
+    fn cross_thread_bleed_is_reproducible_without_lock_then_recovered_by_fresh_init() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let key = fresh_key();
+        let pubkey = key.verifying_key();
+        fresh_init(tmp.path(), Some(key));
+
+        // Test A writes 3 records.
+        for i in 0..3 {
+            record_decision(
+                "ai:test-a",
+                "allow",
+                "bash",
+                &format!("R00{i}"),
+                serde_json::json!({"a": i}),
+            );
+        }
+
+        // Background thread (does NOT acquire the lock — simulates
+        // an indirect caller in another test module that calls
+        // `check_agent_action` while the sink is live) lands one
+        // extra record. With the global sink shared, this lands in
+        // tmp_A — proving the bleed vector exists when callers
+        // ignore the lock.
+        let handle = std::thread::spawn(|| {
+            record_decision(
+                "ai:bleed-from-elsewhere",
+                "allow",
+                "bash",
+                "R999",
+                serde_json::json!({"source": "background-thread"}),
+            );
+        });
+        handle.join().expect("background thread");
+
+        shutdown();
+        let since = Utc::now().format("%Y-%m-%d").to_string();
+        let report_after_bleed =
+            verify_since(tmp.path(), &since, Some(&pubkey)).expect("verify after bleed");
+
+        // The bleed IS present — 4 records, not 3. This is the
+        // observable symptom of #899 in microcosm. The fix is that
+        // sibling test modules acquire the same lock so the
+        // background thread can never run while this test's body
+        // owns the sink.
+        assert_eq!(
+            report_after_bleed.total_lines, 4,
+            "demonstrating the bleed vector: background thread without lock lands in tmp_A"
+        );
+
+        // Belt-and-suspenders: `fresh_init` on the same tempdir
+        // clears the pre-existing forensic-*.jsonl file (commit
+        // 6ae68d146), recovering the next test's expected count
+        // regardless of what bled in before.
+        fresh_init(tmp.path(), Some(fresh_key()));
+        record_decision(
+            "ai:test-b",
+            "allow",
+            "bash",
+            "R001",
+            serde_json::json!({"b": 1}),
+        );
+        shutdown();
+        let report_after_recover =
+            verify_since(tmp.path(), &since, None).expect("verify after recover");
+        assert_eq!(
+            report_after_recover.total_lines, 1,
+            "fresh_init must clear the tempdir so test-B sees only its own row"
+        );
     }
 }

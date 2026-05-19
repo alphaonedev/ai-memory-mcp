@@ -902,6 +902,35 @@ mod tests {
         rules_store::force_no_operator_pubkey_for_test()
     }
 
+    /// Issue #899 — guard against cross-test forensic-sink bleed.
+    ///
+    /// Every test that calls [`check_agent_action`] (or
+    /// [`check_agent_action_no_audit`]) indirectly fires
+    /// [`crate::governance::audit::record_decision`] via
+    /// [`emit_forensic_decision`]. If a sibling test in
+    /// `governance::audit::tests` has just initialised the
+    /// process-wide forensic sink at its tempdir, this thread's
+    /// `record_decision` would land a row in that sibling's
+    /// tempdir — bleeding the sibling's row count.
+    ///
+    /// Tests that exercise `check_agent_action*` MUST hold this
+    /// lock for the duration of the call. The lock is the same
+    /// `OnceLock<Mutex<()>>` `audit::tests` uses, so the two
+    /// modules now serialise their access to the shared sink.
+    /// Acquire pattern mirrors `no_operator_pubkey`:
+    ///
+    /// ```ignore
+    /// let _forensic = forensic_lock();
+    /// let _no_pubkey = no_operator_pubkey();
+    /// let decision = check_agent_action(&conn, "agent:t", &action).unwrap();
+    /// ```
+    #[must_use = "the guard must be held for the scope of the test"]
+    fn forensic_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::governance::audit::forensic_sink_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     fn add_rule(
         conn: &Connection,
         id: &str,
@@ -983,6 +1012,7 @@ mod tests {
 
     #[test]
     fn allow_when_no_rule_matches() {
+        let _forensic = forensic_lock();
         let conn = fresh_conn();
         let action = AgentAction::Bash {
             command: "ls -la".into(),
@@ -995,6 +1025,7 @@ mod tests {
 
     #[test]
     fn refuse_filesystem_write_glob_match() {
+        let _forensic = forensic_lock();
         let _no_pubkey = no_operator_pubkey();
         let conn = fresh_conn();
         add_rule(
@@ -1019,6 +1050,7 @@ mod tests {
 
     #[test]
     fn allow_filesystem_write_outside_glob() {
+        let _forensic = forensic_lock();
         let conn = fresh_conn();
         add_rule(
             &conn,
@@ -1038,6 +1070,7 @@ mod tests {
 
     #[test]
     fn disabled_rule_does_not_match() {
+        let _forensic = forensic_lock();
         let conn = fresh_conn();
         add_rule(
             &conn,
@@ -1057,6 +1090,7 @@ mod tests {
 
     #[test]
     fn warn_rule_returns_warn_not_refuse() {
+        let _forensic = forensic_lock();
         let _no_pubkey = no_operator_pubkey();
         let conn = fresh_conn();
         add_rule(
@@ -1080,6 +1114,7 @@ mod tests {
 
     #[test]
     fn refuse_wins_over_warn_when_both_match() {
+        let _forensic = forensic_lock();
         let _no_pubkey = no_operator_pubkey();
         let conn = fresh_conn();
         add_rule(
@@ -1108,6 +1143,7 @@ mod tests {
 
     #[test]
     fn process_spawn_binary_match() {
+        let _forensic = forensic_lock();
         let _no_pubkey = no_operator_pubkey();
         let conn = fresh_conn();
         add_rule(
@@ -1128,6 +1164,7 @@ mod tests {
 
     #[test]
     fn process_spawn_binary_mismatch_allows() {
+        let _forensic = forensic_lock();
         let conn = fresh_conn();
         add_rule(
             &conn,
@@ -1147,6 +1184,7 @@ mod tests {
 
     #[test]
     fn network_request_exact_host_match() {
+        let _forensic = forensic_lock();
         let _no_pubkey = no_operator_pubkey();
         let conn = fresh_conn();
         add_rule(
@@ -1174,6 +1212,7 @@ mod tests {
 
     #[test]
     fn custom_action_matches_on_kind() {
+        let _forensic = forensic_lock();
         let _no_pubkey = no_operator_pubkey();
         let conn = fresh_conn();
         add_rule(
@@ -1194,6 +1233,7 @@ mod tests {
 
     #[test]
     fn check_emits_signed_event() {
+        let _forensic = forensic_lock();
         let conn = fresh_conn();
         let action = AgentAction::Bash {
             command: "ls".into(),
@@ -1212,6 +1252,7 @@ mod tests {
 
     #[test]
     fn refuse_short_circuit_still_emits_event() {
+        let _forensic = forensic_lock();
         let conn = fresh_conn();
         add_rule(
             &conn,
@@ -1262,6 +1303,7 @@ mod tests {
 
     #[test]
     fn malformed_matcher_does_not_panic() {
+        let _forensic = forensic_lock();
         let conn = fresh_conn();
         add_rule(&conn, "R-bad", "bash", "not json", "refuse", true);
         let action = AgentAction::Bash {
@@ -1315,6 +1357,7 @@ mod tests {
 
     #[test]
     fn most_recent_check_returns_latest() {
+        let _forensic = forensic_lock();
         let conn = fresh_conn();
         let action = AgentAction::Bash {
             command: "x".into(),
@@ -1334,6 +1377,7 @@ mod tests {
 
     #[test]
     fn no_audit_allow_when_no_rule_matches() {
+        let _forensic = forensic_lock();
         let conn = fresh_conn();
         let action = AgentAction::Bash {
             command: "ls".into(),
@@ -1349,6 +1393,7 @@ mod tests {
 
     #[test]
     fn no_audit_refuses_with_same_shape_as_audited_path() {
+        let _forensic = forensic_lock();
         let _no_pubkey = no_operator_pubkey();
         let conn = fresh_conn();
         add_rule(
@@ -1379,6 +1424,7 @@ mod tests {
 
     #[test]
     fn no_audit_disabled_rule_yields_allow() {
+        let _forensic = forensic_lock();
         let conn = fresh_conn();
         add_rule(
             &conn,
@@ -1398,6 +1444,7 @@ mod tests {
 
     #[test]
     fn no_audit_warn_returned_when_no_refuse_matches() {
+        let _forensic = forensic_lock();
         let _no_pubkey = no_operator_pubkey();
         let conn = fresh_conn();
         add_rule(

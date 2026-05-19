@@ -195,6 +195,25 @@ mod tests {
     use super::*;
     use crate::governance::rules_store::{self, Rule};
 
+    /// Issue #899 — guard against cross-test forensic-sink bleed.
+    ///
+    /// `handle_check_agent_action` calls `check_agent_action`, which
+    /// indirectly fires `crate::governance::audit::record_decision`
+    /// via `emit_forensic_decision`. If a sibling test in
+    /// `governance::audit::tests` has initialised the process-wide
+    /// forensic sink at its tempdir, this thread's `record_decision`
+    /// would land a row in that sibling's tempdir.
+    ///
+    /// Every test in this module that fires
+    /// `handle_check_agent_action` MUST hold this lock for the
+    /// duration of the call. See `governance::audit::forensic_sink_test_lock`.
+    #[must_use = "the guard must be held for the scope of the test"]
+    fn forensic_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::governance::audit::forensic_sink_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     fn fresh_conn() -> rusqlite::Connection {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch(
@@ -230,6 +249,7 @@ mod tests {
 
     #[test]
     fn missing_kind_errors() {
+        let _forensic = forensic_lock();
         let conn = fresh_conn();
         let r = handle_check_agent_action(&conn, &json!({}));
         assert!(r.is_err());
@@ -237,6 +257,7 @@ mod tests {
 
     #[test]
     fn bash_kind_allows_when_no_rule() {
+        let _forensic = forensic_lock();
         let conn = fresh_conn();
         let r = handle_check_agent_action(&conn, &json!({"kind":"bash","command":"ls"})).unwrap();
         assert_eq!(r["decision"]["decision"], "allow");
@@ -249,6 +270,7 @@ mod tests {
         // enforces consistently regardless of dev-host / CI-runner
         // state (other tests in the same binary may have created
         // an operator.key.pub file at the platform config path).
+        let _forensic = forensic_lock();
         let _no_pubkey = rules_store::force_no_operator_pubkey_for_test();
         let conn = fresh_conn();
         rules_store::insert(
@@ -277,6 +299,7 @@ mod tests {
 
     #[test]
     fn unknown_kind_errors() {
+        let _forensic = forensic_lock();
         let conn = fresh_conn();
         let r = handle_check_agent_action(&conn, &json!({"kind":"nope"}));
         assert!(r.is_err());
@@ -284,6 +307,7 @@ mod tests {
 
     #[test]
     fn missing_required_field_errors() {
+        let _forensic = forensic_lock();
         let conn = fresh_conn();
         let r = handle_check_agent_action(&conn, &json!({"kind":"bash"}));
         assert!(r.is_err());
@@ -301,6 +325,7 @@ mod tests {
     // filesystem_write requires `path`.
     #[test]
     fn filesystem_write_missing_path_errors() {
+        let _forensic = forensic_lock();
         let conn = fresh_conn();
         let err =
             handle_check_agent_action(&conn, &json!({"kind": "filesystem_write"})).unwrap_err();
@@ -310,6 +335,7 @@ mod tests {
     // filesystem_write happy path with optional byte_estimate.
     #[test]
     fn filesystem_write_with_byte_estimate_allows_when_no_rule() {
+        let _forensic = forensic_lock();
         let conn = fresh_conn();
         let resp = handle_check_agent_action(
             &conn,
@@ -326,6 +352,7 @@ mod tests {
     // network_request happy path with default scheme.
     #[test]
     fn network_request_default_scheme_allows() {
+        let _forensic = forensic_lock();
         let conn = fresh_conn();
         let resp = handle_check_agent_action(
             &conn,
@@ -338,6 +365,7 @@ mod tests {
     // network_request with custom scheme.
     #[test]
     fn network_request_custom_scheme() {
+        let _forensic = forensic_lock();
         let conn = fresh_conn();
         let resp = handle_check_agent_action(
             &conn,
@@ -350,6 +378,7 @@ mod tests {
     // network_request missing host → error.
     #[test]
     fn network_request_missing_host_errors() {
+        let _forensic = forensic_lock();
         let conn = fresh_conn();
         let err =
             handle_check_agent_action(&conn, &json!({"kind": "network_request"})).unwrap_err();
@@ -359,6 +388,7 @@ mod tests {
     // process_spawn happy path with no args.
     #[test]
     fn process_spawn_no_args_allows() {
+        let _forensic = forensic_lock();
         let conn = fresh_conn();
         let resp = handle_check_agent_action(
             &conn,
@@ -371,6 +401,7 @@ mod tests {
     // process_spawn with args array.
     #[test]
     fn process_spawn_with_args() {
+        let _forensic = forensic_lock();
         let conn = fresh_conn();
         let resp = handle_check_agent_action(
             &conn,
@@ -387,6 +418,7 @@ mod tests {
     // process_spawn missing binary → error.
     #[test]
     fn process_spawn_missing_binary_errors() {
+        let _forensic = forensic_lock();
         let conn = fresh_conn();
         let err = handle_check_agent_action(&conn, &json!({"kind": "process_spawn"})).unwrap_err();
         assert!(err.contains("binary"), "got: {err}");
@@ -395,6 +427,7 @@ mod tests {
     // custom kind with custom_kind field.
     #[test]
     fn custom_kind_allows() {
+        let _forensic = forensic_lock();
         let conn = fresh_conn();
         let resp = handle_check_agent_action(
             &conn,
@@ -407,6 +440,7 @@ mod tests {
     // custom kind missing custom_kind → error.
     #[test]
     fn custom_kind_missing_custom_kind_errors() {
+        let _forensic = forensic_lock();
         let conn = fresh_conn();
         let err = handle_check_agent_action(&conn, &json!({"kind": "custom"})).unwrap_err();
         assert!(err.contains("custom_kind"), "got: {err}");
@@ -415,6 +449,7 @@ mod tests {
     // custom kind with `kind_inner` alias.
     #[test]
     fn custom_kind_kind_inner_alias() {
+        let _forensic = forensic_lock();
         let conn = fresh_conn();
         let resp = handle_check_agent_action(
             &conn,
@@ -427,6 +462,7 @@ mod tests {
     // Bash with cwd specified.
     #[test]
     fn bash_with_cwd_allows() {
+        let _forensic = forensic_lock();
         let conn = fresh_conn();
         let resp = handle_check_agent_action(
             &conn,
@@ -439,6 +475,7 @@ mod tests {
     // Agent_id provided in arguments — echoed in response.
     #[test]
     fn agent_id_echoed_in_response() {
+        let _forensic = forensic_lock();
         let conn = fresh_conn();
         let resp = handle_check_agent_action(
             &conn,
@@ -455,6 +492,7 @@ mod tests {
     // Default agent_id ("anonymous:mcp") used when omitted.
     #[test]
     fn default_agent_id_when_omitted() {
+        let _forensic = forensic_lock();
         let conn = fresh_conn();
         let resp = handle_check_agent_action(&conn, &json!({"kind": "bash", "command": "ls"}))
             .expect("ok");
@@ -466,6 +504,7 @@ mod tests {
     #[test]
     fn warn_severity_surfaces_rule_id() {
         // Issue #819 — suppress operator pubkey resolution.
+        let _forensic = forensic_lock();
         let _no_pubkey = rules_store::force_no_operator_pubkey_for_test();
         let conn = fresh_conn();
         rules_store::insert(
@@ -498,6 +537,7 @@ mod tests {
     #[test]
     fn process_spawn_refuses_on_binary_match() {
         // Issue #819 — suppress operator pubkey resolution.
+        let _forensic = forensic_lock();
         let _no_pubkey = rules_store::force_no_operator_pubkey_for_test();
         let conn = fresh_conn();
         rules_store::insert(

@@ -1068,6 +1068,21 @@ fn emit_ok(
 mod tests {
     use super::*;
 
+    /// Issue #899 — guard against cross-test forensic-sink bleed.
+    ///
+    /// `RulesAction::Check` fires `check_agent_action`, which
+    /// indirectly emits `crate::governance::audit::record_decision`.
+    /// Tests in this module that exercise `RulesAction::Check`
+    /// MUST hold this lock so a sibling `audit::tests::*` test does
+    /// not see this thread's `record_decision` land in its tempdir.
+    /// See `governance::audit::forensic_sink_test_lock`.
+    #[must_use = "the guard must be held for the scope of the test"]
+    fn forensic_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::governance::audit::forensic_sink_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn build_action_bash_parses() {
         let a = build_action("bash", r#"{"command":"ls -la"}"#).unwrap();
@@ -1616,6 +1631,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn run_rules_check_evaluates_action_against_empty_set() {
+        let _forensic = forensic_lock();
         let (_dir, db_path, key_dir) = fresh_env_with_operator_key();
         let args = RulesArgs {
             key_dir: Some(key_dir),
@@ -1640,6 +1656,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn run_rules_check_without_agent_id_uses_default() {
+        let _forensic = forensic_lock();
         let (_dir, db_path, key_dir) = fresh_env_with_operator_key();
         let args = RulesArgs {
             key_dir: Some(key_dir),
