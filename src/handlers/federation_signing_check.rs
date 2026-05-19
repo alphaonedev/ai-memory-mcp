@@ -405,12 +405,16 @@ pub(super) fn verify_signature_or_reject(
     headers: &HeaderMap,
     body_bytes: &[u8],
     peer_id: Option<&str>,
+    federation_nonce_cache: &crate::identity::replay::FederationNonceCache,
 ) -> Option<Response> {
     if !fed_signing::require_sig() {
         return None;
     }
     let sig_header = headers
         .get(fed_signing::SIGNATURE_HEADER)
+        .and_then(|v| v.to_str().ok());
+    let nonce_header = headers
+        .get(fed_signing::NONCE_HEADER)
         .and_then(|v| v.to_str().ok());
     let pubkey = peer_id.and_then(|pid| {
         crate::governance::audit::load_daemon_verifying_key(pid)
@@ -420,7 +424,14 @@ pub(super) fn verify_signature_or_reject(
 
     match (sig_header, pubkey.as_ref()) {
         (Some(sig), Some(pk)) => {
-            if let Err(e) = fed_signing::verify_header(Some(sig), body_bytes, pk) {
+            // v0.7.0 #922 — nonce-bound signature verify when nonce
+            // header is present; legacy body-only verify otherwise.
+            let verify_result = if let Some(nonce) = nonce_header {
+                fed_signing::verify_header_with_nonce(Some(sig), body_bytes, nonce, pk)
+            } else {
+                fed_signing::verify_header(Some(sig), body_bytes, pk)
+            };
+            if let Err(e) = verify_result {
                 tracing::warn!(
                     target: "federation::signing",
                     tag = e.tag(),
@@ -440,7 +451,60 @@ pub(super) fn verify_signature_or_reject(
                         .into_response(),
                 );
             }
-            None
+            // v0.7.0 #922 — apply nonce-freshness gate.
+            let pid_for_cache = peer_id.unwrap_or("");
+            match nonce_header {
+                Some(nonce) if !nonce.is_empty() => {
+                    match federation_nonce_cache.record_and_check(pid_for_cache, nonce) {
+                        crate::identity::replay::ReplayDecision::Fresh => None,
+                        crate::identity::replay::ReplayDecision::Replay => {
+                            tracing::warn!(
+                                target: "federation::signing",
+                                tag = fed_signing::VerifyError::ReplayedNonce.tag(),
+                                peer_id = %pid_for_cache,
+                                "sync_push: X-Memory-Nonce replay detected"
+                            );
+                            Some(
+                                (
+                                    StatusCode::UNAUTHORIZED,
+                                    Json(json!({
+                                        "error": fed_signing::VerifyError::ReplayedNonce.tag(),
+                                        "note": "AI_MEMORY_FED_REQUIRE_NONCE=1 enforces per-message nonce freshness.",
+                                    })),
+                                )
+                                    .into_response(),
+                            )
+                        }
+                    }
+                }
+                _ => {
+                    if fed_signing::require_nonce() {
+                        tracing::warn!(
+                            target: "federation::signing",
+                            tag = fed_signing::VerifyError::NonceMissing.tag(),
+                            peer_id = %pid_for_cache,
+                            "sync_push: X-Memory-Nonce header absent — strict refusal"
+                        );
+                        Some(
+                            (
+                                StatusCode::UNAUTHORIZED,
+                                Json(json!({
+                                    "error": fed_signing::VerifyError::NonceMissing.tag(),
+                                    "note": "AI_MEMORY_FED_REQUIRE_NONCE=1 requires X-Memory-Nonce; set =0 to bypass.",
+                                })),
+                            )
+                                .into_response(),
+                        )
+                    } else {
+                        tracing::warn!(
+                            target: "federation::signing",
+                            peer_id = %pid_for_cache,
+                            "sync_push: X-Memory-Nonce absent — permissive, accepting"
+                        );
+                        None
+                    }
+                }
+            }
         }
         (Some(_), None) => {
             tracing::warn!(

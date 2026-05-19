@@ -379,6 +379,9 @@ mod cov897_tests {
             llm_call_timeout: std::time::Duration::from_secs(30),
             replay_cache: Arc::new(crate::identity::replay::ReplayCache::default()),
             verify_require_nonce: false,
+            federation_nonce_cache: Arc::new(
+                crate::identity::replay::FederationNonceCache::default(),
+            ),
             autonomous_hooks: autonomous,
             recall_scope: Arc::new(None),
             deferred_audit_queue: Arc::new(None),

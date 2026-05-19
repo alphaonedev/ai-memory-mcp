@@ -69,7 +69,13 @@ chain — with V-4 cross-row hash chain at v34 (#698) — sidechain
 transcripts with `memory_replay`, programmable
 25-event hook pipeline, opt-in Apache AGE acceleration, K1/G1
 namespace-inheritance enforcement, real permission system with
-deny-first semantics, A2A maturity).
+deny-first semantics, A2A maturity). Note: signed-events row `sig`
+population is gated on the resolved daemon `agent_id` having an
+Ed25519 `*.priv` on disk under the key directory
+(`src/main.rs:96-98` — `load_daemon_signing_key` returning `None`
+deliberately swallows the failure with the "continuing unsigned"
+stderr line; the cross-row hash chain itself remains tamper-evident
+in either posture).
 
 ## What's new since v0.6.4
 
@@ -972,12 +978,14 @@ on 2026-05-18) and pre-merged into the v0.7.0 retag candidate:
   `attest_level`, `signed_at`). Commit `091350c`.
 - **#861** — `memory_archive_list` preserves metadata + emits tags
   as JSON array (was emitting the SQL-side string). Commit `091350c`.
-- **#862** — clarified "70 of 70 advertised" vs. "71 advertised
+- **#862** — clarified "72 of 72 advertised" vs. "73 advertised
   entries at v0.7.0" — the +1 is the always-on `memory_capabilities`
-  bootstrap; `Profile::full().expected_tool_count()` returns 71 while
-  `memory_capabilities` summary reports the 70-memory-tool count;
+  bootstrap; `Profile::full().expected_tool_count()` returns 73 while
+  `memory_capabilities` summary reports the 72-memory-tool count;
   both numbers are intentional. Commit `dc07da4` (docs/index.html
-  header correction).
+  header correction); subsequent tool additions in the v0.7.0
+  cycle moved the historical 70/71 reference at #862-close time to
+  the current 72/73 numbers — `src/profile.rs::Profile::full().expected_tool_count()` is the canonical assertion.
 - **#863** — `ai-memory governance check-action` CLI subcommand —
   parity with the substrate `check_agent_action` MCP tool. Commit
   `3b21228`.

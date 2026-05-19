@@ -289,9 +289,13 @@ pub async fn sync_push(
     // deserialising the body. Keeps the verifier's input identical
     // to the wire bytes (signer + verifier MUST agree byte-for-byte).
     let peer_header_owned = extract_peer_id(&headers).map(str::to_string);
-    if let Some(rejection) =
-        verify_signature_or_reject(&headers, &body_bytes, peer_header_owned.as_deref())
-    {
+    // v0.7.0 #922 — chained nonce-freshness check after signature verifies.
+    if let Some(rejection) = verify_signature_or_reject(
+        &headers,
+        &body_bytes,
+        peer_header_owned.as_deref(),
+        &app.federation_nonce_cache,
+    ) {
         return rejection;
     }
 
