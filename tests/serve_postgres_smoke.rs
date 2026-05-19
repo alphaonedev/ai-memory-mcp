@@ -297,8 +297,13 @@ async fn serve_postgres_smoke_round_trip() {
         Some("unsigned" | "self_signed")
     ));
 
+    // The route is `/api/v1/links/{id}` (src/lib.rs:294) — there's no
+    // `/api/v1/memories/{id}/links` nested route. Earlier versions of
+    // this test called the nested form and silently 404'd before the
+    // sal-postgres CI gate started exercising this path; bringing the
+    // path back to the actual route.
     let edges: Value = client
-        .get(format!("{base}/api/v1/memories/{mem_id}/links"))
+        .get(format!("{base}/api/v1/links/{mem_id}"))
         .send()
         .await
         .expect("links GET")
