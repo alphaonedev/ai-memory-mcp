@@ -7094,6 +7094,96 @@ mod tests {
         assert_eq!(events[0]["target_id"], tgt_id);
     }
 
+    // ------------------------------------------------------------------
+    // Coverage-uplift (2026-05-19): exercise the by_source_uri arm of
+    // handle_kg_query (lines 22-48 of mcp/tools/kg_query.rs).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn handle_kg_query_by_source_uri_returns_roots() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        // Seed two memories sharing the same source_uri.
+        let mk = |ns: &str, t: &str, uri: Option<&str>| Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Long,
+            namespace: ns.into(),
+            title: t.into(),
+            content: "c".into(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".into(),
+            access_count: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({}),
+            reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: uri.map(str::to_string),
+            source_span: None,
+            confidence_source: crate::models::ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
+        };
+        let uri = "doc:test-uplift/abc#section-1";
+        db::insert(&conn, &mk("kg-uplift", "a", Some(uri))).unwrap();
+        db::insert(&conn, &mk("kg-uplift", "b", Some(uri))).unwrap();
+        db::insert(&conn, &mk("kg-uplift", "c", None)).unwrap();
+
+        let req = make_tools_call(
+            "memory_kg_query",
+            json!({"by_source_uri": uri, "namespace": "kg-uplift"}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(resp.error.is_none(), "{resp:?}");
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(val["by_source_uri"], uri);
+        assert_eq!(val["count"], 2);
+        let mems = val["memories"].as_array().unwrap();
+        assert_eq!(mems.len(), 2);
+        // The depth field of every root row is 0 (one-hop semantics).
+        assert!(mems.iter().all(|m| m["depth"].as_u64() == Some(0)));
+    }
+
+    #[test]
+    fn handle_kg_query_by_source_uri_rejects_invalid_uri() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        // Whitespace-only URI: trimmed to empty so the by_source_uri
+        // branch falls through and source_id is required.
+        let req = make_tools_call("memory_kg_query", json!({"by_source_uri": "   "}));
+        let resp = invoke_handle_request(&conn, &req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], true);
+        // The error string is "source_id is required" (the by_source_uri
+        // arm dropped through because the trimmed value was empty).
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("source_id is required"));
+    }
+
+    #[test]
+    fn handle_kg_query_by_source_uri_validates_uri_shape() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        // A URI that fails validate_source_uri (e.g. contains a null byte
+        // or empty after trim). Pass a control char to trigger refusal.
+        let req = make_tools_call(
+            "memory_kg_query",
+            json!({"by_source_uri": "bad\u{0007}uri"}),
+        );
+        let resp = invoke_handle_request(&conn, &req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], true);
+    }
+
     #[test]
     fn handle_kg_query_with_seeded_link_returns_node() {
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();

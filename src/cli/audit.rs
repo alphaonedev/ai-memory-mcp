@@ -1168,4 +1168,106 @@ mod tests {
         let s = std::str::from_utf8(&stdout).unwrap();
         assert!(s.contains("audit_log"), "got: {s}");
     }
+
+    // ------------------------------------------------------------------
+    // Coverage-uplift block (2026-05-19): exercise `run_forensic_verify`
+    // dispatch (lines 215-216, 295-410) by hand-writing an empty
+    // forensic directory + invoking `audit verify --since`. The substrate
+    // helper `crate::governance::audit::verify_since` is already covered
+    // by `governance::audit::tests`; the CLI wrapper's distinct paths
+    // are dispatch + envelope/render arms.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn audit_verify_with_since_dispatches_to_forensic_verify_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Audit dir with NO forensic files — verify_since walks an
+        // empty dir and returns Ok(report with total_lines=0, no
+        // failures). The dispatch arm covers lines 215-216, 295-309,
+        // 321-323, 380-391.
+        let cfg = AppConfig::default();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+        // Pass `path` pointed at a (non-existent) audit.log file
+        // INSIDE the tempdir. resolve_path strips to the parent (the
+        // tempdir) as the forensic-files directory.
+        let exit = run_verify(
+            &VerifyArgs {
+                path: Some(tmp.path().join("audit.log").to_string_lossy().into_owned()),
+                json: true,
+                since: Some("2026-01-01".into()),
+                forensic_agent_id: Some("ai:nobody-test".into()),
+            },
+            None,
+            &cfg,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(exit, 0);
+        let s = std::str::from_utf8(&stdout).unwrap();
+        let v: serde_json::Value = serde_json::from_str(s.trim()).unwrap();
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["total_lines"], 0);
+        assert_eq!(v["since"], "2026-01-01");
+    }
+
+    #[test]
+    fn audit_verify_with_since_human_render_emits_summary_line() {
+        // Non-JSON path through run_forensic_verify when the report
+        // is OK and contains zero rows (no files exist). Covers
+        // lines 392-401.
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = AppConfig::default();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+        let exit = run_verify(
+            &VerifyArgs {
+                path: Some(tmp.path().join("audit.log").to_string_lossy().into_owned()),
+                json: false,
+                since: Some("2026-01-01".into()),
+                forensic_agent_id: None,
+            },
+            None,
+            &cfg,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(exit, 0);
+        let s = std::str::from_utf8(&stdout).unwrap();
+        // Human render starts with "forensic verify OK:".
+        assert!(s.starts_with("forensic verify OK:"), "got: {s}");
+        assert!(s.contains("0 line(s)"));
+        assert!(s.contains("since 2026-01-01"));
+    }
+
+    #[test]
+    fn audit_verify_with_since_returns_error_on_unparseable_date() {
+        // Drives lines 323-345 — verify_since errors out on bad
+        // date, the dispatch wraps the error into exit=2 + the
+        // appropriate envelope.
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = AppConfig::default();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+        let exit = run_verify(
+            &VerifyArgs {
+                path: Some(tmp.path().join("audit.log").to_string_lossy().into_owned()),
+                json: true,
+                since: Some("not-a-date".into()),
+                forensic_agent_id: None,
+            },
+            None,
+            &cfg,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(exit, 2);
+        let s = std::str::from_utf8(&stdout).unwrap();
+        let v: serde_json::Value = serde_json::from_str(s.trim()).unwrap();
+        assert_eq!(v["status"], "error");
+        assert!(v["error"].as_str().unwrap().contains("parsing --since"));
+    }
 }
