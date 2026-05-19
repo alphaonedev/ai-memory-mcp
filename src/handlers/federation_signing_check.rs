@@ -28,10 +28,6 @@ use super::federation_receive::{
     SyncPushBody, attribute_agent_for_quota, check_sender_clock_skew, next_utc_midnight,
 };
 #[cfg(feature = "sal")]
-use crate::db;
-#[cfg(feature = "sal")]
-use crate::models::Memory;
-#[cfg(feature = "sal")]
 use crate::validate;
 
 #[cfg(feature = "sal")]

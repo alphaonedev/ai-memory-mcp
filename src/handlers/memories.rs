@@ -636,14 +636,15 @@ pub async fn promote_memory(
         // total) before surfacing 404 — well below the 2 s daemon
         // p99 SLO and dwarfed by typical store-side replication
         // latency. See `get_with_visibility_retry` for the helper.
-        let target = match get_with_visibility_retry(app.store.as_ref(), &ctx, &id).await {
-            Ok(m) => m,
-            Err(crate::store::StoreError::NotFound { .. }) => {
-                return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"})))
-                    .into_response();
-            }
-            Err(e) => return store_err_to_response(e),
-        };
+        let target =
+            match super::http::get_with_visibility_retry(app.store.as_ref(), &ctx, &id).await {
+                Ok(m) => m,
+                Err(crate::store::StoreError::NotFound { .. }) => {
+                    return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"})))
+                        .into_response();
+                }
+                Err(e) => return store_err_to_response(e),
+            };
 
         // F-A2A1.2 (#700) — governance enforcement on the postgres promote
         // path. Mirrors the sqlite gate at line ~2169 below: an `owner`

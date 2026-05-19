@@ -21,7 +21,9 @@ use serde_json::json;
 
 use crate::db;
 #[cfg(feature = "sal")]
-use crate::models::Tier;
+use crate::models::{ConfidenceSource, Memory, Tier};
+#[cfg(feature = "sal")]
+use chrono::Utc;
 
 use super::AppState;
 #[cfg(feature = "sal")]
