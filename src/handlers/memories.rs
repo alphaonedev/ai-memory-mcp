@@ -30,7 +30,7 @@ use super::store_err_to_response;
 
 pub async fn get_memory(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    #[cfg_attr(not(feature = "sal"), allow(unused_variables))] headers: HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     if let Err(e) = validate::validate_id(&id) {
@@ -41,14 +41,6 @@ pub async fn get_memory(
             .into_response();
     }
 
-    // #910 SAL-level — resolve the caller from `X-Agent-Id` so the
-    // SAL `get` filter has a known principal. Header-only auth on
-    // this GET surface; anonymous callers get a per-request
-    // `anonymous:req-…` id and see only non-private rows.
-    let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
-    let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
-        .unwrap_or_else(|_| format!("anonymous:req-{}", uuid::Uuid::new_v4()));
-
     // v0.7.0 Wave-3 — Postgres-backed daemons dispatch through the
     // SAL trait. The legacy `db::resolve_id` path is SQLite-bound (it
     // walks `memories` + `memory_links` directly through the
@@ -58,6 +50,15 @@ pub async fn get_memory(
     // legacy direct-rusqlite path for v0.7.0 binary parity.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
+        // #910 SAL-level — resolve the caller from `X-Agent-Id` so the
+        // SAL `get` filter has a known principal. Header-only auth on
+        // this GET surface; anonymous callers get a per-request
+        // `anonymous:req-…` id and see only non-private rows. Bound
+        // inside the cfg block so default-features builds don't flag
+        // it as unused.
+        let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+        let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
+            .unwrap_or_else(|_| format!("anonymous:req-{}", uuid::Uuid::new_v4()));
         let ctx = crate::store::CallerContext::for_agent(&caller);
         return match app.store.get(&ctx, &id).await {
             Ok(mem) => {
