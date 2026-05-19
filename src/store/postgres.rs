@@ -6362,12 +6362,45 @@ impl MemoryStore for PostgresStore {
         //
         // Tier never downgrades (blocker #296 / SQLite parity): on
         // conflict tier takes max of existing vs new via rank mapping.
+        // v0.7.0 #900 — Form-4 fact-provenance + Form-5 confidence
+        // provenance columns ride the same INSERT so the PG store
+        // round-trips `Memory::source_uri`, `citations`, `source_span`,
+        // and the three confidence columns. Pre-#900 the INSERT only
+        // wrote 17 columns and `list_by_source_uri` / `search_with_
+        // source_uri` returned empty against PG. Pinned by
+        // `tests/store_parity_gaps.rs::pg_parity_gap_2_source_uri_column`.
+        let citations_json =
+            serde_json::to_string(&memory.citations).map_err(|e| StoreError::IntegrityFailed {
+                detail: format!("serialize citations: {e}"),
+            })?;
+        let source_span_json = match memory.source_span {
+            Some(span) => {
+                Some(
+                    serde_json::to_string(&span).map_err(|e| StoreError::IntegrityFailed {
+                        detail: format!("serialize source_span: {e}"),
+                    })?,
+                )
+            }
+            None => None,
+        };
+        let confidence_signals_json = match &memory.confidence_signals {
+            Some(s) => Some(
+                serde_json::to_string(s).map_err(|e| StoreError::IntegrityFailed {
+                    detail: format!("serialize confidence_signals: {e}"),
+                })?,
+            ),
+            None => None,
+        };
         let id: String = sqlx::query(
             "INSERT INTO memories (
                 id, tier, namespace, title, content, tags, priority, confidence,
                 source, access_count, created_at, updated_at, last_accessed_at,
-                expires_at, metadata, reflection_depth, memory_kind
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+                expires_at, metadata, reflection_depth, memory_kind,
+                citations, source_uri, source_span,
+                confidence_source, confidence_signals, confidence_decayed_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
+                      $18, $19, $20,
+                      $21, $22, $23)
             ON CONFLICT (title, namespace) DO UPDATE SET
                 content = EXCLUDED.content,
                 tier = CASE
@@ -6394,7 +6427,16 @@ impl MemoryStore for PostgresStore {
                 reflection_depth = GREATEST(memories.reflection_depth, EXCLUDED.reflection_depth),
                 -- L1-1 — kind is sticky: once Reflection, always Reflection.
                 memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
-                                   ELSE EXCLUDED.memory_kind END
+                                   ELSE EXCLUDED.memory_kind END,
+                -- v0.7.0 #900 — Form-4 / Form-5 provenance columns ride
+                -- the upsert so a re-store doesn't blank out the URI /
+                -- citation context.
+                citations = EXCLUDED.citations,
+                source_uri = COALESCE(EXCLUDED.source_uri, memories.source_uri),
+                source_span = COALESCE(EXCLUDED.source_span, memories.source_span),
+                confidence_source = EXCLUDED.confidence_source,
+                confidence_signals = COALESCE(EXCLUDED.confidence_signals, memories.confidence_signals),
+                confidence_decayed_at = COALESCE(EXCLUDED.confidence_decayed_at, memories.confidence_decayed_at)
             RETURNING id",
         )
         .bind(&memory.id)
@@ -6414,6 +6456,12 @@ impl MemoryStore for PostgresStore {
         .bind(&memory.metadata)
         .bind(memory.reflection_depth)
         .bind(memory.memory_kind.as_str())
+        .bind(&citations_json)
+        .bind(memory.source_uri.as_deref())
+        .bind(source_span_json.as_deref())
+        .bind(memory.confidence_source.as_str())
+        .bind(confidence_signals_json.as_deref())
+        .bind(memory.confidence_decayed_at.as_deref())
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| to_store_err("insert memory", e))?
