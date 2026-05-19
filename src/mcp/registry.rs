@@ -578,7 +578,7 @@ pub fn tool_definitions() -> Value {
                         "tags": {"type": "string", "description": "Tag filter"},
                         "since": {"type": "string", "description": "RFC3339 lower bound on created_at"},
                         "until": {"type": "string", "description": "RFC3339 upper bound on created_at"},
-                        "as_agent": {"type": "string", "description": "Task 1.5 querying-agent position for scope visibility."},
+                        "as_agent": {"type": "string", "description": "#151 scope-visibility agent."},
                         "budget_tokens": {"type": "integer", "minimum": 0, "description": "P6/R1 cl100k content cap. 0=empty; top kept (meta.budget_overflow=true)."},
                         "context_tokens": {"type": "array", "items": {"type": "string"}, "description": "Recent conversation tokens; biases query embedding 70/30 (v0.6.0.0)."},
                         "session_default": {"type": "boolean", "default": false, "description": "Splice [agents.defaults.recall_scope]. explicit > scope > defaults."},
@@ -627,7 +627,7 @@ pub fn tool_definitions() -> Value {
                         "tier": {"type": "string", "enum": ["short", "mid", "long"]},
                         "limit": {"type": "integer", "default": 20, "maximum": 200},
                         "agent_id": {"type": "string", "description": "Exact metadata.agent_id filter."},
-                        "as_agent": {"type": "string", "description": "Task 1.5 querying-agent position for scope visibility."},
+                        "as_agent": {"type": "string", "description": "#151 scope-visibility agent."},
                         "include_archived": {"type": "boolean", "default": false, "description": "WT-1-E: include atomised sources."},
                         "format": {"type": "string", "enum": ["json", "toon", "toon_compact"], "default": "toon_compact", "description": "Response format. toon_compact saves 79%."}
                     },
