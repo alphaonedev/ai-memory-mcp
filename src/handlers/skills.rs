@@ -11,11 +11,43 @@
 //! All handlers were extracted verbatim from `src/handlers/http.rs`
 //! (commit 88d9a96, lines 7591-7782); wire compatibility is preserved
 //! via the `pub use skills::*` re-export from `src/handlers/mod.rs`.
+//!
+//! # v0.7.0 #949 (Track A QC sweep, 2026-05-20) — admin-role gate on
+//! every skill route
+//!
+//! Pre-#949 none of the 7 routes accepted a `HeaderMap`, resolved the
+//! caller, or applied any cross-tenant gate. Skills are executable
+//! artefacts (SKILL.md + resources + signing surface) — the supply-
+//! chain attack surface is broader than a memory row:
+//!
+//! - register / promote / compose: WRITE surfaces that mint or
+//!   re-mint executable capabilities. Cross-tenant write = forged
+//!   provenance on a skill that other agents will subsequently
+//!   activate.
+//! - export: WRITES to the daemon-host filesystem (target_folder
+//!   resolved on the daemon, written under the daemon user). Cross-
+//!   tenant export = arbitrary-path write surface from any caller.
+//! - list / get / resource: READ surfaces that exfiltrate skill
+//!   bodies, manifests, and resource blobs (potentially tagged with
+//!   another tenant's `signing_agent`).
+//!
+//! Posture: **admin-only across all 7 routes** via
+//! [`crate::handlers::admin_role::require_admin`]. This is the same
+//! shape #957 (`export_memories`) and #946 (`list_agents`) use for
+//! their corpus-scale admin surfaces. Skills don't carry a Memory-
+//! shaped `metadata.scope` / `metadata.agent_id` in the canonical
+//! `Memory` struct the `crate::visibility::is_visible_to_caller`
+//! helper operates on — the skill `signing_agent` column is only
+//! populated when the daemon boots with a keypair (the default install
+//! has none). A per-owner gate based on `signing_agent` would be open
+//! by default; the admin gate is closed by default. Per the v0.7.0
+//! safe-by-default posture, every skill HTTP surface MUST be admin-
+//! only until a future cluster lands a richer skill-ACL model.
 
 use axum::{
     Json,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
 use serde::Deserialize;
@@ -26,8 +58,16 @@ use super::AppState;
 /// `POST /api/v1/skill` — register a new skill from an inline body.
 pub async fn skill_register_route(
     State(app): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    // #949 — admin-only. Skill registration mints an executable
+    // artefact; non-admin callers MUST NOT be able to plant a row
+    // other agents will subsequently activate.
+    if let Err(resp) = crate::handlers::admin_role::require_admin(&app, &headers, "skill_register")
+    {
+        return resp;
+    }
     let lock = app.db.lock().await;
     let kp = (*app.active_keypair).as_ref();
     match crate::mcp::handle_skill_register(&lock.0, &body, kp) {
@@ -47,8 +87,17 @@ pub struct SkillListQuery {
 
 pub async fn skill_list_route(
     State(app): State<AppState>,
+    headers: HeaderMap,
     Query(q): Query<SkillListQuery>,
 ) -> impl IntoResponse {
+    // #949 — admin-only. The list payload enumerates every skill in
+    // the requested namespace including bodies that may be tagged
+    // with another tenant's `signing_agent`. Cross-tenant
+    // enumeration of executable artefacts is a supply-chain probe
+    // vector.
+    if let Err(resp) = crate::handlers::admin_role::require_admin(&app, &headers, "skill_list") {
+        return resp;
+    }
     let mut params = json!({});
     if let Some(ns) = q.namespace {
         params["namespace"] = json!(ns);
@@ -66,8 +115,14 @@ pub async fn skill_list_route(
 /// `GET /api/v1/skill/{id}` — full activation payload (body included).
 pub async fn skill_get_route(
     State(app): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    // #949 — admin-only. The GET response includes the full
+    // (decompressed) skill body — the executable capability bundle.
+    if let Err(resp) = crate::handlers::admin_role::require_admin(&app, &headers, "skill_get") {
+        return resp;
+    }
     let params = json!({"skill_id": id});
     let lock = app.db.lock().await;
     match crate::mcp::handle_skill_get(&lock.0, &params) {
@@ -92,9 +147,17 @@ pub struct SkillResourceQuery {
 
 pub async fn skill_resource_route(
     State(app): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Query(q): Query<SkillResourceQuery>,
 ) -> impl IntoResponse {
+    // #949 — admin-only. Skill resource blobs are part of the
+    // executable bundle (scripts, prompts, fixtures) and inherit
+    // the same supply-chain threat surface as the skill body.
+    if let Err(resp) = crate::handlers::admin_role::require_admin(&app, &headers, "skill_resource")
+    {
+        return resp;
+    }
     let params = json!({
         "skill_id": id,
         "resource_path": q.path,
@@ -124,9 +187,18 @@ pub struct SkillExportBody {
 
 pub async fn skill_export_route(
     State(app): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(body): Json<SkillExportBody>,
 ) -> impl IntoResponse {
+    // #949 — admin-only. Export writes `target_folder` on the daemon
+    // host (resolved by the daemon, written under the daemon user);
+    // any non-admin caller would gain an arbitrary-path write
+    // primitive on the host filesystem. Same admin-class shape as
+    // #957 (`export_memories`).
+    if let Err(resp) = crate::handlers::admin_role::require_admin(&app, &headers, "skill_export") {
+        return resp;
+    }
     let params = json!({
         "skill_id": id,
         "target_folder": body.target_folder,
@@ -160,9 +232,17 @@ pub struct SkillPromoteBody {
 
 pub async fn skill_promote_route(
     State(app): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(body): Json<SkillPromoteBody>,
 ) -> impl IntoResponse {
+    // #949 — admin-only. Promote consumes a reflection memory and
+    // mints a new skill row carrying the promoting agent's signing
+    // surface. Cross-tenant promote = laundering an executable
+    // capability through someone else's reflection.
+    if let Err(resp) = crate::handlers::admin_role::require_admin(&app, &headers, "skill_promote") {
+        return resp;
+    }
     let mut params = json!({
         "reflection_id": id,
         "skill_name": body.name,
@@ -196,9 +276,18 @@ pub struct SkillComposeBody {
 
 pub async fn skill_compose_route(
     State(app): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     body: Option<Json<SkillComposeBody>>,
 ) -> impl IntoResponse {
+    // #949 — admin-only. Compose reads the skill body PLUS the
+    // reflections declared in `composes_with_reflections` — a
+    // multi-row read across the caller and other agents' reflection
+    // memories. Cross-tenant compose = exfiltrate the skill author's
+    // private reflection chain bundled with the executable body.
+    if let Err(resp) = crate::handlers::admin_role::require_admin(&app, &headers, "skill_compose") {
+        return resp;
+    }
     let Json(body) = body.unwrap_or(Json(SkillComposeBody::default()));
     let mut params = json!({"skill_id": id});
     if let Some(b) = body.budget_tokens {
