@@ -1610,6 +1610,10 @@ impl Capabilities {
             // subcommand, and the `memory_calibrate_confidence` MCP
             // tool.
             confidence_calibration: CapabilityConfidenceCalibration::current(),
+            // v0.7.0 #973 Item C — do-calculus / Ortega-de-Freitas
+            // narrative surface. Helper does the source-tree honesty
+            // check at the comment site; see the helper's docstring.
+            provenance_substrate_layer: default_capability_provenance_substrate_layer(),
         }
     }
 }
@@ -1841,6 +1845,69 @@ pub struct CapabilitiesV3 {
     /// `default_capability_confidence_calibration` helper.
     #[serde(default = "default_capability_confidence_calibration")]
     pub confidence_calibration: CapabilityConfidenceCalibration,
+
+    /// v0.7.0 #973 Item C — narrative summary of the substrate's
+    /// do-calculus posture.
+    #[serde(default = "default_capability_provenance_substrate_layer")]
+    pub provenance_substrate_layer: CapabilityProvenanceSubstrateLayer,
+}
+
+/// v0.7.0 #973 Item C — substrate-layer provenance posture. Lets an
+/// LLM agent self-describe ai-memory's do-calculus
+/// intervention/observation distinction (Pearl 2009) per Ortega &
+/// de Freitas (2026) framing. Honesty discipline: every
+/// `enforcement_layers` entry must map to a shipped substrate
+/// primitive in source.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CapabilityProvenanceSubstrateLayer {
+    #[serde(default)]
+    pub posture: String,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub enforcement_layers: Vec<String>,
+    #[serde(default)]
+    pub honest_limitations: Vec<String>,
+    #[serde(default)]
+    pub spec_references: SpecReferences,
+}
+
+/// v0.7.0 #973 Item C — academic citations. Vendor-neutral.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct SpecReferences {
+    #[serde(default)]
+    pub do_calculus: String,
+    #[serde(default)]
+    pub interactional_agency: String,
+}
+
+#[must_use]
+pub fn default_capability_provenance_substrate_layer() -> CapabilityProvenanceSubstrateLayer {
+    CapabilityProvenanceSubstrateLayer {
+        posture: "do_calculus_aligned".to_string(),
+        summary: "ai-memory implements the do-calculus intervention/observation \
+                  distinction at the substrate layer via Form 4 fact-provenance, \
+                  Form 6 MemoryKind vocabulary, Form 7 agent-EXTERNAL governance, \
+                  the V-4 signed-events cross-row hash chain, and the seven Gap \
+                  provenance framework; stops cross-session delusion amplification \
+                  but not intra-session hallucination (consumer LLM responsibility)."
+            .to_string(),
+        enforcement_layers: vec![
+            "form_4_fact_provenance".to_string(),
+            "form_6_memory_kind".to_string(),
+            "form_7_agent_external_governance".to_string(),
+            "signed_events_v4_chain".to_string(),
+            "seven_gap_framework".to_string(),
+        ],
+        honest_limitations: vec![
+            "intra_session_hallucination_is_consumer_responsibility".to_string(),
+            "federation_reliability_via_dlq_not_silent_drop".to_string(),
+        ],
+        spec_references: SpecReferences {
+            do_calculus: "Pearl (2009)".to_string(),
+            interactional_agency: "Ortega and de Freitas (2026)".to_string(),
+        },
+    }
 }
 
 // ---------------------------------------------------------------------------
