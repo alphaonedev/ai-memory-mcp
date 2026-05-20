@@ -12,6 +12,15 @@
 #   - `Per-Module Coverage Thresholds` (this file) enforces a per-module
 #     floor so that no single module can quietly slide while the workspace
 #     average stays high.
+#
+# v0.7.0 ship-hardening (2026-05-20) — instrument with live PG+AGE+pgvector
+# service container so postgres-store tests connect at runtime instead of
+# skipping. Without this, `store/postgres.rs` (5852 executable lines) is
+# effectively uncovered and the workspace total drops ~4.10pp — masking
+# regressions on the postgres backend. The apache/age:release_PG16_1.6.0
+# base image has AGE+postgres; pgvector is installed at service-start via
+# the runtime `postgresql-16-pgvector` apt package. Mirror of the
+# `infra/lan-parity-test/` Docker stack the Tier 4 cov audit used.
 
 name: Per-Module Coverage Thresholds
 
@@ -24,6 +33,13 @@ on:
 env:
   CARGO_TERM_COLOR: always
   AI_MEMORY_NO_CONFIG: "1"
+  # Pin the postgres-store test URL so postgres-backed integration
+  # tests (`live_*` / `serve_postgres_*` / `g[1-9]_postgres_*` /
+  # `federation_dlq_replay`) connect to the service container below
+  # instead of skipping their `let Some(url) = postgres_url() else { return };`
+  # guard.
+  AI_MEMORY_TEST_POSTGRES_URL: "postgres://ai_memory:ai_memory_test@127.0.0.1:5432/ai_memory_test"
+  AI_MEMORY_TEST_AGE_URL: "postgres://ai_memory:ai_memory_test@127.0.0.1:5432/ai_memory_test"
 
 jobs:
   per-module-thresholds:
@@ -32,6 +48,27 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
+    services:
+      # Live PG + Apache AGE 1.6.0 (graph extension on PostgreSQL 16).
+      # The pgvector extension is layered in via the
+      # `Install pgvector + provision AGE/vector extensions` step below
+      # because the upstream `apache/age` image doesn't ship pgvector
+      # by default. Mirrors `infra/lan-parity-test/docker-compose.yml`
+      # exactly so the live-PG coverage measurement on this CI matches
+      # what the Tier 4 audit measured locally (92.58% workspace).
+      pg-age:
+        image: apache/age:release_PG16_1.6.0
+        env:
+          POSTGRES_USER: ai_memory
+          POSTGRES_PASSWORD: ai_memory_test
+          POSTGRES_DB: ai_memory_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ai_memory -d ai_memory_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
     steps:
       - uses: actions/checkout@v5
 
@@ -45,8 +82,29 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
-      - name: Install jq
-        run: sudo apt-get update && sudo apt-get install -y jq
+      - name: Install jq + postgresql-client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq postgresql-client
+
+      - name: Install pgvector + provision AGE/vector extensions
+        env:
+          PGPASSWORD: ai_memory_test
+        run: |
+          set -euo pipefail
+          # Locate the pg-age service container so we can apt-get
+          # install pgvector against the same Debian-based image
+          # (apache/age inherits debian-bookworm via postgres:16).
+          PG_CONTAINER=$(docker ps --filter "ancestor=apache/age:release_PG16_1.6.0" --format '{{.ID}}' | head -1)
+          echo "pg container: $PG_CONTAINER"
+          docker exec "$PG_CONTAINER" apt-get update
+          docker exec "$PG_CONTAINER" apt-get install -y postgresql-16-pgvector
+          # Provision extensions + the memory_graph AGE graph the SAL
+          # postgres adapter expects. Mirrors infra/lan-parity-test/init-age.sql.
+          psql -h 127.0.0.1 -p 5432 -U ai_memory -d ai_memory_test -c "CREATE EXTENSION IF NOT EXISTS vector;"
+          psql -h 127.0.0.1 -p 5432 -U ai_memory -d ai_memory_test -c "LOAD 'age'; SET search_path = ag_catalog, \"\$user\", public; SELECT ag_catalog.create_graph('memory_graph');" || echo "memory_graph already exists or AGE init handled by ladder"
+          # Sanity check: extensions present.
+          psql -h 127.0.0.1 -p 5432 -U ai_memory -d ai_memory_test -c "SELECT extname FROM pg_extension ORDER BY extname;"
 
       - name: Generate coverage JSON
         run: |
