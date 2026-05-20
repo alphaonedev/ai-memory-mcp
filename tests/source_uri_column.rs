@@ -81,7 +81,7 @@ fn list_by_source_uri_returns_all_matching_rows() {
     db::insert(&conn, &other_a).expect("insert");
     db::insert(&conn, &other_b).expect("insert");
 
-    let hits = db::list_by_source_uri(&conn, uri, None, None).expect("list");
+    let hits = db::list_by_source_uri(&conn, uri, None, None, None).expect("list");
     assert_eq!(hits.len(), 3, "exactly three rows share the URI");
     for h in &hits {
         assert_eq!(h.source_uri.as_deref(), Some(uri));
@@ -226,7 +226,7 @@ fn list_by_source_uri_returns_zero_rows_for_unknown_uri() {
         let mem = make_memory_with_uri(&format!("present-{i}"), Some("doc:present"));
         db::insert(&conn, &mem).expect("insert");
     }
-    let hits = db::list_by_source_uri(&conn, "doc:does-not-exist", None, None).expect("list");
+    let hits = db::list_by_source_uri(&conn, "doc:does-not-exist", None, None, None).expect("list");
     assert!(hits.is_empty(), "unknown URI ⇒ zero rows, not fallback-all");
 }
 
@@ -240,9 +240,9 @@ fn list_by_source_uri_respects_limit_param() {
         let mem = make_memory_with_uri(&format!("lim-{i}"), Some("doc:lim"));
         db::insert(&conn, &mem).expect("insert");
     }
-    let three = db::list_by_source_uri(&conn, "doc:lim", None, Some(3)).expect("list");
+    let three = db::list_by_source_uri(&conn, "doc:lim", None, Some(3), None).expect("list");
     assert_eq!(three.len(), 3, "limit=3 caps the response");
-    let unlimited = db::list_by_source_uri(&conn, "doc:lim", None, None).expect("list");
+    let unlimited = db::list_by_source_uri(&conn, "doc:lim", None, None, None).expect("list");
     assert_eq!(unlimited.len(), 10, "no limit ⇒ default cap is high enough");
 }
 

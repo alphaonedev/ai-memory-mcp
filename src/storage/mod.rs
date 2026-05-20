@@ -2000,14 +2000,27 @@ pub fn search_with_source_uri(
 /// want the full reciprocal set ("every memory from this document")
 /// don't need to type a query. Hits the partial
 /// `idx_memories_source_uri` index directly. Pure read.
+///
+/// `as_agent` is the visibility principal. When `Some(...)`, the
+/// `compute_visibility_prefixes` + `visibility_clause` pair is applied
+/// so the reciprocal source-uri endpoint respects the same
+/// scope=private gate as `search_with_source_uri` (#942 + #975
+/// follow-up: any query path returning Memory MUST inherit the SAL
+/// #910 visibility filter). When `None`, the filter is bypassed —
+/// reserved for substrate-internal callers + tests that explicitly
+/// opt out.
 pub fn list_by_source_uri(
     conn: &Connection,
     source_uri: &str,
     namespace: Option<&str>,
     limit: Option<usize>,
+    as_agent: Option<&str>,
 ) -> Result<Vec<Memory>> {
     let cap = limit.unwrap_or(200).min(1000);
-    let mut stmt = conn.prepare(
+    let (vis_p, vis_t, vis_u, vis_o) = compute_visibility_prefixes(as_agent);
+    // Placeholder layout: ?1 = uri, ?2 = namespace, ?3 = limit,
+    // ?4..?7 = visibility prefixes (private/team/unit/org).
+    let sql = format!(
         "SELECT m.id, m.tier, m.namespace, m.title, m.content, m.tags, m.priority,
                 m.confidence, m.source, m.access_count, m.created_at, m.updated_at,
                 m.last_accessed_at, m.expires_at, m.metadata, m.reflection_depth,
@@ -2018,14 +2031,21 @@ pub fn list_by_source_uri(
          FROM memories m
          WHERE m.source_uri = ?1
            AND (?2 IS NULL OR m.namespace = ?2)
+           {vis}
          ORDER BY m.created_at ASC
          LIMIT ?3",
-    )?;
+        vis = visibility_clause(4, "m"),
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(
         params![
             source_uri,
             namespace,
-            i64::try_from(cap).unwrap_or(i64::MAX)
+            i64::try_from(cap).unwrap_or(i64::MAX),
+            vis_p,
+            vis_t,
+            vis_u,
+            vis_o,
         ],
         row_to_memory,
     )?;

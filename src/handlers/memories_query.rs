@@ -326,7 +326,18 @@ pub async fn search_memories(
                 .into_response();
         }
         if p.q.trim().is_empty() {
-            return match db::list_by_source_uri(&lock.0, uri, p.namespace.as_deref(), Some(limit)) {
+            // #975 — thread the HTTP-resolved visibility principal so
+            // the source_uri-only reciprocal endpoint applies the same
+            // scope=private gate as the q+source_uri compose path.
+            // Pre-fix the reciprocal path bypassed visibility entirely;
+            // anonymous callers could read every row in every doc.
+            return match db::list_by_source_uri(
+                &lock.0,
+                uri,
+                p.namespace.as_deref(),
+                Some(limit),
+                effective_as_agent.as_deref(),
+            ) {
                 Ok(r) => {
                     Json(json!({"results": r, "count": r.len(), "source_uri": uri})).into_response()
                 }
