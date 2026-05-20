@@ -34,40 +34,15 @@ use super::StorageBackend;
 use super::store_err_to_response;
 use super::{BULK_FANOUT_CONCURRENCY, MAX_BULK_SIZE};
 
-/// #910 (security-medium, 2026-05-19) — apply the scope=private
-/// visibility filter on `GET /api/v1/memories` and `POST /api/v1/kg/query`
-/// result sets. Pre-#910, both endpoints returned every row matching
-/// the requested namespace/tier/etc. shape regardless of
-/// `metadata.scope` — a caller authenticated as `bob` could
-/// enumerate `alice`'s scope=private rows by listing the namespace.
-///
-/// Visibility rule (mirrors `storage::is_visible_to_agent` + the
-/// generated `scope_idx` column's COALESCE-to-`private` default):
-/// row is returned iff
-///   `metadata.scope != "private"` (rows w/o the field are private
-///   by the CLAUDE.md NHI contract)
-///   OR `metadata.agent_id == caller`.
-///
-/// Operator-equivalent surfaces (CLI / MCP) already filter via
-/// `visibility_clause`; this helper is the missing HTTP-side mirror
-/// of that filter on the plain `list` + `kg_query` paths.
-#[must_use]
-fn is_visible_to_caller(mem: &Memory, caller: &str) -> bool {
-    let scope = mem
-        .metadata
-        .get("scope")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("private");
-    if scope != "private" {
-        return true;
-    }
-    let owner = mem
-        .metadata
-        .get("agent_id")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
-    owner == caller
-}
+/// #951 (Track A QC sweep, 2026-05-20) — replaced the local
+/// duplicate of `is_visible_to_caller` with a re-export of the
+/// canonical helper at [`crate::visibility::is_visible_to_caller`].
+/// The local copy was missing the `metadata.target_agent_id` inbox
+/// carve-out that the canonical SAL version had — the drift would
+/// have silently blocked recipients from seeing their own private-
+/// scope inbox messages on list/kg-query paths. Single source now;
+/// both `sal` and non-sal builds share the same predicate.
+use crate::visibility::is_visible_to_caller;
 
 pub async fn list_memories(
     State(app): State<AppState>,
