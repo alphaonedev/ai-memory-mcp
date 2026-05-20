@@ -191,6 +191,13 @@ fn serve_create_then_get_memory() {
     let client = http_client();
 
     // POST /api/v1/memories
+    // #927/#930 (Track A P4/P9, 2026-05-20) added scope=private +
+    // caller-vs-owner gates on the sqlite GET/UPDATE/PROMOTE paths.
+    // Set a stable X-Agent-Id on BOTH the write and the read so the
+    // round-trip lands on the same principal — without it the write
+    // creates a row owned by `anonymous:req-A` and the read tries to
+    // load it as `anonymous:req-B`, and the visibility gate 404s.
+    const AGENT: &str = "ai:serve-roundtrip";
     let create_body = serde_json::json!({
         "tier": "mid",
         "namespace": "test-ns",
@@ -199,6 +206,7 @@ fn serve_create_then_get_memory() {
     });
     let resp = client
         .post(serve.url("/api/v1/memories"))
+        .header("X-Agent-Id", AGENT)
         .json(&create_body)
         .send()
         .unwrap();
@@ -214,6 +222,7 @@ fn serve_create_then_get_memory() {
     // GET /api/v1/memories/{id}
     let resp = client
         .get(serve.url(&format!("/api/v1/memories/{id}")))
+        .header("X-Agent-Id", AGENT)
         .send()
         .unwrap();
     assert!(resp.status().is_success());
