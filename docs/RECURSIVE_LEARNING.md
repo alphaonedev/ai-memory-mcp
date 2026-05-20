@@ -1,5 +1,47 @@
 # Recursive learning (v0.7.0)
 
+## Substrate-vs-application boundary (Item B, issue #973)
+
+Ortega & de Freitas (2026) "delusion amplification" is a
+**training-layer** result: an LLM under supervised fine-tuning on
+its own past outputs accumulates miscalibrated beliefs because SFT
+doesn't carry the intervention/observation distinction from the
+do-calculus. ai-memory operates one layer up, at the storage
+substrate. The honest claim follows directly:
+
+> ai-memory's substrate-level Form-4 fact-provenance + 7-level
+> Provenance Gap framework + Form-7 agent-EXTERNAL governance gate
+> stops **cross-session delusion amplification** by preserving the
+> intervention/observation distinction in the storage layer
+> (citations vs agent self-claim; `MemoryKind::Observation` vs
+> `Reflection` vs `Claim`; `AgentAction`-gated writes typed at the
+> policy engine). It does **not** stop **intra-session
+> hallucination** — that's the consumer LLM's training-layer +
+> decoding-layer problem, outside the substrate's contract.
+
+A second axis: the substrate's evidence claim depends on
+**federation reliability** as much as on cryptographic attestation.
+v48 schema added the `federation_push_dlq` table (#933) so
+federation broadcast failures land in a per-peer DLQ with a
+retry-replay worker + Prometheus `federation_push_dlq_depth` gauge.
+A signed event chain that drops messages silently across the mesh
+is *not* the same as one that delivers reliably with DLQ-tracked
+failures. DLQ is observable + replayable, not hidden. A consumer
+that needs to claim "this agent's reflection chain is forensically
+defensible across the federation" must inspect DLQ depth + replay
+history alongside the cryptographic V-4 hash chain (#698) — both
+are wire-format authoritative.
+
+In short: the substrate gives a clean intervention/observation cut
+at write-time, a recall-consumption ledger at read-time (Gap 3),
+DLQ-tracked federation reliability at multi-node-time, and a signed
+hash chain at audit-time. What an LLM agent does between calls to
+the substrate (intra-session reasoning) is its own responsibility.
+See `docs/rationale/academic-context.md` for the procurement-
+audience version.
+
+---
+
 > **Status (2026-05-14):** The recursive-learning grand-slam ships in
 > v0.7.0. Tasks 1-8 of the original recursive-learning add-on (issue
 > [#655](https://github.com/alphaonedev/ai-memory-mcp/issues/655)) plus
