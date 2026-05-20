@@ -276,25 +276,17 @@ pub async fn update_memory(
     // origin path via signed_events).
     let existing_for_authz = db::get(&lock.0, &resolved_id).ok().flatten();
     if let Some(ref existing) = existing_for_authz {
-        let owner = existing
-            .metadata
-            .get("agent_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        if !owner.is_empty() && owner != caller && caller != "daemon" {
-            tracing::warn!(
-                target: "ai_memory::authz",
-                "PUT /memories/{{id}} 403: caller {caller} != owner {owner} (id={resolved_id})"
-            );
-            return (
-                StatusCode::FORBIDDEN,
-                Json(json!({
-                    "error": "caller does not own this memory",
-                    "owner": owner,
-                    "caller": caller
-                })),
-            )
-                .into_response();
+        // #954 (Track A QC sweep, 2026-05-20) — delegated to the
+        // canonical DRY helper. The previous inline check has been
+        // replaced verbatim; the helper preserves the
+        // legacy-unowned + daemon-exempt carve-outs and emits the
+        // same 403 wire shape. Inbox carve-out disabled here: the
+        // inbox target should NOT be able to mutate an out-of-band
+        // sender's row via PUT.
+        if let Some(resp) =
+            crate::handlers::parity::require_caller_owns_memory(existing, &caller, false)
+        {
+            return resp;
         }
     }
     // Preserve existing agent_id when caller provides new metadata — provenance
@@ -584,32 +576,16 @@ pub async fn delete_memory(
         // even without a policy, a non-owner cannot delete someone
         // else's row. Mirrors the gate added in #930 for UPDATE +
         // PROMOTE (commit 49739bb46) and #938 / #940 / #939+#941.
-        if let Some(ref owner) = mem_owner
-            && !owner.is_empty()
-            && owner.as_str() != agent_id
-            && agent_id != "daemon"
+        //
+        // #954 (Track A QC sweep, 2026-05-20) — delegated to the
+        // canonical DRY helper. Inbox carve-out enabled: the
+        // recipient of an inbox message (`metadata.target_agent_id`)
+        // IS permitted to delete that message after consuming it,
+        // per the pre-#954 inline behaviour.
+        if let Some(resp) =
+            crate::handlers::parity::require_caller_owns_memory(&target, &agent_id, true)
         {
-            let target_agent = target
-                .metadata
-                .get("target_agent_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if target_agent != agent_id {
-                tracing::warn!(
-                    target: "ai_memory::authz",
-                    "DELETE /memories/{{id}} 403: caller {agent_id} != owner {owner} (id={})",
-                    target.id
-                );
-                return (
-                    StatusCode::FORBIDDEN,
-                    Json(json!({
-                        "error": "caller does not own this memory",
-                        "owner": owner,
-                        "caller": agent_id
-                    })),
-                )
-                    .into_response();
-            }
+            return resp;
         }
         let payload = json!({"id": target.id, "title": target.title});
         match db::enforce_governance(
@@ -969,25 +945,15 @@ pub async fn promote_memory(
         // even without a namespace policy, a non-owner cannot promote
         // someone else's row. Mirrors the UPDATE gate added in the
         // same campaign.
-        if let Some(ref owner) = mem_owner
-            && !owner.is_empty()
-            && owner.as_str() != agent_id
-            && agent_id != "daemon"
+        //
+        // #954 (Track A QC sweep, 2026-05-20) — delegated to the
+        // canonical DRY helper at `parity::require_caller_owns_memory`.
+        // Inbox carve-out disabled: the inbox target should not be
+        // able to promote / TTL-change the sender's row.
+        if let Some(resp) =
+            crate::handlers::parity::require_caller_owns_memory(&target, &agent_id, false)
         {
-            tracing::warn!(
-                target: "ai_memory::authz",
-                "POST /memories/{{id}}/promote 403: caller {agent_id} != owner {owner} (id={})",
-                target.id
-            );
-            return (
-                StatusCode::FORBIDDEN,
-                Json(json!({
-                    "error": "caller does not own this memory",
-                    "owner": owner,
-                    "caller": agent_id
-                })),
-            )
-                .into_response();
+            return resp;
         }
         let payload = json!({"id": target.id});
         match db::enforce_governance(

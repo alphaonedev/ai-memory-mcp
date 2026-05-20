@@ -32,6 +32,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
+use serde_json::json;
 
 use super::transport::AppState;
 use crate::federation::QuorumNotMetPayload;
@@ -180,4 +181,167 @@ pub(crate) fn http_caller_ctx(
         "anonymous:invalid".to_string()
     });
     crate::store::CallerContext::for_agent(resolved)
+}
+
+#[cfg(test)]
+mod require_caller_owns_memory_tests {
+    use super::*;
+    use crate::models::{ConfidenceSource, Memory, MemoryKind, Tier};
+    use serde_json::json;
+
+    fn mem_with(metadata: serde_json::Value) -> Memory {
+        Memory {
+            id: "test-id".to_string(),
+            tier: Tier::Long,
+            namespace: "test-ns".to_string(),
+            title: "test".to_string(),
+            content: "test".to_string(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".to_string(),
+            access_count: 0,
+            created_at: "2026-05-20T00:00:00Z".to_string(),
+            updated_at: "2026-05-20T00:00:00Z".to_string(),
+            last_accessed_at: None,
+            expires_at: None,
+            metadata,
+            reflection_depth: 0,
+            memory_kind: MemoryKind::Observation,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
+        }
+    }
+
+    #[test]
+    fn owner_passes() {
+        let mem = mem_with(json!({"agent_id": "alice"}));
+        assert!(require_caller_owns_memory(&mem, "alice", false).is_none());
+    }
+
+    #[test]
+    fn non_owner_blocked() {
+        let mem = mem_with(json!({"agent_id": "alice"}));
+        assert!(require_caller_owns_memory(&mem, "bob", false).is_some());
+    }
+
+    #[test]
+    fn legacy_unowned_passes() {
+        let mem = mem_with(json!({}));
+        assert!(require_caller_owns_memory(&mem, "bob", false).is_none());
+        let mem = mem_with(json!({"agent_id": ""}));
+        assert!(require_caller_owns_memory(&mem, "bob", false).is_none());
+    }
+
+    #[test]
+    fn daemon_passes() {
+        let mem = mem_with(json!({"agent_id": "alice"}));
+        assert!(require_caller_owns_memory(&mem, "daemon", false).is_none());
+    }
+
+    #[test]
+    fn inbox_target_passes_when_allowed() {
+        let mem = mem_with(json!({
+            "agent_id": "alice",
+            "target_agent_id": "bob",
+        }));
+        // allow_inbox = true (DELETE case): bob is the inbox target,
+        // permitted to consume the message.
+        assert!(require_caller_owns_memory(&mem, "bob", true).is_none());
+    }
+
+    #[test]
+    fn inbox_target_blocked_when_disallowed() {
+        let mem = mem_with(json!({
+            "agent_id": "alice",
+            "target_agent_id": "bob",
+        }));
+        // allow_inbox = false (UPDATE/PROMOTE case): bob may NOT
+        // mutate alice's row even though he's the inbox target.
+        assert!(require_caller_owns_memory(&mem, "bob", false).is_some());
+    }
+
+    #[test]
+    fn inbox_target_mismatch_blocked() {
+        let mem = mem_with(json!({
+            "agent_id": "alice",
+            "target_agent_id": "carol",
+        }));
+        // bob is neither owner nor inbox target.
+        assert!(require_caller_owns_memory(&mem, "bob", true).is_some());
+    }
+}
+
+/// #954 — DRY helper for the caller-vs-row-owner ownership gate that
+/// guards mutating handlers (update, promote, delete, archive, restore,
+/// link create / delete).
+///
+/// Returns `None` when the caller is permitted to mutate the row;
+/// returns `Some(403 Forbidden response)` when ownership fails —
+/// caller short-circuits with `return` on the `Some` branch.
+///
+/// **Carve-outs (preserved verbatim from the inline sites the helper
+/// replaces):**
+/// - `owner.is_empty()` → unowned/legacy row falls through to caller
+///   (legacy-unowned carve-out used across the codebase).
+/// - `caller == "daemon"` → daemon-origin path exempt; the audit
+///   chain captures the daemon-origin write via signed_events.
+/// - `allow_inbox && metadata.target_agent_id == caller` → the
+///   sender-stamped inbox carve-out from the DELETE handler. Only
+///   the recipient of an inbox message may delete it; passing
+///   `allow_inbox = false` disables this carve-out for handlers
+///   (update / promote) where the inbox target should NOT be able
+///   to mutate someone else's row.
+///
+/// **Wire shape on rejection.** `403 Forbidden` with body
+/// `{"error": "caller does not own this memory", "owner": "<owner>",
+/// "caller": "<caller>"}` — matches the inline-site shape so test
+/// expectations + audit grep patterns remain valid.
+#[must_use]
+pub fn require_caller_owns_memory(
+    mem: &Memory,
+    caller: &str,
+    allow_inbox: bool,
+) -> Option<axum::response::Response> {
+    let owner = mem
+        .metadata
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if owner.is_empty() || owner == caller || caller == "daemon" {
+        return None;
+    }
+    if allow_inbox {
+        let target = mem
+            .metadata
+            .get("target_agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if !target.is_empty() && target == caller {
+            return None;
+        }
+    }
+    tracing::warn!(
+        target: "ai_memory::authz",
+        "ownership-gate 403: caller {caller} != owner {owner} (id={})",
+        mem.id
+    );
+    Some(
+        (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "caller does not own this memory",
+                "owner": owner,
+                "caller": caller,
+            })),
+        )
+            .into_response(),
+    )
 }
