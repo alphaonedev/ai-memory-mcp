@@ -101,37 +101,20 @@ pub async fn get_memory(
             // #927 — 404 (not 403) on a private-row read by a non-owner
             // matches the existing visibility convention: returning
             // 403 would leak the existence of a row the caller is not
-            // entitled to know about. Inlines the scope=private +
-            // owner-match + target-agent-id-inbox-carve-out semantics
-            // that the sal-gated `store::is_visible_to_caller` helper
-            // implements; can't import the helper directly because
-            // `crate::store` is `#[cfg(feature = "sal")]`-gated and
-            // this handler runs on both build profiles.
-            let scope = mem
-                .metadata
-                .get("scope")
-                .and_then(|v| v.as_str())
-                .unwrap_or("private");
-            if scope == "private" {
-                let owner = mem
-                    .metadata
-                    .get("agent_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let target = mem
-                    .metadata
-                    .get("target_agent_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                if owner != caller && target != caller {
-                    tracing::warn!(
-                        target: "ai_memory::visibility",
-                        "GET /memories/{{id}} 404-masked: scope=private + caller {caller} != owner {owner} + != target {target} (id={})",
-                        mem.id
-                    );
-                    return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"})))
-                        .into_response();
-                }
+            // entitled to know about.
+            //
+            // #951 (Track A QC sweep, 2026-05-20) — delegated to the
+            // canonical `crate::visibility::is_visible_to_caller`
+            // helper. Pre-#951 the inline check duplicated the
+            // semantic at risk of drifting from the SAL version.
+            if !crate::visibility::is_visible_to_caller(&mem, &caller) {
+                tracing::warn!(
+                    target: "ai_memory::visibility",
+                    "GET /memories/{{id}} 404-masked: not visible to caller {caller} (id={})",
+                    mem.id
+                );
+                return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"})))
+                    .into_response();
             }
             // #869 audit (Category B — safe default): a substrate
             // failure on `get_links` is non-fatal — the memory body

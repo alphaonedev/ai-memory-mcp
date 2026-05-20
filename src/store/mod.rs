@@ -325,37 +325,12 @@ impl CallerContext {
 /// The `caller` argument is typically [`CallerContext::effective_principal`]
 /// so the `as_agent` override (operator-impersonates-agent) flows
 /// through correctly.
-#[must_use]
-pub fn is_visible_to_caller(mem: &Memory, caller: &str) -> bool {
-    let scope = mem
-        .metadata
-        .get("scope")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("private");
-    if scope != "private" {
-        return true;
-    }
-    let owner = mem
-        .metadata
-        .get("agent_id")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
-    if owner == caller {
-        return true;
-    }
-    // Inbox-row carve-out — notify writes a private-by-default memory
-    // in `_inbox/<target>` with `metadata.target_agent_id` set. The
-    // target is the legitimate reader of their own inbox; without
-    // this clause the SAL filter would drop every inbox message
-    // because the sender's agent_id stamps the row. The sender keeps
-    // visibility via the owner check above.
-    let target = mem
-        .metadata
-        .get("target_agent_id")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
-    target == caller
-}
+/// #951 (Track A QC sweep, 2026-05-20) — single canonical
+/// implementation lives at [`crate::visibility::is_visible_to_caller`].
+/// This re-export preserves the existing call-site shape (`crate::
+/// store::is_visible_to_caller`) used by the SAL adapter ports and
+/// substrate code so the move is a no-op for callers.
+pub use crate::visibility::is_visible_to_caller;
 
 bitflags! {
     /// Capability flags advertised by each adapter. Enables feature

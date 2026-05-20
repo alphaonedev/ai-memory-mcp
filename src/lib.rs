@@ -154,6 +154,11 @@ pub mod tls;
 pub mod toon;
 pub mod transcripts;
 pub mod validate;
+/// #951 (Track A QC sweep, 2026-05-20) — canonical
+/// `is_visible_to_caller` helper, non-sal-gated so both feature
+/// flag profiles share the same predicate. See module docstring
+/// for the drift history that motivated the consolidation.
+pub mod visibility;
 
 #[cfg(feature = "sal")]
 pub mod migrate;
