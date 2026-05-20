@@ -79,6 +79,70 @@ crates).
 `rust-analyzer` is treated as a build-time tool, not a runtime
 dependency of ai-memory itself. CI doesn't require it.
 
+### CodeGraph setup (v0.7.0 — Claude Code MCP server)
+
+Per the 2026-05-19/20 v0.7.0 ship-hardening cycle retrospective (issue #923):
+**CodeGraph is the L1 structural-safety tool** in the AI-NHI development
+workflow. It is **complementary to** rust-analyzer LSP (above), NOT a
+replacement.
+
+| Question shape | Tool |
+|---|---|
+| "Where is this exact symbol used right now?" | LSP (`findReferences`, ~50× faster than grep) |
+| "What's the shape of the code? What calls what? What would break if I changed Z?" | CodeGraph (`codegraph_callers`, `codegraph_impact`, `codegraph_context`) |
+| "What did the prior session learn about this symbol's behavior?" | ai-memory (`memory_recall`) |
+
+**One-time per-developer setup:**
+
+```bash
+npm install -g @colbymchenry/codegraph
+codegraph install   # writes ~/.claude.json + ~/.claude/CLAUDE.md + ~/.claude/settings.json
+cd /path/to/ai-memory-mcp
+codegraph init -i   # indexes into .codegraph/codegraph.db (~63 MB for v0.7.0)
+```
+
+The installer auto-writes a global `~/.claude/CLAUDE.md` instructing every
+future Claude Code session to use the `codegraph_*` MCP tools by default;
+no project-side changes are needed for the runtime priors.
+
+**When CodeGraph would have saved cycles (v0.7.0 cases):**
+
+- The 10-site `CallerContext::for_agent("<literal>")` hardcode sweep
+  across `handlers/{recall,memories,links,memories_query,power,power_consolidation,kg,archive,admin,hook_subscribers,http}.rs` —
+  one `codegraph_search` query vs. hours of iterative greps.
+- Impact analysis when adding `headers: HeaderMap` to 8 handler entry
+  points — `codegraph callers <fn>` would have confirmed every call
+  site got the matching update.
+- Handler-chain tracing for the `bucket_c_namespace_standards_enforce`
+  and `pending_approve_missing_id_returns_404` test failures —
+  `codegraph context` surfaced the route → handler → SAL → error-mapping
+  chain in one query.
+
+**What CodeGraph does NOT replace:**
+
+- Semantic correctness review (e.g., "is this use of `for_admin`
+  appropriate here?") — that's L2, a code-reviewer subagent invocation.
+- Security review of business logic — also L2.
+- Runtime / behavioral correctness — L3, `cargo test` against the
+  scoped Docker stack at `infra/lan-parity-test/`.
+
+**Caveats:**
+
+- Index lag: the file watcher debounces ~500ms behind writes. Don't
+  re-query immediately after editing a file in the same turn.
+- Trust codegraph results: do NOT re-verify symbol lookups with grep.
+  Grep is slower, less accurate, and wastes context.
+- The `.codegraph/` directory is `.gitignore`'d (per-developer index;
+  not committed).
+
+**Allowlist-gated structural checks** (tracked under #923 D2):
+`scripts/qc-codegraph-precheck.sh` will run pre-PR + in CI to block
+new `CallerContext::for_agent("<literal>")` sites outside the
+allowlist + new `for_admin` privacy-bypass sites outside the allowlist
++ dangling callers after symbol removal. This is the **C8** orchestrator
+safeguard (added to the C1–C7 set in §"Enforceable Orchestrator
+Safeguards"); HARD-BLOCK on any violation.
+
 Every commit you author must end with a `Co-Authored-By:` trailer naming the model.
 Every PR you open must include the **AI involvement** section described in
 [`AI_DEVELOPER_WORKFLOW.md` §8.2](docs/AI_DEVELOPER_WORKFLOW.md).
@@ -477,7 +541,7 @@ the task complete until the URL is produced.
 **Enforceable Orchestrator Safeguards (canonical memory
 `a1cc142d-053a-49ab-83bd-1a99992fa93e`, namespace
 `_v070_orchestrator_safeguards`, set as the namespace
-standard).** Seven HARD-BLOCK checks the orchestrator MUST
+standard).** Eight HARD-BLOCK checks the orchestrator MUST
 run on every agent return BEFORE marking the task complete:
 
 - **C1** Banned-phrase scan ("no network access", "operator
@@ -496,6 +560,17 @@ run on every agent return BEFORE marking the task complete:
   + commit + gh close + URL in report + ai-memory updated)
 - **C7** Discrepancy detection (report claims vs observable
   state via git log / gh issue list / cargo test / LOC counts)
+- **C8** CodeGraph structural-drift detection (added per
+  issue #923, 2026-05-20). After any agent task that touches
+  handler / SAL / trait surface code, run
+  `scripts/qc-codegraph-precheck.sh` and HARD-BLOCK on:
+  (a) new `CallerContext::for_agent("<literal>")` outside
+  `scripts/qc-codegraph-allowlists/caller-context-literals.txt`,
+  (b) new `for_admin` privacy-bypass sites outside
+  `scripts/qc-codegraph-allowlists/for-admin-bypass.txt`,
+  (c) dangling callers after symbol removal, (d) handler
+  entry signatures missing `headers: HeaderMap` for any
+  endpoint in the postgres-gate allow-list.
 
 On any HARD-BLOCK fail: orchestrator (1) verifies the claim
 independently, (2) completes the work the agent shirked,
