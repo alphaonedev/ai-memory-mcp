@@ -45,8 +45,12 @@ pub(super) fn handle_search(conn: &rusqlite::Connection, params: &Value) -> Resu
     // every memory from this document" without typing a query token.
     if query.unwrap_or("").trim().is_empty() {
         if let Some(uri) = source_uri {
-            let results = db::list_by_source_uri(conn, uri, namespace, Some(limit.min(200)))
-                .map_err(|e| e.to_string())?;
+            // #975 — propagate the caller's `as_agent` to the reciprocal
+            // source-uri endpoint so the MCP source_uri-only path
+            // respects the same scope=private gate as `search_with_source_uri`.
+            let results =
+                db::list_by_source_uri(conn, uri, namespace, Some(limit.min(200)), as_agent)
+                    .map_err(|e| e.to_string())?;
             return Ok(json!({"results": results, "count": results.len()}));
         }
         return Err("query is required".into());

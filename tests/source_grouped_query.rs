@@ -52,7 +52,7 @@ fn list_by_source_uri_returns_all_five_matches() {
     let no_uri = make_memory("no-uri", None);
     db::insert(&conn, &no_uri).expect("insert no-uri");
 
-    let hits = db::list_by_source_uri(&conn, shared, None, None).expect("list");
+    let hits = db::list_by_source_uri(&conn, shared, None, None, None).expect("list");
     assert_eq!(
         hits.len(),
         5,
@@ -79,11 +79,11 @@ fn list_by_source_uri_respects_namespace_filter() {
         mem.namespace = "beta".to_string();
         db::insert(&conn, &mem).expect("insert beta");
     }
-    let alpha = db::list_by_source_uri(&conn, uri, Some("alpha"), None).expect("alpha");
+    let alpha = db::list_by_source_uri(&conn, uri, Some("alpha"), None, None).expect("alpha");
     assert_eq!(alpha.len(), 2);
-    let beta = db::list_by_source_uri(&conn, uri, Some("beta"), None).expect("beta");
+    let beta = db::list_by_source_uri(&conn, uri, Some("beta"), None, None).expect("beta");
     assert_eq!(beta.len(), 3);
-    let all = db::list_by_source_uri(&conn, uri, None, None).expect("all");
+    let all = db::list_by_source_uri(&conn, uri, None, None, None).expect("all");
     assert_eq!(all.len(), 5);
 }
 
@@ -163,8 +163,8 @@ fn list_by_source_uri_orders_results_deterministically() {
         mem.updated_at = mem.created_at.clone();
         db::insert(&conn, &mem).expect("insert");
     }
-    let first = db::list_by_source_uri(&conn, shared, None, None).expect("list");
-    let second = db::list_by_source_uri(&conn, shared, None, None).expect("list");
+    let first = db::list_by_source_uri(&conn, shared, None, None, None).expect("list");
+    let second = db::list_by_source_uri(&conn, shared, None, None, None).expect("list");
     assert_eq!(
         first.iter().map(|m| m.title.clone()).collect::<Vec<_>>(),
         second.iter().map(|m| m.title.clone()).collect::<Vec<_>>(),
@@ -242,7 +242,7 @@ fn kg_query_by_source_uri_returns_all_rooted_memories() {
         let mem = make_memory(&format!("root-{i}"), Some(uri));
         db::insert(&conn, &mem).expect("insert");
     }
-    let roots = db::list_by_source_uri(&conn, uri, None, None).expect("list");
+    let roots = db::list_by_source_uri(&conn, uri, None, None, None).expect("list");
     assert_eq!(roots.len(), 4, "all four root memories returned");
     // The MCP wrapper at src/mcp/tools/kg_query.rs maps each row into
     // a JSON node with target_id / title / target_namespace / depth=0.
@@ -264,6 +264,6 @@ fn empty_uri_returns_zero_rows_not_all_rows() {
         let mem = make_memory(&format!("filler-{i}"), Some("doc:populated"));
         db::insert(&conn, &mem).expect("insert");
     }
-    let hits = db::list_by_source_uri(&conn, "doc:does-not-exist", None, None).expect("list");
+    let hits = db::list_by_source_uri(&conn, "doc:does-not-exist", None, None, None).expect("list");
     assert!(hits.is_empty(), "unknown URI must return zero rows");
 }

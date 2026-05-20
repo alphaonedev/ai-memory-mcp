@@ -118,6 +118,15 @@ async fn http_search_composes_q_with_source_uri_filter() {
     // narrows the FTS result set. Note: this exercises only ONE row
     // per source URI (the FTS query is title-based and the seed_many
     // helper writes per-iteration distinct titles).
+    //
+    // #975 (2026-05-20): pass `as_agent=ns-compose` so the post-#942
+    // visibility filter (which synthesises `anonymous:req-<uuid>` for
+    // HTTP requests without `X-Agent-Id`) sees the seeded rows.
+    // `as_agent` aligns the caller's visibility-principal namespace
+    // with the seeded rows' namespace so the `scope=private` rows
+    // are visible. Pre-#975 the test ran against a synthetic anon
+    // principal and the visibility WHERE-clause rejected every row,
+    // returning count=0.
     let (router, file) = build_test_router();
     seed_many(file.path(), "ns-compose", 3, Some("doc:abc"));
     seed_many(file.path(), "ns-compose", 2, Some("doc:xyz"));
@@ -125,7 +134,11 @@ async fn http_search_composes_q_with_source_uri_filter() {
     // FTS sanitization breaks tokens apart — pick a specific title
     // token so the result set is deterministic and the URI filter
     // can be observed shrinking it.
-    let (status, body) = get_search(&router, "q=ns-compose&source_uri=doc%3Aabc").await;
+    let (status, body) = get_search(
+        &router,
+        "q=ns-compose&source_uri=doc%3Aabc&as_agent=ns-compose",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let count = body["count"].as_u64().unwrap_or_default();
     assert!(
@@ -182,22 +195,78 @@ async fn http_search_with_unknown_source_uri_intersected_returns_empty() {
 #[tokio::test]
 async fn http_search_with_source_uri_only_returns_all_rows_from_that_doc_issue_891() {
     // AC pin (blocked): \"HTTP `GET /api/v1/memories?source_uri=X`
-    // query param\" per issue #889. The source_uri-only path on the
-    // HTTP layer is unreachable today (issue #891) — the handler
-    // rejects with 400 \"query is required\" before reaching the
-    // source-uri-only branch. Test is marked #[ignore] so the
-    // regression pin lands now; the test goes green once #891 fixes
-    // land.
+    // query param\" per issue #889.
+    //
+    // #975 (2026-05-20): the source_uri-only reciprocal endpoint now
+    // applies the same scope=private visibility gate as
+    // `search_with_source_uri` (closing the post-#942 visibility
+    // inconsistency). The test passes `as_agent=ns-doc` so the
+    // caller's visibility-principal namespace matches the seeded
+    // rows. Pre-#975 the source_uri-only path bypassed visibility
+    // entirely — any HTTP caller (no `X-Agent-Id`, no `as_agent`)
+    // could read every row in every document.
     let (router, file) = build_test_router();
     seed_many(file.path(), "ns-doc", 5, Some("doc:contract-2026"));
     seed_many(file.path(), "ns-doc", 3, Some("doc:other-thing"));
     seed_many(file.path(), "ns-doc", 2, None);
 
-    let (status, body) = get_search(&router, "source_uri=doc%3Acontract-2026").await;
+    let (status, body) =
+        get_search(&router, "source_uri=doc%3Acontract-2026&as_agent=ns-doc").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["count"].as_u64(), Some(5));
     let results = body["results"].as_array().expect("results");
     for r in results {
         assert_eq!(r["source_uri"].as_str(), Some("doc:contract-2026"));
     }
+}
+
+// #975 regression pin (2026-05-20): the source_uri-only reciprocal
+// endpoint MUST apply the same scope=private visibility gate as
+// `search_with_source_uri`. Pre-#975 every HTTP caller (including a
+// synthetic `anonymous:req-<uuid>` principal) could see scope=private
+// rows in any document by hitting `?source_uri=X` alone. After #975
+// the `as_agent` principal is honoured; a mismatched principal sees
+// no rows even when the requested doc has matches.
+#[tokio::test]
+async fn http_search_source_uri_only_applies_visibility_gate_975() {
+    let (router, file) = build_test_router();
+    seed_many(file.path(), "ns-private-doc", 4, Some("doc:secret"));
+    // Caller asks under a DIFFERENT principal namespace than the
+    // seeded rows. With scope=private (the default) the visibility
+    // WHERE-clause must reject every row.
+    let (status, body) = get_search(&router, "source_uri=doc%3Asecret&as_agent=ns-other").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["count"].as_u64(),
+        Some(0),
+        "source_uri-only path must honour the scope=private visibility gate (was leaking pre-#975)",
+    );
+}
+
+// #975 regression pin (2026-05-20): q+source_uri composition with the
+// matching `as_agent` principal returns the abc rows only. Co-pinned
+// with the source_uri-only sibling above so future drift in either
+// path is caught by the same test file.
+#[tokio::test]
+async fn http_search_q_plus_source_uri_applies_visibility_gate_975() {
+    let (router, file) = build_test_router();
+    seed_many(file.path(), "ns-vg", 3, Some("doc:abc"));
+    seed_many(file.path(), "ns-vg", 2, Some("doc:xyz"));
+    // Mismatched principal — visibility gate rejects every row.
+    let (status, body) =
+        get_search(&router, "q=ns-vg&source_uri=doc%3Aabc&as_agent=ns-other").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["count"].as_u64(),
+        Some(0),
+        "q+source_uri must reject when caller principal mismatches seeded namespace",
+    );
+    // Matched principal — abc rows surface.
+    let (status, body) = get_search(&router, "q=ns-vg&source_uri=doc%3Aabc&as_agent=ns-vg").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let count = body["count"].as_u64().unwrap_or_default();
+    assert!(
+        (1..=3).contains(&count),
+        "matched principal sees abc rows only (got {count})",
+    );
 }

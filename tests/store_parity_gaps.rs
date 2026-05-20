@@ -214,7 +214,7 @@ fn verify_gap_2_source_uri_sqlite() {
     )
     .expect("seed third source_uri row");
 
-    let hits = db::list_by_source_uri(&conn, "uri:fixture/a", Some("test"), None)
+    let hits = db::list_by_source_uri(&conn, "uri:fixture/a", Some("test"), None, None)
         .expect("list_by_source_uri");
     assert_eq!(hits.len(), 2, "two memories under uri:fixture/a");
     for m in &hits {

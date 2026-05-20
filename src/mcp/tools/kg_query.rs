@@ -26,8 +26,17 @@ pub(super) fn handle_kg_query(
         let limit = params["limit"]
             .as_u64()
             .and_then(|n| usize::try_from(n).ok());
-        let roots =
-            db::list_by_source_uri(conn, uri, namespace, limit).map_err(|e| e.to_string())?;
+        // #975 — accept an `as_agent` MCP param so callers that
+        // identify themselves get the post-#942 scope=private
+        // visibility gate on the reciprocal source-uri endpoint.
+        // Absent param leaves `as_agent = None` which preserves the
+        // pre-#975 unfiltered behaviour for substrate-internal callers.
+        let as_agent = params["as_agent"].as_str();
+        if let Some(a) = as_agent {
+            validate::validate_namespace(a).map_err(|e| e.to_string())?;
+        }
+        let roots = db::list_by_source_uri(conn, uri, namespace, limit, as_agent)
+            .map_err(|e| e.to_string())?;
         let memories_json: Vec<Value> = roots
             .iter()
             .map(|m| {
