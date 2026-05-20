@@ -30,7 +30,7 @@ use super::store_err_to_response;
 
 pub async fn get_memory(
     State(app): State<AppState>,
-    #[cfg_attr(not(feature = "sal"), allow(unused_variables))] headers: HeaderMap,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     if let Err(e) = validate::validate_id(&id) {
@@ -85,9 +85,54 @@ pub async fn get_memory(
         };
     }
 
+    // #927 SECURITY-medium (Track A P4, 2026-05-20): apply the
+    // scope=private visibility filter on the sqlite GET-by-id path.
+    // Pre-fix Bob could fetch Alice's scope=private row by id — the
+    // single-record GET surface didn't extract X-Agent-Id and didn't
+    // gate on ownership. Mirrors the postgres SAL branch above which
+    // routes through `app.store.get(&ctx, &id)` with caller context.
+    let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+    let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
+        .unwrap_or_else(|_| format!("anonymous:req-{}", uuid::Uuid::new_v4()));
+
     let lock = app.db.lock().await;
     match db::resolve_id(&lock.0, &id) {
         Ok(Some(mem)) => {
+            // #927 — 404 (not 403) on a private-row read by a non-owner
+            // matches the existing visibility convention: returning
+            // 403 would leak the existence of a row the caller is not
+            // entitled to know about. Inlines the scope=private +
+            // owner-match + target-agent-id-inbox-carve-out semantics
+            // that the sal-gated `store::is_visible_to_caller` helper
+            // implements; can't import the helper directly because
+            // `crate::store` is `#[cfg(feature = "sal")]`-gated and
+            // this handler runs on both build profiles.
+            let scope = mem
+                .metadata
+                .get("scope")
+                .and_then(|v| v.as_str())
+                .unwrap_or("private");
+            if scope == "private" {
+                let owner = mem
+                    .metadata
+                    .get("agent_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let target = mem
+                    .metadata
+                    .get("target_agent_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if owner != caller && target != caller {
+                    tracing::warn!(
+                        target: "ai_memory::visibility",
+                        "GET /memories/{{id}} 404-masked: scope=private + caller {caller} != owner {owner} + != target {target} (id={})",
+                        mem.id
+                    );
+                    return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"})))
+                        .into_response();
+                }
+            }
             // #869 audit (Category B — safe default): a substrate
             // failure on `get_links` is non-fatal — the memory body
             // itself was retrieved cleanly. Empty `links` array
@@ -189,6 +234,34 @@ pub async fn update_memory(
         };
     }
 
+    // #930 SECURITY-high (Track A P9, 2026-05-20) — Full-Measure-A on
+    // the sqlite UPDATE path. Resolve X-Agent-Id and refuse body /
+    // header mismatch with HTTP 403. Mirrors the CREATE handler's
+    // #874 / #901 / #907 gate. Pre-fix UPDATE silently accepted any
+    // body.agent_id (including a forged one matching the row owner)
+    // because the substrate `db::update_with_expected_version` takes
+    // no caller-principal parameter.
+    let caller = match crate::handlers::parity::resolve_caller_agent_id(
+        body.agent_id.as_deref(),
+        &headers,
+        None,
+    ) {
+        Ok(c) => c,
+        Err(err) if err.contains("agent_id_body_header_mismatch") => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "error": err,
+                    "message": "body.agent_id must match the X-Agent-Id header"
+                })),
+            )
+                .into_response();
+        }
+        Err(err) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": err}))).into_response();
+        }
+    };
+
     let lock = state.lock().await;
     // Resolve prefix if exact ID not found
     let resolved_id = match db::resolve_id(&lock.0, &id) {
@@ -209,12 +282,44 @@ pub async fn update_memory(
                 .into_response();
         }
     };
+    // #930 — owner gate. Fetch the row's recorded `metadata.agent_id`
+    // and refuse the update when the caller is neither the owner nor
+    // the legacy "daemon" sentinel. 403 (not 404) here because the
+    // caller has been authenticated by X-Agent-Id and has presented a
+    // known id — the rejection IS the authorization signal, not an
+    // existence-mask. The legacy "daemon" sentinel preserves backward
+    // compatibility for boot-time / hook-driven updates that don't
+    // route through X-Agent-Id (the audit chain captures the daemon-
+    // origin path via signed_events).
+    let existing_for_authz = db::get(&lock.0, &resolved_id).ok().flatten();
+    if let Some(ref existing) = existing_for_authz {
+        let owner = existing
+            .metadata
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if !owner.is_empty() && owner != caller && caller != "daemon" {
+            tracing::warn!(
+                target: "ai_memory::authz",
+                "PUT /memories/{{id}} 403: caller {caller} != owner {owner} (id={resolved_id})"
+            );
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "error": "caller does not own this memory",
+                    "owner": owner,
+                    "caller": caller
+                })),
+            )
+                .into_response();
+        }
+    }
     // Preserve existing agent_id when caller provides new metadata — provenance
     // is immutable after first write (see NHI design in crate::identity).
     let preserved_metadata = body.metadata.as_ref().map(|new_meta| {
-        let existing_meta = db::get(&lock.0, &resolved_id).ok().flatten().map_or_else(
+        let existing_meta = existing_for_authz.as_ref().map_or_else(
             || serde_json::Value::Object(serde_json::Map::new()),
-            |m| m.metadata,
+            |m| m.metadata.clone(),
         );
         crate::identity::preserve_agent_id(&existing_meta, new_meta)
     });
@@ -837,6 +942,35 @@ pub async fn promote_memory(
             .get("agent_id")
             .and_then(|v| v.as_str())
             .map(str::to_string);
+        // #930 SECURITY-high (Track A P9, 2026-05-20) — caller-owner
+        // gate on PROMOTE. Pre-fix Bob could promote Alice's row from
+        // `short`→`long` (changing the TTL semantics on her row) when
+        // no namespace governance standard was set, because
+        // enforce_governance defaults to Allow on absent policy. The
+        // ownership check is identity-level, not governance-level —
+        // even without a namespace policy, a non-owner cannot promote
+        // someone else's row. Mirrors the UPDATE gate added in the
+        // same campaign.
+        if let Some(ref owner) = mem_owner
+            && !owner.is_empty()
+            && owner.as_str() != agent_id
+            && agent_id != "daemon"
+        {
+            tracing::warn!(
+                target: "ai_memory::authz",
+                "POST /memories/{{id}}/promote 403: caller {agent_id} != owner {owner} (id={})",
+                target.id
+            );
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "error": "caller does not own this memory",
+                    "owner": owner,
+                    "caller": agent_id
+                })),
+            )
+                .into_response();
+        }
         let payload = json!({"id": target.id});
         match db::enforce_governance(
             &lock.0,

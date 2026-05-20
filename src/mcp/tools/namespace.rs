@@ -41,6 +41,66 @@ pub fn handle_namespace_set_standard(
         }),
     );
 
+    // #929 SECURITY-high (Track A P6, 2026-05-20) — ownership gate on
+    // the MCP entry. Mirrors the HTTP handler gate at
+    // `handlers/hook_subscribers.rs::set_namespace_standard_inner`.
+    // Without this gate any MCP caller could overwrite any namespace's
+    // governance policy by passing the existing standard's id —
+    // sibling vector to the HTTP path. Legacy "system" / empty owners
+    // are treated as unowned and the caller claims ownership via the
+    // metadata.agent_id rewrite below.
+    if let Ok(Some(existing_mem)) = db::get(conn, id) {
+        let recorded_owner = existing_mem
+            .metadata
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let is_unowned = recorded_owner.is_empty() || recorded_owner == "system";
+        if !is_unowned && recorded_owner != caller && caller != "daemon" {
+            return Err(format!(
+                "caller does not own this namespace standard (caller={caller}, owner={recorded_owner})"
+            ));
+        }
+        // Unowned-legacy claim — rewrite metadata.agent_id to caller
+        // so subsequent calls are gated. No-op when caller is the
+        // anonymous fallback (don't anchor ownership to anonymous).
+        if is_unowned && !caller.is_empty() && caller != "anonymous:invalid" {
+            let mut new_meta = if existing_mem.metadata.is_object() {
+                existing_mem.metadata.clone()
+            } else {
+                serde_json::json!({})
+            };
+            if let Some(obj) = new_meta.as_object_mut() {
+                obj.insert(
+                    "agent_id".to_string(),
+                    serde_json::Value::String(caller.clone()),
+                );
+                obj.entry("scope".to_string())
+                    .or_insert_with(|| serde_json::Value::String("shared".to_string()));
+            }
+            // Best-effort: don't fail the set-standard call if the
+            // claim rewrite fails — the ownership gate will refire on
+            // the next call once metadata.agent_id is non-empty.
+            if let Err(e) = db::update(
+                conn,
+                id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(&new_meta),
+            ) {
+                tracing::warn!(
+                    "namespace_standard (MCP): ownership-claim metadata update failed: {e}"
+                );
+            }
+        }
+    }
+
     // Task 1.8: optional governance policy merged into the standard memory's
     // metadata.governance. Policy is deserialized + validated before write.
     //

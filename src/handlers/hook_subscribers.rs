@@ -334,17 +334,21 @@ async fn set_namespace_standard_inner(
                 id
             } else {
                 let now = Utc::now().to_rfc3339();
-                // QC P1 follow-up (2026-05-20): the placeholder is the
-                // namespace's governance config — multiple agents in the
-                // namespace need to read it for policy resolution. Mark
-                // it `scope=shared` so the SAL #910 visibility filter
-                // doesn't restrict it to a single owner. Stamping
-                // `agent_id` to "system" preserves the audit trail
-                // shape; the read path's owner=="system" check is
-                // bypassed by the scope=shared branch in
-                // `is_visible_to_caller`.
+                // #929 SECURITY-high (Track A P6, 2026-05-20) — anchor
+                // ownership to the caller on first-write. Pre-fix
+                // stamped "system" and any subsequent caller could
+                // overwrite. The uniform ownership-gate below catches
+                // mutation by non-owners.
+                // scope=shared preserves multi-reader visibility under
+                // the SAL #910 filter so consumers across the
+                // namespace can read the governance policy.
+                let placeholder_agent_id = if caller.is_empty() || caller == "anonymous:invalid" {
+                    "system".to_string()
+                } else {
+                    caller.clone()
+                };
                 let mut metadata = serde_json::json!({
-                    "agent_id": "system",
+                    "agent_id": placeholder_agent_id,
                     "scope": "shared",
                 });
                 if let Some(g) = body.governance.clone()
@@ -386,6 +390,66 @@ async fn set_namespace_standard_inner(
                 }
             }
         };
+
+        // #929 SECURITY-high (Track A P6, 2026-05-20) — uniform
+        // ownership gate on the postgres path. Catches both the
+        // body.id-supplied branch and the auto-seed reuse branch.
+        // First-writes land on a placeholder stamped with the
+        // caller's id (above), so an immediate re-fetch returns the
+        // caller as owner and this gate is a no-op for first writes.
+        // Subsequent writes by a different caller hit the !is_unowned
+        // branch and 403.
+        if let Ok(resolved_mem) = app.store.get(&ctx, &standard_id).await {
+            let recorded_owner = resolved_mem
+                .metadata
+                .get("agent_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let is_unowned = recorded_owner.is_empty() || recorded_owner == "system";
+            let caller_principal = ctx.effective_principal();
+            if !is_unowned && recorded_owner != caller_principal && caller_principal != "daemon" {
+                tracing::warn!(
+                    target: "ai_memory::authz",
+                    "POST /namespaces/{{ns}}/standard 403 (postgres path): caller {caller_principal} != owner {recorded_owner} (ns={ns}, id={standard_id})"
+                );
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({
+                        "error": "caller does not own this namespace standard",
+                        "owner": recorded_owner,
+                        "caller": caller_principal
+                    })),
+                )
+                    .into_response();
+            }
+            // Unowned-legacy claim: rewrite metadata.agent_id to caller
+            // so subsequent calls are properly gated.
+            if is_unowned && !caller_principal.is_empty() && caller_principal != "anonymous:invalid"
+            {
+                let mut new_meta = if resolved_mem.metadata.is_object() {
+                    resolved_mem.metadata.clone()
+                } else {
+                    json!({})
+                };
+                if let Some(obj) = new_meta.as_object_mut() {
+                    obj.insert(
+                        "agent_id".to_string(),
+                        serde_json::Value::String(caller_principal.to_string()),
+                    );
+                    obj.entry("scope".to_string())
+                        .or_insert_with(|| serde_json::Value::String("shared".to_string()));
+                }
+                let patch = crate::store::UpdatePatch {
+                    metadata: Some(new_meta),
+                    ..Default::default()
+                };
+                if let Err(e) = app.store.update(&ctx, &standard_id, patch).await {
+                    tracing::warn!(
+                        "namespace_standard (postgres): ownership-claim metadata update failed: {e}"
+                    );
+                }
+            }
+        }
 
         // v0.7.0 Wave-3 Continuation 5 (Bucket C / S35+S53+S60+S80) —
         // when the caller supplied a `governance` policy AND a pre-
@@ -490,9 +554,87 @@ async fn set_namespace_standard_inner(
         .ok()
         .and_then(|v| v.into_iter().next());
         if let Some(m) = existing {
+            // #929 SECURITY-high (Track A P6, 2026-05-20) — ownership
+            // gate on the namespace-standard surface. Pre-fix any
+            // authenticated caller could overwrite any namespace's
+            // governance policy because the placeholder was stamped
+            // metadata.agent_id="system" (an unowned sentinel) and no
+            // caller-vs-owner comparison was performed. Now: the
+            // recorded owner is the only principal who can mutate the
+            // standard. Legacy "system" / empty owners are treated as
+            // unowned (any caller may CLAIM via the
+            // metadata.agent_id rewrite below) for backward
+            // compatibility with rows written before this fix.
+            let recorded_owner = m
+                .metadata
+                .get("agent_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let is_unowned = recorded_owner.is_empty() || recorded_owner == "system";
+            if !is_unowned && recorded_owner != caller && caller != "daemon" {
+                tracing::warn!(
+                    target: "ai_memory::authz",
+                    "POST /namespaces/{{ns}}/standard 403: caller {caller} != owner {recorded_owner} (ns={ns})"
+                );
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({
+                        "error": "caller does not own this namespace standard",
+                        "owner": recorded_owner,
+                        "caller": caller
+                    })),
+                )
+                    .into_response();
+            }
+            // Unowned-legacy fast path: claim ownership by rewriting
+            // metadata.agent_id to the caller. Next request from a
+            // different caller will be 403'd.
+            if is_unowned && !caller.is_empty() && caller != "anonymous:invalid" {
+                let mut new_meta = if m.metadata.is_object() {
+                    m.metadata.clone()
+                } else {
+                    json!({})
+                };
+                if let Some(obj) = new_meta.as_object_mut() {
+                    obj.insert(
+                        "agent_id".to_string(),
+                        serde_json::Value::String(caller.clone()),
+                    );
+                    // Preserve scope=shared if not already set so the
+                    // SAL #910 filter still surfaces the standard to
+                    // every reader.
+                    obj.entry("scope".to_string())
+                        .or_insert_with(|| serde_json::Value::String("shared".to_string()));
+                }
+                if let Err(e) = db::update(
+                    &lock.0,
+                    &m.id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(&new_meta),
+                ) {
+                    tracing::warn!(
+                        "namespace_standard: ownership-claim metadata update failed: {e}"
+                    );
+                }
+            }
             m.id
         } else {
             let now = Utc::now().to_rfc3339();
+            // #929 — first-write anchors ownership to the caller, not
+            // the legacy "system" sentinel. scope=shared preserves
+            // multi-reader visibility under the SAL #910 filter.
+            let placeholder_agent_id = if caller.is_empty() || caller == "anonymous:invalid" {
+                "system".to_string()
+            } else {
+                caller.clone()
+            };
             let placeholder = Memory {
                 id: Uuid::new_v4().to_string(),
                 tier: Tier::Long,
@@ -508,7 +650,10 @@ async fn set_namespace_standard_inner(
                 updated_at: now,
                 last_accessed_at: None,
                 expires_at: None,
-                metadata: serde_json::json!({"agent_id": "system"}),
+                metadata: serde_json::json!({
+                    "agent_id": placeholder_agent_id,
+                    "scope": "shared",
+                }),
                 reflection_depth: 0,
                 memory_kind: crate::models::MemoryKind::Observation,
                 entity_id: None,
@@ -534,6 +679,37 @@ async fn set_namespace_standard_inner(
             }
         }
     };
+
+    // #929 SECURITY-high (Track A P6, 2026-05-20) — uniform ownership
+    // gate. Catches the path where the caller supplied `body.id`
+    // directly (bypassing the auto-seed lookup above). Load the
+    // resolved standard memory by id, check ownership. The auto-seed
+    // path already validated above and re-checking here is a no-op for
+    // it; the body.id-supplied path goes through this gate once.
+    if let Ok(Some(resolved_mem)) = db::get(&lock.0, &resolved_id) {
+        let recorded_owner = resolved_mem
+            .metadata
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let is_unowned = recorded_owner.is_empty() || recorded_owner == "system";
+        if !is_unowned && recorded_owner != caller && caller != "daemon" {
+            tracing::warn!(
+                target: "ai_memory::authz",
+                "POST /namespaces/{{ns}}/standard 403 (body.id path): caller {caller} != owner {recorded_owner} (ns={ns}, id={resolved_id})"
+            );
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "error": "caller does not own this namespace standard",
+                    "owner": recorded_owner,
+                    "caller": caller
+                })),
+            )
+                .into_response();
+        }
+    }
+
     let mut effective = body;
     effective.id = Some(resolved_id.clone());
     let params = namespace_standard_params(ns, &effective);
