@@ -593,6 +593,41 @@ pub async fn delete_memory(
             .get("agent_id")
             .and_then(|v| v.as_str())
             .map(str::to_string);
+        // #937 SECURITY-high (Track A QC sweep, 2026-05-20) — caller-
+        // vs-row-owner gate on DELETE. Pre-fix any caller could delete
+        // any memory in the unconfigured-governance default posture
+        // because `enforce_governance` returns Allow when no policy is
+        // set. Identity-level check is independent of governance —
+        // even without a policy, a non-owner cannot delete someone
+        // else's row. Mirrors the gate added in #930 for UPDATE +
+        // PROMOTE (commit 49739bb46) and #938 / #940 / #939+#941.
+        if let Some(ref owner) = mem_owner
+            && !owner.is_empty()
+            && owner.as_str() != agent_id
+            && agent_id != "daemon"
+        {
+            let target_agent = target
+                .metadata
+                .get("target_agent_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if target_agent != agent_id {
+                tracing::warn!(
+                    target: "ai_memory::authz",
+                    "DELETE /memories/{{id}} 403: caller {agent_id} != owner {owner} (id={})",
+                    target.id
+                );
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({
+                        "error": "caller does not own this memory",
+                        "owner": owner,
+                        "caller": agent_id
+                    })),
+                )
+                    .into_response();
+            }
+        }
         let payload = json!({"id": target.id, "title": target.title});
         match db::enforce_governance(
             &lock.0,
