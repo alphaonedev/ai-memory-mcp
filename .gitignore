@@ -64,3 +64,14 @@ coverage/comment.md
 coverage/html/
 coverage/*.profraw
 coverage/*.profdata
+
+
+# CodeGraph per-developer index (issue #923 — not committed; each
+# developer indexes via `codegraph init -i` per the CLAUDE.md
+# "CodeGraph setup" section). The .db can be ~60 MB and is
+# rebuildable from source in ~90s.
+.codegraph/
+
+# Stray per-issue cargo target dirs left by prior session work (#899,
+# #922, etc.). Each is a separate compile cache, never committed.
+.cargo-*-target/
