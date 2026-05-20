@@ -170,7 +170,11 @@ pub async fn update_memory(
             // v0.7.0 Provenance Gap 2 (#906) — thread source_uri patch.
             source_uri: body.source_uri.clone(),
         };
-        let ctx = crate::store::CallerContext::for_agent("ai:http");
+        // v0.7.0 ship-hardening (2026-05-19): resolve caller from
+        // X-Agent-Id header so update() can authorize against the
+        // memory's owner. Pre-fix this hardcoded "ai:http" which made
+        // every update appear as if from the legacy daemon principal.
+        let ctx = crate::handlers::parity::http_caller_ctx(&headers, None);
         return match app.store.update(&ctx, &id, patch).await {
             Ok(()) => {
                 // Re-fetch through the trait so the response payload

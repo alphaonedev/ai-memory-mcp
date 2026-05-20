@@ -85,12 +85,16 @@ fn default_ns() -> String {
 /// The blocking Ollama call is wrapped in `tokio::task::spawn_blocking`
 /// to keep the async runtime healthy under load — same pattern as
 /// `maybe_auto_tag`.
-async fn resolve_consolidate_summary(app: &AppState, ids: &[String]) -> Result<String, Response> {
+async fn resolve_consolidate_summary(
+    app: &AppState,
+    ids: &[String],
+    caller: &crate::store::CallerContext,
+) -> Result<String, Response> {
     // Collect (title, content) pairs from the appropriate backend so
     // the LLM has the actual source material. SAL on postgres; legacy
     // db on sqlite. A missing source memory short-circuits to 400 with
     // the offending id, matching the MCP path.
-    let pairs = fetch_consolidate_source_pairs(app, ids).await?;
+    let pairs = fetch_consolidate_source_pairs(app, ids, caller).await?;
 
     // No LLM available — deterministic concat fallback. Titles only
     // (not full content) so the result stays a "summary" rather than a
@@ -150,13 +154,22 @@ async fn resolve_consolidate_summary(app: &AppState, ids: &[String]) -> Result<S
 async fn fetch_consolidate_source_pairs(
     app: &AppState,
     ids: &[String],
+    caller: &crate::store::CallerContext,
 ) -> Result<Vec<(String, String)>, Response> {
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        let ctx = crate::store::CallerContext::for_agent("ai:http");
+        // v0.7.0 ship-hardening (QC P1, 2026-05-20): use the resolved
+        // caller principal from the request headers so the SAL #910
+        // scope=private visibility filter naturally rejects source
+        // IDs the caller doesn't own. The earlier `for_admin` shape
+        // was a privacy escalation — any authenticated caller could
+        // submit IDs they didn't own and the SAL bypass would read
+        // them. Cross-author consolidation requires an explicit
+        // admin role (a v0.7.1+ feature); for now the consolidation
+        // surface is single-owner.
         let mut out: Vec<(String, String)> = Vec::with_capacity(ids.len());
         for id in ids {
-            match app.store.get(&ctx, id).await {
+            match app.store.get(caller, id).await {
                 Ok(mem) => out.push((mem.title, mem.content)),
                 Err(crate::store::StoreError::NotFound { .. }) => {
                     return Err((
@@ -208,9 +221,14 @@ pub async fn consolidate_memories(
     // is available, synthesise a deterministic concat of the source
     // titles so the row still lands rather than 422'ing on a wire-shape
     // mismatch S51 has tripped on.
+    // QC P1 fix (2026-05-20): resolve the caller from headers so the
+    // SAL #910 scope=private visibility filter applies to the
+    // source-id reads (consolidation can only access memories the
+    // caller owns or that are scope=shared/public).
+    let consolidate_caller = crate::handlers::parity::http_caller_ctx(&headers, None);
     let summary = match body.summary.clone() {
         Some(s) if !s.is_empty() => s,
-        _ => match resolve_consolidate_summary(&app, &body.ids).await {
+        _ => match resolve_consolidate_summary(&app, &body.ids, &consolidate_caller).await {
             Ok(s) => s,
             Err(resp) => return resp,
         },
@@ -447,6 +465,7 @@ pub struct AutoTagBody {
 /// the model is slow.
 pub async fn auto_tag_handler(
     State(app): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<AutoTagBody>,
 ) -> impl IntoResponse {
     if app.llm.is_none() {
@@ -456,6 +475,10 @@ pub async fn auto_tag_handler(
         )
             .into_response();
     }
+
+    // QC P1 fix (2026-05-20): use header-resolved caller for the
+    // source-memory fetch so the SAL #910 visibility filter applies.
+    let auto_tag_caller = crate::handlers::parity::http_caller_ctx(&headers, None);
 
     // Resolve (title, content). S51 sends `memory_id`; we fetch the
     // memory from the active backend. Ad-hoc callers may instead
@@ -469,7 +492,7 @@ pub async fn auto_tag_handler(
                 )
                     .into_response();
             }
-            match fetch_memory_for_handler(&app, id).await {
+            match fetch_memory_for_handler(&app, id, &auto_tag_caller).await {
                 Ok(mem) => (mem.title, mem.content, Some(id.to_string())),
                 Err(resp) => return resp,
             }
@@ -642,11 +665,17 @@ pub async fn expand_query_handler(
 /// v0.7.0 L6/L7 — fetch a single memory by id off the active storage
 /// backend. Returns a structured 4xx/5xx response on miss / lookup
 /// failure so the calling handler can `return Err(resp)`.
-async fn fetch_memory_for_handler(app: &AppState, id: &str) -> Result<Memory, Response> {
+async fn fetch_memory_for_handler(
+    app: &AppState,
+    id: &str,
+    caller: &crate::store::CallerContext,
+) -> Result<Memory, Response> {
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        let ctx = crate::store::CallerContext::for_agent("ai:http");
-        return match app.store.get(&ctx, id).await {
+        // QC P1 fix (2026-05-20): use header-resolved caller so the
+        // SAL #910 scope=private visibility filter applies — caller
+        // can only fetch memories they own (or scope=shared/public).
+        return match app.store.get(caller, id).await {
             Ok(mem) => Ok(mem),
             Err(crate::store::StoreError::NotFound { .. }) => Err((
                 StatusCode::NOT_FOUND,
@@ -701,6 +730,7 @@ pub struct LoadFamilyBody {
 /// - response 400: unknown family / bad namespace
 pub async fn load_family_handler(
     State(app): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<LoadFamilyBody>,
 ) -> impl IntoResponse {
     use std::str::FromStr;
@@ -745,7 +775,14 @@ pub async fn load_family_handler(
             until: None,
             limit: MAX_BULK_SIZE,
         };
-        let ctx = crate::store::CallerContext::for_agent("ai:http");
+        // QC P1 fix (2026-05-20): load_family lists every memory in
+        // the namespace tagged with a `family` metadata field. With
+        // `for_admin` this leaked scope=private memories of other
+        // tenants in the same namespace. Resolve the caller from
+        // headers so the SAL visibility filter naturally limits the
+        // result set to the caller's own memories (+ scope=shared/
+        // public, which the filter passes through).
+        let ctx = crate::handlers::parity::http_caller_ctx(&headers, None);
         return match app.store.list(&ctx, &filter).await {
             Ok(all) => {
                 let mut filtered: Vec<Memory> = all

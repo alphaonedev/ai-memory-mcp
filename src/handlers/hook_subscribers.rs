@@ -302,7 +302,17 @@ async fn set_namespace_standard_inner(
     // store path.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        let ctx = crate::store::CallerContext::for_agent("ai:http");
+        // v0.7.0 ship-hardening: use the resolved caller principal
+        // (X-Agent-Id header) so the SAL #910 scope=private
+        // visibility filter sees the actual request principal. Pre-fix
+        // this used a hardcoded "ai:http" which mismatched every
+        // memory's metadata.agent_id and made the standard write
+        // 404 when looking up its own placeholder.
+        let ctx = if let Some(h) = headers {
+            crate::handlers::parity::http_caller_ctx(h, None)
+        } else {
+            crate::store::CallerContext::for_agent("ai:http")
+        };
         // Resolve standard_id: caller-supplied or auto-seed a placeholder.
         let standard_id = if let Some(id) = body.id.clone() {
             id
@@ -324,7 +334,19 @@ async fn set_namespace_standard_inner(
                 id
             } else {
                 let now = Utc::now().to_rfc3339();
-                let mut metadata = serde_json::json!({"agent_id": "system"});
+                // QC P1 follow-up (2026-05-20): the placeholder is the
+                // namespace's governance config — multiple agents in the
+                // namespace need to read it for policy resolution. Mark
+                // it `scope=shared` so the SAL #910 visibility filter
+                // doesn't restrict it to a single owner. Stamping
+                // `agent_id` to "system" preserves the audit trail
+                // shape; the read path's owner=="system" check is
+                // bypassed by the scope=shared branch in
+                // `is_visible_to_caller`.
+                let mut metadata = serde_json::json!({
+                    "agent_id": "system",
+                    "scope": "shared",
+                });
                 if let Some(g) = body.governance.clone()
                     && let Some(obj) = metadata.as_object_mut()
                 {
@@ -636,7 +658,12 @@ pub async fn get_namespace_standard_qs(
     // the exact namespace.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        let ctx = crate::store::CallerContext::for_agent("ai:http");
+        // v0.7.0 ship-hardening (2026-05-19): namespace standards are
+        // governance POLICY — readable by any caller that can query
+        // the namespace itself. Use for_admin so the SAL #910
+        // scope=private visibility filter doesn't drop the standard
+        // memory when the requester is not the policy author.
+        let ctx = crate::store::CallerContext::for_admin("ai:http-internal");
         let inherit = q.inherit.unwrap_or(false);
         // Build chain leaf → root (most-specific first) by trimming
         // `/segment` until empty. The chain matches the SQLite
@@ -804,7 +831,12 @@ async fn clear_namespace_standard_inner(
     // v0.7.0 Wave-3 Continuation 2 (Phase 11) — postgres-backed clear.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        let ctx = crate::store::CallerContext::for_agent("ai:http");
+        // v0.7.0 ship-hardening (2026-05-19): use the resolved caller
+        // from the X-Agent-Id header. Pre-fix this hardcoded "ai:http"
+        // which made the standard-clear lookup miss its target memory
+        // when caller != "ai:http". `caller` here is the
+        // header-resolved id used for the audit-record above.
+        let ctx = crate::store::CallerContext::for_agent(caller.clone());
         return match app.store.clear_namespace_standard(&ctx, ns).await {
             Ok(true) => (
                 StatusCode::OK,

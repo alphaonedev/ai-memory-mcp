@@ -136,3 +136,48 @@ pub(crate) fn resolve_caller_agent_id(
 
     Ok(resolved)
 }
+
+/// Build a [`crate::store::CallerContext`] from the request headers
+/// (and optional body-supplied agent id) for handlers that dispatch
+/// through the SAL trait.
+///
+/// v0.7.0 ship-hardening (2026-05-19): the SAL recall/get/list/search
+/// surfaces apply the #910 scope=private visibility filter using the
+/// `CallerContext`'s `effective_principal()`. Multiple handlers
+/// (`recall`, `set_namespace_standard`, `power_consolidation`,
+/// `links`, etc.) historically hardcoded the principal to `"ai:http"`
+/// or `"daemon"` — guaranteeing a mismatch with every memory's
+/// `metadata.agent_id` and causing the filter to drop the caller's
+/// own data. This helper consolidates the canonical resolution path
+/// so handlers can switch from the legacy hardcode with a one-line
+/// change.
+///
+/// On a missing / invalid `X-Agent-Id` header the function synthesizes
+/// `anonymous:req-<uuid8>` (mirrors the same fallback path as
+/// `crate::identity::resolve_http_agent_id`), keeping anonymous writes
+/// possible while still binding the write + the subsequent read to
+/// the SAME synthesized principal within a request scope (NOT across
+/// requests — clients that need cross-request visibility on
+/// scope=private memories MUST set `X-Agent-Id` explicitly).
+#[cfg(feature = "sal")]
+pub(crate) fn http_caller_ctx(
+    headers: &axum::http::HeaderMap,
+    body_agent_id: Option<&str>,
+) -> crate::store::CallerContext {
+    let resolved = resolve_caller_agent_id(body_agent_id, headers, None).unwrap_or_else(|e| {
+        // QC Obs #2 (2026-05-20): the prior shape silently fell back
+        // to `"anonymous:invalid"` on resolve error, polluting audit
+        // trails with a bogus principal. Log the failure as a WARN so
+        // operators see the anomaly; the full Result-propagation
+        // refactor (return `Result<CallerContext, Response>` so the
+        // handler can map to a 4xx) is tracked as a v0.7.1 follow-up
+        // since it requires touching every call site.
+        tracing::warn!(
+            target = "handlers::parity",
+            error = %e,
+            "http_caller_ctx: invalid X-Agent-Id / body.agent_id, falling back to anonymous:invalid"
+        );
+        "anonymous:invalid".to_string()
+    });
+    crate::store::CallerContext::for_agent(resolved)
+}

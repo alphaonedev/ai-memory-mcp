@@ -67,6 +67,7 @@ pub struct ContradictionsQuery {
 #[allow(clippy::too_many_lines)]
 pub async fn detect_contradictions(
     State(app): State<AppState>,
+    headers: axum::http::HeaderMap,
     Query(q): Query<ContradictionsQuery>,
 ) -> impl IntoResponse {
     if q.topic.is_none() && q.namespace.is_none() {
@@ -96,7 +97,12 @@ pub async fn detect_contradictions(
     // through `app.store.list` then runs the same pairwise heuristic.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        let ctx = crate::store::CallerContext::for_agent("http");
+        // QC P1 fix (2026-05-20): resolve caller from X-Agent-Id so
+        // the SAL #910 visibility filter limits the contradiction
+        // sweep to memories the caller can actually see. Pre-fix the
+        // hardcoded `for_agent("http")` caller mismatched every
+        // memory's metadata.agent_id and zeroed the candidate pool.
+        let ctx = crate::handlers::parity::http_caller_ctx(&headers, None);
         let filter = crate::store::Filter {
             namespace: q.namespace.clone(),
             limit,
@@ -344,7 +350,16 @@ pub async fn list_namespaces(State(app): State<AppState>) -> impl IntoResponse {
     // distinct namespaces from `memories` via the SAL `list` method.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        let ctx = crate::store::CallerContext::for_agent("daemon");
+        // QC P1 follow-up (2026-05-20): namespace identifiers are
+        // structural metadata, not user data — same posture as
+        // `get_namespace_standard_qs` (which is also `for_admin`).
+        // Without bypass the SAL #910 visibility filter would gate
+        // every namespace name behind owner==caller and the list
+        // would only ever return the caller's own namespaces, which
+        // breaks the cert harness `namespaces_round_trip_via_sal`
+        // test and surfaces in production as a fragmented namespace
+        // catalog per-tenant.
+        let ctx = crate::store::CallerContext::for_admin("ai:http-internal");
         let filter = crate::store::Filter {
             limit: 1_000_000,
             ..Default::default()
@@ -603,6 +618,7 @@ pub struct CheckDuplicateBody {
 /// threshold.
 pub async fn check_duplicate(
     State(app): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<CheckDuplicateBody>,
 ) -> impl IntoResponse {
     if let Err(e) = validate::validate_title(&body.title) {
@@ -647,7 +663,12 @@ pub async fn check_duplicate(
     // before the embedding pass).
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        let ctx = crate::store::CallerContext::for_agent("daemon");
+        // QC P1 fix (2026-05-20): use header-resolved caller so the
+        // SAL #910 visibility filter applies — duplicate-detection
+        // only sees memories the caller owns (or scope=shared/public).
+        // Pre-fix `for_agent("daemon")` mismatched every memory's
+        // metadata.agent_id and the candidate pool was zero.
+        let ctx = crate::handlers::parity::http_caller_ctx(&headers, None);
         let filter = crate::store::Filter {
             namespace: namespace.map(str::to_string),
             limit: 1000,

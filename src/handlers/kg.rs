@@ -354,6 +354,7 @@ pub async fn entity_register(
 /// "no match" from a server error.
 pub async fn entity_get_by_alias(
     State(app): State<AppState>,
+    headers: axum::http::HeaderMap,
     Query(p): Query<EntityByAliasQuery>,
 ) -> impl IntoResponse {
     let alias = p.alias.trim();
@@ -384,7 +385,11 @@ pub async fn entity_get_by_alias(
     // and match against `metadata.aliases` client-side.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        let ctx = crate::store::CallerContext::for_agent("daemon");
+        // QC P1 fix (2026-05-20): use header-resolved caller so the
+        // SAL #910 visibility filter applies to the entity walk.
+        // Pre-fix the hardcoded `for_agent("daemon")` caller mismatched
+        // every entity memory's owner and dropped the entire list.
+        let ctx = crate::handlers::parity::http_caller_ctx(&headers, None);
         let filter = crate::store::Filter {
             namespace: namespace.map(str::to_string),
             limit: 1000,

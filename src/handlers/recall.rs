@@ -91,6 +91,7 @@ fn apply_recall_scope_defaults(
 
 pub async fn recall_memories_get(
     State(app): State<AppState>,
+    headers: axum::http::HeaderMap,
     Query(p): Query<RecallQuery>,
 ) -> impl IntoResponse {
     // Accept `context` (canonical), `query` (cert harness alias —
@@ -138,6 +139,27 @@ pub async fn recall_memories_get(
         p.limit,
     );
     let kinds = p.resolved_kinds();
+    // v0.7.0 ship-hardening (2026-05-19): resolve the caller principal
+    // from the X-Agent-Id header (synthesizes anonymous on miss) so
+    // the SAL visibility filter has the actual request principal.
+    // Pre-fix the recall path hardcoded `"daemon"` as the caller,
+    // which mismatched the per-request id stamped on every memory
+    // and caused the #910 scope=private visibility filter to drop
+    // every row the caller actually owned.
+    let caller_principal = match crate::handlers::parity::resolve_caller_agent_id(
+        None,
+        &headers,
+        p.as_agent.as_deref(),
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::FORBIDDEN,
+                Json(json!({"error": e})),
+            )
+                .into_response();
+        }
+    };
     recall_response(
         &app,
         &ctx,
@@ -147,6 +169,7 @@ pub async fn recall_memories_get(
         since_resolved.as_deref(),
         p.until.as_deref(),
         p.as_agent.as_deref(),
+        Some(caller_principal.as_str()),
         p.budget_tokens,
         tier_resolved.as_deref(),
         p.has_citations.unwrap_or(false),
@@ -159,6 +182,7 @@ pub async fn recall_memories_get(
 
 pub async fn recall_memories_post(
     State(app): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<RecallBody>,
 ) -> impl IntoResponse {
     // Accept either `context` (canonical) or `query` (cert harness
@@ -191,6 +215,21 @@ pub async fn recall_memories_post(
         body.limit,
     );
     let kinds = body.resolved_kinds();
+    // See GET handler for the caller-resolution rationale.
+    let caller_principal = match crate::handlers::parity::resolve_caller_agent_id(
+        None,
+        &headers,
+        body.as_agent.as_deref(),
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::FORBIDDEN,
+                Json(json!({"error": e})),
+            )
+                .into_response();
+        }
+    };
     recall_response(
         &app,
         &ctx_val,
@@ -200,6 +239,7 @@ pub async fn recall_memories_post(
         since_resolved.as_deref(),
         body.until.as_deref(),
         body.as_agent.as_deref(),
+        Some(caller_principal.as_str()),
         body.budget_tokens,
         tier_resolved.as_deref(),
         body.has_citations.unwrap_or(false),
@@ -237,6 +277,14 @@ async fn recall_response(
     since: Option<&str>,
     until: Option<&str>,
     as_agent: Option<&str>,
+    // v0.7.0 ship-hardening (2026-05-19): caller principal resolved
+    // from the X-Agent-Id header by the GET/POST entry. When `Some`,
+    // overrides the legacy `as_agent.unwrap_or("daemon")` shape used
+    // for the SAL CallerContext — required so the #910 scope=private
+    // visibility filter sees the actual request principal. `None`
+    // preserves the legacy default for callers that haven't migrated
+    // (e.g. in-test direct invocations of recall_response).
+    caller_principal: Option<&str>,
     budget_tokens: Option<usize>,
     // v0.7.0 (issue #518) — spliced
     // `[agents.defaults.recall_scope].tier` when the caller passed
@@ -301,8 +349,18 @@ async fn recall_response(
             "keyword"
         };
 
-        let ctx_caller =
-            crate::store::CallerContext::for_agent(as_agent.unwrap_or("daemon").to_string());
+        // `as_agent` is the explicit query-param override (admin /
+        // act-on-behalf semantics). When set, it overrides the
+        // header-derived principal. Otherwise use `caller_principal`
+        // (resolved from X-Agent-Id by the entry handler), falling
+        // back to "daemon" only when neither is present (legacy
+        // pre-#910 behavior, harmless on non-scope=private memories).
+        let ctx_caller = crate::store::CallerContext::for_agent(
+            as_agent
+                .or(caller_principal)
+                .unwrap_or("daemon")
+                .to_string(),
+        );
         let mut filter = crate::store::Filter {
             namespace: namespace.map(str::to_string),
             limit,

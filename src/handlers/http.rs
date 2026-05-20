@@ -270,7 +270,14 @@ async fn fetch_namespace_candidates(
 ) -> Result<Vec<(String, String, String)>, String> {
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        let ctx = crate::store::CallerContext::for_agent("ai:http");
+        // v0.7.0 ship-hardening (2026-05-19): use for_admin so the
+        // duplicate-candidate lookup doesn't get scope=private
+        // filtered. The check_duplicate handler queries a namespace
+        // the caller is about to write into; pre-write candidate
+        // resolution is system-internal, not a user-visible read,
+        // and we want the candidate pool to surface every memory in
+        // the namespace regardless of who originally authored it.
+        let ctx = crate::store::CallerContext::for_admin("ai:http-internal");
         let filter = crate::store::Filter {
             namespace: Some(namespace.to_string()),
             limit: limit + 1,
