@@ -302,16 +302,20 @@ async fn set_namespace_standard_inner(
     // store path.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        // v0.7.0 ship-hardening: use the resolved caller principal
-        // (X-Agent-Id header) so the SAL #910 scope=private
-        // visibility filter sees the actual request principal. Pre-fix
-        // this used a hardcoded "ai:http" which mismatched every
-        // memory's metadata.agent_id and made the standard write
-        // 404 when looking up its own placeholder.
+        // #955 SECURITY-medium (Track A QC sweep, 2026-05-20) — drop
+        // the "ai:http" literal fallback. The outer function already
+        // resolved `caller` from headers above (with
+        // `anonymous:invalid` as the explicit non-header fallback);
+        // reuse it so the SAL #910 visibility filter sees the actual
+        // request principal in both call paths instead of a synthetic
+        // daemon-side placeholder. Pre-fix the "ai:http" literal made
+        // the standard write 404 when looking up its own placeholder
+        // and let any MCP-via-headers=None caller claim the literal
+        // principal as the daemon identity.
         let ctx = if let Some(h) = headers {
             crate::handlers::parity::http_caller_ctx(h, None)
         } else {
-            crate::store::CallerContext::for_agent("ai:http")
+            crate::store::CallerContext::for_agent(&caller)
         };
         // Resolve standard_id: caller-supplied or auto-seed a placeholder.
         let standard_id = if let Some(id) = body.id.clone() {

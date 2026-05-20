@@ -8628,7 +8628,17 @@ impl MemoryStore for PostgresStore {
         // Reuse the existing list path with an unbounded filter — postgres
         // adapter's `list` already projects the full Memory shape and the
         // ATOMIC_MULTI_WRITE-class semantics make a snapshot read safe.
-        let ctx = CallerContext::for_agent("export");
+        //
+        // #955 SECURITY-medium (Track A QC sweep, 2026-05-20) — use
+        // `for_admin` instead of `for_agent("export")`. The trait method
+        // does not yet take a caller, and the only HTTP entry
+        // (`handlers::admin::export_memories`) is already admin-gated via
+        // `require_admin`; `for_admin` matches that contract by bypassing
+        // the SAL #910 scope=private visibility filter so the export
+        // returns the FULL corpus rather than silently dropping any row
+        // whose `metadata.agent_id != "export"`. Reserved for operator
+        // surfaces per the `for_admin` docs.
+        let ctx = CallerContext::for_admin("export-internal");
         let filter = Filter {
             limit: 100_000,
             ..Filter::default()
@@ -8787,7 +8797,19 @@ impl MemoryStore for PostgresStore {
                 continue;
             };
             // Read the standard's metadata.
-            let ctx = CallerContext::for_agent("governance");
+            //
+            // #955 SECURITY-medium (Track A QC sweep, 2026-05-20) —
+            // use `for_admin` instead of `for_agent("governance")`.
+            // This is a substrate-internal policy read (called by
+            // other trait methods that have already resolved their
+            // own caller context); the standard memory is governance
+            // policy that the substrate itself needs to read
+            // regardless of `metadata.scope`. `for_admin` bypasses
+            // the #910 visibility filter to match that contract;
+            // `for_agent("governance")` would mismatch the standard's
+            // owner and drop the policy row when scope=private,
+            // breaking governance resolution for private namespaces.
+            let ctx = CallerContext::for_admin("governance-internal");
             let mem = match self.get(&ctx, &standard_id).await {
                 Ok(m) => m,
                 Err(StoreError::NotFound { .. }) => continue,
