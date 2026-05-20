@@ -71,6 +71,11 @@ fn spawn_serve(
     let port_s = port.to_string();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ai-memory"));
     cmd.env("AI_MEMORY_NO_CONFIG", "1")
+        // #976 (2026-05-20) — wildcard admin allowlist so the
+        // post-#946 admin-gated routes (stats, archive, forget, …)
+        // exercise the happy-path 200 in this test fixture. Negative
+        // admin contracts belong in dedicated test files.
+        .env("AI_MEMORY_ADMIN_AGENT_IDS", "*")
         .args([
             "--db",
             db.to_str().unwrap(),
@@ -256,6 +261,11 @@ fn serve_api_key_required_when_configured() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_ai-memory"))
         .env_remove("AI_MEMORY_NO_CONFIG")
         .env("HOME", tmp.path().to_str().unwrap())
+        // #976 (2026-05-20) — `/api/v1/stats` is admin-gated post-#955;
+        // the test exercises the api_key auth happy path, not the
+        // admin-rejection contract, so seed the wildcard admin
+        // allowlist via the env var (precedence wins over config.toml).
+        .env("AI_MEMORY_ADMIN_AGENT_IDS", "*")
         .args([
             "--db",
             db.to_str().unwrap(),
