@@ -151,8 +151,31 @@ pub async fn restore_archive(
         // can only touch memories owned by the caller.
         let ctx = crate::store::CallerContext::for_agent(caller.clone());
         return match app.store.archive_restore(&ctx, &id).await {
-            Ok(true) => Json(json!({"restored": true, "id": id, "storage_backend": "postgres"}))
-                .into_response(),
+            Ok(true) => {
+                // #950 SECURITY-medium (Track A QC sweep, 2026-05-20)
+                // — fire subscription dispatch on the postgres restore
+                // path. Re-fetch the restored row to anchor the event
+                // on its namespace; if the lookup fails, skip dispatch
+                // rather than firing with a synthetic namespace.
+                if let Ok(mem) = app.store.get(&ctx, &id).await {
+                    let mem_owner = mem
+                        .metadata
+                        .get("agent_id")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    super::dispatch_event_postgres(
+                        &app,
+                        "memory_restore",
+                        &id,
+                        &mem.namespace,
+                        mem_owner.as_deref(),
+                        None,
+                    )
+                    .await;
+                }
+                Json(json!({"restored": true, "id": id, "storage_backend": "postgres"}))
+                    .into_response()
+            }
             Ok(false) => (
                 StatusCode::NOT_FOUND,
                 Json(json!({"error": "not found in archive"})),
@@ -445,6 +468,23 @@ pub async fn archive_by_ids(
                 Ok(_) => missing.push(id.clone()),
                 Err(e) => return store_err_to_response(e),
             }
+        }
+        // #950 SECURITY-medium (Track A QC sweep, 2026-05-20) — fire
+        // `memory_archive` per archived row on the postgres path. Each
+        // archive event is anchored on the (now-archived) memory id;
+        // for namespace anchoring we look the row up in archive via
+        // the SAL trait. If a follow-up `archive_get_by_id`-style read
+        // is unavailable on this trait surface, we fall back to an
+        // empty namespace + no owner (best-effort dispatch).
+        for id in &archived {
+            // The row no longer lives in `memories`; reading via
+            // app.store.get returns NotFound after the archive write.
+            // Fire the event with the caller as the agent_id and no
+            // namespace anchor — downstream subscribers match by
+            // event_type + memory_id, not namespace, for archive
+            // events.
+            super::dispatch_event_postgres(&app, "memory_archive", id, "", Some(&caller), None)
+                .await;
         }
         return (
             StatusCode::OK,
