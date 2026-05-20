@@ -208,10 +208,45 @@ pub async fn update_memory(
                 // Re-fetch through the trait so the response payload
                 // mirrors the legacy SQLite path's "return the updated
                 // row" wire shape.
-                match app.store.get(&ctx, &id).await {
-                    Ok(mem) => Json(json!(mem)).into_response(),
-                    Err(_) => Json(json!({"updated": true, "id": id})).into_response(),
-                }
+                let response_body = match app.store.get(&ctx, &id).await {
+                    Ok(mem) => {
+                        // #950 SECURITY-medium (Track A QC sweep,
+                        // 2026-05-20) — fire subscription dispatch on
+                        // the postgres update path. Pre-#950 only the
+                        // `create_memory` postgres branch dispatched;
+                        // every other memory-state-changing operation
+                        // (update / delete / promote / link create /
+                        // link delete / archive / restore / forget)
+                        // silently skipped dispatch on postgres-backed
+                        // daemons, breaking K7-style cross-namespace
+                        // event-type registration end-to-end.
+                        let agent_for_dispatch = mem
+                            .metadata
+                            .get("agent_id")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
+                        let ns_for_dispatch = mem.namespace.clone();
+                        super::dispatch_event_postgres(
+                            &app,
+                            "memory_update",
+                            &id,
+                            &ns_for_dispatch,
+                            agent_for_dispatch.as_deref(),
+                            None,
+                        )
+                        .await;
+                        Json(json!(mem)).into_response()
+                    }
+                    Err(_) => {
+                        // Fallback wire shape — no `Memory` available to
+                        // pull namespace/agent_id from. Dispatch is
+                        // best-effort; without the namespace the event
+                        // would have nowhere to anchor, so skip in this
+                        // tail.
+                        Json(json!({"updated": true, "id": id})).into_response()
+                    }
+                };
+                response_body
             }
             Err(e) => store_err_to_response(e),
         };
@@ -518,9 +553,32 @@ pub async fn delete_memory(
                         .unwrap_or_else(|| (String::new(), None, None));
                     crate::audit::emit(crate::audit::EventBuilder::new(
                         crate::audit::AuditAction::Delete,
-                        crate::audit::actor(agent_id, "http_header", None),
+                        crate::audit::actor(&agent_id, "http_header", None),
                         crate::audit::target_memory(id.clone(), namespace, title, tier, None),
                     ));
+                }
+                // #950 SECURITY-medium (Track A QC sweep, 2026-05-20) —
+                // fire subscription dispatch on the postgres delete
+                // path. Best-effort: when the target was missing we
+                // skip dispatch (no namespace anchor); otherwise emit
+                // the canonical `memory_delete` event so
+                // K7-style cross-namespace event subscribers get the
+                // delete notification on postgres-backed daemons.
+                if let Some(ref mem) = target {
+                    let mem_owner = mem
+                        .metadata
+                        .get("agent_id")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    super::dispatch_event_postgres(
+                        &app,
+                        "memory_delete",
+                        &id,
+                        &mem.namespace,
+                        mem_owner.as_deref(),
+                        None,
+                    )
+                    .await;
                 }
                 (StatusCode::OK, Json(json!({"deleted": true, "id": id}))).into_response()
             }
@@ -882,6 +940,23 @@ pub async fn promote_memory(
                         }
                     }
                 }
+                // #950 SECURITY-medium (Track A QC sweep, 2026-05-20)
+                // — fire subscription dispatch on the postgres promote
+                // path. Mirrors `memory_promote` on the sqlite branch.
+                let mem_owner = target
+                    .metadata
+                    .get("agent_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                super::dispatch_event_postgres(
+                    &app,
+                    "memory_promote",
+                    &target.id,
+                    &target.namespace,
+                    mem_owner.as_deref(),
+                    None,
+                )
+                .await;
                 Json(json!({
                     "promoted": true,
                     "id": target.id,

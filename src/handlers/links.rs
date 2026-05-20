@@ -386,6 +386,39 @@ pub async fn create_link(
                         ),
                     ));
                 }
+                // #950 SECURITY-medium (Track A QC sweep, 2026-05-20) —
+                // fire `memory_link_created` on the postgres path.
+                // Look up the source memory to anchor the event on the
+                // source's namespace (matches the sqlite path's
+                // dispatch_event_with_details posture at line ~508).
+                let (link_namespace, link_owner) = match app.store.get(&ctx, &source_id).await {
+                    Ok(m) => {
+                        let owner = m
+                            .metadata
+                            .get("agent_id")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
+                        (Some(m.namespace), owner)
+                    }
+                    Err(_) => (None, None),
+                };
+                if let Some(ns) = link_namespace {
+                    let details =
+                        serde_json::to_value(crate::subscriptions::LinkCreatedEventDetails {
+                            target_id: target_id.clone(),
+                            relation: relation.clone(),
+                        })
+                        .ok();
+                    super::dispatch_event_postgres(
+                        &app,
+                        "memory_link_created",
+                        &source_id,
+                        &ns,
+                        link_owner.as_deref(),
+                        details,
+                    )
+                    .await;
+                }
                 (
                     StatusCode::CREATED,
                     Json(json!({
