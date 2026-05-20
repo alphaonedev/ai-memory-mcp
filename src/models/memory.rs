@@ -842,6 +842,15 @@ pub struct UpdateMemory {
     /// Validated by `validate::validate_source_uri` before reaching
     /// storage.
     pub source_uri: Option<String>,
+    /// v0.7.0 #930 SECURITY-high (Track A P9, 2026-05-20) — optional
+    /// caller-asserted `agent_id` for body/header parity. When set,
+    /// MUST match the resolved `X-Agent-Id` header (Full-Measure-A
+    /// posture). Mismatch → HTTP 403. Pre-fix the sqlite UPDATE path
+    /// silently accepted ANY body.agent_id (or none) and never gated
+    /// the writer against the row's recorded owner — enabling
+    /// cross-tenant write hijack with forged provenance.
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

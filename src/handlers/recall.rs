@@ -311,8 +311,6 @@ async fn recall_response(
     // hook_subscribers.rs.
     #[cfg(not(feature = "sal"))]
     let _ = recall_scope_tier;
-    #[cfg(not(feature = "sal"))]
-    let _ = caller_principal;
     // v0.7.0 Wave-3 Continuation 2 (Phase 10) — postgres-backed
     // hybrid recall via the SAL trait. Embeds the query AND dispatches
     // through `app.store.recall_hybrid` so the postgres adapter applies
@@ -507,7 +505,16 @@ async fn recall_response(
             vi_ref,
             short_extend,
             mid_extend,
-            as_agent,
+            // #928 SECURITY-medium (Track A P5, 2026-05-20):
+            // thread the header-resolved caller_principal as the
+            // visibility-filter principal so scope=private rows owned
+            // by other agents are NOT leaked when the caller doesn't
+            // set body.as_agent. Pre-fix the sqlite path passed only
+            // `as_agent` (typically None from real callers) and the
+            // visibility_clause short-circuited to "all rows visible".
+            // Mirror of the postgres SAL branch's
+            // `as_agent.or(caller_principal).unwrap_or("daemon")`.
+            as_agent.or(caller_principal),
             budget_tokens,
             app.scoring.as_ref(),
             false,
@@ -531,7 +538,9 @@ async fn recall_response(
             until,
             short_extend,
             mid_extend,
-            as_agent,
+            // #928 — same caller_principal fallback as the hybrid
+            // branch above; see the longer note there.
+            as_agent.or(caller_principal),
             budget_tokens,
             false,
             // v0.7.0 Cluster-A PERF-3 — see hybrid branch above.
