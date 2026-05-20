@@ -347,7 +347,18 @@ pub async fn detect_contradictions(
     .into_response()
 }
 
-pub async fn list_namespaces(State(app): State<AppState>) -> impl IntoResponse {
+pub async fn list_namespaces(
+    State(app): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    // #945 SECURITY-medium (Track A QC sweep, 2026-05-20) — admin-
+    // only gate. Pre-fix any caller could enumerate every namespace
+    // in the deployment via `for_admin("ai:http-internal")` bypass.
+    // Sibling of #946 list_agents.
+    if let Err(resp) = crate::handlers::admin_role::require_admin(&app, &headers, "list_namespaces")
+    {
+        return resp;
+    }
     // v0.7.0 Wave-3 Continuation — postgres-backed daemons aggregate the
     // distinct namespaces from `memories` via the SAL `list` method.
     #[cfg(feature = "sal")]
@@ -418,8 +429,16 @@ pub struct TaxonomyQuery {
 /// flag when `limit` dropped rows from the walk.
 pub async fn get_taxonomy(
     State(app): State<AppState>,
+    headers: axum::http::HeaderMap,
     Query(p): Query<TaxonomyQuery>,
 ) -> impl IntoResponse {
+    // #945 SECURITY-medium (Track A QC sweep, 2026-05-20) — admin-
+    // only gate. Pre-fix any caller could enumerate the full
+    // hierarchical namespace tree + per-node counts via the
+    // for_admin bypass. Sibling of list_namespaces above.
+    if let Err(resp) = crate::handlers::admin_role::require_admin(&app, &headers, "get_taxonomy") {
+        return resp;
+    }
     let prefix_owned: Option<String> = p
         .prefix
         .as_deref()

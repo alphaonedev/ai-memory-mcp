@@ -829,14 +829,22 @@ pub async fn set_namespace_standard_qs(
 
 pub async fn get_namespace_standard_qs(
     State(app): State<AppState>,
+    headers: HeaderMap,
     Query(q): Query<NamespaceStandardQuery>,
 ) -> impl IntoResponse {
     // If no namespace is supplied this shares a route with the existing
     // `list_namespaces` GET; the router chains the two so a plain
     // `GET /api/v1/namespaces` still returns the list.
     let Some(ns) = q.namespace.clone() else {
-        return list_namespaces(State(app)).await.into_response();
+        // #945 SECURITY-medium (Track A QC sweep, 2026-05-20) —
+        // list_namespaces now requires admin via require_admin;
+        // thread headers through so the gate sees the X-Agent-Id.
+        return list_namespaces(State(app), headers).await.into_response();
     };
+    // #945-sibling — when ns IS supplied, this becomes a per-namespace
+    // standard fetch. Currently no caller-vs-owner gate on this read
+    // path (filed as a follow-up under #959).
+    let _ = &headers;
 
     // v0.7.0 Wave-3 Continuation 5 (Bucket C / S35) — postgres-backed
     // daemons resolve the namespace standard via the SAL trait. When
