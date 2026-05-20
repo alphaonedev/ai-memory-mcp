@@ -490,6 +490,7 @@ pub struct KgTimelineQuery {
 /// link assertions from `source_id` ordered by `valid_from ASC`.
 pub async fn kg_timeline(
     State(app): State<AppState>,
+    headers: axum::http::HeaderMap,
     Query(p): Query<KgTimelineQuery>,
 ) -> impl IntoResponse {
     if let Err(e) = validate::validate_id(&p.source_id) {
@@ -516,6 +517,86 @@ pub async fn kg_timeline(
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": format!("invalid until: {e}")})),
+        )
+            .into_response();
+    }
+
+    // #944 SECURITY-high (Track A QC sweep, 2026-05-20) —
+    // caller-vs-source-memory-owner gate. Pre-fix the GET handler
+    // took NO `headers: HeaderMap` parameter, so any authenticated
+    // caller could read the full outbound link-event timeline
+    // (`target_id`, `relation`, `valid_from`, `valid_until`,
+    // `observed_by`, `title`, `target_namespace`) for ANY source_id
+    // — including memories owned by other tenants. Cross-tenant
+    // info-leak on the temporal-graph surface. Mirrors the #938
+    // `kg_invalidate` gate shape (commit 54706eeed, same file) and
+    // the #937 `delete_memory` shape (commit a582bdc5b).
+    let caller = match crate::handlers::parity::resolve_caller_agent_id(None, &headers, None) {
+        Ok(c) => c,
+        Err(err) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": err}))).into_response();
+        }
+    };
+
+    // Fetch the source memory + verify caller owns it (or is the
+    // inbox target, or the row is unowned-legacy, or caller is
+    // "daemon" sentinel). Mirrors the gate shape in #938
+    // kg_invalidate and #937 delete_memory.
+    let source_owner: Option<(String, String)> = {
+        let lock = app.db.lock().await;
+        match db::get(&lock.0, &p.source_id) {
+            Ok(Some(mem)) => {
+                let owner = mem
+                    .metadata
+                    .get("agent_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let target = mem
+                    .metadata
+                    .get("target_agent_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                Some((owner, target))
+            }
+            Ok(None) => None,
+            Err(e) => {
+                tracing::error!("kg_timeline: source lookup failed: {e}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "internal server error"})),
+                )
+                    .into_response();
+            }
+        }
+    };
+    let Some((owner, target)) = source_owner else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "found": false,
+                "source_id": p.source_id,
+                "error": "source memory not found",
+            })),
+        )
+            .into_response();
+    };
+    let is_unowned_legacy = owner.is_empty();
+    if !is_unowned_legacy && owner != caller && target != caller && caller != "daemon" {
+        tracing::warn!(
+            target: "ai_memory::authz",
+            "GET /api/v1/kg/timeline 403: caller {caller} != owner {owner} (source_id={})",
+            p.source_id
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "caller does not own this source memory",
+                "owner": owner,
+                "caller": caller,
+                "source_id": p.source_id,
+            })),
         )
             .into_response();
     }
