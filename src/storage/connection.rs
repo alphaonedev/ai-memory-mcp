@@ -145,9 +145,10 @@ fn apply_check_constraint_triggers(conn: &Connection) -> Result<()> {
 #[cfg(feature = "sqlcipher")]
 fn apply_sqlcipher_key(conn: &Connection) -> Result<()> {
     let Ok(passphrase) = std::env::var("AI_MEMORY_DB_PASSPHRASE") else {
-        anyhow::bail!(
-            "sqlcipher build requires AI_MEMORY_DB_PASSPHRASE (set via --db-passphrase-file <path>)"
-        );
+        // #962 typed envelope — fatal boot refusal.
+        return Err(anyhow::Error::new(
+            super::error::StorageError::SqlcipherMissingPassphrase,
+        ));
     };
     // PRAGMA key must be the FIRST operation on a new connection. The
     // passphrase is quoted with SQL string-literal quoting rules.

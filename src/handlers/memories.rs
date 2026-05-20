@@ -125,9 +125,19 @@ pub async fn get_memory(
         }
         Ok(None) => (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response(),
         Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("ambiguous ID prefix") {
-                return (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response();
+            // #962 — typed downcast (was: msg.contains("ambiguous ID
+            // prefix")). The substrate emits `StorageError::AmbiguousIdPrefix`
+            // wrapped in anyhow; surface 400 with the typed Display body
+            // (byte-identical to the legacy bail!() string).
+            if matches!(
+                e.downcast_ref::<crate::storage::StorageError>(),
+                Some(crate::storage::StorageError::AmbiguousIdPrefix { .. })
+            ) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": e.to_string()})),
+                )
+                    .into_response();
             }
             tracing::error!("handler error: {e}");
             (
@@ -288,9 +298,19 @@ pub async fn update_memory(
             return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response();
         }
         Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("ambiguous ID prefix") {
-                return (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response();
+            // #962 — typed downcast (was: msg.contains("ambiguous ID
+            // prefix")). The substrate emits `StorageError::AmbiguousIdPrefix`
+            // wrapped in anyhow; surface 400 with the typed Display body
+            // (byte-identical to the legacy bail!() string).
+            if matches!(
+                e.downcast_ref::<crate::storage::StorageError>(),
+                Some(crate::storage::StorageError::AmbiguousIdPrefix { .. })
+            ) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": e.to_string()})),
+                )
+                    .into_response();
             }
             tracing::error!("handler error: {e}");
             return (
@@ -594,9 +614,19 @@ pub async fn delete_memory(
             return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response();
         }
         Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("ambiguous ID prefix") {
-                return (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response();
+            // #962 — typed downcast (was: msg.contains("ambiguous ID
+            // prefix")). The substrate emits `StorageError::AmbiguousIdPrefix`
+            // wrapped in anyhow; surface 400 with the typed Display body
+            // (byte-identical to the legacy bail!() string).
+            if matches!(
+                e.downcast_ref::<crate::storage::StorageError>(),
+                Some(crate::storage::StorageError::AmbiguousIdPrefix { .. })
+            ) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": e.to_string()})),
+                )
+                    .into_response();
             }
             tracing::error!("handler error: {e}");
             return (
@@ -980,9 +1010,19 @@ pub async fn promote_memory(
             return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response();
         }
         Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("ambiguous ID prefix") {
-                return (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response();
+            // #962 — typed downcast (was: msg.contains("ambiguous ID
+            // prefix")). The substrate emits `StorageError::AmbiguousIdPrefix`
+            // wrapped in anyhow; surface 400 with the typed Display body
+            // (byte-identical to the legacy bail!() string).
+            if matches!(
+                e.downcast_ref::<crate::storage::StorageError>(),
+                Some(crate::storage::StorageError::AmbiguousIdPrefix { .. })
+            ) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": e.to_string()})),
+                )
+                    .into_response();
             }
             tracing::error!("handler error: {e}");
             return (
