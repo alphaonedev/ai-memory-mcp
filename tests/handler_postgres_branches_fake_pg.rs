@@ -1437,9 +1437,15 @@ async fn pg_import_memories_happy() {
         "links": []
     });
     let (status, v) = post_json(&router, "/api/v1/import", body).await;
-    assert!(
-        status == StatusCode::OK || status == StatusCode::CREATED,
-        "import pg: {status} body={v}",
+    // #956 (security-medium, 2026-05-20) — `/api/v1/import` admin-gated;
+    // empty-allowlist fixture correctly rejects anonymous caller. The
+    // pg-branch row walk + SAL store integration is exercised against
+    // real postgres + admin-allowlisted caller at
+    // `serve_postgres_continuation3.rs::import_lands_memories_via_sal`.
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "#956: empty-allowlist pg-branch import MUST reject; body={v}",
     );
 }
 
@@ -1467,10 +1473,8 @@ async fn pg_import_memories_with_invalid_member_records_error() {
         }],
     });
     let (status, v) = post_json(&router, "/api/v1/import", body).await;
-    assert!(
-        status == StatusCode::OK || status == StatusCode::CREATED,
-        "{v}"
-    );
+    // #956 — empty-allowlist pg-branch import correctly rejects.
+    assert_eq!(status, StatusCode::FORBIDDEN, "{v}");
 }
 
 #[tokio::test]

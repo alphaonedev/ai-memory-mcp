@@ -1789,6 +1789,9 @@ async fn http_export_returns_envelope() {
 
 #[tokio::test]
 async fn http_import_happy() {
+    // #956 (security-medium, 2026-05-20) — `/api/v1/import` admin-gated;
+    // empty-allowlist fixture correctly rejects anonymous caller.
+    // Happy path covered by `tests/import_memories_admin_gate_956.rs`.
     let (router, _f) = build_router_fixture();
     let body = json!({
         "memories": [{
@@ -1808,16 +1811,26 @@ async fn http_import_happy() {
             "reflection_depth": 0,
         }]
     });
-    let (status, _payload) = post_json(&router, "/api/v1/import", body).await;
-    assert!(status == StatusCode::OK || status == StatusCode::CREATED);
+    let (status, payload) = post_json(&router, "/api/v1/import", body).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "#956: empty-allowlist import MUST reject; body={payload}"
+    );
+    assert_eq!(
+        payload["error"].as_str(),
+        Some("admin role required"),
+        "body={payload}"
+    );
 }
 
 #[tokio::test]
 async fn http_import_empty_400_or_ok() {
+    // #956 — same admin-gate rejection.
     let (router, _f) = build_router_fixture();
     let body = json!({"memories": []});
     let (status, _payload) = post_json(&router, "/api/v1/import", body).await;
-    assert!(status == StatusCode::OK || status == StatusCode::BAD_REQUEST);
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
 // ---------------------------------------------------------------------------

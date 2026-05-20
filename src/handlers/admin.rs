@@ -591,14 +591,38 @@ pub async fn import_memories(
             .into_response();
     }
 
+    // #956 (security-medium, 2026-05-20) — admin-role gate + provenance
+    // restamp on `/api/v1/import`. Pre-#956 the handler resolved the
+    // caller from `X-Agent-Id` but then took `mem.metadata.agent_id`
+    // verbatim from the request body. Any authenticated caller could
+    // submit `{"memories":[{"metadata":{"agent_id":"alice", ...}}]}`
+    // and stamp alice's name on the imported row — same forge primitive
+    // #874/#901/#905/#907/#909 closed across other surfaces. Mirrors
+    // #957 (export) and the CLI `--trust-source`-off branch at
+    // `src/cli/io.rs:97-118`.
+    //
+    // 1. Gate via `handlers::admin_role::require_admin` — sanitised
+    //    `403 {"error":"admin role required"}` on non-admin callers,
+    //    audited via `governance::audit::record_decision` whether
+    //    admitted or rejected. Empty allowlist (v0.7.0 default) closes
+    //    the endpoint to every caller (safe-by-default).
+    //
+    // 2. For each admitted row, restamp `metadata.agent_id` to the
+    //    admin caller and preserve the body's original claim under
+    //    `metadata.imported_from_agent_id` (only when the original
+    //    differs from the caller — no provenance noise on identical
+    //    writes). Mirrors the CLI restamp contract exactly.
+    let caller = match crate::handlers::admin_role::require_admin(&app, &headers, "import_memories")
+    {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+
     // #913 (security-medium / SOC2, 2026-05-19) — admin/bulk-write audit.
     // Import landings can move thousands of memories in one call; emit a
     // single forensic-chain entry BEFORE the storage writes so the audit
     // trail captures the batch size + caller identity even on partial
     // success.
-    let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
-    let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
-        .unwrap_or_else(|_| "anonymous:invalid".to_string());
     crate::governance::audit::record_decision(
         &caller,
         "allow",
@@ -609,6 +633,34 @@ pub async fn import_memories(
             "link_count": body.links.as_ref().map(Vec::len).unwrap_or(0),
         }),
     );
+
+    // #956 provenance restamp closure. Applied per-row on both
+    // backends BEFORE validate / governance / store so all downstream
+    // consumers (governance enforce, store.store / db::insert) see
+    // the admin caller as the row's principal.
+    let restamp_agent_id = |mem: &mut Memory| {
+        if !mem.metadata.is_object() {
+            mem.metadata = json!({});
+        }
+        if let Some(obj) = mem.metadata.as_object_mut() {
+            let original = obj
+                .get("agent_id")
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string);
+            obj.insert(
+                "agent_id".to_string(),
+                serde_json::Value::String(caller.clone()),
+            );
+            if let Some(orig) = original
+                && orig != caller
+            {
+                obj.insert(
+                    "imported_from_agent_id".to_string(),
+                    serde_json::Value::String(orig),
+                );
+            }
+        }
+    };
     // v0.7.0 Wave-3 Continuation 3 (Phase 18) — postgres-backed daemons
     // route through the SAL trait. We re-use `app.store.store(...)` per
     // memory (the upsert path that preserves agent_id immutability) and
@@ -630,7 +682,9 @@ pub async fn import_memories(
         let mut imported = 0usize;
         let mut errors: Vec<String> = Vec::new();
         let mut pending: Vec<serde_json::Value> = Vec::new();
-        for mem in body.memories {
+        for mut mem in body.memories {
+            // #956 — restamp before validate / governance / store.
+            restamp_agent_id(&mut mem);
             if let Err(e) = validate::validate_memory(&mem) {
                 // Issue #851: never echo the raw `e` to the wire paired
                 // with the user-supplied id (the combo reflects the
@@ -655,11 +709,12 @@ pub async fn import_memories(
             // bulk-import surface (same A2A bypass cluster fold-A2A1.2
             // closed on delete/promote/create paths).
             use crate::models::GovernanceDecision;
+            // Post-#956 restamp, agent_id is always the admin caller.
             let agent_id = mem
                 .metadata
                 .get("agent_id")
                 .and_then(|v| v.as_str())
-                .unwrap_or("http-import");
+                .unwrap_or(caller.as_str());
             let payload_for_pending = serde_json::to_value(&mem).unwrap_or_else(|_| json!({}));
             match app
                 .store
@@ -729,7 +784,9 @@ pub async fn import_memories(
     let lock = app.db.lock().await;
     let mut imported = 0usize;
     let mut errors = Vec::new();
-    for mem in body.memories {
+    for mut mem in body.memories {
+        // #956 — restamp before validate / insert.
+        restamp_agent_id(&mut mem);
         if let Err(e) = validate::validate_memory(&mem) {
             // Issue #851: never echo `<id>: <validate error>` paired —
             // the combo reflects the caller's request and the inner

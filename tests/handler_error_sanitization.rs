@@ -190,14 +190,21 @@ async fn import_with_invalid_memory_returns_sanitized_errors() {
         .body(Body::from(body.to_string()))
         .unwrap();
     let (status, body) = run_request(router, req).await;
+    // #956 (security-medium, 2026-05-20) — `/api/v1/import` is now
+    // admin-gated. The fixture ships with an empty admin allowlist
+    // (v0.7.0 safe-by-default), so this anonymous request correctly
+    // returns 403 with the sanitised `{"error":"admin role required"}`
+    // body. The suite's invariants — no FORBIDDEN substrings, no
+    // leak of the user-supplied memory id — still hold against the
+    // 403 body. The pre-#956 partial-error sanitisation path (200
+    // with sanitised `errors[]`) is covered by
+    // `tests/import_memories_admin_gate_956.rs`.
     assert_eq!(
         status,
-        StatusCode::OK,
-        "import returns 200 with partial errors: body={body}"
+        StatusCode::FORBIDDEN,
+        "#956: empty-allowlist import MUST reject; body={body}"
     );
     assert_no_leaks("import_with_invalid_memory", &body);
-    // Echoing the user-supplied memory id paired with the raw error
-    // would be observable here; pin its absence specifically.
     assert!(
         !body.contains("00000000-0000-0000-0000-000000000001"),
         "import response leaks the user-supplied memory id: {body}"

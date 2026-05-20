@@ -5558,10 +5558,14 @@ async fn http_import_memories_oversized_batch_rejected() {
 #[tokio::test]
 async fn http_import_memories_skips_invalid_rows() {
     // One valid + one invalid (missing required fields) → 200 with errors.
+    // #956 (security-medium, 2026-05-20) — `/api/v1/import` is now
+    // admin-gated; route through `test_app_state_with_admin` + matching
+    // `X-Agent-Id` header. Non-admin rejection surface covered by
+    // `tests/import_memories_admin_gate_956.rs`.
     let state = test_state();
     let app = Router::new()
         .route("/api/v1/import", axum_post(import_memories))
-        .with_state(test_app_state(state));
+        .with_state(test_app_state_with_admin(state, "ops:admin"));
     let valid = serde_json::json!({
         "id": Uuid::new_v4().to_string(),
         "tier": "long",
@@ -5604,6 +5608,7 @@ async fn http_import_memories_skips_invalid_rows() {
                 .uri("/api/v1/import")
                 .method("POST")
                 .header("content-type", "application/json")
+                .header("x-agent-id", "ops:admin")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -11531,10 +11536,12 @@ async fn http_export_memories_with_data_returns_count() {
 
 #[tokio::test]
 async fn http_import_memories_inserts_valid_rows() {
+    // #956 — `/api/v1/import` is admin-gated; route through
+    // `test_app_state_with_admin` + matching `X-Agent-Id`.
     let state = test_state();
     let app = Router::new()
         .route("/api/v1/import", axum_post(import_memories))
-        .with_state(test_app_state(state));
+        .with_state(test_app_state_with_admin(state, "ops:admin"));
     let now = Utc::now().to_rfc3339();
     let mem = serde_json::json!({
         "id": Uuid::new_v4().to_string(),
@@ -11560,6 +11567,7 @@ async fn http_import_memories_inserts_valid_rows() {
                 .uri("/api/v1/import")
                 .method("POST")
                 .header("content-type", "application/json")
+                .header("x-agent-id", "ops:admin")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
