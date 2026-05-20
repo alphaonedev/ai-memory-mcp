@@ -1207,9 +1207,17 @@ async fn pg_run_gc_happy() {
 
 #[tokio::test]
 async fn pg_export_returns_envelope() {
+    // #957 (security-critical, 2026-05-20) — `/api/v1/export` is
+    // admin-gated. Empty allowlist (the fixture default) rejects
+    // every caller. The admin-admit path is covered by
+    // `tests/export_memories_admin_gate_957.rs`.
     let (router, _f) = build_fake_pg_router();
-    let (status, _v) = get_uri(&router, "/api/v1/export").await;
-    assert_eq!(status, StatusCode::OK);
+    let (status, v) = get_uri(&router, "/api/v1/export").await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "#957: empty-allowlist pg export MUST reject; body={v}"
+    );
 }
 
 // ---------------------------------------------------------------------------

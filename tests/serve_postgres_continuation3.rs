@@ -74,7 +74,13 @@ async fn build_postgres_app_state(url: &str) -> AppState {
         autonomous_hooks: false,
         recall_scope: Arc::new(None),
         deferred_audit_queue: Arc::new(None),
-        admin_agent_ids: Arc::new(Vec::new()),
+        // #957 (security-critical, 2026-05-20) — `/api/v1/export`
+        // is admin-gated. Pre-seed the test's pg_test_client
+        // agent id as admin so the continuation-3 export test
+        // (and any future admin-class endpoint tests) can drive
+        // the happy path. The role-gate semantic itself is
+        // covered by `tests/export_memories_admin_gate_957.rs`.
+        admin_agent_ids: Arc::new(vec!["ai:cont3-test".to_string()]),
     }
 }
 

@@ -500,12 +500,47 @@ pub async fn run_gc(State(app): State<AppState>, headers: HeaderMap) -> impl Int
     }
 }
 
-pub async fn export_memories(State(app): State<AppState>) -> impl IntoResponse {
+pub async fn export_memories(State(app): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    // #957 (security-critical, 2026-05-20) — admin-role gate.
+    // Pre-#957 the handler took NO headers, accepted no caller, and
+    // dispatched directly to the export path which intentionally
+    // bypasses every visibility filter (postgres SAL branch uses
+    // `for_agent("export")` — see `src/store/postgres.rs:8577` — and
+    // the sqlite branch reads the whole `memories` table via
+    // `db::export_all`). The legacy `api_key_auth` middleware passes
+    // through when `api_key` is unset (the default — see #946 RCA),
+    // so the endpoint was open by default and any authenticated
+    // caller could dump every memory across every owner, every
+    // namespace, every scope (including `scope=private`) plus every
+    // link in the graph.
+    //
+    // Fix: require the caller's resolved `agent_id` (from
+    // `X-Agent-Id`, the same primitive every other handler uses)
+    // to appear in the operator-configured `[admin].agent_ids`
+    // allowlist before the corpus dump fires. Non-admin callers
+    // get `403 Forbidden` with the sanitised
+    // `{"error":"admin role required"}` body — intentionally
+    // generic so the rejection does not leak the allowlist
+    // configuration. The role decision is forensic-chain audited
+    // via `governance::audit::record_decision` whether admitted
+    // or rejected (`handlers::admin_role::require_admin`).
+    let caller = match crate::handlers::admin_role::require_admin(&app, &headers, "export_memories")
+    {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+
     // v0.7.0 Wave-3 Continuation 3 (Phase 18) — postgres-backed daemons
     // route through the SAL trait. Wire shape preserved:
-    // `{memories, links, count, exported_at}`.
+    // `{memories, links, count, exported_at}`. The admin gate above
+    // is the load-bearing authorisation check; the SAL-level
+    // `for_admin(caller)` context just preserves the full-fidelity
+    // backup semantic (admin export round-trips every row regardless
+    // of `metadata.scope`).
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
+        let _ = &caller; // resolved + audited above; SAL methods are
+        // owner-blind under the operator export contract.
         let mems = match app.store.export_memories().await {
             Ok(v) => v,
             Err(e) => return store_err_to_response(e),
@@ -525,6 +560,7 @@ pub async fn export_memories(State(app): State<AppState>) -> impl IntoResponse {
         .into_response();
     }
 
+    let _ = &caller;
     let lock = app.db.lock().await;
     match (db::export_all(&lock.0), db::export_links(&lock.0)) {
         (Ok(memories), Ok(links)) => {
