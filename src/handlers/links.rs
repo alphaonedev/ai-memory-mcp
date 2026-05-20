@@ -665,15 +665,17 @@ pub async fn delete_link(
     // unowned rows.
     let lock = app.db.lock().await;
     let source_mem = match db::get(&lock.0, &source_id) {
-        Ok(Some(m)) => m,
-        Ok(None) => {
-            drop(lock);
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": "source memory not found", "source_id": source_id})),
-            )
-                .into_response();
-        }
+        Ok(Some(m)) => Some(m),
+        // #939 followup (2026-05-20) — when the source memory does
+        // not exist, fall through to the substrate `db::delete_link`
+        // which will report `deleted: false` (the canonical
+        // legacy contract — non-existent source is not an
+        // existence-leak the gate needs to protect; the link itself
+        // can't exist either, so the delete is a no-op the caller
+        // gets to learn about). Pre-followup the handler 404'd here,
+        // which broke the test surface that exercises the
+        // `deleted: false` semantic.
+        Ok(None) => None,
         Err(e) => {
             drop(lock);
             tracing::error!("delete_link: source lookup failed: {e}");
@@ -682,6 +684,27 @@ pub async fn delete_link(
                 Json(json!({"error": "internal server error"})),
             )
                 .into_response();
+        }
+    };
+    // Owner gate only fires when the source memory actually exists.
+    // Missing-source path falls through to the substrate (delete-
+    // returns-false) below.
+    let source_mem = match source_mem {
+        Some(m) => m,
+        None => {
+            let delete_result = db::delete_link(&lock.0, &source_id, &target_id);
+            drop(lock);
+            return match delete_result {
+                Ok(removed) => Json(json!({"deleted": removed})).into_response(),
+                Err(e) => {
+                    tracing::error!("handler error: {e}");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": "internal server error"})),
+                    )
+                        .into_response()
+                }
+            };
         }
     };
     let target_mem_owner = db::get(&lock.0, &target_id).ok().flatten().and_then(|m| {

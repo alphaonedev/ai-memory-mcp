@@ -215,7 +215,19 @@ pub async fn register_agent(
     }
 }
 
-pub async fn list_agents(State(app): State<AppState>) -> impl IntoResponse {
+pub async fn list_agents(
+    State(app): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    // #946 SECURITY-medium (Track A QC sweep, 2026-05-20) — admin-
+    // only gate. Pre-fix any caller could enumerate the full NHI
+    // population + agent capabilities + registration timestamps.
+    // The handler uses `CallerContext::for_admin` below to bypass
+    // the SAL visibility filter; that's correct for operators but
+    // was unauthenticated. Mirror the #957 admin pattern.
+    if let Err(resp) = crate::handlers::admin_role::require_admin(&app, &headers, "list_agents") {
+        return resp;
+    }
     // v0.7.0 Wave-3 Continuation — postgres-backed daemons project from
     // the `_agents` namespace via the SAL `list` trait method, mirroring
     // how sqlite's `db::list_agents` reads from the same namespace.
@@ -371,6 +383,16 @@ pub async fn quota_status_handler(
     }
 
     // No agent_id supplied — operator-facing list path.
+    //
+    // #960 SECURITY-medium (Track A QC sweep, 2026-05-20) — admin-
+    // only gate on the list path. Pre-fix any HTTP caller posting
+    // `{}` could enumerate the full per-agent quota table. Sibling
+    // of #909 (per-agent path) — same disclosure shape.
+    if let Err(resp) =
+        crate::handlers::admin_role::require_admin(&app, &headers, "quota_status_list")
+    {
+        return resp;
+    }
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         return match app.store.quota_status_list().await {
@@ -396,7 +418,16 @@ pub async fn quota_status_handler(
     }
 }
 
-pub async fn get_stats(State(app): State<AppState>) -> impl IntoResponse {
+pub async fn get_stats(
+    State(app): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    // #946 SECURITY-medium (Track A QC sweep, 2026-05-20) — admin-only
+    // gate. Pre-fix any caller could enumerate full per-tier counts +
+    // per-namespace stats + WAL counters; admin-class endpoint.
+    if let Err(resp) = crate::handlers::admin_role::require_admin(&app, &headers, "get_stats") {
+        return resp;
+    }
     // v0.7.0 Wave-3 Continuation — postgres-backed daemons project a
     // basic count from the SAL `list` method. Detailed per-tier
     // breakdown + DB file size + WAL counters are sqlite-only fields
