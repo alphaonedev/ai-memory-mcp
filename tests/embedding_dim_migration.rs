@@ -52,12 +52,12 @@ use common::postgres_url;
 /// `reset_schema` then bootstrap the schema at their target dim.
 /// Without serialization they race: test A drops tables, test B drops
 /// (no-op), test B bootstraps at 768, test A bootstraps at 384 — but
-/// connect_with_dim is a NO-OP on an existing schema, so test A sees
+/// `connect_with_dim` is a NO-OP on an existing schema, so test A sees
 /// 768 from test B's bootstrap and asserts fail. The race was
 /// observable but uncommon until the connect-time advisory lock
 /// (`MIGRATION_ADVISORY_LOCK_KEY`) introduced a small queueing delay
 /// that widened the interleaving window. Holding this mutex from
-/// reset_schema through the assertion keeps each test's
+/// `reset_schema` through the assertion keeps each test's
 /// (reset → bootstrap → verify) sequence atomic relative to peers.
 static SUITE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
