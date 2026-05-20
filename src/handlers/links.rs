@@ -765,7 +765,11 @@ pub async fn delete_link(
     }
 }
 
-pub async fn get_links(State(app): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
+pub async fn get_links(
+    State(app): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
     if let Err(e) = validate::validate_id(&id) {
         return (
             StatusCode::BAD_REQUEST,
@@ -773,6 +777,19 @@ pub async fn get_links(State(app): State<AppState>, Path(id): Path<String>) -> i
         )
             .into_response();
     }
+
+    // #959 SECURITY-medium (Track A QC sweep, 2026-05-20) — resolve
+    // caller for the visibility post-filter on the edge set. Pre-fix
+    // an attacker who knew / guessed a victim's memory id could
+    // enumerate that memory's outgoing link topology regardless of
+    // whether either endpoint memory was scope=private owned by a
+    // different agent. Admin callers bypass the filter.
+    let caller = {
+        let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+        crate::identity::resolve_http_agent_id(None, header_agent_id)
+            .unwrap_or_else(|_| format!("anonymous:req-{}", uuid::Uuid::new_v4()))
+    };
+    let caller_is_admin = crate::handlers::admin_role::is_admin_caller(&app, &caller);
 
     // v0.7.0 Wave-3 — Postgres-backed daemons walk `list_links` (no
     // namespace filter — the same projection as the legacy
@@ -788,7 +805,36 @@ pub async fn get_links(State(app): State<AppState>, Path(id): Path<String>) -> i
                     .into_iter()
                     .filter(|l| l.source_id == id || l.target_id == id)
                     .collect();
-                Json(json!({"links": edges})).into_response()
+                let visible = if caller_is_admin {
+                    edges
+                } else {
+                    let ctx = crate::store::CallerContext::for_agent(&caller);
+                    let mut keep: Vec<_> = Vec::with_capacity(edges.len());
+                    for link in edges {
+                        // The SAL `get` already applies its own #910
+                        // visibility filter, so a private-blocked
+                        // endpoint surfaces as Err(StoreError::NotFound)
+                        // or Err(StoreError::Forbidden). Either way the
+                        // edge gets dropped from the visible set.
+                        let src_ok = app
+                            .store
+                            .get(&ctx, &link.source_id)
+                            .await
+                            .map(|m| crate::visibility::is_visible_to_caller(&m, &caller))
+                            .unwrap_or(false);
+                        let tgt_ok = app
+                            .store
+                            .get(&ctx, &link.target_id)
+                            .await
+                            .map(|m| crate::visibility::is_visible_to_caller(&m, &caller))
+                            .unwrap_or(false);
+                        if src_ok && tgt_ok {
+                            keep.push(link);
+                        }
+                    }
+                    keep
+                };
+                Json(json!({"links": visible})).into_response()
             }
             Err(e) => store_err_to_response(e),
         };
@@ -796,7 +842,37 @@ pub async fn get_links(State(app): State<AppState>, Path(id): Path<String>) -> i
 
     let lock = app.db.lock().await;
     match db::get_links(&lock.0, &id) {
-        Ok(links) => Json(json!({"links": links})).into_response(),
+        Ok(links) => {
+            let visible = if caller_is_admin {
+                links
+            } else {
+                // sqlite-legacy: post-filter via in-process db::get +
+                // is_visible_to_caller on each endpoint. The unconditional
+                // `is_some_and(|m| visible)` returns false when the row is
+                // missing entirely — same posture as the postgres branch
+                // above. Note an attacker who can correctly guess a memory
+                // id AND see that the row exists at all is already past
+                // a more sensitive surface; this filter is a defence-in-
+                // depth on the graph-edge surface.
+                links
+                    .into_iter()
+                    .filter(|link| {
+                        let src_ok = db::get(&lock.0, &link.source_id)
+                            .ok()
+                            .flatten()
+                            .as_ref()
+                            .is_some_and(|m| crate::visibility::is_visible_to_caller(m, &caller));
+                        let tgt_ok = db::get(&lock.0, &link.target_id)
+                            .ok()
+                            .flatten()
+                            .as_ref()
+                            .is_some_and(|m| crate::visibility::is_visible_to_caller(m, &caller));
+                        src_ok && tgt_ok
+                    })
+                    .collect()
+            };
+            Json(json!({"links": visible})).into_response()
+        }
         Err(e) => {
             tracing::error!("handler error: {e}");
             (
