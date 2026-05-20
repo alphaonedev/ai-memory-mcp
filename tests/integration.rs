@@ -10748,6 +10748,8 @@ fn federation_cfg_for_test(
         sender_agent_id: "ai:fed-test".to_string(),
         api_key: None,
         signing_key: None,
+        #[cfg(feature = "sal")]
+        dlq_sink: None,
     }
 }
 

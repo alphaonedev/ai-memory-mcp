@@ -150,6 +150,8 @@ fn federation_cfg_for_test(peer_urls: &[String], quorum_writes: usize) -> Federa
         sender_agent_id: "ai:fold-a2a1-6-test".to_string(),
         api_key: None,
         signing_key: None,
+        #[cfg(feature = "sal")]
+        dlq_sink: None,
     }
 }
 

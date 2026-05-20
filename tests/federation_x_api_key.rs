@@ -180,6 +180,8 @@ fn fed_cfg(
         sender_agent_id: "ai:fanout-leader".to_string(),
         api_key,
         signing_key: None,
+        #[cfg(feature = "sal")]
+        dlq_sink: None,
     }
 }
 
