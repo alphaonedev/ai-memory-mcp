@@ -753,21 +753,51 @@ async fn create_memory_postgres(
                 ));
             }
             // F-A2A1.6 (#700, S18) — postgres-branch federation fanout.
-            if let Some(fed) = app.federation.as_ref() {
-                let mut mem_echo = mem.clone();
-                mem_echo.id = id.clone();
-                match crate::federation::broadcast_store_quorum(fed, &mem_echo).await {
-                    Ok(tracker) => {
-                        if let Err(err) = crate::federation::finalise_quorum(&tracker) {
-                            // #869 — typed 503 envelope via the shared helper.
+            //
+            // #931 (v0.7.0 Track D, 2026-05-20) — debug-level entry
+            // logs on BOTH the `Some(fed)` and the `None` arm so the
+            // Track D Docker probe can distinguish "federation was
+            // never wired into AppState" from "federation was wired
+            // but emitted zero peer requests". Pre-#931 the postgres
+            // branch was completely silent on the broadcast path,
+            // so `docker logs alice | grep federation` came up empty
+            // even when `app.federation` resolved correctly and the
+            // broadcast actually fired against zero peers.
+            match app.federation.as_ref() {
+                Some(fed) => {
+                    tracing::debug!(
+                        target: "ai_memory::federation::sync",
+                        memory_id = %id,
+                        namespace = %mem.namespace,
+                        peer_count = fed.peer_count(),
+                        backend = "postgres",
+                        "create_memory_postgres: entering broadcast_store_quorum",
+                    );
+                    let mut mem_echo = mem.clone();
+                    mem_echo.id = id.clone();
+                    match crate::federation::broadcast_store_quorum(fed, &mem_echo).await {
+                        Ok(tracker) => {
+                            if let Err(err) = crate::federation::finalise_quorum(&tracker) {
+                                // #869 — typed 503 envelope via the shared helper.
+                                let payload =
+                                    crate::federation::QuorumNotMetPayload::from_err(&err);
+                                return super::quorum_not_met_response(&payload);
+                            }
+                        }
+                        Err(err) => {
                             let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
                             return super::quorum_not_met_response(&payload);
                         }
                     }
-                    Err(err) => {
-                        let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                        return super::quorum_not_met_response(&payload);
-                    }
+                }
+                None => {
+                    tracing::debug!(
+                        target: "ai_memory::federation::sync",
+                        memory_id = %id,
+                        namespace = %mem.namespace,
+                        backend = "postgres",
+                        "create_memory_postgres: federation disabled — skipping broadcast",
+                    );
                 }
             }
             // #869 — typed serialise helper so a 201 + `{}` never masks

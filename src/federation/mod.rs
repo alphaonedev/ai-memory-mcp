@@ -259,6 +259,84 @@ mod tests {
         assert!(calls >= 1);
     }
 
+    /// #931 (v0.7.0 Track D, 2026-05-20) — `broadcast_store_quorum`
+    /// MUST emit an info-level entry-line log on every call so the
+    /// silent-bypass case (function never invoked) is immediately
+    /// distinguishable from "function called but every peer failed".
+    /// Pre-#931 there was no entry log; the only federation tracing
+    /// was per-peer warn lines on a per-peer failure, so the Track D
+    /// Docker probe couldn't tell whether `app.federation` was
+    /// `None` (handler bypassed the call) or every peer 401'd.
+    ///
+    /// This test pins the wire wording `federation::broadcast: store`
+    /// and the structured fields. Any refactor that drops the log or
+    /// changes the phrase MUST update the Track D docker probe in
+    /// lockstep.
+    #[tokio::test]
+    async fn broadcast_emits_entry_line_log_for_track_d_grep() {
+        use tracing_subscriber::Registry;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Clone, Default)]
+        struct CaptureLayer(Arc<std::sync::Mutex<Vec<String>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct Visit<'a>(&'a mut Vec<String>);
+                impl tracing::field::Visit for Visit<'_> {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        if field.name() == "message" {
+                            self.0.push(format!("{value:?}"));
+                        }
+                    }
+                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                        if field.name() == "message" {
+                            self.0.push(value.to_string());
+                        }
+                    }
+                }
+                let mut local: Vec<String> = Vec::new();
+                event.record(&mut Visit(&mut local));
+                if let Ok(mut buf) = self.0.lock() {
+                    buf.extend(local);
+                }
+            }
+        }
+
+        let (url1, _) = spawn_mock_peer(MockBehaviour::Ack).await;
+        let cfg = build_config(vec![url1], 1, 1000);
+
+        let layer = CaptureLayer::default();
+        let messages = layer.0.clone();
+        let dispatch = tracing::Dispatch::new(Registry::default().with(layer));
+
+        // Bind the subscriber for the duration of the broadcast call.
+        // `set_default` is per-thread; the broadcast lives inside the
+        // current task, but spawned peer-fanout tasks may run on
+        // other tokio workers — we only need the entry-line log
+        // which fires on the calling thread before any spawn.
+        {
+            let _guard = tracing::dispatcher::set_default(&dispatch);
+            let _ = broadcast_store_quorum(&cfg, &sample_memory())
+                .await
+                .expect("broadcast must succeed");
+        }
+
+        let captured = messages.lock().unwrap().clone();
+        let joined = captured.join("\n");
+        assert!(
+            joined.contains("federation::broadcast: store"),
+            "expected entry-line log `federation::broadcast: store ... -> 1 peer(s)`; got:\n{joined}"
+        );
+    }
+
     #[tokio::test]
     async fn post_quorum_fanout_reaches_all_peers() {
         // Contract: once quorum is met, the background detach must still
