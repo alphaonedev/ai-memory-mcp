@@ -39,6 +39,15 @@ use crate::models::{
     PendingAction, SourceSpan, Stats, Taxonomy, TaxonomyNode, Tier, TierCount, namespace_ancestors,
 };
 
+// #962 — typed substrate-layer error envelope. Substrate code emits
+// `anyhow::Error::new(StorageError::…)` instead of the legacy
+// `anyhow::bail!("…")`; handlers downcast via
+// `MemoryError::from(anyhow::Error)` to map each variant to its
+// canonical HTTP status. The error-prefix constants live alongside the
+// typed enum so the Display impl and the prefix tokens stay in lockstep.
+mod error;
+pub use error::{LINK_CYCLE_ERR_PREFIX, LINK_PERMISSION_DENIED_ERR_PREFIX, LinkEnd, StorageError};
+
 // ---------------------------------------------------------------------------
 // v0.7.0 L1-6 Deliverable E — governance pre-write hook (issue #691)
 // ---------------------------------------------------------------------------
@@ -910,12 +919,17 @@ pub fn get_by_prefix(conn: &Connection, prefix: &str) -> Result<Option<Memory>> 
     match rows.len() {
         0 => Ok(None),
         1 => Ok(Some(rows.into_iter().next().expect("len checked"))),
-        n => {
+        _ => {
             let ids: Vec<String> = rows.iter().map(|m| m.id.clone()).collect();
-            anyhow::bail!(
-                "ambiguous ID prefix '{prefix}': {n} matches\n{}",
-                ids.join("\n")
-            );
+            // #962 — typed envelope; handler downcasts via
+            // `MemoryError::from(anyhow::Error)` to map to 400 BAD_REQUEST.
+            // The match-count is preserved in `candidates.len()` so the
+            // Display format ("ambiguous ID prefix 'X': N matches\n…")
+            // stays byte-identical to the legacy bail!() string.
+            Err(anyhow::Error::new(StorageError::AmbiguousIdPrefix {
+                prefix: prefix.to_string(),
+                candidates: ids,
+            }))
         }
     }
 }
@@ -1254,9 +1268,13 @@ pub fn update_with_expected_version(
                 )
                 .ok();
             if let Some(other_id) = other {
-                anyhow::bail!(
-                    "title '{new_title}' already exists in namespace '{namespace}' (memory {other_id})"
-                );
+                // #962 typed envelope — UniqueConflict surfaces as
+                // `MemoryError::Conflict` (HTTP 409).
+                return Err(anyhow::Error::new(StorageError::UniqueConflict {
+                    reason: format!(
+                        "title '{new_title}' already exists in namespace '{namespace}' (memory {other_id})"
+                    ),
+                }));
             }
             Err(anyhow::anyhow!("update failed with constraint violation"))
         }
@@ -1335,7 +1353,11 @@ pub fn update_with_archive_on_supersede(
     let mut stmt = conn.prepare("SELECT * FROM memories WHERE id = ?1")?;
     let mut rows = stmt.query_map(params![id], row_to_memory)?;
     let Some(Ok(existing)) = rows.next() else {
-        anyhow::bail!("memory not found: {id}");
+        // #962 typed envelope — 404 NOT_FOUND through MemoryError mapping.
+        return Err(anyhow::Error::new(StorageError::MemoryNotFound {
+            id: id.to_string(),
+            role: None,
+        }));
     };
     drop(rows);
     drop(stmt);
@@ -1412,7 +1434,11 @@ pub fn update_with_archive_on_supersede(
     // Step 1: archive the OLD row with reason='superseded'.
     let moved = archive_memory(conn, &archived_id, Some("superseded"))?;
     if !moved {
-        anyhow::bail!("supersede archive failed for {archived_id}");
+        // #962 typed envelope — substrate-internal fault (DB row vanished
+        // between read and write or row count drifted). Maps to 500.
+        return Err(anyhow::Error::new(StorageError::ArchiveSupersedeFailed {
+            archived_id: archived_id.clone(),
+        }));
     }
 
     // Step 2: insert the NEW row carrying the patched content.
@@ -1620,7 +1646,10 @@ pub fn forget_count(
     tier: Option<&Tier>,
 ) -> Result<usize> {
     if pattern.is_none() && namespace.is_none() && tier.is_none() {
-        anyhow::bail!("at least one of namespace, pattern, or tier is required");
+        // #962 typed envelope — 400 BAD_REQUEST via ValidationFailed.
+        return Err(anyhow::Error::new(StorageError::InvalidArgument {
+            reason: "at least one of namespace, pattern, or tier is required".to_string(),
+        }));
     }
     if let Some(pat) = pattern {
         let fts_query = sanitize_fts_query(pat, true);
@@ -1657,7 +1686,10 @@ pub fn forget(
     archive: bool,
 ) -> Result<usize> {
     if pattern.is_none() && namespace.is_none() && tier.is_none() {
-        anyhow::bail!("at least one of namespace, pattern, or tier is required");
+        // #962 typed envelope — 400 BAD_REQUEST via ValidationFailed.
+        return Err(anyhow::Error::new(StorageError::InvalidArgument {
+            reason: "at least one of namespace, pattern, or tier is required".to_string(),
+        }));
     }
 
     if archive {
@@ -2472,22 +2504,38 @@ pub fn promote_to_namespace(
     to_namespace: &str,
 ) -> Result<String> {
     if to_namespace.is_empty() {
-        anyhow::bail!("to_namespace cannot be empty");
+        // #962 typed envelope.
+        return Err(anyhow::Error::new(StorageError::InvalidArgument {
+            reason: "to_namespace cannot be empty".to_string(),
+        }));
     }
-    let source = get(conn, source_id)?
-        .ok_or_else(|| anyhow::anyhow!("source memory not found: {source_id}"))?;
+    let source = get(conn, source_id)?.ok_or_else(|| {
+        // #962 typed envelope. `Source` here labels the promotion source,
+        // not a link end, but the user-facing message ("source memory
+        // not found: …") is preserved via the LinkEnd::Source Display arm.
+        anyhow::Error::new(StorageError::MemoryNotFound {
+            id: source_id.to_string(),
+            role: Some(LinkEnd::Source),
+        })
+    })?;
     if to_namespace == source.namespace {
-        anyhow::bail!(
-            "to_namespace must be a proper ancestor of the memory's namespace (got self: {})",
-            source.namespace
-        );
+        // #962 typed envelope.
+        return Err(anyhow::Error::new(StorageError::InvalidArgument {
+            reason: format!(
+                "to_namespace must be a proper ancestor of the memory's namespace (got self: {})",
+                source.namespace
+            ),
+        }));
     }
     let ancestors = namespace_ancestors(&source.namespace);
     if !ancestors.iter().any(|a| a == to_namespace) {
-        anyhow::bail!(
-            "to_namespace '{to_namespace}' is not an ancestor of '{}' (ancestors: {ancestors:?})",
-            source.namespace
-        );
+        // #962 typed envelope.
+        return Err(anyhow::Error::new(StorageError::InvalidArgument {
+            reason: format!(
+                "to_namespace '{to_namespace}' is not an ancestor of '{}' (ancestors: {ancestors:?})",
+                source.namespace
+            ),
+        }));
     }
 
     let now = Utc::now().to_rfc3339();
@@ -2575,10 +2623,15 @@ pub fn next_versioned_title(
             return Ok(candidate);
         }
     }
-    anyhow::bail!(
-        "could not find a free versioned title for '{base_title}' in namespace '{namespace}' \
-         within {MAX_VERSION_SUFFIX} attempts"
-    )
+    // #962 typed envelope — UniqueConflict (the substrate could not
+    // mint a non-colliding versioned title within the cap). Caller is
+    // expected to retry with a different base title or raise the cap.
+    Err(anyhow::Error::new(StorageError::UniqueConflict {
+        reason: format!(
+            "could not find a free versioned title for '{base_title}' in namespace '{namespace}' \
+             within {MAX_VERSION_SUFFIX} attempts"
+        ),
+    }))
 }
 
 /// Detect potential contradictions: memories in same namespace with similar titles.
@@ -2603,19 +2656,13 @@ pub fn find_contradictions(conn: &Connection, title: &str, namespace: &str) -> R
 }
 
 // --- Links ---
-
-/// v0.7.0 fix-campaign A3 (LINK-PARITY) — error prefix used when
-/// `validate_link_pre_create` rejects a `reflects_on` edge because it
-/// would close a cycle in the reflection graph. HTTP / SAL response
-/// mappers look for this prefix to surface 409 CONFLICT; MCP surfaces
-/// it as a plain text error. Centralised so all three entry points
-/// stay in lockstep.
-pub const LINK_CYCLE_ERR_PREFIX: &str = "link refused: reflection cycle";
-
-/// v0.7.0 fix-campaign A3 (LINK-PARITY) — error prefix used when the
-/// K9 permission pipeline returns `Deny` for a link write. HTTP / SAL
-/// response mappers translate this to 403 FORBIDDEN.
-pub const LINK_PERMISSION_DENIED_ERR_PREFIX: &str = "link denied by permission rule";
+//
+// v0.7.0 fix-campaign A3 (LINK-PARITY) error prefix constants
+// (`LINK_CYCLE_ERR_PREFIX`, `LINK_PERMISSION_DENIED_ERR_PREFIX`) moved
+// to `super::error` under #962 so they stay co-located with the typed
+// `StorageError` variants whose Display impl emits them. Re-exported
+// at the module root above for `db::LINK_CYCLE_ERR_PREFIX` path
+// stability.
 
 /// v0.7.0 fix-campaign A3 (LINK-PARITY) — would creating
 /// `source_id --reflects_on--> target_id` close a cycle in the
@@ -2736,10 +2783,11 @@ pub fn validate_link_pre_create(
     // DAG invariant — the other four relations are intentionally
     // allowed to form cycles (e.g. mutual `related_to`).
     if relation == "reflects_on" && would_create_reflection_cycle(conn, source_id, target_id)? {
-        anyhow::bail!(
-            "{LINK_CYCLE_ERR_PREFIX}: \
-             {source_id} --reflects_on--> {target_id} would close a cycle"
-        );
+        // #962 typed envelope. Display preserves `LINK_CYCLE_ERR_PREFIX`.
+        return Err(anyhow::Error::new(StorageError::LinkReflectionCycle {
+            source_id: source_id.to_string(),
+            target_id: target_id.to_string(),
+        }));
     }
 
     // Pass 2: K9 permission eval. Skip when the caller has already
@@ -2768,15 +2816,19 @@ pub fn validate_link_pre_create(
         match Permissions::evaluate(&ctx, &[]) {
             Decision::Allow | Decision::Modify(_) => {}
             Decision::Deny(reason) => {
-                anyhow::bail!("{LINK_PERMISSION_DENIED_ERR_PREFIX}: {reason}");
+                // #962 typed envelope. Display preserves
+                // `LINK_PERMISSION_DENIED_ERR_PREFIX`.
+                return Err(anyhow::Error::new(StorageError::LinkPermissionDenied {
+                    reason,
+                }));
             }
             Decision::Ask(prompt) => {
                 // Storage layer has no Ask channel; surface as Deny.
                 // MCP path handles Ask directly via its own pre-call
                 // evaluate (returns the `{"status":"ask"}` envelope).
-                anyhow::bail!(
-                    "{LINK_PERMISSION_DENIED_ERR_PREFIX}: ask deferred to storage layer ({prompt})"
-                );
+                return Err(anyhow::Error::new(StorageError::LinkPermissionDenied {
+                    reason: format!("ask deferred to storage layer ({prompt})"),
+                }));
             }
         }
     }
@@ -2862,7 +2914,11 @@ pub fn create_link_signed(
         )
         .unwrap_or(false);
     if !source_exists {
-        anyhow::bail!("source memory not found: {source_id}");
+        // #962 typed envelope — MemoryNotFound{role=Source}.
+        return Err(anyhow::Error::new(StorageError::MemoryNotFound {
+            id: source_id.to_string(),
+            role: Some(LinkEnd::Source),
+        }));
     }
     let target_exists: bool = conn
         .query_row(
@@ -2872,7 +2928,11 @@ pub fn create_link_signed(
         )
         .unwrap_or(false);
     if !target_exists {
-        anyhow::bail!("target memory not found: {target_id}");
+        // #962 typed envelope — MemoryNotFound{role=Target}.
+        return Err(anyhow::Error::new(StorageError::MemoryNotFound {
+            id: target_id.to_string(),
+            role: Some(LinkEnd::Target),
+        }));
     }
     // Schema v15 (Pillar 2 / Stream B) added `valid_from` for temporal
     // KG queries. Backfill on migration handled legacy rows; here we
@@ -3121,7 +3181,11 @@ pub fn create_link_inbound(conn: &Connection, link: &MemoryLink, attest_level: &
         )
         .unwrap_or(false);
     if !source_exists {
-        anyhow::bail!("source memory not found: {}", link.source_id);
+        // #962 typed envelope — MemoryNotFound{role=Source}.
+        return Err(anyhow::Error::new(StorageError::MemoryNotFound {
+            id: link.source_id.clone(),
+            role: Some(LinkEnd::Source),
+        }));
     }
     let target_exists: bool = conn
         .query_row(
@@ -3131,7 +3195,11 @@ pub fn create_link_inbound(conn: &Connection, link: &MemoryLink, attest_level: &
         )
         .unwrap_or(false);
     if !target_exists {
-        anyhow::bail!("target memory not found: {}", link.target_id);
+        // #962 typed envelope — MemoryNotFound{role=Target}.
+        return Err(anyhow::Error::new(StorageError::MemoryNotFound {
+            id: link.target_id.clone(),
+            role: Some(LinkEnd::Target),
+        }));
     }
 
     let now = Utc::now().to_rfc3339();
@@ -3416,7 +3484,13 @@ pub fn consolidate(
                         );
                     }
                 }
-                None => anyhow::bail!("memory not found: {id}"),
+                None => {
+                    // #962 typed envelope.
+                    return Err(anyhow::Error::new(StorageError::MemoryNotFound {
+                        id: id.to_string(),
+                        role: None,
+                    }));
+                }
             }
         }
         all_tags.sort();
@@ -4281,9 +4355,12 @@ pub fn entity_register(
             Err(e) => return Err(e.into()),
         };
         if collision.is_some() {
-            anyhow::bail!(
-                "entity_register: title '{canonical_name}' in namespace '{namespace}' is already used by a non-entity memory"
-            );
+            // #962 typed envelope — UniqueConflict (409).
+            return Err(anyhow::Error::new(StorageError::UniqueConflict {
+                reason: format!(
+                    "entity_register: title '{canonical_name}' in namespace '{namespace}' is already used by a non-entity memory"
+                ),
+            }));
         }
 
         // Build metadata: caller-supplied object merged, kind forced
@@ -4800,12 +4877,18 @@ pub fn kg_query(
     use crate::models::KgQueryNode;
 
     if max_depth == 0 {
-        anyhow::bail!("max_depth must be >= 1");
+        // #962 typed envelope.
+        return Err(anyhow::Error::new(StorageError::InvalidArgument {
+            reason: "max_depth must be >= 1".to_string(),
+        }));
     }
     if max_depth > KG_QUERY_MAX_SUPPORTED_DEPTH {
-        anyhow::bail!(
-            "max_depth={max_depth} exceeds supported depth={KG_QUERY_MAX_SUPPORTED_DEPTH}"
-        );
+        // #962 typed envelope.
+        return Err(anyhow::Error::new(StorageError::InvalidArgument {
+            reason: format!(
+                "max_depth={max_depth} exceeds supported depth={KG_QUERY_MAX_SUPPORTED_DEPTH}"
+            ),
+        }));
     }
 
     // Empty allowlist == "no agents are trusted" — short-circuit so we
@@ -5022,12 +5105,18 @@ pub fn find_paths(
 ) -> Result<Vec<Vec<String>>> {
     let depth = max_depth.unwrap_or(FIND_PATHS_DEFAULT_DEPTH);
     if depth == 0 {
-        anyhow::bail!("max_depth must be >= 1");
+        // #962 typed envelope.
+        return Err(anyhow::Error::new(StorageError::InvalidArgument {
+            reason: "max_depth must be >= 1".to_string(),
+        }));
     }
     if depth > FIND_PATHS_MAX_DEPTH {
-        anyhow::bail!(
-            "max_depth={depth} exceeds supported depth={FIND_PATHS_MAX_DEPTH} (FIND_PATHS_MAX_DEPTH); contact maintainers to raise this bound after benchmarking"
-        );
+        // #962 typed envelope.
+        return Err(anyhow::Error::new(StorageError::InvalidArgument {
+            reason: format!(
+                "max_depth={depth} exceeds supported depth={FIND_PATHS_MAX_DEPTH} (FIND_PATHS_MAX_DEPTH); contact maintainers to raise this bound after benchmarking"
+            ),
+        }));
     }
     let cap = max_results
         .unwrap_or(FIND_PATHS_DEFAULT_LIMIT)
@@ -5506,9 +5595,10 @@ pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
             )
             .unwrap_or(false);
         if active_exists {
-            anyhow::bail!(
-                "cannot restore: memory {id} already exists in active table (would overwrite)"
-            );
+            // #962 typed envelope — ArchiveRestoreCollision (409).
+            return Err(anyhow::Error::new(StorageError::ArchiveRestoreCollision {
+                id: id.to_string(),
+            }));
         }
         // Validate archived metadata before restoring
         let archived_metadata: String = conn
@@ -5610,9 +5700,10 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
             )
             .unwrap_or(false);
         if active_exists {
-            anyhow::bail!(
-                "cannot restore: memory {id} already exists in active table (would overwrite)"
-            );
+            // #962 typed envelope — ArchiveRestoreCollision (409).
+            return Err(anyhow::Error::new(StorageError::ArchiveRestoreCollision {
+                id: id.to_string(),
+            }));
         }
         // Validate archived metadata before restoring (mirror restore_archived).
         let archived_metadata: String = conn
@@ -5661,7 +5752,10 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
 pub fn purge_archive(conn: &Connection, older_than_days: Option<i64>) -> Result<usize> {
     match older_than_days {
         Some(days) if days < 0 => {
-            anyhow::bail!("older_than_days must be non-negative (got {days})");
+            // #962 typed envelope.
+            return Err(anyhow::Error::new(StorageError::InvalidArgument {
+                reason: format!("older_than_days must be non-negative (got {days})"),
+            }));
         }
         Some(days) => {
             let cutoff = (Utc::now() - chrono::Duration::days(days)).to_rfc3339();
@@ -5706,7 +5800,10 @@ pub fn purge_archive_for_caller(
 ) -> Result<usize> {
     match older_than_days {
         Some(days) if days < 0 => {
-            anyhow::bail!("older_than_days must be non-negative (got {days})");
+            // #962 typed envelope.
+            return Err(anyhow::Error::new(StorageError::InvalidArgument {
+                reason: format!("older_than_days must be non-negative (got {days})"),
+            }));
         }
         Some(days) => {
             let cutoff = (Utc::now() - chrono::Duration::days(days)).to_rfc3339();
@@ -7115,13 +7212,21 @@ pub fn set_namespace_standard(
     parent: Option<&str>,
 ) -> Result<()> {
     // Verify the memory exists (but allow cross-namespace — shared policy)
-    let _mem = get(conn, standard_id)?
-        .ok_or_else(|| anyhow::anyhow!("memory not found: {standard_id}"))?;
+    let _mem = get(conn, standard_id)?.ok_or_else(|| {
+        // #962 typed envelope — 404 NOT_FOUND.
+        anyhow::Error::new(StorageError::MemoryNotFound {
+            id: standard_id.to_string(),
+            role: None,
+        })
+    })?;
     // Resolve parent: explicit > auto-detect by `-` prefix > none
     let resolved_parent = match parent {
         Some(p) => {
             if p == namespace {
-                anyhow::bail!("namespace cannot be its own parent");
+                // #962 typed envelope.
+                return Err(anyhow::Error::new(StorageError::InvalidArgument {
+                    reason: "namespace cannot be its own parent".to_string(),
+                }));
             }
             Some(p.to_string())
         }
@@ -8000,12 +8105,13 @@ fn verify_payload_agent_id(pa: &PendingAction) -> Result<()> {
     if let Some(claimed) = payload_agent_id
         && claimed != pa.requested_by
     {
-        anyhow::bail!(
-            "approver-on-behalf laundering refused: payload agent_id '{claimed}' != requested_by '{requester}' (pending_id={pid})",
-            claimed = claimed,
-            requester = pa.requested_by,
-            pid = pa.id,
-        );
+        // #962 typed envelope — ApproverLaundering maps to 403 FORBIDDEN
+        // via MemoryError::RefusedByGovernance (S5-H4 contract).
+        return Err(anyhow::Error::new(StorageError::ApproverLaundering {
+            pending_id: pa.id.clone(),
+            claimed: claimed.to_string(),
+            requester: pa.requested_by.clone(),
+        }));
     }
     Ok(())
 }
@@ -8149,10 +8255,19 @@ pub fn approve_with_approver_type(
 /// transitions are audit-complete together).
 pub fn execute_pending_action(conn: &Connection, pending_id: &str) -> Result<Option<String>> {
     let Some(pa) = get_pending_action(conn, pending_id)? else {
-        anyhow::bail!("pending action not found: {pending_id}");
+        // #962 typed envelope — 404 NOT_FOUND.
+        return Err(anyhow::Error::new(StorageError::PendingActionNotFound {
+            pending_id: pending_id.to_string(),
+        }));
     };
     if pa.status != "approved" {
-        anyhow::bail!("cannot execute non-approved action (status={})", pa.status);
+        // #962 typed envelope — 409 CONFLICT (action is in the wrong state).
+        return Err(anyhow::Error::new(
+            StorageError::PendingActionStateInvalid {
+                pending_id: pending_id.to_string(),
+                status: pa.status.clone(),
+            },
+        ));
     }
     // S5-H4: refuse approver-on-behalf laundering BEFORE the side-effecting
     // write. Emit an audit row on refusal so the laundering attempt is
@@ -8164,8 +8279,12 @@ pub fn execute_pending_action(conn: &Connection, pending_id: &str) -> Result<Opt
     }
     let memory_id = match pa.action_type.as_str() {
         "store" => {
-            let mut mem: Memory = serde_json::from_value(pa.payload.clone())
-                .map_err(|e| anyhow::anyhow!("invalid store payload: {e}"))?;
+            let mut mem: Memory = serde_json::from_value(pa.payload.clone()).map_err(|e| {
+                // #962 typed envelope.
+                anyhow::Error::new(StorageError::InvalidArgument {
+                    reason: format!("invalid store payload: {e}"),
+                })
+            })?;
             // Stamp fresh id + timestamps so the execution is idempotent on replay.
             mem.id = uuid::Uuid::new_v4().to_string();
             let now = Utc::now().to_rfc3339();
@@ -8211,7 +8330,12 @@ pub fn execute_pending_action(conn: &Connection, pending_id: &str) -> Result<Opt
             }
         }
         "reflect" => execute_reflect_from_payload(conn, &pa)?,
-        other => anyhow::bail!("unknown action_type: {other}"),
+        other => {
+            // #962 typed envelope.
+            return Err(anyhow::Error::new(StorageError::InvalidArgument {
+                reason: format!("unknown action_type: {other}"),
+            }));
+        }
     };
     // S5-M1: emit the approve audit row after the side-effecting write
     // succeeded so the audit chain reflects the post-execute state. The
@@ -8265,17 +8389,30 @@ fn execute_reflect_from_payload(conn: &Connection, pa: &PendingAction) -> Result
         })
         .unwrap_or_default();
     if source_ids.is_empty() {
-        anyhow::bail!("invalid reflect payload: source_ids missing or empty");
+        // #962 typed envelope.
+        return Err(anyhow::Error::new(StorageError::InvalidArgument {
+            reason: "invalid reflect payload: source_ids missing or empty".to_string(),
+        }));
     }
     let title = payload
         .get("title")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("invalid reflect payload: title missing"))?
+        .ok_or_else(|| {
+            // #962 typed envelope.
+            anyhow::Error::new(StorageError::InvalidArgument {
+                reason: "invalid reflect payload: title missing".to_string(),
+            })
+        })?
         .to_string();
     let content = payload
         .get("content")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("invalid reflect payload: content missing"))?
+        .ok_or_else(|| {
+            // #962 typed envelope.
+            anyhow::Error::new(StorageError::InvalidArgument {
+                reason: "invalid reflect payload: content missing".to_string(),
+            })
+        })?
         .to_string();
     let namespace = payload
         .get("namespace")

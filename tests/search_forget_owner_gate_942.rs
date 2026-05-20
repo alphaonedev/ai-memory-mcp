@@ -1,7 +1,7 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
-//! Issue #942 — search_memories + forget_memories caller-vs-row-owner
+//! Issue #942 — `search_memories` + `forget_memories` caller-vs-row-owner
 //! gates (security-high, Track A QC sweep 2026-05-20).
 //!
 //! Pre-fix:
@@ -15,11 +15,11 @@
 //!   any caller could bulk-delete by namespace+pattern+tier.
 //!
 //! Fix:
-//! - search: header param added, CallerContext threads the real
+//! - search: header param added, `CallerContext` threads the real
 //!   resolved id, sqlite fallback for `as_agent` uses the X-Agent-Id
 //!   header when the query param is absent.
 //! - forget: admin-only gate via `handlers::admin_role::require_admin`
-//!   (same pattern as #957 export_memories) — substrate refactor for
+//!   (same pattern as #957 `export_memories`) — substrate refactor for
 //!   a per-row caller-filter on forget is bigger than the QC sweep
 //!   budget; admin-only is the right semantic for a destructive bulk
 //!   operation.

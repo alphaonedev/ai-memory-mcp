@@ -161,6 +161,33 @@ impl From<anyhow::Error> for MemoryError {
         if let Some(refusal) = e.downcast_ref::<crate::storage::GovernanceRefusal>() {
             return Self::RefusedByGovernance(refusal.reason.clone());
         }
+        // #962 — typed substrate-layer error envelope. Each
+        // `StorageError` variant maps to its canonical HTTP status by
+        // selecting the right `MemoryError` discriminant; the
+        // user-facing message is the variant's `Display` impl so the
+        // wire shape stays byte-identical to the pre-#962 `bail!()`
+        // strings (preserves `.to_string().starts_with(...)` consumers).
+        if let Some(se) = e.downcast_ref::<crate::storage::StorageError>() {
+            use crate::storage::StorageError as SE;
+            return match se {
+                SE::MemoryNotFound { .. } | SE::PendingActionNotFound { .. } => {
+                    Self::NotFound(se.to_string())
+                }
+                SE::AmbiguousIdPrefix { .. } | SE::InvalidArgument { .. } => {
+                    Self::ValidationFailed(se.to_string())
+                }
+                SE::PendingActionStateInvalid { .. }
+                | SE::UniqueConflict { .. }
+                | SE::ArchiveRestoreCollision { .. }
+                | SE::LinkReflectionCycle { .. } => Self::Conflict(se.to_string()),
+                SE::LinkPermissionDenied { .. } | SE::ApproverLaundering { .. } => {
+                    Self::RefusedByGovernance(se.to_string())
+                }
+                SE::ArchiveSupersedeFailed { .. } | SE::SqlcipherMissingPassphrase => {
+                    Self::DatabaseError(se.to_string())
+                }
+            };
+        }
         Self::DatabaseError(e.to_string())
     }
 }
@@ -535,5 +562,164 @@ mod tests {
         let any_err = anyhow::anyhow!("plain old db failure");
         let mapped: MemoryError = any_err.into();
         assert_eq!(mapped.code(), "DATABASE_ERROR");
+    }
+
+    // ---------------------------------------------------------------
+    // #962 — typed StorageError downcast coverage. Pins that every
+    // variant lands on the right HTTP status discriminant; the wire
+    // body is the variant's Display impl (preserves byte-identical
+    // pre-#962 bail!() strings).
+    // ---------------------------------------------------------------
+
+    fn map_storage(se: crate::storage::StorageError) -> MemoryError {
+        let any_err: anyhow::Error = anyhow::Error::new(se);
+        MemoryError::from(any_err)
+    }
+
+    #[test]
+    fn from_anyhow_storage_memory_not_found_maps_to_notfound() {
+        let mapped = map_storage(crate::storage::StorageError::MemoryNotFound {
+            id: "m1".into(),
+            role: None,
+        });
+        assert_eq!(mapped.code(), "NOT_FOUND");
+        assert_eq!(mapped.status(), StatusCode::NOT_FOUND);
+        assert!(mapped.message().contains("memory not found"));
+    }
+
+    #[test]
+    fn from_anyhow_storage_pending_action_not_found_maps_to_notfound() {
+        let mapped = map_storage(crate::storage::StorageError::PendingActionNotFound {
+            pending_id: "pa-1".into(),
+        });
+        assert_eq!(mapped.status(), StatusCode::NOT_FOUND);
+        assert!(mapped.message().contains("pending action not found"));
+    }
+
+    #[test]
+    fn from_anyhow_storage_ambiguous_id_prefix_maps_to_validation() {
+        let mapped = map_storage(crate::storage::StorageError::AmbiguousIdPrefix {
+            prefix: "ab".into(),
+            candidates: vec!["abc1".into(), "abc2".into()],
+        });
+        assert_eq!(mapped.code(), "VALIDATION_FAILED");
+        assert_eq!(mapped.status(), StatusCode::BAD_REQUEST);
+        // Wire body must contain the legacy prefix so consumers that
+        // string-match `.contains("ambiguous ID prefix")` keep working.
+        assert!(mapped.message().contains("ambiguous ID prefix"));
+    }
+
+    #[test]
+    fn from_anyhow_storage_invalid_argument_maps_to_validation() {
+        let mapped = map_storage(crate::storage::StorageError::InvalidArgument {
+            reason: "max_depth must be >= 1".into(),
+        });
+        assert_eq!(mapped.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(mapped.message(), "max_depth must be >= 1");
+    }
+
+    #[test]
+    fn from_anyhow_storage_pending_action_state_invalid_maps_to_conflict() {
+        let mapped = map_storage(crate::storage::StorageError::PendingActionStateInvalid {
+            pending_id: "pa-9".into(),
+            status: "rejected".into(),
+        });
+        assert_eq!(mapped.code(), "CONFLICT");
+        assert_eq!(mapped.status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn from_anyhow_storage_unique_conflict_maps_to_conflict() {
+        let mapped = map_storage(crate::storage::StorageError::UniqueConflict {
+            reason: "title 'X' already exists".into(),
+        });
+        assert_eq!(mapped.status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn from_anyhow_storage_archive_restore_collision_maps_to_conflict() {
+        let mapped =
+            map_storage(crate::storage::StorageError::ArchiveRestoreCollision { id: "m1".into() });
+        assert_eq!(mapped.status(), StatusCode::CONFLICT);
+        assert!(mapped.message().contains("already exists in active table"));
+    }
+
+    #[test]
+    fn from_anyhow_storage_link_reflection_cycle_maps_to_conflict() {
+        let mapped = map_storage(crate::storage::StorageError::LinkReflectionCycle {
+            source_id: "a".into(),
+            target_id: "b".into(),
+        });
+        // The link handler maps reflects_on cycles to 409 CONFLICT —
+        // the graph state conflicts with the new edge.
+        assert_eq!(mapped.status(), StatusCode::CONFLICT);
+        assert!(
+            mapped
+                .message()
+                .starts_with(crate::storage::LINK_CYCLE_ERR_PREFIX),
+            "wire body must preserve the canonical cycle prefix"
+        );
+    }
+
+    #[test]
+    fn from_anyhow_storage_link_permission_denied_maps_to_governance() {
+        let mapped = map_storage(crate::storage::StorageError::LinkPermissionDenied {
+            reason: "rule R7".into(),
+        });
+        assert_eq!(mapped.code(), "GOVERNANCE_REFUSED");
+        assert_eq!(mapped.status(), StatusCode::FORBIDDEN);
+        // `MemoryError::message()` for `RefusedByGovernance` wraps the
+        // reason with `"write refused by substrate governance: "`, so we
+        // assert containment (not `starts_with`) of the canonical prefix
+        // — the typed prefix survives the layered wrap, and the
+        // `handlers/links.rs` 403 path that bypasses `MemoryError`
+        // serialises `StorageError::Display` directly (see the dedicated
+        // unit test in `src/storage/error.rs`).
+        assert!(
+            mapped
+                .message()
+                .contains(crate::storage::LINK_PERMISSION_DENIED_ERR_PREFIX),
+            "wire body must preserve the canonical denial prefix as a substring"
+        );
+    }
+
+    #[test]
+    fn from_anyhow_storage_approver_laundering_maps_to_governance() {
+        let mapped = map_storage(crate::storage::StorageError::ApproverLaundering {
+            pending_id: "pa-1".into(),
+            claimed: "x".into(),
+            requester: "y".into(),
+        });
+        assert_eq!(mapped.status(), StatusCode::FORBIDDEN);
+        assert!(mapped.message().contains("approver-on-behalf laundering"));
+    }
+
+    #[test]
+    fn from_anyhow_storage_archive_supersede_failed_maps_to_database_error() {
+        let mapped = map_storage(crate::storage::StorageError::ArchiveSupersedeFailed {
+            archived_id: "arch-1".into(),
+        });
+        assert_eq!(mapped.code(), "DATABASE_ERROR");
+        assert_eq!(mapped.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn from_anyhow_storage_sqlcipher_missing_passphrase_maps_to_database_error() {
+        let mapped = map_storage(crate::storage::StorageError::SqlcipherMissingPassphrase);
+        assert_eq!(mapped.code(), "DATABASE_ERROR");
+        assert!(mapped.message().contains("AI_MEMORY_DB_PASSPHRASE"));
+    }
+
+    #[test]
+    fn from_anyhow_storage_governance_refusal_still_wins_when_chained() {
+        // The original substrate `GovernanceRefusal` mapping is checked
+        // first; pinning here so a future refactor can't silently move
+        // it past the new StorageError branch and demote a refusal to
+        // an internal DB error.
+        let refusal = crate::storage::GovernanceRefusal {
+            reason: "policy".into(),
+        };
+        let mapped: MemoryError = anyhow::Error::new(refusal).into();
+        assert_eq!(mapped.code(), "GOVERNANCE_REFUSED");
     }
 }
