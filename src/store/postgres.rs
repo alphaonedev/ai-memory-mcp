@@ -234,6 +234,19 @@ const MIGRATION_V46_LINKS_TEMPORAL_COLUMNS: &str =
 const MIGRATION_V47_PERSONA_SIGNING_ATOMICITY: &str =
     include_str!("../../migrations/postgres/0024_v07_persona_signing_atomicity.sql");
 
+/// v48 — Federation push DLQ table (Track D #933).
+///
+/// Adds `federation_push_dlq` so per-peer fanout failures inside
+/// `broadcast_store_quorum` can be replayed by the new
+/// `replay_federation_push_dlq` worker (spawned alongside the catchup
+/// loop in `daemon_runtime::spawn_catchup_loop_with_store`). The table
+/// also ships inline in `postgres_schema.sql` for greenfield installs;
+/// this migration covers legacy-upgrade paths. Pure additive CREATE
+/// TABLE IF NOT EXISTS + indexes — fully idempotent. Mirrors SQLite
+/// schema v48 / `migrations/sqlite/0041_v07_federation_push_dlq.sql`.
+const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
+    include_str!("../../migrations/postgres/0030_v07_federation_push_dlq.sql");
+
 /// Current schema version. Matches SQLite CURRENT_SCHEMA_VERSION (src/db.rs:233).
 /// Incremented on each migration step.
 ///
@@ -388,7 +401,14 @@ const MIGRATION_V47_PERSONA_SIGNING_ATOMICITY: &str =
 //       attest_level). All four already ship inline in
 //       postgres_schema.sql for greenfield; this migration covers
 //       legacy upgrade paths. Pure additive — fully idempotent.
-const CURRENT_SCHEMA_VERSION: i32 = 47;
+// v47 = v0.7.0 #902 — register the orphaned `memory_links` persona-
+//       signing atomicity CHECK constraint via the SAL ladder.
+// v48 = v0.7.0 Track D #933 — `federation_push_dlq` table backing the
+//       quorum-broadcast fanout dead-letter queue (parity with SQLite
+//       v48 / `migrations/sqlite/0041_v07_federation_push_dlq.sql`).
+//       Pure additive CREATE TABLE IF NOT EXISTS + indexes — fully
+//       idempotent.
+const CURRENT_SCHEMA_VERSION: i32 = 48;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -886,6 +906,20 @@ impl PostgresStore {
         self.kg_backend
     }
 
+    /// Borrow the underlying sqlx connection pool.
+    ///
+    /// v0.7.0 Track D #933 — adapters layered on top of the
+    /// `PostgresStore` (notably the federation push DLQ sink in
+    /// `src/federation/push_dlq.rs::PostgresDlqSink`) need pool access
+    /// to issue raw SQL against tables that aren't yet first-class on
+    /// the `MemoryStore` trait surface. Keep this accessor narrow —
+    /// new behaviour should land as trait methods so the sqlite path
+    /// gets parity automatically.
+    #[must_use]
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
     /// Run schema migrations on the connection. Called after bootstrap schema
     /// is loaded. Reads the current schema_version, then applies all pending
     /// migrations in a transaction per version step (matching SQLite behavior
@@ -1082,6 +1116,9 @@ impl PostgresStore {
         }
         if current_version < 47 {
             self.migrate_v47().await?;
+        }
+        if current_version < 48 {
+            self.migrate_v48().await?;
         }
 
         Ok(())
@@ -1801,6 +1838,40 @@ impl PostgresStore {
         tracing::info!(
             target = "store::postgres",
             "schema migration v47 applied (#902: memory_links attest+signature atomic CHECK)"
+        );
+        Ok(())
+    }
+
+    /// v48 — Federation push DLQ table (Track D #933).
+    ///
+    /// Adds `federation_push_dlq` (id BIGSERIAL, memory_id TEXT, peer_id
+    /// TEXT, payload_json JSONB, attempt_count INTEGER, last_error TEXT,
+    /// failed_at TIMESTAMPTZ, replayed_at TIMESTAMPTZ NULL) plus three
+    /// indexes (pending-rows-by-failed_at, per-peer pending, partial
+    /// unique on `(memory_id, peer_id) WHERE replayed_at IS NULL`).
+    /// Pure additive CREATE TABLE IF NOT EXISTS — fully idempotent.
+    /// Mirrors SQLite schema v48 / `migrations/sqlite/0041_v07_federation_push_dlq.sql`.
+    async fn migrate_v48(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v48 tx", e))?;
+
+        sqlx::raw_sql(MIGRATION_V48_FEDERATION_PUSH_DLQ)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("apply v48 federation push DLQ", e))?;
+
+        record_schema_version(&mut tx, 48).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v48 migration", e))?;
+
+        tracing::info!(
+            target = "store::postgres",
+            "schema migration v48 applied (#933: federation_push_dlq table)"
         );
         Ok(())
     }
@@ -11061,11 +11132,12 @@ mod tests {
         //   v45 = edit_source archive metadata + lookup indexes (Gap 5 #888)
         //   v46 = memory_links temporal columns (Gap 7 / #860)
         //   v47 = memory_links persona-signing atomicity CHECK (#902)
+        //   v48 = federation_push_dlq table (Track D #933)
         //
         // A future bump on either side without the corresponding port
         // re-trips this assertion before the migration runner gets a
         // chance to write a partial schema to disk.
-        assert_eq!(CURRENT_SCHEMA_VERSION, 47);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 48);
     }
 
     #[tokio::test]

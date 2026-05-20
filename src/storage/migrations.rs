@@ -7,9 +7,12 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 47).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 48).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
+//! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
+//! broadcast fanout failures can be replayed by the new
+//! `replay_federation_push_dlq` worker.
 
 use anyhow::Result;
 use rusqlite::{Connection, params};
@@ -268,6 +271,33 @@ CREATE INDEX IF NOT EXISTS idx_signed_events_dlq_failed_at
     ON signed_events_dlq(failed_at);
 CREATE INDEX IF NOT EXISTS idx_signed_events_dlq_agent
     ON signed_events_dlq(agent_id);
+
+-- v48 (Track D #933) — federation push DLQ. Mirrors
+-- `migrations/sqlite/0041_v07_federation_push_dlq.sql` so a fresh DB
+-- bootstrap that bypasses the migration ladder still ends up with the
+-- table present. See the migration file for the full design
+-- rationale (every per-peer fanout failure inside
+-- `broadcast_store_quorum` lands a row; the replay worker re-attempts
+-- `post_once` and stamps `replayed_at` on Ack).
+CREATE TABLE IF NOT EXISTS federation_push_dlq (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    memory_id      TEXT NOT NULL,
+    peer_id        TEXT NOT NULL,
+    payload_json   TEXT NOT NULL,
+    attempt_count  INTEGER NOT NULL DEFAULT 1,
+    last_error     TEXT NOT NULL,
+    failed_at      TEXT NOT NULL,
+    replayed_at    TEXT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_federation_push_dlq_pending_failed_at
+    ON federation_push_dlq(failed_at)
+    WHERE replayed_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_federation_push_dlq_peer_pending
+    ON federation_push_dlq(peer_id)
+    WHERE replayed_at IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_federation_push_dlq_pending_uniq
+    ON federation_push_dlq(memory_id, peer_id)
+    WHERE replayed_at IS NULL;
 ";
 
 // v17 = v0.6.3.1 (P4, audit G1) governance.inherit backfill.
@@ -475,7 +505,15 @@ CREATE INDEX IF NOT EXISTS idx_signed_events_dlq_agent
 //       the column.
 // v47 = v0.7.0 Provenance Gap 3 (issue #886) — recall-consumption
 //       observation tier (sibling-agent landing).
-const CURRENT_SCHEMA_VERSION: i64 = 47;
+// v48 = v0.7.0 Track D #933 — `federation_push_dlq` table backing the
+//       quorum-broadcast fanout dead-letter queue. Every per-peer
+//       fanout failure inside `broadcast_store_quorum` lands a row;
+//       the new `replay_federation_push_dlq` worker (spawned alongside
+//       the catchup loop in `daemon_runtime::spawn_catchup_loop_with_store`)
+//       polls every N seconds and re-attempts `post_once`, stamping
+//       `replayed_at` on Ack. Pure additive CREATE TABLE IF NOT
+//       EXISTS + indexes — fully idempotent.
+const CURRENT_SCHEMA_VERSION: i64 = 48;
 
 /// v0.7.0 refactor PR-1 (#793) — schema-pins SSOT.
 ///
@@ -794,6 +832,14 @@ const MIGRATION_V46_SQLITE: &str =
 // `CREATE INDEX IF NOT EXISTS` statements — fully replay-safe.
 const MIGRATION_V47_SQLITE: &str =
     include_str!("../../migrations/sqlite/0038_v07_recall_observations.sql");
+// v0.7.0 Track D #933 — `federation_push_dlq` table backing the
+// quorum-broadcast fanout dead-letter queue. CREATE TABLE IF NOT
+// EXISTS + three indexes (one supporting the pending-rows scan by
+// failed_at, one per-peer alert lookup, and a partial unique index
+// on `(memory_id, peer_id) WHERE replayed_at IS NULL` so a flapping
+// peer doesn't stack duplicate pending rows). Fully replay-safe.
+const MIGRATION_V48_SQLITE: &str =
+    include_str!("../../migrations/sqlite/0041_v07_federation_push_dlq.sql");
 
 // COVERAGE: per-version ALTER/CREATE branches inside this function
 // are guarded by `has_X` column-existence probes and `IF NOT EXISTS`
@@ -1926,6 +1972,14 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             // `CREATE INDEX IF NOT EXISTS` statements — fully
             // replay-safe.
             conn.execute_batch(MIGRATION_V47_SQLITE)?;
+        }
+
+        if version < 48 {
+            // v0.7.0 Track D #933 — federation push DLQ. Pure
+            // additive CREATE TABLE IF NOT EXISTS + three index
+            // CREATE INDEX IF NOT EXISTS statements — fully
+            // replay-safe.
+            conn.execute_batch(MIGRATION_V48_SQLITE)?;
         }
 
         conn.execute("DELETE FROM schema_version", [])?;

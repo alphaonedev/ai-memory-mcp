@@ -127,7 +127,12 @@ pub const MIN_SUPPORTED_SCHEMA: u32 = 16;
 /// `memories.source_uri` first-class column from `metadata.source_uri`
 /// and `citations[0].uri`), and v47 for Gap 3 (#886, the
 /// `recall_observations` ledger).
-pub const MAX_SUPPORTED_SCHEMA: u32 = 47;
+///
+/// v48 (Track D #933) — `federation_push_dlq` table backing the
+/// quorum-broadcast fanout dead-letter queue. The new
+/// `replay_federation_push_dlq` worker spawned alongside the catchup
+/// loop polls every N seconds and re-attempts `post_once`.
+pub const MAX_SUPPORTED_SCHEMA: u32 = 48;
 
 /// Pure boundary check: `true` when `v` lies within
 /// `[MIN_SUPPORTED_SCHEMA, MAX_SUPPORTED_SCHEMA]`. Extracted so the
