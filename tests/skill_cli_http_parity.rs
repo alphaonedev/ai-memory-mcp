@@ -106,6 +106,7 @@ fn build_router_with_db_path(db_path: &std::path::Path) -> (axum::Router, ai_mem
         autonomous_hooks: false,
         recall_scope: std::sync::Arc::new(None),
         deferred_audit_queue: std::sync::Arc::new(None),
+        admin_agent_ids: std::sync::Arc::new(Vec::new()),
     };
     let api_key_state = ai_memory::handlers::ApiKeyState {
         key: None,

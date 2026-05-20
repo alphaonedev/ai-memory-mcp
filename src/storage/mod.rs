@@ -5496,6 +5496,62 @@ pub fn purge_archive(conn: &Connection, older_than_days: Option<i64>) -> Result<
     }
 }
 
+/// #936 (security-critical, 2026-05-20) — caller-scoped purge variant.
+/// Mirrors [`purge_archive`] but constrains the DELETE to rows whose
+/// `metadata->'agent_id'` JSON field matches `caller` (with the
+/// inbox-target carve-out: rows whose `metadata->'target_agent_id'`
+/// matches `caller` are also purgeable by the inbox owner, matching
+/// the SAL [`crate::store::is_visible_to_caller`] visibility
+/// predicate).
+///
+/// Pre-#936 the only purge variant was owner-blind; any authenticated
+/// HTTP caller could destroy every owner's archive corpus via
+/// `DELETE /api/v1/archive`. The handler at
+/// `src/handlers/archive.rs::purge_archive` now resolves the caller
+/// from `X-Agent-Id` and routes through this owner-scoped variant by
+/// default; the admin/operator path (full owner-blind wipe) is
+/// reserved for callers whose `agent_id` appears in the
+/// `[admin].agent_ids` allowlist and is reached via the SAL trait
+/// path with `CallerContext::bypass_visibility = true`.
+///
+/// Returns the count of rows actually deleted; a non-admin call with
+/// no matching rows returns `Ok(0)` so the caller cannot enumerate
+/// other owners' archive corpus via this surface.
+pub fn purge_archive_for_caller(
+    conn: &Connection,
+    caller: &str,
+    older_than_days: Option<i64>,
+) -> Result<usize> {
+    match older_than_days {
+        Some(days) if days < 0 => {
+            anyhow::bail!("older_than_days must be non-negative (got {days})");
+        }
+        Some(days) => {
+            let cutoff = (Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+            let deleted = conn.execute(
+                "DELETE FROM archived_memories \
+                 WHERE archived_at < ?1 \
+                   AND ( \
+                     json_extract(metadata, '$.agent_id') = ?2 OR \
+                     json_extract(metadata, '$.target_agent_id') = ?2 \
+                   )",
+                params![cutoff, caller],
+            )?;
+            Ok(deleted)
+        }
+        None => {
+            let deleted = conn.execute(
+                "DELETE FROM archived_memories \
+                 WHERE \
+                   json_extract(metadata, '$.agent_id') = ?1 OR \
+                   json_extract(metadata, '$.target_agent_id') = ?1",
+                params![caller],
+            )?;
+            Ok(deleted)
+        }
+    }
+}
+
 pub fn archive_stats(conn: &Connection) -> Result<serde_json::Value> {
     let total: i64 = conn.query_row("SELECT COUNT(*) FROM archived_memories", [], |r| r.get(0))?;
     let mut stmt = conn.prepare(

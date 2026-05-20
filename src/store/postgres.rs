@@ -8483,25 +8483,79 @@ impl MemoryStore for PostgresStore {
         Ok(true)
     }
 
-    async fn archive_purge(&self, older_than_days: Option<i64>) -> StoreResult<usize> {
-        let res = match older_than_days {
-            Some(days) if days < 0 => {
+    async fn archive_purge(
+        &self,
+        ctx: &CallerContext,
+        older_than_days: Option<i64>,
+    ) -> StoreResult<usize> {
+        if let Some(days) = older_than_days {
+            if days < 0 {
                 return Err(StoreError::InvalidInput {
                     detail: format!("older_than_days must be non-negative (got {days})"),
                 });
             }
-            Some(days) => {
+        }
+
+        // #936 (security-critical, 2026-05-20) — owner-vs-caller gate.
+        // Pre-#936 the postgres branch issued an unconstrained DELETE so
+        // any authenticated HTTP caller could destroy every owner's
+        // archive corpus. We now constrain the DELETE to rows whose
+        // `metadata.agent_id` matches the caller (with the
+        // `_inbox/<target>` carve-out: rows where
+        // `metadata.target_agent_id == caller` are also purgeable by
+        // the inbox owner — mirrors the [`is_visible_to_caller`]
+        // visibility predicate). The operator/admin surface skips
+        // the gate by setting `ctx.bypass_visibility = true` via
+        // [`CallerContext::for_admin`], which the SHIP cluster admin
+        // role gate at `handlers::admin_role::require_admin`
+        // exclusively controls.
+        let caller = ctx.effective_principal();
+        let bypass = ctx.bypass_visibility;
+
+        let res = match (older_than_days, bypass) {
+            // Admin path — full owner-blind purge. The route's role
+            // gate ensures only admin callers can reach this branch.
+            (Some(days), true) => {
                 let cutoff = chrono::Utc::now() - chrono::Duration::days(days);
                 sqlx::query("DELETE FROM archived_memories WHERE archived_at < $1")
                     .bind(cutoff)
                     .execute(&self.pool)
                     .await
-                    .map_err(|e| to_store_err("archive_purge", e))?
+                    .map_err(|e| to_store_err("archive_purge admin", e))?
             }
-            None => sqlx::query("DELETE FROM archived_memories")
+            (None, true) => sqlx::query("DELETE FROM archived_memories")
                 .execute(&self.pool)
                 .await
-                .map_err(|e| to_store_err("archive_purge all", e))?,
+                .map_err(|e| to_store_err("archive_purge admin all", e))?,
+            // Owner-scoped path — narrow to rows the caller owns
+            // (`metadata.agent_id == caller` OR the inbox-target
+            // carve-out `metadata.target_agent_id == caller`).
+            (Some(days), false) => {
+                let cutoff = chrono::Utc::now() - chrono::Duration::days(days);
+                sqlx::query(
+                    "DELETE FROM archived_memories \
+                     WHERE archived_at < $1 \
+                       AND ( \
+                         (metadata->>'agent_id') = $2 OR \
+                         (metadata->>'target_agent_id') = $2 \
+                       )",
+                )
+                .bind(cutoff)
+                .bind(caller)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| to_store_err("archive_purge owner", e))?
+            }
+            (None, false) => sqlx::query(
+                "DELETE FROM archived_memories \
+                 WHERE \
+                   (metadata->>'agent_id') = $1 OR \
+                   (metadata->>'target_agent_id') = $1",
+            )
+            .bind(caller)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| to_store_err("archive_purge owner all", e))?,
         };
         Ok(usize::try_from(res.rows_affected()).unwrap_or(0))
     }

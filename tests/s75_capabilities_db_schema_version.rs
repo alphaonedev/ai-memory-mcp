@@ -101,6 +101,7 @@ fn build_sqlite_app_state() -> (AppState, tempfile::NamedTempFile) {
         autonomous_hooks: false,
         recall_scope: Arc::new(None),
         deferred_audit_queue: Arc::new(None),
+        admin_agent_ids: Arc::new(Vec::new()),
     };
     (state, tmp)
 }

@@ -2474,6 +2474,17 @@ pub struct AppConfig {
     /// NOT ship retention, so a long-running shadow-enabled deployment
     /// would see unbounded growth.
     pub confidence: Option<ConfidenceConfig>,
+    /// v0.7.0 SHIP cluster (#946 / #957 / #960 / #961, 2026-05-20) —
+    /// `[admin]` top-level block. Carries the operator-configured
+    /// allowlist of `agent_ids` whose authenticated HTTP requests
+    /// are treated as admin-class callers (full cross-tenant
+    /// visibility for endpoints that must observe corpus-scale
+    /// metadata: `GET /api/v1/export`, `GET /api/v1/agents`,
+    /// `GET /api/v1/stats`, the `POST /api/v1/quota/status` list
+    /// path). `None` (the default) closes those endpoints to all
+    /// non-admin callers — the safe-by-default posture per CLAUDE.md
+    /// `pm-v3`. See [`AdminConfig`] for the full role-gate semantics.
+    pub admin: Option<AdminConfig>,
 }
 
 /// v0.7.0 SEC-2 (Cluster D, issue #767) — `[governance]` top-level
@@ -2502,6 +2513,80 @@ pub struct GovernanceConfig {
     /// message naming the missing pubkey path.
     #[serde(default)]
     pub require_operator_pubkey: bool,
+}
+
+/// v0.7.0 SHIP cluster (#946 / #957 / #960 / #961, 2026-05-20) —
+/// `[admin]` top-level block. The operator-configured allowlist of
+/// `agent_ids` whose authenticated HTTP requests are treated as
+/// admin-class callers, granting full cross-tenant visibility on
+/// endpoints whose payloads necessarily expose corpus-scale
+/// metadata (`GET /api/v1/export`, `GET /api/v1/agents`,
+/// `GET /api/v1/stats`, the `POST /api/v1/quota/status` list path).
+///
+/// Wire format:
+/// ```toml
+/// [admin]
+/// agent_ids = ["ops:admin", "ai:claude@workstation"]
+/// ```
+///
+/// **Default-closed.** When the block is absent, the allowlist is
+/// empty and every admin-class endpoint returns `403 Forbidden` for
+/// every caller. Operators MUST set `[admin].agent_ids = [...]`
+/// explicitly to grant any caller admin privileges. This closes
+/// the v0.7.0 SHIP-blocking cross-tenant exfiltration defects
+/// (#946 / #957 / #960) where admin endpoints landed open by default
+/// because the legacy `api_key_auth` middleware passes through when
+/// no API key is configured.
+///
+/// **Caller resolution** uses the same primitive other handlers do
+/// (`identity::resolve_http_agent_id` against `X-Agent-Id`). The
+/// allowlist matches against the resolved caller string verbatim;
+/// there is no glob / prefix support today (planned under #961 when
+/// the operator surface grows beyond a static list).
+///
+/// **Not a substitute for authentication.** The role gate runs
+/// AFTER `api_key_auth`. Deployments serving sensitive corpora
+/// MUST set `api_key` so the bare-network surface requires the key
+/// AND the role gate runs on top of it. The two layers compose:
+/// `api_key_auth` answers "is the request authenticated?" and the
+/// admin gate answers "is the authenticated caller an admin?".
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdminConfig {
+    /// Explicit list of `agent_id` strings whose authenticated
+    /// requests are treated as admin-class. Default `vec![]`
+    /// (empty) means no caller is an admin — every admin-class
+    /// endpoint returns 403.
+    ///
+    /// Each entry MUST match a caller's resolved `agent_id`
+    /// verbatim. Validation: the SAL accepts the same NHI
+    /// `agent_id` charset that
+    /// [`crate::validate::validate_agent_id`] enforces (see the
+    /// "Agent Identity (NHI)" section of CLAUDE.md). Entries that
+    /// fail validation at boot are logged at `warn` and dropped
+    /// from the in-memory allowlist; the daemon still starts so
+    /// a single typo does not lock the operator out.
+    #[serde(default)]
+    pub agent_ids: Vec<String>,
+}
+
+impl AdminConfig {
+    /// Returns the validated subset of `agent_ids` — entries that
+    /// pass [`crate::validate::validate_agent_id`]. Entries that
+    /// fail validation are dropped (with a `warn` log) so a single
+    /// typo in `config.toml` cannot lock the operator out.
+    #[must_use]
+    pub fn validated_agent_ids(&self) -> Vec<String> {
+        let mut out = Vec::with_capacity(self.agent_ids.len());
+        for id in &self.agent_ids {
+            match crate::validate::validate_agent_id(id) {
+                Ok(()) => out.push(id.clone()),
+                Err(e) => {
+                    tracing::warn!("[admin] dropping invalid agent_id '{id}' from allowlist: {e}");
+                }
+            }
+        }
+        out
+    }
 }
 
 /// v0.7.0 (issue #518) — `[agents]` top-level block. Today only carries
@@ -3620,7 +3705,9 @@ impl AppConfig {
             "verify",
             "mcp_federation_forward_url",
             "agents",
+            "governance",
             "confidence",
+            "admin",
         ];
 
         let value: toml::Value = match toml::from_str(contents) {
@@ -5137,6 +5224,7 @@ legacy_scoring = false
             agents: Some(AgentsConfig::default()),
             governance: Some(GovernanceConfig::default()),
             confidence: Some(ConfidenceConfig::default()),
+            admin: Some(AdminConfig::default()),
         };
 
         let serialised = toml::to_string(&cfg).expect("serialise AppConfig to TOML");
@@ -5181,6 +5269,7 @@ legacy_scoring = false
             "agents",
             "governance",
             "confidence",
+            "admin",
         ];
 
         for key in table.keys() {

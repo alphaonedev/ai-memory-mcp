@@ -623,9 +623,26 @@ impl MemoryStore for SqliteStore {
         db::restore_archived(&conn, id).map_err(box_err)
     }
 
-    async fn archive_purge(&self, older_than_days: Option<i64>) -> StoreResult<usize> {
+    async fn archive_purge(
+        &self,
+        ctx: &CallerContext,
+        older_than_days: Option<i64>,
+    ) -> StoreResult<usize> {
+        // #936 (security-critical, 2026-05-20) — owner-vs-caller gate.
+        // Same posture as the postgres branch: non-admin callers are
+        // constrained to rows whose `metadata.agent_id` matches the
+        // caller (with the inbox-target carve-out); admin callers
+        // (`ctx.bypass_visibility == true`) bypass the filter for
+        // the operator full-wipe surface. The shared admin-role
+        // allowlist at `handlers::admin_role::require_admin`
+        // exclusively controls who reaches the bypass branch.
         let conn = self.state.lock().await;
-        db::purge_archive(&conn, older_than_days).map_err(box_err)
+        if ctx.bypass_visibility {
+            db::purge_archive(&conn, older_than_days).map_err(box_err)
+        } else {
+            db::purge_archive_for_caller(&conn, ctx.effective_principal(), older_than_days)
+                .map_err(box_err)
+        }
     }
 
     async fn archive_by_ids(
@@ -1547,11 +1564,21 @@ mod tests {
     #[tokio::test]
     async fn archive_purge_zero_threshold_purges_all() {
         let store = fresh_store();
+        // Admin context — full owner-blind wipe (the operator path).
+        // The non-admin owner-scoped path is exercised by the
+        // regression test in `tests/archive_purge_owner_gate.rs`.
+        let admin = CallerContext::for_admin("ops:admin");
         // Empty archive ⇒ 0 purged.
-        let n = store.archive_purge(Some(0)).await.expect("archive_purge");
+        let n = store
+            .archive_purge(&admin, Some(0))
+            .await
+            .expect("archive_purge");
         assert_eq!(n, 0);
         // None means "purge all" — still zero on empty archive.
-        let n = store.archive_purge(None).await.expect("archive_purge all");
+        let n = store
+            .archive_purge(&admin, None)
+            .await
+            .expect("archive_purge all");
         assert_eq!(n, 0);
     }
 

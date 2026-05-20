@@ -250,6 +250,23 @@ pub struct AppState {
     /// `Option<...>` shape lets tests inject `None` in scaffolds
     /// that don't need the audit chain.
     pub deferred_audit_queue: Arc<Option<crate::governance::deferred_audit::DeferredAuditQueue>>,
+
+    /// v0.7.0 SHIP cluster (#946 / #957 / #960 / #961, 2026-05-20) —
+    /// resolved `[admin].agent_ids` allowlist from `config.toml`. The
+    /// shared admin-role gate (see [`crate::handlers::admin_role`])
+    /// consults this list before any admin-class endpoint
+    /// (`/api/v1/export`, `/api/v1/agents`, `/api/v1/stats`, the
+    /// `/api/v1/quota/status` list path) honors the request.
+    ///
+    /// Default-empty closes those endpoints to all callers, matching
+    /// the `pm-v3` safe-by-default posture. Operators opt callers in
+    /// via `[admin] agent_ids = [...]` in `config.toml`.
+    ///
+    /// `Arc<Vec<String>>` rather than `Arc<HashSet<String>>` so the
+    /// shape stays cheap to clone (per the AppState contract) and the
+    /// list is short by design — admin-role allowlists are
+    /// operator-curated, typically <10 entries.
+    pub admin_agent_ids: Arc<Vec<String>>,
 }
 
 /// v0.7.0 B3 — canonical 1-2 sentence English descriptors for each

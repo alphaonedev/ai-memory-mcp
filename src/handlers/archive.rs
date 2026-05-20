@@ -221,6 +221,26 @@ pub async fn purge_archive(
     let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
     let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
         .unwrap_or_else(|_| "anonymous:invalid".to_string());
+
+    // #936 (security-critical, 2026-05-20) — caller-vs-row-owner gate.
+    // Pre-#936 the SAL trait method took NO caller and the handler
+    // resolved the caller only for the audit emit; the destructive
+    // DELETE then ran without any owner constraint. Any authenticated
+    // caller could destroy every owner's archive corpus.
+    //
+    // Default posture: `CallerContext::for_agent(caller)` — the SAL
+    // constrains the DELETE to rows whose `metadata.agent_id`
+    // (or the inbox-target carve-out `metadata.target_agent_id`)
+    // matches the caller. A non-admin call with no matching rows
+    // returns 200 OK with `{purged: 0}` so the surface cannot be
+    // used to enumerate other owners' archived rows.
+    //
+    // Admin/operator path: when the caller appears in the
+    // operator-configured `[admin].agent_ids` allowlist the SAL is
+    // called with `bypass_visibility = true` (the SHIP-cluster
+    // `for_admin` posture) so the DELETE runs cross-tenant — the
+    // legitimate `archive_max_days` operator wipe surface.
+    let is_admin = crate::handlers::admin_role::is_admin_caller(&app, &caller);
     crate::governance::audit::record_decision(
         &caller,
         "allow",
@@ -228,6 +248,7 @@ pub async fn purge_archive(
         "",
         json!({
             "older_than_days": q.older_than_days,
+            "owner_scope": if is_admin { "admin" } else { "caller" },
         }),
     );
 
@@ -235,15 +256,34 @@ pub async fn purge_archive(
     // route through the SAL trait. Wire shape preserved: `{purged}`.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        return match app.store.archive_purge(q.older_than_days).await {
-            Ok(n) => Json(json!({"purged": n, "storage_backend": "postgres"})).into_response(),
+        let ctx = if is_admin {
+            crate::store::CallerContext::for_admin(caller.clone())
+        } else {
+            crate::store::CallerContext::for_agent(caller.clone())
+        };
+        return match app.store.archive_purge(&ctx, q.older_than_days).await {
+            Ok(n) => Json(json!({
+                "purged": n,
+                "owner_scope": if is_admin { "admin" } else { "caller" },
+                "storage_backend": "postgres",
+            }))
+            .into_response(),
             Err(e) => store_err_to_response(e),
         };
     }
 
     let lock = app.db.lock().await;
-    match db::purge_archive(&lock.0, q.older_than_days) {
-        Ok(n) => Json(json!({"purged": n})).into_response(),
+    let purge_result = if is_admin {
+        db::purge_archive(&lock.0, q.older_than_days)
+    } else {
+        db::purge_archive_for_caller(&lock.0, &caller, q.older_than_days)
+    };
+    match purge_result {
+        Ok(n) => Json(json!({
+            "purged": n,
+            "owner_scope": if is_admin { "admin" } else { "caller" },
+        }))
+        .into_response(),
         Err(e) => {
             tracing::error!("handler error: {e}");
             (

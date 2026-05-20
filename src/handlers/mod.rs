@@ -46,6 +46,7 @@
 //! - [`approvals`]   — v0.7.0 K10 approval API.
 
 pub mod admin;
+pub mod admin_role;
 pub mod approvals;
 pub mod archive;
 pub mod create;
@@ -75,6 +76,7 @@ pub mod transport;
 // reference `handlers::<name>` without knowing which sub-module the
 // item came from. Wire compatibility is preserved verbatim.
 pub use admin::*;
+pub use admin_role::*;
 pub use approvals::*;
 pub use archive::*;
 pub use create::*;
