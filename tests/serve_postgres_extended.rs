@@ -33,7 +33,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, Notify, RwLock};
 
 mod common;
-use common::{free_port, postgres_url};
+use common::{free_port, pg_test_client, postgres_url};
 
 async fn build_postgres_app_state(url: &str) -> AppState {
     let conn = ai_memory::db::open(std::path::Path::new(":memory:")).expect("scratch sqlite");
@@ -128,7 +128,7 @@ async fn route_gate_returns_501_for_unsupported_endpoint() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:ext-test");
 
     // Pick an endpoint that is routed but NOT on
     // `postgres_endpoint_supported`. /api/v1/forget was the original
@@ -168,7 +168,7 @@ async fn agents_round_trip_via_sal() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:ext-test");
 
     let agent_id = format!("ext-agent-{}", uuid::Uuid::new_v4());
     let reg = client
@@ -210,7 +210,7 @@ async fn stats_round_trip_via_sal() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:ext-test");
 
     let unique_ns = format!("stats-{}", uuid::Uuid::new_v4());
     for i in 0..3 {
@@ -257,7 +257,7 @@ async fn namespaces_round_trip_via_sal() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:ext-test");
 
     let unique_ns = format!("ns-{}", uuid::Uuid::new_v4());
     client
@@ -301,7 +301,7 @@ async fn bulk_create_round_trip_via_sal() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:ext-test");
 
     let unique_ns = format!("bulk-{}", uuid::Uuid::new_v4());
     let bulk = (0..5)
@@ -348,7 +348,7 @@ async fn entity_registry_round_trip_via_sal() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:ext-test");
 
     let unique_ns = format!("ent-{}", uuid::Uuid::new_v4());
     let ent = client
@@ -393,7 +393,7 @@ async fn recall_keyword_fallback_via_sal() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:ext-test");
 
     let unique_ns = format!("recall-{}", uuid::Uuid::new_v4());
     let unique_word = format!("XYZ{}", uuid::Uuid::new_v4().simple());
@@ -448,7 +448,7 @@ async fn taxonomy_round_trip_via_sal() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:ext-test");
 
     let unique_ns = format!("tax-{}", uuid::Uuid::new_v4());
     for i in 0..3 {
@@ -511,7 +511,7 @@ async fn archive_list_returns_empty_envelope_on_postgres() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:ext-test");
 
     let resp: Value = client
         .get(format!("{base}/api/v1/archive"))
@@ -548,7 +548,7 @@ async fn kg_query_dispatches_via_sal() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:ext-test");
 
     // Create source memory for predictable id.
     let unique_ns = format!("kg-{}", uuid::Uuid::new_v4());
@@ -603,7 +603,7 @@ async fn pending_list_returns_structured_empty_on_postgres() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:ext-test");
 
     let resp: Value = client
         .get(format!("{base}/api/v1/pending"))
@@ -629,7 +629,7 @@ async fn subscriptions_list_returns_structured_empty_on_postgres() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:ext-test");
 
     let resp: Value = client
         .get(format!("{base}/api/v1/subscriptions"))

@@ -151,6 +151,17 @@ async fn spawn_daemon(
     (format!("http://{addr}"), shutdown, handle)
 }
 
+/// Stable agent id used across all g4 HTTP requests so the
+/// #910 SAL-level visibility filter on `find_paths` (which drops
+/// any path whose nodes are `scope=private` and not owned by the
+/// caller) treats the seeded chain as visible to the
+/// find_paths-issuing client. Without a stable `X-Agent-Id`,
+/// every request gets a unique per-request `anonymous:req-<uuid>`
+/// id, the stored memories' `metadata.agent_id` ≠ caller, and
+/// every path gets filtered out (empty result with the
+/// equally-valid-looking 200 response).
+const G4_TEST_AGENT_ID: &str = "ai:g4-test";
+
 async fn store_memory(
     client: &reqwest::Client,
     base: &str,
@@ -169,6 +180,7 @@ async fn store_memory(
     });
     let resp = client
         .post(format!("{base}/api/v1/memories"))
+        .header("X-Agent-Id", G4_TEST_AGENT_ID)
         .json(&body)
         .send()
         .await
@@ -292,6 +304,7 @@ async fn g4_postgres_link_projects_memories_into_age_graph() {
     for w in ids.windows(2) {
         let resp = client
             .post(format!("{base}/api/v1/links"))
+            .header("X-Agent-Id", G4_TEST_AGENT_ID)
             .json(&json!({
                 "source_id": w[0],
                 "target_id": w[1],
@@ -324,6 +337,7 @@ async fn g4_postgres_link_projects_memories_into_age_graph() {
     // S65 wire: depth=7 (max ceiling) covers a 4-hop chain.
     let resp = client
         .post(format!("{base}/api/v1/kg/find_paths"))
+        .header("X-Agent-Id", G4_TEST_AGENT_ID)
         .json(&json!({
             "source_id": ids[0],
             "target_id": ids[ids.len() - 1],

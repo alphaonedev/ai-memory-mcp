@@ -67,7 +67,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, Notify, RwLock};
 
 mod common;
-use common::{free_port, postgres_url};
+use common::{free_port, pg_test_client, postgres_url};
 
 async fn build_postgres_app_state(url: &str) -> AppState {
     // Match the production daemon's posture: `permissions.mode = enforce`
@@ -201,7 +201,7 @@ async fn bucket_a_hybrid_recall_returns_results() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:parity-test");
     let ns = format!("bucket-a-{}", uuid::Uuid::new_v4());
 
     // Seed with three memories whose content shares a query token.
@@ -262,7 +262,7 @@ async fn bucket_a_find_paths_depth_10() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:parity-test");
     let ns = format!("bucket-a-paths-{}", uuid::Uuid::new_v4());
 
     // Build a chain A -> B -> C -> D -> E.
@@ -325,7 +325,7 @@ async fn bucket_b_notify_delivers_to_inbox() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:parity-test");
     let bob = format!("bucket-b-bob-{}", &uuid::Uuid::new_v4().to_string()[..8]);
     let alice = format!("bucket-b-alice-{}", &uuid::Uuid::new_v4().to_string()[..8]);
     let marker = format!("marker-{}", uuid::Uuid::new_v4());
@@ -382,7 +382,7 @@ async fn bucket_b_subscriptions_persist() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:parity-test");
     let bob = format!("bucket-b-bob-{}", &uuid::Uuid::new_v4().to_string()[..8]);
     let target_ns = format!("bucket-b-target-{}", uuid::Uuid::new_v4());
 
@@ -448,7 +448,6 @@ async fn bucket_c_namespace_standards_enforce() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
     let parent_ns = format!("bucket-c-parent-{}", &uuid::Uuid::new_v4().to_string()[..8]);
     let alice = format!("bucket-c-alice-{}", &uuid::Uuid::new_v4().to_string()[..8]);
     let intruder = format!(
@@ -456,18 +455,29 @@ async fn bucket_c_namespace_standards_enforce() {
         &uuid::Uuid::new_v4().to_string()[..8]
     );
 
+    // v0.7.0 ship-hardening (2026-05-20): per-principal clients so the
+    // SAL #910 visibility filter sees a consistent owner across the
+    // (store memory) → (set standard referencing that memory) →
+    // (intruder write attempt) round-trip. Pre-fix the standard memory
+    // was stored under the default "ai:parity-test" client header,
+    // then set-standard was POSTed with `x-agent-id: alice`. The
+    // post-#910 handler tries to GET the standard memory under
+    // `alice` (correct), but the visibility filter drops it because
+    // owner ("ai:parity-test") != caller ("alice"). Result: 404.
+    let alice_client = pg_test_client(&alice);
+    let intruder_client = pg_test_client(&intruder);
+
     // alice creates the parent + sets governance.write=owner.
     let standard_id = store_memory(
-        &client,
+        &alice_client,
         &base,
         &parent_ns,
         "standard",
         "parent governance standard",
     )
     .await;
-    let resp = client
+    let resp = alice_client
         .post(format!("{base}/api/v1/namespaces"))
-        .header("x-agent-id", &alice)
         .json(&json!({
             "namespace": parent_ns,
             "id": standard_id,
@@ -484,9 +494,8 @@ async fn bucket_c_namespace_standards_enforce() {
 
     // intruder tries to write to a deep child of parent_ns.
     let child_ns = format!("{parent_ns}/sub/level/deep");
-    let resp = client
+    let resp = intruder_client
         .post(format!("{base}/api/v1/memories"))
-        .header("x-agent-id", &intruder)
         .json(&json!({
             "tier": "long",
             "namespace": child_ns,
@@ -521,7 +530,7 @@ async fn bucket_c_namespace_meta_propagation() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:parity-test");
     let parent_ns = format!("bucket-c-meta-{}", &uuid::Uuid::new_v4().to_string()[..8]);
 
     let standard_id = store_memory(
@@ -576,7 +585,7 @@ async fn bucket_d_kg_timeline_returns_events() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:parity-test");
     let ns = format!("bucket-d-{}", uuid::Uuid::new_v4());
 
     let a = store_memory(&client, &base, &ns, "A", "node A").await;
@@ -625,7 +634,7 @@ async fn bucket_d_age_kg_via_daemon() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:parity-test");
     let ns = format!("bucket-d-age-{}", uuid::Uuid::new_v4());
 
     let a = store_memory(&client, &base, &ns, "A", "node A").await;
@@ -668,7 +677,7 @@ async fn bucket_e_taxonomy_walk() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:parity-test");
     let root = format!("bucket-e-tax-{}", &uuid::Uuid::new_v4().to_string()[..8]);
     store_memory(&client, &base, &root, "root-mem", "root").await;
     store_memory(&client, &base, &format!("{root}/child1"), "c1-mem", "c1").await;
@@ -707,7 +716,7 @@ async fn bucket_e_entity_aliases() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:parity-test");
     let ns = format!(
         "bucket-e-aliases-{}",
         &uuid::Uuid::new_v4().to_string()[..8]
@@ -769,7 +778,7 @@ async fn bucket_e_check_duplicate() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:parity-test");
     let ns = format!("bucket-e-dup-{}", &uuid::Uuid::new_v4().to_string()[..8]);
     let title = "Duplicate Source";
     let content = "The original content for the dup test.";
@@ -809,7 +818,7 @@ async fn bucket_e_agent_quotas() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:parity-test");
     let agent = format!("bucket-e-quota-{}", &uuid::Uuid::new_v4().to_string()[..8]);
     let ns = format!("bucket-e-quota-ns-{}", uuid::Uuid::new_v4());
 
@@ -868,7 +877,7 @@ async fn bucket_f_link_signing_observed_by() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:parity-test");
     let ns = format!("bucket-f-signed-{}", &uuid::Uuid::new_v4().to_string()[..8]);
     let a = store_memory(&client, &base, &ns, "src", "source").await;
     let b = store_memory(&client, &base, &ns, "tgt", "target").await;
@@ -912,7 +921,7 @@ async fn bucket_g_pg_schema_version() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:parity-test");
     let resp = client
         .get(format!("{base}/api/v1/capabilities"))
         .send()
@@ -948,7 +957,7 @@ async fn state_flake_memory_promote() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:parity-test");
     let ns = format!(
         "state-flake-{}-{}",
         std::process::id(),
@@ -1007,8 +1016,17 @@ async fn cont6_quota_status_postgres() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    // v0.7.0 ship-hardening (2026-05-20): #909 (security-medium) binds
+    // `body.agent_id` to the authenticated `X-Agent-Id` header — any
+    // mismatch surfaces as 403. The test previously used a generic
+    // `pg_test_client("ai:parity-test")` header and a separate
+    // body.agent_id, which is now (correctly) rejected. Use a client
+    // whose default `X-Agent-Id` matches the body.agent_id so the
+    // test exercises the success path. Cross-agent quota probing
+    // remains a 403 by design and is covered by the #909 regression
+    // suite (`g_issue_909_quota_status_cross_agent`).
     let agent = format!("cont6-quota-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    let client = pg_test_client(&agent);
 
     let resp = client
         .post(format!("{base}/api/v1/quota/status"))
@@ -1054,20 +1072,25 @@ async fn cont6_quota_status_list_postgres() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
     let agent = format!(
         "cont6-quota-list-{}",
         &uuid::Uuid::new_v4().to_string()[..8]
     );
-    // Auto-insert one row first.
-    client
+    // v0.7.0 ship-hardening (2026-05-20): see `cont6_quota_status_postgres`
+    // — #909 requires the auto-insert (body.agent_id = agent) to be
+    // performed AS `agent`, then the list call (body.agent_id absent)
+    // is the operator path and works for any caller.
+    let agent_client = pg_test_client(&agent);
+    let list_client = pg_test_client("ai:parity-test");
+    // Auto-insert one row first as the agent itself.
+    agent_client
         .post(format!("{base}/api/v1/quota/status"))
         .json(&json!({"agent_id": agent}))
         .send()
         .await
         .expect("quota POST");
 
-    let resp = client
+    let resp = list_client
         .post(format!("{base}/api/v1/quota/status"))
         .json(&json!({}))
         .send()
@@ -1093,7 +1116,7 @@ async fn cont6_quota_status_rejects_invalid_agent() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:parity-test");
     let resp = client
         .post(format!("{base}/api/v1/quota/status"))
         // whitespace + control chars are rejected by validate_agent_id.
@@ -1118,7 +1141,7 @@ async fn cont6_find_paths_returns_chain() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:parity-test");
     let ns = format!("cont6-paths-{}", uuid::Uuid::new_v4());
 
     // Build A -> B -> C -> D chain.
@@ -1189,7 +1212,7 @@ async fn cont6_find_paths_rejects_invalid_id() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:parity-test");
     let resp = client
         .post(format!("{base}/api/v1/kg/find_paths"))
         .json(&json!({
@@ -1214,7 +1237,7 @@ async fn cont6_verify_link_unsigned() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:parity-test");
     let ns = format!("cont6-verify-{}", uuid::Uuid::new_v4());
 
     let src = store_memory(&client, &base, &ns, "src", "source memory").await;
@@ -1264,7 +1287,7 @@ async fn cont6_verify_link_rejects_empty_filter() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:parity-test");
     let resp = client
         .post(format!("{base}/api/v1/links/verify"))
         .json(&json!({}))
@@ -1285,7 +1308,7 @@ async fn cont6_verify_link_missing_returns_not_found() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:parity-test");
     let bogus_src = uuid::Uuid::new_v4().to_string();
     let bogus_tgt = uuid::Uuid::new_v4().to_string();
     let resp = client

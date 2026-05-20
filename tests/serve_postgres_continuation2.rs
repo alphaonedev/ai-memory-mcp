@@ -37,7 +37,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, Notify, RwLock};
 
 mod common;
-use common::{free_port, postgres_url};
+use common::{free_port, pg_test_client, postgres_url};
 
 /// v0.7.0 #238/#239 — set the federation legacy-bypass env vars
 /// once per test process so this postgres-only suite drives
@@ -45,6 +45,14 @@ use common::{free_port, postgres_url};
 /// the new wire-level `x-peer-id` header. The new regression tests
 /// at `tests/g_issue_238_*` and `tests/g_issue_239_*` exercise the
 /// default-enforce posture in separate test binaries.
+/// v0.7.0 ship-hardening (2026-05-20): serialize the two HMAC-gated
+/// pending-approve/reject tests against the process-wide
+/// `set_active_hooks_hmac_secret` mutator. Both tests set the secret
+/// at entry and clear it on exit; running them in parallel can race
+/// (test A clears while test B is mid-validate → B gets 401 from
+/// missing-secret, not the expected 404 from missing-id).
+static HMAC_SECRET_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 static FED_LEGACY_BYPASS_INIT: std::sync::Once = std::sync::Once::new();
 fn install_federation_legacy_bypass() {
     FED_LEGACY_BYPASS_INIT.call_once(|| unsafe {
@@ -145,7 +153,7 @@ async fn federation_sync_push_round_trip_via_sal() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:cont2-test");
 
     let unique_ns = format!("fed-{}", uuid::Uuid::new_v4());
     let mem_id = uuid::Uuid::new_v4().to_string();
@@ -210,7 +218,7 @@ async fn federation_sync_push_dry_run_via_sal() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:cont2-test");
     let unique_ns = format!("fed-dryrun-{}", uuid::Uuid::new_v4());
     let mem_id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
@@ -259,7 +267,7 @@ async fn federation_sync_push_idempotent_on_duplicate() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:cont2-test");
     let unique_ns = format!("fed-dup-{}", uuid::Uuid::new_v4());
     let mem_id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
@@ -342,7 +350,7 @@ async fn audit_chain_persists_across_restart_on_postgres() {
     {
         ai_memory::audit::init(&audit_path, false, false).expect("audit init 1");
         let (base, shutdown, handle) = spawn_daemon(&url).await;
-        let client = reqwest::Client::new();
+        let client = pg_test_client("ai:cont2-test");
         let unique_ns = format!("audit-{}", uuid::Uuid::new_v4());
         let resp = client
             .post(format!("{base}/api/v1/memories"))
@@ -375,7 +383,7 @@ async fn audit_chain_persists_across_restart_on_postgres() {
     {
         ai_memory::audit::init(&audit_path, false, false).expect("audit init 2");
         let (base, shutdown, handle) = spawn_daemon(&url).await;
-        let client = reqwest::Client::new();
+        let client = pg_test_client("ai:cont2-test");
         let unique_ns = format!("audit-{}", uuid::Uuid::new_v4());
         let resp = client
             .post(format!("{base}/api/v1/memories"))
@@ -429,7 +437,7 @@ async fn recall_hybrid_pipeline_runs_on_postgres() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:cont2-test");
     let unique_ns = format!("recall-{}", uuid::Uuid::new_v4());
 
     // Seed three memories with varying content lengths so the
@@ -499,7 +507,7 @@ async fn namespace_standard_set_via_sal() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:cont2-test");
     let ns = format!("gov-{}", uuid::Uuid::new_v4());
 
     let resp = client
@@ -547,7 +555,7 @@ async fn namespace_standard_clear_via_sal() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:cont2-test");
     let ns = format!("gov-clear-{}", uuid::Uuid::new_v4());
     // Seed a standard.
     client
@@ -643,10 +651,11 @@ async fn pending_approve_missing_id_returns_404() {
         eprintln!("skipping pending_approve_missing_id_returns_404");
         return;
     };
+    let _hmac_guard = HMAC_SECRET_LOCK.lock().await;
     let secret = "pending-test-secret";
     ai_memory::config::set_active_hooks_hmac_secret(Some(secret.to_string()));
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:cont2-test");
     let id = uuid::Uuid::new_v4().to_string();
     let body = String::new();
     let timestamp = chrono::Utc::now().timestamp().to_string();
@@ -674,10 +683,11 @@ async fn pending_reject_missing_id_returns_404() {
         eprintln!("skipping pending_reject_missing_id_returns_404");
         return;
     };
+    let _hmac_guard = HMAC_SECRET_LOCK.lock().await;
     let secret = "pending-test-secret";
     ai_memory::config::set_active_hooks_hmac_secret(Some(secret.to_string()));
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:cont2-test");
     let id = uuid::Uuid::new_v4().to_string();
     let body = String::new();
     let timestamp = chrono::Utc::now().timestamp().to_string();

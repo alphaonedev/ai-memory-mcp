@@ -38,7 +38,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, Notify, RwLock};
 
 mod common;
-use common::{free_port, postgres_url};
+use common::{free_port, pg_test_client, postgres_url};
 
 async fn build_postgres_app_state(url: &str) -> AppState {
     let conn = ai_memory::db::open(std::path::Path::new(":memory:")).expect("scratch sqlite");
@@ -156,7 +156,7 @@ async fn forget_by_namespace_via_sal() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:cont3-test");
     let ns = format!("forget-ns-{}", uuid::Uuid::new_v4());
     for i in 0..3 {
         store_memory(&client, &base, &ns, &format!("forget-mem-{i}")).await;
@@ -182,7 +182,7 @@ async fn forget_no_filter_returns_400_via_sal() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:cont3-test");
     let resp = client
         .post(format!("{base}/api/v1/forget"))
         .json(&json!({}))
@@ -207,7 +207,19 @@ async fn consolidate_preserves_provenance_via_sal() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    // v0.7.0 QC P1 (2026-05-20): consolidation now correctly enforces
+    // the SAL #910 scope=private visibility filter on source reads
+    // (no more `for_admin` privacy escalation). All three sources +
+    // the consolidate call + the verify-GET must therefore share the
+    // SAME principal, otherwise the SAL `get()` returns NotFound and
+    // the handler 400s with "memory not found" on the first source.
+    // The pre-fix test scenario (3 distinct authors + 1 cross-author
+    // consolidator) requires an explicit admin role on the HTTP
+    // surface — tracked as a v0.7.1+ enhancement. For v0.7.0 the
+    // mechanical provenance contract is exercised with a single
+    // owner; `consolidated_from_agents` still lands as an array.
+    let bob = "consolidator-bob";
+    let client = pg_test_client(bob);
     let ns = format!("consolidate-{}", uuid::Uuid::new_v4());
     let mut ids = Vec::new();
     for i in 0..3 {
@@ -220,7 +232,6 @@ async fn consolidate_preserves_provenance_via_sal() {
             "priority": 5,
             "confidence": 1.0,
             "source": "import",
-            "agent_id": format!("author-{i}"),
         });
         let v: Value = client
             .post(format!("{base}/api/v1/memories"))
@@ -235,7 +246,6 @@ async fn consolidate_preserves_provenance_via_sal() {
     }
     let resp = client
         .post(format!("{base}/api/v1/consolidate"))
-        .header("x-agent-id", "consolidator-bob")
         .json(&json!({
             "ids": ids,
             "title": "consolidated-summary",
@@ -259,12 +269,8 @@ async fn consolidate_preserves_provenance_via_sal() {
         .json()
         .await
         .expect("body");
-    // GET /api/v1/memories/{id} envelope is `{"links": [...], "memory":
-    // {"metadata": {...}, ...}}` — metadata is nested under `memory`, not
-    // at the top level. Original test had `got["metadata"]` which always
-    // resolves to Null.
     let metadata = &got["memory"]["metadata"];
-    assert_eq!(metadata["agent_id"], "consolidator-bob");
+    assert_eq!(metadata["agent_id"], bob);
     assert!(
         metadata["consolidated_from_agents"].is_array(),
         "consolidated_from_agents must be present"
@@ -286,7 +292,7 @@ async fn detect_contradictions_synthesizes_pair_via_sal() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:cont3-test");
     let ns = format!("contradict-{}", uuid::Uuid::new_v4());
     for content in ["the answer is 42", "the answer is 7"] {
         let body = json!({
@@ -337,7 +343,7 @@ async fn notify_lands_in_target_inbox_via_sal() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:cont3-test");
     let target = format!("target-{}", uuid::Uuid::new_v4());
     let resp = client
         .post(format!("{base}/api/v1/notify"))
@@ -370,7 +376,7 @@ async fn gc_clean_db_returns_zero_via_sal() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:cont3-test");
     let resp = client
         .post(format!("{base}/api/v1/gc"))
         .send()
@@ -396,7 +402,7 @@ async fn export_returns_full_envelope_via_sal() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:cont3-test");
     let ns = format!("export-{}", uuid::Uuid::new_v4());
     store_memory(&client, &base, &ns, "exportable-1").await;
     let resp = client
@@ -422,7 +428,7 @@ async fn import_lands_memories_via_sal() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:cont3-test");
     let ns = format!("import-{}", uuid::Uuid::new_v4());
     let now = chrono::Utc::now().to_rfc3339();
     let body = json!({
@@ -469,7 +475,7 @@ async fn archive_then_restore_via_sal() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:cont3-test");
     let ns = format!("archive-restore-{}", uuid::Uuid::new_v4());
     let id = store_memory(&client, &base, &ns, "round-trip").await;
 
@@ -506,7 +512,7 @@ async fn restore_missing_id_returns_404_via_sal() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:cont3-test");
     let bogus = uuid::Uuid::new_v4().to_string();
     let resp = client
         .post(format!("{base}/api/v1/archive/{bogus}/restore"))
@@ -535,7 +541,7 @@ async fn approve_unknown_pending_id_rejected_via_sal() {
     let secret = "continuation3-approve-secret";
     ai_memory::config::set_active_hooks_hmac_secret(Some(secret.to_string()));
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:cont3-test");
     let bogus = uuid::Uuid::new_v4().to_string();
     let body = String::new();
     let timestamp = chrono::Utc::now().timestamp().to_string();
@@ -619,7 +625,7 @@ async fn inheritance_walk_no_policy_allows_via_sal() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:cont3-test");
     let ns = format!("ungoverned-{}", uuid::Uuid::new_v4());
     let body = json!({
         "tier": "long",

@@ -42,6 +42,45 @@ use rand_core::OsRng;
 use rusqlite::Connection;
 use tempfile::NamedTempFile;
 
+/// Build a `reqwest::Client` that sends a stable `X-Agent-Id` header
+/// on every request to the test daemon.
+///
+/// The HTTP daemon (`POST /api/v1/*`) is multi-tenant and resolves the
+/// caller's identity via, in order: the request body's `agent_id`
+/// field, the `X-Agent-Id` header, or a per-request anonymous
+/// fallback `anonymous:req-<uuid8>` (see `CLAUDE.md` §"Agent Identity").
+///
+/// The #910 SAL-level visibility filter (path-traversal flavour in
+/// `PostgresStore::find_paths`, and the parallel guards on `recall`,
+/// `get`, `list`, `search`) drops any memory whose `metadata.agent_id`
+/// is not the caller's id when the memory's `scope` is `"private"`
+/// (the default). Without a stable `X-Agent-Id` header, every test
+/// request gets a UNIQUE anonymous id — the seed-then-read pattern
+/// (POST /memories → POST /find_paths or GET /recall) ends up with
+/// the reader being a different anonymous principal than the writer
+/// and the filter drops every row, surfacing as an empty `paths` /
+/// `memories` array on an otherwise-200 response.
+///
+/// This helper consolidates the workaround so a one-line client
+/// construction swap suffices to make the test's writes and reads
+/// share the same principal. Agent ids should be unique per test
+/// (or per test binary) to avoid cross-test cross-pollution against
+/// a shared scratch DB.
+#[allow(dead_code)]
+pub fn pg_test_client(agent_id: &str) -> reqwest::Client {
+    use reqwest::header::{HeaderMap, HeaderValue};
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "X-Agent-Id",
+        HeaderValue::from_str(agent_id)
+            .unwrap_or_else(|e| panic!("pg_test_client: invalid X-Agent-Id {agent_id:?}: {e}")),
+    );
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .expect("build reqwest client with default X-Agent-Id header")
+}
+
 /// Process-wide lock that serializes env-var mutation across parallel
 /// tests in the same integration binary. Each `EnvVarGuard` holds this
 /// lock for its lifetime so a panicking assertion still restores prior

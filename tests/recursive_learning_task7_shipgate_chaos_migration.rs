@@ -306,8 +306,16 @@ async fn postgres_schema_carries_reflection_depth_and_signed_events() {
         "signed_events table must exist on Postgres"
     );
 
-    // Round-trip a reflection through the Postgres store.
-    let ctx = CallerContext::for_agent("test-agent-task7-pg".to_string());
+    // Round-trip a reflection through the Postgres store. Use
+    // for_admin (bypass visibility) since make_memory() stamps the
+    // source with metadata.agent_id="test-agent-task7-chaos" not
+    // "test-agent-task7-pg" — the test exercises reflect-on-source
+    // schema correctness, not visibility filtering. Matches the
+    // pattern of recursive_learning_task4_memory_reflect.rs which
+    // landed the same for_admin fix in the prior session
+    // (3-way identity mismatch between source.metadata.agent_id,
+    // input.agent_id, and ctx).
+    let ctx = CallerContext::for_admin("test-agent-task7-pg".to_string());
     let ns = format!("task7-pg-migration-{}", uuid::Uuid::new_v4().simple());
     let mut src = make_memory(&ns, "pg-src", 0);
     src.namespace = ns.clone();

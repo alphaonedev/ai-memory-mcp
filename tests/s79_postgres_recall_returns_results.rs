@@ -57,7 +57,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, Notify, RwLock};
 
 mod common;
-use common::{free_port, postgres_url};
+use common::{free_port, pg_test_client, postgres_url};
 
 async fn build_postgres_app_state(url: &str) -> AppState {
     let conn = ai_memory::db::open(std::path::Path::new(":memory:")).expect("scratch sqlite");
@@ -185,7 +185,7 @@ async fn s79_postgres_recall_or_style_returns_namespace_results() {
     };
 
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:s79-test");
 
     // Per-test namespace so concurrent runs against a shared scratch DB
     // don't reuse memory ids.
