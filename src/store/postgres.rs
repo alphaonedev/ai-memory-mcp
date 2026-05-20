@@ -390,6 +390,24 @@ const MIGRATION_V47_PERSONA_SIGNING_ATOMICITY: &str =
 //       legacy upgrade paths. Pure additive — fully idempotent.
 const CURRENT_SCHEMA_VERSION: i32 = 47;
 
+/// PostgreSQL session-scoped advisory lock key used to serialize
+/// concurrent `migrate()` invocations across processes and across
+/// in-process parallel `connect()` calls. Without this lock, racing
+/// `CREATE INDEX` / `ADD CONSTRAINT` / `ALTER TYPE` DDL statements
+/// across the migration ladder collide and surface as `tuple
+/// concurrently updated`, `duplicate key value violates unique
+/// constraint "pg_class_relname_nsp_index"`, or `constraint
+/// "<name>" already exists` errors.
+///
+/// Arbitrary i64 namespaced to ai-memory's PostgresStore — picked once
+/// at v0.7.0 ship-hardening and frozen thereafter. Changing this value
+/// in a future release would risk an in-flight migration on an older
+/// daemon being raced by a newer daemon (different lock keys = no
+/// serialization between them).
+///
+/// Hex breakdown: `0x4149_4D45_4D49_4701` — "AIMEMIG\x01" as ASCII.
+const MIGRATION_ADVISORY_LOCK_KEY: i64 = 0x4149_4D45_4D49_4701;
+
 /// Default embedding column dimension used when the caller doesn't pass
 /// `--embedding-dim` to `ai-memory schema-init`. Matches the v0.7.0
 /// baseline schema (`MiniLmL6V2` embedder = 384). Operators upgrading
@@ -576,55 +594,110 @@ impl PostgresStore {
                 detail: format!("connect: {e}"),
             })?;
 
-        // Bootstrap schema — idempotent. The bundled template uses
-        // `vector({EMBEDDING_DIM})` for the two vector columns; we
-        // substitute the caller's chosen dim here. CREATE TABLE IF NOT
-        // EXISTS means the dim only "takes" on first init; subsequent
-        // calls against an already-populated schema are no-ops.
+        // v0.7.0 ship-hardening: acquire MIGRATION_ADVISORY_LOCK_KEY
+        // across the entire bootstrap (INIT_SCHEMA + sanity checks +
+        // KG detection + migrate) so concurrent connect() callers on
+        // a fresh DB cannot race CREATE EXTENSION / CREATE INDEX /
+        // ADD CONSTRAINT statements. The legacy retry-on-race loop
+        // around INIT_SCHEMA (kept below as defense-in-depth) was
+        // insufficient under heavy parallel load — the LAN-parity
+        // audit on 2026-05-19 surfaced both "init schema: tuple
+        // concurrently updated" and "apply v32 ... constraint already
+        // exists" failures.
         //
-        // v0.7.0 ship-readiness: CI runs 30+ `live_*` tests in parallel
-        // against a single postgres service container. `CREATE EXTENSION
-        // IF NOT EXISTS vector` is DDL-idempotent but Postgres' catalog
-        // serializes EXTENSION installs at a lower layer, so concurrent
-        // first-init calls can collide with `duplicate key value
-        // violates unique constraint "pg_extension_name_index"` or
-        // `tuple concurrently updated`. Both are race-only errors — the
-        // extension always lands on at least one of the racing callers.
-        // We retry up to 5 times with brief backoff and treat the retry-
-        // success as the canonical idempotent semantics.
-        let init_sql = render_schema_sql(INIT_SCHEMA, dim);
-        let mut last_err: Option<sqlx::Error> = None;
-        for attempt in 0..5_u32 {
-            match sqlx::raw_sql(&init_sql).execute(&pool).await {
-                Ok(_) => {
-                    last_err = None;
-                    break;
-                }
-                Err(e) => {
-                    let msg = e.to_string();
-                    let is_concurrent_init = msg.contains("pg_extension_name_index")
-                        || msg.contains("tuple concurrently updated")
-                        || msg.contains("duplicate key value")
-                        || msg.contains("deadlock detected")
-                        || msg.contains("concurrent update")
-                        || msg.contains("could not serialize access");
-                    if !is_concurrent_init || attempt == 4 {
-                        last_err = Some(e);
+        // The lock is held on a dedicated PoolConnection for the
+        // lifetime of the bootstrap; queue depth = other in-flight
+        // callers. Released explicitly via pg_advisory_unlock_all() +
+        // implicit drop. Reentrant within the same session, but we
+        // acquire ONCE here and switch the inner `store.migrate()`
+        // call to the lock-free `store.migrate_locked()` to avoid the
+        // second acquire-from-different-session that would deadlock.
+        let mut bootstrap_lock_conn = pool.acquire().await.map_err(|e| {
+            StoreError::BackendUnavailable {
+                backend: "postgres".to_string(),
+                detail: format!("acquire bootstrap lock connection: {e}"),
+            }
+        })?;
+        // v0.7.0 ship-hardening (2026-05-19, QC P0): the per-session
+        // statement_timeout=30s set in `after_connect` would abort
+        // `pg_advisory_lock` itself if a holder takes >30s
+        // (plausible on a busy DB for the full v15→v47 ladder).
+        // `lock_timeout` is no-op for advisory locks per PG docs but
+        // we clear both for clarity. SET LOCAL is session-scoped and
+        // is released when the connection drops back to the pool.
+        // Multi-statement SQL would trip sqlx's prepared-statement
+        // protocol ("cannot insert multiple commands into a prepared
+        // statement"); split into two separate executes.
+        sqlx::query("SET statement_timeout = 0")
+            .execute(&mut *bootstrap_lock_conn)
+            .await
+            .map_err(|e| StoreError::BackendUnavailable {
+                backend: "postgres".to_string(),
+                detail: format!("clear statement_timeout on bootstrap lock connection: {e}"),
+            })?;
+        sqlx::query("SET lock_timeout = 0")
+            .execute(&mut *bootstrap_lock_conn)
+            .await
+            .map_err(|e| StoreError::BackendUnavailable {
+                backend: "postgres".to_string(),
+                detail: format!("clear lock_timeout on bootstrap lock connection: {e}"),
+            })?;
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(MIGRATION_ADVISORY_LOCK_KEY)
+            .execute(&mut *bootstrap_lock_conn)
+            .await
+            .map_err(|e| StoreError::BackendUnavailable {
+                backend: "postgres".to_string(),
+                detail: format!("acquire bootstrap pg_advisory_lock: {e}"),
+            })?;
+
+        // Run the full bootstrap inside an async block so we can
+        // ALWAYS release the lock — even if any error propagates.
+        // `async move` captures `pool` so the final `Self { pool, ... }`
+        // construction can consume it. `bootstrap_lock_conn` lives in
+        // the outer scope with its own Arc ref to the pool, so the move
+        // doesn't invalidate the lock-holding connection.
+        let bootstrap_result: StoreResult<Self> = async move {
+            // Bootstrap schema — idempotent. The bundled template uses
+            // `vector({EMBEDDING_DIM})` for the two vector columns; we
+            // substitute the caller's chosen dim here. CREATE TABLE IF NOT
+            // EXISTS means the dim only "takes" on first init; subsequent
+            // calls against an already-populated schema are no-ops.
+            //
+            // The retry loop is still in place as defense-in-depth for any
+            // residual catalog-level race the advisory lock can't cover
+            // (e.g., a third process bypassing the lock entirely).
+            let init_sql = render_schema_sql(INIT_SCHEMA, dim);
+            let mut last_err: Option<sqlx::Error> = None;
+            for attempt in 0..5_u32 {
+                match sqlx::raw_sql(&init_sql).execute(&pool).await {
+                    Ok(_) => {
+                        last_err = None;
                         break;
                     }
-                    // Brief jittered backoff: 50 / 100 / 200 / 400ms (wider
-                    // for deadlocks which need both racers to retry).
-                    let backoff_ms = 50u64 << attempt;
-                    tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
+                    Err(e) => {
+                        let msg = e.to_string();
+                        let is_concurrent_init = msg.contains("pg_extension_name_index")
+                            || msg.contains("tuple concurrently updated")
+                            || msg.contains("duplicate key value")
+                            || msg.contains("deadlock detected")
+                            || msg.contains("concurrent update")
+                            || msg.contains("could not serialize access");
+                        if !is_concurrent_init || attempt == 4 {
+                            last_err = Some(e);
+                            break;
+                        }
+                        let backoff_ms = 50u64 << attempt;
+                        tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
+                    }
                 }
             }
-        }
-        if let Some(e) = last_err {
-            return Err(StoreError::BackendUnavailable {
-                backend: "postgres".to_string(),
-                detail: format!("init schema: {e}"),
-            });
-        }
+            if let Some(e) = last_err {
+                return Err(StoreError::BackendUnavailable {
+                    backend: "postgres".to_string(),
+                    detail: format!("init schema: {e}"),
+                });
+            }
 
         // Sanity-check pgvector version. We support 0.7.x–0.8.x; older
         // versions have HNSW behaviour differences we haven't tested
@@ -718,11 +791,28 @@ impl PostgresStore {
             );
         }
 
-        // Run schema migrations after bootstrap schema is loaded.
-        let store = Self { pool, kg_backend };
-        store.migrate().await?;
+            // Run schema migrations after bootstrap schema is loaded.
+            // We hold the bootstrap advisory lock at the outer scope, so
+            // call the lock-free body `migrate_locked()` here to avoid a
+            // second acquire-from-different-session that would deadlock.
+            let store = Self { pool, kg_backend };
+            store.migrate_locked().await?;
 
-        Ok(store)
+            Ok(store)
+        }
+        .await;
+
+        // Always release the bootstrap advisory lock, even on the error
+        // path. pg_advisory_unlock_all() releases all locks held in this
+        // session, more robust than pg_advisory_unlock(key) against any
+        // accidental re-acquire inside the bootstrap. Best-effort —
+        // implicit release on connection drop is the backstop.
+        let _ = sqlx::query("SELECT pg_advisory_unlock_all()")
+            .execute(&mut *bootstrap_lock_conn)
+            .await;
+        drop(bootstrap_lock_conn);
+
+        bootstrap_result
     }
 
     /// Issue #877 (HIGH-SEV): Connect with an explicit embedding dim and
@@ -804,7 +894,76 @@ impl PostgresStore {
     ///
     /// Returns `StoreError::BackendUnavailable` if migration fails.
     async fn migrate(&self) -> StoreResult<()> {
-        // Read the current version from schema_version table.
+        // v0.7.0 ship-hardening: serialize concurrent migrate() applies
+        // across processes (and across in-process parallel connect()
+        // calls) via a session-scoped advisory lock. Without it, racing
+        // CREATE INDEX / ADD CONSTRAINT / ALTER TYPE DDL statements
+        // collide and surface as `tuple concurrently updated`,
+        // `pg_class_relname_nsp_index` duplicate key, or `constraint
+        // already exists`. Empirically caught during the
+        // 2026-05-19 LAN-parity audit (17 of 37 cargo SAL-postgres
+        // failures were this race).
+        //
+        // The lock is acquired on a dedicated connection held for the
+        // entire migration ladder. Other callers (other processes OR
+        // in-process parallel connects) block on pg_advisory_lock
+        // until release, then re-read schema_version inside
+        // migrate_locked() and skip via the early-return when
+        // current_version >= CURRENT_SCHEMA_VERSION. The session-scoped
+        // lock is released explicitly via pg_advisory_unlock_all() and
+        // implicitly when the dedicated connection drops.
+        let mut lock_conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| to_store_err("acquire migration lock connection", e))?;
+
+        // QC P0: clear statement_timeout / lock_timeout on the lock
+        // connection so the `pg_advisory_lock` wait itself isn't
+        // aborted under contention (per-session default is 30s from
+        // `after_connect`). Split into two separate executes — sqlx
+        // prepared-statement protocol rejects multi-statement SQL.
+        sqlx::query("SET statement_timeout = 0")
+            .execute(&mut *lock_conn)
+            .await
+            .map_err(|e| to_store_err("clear statement_timeout on migration lock connection", e))?;
+        sqlx::query("SET lock_timeout = 0")
+            .execute(&mut *lock_conn)
+            .await
+            .map_err(|e| to_store_err("clear lock_timeout on migration lock connection", e))?;
+
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(MIGRATION_ADVISORY_LOCK_KEY)
+            .execute(&mut *lock_conn)
+            .await
+            .map_err(|e| to_store_err("acquire pg_advisory_lock", e))?;
+
+        // Run the migration body, capturing the result so we can always
+        // release the lock even on a per-migration failure.
+        let result = self.migrate_locked().await;
+
+        // Release ALL advisory locks held in this session (more robust
+        // than pg_advisory_unlock(key) — defends against the body
+        // accidentally acquiring further locks). Best-effort: a failure
+        // to unlock would still release implicitly on connection close.
+        let _ = sqlx::query("SELECT pg_advisory_unlock_all()")
+            .execute(&mut *lock_conn)
+            .await;
+        drop(lock_conn);
+
+        result
+    }
+
+    /// The actual migration ladder body. Held under the
+    /// `MIGRATION_ADVISORY_LOCK_KEY` advisory lock acquired in
+    /// [`Self::migrate`] — do not call directly from outside that
+    /// wrapper without holding the lock, or the cross-process
+    /// serialization invariant is lost.
+    async fn migrate_locked(&self) -> StoreResult<()> {
+        // Read the current version from schema_version table — this is
+        // re-read under the lock so racers that queued while another
+        // process applied the ladder see the up-to-date value and
+        // early-return.
         let current_version: Option<i32> =
             sqlx::query_scalar("SELECT COALESCE(MAX(version), 0) FROM schema_version")
                 .fetch_optional(&self.pool)
@@ -4546,57 +4705,71 @@ impl PostgresStore {
             .await
             .map_err(|e| to_store_err("set search_path", e))?;
 
-        // v0.7.0.1 G5 — the prior shape `RETURN [n IN nodes(p) |
-        // properties(n).id] AS path` triggered AGE 1.5.0's grammar at
-        // the `|` separator with `syntax error at or near "|"`
-        // (HALT R1b S65). AGE 1.5.0's parser does support list
-        // comprehensions in isolation but `convert_cypher_to_subquery`
-        // mis-handles the form when the iteration variable is bound
-        // from a function call (`nodes(p)`) and the projection touches
-        // a property — the analyzer's `|` recovery point bubbles up as
-        // a Postgres syntax error before the Cypher body even reaches
-        // the planner. The `reduce()` form below uses the same
-        // iteration grammar (`var IN list | expr`) that already ships
-        // working in `kg_query_cypher`'s `reduce(s = a.id, n IN
-        // nodes(p)[1..] | s + '->' + n.id)` projection — `reduce` and
-        // list comprehension share an AST node in AGE 1.5 but only the
-        // former survives the analyzer pass against this fixture.
+        // v0.7.0 ship-hardening (2026-05-19): the prior shape
+        // `RETURN reduce(s = a.id, n IN nodes(p)[1..] | s + '->' +
+        // n.id) AS path` is REJECTED at parse time by AGE 1.6.0 with
+        // `syntax error at or near "|"`. AGE 1.5.0 accepted reduce
+        // bodies containing `|`; AGE 1.6.0's grammar narrowed the
+        // `|` recovery point and now treats it as the list-comprehension
+        // pipe separator only — making `reduce(... | ...)` ambiguous
+        // with `[var IN list | expr]` and rejected entirely. Direct
+        // psql PREPARE/EXECUTE confirms: the reduce form errors, the
+        // list-comp form errors with "could not find properties for n"
+        // (same grammar narrowing), and the alternative `UNWIND + collect`
+        // form silently returns an empty path. The ONLY portable shape
+        // that survives both AGE 1.5 and 1.6 is `RETURN nodes(p)` which
+        // returns the vertex list directly; the Rust-side decode then
+        // strips AGE's text-format `::vertex` type tags and pulls each
+        // `properties.id` to reconstruct the path.
         //
-        // The delimiter is `->` (an arrow) which cannot appear in a
-        // memory id (the validator constrains ids to UUIDv4 / a-z0-9_-)
-        // so server-side splitting is unambiguous. We stay away from a
-        // bare `|` literal to avoid re-triggering any analyzer recovery
-        // point on the parser side.
+        // The variable-length pattern stays `-[*1..N]-` (un-arrowed,
+        // explicit lower bound) per the symmetric-closure contract
+        // from the CTE branch — matching either declared edge
+        // direction. AGE 1.6.0 accepts this shape; the `convert_cypher_to_subquery`
+        // pattern walker round-trips it correctly.
+        // v0.7.0 ship-hardening (2026-05-19): use 2-arg `cypher()` with
+        // IDs inlined into the cypher body instead of a 3-arg form with
+        // a params dict. Empirical findings via PREPARE/EXECUTE + raw
+        // SQL in psql + sqlx round-trips:
         //
-        // The variable-length pattern is `*1..N` (explicit minimum)
-        // rather than `*..N`. AGE 1.5.0 accepts both at the grammar
-        // level but only the explicit form round-trips through
-        // `convert_cypher_to_subquery`'s pattern walker — same fix
-        // shape as `kg_query_cypher`. The pattern stays un-arrowed
-        // (`-[*1..N]-`) so the symmetric-closure contract from the CTE
-        // branch holds: matching either declared edge direction.
-        const PATH_DELIM: &str = "->";
-        let cypher = format!(
-            "MATCH p = (a)-[*1..{depth}]-(b) \
-             WHERE a.id = $start_id AND b.id = $target_id \
-             RETURN reduce(s = a.id, n IN nodes(p)[1..] | \
-                           s + '{PATH_DELIM}' + n.id) AS path \
+        //   * 3-arg `cypher(graph, body, params)` with `params` bound
+        //     via sqlx's `Agtype` binary wrapper → cypher executes
+        //     without error but matches 0 rows (the `$start_id` /
+        //     `$target_id` variable substitution doesn't happen — the
+        //     binary protocol's agtype encoding does not surface the
+        //     params dict's keys to AGE's cypher analyzer).
+        //   * 3-arg `cypher(graph, body, '{"…"}'::agtype)` with an
+        //     INLINE agtype literal → AGE 1.5/1.6 rejects: "third
+        //     argument of cypher function must be a parameter" (the
+        //     `Const` node it sees isn't accepted).
+        //   * 2-arg `cypher(graph, body)` with the IDs inlined into
+        //     the cypher TEXT (WHERE a.id = 'literal') → works on
+        //     both AGE 1.5 and 1.6, returns matched paths correctly.
+        //
+        // We take the 2-arg path. Source and target IDs are
+        // UUID-validated upstream (`validate_memory_id`) so the
+        // inlined values are safe from SQL injection; the
+        // defense-in-depth `assert_age_id_safe()` check below rejects
+        // any residual id that doesn't match `[A-Za-z0-9_-]+` before
+        // it reaches the format string. The `reduce(... | ...)`
+        // string-join shape from earlier was ALSO broken on AGE
+        // 1.6 (the `|` separator became unparseable in reduce
+        // bodies); the new cypher uses `RETURN nodes(p)` and the
+        // Rust-side decode pulls each vertex's `properties.id` to
+        // reconstruct the chain.
+        assert_age_id_safe(source_id).map_err(|detail| StoreError::InvalidInput { detail })?;
+        assert_age_id_safe(target_id).map_err(|detail| StoreError::InvalidInput { detail })?;
+
+        let sql = format!(
+            "SELECT path FROM cypher('memory_graph', $$ \
+             MATCH p = (a)-[*1..{depth}]-(b) \
+             WHERE a.id = '{source_id}' AND b.id = '{target_id}' \
+             RETURN nodes(p) AS path \
              ORDER BY length(p) ASC \
-             LIMIT {cap}"
+             LIMIT {cap} \
+             $$) AS (path agtype)"
         );
-
-        // v0.7.0.1 G2 — bind the params dict as an `agtype`-typed
-        // parameter through sqlx (`$1`) rather than inlining it as a
-        // SQL literal. AGE 1.5.0's `convert_cypher_to_subquery`
-        // analyzer rejects ANY non-Param node at the third-argument
-        // position; the literal form previously here surfaces as a
-        // 503 from `POST /api/v1/kg/find_paths` (HALT R1b S65).
-        let params = age_params_jsonb(&[("start_id", source_id), ("target_id", target_id)]);
-        let sql =
-            format!("SELECT path FROM cypher('memory_graph', $$ {cypher} $$, $1) AS (path agtype)");
-
         let rows = sqlx::query(&sql)
-            .bind(Agtype(params))
             .fetch_all(&mut *tx)
             .await
             .map_err(|e| to_store_err("cypher find_paths", e))?;
@@ -4620,11 +4793,60 @@ impl PostgresStore {
                 // AGE serialises strings as JSON-quoted strings (e.g.
                 // `"abc"`); parse as JSON to strip the
                 // quotes and decode any escapes the encoder applied.
-                let joined: String =
-                    serde_json::from_str(&raw.0).map_err(|e| StoreError::IntegrityFailed {
-                        detail: format!("non-JSON AGE path: {}: {e}", raw.0),
+                // `raw.0` is AGE's text format for a vertex list:
+                //   `[{"id":..., "label":"Memory",
+                //      "properties":{"id":"uuid1"}}::vertex,
+                //     {"id":..., "properties":{"id":"uuid2"}}::vertex, ...]`
+                // The `::vertex` (and `::edge`, `::path`) suffixes are
+                // AGE's text-format type tags and are NOT valid JSON.
+                // Strip them, parse as JSON, then pull each
+                // `properties.id` to reconstruct the chain.
+                let json_payload = raw
+                    .0
+                    .replace("::vertex", "")
+                    .replace("::edge", "")
+                    .replace("::path", "");
+                // QC Obs #8 (2026-05-20): cap echoed payload at 200
+                // chars in error messages so an unbounded malformed
+                // response doesn't blow up the log / response body.
+                let payload_preview = |s: &str| -> String {
+                    if s.len() <= 200 {
+                        s.to_string()
+                    } else {
+                        format!("{}…<{}b truncated>", &s[..200], s.len() - 200)
+                    }
+                };
+                let arr: serde_json::Value = serde_json::from_str(&json_payload).map_err(|e| {
+                    StoreError::IntegrityFailed {
+                        detail: format!(
+                            "non-JSON AGE path payload: {}: {e}",
+                            payload_preview(&raw.0)
+                        ),
+                    }
+                })?;
+                let nodes = arr
+                    .as_array()
+                    .ok_or_else(|| StoreError::IntegrityFailed {
+                        detail: format!("AGE path is not an array: {}", payload_preview(&raw.0)),
                     })?;
-                Ok(joined.split(PATH_DELIM).map(str::to_string).collect())
+                let ids: Vec<String> = nodes
+                    .iter()
+                    .filter_map(|v| {
+                        v.get("properties")
+                            .and_then(|p| p.get("id"))
+                            .and_then(|i| i.as_str())
+                            .map(String::from)
+                    })
+                    .collect();
+                if ids.is_empty() {
+                    return Err(StoreError::IntegrityFailed {
+                        detail: format!(
+                            "AGE path has no extractable ids: {}",
+                            payload_preview(&raw.0)
+                        ),
+                    });
+                }
+                Ok(ids)
             })
             .collect()
     }
@@ -5826,6 +6048,27 @@ fn clamp_timeline_limit(limit: Option<usize>) -> usize {
 /// the JSON are escaped as `''` (SQL standard); the agtype JSON dialect
 /// uses `"` for string delimiters and `\"` for embedded double quotes,
 /// so the only character that needs SQL-side escaping here is `'`.
+/// Defense-in-depth check for ids that we inline directly into a
+/// cypher() body string (the 2-arg form, where there's no params dict
+/// to substitute through). The upstream `validate_memory_id` already
+/// constrains the format to a UUIDv4-style alphabet but this assert
+/// rejects anything outside `[A-Za-z0-9_-]` so a future code path
+/// that bypasses validation still can't SQL-inject through cypher.
+fn assert_age_id_safe(id: &str) -> Result<(), String> {
+    if id.is_empty() || id.len() > 128 {
+        return Err(format!(
+            "id length {} out of bounds for cypher inline (1..=128)",
+            id.len()
+        ));
+    }
+    if !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        return Err(format!(
+            "id contains characters unsafe for cypher inline (allowed: [A-Za-z0-9_-]): {id:?}"
+        ));
+    }
+    Ok(())
+}
+
 fn age_params_literal(pairs: &[(&str, &str)]) -> String {
     let mut map = serde_json::Map::with_capacity(pairs.len());
     for (k, v) in pairs {
@@ -9567,6 +9810,118 @@ impl PostgresStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // QC Obs #6 (2026-05-20) — `assert_age_id_safe` is a security
+    // primitive: it gates whether a caller-supplied id can be inlined
+    // into a `cypher()` body string (2-arg form, no params dict). A
+    // regression that loosened the regex would surface as cypher
+    // injection. These unit tests pin the alphabet (only ASCII
+    // alphanumeric + `-_`), length bounds (1..=128), and every
+    // adversarial char class we'd see in an injection attempt.
+    #[test]
+    fn assert_age_id_safe_accepts_canonical_uuid() {
+        assert!(assert_age_id_safe("a0a15bb5-5aa2-4219-96bd-d15f27618eb8").is_ok());
+    }
+
+    #[test]
+    fn assert_age_id_safe_accepts_alphanumeric_dash_underscore() {
+        assert!(assert_age_id_safe("AaZz09-_").is_ok());
+        assert!(assert_age_id_safe("single").is_ok());
+    }
+
+    #[test]
+    fn assert_age_id_safe_rejects_empty() {
+        assert!(assert_age_id_safe("").is_err());
+    }
+
+    #[test]
+    fn assert_age_id_safe_rejects_over_max_length() {
+        let s = "a".repeat(129);
+        assert!(assert_age_id_safe(&s).is_err());
+        let s = "a".repeat(128);
+        assert!(assert_age_id_safe(&s).is_ok(), "boundary 128 is inclusive");
+    }
+
+    #[test]
+    fn assert_age_id_safe_rejects_single_quote() {
+        // Closes the cypher-string-literal escape vector.
+        assert!(assert_age_id_safe("a'b").is_err());
+        assert!(assert_age_id_safe("a''b").is_err());
+    }
+
+    #[test]
+    fn assert_age_id_safe_rejects_double_quote_and_backtick() {
+        assert!(assert_age_id_safe("a\"b").is_err());
+        assert!(assert_age_id_safe("a`b").is_err());
+    }
+
+    #[test]
+    fn assert_age_id_safe_rejects_dollar_sign() {
+        // Closes the cypher dollar-quote / param-reference vector.
+        assert!(assert_age_id_safe("$start").is_err());
+        assert!(assert_age_id_safe("a$$b").is_err());
+    }
+
+    #[test]
+    fn assert_age_id_safe_rejects_braces_brackets_parens() {
+        // Closes pattern / property / function injection.
+        assert!(assert_age_id_safe("a{b").is_err());
+        assert!(assert_age_id_safe("a}b").is_err());
+        assert!(assert_age_id_safe("a[b").is_err());
+        assert!(assert_age_id_safe("a]b").is_err());
+        assert!(assert_age_id_safe("a(b").is_err());
+        assert!(assert_age_id_safe("a)b").is_err());
+    }
+
+    #[test]
+    fn assert_age_id_safe_rejects_semicolon_and_comma() {
+        // Closes statement-terminator + list-separator vectors.
+        assert!(assert_age_id_safe("a;b").is_err());
+        assert!(assert_age_id_safe("a,b").is_err());
+    }
+
+    #[test]
+    fn assert_age_id_safe_rejects_comment_chars() {
+        // Closes `--` comment, `/* */` block comment.
+        assert!(assert_age_id_safe("a/b").is_err());
+        assert!(assert_age_id_safe("a*b").is_err());
+        // `-` is allowed (UUID separator) but `--` is just two allowed
+        // chars; injection via comment requires `--` followed by chars
+        // that the regex would reject (whitespace/colon/etc), so the
+        // structural defense holds even with `--` permitted.
+        assert!(assert_age_id_safe("a--b").is_ok());
+    }
+
+    #[test]
+    fn assert_age_id_safe_rejects_whitespace() {
+        // Closes pattern-break + cypher-keyword smuggling.
+        assert!(assert_age_id_safe("a b").is_err());
+        assert!(assert_age_id_safe("a\tb").is_err());
+        assert!(assert_age_id_safe("a\nb").is_err());
+        assert!(assert_age_id_safe("a\rb").is_err());
+    }
+
+    #[test]
+    fn assert_age_id_safe_rejects_age_type_tags() {
+        // The decode strips `::vertex` / `::edge` / `::path` — if an
+        // id contained one of those it'd be silently shortened on
+        // round-trip. The colon character rejects them outright.
+        assert!(assert_age_id_safe("a::vertex").is_err());
+        assert!(assert_age_id_safe("a:b").is_err());
+    }
+
+    #[test]
+    fn assert_age_id_safe_rejects_unicode_homoglyphs() {
+        // Closes lookalike-character bypass attempts.
+        assert!(assert_age_id_safe("аbc").is_err()); // cyrillic 'а'
+        assert!(assert_age_id_safe("a\u{200B}b").is_err()); // zero-width space
+        assert!(assert_age_id_safe("⟨admin⟩").is_err());
+    }
+
+    #[test]
+    fn assert_age_id_safe_rejects_null_byte() {
+        assert!(assert_age_id_safe("a\0b").is_err());
+    }
 
     #[test]
     fn capabilities_advertise_native_vector() {
