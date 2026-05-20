@@ -614,6 +614,7 @@ pub struct KgInvalidateBody {
 /// existed; 404 with `{found: false}` when no link matches the triple.
 pub async fn kg_invalidate(
     State(app): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<KgInvalidateBody>,
 ) -> impl IntoResponse {
     if let Err(e) = validate::validate_link(&body.source_id, &body.target_id, &body.relation) {
@@ -634,6 +635,84 @@ pub async fn kg_invalidate(
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": format!("invalid valid_until: {e}")})),
+        )
+            .into_response();
+    }
+
+    // #938 SECURITY-high (Track A QC sweep, 2026-05-20) —
+    // caller-vs-source-memory-owner gate. Pre-fix any HTTP caller
+    // could forge temporal-graph state by invalidating another
+    // tenant's `:supersedes` / `:contradicts` / governance edges via
+    // `valid_until = now()`, hiding contradiction history. Mirrors the
+    // #930 caller-vs-owner gate shape on update/promote.
+    let caller = match crate::handlers::parity::resolve_caller_agent_id(None, &headers, None) {
+        Ok(c) => c,
+        Err(err) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": err}))).into_response();
+        }
+    };
+
+    // Fetch the source memory + verify caller owns it (or is the
+    // inbox target, or the row is unowned-legacy, or caller is
+    // "daemon" sentinel). Mirrors the gate shape in #930 update_memory
+    // and #936 archive_purge.
+    let source_owner: Option<(String, String)> = {
+        let lock = app.db.lock().await;
+        match db::get(&lock.0, &body.source_id) {
+            Ok(Some(mem)) => {
+                let owner = mem
+                    .metadata
+                    .get("agent_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let target = mem
+                    .metadata
+                    .get("target_agent_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                Some((owner, target))
+            }
+            Ok(None) => None,
+            Err(e) => {
+                tracing::error!("kg_invalidate: source lookup failed: {e}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "internal server error"})),
+                )
+                    .into_response();
+            }
+        }
+    };
+    let Some((owner, target)) = source_owner else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "found": false,
+                "source_id": body.source_id,
+                "target_id": body.target_id,
+                "relation": body.relation,
+                "error": "source memory not found",
+            })),
+        )
+            .into_response();
+    };
+    let is_unowned_legacy = owner.is_empty();
+    if !is_unowned_legacy && owner != caller && target != caller && caller != "daemon" {
+        tracing::warn!(
+            target: "ai_memory::authz",
+            "POST /api/v1/kg/invalidate 403: caller {caller} != owner {owner} (source_id={})",
+            body.source_id
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "caller does not own this source memory",
+                "owner": owner,
+                "caller": caller,
+                "source_id": body.source_id,
+            })),
         )
             .into_response();
     }
