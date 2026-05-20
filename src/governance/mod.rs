@@ -81,6 +81,12 @@ pub mod rules_store;
 // federation::sync, hooks::executor, llm) calls
 // `wire_check::check(&action)?` to consult it.
 pub mod wire_check;
+// #963 — typed governance refusal envelope. Currently exposed as a
+// self-contained module + unit-tested in isolation; the wire-in to
+// `GovernanceDecision::Deny` lands in the follow-up commit per the
+// per-issue end-to-end protocol (see issue #963 body).
+pub mod refusal;
+pub use refusal::GovernanceRefusal;
 
 // ---------------------------------------------------------------------------
 // Op tag — the five gated operations
