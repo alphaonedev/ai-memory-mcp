@@ -271,7 +271,12 @@ pub fn list_by_event(conn: &Connection, event_type: &str) -> Result<Vec<Subscrip
 /// legacy `sub_events` comma-string — the structured opt-in is the
 /// authoritative filter for that subscriber. When `None`, the legacy
 /// whitelist applies (backward compat for pre-P5 subscribers).
-fn matches_filters(
+///
+/// #932 (v0.7.0 Track D, 2026-05-20) — bumped from private to
+/// `pub(crate)` so the postgres-aware dispatch helper at
+/// `crate::handlers::subscriptions::dispatch_event_postgres` can
+/// reuse the canonical filter logic instead of forking it.
+pub(crate) fn matches_filters(
     sub_events: &str,
     sub_event_types: Option<&[String]>,
     sub_namespace: Option<&str>,
@@ -560,7 +565,12 @@ pub fn dispatch_event_with_details(
             return;
         }
     };
-    let matching: Vec<Subscription> = subs
+    // Resolve each matching sub's secret_hash from sqlite BEFORE
+    // dispatching to the per-sub worker pool. #932 (v0.7.0 Track D,
+    // 2026-05-20) extracted this into `dispatch_event_to_subs` so the
+    // postgres-backed `dispatch_event_postgres` path can resolve
+    // secret_hash from the subscription memory's metadata instead.
+    let matching: Vec<(Subscription, Option<String>)> = subs
         .into_iter()
         .filter(|s| {
             matches_filters(
@@ -573,7 +583,39 @@ pub fn dispatch_event_with_details(
                 agent_id,
             )
         })
+        .map(|s| {
+            let secret_hash = load_secret_hash(db_path, &s.id).unwrap_or(None);
+            (s, secret_hash)
+        })
         .collect();
+    dispatch_event_to_subs(
+        matching, event, memory_id, namespace, agent_id, db_path, details,
+    );
+}
+
+/// #932 (v0.7.0 Track D, 2026-05-20) — backend-neutral per-sub
+/// dispatch worker pool. Takes an already-resolved
+/// `Vec<(Subscription, Option<secret_hash>)>` so the sqlite path
+/// (via `dispatch_event_with_details`) and the postgres path (via
+/// `dispatch_event_postgres`) share the same delivery + audit +
+/// DLQ + HMAC code while their subscription-source lookups remain
+/// adapter-specific.
+///
+/// The `db_path` argument is still the SQLite audit-mirror path —
+/// `record_subscription_event` / `record_dispatch` / `record_dlq`
+/// still write to sqlite even on postgres-backed daemons because
+/// every daemon currently keeps a sqlite scratch DB alongside the
+/// SAL store handle. A future SAL audit-log surface (#-tracking)
+/// will route this through the trait too.
+pub fn dispatch_event_to_subs(
+    matching: Vec<(Subscription, Option<String>)>,
+    event: &str,
+    memory_id: &str,
+    namespace: &str,
+    agent_id: Option<&str>,
+    db_path: &std::path::Path,
+    details: Option<serde_json::Value>,
+) {
     if matching.is_empty() {
         return;
     }
@@ -582,7 +624,7 @@ pub fn dispatch_event_with_details(
     // differs from their clock by more than 5 minutes (replay window).
     // (#301 item 1 — prior implementation had no replay protection.)
     let timestamp = chrono::Utc::now().timestamp().to_string();
-    for sub in matching {
+    for (sub, sub_secret_hash) in matching {
         // v0.7.0 K6 — UUIDv7 correlation id is generated per
         // (subscription, event) pair so receivers can correlate ACKs
         // back to the dispatched payload across the retry ladder.
@@ -611,6 +653,7 @@ pub fn dispatch_event_with_details(
         let event_owned = event.to_string();
         let ts = timestamp.clone();
         let db_path = db_path.to_path_buf();
+        let secret_hash_owned = sub_secret_hash.clone();
         std::thread::spawn(move || {
             // Persist the per-delivery audit row BEFORE the network
             // send so replay-from-cursor (K7) sees a stable record
@@ -620,13 +663,7 @@ pub fn dispatch_event_with_details(
             {
                 tracing::warn!("subscription event audit write failed: {e}");
             }
-            let secret_hash = match load_secret_hash(&db_path, &sub_id) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("subscription secret lookup failed: {e}");
-                    return;
-                }
-            };
+            let secret_hash = secret_hash_owned;
             // Canonical string: "<timestamp>.<body>". Keyed HMAC over
             // the DB-stored secret hash. Receivers verify by computing
             // SHA256(plaintext_secret) and then
@@ -689,8 +726,8 @@ pub fn dispatch_event_with_details(
             let ok = outcome.success;
             record_dispatch(&db_path, &sub_id, ok);
             update_event_status(&db_path, &correlation_id, ok);
-            if !ok {
-                if let Err(e) = record_dlq(
+            if !ok
+                && let Err(e) = record_dlq(
                     &db_path,
                     &sub_id,
                     &correlation_id,
@@ -700,9 +737,9 @@ pub fn dispatch_event_with_details(
                     &outcome.last_error,
                     &outcome.first_failed_at,
                     &outcome.last_failed_at,
-                ) {
-                    tracing::warn!("subscription DLQ write failed: {e}");
-                }
+                )
+            {
+                tracing::warn!("subscription DLQ write failed: {e}");
             }
         });
     }
