@@ -70,12 +70,18 @@ services:
       - ic-parity-mesh
 
   ic-parity-alice:
-    # Reuse the existing Plan-C build context — same Dockerfile,
-    # same CARGO_FEATURES=sal-postgres. First-time build is ~3-5min
-    # on Apple Silicon; subsequent are layer-cached.
+    # #926 (2026-05-20): switched from Dockerfile.plan-c (heavy,
+    # ~367 MB, carries test + bench pre-builds) to
+    # Dockerfile.tier2-trackb (slim, ~335 MB, daemon-only). The mesh
+    # exercises the federation / A2A peer-reach + SAL-postgres + AGE
+    # path; it does not need the in-image test/bench binaries that
+    # Dockerfile.plan-c bundles, so the slim image is the right
+    # default for the lan-parity smoke. Operators wanting the full
+    # plan-c image can override `dockerfile: Dockerfile.plan-c` via a
+    # compose overlay file.
     build:
       context: ../..
-      dockerfile: Dockerfile.plan-c
+      dockerfile: Dockerfile.tier2-trackb
       args:
         CARGO_FEATURES: sal-postgres
     image: ai-memory-lan-parity:latest
@@ -88,6 +94,16 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
+      # #926 (2026-05-20): break the peer-preflight chicken-and-egg.
+      # Without this flag alice's entrypoint dies with `[#878
+      # preflight] UNREACHABLE peer=http://ic-parity-bob:19077`
+      # before bob has booted — bob can't boot if it's waiting for
+      # alice. `depends_on` is necessary but not sufficient (TCP-up
+      # != HTTP-handler-ready). Setting the flag on BOTH services
+      # accepts the per-pair-of-daemons posture that no preflight
+      # check fires on boot; the federation broadcast loop discovers
+      # peers lazily on the first store/forward.
+      AI_MEMORY_SKIP_PEER_PREFLIGHT: "1"
       AI_MEMORY_AGENT_ID: "ai:ic-parity-alice@lan-parity"
       AI_MEMORY_TIER: autonomous
       AI_MEMORY_LISTEN_HOST: "0.0.0.0"
@@ -129,6 +145,9 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
+      # #926 — see alice's block above for the rationale. Both
+      # services must skip preflight or the boot chain deadlocks.
+      AI_MEMORY_SKIP_PEER_PREFLIGHT: "1"
       AI_MEMORY_AGENT_ID: "ai:ic-parity-bob@lan-parity"
       AI_MEMORY_TIER: autonomous
       AI_MEMORY_LISTEN_HOST: "0.0.0.0"
