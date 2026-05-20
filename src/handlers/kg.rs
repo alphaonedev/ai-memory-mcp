@@ -725,7 +725,15 @@ pub async fn kg_invalidate(
 /// returned path count.
 #[derive(Debug, Deserialize)]
 pub struct FindPathsBody {
+    /// Source memory id. Accepts the legacy `from_id` alias for
+    /// compatibility with the MCP `memory_find_paths` tool, the CLI
+    /// `find-paths --from`, and pre-v0.7.0 docs (#934 field-name drift
+    /// fix, 2026-05-20).
+    #[serde(alias = "from_id")]
     pub source_id: String,
+    /// Target memory id. Accepts the legacy `to_id` alias for the same
+    /// MCP / CLI / docs compatibility surface as `source_id`.
+    #[serde(alias = "to_id")]
     pub target_id: String,
     #[serde(default)]
     pub max_depth: Option<usize>,

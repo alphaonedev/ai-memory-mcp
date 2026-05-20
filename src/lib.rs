@@ -339,6 +339,15 @@ pub fn build_router_with_timeout(
         .route("/api/v1/kg/query", post(handlers::kg_query))
         // v0.7.0 Continuation 6 — KG path enumeration (S65).
         .route("/api/v1/kg/find_paths", post(handlers::kg_find_paths))
+        // #934 (Track C, 2026-05-20) — alias for legacy callers that
+        // hit the bare `/api/v1/find_paths` route (advertised under
+        // the MCP `memory_find_paths` shape + pre-v0.7.0 docs). Pre-
+        // fix the bare path was intercepted by the postgres-gate
+        // fallback and returned a misleading 501 "not yet
+        // implemented" — actually the route just lived under `/kg/`.
+        // Mounting both paths to the same handler closes the drift
+        // for all callers without a redirect.
+        .route("/api/v1/find_paths", post(handlers::kg_find_paths))
         // v0.7.0 Continuation 6 — link signature verification (S52).
         .route("/api/v1/links/verify", post(handlers::verify_link_handler))
         // v0.7.0 Continuation 6 — per-agent quota status (S61).

@@ -49,13 +49,26 @@ use super::{AppState, StorageBackend};
 #[cfg(feature = "sal")]
 #[must_use]
 pub fn postgres_not_implemented(endpoint: &'static str) -> Response {
+    // #934 (Track C, 2026-05-20) — for `/api/v1/find_paths` callers
+    // who hit this fallback on a pre-alias binary, point at the
+    // canonical `/api/v1/kg/find_paths` so the remediation hint is
+    // actually actionable. The alias landed in `src/lib.rs` so
+    // /find_paths no longer reaches this gate at runtime on a
+    // current binary — this branch survives so historic clients on
+    // older binaries still get a useful pointer instead of a
+    // confusing "feature missing" message.
+    let remediation = if endpoint == "/api/v1/find_paths" {
+        "POST /api/v1/kg/find_paths instead (same handler; the bare /find_paths path is now an alias on v0.7.0+ binaries). Accepts both `source_id`/`target_id` and `from_id`/`to_id` body fields."
+    } else {
+        "use sqlite-backed daemon or wait for v0.7.x trait coverage"
+    };
     (
         StatusCode::NOT_IMPLEMENTED,
         Json(json!({
             "error": "endpoint not yet implemented for postgres-backed daemon",
             "endpoint": endpoint,
             "storage_backend": "postgres",
-            "remediation": "use sqlite-backed daemon or wait for v0.7.x trait coverage",
+            "remediation": remediation,
         })),
     )
         .into_response()
