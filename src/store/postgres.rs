@@ -3754,7 +3754,20 @@ impl PostgresStore {
             .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("LOAD age", e))?;
-        sqlx::query("SET search_path = ag_catalog, \"$user\", public")
+        // #925 (2026-05-20): use `SET LOCAL` so the search_path
+        // mutation is transaction-scoped and auto-reverts at
+        // COMMIT/ROLLBACK. Pre-fix the bare `SET search_path`
+        // persisted across the transaction boundary; sqlx's pool
+        // reset doesn't fire until the NEXT checkout, so a subsequent
+        // regular `INSERT INTO memories` on the same pooled
+        // connection inherited `ag_catalog` as the first search_path
+        // entry and the row landed under `ag_catalog.memories`
+        // instead of the operator-requested per-IronClaw schema
+        // (e.g. `ic_alice`). That broke the per-daemon data
+        // isolation the lan-parity test mesh depends on. The other
+        // three AGE entry points (sibling sites below) follow the
+        // same `SET LOCAL` pattern.
+        sqlx::query("SET LOCAL search_path = ag_catalog, \"$user\", public")
             .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("set search_path", e))?;
@@ -4037,7 +4050,7 @@ impl PostgresStore {
             .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("LOAD age", e))?;
-        sqlx::query("SET search_path = ag_catalog, \"$user\", public")
+        sqlx::query("SET LOCAL search_path = ag_catalog, \"$user\", public")
             .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("set search_path", e))?;
@@ -4404,7 +4417,7 @@ impl PostgresStore {
             .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("LOAD age", e))?;
-        sqlx::query("SET search_path = ag_catalog, \"$user\", public")
+        sqlx::query("SET LOCAL search_path = ag_catalog, \"$user\", public")
             .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("set search_path", e))?;
@@ -4772,7 +4785,7 @@ impl PostgresStore {
             .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("LOAD age", e))?;
-        sqlx::query("SET search_path = ag_catalog, \"$user\", public")
+        sqlx::query("SET LOCAL search_path = ag_catalog, \"$user\", public")
             .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("set search_path", e))?;
