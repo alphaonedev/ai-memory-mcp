@@ -8315,6 +8315,13 @@ async fn http_register_agent_capabilities_array_preserved() {
 #[tokio::test]
 async fn http_list_pending_with_pending_actions_returns_them() {
     // Queue two pending actions and confirm both surface.
+    // #958 (security-medium, 2026-05-20) — `/api/v1/pending` is now
+    // caller-gated. To exercise the legacy cross-requester listing
+    // semantic this test was written for, route through
+    // `test_app_state_with_admin("ops:admin")` + the matching
+    // `X-Agent-Id` header so the admin allowlist bypass admits the
+    // cross-tenant view. The non-admin filter contract is covered by
+    // `tests/list_pending_owner_gate_958.rs`.
     use crate::models::GovernedAction;
     let state = test_state();
     {
@@ -8340,11 +8347,12 @@ async fn http_list_pending_with_pending_actions_returns_them() {
     }
     let app = Router::new()
         .route("/api/v1/pending", axum_get(list_pending))
-        .with_state(test_app_state(state.clone()));
+        .with_state(test_app_state_with_admin(state.clone(), "ops:admin"));
     let resp = app
         .oneshot(
             axum::http::Request::builder()
                 .uri("/api/v1/pending")
+                .header("x-agent-id", "ops:admin")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -8361,6 +8369,11 @@ async fn http_list_pending_with_pending_actions_returns_them() {
 
 #[tokio::test]
 async fn http_list_pending_filters_by_status_pending() {
+    // #958 — list_pending caller-gated. Route through the admin
+    // bypass + `X-Agent-Id: ops:admin` so the status filter under
+    // test (status=pending) is exercised on the unfiltered queue.
+    // Caller-scoped filtering is covered by
+    // `tests/list_pending_owner_gate_958.rs`.
     use crate::models::GovernedAction;
     let state = test_state();
     let kept_id = {
@@ -8390,11 +8403,12 @@ async fn http_list_pending_filters_by_status_pending() {
     };
     let app = Router::new()
         .route("/api/v1/pending", axum_get(list_pending))
-        .with_state(test_app_state(state.clone()));
+        .with_state(test_app_state_with_admin(state.clone(), "ops:admin"));
     let resp = app
         .oneshot(
             axum::http::Request::builder()
                 .uri("/api/v1/pending?status=pending")
+                .header("x-agent-id", "ops:admin")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -8413,6 +8427,9 @@ async fn http_list_pending_filters_by_status_pending() {
 
 #[tokio::test]
 async fn http_list_pending_filters_by_status_rejected() {
+    // #958 — list_pending caller-gated. Admin bypass + matching
+    // header so the `status=rejected` query path is exercised on
+    // the unfiltered queue.
     use crate::models::GovernedAction;
     let state = test_state();
     {
@@ -8440,11 +8457,12 @@ async fn http_list_pending_filters_by_status_rejected() {
     }
     let app = Router::new()
         .route("/api/v1/pending", axum_get(list_pending))
-        .with_state(test_app_state(state.clone()));
+        .with_state(test_app_state_with_admin(state.clone(), "ops:admin"));
     let resp = app
         .oneshot(
             axum::http::Request::builder()
                 .uri("/api/v1/pending?status=rejected&limit=10")
+                .header("x-agent-id", "ops:admin")
                 .body(Body::empty())
                 .unwrap(),
         )
