@@ -274,6 +274,7 @@ pub async fn create_link(
     headers: axum::http::HeaderMap,
     Json(raw): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    let _ = &headers;
     // v0.7.0 G-PHASE-E-1 (#706) — reject unknown fields with a
     // structured 400 instead of silently defaulting `relation` to
     // `related_to`. The canonical shape is `{source_id|from,

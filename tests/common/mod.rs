@@ -56,7 +56,7 @@ use tempfile::NamedTempFile;
 /// is not the caller's id when the memory's `scope` is `"private"`
 /// (the default). Without a stable `X-Agent-Id` header, every test
 /// request gets a UNIQUE anonymous id — the seed-then-read pattern
-/// (POST /memories → POST /find_paths or GET /recall) ends up with
+/// (POST `/memories` → POST `/find_paths` or GET `/recall`) ends up with
 /// the reader being a different anonymous principal than the writer
 /// and the filter drops every row, surfacing as an empty `paths` /
 /// `memories` array on an otherwise-200 response.

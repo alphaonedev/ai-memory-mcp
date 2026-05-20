@@ -162,6 +162,7 @@ async fn fetch_consolidate_source_pairs(
     ids: &[String],
     caller_principal: &str,
 ) -> Result<Vec<(String, String)>, Response> {
+    let _ = caller_principal;
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         // v0.7.0 ship-hardening (QC P1, 2026-05-20): use the resolved
@@ -688,6 +689,7 @@ async fn fetch_memory_for_handler(
     id: &str,
     caller_principal: &str,
 ) -> Result<Memory, Response> {
+    let _ = caller_principal;
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         // QC P1 fix (2026-05-20): use header-resolved caller so the
@@ -752,6 +754,7 @@ pub async fn load_family_handler(
     headers: HeaderMap,
     Json(body): Json<LoadFamilyBody>,
 ) -> impl IntoResponse {
+    let _ = &headers;
     use std::str::FromStr;
 
     let family = match Family::from_str(&body.family) {

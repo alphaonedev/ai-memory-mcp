@@ -311,6 +311,8 @@ async fn recall_response(
     // hook_subscribers.rs.
     #[cfg(not(feature = "sal"))]
     let _ = recall_scope_tier;
+    #[cfg(not(feature = "sal"))]
+    let _ = caller_principal;
     // v0.7.0 Wave-3 Continuation 2 (Phase 10) — postgres-backed
     // hybrid recall via the SAL trait. Embeds the query AND dispatches
     // through `app.store.recall_hybrid` so the postgres adapter applies

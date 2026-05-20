@@ -70,6 +70,7 @@ pub async fn detect_contradictions(
     headers: axum::http::HeaderMap,
     Query(q): Query<ContradictionsQuery>,
 ) -> impl IntoResponse {
+    let _ = &headers;
     if q.topic.is_none() && q.namespace.is_none() {
         return (
             StatusCode::BAD_REQUEST,
@@ -621,6 +622,7 @@ pub async fn check_duplicate(
     headers: axum::http::HeaderMap,
     Json(body): Json<CheckDuplicateBody>,
 ) -> impl IntoResponse {
+    let _ = &headers;
     if let Err(e) = validate::validate_title(&body.title) {
         return (
             StatusCode::BAD_REQUEST,
