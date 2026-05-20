@@ -8910,7 +8910,14 @@ impl OneshotDaemon {
             autonomous_hooks: false,
             recall_scope: std::sync::Arc::new(None),
             deferred_audit_queue: std::sync::Arc::new(None),
-            admin_agent_ids: std::sync::Arc::new(Vec::new()),
+            // #956 / #957 (security, 2026-05-20) — `/api/v1/import` +
+            // `/api/v1/export` admin-gated via
+            // `handlers::admin_role::require_admin`. The in-process
+            // integration suite drives both surfaces via
+            // `route_post(..., Some("ai:phase4-admin"))`; seed the
+            // matching admin allowlist so happy-path tests continue
+            // to exercise the row walk against the gated handler.
+            admin_agent_ids: std::sync::Arc::new(vec!["ai:phase4-admin".to_string()]),
         };
         let api_key_state = ai_memory::handlers::ApiKeyState {
             key: None,
@@ -11834,6 +11841,8 @@ async fn http_phase4_import_memories() {
         }),
     ];
 
+    // #956 — `/api/v1/import` admin-gated; OneshotDaemon seeds
+    // `ai:phase4-admin` into the allowlist; pass via `route_post`.
     let (code, body) = route_post(
         &d,
         "/api/v1/import",
@@ -11841,7 +11850,7 @@ async fn http_phase4_import_memories() {
             "memories": memories_to_import,
             "links": []
         }),
-        None,
+        Some("ai:phase4-admin"),
     )
     .await;
     assert_eq!(code, "200", "import status code: {body}");
