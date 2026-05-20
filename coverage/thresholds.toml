@@ -25,18 +25,31 @@
 # reshaped.
 
 [global]
-# Global floor on the workspace TOTAL line coverage. Set at the current
-# measured value rounded down (floor(measured - 0.5)).
-# Current measured: 92.58% (live-PG + AGE, --features sal,sal-postgres
-# --lib --tests --workspace, 2026-05-20 measurement against
-# .local-runs/coverage-tier4-audit.json). Raised from 88.0 per Task #99
-# / #836 Tier 4 release gate ("Coverage uplift: global 89.02% → ≥90.5%,
-# set floor 90"). The 90 floor preserves ~2.58pp headroom for jitter
-# (was ~0.56pp at the 88 floor vs 88.56% measured).
-# Note: the `Code Coverage` job in .github/workflows/ci.yml runs a different
-# feature set (`--features sal`) and has its own absolute floor (90%) plus
-# ratchet against `.coverage-baseline` (93.13). That job is unaffected by
-# this gate; this gate is the per-module + per-feature-set complement.
+# Global floor on the workspace TOTAL line coverage. Set at
+# floor(measured - 0.5) over the LIVE-PG+AGE+pgvector workflow
+# measurement.
+#
+# Current measured: 92.58% (live-PG + AGE + pgvector,
+# --features sal,sal-postgres --lib --tests --workspace,
+# 2026-05-20 measurement against .local-runs/coverage-tier4-audit.json
+# from Tier 4 audit agent afaa498d2f92a9026). The 90 floor preserves
+# ~2.58pp headroom over the live-PG measurement for run-to-run
+# jitter — store/postgres.rs (5852 executable lines) at 70.54%
+# accounts for ~4.10pp on the global denominator and is exercised
+# by `live_*` / `serve_postgres_*` / `g[1-9]_postgres_*` /
+# `federation_dlq_replay` tests when AI_MEMORY_TEST_POSTGRES_URL is
+# set.
+#
+# This gate runs `.github/workflows/coverage.yml` which provisions a
+# pgvector/AGE service container so the postgres-store tests connect
+# at runtime instead of skipping. The workflow's `services:` block +
+# `init-age.sql`-equivalent step ensures both pgvector AND apache/age
+# extensions are loaded before cargo-llvm-cov runs.
+#
+# The `Code Coverage` job in .github/workflows/ci.yml runs a different
+# feature set (`--features sal` only) and has its own absolute floor
+# (90%) plus ratchet against `.coverage-baseline` (93.13). That job is
+# unaffected by this gate.
 min_line_coverage = 90.0
 
 [modules]

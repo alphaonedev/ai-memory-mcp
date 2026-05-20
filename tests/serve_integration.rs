@@ -185,12 +185,6 @@ fn serve_metrics_endpoint_at_v1_path() {
 
 #[test]
 fn serve_create_then_get_memory() {
-    let tmp = TempDir::new().unwrap();
-    let db = tmp.path().join("ai-memory.db");
-    let serve = spawn_serve(&db, &[], &[]);
-    let client = http_client();
-
-    // POST /api/v1/memories
     // #927/#930 (Track A P4/P9, 2026-05-20) added scope=private +
     // caller-vs-owner gates on the sqlite GET/UPDATE/PROMOTE paths.
     // Set a stable X-Agent-Id on BOTH the write and the read so the
@@ -198,6 +192,13 @@ fn serve_create_then_get_memory() {
     // creates a row owned by `anonymous:req-A` and the read tries to
     // load it as `anonymous:req-B`, and the visibility gate 404s.
     const AGENT: &str = "ai:serve-roundtrip";
+
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("ai-memory.db");
+    let serve = spawn_serve(&db, &[], &[]);
+    let client = http_client();
+
+    // POST /api/v1/memories
     let create_body = serde_json::json!({
         "tier": "mid",
         "namespace": "test-ns",
