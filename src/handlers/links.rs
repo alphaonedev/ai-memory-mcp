@@ -274,7 +274,6 @@ pub async fn create_link(
     headers: axum::http::HeaderMap,
     Json(raw): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let _ = &headers;
     // v0.7.0 G-PHASE-E-1 (#706) — reject unknown fields with a
     // structured 400 instead of silently defaulting `relation` to
     // `related_to`. The canonical shape is `{source_id|from,
@@ -403,7 +402,75 @@ pub async fn create_link(
         };
     }
 
+    // #941 SECURITY-high (Track A QC sweep, 2026-05-20) — caller-vs-
+    // source-memory-owner gate on the sqlite create_link path. Pre-fix
+    // any caller could create a link rooted at any source_id
+    // regardless of ownership — a forge primitive against the v0.7
+    // typed link graph (`:supersedes` / `:contradicts` / `:reflects_on`
+    // pollution). The postgres SAL branch above is correct because
+    // `app.store.link_signed` uses the ctx the handler threaded
+    // through. The sqlite path needs the explicit gate.
+    let caller = match crate::handlers::parity::resolve_caller_agent_id(None, &headers, None) {
+        Ok(c) => c,
+        Err(err) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": err}))).into_response();
+        }
+    };
+
     let lock = app.db.lock().await;
+
+    // Fetch the source memory + compare ownership. Permits source-
+    // owner, inbox-target (`metadata.target_agent_id == caller`), the
+    // legacy "daemon" sentinel, and legacy unowned (empty
+    // `metadata.agent_id`) rows. Mirrors the gate shape in #938
+    // kg_invalidate (commit 54706eeed) and #930 update_memory.
+    let source_mem = match db::get(&lock.0, &source_id) {
+        Ok(Some(m)) => m,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "source memory not found", "source_id": source_id})),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            tracing::error!("create_link: source lookup failed: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "internal server error"})),
+            )
+                .into_response();
+        }
+    };
+    let source_owner = source_mem
+        .metadata
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let source_target = source_mem
+        .metadata
+        .get("target_agent_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let is_unowned_legacy = source_owner.is_empty();
+    if !is_unowned_legacy && source_owner != caller && source_target != caller && caller != "daemon"
+    {
+        tracing::warn!(
+            target: "ai_memory::authz",
+            "POST /api/v1/links 403: caller {caller} != source owner {source_owner} (source_id={source_id})"
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "caller does not own this source memory",
+                "owner": source_owner,
+                "caller": caller,
+                "source_id": source_id,
+            })),
+        )
+            .into_response();
+    }
+
     // v0.7 H2 — sign with the active keypair when one was loaded at
     // startup. Falls back to unsigned (signature NULL, attest_level
     // "unsigned") when no keypair is configured. Either way the chosen
@@ -586,7 +653,80 @@ pub async fn delete_link(
         }),
     );
 
+    // #939 SECURITY-high (Track A QC sweep, 2026-05-20) — caller-vs-
+    // source-or-target-memory-owner gate. Pre-fix any caller could
+    // remove any directional link in the graph regardless of who
+    // authored either endpoint. The audit row above logs intent;
+    // this gate enforces the actual write authorization.
+    //
+    // Permits: caller owns EITHER endpoint (mirrors the symmetric
+    // nature of a link delete — either party can sever), inbox
+    // carve-out on either endpoint, legacy "daemon" sentinel, legacy
+    // unowned rows.
     let lock = app.db.lock().await;
+    let source_mem = match db::get(&lock.0, &source_id) {
+        Ok(Some(m)) => m,
+        Ok(None) => {
+            drop(lock);
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "source memory not found", "source_id": source_id})),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            drop(lock);
+            tracing::error!("delete_link: source lookup failed: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "internal server error"})),
+            )
+                .into_response();
+        }
+    };
+    let target_mem_owner = db::get(&lock.0, &target_id).ok().flatten().and_then(|m| {
+        m.metadata
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    });
+    let source_owner = source_mem
+        .metadata
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let source_target = source_mem
+        .metadata
+        .get("target_agent_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let is_unowned_legacy =
+        source_owner.is_empty() && target_mem_owner.as_deref().unwrap_or("").is_empty();
+    let owns_source = source_owner == caller || source_target == caller;
+    let owns_target = target_mem_owner.as_deref() == Some(caller.as_str());
+    if !is_unowned_legacy && !owns_source && !owns_target && caller != "daemon" {
+        drop(lock);
+        tracing::warn!(
+            target: "ai_memory::authz",
+            "DELETE /api/v1/links 403: caller {caller} owns neither source {source_owner} nor target {} (source_id={source_id})",
+            target_mem_owner.as_deref().unwrap_or("")
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "caller does not own either endpoint of this link",
+                "source_owner": source_owner,
+                "target_owner": target_mem_owner.unwrap_or_default(),
+                "caller": caller,
+                "source_id": source_id,
+                "target_id": target_id,
+            })),
+        )
+            .into_response();
+    }
+
     let delete_result = db::delete_link(&lock.0, &source_id, &target_id);
     drop(lock);
     match delete_result {
