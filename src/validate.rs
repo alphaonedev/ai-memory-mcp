@@ -221,16 +221,73 @@ pub fn validate_source(source: &str) -> Result<()> {
     Ok(())
 }
 
-/// Validate an agent identifier (NHI-hardened).
+/// Reserved internal agent identifiers (issue #977).
+///
+/// Each of these names is used as a `CallerContext` principal by an
+/// internal admin/system path that constructs the context DIRECTLY via
+/// [`crate::store::CallerContext::for_admin`] — bypassing
+/// [`validate_agent_id`] by design. The downstream cross-tenant
+/// ownership gates carve out these literal strings as the "internal
+/// path is exempt" signal (e.g. `caller == "daemon"` in
+/// `src/handlers/parity.rs::require_caller_owns_memory`,
+/// `src/handlers/links.rs`, `src/handlers/kg.rs`,
+/// `src/handlers/hook_subscribers.rs`, `src/mcp/tools/namespace.rs`).
+///
+/// Without this guard, a wire caller setting `X-Agent-Id: daemon` (or
+/// any of the other reserved names) — or the same via the MCP-tool
+/// `agent_id` input field, or the HTTP body `agent_id` field — would
+/// reach `CallerContext.principal == "daemon"` and bypass every cross-
+/// tenant ownership gate. The list below MUST stay in sync with the
+/// production sites that construct `CallerContext::for_admin(...)` with
+/// literal-string principals; adding a new internal sentinel requires
+/// adding the matching reserved-name entry here.
+///
+/// Sites that legitimately use these as internal callers (each calls
+/// `CallerContext::for_admin(...)` directly and never traverses this
+/// validator):
+///
+/// - `"daemon"` → `src/handlers/admin.rs:110,239,441`
+/// - `"subscription-dispatch"` → `src/handlers/subscriptions.rs::dispatch_approval_requested`
+/// - `"ai:http-internal"` → `src/handlers/{http,power,hook_subscribers}.rs`
+/// - `"ai:migrate"` → `src/migrate.rs`
+/// - `"federation-catchup"` → `src/federation/receive.rs`
+/// - `"export-internal"` → `src/store/postgres.rs::export_*`
+/// - `"governance-internal"` → `src/store/postgres.rs::governance_*`
+/// - `"system"` → `src/handlers/hook_subscribers.rs` (stamped on
+///   legacy-rewrite rows; also matched as the unowned-marker sentinel
+///   in cross-tenant gates, so wire spoofing it would let the caller
+///   silently claim ownership of legacy-unowned rows).
+const RESERVED_AGENT_IDS: &[&str] = &[
+    "daemon",
+    "system",
+    "federation-catchup",
+    "subscription-dispatch",
+    "ai:http-internal",
+    "ai:migrate",
+    "export-internal",
+    "governance-internal",
+];
+
+/// Shape-only validation for an agent identifier — the pre-#977
+/// behaviour, separated so internal callers that legitimately need to
+/// load/generate keypairs with reserved-sentinel labels (e.g. the
+/// daemon's own `"daemon"` self-signing keypair at
+/// `src/daemon_runtime.rs:1724 DAEMON_KEYPAIR_LABEL`) can opt into the
+/// looser check.
 ///
 /// Allowed characters: alphanumeric plus `_`, `-`, `:`, `@`, `.`, `/`.
-/// Length: 1..=128 bytes.
+/// Length: 1..=128 bytes. Rejects whitespace, null bytes, control
+/// chars, and shell metacharacters.
 ///
-/// This intentionally permits prefixed/scoped forms such as
-/// `ai:claude-code@host-1:pid-123`, `host:dev-1:pid-9-deadbeef`,
-/// `anonymous:req-abcdef01`, and future SPIFFE-style ids containing `/`.
-/// Rejects whitespace, null bytes, control chars, and shell metacharacters.
-pub fn validate_agent_id(agent_id: &str) -> Result<()> {
+/// New callers SHOULD prefer [`validate_agent_id`] (the wire-side
+/// function that ALSO rejects [`RESERVED_AGENT_IDS`]). Use this
+/// shape-only entry point ONLY for internal paths that operate on
+/// hardcoded-literal sentinels (the daemon's keypair load + the
+/// internal admin `CallerContext::for_admin(...)` construction sites);
+/// every wire entry point (HTTP `X-Agent-Id` header, HTTP body
+/// `agent_id`, MCP-tool `agent_id` input, CLI `--as-agent`) MUST go
+/// through [`validate_agent_id`] instead.
+pub fn validate_agent_id_shape(agent_id: &str) -> Result<()> {
     if agent_id.is_empty() {
         bail!("agent_id cannot be empty");
     }
@@ -241,6 +298,38 @@ pub fn validate_agent_id(agent_id: &str) -> Result<()> {
         if !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ':' | '@' | '.' | '/')) {
             bail!("agent_id contains invalid character '{c}' (allowed: alphanumeric, _-:@./)");
         }
+    }
+    Ok(())
+}
+
+/// Validate an agent identifier (NHI-hardened) for wire-side use.
+///
+/// Calls [`validate_agent_id_shape`] for the shape check, then rejects
+/// the [`RESERVED_AGENT_IDS`] reserved-name set (issue #977) so wire
+/// callers cannot spoof an internal `CallerContext` principal. Internal
+/// callers constructing `CallerContext::for_admin` directly do not
+/// traverse this validator and remain unaffected; internal keypair
+/// load/generate uses [`validate_agent_id_shape`] (shape-only) so the
+/// daemon's `"daemon"`-labelled self-signing keypair still loads.
+///
+/// This is the function every WIRE entry point MUST call:
+/// - HTTP `X-Agent-Id` header / body `agent_id` field
+///   ([`crate::identity::resolve_http_agent_id`])
+/// - MCP-tool `agent_id` input (validated at each tool's entry point)
+/// - HTTP admin endpoints
+/// - CLI `--as-agent` / `identity generate`
+pub fn validate_agent_id(agent_id: &str) -> Result<()> {
+    validate_agent_id_shape(agent_id)?;
+    // #977 — block wire callers from spoofing the internal sentinels
+    // that downstream gates carve out as the "internal path is exempt"
+    // signal. Internal `CallerContext::for_admin(...)` constructions +
+    // the daemon's own keypair load (via `validate_agent_id_shape`)
+    // skip this reserved-name reject by design.
+    if RESERVED_AGENT_IDS.contains(&agent_id) {
+        bail!(
+            "agent_id '{agent_id}' is reserved for internal use and cannot be supplied by wire \
+             callers"
+        );
     }
     Ok(())
 }
@@ -985,6 +1074,63 @@ mod tests {
         assert!(validate_agent_id("alice\\bs").is_err());
         assert!(validate_agent_id("alice?q").is_err());
         assert!(validate_agent_id("alice*glob").is_err());
+    }
+
+    /// #977 — every reserved internal sentinel MUST be rejected by the
+    /// wire-side validator. Each name corresponds to a downstream
+    /// cross-tenant ownership gate that carves it out as the "internal
+    /// path is exempt" signal; without this guard, a wire caller could
+    /// spoof the sentinel via `X-Agent-Id` / MCP-tool `agent_id` / HTTP
+    /// body `agent_id` and bypass every such gate.
+    #[test]
+    fn test_reserved_internal_agent_ids_rejected_977() {
+        for &reserved in RESERVED_AGENT_IDS {
+            let r = validate_agent_id(reserved);
+            assert!(
+                r.is_err(),
+                "reserved agent_id '{reserved}' MUST be rejected on the wire (issue #977)",
+            );
+            // The error message must cite the reserved-name reason so
+            // wire-side log triage can tell this apart from the generic
+            // shape rejection (length / char class).
+            let msg = r.unwrap_err().to_string();
+            assert!(
+                msg.contains("reserved for internal use"),
+                "reserved-name reject must surface the dedicated reason; got: {msg}",
+            );
+        }
+    }
+
+    /// #977 — the canonical NHI shapes that operators / agents legitimately
+    /// stamp on the wire MUST continue to pass. Pins that the reserved-name
+    /// set didn't accidentally swallow a legitimate prefix family.
+    #[test]
+    fn test_legitimate_agent_ids_still_pass_after_977() {
+        // These are the shapes documented in CLAUDE.md "Agent Identity
+        // (NHI)" and exercised across the integration suite.
+        for legitimate in [
+            "alice",
+            "ai:claude-code@host-1:pid-123",
+            "host:dev-1:pid-9-deadbeef",
+            "anonymous:req-abcdef01",
+            "anonymous:pid-42-0123abcd",
+            "spiffe://example.org/ns/prod",
+            // Sibling forms that share a SUBSTRING with reserved names
+            // but are NOT themselves reserved.
+            "daemon-1",
+            "system-admin",
+            "ai:daemon-impostor",
+            "federation-catchup-v2",
+            "subscription-dispatch-replica",
+            "ai:http-internal-shadow",
+            "export-internal-tester",
+            "governance-internal-audit",
+        ] {
+            assert!(
+                validate_agent_id(legitimate).is_ok(),
+                "legitimate NHI shape '{legitimate}' MUST still pass after #977",
+            );
+        }
     }
 
     #[test]
