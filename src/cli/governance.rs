@@ -103,11 +103,12 @@ pub fn enforce(
         payload,
     )? {
         GovernanceDecision::Allow => Ok(GovernanceOutcome::Allow),
-        GovernanceDecision::Deny(reason) => {
+        GovernanceDecision::Deny(refusal) => {
             writeln!(
                 out.stderr,
                 "{} denied by governance: {reason}",
-                action.as_str()
+                action.as_str(),
+                reason = refusal.reason,
             )?;
             Ok(GovernanceOutcome::Deny)
         }

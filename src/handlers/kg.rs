@@ -254,14 +254,14 @@ pub async fn entity_register(
                 .await
             {
                 Ok(GovernanceDecision::Allow) => {}
-                Ok(GovernanceDecision::Deny(reason)) => {
+                Ok(GovernanceDecision::Deny(refusal)) => {
                     return (
                         StatusCode::FORBIDDEN,
                         Json(json!({
                             "error": crate::governance::deny_message(
                                 "entity_register",
                                 crate::governance::DenyGate::Governance,
-                                &reason,
+                                &refusal.reason,
                             ),
                         })),
                     )

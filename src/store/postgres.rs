@@ -9157,15 +9157,34 @@ impl MemoryStore for PostgresStore {
         // - Owner: caller must equal `memory_owner` (delete/promote) or
         //   `namespace_owner` (store)
         // - Approve: caller is non-owner ⇒ queue pending action
+        // #963 Phase 2: build the typed governance-action enum that the
+        // refusal envelope carries. The SAL `super::GovernedAction` and
+        // the model-layer `crate::models::GovernedAction` are distinct
+        // enums (the SAL one is a backend-trait abstraction; the model
+        // one is the persisted serde shape). Map here once.
+        let model_action = match action {
+            super::GovernedAction::Store => crate::models::GovernedAction::Store,
+            super::GovernedAction::Delete => crate::models::GovernedAction::Delete,
+            super::GovernedAction::Promote => crate::models::GovernedAction::Promote,
+            super::GovernedAction::Reflect => crate::models::GovernedAction::Reflect,
+        };
         let decision = match level {
             GovernanceLevel::Any => GovernanceDecision::Allow,
             GovernanceLevel::Registered => {
                 if registered_agent_check {
                     GovernanceDecision::Allow
                 } else {
-                    GovernanceDecision::Deny(format!(
-                        "agent '{agent_id}' is not registered for namespace '{namespace}'"
-                    ))
+                    GovernanceDecision::Deny(
+                        crate::governance::GovernanceRefusal::new(
+                            model_action,
+                            GovernanceLevel::Registered,
+                            agent_id,
+                            format!(
+                                "agent '{agent_id}' is not registered for namespace '{namespace}'"
+                            ),
+                        )
+                        .with_namespace(namespace),
+                    )
                 }
             }
             GovernanceLevel::Owner => {
@@ -9175,9 +9194,18 @@ impl MemoryStore for PostgresStore {
                 };
                 match owner_to_compare {
                     Some(o) if o == agent_id => GovernanceDecision::Allow,
-                    Some(o) => GovernanceDecision::Deny(format!(
-                        "owner-only namespace '{namespace}': caller '{agent_id}' is not '{o}'"
-                    )),
+                    Some(o) => GovernanceDecision::Deny(
+                        crate::governance::GovernanceRefusal::new(
+                            model_action,
+                            GovernanceLevel::Owner,
+                            agent_id,
+                            format!(
+                                "owner-only namespace '{namespace}': caller '{agent_id}' is not '{o}'"
+                            ),
+                        )
+                        .with_namespace(namespace)
+                        .with_owner(o),
+                    ),
                     None => GovernanceDecision::Allow,
                 }
             }
@@ -11733,11 +11761,16 @@ mod tests {
             .await
             .expect("enforce_governance_action");
         match decision {
-            crate::models::GovernanceDecision::Deny(reason) => {
+            crate::models::GovernanceDecision::Deny(refusal) => {
                 assert!(
-                    reason.contains("owner-only namespace")
-                        || reason.to_lowercase().contains("owner"),
-                    "deny reason should reference owner-only policy; got: {reason}"
+                    refusal.reason.contains("owner-only namespace")
+                        || refusal.reason.to_lowercase().contains("owner"),
+                    "deny reason should reference owner-only policy; got: {refusal:?}"
+                );
+                assert_eq!(
+                    refusal.denied_level,
+                    crate::models::GovernanceLevel::Owner,
+                    "owner-level deny must carry GovernanceLevel::Owner; got {refusal:?}",
                 );
             }
             other => panic!("intruder write to deep child must Deny; got {other:?}"),

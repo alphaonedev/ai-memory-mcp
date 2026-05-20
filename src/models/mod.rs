@@ -430,10 +430,24 @@ mod tests {
 
     #[test]
     fn governance_decision_equality() {
+        use crate::governance::GovernanceRefusal;
         assert_eq!(GovernanceDecision::Allow, GovernanceDecision::Allow);
+        // #963 Phase 2 — `Deny` carries the typed
+        // `GovernanceRefusal` envelope; equality reduces to struct equality
+        // so two refusals with different `reason` still compare unequal.
         assert_ne!(
-            GovernanceDecision::Deny("a".into()),
-            GovernanceDecision::Deny("b".into()),
+            GovernanceDecision::Deny(GovernanceRefusal::new(
+                GovernedAction::Store,
+                GovernanceLevel::Owner,
+                "ai:x",
+                "a",
+            )),
+            GovernanceDecision::Deny(GovernanceRefusal::new(
+                GovernedAction::Store,
+                GovernanceLevel::Owner,
+                "ai:x",
+                "b",
+            )),
         );
         assert_eq!(
             GovernanceDecision::Pending("p1".into()),

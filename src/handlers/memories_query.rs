@@ -619,10 +619,11 @@ pub async fn bulk_create(
                 .await
             {
                 Ok(GovernanceDecision::Allow) => {}
-                Ok(GovernanceDecision::Deny(reason)) => {
+                Ok(GovernanceDecision::Deny(refusal)) => {
                     errors.push(format!(
                         "{}: bulk_create denied by governance: {reason}",
-                        mem.title
+                        mem.title,
+                        reason = refusal.reason,
                     ));
                     continue;
                 }

@@ -138,11 +138,11 @@ pub(crate) fn handle_store(
         .map_err(|e| e.to_string())?
         {
             GovernanceDecision::Allow => {}
-            GovernanceDecision::Deny(reason) => {
+            GovernanceDecision::Deny(refusal) => {
                 return Err(crate::governance::deny_message(
                     "store",
                     crate::governance::DenyGate::Governance,
-                    &reason,
+                    &refusal.reason,
                 ));
             }
             GovernanceDecision::Pending(pending_id) => {

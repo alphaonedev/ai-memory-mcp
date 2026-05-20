@@ -760,14 +760,15 @@ pub async fn import_memories(
                 .await
             {
                 Ok(GovernanceDecision::Allow) => {}
-                Ok(GovernanceDecision::Deny(reason)) => {
-                    let mut msg = String::with_capacity(mem.id.len() + 2 + 50 + reason.len());
+                Ok(GovernanceDecision::Deny(refusal)) => {
+                    let mut msg =
+                        String::with_capacity(mem.id.len() + 2 + 50 + refusal.reason.len());
                     msg.push_str(&mem.id);
                     msg.push_str(": ");
                     msg.push_str(&crate::governance::deny_message(
                         "import",
                         crate::governance::DenyGate::Governance,
-                        &reason,
+                        &refusal.reason,
                     ));
                     errors.push(msg);
                     continue;

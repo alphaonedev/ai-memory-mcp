@@ -7626,37 +7626,71 @@ pub fn is_registered_agent(conn: &Connection, agent_id: &str) -> bool {
 }
 
 /// Evaluate a governance level against caller context.
+/// - `action`: the [`GovernedAction`] under evaluation; threaded into the
+///   [`crate::governance::GovernanceRefusal`] envelope so refusal Display
+///   includes the action verb without the caller having to wrap.
+/// - `namespace`: target namespace; attached to the refusal envelope.
 /// - `memory_owner`: the existing memory's `metadata.agent_id` (delete/promote paths).
 ///   Pass `None` for store operations.
 /// - `namespace_owner`: the `metadata.agent_id` of the namespace's standard memory,
 ///   used as the "owner" for store operations. Resolved once by the caller.
+///
+/// #963 Phase 2 — `Deny` returns a typed
+/// [`crate::governance::GovernanceRefusal`]. The `reason` field carries
+/// the human-readable phrase WITHOUT the `"governance: "` prefix (the
+/// envelope's `Display` adds the `"<action> denied by governance: "`
+/// header). Pre-#963 the same path produced
+/// `Deny(format!("governance: ..."))` which doubled the prefix when
+/// consumers re-wrapped via `deny_message`.
 fn evaluate_level(
     conn: &Connection,
+    action: GovernedAction,
+    namespace: &str,
     level: &GovernanceLevel,
     agent_id: &str,
     memory_owner: Option<&str>,
     namespace_owner: Option<&str>,
 ) -> GovernanceDecision {
+    use crate::governance::GovernanceRefusal;
     match level {
         GovernanceLevel::Any => GovernanceDecision::Allow,
         GovernanceLevel::Registered => {
             if is_registered_agent(conn, agent_id) {
                 GovernanceDecision::Allow
             } else {
-                GovernanceDecision::Deny(format!(
-                    "governance: caller '{agent_id}' is not a registered agent"
-                ))
+                GovernanceDecision::Deny(
+                    GovernanceRefusal::new(
+                        action,
+                        GovernanceLevel::Registered,
+                        agent_id,
+                        format!("caller '{agent_id}' is not a registered agent"),
+                    )
+                    .with_namespace(namespace),
+                )
             }
         }
         GovernanceLevel::Owner => {
             let owner = memory_owner.or(namespace_owner);
             match owner {
                 Some(o) if o == agent_id => GovernanceDecision::Allow,
-                Some(o) => GovernanceDecision::Deny(format!(
-                    "governance: caller '{agent_id}' is not the owner ('{o}')"
-                )),
+                Some(o) => GovernanceDecision::Deny(
+                    GovernanceRefusal::new(
+                        action,
+                        GovernanceLevel::Owner,
+                        agent_id,
+                        format!("caller '{agent_id}' is not the owner ('{o}')"),
+                    )
+                    .with_namespace(namespace)
+                    .with_owner(o),
+                ),
                 None => GovernanceDecision::Deny(
-                    "governance: owner-level action has no resolvable owner".into(),
+                    GovernanceRefusal::new(
+                        action,
+                        GovernanceLevel::Owner,
+                        agent_id,
+                        "owner-level action has no resolvable owner",
+                    )
+                    .with_namespace(namespace),
                 ),
             }
         }
@@ -7776,7 +7810,15 @@ pub fn enforce_governance(
         None
     };
 
-    let decision = evaluate_level(conn, level, agent_id, memory_owner, ns_owner.as_deref());
+    let decision = evaluate_level(
+        conn,
+        action,
+        namespace,
+        level,
+        agent_id,
+        memory_owner,
+        ns_owner.as_deref(),
+    );
 
     // K3 — `Advisory` logs the would-be outcome but does not block or
     // queue a pending row. The capabilities surface continues to
@@ -7785,13 +7827,14 @@ pub fn enforce_governance(
     if mode == PermissionsMode::Advisory {
         match &decision {
             GovernanceDecision::Allow => {}
-            GovernanceDecision::Deny(reason) => {
+            GovernanceDecision::Deny(refusal) => {
                 tracing::warn!(
                     target: "ai_memory::governance",
                     namespace = %namespace,
                     agent_id = %agent_id,
                     action = ?action,
-                    reason = %reason,
+                    reason = %refusal.reason,
+                    denied_level = %refusal.denied_level.as_str(),
                     "permissions.mode=advisory: would-deny suppressed (allowing)"
                 );
             }
@@ -12326,10 +12369,15 @@ mod tests {
         )
         .expect("enforce_governance must not error");
         match deny {
-            GovernanceDecision::Deny(reason) => {
+            GovernanceDecision::Deny(refusal) => {
                 assert!(
-                    reason.contains("not the owner"),
-                    "non-owner deny should cite ownership mismatch, got: {reason}"
+                    refusal.reason.contains("not the owner"),
+                    "non-owner deny should cite ownership mismatch, got: {refusal:?}"
+                );
+                assert_eq!(
+                    refusal.denied_level,
+                    GovernanceLevel::Owner,
+                    "owner-level refusal must carry GovernanceLevel::Owner; got {refusal:?}",
                 );
             }
             other => panic!("expected Deny for non-owner, got {other:?}"),

@@ -67,6 +67,20 @@ pub enum MemoryError {
     /// Carries the operator-authored `reason` from the matching
     /// `governance_rules.reason` column verbatim.
     RefusedByGovernance(String),
+    /// #963 Phase 2 — substrate gate-evaluator refusal
+    /// ([`crate::storage::enforce_governance`] /
+    /// `Store::enforce_governance_action`). Distinguished from
+    /// [`Self::RefusedByGovernance`] (the substrate pre-write hook) by
+    /// carrying the typed [`crate::governance::GovernanceRefusal`]
+    /// envelope so handlers can surface
+    /// `denied_level` / `namespace` / `owner` in HTTP / MCP / CLI
+    /// responses without re-parsing the wire message.
+    ///
+    /// Wire shape (HTTP): `403 FORBIDDEN` with code `GOVERNANCE_REFUSED`.
+    /// The `message()` is the canonical envelope `Display`
+    /// (`"<action> denied by governance: <reason>"`), byte-identical to
+    /// the pre-#963 free-form `Deny(String)` wire shape.
+    RefusedByGovernanceGate(crate::governance::GovernanceRefusal),
 }
 
 impl MemoryError {
@@ -78,7 +92,7 @@ impl MemoryError {
             Self::Conflict(_) => "CONFLICT",
             Self::ReflectionDepthExceeded { .. } => "REFLECTION_DEPTH_EXCEEDED",
             Self::ReflectionCycleDetected { .. } => "REFLECTION_CYCLE_DETECTED",
-            Self::RefusedByGovernance(_) => "GOVERNANCE_REFUSED",
+            Self::RefusedByGovernance(_) | Self::RefusedByGovernanceGate(_) => "GOVERNANCE_REFUSED",
         }
     }
 
@@ -99,7 +113,9 @@ impl MemoryError {
             // explicitly refuses it. 403 FORBIDDEN matches the HTTP
             // semantic the rest of the substrate exposes for "the
             // server understood but refuses to authorize".
-            Self::RefusedByGovernance(_) => StatusCode::FORBIDDEN,
+            Self::RefusedByGovernance(_) | Self::RefusedByGovernanceGate(_) => {
+                StatusCode::FORBIDDEN
+            }
         }
     }
 
@@ -128,6 +144,13 @@ impl MemoryError {
             Self::RefusedByGovernance(reason) => {
                 format!("write refused by substrate governance: {reason}")
             }
+            // #963 Phase 2 — the gate-evaluator refusal carries the
+            // canonical Display via `GovernanceRefusal::Display`, which
+            // is byte-identical to the pre-#963 `Deny(String)` shape:
+            // `"<action> denied by governance: <reason>"`. Surface that
+            // directly so the HTTP / MCP / CLI surfaces emit the same
+            // wire string they did before the typed envelope landed.
+            Self::RefusedByGovernanceGate(refusal) => refusal.to_string(),
         }
     }
 }
@@ -160,6 +183,17 @@ impl From<anyhow::Error> for MemoryError {
         // anyhow chains so this conversion stays additive.
         if let Some(refusal) = e.downcast_ref::<crate::storage::GovernanceRefusal>() {
             return Self::RefusedByGovernance(refusal.reason.clone());
+        }
+        // #963 Phase 2 — the gate-evaluator refusal envelope (typed
+        // `crate::governance::GovernanceRefusal`). Distinct from the
+        // pre-write hook refusal above (`crate::storage::GovernanceRefusal`),
+        // even though they share a struct name in different modules. The
+        // canonical Display is preserved through `RefusedByGovernanceGate`
+        // (see `message()` arm), and the typed fields survive the round
+        // trip via the variant's payload so downstream handlers can
+        // surface `denied_level`/`namespace`/`owner` in JSON.
+        if let Some(refusal) = e.downcast_ref::<crate::governance::GovernanceRefusal>() {
+            return Self::RefusedByGovernanceGate(refusal.clone());
         }
         // #962 — typed substrate-layer error envelope. Each
         // `StorageError` variant maps to its canonical HTTP status by
@@ -261,6 +295,80 @@ mod tests {
         let err: MemoryError = anyhow::anyhow!("db broke").into();
         assert_eq!(err.code(), "DATABASE_ERROR");
         assert!(err.message().contains("db broke"));
+    }
+
+    /// #963 Phase 2 — a typed `crate::governance::GovernanceRefusal`
+    /// wrapped in `anyhow::Error` MUST downcast through
+    /// `From<anyhow::Error>` into the new `RefusedByGovernanceGate`
+    /// variant (NOT the pre-write-hook `RefusedByGovernance`), preserve
+    /// the canonical Display in `message()`, surface
+    /// `GOVERNANCE_REFUSED` + 403, and keep the typed fields readable
+    /// for downstream JSON projection.
+    #[test]
+    fn from_anyhow_downcasts_governance_gate_refusal() {
+        use crate::governance::GovernanceRefusal;
+        use crate::models::{GovernanceLevel, GovernedAction};
+
+        let refusal = GovernanceRefusal::new(
+            GovernedAction::Store,
+            GovernanceLevel::Owner,
+            "ai:bob",
+            "caller 'ai:bob' is not the owner ('ai:alice')",
+        )
+        .with_namespace("team/prod")
+        .with_owner("ai:alice");
+        let anyhow_err = anyhow::Error::new(refusal.clone());
+
+        let mem_err: MemoryError = anyhow_err.into();
+        assert_eq!(mem_err.code(), "GOVERNANCE_REFUSED");
+        assert_eq!(mem_err.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            mem_err.message(),
+            "store denied by governance: caller 'ai:bob' is not the owner ('ai:alice')",
+        );
+
+        match &mem_err {
+            MemoryError::RefusedByGovernanceGate(r) => {
+                assert_eq!(r.action, GovernedAction::Store);
+                assert_eq!(r.denied_level, GovernanceLevel::Owner);
+                assert_eq!(r.namespace.as_deref(), Some("team/prod"));
+                assert_eq!(r.owner.as_deref(), Some("ai:alice"));
+                assert_eq!(r.agent_id, "ai:bob");
+                assert_eq!(r, &refusal);
+            }
+            other => {
+                panic!("typed envelope must downcast to RefusedByGovernanceGate; got {other:?}")
+            }
+        }
+    }
+
+    /// The substrate pre-write hook refusal
+    /// (`crate::storage::GovernanceRefusal`, a *different type* with the
+    /// same name in a different module) still downcasts into the legacy
+    /// `RefusedByGovernance(String)` variant. Pins the disambiguation —
+    /// the new `From<anyhow::Error>` arm for the gate-evaluator refusal
+    /// MUST NOT cannibalise the pre-write-hook path.
+    #[test]
+    fn from_anyhow_preserves_pre_write_hook_refusal_variant() {
+        let hook_refusal = crate::storage::GovernanceRefusal {
+            reason: "rule R1 denies write".to_string(),
+        };
+        let anyhow_err = anyhow::Error::new(hook_refusal);
+
+        let mem_err: MemoryError = anyhow_err.into();
+        assert_eq!(mem_err.code(), "GOVERNANCE_REFUSED");
+        assert_eq!(mem_err.status(), StatusCode::FORBIDDEN);
+        // The pre-write-hook path wraps with "write refused by substrate
+        // governance: " — distinct prefix from the gate-evaluator path
+        // ("<action> denied by governance: ").
+        assert_eq!(
+            mem_err.message(),
+            "write refused by substrate governance: rule R1 denies write",
+        );
+        assert!(
+            matches!(mem_err, MemoryError::RefusedByGovernance(_)),
+            "pre-write-hook refusal must map to RefusedByGovernance, not the new gate variant",
+        );
     }
 
     #[test]

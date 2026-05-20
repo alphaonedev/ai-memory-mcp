@@ -292,12 +292,12 @@ async fn enforce_create_governance<'a>(
         &payload,
     ) {
         Ok(GovernanceDecision::Allow) => Ok(lock),
-        Ok(GovernanceDecision::Deny(reason)) => Err((
+        Ok(GovernanceDecision::Deny(refusal)) => Err((
             StatusCode::FORBIDDEN,
             Json(json!({"error": crate::governance::deny_message(
                 "store",
                 crate::governance::DenyGate::Governance,
-                &reason,
+                &refusal.reason,
             )})),
         )
             .into_response()),
@@ -728,10 +728,10 @@ async fn create_memory_postgres(
         .await
     {
         Ok(crate::models::GovernanceDecision::Allow) => {}
-        Ok(crate::models::GovernanceDecision::Deny(reason)) => {
+        Ok(crate::models::GovernanceDecision::Deny(refusal)) => {
             return (
                 StatusCode::FORBIDDEN,
-                Json(json!({"error": format!("denied: {reason}")})),
+                Json(json!({"error": format!("denied: {reason}", reason = refusal.reason)})),
             )
                 .into_response();
         }
