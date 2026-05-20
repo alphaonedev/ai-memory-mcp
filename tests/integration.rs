@@ -37,6 +37,27 @@ fn cmd(binary: &str) -> std::process::Command {
     // their own test binaries.
     c.env("AI_MEMORY_FED_TRUST_BODY_AGENT_ID", "1");
     c.env("AI_MEMORY_FED_SYNC_TRUST_PEER", "1");
+    // #976 (2026-05-20) — the integration suite's federation tests
+    // pre-date #791 (Ed25519 signed sync) + #922 (per-message nonce
+    // replay protection). The test daemons drive /sync/push and
+    // /sync/since over plain HTTP bodies without minting per-message
+    // signatures or nonces; turn off both requirements at the suite
+    // level so the existing assertions hold. Per-issue regression
+    // tests in `tests/g_issue_*` exercise the default-enforce posture
+    // in their own test binaries.
+    c.env("AI_MEMORY_FED_REQUIRE_SIG", "0");
+    c.env("AI_MEMORY_FED_REQUIRE_NONCE", "0");
+    // #976 (2026-05-20) — every integration-test daemon needs admin
+    // role for the test caller. The admin-gate tightening cluster
+    // (#943 / #946 / #949 / #957 / #960) added `require_admin` to
+    // archive / pending / phase4 / sync_push / smoke / forget /
+    // import routes; pre-#976 the test fixtures had no way to set
+    // up the allowlist (no env-var, no CLI flag), so every test
+    // crashing on 403. The wildcard `*` makes every authenticated
+    // caller admin — appropriate scoping for the test suite where
+    // the daemon process is isolated per-test via tempfile DBs.
+    // Per-test overrides still win (env shadows at `.env()` call).
+    c.env("AI_MEMORY_ADMIN_AGENT_IDS", "*");
     c
 }
 /// Spawn a command and collect its output, panicking with a descriptive
@@ -8150,6 +8171,14 @@ fn test_sync_daemon_mesh_propagates_memory_between_peers() {
     );
 
     // 2. Seed memory into db_B via HTTP.
+    //
+    // #976 (2026-05-20) — post-#948 the federation `/sync/since`
+    // endpoint applies the SAL visibility filter: scope=private rows
+    // are only visible to their owner / inbox target. The mesh test
+    // exercises cross-peer propagation of a SHARED row, so the seed
+    // must mark `scope=collective` in metadata. Pre-#976 the seed
+    // defaulted to scope=private and post-#948 the sync-daemon
+    // received `count=0` every cycle, never meshing the memory.
     let seed_body = serde_json::json!({
         "tier": "long",
         "namespace": "mesh-demo",
@@ -8159,7 +8188,7 @@ fn test_sync_daemon_mesh_propagates_memory_between_peers() {
         "priority": 7,
         "confidence": 1.0,
         "source": "api",
-        "metadata": {},
+        "metadata": {"scope": "collective"},
     });
     let seed_out = std::process::Command::new("curl")
         .args([
@@ -8496,6 +8525,13 @@ fn test_serve_mtls_fingerprint_allowlist_accepts_only_known_peer() {
     assert!(ready, "mTLS serve never accepted peer A's cert for health");
 
     // Seed a memory via mTLS POST.
+    //
+    // #976 (2026-05-20) — post-#948 `/sync/since` applies the SAL
+    // visibility gate; mark `scope=collective` so the federation
+    // pull surfaces this row to peer A (different agent_id than
+    // peer-b). The mTLS layer is orthogonal to the visibility gate —
+    // mTLS authenticates the peer connection; scope governs which
+    // rows that authenticated peer can read.
     let seed = serde_json::json!({
         "tier": "long",
         "namespace": "mtls-demo",
@@ -8505,7 +8541,7 @@ fn test_serve_mtls_fingerprint_allowlist_accepts_only_known_peer() {
         "priority": 7,
         "confidence": 1.0,
         "source": "api",
-        "metadata": {},
+        "metadata": {"scope": "collective"},
     });
     let seed_resp = client_a
         .post(format!("https://127.0.0.1:{port_b}/api/v1/memories"))
@@ -8910,14 +8946,22 @@ impl OneshotDaemon {
             autonomous_hooks: false,
             recall_scope: std::sync::Arc::new(None),
             deferred_audit_queue: std::sync::Arc::new(None),
-            // #956 / #957 (security, 2026-05-20) — `/api/v1/import` +
-            // `/api/v1/export` admin-gated via
-            // `handlers::admin_role::require_admin`. The in-process
-            // integration suite drives both surfaces via
-            // `route_post(..., Some("ai:phase4-admin"))`; seed the
-            // matching admin allowlist so happy-path tests continue
-            // to exercise the row walk against the gated handler.
-            admin_agent_ids: std::sync::Arc::new(vec!["ai:phase4-admin".to_string()]),
+            // #976 (2026-05-20) — every admin-gated endpoint
+            // (`/api/v1/import`, `/api/v1/export`, `/api/v1/archive*`,
+            // `/api/v1/forget`, `/api/v1/skills/*`, sync push/since,
+            // pending governance flows) requires the test caller to be
+            // in the admin allowlist. Pre-#976 the allowlist only
+            // contained `ai:phase4-admin` (the #956/#957 import/export
+            // gate fix), so happy-path tests that drove archive /
+            // phase4 / smoke routes under non-admin callers (or no
+            // caller) returned 403 from `require_admin`. Using the
+            // `*` wildcard matches the posture in `src/handlers/tests.rs:362`
+            // and the subprocess `cmd()` daemon's
+            // `AI_MEMORY_ADMIN_AGENT_IDS=*` env. Negative-admin tests
+            // belong in dedicated fixtures (e.g., the
+            // `src/handlers/admin_role.rs` unit tests) that build
+            // their own AppState with a restricted allowlist.
+            admin_agent_ids: std::sync::Arc::new(vec!["*".to_string()]),
         };
         let api_key_state = ai_memory::handlers::ApiKeyState {
             key: None,
@@ -11726,7 +11770,9 @@ async fn http_phase4_archive_by_ids() {
     assert_eq!(code, "201");
     let mem_id = mem_body["id"].as_str().unwrap().to_string();
 
-    // Archive by IDs (POST /api/v1/archive)
+    // #976 (2026-05-20) — archive caller must own the memory under the
+    // post-#940 caller-vs-row-owner gate. Threading `ai:phase4-agent`
+    // matches the create-time owner (above).
     let (code, body) = route_post(
         &d,
         "/api/v1/archive",
@@ -11734,7 +11780,7 @@ async fn http_phase4_archive_by_ids() {
             "ids": [mem_id.clone()],
             "reason": "test archive"
         }),
-        None,
+        Some("ai:phase4-agent"),
     )
     .await;
     assert_eq!(code, "200", "archive status code: {body}");
@@ -11777,14 +11823,20 @@ async fn http_phase4_restore_archive() {
     assert_eq!(code, "201");
     let mem_id = mem_body["id"].as_str().unwrap().to_string();
 
-    // Archive it
+    // #976 (2026-05-20) — archive + restore must use the same caller
+    // identity as the memory's owner so the post-#940 caller-vs-row-owner
+    // gate in `db::restore_archived_for_caller` matches the row. Pre-#976
+    // the test posted with `None` (synthetic `anonymous:req-<uuid>`),
+    // and the restore-caller's `anonymous:req-<DIFFERENT uuid>` failed
+    // the owner check → 404. Threading `ai:phase4-agent` through both
+    // calls aligns the visibility principal with the memory's owner.
     let (code, _arch_body) = route_post(
         &d,
         "/api/v1/archive",
         &serde_json::json!({
             "ids": [mem_id.clone()]
         }),
-        None,
+        Some("ai:phase4-agent"),
     )
     .await;
     assert_eq!(code, "200");
@@ -11794,7 +11846,7 @@ async fn http_phase4_restore_archive() {
         &d,
         &format!("/api/v1/archive/{mem_id}/restore"),
         &serde_json::json!({}),
-        None,
+        Some("ai:phase4-agent"),
     )
     .await;
     assert_eq!(code, "200", "restore status code: {body}");

@@ -1474,6 +1474,50 @@ pub fn apply_anonymize_default(app_config: &AppConfig) {
     }
 }
 
+/// #976 (2026-05-20) — resolve the admin-allowlist with env-var
+/// precedence over the config-file `[admin].agent_ids` block.
+///
+/// `AI_MEMORY_ADMIN_AGENT_IDS` is a comma-separated list of agent_ids.
+/// The wildcard `*` is honoured (every authenticated caller becomes
+/// admin — appropriate for test daemons + container deploys that
+/// receive the admin allowlist from orchestration secrets instead of a
+/// shipped config.toml). Same `validate_agent_id` filter as the config
+/// path; malformed entries are dropped with a `warn` log so a single
+/// typo cannot lock the operator out.
+///
+/// Returns the config-file allowlist when the env var is absent or
+/// empty; returns an empty Vec when neither source provides agent_ids
+/// (closes every admin-class endpoint by default — the secure
+/// posture per the post-#946 NHI contract).
+#[must_use]
+pub fn resolve_admin_agent_ids(admin_cfg: Option<&crate::config::AdminConfig>) -> Vec<String> {
+    if let Ok(raw) = std::env::var("AI_MEMORY_ADMIN_AGENT_IDS")
+        && !raw.trim().is_empty()
+    {
+        let mut out = Vec::new();
+        for entry in raw.split(',') {
+            let id = entry.trim();
+            if id.is_empty() {
+                continue;
+            }
+            if id == "*" {
+                out.push("*".to_string());
+                continue;
+            }
+            match crate::validate::validate_agent_id(id) {
+                Ok(()) => out.push(id.to_string()),
+                Err(e) => {
+                    tracing::warn!("AI_MEMORY_ADMIN_AGENT_IDS entry '{id}' rejected: {e}; dropping")
+                }
+            }
+        }
+        return out;
+    }
+    admin_cfg
+        .map(crate::config::AdminConfig::validated_agent_ids)
+        .unwrap_or_default()
+}
+
 // ---------------------------------------------------------------------------
 // Embedder / vector-index canonical builders
 // ---------------------------------------------------------------------------
@@ -2822,13 +2866,15 @@ pub async fn bootstrap_serve(
         // `warn` log so a single typo cannot lock the operator out;
         // an absent `[admin]` block resolves to an empty Vec which
         // closes every admin-class endpoint by default.
-        admin_agent_ids: Arc::new(
-            app_config
-                .admin
-                .as_ref()
-                .map(crate::config::AdminConfig::validated_agent_ids)
-                .unwrap_or_default(),
-        ),
+        //
+        // #976 (2026-05-20): `AI_MEMORY_ADMIN_AGENT_IDS` env var
+        // overrides the config-file allowlist. Comma-separated list of
+        // agent_ids; `*` is the wildcard (everyone is admin —
+        // appropriate for test daemons + container deploys where the
+        // allowlist comes from orchestration secrets, not config.toml).
+        // Same `validate_agent_id` filter applies; malformed entries
+        // warn + drop. Precedence: env var > `[admin]` config block.
+        admin_agent_ids: Arc::new(resolve_admin_agent_ids(app_config.admin.as_ref())),
     };
 
     // v0.7.0 Policy-Engine Item 3 — register the deferred-audit
