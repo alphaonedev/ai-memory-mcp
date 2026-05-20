@@ -17,6 +17,24 @@ pub(super) fn handle_delete(
     let id = params["id"].as_str().ok_or("id is required")?;
     validate::validate_id(id).map_err(|e| e.to_string())?;
 
+    // #913 (security-medium / SOC2, 2026-05-19) — admin/destructive
+    // state-change audit. MCP `memory_delete` is the canonical
+    // destructive operation; emit the forensic-chain row BEFORE the
+    // permission gate + storage write so the audit trail captures the
+    // caller's intent regardless of downstream outcome. Complementary
+    // to `audit::emit(AuditAction::Delete)` further down which writes
+    // the SIEM-shaped enterprise row AFTER the delete commits.
+    let caller_for_forensic =
+        crate::identity::resolve_agent_id(params["agent_id"].as_str(), mcp_client)
+            .unwrap_or_else(|_| "anonymous:invalid".to_string());
+    crate::governance::audit::record_decision(
+        &caller_for_forensic,
+        "allow",
+        "memory_delete",
+        "",
+        json!({ "id": id }),
+    );
+
     // Resolve the memory first so governance has owner context.
     let target = if let Some(m) = db::get(conn, id).map_err(|e| e.to_string())? {
         Some(m)
@@ -54,7 +72,11 @@ pub(super) fn handle_delete(
         match Permissions::evaluate(&ctx, &[]) {
             crate::permissions::Decision::Allow | crate::permissions::Decision::Modify(_) => {}
             crate::permissions::Decision::Deny(reason) => {
-                return Err(format!("delete denied by permission rule: {reason}"));
+                return Err(crate::governance::deny_message(
+                    "delete",
+                    crate::governance::DenyGate::PermissionRule,
+                    &reason,
+                ));
             }
             crate::permissions::Decision::Ask(prompt) => {
                 return Ok(json!({
@@ -90,8 +112,12 @@ pub(super) fn handle_delete(
         .map_err(|e| e.to_string())?
         {
             GovernanceDecision::Allow => {}
-            GovernanceDecision::Deny(reason) => {
-                return Err(format!("delete denied by governance: {reason}"));
+            GovernanceDecision::Deny(refusal) => {
+                return Err(crate::governance::deny_message(
+                    "delete",
+                    crate::governance::DenyGate::Governance,
+                    &refusal.reason,
+                ));
             }
             GovernanceDecision::Pending(pending_id) => {
                 // v0.7.0 K4 — see the store-side companion call.
@@ -203,6 +229,7 @@ mod tests {
             confidence_source: crate::models::ConfidenceSource::CallerProvided,
             confidence_signals: None,
             confidence_decayed_at: None,
+            version: 1,
         }
     }
 
@@ -428,28 +455,14 @@ mod tests {
         approver: crate::models::ApproverType,
         owner: &str,
     ) {
-        use crate::models::{GovernanceLevel, GovernancePolicy, default_metadata};
+        use crate::models::{CorePolicy, GovernancePolicy, default_metadata};
         let policy = GovernancePolicy {
-            write: GovernanceLevel::Any,
-            promote: GovernanceLevel::Any,
-            delete: delete_level,
-            approver,
-            inherit: true,
-            max_reflection_depth: None,
-            auto_export_reflections_to_filesystem: None,
-            auto_atomise: None,
-            auto_atomise_threshold_cl100k: None,
-            auto_atomise_max_atom_tokens: None,
-            auto_atomise_max_retries: None,
-            auto_persona_trigger_every_n_memories: None,
-            auto_export_personas_to_filesystem: None,
-            auto_atomise_mode: None,
-            legacy_per_pair_classifier: None,
-            auto_classify_kind: None,
-            synthesis_failure_mode: None,
-            synthesis_max_deletes_per_call: None,
-            synthesis_max_candidate_chars: None,
-            multistep_max_content_chars: None,
+            core: CorePolicy {
+                delete: delete_level,
+                approver,
+                ..CorePolicy::default()
+            },
+            ..Default::default()
         };
         let now = chrono::Utc::now().to_rfc3339();
         let mut metadata = default_metadata();
@@ -489,6 +502,7 @@ mod tests {
             confidence_source: crate::models::ConfidenceSource::CallerProvided,
             confidence_signals: None,
             confidence_decayed_at: None,
+            version: 1,
         };
         let sid = db::insert(conn, &standard).expect("insert standard");
         db::set_namespace_standard(conn, ns, &sid, None).expect("set standard");

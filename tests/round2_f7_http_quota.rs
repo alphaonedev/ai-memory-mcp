@@ -62,9 +62,13 @@ fn build_test_router() -> (axum::Router, std::path::PathBuf, NamedTempFile) {
         replay_cache: std::sync::Arc::new(ai_memory::identity::replay::ReplayCache::default()),
 
         verify_require_nonce: false,
+        federation_nonce_cache: std::sync::Arc::new(
+            ai_memory::identity::replay::FederationNonceCache::default(),
+        ),
         autonomous_hooks: false,
         recall_scope: Arc::new(None),
         deferred_audit_queue: Arc::new(None),
+        admin_agent_ids: Arc::new(Vec::new()),
     };
     let api_key_state = ApiKeyState {
         key: None,
@@ -96,6 +100,9 @@ async fn http_store(
         .method("POST")
         .uri("/api/v1/memories")
         .header("content-type", "application/json")
+        // #907/#910 — match X-Agent-Id to body.agent_id so the spoof
+        // guard accepts the write and the SAL filter knows the owner.
+        .header("x-agent-id", agent_id)
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap();
     let resp = router.clone().oneshot(req).await.unwrap();

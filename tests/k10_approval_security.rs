@@ -93,9 +93,13 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
         replay_cache: std::sync::Arc::new(ai_memory::identity::replay::ReplayCache::default()),
 
         verify_require_nonce: false,
+        federation_nonce_cache: std::sync::Arc::new(
+            ai_memory::identity::replay::FederationNonceCache::default(),
+        ),
         autonomous_hooks: false,
         recall_scope: std::sync::Arc::new(None),
         deferred_audit_queue: std::sync::Arc::new(None),
+        admin_agent_ids: std::sync::Arc::new(Vec::new()),
     };
     let api_key_state = ai_memory::handlers::ApiKeyState {
         key: None,
@@ -137,6 +141,7 @@ async fn seed_pending_delete_row(
         confidence_source: ConfidenceSource::CallerProvided,
         confidence_signals: None,
         confidence_decayed_at: None,
+        version: 1,
     };
     let mem_id = ai_memory::db::insert(&lock.0, &mem).expect("insert memory");
     let payload = json!({"reason": "k10-security"});

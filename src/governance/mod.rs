@@ -53,6 +53,13 @@ use crate::hooks::events::MemoryDelta;
 // `ai-memory governance install-defaults` (one-shot bulk enable)
 // or `ai-memory rules enable <id> --sign` (per-rule).
 pub mod agent_action;
+// v0.7.0 #697 — Ed25519-signed forensic audit log. Independent of the
+// file-based `audit.rs` chain (which logs memory-substrate ops);
+// `governance::audit` captures every governance DECISION (allow /
+// refuse / warn) into a daily-rotated, hash-chained, Ed25519-signed
+// `audit/forensic-<YYYY-MM-DD>.jsonl`. The `ai-memory audit verify
+// --since <ISO_DATE>` CLI walks the chain + signatures.
+pub mod audit;
 // v0.7.0 Policy-Engine Item 3 — deferred audit-log queue for
 // storage-hook refusals. Closes the cryptographic-log gap on the
 // `GOVERNANCE_PRE_WRITE` path that previously routed through
@@ -74,6 +81,12 @@ pub mod rules_store;
 // federation::sync, hooks::executor, llm) calls
 // `wire_check::check(&action)?` to consult it.
 pub mod wire_check;
+// #963 — typed governance refusal envelope. Currently exposed as a
+// self-contained module + unit-tested in isolation; the wire-in to
+// `GovernanceDecision::Deny` lands in the follow-up commit per the
+// per-issue end-to-end protocol (see issue #963 body).
+pub mod refusal;
+pub use refusal::GovernanceRefusal;
 
 // ---------------------------------------------------------------------------
 // Op tag — the five gated operations
@@ -793,10 +806,111 @@ pub fn clear_active_permission_rules_for_test() {
     set_active_permission_rules(Vec::new());
 }
 
+/// #971 (2026-05-20) — single canonical builder for governance /
+/// permission-rule refusal messages.
+///
+/// **Why this exists.** Pre-#971 the same shape
+/// `format!("{verb} denied by {gate}: {reason}")` was inlined at
+/// ~20 sites across `mcp/tools/*`, `handlers/*`, and `cli/commands/*`.
+/// Each call site allocated through the `format!` macro's
+/// formatter-type-erasure path, and the message shape itself drifted
+/// in subtle ways (some sites missed the action verb, some used
+/// `"denied by governance:"`, others `"denied by permission rule:"`).
+///
+/// Centralising the construction here:
+///
+/// 1. **Eliminates the formatter machinery** — one direct
+///    `String::with_capacity` + four `push_str` calls per refusal,
+///    no monomorphised `Arguments` indirection.
+/// 2. **Fixes the shape in one place** — when #963 (typed
+///    `GovernanceRefusal`) lands, every caller flips at the helper
+///    boundary, not at 20 inline sites.
+/// 3. **Documents the wire contract** — the message format is part
+///    of the public refusal contract (clients grep for "denied by
+///    governance" / "denied by permission rule" to detect refusals);
+///    the helper's docs anchor that contract.
+///
+/// The wire shape is preserved byte-identical to the pre-#971
+/// `format!()` output so existing test expectations + client
+/// substring-matches remain valid.
+#[must_use]
+pub fn deny_message(action: &str, gate: DenyGate, reason: &str) -> String {
+    let gate_str = gate.as_str();
+    let mut out = String::with_capacity(action.len() + 12 + gate_str.len() + 2 + reason.len());
+    out.push_str(action);
+    out.push_str(" denied by ");
+    out.push_str(gate_str);
+    out.push_str(": ");
+    out.push_str(reason);
+    out
+}
+
+/// Which gate produced a refusal — controls the `"denied by X"`
+/// substring in the message built by [`deny_message`]. Closed set so
+/// the wire contract cannot drift via free-form string literals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DenyGate {
+    /// K9 / namespace-standard rule refusal.
+    PermissionRule,
+    /// Substrate governance-level refusal (e.g. `enforce_governance`
+    /// returning `GovernanceDecision::Deny`).
+    Governance,
+}
+
+impl DenyGate {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DenyGate::PermissionRule => "permission rule",
+            DenyGate::Governance => "governance",
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests — unit-level coverage for the matcher + combiner.
 // The full pipeline is exercised by tests/k9_permission_pipeline.rs.
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod deny_message_tests {
+    use super::*;
+
+    #[test]
+    fn governance_shape_byte_identical_to_pre_971_format() {
+        // #971 contract: the wire shape MUST match the pre-helper
+        // `format!("{verb} denied by governance: {reason}")` output so
+        // existing client substring-matches + test expectations remain
+        // valid.
+        let got = deny_message("store", DenyGate::Governance, "policy XYZ denies write");
+        assert_eq!(got, "store denied by governance: policy XYZ denies write");
+    }
+
+    #[test]
+    fn permission_rule_shape_byte_identical_to_pre_971_format() {
+        let got = deny_message("delete", DenyGate::PermissionRule, "rule R1 deny");
+        assert_eq!(got, "delete denied by permission rule: rule R1 deny");
+    }
+
+    #[test]
+    fn empty_reason_does_not_panic() {
+        let got = deny_message("archive", DenyGate::Governance, "");
+        assert_eq!(got, "archive denied by governance: ");
+    }
+
+    #[test]
+    fn long_action_verb_with_underscores() {
+        // entity_register / kg_invalidate / etc. — multi-word verbs.
+        let got = deny_message("kg_invalidate", DenyGate::PermissionRule, "K9");
+        assert_eq!(got, "kg_invalidate denied by permission rule: K9");
+    }
+
+    #[test]
+    fn gate_as_str_round_trips() {
+        assert_eq!(DenyGate::PermissionRule.as_str(), "permission rule");
+        assert_eq!(DenyGate::Governance.as_str(), "governance");
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1214,5 +1328,70 @@ mod tests {
             PermissionsMode::Enforce,
         );
         assert_eq!(d, Decision::Allow);
+    }
+
+    // ------------------------------------------------------------------
+    // Coverage-uplift block (2026-05-19): exercise the same-variant
+    // arms of `impl PartialEq for Decision` (lines 176-185) and the
+    // `default_agent_pattern` helper (line 252-254).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn decision_partial_eq_same_allow_arms_match() {
+        // The (Allow, Allow) arm at line 176.
+        let a = Decision::Allow;
+        let b = Decision::Allow;
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn decision_partial_eq_same_deny_arms_match_by_reason() {
+        // The (Deny, Deny) arm at line 177 compares the inner reason
+        // string.
+        let same = Decision::Deny("nope".into());
+        let same_again = Decision::Deny("nope".into());
+        assert_eq!(same, same_again);
+        let different_reason = Decision::Deny("other".into());
+        assert_ne!(same, different_reason);
+    }
+
+    #[test]
+    fn decision_partial_eq_same_modify_arms_compare_canonical_json() {
+        // The (Modify, Modify) arm at lines 178-183 compares via
+        // canonical JSON because MemoryDelta carries a metadata
+        // serde_json::Value that is not Eq.
+        let a = Decision::Modify(MemoryDelta::default());
+        let b = Decision::Modify(MemoryDelta::default());
+        assert_eq!(a, b);
+        let mut delta_with_meta = MemoryDelta::default();
+        delta_with_meta.metadata = Some(serde_json::json!({"k":"v"}));
+        let c = Decision::Modify(delta_with_meta);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn decision_partial_eq_same_ask_arms_match_by_prompt() {
+        // The (Ask, Ask) arm at line 184.
+        let a = Decision::Ask("really?".into());
+        let b = Decision::Ask("really?".into());
+        assert_eq!(a, b);
+        let c = Decision::Ask("hmm?".into());
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn permission_rule_default_agent_pattern_is_wildcard() {
+        // Drives lines 252-254 (`default_agent_pattern`) via serde's
+        // default-fill on the field. JSON without `agent_pattern`
+        // should deserialise to "*".
+        let json = r#"{
+            "namespace_pattern": "*",
+            "op": "memory_store",
+            "decision": "allow"
+        }"#;
+        let rule: PermissionRule = serde_json::from_str(json).expect("deserialise");
+        assert_eq!(rule.agent_pattern, "*");
+        // Direct call also documents the contract.
+        assert_eq!(default_agent_pattern(), "*");
     }
 }

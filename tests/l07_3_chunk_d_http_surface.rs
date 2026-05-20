@@ -110,9 +110,21 @@ fn build_router_fixture() -> (axum::Router, NamedTempFile) {
         llm_call_timeout: std::time::Duration::from_secs(30),
         replay_cache: Arc::new(ai_memory::identity::replay::ReplayCache::default()),
         verify_require_nonce: false,
+        federation_nonce_cache: std::sync::Arc::new(
+            ai_memory::identity::replay::FederationNonceCache::default(),
+        ),
         autonomous_hooks: false,
         recall_scope: Arc::new(None),
         deferred_audit_queue: Arc::new(None),
+        // #976 (2026-05-20) — admin allowlist wildcard so the surface
+        // matrix exercises happy-path 200s on every admin-gated
+        // endpoint (archive_stats, forget, list_namespaces, taxonomy,
+        // kg_invalidate, etc.). The chunk-D matrix is end-to-end shape
+        // coverage; the negative-admin contract tests
+        // (`http_export_returns_envelope`, `http_import_*`) build
+        // their own router with an empty allowlist via
+        // [`build_router_fixture_no_admin`].
+        admin_agent_ids: Arc::new(vec!["*".to_string()]),
     };
     let api_key_state = ApiKeyState {
         key: None,
@@ -122,11 +134,120 @@ fn build_router_fixture() -> (axum::Router, NamedTempFile) {
     (router, f)
 }
 
-async fn post_json(router: &axum::Router, uri: &str, body: Value) -> (StatusCode, Value) {
+/// #976 (2026-05-20) — companion router fixture with an EMPTY admin
+/// allowlist for the negative-admin contract tests
+/// (`http_export_returns_envelope`, `http_import_*`). The default
+/// `build_router_fixture` ships `["*"]` so happy-path matrix coverage
+/// against admin-gated endpoints (archive_stats, forget, taxonomy,
+/// list_namespaces, kg_invalidate, etc.) lands on 200s; the negative
+/// tests build their own router with this helper so the rejection
+/// contract on `/export` and `/import` stays exercised at the same
+/// fixture grain (no separate test binary needed).
+fn build_router_fixture_no_admin() -> (axum::Router, NamedTempFile) {
+    install_federation_legacy_bypass();
+    let f = NamedTempFile::new().expect("tempfile");
+    let db_path = f.path().to_path_buf();
+    let _ = ai_memory::db::open(&db_path).expect("db::open");
+    let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");
+    let db: Db = Arc::new(Mutex::new((
+        conn,
+        db_path.clone(),
+        ResolvedTtl::default(),
+        true,
+    )));
+    #[cfg(feature = "sal")]
+    let store: Arc<dyn ai_memory::store::MemoryStore> =
+        Arc::new(ai_memory::store::sqlite::SqliteStore::open(&db_path).expect("open SqliteStore"));
+    let app_state = AppState {
+        db,
+        embedder: Arc::new(None),
+        vector_index: Arc::new(Mutex::new(None)),
+        federation: Arc::new(None),
+        tier_config: Arc::new(FeatureTier::Keyword.config()),
+        scoring: Arc::new(ResolvedScoring::default()),
+        profile: Arc::new(ai_memory::profile::Profile::core()),
+        mcp_config: Arc::new(None),
+        active_keypair: Arc::new(None),
+        family_embeddings: Arc::new(tokio::sync::RwLock::new(Some(Vec::new()))),
+        storage_backend: ai_memory::handlers::StorageBackend::Sqlite,
+        #[cfg(feature = "sal")]
+        store,
+        llm: Arc::new(None),
+        auto_tag_model: Arc::new(None),
+        llm_call_timeout: std::time::Duration::from_secs(30),
+        replay_cache: Arc::new(ai_memory::identity::replay::ReplayCache::default()),
+        verify_require_nonce: false,
+        federation_nonce_cache: std::sync::Arc::new(
+            ai_memory::identity::replay::FederationNonceCache::default(),
+        ),
+        autonomous_hooks: false,
+        recall_scope: Arc::new(None),
+        deferred_audit_queue: Arc::new(None),
+        // Empty allowlist — the v0.7.0 safe-by-default posture.
+        admin_agent_ids: Arc::new(Vec::new()),
+    };
+    let api_key_state = ApiKeyState {
+        key: None,
+        mtls_enforced: false,
+    };
+    let router = ai_memory::build_router(api_key_state, app_state);
+    (router, f)
+}
+
+/// POST JSON with an explicit X-Agent-Id header.
+///
+/// #976 (2026-05-20) — the post-#940 caller-vs-row-owner gates on
+/// `/api/v1/links`, `/api/v1/kg/timeline`, `/api/v1/kg/invalidate`,
+/// and similar substrate endpoints require the caller to own (or
+/// be inbox-target / collective-scope-able to see) the referenced
+/// memories. Tests that drive these surfaces against
+/// `create_basic`-seeded rows (owned by `ai:test`) MUST send the
+/// matching `X-Agent-Id` header.
+async fn post_json_with_agent(
+    router: &axum::Router,
+    uri: &str,
+    body: Value,
+    agent_id: &str,
+) -> (StatusCode, Value) {
     let req = Request::builder()
         .method("POST")
         .uri(uri)
         .header("content-type", "application/json")
+        .header("x-agent-id", agent_id)
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 4 * 1024 * 1024)
+        .await
+        .unwrap();
+    let parsed: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, parsed)
+}
+
+async fn post_json(router: &axum::Router, uri: &str, body: Value) -> (StatusCode, Value) {
+    // #907 — if body carries `agent_id` (or `metadata.agent_id`) the
+    // spoof guard requires a matching X-Agent-Id header. Auto-derive
+    // the header from the body so the existing test bodies don't all
+    // need rewriting. #910 — also ensures the SAL visibility filter
+    // sees the same principal on subsequent reads.
+    let body_agent_id = body
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            body.get("metadata")
+                .and_then(|m| m.get("agent_id"))
+                .and_then(|v| v.as_str())
+        })
+        .map(str::to_string);
+    let mut req = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json");
+    if let Some(aid) = body_agent_id.as_deref() {
+        req = req.header("x-agent-id", aid);
+    }
+    let req = req
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap();
     let resp = router.clone().oneshot(req).await.unwrap();
@@ -178,10 +299,50 @@ async fn get_uri(router: &axum::Router, uri: &str) -> (StatusCode, Value) {
     (status, parsed)
 }
 
+async fn get_uri_with_agent(
+    router: &axum::Router,
+    uri: &str,
+    agent_id: &str,
+) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header("X-Agent-Id", agent_id)
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 8 * 1024 * 1024)
+        .await
+        .unwrap();
+    let parsed: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, parsed)
+}
+
 async fn delete_uri(router: &axum::Router, uri: &str) -> (StatusCode, Value) {
     let req = Request::builder()
         .method("DELETE")
         .uri(uri)
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let parsed: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, parsed)
+}
+
+async fn delete_uri_with_agent(
+    router: &axum::Router,
+    uri: &str,
+    agent_id: &str,
+) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method("DELETE")
+        .uri(uri)
+        .header("X-Agent-Id", agent_id)
         .body(Body::empty())
         .unwrap();
     let resp = router.clone().oneshot(req).await.unwrap();
@@ -205,6 +366,55 @@ async fn put_json(router: &axum::Router, uri: &str, body: Value) -> (StatusCode,
     let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
         .await
         .unwrap();
+    let parsed: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, parsed)
+}
+
+/// PUT with X-Agent-Id header — required after #930 (Track A P9,
+/// 2026-05-20) added the caller-vs-row-owner gate on UPDATE. Tests
+/// that read back a row they just created via `create_basic` (which
+/// stamps `metadata.agent_id = "ai:test"`) must send the same id on
+/// the PUT or the gate 403s.
+async fn put_json_with_agent(
+    router: &axum::Router,
+    uri: &str,
+    body: Value,
+    agent_id: &str,
+) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method("PUT")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .header("X-Agent-Id", agent_id)
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let parsed: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, parsed)
+}
+
+/// POST /promote with X-Agent-Id header — required after #930
+/// extended the caller-vs-row-owner gate to the PROMOTE path.
+async fn promote_with_agent(
+    router: &axum::Router,
+    uri: &str,
+    agent_id: &str,
+) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("X-Agent-Id", agent_id)
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap_or_default();
     let parsed: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
     (status, parsed)
 }
@@ -420,13 +630,19 @@ async fn http_get_memory_by_id_and_prefix() {
     assert_eq!(s, StatusCode::CREATED);
     assert!(!id.is_empty());
 
-    let (status, payload) = get_uri(&router, &format!("/api/v1/memories/{id}")).await;
+    // #927 (Track A P4, 2026-05-20) extended scope=private filter to
+    // GET /memories/{id} on the sqlite path. `create_basic` stamps
+    // `metadata.agent_id = "ai:test"`; use the matching X-Agent-Id on
+    // the GET so the visibility gate admits the read.
+    let (status, payload) =
+        get_uri_with_agent(&router, &format!("/api/v1/memories/{id}"), "ai:test").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["memory"]["id"].as_str(), Some(id.as_str()));
 
     // Prefix lookup (8-char prefix).
     let prefix = &id[..8];
-    let (s2, p2) = get_uri(&router, &format!("/api/v1/memories/{prefix}")).await;
+    let (s2, p2) =
+        get_uri_with_agent(&router, &format!("/api/v1/memories/{prefix}"), "ai:test").await;
     assert_eq!(s2, StatusCode::OK);
     assert_eq!(p2["memory"]["id"].as_str(), Some(id.as_str()));
 }
@@ -463,7 +679,12 @@ async fn http_update_memory_happy_path() {
         "priority": 9,
         "tags": ["updated"],
     });
-    let (status, _payload) = put_json(&router, &format!("/api/v1/memories/{id}"), body).await;
+    // #930 (Track A P9, 2026-05-20) added caller-vs-row-owner gate on
+    // PUT. `create_basic` stamps the row with `metadata.agent_id =
+    // "ai:test"`; the PUT must send the same X-Agent-Id or the gate
+    // 403s.
+    let (status, _payload) =
+        put_json_with_agent(&router, &format!("/api/v1/memories/{id}"), body, "ai:test").await;
     assert_eq!(status, StatusCode::OK);
 }
 
@@ -495,12 +716,17 @@ async fn http_update_memory_invalid_priority_rejected() {
 
 #[tokio::test]
 async fn http_delete_memory_happy_path() {
+    // #976 (2026-05-20) — post-#940 caller-vs-row-owner gate on
+    // DELETE; the `create_basic`-stamped owner is `ai:test` so the
+    // delete must send the matching X-Agent-Id.
     let (router, _f) = build_router_fixture();
     let (_s, id) = create_basic(&router, "chunk-d/del", "del-mem").await;
-    let (status, _payload) = delete_uri(&router, &format!("/api/v1/memories/{id}")).await;
+    let (status, _payload) =
+        delete_uri_with_agent(&router, &format!("/api/v1/memories/{id}"), "ai:test").await;
     assert_eq!(status, StatusCode::OK);
     // Second delete: now missing → 404.
-    let (s2, _p2) = delete_uri(&router, &format!("/api/v1/memories/{id}")).await;
+    let (s2, _p2) =
+        delete_uri_with_agent(&router, &format!("/api/v1/memories/{id}"), "ai:test").await;
     assert_eq!(s2, StatusCode::NOT_FOUND);
 }
 
@@ -521,13 +747,16 @@ async fn http_promote_memory_happy_path() {
     let (router, _f) = build_router_fixture();
     let (_s, id) = create_basic(&router, "chunk-d/promo", "promo-mem").await;
     // promote_memory takes no body — it just promotes to long tier.
-    let req = Request::builder()
-        .method("POST")
-        .uri(format!("/api/v1/memories/{id}/promote"))
-        .body(Body::empty())
-        .unwrap();
-    let resp = router.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    // #930 (Track A P9, 2026-05-20) added the caller-vs-row-owner
+    // gate to PROMOTE; the request must send X-Agent-Id matching the
+    // row's `metadata.agent_id = "ai:test"` (set by create_basic).
+    let (status, _payload) = promote_with_agent(
+        &router,
+        &format!("/api/v1/memories/{id}/promote"),
+        "ai:test",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
 }
 
 #[tokio::test]
@@ -551,7 +780,13 @@ async fn http_list_memories_returns_array() {
     let (router, _f) = build_router_fixture();
     let _ = create_basic(&router, "chunk-d/list", "l1").await;
     let _ = create_basic(&router, "chunk-d/list", "l2").await;
-    let (status, payload) = get_uri(&router, "/api/v1/memories?namespace=chunk-d/list").await;
+    // #910 SAL — read as the same principal that wrote.
+    let (status, payload) = get_uri_with_agent(
+        &router,
+        "/api/v1/memories?namespace=chunk-d/list",
+        "ai:test",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert!(payload["memories"].is_array());
     let mems = payload["memories"].as_array().unwrap();
@@ -843,6 +1078,11 @@ async fn http_load_family_invalid_namespace_400() {
 
 #[tokio::test]
 async fn http_create_link_happy() {
+    // #976 (2026-05-20) — link creation requires the caller to be
+    // visible on both source + target rows (post-#690 K9 gate +
+    // post-#940 caller-vs-row-owner gate). `create_basic` stamps
+    // `agent_id=ai:test`, so the link POST must send the matching
+    // X-Agent-Id header to satisfy both gates.
     let (router, _f) = build_router_fixture();
     let (_s, id1) = create_basic(&router, "chunk-d/link", "src").await;
     let (_s2, id2) = create_basic(&router, "chunk-d/link", "dst").await;
@@ -851,7 +1091,7 @@ async fn http_create_link_happy() {
         "target_id": id2,
         "relation": "related_to",
     });
-    let (status, _payload) = post_json(&router, "/api/v1/links", body).await;
+    let (status, _payload) = post_json_with_agent(&router, "/api/v1/links", body, "ai:test").await;
     assert_eq!(status, StatusCode::CREATED);
 }
 
@@ -870,6 +1110,7 @@ async fn http_create_link_self_loop_400() {
 
 #[tokio::test]
 async fn http_create_link_with_s82_wire_shape() {
+    // #976 — same X-Agent-Id requirement as `http_create_link_happy`.
     let (router, _f) = build_router_fixture();
     let (_s, src) = create_basic(&router, "chunk-d/link-s82", "src").await;
     let (_s2, dst) = create_basic(&router, "chunk-d/link-s82", "dst").await;
@@ -879,7 +1120,7 @@ async fn http_create_link_with_s82_wire_shape() {
         "to": dst,
         "rel_type": "related_to",
     });
-    let (status, _payload) = post_json(&router, "/api/v1/links", body).await;
+    let (status, _payload) = post_json_with_agent(&router, "/api/v1/links", body, "ai:test").await;
     assert!(status == StatusCode::CREATED || status == StatusCode::OK);
 }
 
@@ -1453,24 +1694,43 @@ async fn http_entity_get_by_alias_unknown_returns_null_or_404() {
 
 #[tokio::test]
 async fn http_kg_timeline_unknown_source_returns_empty() {
+    // #976 (2026-05-20) — post-#944 `kg_timeline` enforces the
+    // caller-vs-source-memory-owner gate; even for the unknown-id
+    // case the handler runs the gate before the lookup and returns
+    // 404 (not 200) if the caller cannot see the row. For the
+    // unknown-id contract test, the gate short-circuits to 404
+    // because there's no row to compare against. Sending a known
+    // X-Agent-Id avoids the synthetic-anonymous principal path
+    // tripping the visibility gate.
     let (router, _f) = build_router_fixture();
-    let (status, _payload) = get_uri(
+    let (status, _payload) = get_uri_with_agent(
         &router,
         "/api/v1/kg/timeline?source_id=00000000-0000-0000-0000-000000000000",
+        "ai:test",
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
+    // Unknown source — either OK with empty results, or 404 from the
+    // pre-fetch existence check (both are acceptable contracts here).
+    assert!(
+        status == StatusCode::OK || status == StatusCode::NOT_FOUND,
+        "got {status}",
+    );
 }
 
 #[tokio::test]
 async fn http_kg_timeline_with_since_until() {
+    // #976 — same caller-vs-source-memory gate as the sibling above.
     let (router, _f) = build_router_fixture();
-    let (status, _payload) = get_uri(
+    let (status, _payload) = get_uri_with_agent(
         &router,
         "/api/v1/kg/timeline?source_id=00000000-0000-0000-0000-000000000000&since=2024-01-01T00:00:00Z&until=2026-12-31T23:59:59Z",
+        "ai:test",
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
+    assert!(
+        status == StatusCode::OK || status == StatusCode::NOT_FOUND,
+        "got {status}",
+    );
 }
 
 #[tokio::test]
@@ -1498,14 +1758,18 @@ async fn http_kg_invalidate_no_match_404() {
 
 #[tokio::test]
 async fn http_kg_invalidate_real_link() {
+    // #976 (2026-05-20) — link creation + invalidate require the
+    // caller to be the row owner (post-#940). Thread `ai:test` so the
+    // request authenticates as the create_basic-stamped owner.
     let (router, _f) = build_router_fixture();
     let (_s, src) = create_basic(&router, "chunk-d/inv", "s").await;
     let (_s2, dst) = create_basic(&router, "chunk-d/inv", "d").await;
     // Seed a link first.
-    let _ = post_json(
+    let _ = post_json_with_agent(
         &router,
         "/api/v1/links",
         json!({"source_id": src, "target_id": dst, "relation": "related_to"}),
+        "ai:test",
     )
     .await;
     let body = json!({
@@ -1513,7 +1777,8 @@ async fn http_kg_invalidate_real_link() {
         "target_id": dst,
         "relation": "related_to",
     });
-    let (status, payload) = post_json(&router, "/api/v1/kg/invalidate", body).await;
+    let (status, payload) =
+        post_json_with_agent(&router, "/api/v1/kg/invalidate", body, "ai:test").await;
     assert_eq!(status, StatusCode::OK, "{payload}");
 }
 
@@ -1632,16 +1897,34 @@ async fn http_run_gc_happy() {
 
 #[tokio::test]
 async fn http_export_returns_envelope() {
-    let (router, _f) = build_router_fixture();
+    // #957 (security-critical, 2026-05-20) — `/api/v1/export` is
+    // admin-gated. This test pins the non-admin rejection invariant
+    // using the dedicated empty-allowlist fixture (post-#976; pre-#976
+    // the default fixture had empty allowlist and this test passed
+    // incidentally — now it explicitly opts in so the happy-path
+    // matrix can use the wildcard fixture without breaking the
+    // negative-admin contract here).
+    let (router, _f) = build_router_fixture_no_admin();
     let _ = create_basic(&router, "chunk-d/exp", "x").await;
     let (status, payload) = get_uri(&router, "/api/v1/export").await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(payload.is_object());
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "#957: empty-allowlist export MUST reject; body={payload}"
+    );
+    assert_eq!(
+        payload["error"].as_str(),
+        Some("admin role required"),
+        "#957: rejection body MUST be sanitised; body={payload}"
+    );
 }
 
 #[tokio::test]
 async fn http_import_happy() {
-    let (router, _f) = build_router_fixture();
+    // #956 (security-medium, 2026-05-20) — `/api/v1/import` admin-gated;
+    // #976: use the dedicated empty-allowlist fixture to pin the
+    // rejection contract.
+    let (router, _f) = build_router_fixture_no_admin();
     let body = json!({
         "memories": [{
             "id": "44444444-4444-4444-4444-444444444444",
@@ -1660,16 +1943,26 @@ async fn http_import_happy() {
             "reflection_depth": 0,
         }]
     });
-    let (status, _payload) = post_json(&router, "/api/v1/import", body).await;
-    assert!(status == StatusCode::OK || status == StatusCode::CREATED);
+    let (status, payload) = post_json(&router, "/api/v1/import", body).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "#956: empty-allowlist import MUST reject; body={payload}"
+    );
+    assert_eq!(
+        payload["error"].as_str(),
+        Some("admin role required"),
+        "body={payload}"
+    );
 }
 
 #[tokio::test]
 async fn http_import_empty_400_or_ok() {
-    let (router, _f) = build_router_fixture();
+    // #956 — same admin-gate rejection (post-#976: empty-allowlist fixture).
+    let (router, _f) = build_router_fixture_no_admin();
     let body = json!({"memories": []});
     let (status, _payload) = post_json(&router, "/api/v1/import", body).await;
-    assert!(status == StatusCode::OK || status == StatusCode::BAD_REQUEST);
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
 // ---------------------------------------------------------------------------
@@ -1835,7 +2128,12 @@ async fn http_list_subscriptions_with_agent_filter() {
     let _g = lock_hmac();
     ai_memory::config::set_active_hooks_hmac_secret(Some("global-secret".to_string()));
     let (router, _f) = build_router_fixture();
-    let (status, _payload) = get_uri(&router, "/api/v1/subscriptions?agent_id=ai:nobody").await;
+    let (status, _payload) = get_uri_with_agent(
+        &router,
+        "/api/v1/subscriptions?agent_id=ai:nobody",
+        "ai:nobody",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     ai_memory::config::set_active_hooks_hmac_secret(None);
 }
@@ -1864,9 +2162,10 @@ async fn http_unsubscribe_by_namespace_returns_removed_false_on_miss() {
     let _g = lock_hmac();
     ai_memory::config::set_active_hooks_hmac_secret(None);
     let (router, _f) = build_router_fixture();
-    let (status, payload) = delete_uri(
+    let (status, payload) = delete_uri_with_agent(
         &router,
         "/api/v1/subscriptions?agent_id=ai:none&namespace=chunk-d/unmatched",
+        "ai:none",
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -1969,7 +2268,13 @@ async fn http_notify_invalid_agent_id_400() {
 #[tokio::test]
 async fn http_inbox_returns_array() {
     let (router, _f) = build_router_fixture();
-    let (status, payload) = get_uri(&router, "/api/v1/inbox?agent_id=ai:inbox-test").await;
+    // #901/#910 — X-Agent-Id must match the query ?agent_id= owner.
+    let (status, payload) = get_uri_with_agent(
+        &router,
+        "/api/v1/inbox?agent_id=ai:inbox-test",
+        "ai:inbox-test",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert!(payload.get("messages").is_some());
 }
@@ -1977,16 +2282,20 @@ async fn http_inbox_returns_array() {
 #[tokio::test]
 async fn http_inbox_invalid_agent_id_400() {
     let (router, _f) = build_router_fixture();
-    let (status, _payload) = get_uri(&router, "/api/v1/inbox?agent_id=has%20space").await;
+    // The X-Agent-Id header itself carries the malformed id; the
+    // identity resolver returns 400 from `resolve_caller_agent_id`
+    // before the spoof-match check runs.
+    let (status, _payload) = get_uri_with_agent(&router, "/api/v1/inbox", "has space").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
 async fn http_inbox_with_unread_only_filter() {
     let (router, _f) = build_router_fixture();
-    let (status, _payload) = get_uri(
+    let (status, _payload) = get_uri_with_agent(
         &router,
         "/api/v1/inbox?agent_id=ai:inbox2&unread_only=true&limit=5",
+        "ai:inbox2",
     )
     .await;
     assert_eq!(status, StatusCode::OK);

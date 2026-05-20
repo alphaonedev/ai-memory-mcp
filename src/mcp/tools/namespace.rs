@@ -21,6 +21,103 @@ pub fn handle_namespace_set_standard(
         validate::validate_namespace(p).map_err(|e| e.to_string())?;
     }
 
+    // #913 (security-medium / SOC2, 2026-05-19) — admin governance
+    // audit. Namespace-standard mutations gate every downstream write;
+    // the forensic-chain row MUST land before the storage write so the
+    // audit trail captures intent even on validate/storage failure
+    // downstream. MCP callers resolve via `identity::resolve_agent_id`.
+    let caller = crate::identity::resolve_agent_id(params["agent_id"].as_str(), None)
+        .unwrap_or_else(|_| "anonymous:invalid".to_string());
+    crate::governance::audit::record_decision(
+        &caller,
+        "allow",
+        "namespace_set_standard",
+        "",
+        serde_json::json!({
+            "namespace": namespace,
+            "standard_id": id,
+            "parent": parent,
+            "has_governance": params.get("governance").is_some_and(|v| !v.is_null()),
+        }),
+    );
+
+    // #929 SECURITY-high (Track A P6, 2026-05-20) — ownership gate on
+    // the MCP entry. Mirrors the HTTP handler gate at
+    // `handlers/hook_subscribers.rs::set_namespace_standard_inner`.
+    // Without this gate any MCP caller could overwrite any namespace's
+    // governance policy by passing the existing standard's id —
+    // sibling vector to the HTTP path.
+    //
+    // Gate scope: ONLY applies when the caller has explicitly claimed
+    // identity via `params["agent_id"]`. When agent_id is absent the
+    // caller is identifying as the daemon process itself (the
+    // historical "no claim, no gate" semantic — used by integration
+    // tests that invoke this MCP function as a library call without
+    // setting up a full identity chain, and by daemon-internal
+    // bootstrap paths). The HTTP entry is the load-bearing gate for
+    // external callers because it ALWAYS resolves caller via
+    // X-Agent-Id (anonymous fallback included) and threads the
+    // resolved caller into the MCP params before calling here (see
+    // `set_namespace_standard_inner` line 715-720). Direct MCP
+    // callers that DO claim identity (via stdio JSON-RPC params)
+    // remain gated by this check; daemon-internal callers and tests
+    // that don't claim identity get the legacy posture.
+    let identity_claimed = params
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.is_empty());
+    if identity_claimed && let Ok(Some(existing_mem)) = db::get(conn, id) {
+        let recorded_owner = existing_mem
+            .metadata
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let is_unowned = recorded_owner.is_empty() || recorded_owner == "system";
+        if !is_unowned && recorded_owner != caller && caller != "daemon" {
+            return Err(format!(
+                "caller does not own this namespace standard (caller={caller}, owner={recorded_owner})"
+            ));
+        }
+        // Unowned-legacy claim — rewrite metadata.agent_id to caller
+        // so subsequent calls are gated. No-op when caller is the
+        // anonymous fallback (don't anchor ownership to anonymous).
+        if is_unowned && !caller.is_empty() && caller != "anonymous:invalid" {
+            let mut new_meta = if existing_mem.metadata.is_object() {
+                existing_mem.metadata.clone()
+            } else {
+                serde_json::json!({})
+            };
+            if let Some(obj) = new_meta.as_object_mut() {
+                obj.insert(
+                    "agent_id".to_string(),
+                    serde_json::Value::String(caller.clone()),
+                );
+                obj.entry("scope".to_string())
+                    .or_insert_with(|| serde_json::Value::String("shared".to_string()));
+            }
+            // Best-effort: don't fail the set-standard call if the
+            // claim rewrite fails — the ownership gate will refire on
+            // the next call once metadata.agent_id is non-empty.
+            if let Err(e) = db::update(
+                conn,
+                id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(&new_meta),
+            ) {
+                tracing::warn!(
+                    "namespace_standard (MCP): ownership-claim metadata update failed: {e}"
+                );
+            }
+        }
+    }
+
     // Task 1.8: optional governance policy merged into the standard memory's
     // metadata.governance. Policy is deserialized + validated before write.
     //
@@ -185,6 +282,18 @@ pub(crate) fn handle_namespace_clear_standard(
         .as_str()
         .ok_or("namespace is required")?;
     validate::validate_namespace(namespace).map_err(|e| e.to_string())?;
+
+    // #913 (security-medium / SOC2, 2026-05-19) — admin governance audit.
+    let caller = crate::identity::resolve_agent_id(params["agent_id"].as_str(), None)
+        .unwrap_or_else(|_| "anonymous:invalid".to_string());
+    crate::governance::audit::record_decision(
+        &caller,
+        "allow",
+        "namespace_clear_standard",
+        "",
+        serde_json::json!({ "namespace": namespace }),
+    );
+
     let cleared = db::clear_namespace_standard(conn, namespace).map_err(|e| e.to_string())?;
     Ok(json!({"cleared": cleared, "namespace": namespace}))
 }
@@ -317,6 +426,7 @@ mod tests {
             confidence_source: crate::models::ConfidenceSource::CallerProvided,
             confidence_signals: None,
             confidence_decayed_at: None,
+            version: 1,
         };
         db::insert(conn, &mem).expect("insert")
     }

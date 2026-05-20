@@ -144,16 +144,33 @@ pub(super) async fn catchup_once_with_store(
         // the returned rows. Without this, a v0.7.0 peer that's
         // configured an allowlist will default-deny our catchup and
         // hand back an empty page.
-        let resp = match config
+        //
+        // #935 (v0.7.0 Track D, 2026-05-20): attach `x-api-key` when
+        // the daemon was configured with `[api] api_key` so peers
+        // running with api-key auth accept the catchup GET. The
+        // pre-#935 catchup loop omitted this header even though
+        // `sync_cycle_once` and `broadcast_store_quorum` both forward
+        // it, so alice's catchup-pull from bob 401'd on every tick
+        // while the broadcast path worked. The header is attached
+        // ONLY when `config.api_key` is `Some` so mTLS-only
+        // deployments keep the v0.6.x backwards-compatible header
+        // set (the inbound `/sync/since` auth bypass for mTLS
+        // listeners absorbs the missing header). Also attach
+        // `x-agent-id` for parity with `sync_cycle_once` so the
+        // receive-side identity gate (#238/#239) sees a consistent
+        // wire identity on every sync path.
+        let mut req = config
             .client
             .get(&url)
+            .header("x-agent-id", local_id.as_str())
             .header(
                 crate::federation::peer_attestation::PEER_ID_HEADER,
                 local_id.as_str(),
-            )
-            .send()
-            .await
-        {
+            );
+        if let Some(ref key) = config.api_key {
+            req = req.header("x-api-key", key);
+        }
+        let resp = match req.send().await {
             Ok(r) if r.status().is_success() => r,
             Ok(r) => {
                 tracing::debug!(
@@ -182,6 +199,19 @@ pub(super) async fn catchup_once_with_store(
             None => continue,
         };
 
+        // #935 (v0.7.0 Track D, 2026-05-20): emit an info-level
+        // success line on every accepted pull so operators tailing
+        // `docker logs alice | grep catchup` can confirm the
+        // catchup loop is healthy without enabling `RUST_LOG=trace`.
+        // The "pull: <peer-id> ok" tag pins the canonical wording
+        // pinned by the regression test in
+        // `tests/federation_catchup_api_key.rs`.
+        tracing::info!(
+            "catchup: pull: {} ok ({} row(s) returned)",
+            peer.id,
+            memories.len(),
+        );
+
         if memories.is_empty() {
             continue;
         }
@@ -197,7 +227,11 @@ pub(super) async fn catchup_once_with_store(
         // `db::insert_if_newer`) for daemons that don't yet have a SAL
         // handle plumbed through (e.g. v0.6.x configurations).
         if let Some(store) = store {
-            let ctx = crate::store::CallerContext::for_agent("federation-catchup");
+            // #910 — federation catchup is operator-level (peer sync);
+            // it MUST round-trip every row regardless of metadata.scope
+            // so the receiving daemon has the full snapshot. Use the
+            // admin builder to bypass the SAL visibility filter.
+            let ctx = crate::store::CallerContext::for_admin("federation-catchup");
             for raw in &memories {
                 let mem: crate::models::Memory = match serde_json::from_value(raw.clone()) {
                     Ok(m) => m,
@@ -304,16 +338,23 @@ async fn catchup_once_legacy(config: &FederationConfig, db: &crate::handlers::Db
         // v0.7.0 #239 — attach `x-peer-id` so the peer's per-peer
         // namespace allowlist can scope the returned rows (sqlite
         // catchup path, parity with the SAL-routed loop above).
-        let resp = match config
+        //
+        // #935 (v0.7.0 Track D, 2026-05-20): attach `x-api-key` +
+        // `x-agent-id` for parity with the SAL branch and
+        // `sync_cycle_once`. See the matching block in
+        // `catchup_once_with_store` for the full RCA.
+        let mut req = config
             .client
             .get(&url)
+            .header("x-agent-id", local_id.as_str())
             .header(
                 crate::federation::peer_attestation::PEER_ID_HEADER,
                 local_id.as_str(),
-            )
-            .send()
-            .await
-        {
+            );
+        if let Some(ref key) = config.api_key {
+            req = req.header("x-api-key", key);
+        }
+        let resp = match req.send().await {
             Ok(r) if r.status().is_success() => r,
             Ok(r) => {
                 tracing::debug!(
@@ -341,6 +382,14 @@ async fn catchup_once_legacy(config: &FederationConfig, db: &crate::handlers::Db
             Some(arr) => arr.clone(),
             None => continue,
         };
+
+        // #935 — emit the canonical "pull: <peer> ok" success line
+        // pinned by `tests/federation_catchup_api_key.rs`.
+        tracing::info!(
+            "catchup: pull: {} ok ({} row(s) returned)",
+            peer.id,
+            memories.len(),
+        );
 
         if memories.is_empty() {
             continue;
@@ -385,6 +434,80 @@ async fn catchup_once_legacy(config: &FederationConfig, db: &crate::handlers::Db
                 since_opt.as_deref().unwrap_or("<full-snapshot>"),
             );
         }
+    }
+}
+
+/// v0.7.0 Track D #935 — minimal test-driver helper for the
+/// catchup GET path. Used by `tests/federation_catchup_api_key.rs`
+/// to assert the outbound request headers without bringing the
+/// full sqlite `Db` / `MemoryStore` plumbing into the test scope.
+///
+/// The helper fires ONE GET against the configured peer's
+/// `/api/v1/sync/since` endpoint using the exact same header set
+/// `catchup_once_with_store` does (including the #935 `x-api-key`
+/// forward when `config.api_key.is_some()`), then logs the
+/// canonical `catchup: pull: <peer-id> ok` line on success so
+/// regression coverage can pin the wire-level wording.
+///
+/// This is a no-side-effect probe: no memories are applied, no
+/// sync-state is advanced. Production code MUST continue to call
+/// `spawn_catchup_loop_with_store` (SAL) or `spawn_catchup_loop`
+/// (sqlite-only) — this helper is `#[cfg(any(test, ...))]`-gated
+/// for the integration test only.
+#[doc(hidden)]
+pub async fn catchup_once_for_tests(config: &FederationConfig) {
+    let local_id = config.sender_agent_id.clone();
+    for peer in &config.peers {
+        let base = peer
+            .sync_push_url
+            .trim_end_matches("/api/v1/sync/push")
+            .to_string();
+        let url = format!("{base}/api/v1/sync/since?peer={local_id}");
+
+        let mut req = config
+            .client
+            .get(&url)
+            .header("x-agent-id", local_id.as_str())
+            .header(
+                crate::federation::peer_attestation::PEER_ID_HEADER,
+                local_id.as_str(),
+            );
+        if let Some(ref key) = config.api_key {
+            req = req.header("x-api-key", key);
+        }
+        let resp = match req.send().await {
+            Ok(r) if r.status().is_success() => r,
+            Ok(r) => {
+                tracing::debug!(
+                    "catchup: peer {} returned HTTP {} — skipping this tick",
+                    peer.id,
+                    r.status()
+                );
+                continue;
+            }
+            Err(e) => {
+                tracing::debug!("catchup: peer {} unreachable: {e}", peer.id);
+                continue;
+            }
+        };
+
+        let body: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("catchup: peer {} returned unparseable body: {e}", peer.id);
+                continue;
+            }
+        };
+        let memories = body
+            .get("memories")
+            .and_then(|v| v.as_array())
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        tracing::info!(
+            "catchup: pull: {} ok ({} row(s) returned)",
+            peer.id,
+            memories.len(),
+        );
     }
 }
 

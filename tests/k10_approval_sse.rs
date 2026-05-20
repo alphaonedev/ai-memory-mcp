@@ -143,9 +143,13 @@ async fn http_sse_endpoint_emits_event_to_attached_client() {
         replay_cache: std::sync::Arc::new(ai_memory::identity::replay::ReplayCache::default()),
 
         verify_require_nonce: false,
+        federation_nonce_cache: std::sync::Arc::new(
+            ai_memory::identity::replay::FederationNonceCache::default(),
+        ),
         autonomous_hooks: false,
         recall_scope: std::sync::Arc::new(None),
         deferred_audit_queue: std::sync::Arc::new(None),
+        admin_agent_ids: std::sync::Arc::new(Vec::new()),
     };
     let api_key_state = ai_memory::handlers::ApiKeyState {
         key: None,

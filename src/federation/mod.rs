@@ -36,9 +36,23 @@
 
 pub mod peer;
 pub mod peer_attestation;
+// v0.7.0 Track D #933 — federation push DLQ + replay worker. The
+// concrete module requires `async-trait` for the object-safe sink
+// trait + sqlx for the postgres sink; both are SAL-feature deps so
+// the entire DLQ surface is feature-gated to `--features sal`. The
+// sqlite-only (default-features) build keeps `FederationConfig.dlq_sink`
+// typed as `Option<()>` via the stub below so call sites stay uniform
+// across builds.
+#[cfg(feature = "sal")]
+pub mod push_dlq;
 pub mod quorum;
 pub mod receive;
 pub mod reflection_bookkeeping;
+// v0.7.0 #791 — per-message Ed25519 signing of federation POSTs.
+// Outbound POSTs (`broadcast_*_quorum`) attach an `X-Memory-Sig`
+// header; inbound `/sync/push` rejects missing / invalid sigs with
+// `401 Unauthorized` when `AI_MEMORY_FED_REQUIRE_SIG=1` (default).
+pub mod signing;
 pub mod sync;
 pub mod vector_clock;
 
@@ -46,7 +60,20 @@ pub use quorum::*;
 pub use receive::spawn_catchup_loop;
 #[cfg(feature = "sal")]
 pub use receive::spawn_catchup_loop_with_store;
+// #935 (v0.7.0 Track D, 2026-05-20) — `catchup_once_for_tests` is a
+// public test driver for the integration test in
+// `tests/federation_catchup_api_key.rs`. Marked `#[doc(hidden)]` on
+// the source-side so it doesn't appear in rustdoc, but kept `pub`
+// here so the integration test (separate crate) can import it.
+pub use receive::catchup_once_for_tests;
 pub use sync::*;
+// v0.7.0 Track D #933 — re-export push DLQ surface for daemon bootstrap +
+// integration tests.
+#[cfg(feature = "sal")]
+pub use push_dlq::{
+    FederationDlqSink, FederationPushDlqRow, REPLAY_BATCH_SIZE, replay_once,
+    spawn_replay_federation_push_dlq,
+};
 
 use crate::replication::QuorumPolicy;
 
@@ -67,6 +94,25 @@ pub struct FederationConfig {
     /// stay unmodified (backwards-compatible with mTLS-only deployments
     /// and the v0.6.x default-off auth posture).
     pub api_key: Option<String>,
+    /// v0.7.0 #791 — Ed25519 signing key the outbound `post_once` uses
+    /// to compute the `X-Memory-Sig: ed25519=<base64>` header. `None`
+    /// = no header attached (legacy peers + receivers that opted out
+    /// via `AI_MEMORY_FED_REQUIRE_SIG=0` keep working).
+    pub signing_key: Option<std::sync::Arc<ed25519_dalek::SigningKey>>,
+    /// v0.7.0 Track D #933 — federation push DLQ sink. When `Some`,
+    /// per-peer fanout failures inside `broadcast_store_quorum`
+    /// (Fail outcome OR no-Ack-before-deadline) land a row in
+    /// `federation_push_dlq` via this sink, and the
+    /// `replay_federation_push_dlq` worker re-attempts the push
+    /// later. `None` preserves pre-#933 behaviour (silent fanout
+    /// failures) for builds/configs that haven't wired the SAL store
+    /// — typically test harnesses that exercise `broadcast_*_quorum`
+    /// in isolation.
+    ///
+    /// Feature-gated to `--features sal` because the trait surface
+    /// (`async-trait`) is a SAL-only dep.
+    #[cfg(feature = "sal")]
+    pub dlq_sink: Option<std::sync::Arc<dyn push_dlq::FederationDlqSink>>,
 }
 
 /// A single peer in the quorum mesh. The `id` is what we record in
@@ -122,6 +168,7 @@ mod tests {
             confidence_source: crate::models::ConfidenceSource::CallerProvided,
             confidence_signals: None,
             confidence_decayed_at: None,
+            version: 1,
         }
     }
 
@@ -219,6 +266,9 @@ mod tests {
             client,
             sender_agent_id: "ai:fed-test".to_string(),
             api_key: None,
+            signing_key: None,
+            #[cfg(feature = "sal")]
+            dlq_sink: None,
         }
     }
 
@@ -239,6 +289,84 @@ mod tests {
         // acked before return".
         let calls = count1.load(Ordering::Relaxed) + count2.load(Ordering::Relaxed);
         assert!(calls >= 1);
+    }
+
+    /// #931 (v0.7.0 Track D, 2026-05-20) — `broadcast_store_quorum`
+    /// MUST emit an info-level entry-line log on every call so the
+    /// silent-bypass case (function never invoked) is immediately
+    /// distinguishable from "function called but every peer failed".
+    /// Pre-#931 there was no entry log; the only federation tracing
+    /// was per-peer warn lines on a per-peer failure, so the Track D
+    /// Docker probe couldn't tell whether `app.federation` was
+    /// `None` (handler bypassed the call) or every peer 401'd.
+    ///
+    /// This test pins the wire wording `federation::broadcast: store`
+    /// and the structured fields. Any refactor that drops the log or
+    /// changes the phrase MUST update the Track D docker probe in
+    /// lockstep.
+    #[tokio::test]
+    async fn broadcast_emits_entry_line_log_for_track_d_grep() {
+        use tracing_subscriber::Registry;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Clone, Default)]
+        struct CaptureLayer(Arc<std::sync::Mutex<Vec<String>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct Visit<'a>(&'a mut Vec<String>);
+                impl tracing::field::Visit for Visit<'_> {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        if field.name() == "message" {
+                            self.0.push(format!("{value:?}"));
+                        }
+                    }
+                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                        if field.name() == "message" {
+                            self.0.push(value.to_string());
+                        }
+                    }
+                }
+                let mut local: Vec<String> = Vec::new();
+                event.record(&mut Visit(&mut local));
+                if let Ok(mut buf) = self.0.lock() {
+                    buf.extend(local);
+                }
+            }
+        }
+
+        let (url1, _) = spawn_mock_peer(MockBehaviour::Ack).await;
+        let cfg = build_config(vec![url1], 1, 1000);
+
+        let layer = CaptureLayer::default();
+        let messages = layer.0.clone();
+        let dispatch = tracing::Dispatch::new(Registry::default().with(layer));
+
+        // Bind the subscriber for the duration of the broadcast call.
+        // `set_default` is per-thread; the broadcast lives inside the
+        // current task, but spawned peer-fanout tasks may run on
+        // other tokio workers — we only need the entry-line log
+        // which fires on the calling thread before any spawn.
+        {
+            let _guard = tracing::dispatcher::set_default(&dispatch);
+            let _ = broadcast_store_quorum(&cfg, &sample_memory())
+                .await
+                .expect("broadcast must succeed");
+        }
+
+        let captured = messages.lock().unwrap().clone();
+        let joined = captured.join("\n");
+        assert!(
+            joined.contains("federation::broadcast: store"),
+            "expected entry-line log `federation::broadcast: store ... -> 1 peer(s)`; got:\n{joined}"
+        );
     }
 
     #[tokio::test]
@@ -609,6 +737,7 @@ mod tests {
             observed_by: None,
             valid_from: None,
             valid_until: None,
+            attest_level: None,
         }
     }
 
@@ -1318,6 +1447,9 @@ mod tests {
             client,
             sender_agent_id: "ai:catchup-test".to_string(),
             api_key: None,
+            signing_key: None,
+            #[cfg(feature = "sal")]
+            dlq_sink: None,
         }
     }
 
@@ -1346,7 +1478,16 @@ mod tests {
             updated_at: updated_at.to_string(),
             last_accessed_at: None,
             expires_at: None,
-            metadata: serde_json::json!({"agent_id":"ai:peer-0"}),
+            // #910 — mark scope=collective so the test's post-catchup
+            // `store.get(&CallerContext::for_agent("test"), ...)` round-
+            // trip doesn't trip the SAL-level scope=private filter.
+            // Real-world catchup uses `for_admin` and bypasses the
+            // filter; the test fixtures need `scope=collective` to
+            // round-trip via tenant-scoped reads.
+            metadata: serde_json::json!({
+                "agent_id": "ai:peer-0",
+                "scope": "collective",
+            }),
             reflection_depth: 0,
             memory_kind: crate::models::MemoryKind::Observation,
             entity_id: None,
@@ -1357,6 +1498,7 @@ mod tests {
             confidence_source: crate::models::ConfidenceSource::CallerProvided,
             confidence_signals: None,
             confidence_decayed_at: None,
+            version: 1,
         }
     }
 
@@ -1745,7 +1887,7 @@ mod tests {
         let target = format!("{url}/api/v1/sync/push");
 
         let outcome =
-            post_and_classify(&client, &target, &body, "mem-x", Some("mem-x"), None).await;
+            post_and_classify(&client, &target, &body, "mem-x", Some("mem-x"), None, None).await;
         match outcome {
             AckOutcome::Fail(reason) => {
                 assert!(
@@ -1802,7 +1944,8 @@ mod tests {
             .build()
             .unwrap();
         let body = serde_json::json!({"sender_agent_id":"ai:test","memories":[]});
-        let outcome = post_and_classify(&client, &url, &body, "mem-x", Some("mem-x"), None).await;
+        let outcome =
+            post_and_classify(&client, &url, &body, "mem-x", Some("mem-x"), None, None).await;
         assert!(
             matches!(outcome, AckOutcome::IdDrift),
             "expected IdDrift, got {outcome:?}"
@@ -1832,6 +1975,9 @@ mod tests {
             client,
             sender_agent_id: "ai:no-peers".to_string(),
             api_key: None,
+            signing_key: None,
+            #[cfg(feature = "sal")]
+            dlq_sink: None,
         };
         // Non-empty memories list — the shortcut should still fire because
         // the peer list is empty.
@@ -2096,6 +2242,9 @@ mod tests {
             client,
             sender_agent_id: "ai:no-suffix".to_string(),
             api_key: None,
+            signing_key: None,
+            #[cfg(feature = "sal")]
+            dlq_sink: None,
         };
         let db = build_test_db();
         catchup_once(&cfg, &db).await;

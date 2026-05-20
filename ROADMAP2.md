@@ -320,6 +320,47 @@ Defer: G5/G6/G9, R7 (doctor), TOON wire format polish.
 
 ### 7.3 v0.7 — Trust + A2A Maturity — Q2 2026 (June target)
 
+> **Doc-drift note (Item D, issue #973, 2026-05-20):** This document
+> was authored 2026-04-29 and is 5+ weeks stale relative to actual
+> v0.7.0 ship state. The authoritative current-state references are:
+>
+> - **Schema version:** `CURRENT_SCHEMA_VERSION = 48` on BOTH ladders
+>   (sqlite at `src/storage/migrations.rs`, postgres at
+>   `src/store/postgres.rs:391`). Last bump v47 → v48 was #933
+>   federation_push_dlq landing this session. Lockstep enforced by
+>   `tests/postgres_schema_parity.rs::schema_versions_match_across_adapters`.
+> - **MCP tool count:** 73 at `--profile full` (72 callable + the
+>   always-on `memory_capabilities` bootstrap). See
+>   `Profile::full().expected_tool_count()` in `src/profile.rs` for
+>   the canonical assertion. Default `--profile core` ships 7 tools.
+> - **Provenance framework:** 7-level Gaps #884-#890 ALL SHIPPED end-
+>   to-end (versioned writes / source-uri first-class / recall-
+>   consumption ledger / confidence tiers / reciprocal supersession /
+>   search-by-uri / verbose recall decoration).
+> - **Batman forms:** Forms 1-6 IMPLEMENTED. Form 7 (agent-EXTERNAL
+>   governance / `AgentAction` typed enum / operator-signed seed
+>   rules / canonical-bytes signing fix `3cdec59`) IMPLEMENTED.
+> - **Recursive learning:** #655 Tasks 1-8 ALL shipped on
+>   `feat/v0.7.0-grand-slam` rolled into the v0.7.0 tag. L1 substrate
+>   stack (#666-#680) + L2 wave (curator mode, federation
+>   coordination, invalidation propagation, transcript replay union,
+>   forensic bundles, reflection-as-skill promotion, skill
+>   composition, reflection-aware reranker boost) all shipped.
+> - **Federation reliability:** v48 added `federation_push_dlq` table
+>   (#933) — federation broadcast failures land in per-peer DLQ with
+>   retry-replay worker + Prometheus
+>   `federation_push_dlq_depth` gauge.
+> - **Capabilities envelope:** schema `"3"` is the default since A5;
+>   v3 carries `summary` + `to_describe_to_user` + per-tool
+>   `callable_now` + `agent_permitted_families` + `atomisation` +
+>   `memory_kind_vocab` + `confidence_calibration` + (post-Item-C)
+>   `provenance_substrate_layer` narrative.
+>
+> The numerical claims in the bullets below should be read as
+> snapshot-at-publication (2026-04-29) and re-verified against the
+> live constants. The §16 Net update at the bottom of this document
+> carries the same caveat.
+
 #### Bucket 0 — Hook Pipeline
 
 Programmable lifecycle events at every memory operation point. Subprocess JSON-over-stdio with daemon-mode IPC for hot paths.
@@ -954,6 +995,36 @@ distinct property the operator directive named.
 ---
 
 ## 17. Net
+
+> **Doc-drift correction (Item D, issue #973, 2026-05-20):** The
+> "v0.7.0 grand-slam terminal ship state" line below reads from a
+> 2026-04-29 snapshot and is 5+ weeks stale. Live numbers:
+>
+> - Schema: **v48 on both ladders** (sqlite + postgres in lockstep);
+>   last bump v47 → v48 was #933 federation_push_dlq.
+> - MCP tools: **73 at `--profile full`** (72 + always-on
+>   `memory_capabilities` bootstrap) per
+>   `Profile::full().expected_tool_count()`.
+> - Hook lifecycle events: 25 (unchanged).
+> - 7-level Provenance Gap framework #884-#890 ALL SHIPPED.
+> - Batman Forms 1-6 IMPLEMENTED; Form 7 + L1-6 SHIPPED with the
+>   canonical-bytes signing fix in commit `3cdec59`.
+> - Capabilities envelope v3 default since A5; carries the
+>   `provenance_substrate_layer` narrative (per #973 Item C) +
+>   existing `summary` / `to_describe_to_user` / `tools[]` /
+>   `agent_permitted_families` / `atomisation` / `memory_kind_vocab`
+>   / `confidence_calibration` blocks.
+> - Recursive learning (#655) Tasks 1-8 + L1 substrate stack +
+>   L2 wave ALL shipped.
+> - Federation reliability: per-peer DLQ + replay worker +
+>   Prometheus `federation_push_dlq_depth` gauge.
+>
+> Authoritative current-state references at write time:
+> - `src/storage/migrations.rs::CURRENT_SCHEMA_VERSION`
+> - `src/store/postgres.rs:391::CURRENT_SCHEMA_VERSION`
+> - `Profile::full().expected_tool_count()` in `src/profile.rs`
+> - `docs/v0.7.0/release-notes.md`
+> - CHANGELOG.md `[Unreleased]` section
 
 ai-memory v0.6.3 shipped clean: 1,809 tests, 93.08% coverage, ship-gate 4/4, A2A 48/48 mTLS, 5/5 channels, LongMemEval R@5 97.8% / R@10 99.0% / R@20 99.8%, 43 MCP tools, schema v15. v0.6.3.1 then landed (2026-04-30) with the never-lose-context release: 1,886 lib tests (+281), 93.84% line coverage, schema v19 (ladder v15→v17→v18→v19), 7 new CLI surfaces (boot/install/wrap/logs/audit/doctor/bench), and 17 documented integrations across 10 platforms. v0.7.0 grand-slam terminal ship state (HEAD `12a7f29` on `feat/v0.7.0-grand-slam`): schema **v34 sqlite / v33 postgres** (ladder per §4.1, including V-4 closeout #698 `signed_events` cross-row chain), **63 MCP tools** total (7 Agent Skills tools = L1-5 register/list/get/resource/export + L2-6 `promote_from_reflection` + L2-7 `compositional_context`, with the L2-6 promote tool landed at v0.7.0 per `05e0cb9a` v0.7.1-fold decision), **25 hook lifecycle events** (see §4.7 grand-slam block for the ladder), and Policy Engine Option B foundation (L1-6 substrate rules + PE-1/PE-2/PE-3 all merged on grand-slam).
 

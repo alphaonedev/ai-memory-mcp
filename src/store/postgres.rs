@@ -55,7 +55,7 @@ use sqlx::{PgPool, Row};
 use super::{
     CallerContext, Capabilities, Filter, KgBackend, KgInvalidateRow, KgQueryRow, KgTimelineRow,
     MemoryStore, StoreError, StoreResult, UpdatePatch, VerifyFilter, VerifyLinkReport,
-    VerifyReport,
+    VerifyReport, is_visible_to_caller,
 };
 use crate::models::{AgentRegistration, Memory, MemoryLink, Tier};
 use crate::quotas::{
@@ -172,6 +172,80 @@ const MIGRATION_V40_SHADOW_RETENTION: &str =
 /// indexed column without a second migration.
 const MIGRATION_V41_AUTO_PERSONA_ENTITY_ID: &str =
     include_str!("../../migrations/postgres/0023_v07_auto_persona_entity_id.sql");
+
+/// v0.7.0 Provenance Gap 1 (issue #884) — postgres v42 mirror of SQLite
+/// schema v45. Adds `memories.version BIGINT NOT NULL DEFAULT 1` so
+/// every memory row carries an optimistic-concurrency counter. The
+/// `version` column is bumped on every mutation by
+/// [`PostgresStore::update_with_expected_version`]; concurrent updates
+/// pass `expected_version` and receive a typed `VersionConflict`
+/// envelope when the stored version has drifted.
+const MIGRATION_V42_MEMORY_VERSION: &str =
+    include_str!("../../migrations/postgres/0025_v07_memory_version.sql");
+
+/// v0.7.0 Provenance Gap 2 (issue #885) — postgres v43 mirror of SQLite
+/// schema v46. Re-asserts `memories.source_uri TEXT NULL` + partial
+/// index `idx_memories_source_uri` for legacy upgrades, then backfills
+/// the column from `metadata.source_uri` and `citations[0].uri` for
+/// pre-Form-4 rows. The column itself + partial index originally
+/// shipped at postgres v37 (`0019_v07_form4_provenance.sql`); this arm
+/// covers the upgrade path for installs that pre-dated v37.
+const MIGRATION_V43_SOURCE_URI_UPGRADE: &str =
+    include_str!("../../migrations/postgres/0026_v07_source_uri_upgrade.sql");
+
+/// v0.7.0 Gap 3 (issue #886) — postgres v44 mirror of SQLite schema v47.
+/// Adds the `recall_observations` ledger keyed by
+/// `(recall_id, memory_id)`, carrying retriever / rank / score plus
+/// the consumed_at + consumed_by_memory_id columns set when a
+/// `memory_store` or `memory_link` request cites a prior `recall_id`.
+/// CASCADE-deletes alongside the referenced memory rows. Pure additive
+/// `CREATE TABLE IF NOT EXISTS` + three index `CREATE INDEX IF NOT
+/// EXISTS` statements — fully idempotent.
+const MIGRATION_V44_RECALL_OBSERVATIONS: &str =
+    include_str!("../../migrations/postgres/0027_v07_recall_observations.sql");
+
+/// v0.7.0 Provenance Gap 5 (issue #888) — postgres v45 mirror of the
+/// SQLite Gap-5 split-write surface. The `archive_reason` column has no
+/// CHECK clause so `'superseded'` lands without DDL; this arm adds two
+/// performance indexes the Gap-5 audit + lineage read paths rely on:
+/// `idx_archived_reason` for time-bounded "what got superseded in the
+/// last day" scans, and `idx_memories_metadata_superseded` for the
+/// reciprocal "find the live row that superseded archived X" lookup.
+const MIGRATION_V45_EDIT_SOURCE_ARCHIVE: &str =
+    include_str!("../../migrations/postgres/0028_v07_edit_source_archive_metadata.sql");
+
+/// v0.7.0 issue #860 — postgres v46 mirror of the SQLite Gap-7 surface.
+/// Defensive belt-and-braces `ADD COLUMN IF NOT EXISTS` on the four
+/// temporal-validity + attestation columns
+/// (`valid_from`, `valid_until`, `observed_by`, `attest_level`) on
+/// `memory_links`, all of which already ship inline in
+/// `postgres_schema.sql:283-291` for greenfield deploys. Re-asserts
+/// the matching indexes via `CREATE INDEX IF NOT EXISTS` so a legacy
+/// DB that was created before those declarations picks them up.
+const MIGRATION_V46_LINKS_TEMPORAL_COLUMNS: &str =
+    include_str!("../../migrations/postgres/0029_v07_links_temporal_columns.sql");
+
+/// v47 — Persona signing atomicity CHECK constraint on `memory_links`
+/// (sqlite parity via `migrations/sqlite/0037_v07_persona_signing_atomicity.sql`).
+/// Closes #902: the file existed at `0024_v07_persona_signing_atomicity.sql`
+/// but was orphaned (never registered in the ladder). Without it, postgres
+/// accepts `attest_level IN ('self_signed','peer_attested')` rows with NULL
+/// or wrong-length signature; sqlite correctly rejects.
+const MIGRATION_V47_PERSONA_SIGNING_ATOMICITY: &str =
+    include_str!("../../migrations/postgres/0024_v07_persona_signing_atomicity.sql");
+
+/// v48 — Federation push DLQ table (Track D #933).
+///
+/// Adds `federation_push_dlq` so per-peer fanout failures inside
+/// `broadcast_store_quorum` can be replayed by the new
+/// `replay_federation_push_dlq` worker (spawned alongside the catchup
+/// loop in `daemon_runtime::spawn_catchup_loop_with_store`). The table
+/// also ships inline in `postgres_schema.sql` for greenfield installs;
+/// this migration covers legacy-upgrade paths. Pure additive CREATE
+/// TABLE IF NOT EXISTS + indexes — fully idempotent. Mirrors SQLite
+/// schema v48 / `migrations/sqlite/0041_v07_federation_push_dlq.sql`.
+const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
+    include_str!("../../migrations/postgres/0030_v07_federation_push_dlq.sql");
 
 /// Current schema version. Matches SQLite CURRENT_SCHEMA_VERSION (src/db.rs:233).
 /// Incremented on each migration step.
@@ -297,7 +371,62 @@ const MIGRATION_V41_AUTO_PERSONA_ENTITY_ID: &str =
 //       Column-name deliberately distinct from QW-2's `entity_id`
 //       (Persona-row attribution); PERF-8 reads the OPPOSITE direction
 //       (the entity an observation/reflection mentions).
-const CURRENT_SCHEMA_VERSION: i32 = 41;
+// v42 = v0.7.0 Provenance Gap 1 (issue #884) — `memories.version
+//       BIGINT NOT NULL DEFAULT 1` optimistic-concurrency counter.
+//       Mirrors SQLite schema v45. Pure additive ADD COLUMN IF NOT
+//       EXISTS — fully idempotent. The new
+//       `PostgresStore::update_with_expected_version` bumps the
+//       column atomically and refuses an update whose
+//       expected_version has drifted via the typed
+//       `VersionConflict` envelope.
+// v43 = v0.7.0 Provenance Gap 2 (issue #885) — re-asserts
+//       `memories.source_uri TEXT` + partial index
+//       `idx_memories_source_uri` for upgrade paths that pre-date
+//       the v37 Form-4 migration, then backfills the column from
+//       `metadata.source_uri` and `citations[0].uri` for pre-Form-4
+//       rows. Mirrors SQLite schema v46. Pure additive +
+//       guarded UPDATE — fully idempotent.
+// v44 = v0.7.0 Gap 3 (issue #886) — `recall_observations` ledger
+//       table keyed by (recall_id, memory_id). Mirrors SQLite
+//       schema v47. Pure additive CREATE TABLE IF NOT EXISTS +
+//       three indexes — fully idempotent.
+// v45 = v0.7.0 Provenance Gap 5 (issue #888) — append-and-archive
+//       Gap-5 support indexes (`idx_archived_reason` +
+//       `idx_memories_metadata_superseded`). No CHECK on
+//       archive_reason to expand (free-form TEXT column). Pure
+//       additive CREATE INDEX IF NOT EXISTS — fully idempotent.
+// v46 = v0.7.0 issue #860 — defensive `ADD COLUMN IF NOT EXISTS` on
+//       the four temporal-validity + attestation columns on
+//       `memory_links` (valid_from, valid_until, observed_by,
+//       attest_level). All four already ship inline in
+//       postgres_schema.sql for greenfield; this migration covers
+//       legacy upgrade paths. Pure additive — fully idempotent.
+// v47 = v0.7.0 #902 — register the orphaned `memory_links` persona-
+//       signing atomicity CHECK constraint via the SAL ladder.
+// v48 = v0.7.0 Track D #933 — `federation_push_dlq` table backing the
+//       quorum-broadcast fanout dead-letter queue (parity with SQLite
+//       v48 / `migrations/sqlite/0041_v07_federation_push_dlq.sql`).
+//       Pure additive CREATE TABLE IF NOT EXISTS + indexes — fully
+//       idempotent.
+const CURRENT_SCHEMA_VERSION: i32 = 48;
+
+/// PostgreSQL session-scoped advisory lock key used to serialize
+/// concurrent `migrate()` invocations across processes and across
+/// in-process parallel `connect()` calls. Without this lock, racing
+/// `CREATE INDEX` / `ADD CONSTRAINT` / `ALTER TYPE` DDL statements
+/// across the migration ladder collide and surface as `tuple
+/// concurrently updated`, `duplicate key value violates unique
+/// constraint "pg_class_relname_nsp_index"`, or `constraint
+/// "<name>" already exists` errors.
+///
+/// Arbitrary i64 namespaced to ai-memory's PostgresStore — picked once
+/// at v0.7.0 ship-hardening and frozen thereafter. Changing this value
+/// in a future release would risk an in-flight migration on an older
+/// daemon being raced by a newer daemon (different lock keys = no
+/// serialization between them).
+///
+/// Hex breakdown: `0x4149_4D45_4D49_4701` — "AIMEMIG\x01" as ASCII.
+const MIGRATION_ADVISORY_LOCK_KEY: i64 = 0x4149_4D45_4D49_4701;
 
 /// Default embedding column dimension used when the caller doesn't pass
 /// `--embedding-dim` to `ai-memory schema-init`. Matches the v0.7.0
@@ -485,55 +614,111 @@ impl PostgresStore {
                 detail: format!("connect: {e}"),
             })?;
 
-        // Bootstrap schema — idempotent. The bundled template uses
-        // `vector({EMBEDDING_DIM})` for the two vector columns; we
-        // substitute the caller's chosen dim here. CREATE TABLE IF NOT
-        // EXISTS means the dim only "takes" on first init; subsequent
-        // calls against an already-populated schema are no-ops.
+        // v0.7.0 ship-hardening: acquire MIGRATION_ADVISORY_LOCK_KEY
+        // across the entire bootstrap (INIT_SCHEMA + sanity checks +
+        // KG detection + migrate) so concurrent connect() callers on
+        // a fresh DB cannot race CREATE EXTENSION / CREATE INDEX /
+        // ADD CONSTRAINT statements. The legacy retry-on-race loop
+        // around INIT_SCHEMA (kept below as defense-in-depth) was
+        // insufficient under heavy parallel load — the LAN-parity
+        // audit on 2026-05-19 surfaced both "init schema: tuple
+        // concurrently updated" and "apply v32 ... constraint already
+        // exists" failures.
         //
-        // v0.7.0 ship-readiness: CI runs 30+ `live_*` tests in parallel
-        // against a single postgres service container. `CREATE EXTENSION
-        // IF NOT EXISTS vector` is DDL-idempotent but Postgres' catalog
-        // serializes EXTENSION installs at a lower layer, so concurrent
-        // first-init calls can collide with `duplicate key value
-        // violates unique constraint "pg_extension_name_index"` or
-        // `tuple concurrently updated`. Both are race-only errors — the
-        // extension always lands on at least one of the racing callers.
-        // We retry up to 5 times with brief backoff and treat the retry-
-        // success as the canonical idempotent semantics.
-        let init_sql = render_schema_sql(INIT_SCHEMA, dim);
-        let mut last_err: Option<sqlx::Error> = None;
-        for attempt in 0..5_u32 {
-            match sqlx::raw_sql(&init_sql).execute(&pool).await {
-                Ok(_) => {
-                    last_err = None;
-                    break;
-                }
-                Err(e) => {
-                    let msg = e.to_string();
-                    let is_concurrent_init = msg.contains("pg_extension_name_index")
-                        || msg.contains("tuple concurrently updated")
-                        || msg.contains("duplicate key value")
-                        || msg.contains("deadlock detected")
-                        || msg.contains("concurrent update")
-                        || msg.contains("could not serialize access");
-                    if !is_concurrent_init || attempt == 4 {
-                        last_err = Some(e);
+        // The lock is held on a dedicated PoolConnection for the
+        // lifetime of the bootstrap; queue depth = other in-flight
+        // callers. Released explicitly via pg_advisory_unlock_all() +
+        // implicit drop. Reentrant within the same session, but we
+        // acquire ONCE here and switch the inner `store.migrate()`
+        // call to the lock-free `store.migrate_locked()` to avoid the
+        // second acquire-from-different-session that would deadlock.
+        let mut bootstrap_lock_conn =
+            pool.acquire()
+                .await
+                .map_err(|e| StoreError::BackendUnavailable {
+                    backend: "postgres".to_string(),
+                    detail: format!("acquire bootstrap lock connection: {e}"),
+                })?;
+        // v0.7.0 ship-hardening (2026-05-19, QC P0): the per-session
+        // statement_timeout=30s set in `after_connect` would abort
+        // `pg_advisory_lock` itself if a holder takes >30s
+        // (plausible on a busy DB for the full v15→v47 ladder).
+        // `lock_timeout` is no-op for advisory locks per PG docs but
+        // we clear both for clarity. SET LOCAL is session-scoped and
+        // is released when the connection drops back to the pool.
+        // Multi-statement SQL would trip sqlx's prepared-statement
+        // protocol ("cannot insert multiple commands into a prepared
+        // statement"); split into two separate executes.
+        sqlx::query("SET statement_timeout = 0")
+            .execute(&mut *bootstrap_lock_conn)
+            .await
+            .map_err(|e| StoreError::BackendUnavailable {
+                backend: "postgres".to_string(),
+                detail: format!("clear statement_timeout on bootstrap lock connection: {e}"),
+            })?;
+        sqlx::query("SET lock_timeout = 0")
+            .execute(&mut *bootstrap_lock_conn)
+            .await
+            .map_err(|e| StoreError::BackendUnavailable {
+                backend: "postgres".to_string(),
+                detail: format!("clear lock_timeout on bootstrap lock connection: {e}"),
+            })?;
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(MIGRATION_ADVISORY_LOCK_KEY)
+            .execute(&mut *bootstrap_lock_conn)
+            .await
+            .map_err(|e| StoreError::BackendUnavailable {
+                backend: "postgres".to_string(),
+                detail: format!("acquire bootstrap pg_advisory_lock: {e}"),
+            })?;
+
+        // Run the full bootstrap inside an async block so we can
+        // ALWAYS release the lock — even if any error propagates.
+        // `async move` captures `pool` so the final `Self { pool, ... }`
+        // construction can consume it. `bootstrap_lock_conn` lives in
+        // the outer scope with its own Arc ref to the pool, so the move
+        // doesn't invalidate the lock-holding connection.
+        let bootstrap_result: StoreResult<Self> = async move {
+            // Bootstrap schema — idempotent. The bundled template uses
+            // `vector({EMBEDDING_DIM})` for the two vector columns; we
+            // substitute the caller's chosen dim here. CREATE TABLE IF NOT
+            // EXISTS means the dim only "takes" on first init; subsequent
+            // calls against an already-populated schema are no-ops.
+            //
+            // The retry loop is still in place as defense-in-depth for any
+            // residual catalog-level race the advisory lock can't cover
+            // (e.g., a third process bypassing the lock entirely).
+            let init_sql = render_schema_sql(INIT_SCHEMA, dim);
+            let mut last_err: Option<sqlx::Error> = None;
+            for attempt in 0..5_u32 {
+                match sqlx::raw_sql(&init_sql).execute(&pool).await {
+                    Ok(_) => {
+                        last_err = None;
                         break;
                     }
-                    // Brief jittered backoff: 50 / 100 / 200 / 400ms (wider
-                    // for deadlocks which need both racers to retry).
-                    let backoff_ms = 50u64 << attempt;
-                    tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
+                    Err(e) => {
+                        let msg = e.to_string();
+                        let is_concurrent_init = msg.contains("pg_extension_name_index")
+                            || msg.contains("tuple concurrently updated")
+                            || msg.contains("duplicate key value")
+                            || msg.contains("deadlock detected")
+                            || msg.contains("concurrent update")
+                            || msg.contains("could not serialize access");
+                        if !is_concurrent_init || attempt == 4 {
+                            last_err = Some(e);
+                            break;
+                        }
+                        let backoff_ms = 50u64 << attempt;
+                        tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
+                    }
                 }
             }
-        }
-        if let Some(e) = last_err {
-            return Err(StoreError::BackendUnavailable {
-                backend: "postgres".to_string(),
-                detail: format!("init schema: {e}"),
-            });
-        }
+            if let Some(e) = last_err {
+                return Err(StoreError::BackendUnavailable {
+                    backend: "postgres".to_string(),
+                    detail: format!("init schema: {e}"),
+                });
+            }
 
         // Sanity-check pgvector version. We support 0.7.x–0.8.x; older
         // versions have HNSW behaviour differences we haven't tested
@@ -627,11 +812,86 @@ impl PostgresStore {
             );
         }
 
-        // Run schema migrations after bootstrap schema is loaded.
-        let store = Self { pool, kg_backend };
-        store.migrate().await?;
+            // Run schema migrations after bootstrap schema is loaded.
+            // We hold the bootstrap advisory lock at the outer scope, so
+            // call the lock-free body `migrate_locked()` here to avoid a
+            // second acquire-from-different-session that would deadlock.
+            let store = Self { pool, kg_backend };
+            store.migrate_locked().await?;
 
-        Ok(store)
+            Ok(store)
+        }
+        .await;
+
+        // Always release the bootstrap advisory lock, even on the error
+        // path. pg_advisory_unlock_all() releases all locks held in this
+        // session, more robust than pg_advisory_unlock(key) against any
+        // accidental re-acquire inside the bootstrap. Best-effort —
+        // implicit release on connection drop is the backstop.
+        let _ = sqlx::query("SELECT pg_advisory_unlock_all()")
+            .execute(&mut *bootstrap_lock_conn)
+            .await;
+        drop(bootstrap_lock_conn);
+
+        bootstrap_result
+    }
+
+    /// Issue #877 (HIGH-SEV): Connect with an explicit embedding dim and
+    /// auto-migrate the live `memories.embedding` (+ archive) column to
+    /// `vector(<dim>)` when the existing schema disagrees.
+    ///
+    /// This is the daemon-bootstrap entry point. The plain
+    /// [`Self::connect_with_dim`] would WARN and continue if the schema
+    /// was created with a different dim (e.g. a fresh container picked up
+    /// `DEFAULT_EMBEDDING_DIM` = 384 from a no-flag boot, then the
+    /// operator switched the configured embedder to `nomic_embed_v15`
+    /// (768)). The result was every HTTP POST `/api/v1/memories` rejected
+    /// at pgvector with `expected 384 dimensions, not 768` — a hard
+    /// production outage Plan-C retest surfaced.
+    ///
+    /// Behaviour:
+    /// - Connect + bootstrap exactly like [`Self::connect_with_dim_and_timeout`].
+    /// - Probe `current_embedding_dim()`. If it equals `dim`, return Ok.
+    /// - If it differs (or is missing), invoke
+    ///   [`Self::migrate_embedding_dim`] which is destructive on the
+    ///   embedding column (existing vectors are NULLed; rows themselves
+    ///   survive). Operators must re-embed after.
+    /// - The migration is gated to the supported dim set (384, 768); any
+    ///   other value bubbles `StoreError::InvalidInput` from the
+    ///   sub-call.
+    ///
+    /// Existing callers ([`Self::connect`], CLI `schema-init`) keep the
+    /// non-auto-migrate semantics so a one-shot CLI tool can't silently
+    /// destroy embeddings.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::connect_with_dim_and_timeout`], plus any error
+    /// from the in-place conversion.
+    pub async fn connect_with_dim_and_timeout_auto_migrate(
+        url: &str,
+        dim: u32,
+        statement_timeout_secs: u64,
+    ) -> StoreResult<Self> {
+        let store = Self::connect_with_dim_and_timeout(url, dim, statement_timeout_secs).await?;
+
+        let current = store.current_embedding_dim().await?;
+        let target_i32 = i32::try_from(dim).unwrap_or(384);
+        match current {
+            Some(cur) if cur == target_i32 => Ok(store),
+            _ => {
+                tracing::warn!(
+                    target = "store::postgres",
+                    current = ?current,
+                    target = target_i32,
+                    "issue #877 auto-migrate: existing memories.embedding column dim disagrees \
+                     with configured embedder dim ({target_i32}); converting in place. \
+                     Existing embeddings will be NULLed — re-embed required after this completes."
+                );
+                store.migrate_embedding_dim(dim).await?;
+                Ok(store)
+            }
+        }
     }
 
     /// Knowledge-graph backend resolved at [`Self::connect`] time.
@@ -646,6 +906,20 @@ impl PostgresStore {
         self.kg_backend
     }
 
+    /// Borrow the underlying sqlx connection pool.
+    ///
+    /// v0.7.0 Track D #933 — adapters layered on top of the
+    /// `PostgresStore` (notably the federation push DLQ sink in
+    /// `src/federation/push_dlq.rs::PostgresDlqSink`) need pool access
+    /// to issue raw SQL against tables that aren't yet first-class on
+    /// the `MemoryStore` trait surface. Keep this accessor narrow —
+    /// new behaviour should land as trait methods so the sqlite path
+    /// gets parity automatically.
+    #[must_use]
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
     /// Run schema migrations on the connection. Called after bootstrap schema
     /// is loaded. Reads the current schema_version, then applies all pending
     /// migrations in a transaction per version step (matching SQLite behavior
@@ -655,7 +929,76 @@ impl PostgresStore {
     ///
     /// Returns `StoreError::BackendUnavailable` if migration fails.
     async fn migrate(&self) -> StoreResult<()> {
-        // Read the current version from schema_version table.
+        // v0.7.0 ship-hardening: serialize concurrent migrate() applies
+        // across processes (and across in-process parallel connect()
+        // calls) via a session-scoped advisory lock. Without it, racing
+        // CREATE INDEX / ADD CONSTRAINT / ALTER TYPE DDL statements
+        // collide and surface as `tuple concurrently updated`,
+        // `pg_class_relname_nsp_index` duplicate key, or `constraint
+        // already exists`. Empirically caught during the
+        // 2026-05-19 LAN-parity audit (17 of 37 cargo SAL-postgres
+        // failures were this race).
+        //
+        // The lock is acquired on a dedicated connection held for the
+        // entire migration ladder. Other callers (other processes OR
+        // in-process parallel connects) block on pg_advisory_lock
+        // until release, then re-read schema_version inside
+        // migrate_locked() and skip via the early-return when
+        // current_version >= CURRENT_SCHEMA_VERSION. The session-scoped
+        // lock is released explicitly via pg_advisory_unlock_all() and
+        // implicitly when the dedicated connection drops.
+        let mut lock_conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| to_store_err("acquire migration lock connection", e))?;
+
+        // QC P0: clear statement_timeout / lock_timeout on the lock
+        // connection so the `pg_advisory_lock` wait itself isn't
+        // aborted under contention (per-session default is 30s from
+        // `after_connect`). Split into two separate executes — sqlx
+        // prepared-statement protocol rejects multi-statement SQL.
+        sqlx::query("SET statement_timeout = 0")
+            .execute(&mut *lock_conn)
+            .await
+            .map_err(|e| to_store_err("clear statement_timeout on migration lock connection", e))?;
+        sqlx::query("SET lock_timeout = 0")
+            .execute(&mut *lock_conn)
+            .await
+            .map_err(|e| to_store_err("clear lock_timeout on migration lock connection", e))?;
+
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(MIGRATION_ADVISORY_LOCK_KEY)
+            .execute(&mut *lock_conn)
+            .await
+            .map_err(|e| to_store_err("acquire pg_advisory_lock", e))?;
+
+        // Run the migration body, capturing the result so we can always
+        // release the lock even on a per-migration failure.
+        let result = self.migrate_locked().await;
+
+        // Release ALL advisory locks held in this session (more robust
+        // than pg_advisory_unlock(key) — defends against the body
+        // accidentally acquiring further locks). Best-effort: a failure
+        // to unlock would still release implicitly on connection close.
+        let _ = sqlx::query("SELECT pg_advisory_unlock_all()")
+            .execute(&mut *lock_conn)
+            .await;
+        drop(lock_conn);
+
+        result
+    }
+
+    /// The actual migration ladder body. Held under the
+    /// `MIGRATION_ADVISORY_LOCK_KEY` advisory lock acquired in
+    /// [`Self::migrate`] — do not call directly from outside that
+    /// wrapper without holding the lock, or the cross-process
+    /// serialization invariant is lost.
+    async fn migrate_locked(&self) -> StoreResult<()> {
+        // Read the current version from schema_version table — this is
+        // re-read under the lock so racers that queued while another
+        // process applied the ladder see the up-to-date value and
+        // early-return.
         let current_version: Option<i32> =
             sqlx::query_scalar("SELECT COALESCE(MAX(version), 0) FROM schema_version")
                 .fetch_optional(&self.pool)
@@ -755,6 +1098,27 @@ impl PostgresStore {
         }
         if current_version < 41 {
             self.migrate_v41().await?;
+        }
+        if current_version < 42 {
+            self.migrate_v42().await?;
+        }
+        if current_version < 43 {
+            self.migrate_v43().await?;
+        }
+        if current_version < 44 {
+            self.migrate_v44().await?;
+        }
+        if current_version < 45 {
+            self.migrate_v45().await?;
+        }
+        if current_version < 46 {
+            self.migrate_v46().await?;
+        }
+        if current_version < 47 {
+            self.migrate_v47().await?;
+        }
+        if current_version < 48 {
+            self.migrate_v48().await?;
         }
 
         Ok(())
@@ -1310,6 +1674,814 @@ impl PostgresStore {
         );
         Ok(())
     }
+
+    /// v0.7.0 Provenance Gap 1 (issue #884) — adds `memories.version`
+    /// optimistic-concurrency counter. Mirrors SQLite schema v45.
+    async fn migrate_v42(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v42 tx", e))?;
+
+        sqlx::raw_sql(MIGRATION_V42_MEMORY_VERSION)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("apply v42 memory_version", e))?;
+
+        record_schema_version(&mut tx, 42).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v42 migration", e))?;
+
+        tracing::info!(
+            target = "store::postgres",
+            "schema migration v42 applied (Provenance Gap 1: memories.version)"
+        );
+        Ok(())
+    }
+
+    /// v0.7.0 Provenance Gap 2 (issue #885) — re-asserts
+    /// `memories.source_uri` column + partial index for legacy upgrade
+    /// paths and backfills the column from metadata/citations. Mirrors
+    /// SQLite schema v46.
+    async fn migrate_v43(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v43 tx", e))?;
+
+        sqlx::raw_sql(MIGRATION_V43_SOURCE_URI_UPGRADE)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("apply v43 source_uri upgrade", e))?;
+
+        record_schema_version(&mut tx, 43).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v43 migration", e))?;
+
+        tracing::info!(
+            target = "store::postgres",
+            "schema migration v43 applied (Provenance Gap 2: source_uri upgrade + backfill)"
+        );
+        Ok(())
+    }
+
+    /// v0.7.0 Gap 3 (issue #886) — recall_observations ledger table.
+    /// Mirrors SQLite schema v47.
+    async fn migrate_v44(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v44 tx", e))?;
+
+        sqlx::raw_sql(MIGRATION_V44_RECALL_OBSERVATIONS)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("apply v44 recall_observations", e))?;
+
+        record_schema_version(&mut tx, 44).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v44 migration", e))?;
+
+        tracing::info!(
+            target = "store::postgres",
+            "schema migration v44 applied (Gap 3: recall_observations ledger)"
+        );
+        Ok(())
+    }
+
+    /// v0.7.0 Provenance Gap 5 (issue #888) — Gap-5 append-and-archive
+    /// support indexes.
+    async fn migrate_v45(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v45 tx", e))?;
+
+        sqlx::raw_sql(MIGRATION_V45_EDIT_SOURCE_ARCHIVE)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("apply v45 edit_source archive", e))?;
+
+        record_schema_version(&mut tx, 45).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v45 migration", e))?;
+
+        tracing::info!(
+            target = "store::postgres",
+            "schema migration v45 applied (Provenance Gap 5: archive_reason indexes)"
+        );
+        Ok(())
+    }
+
+    /// v0.7.0 issue #860 — defensive `ADD COLUMN IF NOT EXISTS` on the
+    /// four temporal-validity + attestation columns on `memory_links`.
+    async fn migrate_v46(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v46 tx", e))?;
+
+        sqlx::raw_sql(MIGRATION_V46_LINKS_TEMPORAL_COLUMNS)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("apply v46 links temporal columns", e))?;
+
+        record_schema_version(&mut tx, 46).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v46 migration", e))?;
+
+        tracing::info!(
+            target = "store::postgres",
+            "schema migration v46 applied (#860: memory_links temporal + attest columns)"
+        );
+        Ok(())
+    }
+
+    /// v47 — Apply the orphaned persona-signing-atomicity CHECK constraint
+    /// on `memory_links` (#902). Sqlite parity is migration
+    /// `0037_v07_persona_signing_atomicity.sql`. The SQL backfills phantom
+    /// rows to `attest_level='unsigned'` BEFORE adding the CHECK so legacy
+    /// DBs don't trip constraint creation.
+    async fn migrate_v47(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v47 tx", e))?;
+
+        sqlx::raw_sql(MIGRATION_V47_PERSONA_SIGNING_ATOMICITY)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("apply v47 persona signing atomicity", e))?;
+
+        record_schema_version(&mut tx, 47).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v47 migration", e))?;
+
+        tracing::info!(
+            target = "store::postgres",
+            "schema migration v47 applied (#902: memory_links attest+signature atomic CHECK)"
+        );
+        Ok(())
+    }
+
+    /// v48 — Federation push DLQ table (Track D #933).
+    ///
+    /// Adds `federation_push_dlq` (id BIGSERIAL, memory_id TEXT, peer_id
+    /// TEXT, payload_json JSONB, attempt_count INTEGER, last_error TEXT,
+    /// failed_at TIMESTAMPTZ, replayed_at TIMESTAMPTZ NULL) plus three
+    /// indexes (pending-rows-by-failed_at, per-peer pending, partial
+    /// unique on `(memory_id, peer_id) WHERE replayed_at IS NULL`).
+    /// Pure additive CREATE TABLE IF NOT EXISTS — fully idempotent.
+    /// Mirrors SQLite schema v48 / `migrations/sqlite/0041_v07_federation_push_dlq.sql`.
+    async fn migrate_v48(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v48 tx", e))?;
+
+        sqlx::raw_sql(MIGRATION_V48_FEDERATION_PUSH_DLQ)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("apply v48 federation push DLQ", e))?;
+
+        record_schema_version(&mut tx, 48).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v48 migration", e))?;
+
+        tracing::info!(
+            target = "store::postgres",
+            "schema migration v48 applied (#933: federation_push_dlq table)"
+        );
+        Ok(())
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // v0.7.0 Provenance Gap parity — postgres SAL methods (issue #894).
+    //
+    // The six methods below bring `PostgresStore` to parity with the
+    // sqlite-side `storage::` free functions for the Gap-1/2/3/5/6/7
+    // provenance closeouts. Inherent methods (not on the
+    // [`MemoryStore`] trait) so call-sites that hold an
+    // `Arc<PostgresStore>` can drive them today; the trait can be
+    // widened in a follow-up once both adapters stabilise.
+    //
+    // Sqlite reference impls:
+    //   * `storage::update_with_expected_version` (Gap 1, #884)
+    //   * `storage::update_with_archive_on_supersede` (Gap 5, #888)
+    //   * `storage::search_with_source_uri` (Gap 6, #889)
+    //   * `storage::list_by_source_uri` (Gap 6, #889)
+    //   * `observations::record_recall` + `observations::gc::prune`
+    //     (Gap 3, #886)
+    // ─────────────────────────────────────────────────────────────────
+
+    /// v0.7.0 Provenance Gap 1 (issue #884) — optimistic-concurrency
+    /// aware update. Postgres twin of
+    /// [`crate::storage::update_with_expected_version`].
+    ///
+    /// When `expected_version` is `Some(v)`, the update fails with a
+    /// typed [`crate::storage::VersionConflict`] error if the stored
+    /// row's `version` is not equal to `v`. When `None`, the legacy
+    /// last-write-wins behaviour is preserved (still bumps `version`
+    /// on success). On a successful mutation the row's `version` is
+    /// monotonically incremented; the new value is observable on the
+    /// subsequent read.
+    ///
+    /// Atomicity: the version gate is asserted inside the UPDATE
+    /// WHERE clause AND re-checked on a 0-rows-affected outcome so
+    /// a racing writer that slipped in between client read + server
+    /// update still fails CONFLICT.
+    ///
+    /// # Errors
+    ///
+    /// * [`crate::storage::VersionConflict`] — when `expected_version`
+    ///   is `Some` and the stored value has drifted.
+    /// * `StoreError::NotFound` — when no live memory matches `id`.
+    /// * `StoreError::BackendUnavailable` — on SQL failure.
+    pub async fn update_with_expected_version(
+        &self,
+        id: &str,
+        patch: UpdatePatch,
+        expected_version: Option<i64>,
+    ) -> StoreResult<i64> {
+        // Pre-read the current version so a CONFLICT carries the
+        // observed-current value in the typed error. The UPDATE
+        // re-asserts the gate atomically below.
+        let current_row: Option<(i64,)> =
+            sqlx::query_as("SELECT version FROM memories WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| to_store_err("read memories.version", e))?;
+        let Some((current,)) = current_row else {
+            return Err(StoreError::NotFound { id: id.to_string() });
+        };
+
+        // Pre-check (cheap fast-path); the atomic re-check below is
+        // the load-bearing guard.
+        if let Some(expected) = expected_version
+            && expected != current
+        {
+            return Err(StoreError::IntegrityFailed {
+                detail: format!(
+                    "VersionConflict: memory {id} expected_version={expected} but stored version={current}"
+                ),
+            });
+        }
+
+        let new_version = current + 1;
+        // v0.7.0 Provenance Gap 2 (#906) — source_uri ($10) follows
+        // COALESCE semantics so a patch that omits source_uri leaves
+        // the stored value alone. The expected_version gate is shifted
+        // to $11.
+        let rows_affected = sqlx::query(
+            "UPDATE memories SET
+                title = COALESCE($2, title),
+                content = COALESCE($3, content),
+                tier = CASE
+                    WHEN $4::TEXT IS NULL THEN tier
+                    WHEN tier_rank($4::TEXT) >= tier_rank(tier) THEN $4::TEXT
+                    ELSE tier
+                END,
+                namespace = COALESCE($5, namespace),
+                tags = COALESCE($6, tags),
+                priority = COALESCE($7, priority),
+                confidence = COALESCE($8, confidence),
+                metadata = CASE
+                    WHEN $9::JSONB IS NULL THEN metadata
+                    WHEN metadata ? 'agent_id' THEN jsonb_set(
+                        $9::JSONB, '{agent_id}', metadata -> 'agent_id'
+                    )
+                    ELSE $9::JSONB
+                END,
+                source_uri = COALESCE($10, source_uri),
+                updated_at = NOW(),
+                version = version + 1
+             WHERE id = $1
+               AND ($11::BIGINT IS NULL OR version = $11::BIGINT)",
+        )
+        .bind(id)
+        .bind(patch.title)
+        .bind(patch.content)
+        .bind(patch.tier.as_ref().map(Tier::as_str))
+        .bind(patch.namespace)
+        .bind(
+            patch
+                .tags
+                .map(serde_json::to_value)
+                .transpose()
+                .map_err(|e| StoreError::IntegrityFailed {
+                    detail: format!("serialize tags patch: {e}"),
+                })?,
+        )
+        .bind(patch.priority)
+        .bind(patch.confidence)
+        .bind(patch.metadata)
+        .bind(patch.source_uri)
+        .bind(expected_version)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| to_store_err("update_with_expected_version", e))?
+        .rows_affected();
+
+        if rows_affected == 0 {
+            // Either the row vanished or the version drifted between
+            // SELECT and UPDATE. Re-read to populate the typed error.
+            let observed: Option<(i64,)> =
+                sqlx::query_as("SELECT version FROM memories WHERE id = $1")
+                    .bind(id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|e| to_store_err("re-read version on conflict", e))?;
+            if let Some((cur,)) = observed {
+                let exp = expected_version.unwrap_or(current);
+                return Err(StoreError::IntegrityFailed {
+                    detail: format!(
+                        "VersionConflict: memory {id} expected_version={exp} but stored version={cur}"
+                    ),
+                });
+            }
+            return Err(StoreError::NotFound { id: id.to_string() });
+        }
+        Ok(new_version)
+    }
+
+    /// v0.7.0 Provenance Gap 5 (issue #888) — append-and-archive write
+    /// path. Postgres twin of
+    /// [`crate::storage::update_with_archive_on_supersede`].
+    ///
+    /// Used by the MCP `memory_update` tool when the caller passes
+    /// `edit_source` of `llm` or `hook`. Atomic: every step runs
+    /// inside a single `sqlx::Transaction` so a failure mid-way
+    /// rolls every step back.
+    ///
+    /// Sequence (mirrors mem9's split-write-path pattern):
+    /// 1. Honor the optimistic-concurrency gate (`expected_version`).
+    ///    Conflict surfaces as `IntegrityFailed` carrying the
+    ///    typed `VersionConflict` message before any mutation lands.
+    /// 2. Archive the OLD row with `archive_reason='superseded'`.
+    /// 3. Insert a NEW memory row carrying the patched fields plus
+    ///    `metadata.superseded_id` forward pointer and the
+    ///    `edit_source` provenance tag.
+    /// 4. The supersede lineage is encoded via 2 mechanisms (not 3):
+    ///    `archived_memories.archive_reason='superseded'` on OLD +
+    ///    `new_memory.metadata.superseded_id` forward pointer on NEW.
+    ///    No `memory_links` `supersedes` edge is written — the FK
+    ///    target would point at a row that has left the live
+    ///    `memories` table. See #895 for the archive-cross-ref
+    ///    follow-on.
+    ///
+    /// Returns `(archived_id, new_id)` so callers (HTTP / MCP
+    /// surfaces) can surface both in the wire response without a
+    /// second SELECT.
+    ///
+    /// # Errors
+    ///
+    /// * `IntegrityFailed` carrying a `VersionConflict` message — when
+    ///   `expected_version` is `Some` and the stored version drifted.
+    /// * `NotFound` — when no live memory matches `id`.
+    /// * `BackendUnavailable` — on SQL failure.
+    pub async fn update_with_archive_on_supersede(
+        &self,
+        id: &str,
+        patch: UpdatePatch,
+        expected_version: Option<i64>,
+        edit_source: crate::models::EditSource,
+    ) -> StoreResult<(String, String)> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin supersede tx", e))?;
+
+        // Pre-read the existing row so we can compose the NEW row from
+        // the OLD values. SELECT FOR UPDATE pins the row across the
+        // archive + insert so a concurrent writer can't race past.
+        let existing_row = sqlx::query("SELECT * FROM memories WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("select existing for supersede", e))?;
+        let Some(existing_pg) = existing_row else {
+            return Err(StoreError::NotFound { id: id.to_string() });
+        };
+
+        let existing = Self::row_to_memory(&existing_pg)?;
+
+        // Optimistic-concurrency gate against the OLD row.
+        if let Some(expected) = expected_version
+            && expected != existing.version
+        {
+            return Err(StoreError::IntegrityFailed {
+                detail: format!(
+                    "VersionConflict: memory {id} expected_version={expected} but stored version={}",
+                    existing.version
+                ),
+            });
+        }
+
+        // Compose the NEW row by overlaying the patch on the OLD row.
+        let new_id = uuid::Uuid::new_v4().to_string();
+
+        // Tier monotonicity preserved (long ≥ mid ≥ short).
+        let new_tier = match (patch.tier.as_ref(), &existing.tier) {
+            (Some(requested), existing_tier) => match (existing_tier, requested) {
+                (Tier::Long, _) => Tier::Long,
+                (Tier::Mid, Tier::Short) => Tier::Mid,
+                (_, r) => r.clone(),
+            },
+            (None, existing_tier) => existing_tier.clone(),
+        };
+
+        let new_title = patch
+            .title
+            .as_deref()
+            .unwrap_or(existing.title.as_str())
+            .to_string();
+        let new_content = patch
+            .content
+            .as_deref()
+            .unwrap_or(existing.content.as_str())
+            .to_string();
+        let new_namespace = patch
+            .namespace
+            .as_deref()
+            .unwrap_or(existing.namespace.as_str())
+            .to_string();
+        let new_tags = patch.tags.clone().unwrap_or_else(|| existing.tags.clone());
+        let new_priority = patch.priority.unwrap_or(existing.priority);
+        let new_confidence = patch.confidence.unwrap_or(existing.confidence);
+        // v0.7.0 Provenance Gap 2 (#906) — caller-supplied source_uri
+        // wins; otherwise inherit from the OLD row.
+        let new_source_uri = patch
+            .source_uri
+            .clone()
+            .or_else(|| existing.source_uri.clone());
+        // Stamp edit_source + superseded_id into the new row's metadata.
+        let mut new_metadata = patch
+            .metadata
+            .clone()
+            .unwrap_or_else(|| existing.metadata.clone());
+        if let serde_json::Value::Object(ref mut m) = new_metadata {
+            m.insert(
+                "edit_source".to_string(),
+                serde_json::Value::String(edit_source.as_str().to_string()),
+            );
+            m.insert(
+                "superseded_id".to_string(),
+                serde_json::Value::String(existing.id.clone()),
+            );
+        }
+
+        // Step 1: archive the OLD row with archive_reason='superseded'.
+        let archive_rows = sqlx::query(
+            "INSERT INTO archived_memories
+                (id, tier, namespace, title, content, tags, priority, confidence,
+                 source, access_count, created_at, updated_at, last_accessed_at,
+                 expires_at, archived_at, archive_reason, metadata,
+                 embedding, embedding_dim, original_tier, original_expires_at)
+             SELECT id, tier, namespace, title, content, tags, priority, confidence,
+                    source, access_count, created_at, updated_at, last_accessed_at,
+                    expires_at, NOW(), 'superseded', metadata,
+                    embedding, embedding_dim, tier, expires_at
+             FROM memories WHERE id = $1
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("archive on supersede", e))?
+        .rows_affected();
+        if archive_rows == 0 {
+            // Row vanished or the ON CONFLICT path took over — surface a
+            // typed not-found instead of silently dropping the supersede.
+            tx.rollback()
+                .await
+                .map_err(|e| to_store_err("rollback supersede", e))?;
+            return Err(StoreError::NotFound { id: id.to_string() });
+        }
+
+        // Step 2: DELETE the OLD row from the live `memories` table so
+        // the (title, namespace) UNIQUE index doesn't collide with the
+        // new INSERT.
+        sqlx::query("DELETE FROM memories WHERE id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("delete old on supersede", e))?;
+
+        // Step 3: insert the NEW row carrying the patched content.
+        // version starts at 1 (fresh row, not a continuation).
+        // v0.7.0 Provenance Gap 2 (#906) — source_uri ($11) is carried
+        // onto the new row via patch-or-inherit composition above.
+        sqlx::query(
+            "INSERT INTO memories
+                (id, tier, namespace, title, content, tags, priority, confidence,
+                 source, access_count, created_at, updated_at, metadata, version, source_uri)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 0, NOW(), NOW(), $10, 1, $11)",
+        )
+        .bind(&new_id)
+        .bind(new_tier.as_str())
+        .bind(&new_namespace)
+        .bind(&new_title)
+        .bind(&new_content)
+        .bind(
+            serde_json::to_value(&new_tags).map_err(|e| StoreError::IntegrityFailed {
+                detail: format!("serialize tags: {e}"),
+            })?,
+        )
+        .bind(new_priority)
+        .bind(new_confidence)
+        .bind(&existing.source)
+        .bind(&new_metadata)
+        .bind(&new_source_uri)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("insert new on supersede", e))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit supersede tx", e))?;
+
+        Ok((existing.id, new_id))
+    }
+
+    /// v0.7.0 Provenance Gap 6 (issue #889) — keyword search with
+    /// optional reciprocal `source_uri` filter. Postgres twin of
+    /// [`crate::storage::search_with_source_uri`].
+    ///
+    /// When `source_uri` is `Some(uri)`, the full-text search is
+    /// post-filtered to memories whose `source_uri` column equals the
+    /// supplied value verbatim. The partial `idx_memories_source_uri`
+    /// index (created at v37) covers the lookup, keeping it O(log N)
+    /// over the URI-keyed subspace.
+    ///
+    /// Returns up to `limit` matches ordered descending by a blended
+    /// score (text-rank + priority + recency).
+    pub async fn search_with_source_uri(
+        &self,
+        query: &str,
+        filter: &Filter,
+        source_uri: Option<&str>,
+    ) -> StoreResult<Vec<Memory>> {
+        let limit: i64 = filter.limit.clamp(1, 1000).try_into().unwrap_or(100);
+        let rows = sqlx::query(
+            "SELECT m.*,
+                    ts_rank(to_tsvector('english', m.title || ' ' || m.content),
+                            plainto_tsquery('english', $1)) AS rank
+             FROM memories m
+             WHERE to_tsvector('english', m.title || ' ' || m.content)
+                   @@ plainto_tsquery('english', $1)
+               AND ($2::text IS NULL OR m.namespace = $2)
+               AND ($3::text IS NULL OR m.tier = $3)
+               AND (m.expires_at IS NULL OR m.expires_at > NOW())
+               AND ($4::timestamptz IS NULL OR m.created_at >= $4)
+               AND ($5::timestamptz IS NULL OR m.created_at <= $5)
+               AND ($6::text IS NULL OR m.source_uri = $6)
+             ORDER BY rank DESC,
+                      m.priority DESC,
+                      m.updated_at DESC
+             LIMIT $7",
+        )
+        .bind(query)
+        .bind(filter.namespace.as_ref())
+        .bind(filter.tier.as_ref().map(Tier::as_str))
+        .bind(filter.since)
+        .bind(filter.until)
+        .bind(source_uri)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| to_store_err("search_with_source_uri", e))?;
+
+        rows.iter().map(Self::row_to_memory).collect()
+    }
+
+    /// v0.7.0 Provenance Gap 6 (issue #889) — list every memory
+    /// carrying the supplied `source_uri`. Postgres twin of
+    /// [`crate::storage::list_by_source_uri`].
+    ///
+    /// Bypasses the FTS layer so callers that want the full reciprocal
+    /// set ("every memory from this document") don't need to type a
+    /// query. Hits the partial `idx_memories_source_uri` index
+    /// directly. Pure read.
+    pub async fn list_by_source_uri(
+        &self,
+        source_uri: &str,
+        namespace: Option<&str>,
+        limit: Option<usize>,
+    ) -> StoreResult<Vec<Memory>> {
+        let cap_usize = limit.unwrap_or(200).min(1000);
+        let cap: i64 = i64::try_from(cap_usize).unwrap_or(200);
+        let rows = sqlx::query(
+            "SELECT m.* FROM memories m
+              WHERE m.source_uri = $1
+                AND ($2::text IS NULL OR m.namespace = $2)
+              ORDER BY m.created_at ASC
+              LIMIT $3",
+        )
+        .bind(source_uri)
+        .bind(namespace)
+        .bind(cap)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| to_store_err("list_by_source_uri", e))?;
+
+        rows.iter().map(Self::row_to_memory).collect()
+    }
+
+    /// v0.7.0 Gap 3 (issue #886) — insert one or more
+    /// `recall_observations` rows under a single `recall_id`. Postgres
+    /// twin of [`crate::observations::record_recall`].
+    ///
+    /// Idempotent via `ON CONFLICT (recall_id, memory_id) DO NOTHING`
+    /// — replaying the same recall is a no-op rather than a
+    /// constraint violation.
+    ///
+    /// `candidates` is a slice of `(memory_id, retriever, rank, score)`
+    /// tuples. Returns the number of rows actually inserted (excludes
+    /// ON CONFLICT no-ops).
+    pub async fn recall_observation_insert(
+        &self,
+        recall_id: &str,
+        candidates: &[(String, String, i64, f64)],
+    ) -> StoreResult<usize> {
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin recall_observation tx", e))?;
+        let mut written: usize = 0;
+        for (memory_id, retriever, rank, score) in candidates {
+            let n = sqlx::query(
+                "INSERT INTO recall_observations
+                    (recall_id, memory_id, retriever, rank, score)
+                 VALUES ($1, $2, $3, $4, $5)
+                 ON CONFLICT (recall_id, memory_id) DO NOTHING",
+            )
+            .bind(recall_id)
+            .bind(memory_id)
+            .bind(retriever)
+            .bind(rank)
+            .bind(score)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("insert recall_observation", e))?
+            .rows_affected();
+            written += usize::try_from(n).unwrap_or(0);
+        }
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit recall_observation tx", e))?;
+        Ok(written)
+    }
+
+    /// v0.7.0 Gap 3 (issue #886) — TTL-based prune of the
+    /// `recall_observations` ledger. Postgres twin of
+    /// [`crate::observations::gc::prune`].
+    ///
+    /// Deletes every row whose `observed_at` is older than `ttl_days`
+    /// days. Returns the count of rows pruned. Safe to invoke
+    /// concurrently with `recall_observation_insert`.
+    pub async fn recall_observation_gc(&self, ttl_days: i64) -> StoreResult<usize> {
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(ttl_days.max(1));
+        let n = sqlx::query("DELETE FROM recall_observations WHERE observed_at < $1")
+            .bind(cutoff)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| to_store_err("recall_observation_gc", e))?
+            .rows_affected();
+        Ok(usize::try_from(n).unwrap_or(0))
+    }
+
+    /// v0.7.0 issue #860 — Postgres twin of
+    /// [`crate::storage::get_links`] expanded to surface the four
+    /// temporal-validity + attestation columns
+    /// (`valid_from`, `valid_until`, `observed_by`, `attest_level`)
+    /// the `memory_get_links` MCP tool's docstring promises.
+    ///
+    /// Returns every link row where `id` is either source OR target,
+    /// projecting the full row shape so the read path matches the
+    /// SQLite contract byte-for-byte.
+    pub async fn get_links(&self, id: &str) -> StoreResult<Vec<MemoryLink>> {
+        let rows = sqlx::query(
+            "SELECT source_id, target_id, relation, created_at,
+                    valid_from, valid_until, observed_by, attest_level
+             FROM memory_links
+             WHERE source_id = $1 OR target_id = $1
+             ORDER BY source_id, target_id, relation",
+        )
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| to_store_err("get_links", e))?;
+
+        rows.iter()
+            .map(|r| {
+                let created_at: DateTime<Utc> = r
+                    .try_get("created_at")
+                    .map_err(|e| to_store_err("read created_at", e))?;
+                let valid_from: Option<DateTime<Utc>> = r
+                    .try_get("valid_from")
+                    .map_err(|e| to_store_err("read valid_from", e))?;
+                let valid_until: Option<DateTime<Utc>> = r
+                    .try_get("valid_until")
+                    .map_err(|e| to_store_err("read valid_until", e))?;
+                let observed_by: Option<String> = r
+                    .try_get("observed_by")
+                    .map_err(|e| to_store_err("read observed_by", e))?;
+                let attest_level: Option<String> = r
+                    .try_get("attest_level")
+                    .map_err(|e| to_store_err("read attest_level", e))?;
+                let relation_str: String = r
+                    .try_get("relation")
+                    .map_err(|e| to_store_err("read relation", e))?;
+                Ok(MemoryLink {
+                    source_id: r
+                        .try_get("source_id")
+                        .map_err(|e| to_store_err("read source_id", e))?,
+                    target_id: r
+                        .try_get("target_id")
+                        .map_err(|e| to_store_err("read target_id", e))?,
+                    relation: crate::models::MemoryLinkRelation::from_str(&relation_str)
+                        .unwrap_or_default(),
+                    created_at: created_at.to_rfc3339(),
+                    // `signature` is intentionally NOT surfaced through
+                    // the get_links read path — that bytes-on-the-wire
+                    // surface is the verifier's concern
+                    // (`LinkVerifyRecord`), and exposing it here would
+                    // force the JSON response to carry a base64 blob
+                    // every existing caller would have to ignore.
+                    signature: None,
+                    valid_from: valid_from.map(|t| t.to_rfc3339()),
+                    valid_until: valid_until.map(|t| t.to_rfc3339()),
+                    observed_by,
+                    attest_level,
+                })
+            })
+            .collect()
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // AGE Cypher templates for Gap-5 / Gap-7 (issue #894 PG+AGE parity).
+    //
+    // These constants bind the canonical Cypher snippets a future AGE
+    // runner will switch on when the operator network constraint lifts
+    // (Track C/D: 192.168.50.100 ↔ 192.168.1.50 routing). They are
+    // intentionally NOT executed by this build — the v0.7.0 PG path's
+    // `kg_backend` probes for AGE at connect time and falls back to
+    // the recursive-CTE path on `KgBackend::Cte` (the current default
+    // on every PG instance we run against).
+    //
+    // When AGE is enrolled, the dispatch site:
+    //   1. Pulls the template constant
+    //   2. Substitutes `$param` placeholders via the AGE Cypher
+    //      parameter-binding contract
+    //   3. Executes via `SELECT * FROM cypher('memory_graph', $$ ... $$,
+    //      $1) AS (col agtype)`
+    //
+    // Until then, the constants serve as the contract documentation
+    // the AGE arm will commit to.
+    // ─────────────────────────────────────────────────────────────────
+
+    /// v0.7.0 Provenance Gap 5 (#888) — AGE Cypher template for the
+    /// supersede edge. Bound but not executed pending AGE enrolment.
+    /// Mirrors the metadata-pointer encoding the SQL path uses (#895
+    /// is the follow-on for the FK-safe archive cross-ref).
+    pub const AGE_CYPHER_SUPERSEDE_EDGE: &'static str = "\
+        MERGE (a:Memory {id: $new_id})-[:SUPERSEDES {at: $ts, edit_source: $src}]->\
+        (b:Memory {id: $archived_id})";
+
+    /// v0.7.0 Provenance Gap 7 (#890) — AGE Cypher template for the
+    /// `latest_link_attest_level` decoration: max of attest_level over
+    /// every outbound link on a memory. Bound but not executed pending
+    /// AGE enrolment.
+    pub const AGE_CYPHER_LATEST_LINK_ATTEST_LEVEL: &'static str = "\
+        MATCH (m:Memory {id: $id})-[r]->() \
+        RETURN max(coalesce(r.attest_level, 'unsigned'))";
 
     /// v29 connect-time no-op pass.
     ///
@@ -2582,7 +3754,20 @@ impl PostgresStore {
             .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("LOAD age", e))?;
-        sqlx::query("SET search_path = ag_catalog, \"$user\", public")
+        // #925 (2026-05-20): use `SET LOCAL` so the search_path
+        // mutation is transaction-scoped and auto-reverts at
+        // COMMIT/ROLLBACK. Pre-fix the bare `SET search_path`
+        // persisted across the transaction boundary; sqlx's pool
+        // reset doesn't fire until the NEXT checkout, so a subsequent
+        // regular `INSERT INTO memories` on the same pooled
+        // connection inherited `ag_catalog` as the first search_path
+        // entry and the row landed under `ag_catalog.memories`
+        // instead of the operator-requested per-IronClaw schema
+        // (e.g. `ic_alice`). That broke the per-daemon data
+        // isolation the lan-parity test mesh depends on. The other
+        // three AGE entry points (sibling sites below) follow the
+        // same `SET LOCAL` pattern.
+        sqlx::query("SET LOCAL search_path = ag_catalog, \"$user\", public")
             .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("set search_path", e))?;
@@ -2865,7 +4050,7 @@ impl PostgresStore {
             .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("LOAD age", e))?;
-        sqlx::query("SET search_path = ag_catalog, \"$user\", public")
+        sqlx::query("SET LOCAL search_path = ag_catalog, \"$user\", public")
             .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("set search_path", e))?;
@@ -3232,7 +4417,7 @@ impl PostgresStore {
             .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("LOAD age", e))?;
-        sqlx::query("SET search_path = ag_catalog, \"$user\", public")
+        sqlx::query("SET LOCAL search_path = ag_catalog, \"$user\", public")
             .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("set search_path", e))?;
@@ -3600,62 +4785,76 @@ impl PostgresStore {
             .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("LOAD age", e))?;
-        sqlx::query("SET search_path = ag_catalog, \"$user\", public")
+        sqlx::query("SET LOCAL search_path = ag_catalog, \"$user\", public")
             .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("set search_path", e))?;
 
-        // v0.7.0.1 G5 — the prior shape `RETURN [n IN nodes(p) |
-        // properties(n).id] AS path` triggered AGE 1.5.0's grammar at
-        // the `|` separator with `syntax error at or near "|"`
-        // (HALT R1b S65). AGE 1.5.0's parser does support list
-        // comprehensions in isolation but `convert_cypher_to_subquery`
-        // mis-handles the form when the iteration variable is bound
-        // from a function call (`nodes(p)`) and the projection touches
-        // a property — the analyzer's `|` recovery point bubbles up as
-        // a Postgres syntax error before the Cypher body even reaches
-        // the planner. The `reduce()` form below uses the same
-        // iteration grammar (`var IN list | expr`) that already ships
-        // working in `kg_query_cypher`'s `reduce(s = a.id, n IN
-        // nodes(p)[1..] | s + '->' + n.id)` projection — `reduce` and
-        // list comprehension share an AST node in AGE 1.5 but only the
-        // former survives the analyzer pass against this fixture.
+        // v0.7.0 ship-hardening (2026-05-19): the prior shape
+        // `RETURN reduce(s = a.id, n IN nodes(p)[1..] | s + '->' +
+        // n.id) AS path` is REJECTED at parse time by AGE 1.6.0 with
+        // `syntax error at or near "|"`. AGE 1.5.0 accepted reduce
+        // bodies containing `|`; AGE 1.6.0's grammar narrowed the
+        // `|` recovery point and now treats it as the list-comprehension
+        // pipe separator only — making `reduce(... | ...)` ambiguous
+        // with `[var IN list | expr]` and rejected entirely. Direct
+        // psql PREPARE/EXECUTE confirms: the reduce form errors, the
+        // list-comp form errors with "could not find properties for n"
+        // (same grammar narrowing), and the alternative `UNWIND + collect`
+        // form silently returns an empty path. The ONLY portable shape
+        // that survives both AGE 1.5 and 1.6 is `RETURN nodes(p)` which
+        // returns the vertex list directly; the Rust-side decode then
+        // strips AGE's text-format `::vertex` type tags and pulls each
+        // `properties.id` to reconstruct the path.
         //
-        // The delimiter is `->` (an arrow) which cannot appear in a
-        // memory id (the validator constrains ids to UUIDv4 / a-z0-9_-)
-        // so server-side splitting is unambiguous. We stay away from a
-        // bare `|` literal to avoid re-triggering any analyzer recovery
-        // point on the parser side.
+        // The variable-length pattern stays `-[*1..N]-` (un-arrowed,
+        // explicit lower bound) per the symmetric-closure contract
+        // from the CTE branch — matching either declared edge
+        // direction. AGE 1.6.0 accepts this shape; the `convert_cypher_to_subquery`
+        // pattern walker round-trips it correctly.
+        // v0.7.0 ship-hardening (2026-05-19): use 2-arg `cypher()` with
+        // IDs inlined into the cypher body instead of a 3-arg form with
+        // a params dict. Empirical findings via PREPARE/EXECUTE + raw
+        // SQL in psql + sqlx round-trips:
         //
-        // The variable-length pattern is `*1..N` (explicit minimum)
-        // rather than `*..N`. AGE 1.5.0 accepts both at the grammar
-        // level but only the explicit form round-trips through
-        // `convert_cypher_to_subquery`'s pattern walker — same fix
-        // shape as `kg_query_cypher`. The pattern stays un-arrowed
-        // (`-[*1..N]-`) so the symmetric-closure contract from the CTE
-        // branch holds: matching either declared edge direction.
-        const PATH_DELIM: &str = "->";
-        let cypher = format!(
-            "MATCH p = (a)-[*1..{depth}]-(b) \
-             WHERE a.id = $start_id AND b.id = $target_id \
-             RETURN reduce(s = a.id, n IN nodes(p)[1..] | \
-                           s + '{PATH_DELIM}' + n.id) AS path \
+        //   * 3-arg `cypher(graph, body, params)` with `params` bound
+        //     via sqlx's `Agtype` binary wrapper → cypher executes
+        //     without error but matches 0 rows (the `$start_id` /
+        //     `$target_id` variable substitution doesn't happen — the
+        //     binary protocol's agtype encoding does not surface the
+        //     params dict's keys to AGE's cypher analyzer).
+        //   * 3-arg `cypher(graph, body, '{"…"}'::agtype)` with an
+        //     INLINE agtype literal → AGE 1.5/1.6 rejects: "third
+        //     argument of cypher function must be a parameter" (the
+        //     `Const` node it sees isn't accepted).
+        //   * 2-arg `cypher(graph, body)` with the IDs inlined into
+        //     the cypher TEXT (WHERE a.id = 'literal') → works on
+        //     both AGE 1.5 and 1.6, returns matched paths correctly.
+        //
+        // We take the 2-arg path. Source and target IDs are
+        // UUID-validated upstream (`validate_memory_id`) so the
+        // inlined values are safe from SQL injection; the
+        // defense-in-depth `assert_age_id_safe()` check below rejects
+        // any residual id that doesn't match `[A-Za-z0-9_-]+` before
+        // it reaches the format string. The `reduce(... | ...)`
+        // string-join shape from earlier was ALSO broken on AGE
+        // 1.6 (the `|` separator became unparseable in reduce
+        // bodies); the new cypher uses `RETURN nodes(p)` and the
+        // Rust-side decode pulls each vertex's `properties.id` to
+        // reconstruct the chain.
+        assert_age_id_safe(source_id).map_err(|detail| StoreError::InvalidInput { detail })?;
+        assert_age_id_safe(target_id).map_err(|detail| StoreError::InvalidInput { detail })?;
+
+        let sql = format!(
+            "SELECT path FROM cypher('memory_graph', $$ \
+             MATCH p = (a)-[*1..{depth}]-(b) \
+             WHERE a.id = '{source_id}' AND b.id = '{target_id}' \
+             RETURN nodes(p) AS path \
              ORDER BY length(p) ASC \
-             LIMIT {cap}"
+             LIMIT {cap} \
+             $$) AS (path agtype)"
         );
-
-        // v0.7.0.1 G2 — bind the params dict as an `agtype`-typed
-        // parameter through sqlx (`$1`) rather than inlining it as a
-        // SQL literal. AGE 1.5.0's `convert_cypher_to_subquery`
-        // analyzer rejects ANY non-Param node at the third-argument
-        // position; the literal form previously here surfaces as a
-        // 503 from `POST /api/v1/kg/find_paths` (HALT R1b S65).
-        let params = age_params_jsonb(&[("start_id", source_id), ("target_id", target_id)]);
-        let sql =
-            format!("SELECT path FROM cypher('memory_graph', $$ {cypher} $$, $1) AS (path agtype)");
-
         let rows = sqlx::query(&sql)
-            .bind(Agtype(params))
             .fetch_all(&mut *tx)
             .await
             .map_err(|e| to_store_err("cypher find_paths", e))?;
@@ -3679,11 +4878,58 @@ impl PostgresStore {
                 // AGE serialises strings as JSON-quoted strings (e.g.
                 // `"abc"`); parse as JSON to strip the
                 // quotes and decode any escapes the encoder applied.
-                let joined: String =
-                    serde_json::from_str(&raw.0).map_err(|e| StoreError::IntegrityFailed {
-                        detail: format!("non-JSON AGE path: {}: {e}", raw.0),
-                    })?;
-                Ok(joined.split(PATH_DELIM).map(str::to_string).collect())
+                // `raw.0` is AGE's text format for a vertex list:
+                //   `[{"id":..., "label":"Memory",
+                //      "properties":{"id":"uuid1"}}::vertex,
+                //     {"id":..., "properties":{"id":"uuid2"}}::vertex, ...]`
+                // The `::vertex` (and `::edge`, `::path`) suffixes are
+                // AGE's text-format type tags and are NOT valid JSON.
+                // Strip them, parse as JSON, then pull each
+                // `properties.id` to reconstruct the chain.
+                let json_payload = raw
+                    .0
+                    .replace("::vertex", "")
+                    .replace("::edge", "")
+                    .replace("::path", "");
+                // QC Obs #8 (2026-05-20): cap echoed payload at 200
+                // chars in error messages so an unbounded malformed
+                // response doesn't blow up the log / response body.
+                let payload_preview = |s: &str| -> String {
+                    if s.len() <= 200 {
+                        s.to_string()
+                    } else {
+                        format!("{}…<{}b truncated>", &s[..200], s.len() - 200)
+                    }
+                };
+                let arr: serde_json::Value = serde_json::from_str(&json_payload).map_err(|e| {
+                    StoreError::IntegrityFailed {
+                        detail: format!(
+                            "non-JSON AGE path payload: {}: {e}",
+                            payload_preview(&raw.0)
+                        ),
+                    }
+                })?;
+                let nodes = arr.as_array().ok_or_else(|| StoreError::IntegrityFailed {
+                    detail: format!("AGE path is not an array: {}", payload_preview(&raw.0)),
+                })?;
+                let ids: Vec<String> = nodes
+                    .iter()
+                    .filter_map(|v| {
+                        v.get("properties")
+                            .and_then(|p| p.get("id"))
+                            .and_then(|i| i.as_str())
+                            .map(String::from)
+                    })
+                    .collect();
+                if ids.is_empty() {
+                    return Err(StoreError::IntegrityFailed {
+                        detail: format!(
+                            "AGE path has no extractable ids: {}",
+                            payload_preview(&raw.0)
+                        ),
+                    });
+                }
+                Ok(ids)
             })
             .collect()
     }
@@ -3844,13 +5090,57 @@ impl PostgresStore {
         .map_err(|e| to_store_err("insert memory_link", e))?;
 
         if matches!(self.kg_backend, KgBackend::Age) {
-            project_link_into_age(
+            // v0.7.0 fold-A2A1.3 (#700) extended to the link path
+            // (#858 follow-up, 2026-05-18): AGE projection is
+            // best-effort. The relational `memory_links` insert
+            // above is the canonical source of truth — the AGE
+            // graph projection is a query-acceleration mirror used
+            // by the cypher-backed `find_paths_cypher` path, which
+            // already falls back to the recursive CTE
+            // (`is_age_runtime_failure` → `warn_age_fallback`) when
+            // AGE is unavailable at query time.
+            //
+            // Pre-fix: any AGE runtime failure here (e.g. the test
+            // postgres user lacking permission to `LOAD 'age'`)
+            // propagated up as `BackendUnavailable` → HTTP 503,
+            // even though the link row was successfully inserted
+            // into `memory_links`. That broke every link-creating
+            // postgres test (smoke + 5 handler_parity tests +
+            // anything else that creates a link before reading via
+            // cypher). The canonical link insert had already
+            // committed at this point (well, it was queued in
+            // `tx` — see below); the AGE projection failure should
+            // degrade to a warning, not a 503.
+            //
+            // Treatment: catch the failure, log a structured warn
+            // event with the same shape `warn_age_fallback` uses,
+            // and continue to commit. Operators monitoring the
+            // tracing stream see exactly which link skipped its
+            // AGE projection.
+            if let Err(e) = project_link_into_age(
                 &mut tx,
                 &link.source_id,
                 &link.target_id,
                 link.relation.as_str(),
             )
-            .await?;
+            .await
+            {
+                if is_age_runtime_failure(&e) {
+                    tracing::warn!(
+                        target = "store::postgres::kg",
+                        source_id = %link.source_id,
+                        target_id = %link.target_id,
+                        relation = link.relation.as_str(),
+                        err = %e,
+                        "AGE projection skipped on link insert — \
+                         relational memory_links row still committed. \
+                         find_paths_cypher will degrade to CTE fallback for \
+                         queries that traverse this edge."
+                    );
+                } else {
+                    return Err(e);
+                }
+            }
         }
 
         tx.commit()
@@ -3975,6 +5265,12 @@ impl PostgresStore {
             confidence_decayed_at: row
                 .try_get::<Option<String>, _>("confidence_decayed_at")
                 .unwrap_or(None),
+            // v0.7.0 Provenance Gap 1 (#884) — read the v42 column.
+            // Pre-v42 rows / backups missing the column fall back to
+            // the SQL DEFAULT (1) via `default_memory_version()`.
+            version: row
+                .try_get::<i64, _>("version")
+                .unwrap_or_else(|_| crate::models::default_memory_version()),
         })
     }
 
@@ -4835,6 +6131,30 @@ fn clamp_timeline_limit(limit: Option<usize>) -> usize {
 /// the JSON are escaped as `''` (SQL standard); the agtype JSON dialect
 /// uses `"` for string delimiters and `\"` for embedded double quotes,
 /// so the only character that needs SQL-side escaping here is `'`.
+/// Defense-in-depth check for ids that we inline directly into a
+/// cypher() body string (the 2-arg form, where there's no params dict
+/// to substitute through). The upstream `validate_memory_id` already
+/// constrains the format to a UUIDv4-style alphabet but this assert
+/// rejects anything outside `[A-Za-z0-9_-]` so a future code path
+/// that bypasses validation still can't SQL-inject through cypher.
+fn assert_age_id_safe(id: &str) -> Result<(), String> {
+    if id.is_empty() || id.len() > 128 {
+        return Err(format!(
+            "id length {} out of bounds for cypher inline (1..=128)",
+            id.len()
+        ));
+    }
+    if !id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err(format!(
+            "id contains characters unsafe for cypher inline (allowed: [A-Za-z0-9_-]): {id:?}"
+        ));
+    }
+    Ok(())
+}
+
 fn age_params_literal(pairs: &[(&str, &str)]) -> String {
     let mut map = serde_json::Map::with_capacity(pairs.len());
     for (k, v) in pairs {
@@ -5428,12 +6748,45 @@ impl MemoryStore for PostgresStore {
         //
         // Tier never downgrades (blocker #296 / SQLite parity): on
         // conflict tier takes max of existing vs new via rank mapping.
+        // v0.7.0 #900 — Form-4 fact-provenance + Form-5 confidence
+        // provenance columns ride the same INSERT so the PG store
+        // round-trips `Memory::source_uri`, `citations`, `source_span`,
+        // and the three confidence columns. Pre-#900 the INSERT only
+        // wrote 17 columns and `list_by_source_uri` / `search_with_
+        // source_uri` returned empty against PG. Pinned by
+        // `tests/store_parity_gaps.rs::pg_parity_gap_2_source_uri_column`.
+        let citations_json =
+            serde_json::to_string(&memory.citations).map_err(|e| StoreError::IntegrityFailed {
+                detail: format!("serialize citations: {e}"),
+            })?;
+        let source_span_json = match memory.source_span {
+            Some(span) => {
+                Some(
+                    serde_json::to_string(&span).map_err(|e| StoreError::IntegrityFailed {
+                        detail: format!("serialize source_span: {e}"),
+                    })?,
+                )
+            }
+            None => None,
+        };
+        let confidence_signals_json = match &memory.confidence_signals {
+            Some(s) => Some(
+                serde_json::to_string(s).map_err(|e| StoreError::IntegrityFailed {
+                    detail: format!("serialize confidence_signals: {e}"),
+                })?,
+            ),
+            None => None,
+        };
         let id: String = sqlx::query(
             "INSERT INTO memories (
                 id, tier, namespace, title, content, tags, priority, confidence,
                 source, access_count, created_at, updated_at, last_accessed_at,
-                expires_at, metadata, reflection_depth, memory_kind
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+                expires_at, metadata, reflection_depth, memory_kind,
+                citations, source_uri, source_span,
+                confidence_source, confidence_signals, confidence_decayed_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
+                      $18, $19, $20,
+                      $21, $22, $23)
             ON CONFLICT (title, namespace) DO UPDATE SET
                 content = EXCLUDED.content,
                 tier = CASE
@@ -5460,7 +6813,16 @@ impl MemoryStore for PostgresStore {
                 reflection_depth = GREATEST(memories.reflection_depth, EXCLUDED.reflection_depth),
                 -- L1-1 — kind is sticky: once Reflection, always Reflection.
                 memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
-                                   ELSE EXCLUDED.memory_kind END
+                                   ELSE EXCLUDED.memory_kind END,
+                -- v0.7.0 #900 — Form-4 / Form-5 provenance columns ride
+                -- the upsert so a re-store doesn't blank out the URI /
+                -- citation context.
+                citations = EXCLUDED.citations,
+                source_uri = COALESCE(EXCLUDED.source_uri, memories.source_uri),
+                source_span = COALESCE(EXCLUDED.source_span, memories.source_span),
+                confidence_source = EXCLUDED.confidence_source,
+                confidence_signals = COALESCE(EXCLUDED.confidence_signals, memories.confidence_signals),
+                confidence_decayed_at = COALESCE(EXCLUDED.confidence_decayed_at, memories.confidence_decayed_at)
             RETURNING id",
         )
         .bind(&memory.id)
@@ -5480,6 +6842,12 @@ impl MemoryStore for PostgresStore {
         .bind(&memory.metadata)
         .bind(memory.reflection_depth)
         .bind(memory.memory_kind.as_str())
+        .bind(&citations_json)
+        .bind(memory.source_uri.as_deref())
+        .bind(source_span_json.as_deref())
+        .bind(memory.confidence_source.as_str())
+        .bind(confidence_signals_json.as_deref())
+        .bind(memory.confidence_decayed_at.as_deref())
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| to_store_err("insert memory", e))?
@@ -5612,14 +6980,25 @@ impl MemoryStore for PostgresStore {
         Ok(())
     }
 
-    async fn get(&self, _ctx: &CallerContext, id: &str) -> StoreResult<Memory> {
+    async fn get(&self, ctx: &CallerContext, id: &str) -> StoreResult<Memory> {
         let row = sqlx::query("SELECT * FROM memories WHERE id = $1")
             .bind(id)
             .fetch_optional(&self.pool)
             .await
             .map_err(|e| to_store_err("select by id", e))?;
         match row {
-            Some(r) => Self::row_to_memory(&r),
+            Some(r) => {
+                let mem = Self::row_to_memory(&r)?;
+                // #910 SAL-level scope=private gate — fold permission
+                // denials into NotFound so the trait does not leak
+                // existence to callers that lack read permission.
+                // Admin/migrate paths set `bypass_visibility`.
+                if ctx.bypass_visibility || is_visible_to_caller(&mem, ctx.effective_principal()) {
+                    Ok(mem)
+                } else {
+                    Err(StoreError::NotFound { id: id.to_string() })
+                }
+            }
             None => Err(StoreError::NotFound { id: id.to_string() }),
         }
     }
@@ -5635,6 +7014,11 @@ impl MemoryStore for PostgresStore {
         // Blocker #295: `metadata.agent_id` is SQL-layer-immutable. If
         // the current row has an agent_id we preserve it against any
         // patch; otherwise the patch's metadata (if provided) wins.
+        //
+        // v0.7.0 Provenance Gap 2 (#906): `source_uri` follows COALESCE
+        // semantics — a patch that doesn't touch source_uri leaves the
+        // stored value alone; a patch that supplies one rewrites the
+        // row's source_uri verbatim.
         let rows_affected = sqlx::query(
             "UPDATE memories SET
                 title = COALESCE($2, title),
@@ -5657,6 +7041,7 @@ impl MemoryStore for PostgresStore {
                     )
                     ELSE $9::JSONB
                 END,
+                source_uri = COALESCE($10, source_uri),
                 updated_at = NOW()
              WHERE id = $1",
         )
@@ -5677,6 +7062,7 @@ impl MemoryStore for PostgresStore {
         .bind(patch.priority)
         .bind(patch.confidence)
         .bind(patch.metadata)
+        .bind(patch.source_uri)
         .execute(&self.pool)
         .await
         .map_err(|e| to_store_err("update", e))?
@@ -5703,8 +7089,25 @@ impl MemoryStore for PostgresStore {
         }
     }
 
-    async fn list(&self, _ctx: &CallerContext, filter: &Filter) -> StoreResult<Vec<Memory>> {
+    async fn list(&self, ctx: &CallerContext, filter: &Filter) -> StoreResult<Vec<Memory>> {
         let limit: i64 = filter.limit.clamp(1, 1000).try_into().unwrap_or(100);
+        // #910 SAL-level scope=private gate — push the visibility
+        // predicate into SQL so the row filter runs server-side and
+        // the result-set size scales with what the caller can see,
+        // not what exists. `metadata->>'scope'` defaults to 'private'
+        // when missing (matches the CLAUDE.md NHI contract +
+        // SQLite's COALESCE-to-'private' generated column).
+        //
+        // Admin/migrate paths set `bypass_visibility`; we pass NULL
+        // as the visibility-bypass sentinel which short-circuits the
+        // `(scope <> 'private' OR agent_id = caller)` test via the
+        // leading `$7 IS NULL` clause.
+        let caller = ctx.effective_principal();
+        let caller_opt: Option<&str> = if ctx.bypass_visibility {
+            None
+        } else {
+            Some(caller)
+        };
         let rows = sqlx::query(
             "SELECT * FROM memories
              WHERE ($1::text IS NULL OR namespace = $1)
@@ -5712,6 +7115,12 @@ impl MemoryStore for PostgresStore {
                AND (expires_at IS NULL OR expires_at > NOW())
                AND ($3::timestamptz IS NULL OR created_at >= $3)
                AND ($4::timestamptz IS NULL OR created_at <= $4)
+               AND (
+                   $6::text IS NULL
+                   OR COALESCE(metadata->>'scope', 'private') <> 'private'
+                   OR metadata->>'agent_id' = $6
+                   OR metadata->>'target_agent_id' = $6
+               )
              ORDER BY priority DESC, updated_at DESC
              LIMIT $5",
         )
@@ -5720,20 +7129,36 @@ impl MemoryStore for PostgresStore {
         .bind(filter.since)
         .bind(filter.until)
         .bind(limit)
+        .bind(caller_opt)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| to_store_err("list", e))?;
 
-        rows.iter().map(Self::row_to_memory).collect()
+        // Belt-and-suspenders: re-apply the predicate in-process so a
+        // hypothetical SQL drift between the WHERE clause above and
+        // the canonical Rust predicate cannot widen the visibility
+        // window. Costs O(returned-rows); negligible.
+        let mems: Vec<Memory> = rows
+            .iter()
+            .map(Self::row_to_memory)
+            .collect::<StoreResult<Vec<_>>>()?;
+        if ctx.bypass_visibility {
+            return Ok(mems);
+        }
+        Ok(mems
+            .into_iter()
+            .filter(|m| is_visible_to_caller(m, caller))
+            .collect())
     }
 
     async fn search(
         &self,
-        _ctx: &CallerContext,
+        ctx: &CallerContext,
         query: &str,
         filter: &Filter,
     ) -> StoreResult<Vec<Memory>> {
         let limit: i64 = filter.limit.clamp(1, 1000).try_into().unwrap_or(100);
+        let caller = ctx.effective_principal();
         // Adapter parity with SQLite (#302 item 3): threads the full
         // Filter (namespace, tier, tags_any, agent_id) into the query.
         // Prior implementation ignored `tags_any` and `agent_id` so
@@ -5782,6 +7207,14 @@ impl MemoryStore for PostgresStore {
         // diverges from sqlite's FTS5 `OR` contract — see
         // `build_or_tsquery` for the sanitization rules.
         let or_tsquery = build_or_tsquery(query);
+        // #910 SAL-level scope=private gate — push the visibility
+        // predicate into SQL via `$7` (caller principal). Admin paths
+        // pass NULL to bypass.
+        let caller_opt: Option<&str> = if ctx.bypass_visibility {
+            None
+        } else {
+            Some(caller)
+        };
         let rows = sqlx::query(
             "SELECT *,
                     ts_rank(
@@ -5806,6 +7239,12 @@ impl MemoryStore for PostgresStore {
                AND ($4::text IS NULL OR tags @> to_jsonb(ARRAY[$4]))
                AND ($5::text IS NULL OR metadata ->> 'agent_id' = $5)
                AND (expires_at IS NULL OR expires_at > NOW())
+               AND (
+                   $7::text IS NULL
+                   OR COALESCE(metadata->>'scope', 'private') <> 'private'
+                   OR metadata->>'agent_id' = $7
+                   OR metadata->>'target_agent_id' = $7
+               )
              ORDER BY rank DESC, priority DESC
              LIMIT $6",
         )
@@ -5815,11 +7254,23 @@ impl MemoryStore for PostgresStore {
         .bind(tags_first)
         .bind(filter.agent_id.as_ref())
         .bind(limit)
+        .bind(caller_opt)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| to_store_err("search", e))?;
 
-        rows.iter().map(Self::row_to_memory).collect()
+        // Belt-and-suspenders: re-apply the predicate in-process.
+        let mems: Vec<Memory> = rows
+            .iter()
+            .map(Self::row_to_memory)
+            .collect::<StoreResult<Vec<_>>>()?;
+        if ctx.bypass_visibility {
+            return Ok(mems);
+        }
+        Ok(mems
+            .into_iter()
+            .filter(|m| is_visible_to_caller(m, caller))
+            .collect())
     }
 
     async fn verify(&self, _ctx: &CallerContext, id: &str) -> StoreResult<VerifyReport> {
@@ -5871,9 +7322,15 @@ impl MemoryStore for PostgresStore {
         // Ordering by `(source_id, target_id, relation)` is the SAL
         // contract — deterministic across calls and matches the unique
         // key, so a paginated migrate can resume without losing rows.
+        //
+        // v0.7.0 issue #860 — SELECT was widened to include `attest_level`
+        // so the Postgres SAL surfaces the same attestation column the
+        // SQLite `db::get_links` path promises in the
+        // `memory_get_links` MCP tool docstring.
         let rows = sqlx::query(
             "SELECT ml.source_id, ml.target_id, ml.relation, ml.created_at,
-                    ml.valid_from, ml.valid_until, ml.observed_by, ml.signature
+                    ml.valid_from, ml.valid_until, ml.observed_by, ml.signature,
+                    ml.attest_level
              FROM memory_links ml
              WHERE ($1::text IS NULL
                     OR EXISTS (SELECT 1 FROM memories m
@@ -5905,6 +7362,9 @@ impl MemoryStore for PostgresStore {
                 let relation_str: String = r
                     .try_get::<String, _>("relation")
                     .map_err(|e| to_store_err("read relation", e))?;
+                let attest_level: Option<String> =
+                    r.try_get::<Option<String>, _>("attest_level")
+                        .map_err(|e| to_store_err("read attest_level", e))?;
                 Ok(MemoryLink {
                     source_id: r
                         .try_get::<String, _>("source_id")
@@ -5923,6 +7383,11 @@ impl MemoryStore for PostgresStore {
                     observed_by,
                     valid_from: valid_from.map(|t| t.to_rfc3339()),
                     valid_until: valid_until.map(|t| t.to_rfc3339()),
+                    // v0.7.0 issue #860 — surface attest_level on the
+                    // Postgres SAL `list_links` read path so the
+                    // adapter matches the `memory_get_links` MCP
+                    // tool's docstring promise.
+                    attest_level,
                 })
             })
             .collect()
@@ -6172,6 +7637,15 @@ impl MemoryStore for PostgresStore {
         // the empty bucket, pulling mean Jaccard@5 below the 0.20
         // floor (HALT v0.7.0 R1 S79).
         let or_tsquery = build_or_tsquery(query);
+        // #910 SAL-level scope=private gate — caller principal for the
+        // visibility predicate pushed into both FTS + semantic SQL.
+        // Admin paths pass NULL to bypass.
+        let caller = ctx.effective_principal();
+        let caller_opt: Option<&str> = if ctx.bypass_visibility {
+            None
+        } else {
+            Some(caller)
+        };
         // FTS candidates with the existing 6-factor blend baked into
         // `rank` (see search() above). Also surfaces content_len so
         // the trait-side adaptive blend can compute semantic_weight
@@ -6203,6 +7677,12 @@ impl MemoryStore for PostgresStore {
                AND ($6::timestamptz IS NULL OR created_at >= $6)
                AND ($7::timestamptz IS NULL OR created_at <= $7)
                AND (expires_at IS NULL OR expires_at > NOW())
+               AND (
+                   $9::text IS NULL
+                   OR COALESCE(metadata->>'scope', 'private') <> 'private'
+                   OR metadata->>'agent_id' = $9
+                   OR metadata->>'target_agent_id' = $9
+               )
              ORDER BY fts_score DESC
              LIMIT $8",
         )
@@ -6214,6 +7694,7 @@ impl MemoryStore for PostgresStore {
         .bind(filter.since)
         .bind(filter.until)
         .bind(fts_pool)
+        .bind(caller_opt)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| to_store_err("recall_hybrid fts pool", e))?;
@@ -6245,6 +7726,7 @@ impl MemoryStore for PostgresStore {
         if let Some(qe) = query_embedding {
             let ann_pool: i64 = (limit_eff * 5).max(50);
             let qvec = pgvector::Vector::from(qe.to_vec());
+            // #910 SAL-level scope=private gate via $9.
             let sem_rows = sqlx::query(
                 "SELECT *, (1.0 - (embedding <=> $1)) AS cosine_sim,
                           octet_length(content) AS content_len
@@ -6258,6 +7740,11 @@ impl MemoryStore for PostgresStore {
                    AND ($7::timestamptz IS NULL OR created_at <= $7)
                    AND (expires_at IS NULL OR expires_at > NOW())
                    AND (1.0 - (embedding <=> $1)) > 0.2
+                   AND (
+                       $9::text IS NULL
+                       OR COALESCE(metadata->>'scope', 'private') <> 'private'
+                       OR metadata->>'agent_id' = $9
+                   )
                  ORDER BY embedding <=> $1
                  LIMIT $8",
             )
@@ -6269,6 +7756,7 @@ impl MemoryStore for PostgresStore {
             .bind(filter.since)
             .bind(filter.until)
             .bind(ann_pool)
+            .bind(caller_opt)
             .fetch_all(&self.pool)
             .await
             .map_err(|e| to_store_err("recall_hybrid semantic pool", e))?;
@@ -6319,6 +7807,13 @@ impl MemoryStore for PostgresStore {
             .collect();
 
         results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // Belt-and-suspenders: drop any row that slipped past the SQL
+        // predicate (defense-in-depth against SQL drift). Filter then
+        // truncate so the limit reflects what the caller can actually
+        // see.
+        if !ctx.bypass_visibility {
+            results.retain(|(m, _)| is_visible_to_caller(m, caller));
+        }
         results.truncate(filter.limit.max(1));
         Ok(results)
     }
@@ -6478,61 +7973,68 @@ impl MemoryStore for PostgresStore {
         // (1h short / 1d mid), auto-promote mid→long at 5 accesses,
         // increment priority every 10 accesses.
         //
-        // We run all three updates inside a single transaction so an
-        // operator-visible recall stays consistent — the access_count
-        // increment, the tier promotion, and the priority bump must
-        // either all land or all roll back.
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| to_store_err("touch_after_recall begin", e))?;
-
+        // Wave-2 Tier-A4 (#852) — collapsed three sequential UPDATEs
+        // into a single statement with CASE expressions. The previous
+        // implementation issued one prepare+execute roundtrip per
+        // operation (3 prepares, 3 executes, plus an explicit
+        // transaction); the single-UPDATE form removes the per-call
+        // tx framing (statement-level atomicity covers it) and brings
+        // the wire cost to one parse + one bind + one execute. The
+        // SQL preserves the original semantics exactly:
+        //
+        //   * access_count = LEAST(access_count + 1, 1_000_000)
+        //   * last_accessed_at = NOW()
+        //   * expires_at — sliding-window replacement per tier
+        //     (1h short / 1d mid, cleared when a mid→long promotion
+        //     fires this round), see memory 830 (pm-v33 fix)
+        //   * tier — auto-promote mid → long once access_count + 1
+        //     would land at or above PROMOTION_THRESHOLD (5)
+        //   * updated_at — bumped only when the tier flip actually
+        //     fires, matching the original two-statement contract
+        //   * priority — bumped by 1 (capped at 10) every 10th
+        //     touch, evaluated against the post-increment / capped
+        //     access_count to remain bit-identical with the original
+        //     two-statement sequence even at the 1_000_000 ceiling
+        //
+        // All CASE predicates read the pre-UPDATE row values per the
+        // SQL standard (RHS of SET evaluates against the OLD row),
+        // so the `access_count + 1` / `LEAST(...)` arithmetic
+        // mirrors what the original ordered sequence saw.
         sqlx::query(
             "UPDATE memories SET
                 access_count = LEAST(access_count + 1, 1000000),
                 last_accessed_at = NOW(),
                 expires_at = CASE
+                    WHEN tier = 'mid' AND access_count + 1 >= 5 THEN NULL
                     WHEN tier = 'long' THEN expires_at
                     WHEN tier = 'short' AND expires_at IS NOT NULL
                         THEN NOW() + INTERVAL '1 hour'
                     WHEN tier = 'mid' AND expires_at IS NOT NULL
                         THEN NOW() + INTERVAL '1 day'
                     ELSE expires_at
+                END,
+                tier = CASE
+                    WHEN tier = 'mid' AND access_count + 1 >= 5 THEN 'long'
+                    ELSE tier
+                END,
+                updated_at = CASE
+                    WHEN tier = 'mid' AND access_count + 1 >= 5 THEN NOW()
+                    ELSE updated_at
+                END,
+                priority = CASE
+                    WHEN LEAST(access_count + 1, 1000000) > 0
+                         AND LEAST(access_count + 1, 1000000) % 10 = 0
+                         AND priority < 10
+                        THEN LEAST(priority + 1, 10)
+                    ELSE priority
                 END
              WHERE id = ANY($1)",
         )
         .bind(ids)
-        .execute(&mut *tx)
+        .execute(&self.pool)
         .await
-        .map_err(|e| to_store_err("touch_after_recall extend", e))?;
+        .map_err(|e| to_store_err("touch_after_recall", e))?;
 
-        // Auto-promote mid → long at 5 accesses.
-        sqlx::query(
-            "UPDATE memories SET tier = 'long', expires_at = NULL, updated_at = NOW()
-             WHERE id = ANY($1) AND tier = 'mid' AND access_count >= 5",
-        )
-        .bind(ids)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| to_store_err("touch_after_recall promote", e))?;
-
-        // Increment priority every 10 accesses.
-        sqlx::query(
-            "UPDATE memories SET priority = LEAST(priority + 1, 10)
-             WHERE id = ANY($1)
-               AND access_count > 0
-               AND access_count % 10 = 0
-               AND priority < 10",
-        )
-        .bind(ids)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| to_store_err("touch_after_recall priority", e))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| to_store_err("touch_after_recall commit", e))?;
         Ok(())
     }
 
@@ -6582,6 +8084,9 @@ impl MemoryStore for PostgresStore {
             "capabilities": agent.capabilities,
             "registered_at": registered_at,
             "last_seen_at": now_rfc,
+            // #910 (SAL-level enforcement) — agent-registration rows
+            // are a public roster. Mirrors the sqlite path's stamp.
+            "scope": "collective",
         });
 
         let content =
@@ -6615,6 +8120,7 @@ impl MemoryStore for PostgresStore {
             confidence_source: ConfidenceSource::CallerProvided,
             confidence_signals: None,
             confidence_decayed_at: None,
+            version: 1,
         };
 
         self.store(ctx, &mem).await.map(|_| ())
@@ -6990,25 +8496,79 @@ impl MemoryStore for PostgresStore {
         Ok(true)
     }
 
-    async fn archive_purge(&self, older_than_days: Option<i64>) -> StoreResult<usize> {
-        let res = match older_than_days {
-            Some(days) if days < 0 => {
+    async fn archive_purge(
+        &self,
+        ctx: &CallerContext,
+        older_than_days: Option<i64>,
+    ) -> StoreResult<usize> {
+        if let Some(days) = older_than_days {
+            if days < 0 {
                 return Err(StoreError::InvalidInput {
                     detail: format!("older_than_days must be non-negative (got {days})"),
                 });
             }
-            Some(days) => {
+        }
+
+        // #936 (security-critical, 2026-05-20) — owner-vs-caller gate.
+        // Pre-#936 the postgres branch issued an unconstrained DELETE so
+        // any authenticated HTTP caller could destroy every owner's
+        // archive corpus. We now constrain the DELETE to rows whose
+        // `metadata.agent_id` matches the caller (with the
+        // `_inbox/<target>` carve-out: rows where
+        // `metadata.target_agent_id == caller` are also purgeable by
+        // the inbox owner — mirrors the [`is_visible_to_caller`]
+        // visibility predicate). The operator/admin surface skips
+        // the gate by setting `ctx.bypass_visibility = true` via
+        // [`CallerContext::for_admin`], which the SHIP cluster admin
+        // role gate at `handlers::admin_role::require_admin`
+        // exclusively controls.
+        let caller = ctx.effective_principal();
+        let bypass = ctx.bypass_visibility;
+
+        let res = match (older_than_days, bypass) {
+            // Admin path — full owner-blind purge. The route's role
+            // gate ensures only admin callers can reach this branch.
+            (Some(days), true) => {
                 let cutoff = chrono::Utc::now() - chrono::Duration::days(days);
                 sqlx::query("DELETE FROM archived_memories WHERE archived_at < $1")
                     .bind(cutoff)
                     .execute(&self.pool)
                     .await
-                    .map_err(|e| to_store_err("archive_purge", e))?
+                    .map_err(|e| to_store_err("archive_purge admin", e))?
             }
-            None => sqlx::query("DELETE FROM archived_memories")
+            (None, true) => sqlx::query("DELETE FROM archived_memories")
                 .execute(&self.pool)
                 .await
-                .map_err(|e| to_store_err("archive_purge all", e))?,
+                .map_err(|e| to_store_err("archive_purge admin all", e))?,
+            // Owner-scoped path — narrow to rows the caller owns
+            // (`metadata.agent_id == caller` OR the inbox-target
+            // carve-out `metadata.target_agent_id == caller`).
+            (Some(days), false) => {
+                let cutoff = chrono::Utc::now() - chrono::Duration::days(days);
+                sqlx::query(
+                    "DELETE FROM archived_memories \
+                     WHERE archived_at < $1 \
+                       AND ( \
+                         (metadata->>'agent_id') = $2 OR \
+                         (metadata->>'target_agent_id') = $2 \
+                       )",
+                )
+                .bind(cutoff)
+                .bind(caller)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| to_store_err("archive_purge owner", e))?
+            }
+            (None, false) => sqlx::query(
+                "DELETE FROM archived_memories \
+                 WHERE \
+                   (metadata->>'agent_id') = $1 OR \
+                   (metadata->>'target_agent_id') = $1",
+            )
+            .bind(caller)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| to_store_err("archive_purge owner all", e))?,
         };
         Ok(usize::try_from(res.rows_affected()).unwrap_or(0))
     }
@@ -7081,7 +8641,17 @@ impl MemoryStore for PostgresStore {
         // Reuse the existing list path with an unbounded filter — postgres
         // adapter's `list` already projects the full Memory shape and the
         // ATOMIC_MULTI_WRITE-class semantics make a snapshot read safe.
-        let ctx = CallerContext::for_agent("export");
+        //
+        // #955 SECURITY-medium (Track A QC sweep, 2026-05-20) — use
+        // `for_admin` instead of `for_agent("export")`. The trait method
+        // does not yet take a caller, and the only HTTP entry
+        // (`handlers::admin::export_memories`) is already admin-gated via
+        // `require_admin`; `for_admin` matches that contract by bypassing
+        // the SAL #910 scope=private visibility filter so the export
+        // returns the FULL corpus rather than silently dropping any row
+        // whose `metadata.agent_id != "export"`. Reserved for operator
+        // surfaces per the `for_admin` docs.
+        let ctx = CallerContext::for_admin("export-internal");
         let filter = Filter {
             limit: 100_000,
             ..Filter::default()
@@ -7138,6 +8708,7 @@ impl MemoryStore for PostgresStore {
             confidence_source: ConfidenceSource::CallerProvided,
             confidence_signals: None,
             confidence_decayed_at: None,
+            version: 1,
         };
         self.store(ctx, &mem).await
     }
@@ -7239,7 +8810,19 @@ impl MemoryStore for PostgresStore {
                 continue;
             };
             // Read the standard's metadata.
-            let ctx = CallerContext::for_agent("governance");
+            //
+            // #955 SECURITY-medium (Track A QC sweep, 2026-05-20) —
+            // use `for_admin` instead of `for_agent("governance")`.
+            // This is a substrate-internal policy read (called by
+            // other trait methods that have already resolved their
+            // own caller context); the standard memory is governance
+            // policy that the substrate itself needs to read
+            // regardless of `metadata.scope`. `for_admin` bypasses
+            // the #910 visibility filter to match that contract;
+            // `for_agent("governance")` would mismatch the standard's
+            // owner and drop the policy row when scope=private,
+            // breaking governance resolution for private namespaces.
+            let ctx = CallerContext::for_admin("governance-internal");
             let mem = match self.get(&ctx, &standard_id).await {
                 Ok(m) => m,
                 Err(StoreError::NotFound { .. }) => continue,
@@ -7258,15 +8841,18 @@ impl MemoryStore for PostgresStore {
         pending_id: &str,
         approver_agent_id: &str,
     ) -> StoreResult<super::ApproveOutcome> {
-        // Load the pending row + assert state.
-        let pa = match self.get_pending(ctx, pending_id).await? {
-            Some(p) => p,
-            None => {
-                return Ok(super::ApproveOutcome::Rejected(format!(
-                    "pending action not found: {pending_id}"
-                )));
-            }
-        };
+        // Load the pending row + assert state. Missing pending_id surfaces
+        // as StoreError::NotFound so the HTTP layer maps it to 404 (the
+        // contract the sqlite path provides via db::approve_with_approver_type's
+        // ApproveOutcome::NotFound variant). Returning Rejected here would
+        // collapse "missing row" into the "policy refused" 403 bucket, which
+        // hides a real distinction from operators.
+        let pa = self
+            .get_pending(ctx, pending_id)
+            .await?
+            .ok_or_else(|| StoreError::NotFound {
+                id: pending_id.to_string(),
+            })?;
         if pa.status != "pending" {
             return Ok(super::ApproveOutcome::Rejected(format!(
                 "already decided: status={}",
@@ -7278,7 +8864,7 @@ impl MemoryStore for PostgresStore {
         let approver = self
             .resolve_governance_policy(&pa.namespace)
             .await?
-            .map_or(crate::models::ApproverType::Human, |p| p.approver);
+            .map_or(crate::models::ApproverType::Human, |p| p.core.approver);
 
         match approver {
             crate::models::ApproverType::Human => {
@@ -7514,12 +9100,12 @@ impl MemoryStore for PostgresStore {
             return Ok(GovernanceDecision::Allow);
         };
         let level = match action {
-            super::GovernedAction::Store => &policy.write,
-            super::GovernedAction::Delete => &policy.delete,
-            super::GovernedAction::Promote => &policy.promote,
+            super::GovernedAction::Store => &policy.core.write,
+            super::GovernedAction::Delete => &policy.core.delete,
+            super::GovernedAction::Promote => &policy.core.promote,
             // v0.7.0 L1-8: Reflect is gated by require_approval_above_depth
             // in the MCP handler; conservative fallback maps to write level.
-            super::GovernedAction::Reflect => &policy.write,
+            super::GovernedAction::Reflect => &policy.core.write,
         };
 
         // v0.7.0 Wave-3 Continuation 4 (Bucket C / S60+S80) — resolve
@@ -7571,15 +9157,34 @@ impl MemoryStore for PostgresStore {
         // - Owner: caller must equal `memory_owner` (delete/promote) or
         //   `namespace_owner` (store)
         // - Approve: caller is non-owner ⇒ queue pending action
+        // #963 Phase 2: build the typed governance-action enum that the
+        // refusal envelope carries. The SAL `super::GovernedAction` and
+        // the model-layer `crate::models::GovernedAction` are distinct
+        // enums (the SAL one is a backend-trait abstraction; the model
+        // one is the persisted serde shape). Map here once.
+        let model_action = match action {
+            super::GovernedAction::Store => crate::models::GovernedAction::Store,
+            super::GovernedAction::Delete => crate::models::GovernedAction::Delete,
+            super::GovernedAction::Promote => crate::models::GovernedAction::Promote,
+            super::GovernedAction::Reflect => crate::models::GovernedAction::Reflect,
+        };
         let decision = match level {
             GovernanceLevel::Any => GovernanceDecision::Allow,
             GovernanceLevel::Registered => {
                 if registered_agent_check {
                     GovernanceDecision::Allow
                 } else {
-                    GovernanceDecision::Deny(format!(
-                        "agent '{agent_id}' is not registered for namespace '{namespace}'"
-                    ))
+                    GovernanceDecision::Deny(
+                        crate::governance::GovernanceRefusal::new(
+                            model_action,
+                            GovernanceLevel::Registered,
+                            agent_id,
+                            format!(
+                                "agent '{agent_id}' is not registered for namespace '{namespace}'"
+                            ),
+                        )
+                        .with_namespace(namespace),
+                    )
                 }
             }
             GovernanceLevel::Owner => {
@@ -7589,9 +9194,18 @@ impl MemoryStore for PostgresStore {
                 };
                 match owner_to_compare {
                     Some(o) if o == agent_id => GovernanceDecision::Allow,
-                    Some(o) => GovernanceDecision::Deny(format!(
-                        "owner-only namespace '{namespace}': caller '{agent_id}' is not '{o}'"
-                    )),
+                    Some(o) => GovernanceDecision::Deny(
+                        crate::governance::GovernanceRefusal::new(
+                            model_action,
+                            GovernanceLevel::Owner,
+                            agent_id,
+                            format!(
+                                "owner-only namespace '{namespace}': caller '{agent_id}' is not '{o}'"
+                            ),
+                        )
+                        .with_namespace(namespace)
+                        .with_owner(o),
+                    ),
                     None => GovernanceDecision::Allow,
                 }
             }
@@ -7871,14 +9485,72 @@ impl MemoryStore for PostgresStore {
 
     async fn find_paths(
         &self,
+        ctx: &CallerContext,
         source_id: &str,
         target_id: &str,
         max_depth: Option<usize>,
         max_results: Option<usize>,
     ) -> StoreResult<Vec<Vec<String>>> {
         // Inherent `PostgresStore::find_paths` already routes AGE vs CTE
-        // off `self.kg_backend`; the trait method just forwards.
-        PostgresStore::find_paths(self, source_id, target_id, max_depth, max_results).await
+        // off `self.kg_backend`; the trait method forwards then applies
+        // the #910 SAL-level visibility filter (path-traversal
+        // flavour). Any path whose node set touches a scope=private
+        // memory the caller does not own is dropped. Fail-closed: a
+        // node that cannot be resolved drops every path that touches
+        // it.
+        let paths =
+            PostgresStore::find_paths(self, source_id, target_id, max_depth, max_results).await?;
+        if ctx.bypass_visibility {
+            return Ok(paths);
+        }
+        let caller = ctx.effective_principal();
+        let mut visible_cache: std::collections::HashMap<String, bool> =
+            std::collections::HashMap::new();
+        let mut filtered: Vec<Vec<String>> = Vec::with_capacity(paths.len());
+        'outer: for path in paths {
+            for node in &path {
+                // Cache hit avoids round-trips for the diamond /
+                // re-visit-node case common in graph-walks.
+                let visible = if let Some(v) = visible_cache.get(node) {
+                    *v
+                } else {
+                    let row = sqlx::query("SELECT metadata FROM memories WHERE id = $1")
+                        .bind(node)
+                        .fetch_optional(&self.pool)
+                        .await
+                        .map_err(|e| to_store_err("find_paths visibility fetch", e))?;
+                    let v = match row {
+                        Some(r) => {
+                            let meta: serde_json::Value = r
+                                .try_get("metadata")
+                                .map_err(|e| to_store_err("read metadata", e))?;
+                            let scope = meta
+                                .get("scope")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("private");
+                            if scope != "private" {
+                                true
+                            } else {
+                                let owner = meta
+                                    .get("agent_id")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("");
+                                owner == caller
+                            }
+                        }
+                        // Fail-closed: missing node ⇒ drop the path.
+                        None => false,
+                    };
+                    visible_cache.insert(node.clone(), v);
+                    v
+                };
+                if !visible {
+                    continue 'outer;
+                }
+            }
+            filtered.push(path);
+        }
+        Ok(filtered)
     }
 }
 
@@ -8328,6 +10000,118 @@ impl PostgresStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // QC Obs #6 (2026-05-20) — `assert_age_id_safe` is a security
+    // primitive: it gates whether a caller-supplied id can be inlined
+    // into a `cypher()` body string (2-arg form, no params dict). A
+    // regression that loosened the regex would surface as cypher
+    // injection. These unit tests pin the alphabet (only ASCII
+    // alphanumeric + `-_`), length bounds (1..=128), and every
+    // adversarial char class we'd see in an injection attempt.
+    #[test]
+    fn assert_age_id_safe_accepts_canonical_uuid() {
+        assert!(assert_age_id_safe("a0a15bb5-5aa2-4219-96bd-d15f27618eb8").is_ok());
+    }
+
+    #[test]
+    fn assert_age_id_safe_accepts_alphanumeric_dash_underscore() {
+        assert!(assert_age_id_safe("AaZz09-_").is_ok());
+        assert!(assert_age_id_safe("single").is_ok());
+    }
+
+    #[test]
+    fn assert_age_id_safe_rejects_empty() {
+        assert!(assert_age_id_safe("").is_err());
+    }
+
+    #[test]
+    fn assert_age_id_safe_rejects_over_max_length() {
+        let s = "a".repeat(129);
+        assert!(assert_age_id_safe(&s).is_err());
+        let s = "a".repeat(128);
+        assert!(assert_age_id_safe(&s).is_ok(), "boundary 128 is inclusive");
+    }
+
+    #[test]
+    fn assert_age_id_safe_rejects_single_quote() {
+        // Closes the cypher-string-literal escape vector.
+        assert!(assert_age_id_safe("a'b").is_err());
+        assert!(assert_age_id_safe("a''b").is_err());
+    }
+
+    #[test]
+    fn assert_age_id_safe_rejects_double_quote_and_backtick() {
+        assert!(assert_age_id_safe("a\"b").is_err());
+        assert!(assert_age_id_safe("a`b").is_err());
+    }
+
+    #[test]
+    fn assert_age_id_safe_rejects_dollar_sign() {
+        // Closes the cypher dollar-quote / param-reference vector.
+        assert!(assert_age_id_safe("$start").is_err());
+        assert!(assert_age_id_safe("a$$b").is_err());
+    }
+
+    #[test]
+    fn assert_age_id_safe_rejects_braces_brackets_parens() {
+        // Closes pattern / property / function injection.
+        assert!(assert_age_id_safe("a{b").is_err());
+        assert!(assert_age_id_safe("a}b").is_err());
+        assert!(assert_age_id_safe("a[b").is_err());
+        assert!(assert_age_id_safe("a]b").is_err());
+        assert!(assert_age_id_safe("a(b").is_err());
+        assert!(assert_age_id_safe("a)b").is_err());
+    }
+
+    #[test]
+    fn assert_age_id_safe_rejects_semicolon_and_comma() {
+        // Closes statement-terminator + list-separator vectors.
+        assert!(assert_age_id_safe("a;b").is_err());
+        assert!(assert_age_id_safe("a,b").is_err());
+    }
+
+    #[test]
+    fn assert_age_id_safe_rejects_comment_chars() {
+        // Closes `--` comment, `/* */` block comment.
+        assert!(assert_age_id_safe("a/b").is_err());
+        assert!(assert_age_id_safe("a*b").is_err());
+        // `-` is allowed (UUID separator) but `--` is just two allowed
+        // chars; injection via comment requires `--` followed by chars
+        // that the regex would reject (whitespace/colon/etc), so the
+        // structural defense holds even with `--` permitted.
+        assert!(assert_age_id_safe("a--b").is_ok());
+    }
+
+    #[test]
+    fn assert_age_id_safe_rejects_whitespace() {
+        // Closes pattern-break + cypher-keyword smuggling.
+        assert!(assert_age_id_safe("a b").is_err());
+        assert!(assert_age_id_safe("a\tb").is_err());
+        assert!(assert_age_id_safe("a\nb").is_err());
+        assert!(assert_age_id_safe("a\rb").is_err());
+    }
+
+    #[test]
+    fn assert_age_id_safe_rejects_age_type_tags() {
+        // The decode strips `::vertex` / `::edge` / `::path` — if an
+        // id contained one of those it'd be silently shortened on
+        // round-trip. The colon character rejects them outright.
+        assert!(assert_age_id_safe("a::vertex").is_err());
+        assert!(assert_age_id_safe("a:b").is_err());
+    }
+
+    #[test]
+    fn assert_age_id_safe_rejects_unicode_homoglyphs() {
+        // Closes lookalike-character bypass attempts.
+        assert!(assert_age_id_safe("аbc").is_err()); // cyrillic 'а'
+        assert!(assert_age_id_safe("a\u{200B}b").is_err()); // zero-width space
+        assert!(assert_age_id_safe("⟨admin⟩").is_err());
+    }
+
+    #[test]
+    fn assert_age_id_safe_rejects_null_byte() {
+        assert!(assert_age_id_safe("a\0b").is_err());
+    }
 
     #[test]
     fn capabilities_advertise_native_vector() {
@@ -9159,6 +10943,7 @@ mod tests {
             confidence_source: ConfidenceSource::CallerProvided,
             confidence_signals: None,
             confidence_decayed_at: None,
+            version: 1,
         }
     }
 
@@ -9268,7 +11053,12 @@ mod tests {
             return;
         };
         let store = PostgresStore::connect(&url).await.unwrap();
-        let ctx = CallerContext::for_agent("ai:sal-test");
+        // Use admin ctx so the SAL-level scope=private filter (#910) doesn't
+        // mask the row — this test is about agent_id IMMUTABILITY (Blocker
+        // #295), not visibility scoping. With `for_agent("ai:sal-test")`
+        // the .get() post-filter returns NotFound against an
+        // "ai:alice"-owned row.
+        let ctx = CallerContext::for_admin("ai:sal-test");
         let ns = format!("sal-agent-{}", uuid::Uuid::new_v4());
 
         let mut first = sample_memory("agent-1", &ns, "owned-by-alice", "original");
@@ -9450,11 +11240,21 @@ mod tests {
         // Task 1/8 — recursive learning). v32 mirrors SQLite v33 — the
         // v0.7.1-fold (#687/#688) SQL-side CHECK constraint on
         // `memory_links.relation`. v33 mirrors SQLite v34 — V-4
-        // closeout (#698) signed_events cross-row hash chain. A
-        // future bump on either side without the corresponding port
+        // closeout (#698) signed_events cross-row hash chain.
+        //
+        // v42-v46 land via #894 (PG+AGE parity for provenance Gaps 1-7):
+        //   v42 = memories.version BIGINT (Gap 1 #884)
+        //   v43 = memories.source_uri upgrade-path + partial index (Gap 2 #885)
+        //   v44 = recall_observations table (Gap 3 #886)
+        //   v45 = edit_source archive metadata + lookup indexes (Gap 5 #888)
+        //   v46 = memory_links temporal columns (Gap 7 / #860)
+        //   v47 = memory_links persona-signing atomicity CHECK (#902)
+        //   v48 = federation_push_dlq table (Track D #933)
+        //
+        // A future bump on either side without the corresponding port
         // re-trips this assertion before the migration runner gets a
         // chance to write a partial schema to disk.
-        assert_eq!(CURRENT_SCHEMA_VERSION, 41);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 48);
     }
 
     #[tokio::test]
@@ -9961,11 +11761,16 @@ mod tests {
             .await
             .expect("enforce_governance_action");
         match decision {
-            crate::models::GovernanceDecision::Deny(reason) => {
+            crate::models::GovernanceDecision::Deny(refusal) => {
                 assert!(
-                    reason.contains("owner-only namespace")
-                        || reason.to_lowercase().contains("owner"),
-                    "deny reason should reference owner-only policy; got: {reason}"
+                    refusal.reason.contains("owner-only namespace")
+                        || refusal.reason.to_lowercase().contains("owner"),
+                    "deny reason should reference owner-only policy; got: {refusal:?}"
+                );
+                assert_eq!(
+                    refusal.denied_level,
+                    crate::models::GovernanceLevel::Owner,
+                    "owner-level deny must carry GovernanceLevel::Owner; got {refusal:?}",
                 );
             }
             other => panic!("intruder write to deep child must Deny; got {other:?}"),

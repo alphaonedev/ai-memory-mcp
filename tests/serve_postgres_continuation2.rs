@@ -36,14 +36,8 @@ use ai_memory::store::postgres::PostgresStore;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, Notify, RwLock};
 
-fn postgres_url() -> Option<String> {
-    std::env::var("AI_MEMORY_TEST_POSTGRES_URL").ok()
-}
-
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
-    listener.local_addr().expect("local_addr").port()
-}
+mod common;
+use common::{free_port, pg_test_client, postgres_url};
 
 /// v0.7.0 #238/#239 — set the federation legacy-bypass env vars
 /// once per test process so this postgres-only suite drives
@@ -51,6 +45,14 @@ fn free_port() -> u16 {
 /// the new wire-level `x-peer-id` header. The new regression tests
 /// at `tests/g_issue_238_*` and `tests/g_issue_239_*` exercise the
 /// default-enforce posture in separate test binaries.
+/// v0.7.0 ship-hardening (2026-05-20): serialize the two HMAC-gated
+/// pending-approve/reject tests against the process-wide
+/// `set_active_hooks_hmac_secret` mutator. Both tests set the secret
+/// at entry and clear it on exit; running them in parallel can race
+/// (test A clears while test B is mid-validate → B gets 401 from
+/// missing-secret, not the expected 404 from missing-id).
+static HMAC_SECRET_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 static FED_LEGACY_BYPASS_INIT: std::sync::Once = std::sync::Once::new();
 fn install_federation_legacy_bypass() {
     FED_LEGACY_BYPASS_INIT.call_once(|| unsafe {
@@ -88,9 +90,13 @@ async fn build_postgres_app_state(url: &str) -> AppState {
         replay_cache: std::sync::Arc::new(ai_memory::identity::replay::ReplayCache::default()),
 
         verify_require_nonce: false,
+        federation_nonce_cache: std::sync::Arc::new(
+            ai_memory::identity::replay::FederationNonceCache::default(),
+        ),
         autonomous_hooks: false,
         recall_scope: Arc::new(None),
         deferred_audit_queue: Arc::new(None),
+        admin_agent_ids: Arc::new(Vec::new()),
     }
 }
 
@@ -148,7 +154,7 @@ async fn federation_sync_push_round_trip_via_sal() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:cont2-test");
 
     let unique_ns = format!("fed-{}", uuid::Uuid::new_v4());
     let mem_id = uuid::Uuid::new_v4().to_string();
@@ -165,7 +171,7 @@ async fn federation_sync_push_round_trip_via_sal() {
             "tags": ["fed"],
             "priority": 5,
             "confidence": 1.0,
-            "source": "fed-test",
+            "source": "import",
             "access_count": 0,
             "created_at": now,
             "updated_at": now,
@@ -213,7 +219,7 @@ async fn federation_sync_push_dry_run_via_sal() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:cont2-test");
     let unique_ns = format!("fed-dryrun-{}", uuid::Uuid::new_v4());
     let mem_id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
@@ -228,7 +234,7 @@ async fn federation_sync_push_dry_run_via_sal() {
             "tags": [],
             "priority": 5,
             "confidence": 1.0,
-            "source": "test",
+            "source": "import",
             "access_count": 0,
             "created_at": now,
             "updated_at": now,
@@ -262,7 +268,7 @@ async fn federation_sync_push_idempotent_on_duplicate() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:cont2-test");
     let unique_ns = format!("fed-dup-{}", uuid::Uuid::new_v4());
     let mem_id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
@@ -277,7 +283,7 @@ async fn federation_sync_push_idempotent_on_duplicate() {
             "tags": [],
             "priority": 5,
             "confidence": 1.0,
-            "source": "test",
+            "source": "import",
             "access_count": 0,
             "created_at": now.clone(),
             "updated_at": now.clone(),
@@ -345,7 +351,7 @@ async fn audit_chain_persists_across_restart_on_postgres() {
     {
         ai_memory::audit::init(&audit_path, false, false).expect("audit init 1");
         let (base, shutdown, handle) = spawn_daemon(&url).await;
-        let client = reqwest::Client::new();
+        let client = pg_test_client("ai:cont2-test");
         let unique_ns = format!("audit-{}", uuid::Uuid::new_v4());
         let resp = client
             .post(format!("{base}/api/v1/memories"))
@@ -358,7 +364,7 @@ async fn audit_chain_persists_across_restart_on_postgres() {
                 "tags": ["audit"],
                 "priority": 5,
                 "confidence": 1.0,
-                "source": "audit-test",
+                "source": "system",
                 "metadata": {}
             }))
             .send()
@@ -378,7 +384,7 @@ async fn audit_chain_persists_across_restart_on_postgres() {
     {
         ai_memory::audit::init(&audit_path, false, false).expect("audit init 2");
         let (base, shutdown, handle) = spawn_daemon(&url).await;
-        let client = reqwest::Client::new();
+        let client = pg_test_client("ai:cont2-test");
         let unique_ns = format!("audit-{}", uuid::Uuid::new_v4());
         let resp = client
             .post(format!("{base}/api/v1/memories"))
@@ -391,7 +397,7 @@ async fn audit_chain_persists_across_restart_on_postgres() {
                 "tags": ["audit"],
                 "priority": 5,
                 "confidence": 1.0,
-                "source": "audit-test",
+                "source": "system",
                 "metadata": {}
             }))
             .send()
@@ -432,7 +438,7 @@ async fn recall_hybrid_pipeline_runs_on_postgres() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:cont2-test");
     let unique_ns = format!("recall-{}", uuid::Uuid::new_v4());
 
     // Seed three memories with varying content lengths so the
@@ -454,7 +460,7 @@ async fn recall_hybrid_pipeline_runs_on_postgres() {
                 "tags": ["recall"],
                 "priority": 5,
                 "confidence": 1.0,
-                "source": "recall-test",
+                "source": "import",
                 "metadata": {}
             }))
             .send()
@@ -502,14 +508,14 @@ async fn namespace_standard_set_via_sal() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:cont2-test");
     let ns = format!("gov-{}", uuid::Uuid::new_v4());
 
     let resp = client
         .post(format!("{base}/api/v1/namespaces/{ns}/standard"))
         .json(&json!({
             "governance": {
-                "consensus_threshold": 1,
+                "write": "approve",
                 "approver": "human"
             }
         }))
@@ -527,7 +533,7 @@ async fn namespace_standard_set_via_sal() {
         .post(format!("{base}/api/v1/namespaces/{ns}/standard"))
         .json(&json!({
             "governance": {
-                "consensus_threshold": 1,
+                "write": "approve",
                 "approver": "human"
             }
         }))
@@ -550,12 +556,12 @@ async fn namespace_standard_clear_via_sal() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:cont2-test");
     let ns = format!("gov-clear-{}", uuid::Uuid::new_v4());
     // Seed a standard.
     client
         .post(format!("{base}/api/v1/namespaces/{ns}/standard"))
-        .json(&json!({"governance": {"consensus_threshold": 1, "approver": "human"}}))
+        .json(&json!({"governance": {"write": "approve", "approver": "human"}}))
         .send()
         .await
         .expect("seed standard");
@@ -582,47 +588,122 @@ async fn namespace_standard_clear_via_sal() {
     let _ = handle.await;
 }
 
+/// Compute the K7-style HMAC signature header value for an approve/reject
+/// request body. Mirrors the helper in `tests/k10_approval_http.rs`. The
+/// canonical-string contract is `<ts>.<METHOD>.<pending_id>.<body>` hashed
+/// with HMAC-SHA256 keyed on `SHA256(secret)`.
+fn sign_approval(secret: &str, timestamp: &str, pending_id: &str, body: &str) -> String {
+    use sha2::{Digest, Sha256};
+    fn sha256_hex(s: &str) -> String {
+        let mut h = Sha256::new();
+        h.update(s.as_bytes());
+        format!("{:x}", h.finalize())
+    }
+    fn hex_decode(s: &str) -> Option<Vec<u8>> {
+        if !s.len().is_multiple_of(2) {
+            return None;
+        }
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+            .collect()
+    }
+    fn hmac_sha256_hex(key_hex: &str, body: &str) -> String {
+        const BLOCK: usize = 64;
+        let key_bytes = hex_decode(key_hex).unwrap_or_else(|| key_hex.as_bytes().to_vec());
+        let mut key = key_bytes;
+        if key.len() > BLOCK {
+            let mut h = Sha256::new();
+            h.update(&key);
+            key = h.finalize().to_vec();
+        }
+        key.resize(BLOCK, 0);
+        let mut opad = [0x5cu8; BLOCK];
+        let mut ipad = [0x36u8; BLOCK];
+        for i in 0..BLOCK {
+            opad[i] ^= key[i];
+            ipad[i] ^= key[i];
+        }
+        let mut inner = Sha256::new();
+        inner.update(ipad);
+        inner.update(body.as_bytes());
+        let inner_digest = inner.finalize();
+        let mut outer = Sha256::new();
+        outer.update(opad);
+        outer.update(inner_digest);
+        format!("{:x}", outer.finalize())
+    }
+    let key_hash = sha256_hex(secret);
+    let canonical = format!("{timestamp}.POST.{pending_id}.{body}");
+    let sig = hmac_sha256_hex(&key_hash, &canonical);
+    format!("sha256={sig}")
+}
+
 /// `POST /api/v1/pending/{id}/approve` returns 404 for a missing id,
 /// proving the trait-routed pending_decide reaches postgres and
 /// reports the row miss honestly (rather than 501).
+///
+/// S5-C1 (2026-05-13) made the approve endpoint HMAC-gated, so the
+/// test must attach a valid signature to reach the 404 path. Process-
+/// wide `set_active_hooks_hmac_secret` is set/cleared per-test.
 #[tokio::test(flavor = "multi_thread")]
 async fn pending_approve_missing_id_returns_404() {
     let Some(url) = postgres_url() else {
         eprintln!("skipping pending_approve_missing_id_returns_404");
         return;
     };
+    let _hmac_guard = HMAC_SECRET_LOCK.lock().await;
+    let secret = "pending-test-secret";
+    ai_memory::config::set_active_hooks_hmac_secret(Some(secret.to_string()));
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:cont2-test");
     let id = uuid::Uuid::new_v4().to_string();
+    let body = String::new();
+    let timestamp = chrono::Utc::now().timestamp().to_string();
+    let sig = sign_approval(secret, &timestamp, &id, &body);
     let resp = client
         .post(format!("{base}/api/v1/pending/{id}/approve"))
         .header("x-agent-id", "pending-test")
+        .header("x-ai-memory-timestamp", &timestamp)
+        .header("x-ai-memory-signature", sig)
+        .body(body)
         .send()
         .await
         .expect("approve");
     assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+    ai_memory::config::set_active_hooks_hmac_secret(None);
     shutdown.notify_one();
     let _ = handle.await;
 }
 
 /// `POST /api/v1/pending/{id}/reject` mirrors the approve contract
-/// for a missing id.
+/// for a missing id (also HMAC-gated post S5-C1).
 #[tokio::test(flavor = "multi_thread")]
 async fn pending_reject_missing_id_returns_404() {
     let Some(url) = postgres_url() else {
         eprintln!("skipping pending_reject_missing_id_returns_404");
         return;
     };
+    let _hmac_guard = HMAC_SECRET_LOCK.lock().await;
+    let secret = "pending-test-secret";
+    ai_memory::config::set_active_hooks_hmac_secret(Some(secret.to_string()));
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:cont2-test");
     let id = uuid::Uuid::new_v4().to_string();
+    let body = String::new();
+    let timestamp = chrono::Utc::now().timestamp().to_string();
+    let sig = sign_approval(secret, &timestamp, &id, &body);
     let resp = client
         .post(format!("{base}/api/v1/pending/{id}/reject"))
         .header("x-agent-id", "pending-test")
+        .header("x-ai-memory-timestamp", &timestamp)
+        .header("x-ai-memory-signature", sig)
+        .body(body)
         .send()
         .await
         .expect("reject");
     assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+    ai_memory::config::set_active_hooks_hmac_secret(None);
     shutdown.notify_one();
     let _ = handle.await;
 }
