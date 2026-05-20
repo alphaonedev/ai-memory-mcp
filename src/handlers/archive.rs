@@ -138,7 +138,10 @@ pub async fn restore_archive(
     // operators relying on multi-node consistency should poll peers.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        let ctx = crate::store::CallerContext::for_agent("http");
+        // QC P1 fix (2026-05-20): use the resolved `caller` (header)
+        // so the SAL #910 visibility filter applies — archive ops
+        // can only touch memories owned by the caller.
+        let ctx = crate::store::CallerContext::for_agent(caller.clone());
         return match app.store.archive_restore(&ctx, &id).await {
             Ok(true) => Json(json!({"restored": true, "id": id, "storage_backend": "postgres"}))
                 .into_response(),
@@ -356,7 +359,10 @@ pub async fn archive_by_ids(
     // consistency should poll peers.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        let ctx = crate::store::CallerContext::for_agent("http");
+        // QC P1 fix (2026-05-20): use the resolved `caller` (header)
+        // so the SAL #910 visibility filter applies — archive ops
+        // can only touch memories owned by the caller.
+        let ctx = crate::store::CallerContext::for_agent(caller.clone());
         // Run per-id so we can split archived vs missing — the trait
         // method bulk-archives but doesn't tell us which were missing,
         // so we probe each via the count delta.

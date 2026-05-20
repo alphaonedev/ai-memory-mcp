@@ -369,6 +369,7 @@ pub async fn search_memories(
 
 pub async fn forget_memories(
     State(app): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<ForgetQuery>,
 ) -> impl IntoResponse {
     // v0.7.0 Wave-3 Continuation 3 (Phase 13) — route through SAL trait
@@ -380,7 +381,12 @@ pub async fn forget_memories(
             let lock = app.db.lock().await;
             lock.3
         };
-        let ctx = crate::store::CallerContext::for_agent("http");
+        // QC P1 fix (2026-05-20): header-resolved caller so forget()
+        // only deletes memories the caller owns. Pre-fix the
+        // hardcoded `for_agent("http")` would have let any caller
+        // delete memories that matched the namespace/pattern filter
+        // regardless of ownership — a destructive privacy bug.
+        let ctx = crate::handlers::parity::http_caller_ctx(&headers, None);
         return match app
             .store
             .forget(
@@ -493,7 +499,15 @@ pub async fn bulk_create(
     // shape (created+errors counts) matches the sqlite path exactly.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        let ctx = crate::store::CallerContext::for_agent("daemon");
+        // QC P1 fix (2026-05-20): bulk_create now uses the already-
+        // resolved `caller` from headers (line 491 above) instead of
+        // the hardcoded "daemon" sentinel. The stored rows still get
+        // their `metadata.agent_id` stamped from the request body /
+        // X-Agent-Id header inside `app.store.store(...)`; the ctx
+        // here is for visibility-filter purposes (e.g., the
+        // `governance_pending_create` precondition lookup the SAL
+        // path runs internally).
+        let ctx = crate::store::CallerContext::for_agent(caller.clone());
         let mut created: usize = 0;
         let mut errors: Vec<String> = Vec::new();
         let mut pending: Vec<serde_json::Value> = Vec::new();

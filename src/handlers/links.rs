@@ -271,6 +271,7 @@ fn unknown_link_body_fields(raw: &serde_json::Value) -> Option<Vec<String>> {
 
 pub async fn create_link(
     State(app): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(raw): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     // v0.7.0 G-PHASE-E-1 (#706) — reject unknown fields with a
@@ -360,7 +361,12 @@ pub async fn create_link(
             signature: None,
             attest_level: None,
         };
-        let ctx = crate::store::CallerContext::for_agent("ai:http");
+        // v0.7.0 ship-hardening (2026-05-19): resolve caller from
+        // X-Agent-Id header so the link write's audit + ownership
+        // attribution matches the request principal. Pre-fix this
+        // hardcoded "ai:http" — every link appeared to come from the
+        // legacy daemon principal regardless of caller.
+        let ctx = crate::handlers::parity::http_caller_ctx(&headers, None);
         return match app
             .store
             .link_signed(&ctx, &link, app.active_keypair.as_ref().as_ref())

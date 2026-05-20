@@ -580,7 +580,17 @@ pub async fn import_memories(
     // same `{imported, errors}` envelope as the sqlite path.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        let ctx = crate::store::CallerContext::for_agent("http-import");
+        // QC P1 fix (2026-05-20): import_memories now stamps the
+        // imported rows under the authenticated `caller` (resolved
+        // from X-Agent-Id, line 564) instead of a synthetic
+        // "http-import" principal. The SAL store path still applies
+        // its `metadata.agent_id` preservation contract — body-
+        // supplied agent_id wins when valid (e.g., legitimate
+        // re-import of memories already authored by another agent),
+        // but the ctx is the auth principal so visibility filters
+        // applied INSIDE store_inner (e.g., upsert dedup lookup)
+        // see the actual caller.
+        let ctx = crate::store::CallerContext::for_agent(caller.clone());
         let mut imported = 0usize;
         let mut errors: Vec<String> = Vec::new();
         let mut pending: Vec<serde_json::Value> = Vec::new();
