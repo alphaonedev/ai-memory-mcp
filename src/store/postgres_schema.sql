@@ -603,6 +603,40 @@ CREATE INDEX IF NOT EXISTS idx_signed_events_dlq_agent
     ON signed_events_dlq(agent_id);
 
 -- ─────────────────────────────────────────────────────────────────────
+-- federation_push_dlq — quorum-broadcast fanout dead-letter queue
+-- (v0.7.0 Track D #933, schema v48 Postgres + SQLite shared bump).
+--
+-- Mirrors `migrations/postgres/0030_v07_federation_push_dlq.sql`. See
+-- the migration file for the full design rationale (every per-peer
+-- fanout failure inside `broadcast_store_quorum` lands a row; the
+-- `replay_federation_push_dlq` worker spawned alongside the catchup
+-- loop polls every N seconds, re-attempts `post_once`, and stamps
+-- `replayed_at` on Ack). NOT a FK to `memories(id)` so the DLQ
+-- survives memory-row lifecycle (we want fanout-failure audit even
+-- if the source row is later deleted).
+-- ─────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS federation_push_dlq (
+    id             BIGSERIAL PRIMARY KEY,
+    memory_id      TEXT NOT NULL,
+    peer_id        TEXT NOT NULL,
+    payload_json   JSONB NOT NULL,
+    attempt_count  INTEGER NOT NULL DEFAULT 1,
+    last_error     TEXT NOT NULL,
+    failed_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    replayed_at    TIMESTAMPTZ NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_federation_push_dlq_pending_failed_at
+    ON federation_push_dlq(failed_at)
+    WHERE replayed_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_federation_push_dlq_peer_pending
+    ON federation_push_dlq(peer_id)
+    WHERE replayed_at IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_federation_push_dlq_pending_uniq
+    ON federation_push_dlq(memory_id, peer_id)
+    WHERE replayed_at IS NULL;
+
+-- ─────────────────────────────────────────────────────────────────────
 -- subscription_events / subscription_dlq — A2A correlation IDs, ACK
 -- semantics, retry, and dead-letter queue (v0.7.0 K6, schema v27).
 --
