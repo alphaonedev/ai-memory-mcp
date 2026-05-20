@@ -143,6 +143,8 @@ fn federation_cfg_for_test(peer_urls: &[String], quorum_writes: usize) -> Federa
         // with api-key auth, so no outbound x-api-key header is needed.
         api_key: None,
         signing_key: None,
+        #[cfg(feature = "sal")]
+        dlq_sink: None,
     }
 }
 
