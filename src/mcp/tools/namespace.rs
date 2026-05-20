@@ -46,10 +46,27 @@ pub fn handle_namespace_set_standard(
     // `handlers/hook_subscribers.rs::set_namespace_standard_inner`.
     // Without this gate any MCP caller could overwrite any namespace's
     // governance policy by passing the existing standard's id —
-    // sibling vector to the HTTP path. Legacy "system" / empty owners
-    // are treated as unowned and the caller claims ownership via the
-    // metadata.agent_id rewrite below.
-    if let Ok(Some(existing_mem)) = db::get(conn, id) {
+    // sibling vector to the HTTP path.
+    //
+    // Gate scope: ONLY applies when the caller has explicitly claimed
+    // identity via `params["agent_id"]`. When agent_id is absent the
+    // caller is identifying as the daemon process itself (the
+    // historical "no claim, no gate" semantic — used by integration
+    // tests that invoke this MCP function as a library call without
+    // setting up a full identity chain, and by daemon-internal
+    // bootstrap paths). The HTTP entry is the load-bearing gate for
+    // external callers because it ALWAYS resolves caller via
+    // X-Agent-Id (anonymous fallback included) and threads the
+    // resolved caller into the MCP params before calling here (see
+    // `set_namespace_standard_inner` line 715-720). Direct MCP
+    // callers that DO claim identity (via stdio JSON-RPC params)
+    // remain gated by this check; daemon-internal callers and tests
+    // that don't claim identity get the legacy posture.
+    let identity_claimed = params
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.is_empty());
+    if identity_claimed && let Ok(Some(existing_mem)) = db::get(conn, id) {
         let recorded_owner = existing_mem
             .metadata
             .get("agent_id")
