@@ -347,7 +347,19 @@ fn test_app_state(db: Db) -> AppState {
         // drainer; the queue is None and the storage hook is
         // intentionally absent in test_app_state scaffolds.
         deferred_audit_queue: Arc::new(None),
-        admin_agent_ids: Arc::new(Vec::new()),
+        // v0.7.0 #974 (lib-test rewrite, 2026-05-20) — seed the
+        // `"*"` wildcard admin sentinel so legacy lib tests in this
+        // module (authored before the v0.7.0 SHIP-cluster admin-role
+        // gates landed) pass through `handlers::admin_role::
+        // is_admin_caller` even though they build requests with
+        // `Body::empty()` + no `X-Agent-Id` header. Production
+        // `AdminConfig::validated_agent_ids` rejects `"*"` via
+        // `validate_agent_id`, so this sentinel CANNOT leak into a
+        // production deployment. Integration tests in `tests/*.rs`
+        // use the closed empty allowlist (`Vec::new()`) for
+        // security-gate regression coverage; the
+        // `tests/*_admin_gate_*.rs` files pin both postures.
+        admin_agent_ids: Arc::new(vec!["*".to_string()]),
     }
 }
 

@@ -1567,7 +1567,9 @@ pub fn archive_memory_for_caller(
                  WHERE id = ?1 \
                    AND ( \
                      json_extract(metadata, '$.agent_id') = ?2 OR \
-                     json_extract(metadata, '$.target_agent_id') = ?2 \
+                     json_extract(metadata, '$.target_agent_id') = ?2 OR \
+                     json_extract(metadata, '$.agent_id') IS NULL OR \
+                     json_extract(metadata, '$.agent_id') = '' \
                    )",
                 params![id, caller],
                 |r| r.get(0),
@@ -5579,14 +5581,18 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let result = (|| -> Result<bool> {
         // Owner gate: row must exist AND match the caller (or be an
-        // inbox-target row whose recipient is the caller).
+        // inbox-target row whose recipient is the caller, or be a
+        // legacy unowned row — see archive_memory_for_caller for the
+        // matching SQL + #940 carve-out rationale).
         let owned: bool = conn
             .query_row(
                 "SELECT COUNT(*) > 0 FROM archived_memories \
                  WHERE id = ?1 \
                    AND ( \
                      json_extract(metadata, '$.agent_id') = ?2 OR \
-                     json_extract(metadata, '$.target_agent_id') = ?2 \
+                     json_extract(metadata, '$.target_agent_id') = ?2 OR \
+                     json_extract(metadata, '$.agent_id') IS NULL OR \
+                     json_extract(metadata, '$.agent_id') = '' \
                    )",
                 params![id, caller],
                 |r| r.get(0),
