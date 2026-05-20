@@ -1,0 +1,33 @@
+# C8 orchestrator safeguard CI gate (issue #953, CLAUDE.md §"Enforceable
+# Orchestrator Safeguards").
+#
+# HARD-BLOCKs PRs that introduce a new `CallerContext::for_agent("<literal>")`
+# site or a new `for_admin` privacy-bypass site outside the allowlists at
+# `scripts/qc-codegraph-allowlists/`. These literals bypass the
+# request-scoped caller identity that the SAL #910 visibility filter
+# depends on; an un-reviewed addition would silently re-introduce
+# cross-tenant leak surfaces of the kind QC sweep #947/#955/#959
+# remediated.
+#
+# Mirrors the local-developer flow: `scripts/qc-codegraph-precheck.sh`
+# is the same script. Run `scripts/qc-codegraph-precheck.sh --update`
+# locally to regenerate the allowlist when you deliberately add a new
+# exception, then review the diff before committing.
+
+name: c8-precheck
+
+on:
+  push:
+    branches: [main, develop, "release/**", "local/**"]
+  pull_request:
+    branches: [main, develop, "release/**"]
+
+jobs:
+  c8-precheck:
+    name: C8 caller-context allowlist check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run C8 precheck
+        run: bash scripts/qc-codegraph-precheck.sh

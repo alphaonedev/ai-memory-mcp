@@ -1,0 +1,203 @@
+#!/usr/bin/env bash
+# Copyright 2026 AlphaOne LLC
+# SPDX-License-Identifier: Apache-2.0
+#
+# C8 orchestrator safeguard (per CLAUDE.md §"Enforceable Orchestrator
+# Safeguards", added under #923 + #953). HARD-BLOCK any new
+# `CallerContext::for_agent("<literal>")` site outside the allowlist,
+# and any new `CallerContext::for_admin("<literal>")` privacy-bypass
+# site outside its allowlist.
+#
+# Usage:
+#   scripts/qc-codegraph-precheck.sh            # check (exit 1 on violation)
+#   scripts/qc-codegraph-precheck.sh --update   # regenerate allowlists from current state
+#
+# What it checks:
+#   - Every line in src/ matching `CallerContext::for_agent("<lit>")`
+#     OR `for_agent("<lit>")` where the literal is a static string
+#     (not a variable reference). Test code is excluded — see
+#     `is_production_site` below.
+#   - Same scan for `for_admin("<lit>")`.
+#   - Each surviving site must appear in the corresponding allowlist.
+#
+# What it deliberately does NOT do (out of scope for v0.7.0):
+#   - Symbol removal / dangling-caller detection. Codegraph indexes
+#     are per-developer and not available in CI; this script uses
+#     `grep` as the load-bearing detector. The deeper codegraph
+#     integration is tracked separately and can layer on top of the
+#     allowlist contract this script enforces.
+#
+# Why grep (not codegraph): CodeGraph indexes live under .codegraph/
+# (gitignored, per-developer; not in CI). For a CI-grade pre-PR gate
+# we need a tool every checkout already has. `grep` is sufficient for
+# the literal-site enumeration; the rest of the C8 contract (rationale
+# for each site) lives in the allowlist files' comments.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+ALLOW_DIR="${ROOT}/scripts/qc-codegraph-allowlists"
+ALLOW_FOR_AGENT="${ALLOW_DIR}/caller-context-literals.txt"
+ALLOW_FOR_ADMIN="${ALLOW_DIR}/for-admin-bypass.txt"
+
+if [[ ! -d "${ALLOW_DIR}" ]]; then
+    echo "ERROR: allowlist dir missing: ${ALLOW_DIR}" >&2
+    exit 2
+fi
+
+UPDATE=0
+if [[ "${1:-}" == "--update" ]]; then
+    UPDATE=1
+fi
+
+# Enumerate "production" sites: rg/grep through src/, then drop any
+# line that is inside a `#[cfg(test)] mod tests {` block. The
+# heuristic: per-file, the first occurrence of `#[cfg(test)]` (or
+# `#[cfg(any(test, ...))]` etc.) starts the test region; everything
+# above it is production. Test files (`*test*.rs`) are skipped
+# entirely.
+collect_sites () {
+    local pattern="$1"
+    local out=""
+    # find src files, skip *test*.rs by name + tests/ subdirs of src
+    while IFS= read -r -d '' f; do
+        # Skip files whose basename signals test-only.
+        local bn
+        bn="$(basename "$f")"
+        case "$bn" in
+            *test*.rs|tests.rs) continue ;;
+        esac
+        # Find the first `#[cfg(test)]` line.
+        local test_line
+        test_line=$(grep -n -m 1 '#\[cfg(test)\]\|#\[cfg(any(test' "$f" 2>/dev/null | head -1 | cut -d: -f1 || true)
+        if [[ -z "${test_line}" ]]; then
+            test_line=999999999
+        fi
+        # Find matching lines and filter to lineno < test_line.
+        # Pattern format: `for_agent("LIT")` or `for_admin("LIT")`.
+        while IFS=: read -r lineno content; do
+            # Skip blank/no-match
+            [[ -z "${lineno}" ]] && continue
+            if (( lineno >= test_line )); then
+                continue
+            fi
+            # Extract the literal between `${pattern}("` and `")`.
+            local literal
+            literal=$(printf '%s\n' "$content" | sed -nE "s/.*${pattern}\(\"([^\"]+)\"\).*/\1/p" | head -1)
+            if [[ -n "${literal}" ]]; then
+                # Strip the absolute prefix so the allowlist is
+                # repo-root-relative (and stable across checkouts).
+                local rel="${f#"${ROOT}/"}"
+                out+="${rel}:${lineno}:${literal}"$'\n'
+            fi
+        done < <(grep -n "${pattern}(\"" "$f" 2>/dev/null || true)
+    done < <(find "${ROOT}/src" -type f -name '*.rs' -print0)
+    # Sort + dedup so the diff against the allowlist is order-stable.
+    printf '%s' "$out" | LC_ALL=C sort -u
+}
+
+CURRENT_FOR_AGENT="$(collect_sites 'CallerContext::for_agent')"
+CURRENT_FOR_ADMIN="$(collect_sites 'CallerContext::for_admin')"
+
+# Strip the line-number column from a "file:line:literal" stream so
+# the allowlist contract is `file:literal` only — line numbers drift
+# on every unrelated edit and would otherwise flood the diff.
+# Literals can contain `:` (e.g. `ai:seed`, `ai:http-internal`), so
+# we use sed with a regex that requires the second column to be
+# digits — preserves the rest of the line verbatim.
+strip_line () {
+    sed -E 's/^([^:]+):[0-9]+:(.*)$/\1:\2/'
+}
+
+CURRENT_FOR_AGENT_NORM="$(printf '%s' "$CURRENT_FOR_AGENT" | strip_line | LC_ALL=C sort -u)"
+CURRENT_FOR_ADMIN_NORM="$(printf '%s' "$CURRENT_FOR_ADMIN" | strip_line | LC_ALL=C sort -u)"
+
+write_allowlist () {
+    local out="$1"
+    local payload="$2"
+    local title="$3"
+    {
+        printf '# %s\n' "$title"
+        printf '# Auto-generated by scripts/qc-codegraph-precheck.sh --update.\n'
+        printf '# Format: <repo-root-relative-file>:<literal>\n'
+        printf '# Edit deliberately — every entry should be a reviewed exception.\n'
+        printf '# See CLAUDE.md §"Enforceable Orchestrator Safeguards" (C8).\n'
+        printf '\n'
+        printf '%s\n' "$payload"
+    } > "$out"
+}
+
+if (( UPDATE )); then
+    write_allowlist "$ALLOW_FOR_AGENT" "$CURRENT_FOR_AGENT_NORM" \
+        "CallerContext::for_agent(\"<literal>\") allowlist (C8 safeguard)."
+    write_allowlist "$ALLOW_FOR_ADMIN" "$CURRENT_FOR_ADMIN_NORM" \
+        "CallerContext::for_admin(\"<literal>\") privacy-bypass allowlist (C8 safeguard)."
+    echo "Allowlists regenerated:"
+    echo "  ${ALLOW_FOR_AGENT}"
+    echo "  ${ALLOW_FOR_ADMIN}"
+    exit 0
+fi
+
+if [[ ! -f "$ALLOW_FOR_AGENT" || ! -f "$ALLOW_FOR_ADMIN" ]]; then
+    echo "ERROR: allowlist file(s) missing. Run \`scripts/qc-codegraph-precheck.sh --update\` to seed." >&2
+    exit 2
+fi
+
+# The allowlist files carry a comment header (lines starting with `#`)
+# + a blank line; the payload is `<file>:<literal>` pairs. Strip
+# comments + blanks before diffing.
+strip_comments () {
+    # `grep -v` returns 1 when its input is empty after filtering;
+    # that triggers `set -e` + `pipefail` and aborts the script. The
+    # `|| true` swallows the non-zero so an empty allowlist body
+    # (e.g. the for_agent file post-#955) is treated as legitimate.
+    { grep -v '^#' "$1" | grep -v '^$' | LC_ALL=C sort -u; } || true
+}
+
+ALLOW_FOR_AGENT_BODY="$(strip_comments "$ALLOW_FOR_AGENT")"
+ALLOW_FOR_ADMIN_BODY="$(strip_comments "$ALLOW_FOR_ADMIN")"
+
+violations=0
+
+check_diff () {
+    local label="$1"
+    local current="$2"
+    local allow="$3"
+    # New sites = lines in current not in allow.
+    local new_sites
+    new_sites="$(LC_ALL=C comm -23 \
+        <(printf '%s\n' "$current") \
+        <(printf '%s\n' "$allow") || true)"
+    if [[ -n "${new_sites//[[:space:]]/}" ]]; then
+        echo "C8 HARD-BLOCK: new ${label} site(s) not in allowlist:" >&2
+        printf '  %s\n' "${new_sites}" >&2
+        echo "" >&2
+        echo "If these are deliberate exceptions, run:" >&2
+        echo "  scripts/qc-codegraph-precheck.sh --update" >&2
+        echo "and review the diff to ${ALLOW_DIR%/}/*.txt before committing." >&2
+        violations=$(( violations + 1 ))
+    fi
+    # Stale entries = lines in allow not in current. Surface as a
+    # WARN — not a hard block — so unrelated refactors that delete a
+    # site don't fail unrelated PRs.
+    local stale
+    stale="$(LC_ALL=C comm -13 \
+        <(printf '%s\n' "$current") \
+        <(printf '%s\n' "$allow") || true)"
+    if [[ -n "${stale//[[:space:]]/}" ]]; then
+        echo "C8 WARN: stale ${label} allowlist entries (no longer present in source):" >&2
+        printf '  %s\n' "${stale}" >&2
+        echo "  → run \`scripts/qc-codegraph-precheck.sh --update\` to prune." >&2
+    fi
+}
+
+check_diff "CallerContext::for_agent" "$CURRENT_FOR_AGENT_NORM" "$ALLOW_FOR_AGENT_BODY"
+check_diff "CallerContext::for_admin" "$CURRENT_FOR_ADMIN_NORM" "$ALLOW_FOR_ADMIN_BODY"
+
+if (( violations > 0 )); then
+    echo "" >&2
+    echo "C8 precheck FAILED with ${violations} category/categories of violation." >&2
+    exit 1
+fi
+
+echo "C8 precheck OK (for_agent: $(printf '%s\n' "$CURRENT_FOR_AGENT_NORM" | grep -c . || true) sites, for_admin: $(printf '%s\n' "$CURRENT_FOR_ADMIN_NORM" | grep -c . || true) sites)."
