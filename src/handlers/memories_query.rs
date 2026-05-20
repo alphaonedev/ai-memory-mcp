@@ -372,6 +372,7 @@ pub async fn forget_memories(
     headers: axum::http::HeaderMap,
     Json(body): Json<ForgetQuery>,
 ) -> impl IntoResponse {
+    let _ = &headers;
     // v0.7.0 Wave-3 Continuation 3 (Phase 13) — route through SAL trait
     // on postgres-backed daemons. Sqlite-backed daemons keep the legacy
     // `db::forget` free-function path verbatim.
