@@ -253,6 +253,30 @@ pub async fn broadcast_store_quorum(
     config: &FederationConfig,
     mem: &Memory,
 ) -> Result<AckTracker, QuorumError> {
+    // #931 (v0.7.0 Track D, 2026-05-20) — entry-line debug + info
+    // logs so the silent-bypass case where this function is never
+    // called (e.g. `app.federation` resolves to `None` on a path
+    // where the handler thought it was `Some`) is immediately
+    // distinguishable from "function called but every peer fails".
+    // Pre-#931 NO log fired on the happy path at all (only at
+    // tracing::warn on a per-peer failure), so the Track D Docker
+    // probe couldn't tell whether the broadcast path was even
+    // exercised. The wire wording `federation::broadcast: store
+    // <mem-id> -> N peer(s)` is pinned by the regression test in
+    // `tests/federation_x_api_key.rs::*`. Info-level (not debug) so
+    // operators tailing `docker logs alice | grep federation` see
+    // it without flipping `RUST_LOG=debug`.
+    tracing::info!(
+        target: "ai_memory::federation::sync",
+        memory_id = %mem.id,
+        namespace = %mem.namespace,
+        peer_count = config.peers.len(),
+        quorum_w = config.policy.w,
+        "federation::broadcast: store {} -> {} peer(s) (quorum W={})",
+        mem.id,
+        config.peers.len(),
+        config.policy.w,
+    );
     let now = Instant::now();
     let tracker = Arc::new(Mutex::new(AckTracker::new(config.policy.clone(), now)));
     tracker.lock().await.record_local();
