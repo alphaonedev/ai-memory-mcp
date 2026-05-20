@@ -54,84 +54,24 @@ use std::time::Instant;
 pub const MIN_SUPPORTED_SCHEMA: u32 = 16;
 
 /// Upper bound of the DB-schema range this binary supports. Mirrors
-/// `db::CURRENT_SCHEMA_VERSION` (34 in v0.7.0 — v21 from K2's
-/// `pending_actions` timeout-sweeper columns, v22 from I1's
-/// `memory_transcripts` BLOB store, v23 from H2's
-/// `memory_links.attest_level` column for outbound link signing, v24
-/// from I2's `memory_transcript_links` join table, v25 from I3's
-/// `memory_transcripts.archived_at` column backing the per-namespace
-/// TTL with archive→prune lifecycle, v26 from H5's append-only
-/// `signed_events` audit table backing the immutable attestation
-/// chain, v27 from K6's `subscription_events.correlation_id`
-/// column + `subscription_dlq` table backing A2A correlation IDs,
-/// ACK/retry semantics, and the dead-letter queue, v28 from K8's
-/// `agent_quotas` table backing the per-agent rate-limit + storage-cap
-/// substrate (memories/day, storage bytes, links/day, with daily reset
-/// at UTC midnight) — all part of the attested-cortex epic, v29
-/// from Task 1/8's `memories.reflection_depth` column backing the
-/// substrate-native recursive-learning mission, v30 from issue #691's
-/// `governance_rules` table backing the substrate-level agent-action
-/// rules engine, v31 from L1-1's `memories.memory_kind TEXT NOT
-/// NULL DEFAULT 'observation'` column backing the typed
-/// `MemoryKind::Reflection` enum, v32 from L1-5's `skills` +
-/// `skill_resources` tables backing the Agent Skills ingestion
-/// substrate (Pillar 1.5), v33 from the v0.7.1-fold (#687/#688)
-/// SQL-side CHECK constraint on `memory_links.relation` that promotes
-/// the v23 RAISE triggers to a declared column-level CHECK clause
-/// (closed taxonomy:
-/// related_to/supersedes/contradicts/derived_from/reflects_on), and
-/// v34 from V-4 closeout (#698) which adds `prev_hash BLOB` +
-/// `sequence INTEGER` columns plus a UNIQUE INDEX on `signed_events`
-/// so the SQL substrate carries a cross-row hash chain (mirror of
-/// the JSONL property in `audit.rs`), v35 from QW-3's context-offload
-/// substrate primitive (`offloaded_blobs` table backing the
-/// offload+deref engine v0.8.0 short-term-context-compression will
-/// build on), v36 from WT-1-A's atomisation foundation which
-/// adds `memories.atomised_into INTEGER` + `memories.atom_of TEXT
-/// REFERENCES memories(id)` columns plus extends the
-/// `memory_links.relation` closed-taxonomy CHECK constraint with the
-/// `derives_from` variant (atomisation provenance edges), v37
-/// from QW-2's Persona-as-artifact substrate primitive (adds
-/// `memories.entity_id TEXT NULL` + `memories.persona_version
-/// INTEGER NULL` plus the `idx_personas_by_entity` partial index),
-/// and v38 from Form 4's fact-provenance closeout (issue #757) which
-/// adds `memories.citations TEXT NOT NULL DEFAULT '[]'`,
-/// `memories.source_uri TEXT NULL`, and `memories.source_span TEXT
-/// NULL` plus the `idx_memories_source_uri` partial index, and v39
-/// from Form 5's auto-confidence + shadow-mode + calibration closeout
-/// (issue #758) which adds `memories.confidence_source TEXT NOT NULL
-/// DEFAULT 'caller_provided'`, `memories.confidence_signals TEXT NULL`,
-/// `memories.confidence_decayed_at TEXT NULL` plus the
-/// `confidence_shadow_observations` table backing per-recall telemetry,
-/// v40 from Cluster C's (#770) SEC-3 closeout adding the
-/// `signed_events_dlq` table backing the deferred-audit drainer, and
-/// v41 from Cluster G's (#767) shadow-mode retention closeout which
-/// adds the denormalised `confidence_shadow_observations.source` column
-/// plus the compound `(namespace, source, observed_at)` index supporting
-/// the streaming calibration scan (PERF-4 + PERF-12), v42 from
-/// polish PERF-8 (#781) — auto-persona indexed entity-id column
-/// (`memories.mentioned_entity_id TEXT` + partial index) replacing the
-/// content `LIKE '%entity_X%'` full-table scan in the auto-persona
-/// matcher, v43 from issue #810 / #813 — atomic
-/// `(attest_level, signature)` invariant on `memory_links` enforced
-/// by a `BEFORE INSERT/UPDATE` trigger pair, and v44 from issue #228
-/// — the additive `memories.encrypted_envelope BLOB NULL` column
-/// backing the E2E content encryption substrate. When a DB's
-/// `schema_version` exceeds this, the binary is too old for a newer
-/// DB and we surface a warning. v0.6.3.1 (PR-9h / issue #487 PR #497
-/// req #72).
+/// `db::CURRENT_SCHEMA_VERSION` (currently 48 at v0.7.0; both sqlite
+/// and postgres ladders land at v48 in lockstep — see
+/// `MIGRATION_LADDER.md` for the per-version column inventory and
+/// `migrations/{sqlite,postgres}/` for the SQL).
 ///
-/// v0.7.0 Provenance write-path closeout: bumped to v47 spanning the
-/// three landings — v45 for Gap 1 (#884, `memories.version` optimistic
-/// concurrency column), v46 for Gap 2 (#885, backfill of the v38
-/// `memories.source_uri` first-class column from `metadata.source_uri`
-/// and `citations[0].uri`), and v47 for Gap 3 (#886, the
-/// `recall_observations` ledger).
+/// When a DB's `schema_version` exceeds this, the binary is too old
+/// for a newer DB and we surface a `warn-schema-unsupported` manifest
+/// header so the user knows to upgrade. v0.6.3.1 (PR-9h / issue #487
+/// PR #497 req #72).
 ///
-/// v48 (Track D #933) — `federation_push_dlq` table backing the
-/// quorum-broadcast fanout dead-letter queue. The new
-/// `replay_federation_push_dlq` worker spawned alongside the catchup
-/// loop polls every N seconds and re-attempts `post_once`.
+/// **#903 cleanup (2026-05-20):** the prior version of this comment
+/// enumerated every v21–v44 landing inline (K2's `pending_actions`,
+/// I1's `memory_transcripts`, H2's `memory_links.attest_level`, …).
+/// That enumeration drifted: it pegged the value at "34 in v0.7.0"
+/// when the live constant was already 48. Per the prime directive's
+/// documentation-drift rule the inventory now lives in
+/// `MIGRATION_LADDER.md` (single source of truth) and this comment
+/// only carries the current value + a pointer.
 pub const MAX_SUPPORTED_SCHEMA: u32 = 48;
 
 /// Pure boundary check: `true` when `v` lies within
