@@ -270,6 +270,55 @@ async fn put_json(router: &axum::Router, uri: &str, body: Value) -> (StatusCode,
     (status, parsed)
 }
 
+/// PUT with X-Agent-Id header — required after #930 (Track A P9,
+/// 2026-05-20) added the caller-vs-row-owner gate on UPDATE. Tests
+/// that read back a row they just created via `create_basic` (which
+/// stamps `metadata.agent_id = "ai:test"`) must send the same id on
+/// the PUT or the gate 403s.
+async fn put_json_with_agent(
+    router: &axum::Router,
+    uri: &str,
+    body: Value,
+    agent_id: &str,
+) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method("PUT")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .header("X-Agent-Id", agent_id)
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let parsed: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, parsed)
+}
+
+/// POST /promote with X-Agent-Id header — required after #930
+/// extended the caller-vs-row-owner gate to the PROMOTE path.
+async fn promote_with_agent(
+    router: &axum::Router,
+    uri: &str,
+    agent_id: &str,
+) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("X-Agent-Id", agent_id)
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap_or_default();
+    let parsed: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, parsed)
+}
+
 /// Create a memory and return its id + status.
 async fn create_basic(router: &axum::Router, ns: &str, title: &str) -> (StatusCode, String) {
     let body = json!({
@@ -481,13 +530,19 @@ async fn http_get_memory_by_id_and_prefix() {
     assert_eq!(s, StatusCode::CREATED);
     assert!(!id.is_empty());
 
-    let (status, payload) = get_uri(&router, &format!("/api/v1/memories/{id}")).await;
+    // #927 (Track A P4, 2026-05-20) extended scope=private filter to
+    // GET /memories/{id} on the sqlite path. `create_basic` stamps
+    // `metadata.agent_id = "ai:test"`; use the matching X-Agent-Id on
+    // the GET so the visibility gate admits the read.
+    let (status, payload) =
+        get_uri_with_agent(&router, &format!("/api/v1/memories/{id}"), "ai:test").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["memory"]["id"].as_str(), Some(id.as_str()));
 
     // Prefix lookup (8-char prefix).
     let prefix = &id[..8];
-    let (s2, p2) = get_uri(&router, &format!("/api/v1/memories/{prefix}")).await;
+    let (s2, p2) =
+        get_uri_with_agent(&router, &format!("/api/v1/memories/{prefix}"), "ai:test").await;
     assert_eq!(s2, StatusCode::OK);
     assert_eq!(p2["memory"]["id"].as_str(), Some(id.as_str()));
 }
@@ -524,7 +579,12 @@ async fn http_update_memory_happy_path() {
         "priority": 9,
         "tags": ["updated"],
     });
-    let (status, _payload) = put_json(&router, &format!("/api/v1/memories/{id}"), body).await;
+    // #930 (Track A P9, 2026-05-20) added caller-vs-row-owner gate on
+    // PUT. `create_basic` stamps the row with `metadata.agent_id =
+    // "ai:test"`; the PUT must send the same X-Agent-Id or the gate
+    // 403s.
+    let (status, _payload) =
+        put_json_with_agent(&router, &format!("/api/v1/memories/{id}"), body, "ai:test").await;
     assert_eq!(status, StatusCode::OK);
 }
 
@@ -582,13 +642,12 @@ async fn http_promote_memory_happy_path() {
     let (router, _f) = build_router_fixture();
     let (_s, id) = create_basic(&router, "chunk-d/promo", "promo-mem").await;
     // promote_memory takes no body — it just promotes to long tier.
-    let req = Request::builder()
-        .method("POST")
-        .uri(format!("/api/v1/memories/{id}/promote"))
-        .body(Body::empty())
-        .unwrap();
-    let resp = router.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    // #930 (Track A P9, 2026-05-20) added the caller-vs-row-owner
+    // gate to PROMOTE; the request must send X-Agent-Id matching the
+    // row's `metadata.agent_id = "ai:test"` (set by create_basic).
+    let (status, _payload) =
+        promote_with_agent(&router, &format!("/api/v1/memories/{id}/promote"), "ai:test").await;
+    assert_eq!(status, StatusCode::OK);
 }
 
 #[tokio::test]
