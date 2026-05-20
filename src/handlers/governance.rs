@@ -46,9 +46,38 @@ fn default_pending_limit() -> Option<usize> {
 
 pub async fn list_pending(
     State(app): State<AppState>,
+    headers: HeaderMap,
     Query(p): Query<PendingListQuery>,
 ) -> impl IntoResponse {
     let limit = p.limit.unwrap_or(100).min(1000);
+
+    // #958 (security-medium, 2026-05-20) — caller-vs-requester gate.
+    // Pre-#958 the handler took NO `headers: HeaderMap`, resolved no
+    // caller, and dispatched directly to the underlying list (sqlite
+    // `db::list_pending_actions` / postgres
+    // `list_pending_actions_via_store`) which themselves take NO
+    // `caller` parameter. The K10 SSE handler (`approvals_sse`)
+    // already applies the per-#628 tenant filter via
+    // `sse_event_visible_to`, but the polling-style HTTP list path
+    // was the legacy gap that same issue closed for the SSE channel
+    // only. Any HTTP caller could enumerate every pending governance
+    // action across every owner + every namespace — leaking the
+    // proposed memory body, the requester agent_id, and the target
+    // namespace topology.
+    //
+    // Fix: resolve the caller from `X-Agent-Id` (the same primitive
+    // every other handler uses), check the admin role allowlist via
+    // the shared `handlers::admin_role::is_admin_caller` predicate
+    // (the #957 SHIP-cluster operator-bypass posture), and post-
+    // filter the pending list to rows whose `requested_by` matches
+    // the resolved caller. Admin callers bypass the filter — the
+    // legitimate operator queue-view surface. Non-admin callers see
+    // only their OWN pending rows; cross-tenant rows are silently
+    // dropped (no enumeration / count leak).
+    let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+    let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
+        .unwrap_or_else(|_| "anonymous:invalid".to_string());
+    let is_admin = crate::handlers::admin_role::is_admin_caller(&app, &caller);
 
     // v0.7.0 Wave-3 Continuation 5 — postgres-backed daemons read
     // from the `pending_actions` table directly. The full governance
@@ -66,19 +95,60 @@ pub async fn list_pending(
         )
         .await
         {
-            Ok(items) => Json(json!({
-                "count": items.len(),
-                "pending": items,
-                "storage_backend": "postgres",
-            }))
-            .into_response(),
+            Ok(items) => {
+                // #958 post-filter: drop rows whose `requested_by`
+                // does not match the caller, unless the caller is an
+                // operator-allowlisted admin. The postgres JSON shape
+                // produced by `list_pending_actions_via_store`
+                // includes `requested_by` as a top-level string field
+                // (see `src/store/postgres.rs::list_pending_actions`).
+                let filtered: Vec<serde_json::Value> = if is_admin {
+                    items
+                } else {
+                    items
+                        .into_iter()
+                        .filter(|row| {
+                            row.get("requested_by")
+                                .and_then(serde_json::Value::as_str)
+                                .is_some_and(|rb| rb == caller)
+                        })
+                        .collect()
+                };
+                Json(json!({
+                    "count": filtered.len(),
+                    "pending": filtered,
+                    "storage_backend": "postgres",
+                    "owner_scope": if is_admin { "admin" } else { "caller" },
+                }))
+                .into_response()
+            }
             Err(e) => store_err_to_response(e),
         };
     }
 
     let lock = app.db.lock().await;
     match db::list_pending_actions(&lock.0, p.status.as_deref(), limit) {
-        Ok(items) => Json(json!({"count": items.len(), "pending": items})).into_response(),
+        Ok(items) => {
+            // #958 post-filter: drop rows whose `requested_by`
+            // does not match the caller, unless the caller is an
+            // operator-allowlisted admin. `PendingAction.requested_by`
+            // is a plain `String` (see
+            // `src/models/namespace.rs::PendingAction`).
+            let filtered: Vec<crate::models::PendingAction> = if is_admin {
+                items
+            } else {
+                items
+                    .into_iter()
+                    .filter(|row| row.requested_by == caller)
+                    .collect()
+            };
+            Json(json!({
+                "count": filtered.len(),
+                "pending": filtered,
+                "owner_scope": if is_admin { "admin" } else { "caller" },
+            }))
+            .into_response()
+        }
         Err(e) => {
             tracing::error!("handler error: {e}");
             (
