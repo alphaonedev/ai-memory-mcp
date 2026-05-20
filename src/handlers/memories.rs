@@ -533,10 +533,10 @@ pub async fn delete_memory(
                 .await
             {
                 Ok(GovernanceDecision::Allow) => {}
-                Ok(GovernanceDecision::Deny(reason)) => {
+                Ok(GovernanceDecision::Deny(refusal)) => {
                     return (
                         StatusCode::FORBIDDEN,
-                        Json(json!({"error": crate::governance::deny_message("delete", crate::governance::DenyGate::Governance, &reason)})),
+                        Json(json!({"error": crate::governance::deny_message("delete", crate::governance::DenyGate::Governance, &refusal.reason)})),
                     )
                         .into_response();
                 }
@@ -686,10 +686,10 @@ pub async fn delete_memory(
             &payload,
         ) {
             Ok(GovernanceDecision::Allow) => {}
-            Ok(GovernanceDecision::Deny(reason)) => {
+            Ok(GovernanceDecision::Deny(refusal)) => {
                 return (
                     StatusCode::FORBIDDEN,
-                    Json(json!({"error": crate::governance::deny_message("delete", crate::governance::DenyGate::Governance, &reason)})),
+                    Json(json!({"error": crate::governance::deny_message("delete", crate::governance::DenyGate::Governance, &refusal.reason)})),
                 )
                     .into_response();
             }
@@ -899,10 +899,10 @@ pub async fn promote_memory(
                 .await
             {
                 Ok(GovernanceDecision::Allow) => {}
-                Ok(GovernanceDecision::Deny(reason)) => {
+                Ok(GovernanceDecision::Deny(refusal)) => {
                     return (
                         StatusCode::FORBIDDEN,
-                        Json(json!({"error": crate::governance::deny_message("promote", crate::governance::DenyGate::Governance, &reason)})),
+                        Json(json!({"error": crate::governance::deny_message("promote", crate::governance::DenyGate::Governance, &refusal.reason)})),
                     )
                         .into_response();
                 }
@@ -1081,10 +1081,10 @@ pub async fn promote_memory(
             &payload,
         ) {
             Ok(GovernanceDecision::Allow) => {}
-            Ok(GovernanceDecision::Deny(reason)) => {
+            Ok(GovernanceDecision::Deny(refusal)) => {
                 return (
                     StatusCode::FORBIDDEN,
-                    Json(json!({"error": crate::governance::deny_message("promote", crate::governance::DenyGate::Governance, &reason)})),
+                    Json(json!({"error": crate::governance::deny_message("promote", crate::governance::DenyGate::Governance, &refusal.reason)})),
                 )
                     .into_response();
             }

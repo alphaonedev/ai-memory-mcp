@@ -106,12 +106,22 @@ pub fn namespace_ancestors(ns: &str) -> Vec<String> {
 /// The outcome of a governance check. Callers MAY execute on `Allow`,
 /// MUST reject on `Deny`, and SHOULD queue + return the `pending_id` on
 /// `Pending`.
+///
+/// `Deny` carries a typed [`crate::governance::GovernanceRefusal`] (issue
+/// #963 Phase 2). `Display` on the refusal produces the canonical wire
+/// shape `"<action> denied by governance: <reason>"`; the typed fields
+/// (`denied_level`, `namespace`, `owner`, `agent_id`) expose structured
+/// info that handlers can surface in HTTP / MCP / CLI responses. Pre-#963
+/// the variant was `Deny(String)` and only the human-readable wire
+/// message survived; callers needing the typed shape route through the
+/// envelope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GovernanceDecision {
     /// Allowed; proceed with the action.
     Allow,
-    /// Denied; surface the reason to the caller.
-    Deny(String),
+    /// Denied; the typed refusal envelope carries the wire message + the
+    /// structured policy context that produced the refusal.
+    Deny(crate::governance::GovernanceRefusal),
     /// Queued for approval; the caller receives the new `pending_id`.
     Pending(String),
 }
