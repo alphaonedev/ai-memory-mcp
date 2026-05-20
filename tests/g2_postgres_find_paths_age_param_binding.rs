@@ -147,6 +147,12 @@ async fn spawn_daemon(
     (format!("http://{addr}"), shutdown, handle)
 }
 
+/// Stable agent id — see g4 fix for full rationale. Required so the
+/// #910 SAL-level visibility filter on `find_paths` doesn't drop the
+/// seeded chain because per-request anonymous ids leave each memory
+/// orphaned relative to the find_paths caller.
+const G2_TEST_AGENT_ID: &str = "ai:g2-test";
+
 async fn store_memory(
     client: &reqwest::Client,
     base: &str,
@@ -165,6 +171,7 @@ async fn store_memory(
     });
     let resp = client
         .post(format!("{base}/api/v1/memories"))
+        .header("X-Agent-Id", G2_TEST_AGENT_ID)
         .json(&body)
         .send()
         .await
@@ -326,6 +333,7 @@ async fn g2_postgres_find_paths_age_returns_200_with_paths() {
     for w in ids.windows(2) {
         let resp = client
             .post(format!("{base}/api/v1/links"))
+            .header("X-Agent-Id", G2_TEST_AGENT_ID)
             .json(&json!({
                 "source_id": w[0],
                 "target_id": w[1],
@@ -352,6 +360,7 @@ async fn g2_postgres_find_paths_age_returns_200_with_paths() {
     // S65 wire: depth=7 (max ceiling) covers a 4-hop chain.
     let resp = client
         .post(format!("{base}/api/v1/kg/find_paths"))
+        .header("X-Agent-Id", G2_TEST_AGENT_ID)
         .json(&json!({
             "source_id": ids[0],
             "target_id": ids[ids.len() - 1],

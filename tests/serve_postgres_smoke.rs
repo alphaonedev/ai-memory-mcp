@@ -49,7 +49,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, Notify, RwLock};
 
 mod common;
-use common::{free_port, postgres_url};
+use common::{free_port, pg_test_client, postgres_url};
 
 /// Build the `AppState` for a postgres-backed in-process daemon.
 ///
@@ -144,7 +144,7 @@ async fn serve_postgres_smoke_round_trip() {
          in-process HTTP daemon failed to bind"
     );
 
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:smoke-test");
     let base = format!("http://{addr}");
 
     // ------------------------------------------------------------------

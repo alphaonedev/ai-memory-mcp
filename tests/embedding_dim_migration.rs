@@ -45,6 +45,22 @@ use sqlx::postgres::PgPoolOptions;
 mod common;
 use common::postgres_url;
 
+/// Process-wide async mutex serializing the 3 dim-migration tests in
+/// this binary against a shared postgres scratch DB.
+///
+/// v0.7.0 ship-hardening (2026-05-19): the tests each call
+/// `reset_schema` then bootstrap the schema at their target dim.
+/// Without serialization they race: test A drops tables, test B drops
+/// (no-op), test B bootstraps at 768, test A bootstraps at 384 — but
+/// connect_with_dim is a NO-OP on an existing schema, so test A sees
+/// 768 from test B's bootstrap and asserts fail. The race was
+/// observable but uncommon until the connect-time advisory lock
+/// (`MIGRATION_ADVISORY_LOCK_KEY`) introduced a small queueing delay
+/// that widened the interleaving window. Holding this mutex from
+/// reset_schema through the assertion keeps each test's
+/// (reset → bootstrap → verify) sequence atomic relative to peers.
+static SUITE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Drop ai-memory tables so each test gets a fresh schema. The postgres
 /// fixture is shared across tests in the suite, so we tear down the
 /// adapter-owned tables (CREATE TABLE IF NOT EXISTS is the bootstrap
@@ -106,6 +122,7 @@ async fn auto_migrate_converts_384_schema_to_768_on_daemon_bootstrap() {
         eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
         return;
     };
+    let _guard = SUITE_LOCK.lock().await;
 
     let inspect = inspection_pool(&url).await;
     reset_schema(&inspect).await;
@@ -162,6 +179,7 @@ async fn auto_migrate_no_op_when_fresh_schema_already_matches() {
         eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
         return;
     };
+    let _guard = SUITE_LOCK.lock().await;
 
     let inspect = inspection_pool(&url).await;
     reset_schema(&inspect).await;
@@ -192,6 +210,7 @@ async fn http_write_path_accepts_768_after_auto_migrate() {
         eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
         return;
     };
+    let _guard = SUITE_LOCK.lock().await;
 
     let inspect = inspection_pool(&url).await;
     reset_schema(&inspect).await;
