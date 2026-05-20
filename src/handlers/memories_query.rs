@@ -222,6 +222,7 @@ pub async fn list_memories(
 
 pub async fn search_memories(
     State(app): State<AppState>,
+    headers: axum::http::HeaderMap,
     Query(p): Query<SearchQuery>,
 ) -> impl IntoResponse {
     // #891: source_uri-only queries are valid (Gap 6 #889 reciprocal
@@ -289,8 +290,18 @@ pub async fn search_memories(
             until,
             limit,
         };
+        // #942 SECURITY-high (Track A QC sweep, 2026-05-20) — replace
+        // the hardcoded `"ai:http"` principal with the header-resolved
+        // caller so the SAL #910 scope=private visibility filter
+        // actually applies per-caller. Pre-fix every HTTP search ran
+        // as the same synthetic principal, so the visibility filter
+        // only filtered out rows owned by other-than-"ai:http" —
+        // effectively no filter for tenant-facing reads.
+        let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+        let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
+            .unwrap_or_else(|_| format!("anonymous:req-{}", uuid::Uuid::new_v4()));
         let ctx = crate::store::CallerContext {
-            agent_id: "ai:http".to_string(),
+            agent_id: caller,
             as_agent: p.as_agent.clone(),
             request_id: None,
             // #910 — tenant-facing path; never bypass the visibility filter.
@@ -301,6 +312,21 @@ pub async fn search_memories(
             Err(e) => store_err_to_response(e),
         };
     }
+
+    // #942 SECURITY-high (Track A QC sweep, 2026-05-20) — fall back
+    // to the header-resolved caller's namespace as the visibility
+    // filter principal when `?as_agent=` is not supplied. Pre-fix
+    // callers who didn't bother to set `as_agent` got an unfiltered
+    // search — including scope=private rows owned by other tenants.
+    // `as_agent` semantics: it's the caller's namespace ancestor
+    // (agent_id IS the agent's namespace prefix per
+    // src/identity/mod.rs); `compute_visibility_prefixes` walks
+    // ancestors from there.
+    let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+    let effective_as_agent: Option<String> = p
+        .as_agent
+        .clone()
+        .or_else(|| crate::identity::resolve_http_agent_id(None, header_agent_id).ok());
 
     let lock = app.db.lock().await;
     // v0.6.2 (S40): mirror the `list_memories` ceiling raise so search
@@ -351,7 +377,7 @@ pub async fn search_memories(
         p.until.as_deref(),
         p.tags.as_deref(),
         p.agent_id.as_deref(),
-        p.as_agent.as_deref(),
+        effective_as_agent.as_deref(),
         false,
         source_uri,
     ) {
@@ -372,7 +398,18 @@ pub async fn forget_memories(
     headers: axum::http::HeaderMap,
     Json(body): Json<ForgetQuery>,
 ) -> impl IntoResponse {
-    let _ = &headers;
+    // #942 SECURITY-high (Track A QC sweep, 2026-05-20) — admin-only
+    // gate on bulk-forget. `db::forget` is a destructive operation
+    // that deletes by namespace + pattern + tier filter; it has no
+    // per-row caller filter and adding one without a substrate
+    // refactor (touching the SQL CTEs that drive the FTS join) is
+    // bigger than the QC sweep budget. Restrict to operators in the
+    // admin allowlist (introduced by the #957 fix in commit
+    // df7f72545) — same posture as `export_memories`.
+    if let Err(resp) = crate::handlers::admin_role::require_admin(&app, &headers, "forget_memories")
+    {
+        return resp;
+    }
     // v0.7.0 Wave-3 Continuation 3 (Phase 13) — route through SAL trait
     // on postgres-backed daemons. Sqlite-backed daemons keep the legacy
     // `db::forget` free-function path verbatim.
