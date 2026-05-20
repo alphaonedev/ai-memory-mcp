@@ -36,6 +36,15 @@
 
 pub mod peer;
 pub mod peer_attestation;
+// v0.7.0 Track D #933 — federation push DLQ + replay worker. The
+// concrete module requires `async-trait` for the object-safe sink
+// trait + sqlx for the postgres sink; both are SAL-feature deps so
+// the entire DLQ surface is feature-gated to `--features sal`. The
+// sqlite-only (default-features) build keeps `FederationConfig.dlq_sink`
+// typed as `Option<()>` via the stub below so call sites stay uniform
+// across builds.
+#[cfg(feature = "sal")]
+pub mod push_dlq;
 pub mod quorum;
 pub mod receive;
 pub mod reflection_bookkeeping;
@@ -58,6 +67,13 @@ pub use receive::spawn_catchup_loop_with_store;
 // here so the integration test (separate crate) can import it.
 pub use receive::catchup_once_for_tests;
 pub use sync::*;
+// v0.7.0 Track D #933 — re-export push DLQ surface for daemon bootstrap +
+// integration tests.
+#[cfg(feature = "sal")]
+pub use push_dlq::{
+    FederationDlqSink, FederationPushDlqRow, REPLAY_BATCH_SIZE, replay_once,
+    spawn_replay_federation_push_dlq,
+};
 
 use crate::replication::QuorumPolicy;
 
@@ -83,6 +99,20 @@ pub struct FederationConfig {
     /// = no header attached (legacy peers + receivers that opted out
     /// via `AI_MEMORY_FED_REQUIRE_SIG=0` keep working).
     pub signing_key: Option<std::sync::Arc<ed25519_dalek::SigningKey>>,
+    /// v0.7.0 Track D #933 — federation push DLQ sink. When `Some`,
+    /// per-peer fanout failures inside `broadcast_store_quorum`
+    /// (Fail outcome OR no-Ack-before-deadline) land a row in
+    /// `federation_push_dlq` via this sink, and the
+    /// `replay_federation_push_dlq` worker re-attempts the push
+    /// later. `None` preserves pre-#933 behaviour (silent fanout
+    /// failures) for builds/configs that haven't wired the SAL store
+    /// — typically test harnesses that exercise `broadcast_*_quorum`
+    /// in isolation.
+    ///
+    /// Feature-gated to `--features sal` because the trait surface
+    /// (`async-trait`) is a SAL-only dep.
+    #[cfg(feature = "sal")]
+    pub dlq_sink: Option<std::sync::Arc<dyn push_dlq::FederationDlqSink>>,
 }
 
 /// A single peer in the quorum mesh. The `id` is what we record in
@@ -237,6 +267,8 @@ mod tests {
             sender_agent_id: "ai:fed-test".to_string(),
             api_key: None,
             signing_key: None,
+            #[cfg(feature = "sal")]
+            dlq_sink: None,
         }
     }
 
@@ -1416,6 +1448,8 @@ mod tests {
             sender_agent_id: "ai:catchup-test".to_string(),
             api_key: None,
             signing_key: None,
+            #[cfg(feature = "sal")]
+            dlq_sink: None,
         }
     }
 
@@ -1942,6 +1976,8 @@ mod tests {
             sender_agent_id: "ai:no-peers".to_string(),
             api_key: None,
             signing_key: None,
+            #[cfg(feature = "sal")]
+            dlq_sink: None,
         };
         // Non-empty memories list — the shortcut should still fire because
         // the peer list is empty.
@@ -2207,6 +2243,8 @@ mod tests {
             sender_agent_id: "ai:no-suffix".to_string(),
             api_key: None,
             signing_key: None,
+            #[cfg(feature = "sal")]
+            dlq_sink: None,
         };
         let db = build_test_db();
         catchup_once(&cfg, &db).await;

@@ -146,6 +146,14 @@ impl FederationConfig {
             sender_agent_id,
             api_key,
             signing_key,
+            // v0.7.0 Track D #933 — federation push DLQ sink is
+            // populated by the daemon bootstrap AFTER the SAL store
+            // handle resolves (see `daemon_runtime.rs`). The build()
+            // path here returns `None` so an `ai-memory serve`
+            // invocation that never bootstraps a store (none today;
+            // belt-and-braces) doesn't trip a half-wired DLQ.
+            #[cfg(feature = "sal")]
+            dlq_sink: None,
         }))
     }
 

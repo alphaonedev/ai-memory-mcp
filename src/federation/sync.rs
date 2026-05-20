@@ -288,6 +288,14 @@ pub async fn broadcast_store_quorum(
     });
 
     let mut joins: JoinSet<(String, AckOutcome)> = JoinSet::new();
+    // v0.7.0 Track D #933 — collect the set of peer ids that were
+    // dispatched so the DLQ landing pass at the bottom of this
+    // function can compute "configured ∖ acked = silently-failed"
+    // independent of whether each task reported a Fail outcome
+    // (deadline-evicted tasks never report; pre-#933 they were
+    // silently lost).
+    #[cfg(feature = "sal")]
+    let dispatched_peer_ids: Vec<String> = config.peers.iter().map(|p| p.id.clone()).collect();
     for peer in &config.peers {
         let client = config.client.clone();
         let url = peer.sync_push_url.clone();
@@ -311,6 +319,15 @@ pub async fn broadcast_store_quorum(
         });
     }
 
+    // v0.7.0 Track D #933 — track per-peer outcomes observed inside
+    // the deadline so the DLQ landing pass at the bottom can tell
+    // (a) acked peers (skip), (b) explicit-fail peers (DLQ with the
+    // failure reason), and (c) deadline-evicted peers (no outcome
+    // observed; DLQ with "deadline" as the failure reason). Pre-#933
+    // the (c) bucket was silently lost.
+    #[cfg(feature = "sal")]
+    let mut explicit_failures: Vec<(String, String)> = Vec::new();
+
     // Deadline is computed ONCE here and never re-derived inside the
     // loop. The tracker carries the same deadline internally — passing
     // a single `Instant` through avoids the few-millisecond disagreement
@@ -331,6 +348,12 @@ pub async fn broadcast_store_quorum(
             }
             Ok(Some(Ok((peer_id, AckOutcome::Fail(reason))))) => {
                 tracing::warn!("federation: peer {peer_id} failed for {}: {reason}", mem.id);
+                #[cfg(feature = "sal")]
+                explicit_failures.push((peer_id.clone(), reason.clone()));
+                #[cfg(not(feature = "sal"))]
+                {
+                    let _ = (peer_id, reason);
+                }
             }
             Ok(Some(Err(e))) => {
                 tracing::warn!("federation: peer join error: {e}");
@@ -435,6 +458,61 @@ pub async fn broadcast_store_quorum(
             crate::metrics::registry()
                 .federation_partial_quorum_total
                 .inc();
+        }
+    }
+
+    // v0.7.0 Track D #933 — federation push DLQ landing. For every
+    // configured peer that did NOT ack inside the deadline (including
+    // explicit Fail outcomes AND deadline-evicted tasks whose outcome
+    // was never observed), insert a `federation_push_dlq` row so the
+    // `replay_federation_push_dlq` worker can re-attempt the push on
+    // peer recovery. Pre-#933 these failures were silently lost — see
+    // the issue body for the full RCA + reproduction.
+    //
+    // Best-effort: a sink error never propagates because the local
+    // commit already succeeded and the quorum verdict is already
+    // computed. Operators observe sink-side errors via the
+    // tracing::warn line below + the gauge.
+    //
+    // Feature-gated to `--features sal` because the trait surface
+    // requires `async-trait`. The default (sqlite-only) build path
+    // never reaches this branch and pre-#933 behaviour is preserved.
+    #[cfg(feature = "sal")]
+    if let Some(sink) = config.dlq_sink.as_ref() {
+        let acked = tracker.acked_peer_ids();
+        let explicit_map: std::collections::HashMap<String, String> =
+            explicit_failures.into_iter().collect();
+        for peer_id in &dispatched_peer_ids {
+            if acked.contains(peer_id) {
+                continue;
+            }
+            let reason = explicit_map
+                .get(peer_id)
+                .cloned()
+                .unwrap_or_else(|| "deadline_exceeded".to_string());
+            if let Err(e) = sink
+                .enqueue_push_failure(&mem.id, peer_id, &body, &reason)
+                .await
+            {
+                tracing::warn!(
+                    target: "ai_memory::federation::push_dlq",
+                    memory_id = %mem.id,
+                    peer_id = %peer_id,
+                    "federation: failed to enqueue push-failure DLQ row \
+                     for peer {peer_id} on memory {}: {e}",
+                    mem.id,
+                );
+            } else {
+                tracing::info!(
+                    target: "ai_memory::federation::push_dlq",
+                    memory_id = %mem.id,
+                    peer_id = %peer_id,
+                    reason = %reason,
+                    "federation: enqueued push-failure DLQ row for peer {peer_id} \
+                     on memory {} (reason: {reason})",
+                    mem.id,
+                );
+            }
         }
     }
     Ok(tracker)
