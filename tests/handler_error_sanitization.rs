@@ -278,6 +278,25 @@ async fn bulk_create_with_invalid_row_returns_sanitized_errors() {
 
 #[tokio::test]
 async fn forget_with_no_filters_returns_safe_sentinel() {
+    // v0.7.0 #942 (Track A QC sweep, 2026-05-20) gated
+    // POST /api/v1/forget on the admin allowlist. The default
+    // `build_router()` fixture seeds an EMPTY admin_agent_ids list
+    // (safe-by-default closed posture), so any caller — including
+    // the no-X-Agent-Id case below — is rejected by the admin gate
+    // BEFORE reaching the substrate's "at least one of namespace,
+    // pattern, or tier is required" validation sentinel. The
+    // no-leaks invariant the test pins still holds against the
+    // admin-gate envelope: the 403 body is the sanitised
+    // `{"error": "admin role required"}` shape from
+    // `handlers::admin_role::require_admin`, which is itself a
+    // safe sentinel (no SQL, no path, no anyhow trace).
+    //
+    // The validation-layer sentinel (BAD_REQUEST + "at least one
+    // of namespace") is covered by the in-process unit tests under
+    // `src/handlers/tests.rs::http_forget_*` which use the
+    // `test_app_state_with_admin` helper to seed an admin caller +
+    // get past the gate. This integration test pins the OUTER gate
+    // shape — same no-leak invariant, different status code.
     let router = build_router();
     let body = json!({});
     let req = Request::builder()
@@ -287,15 +306,9 @@ async fn forget_with_no_filters_returns_safe_sentinel() {
         .body(Body::from(body.to_string()))
         .unwrap();
     let (status, body) = run_request(router, req).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(status, StatusCode::FORBIDDEN);
     assert_error_envelope("forget_with_no_filters", &body);
     assert_no_leaks("forget_with_no_filters", &body);
-    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-    let msg = parsed["error"].as_str().unwrap_or_default();
-    assert!(
-        msg.contains("at least one of namespace"),
-        "expected the safe sentinel for the no-filters case, got: {msg}"
-    );
 }
 
 // -------------------------------------------------------------------------
