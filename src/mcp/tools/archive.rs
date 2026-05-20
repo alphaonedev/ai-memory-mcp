@@ -36,6 +36,38 @@ pub(super) fn handle_archive_purge(
 ) -> Result<Value, String> {
     let older_than_days = params["older_than_days"].as_i64();
 
+    // #913 (security-medium / SOC2, 2026-05-19) — admin/destructive
+    // state-change audit. Archive purge permanently deletes archived
+    // memories; emit the forensic-chain row BEFORE the storage write
+    // so the audit trail captures intent regardless of downstream
+    // permission-gate / storage outcome. Mirrors the #911 HTTP
+    // `purge_archive` fix.
+    let caller = crate::identity::resolve_agent_id(params["agent_id"].as_str(), None)
+        .unwrap_or_else(|_| "anonymous:invalid".to_string());
+    // #936 (security-critical, 2026-05-20) — MCP-side owner gate.
+    // The MCP entry is a second attack surface for the same gap the
+    // HTTP `purge_archive` handler had: pre-#936 the dispatch reached
+    // `db::purge_archive` with no caller, deleting every owner's
+    // archived rows. The MCP tool surface gets the same posture as
+    // the HTTP handler: owner-scoped by default; cross-tenant wipe
+    // requires the explicit `as_admin: true` parameter (no separate
+    // MCP-side admin-config block today — operators use either the
+    // CLI or the HTTP admin allowlist for cross-tenant deletes).
+    let as_admin = params
+        .get("as_admin")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    crate::governance::audit::record_decision(
+        &caller,
+        "allow",
+        "archive_purge",
+        "",
+        json!({
+            "older_than_days": older_than_days,
+            "owner_scope": if as_admin { "admin" } else { "caller" },
+        }),
+    );
+
     // v0.7.0 K9 — unified permission pipeline (archive-side).
     // Archive purge is a destructive across-namespace operation; we
     // evaluate against the global namespace + caller's agent_id.
@@ -48,12 +80,19 @@ pub(super) fn handle_archive_purge(
             op: Op::MemoryArchive,
             namespace: "global".to_string(),
             agent_id,
-            payload: json!({"older_than_days": older_than_days}),
+            payload: json!({
+                "older_than_days": older_than_days,
+                "as_admin": as_admin,
+            }),
         };
         match Permissions::evaluate(&ctx, &[]) {
             crate::permissions::Decision::Allow | crate::permissions::Decision::Modify(_) => {}
             crate::permissions::Decision::Deny(reason) => {
-                return Err(format!("archive denied by permission rule: {reason}"));
+                return Err(crate::governance::deny_message(
+                    "archive",
+                    crate::governance::DenyGate::PermissionRule,
+                    &reason,
+                ));
             }
             crate::permissions::Decision::Ask(prompt) => {
                 return Ok(json!({
@@ -65,8 +104,15 @@ pub(super) fn handle_archive_purge(
         }
     }
 
-    let purged = db::purge_archive(conn, older_than_days).map_err(|e| e.to_string())?;
-    Ok(json!({"purged": purged}))
+    let purged = if as_admin {
+        db::purge_archive(conn, older_than_days).map_err(|e| e.to_string())?
+    } else {
+        db::purge_archive_for_caller(conn, &caller, older_than_days).map_err(|e| e.to_string())?
+    };
+    Ok(json!({
+        "purged": purged,
+        "owner_scope": if as_admin { "admin" } else { "caller" },
+    }))
 }
 
 pub(super) fn handle_archive_stats(conn: &rusqlite::Connection) -> Result<Value, String> {

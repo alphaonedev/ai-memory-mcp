@@ -103,11 +103,12 @@ pub fn enforce(
         payload,
     )? {
         GovernanceDecision::Allow => Ok(GovernanceOutcome::Allow),
-        GovernanceDecision::Deny(reason) => {
+        GovernanceDecision::Deny(refusal) => {
             writeln!(
                 out.stderr,
                 "{} denied by governance: {reason}",
-                action.as_str()
+                action.as_str(),
+                reason = refusal.reason,
             )?;
             Ok(GovernanceOutcome::Deny)
         }
@@ -161,7 +162,7 @@ pub fn enforce(
 mod tests {
     use super::*;
     use crate::cli::test_utils::{TestEnv, seed_memory};
-    use crate::models::{ApproverType, GovernanceLevel, GovernancePolicy};
+    use crate::models::{ApproverType, CorePolicy, GovernanceLevel, GovernancePolicy};
 
     /// v0.7.0 K3 — pin the gate to Enforce so this suite's
     /// historical Pending/Deny outcome assertions still drive the
@@ -224,6 +225,7 @@ mod tests {
             confidence_source: crate::models::ConfidenceSource::CallerProvided,
             confidence_signals: None,
             confidence_decayed_at: None,
+            version: 1,
         };
         let standard_id = db::insert(&conn, &standard).unwrap();
         db::set_namespace_standard(&conn, namespace, &standard_id, None).unwrap();
@@ -263,26 +265,15 @@ mod tests {
         let mut env = TestEnv::fresh();
         let db_path = env.db_path.clone();
         let policy = GovernancePolicy {
-            write: GovernanceLevel::Approve,
-            promote: GovernanceLevel::Any,
-            delete: GovernanceLevel::Owner,
-            approver: ApproverType::Human,
-            inherit: true,
-            max_reflection_depth: None,
-            auto_export_reflections_to_filesystem: None,
-            auto_atomise: None,
-            auto_atomise_threshold_cl100k: None,
-            auto_atomise_max_atom_tokens: None,
-            auto_atomise_max_retries: None,
-            auto_persona_trigger_every_n_memories: None,
-            auto_export_personas_to_filesystem: None,
-            auto_atomise_mode: None,
-            legacy_per_pair_classifier: None,
-            auto_classify_kind: None,
-            synthesis_failure_mode: None,
-            synthesis_max_deletes_per_call: None,
-            synthesis_max_candidate_chars: None,
-            multistep_max_content_chars: None,
+            core: CorePolicy {
+                write: GovernanceLevel::Approve,
+                promote: GovernanceLevel::Any,
+                delete: GovernanceLevel::Owner,
+                approver: ApproverType::Human,
+                inherit: true,
+                max_reflection_depth: None,
+            },
+            ..Default::default()
         };
         seed_governance_policy(&db_path, "gov-ns", policy, "alice");
         let conn = db::open(&db_path).unwrap();
@@ -315,26 +306,15 @@ mod tests {
         let mut env = TestEnv::fresh();
         let db_path = env.db_path.clone();
         let policy = GovernancePolicy {
-            write: GovernanceLevel::Any,
-            promote: GovernanceLevel::Any,
-            delete: GovernanceLevel::Approve,
-            approver: ApproverType::Human,
-            inherit: true,
-            max_reflection_depth: None,
-            auto_export_reflections_to_filesystem: None,
-            auto_atomise: None,
-            auto_atomise_threshold_cl100k: None,
-            auto_atomise_max_atom_tokens: None,
-            auto_atomise_max_retries: None,
-            auto_persona_trigger_every_n_memories: None,
-            auto_export_personas_to_filesystem: None,
-            auto_atomise_mode: None,
-            legacy_per_pair_classifier: None,
-            auto_classify_kind: None,
-            synthesis_failure_mode: None,
-            synthesis_max_deletes_per_call: None,
-            synthesis_max_candidate_chars: None,
-            multistep_max_content_chars: None,
+            core: CorePolicy {
+                write: GovernanceLevel::Any,
+                promote: GovernanceLevel::Any,
+                delete: GovernanceLevel::Approve,
+                approver: ApproverType::Human,
+                inherit: true,
+                max_reflection_depth: None,
+            },
+            ..Default::default()
         };
         seed_governance_policy(&db_path, "gov-ns", policy, "alice");
         let conn = db::open(&db_path).unwrap();
@@ -372,26 +352,15 @@ mod tests {
         let mut env = TestEnv::fresh();
         let db_path = env.db_path.clone();
         let policy = GovernancePolicy {
-            write: GovernanceLevel::Any,
-            promote: GovernanceLevel::Any,
-            delete: GovernanceLevel::Owner,
-            approver: ApproverType::Human,
-            inherit: true,
-            max_reflection_depth: None,
-            auto_export_reflections_to_filesystem: None,
-            auto_atomise: None,
-            auto_atomise_threshold_cl100k: None,
-            auto_atomise_max_atom_tokens: None,
-            auto_atomise_max_retries: None,
-            auto_persona_trigger_every_n_memories: None,
-            auto_export_personas_to_filesystem: None,
-            auto_atomise_mode: None,
-            legacy_per_pair_classifier: None,
-            auto_classify_kind: None,
-            synthesis_failure_mode: None,
-            synthesis_max_deletes_per_call: None,
-            synthesis_max_candidate_chars: None,
-            multistep_max_content_chars: None,
+            core: CorePolicy {
+                write: GovernanceLevel::Any,
+                promote: GovernanceLevel::Any,
+                delete: GovernanceLevel::Owner,
+                approver: ApproverType::Human,
+                inherit: true,
+                max_reflection_depth: None,
+            },
+            ..Default::default()
         };
         seed_governance_policy(&db_path, "gov-ns", policy, "alice");
         let conn = db::open(&db_path).unwrap();
@@ -428,26 +397,15 @@ mod tests {
         let mut env = TestEnv::fresh();
         let db_path = env.db_path.clone();
         let policy = GovernancePolicy {
-            write: GovernanceLevel::Registered,
-            promote: GovernanceLevel::Any,
-            delete: GovernanceLevel::Owner,
-            approver: ApproverType::Human,
-            inherit: true,
-            max_reflection_depth: None,
-            auto_export_reflections_to_filesystem: None,
-            auto_atomise: None,
-            auto_atomise_threshold_cl100k: None,
-            auto_atomise_max_atom_tokens: None,
-            auto_atomise_max_retries: None,
-            auto_persona_trigger_every_n_memories: None,
-            auto_export_personas_to_filesystem: None,
-            auto_atomise_mode: None,
-            legacy_per_pair_classifier: None,
-            auto_classify_kind: None,
-            synthesis_failure_mode: None,
-            synthesis_max_deletes_per_call: None,
-            synthesis_max_candidate_chars: None,
-            multistep_max_content_chars: None,
+            core: CorePolicy {
+                write: GovernanceLevel::Registered,
+                promote: GovernanceLevel::Any,
+                delete: GovernanceLevel::Owner,
+                approver: ApproverType::Human,
+                inherit: true,
+                max_reflection_depth: None,
+            },
+            ..Default::default()
         };
         seed_governance_policy(&db_path, "gov-ns", policy, "alice");
         let conn = db::open(&db_path).unwrap();
@@ -481,26 +439,15 @@ mod tests {
         let mut env = TestEnv::fresh();
         let db_path = env.db_path.clone();
         let policy = GovernancePolicy {
-            write: GovernanceLevel::Approve,
-            promote: GovernanceLevel::Any,
-            delete: GovernanceLevel::Owner,
-            approver: ApproverType::Human,
-            inherit: true,
-            max_reflection_depth: None,
-            auto_export_reflections_to_filesystem: None,
-            auto_atomise: None,
-            auto_atomise_threshold_cl100k: None,
-            auto_atomise_max_atom_tokens: None,
-            auto_atomise_max_retries: None,
-            auto_persona_trigger_every_n_memories: None,
-            auto_export_personas_to_filesystem: None,
-            auto_atomise_mode: None,
-            legacy_per_pair_classifier: None,
-            auto_classify_kind: None,
-            synthesis_failure_mode: None,
-            synthesis_max_deletes_per_call: None,
-            synthesis_max_candidate_chars: None,
-            multistep_max_content_chars: None,
+            core: CorePolicy {
+                write: GovernanceLevel::Approve,
+                promote: GovernanceLevel::Any,
+                delete: GovernanceLevel::Owner,
+                approver: ApproverType::Human,
+                inherit: true,
+                max_reflection_depth: None,
+            },
+            ..Default::default()
         };
         seed_governance_policy(&db_path, "gov-ns", policy, "alice");
         let conn = db::open(&db_path).unwrap();

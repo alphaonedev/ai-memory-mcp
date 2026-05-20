@@ -131,12 +131,29 @@ impl FederationConfig {
             .build()
             .map_err(|e| anyhow::anyhow!("build federation client: {e}"))?;
 
+        // v0.7.0 #791 — load the daemon's Ed25519 signing key (no-op
+        // stub here; the full #697 audit/identity module loads from
+        // disk). NON-FATAL: peers running `AI_MEMORY_FED_REQUIRE_SIG=0`
+        // accept unsigned posts even when the signing key is missing.
+        let signing_key = crate::governance::audit::load_daemon_signing_key(&sender_agent_id)
+            .ok()
+            .flatten()
+            .map(std::sync::Arc::new);
         Ok(Some(Self {
             policy,
             peers,
             client,
             sender_agent_id,
             api_key,
+            signing_key,
+            // v0.7.0 Track D #933 — federation push DLQ sink is
+            // populated by the daemon bootstrap AFTER the SAL store
+            // handle resolves (see `daemon_runtime.rs`). The build()
+            // path here returns `None` so an `ai-memory serve`
+            // invocation that never bootstraps a store (none today;
+            // belt-and-braces) doesn't trip a half-wired DLQ.
+            #[cfg(feature = "sal")]
+            dlq_sink: None,
         }))
     }
 

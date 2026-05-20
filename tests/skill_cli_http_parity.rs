@@ -100,9 +100,18 @@ fn build_router_with_db_path(db_path: &std::path::Path) -> (axum::Router, ai_mem
         llm_call_timeout: std::time::Duration::from_secs(30),
         replay_cache: std::sync::Arc::new(ai_memory::identity::replay::ReplayCache::default()),
         verify_require_nonce: false,
+        federation_nonce_cache: std::sync::Arc::new(
+            ai_memory::identity::replay::FederationNonceCache::default(),
+        ),
         autonomous_hooks: false,
         recall_scope: std::sync::Arc::new(None),
         deferred_audit_queue: std::sync::Arc::new(None),
+        // v0.7.0 #949 (Track A QC sweep, 2026-05-20) — every skill
+        // HTTP route is now admin-only. Seed the test allowlist with
+        // `ops:admin`; tests issue `X-Agent-Id: ops:admin` to traverse
+        // the gate. Mirrors the collateral test-fixture update df7f72545
+        // applied for the #957 `export_memories` admin gate.
+        admin_agent_ids: std::sync::Arc::new(vec!["ops:admin".to_string()]),
     };
     let api_key_state = ai_memory::handlers::ApiKeyState {
         key: None,
@@ -147,6 +156,7 @@ async fn http_skill_register_route_returns_200() {
         .method(Method::POST)
         .uri("/api/v1/skill/register")
         .header("content-type", "application/json")
+        .header("x-agent-id", "ops:admin")
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap();
     let resp = router.oneshot(req).await.unwrap();
@@ -165,6 +175,7 @@ async fn http_skill_list_route_returns_seeded_skill() {
     let req = Request::builder()
         .method(Method::GET)
         .uri("/api/v1/skill/list?namespace=testns")
+        .header("x-agent-id", "ops:admin")
         .body(Body::empty())
         .unwrap();
     let resp = router.oneshot(req).await.unwrap();
@@ -185,6 +196,7 @@ async fn http_skill_get_route_returns_body() {
     let req = Request::builder()
         .method(Method::GET)
         .uri(format!("/api/v1/skill/{id}"))
+        .header("x-agent-id", "ops:admin")
         .body(Body::empty())
         .unwrap();
     let resp = router.oneshot(req).await.unwrap();
@@ -207,6 +219,7 @@ async fn http_skill_get_route_returns_404_on_unknown_id() {
     let req = Request::builder()
         .method(Method::GET)
         .uri("/api/v1/skill/no-such-skill-id")
+        .header("x-agent-id", "ops:admin")
         .body(Body::empty())
         .unwrap();
     let resp = router.oneshot(req).await.unwrap();
@@ -225,6 +238,7 @@ async fn http_skill_export_route_writes_skill_md() {
         .method(Method::POST)
         .uri(format!("/api/v1/skill/{id}/export"))
         .header("content-type", "application/json")
+        .header("x-agent-id", "ops:admin")
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap();
     let resp = router.oneshot(req).await.unwrap();
@@ -246,6 +260,7 @@ async fn http_skill_compose_route_returns_body_only_for_non_composing_skill() {
         .method(Method::POST)
         .uri(format!("/api/v1/skill/{id}/compose"))
         .header("content-type", "application/json")
+        .header("x-agent-id", "ops:admin")
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap();
     let resp = router.oneshot(req).await.unwrap();
@@ -268,6 +283,7 @@ async fn http_skill_resource_route_404_on_missing() {
         .uri(format!(
             "/api/v1/skill/{id}/resource?path=scripts/nothing.sh"
         ))
+        .header("x-agent-id", "ops:admin")
         .body(Body::empty())
         .unwrap();
     let resp = router.oneshot(req).await.unwrap();
@@ -290,6 +306,7 @@ async fn http_skill_promote_route_rejects_non_reflection_400() {
         .method(Method::POST)
         .uri("/api/v1/skill/no-such-reflection/promote")
         .header("content-type", "application/json")
+        .header("x-agent-id", "ops:admin")
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap();
     let resp = router.oneshot(req).await.unwrap();

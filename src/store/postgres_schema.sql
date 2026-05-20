@@ -166,7 +166,15 @@ CREATE TABLE IF NOT EXISTS memories (
     -- direction (the entity a non-persona row mentions). Fresh
     -- schemas carry this inline; existing schemas pick it up via
     -- migrate_v41().
-    mentioned_entity_id   TEXT
+    mentioned_entity_id   TEXT,
+    -- v0.7.0 Provenance Gap 1 (schema v42 postgres / v45 sqlite, issue
+    -- #884) — optimistic-concurrency counter. Bumped on every mutation
+    -- by `PostgresStore::update_with_expected_version`; concurrent
+    -- updates pass `expected_version` and receive a typed
+    -- `VersionConflict` envelope when the stored version has drifted.
+    -- Fresh schemas carry this inline; existing schemas pick it up via
+    -- migrate_v42().
+    version               BIGINT NOT NULL DEFAULT 1
 );
 
 -- v0.6.0 blocker #294 fix: upsert contract is `(title, namespace)`.
@@ -198,42 +206,28 @@ CREATE INDEX IF NOT EXISTS idx_memories_embedding_dim
 CREATE INDEX IF NOT EXISTS idx_memories_ns_dim
     ON memories (namespace, embedding_dim)
     WHERE embedding_dim IS NOT NULL;
--- v0.7.0 WT-1-A — atomisation partial indexes. Restricted predicates
--- keep the index footprint on legacy databases at zero (every row has
--- NULL until WT-1-B starts minting atoms).
-CREATE INDEX IF NOT EXISTS idx_memories_atom_of
-    ON memories(atom_of) WHERE atom_of IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_memories_atomised_into
-    ON memories(atomised_into) WHERE atomised_into > 0;
--- v0.7.0 QW-2 (schema v36 postgres / v37 sqlite) — partial index covering
--- per-entity persona lookups. Persona rows are a small minority of the
--- table; the partial predicate keeps the index footprint minimal on
--- observation/reflection-dominant workloads.
-CREATE INDEX IF NOT EXISTS idx_personas_by_entity
-    ON memories(entity_id, namespace) WHERE memory_kind = 'persona';
--- v0.7.0 polish PERF-8 (schema v41 postgres / v42 sqlite, issue #781)
--- — partial index covering the auto-persona matcher's
--- `WHERE memory_kind = 'reflection' AND mentioned_entity_id = ? AND
--- namespace = ?` lookup. Partial predicate is the literal
--- `memory_kind = 'reflection'` so the planner picks the partial index
--- deterministically; non-reflection rows contribute zero index pages.
-CREATE INDEX IF NOT EXISTS idx_memories_mentioned_entity
-    ON memories(mentioned_entity_id, namespace) WHERE memory_kind = 'reflection';
--- v0.7.0 Form 4 (schema v37 postgres / v38 sqlite) — partial index
--- covering the `--source-uri-prefix` recall filter. Legacy rows
--- have NULL `source_uri` so the partial predicate keeps the index
--- footprint at zero on every pre-v37 database.
-CREATE INDEX IF NOT EXISTS idx_memories_source_uri
-    ON memories(source_uri) WHERE source_uri IS NOT NULL;
--- v0.7.0 Form 5 (schema v38 postgres / v39 sqlite) — partial index
--- covering rows whose `confidence_source` is NOT the (overwhelming-
--- majority) `caller_provided` bucket. The calibration CLI scans this
--- slice to enumerate derived / calibrated / decayed rows; the partial
--- predicate keeps the index footprint on legacy DBs at zero until the
--- auto-confidence engine starts writing.
-CREATE INDEX IF NOT EXISTS idx_memories_confidence_source
-    ON memories(confidence_source)
-    WHERE confidence_source != 'caller_provided';
+-- Partial indexes that reference columns ALTER-added by the migrate
+-- ladder (`atom_of` / `atomised_into` v35 postgres ↔ v36 sqlite;
+-- `entity_id` v36 ↔ v37; `source_uri` v37 ↔ v38; `confidence_source`
+-- v38 ↔ v39; `mentioned_entity_id` v41 ↔ v42) and the v40 compound
+-- shadow index referencing `confidence_shadow_observations.source` are
+-- NOT in this bootstrap (issue #797). They live exclusively in their
+-- migration .sql files (`migrations/postgres/0017_v07_atomisation.sql`,
+-- `0018_v07_persona.sql`, `0019_v07_form4_provenance.sql`,
+-- `0020_v07_form5_confidence_calibration.sql`,
+-- `0022_v07_shadow_retention.sql`,
+-- `0023_v07_auto_persona_entity_id.sql`) and run from the matching
+-- `migrate_vN` arms of `src/store/postgres.rs::migrate` AFTER the
+-- `ALTER TABLE memories ADD COLUMN IF NOT EXISTS` that adds the
+-- referenced column.
+--
+-- `PostgresStore::connect` applies this bootstrap before `migrate`, so
+-- any `CREATE INDEX` here referencing a v35+ column would crash on a
+-- legacy DB whose pre-existing `memories` table makes the `CREATE TABLE
+-- IF NOT EXISTS` above a no-op (the new columns never land). Fresh
+-- installs are unaffected: the `CREATE TABLE` above carries every
+-- v41-era column, then every `if current_version < N` arm runs its
+-- (idempotent) .sql file to attach the partial index.
 
 -- v0.7.0 Form 5 — per-recall shadow-mode telemetry. Populated when
 -- AI_MEMORY_CONFIDENCE_SHADOW=1 and sampled at
@@ -261,8 +255,10 @@ CREATE INDEX IF NOT EXISTS idx_shadow_obs_observed_at
     ON confidence_shadow_observations(observed_at);
 CREATE INDEX IF NOT EXISTS idx_shadow_obs_memory
     ON confidence_shadow_observations(memory_id);
-CREATE INDEX IF NOT EXISTS idx_shadow_obs_namespace_source_observed
-    ON confidence_shadow_observations(namespace, source, observed_at);
+-- `idx_shadow_obs_namespace_source_observed` references the v40
+-- `confidence_shadow_observations.source` column and lives in
+-- `migrations/postgres/0022_v07_shadow_retention.sql` (see #797
+-- comment block above).
 
 -- Full-text search. English stemming; matches the SQLite FTS5 setup.
 CREATE INDEX IF NOT EXISTS memories_content_fts ON memories
@@ -607,6 +603,40 @@ CREATE INDEX IF NOT EXISTS idx_signed_events_dlq_agent
     ON signed_events_dlq(agent_id);
 
 -- ─────────────────────────────────────────────────────────────────────
+-- federation_push_dlq — quorum-broadcast fanout dead-letter queue
+-- (v0.7.0 Track D #933, schema v48 Postgres + SQLite shared bump).
+--
+-- Mirrors `migrations/postgres/0030_v07_federation_push_dlq.sql`. See
+-- the migration file for the full design rationale (every per-peer
+-- fanout failure inside `broadcast_store_quorum` lands a row; the
+-- `replay_federation_push_dlq` worker spawned alongside the catchup
+-- loop polls every N seconds, re-attempts `post_once`, and stamps
+-- `replayed_at` on Ack). NOT a FK to `memories(id)` so the DLQ
+-- survives memory-row lifecycle (we want fanout-failure audit even
+-- if the source row is later deleted).
+-- ─────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS federation_push_dlq (
+    id             BIGSERIAL PRIMARY KEY,
+    memory_id      TEXT NOT NULL,
+    peer_id        TEXT NOT NULL,
+    payload_json   JSONB NOT NULL,
+    attempt_count  INTEGER NOT NULL DEFAULT 1,
+    last_error     TEXT NOT NULL,
+    failed_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    replayed_at    TIMESTAMPTZ NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_federation_push_dlq_pending_failed_at
+    ON federation_push_dlq(failed_at)
+    WHERE replayed_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_federation_push_dlq_peer_pending
+    ON federation_push_dlq(peer_id)
+    WHERE replayed_at IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_federation_push_dlq_pending_uniq
+    ON federation_push_dlq(memory_id, peer_id)
+    WHERE replayed_at IS NULL;
+
+-- ─────────────────────────────────────────────────────────────────────
 -- subscription_events / subscription_dlq — A2A correlation IDs, ACK
 -- semantics, retry, and dead-letter queue (v0.7.0 K6, schema v27).
 --
@@ -684,6 +714,36 @@ CREATE TABLE IF NOT EXISTS agent_quotas (
 -- mirrors the SQLite rationale for the same redundant index.
 CREATE INDEX IF NOT EXISTS idx_agent_quotas_agent_id
     ON agent_quotas (agent_id);
+
+-- ─────────────────────────────────────────────────────────────────────
+-- recall_observations — v0.7.0 Gap 3 (issue #886, schema v44 postgres /
+-- v47 sqlite) — append-only ledger keyed by `(recall_id, memory_id)`
+-- carrying retriever / rank / score plus the consumed_at +
+-- consumed_by_memory_id columns that flip TRUE when a downstream
+-- `memory_store` or `memory_link` request cites a prior recall_id.
+-- Mirrors `migrations/sqlite/0038_v07_recall_observations.sql`. Fresh
+-- schemas carry this inline; existing schemas pick it up via
+-- migrate_v44().
+-- ─────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS recall_observations (
+    recall_id              TEXT        NOT NULL,
+    memory_id              TEXT        NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    retriever              TEXT        NOT NULL,
+    rank                   BIGINT      NOT NULL,
+    score                  DOUBLE PRECISION NOT NULL,
+    consumed               BOOLEAN     NOT NULL DEFAULT FALSE,
+    observed_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    consumed_at            TIMESTAMPTZ NULL,
+    consumed_by_memory_id  TEXT        NULL REFERENCES memories(id) ON DELETE CASCADE,
+    PRIMARY KEY (recall_id, memory_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_recall_observations_recall_id
+    ON recall_observations(recall_id);
+CREATE INDEX IF NOT EXISTS idx_recall_observations_memory_id
+    ON recall_observations(memory_id);
+CREATE INDEX IF NOT EXISTS idx_recall_observations_observed_at
+    ON recall_observations(observed_at);
 
 -- ─────────────────────────────────────────────────────────────────────
 -- F6 Gap 1 (v0.7.0) — SAL knowledge-graph SQL views.

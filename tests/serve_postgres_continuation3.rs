@@ -37,14 +37,8 @@ use ai_memory::store::postgres::PostgresStore;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, Notify, RwLock};
 
-fn postgres_url() -> Option<String> {
-    std::env::var("AI_MEMORY_TEST_POSTGRES_URL").ok()
-}
-
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
-    listener.local_addr().expect("local_addr").port()
-}
+mod common;
+use common::{free_port, pg_test_client, postgres_url};
 
 async fn build_postgres_app_state(url: &str) -> AppState {
     let conn = ai_memory::db::open(std::path::Path::new(":memory:")).expect("scratch sqlite");
@@ -74,9 +68,19 @@ async fn build_postgres_app_state(url: &str) -> AppState {
         replay_cache: std::sync::Arc::new(ai_memory::identity::replay::ReplayCache::default()),
 
         verify_require_nonce: false,
+        federation_nonce_cache: std::sync::Arc::new(
+            ai_memory::identity::replay::FederationNonceCache::default(),
+        ),
         autonomous_hooks: false,
         recall_scope: Arc::new(None),
         deferred_audit_queue: Arc::new(None),
+        // #957 (security-critical, 2026-05-20) — `/api/v1/export`
+        // is admin-gated. Pre-seed the test's pg_test_client
+        // agent id as admin so the continuation-3 export test
+        // (and any future admin-class endpoint tests) can drive
+        // the happy path. The role-gate semantic itself is
+        // covered by `tests/export_memories_admin_gate_957.rs`.
+        admin_agent_ids: Arc::new(vec!["ai:cont3-test".to_string()]),
     }
 }
 
@@ -134,7 +138,7 @@ async fn store_memory(
         "tags": [],
         "priority": 5,
         "confidence": 1.0,
-        "source": "continuation3-test",
+        "source": "import",
     });
     let resp = client
         .post(format!("{base}/api/v1/memories"))
@@ -159,7 +163,7 @@ async fn forget_by_namespace_via_sal() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:cont3-test");
     let ns = format!("forget-ns-{}", uuid::Uuid::new_v4());
     for i in 0..3 {
         store_memory(&client, &base, &ns, &format!("forget-mem-{i}")).await;
@@ -185,7 +189,7 @@ async fn forget_no_filter_returns_400_via_sal() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:cont3-test");
     let resp = client
         .post(format!("{base}/api/v1/forget"))
         .json(&json!({}))
@@ -210,7 +214,19 @@ async fn consolidate_preserves_provenance_via_sal() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    // v0.7.0 QC P1 (2026-05-20): consolidation now correctly enforces
+    // the SAL #910 scope=private visibility filter on source reads
+    // (no more `for_admin` privacy escalation). All three sources +
+    // the consolidate call + the verify-GET must therefore share the
+    // SAME principal, otherwise the SAL `get()` returns NotFound and
+    // the handler 400s with "memory not found" on the first source.
+    // The pre-fix test scenario (3 distinct authors + 1 cross-author
+    // consolidator) requires an explicit admin role on the HTTP
+    // surface — tracked as a v0.7.1+ enhancement. For v0.7.0 the
+    // mechanical provenance contract is exercised with a single
+    // owner; `consolidated_from_agents` still lands as an array.
+    let bob = "consolidator-bob";
+    let client = pg_test_client(bob);
     let ns = format!("consolidate-{}", uuid::Uuid::new_v4());
     let mut ids = Vec::new();
     for i in 0..3 {
@@ -222,8 +238,7 @@ async fn consolidate_preserves_provenance_via_sal() {
             "tags": [],
             "priority": 5,
             "confidence": 1.0,
-            "source": "test",
-            "agent_id": format!("author-{i}"),
+            "source": "import",
         });
         let v: Value = client
             .post(format!("{base}/api/v1/memories"))
@@ -238,7 +253,6 @@ async fn consolidate_preserves_provenance_via_sal() {
     }
     let resp = client
         .post(format!("{base}/api/v1/consolidate"))
-        .header("x-agent-id", "consolidator-bob")
         .json(&json!({
             "ids": ids,
             "title": "consolidated-summary",
@@ -262,8 +276,8 @@ async fn consolidate_preserves_provenance_via_sal() {
         .json()
         .await
         .expect("body");
-    let metadata = &got["metadata"];
-    assert_eq!(metadata["agent_id"], "consolidator-bob");
+    let metadata = &got["memory"]["metadata"];
+    assert_eq!(metadata["agent_id"], bob);
     assert!(
         metadata["consolidated_from_agents"].is_array(),
         "consolidated_from_agents must be present"
@@ -285,7 +299,7 @@ async fn detect_contradictions_synthesizes_pair_via_sal() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:cont3-test");
     let ns = format!("contradict-{}", uuid::Uuid::new_v4());
     for content in ["the answer is 42", "the answer is 7"] {
         let body = json!({
@@ -296,7 +310,7 @@ async fn detect_contradictions_synthesizes_pair_via_sal() {
             "tags": [],
             "priority": 5,
             "confidence": 1.0,
-            "source": "test",
+            "source": "import",
             "metadata": {"topic": "the-answer"},
         });
         client
@@ -336,7 +350,7 @@ async fn notify_lands_in_target_inbox_via_sal() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:cont3-test");
     let target = format!("target-{}", uuid::Uuid::new_v4());
     let resp = client
         .post(format!("{base}/api/v1/notify"))
@@ -369,7 +383,7 @@ async fn gc_clean_db_returns_zero_via_sal() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:cont3-test");
     let resp = client
         .post(format!("{base}/api/v1/gc"))
         .send()
@@ -395,7 +409,7 @@ async fn export_returns_full_envelope_via_sal() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:cont3-test");
     let ns = format!("export-{}", uuid::Uuid::new_v4());
     store_memory(&client, &base, &ns, "exportable-1").await;
     let resp = client
@@ -421,7 +435,7 @@ async fn import_lands_memories_via_sal() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:cont3-test");
     let ns = format!("import-{}", uuid::Uuid::new_v4());
     let now = chrono::Utc::now().to_rfc3339();
     let body = json!({
@@ -435,7 +449,7 @@ async fn import_lands_memories_via_sal() {
                 "tags": [],
                 "priority": 5,
                 "confidence": 1.0,
-                "source": "test",
+                "source": "import",
                 "access_count": 0,
                 "created_at": now,
                 "updated_at": now,
@@ -468,7 +482,7 @@ async fn archive_then_restore_via_sal() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:cont3-test");
     let ns = format!("archive-restore-{}", uuid::Uuid::new_v4());
     let id = store_memory(&client, &base, &ns, "round-trip").await;
 
@@ -505,7 +519,7 @@ async fn restore_missing_id_returns_404_via_sal() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:cont3-test");
     let bogus = uuid::Uuid::new_v4().to_string();
     let resp = client
         .post(format!("{base}/api/v1/archive/{bogus}/restore"))
@@ -528,24 +542,85 @@ async fn approve_unknown_pending_id_rejected_via_sal() {
         eprintln!("skipping approve_unknown_pending_id_rejected_via_sal");
         return;
     };
+    // S5-C1 (2026-05-13): /pending/approve is HMAC-gated. Set the
+    // process-wide secret + attach a valid signature so the test
+    // reaches the trait's governance_approve_with_consensus path.
+    let secret = "continuation3-approve-secret";
+    ai_memory::config::set_active_hooks_hmac_secret(Some(secret.to_string()));
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:cont3-test");
     let bogus = uuid::Uuid::new_v4().to_string();
+    let body = String::new();
+    let timestamp = chrono::Utc::now().timestamp().to_string();
+    let sig = sign_approval(secret, &timestamp, &bogus, &body);
     let resp = client
         .post(format!("{base}/api/v1/pending/{bogus}/approve"))
         .header("x-agent-id", "approver-alice")
+        .header("x-ai-memory-timestamp", &timestamp)
+        .header("x-ai-memory-signature", sig)
+        .body(body)
         .send()
         .await
         .expect("approve");
-    // The full state machine returns 403 (Rejected) for not-found
-    // pendings — the postgres branch surfaces it as a structured
-    // `approve rejected: pending action not found` envelope.
+    // Post-#857 product fix the postgres branch surfaces missing
+    // pending as StoreError::NotFound (404). Pre-fix it returned
+    // ApproveOutcome::Rejected (403). Test tolerates either.
     assert!(
         resp.status() == reqwest::StatusCode::FORBIDDEN
             || resp.status() == reqwest::StatusCode::NOT_FOUND
     );
+    ai_memory::config::set_active_hooks_hmac_secret(None);
     shutdown.notify_one();
     let _ = handle.await;
+}
+
+/// Compute the K7-style HMAC signature header value. Mirrors the
+/// helper in `serve_postgres_continuation2.rs`.
+fn sign_approval(secret: &str, timestamp: &str, pending_id: &str, body: &str) -> String {
+    use sha2::{Digest, Sha256};
+    fn sha256_hex(s: &str) -> String {
+        let mut h = Sha256::new();
+        h.update(s.as_bytes());
+        format!("{:x}", h.finalize())
+    }
+    fn hex_decode(s: &str) -> Option<Vec<u8>> {
+        if !s.len().is_multiple_of(2) {
+            return None;
+        }
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+            .collect()
+    }
+    fn hmac_sha256_hex(key_hex: &str, body: &str) -> String {
+        const BLOCK: usize = 64;
+        let key_bytes = hex_decode(key_hex).unwrap_or_else(|| key_hex.as_bytes().to_vec());
+        let mut key = key_bytes;
+        if key.len() > BLOCK {
+            let mut h = Sha256::new();
+            h.update(&key);
+            key = h.finalize().to_vec();
+        }
+        key.resize(BLOCK, 0);
+        let mut opad = [0x5cu8; BLOCK];
+        let mut ipad = [0x36u8; BLOCK];
+        for i in 0..BLOCK {
+            opad[i] ^= key[i];
+            ipad[i] ^= key[i];
+        }
+        let mut inner = Sha256::new();
+        inner.update(ipad);
+        inner.update(body.as_bytes());
+        let inner_digest = inner.finalize();
+        let mut outer = Sha256::new();
+        outer.update(opad);
+        outer.update(inner_digest);
+        format!("{:x}", outer.finalize())
+    }
+    let key_hash = sha256_hex(secret);
+    let canonical = format!("{timestamp}.POST.{pending_id}.{body}");
+    let sig = hmac_sha256_hex(&key_hash, &canonical);
+    format!("sha256={sig}")
 }
 
 /// Inheritance-chain walk on writes: a namespace with no policy lets
@@ -557,7 +632,7 @@ async fn inheritance_walk_no_policy_allows_via_sal() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:cont3-test");
     let ns = format!("ungoverned-{}", uuid::Uuid::new_v4());
     let body = json!({
         "tier": "long",
@@ -567,7 +642,7 @@ async fn inheritance_walk_no_policy_allows_via_sal() {
         "tags": [],
         "priority": 5,
         "confidence": 1.0,
-        "source": "test",
+        "source": "import",
     });
     let resp = client
         .post(format!("{base}/api/v1/memories"))

@@ -56,14 +56,8 @@ use ai_memory::store::postgres::PostgresStore;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, Notify, RwLock};
 
-fn postgres_url() -> Option<String> {
-    std::env::var("AI_MEMORY_TEST_POSTGRES_URL").ok()
-}
-
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
-    listener.local_addr().expect("local_addr").port()
-}
+mod common;
+use common::{free_port, pg_test_client, postgres_url};
 
 async fn build_postgres_app_state(url: &str) -> AppState {
     let conn = ai_memory::db::open(std::path::Path::new(":memory:")).expect("scratch sqlite");
@@ -93,9 +87,13 @@ async fn build_postgres_app_state(url: &str) -> AppState {
         replay_cache: std::sync::Arc::new(ai_memory::identity::replay::ReplayCache::default()),
 
         verify_require_nonce: false,
+        federation_nonce_cache: std::sync::Arc::new(
+            ai_memory::identity::replay::FederationNonceCache::default(),
+        ),
         autonomous_hooks: false,
         recall_scope: Arc::new(None),
         deferred_audit_queue: Arc::new(None),
+        admin_agent_ids: Arc::new(Vec::new()),
     }
 }
 
@@ -188,7 +186,7 @@ async fn s79_postgres_recall_or_style_returns_namespace_results() {
     };
 
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    let client = pg_test_client("ai:s79-test");
 
     // Per-test namespace so concurrent runs against a shared scratch DB
     // don't reuse memory ids.

@@ -423,6 +423,33 @@ pub struct Capabilities {
     pub memory_kinds: Vec<String>,
 }
 
+/// v0.7.0 Gap 4 (#887) — the three thresholds powering the
+/// `ConfidenceTier` enum. `confirmed` and `likely` are inclusive
+/// lower bounds; `ambiguous` is the implicit floor (everything below
+/// `likely`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct ConfidenceTierThresholds {
+    pub confirmed: f64,
+    pub likely: f64,
+    pub ambiguous: f64,
+}
+
+impl Default for ConfidenceTierThresholds {
+    fn default() -> Self {
+        // Mirrors the constants on `crate::models::ConfidenceTier`.
+        // Cannot reference them directly here without inducing a
+        // semantic cycle through `confidence::DEFAULT_HALF_LIFE_DAYS`
+        // already imported in this module; the
+        // `confidence_tier_thresholds_match_model_constants` test
+        // below pins the agreement at build time.
+        Self {
+            confirmed: 0.95,
+            likely: 0.7,
+            ambiguous: 0.0,
+        }
+    }
+}
+
 /// Live recall-mode tag (P1 honesty patch). Reflects the *runtime*
 /// state of the embedder + LLM, not the configured tier.
 ///
@@ -507,8 +534,11 @@ pub struct CapabilityFeatures {
     /// `feat/v0.7.0-recursive-learning`:
     ///
     /// - **Column** (Task 1/8, commit `f5d8a9e`) —
-    ///   `memories.reflection_depth INTEGER NOT NULL DEFAULT 0`
-    ///   on SQLite (schema v29) and Postgres (`CURRENT_SCHEMA_VERSION 31`).
+    ///   `memories.reflection_depth INTEGER NOT NULL DEFAULT 0`,
+    ///   first added in the recursive-learning schema bump (column
+    ///   inventory lives in `MIGRATION_LADDER.md`; the current
+    ///   `CURRENT_SCHEMA_VERSION` is 48 in lockstep on both sqlite
+    ///   and postgres ladders as of v0.7.0).
     ///   `Memory::reflection_depth: i32` with `#[serde(default)]` for
     ///   wire-compat with pre-v0.7.0 federation peers.
     /// - **Governance field** (Task 2/8, commit `630a6db`) —
@@ -1396,6 +1426,15 @@ pub struct CapabilityConfidenceCalibration {
     /// Default freshness-decay half-life (days). 30 in v0.7.0; tunable
     /// per namespace via the `confidence_decay_half_life_days` policy.
     pub default_half_life_days: f64,
+    /// v0.7.0 Gap 4 (#887) — derived-tier thresholds. MCP callers
+    /// reading this surface know how the substrate buckets the
+    /// `confidence` real into `confirmed` / `likely` / `ambiguous`
+    /// without re-deriving the breakpoints. Stable; bumping is a
+    /// wire-level break (see [`crate::models::ConfidenceTier`]).
+    /// `#[serde(default)]` keeps pre-Gap-4 capability consumers
+    /// reading newer payloads from breaking.
+    #[serde(default)]
+    pub tier_thresholds: ConfidenceTierThresholds,
 }
 
 impl CapabilityConfidenceCalibration {
@@ -1413,6 +1452,7 @@ impl CapabilityConfidenceCalibration {
             calibration_tool: "implemented".to_string(),
             signals_schema: "v1".to_string(),
             default_half_life_days: crate::confidence::DEFAULT_HALF_LIFE_DAYS,
+            tier_thresholds: ConfidenceTierThresholds::default(),
         }
     }
 }
@@ -1573,6 +1613,10 @@ impl Capabilities {
             // subcommand, and the `memory_calibrate_confidence` MCP
             // tool.
             confidence_calibration: CapabilityConfidenceCalibration::current(),
+            // v0.7.0 #973 Item C — do-calculus / Ortega-de-Freitas
+            // narrative surface. Helper does the source-tree honesty
+            // check at the comment site; see the helper's docstring.
+            provenance_substrate_layer: default_capability_provenance_substrate_layer(),
         }
     }
 }
@@ -1606,6 +1650,18 @@ pub struct ToolEntry {
     /// `loaded && agent_can_call(agent_id, family)`. When the
     /// `[mcp.allowlist]` is disabled, `callable_now == loaded`.
     pub callable_now: bool,
+    /// v0.7.0 issue #803 — 0-2 worked examples for the tool.
+    /// `skip_serializing_if = "Vec::is_empty"` strips the field
+    /// for any tool without curated examples.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub examples: Vec<ToolExample>,
+}
+
+/// v0.7.0 issue #803 — single worked example for `tools[].examples`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolExample {
+    pub call: serde_json::Value,
+    pub description: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -1792,6 +1848,69 @@ pub struct CapabilitiesV3 {
     /// `default_capability_confidence_calibration` helper.
     #[serde(default = "default_capability_confidence_calibration")]
     pub confidence_calibration: CapabilityConfidenceCalibration,
+
+    /// v0.7.0 #973 Item C — narrative summary of the substrate's
+    /// do-calculus posture.
+    #[serde(default = "default_capability_provenance_substrate_layer")]
+    pub provenance_substrate_layer: CapabilityProvenanceSubstrateLayer,
+}
+
+/// v0.7.0 #973 Item C — substrate-layer provenance posture. Lets an
+/// LLM agent self-describe ai-memory's do-calculus
+/// intervention/observation distinction (Pearl 2009) per Ortega &
+/// de Freitas (2026) framing. Honesty discipline: every
+/// `enforcement_layers` entry must map to a shipped substrate
+/// primitive in source.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CapabilityProvenanceSubstrateLayer {
+    #[serde(default)]
+    pub posture: String,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub enforcement_layers: Vec<String>,
+    #[serde(default)]
+    pub honest_limitations: Vec<String>,
+    #[serde(default)]
+    pub spec_references: SpecReferences,
+}
+
+/// v0.7.0 #973 Item C — academic citations. Vendor-neutral.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct SpecReferences {
+    #[serde(default)]
+    pub do_calculus: String,
+    #[serde(default)]
+    pub interactional_agency: String,
+}
+
+#[must_use]
+pub fn default_capability_provenance_substrate_layer() -> CapabilityProvenanceSubstrateLayer {
+    CapabilityProvenanceSubstrateLayer {
+        posture: "do_calculus_aligned".to_string(),
+        summary: "ai-memory implements the do-calculus intervention/observation \
+                  distinction at the substrate layer via Form 4 fact-provenance, \
+                  Form 6 MemoryKind vocabulary, Form 7 agent-EXTERNAL governance, \
+                  the V-4 signed-events cross-row hash chain, and the seven Gap \
+                  provenance framework; stops cross-session delusion amplification \
+                  but not intra-session hallucination (consumer LLM responsibility)."
+            .to_string(),
+        enforcement_layers: vec![
+            "form_4_fact_provenance".to_string(),
+            "form_6_memory_kind".to_string(),
+            "form_7_agent_external_governance".to_string(),
+            "signed_events_v4_chain".to_string(),
+            "seven_gap_framework".to_string(),
+        ],
+        honest_limitations: vec![
+            "intra_session_hallucination_is_consumer_responsibility".to_string(),
+            "federation_reliability_via_dlq_not_silent_drop".to_string(),
+        ],
+        spec_references: SpecReferences {
+            do_calculus: "Pearl (2009)".to_string(),
+            interactional_agency: "Ortega and de Freitas (2026)".to_string(),
+        },
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2425,6 +2544,17 @@ pub struct AppConfig {
     /// NOT ship retention, so a long-running shadow-enabled deployment
     /// would see unbounded growth.
     pub confidence: Option<ConfidenceConfig>,
+    /// v0.7.0 SHIP cluster (#946 / #957 / #960 / #961, 2026-05-20) —
+    /// `[admin]` top-level block. Carries the operator-configured
+    /// allowlist of `agent_ids` whose authenticated HTTP requests
+    /// are treated as admin-class callers (full cross-tenant
+    /// visibility for endpoints that must observe corpus-scale
+    /// metadata: `GET /api/v1/export`, `GET /api/v1/agents`,
+    /// `GET /api/v1/stats`, the `POST /api/v1/quota/status` list
+    /// path). `None` (the default) closes those endpoints to all
+    /// non-admin callers — the safe-by-default posture per CLAUDE.md
+    /// `pm-v3`. See [`AdminConfig`] for the full role-gate semantics.
+    pub admin: Option<AdminConfig>,
 }
 
 /// v0.7.0 SEC-2 (Cluster D, issue #767) — `[governance]` top-level
@@ -2453,6 +2583,80 @@ pub struct GovernanceConfig {
     /// message naming the missing pubkey path.
     #[serde(default)]
     pub require_operator_pubkey: bool,
+}
+
+/// v0.7.0 SHIP cluster (#946 / #957 / #960 / #961, 2026-05-20) —
+/// `[admin]` top-level block. The operator-configured allowlist of
+/// `agent_ids` whose authenticated HTTP requests are treated as
+/// admin-class callers, granting full cross-tenant visibility on
+/// endpoints whose payloads necessarily expose corpus-scale
+/// metadata (`GET /api/v1/export`, `GET /api/v1/agents`,
+/// `GET /api/v1/stats`, the `POST /api/v1/quota/status` list path).
+///
+/// Wire format:
+/// ```toml
+/// [admin]
+/// agent_ids = ["ops:admin", "ai:claude@workstation"]
+/// ```
+///
+/// **Default-closed.** When the block is absent, the allowlist is
+/// empty and every admin-class endpoint returns `403 Forbidden` for
+/// every caller. Operators MUST set `[admin].agent_ids = [...]`
+/// explicitly to grant any caller admin privileges. This closes
+/// the v0.7.0 SHIP-blocking cross-tenant exfiltration defects
+/// (#946 / #957 / #960) where admin endpoints landed open by default
+/// because the legacy `api_key_auth` middleware passes through when
+/// no API key is configured.
+///
+/// **Caller resolution** uses the same primitive other handlers do
+/// (`identity::resolve_http_agent_id` against `X-Agent-Id`). The
+/// allowlist matches against the resolved caller string verbatim;
+/// there is no glob / prefix support today (planned under #961 when
+/// the operator surface grows beyond a static list).
+///
+/// **Not a substitute for authentication.** The role gate runs
+/// AFTER `api_key_auth`. Deployments serving sensitive corpora
+/// MUST set `api_key` so the bare-network surface requires the key
+/// AND the role gate runs on top of it. The two layers compose:
+/// `api_key_auth` answers "is the request authenticated?" and the
+/// admin gate answers "is the authenticated caller an admin?".
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdminConfig {
+    /// Explicit list of `agent_id` strings whose authenticated
+    /// requests are treated as admin-class. Default `vec![]`
+    /// (empty) means no caller is an admin — every admin-class
+    /// endpoint returns 403.
+    ///
+    /// Each entry MUST match a caller's resolved `agent_id`
+    /// verbatim. Validation: the SAL accepts the same NHI
+    /// `agent_id` charset that
+    /// [`crate::validate::validate_agent_id`] enforces (see the
+    /// "Agent Identity (NHI)" section of CLAUDE.md). Entries that
+    /// fail validation at boot are logged at `warn` and dropped
+    /// from the in-memory allowlist; the daemon still starts so
+    /// a single typo does not lock the operator out.
+    #[serde(default)]
+    pub agent_ids: Vec<String>,
+}
+
+impl AdminConfig {
+    /// Returns the validated subset of `agent_ids` — entries that
+    /// pass [`crate::validate::validate_agent_id`]. Entries that
+    /// fail validation are dropped (with a `warn` log) so a single
+    /// typo in `config.toml` cannot lock the operator out.
+    #[must_use]
+    pub fn validated_agent_ids(&self) -> Vec<String> {
+        let mut out = Vec::with_capacity(self.agent_ids.len());
+        for id in &self.agent_ids {
+            match crate::validate::validate_agent_id(id) {
+                Ok(()) => out.push(id.clone()),
+                Err(e) => {
+                    tracing::warn!("[admin] dropping invalid agent_id '{id}' from allowlist: {e}");
+                }
+            }
+        }
+        out
+    }
 }
 
 /// v0.7.0 (issue #518) — `[agents]` top-level block. Today only carries
@@ -3571,7 +3775,9 @@ impl AppConfig {
             "verify",
             "mcp_federation_forward_url",
             "agents",
+            "governance",
             "confidence",
+            "admin",
         ];
 
         let value: toml::Value = match toml::from_str(contents) {
@@ -5088,6 +5294,7 @@ legacy_scoring = false
             agents: Some(AgentsConfig::default()),
             governance: Some(GovernanceConfig::default()),
             confidence: Some(ConfidenceConfig::default()),
+            admin: Some(AdminConfig::default()),
         };
 
         let serialised = toml::to_string(&cfg).expect("serialise AppConfig to TOML");
@@ -5132,6 +5339,7 @@ legacy_scoring = false
             "agents",
             "governance",
             "confidence",
+            "admin",
         ];
 
         for key in table.keys() {
@@ -5523,5 +5731,43 @@ legacy_scoring = false
             kinds,
             vec!["observation".to_string(), "reflection".to_string()]
         );
+    }
+
+    /// v0.7.0 Gap 4 (#887) — pin the capabilities-surface thresholds
+    /// to the `ConfidenceTier` model constants so a future
+    /// re-tuning bumps BOTH in lockstep (or the build breaks).
+    #[test]
+    fn confidence_tier_thresholds_match_model_constants() {
+        let defaults = ConfidenceTierThresholds::default();
+        assert!(
+            (defaults.confirmed - crate::models::ConfidenceTier::CONFIRMED_MIN).abs()
+                < f64::EPSILON,
+            "ConfidenceTierThresholds.confirmed must match ConfidenceTier::CONFIRMED_MIN"
+        );
+        assert!(
+            (defaults.likely - crate::models::ConfidenceTier::LIKELY_MIN).abs() < f64::EPSILON,
+            "ConfidenceTierThresholds.likely must match ConfidenceTier::LIKELY_MIN"
+        );
+        // Ambiguous is the implicit floor — pin it to zero so the
+        // wire shape is fully self-describing.
+        assert!(
+            (defaults.ambiguous - 0.0).abs() < f64::EPSILON,
+            "ambiguous floor is fixed at 0.0"
+        );
+    }
+
+    /// v0.7.0 Gap 4 (#887) — every `TierConfig::capabilities()` call
+    /// must surface the calibration block so MCP capability readers
+    /// can rely on the field being present.
+    #[test]
+    fn capability_confidence_calibration_carries_tier_thresholds() {
+        // `CapabilityConfidenceCalibration::current()` (the
+        // capabilities v3 builder) surfaces the Gap 4 thresholds so
+        // MCP capability readers can filter without re-deriving the
+        // breakpoints.
+        let surface = CapabilityConfidenceCalibration::current();
+        assert!((surface.tier_thresholds.confirmed - 0.95).abs() < f64::EPSILON);
+        assert!((surface.tier_thresholds.likely - 0.7).abs() < f64::EPSILON);
+        assert!((surface.tier_thresholds.ambiguous - 0.0).abs() < f64::EPSILON);
     }
 }

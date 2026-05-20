@@ -1,0 +1,27 @@
+# Copyright 2026 AlphaOne LLC
+# SPDX-License-Identifier: Apache-2.0
+#
+# Apache AGE 1.6.0 on PostgreSQL 16 + pgvector.
+#
+# The upstream apache/age:release_PG16_1.6.0 image ships AGE but
+# NOT pgvector. The ai-memory v0.7 SAL postgres adapter (Cargo
+# feature `sal-postgres` → `dep:pgvector`) maps Rust vectors to
+# Postgres `vector` columns, which requires the server-side
+# pgvector extension. This image stacks pgvector on top of the
+# AGE image's apt layer.
+#
+# The pgdg apt repo (already configured in the base image) ships
+# `postgresql-16-pgvector` as a precompiled .deb — no source build.
+
+FROM apache/age:release_PG16_1.6.0
+
+USER root
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends postgresql-16-pgvector \
+ && rm -rf /var/lib/apt/lists/*
+
+# The base image's entrypoint + USER state is preserved by default;
+# no CMD/ENTRYPOINT override needed. AGE is still auto-installed
+# via /docker-entrypoint-initdb.d/00-create-extension-age.sql at
+# first boot.

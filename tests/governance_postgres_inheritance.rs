@@ -45,9 +45,8 @@ use ai_memory::store::postgres::PostgresStore;
 use ai_memory::store::{GovernedAction, MemoryStore};
 use sqlx::PgPool;
 
-fn postgres_url() -> Option<String> {
-    std::env::var("AI_MEMORY_TEST_POSTGRES_URL").ok()
-}
+mod common;
+use common::postgres_url;
 
 fn unique_suffix() -> String {
     uuid::Uuid::new_v4().to_string()[..8].to_string()
@@ -291,11 +290,16 @@ async fn s53_enforce_owner_at_leaf() {
         .await
         .expect("intruder enforce");
     match intruder_decision {
-        GovernanceDecision::Deny(reason) => {
-            let r = reason.to_lowercase();
+        GovernanceDecision::Deny(refusal) => {
+            let r = refusal.reason.to_lowercase();
             assert!(
                 r.contains("owner") || r.contains("not"),
-                "deny reason must reference owner-only policy; got: {reason}"
+                "deny reason must reference owner-only policy; got: {refusal:?}"
+            );
+            assert_eq!(
+                refusal.denied_level,
+                ai_memory::models::GovernanceLevel::Owner,
+                "owner-level refusal must carry GovernanceLevel::Owner; got {refusal:?}",
             );
         }
         other => panic!("intruder write to owner-only ns must Deny; got {other:?}"),

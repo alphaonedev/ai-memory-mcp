@@ -61,7 +61,11 @@ pub fn handle_kg_invalidate(
         match Permissions::evaluate(&ctx, &[]) {
             crate::permissions::Decision::Allow | crate::permissions::Decision::Modify(_) => {}
             crate::permissions::Decision::Deny(reason) => {
-                return Err(format!("kg_invalidate denied by permission rule: {reason}"));
+                return Err(crate::governance::deny_message(
+                    "kg_invalidate",
+                    crate::governance::DenyGate::PermissionRule,
+                    &reason,
+                ));
             }
             crate::permissions::Decision::Ask(prompt) => {
                 return Ok(json!({

@@ -77,6 +77,13 @@ pub struct Metrics {
     /// counter so operator dashboards can alert without scraping
     /// `/metrics` directly.
     pub auto_export_spawn_failed_total: IntCounter,
+    /// v0.7.0 Track D #933 — current depth of the federation push
+    /// DLQ (`federation_push_dlq` table, `WHERE replayed_at IS NULL`).
+    /// Refreshed on every tick of the `replay_federation_push_dlq`
+    /// worker spawned alongside the catchup loop. Operators alert on
+    /// non-zero sustained depth — a healthy mesh should drain back
+    /// to 0 within one replay interval after the peer recovers.
+    pub federation_push_dlq_depth: IntGauge,
 }
 
 /// Lazily-built process-global metrics handle.
@@ -277,6 +284,17 @@ impl Metrics {
         )?;
         registry.register(Box::new(auto_export_spawn_failed_total.clone()))?;
 
+        // v0.7.0 Track D #933 — federation push DLQ depth gauge.
+        let federation_push_dlq_depth = IntGauge::new(
+            "ai_memory_federation_push_dlq_depth",
+            "Current count of pending federation_push_dlq rows \
+             (replayed_at IS NULL). Refreshed on every replay tick. \
+             Non-zero sustained depth indicates one or more peers are \
+             persistently unreachable; healthy meshes drain back to 0 \
+             within one replay interval after peer recovery.",
+        )?;
+        registry.register(Box::new(federation_push_dlq_depth.clone()))?;
+
         Ok(Self {
             registry,
             store_total,
@@ -297,6 +315,7 @@ impl Metrics {
             federation_partial_quorum_total,
             corrupt_provenance_rows_total,
             auto_export_spawn_failed_total,
+            federation_push_dlq_depth,
         })
     }
 }
@@ -427,6 +446,7 @@ mod tests {
         registry().memories_gauge.set(42);
         registry().hnsw_size_gauge.set(42);
         registry().subscriptions_active_gauge.set(3);
+        registry().federation_push_dlq_depth.set(0);
 
         let text = render();
         for name in [
@@ -440,6 +460,8 @@ mod tests {
             "ai_memory_memories",
             "ai_memory_hnsw_size",
             "ai_memory_subscriptions_active",
+            // v0.7.0 Track D #933 — federation push DLQ depth gauge.
+            "ai_memory_federation_push_dlq_depth",
         ] {
             assert!(text.contains(name), "/metrics missing {name}\n\n{text}");
         }

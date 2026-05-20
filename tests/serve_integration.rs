@@ -21,21 +21,19 @@
 //! window but is the standard pattern across Rust integration suites.
 
 use std::io::{BufRead, BufReader};
-use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
-const SPAWN_TIMEOUT: Duration = Duration::from_secs(15);
+mod common;
+use common::free_port;
 
-/// Pick a free port by binding to `127.0.0.1:0` and immediately dropping
-/// the listener. The OS won't reassign that port to another process for
-/// a brief window, which is enough for `serve` to bind it.
-fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1:0");
-    listener.local_addr().expect("local_addr").port()
-}
+// CI's Code Coverage job runs the test binary under `cargo llvm-cov`
+// instrumentation, which inflates startup time by 3-5x. 60s gives
+// enough headroom on every supported CI surface (Linux/macOS/Windows)
+// regardless of instrumentation overhead.
+const SPAWN_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// RAII guard for the spawned daemon. Drops kill the child on test
 /// exit so leaked test processes don't accumulate on flaky failures.
@@ -73,6 +71,11 @@ fn spawn_serve(
     let port_s = port.to_string();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ai-memory"));
     cmd.env("AI_MEMORY_NO_CONFIG", "1")
+        // #976 (2026-05-20) — wildcard admin allowlist so the
+        // post-#946 admin-gated routes (stats, archive, forget, …)
+        // exercise the happy-path 200 in this test fixture. Negative
+        // admin contracts belong in dedicated test files.
+        .env("AI_MEMORY_ADMIN_AGENT_IDS", "*")
         .args([
             "--db",
             db.to_str().unwrap(),
@@ -187,6 +190,14 @@ fn serve_metrics_endpoint_at_v1_path() {
 
 #[test]
 fn serve_create_then_get_memory() {
+    // #927/#930 (Track A P4/P9, 2026-05-20) added scope=private +
+    // caller-vs-owner gates on the sqlite GET/UPDATE/PROMOTE paths.
+    // Set a stable X-Agent-Id on BOTH the write and the read so the
+    // round-trip lands on the same principal — without it the write
+    // creates a row owned by `anonymous:req-A` and the read tries to
+    // load it as `anonymous:req-B`, and the visibility gate 404s.
+    const AGENT: &str = "ai:serve-roundtrip";
+
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("ai-memory.db");
     let serve = spawn_serve(&db, &[], &[]);
@@ -201,6 +212,7 @@ fn serve_create_then_get_memory() {
     });
     let resp = client
         .post(serve.url("/api/v1/memories"))
+        .header("X-Agent-Id", AGENT)
         .json(&create_body)
         .send()
         .unwrap();
@@ -216,6 +228,7 @@ fn serve_create_then_get_memory() {
     // GET /api/v1/memories/{id}
     let resp = client
         .get(serve.url(&format!("/api/v1/memories/{id}")))
+        .header("X-Agent-Id", AGENT)
         .send()
         .unwrap();
     assert!(resp.status().is_success());
@@ -248,6 +261,11 @@ fn serve_api_key_required_when_configured() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_ai-memory"))
         .env_remove("AI_MEMORY_NO_CONFIG")
         .env("HOME", tmp.path().to_str().unwrap())
+        // #976 (2026-05-20) — `/api/v1/stats` is admin-gated post-#955;
+        // the test exercises the api_key auth happy path, not the
+        // admin-rejection contract, so seed the wildcard admin
+        // allowlist via the env var (precedence wins over config.toml).
+        .env("AI_MEMORY_ADMIN_AGENT_IDS", "*")
         .args([
             "--db",
             db.to_str().unwrap(),

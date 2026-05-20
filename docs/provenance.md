@@ -1,5 +1,41 @@
 # Fact-Provenance (Form 4)
 
+## Academic grounding (Item A, issue #973)
+
+The substrate-level distinctions Form 4 enforces map onto Pearl's
+*do-calculus* (Pearl 2009) and the intervention-versus-observation
+axis Ortega & de Freitas (2026) make load-bearing for agent-
+substrate boundaries. The do-calculus separates the conditional
+distribution observed from passive witnessing (`P(Y|X)`) from the
+distribution under an external intervention that *sets* the value
+(`P(Y|do(X))`). An LLM agent that cannot distinguish these — that
+treats its own past assertion-as-intervention identically to a
+tool-output-as-observation when later asked to recall the world —
+is unable to correct course in the presence of stale beliefs; this
+is the "delusion amplification" the Ortega paper studies at the
+SFT training layer.
+
+ai-memory's substrate makes the same cut at the storage layer. Form
+4's `citations` + `source_uri` + `source_span` columns distinguish
+witnessed-source (observation) from agent-self-claim. The seven
+Provenance Gaps (#884-#890) extend this to causal recall-consumption
+ledgers (Gap 3), reciprocal supersession (Gap 5), and capture-time
+confidence calibration (Gap 4). Form 6's `MemoryKind` vocabulary
+(`Observation` / `Reflection` / `Claim` / `Decision` / `Event`)
+gives consumers a semantic axis on which to filter. Form 7's
+agent-EXTERNAL governance gate (`AgentAction` typed enum +
+operator-signed seed rules at the substrate pre-write hook) is the
+storage-layer enforcement primitive. The substrate's evidence claim
+depends on federation reliability (the v48 `federation_push_dlq`
+table from #933) as much as on cryptographic attestation: DLQ-tracked
+failures are observable, not hidden.
+
+Together the seven Gaps + Forms 4, 6, 7 + the V-4 signed-events
+cross-row hash chain (#698) are ai-memory's substrate-level answer
+to the do-calculus question Ortega & de Freitas frame.
+
+---
+
 v0.7.0 closes Batman's **Form 4 — fact-provenance** to IMPLEMENTED. The
 Form 4 brief asks: when an agent stores a memory, can the substrate
 record *where that fact came from*, alongside who recorded it and
