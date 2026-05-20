@@ -154,9 +154,20 @@ pub async fn restore_archive(
         };
     }
 
+    // #940 (security-high, 2026-05-20) — caller-vs-row-owner gate.
+    // Pre-#940 the sqlite branch called the owner-blind
+    // `db::restore_archived(&lock.0, &id)` and any authenticated HTTP
+    // caller could restore any other owner's archived rows back into
+    // the live working set. The postgres SAL branch above was already
+    // QC-P1-fixed (2026-05-20) to pass
+    // `CallerContext::for_agent(caller)`; this routes the sqlite
+    // branch through the caller-scoped variant for parity. A
+    // non-owner attempt returns 404 (not 403) so the surface cannot
+    // be used to enumerate other owners' archived ids — mirrors the
+    // #927 `get_memory` posture.
     let restored = {
         let lock = app.db.lock().await;
-        match db::restore_archived(&lock.0, &id) {
+        match db::restore_archived_for_caller(&lock.0, &id, &caller) {
             Ok(v) => v,
             Err(e) => {
                 tracing::error!("handler error: {e}");
@@ -433,9 +444,21 @@ pub async fn archive_by_ids(
     for id in &body.ids {
         // Local archive. Hold the lock only across this one call per id so
         // we can release it before a potentially slow network fanout.
+        //
+        // #940 (security-high, 2026-05-20) — caller-vs-row-owner gate.
+        // Pre-#940 the sqlite branch called the owner-blind
+        // `db::archive_memory(&lock.0, id, ...)` and any authenticated
+        // HTTP caller could bulk-archive any other owner's live rows
+        // (cross-tenant denial-of-service primitive). The postgres SAL
+        // branch above was already QC-P1-fixed (2026-05-20) to pass
+        // `CallerContext::for_agent(caller)`; this routes the sqlite
+        // branch through the caller-scoped variant for parity. A
+        // non-owner id surfaces in `missing` (same semantics as a row
+        // that wasn't live locally) so the surface cannot be used to
+        // probe other owners' live ids.
         let moved = {
             let lock = app.db.lock().await;
-            match db::archive_memory(&lock.0, id, Some(&reason)) {
+            match db::archive_memory_for_caller(&lock.0, id, Some(&reason), &caller) {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::error!("archive_by_ids: archive_memory({id}) failed: {e}");

@@ -1528,6 +1528,88 @@ pub fn archive_memory(conn: &Connection, id: &str, reason: Option<&str>) -> Resu
     }
 }
 
+/// #940 (security-high, 2026-05-20) — caller-scoped archive variant.
+/// Mirrors [`archive_memory`] but constrains the soft-move to rows
+/// in the live `memories` table whose `metadata->'agent_id'` JSON
+/// field matches `caller` (with the inbox-target carve-out:
+/// `metadata->'target_agent_id' == caller` is also archivable by
+/// the inbox owner, matching
+/// [`crate::store::is_visible_to_caller`]).
+///
+/// Pre-#940 the HTTP handler at
+/// `src/handlers/archive.rs::archive_by_ids` (sqlite branch) called
+/// the owner-blind [`archive_memory`] directly; any authenticated
+/// HTTP caller could bulk-archive any other owner's live rows
+/// (cross-tenant denial-of-service primitive). The postgres SAL
+/// branch was already QC-P1-fixed (2026-05-20) to pass
+/// `CallerContext::for_agent(caller)`; the sqlite branch is closed
+/// by this helper. Returns `Ok(false)` on a non-owner attempt so
+/// the surface cannot be used to probe other owners' live ids.
+///
+/// # Errors
+///
+/// Returns an error if the INSERT-SELECT or DELETE fails.
+pub fn archive_memory_for_caller(
+    conn: &Connection,
+    id: &str,
+    reason: Option<&str>,
+    caller: &str,
+) -> Result<bool> {
+    let now = Utc::now().to_rfc3339();
+    let reason = reason.unwrap_or("archive");
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| -> Result<bool> {
+        // Owner gate: row must exist AND match the caller (or be an
+        // inbox-target row whose recipient is the caller).
+        let owned: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM memories \
+                 WHERE id = ?1 \
+                   AND ( \
+                     json_extract(metadata, '$.agent_id') = ?2 OR \
+                     json_extract(metadata, '$.target_agent_id') = ?2 \
+                   )",
+                params![id, caller],
+                |r| r.get(0),
+            )
+            .unwrap_or(false);
+        if !owned {
+            return Ok(false);
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO archived_memories
+             (id, tier, namespace, title, content, tags, priority, confidence,
+              source, access_count, created_at, updated_at, last_accessed_at,
+              expires_at, archived_at, archive_reason, metadata,
+              embedding, embedding_dim, original_tier, original_expires_at)
+             SELECT id, tier, namespace, title, content, tags, priority, confidence,
+                    source, access_count, created_at, updated_at, last_accessed_at,
+                    expires_at, ?1, ?2, metadata,
+                    embedding, embedding_dim, tier, expires_at
+             FROM memories WHERE id = ?3",
+            params![now, reason, id],
+        )?;
+        // Clean up namespace_meta — mirrors `delete`'s cleanup so an archived
+        // row is not still referenced as the namespace standard.
+        conn.execute(
+            "DELETE FROM namespace_meta WHERE standard_id = ?1",
+            params![id],
+        )?;
+        let removed = conn.execute("DELETE FROM memories WHERE id = ?1", params![id])?;
+        Ok(removed > 0)
+    })();
+    match result {
+        Ok(moved) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(moved)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
+}
+
 /// Count memories that would be deleted by forget (for `dry_run`).
 pub fn forget_count(
     conn: &Connection,
@@ -5449,6 +5531,100 @@ pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
         // migration backfills `original_tier='long'` so they still restore
         // as permanent (the prior behavior — no regression for legacy data).
         // Live writes from v0.6.3.1 onward round-trip the original tier.
+        conn.execute(
+            "INSERT INTO memories
+             (id, tier, namespace, title, content, tags, priority, confidence,
+              source, access_count, created_at, updated_at, last_accessed_at,
+              expires_at, metadata, embedding, embedding_dim)
+             SELECT id, COALESCE(original_tier, 'long'), namespace, title, content,
+                    tags, priority, confidence, source, access_count, created_at,
+                    ?1, last_accessed_at, original_expires_at, metadata,
+                    embedding, embedding_dim
+             FROM archived_memories WHERE id = ?2",
+            params![now, id],
+        )?;
+        conn.execute("DELETE FROM archived_memories WHERE id = ?1", params![id])?;
+        Ok(true)
+    })();
+    match result {
+        Ok(v) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(v)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
+}
+
+/// #940 (security-high, 2026-05-20) — caller-scoped restore variant.
+/// Mirrors [`restore_archived`] but constrains the INSERT-SELECT to
+/// rows whose `metadata->'agent_id'` JSON field matches `caller`
+/// (with the inbox-target carve-out: rows whose
+/// `metadata->'target_agent_id'` matches `caller` are also
+/// restorable by the inbox owner, matching the SAL
+/// [`crate::store::is_visible_to_caller`] visibility predicate).
+///
+/// Pre-#940 the only restore variant was owner-blind; any
+/// authenticated HTTP caller could restore any other owner's
+/// archived rows back into the live working set via
+/// `POST /api/v1/archive/{id}/restore`. The postgres SAL branch was
+/// already QC-P1-fixed (2026-05-20) to pass
+/// `CallerContext::for_agent(caller)`; the sqlite branch is closed
+/// by this helper. Returns `Ok(false)` on a non-owner attempt so the
+/// surface cannot be used to probe other owners' archived ids.
+pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) -> Result<bool> {
+    let now = Utc::now().to_rfc3339();
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| -> Result<bool> {
+        // Owner gate: row must exist AND match the caller (or be an
+        // inbox-target row whose recipient is the caller).
+        let owned: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM archived_memories \
+                 WHERE id = ?1 \
+                   AND ( \
+                     json_extract(metadata, '$.agent_id') = ?2 OR \
+                     json_extract(metadata, '$.target_agent_id') = ?2 \
+                   )",
+                params![id, caller],
+                |r| r.get(0),
+            )
+            .unwrap_or(false);
+        if !owned {
+            return Ok(false);
+        }
+        // Check if ID already exists in active memories to prevent silent overwrite.
+        let active_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM memories WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap_or(false);
+        if active_exists {
+            anyhow::bail!(
+                "cannot restore: memory {id} already exists in active table (would overwrite)"
+            );
+        }
+        // Validate archived metadata before restoring (mirror restore_archived).
+        let archived_metadata: String = conn
+            .query_row(
+                "SELECT metadata FROM archived_memories WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap_or_else(|_| "{}".to_string());
+        let meta_value: serde_json::Value =
+            serde_json::from_str(&archived_metadata).unwrap_or_else(|_| serde_json::json!({}));
+        if let Err(e) = crate::validate::validate_metadata(&meta_value) {
+            tracing::warn!("archived memory {id} has invalid metadata, resetting to {{}}: {e}");
+            conn.execute(
+                "UPDATE archived_memories SET metadata = '{}' WHERE id = ?1",
+                params![id],
+            )?;
+        }
         conn.execute(
             "INSERT INTO memories
              (id, tier, namespace, title, content, tags, priority, confidence,
