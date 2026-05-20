@@ -214,6 +214,19 @@ pub async fn detect_contradictions(
         .into_response();
     }
 
+    // #947 SECURITY-medium (Track A QC sweep, 2026-05-20) — resolve
+    // caller for the visibility post-filter on the contradictions
+    // candidate set. Pre-fix the sqlite branch `db::list`'d the
+    // namespace without a caller filter; any caller could enumerate
+    // contradiction candidates across tenants. Admin callers bypass
+    // the filter (matches the cross-cutting admin posture).
+    let caller = {
+        let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+        crate::identity::resolve_http_agent_id(None, header_agent_id)
+            .unwrap_or_else(|_| format!("anonymous:req-{}", uuid::Uuid::new_v4()))
+    };
+    let caller_is_admin = crate::handlers::admin_role::is_admin_caller(&app, &caller);
+
     let lock = app.db.lock().await;
     let all = match db::list(
         &lock.0,
@@ -245,14 +258,18 @@ pub async fn detect_contradictions(
         Some(t) => all
             .into_iter()
             .filter(|m| {
-                m.metadata
+                (m.metadata
                     .get("topic")
                     .and_then(|v| v.as_str())
                     .is_some_and(|s| s == t)
-                    || m.title == t
+                    || m.title == t)
+                    && (caller_is_admin || crate::visibility::is_visible_to_caller(m, &caller))
             })
             .collect(),
-        None => all,
+        None => all
+            .into_iter()
+            .filter(|m| caller_is_admin || crate::visibility::is_visible_to_caller(m, &caller))
+            .collect(),
     };
 
     // Existing contradicts links involving any candidate.
@@ -788,11 +805,24 @@ pub async fn check_duplicate(
         }
     };
 
+    // #947 SECURITY-medium (Track A QC sweep, 2026-05-20) — resolve
+    // caller for the visibility post-filter on the nearest-duplicate
+    // result. Pre-fix `db::check_duplicate_with_text` scanned the
+    // full namespace's embeddings without a caller filter; an
+    // attacker could probe whether their input matches another
+    // tenant's private memory. Admin bypasses the filter.
+    let caller = {
+        let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+        crate::identity::resolve_http_agent_id(None, header_agent_id)
+            .unwrap_or_else(|_| format!("anonymous:req-{}", uuid::Uuid::new_v4()))
+    };
+    let caller_is_admin = crate::handlers::admin_role::is_admin_caller(&app, &caller);
+
     let lock = app.db.lock().await;
     // Round-2 F18 — short-circuit on raw-content hash equality before
     // falling through to embedding cosine similarity (parity with MCP
     // path).
-    let check = match db::check_duplicate_with_text(
+    let mut check = match db::check_duplicate_with_text(
         &lock.0,
         &query_embedding,
         &embedding_text,
@@ -809,6 +839,20 @@ pub async fn check_duplicate(
                 .into_response();
         }
     };
+
+    // #947 — if the nearest match is a row the caller cannot see
+    // (private + different owner + not the inbox target), mask it
+    // and clear the `is_duplicate` flag. This prevents the duplicate-
+    // detection surface from leaking the existence + similarity of
+    // private rows authored by other tenants.
+    if !caller_is_admin && let Some(near) = check.nearest.as_ref() {
+        if let Ok(Some(full_mem)) = db::get(&lock.0, &near.id)
+            && !crate::visibility::is_visible_to_caller(&full_mem, &caller)
+        {
+            check.nearest = None;
+            check.is_duplicate = false;
+        }
+    }
 
     let nearest_json = check.nearest.as_ref().map(|m| {
         json!({
