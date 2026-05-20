@@ -158,7 +158,7 @@ async fn spawn_daemon(
 /// Stable agent id — see g4 fix for full rationale. Required so the
 /// #910 SAL-level visibility filter on `find_paths` doesn't drop the
 /// seeded chain because per-request anonymous ids leave each memory
-/// orphaned relative to the find_paths caller.
+/// orphaned relative to the `find_paths` caller.
 const G5_TEST_AGENT_ID: &str = "ai:g5-test";
 
 async fn store_memory(
