@@ -151,10 +151,19 @@ pub fn default_key_dir() -> Result<PathBuf> {
 
 /// Generate a fresh Ed25519 keypair for `agent_id` using `OsRng`.
 ///
-/// `agent_id` is validated against [`crate::validate::validate_agent_id`]
-/// so callers cannot smuggle invalid characters into the on-disk filename.
+/// `agent_id` is validated against
+/// [`crate::validate::validate_agent_id_shape`] (shape-only — char
+/// class + length) so callers cannot smuggle invalid characters into
+/// the on-disk filename. The reserved-name reject lives at the WIRE
+/// boundary ([`crate::validate::validate_agent_id`]) so internal
+/// callers using literal sentinels (e.g. the daemon's own
+/// `DAEMON_KEYPAIR_LABEL = "daemon"` self-signing keypair at
+/// `src/daemon_runtime.rs:1724`) can still load/generate cleanly. Wire
+/// entry points that route caller-supplied agent_ids into this
+/// function must validate FIRST via `validate_agent_id` before
+/// reaching here.
 pub fn generate(agent_id: &str) -> Result<AgentKeypair> {
-    validate::validate_agent_id(agent_id)?;
+    validate::validate_agent_id_shape(agent_id)?;
     // ed25519-dalek 2.x consumes a `CryptoRngCore` (rand_core 0.6).
     // `OsRng` is the platform CSPRNG; it never blocks on modern OSes.
     let mut csprng = rand_core::OsRng;
@@ -241,7 +250,13 @@ pub fn save_public_only(keypair: &AgentKeypair, dir: &Path) -> Result<()> {
 /// commercial AgenticMem layer's responsibility — see the
 /// "Hardware-backed key storage" section above).
 pub fn load(agent_id: &str, dir: &Path) -> Result<AgentKeypair> {
-    validate::validate_agent_id(agent_id)?;
+    // #977 — shape-only here; the daemon loads its own keypair under
+    // the reserved label `DAEMON_KEYPAIR_LABEL = "daemon"` and must
+    // continue to succeed. Wire-routed callers (CLI `identity load`,
+    // MCP `agent` tool) validate at their entry point via
+    // [`crate::validate::validate_agent_id`] (which rejects reserved
+    // names) before reaching here.
+    validate::validate_agent_id_shape(agent_id)?;
     let pub_path = dir.join(format!("{agent_id}{PUB_SUFFIX}"));
     let priv_path = dir.join(format!("{agent_id}{PRIV_SUFFIX}"));
 
@@ -370,8 +385,11 @@ pub fn list(dir: &Path) -> Result<Vec<AgentKeypair>> {
             continue;
         };
         // Skip .pub files whose stem is not a valid agent_id — they
-        // can't have been written by this module's `save`.
-        if validate::validate_agent_id(stem).is_err() {
+        // can't have been written by this module's `save`. Shape-only
+        // check because on-disk keys can legitimately be labelled
+        // with reserved-sentinel names (e.g. the daemon's own
+        // `DAEMON_KEYPAIR_LABEL = "daemon"` pubkey).
+        if validate::validate_agent_id_shape(stem).is_err() {
             continue;
         }
         let path = entry.path();
@@ -495,7 +513,13 @@ pub fn ensure_keypair(agent_id: &str, dir: &Path, disabled: bool) -> Result<Ensu
         );
         return Ok(EnsureOutcome::SkippedDisabled);
     }
-    validate::validate_agent_id(agent_id)?;
+    // #977 — shape-only here: `ensure_keypair` is called from the
+    // daemon's own startup path (`src/daemon_runtime.rs:1760`) with
+    // `DAEMON_KEYPAIR_LABEL = "daemon"` (a reserved sentinel). The
+    // wire-routed callers (CLI `identity install`) validate at their
+    // entry point via the reserved-name-rejecting
+    // [`crate::validate::validate_agent_id`].
+    validate::validate_agent_id_shape(agent_id)?;
 
     let pub_path = dir.join(format!("{agent_id}{PUB_SUFFIX}"));
     if pub_path.exists() {
