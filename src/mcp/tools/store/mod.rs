@@ -105,7 +105,11 @@ pub(crate) fn handle_store(
         match Permissions::evaluate(&ctx, &[]) {
             crate::permissions::Decision::Allow | crate::permissions::Decision::Modify(_) => {}
             crate::permissions::Decision::Deny(reason) => {
-                return Err(format!("store denied by permission rule: {reason}"));
+                return Err(crate::governance::deny_message(
+                    "store",
+                    crate::governance::DenyGate::PermissionRule,
+                    &reason,
+                ));
             }
             crate::permissions::Decision::Ask(prompt) => {
                 return Ok(json!({
@@ -135,7 +139,11 @@ pub(crate) fn handle_store(
         {
             GovernanceDecision::Allow => {}
             GovernanceDecision::Deny(reason) => {
-                return Err(format!("store denied by governance: {reason}"));
+                return Err(crate::governance::deny_message(
+                    "store",
+                    crate::governance::DenyGate::Governance,
+                    &reason,
+                ));
             }
             GovernanceDecision::Pending(pending_id) => {
                 // v0.7.0 K4 — surface the new pending row through the

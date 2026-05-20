@@ -60,7 +60,11 @@ pub(super) fn handle_promote(
         {
             GovernanceDecision::Allow => {}
             GovernanceDecision::Deny(reason) => {
-                return Err(format!("promote denied by governance: {reason}"));
+                return Err(crate::governance::deny_message(
+                    "promote",
+                    crate::governance::DenyGate::Governance,
+                    &reason,
+                ));
             }
             GovernanceDecision::Pending(pending_id) => {
                 // v0.7.0 K4 — see the store-side companion call.

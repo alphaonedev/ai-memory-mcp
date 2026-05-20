@@ -258,7 +258,11 @@ pub async fn entity_register(
                     return (
                         StatusCode::FORBIDDEN,
                         Json(json!({
-                            "error": format!("entity_register denied by governance: {reason}"),
+                            "error": crate::governance::deny_message(
+                                "entity_register",
+                                crate::governance::DenyGate::Governance,
+                                &reason,
+                            ),
                         })),
                     )
                         .into_response();

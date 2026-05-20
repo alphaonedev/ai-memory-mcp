@@ -72,7 +72,11 @@ pub(super) fn handle_delete(
         match Permissions::evaluate(&ctx, &[]) {
             crate::permissions::Decision::Allow | crate::permissions::Decision::Modify(_) => {}
             crate::permissions::Decision::Deny(reason) => {
-                return Err(format!("delete denied by permission rule: {reason}"));
+                return Err(crate::governance::deny_message(
+                    "delete",
+                    crate::governance::DenyGate::PermissionRule,
+                    &reason,
+                ));
             }
             crate::permissions::Decision::Ask(prompt) => {
                 return Ok(json!({
@@ -109,7 +113,11 @@ pub(super) fn handle_delete(
         {
             GovernanceDecision::Allow => {}
             GovernanceDecision::Deny(reason) => {
-                return Err(format!("delete denied by governance: {reason}"));
+                return Err(crate::governance::deny_message(
+                    "delete",
+                    crate::governance::DenyGate::Governance,
+                    &reason,
+                ));
             }
             GovernanceDecision::Pending(pending_id) => {
                 // v0.7.0 K4 — see the store-side companion call.
