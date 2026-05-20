@@ -2,6 +2,7 @@ target/
 .cargo-*-target/
 .cargo-shared-target/
 .local-runs/
+.codegraph/
 .git/
 docs/
 benchmarks/
