@@ -1,0 +1,173 @@
+# Copyright 2026 AlphaOne LLC
+# SPDX-License-Identifier: Apache-2.0
+#
+# Scoped LAN-parity test stack: 2 IronClaw daemons + 1 PG+AGE
+# container on a single shared Docker bridge, all on this node
+# (192.168.50.100 / Colima).
+#
+# Why this exists (operator-set 2026-05-19):
+#
+# - macOS Sequoia gates plain connect(2) to RFC1918 destinations for
+#   processes spawned under Claude Code (no NSLocalNetworkUsageDescription
+#   entitlement in the cask binary). That blocks libpq/psql/cargo SAL
+#   tests from reaching 192.168.50.1:5432 (the production pop-os PG).
+# - All traffic inside this compose is either Docker-bridge (172.31.79.x)
+#   or host-loopback (127.0.0.1:15432) — both exempt from the gate.
+# - The 2 IronClaw daemons exercise the federation / A2A peer-reach
+#   path; the PG+AGE container backs them via the in-bridge hostname
+#   `pg-age:5432`. The cargo SAL-postgres tests, run from the host,
+#   hit the same PG via 127.0.0.1:15432.
+# - Co-exists with infra/plan-c/docker-compose.yml: different subnet
+#   (172.31.79.0/24 vs 172.31.78.0/24), different container names
+#   (ic-parity-* vs ic-*), different host ports (19180/19181 vs
+#   19077/19078/19079, 15432 vs 5432).
+#
+# Quick-start:
+#
+#   cd /Users/fate/v07/v07-fixes
+#   docker compose -f infra/lan-parity-test/docker-compose.yml up -d --build
+#   # wait ~30s for pg-age healthcheck + IronClaw boot
+#   docker compose -f infra/lan-parity-test/docker-compose.yml ps
+#   AI_MEMORY_TEST_POSTGRES_URL='postgres://ai_memory:ai_memory_test@127.0.0.1:15432/ai_memory_test' \
+#   AI_MEMORY_NO_CONFIG=1 \
+#   cargo test --features sal,sal-postgres --release 2>&1 | tee .local-runs/lan-parity-2026-05-19.log
+#
+# Teardown (preserves images, drops volumes):
+#
+#   docker compose -f infra/lan-parity-test/docker-compose.yml down -v
+
+name: ai-memory-lan-parity
+
+services:
+  pg-age:
+    # Apache AGE on PostgreSQL 16 — matches the production pop-os PG
+    # major version. AGE 1.6.0 is the most recent pinned release tag
+    # for PG16 as of 2025-09-18.
+    image: apache/age:release_PG16_1.6.0
+    container_name: ai-memory-lan-parity-pg-age
+    hostname: pg-age
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ai_memory
+      POSTGRES_PASSWORD: ai_memory_test
+      POSTGRES_DB: ai_memory_test
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    ports:
+      # Host-loopback exposure for cargo SAL-postgres tests from the
+      # host process tree. 127.0.0.1 binding (not 0.0.0.0) avoids
+      # advertising the test PG on the LAN.
+      - "127.0.0.1:15432:5432"
+    volumes:
+      - pg-age-data:/var/lib/postgresql/data
+      - ./init-age.sql:/docker-entrypoint-initdb.d/01-init-age.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ai_memory -d ai_memory_test"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    networks:
+      - ic-parity-mesh
+
+  ic-parity-alice:
+    # Reuse the existing Plan-C build context — same Dockerfile,
+    # same CARGO_FEATURES=sal-postgres. First-time build is ~3-5min
+    # on Apple Silicon; subsequent are layer-cached.
+    build:
+      context: ../..
+      dockerfile: Dockerfile.plan-c
+      args:
+        CARGO_FEATURES: sal-postgres
+    image: ai-memory-lan-parity:latest
+    container_name: ai-memory-lan-parity-alice
+    hostname: ic-parity-alice
+    restart: on-failure
+    depends_on:
+      pg-age:
+        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      AI_MEMORY_AGENT_ID: "ai:ic-parity-alice@lan-parity"
+      AI_MEMORY_TIER: autonomous
+      AI_MEMORY_LISTEN_HOST: "0.0.0.0"
+      AI_MEMORY_LISTEN_PORT: "19077"
+      # Intra-bridge hostname `pg-age` resolves via Docker's embedded
+      # DNS. Per-IronClaw schema in search_path keeps alice+bob data
+      # cleanly separated even though they share the same database.
+      AI_MEMORY_STORE_URL: "postgres://ai_memory:ai_memory_test@pg-age:5432/ai_memory_test?options=-csearch_path%3Dic_alice%2Cag_catalog%2Cpublic&sslmode=disable"
+      OLLAMA_BASE_URL: "${OLLAMA_BASE_URL:-http://host.docker.internal:11434}"
+      AI_MEMORY_LLM_MODEL: "gemma4:e4b"
+      AI_MEMORY_EMBED_MODEL: "nomic-embed-text"
+      AI_MEMORY_PEER_URLS: "http://ic-parity-bob:19077"
+      AI_MEMORY_API_KEY: "${AI_MEMORY_API_KEY:-lan-parity-test-key}"
+      RUST_LOG: "${RUST_LOG:-ai_memory=info,sqlx=warn}"
+    volumes:
+      - ic-parity-alice-keys:/root/.config/ai-memory/keys
+      - ic-parity-alice-audit:/var/log/ai-memory/audit
+    ports:
+      - "127.0.0.1:19180:19077"
+    networks:
+      - ic-parity-mesh
+    healthcheck:
+      test: ["CMD", "curl", "-f", "-sS", "--max-time", "3", "http://127.0.0.1:19077/api/v1/capabilities"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+
+  ic-parity-bob:
+    image: ai-memory-lan-parity:latest
+    container_name: ai-memory-lan-parity-bob
+    hostname: ic-parity-bob
+    restart: on-failure
+    depends_on:
+      pg-age:
+        condition: service_healthy
+      ic-parity-alice:
+        condition: service_started
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      AI_MEMORY_AGENT_ID: "ai:ic-parity-bob@lan-parity"
+      AI_MEMORY_TIER: autonomous
+      AI_MEMORY_LISTEN_HOST: "0.0.0.0"
+      AI_MEMORY_LISTEN_PORT: "19077"
+      AI_MEMORY_STORE_URL: "postgres://ai_memory:ai_memory_test@pg-age:5432/ai_memory_test?options=-csearch_path%3Dic_bob%2Cag_catalog%2Cpublic&sslmode=disable"
+      OLLAMA_BASE_URL: "${OLLAMA_BASE_URL:-http://host.docker.internal:11434}"
+      AI_MEMORY_LLM_MODEL: "gemma4:e4b"
+      AI_MEMORY_EMBED_MODEL: "nomic-embed-text"
+      AI_MEMORY_PEER_URLS: "http://ic-parity-alice:19077"
+      AI_MEMORY_API_KEY: "${AI_MEMORY_API_KEY:-lan-parity-test-key}"
+      RUST_LOG: "${RUST_LOG:-ai_memory=info,sqlx=warn}"
+    volumes:
+      - ic-parity-bob-keys:/root/.config/ai-memory/keys
+      - ic-parity-bob-audit:/var/log/ai-memory/audit
+    ports:
+      - "127.0.0.1:19181:19077"
+    networks:
+      - ic-parity-mesh
+    healthcheck:
+      test: ["CMD", "curl", "-f", "-sS", "--max-time", "3", "http://127.0.0.1:19077/api/v1/capabilities"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+
+networks:
+  # Distinct subnet from infra/plan-c (172.31.78.0/24) so the two
+  # composes can co-exist on the same Colima host without route
+  # collisions.
+  ic-parity-mesh:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.31.79.0/24
+
+volumes:
+  pg-age-data:
+  ic-parity-alice-keys:
+  ic-parity-alice-audit:
+  ic-parity-bob-keys:
+  ic-parity-bob-audit:
