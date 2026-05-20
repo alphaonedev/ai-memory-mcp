@@ -70,6 +70,7 @@ pub async fn detect_contradictions(
     headers: axum::http::HeaderMap,
     Query(q): Query<ContradictionsQuery>,
 ) -> impl IntoResponse {
+    #[cfg(not(feature = "sal"))]
     let _ = &headers;
     if q.topic.is_none() && q.namespace.is_none() {
         return (
@@ -622,6 +623,7 @@ pub async fn check_duplicate(
     headers: axum::http::HeaderMap,
     Json(body): Json<CheckDuplicateBody>,
 ) -> impl IntoResponse {
+    #[cfg(not(feature = "sal"))]
     let _ = &headers;
     if let Err(e) = validate::validate_title(&body.title) {
         return (
