@@ -534,8 +534,11 @@ pub struct CapabilityFeatures {
     /// `feat/v0.7.0-recursive-learning`:
     ///
     /// - **Column** (Task 1/8, commit `f5d8a9e`) —
-    ///   `memories.reflection_depth INTEGER NOT NULL DEFAULT 0`
-    ///   on SQLite (schema v29) and Postgres (`CURRENT_SCHEMA_VERSION 31`).
+    ///   `memories.reflection_depth INTEGER NOT NULL DEFAULT 0`,
+    ///   first added in the recursive-learning schema bump (column
+    ///   inventory lives in `MIGRATION_LADDER.md`; the current
+    ///   `CURRENT_SCHEMA_VERSION` is 48 in lockstep on both sqlite
+    ///   and postgres ladders as of v0.7.0).
     ///   `Memory::reflection_depth: i32` with `#[serde(default)]` for
     ///   wire-compat with pre-v0.7.0 federation peers.
     /// - **Governance field** (Task 2/8, commit `630a6db`) —
