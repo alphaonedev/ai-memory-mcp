@@ -9804,7 +9804,18 @@ fn http_sync_push_applies_restores() {
     assert_eq!(resp["restored"].as_u64().unwrap_or(0), 1);
 
     // 4. Active GET succeeds again.
-    let (code, body) = curl_get(peer.port, &format!("/api/v1/memories/{id}"));
+    // #927 (Track A P4, 2026-05-20) extended scope=private filter to
+    // the sqlite GET-by-id path; use `curl_get_as` with the row's
+    // recorded owner principal so the gate admits the read. The
+    // restored row retains its original `metadata.agent_id =
+    // "ai:restore-sync"` (provenance immutability — preserved across
+    // archive + federation restore), NOT the sync sender's id.
+    // Pre-#927 the bare `curl_get` worked because GET was unfiltered.
+    let (code, body) = curl_get_as(
+        peer.port,
+        &format!("/api/v1/memories/{id}"),
+        "ai:restore-sync",
+    );
     assert_eq!(code, "200", "restored row must be live again: {body}");
 }
 
@@ -11256,7 +11267,19 @@ async fn http_smoke_matrix_phases_1_3() {
 
     // GET /api/v1/memories/{id} — get_memory, must return 200
     {
-        let (code, body) = route_get(&d, &format!("/api/v1/memories/{memory_id}")).await;
+        // #927 (Track A P4, 2026-05-20) extended the scope=private
+        // visibility filter to the sqlite GET-by-id path. The default
+        // `route_get` doesn't set X-Agent-Id so the read gets a
+        // unique `anonymous:req-<uuid>` principal that doesn't match
+        // the row owner ("ai:smoke-agent" from the POST above). Use
+        // the explicit-principal variant so reader == writer
+        // principal and the gate admits the read.
+        let (code, body) = route_get_with_agent(
+            &d,
+            &format!("/api/v1/memories/{memory_id}"),
+            "ai:smoke-agent",
+        )
+        .await;
         assert_eq!(code, "200", "get_memory: {body}");
         assert_eq!(
             body["memory"]["id"].as_str(),
