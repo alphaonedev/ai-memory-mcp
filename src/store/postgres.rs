@@ -612,12 +612,13 @@ impl PostgresStore {
         // acquire ONCE here and switch the inner `store.migrate()`
         // call to the lock-free `store.migrate_locked()` to avoid the
         // second acquire-from-different-session that would deadlock.
-        let mut bootstrap_lock_conn = pool.acquire().await.map_err(|e| {
-            StoreError::BackendUnavailable {
-                backend: "postgres".to_string(),
-                detail: format!("acquire bootstrap lock connection: {e}"),
-            }
-        })?;
+        let mut bootstrap_lock_conn =
+            pool.acquire()
+                .await
+                .map_err(|e| StoreError::BackendUnavailable {
+                    backend: "postgres".to_string(),
+                    detail: format!("acquire bootstrap lock connection: {e}"),
+                })?;
         // v0.7.0 ship-hardening (2026-05-19, QC P0): the per-session
         // statement_timeout=30s set in `after_connect` would abort
         // `pg_advisory_lock` itself if a holder takes >30s
@@ -4824,11 +4825,9 @@ impl PostgresStore {
                         ),
                     }
                 })?;
-                let nodes = arr
-                    .as_array()
-                    .ok_or_else(|| StoreError::IntegrityFailed {
-                        detail: format!("AGE path is not an array: {}", payload_preview(&raw.0)),
-                    })?;
+                let nodes = arr.as_array().ok_or_else(|| StoreError::IntegrityFailed {
+                    detail: format!("AGE path is not an array: {}", payload_preview(&raw.0)),
+                })?;
                 let ids: Vec<String> = nodes
                     .iter()
                     .filter_map(|v| {
@@ -6061,7 +6060,10 @@ fn assert_age_id_safe(id: &str) -> Result<(), String> {
             id.len()
         ));
     }
-    if !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+    if !id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
         return Err(format!(
             "id contains characters unsafe for cypher inline (allowed: [A-Za-z0-9_-]): {id:?}"
         ));
