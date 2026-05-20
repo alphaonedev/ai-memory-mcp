@@ -153,11 +153,7 @@ pub async fn recall_memories_get(
     ) {
         Ok(p) => p,
         Err(e) => {
-            return (
-                axum::http::StatusCode::FORBIDDEN,
-                Json(json!({"error": e})),
-            )
-                .into_response();
+            return (axum::http::StatusCode::FORBIDDEN, Json(json!({"error": e}))).into_response();
         }
     };
     recall_response(
@@ -223,11 +219,7 @@ pub async fn recall_memories_post(
     ) {
         Ok(p) => p,
         Err(e) => {
-            return (
-                axum::http::StatusCode::FORBIDDEN,
-                Json(json!({"error": e})),
-            )
-                .into_response();
+            return (axum::http::StatusCode::FORBIDDEN, Json(json!({"error": e}))).into_response();
         }
     };
     recall_response(

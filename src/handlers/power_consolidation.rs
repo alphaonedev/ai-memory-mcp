@@ -88,13 +88,19 @@ fn default_ns() -> String {
 async fn resolve_consolidate_summary(
     app: &AppState,
     ids: &[String],
-    caller: &crate::store::CallerContext,
+    caller_principal: &str,
 ) -> Result<String, Response> {
     // Collect (title, content) pairs from the appropriate backend so
     // the LLM has the actual source material. SAL on postgres; legacy
     // db on sqlite. A missing source memory short-circuits to 400 with
     // the offending id, matching the MCP path.
-    let pairs = fetch_consolidate_source_pairs(app, ids, caller).await?;
+    //
+    // Caller is passed as a string (agent id) rather than a typed
+    // `CallerContext` so this helper compiles cleanly under non-sal
+    // feature configurations. The `CallerContext::for_agent(...)`
+    // construction lives inside the sal-gated body of
+    // [`fetch_consolidate_source_pairs`].
+    let pairs = fetch_consolidate_source_pairs(app, ids, caller_principal).await?;
 
     // No LLM available — deterministic concat fallback. Titles only
     // (not full content) so the result stays a "summary" rather than a
@@ -154,7 +160,7 @@ async fn resolve_consolidate_summary(
 async fn fetch_consolidate_source_pairs(
     app: &AppState,
     ids: &[String],
-    caller: &crate::store::CallerContext,
+    caller_principal: &str,
 ) -> Result<Vec<(String, String)>, Response> {
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
@@ -167,9 +173,10 @@ async fn fetch_consolidate_source_pairs(
         // them. Cross-author consolidation requires an explicit
         // admin role (a v0.7.1+ feature); for now the consolidation
         // surface is single-owner.
+        let caller = crate::store::CallerContext::for_agent(caller_principal.to_string());
         let mut out: Vec<(String, String)> = Vec::with_capacity(ids.len());
         for id in ids {
-            match app.store.get(caller, id).await {
+            match app.store.get(&caller, id).await {
                 Ok(mem) => out.push((mem.title, mem.content)),
                 Err(crate::store::StoreError::NotFound { .. }) => {
                     return Err((
@@ -221,17 +228,25 @@ pub async fn consolidate_memories(
     // is available, synthesise a deterministic concat of the source
     // titles so the row still lands rather than 422'ing on a wire-shape
     // mismatch S51 has tripped on.
-    // QC P1 fix (2026-05-20): resolve the caller from headers so the
-    // SAL #910 scope=private visibility filter applies to the
-    // source-id reads (consolidation can only access memories the
-    // caller owns or that are scope=shared/public).
-    let consolidate_caller = crate::handlers::parity::http_caller_ctx(&headers, None);
+    // QC P1 fix (2026-05-20): resolve the caller principal from
+    // headers so the SAL #910 scope=private visibility filter
+    // applies to the source-id reads (consolidation can only access
+    // memories the caller owns or that are scope=shared/public).
+    // The helper takes `&str` (agent id) rather than the typed
+    // `CallerContext` so non-sal builds compile without conditional
+    // gating.
+    let consolidate_caller_principal =
+        crate::handlers::parity::resolve_caller_agent_id(None, &headers, None)
+            .unwrap_or_else(|_| "anonymous:invalid".to_string());
     let summary = match body.summary.clone() {
         Some(s) if !s.is_empty() => s,
-        _ => match resolve_consolidate_summary(&app, &body.ids, &consolidate_caller).await {
-            Ok(s) => s,
-            Err(resp) => return resp,
-        },
+        _ => {
+            match resolve_consolidate_summary(&app, &body.ids, &consolidate_caller_principal).await
+            {
+                Ok(s) => s,
+                Err(resp) => return resp,
+            }
+        }
     };
 
     if let Err(e) =
@@ -476,9 +491,12 @@ pub async fn auto_tag_handler(
             .into_response();
     }
 
-    // QC P1 fix (2026-05-20): use header-resolved caller for the
-    // source-memory fetch so the SAL #910 visibility filter applies.
-    let auto_tag_caller = crate::handlers::parity::http_caller_ctx(&headers, None);
+    // QC P1 fix (2026-05-20): use header-resolved caller principal
+    // for the source-memory fetch so the SAL #910 visibility filter
+    // applies. Helper takes `&str` so non-sal builds compile.
+    let auto_tag_caller_principal =
+        crate::handlers::parity::resolve_caller_agent_id(None, &headers, None)
+            .unwrap_or_else(|_| "anonymous:invalid".to_string());
 
     // Resolve (title, content). S51 sends `memory_id`; we fetch the
     // memory from the active backend. Ad-hoc callers may instead
@@ -492,7 +510,7 @@ pub async fn auto_tag_handler(
                 )
                     .into_response();
             }
-            match fetch_memory_for_handler(&app, id, &auto_tag_caller).await {
+            match fetch_memory_for_handler(&app, id, &auto_tag_caller_principal).await {
                 Ok(mem) => (mem.title, mem.content, Some(id.to_string())),
                 Err(resp) => return resp,
             }
@@ -668,14 +686,15 @@ pub async fn expand_query_handler(
 async fn fetch_memory_for_handler(
     app: &AppState,
     id: &str,
-    caller: &crate::store::CallerContext,
+    caller_principal: &str,
 ) -> Result<Memory, Response> {
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         // QC P1 fix (2026-05-20): use header-resolved caller so the
         // SAL #910 scope=private visibility filter applies — caller
         // can only fetch memories they own (or scope=shared/public).
-        return match app.store.get(caller, id).await {
+        let caller = crate::store::CallerContext::for_agent(caller_principal.to_string());
+        return match app.store.get(&caller, id).await {
             Ok(mem) => Ok(mem),
             Err(crate::store::StoreError::NotFound { .. }) => Err((
                 StatusCode::NOT_FOUND,
