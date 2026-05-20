@@ -51,8 +51,16 @@ fn default_archive_limit() -> Option<usize> {
 
 pub async fn list_archive(
     State(app): State<AppState>,
+    headers: axum::http::HeaderMap,
     Query(q): Query<ArchiveListQuery>,
 ) -> impl IntoResponse {
+    // #943 SECURITY-medium (Track A QC sweep, 2026-05-20) — admin-
+    // only gate. Pre-fix any caller could enumerate every archived
+    // row in the deployment. Mirror the #946 list_agents pattern;
+    // sibling of archive_stats below.
+    if let Err(resp) = crate::handlers::admin_role::require_admin(&app, &headers, "list_archive") {
+        return resp;
+    }
     // Ultrareview #350: validate limit range. `usize` already precludes
     // negative values at the serde layer, but `limit=0` silently
     // returned an empty page — indistinguishable from "no results".
@@ -306,7 +314,17 @@ pub async fn purge_archive(
     }
 }
 
-pub async fn archive_stats(State(app): State<AppState>) -> impl IntoResponse {
+pub async fn archive_stats(
+    State(app): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    // #943 SECURITY-medium (Track A QC sweep, 2026-05-20) — admin-
+    // only gate. Pre-fix any caller could enumerate archive table
+    // size + per-reason counts + per-namespace stats. Sibling of
+    // list_archive above.
+    if let Err(resp) = crate::handlers::admin_role::require_admin(&app, &headers, "archive_stats") {
+        return resp;
+    }
     // v0.7.0 Wave-3 Continuation — postgres-backed daemons aggregate
     // counts directly from the `archived_memories` table.
     #[cfg(feature = "sal-postgres")]
