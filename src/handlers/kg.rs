@@ -448,16 +448,53 @@ pub async fn entity_get_by_alias(
         };
     }
 
+    // #947 SECURITY-medium (Track A QC sweep, 2026-05-20) — resolve
+    // caller for the visibility post-filter on entity aliases. Pre-fix
+    // any caller could resolve a private entity by alias in the sqlite
+    // branch. Admin bypasses the filter.
+    let caller = {
+        let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+        crate::identity::resolve_http_agent_id(None, header_agent_id)
+            .unwrap_or_else(|_| format!("anonymous:req-{}", uuid::Uuid::new_v4()))
+    };
+    let caller_is_admin = crate::handlers::admin_role::is_admin_caller(&app, &caller);
+
     let lock = app.db.lock().await;
     match db::entity_get_by_alias(&lock.0, alias, namespace) {
-        Ok(Some(rec)) => Json(json!({
-            "found": true,
-            "entity_id": rec.entity_id,
-            "canonical_name": rec.canonical_name,
-            "namespace": rec.namespace,
-            "aliases": rec.aliases,
-        }))
-        .into_response(),
+        Ok(Some(rec)) => {
+            // Mask the entity if the caller cannot see the underlying
+            // memory row. The `entity_id` IS the memory id by the
+            // entity-as-memory contract; if the row exists and is not
+            // visible to the caller, return the found:false shape
+            // (existence-leak mask). If the row is missing entirely
+            // (e.g. legacy entity-alias row without a backing memory),
+            // fall through to the visible path — the alias is a
+            // namespace-scoped pointer, not a private secret.
+            let visible = caller_is_admin
+                || db::get(&lock.0, &rec.entity_id)
+                    .ok()
+                    .flatten()
+                    .as_ref()
+                    .is_none_or(|m| crate::visibility::is_visible_to_caller(m, &caller));
+            if !visible {
+                return Json(json!({
+                    "found": false,
+                    "entity_id": null,
+                    "canonical_name": null,
+                    "namespace": null,
+                    "aliases": [],
+                }))
+                .into_response();
+            }
+            Json(json!({
+                "found": true,
+                "entity_id": rec.entity_id,
+                "canonical_name": rec.canonical_name,
+                "namespace": rec.namespace,
+                "aliases": rec.aliases,
+            }))
+            .into_response()
+        }
         Ok(None) => Json(json!({
             "found": false,
             "entity_id": null,
