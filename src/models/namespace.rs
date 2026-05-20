@@ -118,7 +118,8 @@ pub enum GovernanceDecision {
 
 /// Actions that governance gates. Used as the `action_type` column value in
 /// `pending_actions` and as the discriminator for enforcement calls.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum GovernedAction {
     Store,
     Delete,
