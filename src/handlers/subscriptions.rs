@@ -353,6 +353,20 @@ pub async fn subscribe(
         let sub_id = uuid::Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
         let ns = format!("_subscriptions/{caller}");
+        // #932 (v0.7.0 Track D, 2026-05-20) — persist the SHA-256
+        // hash of the per-subscription secret in the metadata blob
+        // so `dispatch_event_postgres` can resolve it back without
+        // an out-of-band sqlite lookup. The plaintext secret is
+        // NEVER persisted (#-301 contract); only the SHA-256 hash
+        // lands. When the operator skipped `secret` and relies on
+        // the server-wide `[hooks.subscription] hmac_secret`, this
+        // field is omitted and the dispatcher falls back to the
+        // server-wide key per the K7 contract.
+        let secret_hash_for_metadata: Option<String> = body
+            .secret
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(crate::subscriptions::sha256_hex);
         let metadata = json!({
             "kind": "subscription",
             "agent_id": caller,
@@ -361,6 +375,7 @@ pub async fn subscribe(
             "events": events,
             "namespace_filter": namespace_filter,
             "agent_filter": agent_filter,
+            "secret_hash": secret_hash_for_metadata,
             "created_by": caller,
             "created_at": now,
         });
@@ -843,4 +858,170 @@ pub async fn list_subscriptions(
         Json(json!({"count": count, "subscriptions": rows})),
     )
         .into_response()
+}
+
+/// #932 (v0.7.0 Track D, 2026-05-20) — postgres-backed webhook
+/// dispatch.
+///
+/// The sqlite path runs `subscriptions::dispatch_event_with_details`
+/// which queries the `subscriptions` table via the shared
+/// `Mutex<Connection>`. On postgres-backed daemons that table is
+/// EMPTY — subscriptions land as memory rows in
+/// `_subscriptions/<agent_id>` via the SAL store (see `subscribe`
+/// above). Pre-#932 the postgres `create_memory_postgres` path
+/// invoked no dispatch helper at all, so a subscribe + store
+/// round-trip on postgres fired zero webhooks — vacuously
+/// satisfying the v0.7.0 "HMAC non-optional" contract.
+///
+/// This helper walks `_subscriptions/<*>` rows across every tenant
+/// (using `for_admin`/`bypass_visibility=true` so visibility doesn't
+/// drop cross-tenant subscribers — same as the sqlite dispatch which
+/// passes `None` as the caller_agent_id scope), reshapes each row
+/// into a `Subscription` struct, resolves the secret_hash from the
+/// memory's metadata, and feeds the canonical
+/// `subscriptions::dispatch_event_to_subs` worker pool. Audit
+/// rows (`record_subscription_event` / `record_dispatch` / DLQ)
+/// still write to sqlite via `db_path` because postgres-backed
+/// daemons keep a sqlite scratch DB alongside the SAL store handle.
+///
+/// Fire-and-forget — never panics, errors logged at warn / debug.
+#[cfg(feature = "sal")]
+pub async fn dispatch_event_postgres(
+    app: &AppState,
+    event: &str,
+    memory_id: &str,
+    namespace: &str,
+    agent_id: Option<&str>,
+    details: Option<serde_json::Value>,
+) {
+    // Cross-tenant view: subscription dispatch needs the full subscriber
+    // population, not just the caller's. `for_admin` bypasses the
+    // scope=private filter so a tenant's collective-scope event can fire
+    // every matching subscriber's hook regardless of which tenant
+    // registered it. The cross-tenant authorization gate lives at the
+    // wire surface (subscribe/list/unsubscribe handlers).
+    let ctx = crate::store::CallerContext::for_admin("subscription-dispatch");
+
+    // We don't have a namespace-prefix filter on the SAL `list` method
+    // yet (`Filter::namespace` is exact-match). For dispatch we list
+    // with `namespace=None` (all rows) and filter to `_subscriptions/`
+    // in Rust. The limit is bounded at 1000 to match the sqlite path's
+    // implicit limit (subscriptions::list has no LIMIT clause, but
+    // production deployments rarely exceed dozens of subscribers).
+    // A future SAL extension can add `namespace_prefix` to push this
+    // filter into SQL.
+    let filter = crate::store::Filter {
+        namespace: None,
+        limit: 1000,
+        ..Default::default()
+    };
+    let memories = match app.store.list(&ctx, &filter).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(
+                "dispatch_event_postgres: SAL list failed: {e} — \
+                 no subscribers will fire this tick"
+            );
+            return;
+        }
+    };
+
+    let mut matching: Vec<(crate::subscriptions::Subscription, Option<String>)> = Vec::new();
+    for m in memories {
+        if !m.namespace.starts_with("_subscriptions/") {
+            continue;
+        }
+        let meta = &m.metadata;
+        if meta.get("kind").and_then(|v| v.as_str()) != Some("subscription") {
+            continue;
+        }
+        let sub_id = meta
+            .get("subscription_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| m.id.clone());
+        let url = match meta.get("url").and_then(|v| v.as_str()) {
+            Some(u) => u.to_string(),
+            None => continue, // malformed row, skip
+        };
+        let events_csv = meta
+            .get("events")
+            .and_then(|v| v.as_str())
+            .unwrap_or("*")
+            .to_string();
+        let namespace_filter = meta
+            .get("namespace_filter")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let agent_filter = meta
+            .get("agent_filter")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let created_by = meta
+            .get("created_by")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let created_at = meta
+            .get("created_at")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let secret_hash = meta
+            .get("secret_hash")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+
+        // Apply the canonical filter (same predicate the sqlite path
+        // uses) so dispatch surface matches across adapters.
+        if !crate::subscriptions::matches_filters(
+            &events_csv,
+            None,
+            namespace_filter.as_deref(),
+            agent_filter.as_deref(),
+            event,
+            namespace,
+            agent_id,
+        ) {
+            continue;
+        }
+
+        let sub = crate::subscriptions::Subscription {
+            id: sub_id,
+            url,
+            events: events_csv,
+            namespace_filter,
+            agent_filter,
+            created_by,
+            created_at,
+            dispatch_count: 0,
+            failure_count: 0,
+            event_types: None,
+        };
+        matching.push((sub, secret_hash));
+    }
+
+    if matching.is_empty() {
+        tracing::debug!(
+            "dispatch_event_postgres: event={event} ns={namespace} \
+             matched zero subscribers (post-#932 dispatch path)"
+        );
+        return;
+    }
+    let n_matched = matching.len();
+    tracing::debug!(
+        "dispatch_event_postgres: event={event} ns={namespace} \
+         dispatching to {n_matched} subscriber(s) via SAL"
+    );
+
+    // Resolve the audit sqlite path via the shared db_state. Postgres
+    // daemons still keep a sqlite scratch DB for federation/governance
+    // state — audit rows + DLQ + dispatch counters still land there.
+    let db_path = {
+        let lock = app.db.lock().await;
+        lock.1.clone()
+    };
+
+    crate::subscriptions::dispatch_event_to_subs(
+        matching, event, memory_id, namespace, agent_id, &db_path, details,
+    );
 }

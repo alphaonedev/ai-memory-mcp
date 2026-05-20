@@ -595,6 +595,26 @@ async fn fanout_and_assemble_create_response(
             response["embed_status_reason"] = json!(reason);
         }
     }
+    // #932 (v0.7.0 Track D, 2026-05-20) — fire `memory_store`
+    // webhook subscribers via the canonical sqlite dispatch path.
+    // Pre-#932 the HTTP `create_memory` sqlite branch invoked no
+    // dispatch hook, so an HTTP-routed store fired zero webhooks
+    // even when matching subscribers were registered. The MCP
+    // `handle_store` path at `src/mcp/tools/store/mod.rs:469` has
+    // always emitted this event; the HTTP path now matches.
+    // Fire-and-forget (worker threads handle delivery).
+    {
+        let lock = app.db.lock().await;
+        crate::subscriptions::dispatch_event(
+            &lock.0,
+            "memory_store",
+            actual_id,
+            &mem.namespace,
+            resolved_agent_id.as_deref(),
+            &lock.1,
+        );
+    }
+
     // v0.7 federation: fan out to peers when --quorum-writes is
     // configured. Per ADR-0001 a failed quorum returns 503 but does
     // NOT roll back the local write.
@@ -752,6 +772,32 @@ async fn create_memory_postgres(
                     ),
                 ));
             }
+            // #932 (v0.7.0 Track D, 2026-05-20) — postgres-backed
+            // subscription dispatch. The sqlite-side dispatch reads
+            // from the `subscriptions` table; postgres subscriptions
+            // land as memories in `_subscriptions/<aid>` and are
+            // INVISIBLE to that lookup. Pre-#932 the postgres
+            // `create_memory_postgres` branch fired zero webhooks on
+            // every `memory_store` event — vacuously satisfying the
+            // v0.7.0 HMAC-non-optional guarantee. `dispatch_event_postgres`
+            // walks every `_subscriptions/<*>` row across tenants
+            // (bypass_visibility=true), applies the same matcher the
+            // sqlite path uses, and feeds the canonical
+            // `dispatch_event_to_subs` worker pool. Fire-and-forget;
+            // never panics; never rolls back the local commit.
+            let id_for_dispatch = id.clone();
+            let ns_for_dispatch = mem.namespace.clone();
+            let agent_for_dispatch = agent_id.to_string();
+            super::dispatch_event_postgres(
+                app,
+                "memory_store",
+                &id_for_dispatch,
+                &ns_for_dispatch,
+                Some(&agent_for_dispatch),
+                None,
+            )
+            .await;
+
             // F-A2A1.6 (#700, S18) — postgres-branch federation fanout.
             //
             // #931 (v0.7.0 Track D, 2026-05-20) — debug-level entry
