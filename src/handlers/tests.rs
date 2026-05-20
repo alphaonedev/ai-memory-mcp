@@ -5484,14 +5484,20 @@ async fn http_run_gc_returns_zero_for_clean_db() {
 
 #[tokio::test]
 async fn http_export_memories_empty_returns_zero_count() {
+    // #957 (security-critical, 2026-05-20) — `/api/v1/export` is now
+    // admin-gated. The empty-corpus happy path still needs to fire so
+    // the test passes an admin caller via `test_app_state_with_admin`
+    // and the matching `X-Agent-Id` header. The non-admin rejection
+    // surface is covered by `tests/export_memories_admin_gate_957.rs`.
     let state = test_state();
     let app = Router::new()
         .route("/api/v1/export", axum::routing::get(export_memories))
-        .with_state(test_app_state(state));
+        .with_state(test_app_state_with_admin(state, "ops:admin"));
     let resp = app
         .oneshot(
             axum::http::Request::builder()
                 .uri("/api/v1/export")
+                .header("x-agent-id", "ops:admin")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -11475,16 +11481,20 @@ async fn http_get_stats_with_data_returns_total() {
 
 #[tokio::test]
 async fn http_export_memories_with_data_returns_count() {
+    // #957 — endpoint is admin-gated; the count happy path runs
+    // through the admin allowlist. Non-admin rejection covered by
+    // `tests/export_memories_admin_gate_957.rs`.
     let state = test_state();
     let _ = insert_test_memory(&state, "ns-export", "t1").await;
     let _ = insert_test_memory(&state, "ns-export", "t2").await;
     let app = Router::new()
         .route("/api/v1/export", axum_get(export_memories))
-        .with_state(test_app_state(state));
+        .with_state(test_app_state_with_admin(state, "ops:admin"));
     let resp = app
         .oneshot(
             axum::http::Request::builder()
                 .uri("/api/v1/export")
+                .header("x-agent-id", "ops:admin")
                 .body(Body::empty())
                 .unwrap(),
         )

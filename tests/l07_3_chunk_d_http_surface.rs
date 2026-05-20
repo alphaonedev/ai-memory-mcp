@@ -1763,11 +1763,28 @@ async fn http_run_gc_happy() {
 
 #[tokio::test]
 async fn http_export_returns_envelope() {
+    // #957 (security-critical, 2026-05-20) — `/api/v1/export` is
+    // admin-gated. The default `build_router_fixture` ships an
+    // empty admin allowlist (the v0.7.0 safe-by-default posture),
+    // so every caller (including the implicit anonymous default)
+    // is correctly rejected with 403. The non-admin rejection
+    // contract is the security-critical invariant — exercise it
+    // here as the in-fixture surface check; the admin-admit
+    // success path + the full role gate matrix are covered by
+    // `tests/export_memories_admin_gate_957.rs`.
     let (router, _f) = build_router_fixture();
     let _ = create_basic(&router, "chunk-d/exp", "x").await;
     let (status, payload) = get_uri(&router, "/api/v1/export").await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(payload.is_object());
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "#957: empty-allowlist export MUST reject; body={payload}"
+    );
+    assert_eq!(
+        payload["error"].as_str(),
+        Some("admin role required"),
+        "#957: rejection body MUST be sanitised; body={payload}"
+    );
 }
 
 #[tokio::test]
