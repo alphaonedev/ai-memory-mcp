@@ -422,7 +422,13 @@ Tracking issue: #198.
 - Zero warnings under `clippy::pedantic`.
 - Copyright header on all source files: `// Copyright 2026 AlphaOne LLC` + `// SPDX-License-Identifier: Apache-2.0`
 - PRs target `develop` branch, not `main`. `main` is production releases only.
-- Commit format: `<type>: <summary>` (feat, fix, docs, style, refactor, test, chore, perf)
+- Commit format: `<type>(scope?): <summary>` — `<type>` ∈
+  {feat, fix, docs, style, refactor, test, chore, perf, infra, ci, build, coverage, qc}.
+  The last five (`infra`, `ci`, `build`, `coverage`, `qc`) are extended types adopted
+  during the v0.7.0 cycle: `infra` for Docker / compose / deployment-config changes,
+  `ci` for `.github/workflows/*`, `build` for Cargo.toml / build-script changes,
+  `coverage` for `coverage/thresholds.toml` and floor adjustments, `qc` for
+  QC-review artefacts + remediation. Scope is encouraged but optional.
 
 ## Prime directive (operator-set, 2026-05-17)
 

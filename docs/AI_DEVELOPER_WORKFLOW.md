@@ -34,7 +34,12 @@ Every AI session that will touch this repository begins by loading shared contex
 
 Load these files into context before proposing any change:
 
-- [`CLAUDE.md`](../CLAUDE.md) — Claude Code integration and tool surface
+- [`CLAUDE.md`](../CLAUDE.md) — Claude Code integration and tool surface; includes
+  §"CodeGraph setup" (the L1 structural-safety MCP server adopted under issue #923).
+  CodeGraph is complementary to rust-analyzer LSP and ai-memory: LSP answers "where is
+  this exact symbol used right now"; CodeGraph answers "what is the shape — what calls
+  what, what would break"; ai-memory answers "what did prior sessions learn". All three
+  should be loaded for cross-cutting work.
 - [`CONTRIBUTING.md`](../CONTRIBUTING.md) — contributor procedures
 - [`docs/ENGINEERING_STANDARDS.md`](ENGINEERING_STANDARDS.md) — code, test, security,
   release standards
