@@ -51,6 +51,12 @@ pub use quorum::*;
 pub use receive::spawn_catchup_loop;
 #[cfg(feature = "sal")]
 pub use receive::spawn_catchup_loop_with_store;
+// #935 (v0.7.0 Track D, 2026-05-20) — `catchup_once_for_tests` is a
+// public test driver for the integration test in
+// `tests/federation_catchup_api_key.rs`. Marked `#[doc(hidden)]` on
+// the source-side so it doesn't appear in rustdoc, but kept `pub`
+// here so the integration test (separate crate) can import it.
+pub use receive::catchup_once_for_tests;
 pub use sync::*;
 
 use crate::replication::QuorumPolicy;
