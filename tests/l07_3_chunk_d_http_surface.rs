@@ -645,8 +645,12 @@ async fn http_promote_memory_happy_path() {
     // #930 (Track A P9, 2026-05-20) added the caller-vs-row-owner
     // gate to PROMOTE; the request must send X-Agent-Id matching the
     // row's `metadata.agent_id = "ai:test"` (set by create_basic).
-    let (status, _payload) =
-        promote_with_agent(&router, &format!("/api/v1/memories/{id}/promote"), "ai:test").await;
+    let (status, _payload) = promote_with_agent(
+        &router,
+        &format!("/api/v1/memories/{id}/promote"),
+        "ai:test",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
 }
 
