@@ -712,7 +712,19 @@ async fn set_namespace_standard_inner(
 
     let mut effective = body;
     effective.id = Some(resolved_id.clone());
-    let params = namespace_standard_params(ns, &effective);
+    let mut params = namespace_standard_params(ns, &effective);
+    // #929 SECURITY-high follow-up (2026-05-20) — thread the HTTP-
+    // resolved caller through to the MCP entry so its #929 ownership
+    // gate sees the same principal as the HTTP-handler gate. Without
+    // this the MCP entry's `resolve_agent_id(params["agent_id"], None)`
+    // falls back to the daemon process identity (`host:<host>:pid-…`),
+    // which never matches a row-owner anchored to the HTTP caller's
+    // X-Agent-Id — 400-rejects every legitimate first-write on the
+    // HTTP standard surface. Verified via Track A re-probe agent
+    // `aaab899d6a4bab36f` 2026-05-20 (re-verify #929 close pending).
+    if let Some(obj) = params.as_object_mut() {
+        obj.insert("agent_id".to_string(), json!(caller));
+    }
     let result = crate::mcp::handle_namespace_set_standard(&lock.0, &params);
     // Capture the standard memory so we can fan it out to peers — cluster
     // visibility of governance rules matters for S34/S35.
