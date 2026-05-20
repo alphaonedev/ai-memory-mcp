@@ -44,12 +44,28 @@ pub(super) fn handle_archive_purge(
     // `purge_archive` fix.
     let caller = crate::identity::resolve_agent_id(params["agent_id"].as_str(), None)
         .unwrap_or_else(|_| "anonymous:invalid".to_string());
+    // #936 (security-critical, 2026-05-20) — MCP-side owner gate.
+    // The MCP entry is a second attack surface for the same gap the
+    // HTTP `purge_archive` handler had: pre-#936 the dispatch reached
+    // `db::purge_archive` with no caller, deleting every owner's
+    // archived rows. The MCP tool surface gets the same posture as
+    // the HTTP handler: owner-scoped by default; cross-tenant wipe
+    // requires the explicit `as_admin: true` parameter (no separate
+    // MCP-side admin-config block today — operators use either the
+    // CLI or the HTTP admin allowlist for cross-tenant deletes).
+    let as_admin = params
+        .get("as_admin")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     crate::governance::audit::record_decision(
         &caller,
         "allow",
         "archive_purge",
         "",
-        json!({ "older_than_days": older_than_days }),
+        json!({
+            "older_than_days": older_than_days,
+            "owner_scope": if as_admin { "admin" } else { "caller" },
+        }),
     );
 
     // v0.7.0 K9 — unified permission pipeline (archive-side).
@@ -64,7 +80,10 @@ pub(super) fn handle_archive_purge(
             op: Op::MemoryArchive,
             namespace: "global".to_string(),
             agent_id,
-            payload: json!({"older_than_days": older_than_days}),
+            payload: json!({
+                "older_than_days": older_than_days,
+                "as_admin": as_admin,
+            }),
         };
         match Permissions::evaluate(&ctx, &[]) {
             crate::permissions::Decision::Allow | crate::permissions::Decision::Modify(_) => {}
@@ -81,8 +100,15 @@ pub(super) fn handle_archive_purge(
         }
     }
 
-    let purged = db::purge_archive(conn, older_than_days).map_err(|e| e.to_string())?;
-    Ok(json!({"purged": purged}))
+    let purged = if as_admin {
+        db::purge_archive(conn, older_than_days).map_err(|e| e.to_string())?
+    } else {
+        db::purge_archive_for_caller(conn, &caller, older_than_days).map_err(|e| e.to_string())?
+    };
+    Ok(json!({
+        "purged": purged,
+        "owner_scope": if as_admin { "admin" } else { "caller" },
+    }))
 }
 
 pub(super) fn handle_archive_stats(conn: &rusqlite::Connection) -> Result<Value, String> {
