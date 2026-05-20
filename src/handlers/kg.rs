@@ -357,6 +357,7 @@ pub async fn entity_get_by_alias(
     headers: axum::http::HeaderMap,
     Query(p): Query<EntityByAliasQuery>,
 ) -> impl IntoResponse {
+    #[cfg(not(feature = "sal"))]
     let _ = &headers;
     let alias = p.alias.trim();
     if alias.is_empty() {

@@ -162,6 +162,7 @@ async fn fetch_consolidate_source_pairs(
     ids: &[String],
     caller_principal: &str,
 ) -> Result<Vec<(String, String)>, Response> {
+    #[cfg(not(feature = "sal"))]
     let _ = caller_principal;
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
@@ -689,6 +690,7 @@ async fn fetch_memory_for_handler(
     id: &str,
     caller_principal: &str,
 ) -> Result<Memory, Response> {
+    #[cfg(not(feature = "sal"))]
     let _ = caller_principal;
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
@@ -754,6 +756,7 @@ pub async fn load_family_handler(
     headers: HeaderMap,
     Json(body): Json<LoadFamilyBody>,
 ) -> impl IntoResponse {
+    #[cfg(not(feature = "sal"))]
     let _ = &headers;
     use std::str::FromStr;
 
