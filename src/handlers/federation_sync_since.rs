@@ -61,6 +61,65 @@ pub async fn sync_since(
     let attest_cfg = PeerAttestationConfig::from_env();
     let trust_bypass = peer_attestation::sync_trust_peer_bypass();
 
+    // v0.7.0 #948 — federation-pull visibility gate. Pre-#948 the
+    // namespace allowlist was the ONLY filter, which meant rows in an
+    // allowlisted namespace with `metadata.scope == "private"` and a
+    // `metadata.agent_id` belonging to an agent that has NOT consented
+    // to share with this peer were still projected. The fix resolves
+    // a federation "caller" identity from the peer-attestation
+    // headers and post-filters every projected row through the
+    // canonical `crate::visibility::is_visible_to_caller` helper
+    // (landed in commit 4d30dd638 / #951).
+    //
+    // Caller resolution ladder (federation contract):
+    //   1. `X-Peer-Id` (the syncing peer's wire-attested identity —
+    //      the same value that already drives `scope_for(...)` above).
+    //   2. `X-Agent-Id` (the daemon principal of the syncing process,
+    //      mirroring the side-effect write path at line ~169 below).
+    //   3. Empty string ("") — opaque/unknown caller; the visibility
+    //      helper denies every scope=private row to a "" caller that
+    //      isn't the (also-empty) owner, which is the correct
+    //      default-deny posture.
+    let federation_caller: String = peer_header
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            headers
+                .get("x-agent-id")
+                .and_then(|v| v.to_str().ok())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or("")
+        .to_string();
+
+    // Federation-pull legacy carve-out: a row with NEITHER an explicit
+    // `scope` field NOR an `agent_id` field carries zero NHI-ownership
+    // signals — it's a pre-multi-tenant (v0.6-era) wire shape that
+    // federation has always projected. Applying the canonical
+    // visibility predicate to such a row would deny it (the helper
+    // defaults missing-scope to "private" and missing-owner to ""),
+    // which would over-block legitimate legacy traffic and regress
+    // the #239 sync-scope baseline. Rows with an EXPLICIT
+    // `scope=private` and/or an EXPLICIT `agent_id` ARE the #948
+    // threat surface — those go through the helper unchanged so the
+    // owner / inbox-target / non-owner decision matches every other
+    // visibility-gated handler in the codebase.
+    fn has_ownership_signal(mem: &Memory) -> bool {
+        let scope_present = mem.metadata.get("scope").is_some();
+        let owner_present = mem
+            .metadata
+            .get("agent_id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|s| !s.is_empty());
+        scope_present || owner_present
+    }
+    let visibility_ok = |mem: &Memory| -> bool {
+        if !has_ownership_signal(mem) {
+            return true; // legacy unauthored row — project unchanged
+        }
+        crate::visibility::is_visible_to_caller(mem, &federation_caller)
+    };
+
     // Pre-resolved scope row: `Some(&PeerScope)` means filter by its
     // namespace allowlist; `None` + bypass means "legacy full dump";
     // `None` + no bypass means "default-deny → empty page".
@@ -86,6 +145,7 @@ pub async fn sync_since(
                 "latest_updated_at": serde_json::Value::Null,
                 "memories": Vec::<Memory>::new(),
                 "excluded_for_scope": 0,
+                "excluded_for_scope_private": 0,
                 "scope_status": "no_allowlist_default_deny",
             })),
         )
@@ -121,8 +181,16 @@ pub async fn sync_since(
             Err(e) => return store_err_to_response(e),
         };
         let total = mems.len();
-        let filtered: Vec<Memory> = mems.into_iter().filter(|m| allowed(&m.namespace)).collect();
-        let excluded = total.saturating_sub(filtered.len());
+        let ns_filtered: Vec<Memory> = mems.into_iter().filter(|m| allowed(&m.namespace)).collect();
+        let after_ns = ns_filtered.len();
+        let excluded = total.saturating_sub(after_ns);
+        // #948 visibility post-filter (see `federation_caller`
+        // resolution above): drop any scope=private row whose owner /
+        // inbox-target does NOT match the federation caller. The
+        // canonical helper centralises the predicate so future scope
+        // semantics change once and land everywhere.
+        let filtered: Vec<Memory> = ns_filtered.into_iter().filter(visibility_ok).collect();
+        let excluded_for_scope_private = after_ns.saturating_sub(filtered.len());
         let earliest_updated_at = filtered.first().map(|m| m.updated_at.clone());
         let latest_updated_at = filtered.last().map(|m| m.updated_at.clone());
         return (
@@ -136,6 +204,7 @@ pub async fn sync_since(
                 "memories": filtered,
                 "storage_backend": "postgres",
                 "excluded_for_scope": excluded,
+                "excluded_for_scope_private": excluded_for_scope_private,
                 "scope_status": if allow_all_legacy { "legacy_bypass" } else { "scoped" },
             })),
         )
@@ -162,6 +231,19 @@ pub async fn sync_since(
     let total = mems.len();
     let mems: Vec<Memory> = mems.into_iter().filter(|m| allowed(&m.namespace)).collect();
     let excluded = total.saturating_sub(mems.len());
+
+    // v0.7.0 #948 — scope=private visibility post-filter. The
+    // canonical `crate::visibility::is_visible_to_caller` helper
+    // (commit 4d30dd638 / #951) enforces the NHI visibility contract:
+    // a scope=private row is projected only when the resolved
+    // federation caller is either the owner (`metadata.agent_id`) or
+    // the inbox target (`metadata.target_agent_id`). Rows that flunk
+    // this check are EXCLUDED from the response (separate from the
+    // namespace-allowlist count so operators can tell the two
+    // filtering modes apart).
+    let after_ns = mems.len();
+    let mems: Vec<Memory> = mems.into_iter().filter(visibility_ok).collect();
+    let excluded_for_scope_private = after_ns.saturating_sub(mems.len());
 
     // Record the puller as a peer so subsequent incremental push/pull
     // pairs have a durable clock entry. Best-effort; don't fail the
@@ -201,6 +283,7 @@ pub async fn sync_since(
             "latest_updated_at": latest_updated_at,
             "memories": mems,
             "excluded_for_scope": excluded,
+            "excluded_for_scope_private": excluded_for_scope_private,
             "scope_status": if allow_all_legacy { "legacy_bypass" } else { "scoped" },
         })),
     )
