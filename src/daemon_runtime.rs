@@ -2464,7 +2464,10 @@ pub async fn bootstrap_serve(
     // Federation: parsed from --quorum-writes / --quorum-peers. Disabled
     // entirely when either is absent — daemon behaves exactly like
     // v0.6.0 in that case.
-    let federation = federation::FederationConfig::build(
+    // #[cfg_attr] keeps the `mut` only when DLQ wire-up below is
+    // active — under default-features the binding is read-only.
+    #[cfg_attr(not(feature = "sal"), allow(unused_mut))]
+    let mut federation = federation::FederationConfig::build(
         args.quorum_writes,
         &args.quorum_peers,
         std::time::Duration::from_millis(args.quorum_timeout_ms),
@@ -2679,6 +2682,53 @@ pub async fn bootstrap_serve(
     #[cfg(not(feature = "sal"))]
     let storage_backend = crate::handlers::StorageBackend::Sqlite;
 
+    // v0.7.0 Track D #933 — federation push DLQ sink. Resolved here
+    // (after `build_store_handle` returns the typed store) so the
+    // `broadcast_store_quorum` fanout can land DLQ rows on per-peer
+    // failure. Sqlite-backed daemons get the shared `Db` mutex sink;
+    // postgres-backed daemons get the pool-backed sink. The chosen
+    // sink is also handed to the `replay_federation_push_dlq` worker
+    // spawned below so the same DLQ rows the broadcast wrote are the
+    // ones the worker drains.
+    //
+    // Feature-gated to `--features sal` — the DLQ trait surface
+    // requires `async-trait` which is a SAL-only dep. Default
+    // (sqlite-only) builds preserve pre-#933 behaviour.
+    #[cfg(feature = "sal")]
+    if let Some(ref mut fed) = federation {
+        let sink: std::sync::Arc<dyn federation::FederationDlqSink> = match storage_backend {
+            #[cfg(feature = "sal-postgres")]
+            crate::handlers::StorageBackend::Postgres => {
+                // Recover the typed PostgresStore via the
+                // `as_any_for_postgres` downcast hatch so the sink
+                // can issue raw SQL through `PostgresStore::pool()`.
+                // Falls back to the sqlite sink (which would error
+                // on every INSERT because the postgres DB has no
+                // sqlite connection) when the downcast fails — that
+                // is unreachable in practice because the only
+                // backend returning `StorageBackend::Postgres` IS
+                // PostgresStore.
+                if let Some(pg) = store_handle
+                    .as_any_for_postgres()
+                    .downcast_ref::<crate::store::postgres::PostgresStore>()
+                {
+                    std::sync::Arc::new(federation::push_dlq::PostgresDlqSink::new(
+                        std::sync::Arc::new(pg.clone()),
+                    ))
+                } else {
+                    tracing::warn!(
+                        "federation push DLQ: PostgresStore downcast failed; \
+                             falling back to sqlite sink (DLQ writes WILL error \
+                             on postgres-backed daemons until the cast is restored)"
+                    );
+                    std::sync::Arc::new(federation::push_dlq::SqliteDlqSink::new(db_state.clone()))
+                }
+            }
+            _ => std::sync::Arc::new(federation::push_dlq::SqliteDlqSink::new(db_state.clone())),
+        };
+        fed.dlq_sink = Some(sink);
+    }
+
     // v0.7.0 M3 — spawn the federation catchup loop now that the SAL
     // store handle has resolved. The loop dispatches each peer-pulled
     // memory through `store.apply_remote_memory` (postgres-aware) on
@@ -2700,6 +2750,21 @@ pub async fn bootstrap_serve(
         #[cfg(not(feature = "sal"))]
         {
             federation::spawn_catchup_loop(fed.clone(), db_state.clone(), interval);
+        }
+
+        // v0.7.0 Track D #933 — federation push DLQ replay worker.
+        // Polls the DLQ at the same cadence as the catchup loop and
+        // re-attempts `post_once` against each peer until the row
+        // Acks. The worker maintains the
+        // `ai_memory_federation_push_dlq_depth` Prometheus gauge.
+        #[cfg(feature = "sal")]
+        if let Some(sink) = fed.dlq_sink.clone() {
+            let _replay_handle =
+                federation::spawn_replay_federation_push_dlq(fed.clone(), sink, interval);
+            tracing::info!(
+                "federation push DLQ replay worker enabled: polling every {}s",
+                args.catchup_interval_secs,
+            );
         }
     }
 
