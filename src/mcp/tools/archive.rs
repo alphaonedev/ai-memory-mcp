@@ -88,7 +88,11 @@ pub(super) fn handle_archive_purge(
         match Permissions::evaluate(&ctx, &[]) {
             crate::permissions::Decision::Allow | crate::permissions::Decision::Modify(_) => {}
             crate::permissions::Decision::Deny(reason) => {
-                return Err(format!("archive denied by permission rule: {reason}"));
+                return Err(crate::governance::deny_message(
+                    "archive",
+                    crate::governance::DenyGate::PermissionRule,
+                    &reason,
+                ));
             }
             crate::permissions::Decision::Ask(prompt) => {
                 return Ok(json!({

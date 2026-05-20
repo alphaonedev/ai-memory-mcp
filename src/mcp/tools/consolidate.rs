@@ -77,7 +77,11 @@ pub(super) fn handle_consolidate(
         match Permissions::evaluate(&ctx, &[]) {
             crate::permissions::Decision::Allow | crate::permissions::Decision::Modify(_) => {}
             crate::permissions::Decision::Deny(reason) => {
-                return Err(format!("consolidate denied by permission rule: {reason}"));
+                return Err(crate::governance::deny_message(
+                    "consolidate",
+                    crate::governance::DenyGate::PermissionRule,
+                    &reason,
+                ));
             }
             crate::permissions::Decision::Ask(prompt) => {
                 return Ok(json!({

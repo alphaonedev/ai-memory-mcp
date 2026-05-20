@@ -126,7 +126,11 @@ pub fn handle_replay(
         match Permissions::evaluate(&ctx, &[]) {
             crate::permissions::Decision::Allow | crate::permissions::Decision::Modify(_) => {}
             crate::permissions::Decision::Deny(reason) => {
-                return Err(format!("replay denied by permission rule: {reason}"));
+                return Err(crate::governance::deny_message(
+                    "replay",
+                    crate::governance::DenyGate::PermissionRule,
+                    &reason,
+                ));
             }
             crate::permissions::Decision::Ask(prompt) => {
                 return Ok(json!({

@@ -516,7 +516,7 @@ pub async fn delete_memory(
                 Ok(GovernanceDecision::Deny(reason)) => {
                     return (
                         StatusCode::FORBIDDEN,
-                        Json(json!({"error": format!("delete denied by governance: {reason}")})),
+                        Json(json!({"error": crate::governance::deny_message("delete", crate::governance::DenyGate::Governance, &reason)})),
                     )
                         .into_response();
                 }
@@ -659,7 +659,7 @@ pub async fn delete_memory(
             Ok(GovernanceDecision::Deny(reason)) => {
                 return (
                     StatusCode::FORBIDDEN,
-                    Json(json!({"error": format!("delete denied by governance: {reason}")})),
+                    Json(json!({"error": crate::governance::deny_message("delete", crate::governance::DenyGate::Governance, &reason)})),
                 )
                     .into_response();
             }
@@ -872,7 +872,7 @@ pub async fn promote_memory(
                 Ok(GovernanceDecision::Deny(reason)) => {
                     return (
                         StatusCode::FORBIDDEN,
-                        Json(json!({"error": format!("promote denied by governance: {reason}")})),
+                        Json(json!({"error": crate::governance::deny_message("promote", crate::governance::DenyGate::Governance, &reason)})),
                     )
                         .into_response();
                 }
@@ -1044,7 +1044,7 @@ pub async fn promote_memory(
             Ok(GovernanceDecision::Deny(reason)) => {
                 return (
                     StatusCode::FORBIDDEN,
-                    Json(json!({"error": format!("promote denied by governance: {reason}")})),
+                    Json(json!({"error": crate::governance::deny_message("promote", crate::governance::DenyGate::Governance, &reason)})),
                 )
                     .into_response();
             }

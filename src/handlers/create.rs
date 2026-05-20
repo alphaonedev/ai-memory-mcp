@@ -294,7 +294,11 @@ async fn enforce_create_governance<'a>(
         Ok(GovernanceDecision::Allow) => Ok(lock),
         Ok(GovernanceDecision::Deny(reason)) => Err((
             StatusCode::FORBIDDEN,
-            Json(json!({"error": format!("store denied by governance: {reason}")})),
+            Json(json!({"error": crate::governance::deny_message(
+                "store",
+                crate::governance::DenyGate::Governance,
+                &reason,
+            )})),
         )
             .into_response()),
         Ok(GovernanceDecision::Pending(pending_id)) => {

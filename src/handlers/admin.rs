@@ -761,7 +761,15 @@ pub async fn import_memories(
             {
                 Ok(GovernanceDecision::Allow) => {}
                 Ok(GovernanceDecision::Deny(reason)) => {
-                    errors.push(format!("{}: import denied by governance: {reason}", mem.id));
+                    let mut msg = String::with_capacity(mem.id.len() + 2 + 50 + reason.len());
+                    msg.push_str(&mem.id);
+                    msg.push_str(": ");
+                    msg.push_str(&crate::governance::deny_message(
+                        "import",
+                        crate::governance::DenyGate::Governance,
+                        &reason,
+                    ));
+                    errors.push(msg);
                     continue;
                 }
                 Ok(GovernanceDecision::Pending(pending_id)) => {
