@@ -27,12 +27,17 @@
 [global]
 # Global floor on the workspace TOTAL line coverage. Set at the current
 # measured value rounded down (floor(measured - 0.5)).
-# Current measured: 88.56% (--features sal,sal-postgres --lib --tests --workspace).
+# Current measured: 92.58% (live-PG + AGE, --features sal,sal-postgres
+# --lib --tests --workspace, 2026-05-20 measurement against
+# .local-runs/coverage-tier4-audit.json). Raised from 88.0 per Task #99
+# / #836 Tier 4 release gate ("Coverage uplift: global 89.02% → ≥90.5%,
+# set floor 90"). The 90 floor preserves ~2.58pp headroom for jitter
+# (was ~0.56pp at the 88 floor vs 88.56% measured).
 # Note: the `Code Coverage` job in .github/workflows/ci.yml runs a different
 # feature set (`--features sal`) and has its own absolute floor (90%) plus
 # ratchet against `.coverage-baseline` (93.13). That job is unaffected by
 # this gate; this gate is the per-module + per-feature-set complement.
-min_line_coverage = 88.0
+min_line_coverage = 90.0
 
 [modules]
 # Format: "<path-relative-to-src/>" = <threshold>  # tier <T>, measured <pct>, [exception?]
