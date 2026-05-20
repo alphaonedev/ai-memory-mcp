@@ -72,6 +72,7 @@ fn build_router_fixture() -> (axum::Router, NamedTempFile) {
         autonomous_hooks: false,
         recall_scope: Arc::new(None),
         deferred_audit_queue: Arc::new(None),
+        admin_agent_ids: Arc::new(Vec::new()),
     };
     let api_key_state = ApiKeyState {
         key: None,

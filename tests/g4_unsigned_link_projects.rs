@@ -319,6 +319,7 @@ async fn g4_unsigned_http_link_projects_into_age() {
         autonomous_hooks: false,
         recall_scope: Arc::new(None),
         deferred_audit_queue: Arc::new(None),
+        admin_agent_ids: Arc::new(Vec::new()),
     };
 
     let port = free_port();

@@ -347,7 +347,22 @@ fn test_app_state(db: Db) -> AppState {
         // drainer; the queue is None and the storage hook is
         // intentionally absent in test_app_state scaffolds.
         deferred_audit_queue: Arc::new(None),
+        admin_agent_ids: Arc::new(Vec::new()),
     }
+}
+
+/// v0.7.0 SHIP cluster (#936, 2026-05-20) — variant of
+/// [`test_app_state`] that admits `agent_id` as an
+/// `[admin].agent_ids` allowlist member. Used by the three
+/// `http_purge_archive_*` happy-path tests which pre-#936 ran
+/// against the owner-blind purge surface and need the admin
+/// bypass to keep exercising the cross-tenant wipe behaviour they
+/// were originally written to cover.
+#[cfg(test)]
+fn test_app_state_with_admin(db: Db, agent_id: &str) -> AppState {
+    let mut state = test_app_state(db);
+    state.admin_agent_ids = Arc::new(vec![agent_id.to_string()]);
+    state
 }
 
 /// v0.7.0 Wave-3 — test-only `Arc<dyn MemoryStore>` that wraps a
@@ -1047,6 +1062,7 @@ async fn http_bulk_create_fans_out_with_federation() {
         autonomous_hooks: false,
         recall_scope: Arc::new(None),
         deferred_audit_queue: Arc::new(None),
+        admin_agent_ids: Arc::new(Vec::new()),
     };
     let router = Router::new()
         .route("/api/v1/memories/bulk", axum_post(bulk_create))
@@ -3339,6 +3355,13 @@ async fn http_purge_archive_negative_days_returns_500() {
 #[tokio::test]
 async fn http_purge_archive_no_days_purges_unconditional() {
     // Omit older_than_days entirely → DELETE every archive row.
+    //
+    // #936 (security-critical, 2026-05-20) — the owner-blind purge is
+    // now admin-only. The test pre-#936 exercised the cross-tenant
+    // wipe surface; it continues to do so via `X-Agent-Id: ops:admin`
+    // with `ops:admin` in the test fixture's `admin_agent_ids`
+    // allowlist. The cross-tenant gate itself is covered by
+    // `tests/archive_purge_owner_gate_936.rs`.
     let state = test_state();
     let id = insert_test_memory(&state, "purge-all", "x").await;
     {
@@ -3347,12 +3370,13 @@ async fn http_purge_archive_no_days_purges_unconditional() {
     }
     let app = Router::new()
         .route("/api/v1/archive/purge", axum_post(purge_archive))
-        .with_state(test_app_state(state.clone()));
+        .with_state(test_app_state_with_admin(state.clone(), "ops:admin"));
     let resp = app
         .oneshot(
             axum::http::Request::builder()
                 .uri("/api/v1/archive/purge")
                 .method("POST")
+                .header("x-agent-id", "ops:admin")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -6064,6 +6088,11 @@ async fn http_purge_archive_older_than_keeps_recent() {
 #[tokio::test]
 async fn http_purge_archive_unfiltered_purges_everything() {
     // No `older_than_days` query → purge all archived rows.
+    //
+    // #936 (security-critical, 2026-05-20) — uses the admin path
+    // (X-Agent-Id matches `admin_agent_ids`) so the destructive
+    // cross-tenant wipe still runs. The non-admin owner-scoped
+    // restriction is covered by `tests/archive_purge_owner_gate_936.rs`.
     let state = test_state();
     for i in 0..3 {
         let id = insert_test_memory(&state, "h8a-purge-all", &format!("row-{i}")).await;
@@ -6072,12 +6101,13 @@ async fn http_purge_archive_unfiltered_purges_everything() {
     }
     let app = Router::new()
         .route("/api/v1/archive", axum::routing::delete(purge_archive))
-        .with_state(test_app_state(state.clone()));
+        .with_state(test_app_state_with_admin(state.clone(), "ops:admin"));
     let resp = app
         .oneshot(
             axum::http::Request::builder()
                 .uri("/api/v1/archive")
                 .method("DELETE")
+                .header("x-agent-id", "ops:admin")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -6098,6 +6128,10 @@ async fn http_purge_archive_unfiltered_purges_everything() {
 async fn http_purge_archive_zero_days_purges_all_archived() {
     // older_than_days=0 → cutoff is "now", so every archived row is
     // older than the cutoff and gets purged.
+    //
+    // #936 (security-critical, 2026-05-20) — uses the admin path so
+    // the cross-tenant wipe still runs. Owner-scoped semantics covered
+    // by `tests/archive_purge_owner_gate_936.rs`.
     let state = test_state();
     let id = insert_test_memory(&state, "h8a-purge-zero", "row").await;
     {
@@ -6106,12 +6140,13 @@ async fn http_purge_archive_zero_days_purges_all_archived() {
     }
     let app = Router::new()
         .route("/api/v1/archive", axum::routing::delete(purge_archive))
-        .with_state(test_app_state(state.clone()));
+        .with_state(test_app_state_with_admin(state.clone(), "ops:admin"));
     let resp = app
         .oneshot(
             axum::http::Request::builder()
                 .uri("/api/v1/archive?older_than_days=0")
                 .method("DELETE")
+                .header("x-agent-id", "ops:admin")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -9572,6 +9607,7 @@ fn h8d_app_state_with_fed(db: Db, peer_urls: Vec<String>, w: usize, timeout_ms: 
         autonomous_hooks: false,
         recall_scope: Arc::new(None),
         deferred_audit_queue: Arc::new(None),
+        admin_agent_ids: Arc::new(Vec::new()),
     }
 }
 

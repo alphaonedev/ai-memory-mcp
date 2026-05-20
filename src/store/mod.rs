@@ -985,11 +985,34 @@ pub trait MemoryStore: Send + Sync {
     }
 
     /// Purge archived rows older than `older_than_days`. When `None`,
-    /// purge ALL archived rows (operator-confirmed full wipe). Returns
-    /// the count purged.
+    /// purge ALL archived rows MATCHING THE CALLER'S OWNERSHIP scope
+    /// (NOT a global wipe — see below). Returns the count purged.
+    ///
+    /// # Caller-vs-row-owner gate (#936, 2026-05-20)
+    ///
+    /// Pre-#936 the trait method took only `older_than_days` and the
+    /// handler at `src/handlers/archive.rs::purge_archive` did not
+    /// gate the call — any authenticated HTTP caller could
+    /// permanently destroy every owner's archived memories. The
+    /// signature now requires a [`CallerContext`] and adapters MUST
+    /// constrain the DELETE to rows whose `metadata.agent_id`
+    /// matches `ctx.effective_principal()` (with the inbox-target
+    /// carve-out preserved by [`is_visible_to_caller`]) UNLESS
+    /// `ctx.bypass_visibility` is set — that's the operator/admin
+    /// surface (`POST /api/v1/export`'s sibling) and is gated by
+    /// the shared admin-role allowlist before the handler ever
+    /// reaches the SAL.
+    ///
+    /// **Owner-blind purges are gone.** A non-admin call with no
+    /// matching rows returns `Ok(0)`; the caller cannot enumerate
+    /// other owners' archive corpus via this surface.
     ///
     /// Default returns `UnsupportedCapability`.
-    async fn archive_purge(&self, _older_than_days: Option<i64>) -> StoreResult<usize> {
+    async fn archive_purge(
+        &self,
+        _ctx: &CallerContext,
+        _older_than_days: Option<i64>,
+    ) -> StoreResult<usize> {
         Err(StoreError::UnsupportedCapability {
             capability: "ARCHIVE_PURGE".to_string(),
         })
@@ -1867,7 +1890,7 @@ mod tests {
             StoreError::UnsupportedCapability { .. }
         ));
         assert!(matches!(
-            s.archive_purge(None).await.unwrap_err(),
+            s.archive_purge(&ctx, None).await.unwrap_err(),
             StoreError::UnsupportedCapability { .. }
         ));
         assert!(matches!(

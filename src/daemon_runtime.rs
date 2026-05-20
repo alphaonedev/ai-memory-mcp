@@ -2816,6 +2816,19 @@ pub async fn bootstrap_serve(
         // above before the storage hook installed). Wrapped in
         // Arc<Option<...>> per the AppState clone-cheap idiom.
         deferred_audit_queue: Arc::new(Some(deferred_audit_queue)),
+        // v0.7.0 SHIP cluster (#946 / #957 / #960 / #961, 2026-05-20)
+        // — operator-configured `[admin] agent_ids = [...]` allowlist.
+        // `validated_agent_ids()` drops malformed entries with a
+        // `warn` log so a single typo cannot lock the operator out;
+        // an absent `[admin]` block resolves to an empty Vec which
+        // closes every admin-class endpoint by default.
+        admin_agent_ids: Arc::new(
+            app_config
+                .admin
+                .as_ref()
+                .map(crate::config::AdminConfig::validated_agent_ids)
+                .unwrap_or_default(),
+        ),
     };
 
     // v0.7.0 Policy-Engine Item 3 — register the deferred-audit
@@ -3677,6 +3690,7 @@ mod tests {
             autonomous_hooks: false,
             recall_scope: Arc::new(None),
             deferred_audit_queue: Arc::new(None),
+            admin_agent_ids: Arc::new(Vec::new()),
         }
     }
 

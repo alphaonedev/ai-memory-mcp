@@ -188,6 +188,7 @@ async fn build_postgres_app_state(url: &str, federation: Option<FederationConfig
         autonomous_hooks: false,
         recall_scope: Arc::new(None),
         deferred_audit_queue: Arc::new(None),
+        admin_agent_ids: Arc::new(Vec::new()),
     }
 }
 
