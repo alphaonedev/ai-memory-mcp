@@ -5,8 +5,152 @@
 
 use crate::config::{RerankerMode, TierConfig};
 use crate::db;
+use crate::mcp::registry::McpTool;
 use crate::reranker::BatchedReranker;
+use schemars::JsonSchema;
+use serde::Deserialize;
 use serde_json::Value;
+
+// --- D1.1 (#982) PoC: per-tool descriptor for `memory_capabilities` ---
+
+/// v0.7.0 #972 D1.1 (#982) — per-tool request body for
+/// `memory_capabilities`. Source of truth for the wire schema; the
+/// schemars-derived shape replaces the hand-coded entry in
+/// [`crate::mcp::registry::tool_definitions`].
+///
+/// **Fix as a side effect of D1.1:** the legacy hand-coded schema
+/// reported `accept: enum ["v1","v2"]` (default `"v2"`), but
+/// [`CapabilitiesAccept`] has been `V1`/`V2`/`V3` since the v0.7.0 A5
+/// release (with `V3` as the actual default). The schemars derive
+/// from this struct will surface `accept` as an optional string
+/// (no enum constraint at this layer — the runtime
+/// [`CapabilitiesAccept::parse`] tolerates any input and falls back
+/// to V3). That removes the schema/runtime drift without forcing
+/// breaking-change semantics on existing v1/v2-pinned clients.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)] // D1.1 PoC: struct is the schemars source; handler still parses Value directly until D1.3.
+pub struct CapabilitiesRequest {
+    /// Schema version selector. Wire values: `"v1"` / `"v2"` /
+    /// `"v3"`. Unknown / missing → falls through to V3 (the v0.7.0 A5
+    /// default).
+    #[serde(default)]
+    pub accept: Option<String>,
+
+    /// Drill into one tool family: one of `core` / `lifecycle` /
+    /// `graph` / `governance` / `power` / `meta` / `archive` /
+    /// `other`. Without `family`, the response carries the families
+    /// overview (no per-tool schema drilldown).
+    #[serde(default)]
+    pub family: Option<String>,
+
+    /// When `true` AND `family` is set, the response carries the full
+    /// `inputSchema` for every tool in that family. Requires
+    /// `family`.
+    #[serde(default)]
+    pub include_schema: Option<bool>,
+
+    /// C2/C4 verbose escape hatch: preserve long-form `docs` +
+    /// every optional `inputSchema.properties` entry. Default `false`
+    /// keeps the token-budget posture.
+    #[serde(default)]
+    pub verbose: Option<bool>,
+}
+
+/// v0.7.0 #972 D1.1 (#982) — zero-sized type implementing [`McpTool`]
+/// for `memory_capabilities`. The trait impl returns the
+/// schemars-derived input_schema; downstream D1.6 (#987) will collapse
+/// the giant `tool_definitions` macro to iterate over `McpTool` impls
+/// like this one. The `dead_code` allow comes off in D1.6 when the
+/// type is registered into `registered_tools()`.
+#[allow(dead_code)]
+pub struct CapabilitiesTool;
+
+impl McpTool for CapabilitiesTool {
+    fn name() -> &'static str {
+        "memory_capabilities"
+    }
+
+    fn description() -> &'static str {
+        "Discover runtime capabilities; family=<name> drills in."
+    }
+
+    fn docs() -> &'static str {
+        "Caps-v3: tier, profile, summary, callable_now, agent_permitted_families, harness detection. \
+         family+include_schema drills one family. verbose=true restores full schema. \
+         NOTE per #864: `family` here = MCP tool-family (8 groups: \
+         core/lifecycle/graph/governance/power/meta/archive/other), NOT memory_kind taxonomy."
+    }
+
+    fn input_schema() -> Value {
+        // Use schemars 0.8's `schema_for!` to derive the schema from the
+        // `CapabilitiesRequest` struct, then convert to `serde_json::Value`.
+        let schema = schemars::schema_for!(CapabilitiesRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+
+    fn family() -> &'static str {
+        "meta"
+    }
+}
+
+#[cfg(test)]
+mod d1_1_982_tests {
+    use super::*;
+
+    #[test]
+    fn capabilities_tool_metadata_982() {
+        assert_eq!(CapabilitiesTool::name(), "memory_capabilities");
+        assert_eq!(CapabilitiesTool::family(), "meta");
+        assert!(CapabilitiesTool::description().contains("capabilities"));
+        assert!(CapabilitiesTool::docs().contains("family"));
+    }
+
+    #[test]
+    fn capabilities_input_schema_has_expected_fields_982() {
+        let schema = CapabilitiesTool::input_schema();
+        // schemars 0.8 emits the schema under either top-level
+        // `properties` or under `$ref`-resolved nesting, depending on
+        // version. Probe both shapes to stay version-tolerant.
+        let direct = schema.get("properties").and_then(Value::as_object);
+        let nested = schema
+            .pointer("/definitions/CapabilitiesRequest/properties")
+            .and_then(Value::as_object);
+        let props = direct
+            .or(nested)
+            .expect("schemars must emit properties under direct or definitions path");
+        for field in &["accept", "family", "include_schema", "verbose"] {
+            assert!(
+                props.contains_key(*field),
+                "schemars-derived schema must include `{field}` (got keys: {:?})",
+                props.keys().collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn capabilities_request_deserializes_empty_982() {
+        let parsed: CapabilitiesRequest = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(parsed.accept.is_none());
+        assert!(parsed.family.is_none());
+        assert!(parsed.include_schema.is_none());
+        assert!(parsed.verbose.is_none());
+    }
+
+    #[test]
+    fn capabilities_request_deserializes_full_982() {
+        let parsed: CapabilitiesRequest = serde_json::from_value(serde_json::json!({
+            "accept": "v3",
+            "family": "core",
+            "include_schema": true,
+            "verbose": false
+        }))
+        .unwrap();
+        assert_eq!(parsed.accept.as_deref(), Some("v3"));
+        assert_eq!(parsed.family.as_deref(), Some("core"));
+        assert_eq!(parsed.include_schema, Some(true));
+        assert_eq!(parsed.verbose, Some(false));
+    }
+}
 
 /// Capabilities schema selector (v0.6.3.1 P1 honesty patch; extended
 /// through v0.7.0 A1–A5).
