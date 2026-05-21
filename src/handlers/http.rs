@@ -21,7 +21,7 @@ use super::StorageBackend;
 /// v0.7.0 L5 — minimum content length (chars) below which the HTTP
 /// `create_memory` handler skips the `auto_tag` autonomy hook. Mirrors
 /// the constant the MCP `handle_store` path uses (`AUTONOMY_MIN_CONTENT_LEN`
-/// at `src/mcp.rs:1405`) so a memory that's too short to be meaningfully
+/// at `crate::mcp::handle_store` (short-row skip)) so a memory that's too short to be meaningfully
 /// tagged doesn't burn a 30s Ollama round-trip on each store.
 const AUTO_TAG_MIN_CONTENT_LEN: usize = 50;
 /// v0.7.0 L5 — maximum number of auto-generated tags merged into the
@@ -77,13 +77,13 @@ pub(super) async fn get_with_visibility_retry(
 ///   - The content is at least [`AUTO_TAG_MIN_CONTENT_LEN`] chars
 ///     (too-short content has no useful taggable signal).
 ///   - The namespace is not internal / system (starts with `_`) —
-///     matches MCP's `handle_store` skip at `src/mcp.rs:1818`.
+///     matches MCP's `handle_store` skip at `crate::mcp::handle_store` (skip-arm).
 ///   - An LLM client is wired on `AppState` and the Ollama endpoint
 ///     is reachable.
 ///
 /// On any LLM error the function returns `Vec::new()` and logs a
 /// `tracing::warn!` — auto_tag is a soft hook and a failure must not
-/// fail the store (mirrors MCP `handle_store` at `src/mcp.rs:1830`).
+/// fail the store (mirrors MCP `handle_store` at `crate::mcp::handle_store` (detect_contradiction block)).
 ///
 /// The blocking Ollama call is wrapped in `tokio::task::spawn_blocking`
 /// to keep the async runtime healthy under load — matches the embedder
@@ -158,7 +158,7 @@ pub(crate) async fn maybe_auto_tag(
 
 /// v0.7.0 (issue #519) — same-namespace conflict probe fired during
 /// `create_memory`. Mirrors the MCP `handle_store` autonomy hook's
-/// `detect_contradiction` loop (`src/mcp.rs:1830-1850`) but lives on the
+/// `detect_contradiction` loop (`crate::mcp::handle_store` (detect_contradiction loop)) but lives on the
 /// HTTP path so a smart/autonomous-tier daemon surfaces conflicts in the
 /// 201 response without requiring the caller to follow up with a manual
 /// `memory_detect_contradiction`.
