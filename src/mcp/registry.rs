@@ -732,13 +732,38 @@ pub(crate) fn strip_docs_from_tools(tools: &mut Vec<Value>) {
             continue;
         };
         obj.remove("docs");
-        if let Some(input_schema) = obj.get_mut("inputSchema").and_then(Value::as_object_mut)
-            && let Some(props) = input_schema
+        if let Some(input_schema) = obj.get_mut("inputSchema").and_then(Value::as_object_mut) {
+            // **v0.7.0 #987/#988 update.** D1.6 schemars-derived schemas
+            // emit additional metadata the legacy hand-coded macro didn't:
+            // - top-level `description` on the request struct itself
+            // - `$schema` reference
+            // - `title` field
+            // - `definitions` map for `$ref`-resolved untagged enums
+            //   (e.g. `RecallKindsFilter::Many(Vec<String>) | One(String)`)
+            //
+            // The wire form is a discovery surface for NHI agents; the
+            // verbose drilldown (`memory_capabilities { verbose=true }`)
+            // is the prose surface. Strip the schemars-only metadata
+            // from the wire to keep the post-D1.6 trimmed-payload
+            // ceiling honest.
+            input_schema.remove("description");
+            input_schema.remove("$schema");
+            input_schema.remove("title");
+            if let Some(defs) = input_schema
+                .get_mut("definitions")
+                .and_then(Value::as_object_mut)
+            {
+                for (_name, def_value) in defs.iter_mut() {
+                    strip_description_recursively(def_value);
+                }
+            }
+            if let Some(props) = input_schema
                 .get_mut("properties")
                 .and_then(Value::as_object_mut)
-        {
-            for (_param_name, prop_value) in props.iter_mut() {
-                strip_description_recursively(prop_value);
+            {
+                for (_param_name, prop_value) in props.iter_mut() {
+                    strip_description_recursively(prop_value);
+                }
             }
         }
     }

@@ -7656,11 +7656,17 @@ fn test_budget_mcp_tool_schema_and_response() {
         "#859: per-property `description` prose must be stripped on the wire"
     );
     // Structural metadata stays so clients can construct valid args.
-    assert_eq!(
-        budget_tokens
-            .get("type")
-            .and_then(serde_json::Value::as_str),
-        Some("integer")
+    // **v0.7.0 #987 update.** D1.6 schemars derives Option<i64> as
+    // `type: ["integer","null"]` (no longer a bare "integer" string).
+    // Accept either legacy bare-type OR the schemars nullable array.
+    let type_field = budget_tokens.get("type").expect("budget_tokens must have `type`");
+    let is_integer = type_field == "integer"
+        || type_field
+            .as_array()
+            .is_some_and(|arr| arr.iter().any(|v| v == "integer"));
+    assert!(
+        is_integer,
+        "budget_tokens must be integer (legacy bare or schemars [\"integer\",\"null\"]); got {type_field}"
     );
     // The required param `context` survives the trim.
     assert!(

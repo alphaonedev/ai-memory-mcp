@@ -3,9 +3,7 @@
     {
       "description": "Store a memory",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
-        "description": "v0.7.0 #972 D1.3 (#984) — request body for `memory_store`. Schemars-derived schema replaces the hand-coded entry in [`crate::mcp::registry::tool_definitions`] (D1.6 (#987) collapses the macro). Every doc-comment description is byte-equal to the legacy `description` text — see the d1_3_984_tests parity contract at the bottom of this file.",
         "properties": {
           "agent_id": {
             "default": null,
@@ -110,7 +108,6 @@
           "content",
           "title"
         ],
-        "title": "StoreRequest",
         "type": "object"
       },
       "name": "memory_store"
@@ -118,27 +115,22 @@
     {
       "description": "Recall memories relevant to a",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
         "definitions": {
           "KindsFilter": {
             "anyOf": [
               {
-                "description": "Array of kind tokens, e.g. `[\"concept\", \"claim\"]`.",
                 "items": {
                   "type": "string"
                 },
                 "type": "array"
               },
               {
-                "description": "Comma-separated kinds string, e.g. `\"concept,claim\"`.",
                 "type": "string"
               }
-            ],
-            "description": "v0.7.0 #972 D1.3 (#984) — `kinds` filter shape for `memory_recall`.\n\nThe legacy hand-coded schema declares this field as a `oneOf` union (array-of-strings OR a single CSV string); modelling it as an `#[serde(untagged)]` enum replicates the wire shape exactly without forcing callers to wrap their CSV in an array.\n\nOriginally lived under `mcp::tools::recall::KindsFilter`; promoted here for the #967 canonical-DTO refactor. Re-exported from the original location for backward compatibility."
+            ]
           }
         },
-        "description": "v0.7.0 #972 D1.3 (#984) / #967 — canonical recall-request DTO.\n\nMarshalled once per surface (HTTP / MCP / CLI), then handed to the downstream recall pipeline. Adding a new field (Form 6 `kinds`, Form 4 `has_citations`, `confidence_tier`, etc.) lands in one place instead of four positional-arg lists.\n\n**Schemars contract.** Every doc-comment description and field attribute is byte-equal to the legacy hand-coded entry in [`crate::mcp::registry::tool_definitions`] — see the `d1_3_984_tests::recall_parity_984` parity test which asserts the derived schema matches byte-for-byte.",
         "properties": {
           "as_agent": {
             "default": null,
@@ -275,7 +267,6 @@
         "required": [
           "context"
         ],
-        "title": "RecallRequest",
         "type": "object"
       },
       "name": "memory_recall"
@@ -283,9 +274,7 @@
     {
       "description": "Search memories by exact",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
-        "description": "v0.7.0 #972 D1.4 (#985) — request body for `memory_search`.",
         "properties": {
           "agent_id": {
             "default": null,
@@ -344,7 +333,6 @@
         "required": [
           "query"
         ],
-        "title": "SearchRequest",
         "type": "object"
       },
       "name": "memory_search"
@@ -352,9 +340,7 @@
     {
       "description": "List memories, optionally",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
-        "description": "v0.7.0 #972 D1.4 (#985) — request body for `memory_list`.",
         "properties": {
           "agent_id": {
             "default": null,
@@ -393,7 +379,6 @@
             ]
           }
         },
-        "title": "ListRequest",
         "type": "object"
       },
       "name": "memory_list"
@@ -401,9 +386,7 @@
     {
       "description": "Load top-k recent +",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
-        "description": "v0.7.0 #972 D1.3 (#984) — request body for `memory_load_family`. Schemars-derived schema replaces the hand-coded entry in [`crate::mcp::registry::tool_definitions`] (D1.6 (#987) collapses the macro).",
         "properties": {
           "family": {
             "type": "string"
@@ -427,7 +410,6 @@
         "required": [
           "family"
         ],
-        "title": "LoadFamilyRequest",
         "type": "object"
       },
       "name": "memory_load_family"
@@ -435,9 +417,7 @@
     {
       "description": "Intent-routed loader: free-text",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
-        "description": "v0.7.0 #972 D1.3 (#984) — request body for `memory_smart_load`.",
         "properties": {
           "intent": {
             "type": "string"
@@ -461,7 +441,6 @@
         "required": [
           "intent"
         ],
-        "title": "SmartLoadRequest",
         "type": "object"
       },
       "name": "memory_smart_load"
@@ -469,9 +448,7 @@
     {
       "description": "Delete a memory by ID.",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
-        "description": "v0.7.0 #972 D1.6 (#987) — request body for `memory_delete`.",
         "properties": {
           "id": {
             "type": "string"
@@ -480,7 +457,6 @@
         "required": [
           "id"
         ],
-        "title": "DeleteRequest",
         "type": "object"
       },
       "name": "memory_delete"
@@ -488,9 +464,7 @@
     {
       "description": "Promote a memory to long (or",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
-        "description": "v0.7.0 #972 D1.6 (#987) — request body for `memory_promote`.",
         "properties": {
           "id": {
             "type": "string"
@@ -513,7 +487,6 @@
         "required": [
           "id"
         ],
-        "title": "PromoteRequest",
         "type": "object"
       },
       "name": "memory_promote"
@@ -521,9 +494,7 @@
     {
       "description": "Bulk delete memories matching a",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
-        "description": "v0.7.0 #972 D1.6 (#987) — request body for `memory_forget`.",
         "properties": {
           "dry_run": {
             "default": null,
@@ -554,7 +525,6 @@
             ]
           }
         },
-        "title": "ForgetRequest",
         "type": "object"
       },
       "name": "memory_forget"
@@ -562,9 +532,7 @@
     {
       "description": "Update an existing memory by ID",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
-        "description": "v0.7.0 #972 D1.6 (#987) — request body for `memory_update`.",
         "properties": {
           "confidence": {
             "default": null,
@@ -659,7 +627,6 @@
         "required": [
           "id"
         ],
-        "title": "UpdateRequest",
         "type": "object"
       },
       "name": "memory_update"
@@ -667,9 +634,7 @@
     {
       "description": "Get a specific memory by ID,",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
-        "description": "v0.7.0 #972 D1.4 (#985) — request body for `memory_get`.",
         "properties": {
           "id": {
             "type": "string"
@@ -678,7 +643,6 @@
         "required": [
           "id"
         ],
-        "title": "GetRequest",
         "type": "object"
       },
       "name": "memory_get"
@@ -686,9 +650,7 @@
     {
       "description": "Discover runtime capabilities",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
-        "description": "v0.7.0 #972 D1.1 (#982) — per-tool request body for `memory_capabilities`. Source of truth for the wire schema; the schemars-derived shape replaces the hand-coded entry in [`crate::mcp::registry::tool_definitions`].\n\n**Fix as a side effect of D1.1:** the legacy hand-coded schema reported `accept: enum [\"v1\",\"v2\"]` (default `\"v2\"`), but [`CapabilitiesAccept`] has been `V1`/`V2`/`V3` since the v0.7.0 A5 release (with `V3` as the actual default). The schemars derive from this struct will surface `accept` as an optional string (no enum constraint at this layer — the runtime [`CapabilitiesAccept::parse`] tolerates any input and falls back to V3). That removes the schema/runtime drift without forcing breaking-change semantics on existing v1/v2-pinned clients.",
         "properties": {
           "accept": {
             "default": null,
@@ -719,7 +681,6 @@
             ]
           }
         },
-        "title": "CapabilitiesRequest",
         "type": "object"
       },
       "name": "memory_capabilities"
@@ -727,9 +688,7 @@
     {
       "description": "Trigger garbage collection on",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
-        "description": "v0.7.0 #972 D1.6 (#987) — request body for `memory_gc`.",
         "properties": {
           "dry_run": {
             "default": null,
@@ -739,7 +698,6 @@
             ]
           }
         },
-        "title": "GcRequest",
         "type": "object"
       },
       "name": "memory_gc"
@@ -747,9 +705,7 @@
     {
       "description": "Set a memory as the",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
-        "description": "v0.7.0 #972 D1.4 (#985) — request body for `memory_namespace_set_standard`.",
         "properties": {
           "governance": {
             "default": null
@@ -772,7 +728,6 @@
           "id",
           "namespace"
         ],
-        "title": "NamespaceSetStandardRequest",
         "type": "object"
       },
       "name": "memory_namespace_set_standard"
@@ -780,9 +735,7 @@
     {
       "description": "Get the standard/policy memory",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
-        "description": "v0.7.0 #972 D1.4 (#985) — request body for `memory_namespace_get_standard`.",
         "properties": {
           "inherit": {
             "default": null,
@@ -798,7 +751,6 @@
         "required": [
           "namespace"
         ],
-        "title": "NamespaceGetStandardRequest",
         "type": "object"
       },
       "name": "memory_namespace_get_standard"
@@ -806,9 +758,7 @@
     {
       "description": "Clear the standard/policy for a",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
-        "description": "v0.7.0 #972 D1.4 (#985) — request body for `memory_namespace_clear_standard`.",
         "properties": {
           "namespace": {
             "type": "string"
@@ -817,7 +767,6 @@
         "required": [
           "namespace"
         ],
-        "title": "NamespaceClearStandardRequest",
         "type": "object"
       },
       "name": "memory_namespace_clear_standard"
@@ -825,9 +774,7 @@
     {
       "description": "List pending governance-queued",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
-        "description": "v0.7.0 #972 D1.4 (#985) — request body for `memory_pending_list`.",
         "properties": {
           "limit": {
             "default": null,
@@ -845,7 +792,6 @@
             ]
           }
         },
-        "title": "PendingListRequest",
         "type": "object"
       },
       "name": "memory_pending_list"
@@ -853,9 +799,7 @@
     {
       "description": "Approve a pending action",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
-        "description": "v0.7.0 #972 D1.4 (#985) — request body for `memory_pending_approve`.",
         "properties": {
           "id": {
             "type": "string"
@@ -871,7 +815,6 @@
         "required": [
           "id"
         ],
-        "title": "PendingApproveRequest",
         "type": "object"
       },
       "name": "memory_pending_approve"
@@ -879,9 +822,7 @@
     {
       "description": "Reject a pending action",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
-        "description": "v0.7.0 #972 D1.4 (#985) — request body for `memory_pending_reject`.",
         "properties": {
           "id": {
             "type": "string"
@@ -897,7 +838,6 @@
         "required": [
           "id"
         ],
-        "title": "PendingRejectRequest",
         "type": "object"
       },
       "name": "memory_pending_reject"
@@ -905,9 +845,7 @@
     {
       "description": "Register a webhook subscription",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
-        "description": "v0.7.0 #972 D1.4 (#985) — request body for `memory_subscribe`.",
         "properties": {
           "agent_filter": {
             "default": null,
@@ -954,7 +892,6 @@
         "required": [
           "url"
         ],
-        "title": "SubscribeRequest",
         "type": "object"
       },
       "name": "memory_subscribe"
@@ -962,9 +899,7 @@
     {
       "description": "Delete a subscription by id.",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
-        "description": "v0.7.0 #972 D1.4 (#985) — request body for `memory_unsubscribe`.",
         "properties": {
           "id": {
             "type": "string"
@@ -973,7 +908,6 @@
         "required": [
           "id"
         ],
-        "title": "UnsubscribeRequest",
         "type": "object"
       },
       "name": "memory_unsubscribe"

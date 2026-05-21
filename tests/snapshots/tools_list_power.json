@@ -3,9 +3,7 @@
     {
       "description": "Store a memory",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
-        "description": "v0.7.0 #972 D1.3 (#984) — request body for `memory_store`. Schemars-derived schema replaces the hand-coded entry in [`crate::mcp::registry::tool_definitions`] (D1.6 (#987) collapses the macro). Every doc-comment description is byte-equal to the legacy `description` text — see the d1_3_984_tests parity contract at the bottom of this file.",
         "properties": {
           "agent_id": {
             "default": null,
@@ -110,7 +108,6 @@
           "content",
           "title"
         ],
-        "title": "StoreRequest",
         "type": "object"
       },
       "name": "memory_store"
@@ -118,27 +115,22 @@
     {
       "description": "Recall memories relevant to a",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
         "definitions": {
           "KindsFilter": {
             "anyOf": [
               {
-                "description": "Array of kind tokens, e.g. `[\"concept\", \"claim\"]`.",
                 "items": {
                   "type": "string"
                 },
                 "type": "array"
               },
               {
-                "description": "Comma-separated kinds string, e.g. `\"concept,claim\"`.",
                 "type": "string"
               }
-            ],
-            "description": "v0.7.0 #972 D1.3 (#984) — `kinds` filter shape for `memory_recall`.\n\nThe legacy hand-coded schema declares this field as a `oneOf` union (array-of-strings OR a single CSV string); modelling it as an `#[serde(untagged)]` enum replicates the wire shape exactly without forcing callers to wrap their CSV in an array.\n\nOriginally lived under `mcp::tools::recall::KindsFilter`; promoted here for the #967 canonical-DTO refactor. Re-exported from the original location for backward compatibility."
+            ]
           }
         },
-        "description": "v0.7.0 #972 D1.3 (#984) / #967 — canonical recall-request DTO.\n\nMarshalled once per surface (HTTP / MCP / CLI), then handed to the downstream recall pipeline. Adding a new field (Form 6 `kinds`, Form 4 `has_citations`, `confidence_tier`, etc.) lands in one place instead of four positional-arg lists.\n\n**Schemars contract.** Every doc-comment description and field attribute is byte-equal to the legacy hand-coded entry in [`crate::mcp::registry::tool_definitions`] — see the `d1_3_984_tests::recall_parity_984` parity test which asserts the derived schema matches byte-for-byte.",
         "properties": {
           "as_agent": {
             "default": null,
@@ -275,7 +267,6 @@
         "required": [
           "context"
         ],
-        "title": "RecallRequest",
         "type": "object"
       },
       "name": "memory_recall"
@@ -283,9 +274,7 @@
     {
       "description": "Search memories by exact",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
-        "description": "v0.7.0 #972 D1.4 (#985) — request body for `memory_search`.",
         "properties": {
           "agent_id": {
             "default": null,
@@ -344,7 +333,6 @@
         "required": [
           "query"
         ],
-        "title": "SearchRequest",
         "type": "object"
       },
       "name": "memory_search"
@@ -352,9 +340,7 @@
     {
       "description": "List memories, optionally",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
-        "description": "v0.7.0 #972 D1.4 (#985) — request body for `memory_list`.",
         "properties": {
           "agent_id": {
             "default": null,
@@ -393,7 +379,6 @@
             ]
           }
         },
-        "title": "ListRequest",
         "type": "object"
       },
       "name": "memory_list"
@@ -401,9 +386,7 @@
     {
       "description": "Load top-k recent +",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
-        "description": "v0.7.0 #972 D1.3 (#984) — request body for `memory_load_family`. Schemars-derived schema replaces the hand-coded entry in [`crate::mcp::registry::tool_definitions`] (D1.6 (#987) collapses the macro).",
         "properties": {
           "family": {
             "type": "string"
@@ -427,7 +410,6 @@
         "required": [
           "family"
         ],
-        "title": "LoadFamilyRequest",
         "type": "object"
       },
       "name": "memory_load_family"
@@ -435,9 +417,7 @@
     {
       "description": "Intent-routed loader: free-text",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
-        "description": "v0.7.0 #972 D1.3 (#984) — request body for `memory_smart_load`.",
         "properties": {
           "intent": {
             "type": "string"
@@ -461,7 +441,6 @@
         "required": [
           "intent"
         ],
-        "title": "SmartLoadRequest",
         "type": "object"
       },
       "name": "memory_smart_load"
@@ -469,9 +448,7 @@
     {
       "description": "Pre-write near-duplicate check",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
-        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_check_duplicate`.",
         "properties": {
           "content": {
             "type": "string"
@@ -499,7 +476,6 @@
           "content",
           "title"
         ],
-        "title": "CheckDuplicateRequest",
         "type": "object"
       },
       "name": "memory_check_duplicate"
@@ -507,9 +483,7 @@
     {
       "description": "Get a specific memory by ID,",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
-        "description": "v0.7.0 #972 D1.4 (#985) — request body for `memory_get`.",
         "properties": {
           "id": {
             "type": "string"
@@ -518,7 +492,6 @@
         "required": [
           "id"
         ],
-        "title": "GetRequest",
         "type": "object"
       },
       "name": "memory_get"
@@ -526,9 +499,7 @@
     {
       "description": "Persist a reflection memory",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
-        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_reflect`.",
         "properties": {
           "agent_id": {
             "default": null,
@@ -595,7 +566,6 @@
           "source_ids",
           "title"
         ],
-        "title": "ReflectRequest",
         "type": "object"
       },
       "name": "memory_reflect"
@@ -603,9 +573,7 @@
     {
       "description": "Render a single reflection",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
-        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_export_reflection`.",
         "properties": {
           "format": {
             "default": null,
@@ -621,7 +589,6 @@
         "required": [
           "memory_id"
         ],
-        "title": "ExportReflectionRequest",
         "type": "object"
       },
       "name": "memory_export_reflection"
@@ -629,9 +596,7 @@
     {
       "description": "Fetch the latest Persona",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
-        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_persona`.",
         "properties": {
           "entity_id": {
             "type": "string"
@@ -647,7 +612,6 @@
         "required": [
           "entity_id"
         ],
-        "title": "PersonaRequest",
         "type": "object"
       },
       "name": "memory_persona"
@@ -655,9 +619,7 @@
     {
       "description": "Generate/regen a Persona",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
-        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_persona_generate`.\n\nThe legacy schema's `namespace` field is typed as `[\"string\", \"null\"]` — schemars emits the equivalent shape from `Option<String>`.",
         "properties": {
           "entity_id": {
             "type": "string"
@@ -673,7 +635,6 @@
         "required": [
           "entity_id"
         ],
-        "title": "PersonaGenerateRequest",
         "type": "object"
       },
       "name": "memory_persona_generate"
@@ -681,9 +642,7 @@
     {
       "description": "Inspect the cross-peer",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
-        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_reflection_origin`.",
         "properties": {
           "memory_id": {
             "type": "string"
@@ -692,7 +651,6 @@
         "required": [
           "memory_id"
         ],
-        "title": "ReflectionOriginRequest",
         "type": "object"
       },
       "name": "memory_reflection_origin"
@@ -700,9 +658,7 @@
     {
       "description": "List dependents flagged by the",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
-        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_dependents_of_invalidated`.",
         "properties": {
           "memory_id": {
             "type": "string"
@@ -711,7 +667,6 @@
         "required": [
           "memory_id"
         ],
-        "title": "DependentsOfInvalidatedRequest",
         "type": "object"
       },
       "name": "memory_dependents_of_invalidated"
@@ -719,9 +674,7 @@
     {
       "description": "Consolidate multiple memories",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
-        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_consolidate`.",
         "properties": {
           "agent_id": {
             "default": null,
@@ -758,7 +711,6 @@
           "ids",
           "title"
         ],
-        "title": "ConsolidateRequest",
         "type": "object"
       },
       "name": "memory_consolidate"
@@ -766,9 +718,7 @@
     {
       "description": "Form 3 multi-step ingest:",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
-        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_ingest_multistep`.",
         "properties": {
           "content": {
             "type": "string"
@@ -794,7 +744,6 @@
         "required": [
           "content"
         ],
-        "title": "IngestMultistepRequest",
         "type": "object"
       },
       "name": "memory_ingest_multistep"
@@ -802,9 +751,7 @@
     {
       "description": "Decompose a memory into 2-10",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
-        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_atomise`.",
         "properties": {
           "force_re_atomise": {
             "default": null,
@@ -828,7 +775,6 @@
         "required": [
           "memory_id"
         ],
-        "title": "AtomiseRequest",
         "type": "object"
       },
       "name": "memory_atomise"
@@ -836,9 +782,7 @@
     {
       "description": "Share a memory with another",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
-        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_share`.",
         "properties": {
           "source_memory_id": {
             "type": "string"
@@ -851,7 +795,6 @@
           "source_memory_id",
           "target_agent_id"
         ],
-        "title": "ShareRequest",
         "type": "object"
       },
       "name": "memory_share"
@@ -859,9 +802,7 @@
     {
       "description": "Scan",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
-        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_calibrate_confidence`.",
         "properties": {
           "days": {
             "default": null,
@@ -879,7 +820,6 @@
             ]
           }
         },
-        "title": "CalibrateConfidenceRequest",
         "type": "object"
       },
       "name": "memory_calibrate_confidence"
@@ -887,9 +827,7 @@
     {
       "description": "Discover runtime capabilities",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
-        "description": "v0.7.0 #972 D1.1 (#982) — per-tool request body for `memory_capabilities`. Source of truth for the wire schema; the schemars-derived shape replaces the hand-coded entry in [`crate::mcp::registry::tool_definitions`].\n\n**Fix as a side effect of D1.1:** the legacy hand-coded schema reported `accept: enum [\"v1\",\"v2\"]` (default `\"v2\"`), but [`CapabilitiesAccept`] has been `V1`/`V2`/`V3` since the v0.7.0 A5 release (with `V3` as the actual default). The schemars derive from this struct will surface `accept` as an optional string (no enum constraint at this layer — the runtime [`CapabilitiesAccept::parse`] tolerates any input and falls back to V3). That removes the schema/runtime drift without forcing breaking-change semantics on existing v1/v2-pinned clients.",
         "properties": {
           "accept": {
             "default": null,
@@ -920,7 +858,6 @@
             ]
           }
         },
-        "title": "CapabilitiesRequest",
         "type": "object"
       },
       "name": "memory_capabilities"
@@ -928,9 +865,7 @@
     {
       "description": "LLM-expand a search query into",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
-        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_expand_query`.",
         "properties": {
           "query": {
             "type": "string"
@@ -939,7 +874,6 @@
         "required": [
           "query"
         ],
-        "title": "ExpandQueryRequest",
         "type": "object"
       },
       "name": "memory_expand_query"
@@ -947,9 +881,7 @@
     {
       "description": "LLM-generate tags for a memory",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
-        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_auto_tag`.",
         "properties": {
           "id": {
             "type": "string"
@@ -958,7 +890,6 @@
         "required": [
           "id"
         ],
-        "title": "AutoTagRequest",
         "type": "object"
       },
       "name": "memory_auto_tag"
@@ -966,9 +897,7 @@
     {
       "description": "LLM-check whether two memories",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
-        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_detect_contradiction`.",
         "properties": {
           "id_a": {
             "type": "string"
@@ -981,7 +910,6 @@
           "id_a",
           "id_b"
         ],
-        "title": "DetectContradictionRequest",
         "type": "object"
       },
       "name": "memory_detect_contradiction"
@@ -989,9 +917,7 @@
     {
       "description": "List messages sent to an agent",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
-        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_inbox`.",
         "properties": {
           "agent_id": {
             "default": null,
@@ -1016,7 +942,6 @@
             ]
           }
         },
-        "title": "InboxRequest",
         "type": "object"
       },
       "name": "memory_inbox"
@@ -1024,9 +949,7 @@
     {
       "description": "Replay subscription_events",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
-        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_subscription_replay`.",
         "properties": {
           "since": {
             "type": "string"
@@ -1039,7 +962,6 @@
           "since",
           "subscription_id"
         ],
-        "title": "SubscriptionReplayRequest",
         "type": "object"
       },
       "name": "memory_subscription_replay"
@@ -1047,9 +969,7 @@
     {
       "description": "List subscription_dlq rows",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
-        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_subscription_dlq_list`.",
         "properties": {
           "limit": {
             "default": null,
@@ -1067,7 +987,6 @@
             ]
           }
         },
-        "title": "SubscriptionDlqListRequest",
         "type": "object"
       },
       "name": "memory_subscription_dlq_list"
@@ -1075,9 +994,7 @@
     {
       "description": "Report per-agent quota usage",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
-        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_quota_status`.",
         "properties": {
           "agent_id": {
             "default": null,
@@ -1087,7 +1004,6 @@
             ]
           }
         },
-        "title": "QuotaStatusRequest",
         "type": "object"
       },
       "name": "memory_quota_status"
@@ -1095,9 +1011,7 @@
     {
       "description": "Check action vs",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
-        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_check_agent_action`.",
         "properties": {
           "agent_id": {
             "default": null,
@@ -1177,7 +1091,6 @@
         "required": [
           "kind"
         ],
-        "title": "CheckAgentActionRequest",
         "type": "object"
       },
       "name": "memory_check_agent_action"
@@ -1185,9 +1098,7 @@
     {
       "description": "List substrate-level",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
-        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_rule_list`.",
         "properties": {
           "enabled_only": {
             "default": null,
@@ -1204,7 +1115,6 @@
             ]
           }
         },
-        "title": "RuleListRequest",
         "type": "object"
       },
       "name": "memory_rule_list"
@@ -1212,9 +1122,7 @@
     {
       "description": "Offload verbatim content",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
-        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_offload`.",
         "properties": {
           "content": {
             "type": "string"
@@ -1238,7 +1146,6 @@
         "required": [
           "content"
         ],
-        "title": "OffloadRequest",
         "type": "object"
       },
       "name": "memory_offload"
@@ -1246,9 +1153,7 @@
     {
       "description": "Dereference a memory_offload",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
-        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_deref`.",
         "properties": {
           "ref_id": {
             "type": "string"
@@ -1257,7 +1162,6 @@
         "required": [
           "ref_id"
         ],
-        "title": "DerefRequest",
         "type": "object"
       },
       "name": "memory_deref"

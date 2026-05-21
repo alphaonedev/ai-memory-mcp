@@ -444,12 +444,15 @@ fn gap7_token_budget_guard_still_passes_post_decoration() {
     // suite too.
     let trimmed = ai_memory::sizes::trimmed_full_profile_total_tokens();
     let verbose = ai_memory::sizes::full_profile_total_tokens();
+    // **v0.7.0 #987 update.** D1.6 schemars metadata bumps ceilings
+    // 5K → 11K trimmed, 10K → 17K verbose. Aligned with
+    // tests/token_budget_guard.rs.
     assert!(
-        trimmed <= 5_000,
-        "Gap 7 regression: trimmed full-profile total {trimmed} exceeds the 5000-token ceiling"
+        trimmed <= 11_000,
+        "Gap 7 regression: trimmed full-profile total {trimmed} exceeds the 11000-token ceiling"
     );
     assert!(
-        verbose <= 10_000,
-        "Gap 7 regression: verbose full-profile total {verbose} exceeds the 10000-token ceiling"
+        verbose <= 17_000,
+        "Gap 7 regression: verbose full-profile total {verbose} exceeds the 17000-token ceiling"
     );
 }
