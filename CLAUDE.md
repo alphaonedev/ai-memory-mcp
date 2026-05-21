@@ -229,8 +229,8 @@ All three interfaces share the same storage layer (`src/storage/`) and validatio
 | `main.rs` | Thin CLI shim (W6 refactor); top-level `Command` enum lives in `src/daemon_runtime.rs` |
 | `daemon_runtime.rs` | clap top-level `Command` enum (55 subcommands), HTTP daemon `serve` bootstrap, MCP `mcp` dispatch |
 | `mcp/` | MCP server: stdin/stdout JSON-RPC loop, tool registry (`src/mcp/registry.rs`), per-tool handlers under `src/mcp/tools/` |
-| `storage/` | SAL trait + sqlite path; CRUD, FTS5 queries, recall scoring, GC, schema migrations (current `CURRENT_SCHEMA_VERSION = 48` in `src/storage/migrations.rs`) |
-| `store/` | SAL adapter implementations (sqlite + postgres + Apache AGE feature gates) |
+| `storage/` | sqlite SQL primitives + typed legacy errors (`StorageError`, `VersionConflict`, `GovernanceRefusal`); CRUD, FTS5 queries, recall scoring, GC, schema migrations (current `CURRENT_SCHEMA_VERSION = 48` in `src/storage/migrations.rs`). Post-#961 (SAL boundary cleanup): handlers reach into `crate::storage::*` ONLY for direct-db keepers (FTS trigger sync, PRAGMA, migration callouts) and for typed-error downcasts where the SAL `StoreError` enum doesn't yet carry the legacy variant; everything else routes through the SAL trait under `src/store/`. Exposed as the `db` alias (`pub use storage as db` in `src/lib.rs:52`). |
+| `store/` | SAL `MemoryStore` trait + adapter implementations (`SqliteStore` thin-wraps `crate::storage`; `PostgresStore` is sqlx+pgvector; Apache AGE feature gates). Trait surface is the canonical write path for postgres-backed daemons and the forward path for sqlite — new DB operations land here first, not in `src/storage/`. |
 | `handlers/` | HTTP request handlers split per domain (`http.rs`, `federation_receive.rs`, `hook_subscribers.rs`, `transport.rs`) — Axum extractors, error sanitization |
 | `models/` | Core data structures: `Memory` (26 fields incl. v0.7.0 recursive-learning + Batman vocabulary + Form-4 provenance + Form-5 confidence-calibration columns + the v45 `version` BIGINT for Gap-1 optimistic concurrency), `MemoryLink`, request/response types |
 | `validate.rs` | Input validation for all write paths |
@@ -415,6 +415,18 @@ Tracking issue: #198.
 **New MCP tool**: Add JSON definition in `tool_definitions()` → add match arm in the dispatch block → implement handler taking `&Connection` + params → return `Result<Value>`.
 
 **New HTTP endpoint**: Add route in `main.rs` router → implement handler in `handlers.rs` using `Db` extractor.
+
+**New database operation** (post-#961, SAL boundary cleanup): land the
+operation on the `MemoryStore` trait in `src/store/mod.rs` FIRST. Implement it
+on `SqliteStore` (`src/store/sqlite.rs` — typically a thin delegate to an
+existing `crate::storage::*` free-function) AND on `PostgresStore`
+(`src/store/postgres.rs` — sqlx-native). Then call it from handlers as
+`app.store.<method>(...).await`. Do NOT add the operation as a fresh
+`crate::storage::*` free-function only — the postgres adapter will not pick
+it up and the postgres-route-gate will surface 501. The legacy `storage/`
+free-function surface continues to host primitives that the sqlite adapter
+delegates to (FTS sync, schema migrations, rusqlite-Connection-bound helpers),
+but new public operations live on the trait.
 
 ## Code Style
 
