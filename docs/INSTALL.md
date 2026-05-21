@@ -1,6 +1,6 @@
 # Installation Guide
 
-> **BLUF (Bottom Line Up Front):** `ai-memory` is an AI-agnostic memory management system that works with **any MCP-compatible AI client** -- including Claude AI, OpenAI ChatGPT, xAI Grok, META Llama, OpenClaw, and others. Install the binary, configure your AI client's MCP settings, and you get **7 MCP memory tools at the default `--profile core`** (or 71 advertised entries at `--profile full` — 70 callable memory tools + the always-on `memory_capabilities` bootstrap) at v0.7.0. The default `semantic` tier includes embedding-based hybrid recall out of the box. Total time: ~60 seconds (pre-built binary + fast internet; first semantic-tier run also downloads a ~100MB embedding model).
+> **BLUF (Bottom Line Up Front):** `ai-memory` is an AI-agnostic memory management system that works with **any MCP-compatible AI client** -- including Claude AI, OpenAI ChatGPT, xAI Grok, META Llama, OpenClaw, and others. Install the binary, configure your AI client's MCP settings, and you get **7 MCP memory tools at the default `--profile core`** (or 73 advertised entries at `--profile full` — 72 callable memory tools + the always-on `memory_capabilities` bootstrap) at v0.7.0. The default `semantic` tier includes embedding-based hybrid recall out of the box. Total time: ~60 seconds (pre-built binary + fast internet; first semantic-tier run also downloads a ~100MB embedding model).
 
 ## Install in 60 Seconds (pre-built binary + fast internet)
 
@@ -121,7 +121,7 @@
 
    > **Note:** `~/.claude.json` likely already exists with other settings. Merge the `mcpServers` key into the existing JSON — do not overwrite the file. See [Claude Code MCP Scopes](#claude-code-mcp-configuration-scopes) below for project-level and team-shared alternatives.
 
-   > The `--tier` flag selects the feature tier: `keyword`, `semantic` (default), `smart`, or `autonomous`. **Important:** The `--tier` flag must be passed in the MCP args — the `config.toml` `tier` setting is not used when the server is launched by an AI client. Smart and autonomous tiers require [Ollama](https://ollama.com) running locally with the appropriate models.
+   > The `--tier` flag selects the feature tier: `keyword`, `semantic` (default), `smart`, or `autonomous`. **Important:** The `--tier` flag must be passed in the MCP args — the `config.toml` `tier` setting is not used when the server is launched by an AI client. Smart and autonomous tiers require an LLM backend — post-[#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067) (v0.7.0), any of: local [Ollama](https://ollama.com), LMStudio, vLLM, llama.cpp server, OR any OpenAI-compatible vendor (xAI Grok, OpenAI, Anthropic, Google Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks). Selected via `AI_MEMORY_LLM_BACKEND` env var. See [`ADMIN_GUIDE.md` § "LLM Backend Setup"](ADMIN_GUIDE.md#llm-backend-setup-smart--autonomous-tiers) for the full matrix.
    > **Other AI platforms** (OpenAI ChatGPT, xAI Grok, META Llama, etc.) have their own MCP configuration locations. Consult your platform's documentation for where to add MCP server entries. The server command and args are the same — only the config file location differs.
 
 3. **Restart your AI client.**
@@ -747,9 +747,20 @@ ai-memory completions zsh > ~/.zfunc/_ai-memory
 ai-memory completions fish > ~/.config/fish/completions/ai-memory.fish
 ```
 
-## Ollama Installation (Smart & Autonomous Tiers)
+## LLM Backend Setup (Smart & Autonomous Tiers)
 
-Smart and autonomous tiers require [Ollama](https://ollama.com) running locally for LLM inference (Gemma 4 models). The `keyword` and `semantic` tiers do **not** require Ollama.
+Smart and autonomous tiers require an LLM backend. **Post-[#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067) (v0.7.0)** the backend is provider-agnostic — pick from:
+
+- **Local LLM:** [Ollama](https://ollama.com), [LMStudio](https://lmstudio.ai), [vLLM](https://docs.vllm.ai), or llama.cpp server (any OpenAI-compatible local endpoint).
+- **Cloud LLM:** xAI Grok, OpenAI, Anthropic (via OpenAI shim), Google Gemini, DeepSeek, Kimi (Moonshot), Qwen (Alibaba), Mistral, Groq, Together AI, Cerebras, OpenRouter, Fireworks.
+
+Selection is by `AI_MEMORY_LLM_BACKEND` env var. See [`ADMIN_GUIDE.md` § "LLM Backend Setup"](ADMIN_GUIDE.md#llm-backend-setup-smart--autonomous-tiers) for the full env-var matrix, vendor aliases, and per-vendor API-key fallback chain.
+
+The `keyword` and `semantic` tiers do **not** require any LLM backend.
+
+### Ollama (local LLM — v0.6.4 default, still supported)
+
+Below is the canonical local-Ollama install path. For other backends, set the env vars per ADMIN_GUIDE.md instead.
 
 ### macOS
 

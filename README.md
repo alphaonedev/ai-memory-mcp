@@ -231,7 +231,7 @@ Create `.mcp.json` in your project root:
 
 > **Windows paths:** Use forward slashes or escaped backslashes in `--db`. Example: `"--db", "C:/Users/YourName/.claude/ai-memory.db"`.
 
-> **Tier flag:** The `--tier` flag selects the feature tier: `keyword`, `semantic` (default), `smart`, or `autonomous`. Smart and autonomous tiers require [Ollama](https://ollama.com) running locally. The `--tier` flag **must** be passed in the args — the `config.toml` tier setting is not used when the MCP server is launched by an AI client.
+> **Tier flag:** The `--tier` flag selects the feature tier: `keyword`, `semantic` (default), `smart`, or `autonomous`. Smart and autonomous tiers need an LLM backend — **post-[#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067) (v0.7.0)** that is any of: local [Ollama](https://ollama.com), xAI Grok, OpenAI, Anthropic, Google Gemini, DeepSeek, Kimi (Moonshot), Qwen (Alibaba), Mistral, Groq, Together AI, Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, or llama.cpp server — selected via `AI_MEMORY_LLM_BACKEND`. The `--tier` flag **must** be passed in the args — the `config.toml` tier setting is not used when the MCP server is launched by an AI client.
 
 > **Important:** MCP servers are **not** configured in `settings.json` or `settings.local.json` — those files do not support `mcpServers`.
 
@@ -365,7 +365,7 @@ Add to `~/.grok/user-settings.json`:
 }
 ```
 
-> **Features:** Auto-recall on session start (injects relevant memories into system prompt), compaction summaries stored as mid-tier memories, MCP tools available in all modes (agent, plan, ask), session-scoped connections (no per-message cold starts). Uses `--tier semantic` by default (local embeddings, no Ollama required). See [grok-cli docs](https://github.com/alphaonedev/grok-cli/blob/main/docs/CONFIGURATION.md) for full setup.
+> **Features:** Auto-recall on session start (injects relevant memories into system prompt), compaction summaries stored as mid-tier memories, MCP tools available in all modes (agent, plan, ask), session-scoped connections (no per-message cold starts). Uses `--tier semantic` by default (local embeddings, no LLM backend required). See [grok-cli docs](https://github.com/alphaonedev/grok-cli/blob/main/docs/CONFIGURATION.md) for full setup.
 
 </details>
 
@@ -667,7 +667,7 @@ The `token-budget` workflow is a **required status check**. It enforces three cl
 - **hf-hub** -- download models from Hugging Face Hub
 - **tokenizers** -- Hugging Face tokenizers for text preprocessing
 - **instant-distance** -- approximate nearest neighbor search
-- **reqwest** -- HTTP client for Ollama API communication (smart/autonomous tiers)
+- **reqwest** -- HTTP client for LLM-backend communication (smart/autonomous tiers — any provider per #1067: Ollama, xAI, OpenAI, Anthropic, Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, llama.cpp server)
 
 ---
 
@@ -691,7 +691,7 @@ Evaluated on the [ICLR 2025 LongMemEval-S](benchmarks/longmemeval/) dataset (500
 |------|-----|-------|-------------|
 | **keyword** | 97.0% | 232 q/s | None |
 | **semantic** | 97.4% | 45 q/s | Embedding model (~100MB) |
-| **smart** | 97.8% | 12 q/s | Ollama + Gemma 4 E2B |
+| **smart** | 97.8% | 12 q/s | Any LLM backend (e.g. local Ollama + Gemma 4 E2B; or xAI Grok 4, OpenAI gpt-4o, Anthropic Claude, Gemini, DeepSeek, etc. post-[#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067)) |
 
 ### Performance Budgets (v0.6.4)
 
@@ -768,8 +768,8 @@ ai-memory supports 4 feature tiers, selected at startup with `ai-memory mcp --ti
 |------|---------------|-------------------|-----------------|
 | **keyword** | FTS5 only | Baseline 26 tools | 0 MB |
 | **semantic** | FTS5 + cosine similarity (hybrid) | MiniLM-L6-v2 embeddings (384-dim), HNSW index, semantic tier (subset of 73-tool surface (v0.7.0)) | ~256 MB |
-| **smart** | Hybrid + LLM query expansion | + nomic-embed-text (768-dim) + Gemma 4 E2B via Ollama: `memory_expand_query`, `memory_auto_tag`, `memory_detect_contradiction`, full 73-tool surface (v0.7.0) | ~1 GB |
-| **autonomous** | Hybrid + LLM expansion + cross-encoder reranking | + Gemma 4 E4B via Ollama, neural cross-encoder (ms-marco-MiniLM), memory reflection, full 73-tool surface (v0.7.0) | ~4 GB |
+| **smart** | Hybrid + LLM query expansion | + nomic-embed-text (768-dim) + LLM-backed `memory_expand_query`, `memory_auto_tag`, `memory_detect_contradiction`, full 73-tool surface (v0.7.0). LLM provider is operator-selected via `AI_MEMORY_LLM_BACKEND` ([#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067)) — local Ollama, xAI, OpenAI, Anthropic, Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, or llama.cpp. | ~1 GB (local Ollama) / ~0 GB (remote API) |
+| **autonomous** | Hybrid + LLM expansion + cross-encoder reranking | + neural cross-encoder (ms-marco-MiniLM), memory reflection, full 73-tool surface (v0.7.0). Same LLM-provider freedom as smart tier. | ~4 GB (local Ollama) / ~3 GB (remote LLM, local cross-encoder only) |
 
 ### Capability Matrix
 
@@ -793,18 +793,26 @@ Every capability mapped to its minimum tier. Each tier includes all capabilities
 | Autonomous memory reflection | -- | -- | -- | Yes |
 | **Models** | | | | |
 | Embedding model | -- | MiniLM-L6-v2 (384d) | nomic-embed-text (768d) | nomic-embed-text (768d) |
-| LLM | -- | -- | gemma4:e2b (~7.2GB) | gemma4:e4b (~9.6GB) |
+| LLM | -- | -- | operator-selected (#1067) — default `gemma3:4b` or `gemma4:e2b` local; remote endpoints carry no local footprint | operator-selected (#1067) — default `gemma4:e4b` local; remote endpoints carry no local footprint |
 | **Resources** | | | | |
 | RAM | 0 MB | ~256 MB | ~1 GB | ~4 GB |
-| External dependencies | None | None | Ollama | Ollama |
+| External dependencies | None | None | LLM backend (Ollama / xAI / OpenAI / Anthropic / Gemini / DeepSeek / Kimi / Qwen / Mistral / Groq / Together / Cerebras / OpenRouter / Fireworks / LMStudio / vLLM / llama.cpp — #1067) | LLM backend (same choices as smart) |
 | MCP tools exposed | 26 | 26 | 26 | 26 |
 
-**Semantic tier** (default) bundles the Candle ML framework and downloads the all-MiniLM-L6-v2 model on first run (~90 MB). **Smart** and **autonomous** tiers require [Ollama](https://ollama.com) running locally.
+**Semantic tier** (default) bundles the Candle ML framework and downloads the all-MiniLM-L6-v2 model on first run (~90 MB). **Smart** and **autonomous** tiers require an LLM backend — post-[#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067) (v0.7.0) that can be local ([Ollama](https://ollama.com), LMStudio, vLLM, llama.cpp server) or any OpenAI-compatible remote endpoint (xAI, OpenAI, Anthropic via OpenAI shim, Google Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks). Selection is by `AI_MEMORY_LLM_BACKEND` env var; per-vendor API keys via `XAI_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` / `DEEPSEEK_API_KEY` / `MOONSHOT_API_KEY` / `DASHSCOPE_API_KEY` / etc. or the canonical `AI_MEMORY_LLM_API_KEY`.
 
-**Tiers gate features, not models.** The `--tier` flag controls which tools are exposed. The LLM model is independently configurable via `llm_model` in `~/.config/ai-memory/config.toml`. For example, run autonomous tier (full 73-tool surface (v0.7.0) + reranker) with the faster e2b model:
+**Tiers gate features, not models — and post-[#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067) (v0.7.0), tiers gate features, not vendors either.** The `--tier` flag controls which tools are exposed. The LLM backend + model are independently configurable via `AI_MEMORY_LLM_BACKEND` + `AI_MEMORY_LLM_MODEL` env vars (or the `llm_model` field in `~/.config/ai-memory/config.toml` for legacy Ollama setups). For example, run autonomous tier (full 73-tool surface (v0.7.0) + reranker) against xAI Grok 4 via the OpenAI-compatible alias:
+
+```bash
+# Remote LLM via env (post-#1067)
+export AI_MEMORY_LLM_BACKEND=xai
+export AI_MEMORY_LLM_MODEL=grok-4
+export XAI_API_KEY=xai-…   # or AI_MEMORY_LLM_API_KEY
+ai-memory mcp --tier autonomous
+```
 
 ```toml
-# ~/.config/ai-memory/config.toml
+# ~/.config/ai-memory/config.toml — legacy local Ollama
 tier = "autonomous"        # all features enabled
 llm_model = "gemma4:e2b"   # faster model (46 tok/s vs 26 tok/s for e4b)
 ```

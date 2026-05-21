@@ -105,6 +105,45 @@ For RHEL / Fedora / Amazon Linux: replace the `apt` lines with the
 PGDG yum repo equivalents and ensure `postgresql16-devel` /
 `postgresql16-contrib` are installed before building AGE.
 
+### Docker — pgvector is required, not optional ([#1065](https://github.com/alphaonedev/ai-memory-mcp/issues/1065))
+
+The popular `apache/age:release_PG16_*` Docker images **do not bundle
+pgvector**. The SAL postgres adapter's `init schema` step calls
+`CREATE EXTENSION IF NOT EXISTS vector` and fails-fast on missing
+extension with the message `extension "vector" is not available` —
+restarting the daemon container indefinitely on Plan C and any
+Compose / K8s deploy.
+
+The canonical fix is a 2-line Dockerfile that layers pgvector on top
+of the upstream Apache AGE image:
+
+```dockerfile
+# Dockerfile.pg-age-vector — see infra/lan-parity-test/Dockerfile.pg-age-vector
+FROM apache/age:release_PG16_1.5.0
+USER root
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends postgresql-16-pgvector \
+ && rm -rf /var/lib/apt/lists/*
+USER postgres
+```
+
+The ai-memory repo ships this Dockerfile at
+[`infra/lan-parity-test/Dockerfile.pg-age-vector`](../infra/lan-parity-test/Dockerfile.pg-age-vector);
+the lan-parity compose file uses it via:
+
+```yaml
+services:
+  pg-age:
+    build:
+      context: .
+      dockerfile: Dockerfile.pg-age-vector
+```
+
+Plan C operators running on K8s / ECS / Cloud Run build this image
+once, tag it (`pg-age-vector:PG16-1.5.0-pgvector0.8`), and reference
+the tag from their workload manifests instead of the bare upstream
+image.
+
 ## Database setup
 
 ```bash
