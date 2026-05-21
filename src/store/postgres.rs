@@ -7487,12 +7487,55 @@ impl MemoryStore for PostgresStore {
                 detail: format!("serialize tags: {e}"),
             })?;
 
+        // #1029 (HIGH, 2026-05-21): extend the federation upsert to
+        // carry the full v0.7.0 column set. Pre-#1029 the INSERT
+        // listed 17 columns; the v0.7.0 Memory struct carries 26.
+        // Missing: citations, source_uri, source_span (Form-4 fact
+        // provenance), confidence_source, confidence_signals,
+        // confidence_decayed_at (Form-5 confidence calibration),
+        // entity_id, persona_version (QW-2 persona artefact), version
+        // (Gap-1 optimistic concurrency). Federation push between two
+        // postgres peers lost all 9 fields on every cross-node sync.
+        //
+        // Serialize the JSON-shaped columns (citations, source_span,
+        // confidence_signals) to String via serde_json::to_string,
+        // matching the pattern used by the local INSERT path at
+        // `store` (~line 6758).
+        let citations_json =
+            serde_json::to_string(&memory.citations).map_err(|e| StoreError::IntegrityFailed {
+                detail: format!("serialize citations: {e}"),
+            })?;
+        let source_span_json = match &memory.source_span {
+            Some(span) => {
+                Some(
+                    serde_json::to_string(span).map_err(|e| StoreError::IntegrityFailed {
+                        detail: format!("serialize source_span: {e}"),
+                    })?,
+                )
+            }
+            None => None,
+        };
+        let confidence_signals_json = match &memory.confidence_signals {
+            Some(s) => Some(
+                serde_json::to_string(s).map_err(|e| StoreError::IntegrityFailed {
+                    detail: format!("serialize confidence_signals: {e}"),
+                })?,
+            ),
+            None => None,
+        };
+        let confidence_decayed_at = parse_rfc3339_opt(memory.confidence_decayed_at.as_deref());
         let row = sqlx::query(
             "INSERT INTO memories (
                 id, tier, namespace, title, content, tags, priority, confidence,
                 source, access_count, created_at, updated_at, last_accessed_at,
-                expires_at, metadata, reflection_depth, memory_kind
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+                expires_at, metadata, reflection_depth, memory_kind,
+                citations, source_uri, source_span,
+                confidence_source, confidence_signals, confidence_decayed_at,
+                entity_id, persona_version, version
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
+                $18, $19, $20, $21, $22, $23, $24, $25, $26
+            )
             ON CONFLICT (title, namespace) DO UPDATE SET
                 content = CASE
                     WHEN EXCLUDED.updated_at > memories.updated_at
@@ -7543,7 +7586,54 @@ impl MemoryStore for PostgresStore {
                 reflection_depth = GREATEST(memories.reflection_depth, EXCLUDED.reflection_depth),
                 -- L1-1 — kind is sticky across federation merges.
                 memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
-                                   ELSE EXCLUDED.memory_kind END
+                                   ELSE EXCLUDED.memory_kind END,
+                -- #1029 (2026-05-21) — Form-4 provenance, Form-5 calibration,
+                -- QW-2 persona, Gap-1 version: all newer-wins (matches the
+                -- existing content/tags/priority/confidence merge shape).
+                citations = CASE
+                    WHEN EXCLUDED.updated_at > memories.updated_at
+                        THEN EXCLUDED.citations
+                    ELSE memories.citations
+                END,
+                source_uri = CASE
+                    WHEN EXCLUDED.updated_at > memories.updated_at
+                        THEN EXCLUDED.source_uri
+                    ELSE memories.source_uri
+                END,
+                source_span = CASE
+                    WHEN EXCLUDED.updated_at > memories.updated_at
+                        THEN EXCLUDED.source_span
+                    ELSE memories.source_span
+                END,
+                confidence_source = CASE
+                    WHEN EXCLUDED.updated_at > memories.updated_at
+                        THEN EXCLUDED.confidence_source
+                    ELSE memories.confidence_source
+                END,
+                confidence_signals = CASE
+                    WHEN EXCLUDED.updated_at > memories.updated_at
+                        THEN EXCLUDED.confidence_signals
+                    ELSE memories.confidence_signals
+                END,
+                confidence_decayed_at = CASE
+                    WHEN EXCLUDED.updated_at > memories.updated_at
+                        THEN EXCLUDED.confidence_decayed_at
+                    ELSE memories.confidence_decayed_at
+                END,
+                entity_id = CASE
+                    WHEN EXCLUDED.updated_at > memories.updated_at
+                        THEN EXCLUDED.entity_id
+                    ELSE memories.entity_id
+                END,
+                persona_version = CASE
+                    WHEN EXCLUDED.updated_at > memories.updated_at
+                        THEN EXCLUDED.persona_version
+                    ELSE memories.persona_version
+                END,
+                -- version is newer-wins; advance to MAX so an out-of-order
+                -- federation push doesn't roll a peer back to a stale
+                -- version.
+                version = GREATEST(memories.version, EXCLUDED.version)
             RETURNING id",
         )
         .bind(&memory.id)
@@ -7563,6 +7653,15 @@ impl MemoryStore for PostgresStore {
         .bind(&memory.metadata)
         .bind(memory.reflection_depth)
         .bind(memory.memory_kind.as_str())
+        .bind(&citations_json)
+        .bind(memory.source_uri.as_ref())
+        .bind(source_span_json.as_deref())
+        .bind(memory.confidence_source.as_str())
+        .bind(confidence_signals_json.as_deref())
+        .bind(confidence_decayed_at)
+        .bind(memory.entity_id.as_ref())
+        .bind(memory.persona_version)
+        .bind(memory.version)
         .fetch_one(&self.pool)
         .await
         .map_err(|e| to_store_err("apply_remote_memory upsert", e))?;
