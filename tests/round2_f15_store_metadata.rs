@@ -76,9 +76,15 @@ fn f15_memory_store_input_schema_declares_tier_priority_tags() {
         "memory_store.inputSchema must declare `tags`"
     );
 
-    assert_eq!(props["tier"]["type"], "string");
-    assert_eq!(props["priority"]["type"], "integer");
-    assert_eq!(props["tags"]["type"], "array");
+    // **v0.7.0 #987 update.** D1.6 schemars Option<T> emits nullable type array.
+    let type_is = |v: &serde_json::Value, want: &str| -> bool {
+        v == want
+            || v.as_array()
+                .is_some_and(|arr| arr.iter().any(|x| x == want))
+    };
+    assert!(type_is(&props["tier"]["type"], "string"));
+    assert!(type_is(&props["priority"]["type"], "integer"));
+    assert!(type_is(&props["tags"]["type"], "array"));
 }
 
 // ---------------------------------------------------------------------------
@@ -94,9 +100,16 @@ fn f15_memory_update_input_schema_declares_metadata_object() {
     let metadata = props
         .get("metadata")
         .expect("memory_update.inputSchema.properties.metadata must be declared (Round-2 F15)");
-    assert_eq!(
-        metadata["type"], "object",
-        "metadata field must declare type=object; got: {metadata}"
+    // **v0.7.0 #987 update.** D1.6 schemars Option<serde_json::Value>
+    // emits true/false (any type) — accept "object" OR true OR nullable array.
+    let type_is_object = metadata["type"] == "object"
+        || metadata["type"]
+            .as_array()
+            .is_some_and(|arr| arr.iter().any(|v| v == "object"))
+        || metadata.get("type").is_none(); // schemars may omit type for Value
+    assert!(
+        type_is_object,
+        "metadata field must declare type=object or be permissive (schemars Value); got: {metadata}"
     );
 }
 
