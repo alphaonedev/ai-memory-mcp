@@ -308,6 +308,97 @@ pub(super) fn handle_reflect(
     }))
 }
 
+// --- D1.5 (#986): per-tool McpTool impl for memory_reflect ---
+
+use crate::mcp::registry::McpTool;
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+/// v0.7.0 #972 D1.5 (#986) — request body for `memory_reflect`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct ReflectRequest {
+    /// Sources reflected on; one reflects_on link per id.
+    pub source_ids: Vec<String>,
+
+    /// Reflection title.
+    pub title: String,
+
+    /// Reflection content.
+    pub content: String,
+
+    /// Target namespace. Defaults to first source's namespace.
+    #[serde(default)]
+    pub namespace: Option<String>,
+
+    #[serde(default)]
+    pub tier: Option<String>,
+
+    #[serde(default)]
+    pub tags: Vec<String>,
+
+    #[serde(default)]
+    pub priority: Option<i64>,
+
+    #[serde(default)]
+    pub confidence: Option<f64>,
+
+    /// Reflection writer NHI; default synthesized.
+    #[serde(default)]
+    pub agent_id: Option<String>,
+
+    /// Merged with system reflection_metadata; caller keys win.
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_reflect`.
+#[allow(dead_code)]
+pub struct ReflectTool;
+
+impl McpTool for ReflectTool {
+    fn name() -> &'static str {
+        "memory_reflect"
+    }
+    fn description() -> &'static str {
+        "Persist a reflection memory plus reflects_on provenance links to each source."
+    }
+    fn docs() -> &'static str {
+        "Task 4/8 (#655): substrate-native recursive-learning primitive. reflection_depth = max(source_depths)+1; gated by namespace governance.max_reflection_depth (Task 2/8) — refusal returns REFLECTION_DEPTH_EXCEEDED. New memory + N reflects_on links land in one atomic txn."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(ReflectRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "power"
+    }
+}
+
+#[cfg(test)]
+mod d1_5_986_tests {
+    //! D1.5 (#986) — schema parity for `memory_reflect`.
+    //! Shared helpers live at [`crate::mcp::parity_test_helpers`].
+    use super::*;
+    use crate::mcp::parity_test_helpers::{
+        assert_descriptions_match, assert_property_set_parity, derived_props_for,
+    };
+
+    #[test]
+    fn reflect_parity_986() {
+        let derived = derived_props_for::<ReflectRequest>();
+        assert_property_set_parity("memory_reflect", &derived);
+        assert_descriptions_match("memory_reflect", &derived);
+    }
+
+    #[test]
+    fn reflect_tool_metadata_986() {
+        assert_eq!(ReflectTool::name(), "memory_reflect");
+        assert_eq!(ReflectTool::family(), "power");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Coverage C-2 — focused tests for `handle_reflect`.

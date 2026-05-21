@@ -171,6 +171,78 @@ pub fn handle_pending_approve(
     }
 }
 
+// --- D1.5 (#986): per-tool McpTool impl for memory_subscription_dlq_list ---
+//
+// `memory_pending_*` belong to Family::Governance and are migrated by
+// the sibling D1.4 (#985) sub-agent. Only the in-scope
+// `memory_subscription_dlq_list` (Family::Power) lands here.
+
+use crate::mcp::registry::McpTool;
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+/// v0.7.0 #972 D1.5 (#986) — request body for `memory_subscription_dlq_list`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct SubscriptionDlqListRequest {
+    /// Restrict to one subscription.
+    #[serde(default)]
+    pub subscription_id: Option<String>,
+
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+/// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_subscription_dlq_list`.
+#[allow(dead_code)]
+pub struct SubscriptionDlqListTool;
+
+impl McpTool for SubscriptionDlqListTool {
+    fn name() -> &'static str {
+        "memory_subscription_dlq_list"
+    }
+    fn description() -> &'static str {
+        "List subscription_dlq rows (exhausted retry ladder)."
+    }
+    fn docs() -> &'static str {
+        "K7: DLQ inspector."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(SubscriptionDlqListRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "power"
+    }
+}
+
+#[cfg(test)]
+mod d1_5_986_tests {
+    //! D1.5 (#986) — schema parity for `memory_subscription_dlq_list`.
+    //! Shared helpers live at [`crate::mcp::parity_test_helpers`].
+    use super::*;
+    use crate::mcp::parity_test_helpers::{
+        assert_descriptions_match, assert_property_set_parity, derived_props_for,
+    };
+
+    #[test]
+    fn subscription_dlq_list_parity_986() {
+        let derived = derived_props_for::<SubscriptionDlqListRequest>();
+        assert_property_set_parity("memory_subscription_dlq_list", &derived);
+        assert_descriptions_match("memory_subscription_dlq_list", &derived);
+    }
+
+    #[test]
+    fn subscription_dlq_list_tool_metadata_986() {
+        assert_eq!(
+            SubscriptionDlqListTool::name(),
+            "memory_subscription_dlq_list"
+        );
+        assert_eq!(SubscriptionDlqListTool::family(), "power");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Coverage C-2 — focused tests for the pending-action handlers and the

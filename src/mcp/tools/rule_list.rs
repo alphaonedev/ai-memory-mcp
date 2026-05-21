@@ -93,6 +93,72 @@ pub fn handle_rule_list(conn: &rusqlite::Connection, arguments: &Value) -> Resul
     }))
 }
 
+// --- D1.5 (#986): per-tool McpTool impl for memory_rule_list ---
+
+use crate::mcp::registry::McpTool;
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+/// v0.7.0 #972 D1.5 (#986) — request body for `memory_rule_list`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct RuleListRequest {
+    /// Restrict to one AgentAction kind.
+    #[serde(default)]
+    pub kind: Option<String>,
+
+    /// Skip disabled rules. Default false.
+    #[serde(default)]
+    pub enabled_only: Option<bool>,
+}
+
+/// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_rule_list`.
+#[allow(dead_code)]
+pub struct RuleListTool;
+
+impl McpTool for RuleListTool {
+    fn name() -> &'static str {
+        "memory_rule_list"
+    }
+    fn description() -> &'static str {
+        "List substrate-level agent-action rules. Read-only (#691)."
+    }
+    fn docs() -> &'static str {
+        "#691: governance_rules read. Mutation operator-only (CLI/HTTP signed); MCP read-only by design 2026-05-13."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(RuleListRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "power"
+    }
+}
+
+#[cfg(test)]
+mod d1_5_986_tests {
+    //! D1.5 (#986) — schema parity for `memory_rule_list`.
+    //! Shared helpers live at [`crate::mcp::parity_test_helpers`].
+    use super::*;
+    use crate::mcp::parity_test_helpers::{
+        assert_descriptions_match, assert_property_set_parity, derived_props_for,
+    };
+
+    #[test]
+    fn rule_list_parity_986() {
+        let derived = derived_props_for::<RuleListRequest>();
+        assert_property_set_parity("memory_rule_list", &derived);
+        assert_descriptions_match("memory_rule_list", &derived);
+    }
+
+    #[test]
+    fn rule_list_tool_metadata_986() {
+        assert_eq!(RuleListTool::name(), "memory_rule_list");
+        assert_eq!(RuleListTool::family(), "power");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

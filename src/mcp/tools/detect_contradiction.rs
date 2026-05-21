@@ -47,6 +47,73 @@ pub(super) fn handle_detect_contradiction(
     }))
 }
 
+// --- D1.5 (#986): per-tool McpTool impl for memory_detect_contradiction ---
+
+use crate::mcp::registry::McpTool;
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+/// v0.7.0 #972 D1.5 (#986) — request body for `memory_detect_contradiction`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct DetectContradictionRequest {
+    /// First memory ID.
+    pub id_a: String,
+
+    /// Second memory ID.
+    pub id_b: String,
+}
+
+/// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_detect_contradiction`.
+#[allow(dead_code)]
+pub struct DetectContradictionTool;
+
+impl McpTool for DetectContradictionTool {
+    fn name() -> &'static str {
+        "memory_detect_contradiction"
+    }
+    fn description() -> &'static str {
+        "LLM-check whether two memories contradict each other (smart/autonomous tier)."
+    }
+    fn docs() -> &'static str {
+        "LLM contradiction check. Smart/autonomous tier."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(DetectContradictionRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "power"
+    }
+}
+
+#[cfg(test)]
+mod d1_5_986_tests {
+    //! D1.5 (#986) — schema parity for `memory_detect_contradiction`.
+    //! Shared helpers live at [`crate::mcp::parity_test_helpers`].
+    use super::*;
+    use crate::mcp::parity_test_helpers::{
+        assert_descriptions_match, assert_property_set_parity, derived_props_for,
+    };
+
+    #[test]
+    fn detect_contradiction_parity_986() {
+        let derived = derived_props_for::<DetectContradictionRequest>();
+        assert_property_set_parity("memory_detect_contradiction", &derived);
+        assert_descriptions_match("memory_detect_contradiction", &derived);
+    }
+
+    #[test]
+    fn detect_contradiction_tool_metadata_986() {
+        assert_eq!(
+            DetectContradictionTool::name(),
+            "memory_detect_contradiction"
+        );
+        assert_eq!(DetectContradictionTool::family(), "power");
+    }
+}
+
 // =====================================================================
 // L0.7-5 Tier D — envelope unit tests
 //
