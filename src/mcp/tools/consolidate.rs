@@ -57,7 +57,8 @@ pub(super) fn handle_consolidate(
         );
     };
 
-    validate::validate_consolidate(&ids, title, &summary, namespace).map_err(|e| e.to_string())?;
+    validate::RequestValidator::validate_consolidate(&ids, title, &summary, namespace)
+        .map_err(|e| e.to_string())?;
 
     // v0.7.0 K9 — unified permission pipeline (consolidate-side).
     {

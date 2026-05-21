@@ -125,7 +125,8 @@ pub fn handle_verify(conn: &rusqlite::Connection, params: &Value) -> Result<Valu
     // Validate the IDs / relation through the same gate `memory_link`
     // uses on the write path — keeps the verify surface from being a
     // back-door past the validator.
-    validate::validate_link(&source_id, &target_id, &relation).map_err(|e| e.to_string())?;
+    validate::RequestValidator::validate_link_triple(&source_id, &target_id, &relation)
+        .map_err(|e| e.to_string())?;
 
     let record = db::get_link_for_verify(conn, &source_id, &target_id, &relation)
         .map_err(|e| e.to_string())?

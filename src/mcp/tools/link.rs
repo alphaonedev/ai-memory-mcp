@@ -106,7 +106,8 @@ pub(super) fn handle_link(
         .ok_or("target_id is required")?;
     let relation = params["relation"].as_str().unwrap_or("related_to");
 
-    validate::validate_link(source_id, target_id, relation).map_err(|e| e.to_string())?;
+    validate::RequestValidator::validate_link_triple(source_id, target_id, relation)
+        .map_err(|e| e.to_string())?;
 
     // v0.7.0 K9 — unified permission pipeline (link-side), Ask
     // short-circuit only.

@@ -3407,7 +3407,7 @@ pub async fn sync_cycle_once(
     {
         let conn = db::open(db_path)?;
         for mem in &pulled.memories {
-            if crate::validate::validate_memory(mem).is_ok() {
+            if crate::validate::RequestValidator::validate_memory(mem).is_ok() {
                 let _ = db::insert_if_newer(&conn, mem);
             }
         }
