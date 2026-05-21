@@ -1,4 +1,4 @@
-# Tool-count drift gate (Cluster H, issue #767).
+# Tool-count drift gate (Cluster H, issue #767; updated post-#987 / #1014).
 #
 # Prevents the v0.6.4 → v0.7.0 tool-count drift bug from recurring.
 # The single source of truth is `Profile::full().expected_tool_count()`
@@ -7,15 +7,18 @@
 # answer is 73 entries at `--profile full` (72 callable + memory_capabilities
 # bootstrap) and 7 at `--profile core`.
 #
-# The grep counts `"memory_*"` LITERALS which include 73 tool-name strings
-# plus 1 field-name reference (`memory_id` in an input schema) = 74 literals
-# at v0.7.0. Range 73±1 covers both noise + the tool-vs-literal off-by-one.
+# Post-#987 (D1.6 split): the historical `tool_definitions()` json! macro
+# was collapsed to a 4-line iteration over `registered_tools()`. Each tool's
+# `"memory_<name>"` literal now lives in its per-tool module under
+# `src/mcp/tools/*.rs` (as the `McpTool::name()` impl), NOT in
+# `src/mcp/registry.rs`. The grep below counts `RegisteredTool::of::`
+# invocations in `registered_tools()` — 1:1 with tool count, no off-by-one.
 #
 # This workflow is a CI grep gate — fast, cheap, deterministic. It
 # catches the most common drift modes:
 #
-#   1. A new MCP tool lands in `src/mcp/registry.rs` but the
-#      `Family::expected_tool_count` arm isn't incremented to match.
+#   1. A new MCP tool lands in `src/mcp/registry.rs::registered_tools()`
+#      but the `Family::expected_tool_count` arm isn't incremented to match.
 #   2. README / release-notes / MIGRATION text claims a stale count
 #      (60 / 63 / 43) without the v0.7.0 footnote.
 #   3. `src/daemon_runtime.rs` `--profile full` help text drifts away
@@ -41,17 +44,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 'registry-vs-profile parity (74 unique memory_* literals at v0.7.0)'
+      - name: 'registry-vs-profile parity (73 RegisteredTool::of entries at v0.7.0)'
         shell: bash
         run: |
-          count=$(grep -oE '"memory_[a-z_]+"' src/mcp/registry.rs | sort -u | wc -l | tr -d ' ')
-          echo "registry has $count unique memory_* tool literals"
-          # 74 at v0.7.0 (73 tool definitions + 1 `memory_id` field reference
-          # in input schema) — bump in lockstep with Family::expected_tool_count.
-          if [ "$count" -lt 73 ] || [ "$count" -gt 75 ]; then
-            echo "::error::registry memory_* literal count ($count) drifted from 74±1"
+          # Post-#987 (D1.6 split): count `RegisteredTool::of::<...>()`
+          # invocations in `registered_tools()`. 1:1 with tool count.
+          count=$(grep -cE '^\s*RegisteredTool::of::' src/mcp/registry.rs)
+          echo "registry has $count RegisteredTool::of:: entries"
+          # 73 at v0.7.0 (72 callable + memory_capabilities bootstrap) ==
+          # Profile::full().expected_tool_count(). Pinned exactly; any drift
+          # must bump Family::expected_tool_count in src/profile.rs in lockstep.
+          if [ "$count" -ne 73 ]; then
+            echo "::error::registry RegisteredTool::of entry count ($count) drifted from 73"
             echo "::error::either update Family::expected_tool_count in src/profile.rs"
-            echo "::error::and this CI gate, or remove the stray tool literal"
+            echo "::error::and this CI gate, or remove the stray RegisteredTool::of entry"
             exit 1
           fi
 
