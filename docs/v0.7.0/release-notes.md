@@ -79,6 +79,50 @@ in either posture).
 
 ## What's new since v0.6.4
 
+### HNSW async rebuild + double-buffering (Wave-2 Tier-C3, issue [#968](https://github.com/alphaonedev/ai-memory-mcp/issues/968))
+
+The in-memory HNSW vector-index rebuild path is now non-blocking. Before
+this change, every rebuild — both the `REBUILD_THRESHOLD`-triggered
+auto-rebuild and the 100k-cap eviction-edge rebuild — ran synchronously
+on the request thread. Graph construction is O(N log N) with constant
+factors that put 100k vectors at ~3-10 s on commodity hardware, so the
+producer's `memory_store` call (and every search caller contending on
+the inner mutex) blocked for the full build window. Recall p95 spiked
+from <20 ms to multi-second on the eviction edge.
+
+Post-#968 the rebuild runs on a background thread (`std::thread::spawn`
+— HNSW build is CPU-bound; no tokio runtime needed). The new graph
+warms up in an `Arc<Mutex<Option<RebuildResult>>>` slot while readers
+and writers continue against the existing `active` graph; the swap
+into `active` is a single `std::mem::swap` under the inner mutex held
+for microseconds. Concurrent writes during rebuild flow into overflow
+normally; the swap path trims only the overflow prefix already in the
+new graph, so no write is ever dropped.
+
+**Operator-visible win.** At the 100k cap eviction edge, `memory_store`
+returns in microseconds instead of blocking for the multi-second graph
+build. Bench-verified by `cargo bench --bench hnsw_rebuild_async`
+(release build, 2k-vector fixture): search **p95 = 43 µs during a
+rebuild**, well under the published 35 ms PERFORMANCE.md budget.
+
+Four regression tests pin the contract in
+`src/hnsw.rs::d1_968_tests`:
+
+- `rebuild_async_does_not_block_search_968` — concurrent search loop
+  completes under budget during a rebuild.
+- `rebuild_failure_leaves_active_unchanged_968` — short-circuit /
+  no-warmed-result paths preserve the prior `active` graph.
+- `concurrent_writes_during_rebuild_consistent_968` — 30 inserts
+  during a rebuild are all findable post-swap.
+- `rebuild_swap_is_atomic_968` — `len()` observer never sees a
+  partial-state index.
+
+The pre-existing synchronous `VectorIndex::rebuild()` is preserved as
+a shim that delegates to `rebuild_async().join() + try_swap_warming()`
+so the v0.6 test contract ("the graph is rebuilt by the time this
+returns") is unchanged. New code paths should call `rebuild_async()`
+directly.
+
 ### Provenance gaps 1-7 + dogfood-fix sprint (2026-05-18)
 
 ai-memory v0.7.0 documented a **7-level provenance framework** (Identity,

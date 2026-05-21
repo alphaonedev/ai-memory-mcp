@@ -40,6 +40,7 @@ are advisory targets.
 | `memory_get_taxonomy` (full tree) | < 100 ms | < 250 ms | *[advisory]* New v0.6.3 |
 | `curator cycle` (1k memories) | < 60 s | < 120 s | *[advisory]* Background |
 | `federation ack` (W=2 quorum) | < 2 s | < 5 s | *[advisory]* Multi-machine |
+| `memory_recall` during HNSW rebuild | < 35 ms | < 100 ms | #968 Wave-2 Tier-C3. v0.6 baseline (synchronous rebuild) blocked search for ~3-10 s on a 100k-vector rebuild; v0.7.x post-#968 uses the async-rebuild + double-buffer pattern so search p95 stays under 35 ms during a rebuild. Bench-verified by `cargo bench --bench hnsw_rebuild_async` (release build, 2k-vector fixture: p95 43 µs, p99 56 µs). |
 
 > **See also:** `docs/performance.html` publishes a complementary,
 > per-feature-tier view (keyword / semantic / autonomous) of these
