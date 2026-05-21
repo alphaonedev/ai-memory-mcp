@@ -87,8 +87,6 @@ pub mod wire_check;
 // per-issue end-to-end protocol (see issue #963 body).
 pub mod refusal;
 pub use refusal::GovernanceRefusal;
-// #983 — process-wide rule cache, consulted by RuleEngine::load_for_action.
-pub mod rule_cache;
 
 // ---------------------------------------------------------------------------
 // Op tag — the five gated operations
