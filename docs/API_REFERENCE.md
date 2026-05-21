@@ -724,9 +724,12 @@ curl http://127.0.0.1:9077/metrics
 ## HTTP ↔ MCP parameter coverage
 
 A small set of parameters are surfaced by only one transport. The MCP
-tool schema in `src/mcp.rs::tool_definitions()` is authoritative for
-the MCP surface; the HTTP body / query types in `src/models.rs` and
-the route handlers in `src/handlers.rs` are authoritative for HTTP.
+tool schema is authoritative via the per-tool `<ToolName>Request`
+structs in `src/mcp/tools/<name>.rs` (schemars-derived; consumed by
+`registered_tools()` in `src/mcp/registry.rs` and projected to
+`tools/list` by `tool_definitions()`). The HTTP body / query types in
+`src/models.rs` and the route handlers in `src/handlers/` are
+authoritative for HTTP.
 
 | Tool | Param | HTTP | MCP | Notes |
 |---|---|---|---|---|

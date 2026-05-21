@@ -743,6 +743,21 @@ procurement-grade evidence path. Full surface in
 - **Hard coverage gate ≥ 93%.** CI fails any PR below the line floor.
 - **Clippy `-D pedantic` clean baseline** restored across nine files
   (#614).
+- **MCP registry refactor (#987 / D1.6 split).** The hand-coded
+  ~1100-line `json!({...})` body in
+  `src/mcp/registry.rs::tool_definitions()` is collapsed to a
+  four-line iteration over `registered_tools()`. Each tool's
+  catalog row is now derived from its per-tool `McpTool` impl
+  (`crate::mcp::registry::McpTool`) via the schemars `JsonSchema`
+  derive on the request struct. Adding a new MCP tool is now ONE
+  line in `registered_tools()` + the per-tool module (vs. the
+  pre-D1.6 multi-site recipe). A 6-test wire-shape regression
+  suite (`src/mcp/registry.rs::d1_6_987_tests`) pins the post-D1.6
+  catalog against a stored pre-D1.6 snapshot
+  (`tests/snapshots/tool_definitions_pre_d1_6.json`) — same tool
+  count, same names, descriptions byte-for-byte equal, same
+  `required[]`. Allowed-diffs are documented in the test module
+  doc-comment.
 - **Test race fixes** for the subscription `dispatch_count` race, the
   snippet env race, the keypair env race, the binary-spawn flake on
   macOS (OnceLock + PID-scoped target), and the b3 budget race.

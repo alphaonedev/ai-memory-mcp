@@ -412,7 +412,34 @@ Tracking issue: #198.
 
 **New CLI command**: Add variant to `Command` enum → define `Args` struct → add dispatch case in `main()` → implement `cmd_*` handler taking `&Path` (db) + args.
 
-**New MCP tool**: Add JSON definition in `tool_definitions()` → add match arm in the dispatch block → implement handler taking `&Connection` + params → return `Result<Value>`.
+**New MCP tool** (post-v0.7.0 #987, the D1.6 split landed):
+
+1. Define `<ToolName>Request` in `src/mcp/tools/<name>.rs` with
+   `#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]` +
+   `#[schemars(deny_unknown_fields)]`. Per-field doc-comments become
+   the JSON-Schema `description`s. For descriptions starting with
+   `#` (markdown heading sigil), use
+   `#[schemars(description = "...")]` instead of a `///` comment.
+2. Define `pub struct <ToolName>Tool` (zero-sized) and
+   `impl McpTool for <ToolName>Tool` — return `name()`,
+   `description()`, `docs()`, `family()`, and
+   `input_schema()` (the schemars schema of the request struct).
+3. Register the tool in `registered_tools()` in
+   `src/mcp/registry.rs` by appending one line:
+   `RegisteredTool::of::<crate::mcp::<name>::<ToolName>Tool>()`.
+4. Add the handler (the `pub(super) fn handle_<name>(...)`) in the
+   same file and a dispatch arm in `src/mcp/mod.rs::handle_request`.
+5. Add a `d1_6_987_tests` mod in the same file that calls the shared
+   parity helpers at `crate::mcp::parity_test_helpers::*`
+   (`derived_props_for::<<ToolName>Request>()`,
+   `assert_property_set_parity`, `assert_descriptions_match`).
+
+The pre-#987 recipe ("add a JSON definition in `tool_definitions()`
++ add a match arm") is GONE — `tool_definitions()` is now a four-line
+iteration over `registered_tools()` and no longer carries
+hand-coded JSON. Adding a tool is one impl + one line in
+`registered_tools()`; the handler dispatch is the only piece that
+hasn't been deduplicated yet (#867 tracks that follow-up).
 
 **New HTTP endpoint**: Add route in `main.rs` router → implement handler in `handlers.rs` using `Db` extractor.
 
