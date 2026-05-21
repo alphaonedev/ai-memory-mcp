@@ -99,7 +99,7 @@ cargo audit</code></pre>
 <section class="wrap-mid">
   <div class="eyebrow-h2">Three interfaces, one example each</div>
   <h2>Pick the surface that fits your call site.</h2>
-  <p>All three share <code>src/db.rs</code> + <code>src/validate.rs</code>. There is no behavioural divergence; whatever the CLI does, the MCP tool and the HTTP endpoint do too.</p>
+  <p>All three share <code>src/db.rs</code> + <code>src/validate.rs</code>. There is no behavioural divergence; whatever the CLI does, the MCP tool and the HTTP endpoint do too. Post-#966 (Wave-2 Tier-C1, May 2026), DTO-bundling validation routes through the shared <code>RequestValidator</code> fluent surface so adding a new cross-field invariant is one impl method on the facade instead of three audited per-surface duplicates.</p>
 
   <h3>MCP &mdash; stdio JSON-RPC 2.0</h3>
   <div class="if-tabs"><span class="if-tab mcp">71 entries at --profile full, 7 default in --profile core</span></div>
