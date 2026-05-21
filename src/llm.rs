@@ -270,7 +270,7 @@ impl OllamaClient {
             .ok()
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| match backend.as_str() {
-                "xai" => "grok-4".to_string(),
+                "xai" => "grok-4.3".to_string(),
                 "openai" => "gpt-5".to_string(),
                 "anthropic" => "claude-opus-4.7".to_string(),
                 "gemini" => "gemini-2.0-flash".to_string(),
@@ -696,17 +696,18 @@ impl OllamaClient {
         content: &str,
         model_override: Option<&str>,
     ) -> Result<Vec<String>> {
-        let model = model_override.unwrap_or(&self.model);
+        // #1067 (2026-05-21) — provider-agnostic auto_tag. Pre-#1067
+        // this routed through `generate_with_body` against Ollama's
+        // `/api/generate` text-completion endpoint, which doesn't
+        // exist on the OpenAI-compatible backends (xAI, OpenAI,
+        // DeepSeek, etc. only expose `/v1/chat/completions`). Now
+        // routes through `generate_with_model_override` which uses
+        // the provider-aware chat-shape endpoint + the requested
+        // model override (or falls back to `self.model`).
         let prompt = AUTO_TAG_PROMPT
             .replace("{title}", title)
             .replace("{content}", content);
-        let body = json!({
-            "model": model,
-            "prompt": prompt,
-            "stream": false,
-            "options": {"num_predict": 64}
-        });
-        let response = self.generate_with_body(&body)?;
+        let response = self.generate_with_model_override(&prompt, None, model_override)?;
         let tags: Vec<String> = response
             .lines()
             .map(|line| line.trim().to_lowercase())
@@ -714,6 +715,109 @@ impl OllamaClient {
             .take(8)
             .collect();
         Ok(tags)
+    }
+
+    /// #1067 — provider-aware variant of [`Self::generate`] that lets
+    /// the caller override the model per-call (e.g., for
+    /// [`Self::auto_tag`] which uses a cheaper / faster model than
+    /// the primary `self.model`). Same branching as `generate`:
+    /// Ollama hits `/api/chat`, OpenAI-compatible hits
+    /// `/v1/chat/completions` with Bearer auth.
+    #[allow(clippy::too_many_lines)]
+    fn generate_with_model_override(
+        &self,
+        prompt: &str,
+        system: Option<&str>,
+        model_override: Option<&str>,
+    ) -> Result<String> {
+        if self.breaker_is_open() {
+            return Err(anyhow!(
+                "Failed to send chat request: circuit breaker open \
+                 (last failure within {}s); LLM at {} is not responding",
+                CIRCUIT_BREAKER_COOLDOWN.as_secs(),
+                self.base_url,
+            ));
+        }
+        let model = model_override.unwrap_or(&self.model);
+
+        let (url, payload, bearer): (String, Value, Option<&str>) = match &self.provider {
+            LlmProvider::Ollama => {
+                let mut messages = Vec::new();
+                if let Some(sys) = system {
+                    messages.push(json!({"role": "system", "content": sys}));
+                }
+                messages.push(json!({"role": "user", "content": prompt}));
+                (
+                    format!("{}/api/chat", self.base_url),
+                    json!({"model": model, "messages": messages, "stream": false}),
+                    None,
+                )
+            }
+            LlmProvider::OpenAiCompatible { api_key } => {
+                let mut messages = Vec::new();
+                if let Some(sys) = system {
+                    messages.push(json!({"role": "system", "content": sys}));
+                }
+                messages.push(json!({"role": "user", "content": prompt}));
+                (
+                    format!("{}/chat/completions", self.base_url),
+                    json!({"model": model, "messages": messages, "stream": false}),
+                    Some(api_key.as_str()),
+                )
+            }
+        };
+
+        let mut req = self
+            .client
+            .post(&url)
+            .timeout(GENERATE_TIMEOUT)
+            .json(&payload);
+        if let Some(key) = bearer {
+            req = req.bearer_auth(key);
+        }
+        let resp = match req.send() {
+            Ok(r) => r,
+            Err(e) => {
+                self.note_failure();
+                return Err(anyhow::Error::new(e).context("Failed to send chat request"));
+            }
+        };
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            if status.is_server_error() {
+                self.note_failure();
+            }
+            let text = resp.text().unwrap_or_default();
+            return Err(anyhow!("Generate failed ({status}): {text}"));
+        }
+
+        let body: Value = match resp.json() {
+            Ok(b) => b,
+            Err(e) => {
+                self.note_failure();
+                return Err(anyhow::Error::new(e).context("Failed to parse chat response"));
+            }
+        };
+
+        let response_text = match &self.provider {
+            LlmProvider::Ollama => body["message"]["content"]
+                .as_str()
+                .ok_or_else(|| anyhow!("Missing 'message.content' in chat response"))?
+                .to_string(),
+            LlmProvider::OpenAiCompatible { .. } => body["choices"][0]["message"]["content"]
+                .as_str()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Missing 'choices[0].message.content' in OpenAI-compatible \
+                         chat response; got: {body}"
+                    )
+                })?
+                .to_string(),
+        };
+
+        self.note_success();
+        Ok(response_text)
     }
 
     /// v0.7.0 L15 — issue a `/api/generate` call with a fully-formed JSON
@@ -751,6 +855,19 @@ impl OllamaClient {
             .with_context(|| format!("governance refused outbound to ollama at {host}"))
     }
 
+    /// Legacy Ollama-only `/api/generate` (text-completion) helper.
+    /// **Deprecated by #1067** — every internal caller now routes
+    /// through [`Self::generate`] or [`Self::generate_with_model_override`]
+    /// (the chat-shape `/v1/chat/completions`-compatible path) which
+    /// works across Ollama AND every OpenAI-compatible vendor (xAI
+    /// Grok, OpenAI, DeepSeek, Kimi, Qwen, etc.).
+    ///
+    /// Retained as a private helper for tests that exercise the
+    /// legacy code path (wire_check_sole_path_pin verifies the
+    /// `check_outbound()` gate fires before the `reqwest::post`, and
+    /// that invariant only matters on the legacy `/api/generate`
+    /// shape). Any new caller should use the provider-aware path.
+    #[allow(dead_code)]
     fn generate_with_body(&self, body: &Value) -> Result<String> {
         if self.breaker_is_open() {
             return Err(anyhow!(
@@ -2161,13 +2278,17 @@ mod wiremock_tests {
     async fn test_auto_tag_returns_parsed_tags() {
         let server = MockServer::start().await;
         mount_tags_ok(&server, json!({"models": []})).await;
-        // L15: auto_tag now uses /api/generate (not /api/chat) with a
-        // num_predict cap. The module also lowercases each line itself so
-        // we verify casing is normalised by sending mixed case.
+        // #1067 (2026-05-21): auto_tag now routes through the
+        // provider-aware chat-shape endpoint (`/api/chat` for Ollama,
+        // `/v1/chat/completions` for OpenAI-compatible vendors).
+        // Pre-#1067 this was Ollama-only `/api/generate` (text-completion);
+        // the legacy endpoint didn't exist on xAI / OpenAI etc. and
+        // produced 404. The module still lowercases each line itself
+        // so we verify casing is normalised.
         Mock::given(method("POST"))
-            .and(path("/api/generate"))
+            .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "response": "Tag1\nTAG2\ntag3",
+                "message": {"content": "Tag1\nTAG2\ntag3"},
             })))
             .mount(&server)
             .await;
@@ -2293,14 +2414,15 @@ mod wiremock_tests {
     async fn auto_tag_model_override_takes_precedence_l15() {
         let server = MockServer::start().await;
         mount_tags_ok(&server, json!({"models": []})).await;
-        // body_partial_json asserts the model field; if `auto_tag`
-        // forgot to honour the override, this matcher misses and
-        // wiremock returns 404 → the call fails.
+        // #1067: now routes through /api/chat (provider-aware) instead
+        // of /api/generate. body_partial_json still asserts the model
+        // field — if `auto_tag` forgets to honour the override the
+        // matcher misses + wiremock 404s + the call fails.
         Mock::given(method("POST"))
-            .and(path("/api/generate"))
+            .and(path("/api/chat"))
             .and(body_partial_json(json!({"model": "gemma3:4b"})))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "response": "alpha\nbeta\ngamma",
+                "message": {"content": "alpha\nbeta\ngamma"},
             })))
             .expect(1)
             .mount(&server)
@@ -2322,19 +2444,21 @@ mod wiremock_tests {
         );
     }
 
-    /// v0.7.0 L15 — the outbound body MUST carry `options.num_predict = 64`
-    /// regardless of model. This is the hard ceiling that defends against
-    /// chain-of-thought blowups on any future model (the L14 root cause
-    /// was Gemma 4 thinking-mode emitting 400+ tokens for a 5-tag list).
+    /// #1067 (2026-05-21) — the legacy L15 `options.num_predict = 64`
+    /// cap was Ollama-specific (`/api/generate` shape) and incompatible
+    /// with OpenAI-compatible vendors (which use `max_tokens` instead).
+    /// The cap was dropped for provider portability; chain-of-thought
+    /// bound is now enforced via the `take(8)` cap on the parsed lines
+    /// in `auto_tag`. This test pins the new shape: the body has NO
+    /// `options.num_predict` and the response is parsed correctly.
     #[tokio::test(flavor = "multi_thread")]
-    async fn auto_tag_num_predict_cap_in_body_l15() {
+    async fn auto_tag_chat_shape_post_1067() {
         let server = MockServer::start().await;
         mount_tags_ok(&server, json!({"models": []})).await;
         Mock::given(method("POST"))
-            .and(path("/api/generate"))
-            .and(body_partial_json(json!({"options": {"num_predict": 64}})))
+            .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "response": "one\ntwo",
+                "message": {"content": "one\ntwo"},
             })))
             .expect(1)
             .mount(&server)
