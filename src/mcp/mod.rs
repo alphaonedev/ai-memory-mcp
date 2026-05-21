@@ -379,6 +379,12 @@ mod rule_list;
 mod search;
 #[path = "tools/session_start.rs"]
 mod session_start;
+// v0.7.0 issues #224 + #311 — `memory_share` tool (Family::Power).
+// Module declaration restored by D1.6 (#987) so the `McpTool` impl
+// in `tools/share.rs` compiles as part of the crate and
+// [`crate::mcp::registry::registered_tools`] can name it.
+#[path = "tools/share.rs"]
+mod share;
 #[path = "tools/store/mod.rs"]
 mod store;
 #[path = "tools/subscribe.rs"]

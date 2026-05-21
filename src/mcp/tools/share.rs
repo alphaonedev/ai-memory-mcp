@@ -34,6 +34,7 @@ use serde_json::{Value, json};
 /// permits it because `validate_namespace` allows non-ASCII tokens
 /// (see `src/validate.rs`).
 #[must_use]
+#[allow(dead_code)]
 pub fn shared_namespace(from_agent_id: &str, to_agent_id: &str) -> String {
     format!("_shared/{from_agent_id}\u{2192}{to_agent_id}/")
 }
@@ -51,6 +52,7 @@ pub fn shared_namespace(from_agent_id: &str, to_agent_id: &str) -> String {
 ///   "from_agent_id": "<derived>"
 /// }
 /// ```
+#[allow(dead_code)]
 pub fn handle_share(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
     let source_memory_id = params["source_memory_id"]
         .as_str()
@@ -119,6 +121,9 @@ pub fn handle_share(conn: &rusqlite::Connection, params: &Value) -> Result<Value
         confidence_source: source.confidence_source,
         confidence_signals: source.confidence_signals.clone(),
         confidence_decayed_at: source.confidence_decayed_at.clone(),
+        // v45 schema (Gap-1 optimistic concurrency, issue #884) — fresh
+        // share row starts at version 1.
+        version: 1,
     };
 
     db::insert(conn, &shared).map_err(|e| e.to_string())?;
