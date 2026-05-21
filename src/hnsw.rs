@@ -21,6 +21,16 @@ use crate::hooks::EvictionEvent;
 /// Maximum overflow entries before triggering a rebuild.
 const REBUILD_THRESHOLD: usize = 200;
 
+/// #1037 (2026-05-21) — bounded spin-wait window for [`VectorIndex::rebuild`]
+/// (the sync shim) when [`VectorIndex::rebuild_async`] short-circuited to
+/// a no-op handle because a prior async rebuild was still in flight.
+/// 1 second is well under any sensible sync-rebuild expectation
+/// (production callers use `rebuild_async`); the budget exists only
+/// to convert "silently return stale graph" → "bounded timeout, then
+/// best-effort swap".
+const REBUILD_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+const REBUILD_WAIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+
 /// Maximum entries before evicting oldest to prevent unbounded memory growth.
 ///
 /// Production code uses the constant 100_000. Tests may construct a
@@ -685,23 +695,37 @@ impl VectorIndex {
     /// blocking behavior to assert post-rebuild invariants without
     /// adding a yield/poll loop.
     pub fn rebuild(&self) {
+        // #1037 (MEDIUM, 2026-05-21): defend the sync-rebuild contract
+        // against the `rebuild_async()` no-op-handle short-circuit.
+        // Pre-#1037 if a previous async rebuild was still in flight
+        // (`rebuild_in_flight==true`), `rebuild_async` returned a
+        // no-op `std::thread::spawn(|| {})` handle that joined
+        // instantly — `try_swap_warming()` then ran against a warming
+        // slot that the IN-FLIGHT build hadn't populated yet, so the
+        // sync contract ("graph is rebuilt by the time this returns")
+        // was silently violated. The caller observed the pre-rebuild
+        // state.
+        //
+        // Fix: after the initial `join()`, spin-wait on
+        // `rebuild_in_flight` for up to REBUILD_WAIT_TIMEOUT so the
+        // in-flight build has a bounded window to complete its
+        // warming-slot insert. Then run `try_swap_warming()`. If the
+        // in-flight build genuinely hangs (test-fixture corner case),
+        // surface that as a clean timeout rather than silently
+        // returning a stale graph.
         let handle = self.rebuild_async();
-        // The build thread is owned: it cannot deadlock against `self`
-        // because the build proper runs WITHOUT holding the inner
-        // mutex (it operates on the captured snapshot), and the
-        // final swap takes the inner mutex only briefly. The join
-        // here blocks the caller — that's the documented sync
-        // contract; async callers must use `rebuild_async` directly.
-        // We tolerate the build-thread panicking (poisoning a lock,
-        // OOM in `instant_distance::Builder::build`) by surfacing the
-        // panic to the caller via `unwrap`; v0.6 also panicked the
-        // calling thread on these conditions, so the contract is
-        // unchanged from the caller's POV.
         let _ = handle.join();
-        // After the build thread exits, drain the warming slot into
-        // active. The thread itself does NOT swap (the swap is owned
-        // by the foreground path so test assertions about
-        // post-rebuild state observe the new graph synchronously).
+        // Bounded spin-wait for any concurrently-running rebuild to
+        // populate `warming`. Cheap CAS read; total budget is
+        // REBUILD_WAIT_TIMEOUT * REBUILD_WAIT_POLL_INTERVAL =
+        // ~10ms × 100 = 1 second worst-case (well under any sensible
+        // sync-rebuild expectation; production callers are async).
+        let start = std::time::Instant::now();
+        while self.rebuild_in_flight.load(Ordering::SeqCst)
+            && start.elapsed() < REBUILD_WAIT_TIMEOUT
+        {
+            std::thread::sleep(REBUILD_WAIT_POLL_INTERVAL);
+        }
         self.try_swap_warming();
     }
 
