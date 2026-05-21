@@ -75,9 +75,6 @@ pub fn insert(conn: &Connection, rule: &Rule) -> Result<()> {
         ],
     )
     .with_context(|| format!("rules_store::insert: id={}", rule.id))?;
-    // #983 — drop every cached `Vec<Rule>` snapshot so the next
-    // `RuleEngine::load_for_action` reads the post-insert state.
-    crate::governance::rule_cache::global().invalidate_all();
     Ok(())
 }
 
@@ -442,8 +439,6 @@ pub fn remove(conn: &Connection, id: &str) -> Result<bool> {
     let affected = conn
         .execute("DELETE FROM governance_rules WHERE id = ?1", params![id])
         .with_context(|| format!("rules_store::remove: id={id}"))?;
-    // #983 — drop cached snapshots so the next reader rebuilds.
-    crate::governance::rule_cache::global().invalidate_all();
     Ok(affected > 0)
 }
 
@@ -463,9 +458,6 @@ pub fn set_enabled(conn: &Connection, id: &str, enabled: bool) -> Result<bool> {
             params![i64::from(enabled), id],
         )
         .with_context(|| format!("rules_store::set_enabled: id={id} enabled={enabled}"))?;
-    // #983 — drop cached snapshots so the next reader rebuilds with
-    // the post-toggle `enabled = ?` filter.
-    crate::governance::rule_cache::global().invalidate_all();
     Ok(affected > 0)
 }
 
@@ -491,9 +483,6 @@ pub fn update_signature(
             params![signature, attest_level, id],
         )
         .with_context(|| format!("rules_store::update_signature: id={id}"))?;
-    // #983 — drop cached snapshots so the next reader re-runs the
-    // L1-6 signature verification gate against the new signature.
-    crate::governance::rule_cache::global().invalidate_all();
     Ok(affected > 0)
 }
 
