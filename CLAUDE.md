@@ -292,6 +292,20 @@ surface (`from_mcp_params` / `from_http_query` / `from_http_body` /
 
 Storing a memory with the same `(title, namespace)` updates the existing one. Tier is never downgraded (takes max). Expiry is only cleared if the new memory is `long`-tier.
 
+### Mobile target support (v0.7.0 Posture-1a, issue #1068)
+
+The lib target (`crate-type = ["rlib", "staticlib", "cdylib"]`) cross-compiles for iOS + Android. CI coverage lives in three layers:
+
+| Layer | Workflow | What it does |
+|---|---|---|
+| 1 — cross-compile | `.github/workflows/ci.yml` job `mobile-cross-compile` | `cargo check --target {aarch64-apple-ios,aarch64-linux-android} --no-default-features --features sqlite-bundled --lib` on every PR + push. Catches ~80% of mobile bit-rot risk. |
+| 2 — release artifacts | `.github/workflows/release.yml` jobs `mobile-ios` + `mobile-android` | Produces `ai-memory-ios.xcframework.tar.gz` (3 slices: device + sim arm64 + sim x86_64) and `ai-memory-android.tar.gz` (4 ABIs in `jniLibs/<abi>/` layout). |
+| 3 — runtime tests | `.github/workflows/mobile-runtime.yml` | Scoped ~50-test subset on the iOS Simulator (`macos-latest`) + Android emulator (`ubuntu-latest` + KVM) on `release/**` push. Tests under `tests/mobile/` cover sandboxing, FTS5+WAL on device sqlite, HNSW CPU recall, embedder CPU path, LLM TLS handshake. |
+
+Selection rationale + CI cost rationale: `tests/mobile/README.md`. The `mobile-runtime` workflow is cost-capped (~$10/month at v0.7.0 release cadence vs. the $50-150 ceiling the spec set) by gating Android to `release/**` push + manual dispatch only.
+
+The C-callable FFI surface itself (`#[no_mangle] extern "C"` items in `src/lib.rs`) lands in a v0.7.x follow-up; v0.7.0 ships the BUILD pipeline + artifact layout but no FFI items, so `cbindgen.toml` generates a stub header until the surface is declared.
+
 ### Database
 
 SQLite with WAL mode, FTS5 virtual table for full-text search. **Current schema = v48** (constant `CURRENT_SCHEMA_VERSION` in `src/storage/migrations.rs` + `src/store/postgres.rs:391`; postgres ladder ends at migration `0030_v07_federation_push_dlq.sql` — sqlite ladder ends at `0041_v07_federation_push_dlq.sql` under `migrations/sqlite/`; the two adapters share a single logical schema number even though the on-disk file-name counters differ because the sqlite split numbers per-bump while the postgres ladder is a single greenfield+upgrade pair. v48 added the `federation_push_dlq` table per issue #933 — federation broadcast failures now land in a per-peer DLQ with retry-replay worker). Automated migrations on first open via `current_version` → `apply_migrations`. Archive table preserves GC'd memories for restoration. FTS is kept in sync via INSERT/DELETE/UPDATE triggers. GC runs every 30 minutes; expired memories are archived before deletion when `archive_on_gc=true` (default). **Capabilities envelope `schema_version` is `"3"` at v0.7.0** (post-A5; v1/v2 still negotiable via `accept=` on `memory_capabilities` MCP / `Accept-Capabilities` HTTP header — `src/mcp/tools/capabilities.rs`).

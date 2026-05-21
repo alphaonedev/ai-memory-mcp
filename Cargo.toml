@@ -414,3 +414,26 @@ lto = "thin"
 # #650 / #867); the allowance keeps CI green while the splits land.
 [lints.clippy]
 too_many_lines = { level = "warn", priority = -1 }
+
+# v0.7.0 Posture-1a (issue #1068) — mobile FFI surface. The default
+# `rlib` keeps Rust-to-Rust linking for every other consumer (bins,
+# integration tests, examples, downstream crates). `staticlib` is the
+# iOS / xcframework build target: `libai_memory.a` links into an
+# Xcode app target through the .xcframework wrapper produced by
+# `release.yml`'s `mobile-ios` job. `cdylib` is the Android NDK build
+# target: `libai_memory.so` lands under `jniLibs/<abi>/` in the
+# `.aar`-compatible archive produced by `release.yml`'s
+# `mobile-android` job. Neither additional crate-type changes default
+# `cargo build` behavior on linux / macOS / windows — they just emit
+# additional artifacts under `target/<profile>/`. The C-callable FFI
+# surface itself lands in a follow-up (#1068 Layer 2 v0.7.x or
+# #1069 wrapper SDK); v0.7.0 Layer 2 only validates that the BUILD
+# pipeline works end-to-end (compile + bundle + publish artifact).
+# The `cbindgen` header generator is invoked from
+# `.github/workflows/release.yml` via `cargo install --locked cbindgen`
+# rather than as a `[build-dependencies]` entry so default builds
+# don't pay the dependency download / compile cost; the release
+# workflow's iOS job runs it explicitly against `cbindgen.toml`.
+[lib]
+name = "ai_memory"
+crate-type = ["rlib", "staticlib", "cdylib"]
