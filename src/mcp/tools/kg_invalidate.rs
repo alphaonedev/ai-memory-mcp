@@ -3,9 +3,57 @@
 
 //! MCP `memory_kg_invalidate` handler.
 
+use crate::mcp::registry::McpTool;
 use crate::{db, validate};
+use schemars::JsonSchema;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::Path;
+
+// --- D1.4 (#985): per-tool McpTool impl for `memory_kg_invalidate` (graph family) ---
+
+/// v0.7.0 #972 D1.4 (#985) — request body for `memory_kg_invalidate`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct KgInvalidateRequest {
+    /// Source memory ID.
+    pub source_id: String,
+
+    /// Target memory ID.
+    pub target_id: String,
+
+    /// Relation label.
+    pub relation: String,
+
+    /// RFC3339 supersession instant. Default now.
+    #[serde(default)]
+    pub valid_until: Option<String>,
+}
+
+/// v0.7.0 #972 D1.4 (#985) — `McpTool` impl for `memory_kg_invalidate`.
+#[allow(dead_code)]
+pub struct KgInvalidateTool;
+
+impl McpTool for KgInvalidateTool {
+    fn name() -> &'static str {
+        "memory_kg_invalidate"
+    }
+    fn description() -> &'static str {
+        "Mark a KG link as superseded by setting its valid_until column."
+    }
+    fn docs() -> &'static str {
+        "Pillar 2 / Stream C: set valid_until on (source_id, target_id, relation). valid_until defaults to now. Idempotent; response carries previous_valid_until. found:false when no match."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(KgInvalidateRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "graph"
+    }
+}
+
 /// SEC-2 / COV-8 (Cluster D, issue #767) — `pub` so the integration
 /// test fleet can drive the handler directly. The function is still
 /// only registered as the MCP `memory_kg_invalidate` tool; visibility
@@ -136,5 +184,27 @@ pub fn handle_kg_invalidate(
             "target_id": target_id,
             "relation": relation,
         })),
+    }
+}
+
+#[cfg(test)]
+mod d1_4_985_tests {
+    //! D1.4 (#985) — schema-parity for `memory_kg_invalidate`.
+    use super::*;
+    use crate::mcp::d1_4_985_helpers::{
+        assert_descriptions_match, assert_property_set_parity, derived_props_for,
+    };
+
+    #[test]
+    fn memory_kg_invalidate_parity_985() {
+        let derived = derived_props_for::<KgInvalidateRequest>();
+        assert_property_set_parity("memory_kg_invalidate", &derived);
+        assert_descriptions_match("memory_kg_invalidate", &derived);
+    }
+
+    #[test]
+    fn memory_kg_invalidate_tool_metadata_985() {
+        assert_eq!(KgInvalidateTool::name(), "memory_kg_invalidate");
+        assert_eq!(KgInvalidateTool::family(), "graph");
     }
 }

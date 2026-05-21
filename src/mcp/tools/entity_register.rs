@@ -3,8 +3,61 @@
 
 //! MCP `memory_entity_register` handler.
 
+use crate::mcp::registry::McpTool;
 use crate::{db, validate};
+use schemars::JsonSchema;
+use serde::Deserialize;
 use serde_json::{Value, json};
+
+// --- D1.4 (#985): per-tool McpTool impl for `memory_entity_register` (graph family) ---
+
+/// v0.7.0 #972 D1.4 (#985) — request body for `memory_entity_register`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct EntityRegisterRequest {
+    /// Display name (entity memory title).
+    pub canonical_name: String,
+
+    /// Entity namespace.
+    pub namespace: String,
+
+    /// Aliases; blanks skipped, deduped.
+    #[serde(default)]
+    pub aliases: Option<Vec<String>>,
+
+    /// Metadata; 'kind' is forced to 'entity'.
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
+
+    /// Override metadata.agent_id.
+    #[serde(default)]
+    pub agent_id: Option<String>,
+}
+
+/// v0.7.0 #972 D1.4 (#985) — `McpTool` impl for `memory_entity_register`.
+#[allow(dead_code)]
+pub struct EntityRegisterTool;
+
+impl McpTool for EntityRegisterTool {
+    fn name() -> &'static str {
+        "memory_entity_register"
+    }
+    fn description() -> &'static str {
+        "Register an entity (canonical name + aliases) under a namespace."
+    }
+    fn docs() -> &'static str {
+        "Pillar 2 / Stream B: register entity as long-tier memory (metadata.kind='entity'). Idempotent on (canonical_name, namespace); merges new aliases. Errors if name collides with a non-entity row."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(EntityRegisterRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "graph"
+    }
+}
+
 pub(super) fn handle_entity_register(
     conn: &rusqlite::Connection,
     params: &Value,
@@ -130,5 +183,27 @@ mod tests {
         let aliases = result["aliases"].as_array().expect("aliases array");
         // The non-string `42` was filtered by the filter_map.
         assert!(aliases.iter().all(|v| v.is_string()));
+    }
+}
+
+#[cfg(test)]
+mod d1_4_985_tests {
+    //! D1.4 (#985) — schema-parity for `memory_entity_register`.
+    use super::*;
+    use crate::mcp::d1_4_985_helpers::{
+        assert_descriptions_match, assert_property_set_parity, derived_props_for,
+    };
+
+    #[test]
+    fn memory_entity_register_parity_985() {
+        let derived = derived_props_for::<EntityRegisterRequest>();
+        assert_property_set_parity("memory_entity_register", &derived);
+        assert_descriptions_match("memory_entity_register", &derived);
+    }
+
+    #[test]
+    fn memory_entity_register_tool_metadata_985() {
+        assert_eq!(EntityRegisterTool::name(), "memory_entity_register");
+        assert_eq!(EntityRegisterTool::family(), "graph");
     }
 }

@@ -3,9 +3,85 @@
 
 //! MCP `memory_link` and `memory_get_links` handlers.
 
+use crate::mcp::registry::McpTool;
 use crate::{db, validate};
+use schemars::JsonSchema;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::Path;
+
+// --- D1.4 (#985): per-tool McpTool impls for `memory_link` and
+// `memory_get_links` (graph family) ---
+
+/// v0.7.0 #972 D1.4 (#985) — request body for `memory_link`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct LinkRequest {
+    /// Source memory ID.
+    pub source_id: String,
+
+    /// Target memory ID.
+    pub target_id: String,
+
+    #[serde(default)]
+    pub relation: Option<String>,
+}
+
+/// v0.7.0 #972 D1.4 (#985) — `McpTool` impl for `memory_link`.
+#[allow(dead_code)]
+pub struct LinkTool;
+
+impl McpTool for LinkTool {
+    fn name() -> &'static str {
+        "memory_link"
+    }
+    fn description() -> &'static str {
+        "Create a typed link between two memories."
+    }
+    fn docs() -> &'static str {
+        "Directional link. Relations: related_to | supersedes | contradicts | derived_from | reflects_on (Task 3/8). H-track signs with active Ed25519 (verify via memory_verify)."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(LinkRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "graph"
+    }
+}
+
+/// v0.7.0 #972 D1.4 (#985) — request body for `memory_get_links`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct GetLinksRequest {
+    /// Memory ID.
+    pub id: String,
+}
+
+/// v0.7.0 #972 D1.4 (#985) — `McpTool` impl for `memory_get_links`.
+#[allow(dead_code)]
+pub struct GetLinksTool;
+
+impl McpTool for GetLinksTool {
+    fn name() -> &'static str {
+        "memory_get_links"
+    }
+    fn description() -> &'static str {
+        "Get all links for a memory (both directions)."
+    }
+    fn docs() -> &'static str {
+        "In + outbound links with relation, attest_level (unsigned/self_signed/peer_attested), valid_from/until/observed_by."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(GetLinksRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "graph"
+    }
+}
 
 /// Relation string for the recursive-learning reflection edge.
 const REFLECTS_ON: &str = "reflects_on";
@@ -777,5 +853,40 @@ mod tests {
         .expect("ok");
         let arr = out["invalidation_notified"].as_array().unwrap();
         assert_eq!(arr.len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod d1_4_985_tests {
+    //! D1.4 (#985) — schema-parity for `memory_link` and `memory_get_links`.
+    use super::*;
+    use crate::mcp::d1_4_985_helpers::{
+        assert_descriptions_match, assert_property_set_parity, derived_props_for,
+    };
+
+    #[test]
+    fn memory_link_parity_985() {
+        let derived = derived_props_for::<LinkRequest>();
+        assert_property_set_parity("memory_link", &derived);
+        assert_descriptions_match("memory_link", &derived);
+    }
+
+    #[test]
+    fn memory_link_tool_metadata_985() {
+        assert_eq!(LinkTool::name(), "memory_link");
+        assert_eq!(LinkTool::family(), "graph");
+    }
+
+    #[test]
+    fn memory_get_links_parity_985() {
+        let derived = derived_props_for::<GetLinksRequest>();
+        assert_property_set_parity("memory_get_links", &derived);
+        assert_descriptions_match("memory_get_links", &derived);
+    }
+
+    #[test]
+    fn memory_get_links_tool_metadata_985() {
+        assert_eq!(GetLinksTool::name(), "memory_get_links");
+        assert_eq!(GetLinksTool::family(), "graph");
     }
 }
