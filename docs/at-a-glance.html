@@ -908,12 +908,12 @@ footer.site-foot a { color: var(--text-muted); }
      ============================================================= -->
 <div class="stats-strip">
   <div class="container" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:1.5rem;">
-    <div class="stat-item"><span class="stat-num">26</span><span class="stat-label">MCP tools</span></div>
-    <div class="stat-item"><span class="stat-num">39</span><span class="stat-label">HTTP endpoints</span></div>
-    <div class="stat-item"><span class="stat-num">28</span><span class="stat-label">CLI commands</span></div>
-    <div class="stat-item"><span class="stat-num">5</span><span class="stat-label">Platforms</span></div>
-    <div class="stat-item"><span class="stat-num">13</span><span class="stat-label">AI clients tested</span></div>
-    <div class="stat-item"><span class="stat-num">0</span><span class="stat-label">Cloud deps</span></div>
+    <div class="stat-item"><span class="stat-num">73</span><span class="stat-label">MCP tools</span></div>
+    <div class="stat-item"><span class="stat-num">72</span><span class="stat-label">HTTP endpoints</span></div>
+    <div class="stat-item"><span class="stat-num">55</span><span class="stat-label">CLI commands</span></div>
+    <div class="stat-item"><span class="stat-num">7</span><span class="stat-label">Platforms (incl. iOS + Android)</span></div>
+    <div class="stat-item"><span class="stat-num">15+</span><span class="stat-label">LLM vendors (Ollama + cloud)</span></div>
+    <div class="stat-item"><span class="stat-num">0</span><span class="stat-label">Mandatory cloud deps</span></div>
   </div>
 </div>
 
@@ -1057,7 +1057,7 @@ footer.site-foot a { color: var(--text-muted); }
       <div class="tier tier-smart">
         <div class="tier-bar"></div>
         <div class="tier-name">smart</div>
-        <div class="tier-deps">+ Ollama (gemma4:e2b) · 4 GB RAM</div>
+        <div class="tier-deps">+ any LLM provider · Ollama (gemma3:e4b) local OR xAI / OpenAI / Anthropic / Gemini / 11 more cloud vendors (#1067) · 4 GB RAM local / ~256 MB cloud-LLM</div>
         <ul class="tier-features">
           <li>Everything in semantic, plus:</li>
           <li>Auto-tagging on store</li>
@@ -1833,13 +1833,18 @@ footer.site-foot a { color: var(--text-muted); }
       </div>
       <div class="dash-tile">
         <div class="dash-label">Distribution targets</div>
-        <div class="dash-num">5</div>
-        <div class="dash-sub">macOS arm64/x64 · Linux arm64/x64 · Win x64</div>
+        <div class="dash-num">7</div>
+        <div class="dash-sub">macOS arm64/x64 · Linux arm64/x64 · Win x64 · iOS arm64 · Android arm64 (#1068)</div>
       </div>
       <div class="dash-tile">
         <div class="dash-label">Package channels</div>
-        <div class="dash-num">5</div>
-        <div class="dash-sub">Homebrew · APT · COPR · GHCR · crates.io</div>
+        <div class="dash-num">7</div>
+        <div class="dash-sub">Homebrew · APT · COPR · GHCR · crates.io · iOS xcframework · Android jniLibs tarball</div>
+      </div>
+      <div class="dash-tile">
+        <div class="dash-label">LLM vendors supported</div>
+        <div class="dash-num">15+</div>
+        <div class="dash-sub">Ollama local · xAI · OpenAI · Anthropic · Gemini · DeepSeek · Kimi · Qwen · Mistral · Groq · Together · Cerebras · OpenRouter · Fireworks · LMStudio · vLLM (#1067)</div>
       </div>
       <div class="dash-tile">
         <div class="dash-label">SSRF defects fixed</div>
@@ -1972,7 +1977,7 @@ footer.site-foot a { color: var(--text-muted); }
     <div style="margin-top:3rem;padding-top:2rem;border-top:1px solid var(--border)">
       <span class="eyebrow">Feature Deep-Dive Atlas</span>
       <h2 style="margin-top:.5rem">Eleven big-sell features, one page each.</h2>
-      <p class="lede">The grand-slam features. Tiers + TTLs (the retention story). Rules (per-namespace policy stack). Archival (two-stage soft-then-hard delete). Encryption (SQLCipher, mTLS, HMAC). Hierarchies (8-level memory trees). Knowledge Graph (4 relations + temporal validity). Autonomous (Gemma 4-powered). A2A messaging. Full lifecycle. Performance + bench tool. Credits (Google Gemma 4, Nomic, Hugging Face, Ollama, SQLite, Rust ecosystem).</p>
+      <p class="lede">The grand-slam features. Tiers + TTLs (the retention story). Rules (per-namespace policy stack). Archival (two-stage soft-then-hard delete). Encryption (SQLCipher, mTLS, HMAC). Hierarchies (8-level memory trees). Knowledge Graph (4 relations + temporal validity). Autonomous (provider-agnostic LLM substrate &mdash; Ollama local OR 15+ cloud vendors via #1067). A2A messaging. Full lifecycle. Performance + bench tool. Credits (Google for Gemma, Nomic, Hugging Face, Ollama, xAI / OpenAI / Anthropic / DeepSeek / Kimi / Qwen / Mistral / Groq / Together / Cerebras / OpenRouter / Fireworks / LMStudio, SQLite, Rust ecosystem).</p>
     </div>
 
     <div class="grid-3" style="gap:1rem;margin-top:1.5rem">
@@ -2041,9 +2046,9 @@ footer.site-foot a { color: var(--text-muted); }
 
       <a href="autonomous.html" style="text-decoration:none">
         <div class="card p1" style="height:100%;display:flex;flex-direction:column">
-          <div class="card-eyebrow" style="color:var(--pillar-1)">▸ POWERED BY GEMMA 4</div>
+          <div class="card-eyebrow" style="color:var(--pillar-1)">▸ PROVIDER-AGNOSTIC LLM (#1067)</div>
           <div class="card-title">Autonomous</div>
-          <p class="card-body">Auto-tag, consolidate, expand-query, contradiction detection, memory reflection, session-start. All powered by Google's open-source Gemma 4 via Ollama. Local-first.</p>
+          <p class="card-body">Auto-tag, consolidate, expand-query, contradiction detection, memory reflection, session-start. Backed by any LLM via <code>AI_MEMORY_LLM_BACKEND</code> &mdash; Ollama (default; Gemma local) or xAI Grok / OpenAI / Anthropic / Gemini / DeepSeek / Kimi / Qwen / Mistral / Groq / Together / Cerebras / OpenRouter / Fireworks / LMStudio / vLLM / llama.cpp-server. Local-first by default, cloud-flexible by config.</p>
           <div style="margin-top:.85rem;font-family:var(--font-mono);font-size:.78rem;color:var(--pillar-1)">autonomous.html →</div>
         </div>
       </a>
@@ -2079,7 +2084,7 @@ footer.site-foot a { color: var(--text-muted); }
         <div class="card p3" style="height:100%;display:flex;flex-direction:column">
           <div class="card-eyebrow" style="color:var(--pillar-3)">▸ THANKS</div>
           <div class="card-title">Credits</div>
-          <p class="card-body">Open-source acknowledgements. Google for Gemma 4. Nomic AI for embeddings. Hugging Face for tokenizers + reranker. Ollama, SQLite, the Rust ecosystem.</p>
+          <p class="card-body">Open-source acknowledgements. Google for Gemma. Nomic AI for embeddings. Hugging Face for tokenizers + reranker. Ollama for the local-LLM runtime; xAI / OpenAI / Anthropic / Gemini / DeepSeek / Kimi / Qwen / Mistral / Groq / Together / Cerebras / OpenRouter / Fireworks / LMStudio / vLLM for the cloud + self-hosted LLM substrate (#1067). SQLite. Rust ecosystem.</p>
           <div style="margin-top:.85rem;font-family:var(--font-mono);font-size:.78rem;color:var(--pillar-3)">credits.html →</div>
         </div>
       </a>

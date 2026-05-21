@@ -98,6 +98,40 @@ sudo dnf install ai-memory</code></pre>
   <pre><code>cargo install ai-memory</code></pre>
 
   <p>Full matrix (Windows, .deb manual install, Docker, source) is in <a href="../INSTALL.md">INSTALL.md</a>.</p>
+
+  <h3>Supported platforms (v0.7.0)</h3>
+  <p>Build + test gates run on:</p>
+  <ul>
+    <li><strong>Linux</strong> x86_64, aarch64 (Ubuntu LTS, RHEL/Fedora, Debian)</li>
+    <li><strong>macOS</strong> x86_64, arm64 (12+)</li>
+    <li><strong>Windows</strong> x86_64</li>
+    <li><strong>iOS</strong> aarch64 (cross-compile gate, #1068; <code>aarch64-apple-ios</code> + simulator slices via <code>ai-memory-ios.xcframework.tar.gz</code>)</li>
+    <li><strong>Android</strong> aarch64, armv7, x86, x86_64 (cross-compile gate, #1068; <code>jniLibs/&lt;abi&gt;/</code> layout via <code>ai-memory-android.tar.gz</code>)</li>
+  </ul>
+  <p>Mobile coverage is layered: every PR + push exercises <code>cargo check --target {aarch64-apple-ios,aarch64-linux-android}</code> (~80% bit-rot coverage), <code>release/**</code> push triggers iOS Simulator + Android emulator runtime tests on the scoped ~50-test mobile subset (FTS5+WAL, HNSW CPU recall, embedder CPU path, LLM TLS handshake). Details: <a href="../v0.7.0/release-notes.md">release-notes.md</a> + <code>tests/mobile/README.md</code> in the repo.</p>
+</section>
+
+<section class="wrap-mid">
+  <div class="eyebrow-h2">Deployment matrix (10 postures)</div>
+  <h2>One binary. 10 deployment shapes.</h2>
+  <p>Post-#1067 (provider-agnostic LLM substrate) + post-#1068 (mobile cross-compile gates), the same Rust binary slots into ten distinct deployment postures. No code branches between them &mdash; just env-var configuration of <code>AI_MEMORY_LLM_BACKEND</code>, <code>AI_MEMORY_LLM_BASE_URL</code>, <code>AI_MEMORY_LLM_MODEL</code>, <code>AI_MEMORY_LLM_API_KEY</code>.</p>
+  <table class="cmp" style="font-size:.86rem">
+    <thead><tr><th>#</th><th>Posture</th><th>CPU / RAM / GPU floor</th><th>LLM source</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>1a</td><td>Cellphone / tablet</td><td>1 core / 256 MB / none</td><td>Cloud (xAI, OpenAI, Anthropic, Gemini)</td><td>iOS arm64 + Android arm64 / armv7 / x86 / x86_64; in-app FFI embed (#1068)</td></tr>
+      <tr><td>1b</td><td>Laptop / workstation</td><td>2 core / 4 GB / optional</td><td>Ollama local OR cloud</td><td>macOS arm64/x64, Linux arm64/x64, Win x64</td></tr>
+      <tr><td>2</td><td>CPU-only cloud VPS ($5/mo)</td><td>1 vCPU / 1 GB / none</td><td>Cloud only</td><td>Linode / Hetzner / DO droplet</td></tr>
+      <tr><td>3</td><td>CPU-only container (Plan C)</td><td>1 vCPU / 512 MB / none</td><td>Cloud (env-injected)</td><td>GHCR Docker, K8s, ECS, Cloud Run</td></tr>
+      <tr><td>4</td><td>CPU-only sidecar</td><td>0.25 vCPU / 256 MB / none</td><td>Cloud</td><td>In-pod sidecar to existing app</td></tr>
+      <tr><td>5</td><td>GPU workstation</td><td>4 core / 8 GB / 8 GB VRAM</td><td>Local Ollama / llama.cpp</td><td>Dev box NVIDIA or Apple-Silicon NPU</td></tr>
+      <tr><td>6</td><td>GPU server (single-node)</td><td>8 core / 32 GB / 24 GB VRAM</td><td>Local vLLM / Ollama</td><td>OpenAI-compatible endpoint inside the box</td></tr>
+      <tr><td>7</td><td>Private DC vLLM cluster</td><td>Cluster-scale</td><td>Self-hosted vLLM (OAI-compat)</td><td>On-prem K8s + vLLM autoscaler</td></tr>
+      <tr><td>8</td><td>Multi-region federation (T4-T5)</td><td>3+ nodes</td><td>Mixed per-region</td><td>Quorum sync + per-region LLM choice</td></tr>
+      <tr><td>9</td><td>Air-gapped / SCIF</td><td>Bring your own</td><td>Ollama / vLLM ONLY (no cloud egress)</td><td>No outbound internet permitted</td></tr>
+      <tr><td>10</td><td>Edge / IoT (arm64 SBC)</td><td>2 core / 2 GB / optional NPU</td><td>Cloud or tiny local</td><td>Raspberry Pi 5, Jetson Nano</td></tr>
+    </tbody>
+  </table>
+  <div class="callout"><strong>Posture transitions are env-var-only.</strong> Switch a Plan C container from posture 3 (cloud-LLM via OpenAI) to posture 7 (self-hosted vLLM) by changing <code>AI_MEMORY_LLM_BACKEND=openai-compatible</code> + <code>AI_MEMORY_LLM_BASE_URL=https://vllm.internal/v1</code>. Same binary, same data, same MCP / HTTP / CLI surfaces. Precedence ladder: CLI flag &gt; <code>AI_MEMORY_*</code> env var &gt; <code>config.toml</code> &gt; compiled default.</div>
 </section>
 
 <section class="wrap-mid">
@@ -137,7 +171,7 @@ api_key_file = "/etc/ai-memory/api.key"  # mode 0400, owned by service user</cod
     <dt>HTTP daemon</dt>
     <dd><code>ai-memory serve</code> &mdash; Axum REST on port 9077, 50 endpoints. Best for shared org deployments with mTLS or API-key gating.</dd>
     <dt>autonomous curator</dt>
-    <dd><code>ai-memory curate</code> &mdash; long-running consolidation + reflection loop, requires Ollama-served LLM. Best as a sidecar to the HTTP daemon.</dd>
+    <dd><code>ai-memory curate</code> &mdash; long-running consolidation + reflection loop. Provider-agnostic (#1067): backs onto Ollama (local) or any OpenAI-compatible vendor via <code>AI_MEMORY_LLM_BACKEND</code> &mdash; xAI Grok, OpenAI, Anthropic, Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, llama.cpp-server. Best as a sidecar to the HTTP daemon.</dd>
     <dt>quorum sync</dt>
     <dd><code>ai-memory federate</code> &mdash; signed-event replication between peer nodes. Best for multi-region hive (T3+) deployments.</dd>
   </dl>
