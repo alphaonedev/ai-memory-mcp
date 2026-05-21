@@ -41,6 +41,14 @@ clap_mangen = "0.2"
 rusqlite = { version = "0.32" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# v0.7.0 #972 D1.1 (#982) — schemars derives the MCP tool inputSchema
+# from Rust request structs instead of hand-coded `json!({...})` blocks
+# in `src/mcp/registry.rs`. Foundation for the #972 split (D1.1 PoC on
+# `memory_capabilities`; D1.3-D1.5 migrate the remaining 72 tools).
+# Pinned to the 0.8 stable line; 1.0-alpha exists but we don't need its
+# additional features yet and the API churn isn't worth pulling forward
+# in a release-gate cycle.
+schemars = "0.8"
 tokio = { version = "1", features = ["full"] }
 # v0.7 K10 — Approval API SSE endpoint adapts a `tokio::sync::broadcast`
 # Receiver into the `futures_core::Stream` axum's `Sse` requires.

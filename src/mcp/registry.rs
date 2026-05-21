@@ -5,6 +5,74 @@
 
 use serde_json::{Value, json};
 
+// --- McpTool trait (v0.7.0 #972 D1.1, issue #982) ---
+
+/// Per-tool descriptor surface introduced by v0.7.0 #972 split D1.1.
+///
+/// The pre-D1 registry was a single 1500-line `json!({...})` macro in
+/// [`tool_definitions`] that hand-coded every tool's `inputSchema`
+/// alongside its `name` / `description` / `docs`. That layout drifted
+/// from handler reality (e.g. `memory_capabilities` schema still says
+/// `accept: ["v1","v2"]` while the [`crate::mcp::tools::capabilities::CapabilitiesAccept`]
+/// enum has been `V1`/`V2`/`V3` since A5) because nothing forced the
+/// schema and the handler to be authored from the same source.
+///
+/// The D1 split moves each tool to its own module under
+/// [`crate::mcp::tools`]. Each module exports a zero-sized type that
+/// implements [`McpTool`]. The trait's [`McpTool::input_schema`]
+/// returns a `serde_json::Value` derived from a per-tool
+/// `#[derive(schemars::JsonSchema, serde::Deserialize)]` request
+/// struct — so a new field on the request struct lands automatically
+/// in the wire schema, and a typo in field name fails to deserialise
+/// at the handler boundary.
+///
+/// D1.1 (this issue, #982) defines the trait + a PoC implementation
+/// for `memory_capabilities`. D1.2 (#983) wires the schemars derive
+/// pipeline. D1.3 (#984) migrates the 5 default `--profile core`
+/// tools. D1.4 (#985) + D1.5 (#986) migrate the remaining ~65 tools
+/// in parallel. D1.6 (#987) deletes the giant `tool_definitions()`
+/// macro and replaces its body with iteration over
+/// `registered_tools()`. D1.7 (#988) lands per-profile snapshot tests
+/// + the compile-time schema↔handler parity invariant. D1.8 (#989)
+/// updates the docs.
+///
+/// During D1.1-D1.5 both surfaces coexist: the legacy `tool_definitions`
+/// macro still emits the full catalog on the wire, and per-tool
+/// `McpTool` impls coexist as a parallel source-of-truth. Snapshot
+/// tests verify the schemars-derived schema matches the legacy
+/// hand-coded one modulo property ordering (schemars sorts).
+///
+/// The `dead_code` allow comes off in D1.6 (#987) when the giant
+/// `tool_definitions` macro is replaced with iteration over
+/// `McpTool` impls. During the D1.1-D1.5 window the trait is
+/// authored ahead of its first consumer (the per-profile
+/// `registered_tools()` iterator that D1.6 introduces).
+#[allow(dead_code)]
+pub trait McpTool {
+    /// Wire-level tool name (e.g. `"memory_capabilities"`).
+    fn name() -> &'static str;
+
+    /// Short one-sentence description (≤ 50 cl100k tokens) shown on
+    /// the bare `tools/list` payload.
+    fn description() -> &'static str;
+
+    /// Long-form prose + examples; reachable via
+    /// `memory_capabilities { family=<f>, include_schema=true, verbose=true }`.
+    /// May be empty for tools that don't ship long-form docs.
+    fn docs() -> &'static str;
+
+    /// JSON Schema for the tool's request body. Derived from the
+    /// per-tool `<Tool>Request` struct via
+    /// `schemars::schema_for!(<Tool>Request)` and converted to
+    /// `serde_json::Value`.
+    fn input_schema() -> Value;
+
+    /// Family tag (one of `core` / `lifecycle` / `graph` /
+    /// `governance` / `power` / `meta` / `archive` / `other`) used by
+    /// [`Profile::loads`] for per-profile filtering on `tools/list`.
+    fn family() -> &'static str;
+}
+
 // --- Tool definitions ---
 
 /// Version tag for the `tools/list` response schema. Bumped whenever
