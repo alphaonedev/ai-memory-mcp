@@ -397,6 +397,12 @@ mod skill_promote;
 // v0.7.0 L2-7 (issue #672) — reflection-skill composition declaration.
 #[path = "tools/skill_compositional_context.rs"]
 mod skill_compositional_context;
+// v0.7.0 #972 D1.4 (#985) — shared test helpers for the per-tool
+// schema-parity tests added under D1.4. Reuses the allowed-diffs
+// catalog documented in d1_2_983_tests.
+#[cfg(test)]
+#[path = "tools/d1_4_985_helpers.rs"]
+pub(crate) mod d1_4_985_helpers;
 
 // ---------------------------------------------------------------------------
 // Re-exports — preserve exact `crate::mcp::*` pub surface (zero new pub items)
