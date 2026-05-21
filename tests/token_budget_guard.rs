@@ -17,13 +17,20 @@
 //!   tool-definitions prefix budget.
 //! - **Trimmed total** (`trimmed_full_profile_total_tokens`) is what
 //!   every MCP host pays per session on the default `tools/list`
-//!   path. It must stay under the post-#859 **5000 cl100k token**
+//!   path. Pinned at the **11000 cl100k token** post-D1.7 (#988)
 //!   ceiling. (The pre-#859 baseline of 3500 cl100k tokens was
 //!   structurally lower because optional property entries were
 //!   dropped from the wire — a behaviour that #859 reverted to
 //!   restore NHI runtime discovery; see
 //!   `tests/c2_tool_docs_field.rs::c2_tools_list_token_budget_is_under_post_859_ceiling`
-//!   for the full history.)
+//!   for the full history. The post-D1.6 schemars-derived `tools/list`
+//!   carries per-property `additionalProperties`, `format`, and
+//!   `[T, "null"]` type-array nodes the legacy hand-coded payload
+//!   didn't — measured ~9825 cl100k tokens post-D1.6. Ceiling bumped
+//!   from 5000 to 11000 to leave ~1175-token headroom for future
+//!   schema additions; partial compensation comes from D1.8 (#989)
+//!   when the trimmer's allow-list filtering of schemars metadata
+//!   lands.)
 //!
 //! Both guards trip on any regression so a casual schema edit can't
 //! land without an explicit budget review. If a guard fires:
@@ -65,7 +72,7 @@ const VERBOSE_FULL_PROFILE_CEILING_TOKENS: usize = 17_000;
 /// already pins the same number for the wire-form payload; this
 /// guard's job is to keep the runtime-computed model
 /// (`trimmed_tool_sizes`) in lockstep.
-const TRIMMED_FULL_PROFILE_CEILING_TOKENS: usize = 5_000;
+const TRIMMED_FULL_PROFILE_CEILING_TOKENS: usize = 11_000;
 
 #[test]
 fn issue_829_verbose_full_profile_total_under_ceiling() {
