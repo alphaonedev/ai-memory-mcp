@@ -79,7 +79,7 @@ pub(super) async fn sync_push_via_store(
 
     // ---- memories ----------------------------------------------------
     for mem in &body.memories {
-        if let Err(e) = validate::validate_memory(mem) {
+        if let Err(e) = validate::RequestValidator::validate_memory(mem) {
             tracing::warn!("sync_push: skipping memory {} ({}): {e}", mem.id, mem.title);
             skipped += 1;
             continue;
@@ -306,8 +306,12 @@ pub(super) async fn sync_push_via_store(
     // Unknown observed_by = accept-and-flag as unsigned. Successful =
     // peer_attested. Mirrors the sqlite-backed handler's H3 contract.
     for link in &body.links {
-        if validate::validate_link(&link.source_id, &link.target_id, link.relation.as_str())
-            .is_err()
+        if validate::RequestValidator::validate_link_triple(
+            &link.source_id,
+            &link.target_id,
+            link.relation.as_str(),
+        )
+        .is_err()
         {
             skipped += 1;
             continue;

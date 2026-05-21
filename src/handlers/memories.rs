@@ -176,7 +176,7 @@ pub async fn update_memory(
         )
             .into_response();
     }
-    if let Err(e) = validate::validate_update(&body) {
+    if let Err(e) = validate::RequestValidator::validate_update(&body) {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": e.to_string()})),

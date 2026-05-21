@@ -884,7 +884,7 @@ pub async fn create_memory(
     JsonOrBadRequest(body): JsonOrBadRequest<CreateMemory>,
 ) -> impl IntoResponse {
     // Input validation (cheapest gate first).
-    if let Err(e) = validate::validate_create(&body) {
+    if let Err(e) = validate::RequestValidator::validate_create(&body) {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": e.to_string()})),
@@ -1306,7 +1306,8 @@ mod tests {
         let body = make_body("");
         // Hit the validator the orchestrator runs at the top of
         // `create_memory`. Any non-Ok result must be a 400.
-        let err = validate::validate_create(&body).expect_err("empty title must fail validation");
+        let err = validate::RequestValidator::validate_create(&body)
+            .expect_err("empty title must fail validation");
         let msg = err.to_string();
         assert!(
             !msg.is_empty(),

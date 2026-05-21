@@ -251,9 +251,12 @@ pub async fn consolidate_memories(
         }
     };
 
-    if let Err(e) =
-        validate::validate_consolidate(&body.ids, &body.title, &summary, &body.namespace)
-    {
+    if let Err(e) = validate::RequestValidator::validate_consolidate(
+        &body.ids,
+        &body.title,
+        &summary,
+        &body.namespace,
+    ) {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": e.to_string()})),
