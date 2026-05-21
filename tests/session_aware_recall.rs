@@ -344,7 +344,17 @@ fn mcp_tool_schema_advertises_session_id() {
         .expect("memory_recall registered");
     let props = &recall["inputSchema"]["properties"];
     let sid = &props["session_id"];
-    assert_eq!(sid["type"].as_str(), Some("string"));
+    // **#1009 update.** D1.6 schemars Option<String> emits nullable
+    // type array.
+    let type_field = &sid["type"];
+    let is_string = type_field == "string"
+        || type_field
+            .as_array()
+            .is_some_and(|arr| arr.iter().any(|v| v == "string"));
+    assert!(
+        is_string,
+        "session_id must be a string (legacy bare or schemars nullable); got {type_field}"
+    );
     let desc = sid["description"].as_str().unwrap_or("");
     assert!(
         desc.contains("#518"),

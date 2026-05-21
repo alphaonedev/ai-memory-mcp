@@ -38,7 +38,12 @@
             ]
           },
           "metadata": {
-            "default": null
+            "additionalProperties": true,
+            "default": null,
+            "type": [
+              "object",
+              "null"
+            ]
           },
           "namespace": {
             "default": null,
@@ -575,7 +580,12 @@
             "type": "string"
           },
           "metadata": {
-            "default": null
+            "additionalProperties": true,
+            "default": null,
+            "type": [
+              "object",
+              "null"
+            ]
           },
           "namespace": {
             "default": null,

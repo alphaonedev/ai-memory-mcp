@@ -76,8 +76,16 @@ pub struct StoreRequest {
     pub source: Option<String>,
 
     /// JSON metadata
+    ///
+    /// **#1009 fix:** typed as `Map<String, Value>` rather than the
+    /// permissive `Value` so the schemars derive emits
+    /// `"type": "object"` on the wire (the pinned #859/#912/F15
+    /// discovery contract). Behavior change: callers must now send a
+    /// JSON object for `metadata`; scalars/arrays/nulls were never the
+    /// documented shape, so this aligns the implementation with the
+    /// existing contract.
     #[serde(default)]
-    pub metadata: Option<Value>,
+    pub metadata: Option<serde_json::Map<String, Value>>,
 
     /// NHI agent_id; synthesized if omitted.
     #[serde(default)]

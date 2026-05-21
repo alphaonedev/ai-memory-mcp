@@ -49,8 +49,13 @@ pub struct UpdateRequest {
     pub expires_at: Option<String>,
 
     /// JSON metadata.
+    ///
+    /// **#1009 fix:** typed as `Map<String, Value>` (same as
+    /// StoreRequest::metadata — emits `type: "object"` on the wire,
+    /// aligns the implementation with the pinned F15 #859/#912 discovery
+    /// contract).
     #[serde(default)]
-    pub metadata: Option<Value>,
+    pub metadata: Option<serde_json::Map<String, Value>>,
 
     #[schemars(description = "#884 If-Match; mismatch → 409 envelope.")]
     #[serde(default)]
