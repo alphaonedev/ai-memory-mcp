@@ -1654,17 +1654,82 @@ pub async fn build_llm_client(
     feature_tier: FeatureTier,
     app_config: &AppConfig,
 ) -> Option<llm::OllamaClient> {
+    // #1067 (2026-05-21) — LLM availability is no longer gated on
+    // `tier_config.llm_model`. Per operator directive every tier
+    // (keyword, semantic, smart, autonomous) can communicate with an
+    // LLM whenever the operator sets the `AI_MEMORY_LLM_*` env vars.
+    // Tier still determines *which features* run (embedder, reranker,
+    // autonomous curator), but the chat-completion path is tier-
+    // independent.
+    //
+    // Resolution order:
+    // 1. `AI_MEMORY_LLM_BACKEND` + companion env vars (handled by
+    //    `OllamaClient::from_env`). This is the universal escape hatch
+    //    — picks Ollama (default), any per-vendor alias, or the
+    //    generic `openai-compatible` for custom URLs.
+    // 2. Legacy fallback: if no env declares a backend AND the tier
+    //    has a default `llm_model`, build the Ollama client against
+    //    the tier-default URL + model. Preserves backward compat for
+    //    operators who don't set any LLM env.
+    // 3. Else: return None (LLM features are no-ops, but the daemon
+    //    boots fine).
+    let backend_env = std::env::var("AI_MEMORY_LLM_BACKEND").ok();
+    if backend_env
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_some()
+    {
+        // Operator explicitly chose a backend — route via `from_env`.
+        let backend = backend_env.unwrap_or_default();
+        let build = match tokio::task::spawn_blocking(llm::OllamaClient::from_env).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("L5: build_llm_client from_env join failed: {e}");
+                return None;
+            }
+        };
+        return match build {
+            Ok(Some(client)) => {
+                tracing::info!(
+                    "L5: llm client ready — tier={} backend={backend} — \
+                     auto_tag/expand_query/contradiction-detection/reflection \
+                     hooks armed",
+                    feature_tier.as_str(),
+                );
+                Some(client)
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    "L5: llm client disabled — AI_MEMORY_LLM_BACKEND={backend} \
+                     resolved to None (no client built); LLM-powered hooks are \
+                     no-ops"
+                );
+                None
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "L5: llm client init failed (backend={backend}, tier={}); \
+                     LLM-powered hooks are no-ops: {e}",
+                    feature_tier.as_str()
+                );
+                None
+            }
+        };
+    }
+
+    // Legacy fallback: no AI_MEMORY_LLM_BACKEND set.
     let tier_config = feature_tier.config();
     let Some(llm_model) = tier_config.llm_model else {
         tracing::debug!(
-            "llm client disabled — tier={} has no llm_model; auto_tag hook will be a no-op",
+            "llm client disabled — no AI_MEMORY_LLM_BACKEND env AND tier={} has \
+             no default llm_model; auto_tag hook will be a no-op (set \
+             AI_MEMORY_LLM_BACKEND=ollama / xai / openai / deepseek / kimi / qwen \
+             / etc. to enable)",
             feature_tier.as_str()
         );
         return None;
     };
-    // Honour an explicit operator override (`llm_model = "..."` in
-    // config.toml) when set; otherwise fall back to the compiled
-    // tier-default Ollama tag (e.g. `gemma4:e2b`).
     let model_id = app_config
         .llm_model
         .clone()
@@ -1684,7 +1749,9 @@ pub async fn build_llm_client(
     match build {
         Ok(client) => {
             tracing::info!(
-                "L5: llm client ready — tier={} model={} — auto_tag hook armed for HTTP create_memory",
+                "L5: llm client ready — tier={} model={} (legacy ollama fallback; \
+                 set AI_MEMORY_LLM_BACKEND for provider-agnostic access) — \
+                 auto_tag hook armed for HTTP create_memory",
                 feature_tier.as_str(),
                 llm_model.ollama_model_id(),
             );
