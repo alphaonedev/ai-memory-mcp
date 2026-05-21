@@ -112,6 +112,7 @@ fn build_router_with_db_path(db_path: &std::path::Path) -> (axum::Router, ai_mem
         // the gate. Mirrors the collateral test-fixture update df7f72545
         // applied for the #957 `export_memories` admin gate.
         admin_agent_ids: std::sync::Arc::new(vec!["ops:admin".to_string()]),
+        rule_cache: std::sync::Arc::new(ai_memory::governance::rule_cache::RuleCache::new()),
     };
     let api_key_state = ai_memory::handlers::ApiKeyState {
         key: None,

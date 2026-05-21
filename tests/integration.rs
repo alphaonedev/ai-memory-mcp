@@ -9008,6 +9008,7 @@ impl OneshotDaemon {
             // `curl_get_as_admin`. Negative-admin tests build their own
             // AppState with a restricted allowlist.
             admin_agent_ids: std::sync::Arc::new(vec![INTEGRATION_TEST_ADMIN.to_string()]),
+            rule_cache: std::sync::Arc::new(ai_memory::governance::rule_cache::RuleCache::new()),
         };
         let api_key_state = ai_memory::handlers::ApiKeyState {
             key: None,
@@ -12843,6 +12844,7 @@ fn build_serve_state(
         recall_scope: std::sync::Arc::new(None),
         deferred_audit_queue: std::sync::Arc::new(None),
         admin_agent_ids: std::sync::Arc::new(Vec::new()),
+        rule_cache: std::sync::Arc::new(ai_memory::governance::rule_cache::RuleCache::new()),
     };
     let api_key_state = ai_memory::handlers::ApiKeyState {
         key: None,

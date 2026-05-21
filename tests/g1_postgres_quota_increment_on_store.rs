@@ -88,6 +88,7 @@ async fn build_postgres_app_state(url: &str) -> AppState {
         recall_scope: Arc::new(None),
         deferred_audit_queue: Arc::new(None),
         admin_agent_ids: Arc::new(Vec::new()),
+        rule_cache: std::sync::Arc::new(ai_memory::governance::rule_cache::RuleCache::new()),
     }
 }
 

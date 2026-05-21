@@ -360,6 +360,7 @@ fn test_app_state(db: Db) -> AppState {
         // security-gate regression coverage; the
         // `tests/*_admin_gate_*.rs` files pin both postures.
         admin_agent_ids: Arc::new(vec!["*".to_string()]),
+        rule_cache: std::sync::Arc::new(crate::governance::rule_cache::RuleCache::new()),
     }
 }
 
@@ -1075,6 +1076,7 @@ async fn http_bulk_create_fans_out_with_federation() {
         recall_scope: Arc::new(None),
         deferred_audit_queue: Arc::new(None),
         admin_agent_ids: Arc::new(Vec::new()),
+        rule_cache: std::sync::Arc::new(crate::governance::rule_cache::RuleCache::new()),
     };
     let router = Router::new()
         .route("/api/v1/memories/bulk", axum_post(bulk_create))
@@ -9649,6 +9651,7 @@ fn h8d_app_state_with_fed(db: Db, peer_urls: Vec<String>, w: usize, timeout_ms: 
         recall_scope: Arc::new(None),
         deferred_audit_queue: Arc::new(None),
         admin_agent_ids: Arc::new(Vec::new()),
+        rule_cache: std::sync::Arc::new(crate::governance::rule_cache::RuleCache::new()),
     }
 }
 

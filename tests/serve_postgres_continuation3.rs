@@ -81,6 +81,7 @@ async fn build_postgres_app_state(url: &str) -> AppState {
         // the happy path. The role-gate semantic itself is
         // covered by `tests/export_memories_admin_gate_957.rs`.
         admin_agent_ids: Arc::new(vec!["ai:cont3-test".to_string()]),
+        rule_cache: std::sync::Arc::new(ai_memory::governance::rule_cache::RuleCache::new()),
     }
 }
 

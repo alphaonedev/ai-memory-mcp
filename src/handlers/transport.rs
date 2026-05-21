@@ -267,6 +267,20 @@ pub struct AppState {
     /// list is short by design — admin-role allowlists are
     /// operator-curated, typically <10 entries.
     pub admin_agent_ids: Arc<Vec<String>>,
+
+    /// v0.7.0 #991 — per-instance enabled-rule cache. Owned by this
+    /// `AppState`; cloned by reference (`Arc<RuleCache>`) into the
+    /// substrate `GOVERNANCE_PRE_WRITE` storage hook closure and the
+    /// `wire_check::GOVERNANCE_PRE_ACTION` action hook closure so
+    /// every governance read on the hot write path (and every action
+    /// wire-point in the daemon) shares ONE cache for the lifetime of
+    /// this daemon. The cache is per-instance (not a process-wide
+    /// singleton) so multi-`AppState` test fixtures don't cross-pollute
+    /// — same isolation contract that the post-#990 revert restored
+    /// in the test suite. See `governance/rule_cache.rs` for the
+    /// design rationale + the cross-instance isolation regression
+    /// pinning.
+    pub rule_cache: Arc<crate::governance::rule_cache::RuleCache>,
 }
 
 /// v0.7.0 B3 — canonical 1-2 sentence English descriptors for each

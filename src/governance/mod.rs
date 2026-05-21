@@ -67,6 +67,13 @@ pub mod audit;
 // re-entrant `Connection` deadlock. See `deferred_audit.rs` for the
 // architecture.
 pub mod deferred_audit;
+// v0.7.0 #991 — per-instance cache for enabled-rule lists keyed by
+// `AgentAction::kind`. Owned by the Connection-bearing context
+// (HTTP `AppState`, MCP main loop, storage / wire-check hook
+// installers); never a global singleton. The per-instance design
+// closes the cross-connection poisoning hole that reverted #983 via
+// #990. See `rule_cache.rs` module docs for the full rationale.
+pub mod rule_cache;
 pub mod rules_store;
 
 // v0.7.0 (issue #691 fold-1) — universal AgentAction wire-point helper.
