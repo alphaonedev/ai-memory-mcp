@@ -34,13 +34,57 @@ pub(super) fn handle_stats(conn: &rusqlite::Connection, db_path: &Path) -> Resul
 }
 
 // --- D1.5 (#986): per-tool McpTool impl for memory_stats ---
+// --- D1.6 (#987): per-tool McpTool impl for memory_forget ---
 //
-// `memory_forget` belongs to Family::Lifecycle and is migrated by the
-// sibling D1.4 (#985) sub-agent; only `memory_stats` is in D1.5 scope.
+// `memory_forget` belongs to Family::Lifecycle. D1.4 (#985) did not migrate
+// it; D1.6 (#987) closes the coverage gap here, alongside `memory_stats`
+// (already in this file from D1.5).
 
 use crate::mcp::registry::McpTool;
 use schemars::JsonSchema;
 use serde::Deserialize;
+
+/// v0.7.0 #972 D1.6 (#987) — request body for `memory_forget`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct ForgetRequest {
+    #[serde(default)]
+    pub namespace: Option<String>,
+
+    #[serde(default)]
+    pub pattern: Option<String>,
+
+    #[serde(default)]
+    pub tier: Option<String>,
+
+    /// Preview without deleting.
+    #[serde(default)]
+    pub dry_run: Option<bool>,
+}
+
+/// v0.7.0 #972 D1.6 (#987) — `McpTool` impl for `memory_forget`.
+#[allow(dead_code)]
+pub struct ForgetTool;
+
+impl McpTool for ForgetTool {
+    fn name() -> &'static str {
+        "memory_forget"
+    }
+    fn description() -> &'static str {
+        "Bulk delete memories matching a pattern, namespace, or tier (archives first)."
+    }
+    fn docs() -> &'static str {
+        "Bulk delete by pattern/namespace/tier. Archives first (recover via memory_archive_restore). dry_run previews."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(ForgetRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "lifecycle"
+    }
+}
 
 /// v0.7.0 #972 D1.5 (#986) — request body for `memory_stats`. The
 /// legacy schema is `properties: {}` — empty struct.
@@ -92,6 +136,28 @@ mod d1_5_986_tests {
     fn stats_tool_metadata_986() {
         assert_eq!(StatsTool::name(), "memory_stats");
         assert_eq!(StatsTool::family(), "meta");
+    }
+}
+
+#[cfg(test)]
+mod d1_6_987_tests {
+    //! D1.6 (#987) — schema parity for `memory_forget`.
+    use super::*;
+    use crate::mcp::parity_test_helpers::{
+        assert_descriptions_match, assert_property_set_parity, derived_props_for,
+    };
+
+    #[test]
+    fn forget_parity_987() {
+        let derived = derived_props_for::<ForgetRequest>();
+        assert_property_set_parity("memory_forget", &derived);
+        assert_descriptions_match("memory_forget", &derived);
+    }
+
+    #[test]
+    fn forget_tool_metadata_987() {
+        assert_eq!(ForgetTool::name(), "memory_forget");
+        assert_eq!(ForgetTool::family(), "lifecycle");
     }
 }
 
