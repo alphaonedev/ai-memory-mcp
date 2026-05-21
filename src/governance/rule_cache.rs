@@ -53,25 +53,44 @@
 //!   load path; the cache hit avoids it entirely until invalidation
 //!   forces a reload.
 //!
-//! ## Invalidation
+//! ## Invalidation — honest contract (post-#1015 doc-drift fix)
 //!
-//! Conservative: every write to `governance_rules` from the SAME
-//! cache-aware caller calls [`RuleCache::invalidate_all`]. The
-//! over-invalidation cost is one cache miss per writer per kind ≈
-//! the original behaviour; readers between writes hit the cache.
+//! **No automatic invalidation on rule writes.** The cache is
+//! **invalidate-on-restart-only** at v0.7.0:
 //!
-//! Per-kind invalidation is supported via [`RuleCache::invalidate`]
-//! but currently no caller takes that path — the rules_store writers
-//! don't know the affected kind without inspecting the row, and the
-//! full-clear is simpler and correct.
+//! - The substrate-internal rule-write surface
+//!   ([`crate::governance::rules_store::insert`] /
+//!   [`crate::governance::rules_store::remove`] /
+//!   [`crate::governance::rules_store::set_enabled`] /
+//!   [`crate::governance::rules_store::update_signature`]) does NOT
+//!   hold an `Arc<RuleCache>` reference and does NOT call
+//!   [`RuleCache::invalidate_all`] after a write.
+//! - Rule writes happen exclusively via the CLI (`ai-memory rules
+//!   …`), which runs as a separate process from any live daemon. The
+//!   daemon's cache cannot observe a sibling-process rule write at
+//!   all, regardless of whether `invalidate_all` is wired in
+//!   intra-process — same effective contract.
+//! - The daemon does NOT expose an HTTP / MCP rule-write surface at
+//!   v0.7.0. If a future release adds one, the wire should call
+//!   [`RuleCache::invalidate_all`] explicitly before returning to the
+//!   caller (or thread an `Arc<RuleCache>` through the rules_store
+//!   mutators — #1015 tracks the option).
 //!
-//! **Cross-process invalidation** is NOT handled: if a separate CLI
-//! process writes a rule against the same DB while the daemon is
-//! running, the daemon's cache becomes stale until the next process
-//! restart. This matches the pre-#990 #983 contract (rule changes via
-//! a separate process require daemon restart to take effect). The
-//! operator-edited rule volume is low enough that this is acceptable;
-//! tracked separately if it ever becomes a hot-path concern.
+//! **What this means in practice:** after `ai-memory rules add` /
+//! `enable` / `disable` / `remove` from the CLI, the operator must
+//! restart any running `ai-memory serve` (or MCP daemon) for the
+//! change to take effect on the daemon's cached rule set. This
+//! matches the pre-#990 #983 contract (rule changes via a separate
+//! process require daemon restart). The operator-edited rule volume
+//! is low enough that this is acceptable; the operator UI
+//! (`ai-memory rules list`) reads directly from SQLite so the
+//! source-of-truth is always current.
+//!
+//! [`RuleCache::invalidate`] and [`RuleCache::invalidate_all`] remain
+//! exposed for tests (which want a fresh cache per fixture) and for
+//! a future `--reload-rules` SIGHUP / admin endpoint that would call
+//! them explicitly. They are NOT load-bearing on the v0.7.0 hot
+//! write path.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
