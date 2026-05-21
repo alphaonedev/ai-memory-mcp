@@ -141,6 +141,53 @@ delegates to `rebuild_async().join() + try_swap_warming()` so the v0.6
 test contract ("the graph is rebuilt by the time this returns") is
 unchanged. New code should call `rebuild_async()` directly.
 
+### v0.7.0 ship-readiness session 2026-05-21 — MCP-registry D1.6 split (#987)
+
+- **`refactor(#987)`** — `src/mcp/registry.rs::tool_definitions()` body
+  collapsed from the original ~1100-line hand-coded `json!({...})`
+  macro to a four-line iteration over the new
+  `registered_tools()` function. Each tool's catalog row is now
+  derived from its per-tool `McpTool` impl
+  (`crate::mcp::registry::McpTool`) via
+  `RegisteredTool::of::<T>()`; the schemars `JsonSchema` derive on
+  the per-tool `<ToolName>Request` struct produces the `inputSchema`
+  on the wire. Net diff: −958 LOC inside `tool_definitions()`,
+  +228 LOC of registry scaffolding + tests.
+
+  Phase 1 closed the McpTool coverage gap for 5 lifecycle tools that
+  D1.4/D1.5 had not migrated: `memory_delete`, `memory_promote`,
+  `memory_forget`, `memory_update`, `memory_gc`. Phase 2 added the
+  `RegisteredTool` struct + `registered_tools()` iterator. Phase 3
+  collapsed `tool_definitions()`. Phase 4 added a 6-test wire-shape
+  regression suite (`src/mcp/registry.rs::d1_6_987_tests`) that pins
+  the post-D1.6 catalog against a stored pre-D1.6 snapshot
+  (`tests/snapshots/tool_definitions_pre_d1_6.json`).
+
+  Wire-shape allowed-diffs (post-D1.6):
+  - Property order (schemars sorts; legacy was insertion-ordered)
+  - `default: null` on Option<T> fields vs. typed legacy defaults
+  - `additionalProperties: false` added by schemars (tightening)
+  - `minimum`/`maximum` range constraints absent (no
+    `#[schemars(range)]` on the request struct yet — addable post-D1.7)
+  - Empty-struct `inputSchema.properties` backfilled to `{}` by
+    `RegisteredTool::to_value()` so the wire shape stays uniform
+
+  Side fix surfaced during enumeration: `src/mcp/tools/share.rs` had
+  a `McpTool` impl but was never declared as a submodule of
+  `src/mcp/` (orphaned by an earlier refactor). Restored
+  `#[path = "tools/share.rs"] mod share;` in `src/mcp/mod.rs` and
+  added the missing `version: 1` field to the share row constructor
+  (v45 schema Gap-1 drift) so the impl compiles and
+  `registered_tools()` can name it. Handler dispatch is still
+  missing (tracked separately under #224).
+
+  The "New MCP tool" recipe in `CLAUDE.md` was updated to reflect
+  the new contract: define `<ToolName>Request` + `McpTool` impl in
+  `src/mcp/tools/<name>.rs`, register in `registered_tools()`, add
+  dispatch arm. The pre-D1.6 step "add JSON definition in
+  `tool_definitions()`" is gone — `tool_definitions()` is now a
+  four-line iteration.
+
 ### v0.7.0 ship-readiness session 2026-05-21 — gate-rerun closures + drift sweep
 
 After the PR #820 merge + the 6-agent review's TB1/TB2 (#977/#978) landed, a
