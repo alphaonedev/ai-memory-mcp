@@ -45,6 +45,14 @@ use tower::ServiceExt as _;
 use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::{ApiKeyState, AppState, Db};
 
+/// #998/#999 (2026-05-21) — concrete admin id seeded into
+/// `build_router_fixture()`'s `admin_agent_ids` allowlist. Replaces the
+/// pre-#980 `"*"` wildcard which became `#[cfg(test)]`-only inside the
+/// lib (and the integration-test compile sees the lib without
+/// `cfg(test)`). Threaded through admin-gated GETs by
+/// [`get_uri_as_admin`].
+const TEST_ADMIN_ID: &str = "ai:l07-3-test-admin";
+
 /// Process-wide serialiser for tests that mutate the global HMAC secret.
 static HMAC_LOCK: StdMutex<()> = StdMutex::new(());
 
@@ -116,7 +124,7 @@ fn build_router_fixture() -> (axum::Router, NamedTempFile) {
         autonomous_hooks: false,
         recall_scope: Arc::new(None),
         deferred_audit_queue: Arc::new(None),
-        // #976 (2026-05-20) — admin allowlist wildcard so the surface
+        // #976 (2026-05-20) — admin allowlist needed so the surface
         // matrix exercises happy-path 200s on every admin-gated
         // endpoint (archive_stats, forget, list_namespaces, taxonomy,
         // kg_invalidate, etc.). The chunk-D matrix is end-to-end shape
@@ -124,7 +132,14 @@ fn build_router_fixture() -> (axum::Router, NamedTempFile) {
         // (`http_export_returns_envelope`, `http_import_*`) build
         // their own router with an empty allowlist via
         // [`build_router_fixture_no_admin`].
-        admin_agent_ids: Arc::new(vec!["*".to_string()]),
+        //
+        // #998/#999 (2026-05-21) — pre-#980 this used the `"*"`
+        // wildcard sentinel. #980 made the wildcard arm `#[cfg(test)]`-
+        // gated inside the lib, but integration tests link against the
+        // lib's non-test compilation, so the wildcard arm is dead code
+        // here. Concrete id `TEST_ADMIN_ID` is threaded through
+        // admin-gated GETs via [`get_uri_as_admin`].
+        admin_agent_ids: Arc::new(vec![TEST_ADMIN_ID.to_string()]),
     };
     let api_key_state = ApiKeyState {
         key: None,
@@ -225,6 +240,14 @@ async fn post_json_with_agent(
     (status, parsed)
 }
 
+/// #998/#999 — admin-flavored shortcut over [`post_json_with_agent`].
+/// Threads [`TEST_ADMIN_ID`] for admin-gated POSTs (`/api/v1/forget`,
+/// etc.).
+#[allow(dead_code)]
+async fn post_json_as_admin(router: &axum::Router, uri: &str, body: Value) -> (StatusCode, Value) {
+    post_json_with_agent(router, uri, body, TEST_ADMIN_ID).await
+}
+
 async fn post_json(router: &axum::Router, uri: &str, body: Value) -> (StatusCode, Value) {
     // #907 — if body carries `agent_id` (or `metadata.agent_id`) the
     // spoof guard requires a matching X-Agent-Id header. Auto-derive
@@ -297,6 +320,13 @@ async fn get_uri(router: &axum::Router, uri: &str) -> (StatusCode, Value) {
         .unwrap();
     let parsed: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
     (status, parsed)
+}
+
+/// #998/#999 — admin-flavored shortcut over [`get_uri_with_agent`].
+/// Threads [`TEST_ADMIN_ID`] so the in-process router's admin allowlist
+/// (seeded by [`build_router_fixture`]) admits the call.
+async fn get_uri_as_admin(router: &axum::Router, uri: &str) -> (StatusCode, Value) {
+    get_uri_with_agent(router, uri, TEST_ADMIN_ID).await
 }
 
 async fn get_uri_with_agent(
@@ -917,7 +947,7 @@ async fn http_forget_by_namespace() {
     let (router, _f) = build_router_fixture();
     let _ = create_basic(&router, "chunk-d/forget", "to-forget").await;
     let body = json!({"namespace": "chunk-d/forget"});
-    let (status, payload) = post_json(&router, "/api/v1/forget", body).await;
+    let (status, payload) = post_json_as_admin(&router, "/api/v1/forget", body).await;
     assert_eq!(status, StatusCode::OK);
     assert!(payload.get("deleted").is_some());
 }
@@ -927,7 +957,7 @@ async fn http_forget_by_pattern() {
     let (router, _f) = build_router_fixture();
     let _ = create_basic(&router, "chunk-d/forget-p", "pattern-mem").await;
     let body = json!({"pattern": "pattern"});
-    let (status, _payload) = post_json(&router, "/api/v1/forget", body).await;
+    let (status, _payload) = post_json_as_admin(&router, "/api/v1/forget", body).await;
     assert_eq!(status, StatusCode::OK);
 }
 
@@ -936,7 +966,7 @@ async fn http_forget_by_tier() {
     let (router, _f) = build_router_fixture();
     let _ = create_basic(&router, "chunk-d/forget-t", "tiered").await;
     let body = json!({"tier": "long"});
-    let (status, _payload) = post_json(&router, "/api/v1/forget", body).await;
+    let (status, _payload) = post_json_as_admin(&router, "/api/v1/forget", body).await;
     assert_eq!(status, StatusCode::OK);
 }
 
@@ -945,7 +975,7 @@ async fn http_forget_actual_removes_rows() {
     let (router, _f) = build_router_fixture();
     let _ = create_basic(&router, "chunk-d/forget-real", "kill-me").await;
     let body = json!({"namespace": "chunk-d/forget-real"});
-    let (status, _payload) = post_json(&router, "/api/v1/forget", body).await;
+    let (status, _payload) = post_json_as_admin(&router, "/api/v1/forget", body).await;
     assert_eq!(status, StatusCode::OK);
 }
 
@@ -953,7 +983,7 @@ async fn http_forget_actual_removes_rows() {
 async fn http_forget_invalid_namespace_400() {
     let (router, _f) = build_router_fixture();
     let body = json!({"namespace": "!bad ns"});
-    let (status, _payload) = post_json(&router, "/api/v1/forget", body).await;
+    let (status, _payload) = post_json_as_admin(&router, "/api/v1/forget", body).await;
     assert!(status == StatusCode::BAD_REQUEST || status == StatusCode::OK);
 }
 
@@ -1216,7 +1246,7 @@ async fn http_list_agents_returns_array() {
         json!({"agent_id": "ai:lister", "agent_type": "ai:generic"}),
     )
     .await;
-    let (status, payload) = get_uri(&router, "/api/v1/agents").await;
+    let (status, payload) = get_uri_as_admin(&router, "/api/v1/agents").await;
     assert_eq!(status, StatusCode::OK);
     assert!(payload["agents"].is_array() || payload["count"].is_number());
 }
@@ -1539,7 +1569,7 @@ async fn http_bulk_create_with_invalid_member_records_error() {
 #[tokio::test]
 async fn http_list_archive_empty_returns_array() {
     let (router, _f) = build_router_fixture();
-    let (status, payload) = get_uri(&router, "/api/v1/archive").await;
+    let (status, payload) = get_uri_as_admin(&router, "/api/v1/archive").await;
     assert_eq!(status, StatusCode::OK);
     assert!(payload["memories"].is_array() || payload["count"].is_number());
 }
@@ -1547,7 +1577,7 @@ async fn http_list_archive_empty_returns_array() {
 #[tokio::test]
 async fn http_archive_stats_returns_struct() {
     let (router, _f) = build_router_fixture();
-    let (status, _payload) = get_uri(&router, "/api/v1/archive/stats").await;
+    let (status, _payload) = get_uri_as_admin(&router, "/api/v1/archive/stats").await;
     assert_eq!(status, StatusCode::OK);
 }
 
@@ -1593,7 +1623,7 @@ async fn http_restore_archive_unknown_id_404() {
 async fn http_list_namespaces_returns_array() {
     let (router, _f) = build_router_fixture();
     let _ = create_basic(&router, "chunk-d/ns1", "x").await;
-    let (status, payload) = get_uri(&router, "/api/v1/namespaces").await;
+    let (status, payload) = get_uri_as_admin(&router, "/api/v1/namespaces").await;
     assert_eq!(status, StatusCode::OK);
     assert!(payload["namespaces"].is_array() || payload["count"].is_number());
 }
@@ -1606,21 +1636,21 @@ async fn http_list_namespaces_returns_array() {
 async fn http_taxonomy_returns_struct() {
     let (router, _f) = build_router_fixture();
     let _ = create_basic(&router, "chunk-d/tax/sub", "x").await;
-    let (status, _payload) = get_uri(&router, "/api/v1/taxonomy?prefix=chunk-d").await;
+    let (status, _payload) = get_uri_as_admin(&router, "/api/v1/taxonomy?prefix=chunk-d").await;
     assert_eq!(status, StatusCode::OK);
 }
 
 #[tokio::test]
 async fn http_taxonomy_with_trailing_slash_handled() {
     let (router, _f) = build_router_fixture();
-    let (status, _payload) = get_uri(&router, "/api/v1/taxonomy?prefix=chunk-d/").await;
+    let (status, _payload) = get_uri_as_admin(&router, "/api/v1/taxonomy?prefix=chunk-d/").await;
     assert_eq!(status, StatusCode::OK);
 }
 
 #[tokio::test]
 async fn http_taxonomy_invalid_prefix_400() {
     let (router, _f) = build_router_fixture();
-    let (status, _payload) = get_uri(&router, "/api/v1/taxonomy?prefix=!bad%20").await;
+    let (status, _payload) = get_uri_as_admin(&router, "/api/v1/taxonomy?prefix=!bad%20").await;
     assert!(status == StatusCode::BAD_REQUEST || status == StatusCode::OK);
 }
 
@@ -1882,7 +1912,7 @@ async fn http_quota_status_invalid_agent_400() {
 #[tokio::test]
 async fn http_get_stats_returns_struct() {
     let (router, _f) = build_router_fixture();
-    let (status, payload) = get_uri(&router, "/api/v1/stats").await;
+    let (status, payload) = get_uri_as_admin(&router, "/api/v1/stats").await;
     assert_eq!(status, StatusCode::OK);
     assert!(payload.is_object());
 }
