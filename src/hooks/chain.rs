@@ -155,41 +155,19 @@ pub struct AskUserPrompt {
 /// on `Deny`. The dispatcher applies the cumulative delta exactly
 /// once when the chain returns `ModifiedAllow`.
 ///
-/// `PartialEq` is hand-rolled because [`MemoryDelta`] contains a
-/// `serde_json::Value` (the metadata bag) which is not itself
-/// `Eq`. We compare `ModifiedAllow` deltas by their canonical JSON
-/// projection so tests can assert structural equality without
-/// caring about field-ordering inside the metadata blob — same
-/// trick `HookDecision::Modify` uses in `decision.rs`.
-#[derive(Debug, Clone)]
+/// #969 — `PartialEq` is now `derive`-able because `MemoryDelta`
+/// derives `PartialEq` (see `hooks/events.rs`). Pre-#969 we
+/// hand-rolled equality routed through `serde_json::to_value(...)`
+/// on the (mistaken) premise that `serde_json::Value` was not
+/// `PartialEq` — it IS. `MemoryDelta`'s `Option<f64>` blocks
+/// `derive(Eq)` (f64 has only `PartialEq`) but not
+/// `derive(PartialEq)`. The historical wrap-and-compare is gone.
+#[derive(Debug, Clone, PartialEq)]
 pub enum ChainResult {
     Allow,
     ModifiedAllow(MemoryDelta),
     Deny { reason: String, code: i32 },
     AskUser { queued: Vec<AskUserPrompt> },
-}
-
-impl PartialEq for ChainResult {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (ChainResult::Allow, ChainResult::Allow) => true,
-            (ChainResult::ModifiedAllow(a), ChainResult::ModifiedAllow(b)) => {
-                serde_json::to_value(a).ok() == serde_json::to_value(b).ok()
-            }
-            (
-                ChainResult::Deny {
-                    reason: r1,
-                    code: c1,
-                },
-                ChainResult::Deny {
-                    reason: r2,
-                    code: c2,
-                },
-            ) => r1 == r2 && c1 == c2,
-            (ChainResult::AskUser { queued: q1 }, ChainResult::AskUser { queued: q2 }) => q1 == q2,
-            _ => false,
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

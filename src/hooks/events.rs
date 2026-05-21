@@ -227,7 +227,16 @@ pub enum HookEvent {
 /// echoing the whole memory back over stdio. The executor (G3)
 /// merges `Some(_)` fields onto the in-flight `CreateMemory`
 /// before calling `db::insert`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+// #969 — `PartialEq` derive enables direct equality in `ChainResult`,
+// `HookDecision`, and `Decision` enums that wrap a `MemoryDelta`.
+// Pre-#969 those enums hand-rolled equality via
+// `serde_json::to_value(a).ok() == serde_json::to_value(b).ok()` on
+// the (mistaken) premise that `serde_json::Value` was not
+// `PartialEq` — it IS (`serde_json-1.0/src/value/mod.rs:115` derives
+// `Eq, PartialEq, Hash`). The real blocker is `Option<f64>` below,
+// which is `PartialEq` but not `Eq`; that blocks `derive(Eq)` but
+// not `derive(PartialEq)`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct MemoryDelta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tier: Option<Tier>,
