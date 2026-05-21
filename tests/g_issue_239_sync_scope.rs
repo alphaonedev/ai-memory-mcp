@@ -101,8 +101,37 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
 }
 
 async fn seed(db: &ai_memory::handlers::Db, ns: &str, title: &str) {
+    seed_inner(db, ns, title, false).await;
+}
+
+/// #978 — seed a row with the operator-explicit
+/// `metadata.federation_share = true` opt-in. Pre-#978 every row that
+/// lacked both `scope` and `agent_id` was projected through the
+/// federation pull regardless of caller (the legacy-unauthored
+/// cross-tenant leak the issue closes). Post-#978 the substrate
+/// requires either:
+///   - a canonical visibility signal (`scope=shared` or owner-match), or
+///   - this explicit operator opt-in
+///
+/// Tests that depend on the federation pull projecting a row whose
+/// content the operator considers shareable (the #239 baseline cases)
+/// use this helper.
+async fn seed_federation_shared(db: &ai_memory::handlers::Db, ns: &str, title: &str) {
+    seed_inner(db, ns, title, true).await;
+}
+
+async fn seed_inner(db: &ai_memory::handlers::Db, ns: &str, title: &str, federation_share: bool) {
     let lock = db.lock().await;
     let now = chrono::Utc::now().to_rfc3339();
+    let mut metadata = ai_memory::models::default_metadata();
+    if federation_share
+        && let Some(obj) = metadata.as_object_mut()
+    {
+        obj.insert(
+            "federation_share".to_string(),
+            serde_json::Value::Bool(true),
+        );
+    }
     let mem = ai_memory::models::Memory {
         id: uuid::Uuid::new_v4().to_string(),
         tier: ai_memory::models::Tier::Long,
@@ -118,7 +147,7 @@ async fn seed(db: &ai_memory::handlers::Db, ns: &str, title: &str) {
         updated_at: now,
         last_accessed_at: None,
         expires_at: None,
-        metadata: ai_memory::models::default_metadata(),
+        metadata,
         reflection_depth: 0,
         memory_kind: ai_memory::models::MemoryKind::Observation,
         entity_id: None,
@@ -175,8 +204,17 @@ async fn case_1_allowlist_match_returns_in_scope_excludes_others() {
         );
     }
     let (router, db) = build_router_with_db();
-    seed(&db, "public/alpha", "a").await;
-    seed(&db, "public/beta", "b").await;
+    // #978 — these rows are operator-intended-to-federate ("public/*"
+    // implies broadcast intent in the test fixture). Stamp the
+    // explicit `federation_share=true` opt-in so the post-#978
+    // visibility gate projects them; pre-#978 the legacy-unauthored
+    // carve-out projected them implicitly, which was the cross-tenant
+    // leak surface closed by this issue.
+    seed_federation_shared(&db, "public/alpha", "a").await;
+    seed_federation_shared(&db, "public/beta", "b").await;
+    // The `private/secret` row is allowlist-out-of-scope by namespace
+    // regardless of the federation_share flag; seeded without opt-in
+    // to keep the fixture honest about the namespace filter.
     seed(&db, "private/secret", "c").await;
     let body = sync_since_body(router, Some("peer-1")).await;
     unsafe {
