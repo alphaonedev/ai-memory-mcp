@@ -1,0 +1,2605 @@
+{
+  "tools": [
+    {
+      "description": "Store a memory",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.3 (#984) — request body for `memory_store`. Schemars-derived schema replaces the hand-coded entry in [`crate::mcp::registry::tool_definitions`] (D1.6 (#987) collapses the macro). Every doc-comment description is byte-equal to the legacy `description` text — see the d1_3_984_tests parity contract at the bottom of this file.",
+        "properties": {
+          "agent_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "confidence": {
+            "default": null,
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "content": {
+            "type": "string"
+          },
+          "force": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "kind": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "metadata": {
+            "default": null
+          },
+          "namespace": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "on_conflict": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "priority": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "scope": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source_uri": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tags": {
+            "default": null,
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "tier": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "content",
+          "title"
+        ],
+        "title": "StoreRequest",
+        "type": "object"
+      },
+      "name": "memory_store"
+    },
+    {
+      "description": "Recall memories relevant to a",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "definitions": {
+          "KindsFilter": {
+            "anyOf": [
+              {
+                "description": "Array of kind tokens, e.g. `[\"concept\", \"claim\"]`.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "description": "Comma-separated kinds string, e.g. `\"concept,claim\"`.",
+                "type": "string"
+              }
+            ],
+            "description": "v0.7.0 #972 D1.3 (#984) — `kinds` filter shape for `memory_recall`.\n\nThe legacy hand-coded schema declares this field as a `oneOf` union (array-of-strings OR a single CSV string); modelling it as an `#[serde(untagged)]` enum replicates the wire shape exactly without forcing callers to wrap their CSV in an array.\n\nOriginally lived under `mcp::tools::recall::KindsFilter`; promoted here for the #967 canonical-DTO refactor. Re-exported from the original location for backward compatibility."
+          }
+        },
+        "description": "v0.7.0 #972 D1.3 (#984) / #967 — canonical recall-request DTO.\n\nMarshalled once per surface (HTTP / MCP / CLI), then handed to the downstream recall pipeline. Adding a new field (Form 6 `kinds`, Form 4 `has_citations`, `confidence_tier`, etc.) lands in one place instead of four positional-arg lists.\n\n**Schemars contract.** Every doc-comment description and field attribute is byte-equal to the legacy hand-coded entry in [`crate::mcp::registry::tool_definitions`] — see the `d1_3_984_tests::recall_parity_984` parity test which asserts the derived schema matches byte-for-byte.",
+        "properties": {
+          "as_agent": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "budget_tokens": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "confidence_tier": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "context": {
+            "type": "string"
+          },
+          "context_tokens": {
+            "default": null,
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "format": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "has_citations": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "include_archived": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "kinds": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/KindsFilter"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "limit": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "namespace": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "session_default": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "session_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "since": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source_uri_prefix": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tags": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "until": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "verbose_provenance": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "context"
+        ],
+        "title": "RecallRequest",
+        "type": "object"
+      },
+      "name": "memory_recall"
+    },
+    {
+      "description": "List recall_observations (#886).",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_recall_observations`.\n\nThe legacy hand-coded entry in [`crate::mcp::registry::tool_definitions`] omits the `description` field on most properties (only field names + types are declared). The schemars-derived schema mirrors that shape via the field naming alone.",
+        "properties": {
+          "consumed": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "limit": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "recall_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "since": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "until": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "RecallObservationsRequest",
+        "type": "object"
+      },
+      "name": "memory_recall_observations"
+    },
+    {
+      "description": "Search memories by exact",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.4 (#985) — request body for `memory_search`.",
+        "properties": {
+          "agent_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "as_agent": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "format": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "include_archived": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "limit": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "namespace": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "query": {
+            "type": "string"
+          },
+          "tier": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "title": "SearchRequest",
+        "type": "object"
+      },
+      "name": "memory_search"
+    },
+    {
+      "description": "List memories, optionally",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.4 (#985) — request body for `memory_list`.",
+        "properties": {
+          "agent_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "format": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "limit": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "namespace": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tier": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "ListRequest",
+        "type": "object"
+      },
+      "name": "memory_list"
+    },
+    {
+      "description": "Load top-k recent +",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.3 (#984) — request body for `memory_load_family`. Schemars-derived schema replaces the hand-coded entry in [`crate::mcp::registry::tool_definitions`] (D1.6 (#987) collapses the macro).",
+        "properties": {
+          "family": {
+            "type": "string"
+          },
+          "k": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "namespace": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "family"
+        ],
+        "title": "LoadFamilyRequest",
+        "type": "object"
+      },
+      "name": "memory_load_family"
+    },
+    {
+      "description": "Intent-routed loader: free-text",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.3 (#984) — request body for `memory_smart_load`.",
+        "properties": {
+          "intent": {
+            "type": "string"
+          },
+          "k": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "namespace": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "intent"
+        ],
+        "title": "SmartLoadRequest",
+        "type": "object"
+      },
+      "name": "memory_smart_load"
+    },
+    {
+      "description": "Return a hierarchical tree of",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.4 (#985) — request body for `memory_get_taxonomy`.",
+        "properties": {
+          "depth": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "limit": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "namespace_prefix": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "GetTaxonomyRequest",
+        "type": "object"
+      },
+      "name": "memory_get_taxonomy"
+    },
+    {
+      "description": "Pre-write near-duplicate check",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_check_duplicate`.",
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "namespace": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "threshold": {
+            "default": null,
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "content",
+          "title"
+        ],
+        "title": "CheckDuplicateRequest",
+        "type": "object"
+      },
+      "name": "memory_check_duplicate"
+    },
+    {
+      "description": "Register an entity (canonical",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.4 (#985) — request body for `memory_entity_register`.",
+        "properties": {
+          "agent_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "aliases": {
+            "default": null,
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "canonical_name": {
+            "type": "string"
+          },
+          "metadata": {
+            "default": null
+          },
+          "namespace": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "canonical_name",
+          "namespace"
+        ],
+        "title": "EntityRegisterRequest",
+        "type": "object"
+      },
+      "name": "memory_entity_register"
+    },
+    {
+      "description": "Resolve an alias to its",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.4 (#985) — request body for `memory_entity_get_by_alias`.",
+        "properties": {
+          "alias": {
+            "type": "string"
+          },
+          "namespace": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "alias"
+        ],
+        "title": "EntityGetByAliasRequest",
+        "type": "object"
+      },
+      "name": "memory_entity_get_by_alias"
+    },
+    {
+      "description": "Ordered fact timeline for an",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.4 (#985) — request body for `memory_kg_timeline`.",
+        "properties": {
+          "limit": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "since": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source_id": {
+            "type": "string"
+          },
+          "until": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "source_id"
+        ],
+        "title": "KgTimelineRequest",
+        "type": "object"
+      },
+      "name": "memory_kg_timeline"
+    },
+    {
+      "description": "Mark a KG link as superseded by",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.4 (#985) — request body for `memory_kg_invalidate`.",
+        "properties": {
+          "relation": {
+            "type": "string"
+          },
+          "source_id": {
+            "type": "string"
+          },
+          "target_id": {
+            "type": "string"
+          },
+          "valid_until": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "relation",
+          "source_id",
+          "target_id"
+        ],
+        "title": "KgInvalidateRequest",
+        "type": "object"
+      },
+      "name": "memory_kg_invalidate"
+    },
+    {
+      "description": "Outbound KG traversal from a",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.4 (#985) — request body for `memory_kg_query`.",
+        "properties": {
+          "allowed_agents": {
+            "default": null,
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "by_source_uri": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "include_invalidated": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "limit": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "max_depth": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "namespace": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source_id": {
+            "type": "string"
+          },
+          "valid_at": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "source_id"
+        ],
+        "title": "KgQueryRequest",
+        "type": "object"
+      },
+      "name": "memory_kg_query"
+    },
+    {
+      "description": "Enumerate up to N paths through",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.4 (#985) — request body for `memory_find_paths`.",
+        "properties": {
+          "include_invalidated": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "max_depth": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "max_results": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "source_id": {
+            "type": "string"
+          },
+          "target_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_id",
+          "target_id"
+        ],
+        "title": "FindPathsRequest",
+        "type": "object"
+      },
+      "name": "memory_find_paths"
+    },
+    {
+      "description": "Delete a memory by ID.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.6 (#987) — request body for `memory_delete`.",
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "title": "DeleteRequest",
+        "type": "object"
+      },
+      "name": "memory_delete"
+    },
+    {
+      "description": "Promote a memory to long (or",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.6 (#987) — request body for `memory_promote`.",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "target_tier": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "to_namespace": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "title": "PromoteRequest",
+        "type": "object"
+      },
+      "name": "memory_promote"
+    },
+    {
+      "description": "Bulk delete memories matching a",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.6 (#987) — request body for `memory_forget`.",
+        "properties": {
+          "dry_run": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "namespace": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pattern": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tier": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "ForgetRequest",
+        "type": "object"
+      },
+      "name": "memory_forget"
+    },
+    {
+      "description": "Get memory store statistics",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_stats`. The legacy schema is `properties: {}` — empty struct.",
+        "properties": {},
+        "title": "StatsRequest",
+        "type": "object"
+      },
+      "name": "memory_stats"
+    },
+    {
+      "description": "Update an existing memory by ID",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.6 (#987) — request body for `memory_update`.",
+        "properties": {
+          "confidence": {
+            "default": null,
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "content": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "edit_source": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "expected_version": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "expires_at": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "metadata": {
+            "default": null
+          },
+          "namespace": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "priority": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "source_uri": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tags": {
+            "default": null,
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "tier": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "title": "UpdateRequest",
+        "type": "object"
+      },
+      "name": "memory_update"
+    },
+    {
+      "description": "Get a specific memory by ID,",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.4 (#985) — request body for `memory_get`.",
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "title": "GetRequest",
+        "type": "object"
+      },
+      "name": "memory_get"
+    },
+    {
+      "description": "Create a typed link between two",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.4 (#985) — request body for `memory_link`.",
+        "properties": {
+          "relation": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source_id": {
+            "type": "string"
+          },
+          "target_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_id",
+          "target_id"
+        ],
+        "title": "LinkRequest",
+        "type": "object"
+      },
+      "name": "memory_link"
+    },
+    {
+      "description": "Get all links for a memory",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.4 (#985) — request body for `memory_get_links`.",
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "title": "GetLinksRequest",
+        "type": "object"
+      },
+      "name": "memory_get_links"
+    },
+    {
+      "description": "Re-verify a stored memory_links",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.4 (#985) — request body for `memory_verify`.",
+        "properties": {
+          "link_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "relation": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "target_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "VerifyRequest",
+        "type": "object"
+      },
+      "name": "memory_verify"
+    },
+    {
+      "description": "Reconstruct the conversation",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.4 (#985) — request body for `memory_replay`.",
+        "properties": {
+          "agent_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "depth": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "memory_id": {
+            "type": "string"
+          },
+          "verbose": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "memory_id"
+        ],
+        "title": "ReplayRequest",
+        "type": "object"
+      },
+      "name": "memory_replay"
+    },
+    {
+      "description": "Persist a reflection memory",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_reflect`.",
+        "properties": {
+          "agent_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "confidence": {
+            "default": null,
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "content": {
+            "type": "string"
+          },
+          "metadata": {
+            "default": null
+          },
+          "namespace": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "priority": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "source_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "tags": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "tier": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "content",
+          "source_ids",
+          "title"
+        ],
+        "title": "ReflectRequest",
+        "type": "object"
+      },
+      "name": "memory_reflect"
+    },
+    {
+      "description": "Render a single reflection",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_export_reflection`.",
+        "properties": {
+          "format": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "memory_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "memory_id"
+        ],
+        "title": "ExportReflectionRequest",
+        "type": "object"
+      },
+      "name": "memory_export_reflection"
+    },
+    {
+      "description": "Fetch the latest Persona",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_persona`.",
+        "properties": {
+          "entity_id": {
+            "type": "string"
+          },
+          "namespace": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "entity_id"
+        ],
+        "title": "PersonaRequest",
+        "type": "object"
+      },
+      "name": "memory_persona"
+    },
+    {
+      "description": "Generate/regen a Persona",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_persona_generate`.\n\nThe legacy schema's `namespace` field is typed as `[\"string\", \"null\"]` — schemars emits the equivalent shape from `Option<String>`.",
+        "properties": {
+          "entity_id": {
+            "type": "string"
+          },
+          "namespace": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "entity_id"
+        ],
+        "title": "PersonaGenerateRequest",
+        "type": "object"
+      },
+      "name": "memory_persona_generate"
+    },
+    {
+      "description": "Inspect the cross-peer",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_reflection_origin`.",
+        "properties": {
+          "memory_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "memory_id"
+        ],
+        "title": "ReflectionOriginRequest",
+        "type": "object"
+      },
+      "name": "memory_reflection_origin"
+    },
+    {
+      "description": "List dependents flagged by the",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_dependents_of_invalidated`.",
+        "properties": {
+          "memory_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "memory_id"
+        ],
+        "title": "DependentsOfInvalidatedRequest",
+        "type": "object"
+      },
+      "name": "memory_dependents_of_invalidated"
+    },
+    {
+      "description": "Consolidate multiple memories",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_consolidate`.",
+        "properties": {
+          "agent_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "namespace": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "summary": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "ids",
+          "title"
+        ],
+        "title": "ConsolidateRequest",
+        "type": "object"
+      },
+      "name": "memory_consolidate"
+    },
+    {
+      "description": "Form 3 multi-step ingest:",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_ingest_multistep`.",
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "namespace": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pipeline_override": {
+            "default": null
+          },
+          "pipeline_variant": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "content"
+        ],
+        "title": "IngestMultistepRequest",
+        "type": "object"
+      },
+      "name": "memory_ingest_multistep"
+    },
+    {
+      "description": "Decompose a memory into 2-10",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_atomise`.",
+        "properties": {
+          "force_re_atomise": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "max_atom_tokens": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "memory_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "memory_id"
+        ],
+        "title": "AtomiseRequest",
+        "type": "object"
+      },
+      "name": "memory_atomise"
+    },
+    {
+      "description": "Share a memory with another",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_share`.",
+        "properties": {
+          "source_memory_id": {
+            "type": "string"
+          },
+          "target_agent_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_memory_id",
+          "target_agent_id"
+        ],
+        "title": "ShareRequest",
+        "type": "object"
+      },
+      "name": "memory_share"
+    },
+    {
+      "description": "Scan",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_calibrate_confidence`.",
+        "properties": {
+          "days": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "output_format": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "CalibrateConfidenceRequest",
+        "type": "object"
+      },
+      "name": "memory_calibrate_confidence"
+    },
+    {
+      "description": "Discover runtime capabilities",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.1 (#982) — per-tool request body for `memory_capabilities`. Source of truth for the wire schema; the schemars-derived shape replaces the hand-coded entry in [`crate::mcp::registry::tool_definitions`].\n\n**Fix as a side effect of D1.1:** the legacy hand-coded schema reported `accept: enum [\"v1\",\"v2\"]` (default `\"v2\"`), but [`CapabilitiesAccept`] has been `V1`/`V2`/`V3` since the v0.7.0 A5 release (with `V3` as the actual default). The schemars derive from this struct will surface `accept` as an optional string (no enum constraint at this layer — the runtime [`CapabilitiesAccept::parse`] tolerates any input and falls back to V3). That removes the schema/runtime drift without forcing breaking-change semantics on existing v1/v2-pinned clients.",
+        "properties": {
+          "accept": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "family": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "include_schema": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "verbose": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "title": "CapabilitiesRequest",
+        "type": "object"
+      },
+      "name": "memory_capabilities"
+    },
+    {
+      "description": "LLM-expand a search query into",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_expand_query`.",
+        "properties": {
+          "query": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "title": "ExpandQueryRequest",
+        "type": "object"
+      },
+      "name": "memory_expand_query"
+    },
+    {
+      "description": "LLM-generate tags for a memory",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_auto_tag`.",
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "title": "AutoTagRequest",
+        "type": "object"
+      },
+      "name": "memory_auto_tag"
+    },
+    {
+      "description": "LLM-check whether two memories",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_detect_contradiction`.",
+        "properties": {
+          "id_a": {
+            "type": "string"
+          },
+          "id_b": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id_a",
+          "id_b"
+        ],
+        "title": "DetectContradictionRequest",
+        "type": "object"
+      },
+      "name": "memory_detect_contradiction"
+    },
+    {
+      "description": "List archived (expired)",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_archive_list`.",
+        "properties": {
+          "limit": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "namespace": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "offset": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "title": "ArchiveListRequest",
+        "type": "object"
+      },
+      "name": "memory_archive_list"
+    },
+    {
+      "description": "Restore an archived memory back",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_archive_restore`.",
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "title": "ArchiveRestoreRequest",
+        "type": "object"
+      },
+      "name": "memory_archive_restore"
+    },
+    {
+      "description": "Permanently delete archived",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_archive_purge`.",
+        "properties": {
+          "older_than_days": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "title": "ArchivePurgeRequest",
+        "type": "object"
+      },
+      "name": "memory_archive_purge"
+    },
+    {
+      "description": "Show archive statistics (total",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_archive_stats`. Legacy schema is `properties: {}` — empty struct.",
+        "properties": {},
+        "title": "ArchiveStatsRequest",
+        "type": "object"
+      },
+      "name": "memory_archive_stats"
+    },
+    {
+      "description": "Trigger garbage collection on",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.6 (#987) — request body for `memory_gc`.",
+        "properties": {
+          "dry_run": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "title": "GcRequest",
+        "type": "object"
+      },
+      "name": "memory_gc"
+    },
+    {
+      "description": "Auto-recall recent memories on",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_session_start`.",
+        "properties": {
+          "format": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "limit": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "namespace": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "SessionStartRequest",
+        "type": "object"
+      },
+      "name": "memory_session_start"
+    },
+    {
+      "description": "Set a memory as the",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.4 (#985) — request body for `memory_namespace_set_standard`.",
+        "properties": {
+          "governance": {
+            "default": null
+          },
+          "id": {
+            "type": "string"
+          },
+          "namespace": {
+            "type": "string"
+          },
+          "parent": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "namespace"
+        ],
+        "title": "NamespaceSetStandardRequest",
+        "type": "object"
+      },
+      "name": "memory_namespace_set_standard"
+    },
+    {
+      "description": "Get the standard/policy memory",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.4 (#985) — request body for `memory_namespace_get_standard`.",
+        "properties": {
+          "inherit": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "namespace": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "namespace"
+        ],
+        "title": "NamespaceGetStandardRequest",
+        "type": "object"
+      },
+      "name": "memory_namespace_get_standard"
+    },
+    {
+      "description": "Clear the standard/policy for a",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.4 (#985) — request body for `memory_namespace_clear_standard`.",
+        "properties": {
+          "namespace": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "namespace"
+        ],
+        "title": "NamespaceClearStandardRequest",
+        "type": "object"
+      },
+      "name": "memory_namespace_clear_standard"
+    },
+    {
+      "description": "List pending governance-queued",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.4 (#985) — request body for `memory_pending_list`.",
+        "properties": {
+          "limit": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "status": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "PendingListRequest",
+        "type": "object"
+      },
+      "name": "memory_pending_list"
+    },
+    {
+      "description": "Approve a pending action",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.4 (#985) — request body for `memory_pending_approve`.",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "remember": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "title": "PendingApproveRequest",
+        "type": "object"
+      },
+      "name": "memory_pending_approve"
+    },
+    {
+      "description": "Reject a pending action",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.4 (#985) — request body for `memory_pending_reject`.",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "remember": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "title": "PendingRejectRequest",
+        "type": "object"
+      },
+      "name": "memory_pending_reject"
+    },
+    {
+      "description": "Register an agent in the",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_agent_register`.",
+        "properties": {
+          "agent_id": {
+            "type": "string"
+          },
+          "agent_type": {
+            "type": "string"
+          },
+          "capabilities": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "agent_id",
+          "agent_type"
+        ],
+        "title": "AgentRegisterRequest",
+        "type": "object"
+      },
+      "name": "memory_agent_register"
+    },
+    {
+      "description": "List every registered agent.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_agent_list`. The legacy schema is `properties: {}` — empty struct.",
+        "properties": {},
+        "title": "AgentListRequest",
+        "type": "object"
+      },
+      "name": "memory_agent_list"
+    },
+    {
+      "description": "Send a message from the caller",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_notify`.",
+        "properties": {
+          "payload": {
+            "type": "string"
+          },
+          "priority": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "target_agent_id": {
+            "type": "string"
+          },
+          "tier": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "payload",
+          "target_agent_id",
+          "title"
+        ],
+        "title": "NotifyRequest",
+        "type": "object"
+      },
+      "name": "memory_notify"
+    },
+    {
+      "description": "List messages sent to an agent",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_inbox`.",
+        "properties": {
+          "agent_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "limit": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "unread_only": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "title": "InboxRequest",
+        "type": "object"
+      },
+      "name": "memory_inbox"
+    },
+    {
+      "description": "Register a webhook subscription",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.4 (#985) — request body for `memory_subscribe`.",
+        "properties": {
+          "agent_filter": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "event_types": {
+            "default": null,
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "events": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "namespace_filter": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "secret": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "title": "SubscribeRequest",
+        "type": "object"
+      },
+      "name": "memory_subscribe"
+    },
+    {
+      "description": "Delete a subscription by id.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.4 (#985) — request body for `memory_unsubscribe`.",
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "title": "UnsubscribeRequest",
+        "type": "object"
+      },
+      "name": "memory_unsubscribe"
+    },
+    {
+      "description": "List active webhook",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_list_subscriptions`. The legacy schema is `properties: {}` — empty struct.",
+        "properties": {},
+        "title": "ListSubscriptionsRequest",
+        "type": "object"
+      },
+      "name": "memory_list_subscriptions"
+    },
+    {
+      "description": "Replay subscription_events",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_subscription_replay`.",
+        "properties": {
+          "since": {
+            "type": "string"
+          },
+          "subscription_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "since",
+          "subscription_id"
+        ],
+        "title": "SubscriptionReplayRequest",
+        "type": "object"
+      },
+      "name": "memory_subscription_replay"
+    },
+    {
+      "description": "List subscription_dlq rows",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_subscription_dlq_list`.",
+        "properties": {
+          "limit": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "subscription_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "SubscriptionDlqListRequest",
+        "type": "object"
+      },
+      "name": "memory_subscription_dlq_list"
+    },
+    {
+      "description": "Report per-agent quota usage",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_quota_status`.",
+        "properties": {
+          "agent_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "QuotaStatusRequest",
+        "type": "object"
+      },
+      "name": "memory_quota_status"
+    },
+    {
+      "description": "Check action vs",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_check_agent_action`.",
+        "properties": {
+          "agent_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "args": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "binary": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "byte_estimate": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "command": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "custom_kind": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "cwd": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "host": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "type": "string"
+          },
+          "path": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "scheme": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "title": "CheckAgentActionRequest",
+        "type": "object"
+      },
+      "name": "memory_check_agent_action"
+    },
+    {
+      "description": "List substrate-level",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_rule_list`.",
+        "properties": {
+          "enabled_only": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "kind": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "RuleListRequest",
+        "type": "object"
+      },
+      "name": "memory_rule_list"
+    },
+    {
+      "description": "Register an agentskills",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_skill_register`.",
+        "properties": {
+          "folder_path": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "inline_skill": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "SkillRegisterRequest",
+        "type": "object"
+      },
+      "name": "memory_skill_register"
+    },
+    {
+      "description": "List current (non-superseded)",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_skill_list`.",
+        "properties": {
+          "filter": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "namespace": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "SkillListRequest",
+        "type": "object"
+      },
+      "name": "memory_skill_list"
+    },
+    {
+      "description": "Get full skill activation",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_skill_get`.",
+        "properties": {
+          "skill_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "skill_id"
+        ],
+        "title": "SkillGetRequest",
+        "type": "object"
+      },
+      "name": "memory_skill_get"
+    },
+    {
+      "description": "Fetch + digest-verify a skill",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_skill_resource`.",
+        "properties": {
+          "resource_path": {
+            "type": "string"
+          },
+          "skill_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "resource_path",
+          "skill_id"
+        ],
+        "title": "SkillResourceRequest",
+        "type": "object"
+      },
+      "name": "memory_skill_resource"
+    },
+    {
+      "description": "Export a skill to a folder",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_skill_export`.",
+        "properties": {
+          "skill_id": {
+            "type": "string"
+          },
+          "target_folder": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "skill_id",
+          "target_folder"
+        ],
+        "title": "SkillExportRequest",
+        "type": "object"
+      },
+      "name": "memory_skill_export"
+    },
+    {
+      "description": "Promote a Reflection into a",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_skill_promote_from_reflection`. The `parameters_schema` property is an opaque pass-through JSON object spliced into the generated SKILL.md `Parameters` section.",
+        "properties": {
+          "parameters_schema": {
+            "default": null
+          },
+          "reflection_id": {
+            "type": "string"
+          },
+          "skill_description": {
+            "type": "string"
+          },
+          "skill_name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "reflection_id",
+          "skill_description",
+          "skill_name"
+        ],
+        "title": "SkillPromoteFromReflectionRequest",
+        "type": "object"
+      },
+      "name": "memory_skill_promote_from_reflection"
+    },
+    {
+      "description": "Skill body +",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_skill_compositional_context`.",
+        "properties": {
+          "budget_tokens": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "skill_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "skill_id"
+        ],
+        "title": "SkillCompositionalContextRequest",
+        "type": "object"
+      },
+      "name": "memory_skill_compositional_context"
+    },
+    {
+      "description": "Offload verbatim content",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_offload`.",
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "namespace": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ttl_seconds": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "content"
+        ],
+        "title": "OffloadRequest",
+        "type": "object"
+      },
+      "name": "memory_offload"
+    },
+    {
+      "description": "Dereference a memory_offload",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "v0.7.0 #972 D1.5 (#986) — request body for `memory_deref`.",
+        "properties": {
+          "ref_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "ref_id"
+        ],
+        "title": "DerefRequest",
+        "type": "object"
+      },
+      "name": "memory_deref"
+    }
+  ],
+  "toolsVersion": "2026-05-06"
+}
