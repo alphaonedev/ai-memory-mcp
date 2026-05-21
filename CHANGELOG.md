@@ -7,6 +7,138 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] — v0.7.x doc follow-ups + Wave-2 refactor (post-tag)
 
+### v0.7.0 ship-readiness session 2026-05-21 — gate-rerun closures + drift sweep
+
+After the PR #820 merge + the 6-agent review's TB1/TB2 (#977/#978) landed, a
+ship-readiness gate-rerun session on 2026-05-21 surfaced four classes of
+follow-up work and one perf-regression revert. Audit trail below.
+
+#### Test-fixture drift from the overnight admin-gate cluster
+
+The overnight admin-gate cluster (#936-#960 + #977/#978) correctly tightened
+production behavior so non-admin callers can no longer reach 25+ admin-gated
+endpoints. Three test fixture surfaces still asserted pre-tightening
+behavior:
+
+- **`#997`** — `tests/handler_postgres_branches_fake_pg.rs` (commit
+  [`a8b424fc0`](https://github.com/alphaonedev/ai-memory-mcp/commit/a8b424fc0)):
+  8 tests asserting `200 OK` on admin-gated routes (stats, agents, archive,
+  archive/stats, taxonomy, namespaces, quota/status, forget). Updated to
+  assert `403 FORBIDDEN` with the gate-closing issue (#943/#946/#945/#960/#942)
+  cited in each comment. Pattern mirrors the existing
+  `pg_export_returns_envelope` (#957) test. 89/89 PASS post-fix.
+- **`#998`** — `tests/integration.rs` (commit
+  [`325477dcd`](https://github.com/alphaonedev/ai-memory-mcp/commit/325477dcd)):
+  the #976/#980 timing collision — `cmd()` and `OneshotDaemon` seeded
+  `admin_agent_ids` with the pre-#980 `"*"` wildcard, but #980 made the
+  wildcard arm `#[cfg(test)]`-only in the lib (and integration tests link the
+  lib without `cfg(test)`, so the arm is dead code). Fix: concrete admin id
+  `INTEGRATION_TEST_ADMIN = "ai:integration-test-admin"`, new
+  `curl_get_as_admin` / `curl_post_as_admin` / `route_get_as_admin` /
+  `route_post_as_admin` helpers, 14 admin-gated call sites updated across 8
+  failing tests. 8/8 PASS post-fix.
+- **`#1000`** — `tests/l07_3_chunk_d_http_surface.rs` (commit
+  [`599347b3c`](https://github.com/alphaonedev/ai-memory-mcp/commit/599347b3c)):
+  same root cause as #998. Fix: `TEST_ADMIN_ID = "ai:l07-3-test-admin"`,
+  `get_uri_as_admin` + `post_json_as_admin` helpers, 13 admin-gated call sites
+  updated (8 GETs + 5 forget POSTs). 160/160 PASS post-fix.
+
+#### Clippy-pedantic regression from #985 future-proofing
+
+- **`#981`** — `tests/postgres_touch_batch.rs` and 9 other fixtures (commits
+  [`c2a2d2294`](https://github.com/alphaonedev/ai-memory-mcp/commit/c2a2d2294)
+  + [`a19d1b6d6`](https://github.com/alphaonedev/ai-memory-mcp/commit/a19d1b6d6)):
+  `#985`'s future-proofing change added `..Memory::default()` rest-pattern to
+  106 integration test fixtures so a new `Memory` field lands without
+  rewriting every fixture at once. 10 of those fixtures happened to specify
+  all 26 current `Memory` fields, which trips `clippy::needless_update` under
+  `-D clippy::all -D clippy::pedantic`. Per-site `#[allow]` doesn't work
+  where the literal is a method-call receiver (expression-attribute,
+  experimental). Fix: file-level `#![allow(clippy::needless_update)]` on the
+  10 offending fixture files. Preserves #985's future-proofing intent
+  exactly; covers every `Memory { ... }` literal in the file with no behavior
+  change.
+
+#### RuleEngineCache perf-regression revert
+
+- **`#990`** (regression report) / revert at commit
+  [`8a18c19f3`](https://github.com/alphaonedev/ai-memory-mcp/commit/8a18c19f3):
+  `#983` (commit `0ac363f3c`) introduced a process-wide `RuleEngineCache`
+  keyed on `AgentAction::kind()` alone. Multi-connection integration tests
+  (e.g. `tests/governance_a2a_rules.rs::disabled_rule_at_peer_b_does_not_enforce_even_if_enabled_at_a`)
+  hit cross-conn cache poisoning: peer_b's empty rule list was cached under
+  `"filesystem_write"` and returned to peer_a's subsequent lookup. Production
+  daemon has one connection so the bug was invisible there, but the
+  correctness invariant ("two independent SQLite connections never share rule
+  state") was broken. Revert restored 5/5 PASS on the governance_a2a_rules
+  suite. The 0.5-3ms-per-write perf gain is recoverable post-ship via the
+  redesign tracked at **`#991`** (per-Connection UUID-wrapped cache).
+
+#### Orphan-commit audit-trail reconciliation
+
+Five overnight commits forward-referenced issue numbers `#981`-`#985` for
+unrelated perf/test/fix work; those numbers were filed for the present
+session's clippy regression (`#981`) and the `#972` MCP-registry split
+(`#982`-`#989`), leaving the original commits' issue refs pointing to
+unrelated surfaces. Retroactive bookkeeping issues filed and closed to
+restore the audit trail:
+
+- **`#992`** ([commit `25aaad36a`](https://github.com/alphaonedev/ai-memory-mcp/commit/25aaad36a))
+  — HNSW `semantic_phase` batch fetch via `get_many` (was tagged `#981`).
+- **`#993`** ([commit `844a48328`](https://github.com/alphaonedev/ai-memory-mcp/commit/844a48328))
+  — recall handler lock-acquisition order inversion (was tagged `#982`).
+- **`#994`** ([commit `0ac363f3c`](https://github.com/alphaonedev/ai-memory-mcp/commit/0ac363f3c))
+  — `RuleEngineCache` (was tagged `#983`; reverted via `#990`; redesign at `#991`).
+- **`#995`** ([commit `b51fbb424`](https://github.com/alphaonedev/ai-memory-mcp/commit/b51fbb424))
+  — `require_admin` returns 400 instead of `anonymous:invalid` sentinel
+  (was tagged `#984`).
+- **`#996`** ([commit `d450c6e25`](https://github.com/alphaonedev/ai-memory-mcp/commit/d450c6e25))
+  — future-proof 106 fixtures with `..Memory::default()` rest-pattern (was
+  tagged `#985`).
+
+Each new `#981`-`#985` carries a cross-reference comment pointing at its
+retro counterpart. Commit subjects on the original five remain untouched
+(history preserved); the breadcrumbs to the actual work surface live in the
+retro issue bodies + cross-ref comments.
+
+#### `#972` MCP tool-registry split (planning)
+
+Per operator directive 2026-05-21 ("take all 9 Wave-2 Tier-B/C/D carve-outs
+in v0.7.0"), the originally-3-4-week `#972` (MCP tool registry schema-binding
+tightening) was split into 8 dependency-graphed sub-issues. Filed:
+
+- **`#982`** D1.1 — schemars dep + `McpTool` trait + PoC on
+  `memory_capabilities` (foundation, blocks all others).
+- **`#983`** D1.2 — schema generation pipeline (JsonSchema derive + parity
+  test).
+- **`#984`** D1.3 — migrate 5 default `--profile core` tools to per-tool
+  schemars (depends on D1.1+D1.2; proves pattern).
+- **`#985`** D1.4 — migrate ~25 tools in `core`+`graph`+`governance`
+  families. Parallel-safe with D1.5.
+- **`#986`** D1.5 — migrate ~40 tools in `power`+`meta`+`archive`+`other`
+  families. Parallel-safe with D1.4.
+- **`#987`** D1.6 — delete the giant `tool_definitions()` `json!` macro after
+  all per-tool modules land.
+- **`#988`** D1.7 — test campaign (per-profile `tools/list` snapshots +
+  compile-time schema↔handler invariant + token-budget gate).
+- **`#989`** D1.8 — docs sweep (CLAUDE.md "New MCP tool" recipe,
+  release-notes, CHANGELOG, per-tool README).
+
+#### Documentation drift umbrella
+
+- **`#999`** — umbrella issue for the v0.7.0 doc + GitHub Pages
+  reconciliation against the overnight cluster (#936-#960, #977-#980, #997,
+  #998, #1000, revert #990). Three categories of stale claims targeted: (1)
+  `AI_MEMORY_ADMIN_AGENT_IDS=*` recommendations (`*` no longer works post
+  #980; explicit admin ids required), (2) `permissions.mode = advisory`
+  default claims (now `enforce` per v0.7.0 secure default), (3) "open"
+  admin-plane endpoints (now require `X-Agent-Id` matching the
+  `admin_agent_ids` allowlist on 25+ routes). Sweep + verification covered
+  by the CHANGELOG entries above; the explicit-recommendation drift was
+  largely already corrected by the time the sweep ran (README, governance.md,
+  ADMIN_GUIDE.md, MIGRATION_v0.7.md, decision-maker.html all carry the
+  correct v0.7.0 statements).
+
 ### v0.7.0 6-agent release-review tag-blockers (TB1 + TB2)
 
 After PR #820 merged the 259-commit ship-hardening bundle into

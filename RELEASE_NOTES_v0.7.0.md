@@ -24,6 +24,37 @@ The **v0.6.4 → v0.7.0 migration guide** lives at:
 
   → [`docs/MIGRATION_v0.7.md`](docs/MIGRATION_v0.7.md)
 
+The **post-merge follow-up bundle** — TB1 (#977 CRITICAL reserved-name
+authz bypass), TB2 (#978 HIGH federation sync_since legacy-row visibility),
+the test-fixture drift sweep (#997/#998/#1000), the clippy-pedantic
+regression (#981), the RuleEngineCache revert (#990 → redesign #991), the
+orphan-commit audit-trail reconciliation (#992-#996), and the `#972` MCP
+tool-registry split into 8 sub-issues (#982-#989) — lives in
+[`CHANGELOG.md`](CHANGELOG.md) under the `[Unreleased]` section
+("v0.7.0 ship-readiness session 2026-05-21" subsection). The bundle is
+on the `fix/v070-tag-blockers-from-6agent-review` branch, queued for fold
+into `release/v0.7.0` ahead of the tag cut.
+
+**Three operator-visible posture changes from the post-merge bundle:**
+
+1. **`AI_MEMORY_ADMIN_AGENT_IDS=*` no longer works.** Per #980 the
+   wildcard is rejected at startup by `validate_agent_id` and dropped
+   with a WARN. Operators must enumerate admin identities explicitly:
+   `AI_MEMORY_ADMIN_AGENT_IDS=ai:ops@acme,ai:platform-admin@acme`.
+2. **`permissions.mode` default flipped to `enforce`** (was `advisory`
+   in v0.6.4 — already documented in MIGRATION_v0.7.md §F8). Rules now
+   actually refuse non-compliant writes by default.
+3. **25+ HTTP routes are now admin-gated.** Cross-tenant enumeration
+   endpoints (`/api/v1/stats`, `/api/v1/agents`, `/api/v1/archive*`,
+   `/api/v1/pending`, `/api/v1/namespaces`, `/api/v1/taxonomy`,
+   `/api/v1/quota/status` list path, `/api/v1/export`, `/api/v1/import`,
+   `/api/v1/forget` no-id, `/api/v1/inbox`, 7× `/api/v1/skills/*`, etc.)
+   require `X-Agent-Id` matching the configured admin allowlist; non-admin
+   callers see `403 admin role required`. Data-plane routes
+   (`POST /api/v1/memories`, `GET /api/v1/memories/{id}`,
+   `POST /api/v1/recall`) stay open with the scope=private visibility
+   filter handling cross-tenant isolation.
+
 ---
 
 ## Headline highlights
