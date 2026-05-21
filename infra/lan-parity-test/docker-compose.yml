@@ -40,10 +40,17 @@ name: ai-memory-lan-parity
 
 services:
   pg-age:
-    # Apache AGE on PostgreSQL 16 — matches the production pop-os PG
-    # major version. AGE 1.6.0 is the most recent pinned release tag
-    # for PG16 as of 2025-09-18.
-    image: apache/age:release_PG16_1.6.0
+    # Apache AGE on PostgreSQL 16 + pgvector — matches the production
+    # pop-os PG major version. AGE 1.6.0 is the most recent pinned
+    # release tag for PG16 as of 2025-09-18. pgvector is layered on
+    # top via Dockerfile.pg-age-vector because the bare apache/age
+    # image ships AGE but NOT pgvector, and the SAL postgres adapter
+    # (feature `sal-postgres` → `dep:pgvector`) requires the
+    # server-side `vector` type for embedding columns (#1065).
+    build:
+      context: .
+      dockerfile: Dockerfile.pg-age-vector
+    image: ai-memory-pg-age-vector:latest
     container_name: ai-memory-lan-parity-pg-age
     hostname: pg-age
     restart: unless-stopped

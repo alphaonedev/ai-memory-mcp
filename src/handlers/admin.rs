@@ -33,6 +33,7 @@ use super::AppState;
 use super::MAX_BULK_SIZE;
 #[cfg(feature = "sal")]
 use super::StorageBackend;
+use super::admin_role::require_admin;
 #[cfg(feature = "sal")]
 use super::store_err_to_response;
 
@@ -490,14 +491,25 @@ pub async fn get_stats(
 }
 
 pub async fn run_gc(State(app): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    // #1027 (security-critical, 2026-05-21) — admin-role gate. GC
+    // permanently sweeps expired rows; pre-#1027 the handler logged
+    // the caller to the forensic chain but accepted ANY API-key
+    // holder (no admin allowlist membership required). An attacker
+    // with the shared API key could force-purge mid-tier-expired
+    // rows across tenants in advance of any restore window. The
+    // require_admin gate now matches the shape of export_memories
+    // (#957) / forget_memories (#956): non-admin callers get a 403
+    // FORBIDDEN before any state change.
+    let caller = match require_admin(&app, &headers, "run_gc") {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+
     // #913 (security-medium / SOC2, 2026-05-19) — admin/destructive
     // state-change audit. GC permanently sweeps expired rows; the
     // forensic-chain entry MUST land before the storage write so the
     // audit trail captures the operator who triggered the sweep even
     // when the downstream collector errors.
-    let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
-    let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
-        .unwrap_or_else(|_| "anonymous:invalid".to_string());
     crate::governance::audit::record_decision(&caller, "allow", "run_gc", "", json!({}));
 
     // v0.7.0 Wave-3 Continuation 3 (Phase 17) — postgres-backed daemons

@@ -1253,6 +1253,20 @@ fn dispatch_memory_notify(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
     handle_notify(ctx.conn, ctx.arguments, ctx.resolved_ttl, ctx.mcp_client)
 }
 
+/// #1050 (2026-05-21) — `memory_share` was registered in
+/// [`crate::mcp::registry::registered_tools`] post-#311 (issue #224
+/// pulled the v0.8 Phase-3 Memory-Sharing-and-Sync RFC forward into
+/// v0.7.0) but the dispatch wrapper + `register_mcp_tool!` arm were
+/// never added. `tools/list` advertised the tool, `memory_capabilities`
+/// v3 reported `callable_now: true` under any profile containing
+/// `Family::Power`, but `tools/call memory_share` returned
+/// `-32601 unknown tool: memory_share`. The handler at
+/// `crate::mcp::share::handle_share` was complete; only the wire
+/// dispatch was missing.
+fn dispatch_memory_share(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    crate::mcp::share::handle_share(ctx.conn, ctx.arguments)
+}
+
 fn dispatch_memory_inbox(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
     handle_inbox(ctx.conn, ctx.arguments, ctx.mcp_client)
 }
@@ -1464,6 +1478,7 @@ pub(crate) static TOOL_DISPATCH_TABLE: &[(&str, DispatchFn)] = &[
     register_mcp_tool!("memory_agent_register", dispatch_memory_agent_register),
     register_mcp_tool!("memory_agent_list", dispatch_memory_agent_list),
     register_mcp_tool!("memory_notify", dispatch_memory_notify),
+    register_mcp_tool!("memory_share", dispatch_memory_share),
     register_mcp_tool!("memory_inbox", dispatch_memory_inbox),
     register_mcp_tool!("memory_subscribe", dispatch_memory_subscribe),
     register_mcp_tool!("memory_unsubscribe", dispatch_memory_unsubscribe),
@@ -12417,5 +12432,43 @@ mod tests {
         let payload = i4_decode_response_payload(&resp);
         assert_eq!(payload["dry_run"], true);
         assert!(payload["collected"].as_u64().unwrap() >= 1);
+    }
+
+    /// #1050 regression — every tool registered in `registered_tools()`
+    /// must have a dispatch arm in `TOOL_DISPATCH_TABLE`. The reverse
+    /// is also true: every dispatch arm must correspond to a registered
+    /// tool (catches dead/orphaned dispatch wrappers).
+    ///
+    /// Pre-#1050 `memory_share` was registered (added in #311 / #224)
+    /// but missing from the dispatch table. `tools/call memory_share`
+    /// returned `-32601 unknown tool` while `tools/list` and
+    /// `memory_capabilities` advertised the tool as callable — a
+    /// silent wire contract break that this test pins.
+    #[test]
+    fn every_registered_tool_has_dispatch_arm_1050() {
+        for tool in crate::mcp::registry::registered_tools() {
+            let name = tool.name;
+            assert!(
+                super::lookup_dispatch(name).is_some(),
+                "tool '{name}' is registered in registered_tools() but has no \
+                 dispatch arm in TOOL_DISPATCH_TABLE — clients calling \
+                 tools/call '{name}' will get -32601 unknown tool (#1050)"
+            );
+        }
+    }
+
+    #[test]
+    fn every_dispatch_arm_has_registered_tool_1050() {
+        let registered: std::collections::HashSet<&str> = crate::mcp::registry::registered_tools()
+            .iter()
+            .map(|t| t.name)
+            .collect();
+        for (name, _f) in super::TOOL_DISPATCH_TABLE {
+            assert!(
+                registered.contains(*name),
+                "dispatch arm '{name}' exists in TOOL_DISPATCH_TABLE but is not \
+                 registered in registered_tools() — orphan dispatch wrapper (#1050)"
+            );
+        }
     }
 }
