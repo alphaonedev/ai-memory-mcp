@@ -350,7 +350,7 @@ table tr:last-child td{border-bottom:none}
     <p>The big T4-relevant capability that's already wired:</p>
     <ul>
       <li><code>src/main.rs:405-411</code> — <code>--quorum-writes N</code> enables W-of-N replication; <code>--quorum-peers a,b,c</code> lists targets.</li>
-      <li><code>src/handlers.rs:442-454</code> — write path calls <code>broadcast_store_quorum</code> then <code>finalise_quorum</code>. Local commit + (W-1) peer acks within <code>--quorum-timeout-ms</code> (default 2000) → <code>200 OK</code> with the achieved ack count returned in the response. Falling short → <code>503 quorum_not_met</code>.</li>
+      <li><code>src/handlers/mod.rs</code> — write path calls <code>broadcast_store_quorum</code> then <code>finalise_quorum</code>. Local commit + (W-1) peer acks within <code>--quorum-timeout-ms</code> (default 2000) → <code>200 OK</code> with the achieved ack count returned in the response. Falling short → <code>503 quorum_not_met</code>.</li>
       <li>Same wiring on <code>link</code>, <code>consolidate</code>, <code>pending_decision</code>, <code>namespace_meta</code>, and the <code>clear_namespace_meta</code> path.</li>
       <li>mTLS for the outbound side via <code>--quorum-client-cert</code> / <code>--quorum-client-key</code> / <code>--quorum-ca-cert</code>.</li>
     </ul>
@@ -462,7 +462,7 @@ ai-memory --db /var/lib/ai-memory/store.db serve \
       <li><code>src/main.rs:405-447</code> — quorum-write CLI surface</li>
       <li><code>src/main.rs:230</code> — <code>--store-url postgres://...</code> URL syntax</li>
       <li><code>src/main.rs:380-393</code> — TLS / mTLS allowlist enforcement</li>
-      <li><code>src/handlers.rs:442-454, 524-540</code> — <code>broadcast_store_quorum</code> + ack counting</li>
+      <li><code>src/src/handlers/:442-454, 524-540</code> — <code>broadcast_store_quorum</code> + ack counting</li>
       <li><code>src/replication.rs</code> (422 lines) — <code>QuorumWriter</code> + <code>AckTracker</code> (functional)</li>
       <li><code>Cargo.toml</code> — <code>sal-postgres</code> feature, sqlx + pgvector deps</li>
       <li><code>CHANGELOG.md</code> — v0.6.0 pre-tag SAL fixes (#294-#297), v0.6.2 fanout bugs (#325-#327)</li>

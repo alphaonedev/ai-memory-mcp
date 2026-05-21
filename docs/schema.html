@@ -504,7 +504,7 @@ footer a{color:var(--text-muted)}
   <div class="container">
     <span class="eyebrow">Migrations</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">Schema is versioned. Migrations are idempotent.</h2>
-    <p class="lede">Every schema change is a forward migration applied at daemon startup. Idempotent so re-runs are safe. v15 was the v0.6.3 Stream B addition (KG temporal-validity columns + entity_aliases). v0.6.3.1 added the v17/v18/v19 ladder: v17 adds governance.inherit backfill (`migrations/sqlite/0012_governance_inherit.sql`), v18 adds embedding_dim guard + archive lossless (`0011_v0631_data_integrity.sql`), v19 adds webhook event_types column + index (`0013_webhook_event_types.sql`). Older versions (≤ v14) remain inline in <code>db.rs::migrate</code>.</p>
+    <p class="lede">Every schema change is a forward migration applied at daemon startup. Idempotent so re-runs are safe. v15 was the v0.6.3 Stream B addition (KG temporal-validity columns + entity_aliases). v0.6.3.1 added the v17/v18/v19 ladder: v17 adds governance.inherit backfill (`migrations/sqlite/0012_governance_inherit.sql`), v18 adds embedding_dim guard + archive lossless (`0011_v0631_data_integrity.sql`), v19 adds webhook event_types column + index (`0013_webhook_event_types.sql`). Older versions (≤ v14) remain inline in <code>src/storage/mod.rs::migrate</code>.</p>
 
     <div class="tbl t-meta">
       <div class="tbl-head">

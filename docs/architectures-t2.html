@@ -364,7 +364,7 @@ table tr:last-child td{border-bottom:none}
 
     <h3>Namespace isolation</h3>
     <p>Every agent has a namespace position — typically <code>agents/&lt;role&gt;</code> or <code>org/team/role</code>. Memories are written with that namespace, and the indexed <code>scope_idx</code> generated column captures the agent's visibility scope (<code>private</code> / <code>team</code> / <code>unit</code> / <code>org</code> / <code>collective</code>).</p>
-    <p>When agent <code>agents/planner</code> calls <code>memory_recall</code> and passes <code>as_agent=agents/planner</code>, <code>compute_visibility_prefixes()</code> (<code>src/db.rs:26-38</code>) walks the namespace ancestors and returns <code>[agents/planner, agents/, '']</code>. The recall SQL then <code>WHERE</code>s on <code>scope_idx IN (...)</code> — the planner sees its own private memories plus anything scoped <code>team</code> or <code>collective</code> that an ancestor namespace publishes.</p>
+    <p>When agent <code>agents/planner</code> calls <code>memory_recall</code> and passes <code>as_agent=agents/planner</code>, <code>compute_visibility_prefixes()</code> (<code>src/storage/mod.rs</code>) walks the namespace ancestors and returns <code>[agents/planner, agents/, '']</code>. The recall SQL then <code>WHERE</code>s on <code>scope_idx IN (...)</code> — the planner sees its own private memories plus anything scoped <code>team</code> or <code>collective</code> that an ancestor namespace publishes.</p>
     <p>This is the same machinery T1 has — but at T2 it's actually doing work.</p>
 
     <h3>Per-namespace governance</h3>
@@ -431,7 +431,7 @@ ai-memory namespace set-standard agents/secops \
     <span class="eyebrow">Wiring</span>
     <h2>Governance, skills, and attestations at T2.</h2>
     <ul>
-      <li><strong>Governance</strong> — Live and enforced. <code>GovernancePolicy</code> (<code>src/models.rs:405-409</code>) per namespace, hierarchical with parent inheritance, supports <code>any</code> / <code>registered</code> / <code>owner</code> / <code>approve</code> for each of <code>write</code> / <code>promote</code> / <code>delete</code>. Namespace metadata lives in <code>namespace_meta</code> and is the source of truth for the gate.</li>
+      <li><strong>Governance</strong> — Live and enforced. <code>GovernancePolicy</code> (<code>src/models/mod.rs</code>) per namespace, hierarchical with parent inheritance, supports <code>any</code> / <code>registered</code> / <code>owner</code> / <code>approve</code> for each of <code>write</code> / <code>promote</code> / <code>delete</code>. Namespace metadata lives in <code>namespace_meta</code> and is the source of truth for the gate.</li>
       <li><strong>Skills</strong> — Skills register themselves as agents (<code>mcp__memory__memory_agent_register</code>). Auto-tagging, contradiction detection, query expansion, and consolidation all run through the same scope visibility — a skill at <code>skills/auto-tag</code> with <code>team</code> scope only sees memories its team published. Skills can be subject to the same governance policies as humans-in-the-loop.</li>
       <li><strong>Attestations</strong> — Field-level reservation only. <code>memory_links.signature</code> (schema v15) is populated with claimed identity at v0.6.3; v0.7 will sign with the agent's keypair and verify on read.</li>
     </ul>
@@ -463,12 +463,12 @@ ai-memory namespace set-standard agents/secops \
     <span class="eyebrow">Source</span>
     <h2>Source-of-truth references.</h2>
     <ul>
-      <li><code>src/db.rs:26-38</code> — <code>compute_visibility_prefixes()</code> (scope visibility)</li>
-      <li><code>src/db.rs:91-104</code> — <code>visibility_clause()</code> (SQL filter)</li>
-      <li><code>src/db.rs:309-330</code> — <code>namespace_meta</code> table for per-namespace policy</li>
-      <li><code>src/models.rs:351-365</code> — <code>PendingAction</code> struct</li>
-      <li><code>src/models.rs:405-409</code> — <code>GovernancePolicy</code></li>
-      <li><code>src/mcp.rs:119</code> — <code>as_agent</code> parameter on recall</li>
+      <li><code>src/storage/mod.rs</code> — <code>compute_visibility_prefixes()</code> (scope visibility)</li>
+      <li><code>src/storage/mod.rs</code> — <code>visibility_clause()</code> (SQL filter)</li>
+      <li><code>src/storage/mod.rs</code> — <code>namespace_meta</code> table for per-namespace policy</li>
+      <li><code>src/models/mod.rs</code> — <code>PendingAction</code> struct</li>
+      <li><code>src/models/mod.rs</code> — <code>GovernancePolicy</code></li>
+      <li><code>src/mcp/mod.rs</code> — <code>as_agent</code> parameter on recall</li>
       <li><code>docs/AI_DEVELOPER_GOVERNANCE.md</code> — governance contract</li>
       <li><code>docs/CHANGELOG.md</code> — v0.6.2 (governance GA), v0.6.3 (taxonomy + capabilities v2)</li>
     </ul>
