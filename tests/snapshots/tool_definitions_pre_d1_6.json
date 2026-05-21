@@ -1,0 +1,2234 @@
+{
+  "tools": [
+    {
+      "description": "Store a memory; deduplicates by title+namespace.",
+      "docs": "Store a memory. Dedupes by (title, namespace). Tier defaults to mid (7d TTL); long is permanent. on_conflict: error|merge|version. scope: Task 1.5 visibility. force (#519): bypass proactive contradiction detection on near-duplicate writes.",
+      "inputSchema": {
+        "properties": {
+          "agent_id": {
+            "description": "NHI agent_id; synthesized if omitted.",
+            "type": "string"
+          },
+          "confidence": {
+            "default": 1.0,
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "type": "number"
+          },
+          "content": {
+            "description": "Memory content",
+            "type": "string"
+          },
+          "force": {
+            "default": false,
+            "description": "#519 bypass proactive contradiction detection.",
+            "type": "boolean"
+          },
+          "kind": {
+            "description": "Form 6 (#759) memory-kind. Default observation.",
+            "enum": [
+              "observation",
+              "reflection",
+              "persona",
+              "concept",
+              "entity",
+              "claim",
+              "relation",
+              "event",
+              "conversation",
+              "decision"
+            ],
+            "type": "string"
+          },
+          "metadata": {
+            "default": {},
+            "description": "JSON metadata",
+            "type": "object"
+          },
+          "namespace": {
+            "description": "Namespace",
+            "type": "string"
+          },
+          "on_conflict": {
+            "description": "P2/G6 (title,ns) collision: error=v2 default; merge=v1; version='(N)'.",
+            "enum": [
+              "error",
+              "merge",
+              "version"
+            ],
+            "type": "string"
+          },
+          "priority": {
+            "default": 5,
+            "maximum": 10,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "scope": {
+            "description": "Task 1.5 visibility. Default private.",
+            "enum": [
+              "private",
+              "team",
+              "unit",
+              "org",
+              "collective"
+            ],
+            "type": "string"
+          },
+          "source": {
+            "default": "claude",
+            "enum": [
+              "user",
+              "claude",
+              "hook",
+              "api",
+              "cli",
+              "import",
+              "consolidation",
+              "system",
+              "chaos"
+            ],
+            "type": "string"
+          },
+          "source_uri": {
+            "description": "#885 Source URI (doc:/uri:/file:); indexed for #889.",
+            "type": "string"
+          },
+          "tags": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "tier": {
+            "default": "mid",
+            "enum": [
+              "short",
+              "mid",
+              "long"
+            ],
+            "type": "string"
+          },
+          "title": {
+            "description": "Short title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "title",
+          "content"
+        ],
+        "type": "object"
+      },
+      "name": "memory_store"
+    },
+    {
+      "description": "Recall memories relevant to a context (ranked).",
+      "docs": "Fuzzy OR recall ranked by relevance + priority + access + tier. Optional: budget_tokens (cl100k cap), context_tokens (query-embed bias), session_id (+0.05 recency boost per #518), session_default (splice [agents.defaults.recall_scope]), include_archived, kinds filter. Default format toon_compact (~79% smaller).",
+      "inputSchema": {
+        "properties": {
+          "as_agent": {
+            "description": "#151 scope-visibility agent.",
+            "type": "string"
+          },
+          "budget_tokens": {
+            "description": "P6/R1 cl100k content cap. 0=empty; top kept (meta.budget_overflow=true).",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "confidence_tier": {
+            "description": "Gap 4 (#887) tier filter.",
+            "enum": [
+              "confirmed",
+              "likely",
+              "ambiguous"
+            ],
+            "type": "string"
+          },
+          "context": {
+            "description": "What to recall",
+            "type": "string"
+          },
+          "context_tokens": {
+            "description": "Recent conversation tokens; biases query embedding 70/30 (v0.6.0.0).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "format": {
+            "default": "toon_compact",
+            "description": "Response format. toon_compact saves 79% vs json.",
+            "enum": [
+              "json",
+              "toon",
+              "toon_compact"
+            ],
+            "type": "string"
+          },
+          "has_citations": {
+            "default": false,
+            "description": "Form 4 (#757): require non-empty citations array.",
+            "type": "boolean"
+          },
+          "include_archived": {
+            "default": false,
+            "description": "WT-1-E: include atomised sources alongside atoms.",
+            "type": "boolean"
+          },
+          "kinds": {
+            "description": "Form 6 (#759) kind filter. Array/CSV. OR within; AND across.",
+            "oneOf": [
+              {
+                "items": {
+                  "enum": [
+                    "observation",
+                    "reflection",
+                    "persona",
+                    "concept",
+                    "entity",
+                    "claim",
+                    "relation",
+                    "event",
+                    "conversation",
+                    "decision"
+                  ],
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "string"
+              }
+            ]
+          },
+          "limit": {
+            "default": 10,
+            "maximum": 50,
+            "type": "integer"
+          },
+          "namespace": {
+            "description": "Namespace filter",
+            "type": "string"
+          },
+          "session_default": {
+            "default": false,
+            "description": "Splice [agents.defaults.recall_scope]. explicit > scope > defaults.",
+            "type": "boolean"
+          },
+          "session_id": {
+            "description": "#518 session id; +0.05 rerank boost for in-session ring (cap 50).",
+            "type": "string"
+          },
+          "since": {
+            "description": "RFC3339 lower bound on created_at",
+            "type": "string"
+          },
+          "source_uri_prefix": {
+            "description": "Form 4 (#757): restrict by source_uri prefix (e.g. 'doc:', 'uri:https://').",
+            "type": "string"
+          },
+          "tags": {
+            "description": "Tag filter",
+            "type": "string"
+          },
+          "until": {
+            "description": "RFC3339 upper bound on created_at",
+            "type": "string"
+          },
+          "verbose_provenance": {
+            "default": true,
+            "description": "Gap 7 (#890): per-row provenance decoration.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "context"
+        ],
+        "type": "object"
+      },
+      "name": "memory_recall"
+    },
+    {
+      "description": "List recall_observations (#886).",
+      "docs": "Gap 3 (#886): recall-consumption ledger filter.",
+      "inputSchema": {
+        "properties": {
+          "consumed": {
+            "type": "boolean"
+          },
+          "limit": {
+            "default": 200,
+            "maximum": 1000,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "recall_id": {
+            "type": "string"
+          },
+          "since": {
+            "type": "string"
+          },
+          "until": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "memory_recall_observations"
+    },
+    {
+      "description": "Search memories by exact keyword match (AND semantics).",
+      "docs": "Exact keyword AND search. Deterministic; no fuzzy/semantic. Filters: namespace, tier, agent_id, as_agent (Task 1.5 scope). WT-1-E: atomised sources hidden by default.",
+      "inputSchema": {
+        "properties": {
+          "agent_id": {
+            "description": "Exact metadata.agent_id filter.",
+            "type": "string"
+          },
+          "as_agent": {
+            "description": "#151 scope-visibility agent.",
+            "type": "string"
+          },
+          "format": {
+            "default": "toon_compact",
+            "description": "Response format. toon_compact saves 79%.",
+            "enum": [
+              "json",
+              "toon",
+              "toon_compact"
+            ],
+            "type": "string"
+          },
+          "include_archived": {
+            "default": false,
+            "description": "WT-1-E: include atomised sources.",
+            "type": "boolean"
+          },
+          "limit": {
+            "default": 20,
+            "maximum": 200,
+            "type": "integer"
+          },
+          "namespace": {
+            "type": "string"
+          },
+          "query": {
+            "type": "string"
+          },
+          "tier": {
+            "enum": [
+              "short",
+              "mid",
+              "long"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "name": "memory_search"
+    },
+    {
+      "description": "List memories, optionally filtered by namespace or tier.",
+      "docs": "Browse memories. Filters: namespace, tier, agent_id. Limit caps at 200.",
+      "inputSchema": {
+        "properties": {
+          "agent_id": {
+            "description": "Exact metadata.agent_id filter.",
+            "type": "string"
+          },
+          "format": {
+            "default": "toon_compact",
+            "description": "Response format.",
+            "enum": [
+              "json",
+              "toon",
+              "toon_compact"
+            ],
+            "type": "string"
+          },
+          "limit": {
+            "default": 20,
+            "maximum": 200,
+            "type": "integer"
+          },
+          "namespace": {
+            "type": "string"
+          },
+          "tier": {
+            "enum": [
+              "short",
+              "mid",
+              "long"
+            ],
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "memory_list"
+    },
+    {
+      "description": "Load top-k recent + high-priority memories from a Family.",
+      "docs": "B1: top-k by metadata.family. Always-on; alternative to memory_recall when family is known. Issue #864 — `family` here is the MCP tool family (8 groups: core/lifecycle/graph/governance/power/meta/archive/other), NOT the memory_kind taxonomy (Observation/Reflection/Plan/Decision/etc).",
+      "inputSchema": {
+        "properties": {
+          "family": {
+            "description": "MCP tool family (8 groups) — NOT the memory_kind taxonomy. See #864.",
+            "enum": [
+              "core",
+              "lifecycle",
+              "graph",
+              "governance",
+              "power",
+              "meta",
+              "archive",
+              "other"
+            ],
+            "type": "string"
+          },
+          "k": {
+            "default": 20,
+            "description": "Top-k cap 100.",
+            "maximum": 100,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "namespace": {
+            "description": "Namespace filter. Default all.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "family"
+        ],
+        "type": "object"
+      },
+      "name": "memory_load_family"
+    },
+    {
+      "description": "Intent-routed loader: free-text intent picks the best Family.",
+      "docs": "B2: pick best Family from free-text intent, then forward to memory_load_family. Issue #864 — `Family` here is the MCP tool family (8 groups: core/lifecycle/graph/governance/power/meta/archive/other), NOT the memory_kind taxonomy (Observation/Reflection/Plan/Decision/etc).",
+      "inputSchema": {
+        "properties": {
+          "intent": {
+            "description": "Free-text goal.",
+            "type": "string"
+          },
+          "k": {
+            "default": 20,
+            "description": "Top-k cap 100.",
+            "maximum": 100,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "namespace": {
+            "description": "Namespace filter. Default all.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "intent"
+        ],
+        "type": "object"
+      },
+      "name": "memory_smart_load"
+    },
+    {
+      "description": "Return a hierarchical tree of namespaces with memory counts.",
+      "docs": "Pillar 1 / Stream A: namespace tree (live rows only). Each node has count + subtree_count. Response includes total_count and truncated flag.",
+      "inputSchema": {
+        "properties": {
+          "depth": {
+            "default": 8,
+            "description": "Max descent. Deeper rows roll up into boundary subtree_count.",
+            "maximum": 8,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "limit": {
+            "default": 1000,
+            "description": "Row cap. Densest namespaces win on truncation.",
+            "maximum": 10000,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "namespace_prefix": {
+            "description": "Restrict to this namespace + descendants. Trailing '/' tolerated.",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "memory_get_taxonomy"
+    },
+    {
+      "description": "Pre-write near-duplicate check via cosine over stored embeddings.",
+      "docs": "Pillar 2 / Stream D: pre-write near-dup check. Embeds title+content, returns highest-cosine match + is_duplicate + suggested_merge. Threshold floor 0.5. Requires semantic tier+.",
+      "inputSchema": {
+        "properties": {
+          "content": {
+            "description": "Candidate content.",
+            "type": "string"
+          },
+          "namespace": {
+            "description": "Namespace filter.",
+            "type": "string"
+          },
+          "threshold": {
+            "default": 0.85,
+            "description": "Cosine threshold; floor 0.5. Default 0.85 tuned for MiniLM-L6-v2.",
+            "maximum": 1.0,
+            "minimum": 0.5,
+            "type": "number"
+          },
+          "title": {
+            "description": "Candidate title.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "title",
+          "content"
+        ],
+        "type": "object"
+      },
+      "name": "memory_check_duplicate"
+    },
+    {
+      "description": "Register an entity (canonical name + aliases) under a namespace.",
+      "docs": "Pillar 2 / Stream B: register entity as long-tier memory (metadata.kind='entity'). Idempotent on (canonical_name, namespace); merges new aliases. Errors if name collides with a non-entity row.",
+      "inputSchema": {
+        "properties": {
+          "agent_id": {
+            "description": "Override metadata.agent_id.",
+            "type": "string"
+          },
+          "aliases": {
+            "description": "Aliases; blanks skipped, deduped.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "canonical_name": {
+            "description": "Display name (entity memory title).",
+            "type": "string"
+          },
+          "metadata": {
+            "description": "Metadata; 'kind' is forced to 'entity'.",
+            "type": "object"
+          },
+          "namespace": {
+            "description": "Entity namespace.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "canonical_name",
+          "namespace"
+        ],
+        "type": "object"
+      },
+      "name": "memory_entity_register"
+    },
+    {
+      "description": "Resolve an alias to its registered entity.",
+      "docs": "Pillar 2 / Stream B: resolve alias to entity. Without namespace, most-recently-created wins. Null when no match.",
+      "inputSchema": {
+        "properties": {
+          "alias": {
+            "description": "Alias; whitespace trimmed.",
+            "type": "string"
+          },
+          "namespace": {
+            "description": "Namespace filter.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "alias"
+        ],
+        "type": "object"
+      },
+      "name": "memory_entity_get_by_alias"
+    },
+    {
+      "description": "Ordered fact timeline for an entity (outbound KG links by valid_from).",
+      "docs": "Pillar 2 / Stream C: outbound links from source_id ordered valid_from ASC. Includes valid_from/valid_until/observed_by + target title/namespace. NULL valid_from rows excluded. Cross-namespace.",
+      "inputSchema": {
+        "properties": {
+          "limit": {
+            "default": 200,
+            "description": "Cap [1,1000].",
+            "maximum": 1000,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "since": {
+            "description": "RFC3339 inclusive lower bound on valid_from.",
+            "type": "string"
+          },
+          "source_id": {
+            "description": "Source memory ID (typically an entity_id).",
+            "type": "string"
+          },
+          "until": {
+            "description": "RFC3339 inclusive upper bound on valid_from.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_kg_timeline"
+    },
+    {
+      "description": "Mark a KG link as superseded by setting its valid_until column.",
+      "docs": "Pillar 2 / Stream C: set valid_until on (source_id, target_id, relation). valid_until defaults to now. Idempotent; response carries previous_valid_until. found:false when no match.",
+      "inputSchema": {
+        "properties": {
+          "relation": {
+            "description": "Relation label.",
+            "type": "string"
+          },
+          "source_id": {
+            "description": "Source memory ID.",
+            "type": "string"
+          },
+          "target_id": {
+            "description": "Target memory ID.",
+            "type": "string"
+          },
+          "valid_until": {
+            "description": "RFC3339 supersession instant. Default now.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_id",
+          "target_id",
+          "relation"
+        ],
+        "type": "object"
+      },
+      "name": "memory_kg_invalidate"
+    },
+    {
+      "description": "Outbound KG traversal from a source memory (<=5 hops).",
+      "docs": "Pillar 2 / Stream C: BFS/CTE traversal with cycle detection. Each row carries valid_from/valid_until/observed_by + target title/namespace. Filters chain across every hop. max_depth ceiling 5.",
+      "inputSchema": {
+        "properties": {
+          "allowed_agents": {
+            "description": "Observed-by allowlist. Empty array = zero rows.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "by_source_uri": {
+            "description": "#889 traverse by source_uri.",
+            "type": "string"
+          },
+          "include_invalidated": {
+            "default": false,
+            "description": "When true, traverse historically-invalidated edges.",
+            "type": "boolean"
+          },
+          "limit": {
+            "default": 200,
+            "description": "Cap across all depths [1,1000].",
+            "maximum": 1000,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "max_depth": {
+            "default": 1,
+            "description": "Hops, 1..=5.",
+            "maximum": 5,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "namespace": {
+            "description": "Restrict to namespace.",
+            "type": "string"
+          },
+          "source_id": {
+            "description": "Source memory ID.",
+            "type": "string"
+          },
+          "valid_at": {
+            "description": "RFC3339; keep links valid at instant. Omit to skip temporal filter.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_kg_query"
+    },
+    {
+      "description": "Enumerate up to N paths through the KG between two memories (BFS, max_depth<=7).",
+      "docs": "J7: undirected BFS over memory_links with cycle detection. Returns id chains source-first. max_depth<=7, max_results<=50.",
+      "inputSchema": {
+        "properties": {
+          "include_invalidated": {
+            "default": false,
+            "description": "When true, include historically-invalidated edges.",
+            "type": "boolean"
+          },
+          "max_depth": {
+            "default": 4,
+            "description": "Max hops, default 4, ceiling 7.",
+            "maximum": 7,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "max_results": {
+            "default": 10,
+            "description": "Max paths (shortest-first), default 10, ceiling 50.",
+            "maximum": 50,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "source_id": {
+            "description": "Path origin.",
+            "type": "string"
+          },
+          "target_id": {
+            "description": "Path destination.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_id",
+          "target_id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_find_paths"
+    },
+    {
+      "description": "Delete a memory by ID.",
+      "docs": "Hard-delete by id (removes row, embedding, FTS, links). Use memory_forget for bulk pattern delete (archives first).",
+      "inputSchema": {
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_delete"
+    },
+    {
+      "description": "Promote a memory to long (or chosen tier) / ancestor namespace.",
+      "docs": "Default: bump to long (clears expiry); short->long and mid->long are single-call. #831: target_tier ('mid'|'long') stops on intermediate. Task 1.7: to_namespace clones to an ancestor + derived_from link.",
+      "inputSchema": {
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "target_tier": {
+            "description": "#831: 'mid' keeps expires_at; 'long' clears it. Downgrades rejected.",
+            "enum": [
+              "mid",
+              "long"
+            ],
+            "type": "string"
+          },
+          "to_namespace": {
+            "description": "Task 1.7: clone target (must be a proper ancestor).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_promote"
+    },
+    {
+      "description": "Bulk delete memories matching a pattern, namespace, or tier (archives first).",
+      "docs": "Bulk delete by pattern/namespace/tier. Archives first (recover via memory_archive_restore). dry_run previews.",
+      "inputSchema": {
+        "properties": {
+          "dry_run": {
+            "default": false,
+            "description": "Preview without deleting.",
+            "type": "boolean"
+          },
+          "namespace": {
+            "type": "string"
+          },
+          "pattern": {
+            "type": "string"
+          },
+          "tier": {
+            "enum": [
+              "short",
+              "mid",
+              "long"
+            ],
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "memory_forget"
+    },
+    {
+      "description": "Get memory store statistics (counts, tier breakdown, sizes).",
+      "docs": "Totals, per-tier + namespace tallies, archive + DB size.",
+      "inputSchema": {
+        "properties": {},
+        "type": "object"
+      },
+      "name": "memory_stats"
+    },
+    {
+      "description": "Update an existing memory by ID (only provided fields change).",
+      "docs": "Partial update by id. Omitted fields preserved. Tier monotone-only. metadata.agent_id preserved.",
+      "inputSchema": {
+        "properties": {
+          "confidence": {
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "type": "number"
+          },
+          "content": {
+            "type": "string"
+          },
+          "edit_source": {
+            "default": "human",
+            "description": "#888 'human'=in-place; 'llm'/'hook'=archive+supersede.",
+            "enum": [
+              "human",
+              "llm",
+              "hook"
+            ],
+            "type": "string"
+          },
+          "expected_version": {
+            "description": "#884 If-Match; mismatch → 409 envelope.",
+            "type": "integer"
+          },
+          "expires_at": {
+            "description": "RFC3339 or null to clear.",
+            "type": "string"
+          },
+          "id": {
+            "description": "Memory ID.",
+            "type": "string"
+          },
+          "metadata": {
+            "description": "JSON metadata.",
+            "type": "object"
+          },
+          "namespace": {
+            "type": "string"
+          },
+          "priority": {
+            "maximum": 10,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "source_uri": {
+            "description": "#906 update source_uri.",
+            "type": "string"
+          },
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "tier": {
+            "enum": [
+              "short",
+              "mid",
+              "long"
+            ],
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_update"
+    },
+    {
+      "description": "Get a specific memory by ID, including its links.",
+      "docs": "Memory row + linked ids (in+out). Use memory_get_links for full link rows with attestation.",
+      "inputSchema": {
+        "properties": {
+          "id": {
+            "description": "Memory ID.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_get"
+    },
+    {
+      "description": "Create a typed link between two memories.",
+      "docs": "Directional link. Relations: related_to | supersedes | contradicts | derived_from | reflects_on (Task 3/8). H-track signs with active Ed25519 (verify via memory_verify).",
+      "inputSchema": {
+        "properties": {
+          "relation": {
+            "default": "related_to",
+            "enum": [
+              "related_to",
+              "supersedes",
+              "contradicts",
+              "derived_from",
+              "reflects_on"
+            ],
+            "type": "string"
+          },
+          "source_id": {
+            "description": "Source memory ID.",
+            "type": "string"
+          },
+          "target_id": {
+            "description": "Target memory ID.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_id",
+          "target_id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_link"
+    },
+    {
+      "description": "Get all links for a memory (both directions).",
+      "docs": "In + outbound links with relation, attest_level (unsigned/self_signed/peer_attested), valid_from/until/observed_by.",
+      "inputSchema": {
+        "properties": {
+          "id": {
+            "description": "Memory ID.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_get_links"
+    },
+    {
+      "description": "Re-verify a stored memory_links row's Ed25519 signature on demand.",
+      "docs": "H4: re-verify link signature. Returns {signature_verified, attest_level, signed_by, signed_at}. Pass link_id composite ('source--relation-->target') or explicit triple.",
+      "inputSchema": {
+        "properties": {
+          "link_id": {
+            "description": "Composite id 'source_id--relation-->target_id'.",
+            "type": "string"
+          },
+          "relation": {
+            "default": "related_to",
+            "description": "Default related_to.",
+            "enum": [
+              "related_to",
+              "supersedes",
+              "contradicts",
+              "derived_from",
+              "reflects_on"
+            ],
+            "type": "string"
+          },
+          "source_id": {
+            "description": "Required when link_id omitted.",
+            "type": "string"
+          },
+          "target_id": {
+            "description": "Required when link_id omitted.",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "memory_verify"
+    },
+    {
+      "description": "Reconstruct the conversation transcript chain that produced a memory.",
+      "docs": "I4: transcript chain (text + span metadata). verbose=false (default) truncates >100KB entries. L2-4 (#669): for reflections, walks reflects_on edges for transcript UNION; cap via depth (null=full, 0=self only).",
+      "inputSchema": {
+        "properties": {
+          "agent_id": {
+            "description": "#912 perm gate.",
+            "type": "string"
+          },
+          "depth": {
+            "default": null,
+            "description": "L2-4 reflects_on hops. null=full, 0=self, N=self+N.",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "memory_id": {
+            "description": "Memory ID.",
+            "type": "string"
+          },
+          "verbose": {
+            "default": false,
+            "description": "I4: when false, >100KB transcripts truncated=true.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "memory_id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_replay"
+    },
+    {
+      "description": "Persist a reflection memory plus reflects_on provenance links to each source.",
+      "docs": "Task 4/8 (#655): substrate-native recursive-learning primitive. reflection_depth = max(source_depths)+1; gated by namespace governance.max_reflection_depth (Task 2/8) — refusal returns REFLECTION_DEPTH_EXCEEDED. New memory + N reflects_on links land in one atomic txn.",
+      "inputSchema": {
+        "properties": {
+          "agent_id": {
+            "description": "Reflection writer NHI; default synthesized.",
+            "type": "string"
+          },
+          "confidence": {
+            "default": 1.0,
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "type": "number"
+          },
+          "content": {
+            "description": "Reflection content.",
+            "type": "string"
+          },
+          "metadata": {
+            "description": "Merged with system reflection_metadata; caller keys win.",
+            "type": "object"
+          },
+          "namespace": {
+            "description": "Target namespace. Defaults to first source's namespace.",
+            "type": "string"
+          },
+          "priority": {
+            "default": 5,
+            "maximum": 10,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "source_ids": {
+            "description": "Sources reflected on; one reflects_on link per id.",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "type": "array"
+          },
+          "tags": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "tier": {
+            "default": "mid",
+            "enum": [
+              "short",
+              "mid",
+              "long"
+            ],
+            "type": "string"
+          },
+          "title": {
+            "description": "Reflection title.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_ids",
+          "title",
+          "content"
+        ],
+        "type": "object"
+      },
+      "name": "memory_reflect"
+    },
+    {
+      "description": "Render a single reflection memory as markdown or JSON (no filesystem write).",
+      "docs": "QW-1: render reflection + reflects_on provenance as YAML-frontmatter md (default) or JSON envelope. Returns {content, suggested_filename}. No FS write — harness owns disk I/O.",
+      "inputSchema": {
+        "properties": {
+          "format": {
+            "default": "md",
+            "description": "md or json.",
+            "enum": [
+              "md",
+              "json"
+            ],
+            "type": "string"
+          },
+          "memory_id": {
+            "description": "Reflection-kind memory id.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "memory_id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_export_reflection"
+    },
+    {
+      "description": "Fetch the latest Persona artefact for an entity (read-only).",
+      "docs": "QW-2: latest MemoryKind::Persona for (entity_id, namespace). Returns envelope {id, entity_id, namespace, body_md, sources, generated_at, version, attest_level}. null when none. Pair with memory_persona_generate.",
+      "inputSchema": {
+        "properties": {
+          "entity_id": {
+            "description": "Persona subject.",
+            "type": "string"
+          },
+          "namespace": {
+            "description": "Default 'global'.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "entity_id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_persona"
+    },
+    {
+      "description": "Generate/regen a Persona artefact for an entity.",
+      "docs": "QW-2 / #848: synthesise MemoryKind::Persona from top-K Reflection memories. Omit namespace (or pass null) for cross-namespace aggregation (#848 — persona lands in 'global'); pass a namespace string for single-namespace scope. Response includes namespace_scope=single|cross_namespace.",
+      "inputSchema": {
+        "properties": {
+          "entity_id": {
+            "description": "Persona subject (1-128 chars).",
+            "type": "string"
+          },
+          "namespace": {
+            "description": "Omit/null → cross-namespace (#848); string → single-namespace.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "entity_id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_persona_generate"
+    },
+    {
+      "description": "Inspect the cross-peer provenance of a reflection memory.",
+      "docs": "L2-2 (S6-M1): {memory_id, peer_origin, signing_agent, original_depth, local_depth_at_arrival, is_reflection}. Non-reflections return envelope with is_reflection=false. Unknown ids => error.",
+      "inputSchema": {
+        "properties": {
+          "memory_id": {
+            "description": "Memory ID.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "memory_id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_reflection_origin"
+    },
+    {
+      "description": "List dependents flagged by the L2-3 invalidation walker.",
+      "docs": "L2-3 (#668): read-only list of memories with reflects_on->memory_id. Notification, NOT cascade — dependents are flagged for curator review. Returns {memory_id, count, dependents:[{id, namespace}]}. Unknown ids => empty.",
+      "inputSchema": {
+        "properties": {
+          "memory_id": {
+            "description": "Invalidated reflection id.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "memory_id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_dependents_of_invalidated"
+    },
+    {
+      "description": "Consolidate multiple memories into one long-term summary.",
+      "docs": "Merge 2-100 sources into one long-tier memory; deletes sources, adds derived_from links. LLM auto-generates summary if omitted (smart/autonomous tier).",
+      "inputSchema": {
+        "properties": {
+          "agent_id": {
+            "description": "#908 consolidator agent_id.",
+            "type": "string"
+          },
+          "ids": {
+            "description": "Source ids (2-100).",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 100,
+            "minItems": 2,
+            "type": "array"
+          },
+          "namespace": {
+            "default": "global",
+            "type": "string"
+          },
+          "summary": {
+            "description": "Optional summary; LLM auto-generates at smart/autonomous tier.",
+            "type": "string"
+          },
+          "title": {
+            "description": "Consolidated title.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "ids",
+          "title"
+        ],
+        "type": "object"
+      },
+      "name": "memory_consolidate"
+    },
+    {
+      "description": "Form 3 multi-step ingest: deterministic helpers + LLM stages.",
+      "docs": "Form 3 (#756): two_phase (FTS + Jaccard -> synthesise) or four_step (load_context -> classify -> enrich -> emit). Helpers run first; LLM stages receive helper output under explicit-trust banner + SHARED PREFIX for cache-key reuse. Response carries trace + cache-key set + final output. Smart+ tier only.",
+      "inputSchema": {
+        "properties": {
+          "content": {
+            "description": "Content to ingest.",
+            "type": "string"
+          },
+          "namespace": {
+            "description": "FTS classifier hint. Default 'global'.",
+            "type": "string"
+          },
+          "pipeline_override": {
+            "description": "Custom Pipeline descriptor.",
+            "type": "object"
+          },
+          "pipeline_variant": {
+            "default": "two_phase",
+            "description": "Named pipeline; ignored if pipeline_override set.",
+            "enum": [
+              "two_phase",
+              "four_step"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "content"
+        ],
+        "type": "object"
+      },
+      "name": "memory_ingest_multistep"
+    },
+    {
+      "description": "Decompose a memory into 2-10 atomic propositions; source archived. Smart+ tier.",
+      "docs": "WT-1-C: atomise via WT-1-B engine. Atoms = Observation memories with metadata.atom_source_id + derives_from link. Source archived (atomised_into=N). Returns {source_id, atom_ids, atom_count, archived_at}. Idempotent (use force_re_atomise to mint fresh). Too-small sources => {source_too_small:true}. Failures => CURATOR_FAILED / GOVERNANCE_REFUSED envelopes.",
+      "inputSchema": {
+        "properties": {
+          "force_re_atomise": {
+            "default": false,
+            "description": "Skip idempotency; mint fresh atoms (old retained).",
+            "type": "boolean"
+          },
+          "max_atom_tokens": {
+            "default": 200,
+            "description": "Per-atom cl100k budget.",
+            "maximum": 1000,
+            "minimum": 50,
+            "type": "integer"
+          },
+          "memory_id": {
+            "description": "Source memory UUID.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "memory_id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_atomise"
+    },
+    {
+      "description": "Share a memory with another agent (copy into _shared/<from>→<to>/).",
+      "docs": "#224/#311 MVP: point-to-point copy into `_shared/<from>→<to>/` with provenance.",
+      "inputSchema": {
+        "properties": {
+          "source_memory_id": {
+            "description": "Memory id (full UUID or unique prefix) to share.",
+            "type": "string"
+          },
+          "target_agent_id": {
+            "description": "Recipient agent id; must satisfy validate_agent_id.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_memory_id",
+          "target_agent_id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_share"
+    },
+    {
+      "description": "Scan confidence_shadow_observations and emit per-source baselines (Form 5).",
+      "docs": "Form 5 (#758): read-only calibration sweep over shadow-mode observations (AI_MEMORY_CONFIDENCE_SHADOW=1). Returns CalibrationReport {window_days, total_observations, baselines:[{namespace, source, count, median, mean, buckets}]}. Default window 30d. Family::Power — refuses on keyword tier.",
+      "inputSchema": {
+        "properties": {
+          "days": {
+            "default": 30,
+            "description": "Window days.",
+            "maximum": 3650,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "output_format": {
+            "default": "json",
+            "description": "json envelope or ASCII table.",
+            "enum": [
+              "json",
+              "table"
+            ],
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "memory_calibrate_confidence"
+    },
+    {
+      "description": "Discover runtime capabilities; family=<name> drills in.",
+      "docs": "Caps-v3: tier, profile, summary, callable_now, agent_permitted_families, harness detection. family+include_schema drills one family. verbose=true restores full schema. NOTE per #864: `family` here = MCP tool-family (8 groups: core/lifecycle/graph/governance/power/meta/archive/other), NOT memory_kind taxonomy.",
+      "inputSchema": {
+        "properties": {
+          "accept": {
+            "default": "v2",
+            "description": "Schema version. v2 default; v1 legacy.",
+            "enum": [
+              "v1",
+              "v2"
+            ],
+            "type": "string"
+          },
+          "family": {
+            "description": "Drill into one family.",
+            "enum": [
+              "core",
+              "lifecycle",
+              "graph",
+              "governance",
+              "power",
+              "meta",
+              "archive",
+              "other"
+            ],
+            "type": "string"
+          },
+          "include_schema": {
+            "default": false,
+            "description": "Return full tool schemas. Requires family.",
+            "type": "boolean"
+          },
+          "verbose": {
+            "default": false,
+            "description": "C2/C4: preserve docs + every optional inputSchema property.",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "name": "memory_capabilities"
+    },
+    {
+      "description": "LLM-expand a search query into related terms (smart/autonomous tier).",
+      "docs": "LLM query expansion. Smart/autonomous tier.",
+      "inputSchema": {
+        "properties": {
+          "query": {
+            "description": "Query to expand.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "name": "memory_expand_query"
+    },
+    {
+      "description": "LLM-generate tags for a memory (smart/autonomous tier).",
+      "docs": "LLM auto-tagging. Smart/autonomous tier.",
+      "inputSchema": {
+        "properties": {
+          "id": {
+            "description": "Memory ID.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_auto_tag"
+    },
+    {
+      "description": "LLM-check whether two memories contradict each other (smart/autonomous tier).",
+      "docs": "LLM contradiction check. Smart/autonomous tier.",
+      "inputSchema": {
+        "properties": {
+          "id_a": {
+            "description": "First memory ID.",
+            "type": "string"
+          },
+          "id_b": {
+            "description": "Second memory ID.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id_a",
+          "id_b"
+        ],
+        "type": "object"
+      },
+      "name": "memory_detect_contradiction"
+    },
+    {
+      "description": "List archived (expired) memories.",
+      "docs": "List archived memories. Filter by namespace; paginate via offset/limit.",
+      "inputSchema": {
+        "properties": {
+          "limit": {
+            "description": "Default 50, max 1000.",
+            "type": "integer"
+          },
+          "namespace": {
+            "description": "Namespace filter.",
+            "type": "string"
+          },
+          "offset": {
+            "description": "Pagination offset.",
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "memory_archive_list"
+    },
+    {
+      "description": "Restore an archived memory back to the active store.",
+      "docs": "Restore archived row; expires_at cleared.",
+      "inputSchema": {
+        "properties": {
+          "id": {
+            "description": "Archived memory id.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_archive_restore"
+    },
+    {
+      "description": "Permanently delete archived memories.",
+      "docs": "Purge archive. Scope via older_than_days. Unrecoverable.",
+      "inputSchema": {
+        "properties": {
+          "older_than_days": {
+            "description": "Only purge entries older than N days.",
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "memory_archive_purge"
+    },
+    {
+      "description": "Show archive statistics (total count and per-namespace breakdown).",
+      "docs": "Archive total + per-namespace counts.",
+      "inputSchema": {
+        "properties": {},
+        "type": "object"
+      },
+      "name": "memory_archive_stats"
+    },
+    {
+      "description": "Trigger garbage collection on expired memories (archives first).",
+      "docs": "GC expired memories. Archives first when archive_on_gc is on (default). dry_run previews.",
+      "inputSchema": {
+        "properties": {
+          "dry_run": {
+            "default": false,
+            "description": "Preview without deleting.",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "name": "memory_gc"
+    },
+    {
+      "description": "Auto-recall recent memories on session start.",
+      "docs": "Most-recently-accessed/updated. At smart/autonomous tier, includes LLM summary.",
+      "inputSchema": {
+        "properties": {
+          "format": {
+            "default": "toon_compact",
+            "enum": [
+              "json",
+              "toon",
+              "toon_compact"
+            ],
+            "type": "string"
+          },
+          "limit": {
+            "default": 10,
+            "maximum": 50,
+            "type": "integer"
+          },
+          "namespace": {
+            "description": "Namespace filter.",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "memory_session_start"
+    },
+    {
+      "description": "Set a memory as the standard/policy for a namespace.",
+      "docs": "Standard memory auto-prepended to recall + session_start. Rule layering: global '*' + parent chain + namespace. Task 1.8: governance policy merged into metadata. P4/G1: inherit flag.",
+      "inputSchema": {
+        "properties": {
+          "governance": {
+            "description": "Task 1.8 policy in metadata.governance.",
+            "properties": {
+              "approver": {
+                "description": "ApproverType: \"human\" | {\"agent\": \"<id>\"} | {\"consensus\": <n>}"
+              },
+              "delete": {
+                "enum": [
+                  "any",
+                  "registered",
+                  "owner",
+                  "approve"
+                ],
+                "type": "string"
+              },
+              "inherit": {
+                "default": true,
+                "description": "P4/G1: parent-chain inheritance. Default on.",
+                "type": "boolean"
+              },
+              "promote": {
+                "enum": [
+                  "any",
+                  "registered",
+                  "owner",
+                  "approve"
+                ],
+                "type": "string"
+              },
+              "write": {
+                "enum": [
+                  "any",
+                  "registered",
+                  "owner",
+                  "approve"
+                ],
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "id": {
+            "description": "Standard memory id.",
+            "type": "string"
+          },
+          "namespace": {
+            "description": "Namespace.",
+            "type": "string"
+          },
+          "parent": {
+            "description": "Inherit-from namespace.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "namespace",
+          "id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_namespace_set_standard"
+    },
+    {
+      "description": "Get the standard/policy memory for a namespace.",
+      "docs": "Returns the standard. inherit=true (Task 1.6) returns the resolved chain (global '*' -> ancestors -> namespace).",
+      "inputSchema": {
+        "properties": {
+          "inherit": {
+            "default": false,
+            "description": "Task 1.6: return full inheritance chain.",
+            "type": "boolean"
+          },
+          "namespace": {
+            "description": "Namespace.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "namespace"
+        ],
+        "type": "object"
+      },
+      "name": "memory_namespace_get_standard"
+    },
+    {
+      "description": "Clear the standard/policy for a namespace.",
+      "docs": "Clear the namespace standard.",
+      "inputSchema": {
+        "properties": {
+          "namespace": {
+            "description": "Namespace.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "namespace"
+        ],
+        "type": "object"
+      },
+      "name": "memory_namespace_clear_standard"
+    },
+    {
+      "description": "List pending governance-queued actions.",
+      "docs": "Task 1.9: list governance-queued actions. status filter (default pending). Limit cap 1000.",
+      "inputSchema": {
+        "properties": {
+          "limit": {
+            "default": 100,
+            "maximum": 1000,
+            "type": "integer"
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "approved",
+              "rejected"
+            ],
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "memory_pending_list"
+    },
+    {
+      "description": "Approve a pending action; `remember` auto-decides next time.",
+      "docs": "Task 1.9 approve. decided_by = caller. K10: remember (once|session|forever) writes a synthetic permit rule.",
+      "inputSchema": {
+        "properties": {
+          "id": {
+            "description": "Pending action id.",
+            "type": "string"
+          },
+          "remember": {
+            "default": "once",
+            "description": "K10 persistence horizon.",
+            "enum": [
+              "once",
+              "session",
+              "forever"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_pending_approve"
+    },
+    {
+      "description": "Reject a pending action; `remember` auto-decides next time.",
+      "docs": "Task 1.9 reject. decided_by = caller. K10: remember writes a synthetic deny rule.",
+      "inputSchema": {
+        "properties": {
+          "id": {
+            "description": "Pending action id.",
+            "type": "string"
+          },
+          "remember": {
+            "default": "once",
+            "description": "K10 persistence horizon.",
+            "enum": [
+              "once",
+              "session",
+              "forever"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_pending_reject"
+    },
+    {
+      "description": "Register an agent in the reserved _agents namespace.",
+      "docs": "Register agent (agent_type, capabilities) in _agents. Refreshes last_seen_at; preserves registered_at. agent_id is CLAIMED, not attested — pair with attestation for security boundary.",
+      "inputSchema": {
+        "properties": {
+          "agent_id": {
+            "description": "Agent id (same validation as metadata.agent_id).",
+            "type": "string"
+          },
+          "agent_type": {
+            "description": "Curated: human, system, ai:<model>. Open-form: any ai:<name>.",
+            "type": "string"
+          },
+          "capabilities": {
+            "default": [],
+            "description": "Capability tags.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "agent_id",
+          "agent_type"
+        ],
+        "type": "object"
+      },
+      "name": "memory_agent_register"
+    },
+    {
+      "description": "List every registered agent.",
+      "docs": "List agents (ordered by registered_at).",
+      "inputSchema": {
+        "properties": {},
+        "type": "object"
+      },
+      "name": "memory_agent_list"
+    },
+    {
+      "description": "Send a message from the caller to another agent's inbox.",
+      "docs": "Send message to _messages/<target>. Sender = caller agent_id. Read via memory_inbox.",
+      "inputSchema": {
+        "properties": {
+          "payload": {
+            "description": "Body.",
+            "type": "string"
+          },
+          "priority": {
+            "default": 5,
+            "maximum": 10,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "target_agent_id": {
+            "description": "Recipient agent_id.",
+            "type": "string"
+          },
+          "tier": {
+            "default": "mid",
+            "description": "short=6h, mid=7d, long=no expiry.",
+            "enum": [
+              "short",
+              "mid",
+              "long"
+            ],
+            "type": "string"
+          },
+          "title": {
+            "description": "Subject (<=200 chars).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "target_agent_id",
+          "title",
+          "payload"
+        ],
+        "type": "object"
+      },
+      "name": "memory_notify"
+    },
+    {
+      "description": "List messages sent to an agent via memory_notify.",
+      "docs": "Read _messages/<agent_id>. access_count==0 is the unread marker.",
+      "inputSchema": {
+        "properties": {
+          "agent_id": {
+            "description": "Recipient; default caller.",
+            "type": "string"
+          },
+          "limit": {
+            "default": 50,
+            "maximum": 500,
+            "type": "integer"
+          },
+          "unread_only": {
+            "default": false,
+            "description": "access_count==0 only.",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "name": "memory_inbox"
+    },
+    {
+      "description": "Register a webhook subscription for memory events.",
+      "docs": "Webhook subscription. HMAC-SHA256 signed via X-Ai-Memory-Signature when secret supplied. https required (http only for loopback). Secret stored hashed only.",
+      "inputSchema": {
+        "properties": {
+          "agent_filter": {
+            "description": "agent_id filter.",
+            "type": "string"
+          },
+          "event_types": {
+            "description": "#912 event-type subset.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "events": {
+            "default": "*",
+            "description": "Comma-list or *. Events: memory_store, memory_delete, memory_promote.",
+            "type": "string"
+          },
+          "namespace_filter": {
+            "description": "Exact namespace match.",
+            "type": "string"
+          },
+          "secret": {
+            "description": "HMAC secret. Omit for unsigned.",
+            "type": "string"
+          },
+          "url": {
+            "description": "https URL (http only for loopback). SSRF guard rejects private IPs.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "type": "object"
+      },
+      "name": "memory_subscribe"
+    },
+    {
+      "description": "Delete a subscription by id.",
+      "docs": "Delete subscription. DLQ rows retained for audit.",
+      "inputSchema": {
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_unsubscribe"
+    },
+    {
+      "description": "List active webhook subscriptions.",
+      "docs": "List subscriptions. Secrets never returned.",
+      "inputSchema": {
+        "properties": {},
+        "type": "object"
+      },
+      "name": "memory_list_subscriptions"
+    },
+    {
+      "description": "Replay subscription_events since an RFC3339 timestamp.",
+      "docs": "K7: replay events ordered by delivered_at asc.",
+      "inputSchema": {
+        "properties": {
+          "since": {
+            "description": "RFC3339 inclusive lower bound.",
+            "type": "string"
+          },
+          "subscription_id": {
+            "description": "Subscription id.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "subscription_id",
+          "since"
+        ],
+        "type": "object"
+      },
+      "name": "memory_subscription_replay"
+    },
+    {
+      "description": "List subscription_dlq rows (exhausted retry ladder).",
+      "docs": "K7: DLQ inspector.",
+      "inputSchema": {
+        "properties": {
+          "limit": {
+            "default": 100,
+            "maximum": 1000,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "subscription_id": {
+            "description": "Restrict to one subscription.",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "memory_subscription_dlq_list"
+    },
+    {
+      "description": "Report per-agent quota usage. Operator-facing.",
+      "docs": "K8: quota usage (memories/day, storage, links/day). Omit agent_id for all.",
+      "inputSchema": {
+        "properties": {
+          "agent_id": {
+            "description": "Restrict to one agent.",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "memory_quota_status"
+    },
+    {
+      "description": "Check action vs governance_rules (#691); Allow/Refuse/Warn.",
+      "docs": "#691: read-only rule check. Harness PreToolUse hook calls on every Bash/Write/Edit. Rule MUTATION over MCP is disabled — use `ai-memory rules --sign` CLI or signed HTTP admin endpoints.",
+      "inputSchema": {
+        "properties": {
+          "agent_id": {
+            "description": "Caller id (audit).",
+            "type": "string"
+          },
+          "args": {
+            "description": "process_spawn argv.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "binary": {
+            "description": "kind=process_spawn.",
+            "type": "string"
+          },
+          "byte_estimate": {
+            "description": "Bytes-to-write hint.",
+            "type": "integer"
+          },
+          "command": {
+            "description": "kind=bash.",
+            "type": "string"
+          },
+          "custom_kind": {
+            "description": "kind=custom.",
+            "type": "string"
+          },
+          "cwd": {
+            "description": "kind=bash cwd.",
+            "type": "string"
+          },
+          "host": {
+            "description": "kind=network_request.",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "bash",
+              "filesystem_write",
+              "network_request",
+              "process_spawn",
+              "custom"
+            ],
+            "type": "string"
+          },
+          "path": {
+            "description": "kind=filesystem_write.",
+            "type": "string"
+          },
+          "scheme": {
+            "description": "Default https.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "type": "object"
+      },
+      "name": "memory_check_agent_action"
+    },
+    {
+      "description": "List substrate-level agent-action rules. Read-only (#691).",
+      "docs": "#691: governance_rules read. Mutation operator-only (CLI/HTTP signed); MCP read-only by design 2026-05-13.",
+      "inputSchema": {
+        "properties": {
+          "enabled_only": {
+            "description": "Skip disabled rules. Default false.",
+            "type": "boolean"
+          },
+          "kind": {
+            "description": "Restrict to one AgentAction kind.",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "memory_rule_list"
+    },
+    {
+      "description": "Register an agentskills.io SKILL.md from a folder or inline text.",
+      "docs": "L1-5: Ed25519-attested skill registration with version chaining. Re-register same (name, namespace) supersedes prior row.",
+      "inputSchema": {
+        "properties": {
+          "folder_path": {
+            "description": "Dir containing SKILL.md + optional resources/.",
+            "type": "string"
+          },
+          "inline_skill": {
+            "description": "Raw SKILL.md text (frontmatter + body).",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "memory_skill_register"
+    },
+    {
+      "description": "List current (non-superseded) skills; body not returned.",
+      "docs": "L1-5: discovery (name, description, id, namespace, digest, metadata). Use memory_skill_get for body.",
+      "inputSchema": {
+        "properties": {
+          "filter": {
+            "description": "Text filter on name + description.",
+            "type": "string"
+          },
+          "namespace": {
+            "description": "Namespace filter. Omit or '%' = all.",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "memory_skill_list"
+    },
+    {
+      "description": "Get full skill activation payload (metadata + body).",
+      "docs": "L1-5: metadata + decompressed body (<5000 tok). Old version ids stay addressable.",
+      "inputSchema": {
+        "properties": {
+          "skill_id": {
+            "description": "Skill UUID.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "skill_id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_skill_get"
+    },
+    {
+      "description": "Fetch + digest-verify a skill resource.",
+      "docs": "L1-5: SHA-256-verified resource fetch. Errors on mismatch.",
+      "inputSchema": {
+        "properties": {
+          "resource_path": {
+            "description": "Relative path (e.g. 'scripts/run.sh').",
+            "type": "string"
+          },
+          "skill_id": {
+            "description": "Parent skill UUID.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "skill_id",
+          "resource_path"
+        ],
+        "type": "object"
+      },
+      "name": "memory_skill_resource"
+    },
+    {
+      "description": "Export a skill to a folder; re-register produces identical digest.",
+      "docs": "L1-5: write SKILL.md + resources/ to target_folder. Round-trip identical SHA-256. Emits skill.exported signed_events row.",
+      "inputSchema": {
+        "properties": {
+          "skill_id": {
+            "description": "Skill UUID.",
+            "type": "string"
+          },
+          "target_folder": {
+            "description": "Destination dir (created if absent).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "skill_id",
+          "target_folder"
+        ],
+        "type": "object"
+      },
+      "name": "memory_skill_export"
+    },
+    {
+      "description": "Promote a Reflection into a reusable Agent Skill.",
+      "docs": "L2-6 (#671): reflection (depth>=namespace.governance.skill_promotion_min_depth, default 1) -> SKILL.md. Each reflects_on source -> references/source_{i}.md. Frontmatter preserves derived_from_reflection_id + original_reflection_depth. Promote->export->register => identical SHA-256. Refuses depth-0.",
+      "inputSchema": {
+        "properties": {
+          "parameters_schema": {
+            "description": "Optional JSON schema spliced as Parameters section.",
+            "type": "object"
+          },
+          "reflection_id": {
+            "description": "Reflection-kind memory UUID.",
+            "type": "string"
+          },
+          "skill_description": {
+            "description": "1-1024 char description.",
+            "type": "string"
+          },
+          "skill_name": {
+            "description": "agentskills.io §3.1 name: ^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$, 1-64.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "reflection_id",
+          "skill_name",
+          "skill_description"
+        ],
+        "type": "object"
+      },
+      "name": "memory_skill_promote_from_reflection"
+    },
+    {
+      "description": "Skill body + composes_with_reflections (bounded by max_reflection_depth).",
+      "docs": "L2-7 (#672): compose skill activation with reflections from SKILL.md composes_with_reflections list. Per-entry min_depth filter; per-namespace max_reflection_depth is the authoritative ceiling (CANNOT bypass bounded-recursion). Reflections ranked recency + recall_count; budget_tokens caps cumulative reflection content (default 4000, max 32000).",
+      "inputSchema": {
+        "properties": {
+          "budget_tokens": {
+            "description": "cl100k cap on reflection content. Default 4000, max 32000.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "skill_id": {
+            "description": "Skill UUID.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "skill_id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_skill_compositional_context"
+    },
+    {
+      "description": "Offload verbatim content; returns ref_id (Family::Power).",
+      "docs": "QW-3 follow-up: store verbatim in offloaded_blobs. Returns {ref_id, content_sha256, stored_at}. Dereference via memory_deref. Semantic+ tier.",
+      "inputSchema": {
+        "properties": {
+          "content": {
+            "description": "Verbatim content.",
+            "type": "string"
+          },
+          "namespace": {
+            "description": "Namespace bucket. Default 'auto'.",
+            "type": "string"
+          },
+          "ttl_seconds": {
+            "description": "Retention hint (seconds).",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "content"
+        ],
+        "type": "object"
+      },
+      "name": "memory_offload"
+    },
+    {
+      "description": "Dereference a memory_offload ref_id (Family::Power).",
+      "docs": "QW-3 follow-up: sha256-verified lookup. Returns {ref_id, content, stored_at, sha256}. Refuses tampered rows. Semantic+ tier.",
+      "inputSchema": {
+        "properties": {
+          "ref_id": {
+            "description": "Ref from memory_offload.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "ref_id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_deref"
+    }
+  ],
+  "toolsVersion": "2026-05-06"
+}
