@@ -112,7 +112,7 @@ footer a{color:var(--muted)}
       <tr><td>Operator-signed substrate rules</td><td class="no">No</td><td class="yes">L1&ndash;L6, key on disk</td></tr>
       <tr><td>HMAC-required event subscriptions</td><td class="no">No</td><td class="yes">SSRF gate by default</td></tr>
       <tr><td>NHI agent_id semantics</td><td class="no">No</td><td class="yes">Resolution ladder, preservation invariants</td></tr>
-      <tr><td>Autonomous tier (consolidate / contradict / auto-tag)</td><td class="no">No</td><td class="yes">LLM-backed, local Ollama or remote</td></tr>
+      <tr><td>Autonomous tier (consolidate / contradict / auto-tag)</td><td class="no">No</td><td class="yes">LLM-backed, vendor-agnostic &mdash; Ollama local OR 15+ cloud vendors (xAI Grok, OpenAI, Anthropic, Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, LMStudio, vLLM)</td></tr>
       <tr><td>Single binary, zero cloud dependency</td><td class="meh">Often hosted</td><td class="yes">Single Rust binary, sqlite default</td></tr>
       <tr><td>Apache-2.0</td><td class="meh">Mixed</td><td class="yes">Yes</td></tr>
     </tbody>
@@ -129,7 +129,7 @@ footer a{color:var(--muted)}
     <div class="risk"><h4>Supply chain</h4><p>Rust, <code>cargo audit</code> required to be clean as a release gate. Binary is statically linkable; reproducible builds are on the v1.0 roadmap.</p></div>
     <div class="risk"><h4>Security posture</h4><p>v0.7.0 secure-default: permissions enforced by default, SSRF gate on webhooks, signed audit chain, HMAC subscriptions, optional sqlcipher for at-rest encryption.</p></div>
     <div class="risk"><h4>Operational risk</h4><p>One process, one DB file. Failure modes are SQLite failure modes (well-understood). Migrations dry-run-tested by the maintainer dogfood loop before every release tag.</p></div>
-    <div class="risk"><h4>Project maturity</h4><p>v0.7.0 is the third major release. 71 MCP entries at <code>--profile full</code>, 72 HTTP routes, ~50 CLI subcommands. Test campaigns are reproducible and publicly logged under <code>docs/v0.7.0/test-campaign-*</code>.</p></div>
+    <div class="risk"><h4>Project maturity</h4><p>v0.7.0 is the third major release. 73 MCP entries at <code>--profile full</code>, 72 HTTP routes, 55 CLI subcommands. CI gates on Linux x64/arm64, macOS x64/arm64, Windows x64, plus iOS + Android cross-compile (Posture 1a, #1068). Test campaigns are reproducible and publicly logged under <code>docs/v0.7.0/test-campaign-*</code>.</p></div>
   </div>
 </section>
 
@@ -141,9 +141,32 @@ footer a{color:var(--muted)}
     <li><strong>Hosting: $0 to whatever you spend on the host.</strong> Single binary. Runs on a developer laptop; runs on a $5/mo VPS; runs on a multi-region fleet. No mandatory cloud.</li>
     <li><strong>Infrastructure: SQLite or Postgres+AGE.</strong> SQLite is bundled. Postgres+AGE is optional for the T3+ graph backend.</li>
     <li><strong>Ops: one process to monitor.</strong> Standard <code>tracing</code> output, append-only audit chain, capabilities endpoint for health checks.</li>
-    <li><strong>LLM cost: optional and local-first.</strong> Smart and autonomous tiers integrate with Ollama (local, free) or any OpenAI-compatible endpoint. Keyword and semantic tiers need no LLM.</li>
+    <li><strong>LLM cost: optional, vendor-agnostic, deployment-flexible.</strong> Post-#1067, every tier accepts any LLM provider via <code>AI_MEMORY_LLM_BACKEND</code> &mdash; Ollama for local/free, xAI Grok / OpenAI / Anthropic / Gemini / DeepSeek / Kimi / Qwen / Mistral / Groq / Together / Cerebras / OpenRouter / Fireworks / LMStudio / vLLM / llama.cpp-server for cloud or self-hosted GPU. GPU is optional &mdash; local Ollama needs one; cloud vendors shift inference to their side. Keyword and semantic tiers need no LLM at all.</li>
   </ul>
-  <p>There is no SaaS billing surface. The only cost you incur is your own hosting and (optionally) your own LLM call budget.</p>
+  <p>There is no SaaS billing surface in ai-memory itself. The only cost you incur is your own hosting plus (optionally) your own LLM call budget, paid directly to whichever vendor you choose.</p>
+</section>
+
+<section class="wrap-mid">
+  <div class="eyebrow-h2">Deployment matrix</div>
+  <h2>10 deployment postures &mdash; from cellphone to private DC.</h2>
+  <p>v0.7.0 unlocks an unusually wide deployment surface because the LLM substrate (provider-agnostic, #1067) and the mobile cross-compile gates (#1068) decouple ai-memory from any single OS, vendor, or hardware floor.</p>
+  <table class="cmp">
+    <thead><tr><th>Posture</th><th>Where it runs</th><th>CPU / RAM / GPU floor</th><th>LLM source</th><th>Cost shape</th></tr></thead>
+    <tbody>
+      <tr><td><strong>1a. Cellphone / tablet</strong></td><td>iOS (arm64) + Android (arm64-v8a, armeabi-v7a, x86, x86_64) &mdash; in-app embed via FFI</td><td>1 core / 256 MB / none</td><td>Cloud (xAI / OpenAI / Anthropic / Gemini)</td><td>Vendor-metered</td></tr>
+      <tr><td><strong>1b. Laptop / workstation</strong></td><td>macOS arm64/x64, Linux arm64/x64, Windows x64</td><td>2 core / 4 GB / optional</td><td>Local Ollama or cloud</td><td>$0 local / vendor-metered cloud</td></tr>
+      <tr><td><strong>2. CPU-only cloud VPS</strong></td><td>Any $5/mo VPS (Linode, Hetzner, DigitalOcean droplet)</td><td>1 vCPU / 1 GB / none</td><td>Cloud LLM only (no local inference floor)</td><td>~$5/mo host + LLM-metered</td></tr>
+      <tr><td><strong>3. CPU-only container (Plan C)</strong></td><td>GHCR Docker image, K8s, ECS, Cloud Run</td><td>1 vCPU / 512 MB / none</td><td>Cloud LLM (env-injected)</td><td>Container-metered + LLM-metered</td></tr>
+      <tr><td><strong>4. CPU-only sidecar (in-pod)</strong></td><td>Sidecar to an existing app pod</td><td>0.25 vCPU / 256 MB / none</td><td>Cloud LLM via vendor API</td><td>Negligible host + LLM-metered</td></tr>
+      <tr><td><strong>5. GPU workstation</strong></td><td>Dev box with NVIDIA / Apple-Silicon NPU</td><td>4 core / 8 GB / 8 GB VRAM</td><td>Local Ollama (gemma3:e4b, llama3, qwen3)</td><td>$0 marginal once hardware owned</td></tr>
+      <tr><td><strong>6. GPU server (single-node)</strong></td><td>Bare-metal or cloud GPU instance</td><td>8 core / 32 GB / 24 GB VRAM</td><td>Local vLLM / Ollama / llama.cpp-server (OpenAI-compatible)</td><td>$0.5-3/hr GPU instance</td></tr>
+      <tr><td><strong>7. Private DC vLLM cluster</strong></td><td>On-prem K8s + vLLM autoscaler</td><td>Cluster-scale</td><td>Self-hosted vLLM (OpenAI-compatible endpoint)</td><td>Capex + power; no per-token fees</td></tr>
+      <tr><td><strong>8. Multi-region federation (T4-T5)</strong></td><td>Multi-region quorum sync, per-region LLM choice</td><td>3+ nodes</td><td>Mixed: each region picks Ollama / cloud / vLLM independently</td><td>Region-aggregated</td></tr>
+      <tr><td><strong>9. Air-gapped / SCIF</strong></td><td>No-internet enclave</td><td>Bring your own</td><td>Local Ollama or self-hosted vLLM only (no cloud egress)</td><td>$0 marginal post-deploy</td></tr>
+      <tr><td><strong>10. Edge / IoT</strong></td><td>arm64 SBC (Raspberry Pi 5, Jetson Nano)</td><td>2 core / 2 GB / optional NPU</td><td>Cloud LLM (default) or tiny local model</td><td>Hardware + LLM-metered</td></tr>
+    </tbody>
+  </table>
+  <p>Operator picks via the universal <code>AI_MEMORY_LLM_BACKEND</code> precedence ladder (CLI flag &gt; env var &gt; config.toml &gt; compiled default). No code changes between postures &mdash; same Rust binary, same MCP / HTTP / CLI surfaces.</p>
 </section>
 
 <section class="wrap-mid">

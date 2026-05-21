@@ -44,9 +44,21 @@ feature that works on sqlite works on postgres.
 | Component | Version | Notes |
 |---|---|---|
 | PostgreSQL | 16.x (16.4+ recommended) | 15.x works for the SAL adapter but Apache AGE 1.5.x targets PG 16. |
-| Apache AGE | 1.5.0 | Built from source against your PG 16. |
-| pgvector | 0.7.x or 0.8.x | 0.8 is preferred (faster HNSW); 0.7 is fine. |
+| Apache AGE | 1.5.0 (1.6.0 supported in the bundled Dockerfile) | Built from source against your PG 16, or use the bundled `Dockerfile.pg-age-vector` (see below). |
+| pgvector | 0.7.x or 0.8.x | 0.8 is preferred (faster HNSW); 0.7 is fine. **Required**: the `sal-postgres` Cargo feature pulls `dep:pgvector` which maps Rust vectors to the Postgres `vector` column type. |
 | ai-memory | v0.7.0 with `--features sal-postgres` | The sql-postgres feature is **off by default** to keep the no-postgres build hermetic. |
+
+### Bundled Dockerfile (Apache AGE + pgvector on PG16, #1065)
+
+The upstream `apache/age:release_PG16_1.6.0` image ships AGE but **not**
+pgvector. Because the ai-memory v0.7 SAL postgres adapter REQUIRES
+pgvector (the `sal-postgres` Cargo feature pulls `dep:pgvector` which
+maps Rust vectors to Postgres `vector` columns), the repo ships a
+ready-made stacked image at
+[`infra/lan-parity-test/Dockerfile.pg-age-vector`](../infra/lan-parity-test/Dockerfile.pg-age-vector)
+(#1065). It stacks `postgresql-16-pgvector` (precompiled .deb from the
+pgdg apt repo) onto the AGE base — no source build needed. Use this
+image for any deployment that backs ai-memory onto Postgres+AGE.
 
 > **AGE 1.5 + PG 16 cypher-binding compat.** AGE 1.5.0 has a known
 > quirk where parameter binding against `cypher()` plus PostgreSQL 16's

@@ -2,7 +2,7 @@
   Copyright 2026 AlphaOne LLC
   SPDX-License-Identifier: Apache-2.0
 
-  Release Pipeline — visual atlas of the 5-platform signed-tag release flow,
+  Release Pipeline — visual atlas of the 7-platform signed-tag release flow,
   the bench-CI workflow, the coverage workflow, and the package channels.
   Targets procurement and operational readiness audiences.
 -->
@@ -12,7 +12,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ai-memory · Release Pipeline — 5 platforms, 5 channels, all signed</title>
-<meta name="description" content="ai-memory's release pipeline: 5-platform signed-tag matrix, bench-CI guard, llvm-cov coverage, 5 distribution channels (Homebrew, APT/deb, RPM/COPR, GHCR Docker, crates.io).">
+<meta name="description" content="ai-memory's release pipeline: 7-platform signed-tag matrix (Linux x64/arm64, macOS x64/arm64, Windows x64, iOS arm64, Android arm64 via #1068), bench-CI guard, llvm-cov coverage, 7 distribution channels (Homebrew, APT/deb, RPM/COPR, GHCR Docker, crates.io, iOS xcframework, Android jniLibs tarball).">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/release-pipeline.html">
 <style>
 :root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#6ee7ff;--p2:#ffb86b;--p3:#c8a2ff;--good:#6ee7ff;--gold:#ffd700;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
@@ -181,8 +181,8 @@ footer a{color:var(--text-muted)}
 </nav>
 
 <section class="hero">
-  <h1>Tag → 5 platforms → 5 channels → all signed.</h1>
-  <p class="tagline">One signed tag. Five platform binaries. Five package channels. All in &lt;10 minutes of CI wallclock. <strong>Procurement-ready operational maturity from day 1.</strong></p>
+  <h1>Tag → 7 platforms → 7 channels → all signed.</h1>
+  <p class="tagline">One signed tag. Seven platform binaries (incl. iOS xcframework + Android jniLibs tarball, #1068). Seven package channels. All in &lt;15 minutes of CI wallclock. <strong>Procurement-ready operational maturity from day 1.</strong></p>
 </section>
 
 <section>
@@ -421,12 +421,13 @@ cargo install ai-memory --features sqlcipher</pre>
 
     <div class="workflow">
       <div class="wftrigger">.github/workflows/ci.yml · release matrix</div>
-      <h3>Release (5-platform fan-out)</h3>
+      <h3>Release (7-platform fan-out, v0.7.0 + #1068)</h3>
       <ul>
-        <li>Triggers on tags matching <code>v*</code></li>
+        <li>Triggers on tags matching <code>v*</code> via <code>workflow_dispatch</code> (operator-gated)</li>
         <li>Depends on <code>check</code> passing first — broken tags don't ship</li>
-        <li>Builds 5 platform targets in parallel</li>
-        <li>Packages tar.gz / .deb / .rpm / .zip</li>
+        <li>Builds 5 server platform targets in parallel (Linux x64/arm64, macOS x64/arm64, Windows x64)</li>
+        <li>Plus 2 mobile artifacts (#1068): iOS xcframework (3 slices) + Android jniLibs tarball (4 ABIs)</li>
+        <li>Packages tar.gz / .deb / .rpm / .zip + <code>ai-memory-ios.xcframework.tar.gz</code> + <code>ai-memory-android.tar.gz</code></li>
         <li>Publishes to GitHub Releases, then fans out to crates.io / Homebrew / PPA / COPR / GHCR</li>
         <li>Pre-release tags (containing <code>-</code>) skip Homebrew + crates.io (RC binaries only)</li>
       </ul>
