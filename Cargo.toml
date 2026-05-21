@@ -353,6 +353,21 @@ harness = false
 name = "longmemeval_reflection"
 harness = false
 
+# v0.7.0 Wave-2 Tier-C3 (issue #968) — HNSW async-rebuild micro-bench.
+# Measures p95 search latency DURING a `rebuild_async` call to pin the
+# non-blocking-reads invariant introduced by #968. v0.6 baseline (the
+# synchronous-rebuild path that #968 replaces) would block search for
+# ~3-10s on a 100k-vector rebuild; post-#968 the same workload should
+# keep search p95 under 35 ms. The bench seeds a fixed-size index
+# (default 5k vectors — large enough to make the rebuild non-trivial
+# in debug mode, small enough to keep the bench run cycle under a
+# minute), spawns a rebuild_async, then drives N=200 searches and
+# reports the p50/p95/p99 distribution. Run with
+# `cargo bench --bench hnsw_rebuild_async`.
+[[bench]]
+name = "hnsw_rebuild_async"
+harness = false
+
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/ai-memory-{ target }.tar.gz"
 bin-dir = "ai-memory"
