@@ -279,6 +279,70 @@ fn yaml_quote(s: &str) -> String {
     }
 }
 
+// --- D1.5 (#986): per-tool McpTool impl for memory_skill_export ---
+
+use crate::mcp::registry::McpTool;
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+/// v0.7.0 #972 D1.5 (#986) — request body for `memory_skill_export`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct SkillExportRequest {
+    /// Skill UUID.
+    pub skill_id: String,
+
+    /// Destination dir (created if absent).
+    pub target_folder: String,
+}
+
+/// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_skill_export`.
+#[allow(dead_code)]
+pub struct SkillExportTool;
+
+impl McpTool for SkillExportTool {
+    fn name() -> &'static str {
+        "memory_skill_export"
+    }
+    fn description() -> &'static str {
+        "Export a skill to a folder; re-register produces identical digest."
+    }
+    fn docs() -> &'static str {
+        "L1-5: write SKILL.md + resources/ to target_folder. Round-trip identical SHA-256. Emits skill.exported signed_events row."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(SkillExportRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "other"
+    }
+}
+
+#[cfg(test)]
+mod d1_5_986_tests {
+    //! D1.5 (#986) — schema parity for `memory_skill_export`.
+    //! Shared helpers live at [`crate::mcp::parity_test_helpers`].
+    use super::*;
+    use crate::mcp::parity_test_helpers::{
+        assert_descriptions_match, assert_property_set_parity, derived_props_for,
+    };
+
+    #[test]
+    fn skill_export_parity_986() {
+        let derived = derived_props_for::<SkillExportRequest>();
+        assert_property_set_parity("memory_skill_export", &derived);
+        assert_descriptions_match("memory_skill_export", &derived);
+    }
+
+    #[test]
+    fn skill_export_tool_metadata_986() {
+        assert_eq!(SkillExportTool::name(), "memory_skill_export");
+        assert_eq!(SkillExportTool::family(), "other");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------

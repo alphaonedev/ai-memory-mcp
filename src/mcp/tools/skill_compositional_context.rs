@@ -333,6 +333,76 @@ fn recall_score(access_count: i64) -> f64 {
     bounded / RECALL_SATURATION as f64
 }
 
+// --- D1.5 (#986): per-tool McpTool impl for memory_skill_compositional_context ---
+
+use crate::mcp::registry::McpTool;
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+/// v0.7.0 #972 D1.5 (#986) — request body for
+/// `memory_skill_compositional_context`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct SkillCompositionalContextRequest {
+    /// Skill UUID.
+    pub skill_id: String,
+
+    /// cl100k cap on reflection content. Default 4000, max 32000.
+    #[serde(default)]
+    pub budget_tokens: Option<i64>,
+}
+
+/// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for
+/// `memory_skill_compositional_context`.
+#[allow(dead_code)]
+pub struct SkillCompositionalContextTool;
+
+impl McpTool for SkillCompositionalContextTool {
+    fn name() -> &'static str {
+        "memory_skill_compositional_context"
+    }
+    fn description() -> &'static str {
+        "Skill body + composes_with_reflections (bounded by max_reflection_depth)."
+    }
+    fn docs() -> &'static str {
+        "L2-7 (#672): compose skill activation with reflections from SKILL.md composes_with_reflections list. Per-entry min_depth filter; per-namespace max_reflection_depth is the authoritative ceiling (CANNOT bypass bounded-recursion). Reflections ranked recency + recall_count; budget_tokens caps cumulative reflection content (default 4000, max 32000)."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(SkillCompositionalContextRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "other"
+    }
+}
+
+#[cfg(test)]
+mod d1_5_986_tests {
+    //! D1.5 (#986) — schema parity for `memory_skill_compositional_context`.
+    //! Shared helpers live at [`crate::mcp::parity_test_helpers`].
+    use super::*;
+    use crate::mcp::parity_test_helpers::{
+        assert_descriptions_match, assert_property_set_parity, derived_props_for,
+    };
+
+    #[test]
+    fn skill_compositional_context_parity_986() {
+        let derived = derived_props_for::<SkillCompositionalContextRequest>();
+        assert_property_set_parity("memory_skill_compositional_context", &derived);
+        assert_descriptions_match("memory_skill_compositional_context", &derived);
+    }
+
+    #[test]
+    fn skill_compositional_context_tool_metadata_986() {
+        assert_eq!(
+            SkillCompositionalContextTool::name(),
+            "memory_skill_compositional_context"
+        );
+        assert_eq!(SkillCompositionalContextTool::family(), "other");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests — score / parse helpers only. End-to-end behaviour is
 // pinned in tests/skill_composition_test.rs against a real DB.
