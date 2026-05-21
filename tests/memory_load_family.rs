@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
+
 //! v0.7 Track B1 — `memory_load_family` MCP tool integration tests.
 //!
 //! B1 ships an always-on alternative to `memory_recall` for the case
@@ -66,6 +68,7 @@ fn seed_family_memory(
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     };
     let _ = models::default_metadata(); // keep the import live for parity with sibling tests
     db::insert(conn, &mem).expect("db::insert")

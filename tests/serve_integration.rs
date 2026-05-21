@@ -71,11 +71,17 @@ fn spawn_serve(
     let port_s = port.to_string();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ai-memory"));
     cmd.env("AI_MEMORY_NO_CONFIG", "1")
-        // #976 (2026-05-20) — wildcard admin allowlist so the
-        // post-#946 admin-gated routes (stats, archive, forget, …)
-        // exercise the happy-path 200 in this test fixture. Negative
-        // admin contracts belong in dedicated test files.
-        .env("AI_MEMORY_ADMIN_AGENT_IDS", "*")
+        // #976 (2026-05-20) — admin allowlist so the post-#946
+        // admin-gated routes (stats, archive, forget, …) exercise the
+        // happy-path 200 in this test fixture. Negative admin
+        // contracts belong in dedicated test files.
+        //
+        // #1001 (2026-05-21) — pre-#980 this used the `"*"` wildcard
+        // sentinel; #980 made `"*"` shape-invalid in
+        // `validate_agent_id`, so the env entry got dropped. Tests
+        // using `spawn_serve` that hit admin endpoints must thread
+        // `X-Agent-Id: ai:serve-test-admin` (matches the env value).
+        .env("AI_MEMORY_ADMIN_AGENT_IDS", "ai:serve-test-admin")
         .args([
             "--db",
             db.to_str().unwrap(),
@@ -263,9 +269,11 @@ fn serve_api_key_required_when_configured() {
         .env("HOME", tmp.path().to_str().unwrap())
         // #976 (2026-05-20) — `/api/v1/stats` is admin-gated post-#955;
         // the test exercises the api_key auth happy path, not the
-        // admin-rejection contract, so seed the wildcard admin
-        // allowlist via the env var (precedence wins over config.toml).
-        .env("AI_MEMORY_ADMIN_AGENT_IDS", "*")
+        // admin-rejection contract, so seed a concrete admin id and
+        // thread it as `X-Agent-Id` on the GET below. #1001: pre-#980
+        // this used the `"*"` wildcard which is now rejected by
+        // `validate_agent_id`.
+        .env("AI_MEMORY_ADMIN_AGENT_IDS", "ai:serve-test-admin")
         .args([
             "--db",
             db.to_str().unwrap(),
@@ -312,10 +320,11 @@ fn serve_api_key_required_when_configured() {
     let resp = client.get(format!("{}/api/v1/stats", &url)).send().unwrap();
     assert_eq!(resp.status().as_u16(), 401);
 
-    // With header → 200
+    // With header → 200 (admin id threaded via X-Agent-Id per #1001).
     let resp = client
         .get(format!("{}/api/v1/stats", &url))
         .header("x-api-key", api_key)
+        .header("x-agent-id", "ai:serve-test-admin")
         .send()
         .unwrap();
     assert!(

@@ -98,6 +98,27 @@ pub use refusal::GovernanceRefusal;
 /// so cross-tenant transcript reads are gated by the same evaluator
 /// that already gates writes. The wire string is the canonical name
 /// surfaced in rule matchers (`op = "memory_store"` etc.).
+///
+/// # Disambiguation (issue #970)
+///
+/// `Op` is the **K9 permission-rule op discriminator**. It is
+/// related-but-distinct from [`crate::models::GovernedAction`], the
+/// **approval-queue discriminator**:
+///
+/// - `Op` wire strings: `memory_store` / `memory_link` /
+///   `memory_delete` / `memory_archive` / `memory_consolidate` /
+///   `memory_replay` (6 variants — every K9-gated tool).
+/// - `GovernedAction` wire strings: `store` / `delete` / `promote`
+///   / `reflect` (4 variants — substrate actions that can be queued
+///   for approval).
+///
+/// The two enums share the `delete` semantic surface but the rest
+/// is disjoint (`Op` covers `link`/`archive`/`consolidate`/`replay`
+/// which never queue; `GovernedAction` covers `promote`/`reflect`
+/// which do not need K9 op-gating). The wire strings are
+/// deliberately different so a config-file misuse is a typed loader
+/// error, not a silent fall-through. See
+/// `docs/internal/enum-proliferation-audit-970.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Op {
@@ -160,7 +181,34 @@ impl Op {
 /// promotion of Ask under [`PermissionsMode::Enforce`] turns this
 /// into Deny so callers don't accidentally approve under strict
 /// mode.
-#[derive(Debug, Clone)]
+///
+/// # Disambiguation (issue #970)
+///
+/// The codebase has five enums named `Decision`. They model
+/// different domain outputs and are NOT substitutable:
+///
+/// - [`Decision`] (this enum) — K9 four-shape pipeline output
+///   (rules + hooks + mode promotion combined).
+/// - [`RuleDecision`] — narrower three-shape TOML rule-row
+///   decision (no `Modify`; rules can't rewrite a payload).
+/// - [`crate::governance::agent_action::Decision`] — three-shape
+///   external-action engine output (`Allow` / `Refuse{rule_id,
+///   reason}` / `Warn{rule_id, reason}`); narrower again, with a
+///   structured refusal payload instead of a string.
+/// - [`crate::models::GovernanceDecision`] — three-shape substrate
+///   governance output (`Allow` / `Deny(GovernanceRefusal)` /
+///   `Pending(String)`); carries a typed refusal envelope.
+/// - [`crate::approvals::Decision`] — two-shape operator submission
+///   verdict (`Approve` / `Deny`) for the K10 transports.
+///
+/// Each enum's variant set is locked to its column / wire contract;
+/// see `docs/internal/enum-proliferation-audit-970.md`.
+// #969 — `PartialEq` derived. Pre-#969 hand-rolled because the
+// inner `MemoryDelta` of `Modify` was thought to lack a usable
+// equality; in fact `serde_json::Value` derives `Eq + PartialEq + Hash`
+// and `MemoryDelta` derives `PartialEq` (its `Option<f64>` blocks
+// `Eq` but not `PartialEq`).
+#[derive(Debug, Clone, PartialEq)]
 pub enum Decision {
     /// Allow the operation to proceed unchanged.
     Allow,
@@ -174,23 +222,6 @@ pub enum Decision {
     /// do with this if no caller is wired into the K10 approval API
     /// (Enforce → Deny, Advisory/Off → Allow).
     Ask(String),
-}
-
-impl PartialEq for Decision {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Decision::Allow, Decision::Allow) => true,
-            (Decision::Deny(a), Decision::Deny(b)) => a == b,
-            (Decision::Modify(a), Decision::Modify(b)) => {
-                // Same trick HookDecision::Modify uses — MemoryDelta
-                // carries a serde_json::Value (metadata) which is not
-                // Eq, so equality is canonical-JSON.
-                serde_json::to_value(a).ok() == serde_json::to_value(b).ok()
-            }
-            (Decision::Ask(a), Decision::Ask(b)) => a == b,
-            _ => false,
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1357,9 +1388,12 @@ mod tests {
 
     #[test]
     fn decision_partial_eq_same_modify_arms_compare_canonical_json() {
-        // The (Modify, Modify) arm at lines 178-183 compares via
-        // canonical JSON because MemoryDelta carries a metadata
-        // serde_json::Value that is not Eq.
+        // #969 — derived `PartialEq` (via `MemoryDelta: PartialEq`)
+        // produces the same answers the previous hand-rolled
+        // canonical-JSON comparison did. Test name preserved for
+        // grep-history continuity; previously the rationale was
+        // "MemoryDelta metadata Value is not Eq" — see #969 audit
+        // doc for the corrected rationale.
         let a = Decision::Modify(MemoryDelta::default());
         let b = Decision::Modify(MemoryDelta::default());
         assert_eq!(a, b);

@@ -31,7 +31,7 @@ The handler-level `audit_log` table is a separate, broader-purpose audit surface
 
 **Why this is SHIP-with-caveat, not a blocker:** the loss is observable (metric + ERROR log + operator instruction) and the audit row that DID survive (the in-flight refusal that triggered the panic) is the only audit-chain hazard; future refusals submitted after the panic are recorded as `send_failures` rather than silently dropped. The DLQ at `signed_events_dlq` (drainer-side) catches the OTHER failure mode (SQLite UNIQUE-race retry exhaustion, `APPEND_UNIQUE_RACE_MAX_RETRIES = 5`). The "audit row silently lost" property is **never** observed — every failure leaves a metric and a log artifact. The "supervisor restarts after panic" semantic the prompt asked about is **not implemented**; the code comments the gap honestly.
 
-**Recommendation (non-blocking, post-v0.7.0):** implement the buffered-restart pattern so the `max_restarts` parameter becomes load-bearing. Tests `supervisor_records_panic_metric_on_drainer_panic` (L1041) + `supervisor_graceful_shutdown_drains_buffered_events` (L1078) pin the current contract.
+**Follow-up (TRACKED-FOR-V071):** implement the buffered-restart pattern so the `max_restarts` parameter becomes load-bearing. Acceptance: drainer panic followed by a fresh `submit` lands the new event in the SQLite `signed_events` table within the `max_restarts` budget without a process restart, with a `drainer_restart_succeeded` metric increment. Tests `supervisor_records_panic_metric_on_drainer_panic` (L1041) + `supervisor_graceful_shutdown_drains_buffered_events` (L1078) pin the current contract; the v0.7.1 follow-up adds `supervisor_buffered_restart_recovers_after_panic`.
 
 ## D.5 — Forensic export bundle integrity
 

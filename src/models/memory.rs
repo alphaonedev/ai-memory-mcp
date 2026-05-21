@@ -326,7 +326,26 @@ impl Default for ConfidenceSignals {
     }
 }
 
-/// Memory tier — mirrors human memory systems.
+/// Memory-lifecycle tier — short (6h TTL) / mid (7d TTL) / long
+/// (permanent). Drives the create-time backstop, the touch-time
+/// sliding window, the auto-promotion at 5 accesses (mid → long),
+/// the GC sweep, and the recall ranker's per-tier bonus.
+///
+/// # Disambiguation (issue #970)
+///
+/// The codebase has three enums whose names end in `Tier`. They are
+/// orthogonal — same descriptive substring, distinct domains:
+///
+/// - [`Tier`] (this enum) — memory-lifecycle TTL bucket.
+/// - [`ConfidenceTier`] — confidence-value bucket (Confirmed /
+///   Likely / Ambiguous) derived from `Memory.confidence` thresholds.
+///   Operator dashboards / human-review queues filter on it.
+/// - [`crate::config::FeatureTier`] — host capability tier
+///   (Keyword / Semantic / Smart / Autonomous) that gates which AI
+///   features the host can fit in RAM.
+///
+/// They do not share variants, do not share wire strings, and are
+/// never substitutable. See `docs/internal/enum-proliferation-audit-970.md`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum Tier {
@@ -628,6 +647,19 @@ pub struct SourceSpan {
 ///
 /// Surfaced to MCP callers via the `confidence_calibration.tier_thresholds`
 /// block on `memory_capabilities` (Gap 4 read-path closeout).
+///
+/// # Disambiguation (issue #970)
+///
+/// The codebase has three enums whose names end in `Tier`.
+/// `ConfidenceTier` (this enum) is the **confidence-value bucket**;
+/// it is unrelated to:
+///
+/// - [`Tier`] — memory-lifecycle TTL bucket (Short/Mid/Long).
+/// - [`crate::config::FeatureTier`] — host capability tier
+///   (Keyword/Semantic/Smart/Autonomous).
+///
+/// They do not share variants, wire strings, or call sites. See
+/// `docs/internal/enum-proliferation-audit-970.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConfidenceTier {

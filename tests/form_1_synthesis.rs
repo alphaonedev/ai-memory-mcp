@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
+
 //! v0.7.x Form 1 acceptance tests (issue #754) — verifying the
 //! single-batch action-emitting synthesis call BEFORE the SQL write.
 //!
@@ -115,6 +117,7 @@ fn seed_existing(conn: &Connection, title: &str, content: &str, namespace: &str)
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     };
     db::insert(conn, &mem).expect("seed insert")
 }
@@ -427,6 +430,7 @@ fn synthesis_parse_response_round_trips() {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     }];
     let raw = r#"{"verdicts":[{"candidate_id":"c1","verb":"delete","reason":"stale"}]}"#;
     let cands_ref: Vec<&Memory> = cands.iter().collect();
@@ -552,6 +556,7 @@ fn install_synthesis_policy(
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     };
     let sid = db::insert(conn, &standard).expect("insert std");
     db::set_namespace_standard(conn, ns, &sid, None).expect("set std");
@@ -780,6 +785,7 @@ fn synthesis_prompt_truncates_candidate_content_at_cap() {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     };
 
     let cap = 200_usize;
@@ -969,6 +975,7 @@ fn synthesis_prompt_format_reuse_byte_identical() {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            ..Memory::default()
         }
     }
 

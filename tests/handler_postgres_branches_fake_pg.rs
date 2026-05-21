@@ -570,6 +570,9 @@ async fn pg_recall_post_with_has_citations_filter() {
 
 #[tokio::test]
 async fn pg_forget_by_namespace_returns_deleted_count() {
+    // #942/#956 (security-2026-05-20) — `/api/v1/forget` requires
+    // caller-scoping; without an admin or matching agent_id, the
+    // handler refuses with 403. #997 fixture-drift fix.
     let (router, _f) = build_fake_pg_router();
     let _ = post_json(
         &router,
@@ -593,8 +596,11 @@ async fn pg_forget_by_namespace_returns_deleted_count() {
         json!({"namespace": "pgfake-forget"}),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{v}");
-    assert!(v.get("deleted").is_some(), "{v}");
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "#942: anon-caller forget on pg branch MUST reject; body={v}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -603,10 +609,16 @@ async fn pg_forget_by_namespace_returns_deleted_count() {
 
 #[tokio::test]
 async fn pg_list_agents_returns_array() {
+    // #946 (security-2026-05-20) — `/api/v1/agents` is admin-gated.
+    // Empty allowlist (fixture default) rejects every caller. #997
+    // fixture-drift fix.
     let (router, _f) = build_fake_pg_router();
     let (status, v) = get_uri(&router, "/api/v1/agents").await;
-    assert_eq!(status, StatusCode::OK, "{v}");
-    assert!(v.get("agents").is_some(), "{v}");
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "#946: empty-allowlist /api/v1/agents MUST reject; body={v}"
+    );
 }
 
 #[tokio::test]
@@ -706,15 +718,15 @@ async fn pg_entity_register_invalid_namespace_400() {
 
 #[tokio::test]
 async fn pg_taxonomy_via_store_pg_branch_envelope() {
+    // #945 (security-2026-05-20) — `/api/v1/taxonomy` is admin-gated.
+    // Empty allowlist (fixture default) rejects every caller before
+    // the downcast / 503 branch can fire. #997 fixture-drift fix.
     let (router, _f) = build_fake_pg_router();
-    let (status, _v) = get_uri(&router, "/api/v1/taxonomy").await;
-    // With `sal-postgres` ON, taxonomy_namespaces_via_store fails the
-    // downcast on a SqliteStore → 503. With only `sal` ON, the cfg-gated
-    // call is compiled out and the sqlite fallback returns 200. Accept
-    // both shapes so the test is feature-set independent.
-    assert!(
-        status == StatusCode::SERVICE_UNAVAILABLE || status == StatusCode::OK,
-        "got {status}",
+    let (status, v) = get_uri(&router, "/api/v1/taxonomy").await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "#945: empty-allowlist /api/v1/taxonomy MUST reject; body={v}"
     );
 }
 
@@ -724,21 +736,29 @@ async fn pg_taxonomy_via_store_pg_branch_envelope() {
 
 #[tokio::test]
 async fn pg_list_archive_via_store_envelope() {
+    // #943 (security-2026-05-20) — `/api/v1/archive` is admin-gated.
+    // Empty allowlist (fixture default) rejects every caller before
+    // the downcast / 503 branch can fire. #997 fixture-drift fix.
     let (router, _f) = build_fake_pg_router();
-    let (status, _v) = get_uri(&router, "/api/v1/archive").await;
-    assert!(
-        status == StatusCode::SERVICE_UNAVAILABLE || status == StatusCode::OK,
-        "got {status}",
+    let (status, v) = get_uri(&router, "/api/v1/archive").await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "#943: empty-allowlist /api/v1/archive MUST reject; body={v}"
     );
 }
 
 #[tokio::test]
 async fn pg_archive_stats_via_store_envelope() {
+    // #943 (security-2026-05-20) — `/api/v1/archive/stats` is
+    // admin-gated. Empty allowlist (fixture default) rejects every
+    // caller. #997 fixture-drift fix.
     let (router, _f) = build_fake_pg_router();
-    let (status, _v) = get_uri(&router, "/api/v1/archive/stats").await;
-    assert!(
-        status == StatusCode::SERVICE_UNAVAILABLE || status == StatusCode::OK,
-        "got {status}",
+    let (status, v) = get_uri(&router, "/api/v1/archive/stats").await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "#943: empty-allowlist /api/v1/archive/stats MUST reject; body={v}"
     );
 }
 
@@ -1020,11 +1040,17 @@ async fn pg_get_namespace_standard_qs_with_inherit() {
 
 #[tokio::test]
 async fn pg_get_namespace_standard_qs_no_namespace_returns_list() {
-    let (router, _f) = build_fake_pg_router();
+    // #945 (security-2026-05-20) — `/api/v1/namespaces` is admin-gated.
     // No namespace → delegates to list_namespaces() (sqlite path even on
-    // pg backend — list_namespaces has its own dispatch).
-    let (status, _v) = get_uri(&router, "/api/v1/namespaces").await;
-    assert_eq!(status, StatusCode::OK);
+    // pg backend). Empty allowlist (fixture default) rejects every
+    // caller. #997 fixture-drift fix.
+    let (router, _f) = build_fake_pg_router();
+    let (status, v) = get_uri(&router, "/api/v1/namespaces").await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "#945: empty-allowlist /api/v1/namespaces MUST reject; body={v}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1189,9 +1215,16 @@ async fn pg_sync_push_with_invalid_memory_skipped() {
 
 #[tokio::test]
 async fn pg_get_stats_returns_struct() {
+    // #946 (security-2026-05-20) — `/api/v1/stats` is admin-gated.
+    // Empty allowlist (fixture default) rejects every caller. #997
+    // fixture-drift fix.
     let (router, _f) = build_fake_pg_router();
-    let (status, _v) = get_uri(&router, "/api/v1/stats").await;
-    assert_eq!(status, StatusCode::OK);
+    let (status, v) = get_uri(&router, "/api/v1/stats").await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "#946: empty-allowlist /api/v1/stats MUST reject; body={v}"
+    );
 }
 
 #[tokio::test]
@@ -1576,10 +1609,16 @@ async fn pg_delete_link_unknown_returns_404_or_ok() {
 
 #[tokio::test]
 async fn pg_quota_status_list_no_agent_returns_list() {
+    // #960 (security-2026-05-20) — `/api/v1/quota/status` list path
+    // (no agent_id) is admin-gated. Empty allowlist (fixture default)
+    // rejects every caller. #997 fixture-drift fix.
     let (router, _f) = build_fake_pg_router();
     let (status, v) = post_json(&router, "/api/v1/quota/status", json!({})).await;
-    assert_eq!(status, StatusCode::OK, "{v}");
-    assert!(v.get("quotas").is_some() || v.get("count").is_some(), "{v}");
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "#960: empty-allowlist quota list MUST reject; body={v}"
+    );
 }
 
 // ---------------------------------------------------------------------------

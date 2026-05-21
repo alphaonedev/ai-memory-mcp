@@ -1,0 +1,927 @@
+{
+  "tools": [
+    {
+      "description": "Store a memory",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "confidence": {
+            "default": null,
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "content": {
+            "type": "string"
+          },
+          "force": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "kind": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "metadata": {
+            "additionalProperties": true,
+            "default": null,
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "namespace": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "on_conflict": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "priority": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "scope": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source_uri": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tags": {
+            "default": null,
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "tier": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "content",
+          "title"
+        ],
+        "type": "object"
+      },
+      "name": "memory_store"
+    },
+    {
+      "description": "Recall memories relevant to a",
+      "inputSchema": {
+        "additionalProperties": false,
+        "definitions": {
+          "KindsFilter": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "string"
+              }
+            ]
+          }
+        },
+        "properties": {
+          "as_agent": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "budget_tokens": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "confidence_tier": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "context": {
+            "type": "string"
+          },
+          "context_tokens": {
+            "default": null,
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "format": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "has_citations": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "include_archived": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "kinds": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/KindsFilter"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "limit": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "namespace": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "session_default": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "session_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "since": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source_uri_prefix": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tags": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "until": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "verbose_provenance": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "context"
+        ],
+        "type": "object"
+      },
+      "name": "memory_recall"
+    },
+    {
+      "description": "Search memories by exact",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "as_agent": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "format": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "include_archived": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "limit": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "namespace": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "query": {
+            "type": "string"
+          },
+          "tier": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "name": "memory_search"
+    },
+    {
+      "description": "List memories, optionally",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "format": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "limit": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "namespace": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tier": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "name": "memory_list"
+    },
+    {
+      "description": "Load top-k recent +",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "family": {
+            "type": "string"
+          },
+          "k": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "namespace": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "family"
+        ],
+        "type": "object"
+      },
+      "name": "memory_load_family"
+    },
+    {
+      "description": "Intent-routed loader: free-text",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "intent": {
+            "type": "string"
+          },
+          "k": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "namespace": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "intent"
+        ],
+        "type": "object"
+      },
+      "name": "memory_smart_load"
+    },
+    {
+      "description": "Delete a memory by ID.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_delete"
+    },
+    {
+      "description": "Promote a memory to long (or",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "target_tier": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "to_namespace": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_promote"
+    },
+    {
+      "description": "Bulk delete memories matching a",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "dry_run": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "namespace": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pattern": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tier": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "name": "memory_forget"
+    },
+    {
+      "description": "Update an existing memory by ID",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "confidence": {
+            "default": null,
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "content": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "edit_source": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "expected_version": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "expires_at": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "metadata": {
+            "additionalProperties": true,
+            "default": null,
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "namespace": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "priority": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "source_uri": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tags": {
+            "default": null,
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "tier": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_update"
+    },
+    {
+      "description": "Get a specific memory by ID,",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_get"
+    },
+    {
+      "description": "Discover runtime capabilities",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "accept": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "family": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "include_schema": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "verbose": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "name": "memory_capabilities"
+    },
+    {
+      "description": "Trigger garbage collection on",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "dry_run": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "name": "memory_gc"
+    },
+    {
+      "description": "Set a memory as the",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "governance": {
+            "default": null
+          },
+          "id": {
+            "type": "string"
+          },
+          "namespace": {
+            "type": "string"
+          },
+          "parent": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "namespace"
+        ],
+        "type": "object"
+      },
+      "name": "memory_namespace_set_standard"
+    },
+    {
+      "description": "Get the standard/policy memory",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "inherit": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "namespace": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "namespace"
+        ],
+        "type": "object"
+      },
+      "name": "memory_namespace_get_standard"
+    },
+    {
+      "description": "Clear the standard/policy for a",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "namespace": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "namespace"
+        ],
+        "type": "object"
+      },
+      "name": "memory_namespace_clear_standard"
+    },
+    {
+      "description": "List pending governance-queued",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "limit": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "status": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "name": "memory_pending_list"
+    },
+    {
+      "description": "Approve a pending action",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "remember": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_pending_approve"
+    },
+    {
+      "description": "Reject a pending action",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "remember": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_pending_reject"
+    },
+    {
+      "description": "Register a webhook subscription",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_filter": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "event_types": {
+            "default": null,
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "events": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "namespace_filter": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "secret": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "type": "object"
+      },
+      "name": "memory_subscribe"
+    },
+    {
+      "description": "Delete a subscription by id.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_unsubscribe"
+    }
+  ],
+  "toolsVersion": "2026-05-06"
+}

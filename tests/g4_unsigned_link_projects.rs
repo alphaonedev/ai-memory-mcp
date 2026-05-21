@@ -49,6 +49,7 @@
 //! and returns cleanly.
 
 #![cfg(feature = "sal-postgres")]
+#![allow(clippy::needless_update)]
 
 use ai_memory::models::ConfidenceSource;
 use std::sync::Arc;
@@ -179,6 +180,7 @@ fn fresh_memory(namespace: &str, title: &str) -> Memory {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     }
 }
 

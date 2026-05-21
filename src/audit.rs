@@ -648,6 +648,32 @@ pub struct VerifyFailure {
     pub detail: String,
 }
 
+/// Why the per-line audit-event hash chain (`AuditEvent` JSONL files
+/// under `audit/`) failed to verify.
+///
+/// # Disambiguation (issue #970)
+///
+/// A sibling enum
+/// [`crate::governance::audit::VerifyFailureKind`] exists for the
+/// **governance forensic-bundle chain** (Ed25519-signed
+/// `ForensicDecision` rows in `signed_events`). Despite the shared
+/// name, the two enums verify different chain shapes and have
+/// different variant sets:
+///
+/// - `audit::VerifyFailureKind` (this enum): `Parse`, `SelfHash`,
+///   `ChainBreak`, `Sequence`. The audit chain hashes each line's
+///   canonical bytes (`SelfHash`) and verifies a monotonically
+///   increasing `sequence` (`Sequence`). It does NOT sign rows
+///   individually.
+/// - `governance::audit::VerifyFailureKind`: `Parse`, `ChainBreak`,
+///   `Signature`. The forensic chain signs each row with an
+///   Ed25519 key (`Signature`) and verifies the cross-row hash
+///   pointer (`ChainBreak`). It has no per-line `SelfHash`
+///   (signature verification subsumes it) and no `Sequence`
+///   variant (sequence is a SQLite column, not a line counter).
+///
+/// They are call-site-disambiguated by their module path. See
+/// `docs/internal/enum-proliferation-audit-970.md`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerifyFailureKind {
     /// Line could not be parsed as an `AuditEvent`.

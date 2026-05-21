@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
+
 //! Issue #940 — `archive_by_ids` (sqlite branch) caller-vs-row-owner
 //! gate regression (security-high, v0.7.0 SHIP-blocker).
 //!
@@ -98,6 +100,7 @@ fn seed_live(
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     };
     ai_memory::db::insert(&conn, &mem).expect("insert seed");
     id

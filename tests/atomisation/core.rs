@@ -1,6 +1,7 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
 // clippy allows: test scaffolding does not need pedantic-clean.
 #![allow(
     clippy::doc_markdown,
@@ -214,6 +215,7 @@ fn insert_long_source(conn: &Connection, ns: &str, n_paras: usize) -> String {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     };
     db::insert(conn, &mem).expect("seed long source")
 }
@@ -248,6 +250,7 @@ fn insert_short_source(conn: &Connection, ns: &str) -> String {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     };
     db::insert(conn, &mem).expect("seed short source")
 }

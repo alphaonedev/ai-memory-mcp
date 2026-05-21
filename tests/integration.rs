@@ -11,6 +11,13 @@
 mod common;
 use common::free_port;
 
+/// #998 (2026-05-21) — concrete admin id seeded into
+/// `AI_MEMORY_ADMIN_AGENT_IDS` for every spawned integration daemon.
+/// Replaces the pre-#980 `"*"` wildcard which now fails
+/// `validate_agent_id`. Threaded through admin-gated GETs by
+/// [`curl_get_as_admin`] / [`curl_post_as_admin`].
+const INTEGRATION_TEST_ADMIN: &str = "ai:integration-test-admin";
+
 fn cmd(binary: &str) -> std::process::Command {
     let mut c = std::process::Command::new(binary);
     c.env("AI_MEMORY_NO_CONFIG", "1");
@@ -53,11 +60,17 @@ fn cmd(binary: &str) -> std::process::Command {
     // archive / pending / phase4 / sync_push / smoke / forget /
     // import routes; pre-#976 the test fixtures had no way to set
     // up the allowlist (no env-var, no CLI flag), so every test
-    // crashing on 403. The wildcard `*` makes every authenticated
-    // caller admin — appropriate scoping for the test suite where
-    // the daemon process is isolated per-test via tempfile DBs.
-    // Per-test overrides still win (env shadows at `.env()` call).
-    c.env("AI_MEMORY_ADMIN_AGENT_IDS", "*");
+    // crashing on 403.
+    //
+    // #998 (2026-05-21) — the original #976 fix used the `"*"`
+    // wildcard sentinel, but #980 (2026-05-20 night) tightened
+    // `daemon_runtime::resolve_admin_agent_ids` to validate each
+    // env-var entry through `validate_agent_id` — `"*"` fails the
+    // shape check and gets dropped. Integration tests need a
+    // concrete admin id; use `ai:integration-test-admin` and thread
+    // it through admin-gated GETs via `curl_get_as_admin` /
+    // `curl_post_as_admin`. Per-test overrides still win.
+    c.env("AI_MEMORY_ADMIN_AGENT_IDS", INTEGRATION_TEST_ADMIN);
     c
 }
 /// Spawn a command and collect its output, panicking with a descriptive
@@ -7643,11 +7656,19 @@ fn test_budget_mcp_tool_schema_and_response() {
         "#859: per-property `description` prose must be stripped on the wire"
     );
     // Structural metadata stays so clients can construct valid args.
-    assert_eq!(
-        budget_tokens
-            .get("type")
-            .and_then(serde_json::Value::as_str),
-        Some("integer")
+    // **v0.7.0 #987 update.** D1.6 schemars derives Option<i64> as
+    // `type: ["integer","null"]` (no longer a bare "integer" string).
+    // Accept either legacy bare-type OR the schemars nullable array.
+    let type_field = budget_tokens
+        .get("type")
+        .expect("budget_tokens must have `type`");
+    let is_integer = type_field == "integer"
+        || type_field
+            .as_array()
+            .is_some_and(|arr| arr.iter().any(|v| v == "integer"));
+    assert!(
+        is_integer,
+        "budget_tokens must be integer (legacy bare or schemars [\"integer\",\"null\"]); got {type_field}"
     );
     // The required param `context` survives the trim.
     assert!(
@@ -8779,6 +8800,30 @@ fn curl_get_as(port: u16, path: &str, agent_id: &str) -> (String, serde_json::Va
     (code.trim().to_string(), v)
 }
 
+/// #998 — admin-flavored shortcut over [`curl_get_as`]. Threads the
+/// [`INTEGRATION_TEST_ADMIN`] id so the spawned daemon's admin allowlist
+/// (seeded by [`cmd`]) admits the call. Use on any GET that hits an
+/// admin-gated endpoint (`/api/v1/stats`, `/api/v1/archive*`,
+/// `/api/v1/pending`, `/api/v1/agents`, `/api/v1/taxonomy`,
+/// `/api/v1/namespaces`, `/api/v1/quota/status` list path, etc.).
+fn curl_get_as_admin(port: u16, path: &str) -> (String, serde_json::Value) {
+    curl_get_as(port, path, INTEGRATION_TEST_ADMIN)
+}
+
+/// #998 — admin-flavored shortcut over [`curl_post`]. Threads
+/// [`INTEGRATION_TEST_ADMIN`] for admin-gated POSTs
+/// (`/api/v1/import`, etc.). Kept as a forward-looking helper alongside
+/// [`curl_get_as_admin`]; today's callers all go through the in-process
+/// `route_*` path.
+#[allow(dead_code)]
+fn curl_post_as_admin(
+    port: u16,
+    path: &str,
+    body: &serde_json::Value,
+) -> (String, serde_json::Value) {
+    curl_post(port, path, body, Some(INTEGRATION_TEST_ADMIN))
+}
+
 fn curl_post(
     port: u16,
     path: &str,
@@ -8950,18 +8995,19 @@ impl OneshotDaemon {
             // (`/api/v1/import`, `/api/v1/export`, `/api/v1/archive*`,
             // `/api/v1/forget`, `/api/v1/skills/*`, sync push/since,
             // pending governance flows) requires the test caller to be
-            // in the admin allowlist. Pre-#976 the allowlist only
-            // contained `ai:phase4-admin` (the #956/#957 import/export
-            // gate fix), so happy-path tests that drove archive /
-            // phase4 / smoke routes under non-admin callers (or no
-            // caller) returned 403 from `require_admin`. Using the
-            // `*` wildcard matches the posture in `src/handlers/tests.rs:362`
-            // and the subprocess `cmd()` daemon's
-            // `AI_MEMORY_ADMIN_AGENT_IDS=*` env. Negative-admin tests
-            // belong in dedicated fixtures (e.g., the
-            // `src/handlers/admin_role.rs` unit tests) that build
-            // their own AppState with a restricted allowlist.
-            admin_agent_ids: std::sync::Arc::new(vec!["*".to_string()]),
+            // in the admin allowlist.
+            //
+            // #998 (2026-05-21) — the original #976 fix used the `"*"`
+            // wildcard, but #980 closed the wildcard arm in
+            // `is_admin_caller` to a `#[cfg(test)]`-only path. The lib
+            // crate (where `is_admin_caller` lives) is compiled WITHOUT
+            // `cfg(test)` when the integration-test crate links against
+            // it, so the wildcard arm is dead code on this path. Use a
+            // concrete id (`INTEGRATION_TEST_ADMIN`) and thread it
+            // through admin-gated GETs via `route_get_as_admin` /
+            // `curl_get_as_admin`. Negative-admin tests build their own
+            // AppState with a restricted allowlist.
+            admin_agent_ids: std::sync::Arc::new(vec![INTEGRATION_TEST_ADMIN.to_string()]),
         };
         let api_key_state = ai_memory::handlers::ApiKeyState {
             key: None,
@@ -9019,6 +9065,26 @@ async fn route_get_with_agent(
 ) -> (String, serde_json::Value) {
     let (status, body) = d.request("GET", path, None, Some(agent_id)).await;
     (status.as_u16().to_string(), body)
+}
+
+/// #998 — admin-flavored shortcut over [`route_get_with_agent`]. Threads
+/// [`INTEGRATION_TEST_ADMIN`] so the in-process daemon's admin
+/// allowlist admits the call.
+#[allow(dead_code)]
+async fn route_get_as_admin(d: &OneshotDaemon, path: &str) -> (String, serde_json::Value) {
+    route_get_with_agent(d, path, INTEGRATION_TEST_ADMIN).await
+}
+
+/// #998 — admin-flavored shortcut over [`route_post`]. Threads
+/// [`INTEGRATION_TEST_ADMIN`] so admin-gated POSTs (e.g. `/api/v1/import`)
+/// land on the admin happy path.
+#[allow(dead_code)]
+async fn route_post_as_admin(
+    d: &OneshotDaemon,
+    path: &str,
+    body: &serde_json::Value,
+) -> (String, serde_json::Value) {
+    route_post(d, path, body, Some(INTEGRATION_TEST_ADMIN)).await
 }
 
 #[allow(dead_code)]
@@ -9528,7 +9594,10 @@ fn http_archive_by_ids_end_to_end_moves_row_from_active_to_archive() {
     assert_eq!(code, "404", "archived memory must no longer be active");
 
     // Archive list contains the entry with the supplied reason.
-    let (code, listing) = curl_get(d.port, "/api/v1/archive?namespace=s29-e2e");
+    // #998 — /api/v1/archive is admin-gated per #943; thread the
+    // INTEGRATION_TEST_ADMIN id so the empty-allowlist no-op'd post-#980
+    // doesn't 403.
+    let (code, listing) = curl_get_as_admin(d.port, "/api/v1/archive?namespace=s29-e2e");
     assert_eq!(code, "200");
     let items = listing["archived"].as_array().unwrap();
     assert_eq!(items.len(), 1);
@@ -10106,7 +10175,7 @@ fn http_sync_push_applies_pendings() {
     assert_eq!(code, "200", "sync_push: {resp}");
     assert_eq!(resp["pendings_applied"].as_u64().unwrap_or(0), 1);
 
-    let (code, list) = curl_get(peer.port, "/api/v1/pending?limit=100");
+    let (code, list) = curl_get_as_admin(peer.port, "/api/v1/pending?limit=100");
     assert_eq!(code, "200", "list_pending: {list}");
     let rows = list["pending"].as_array().expect("pending array");
     assert!(
@@ -10165,7 +10234,7 @@ fn http_sync_push_applies_pending_decisions() {
     assert_eq!(code, "200", "sync_push decisions: {resp}");
     assert_eq!(resp["pending_decisions_applied"].as_u64().unwrap_or(0), 1);
 
-    let (_, list) = curl_get(peer.port, "/api/v1/pending?limit=100");
+    let (_, list) = curl_get_as_admin(peer.port, "/api/v1/pending?limit=100");
     let rows = list["pending"].as_array().expect("pending array");
     let row = rows
         .iter()
@@ -10533,7 +10602,7 @@ fn http_pending_governance_approve_rejects_cross_peer() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let mut found = false;
     while std::time::Instant::now() < deadline {
-        let (code, body) = curl_get(peer.port, "/api/v1/pending?limit=100");
+        let (code, body) = curl_get_as_admin(peer.port, "/api/v1/pending?limit=100");
         if code == "200"
             && let Some(rows) = body["pending"].as_array()
             && rows.iter().any(|r| r["id"].as_str() == Some(&pending_id))
@@ -11180,7 +11249,7 @@ async fn http_smoke_matrix_phases_1_3() {
 
     // /api/v1/stats — GET, must return 200 with stats object
     {
-        let (code, body) = route_get(&d, "/api/v1/stats").await;
+        let (code, body) = route_get_as_admin(&d, "/api/v1/stats").await;
         assert_eq!(code, "200", "stats: {body}");
         assert!(body.get("total").is_some(), "stats.total: {body}");
         assert!(
@@ -11201,7 +11270,7 @@ async fn http_smoke_matrix_phases_1_3() {
 
     // /api/v1/archive/stats — GET, must return 200 with archive stats
     {
-        let (code, body) = route_get(&d, "/api/v1/archive/stats").await;
+        let (code, body) = route_get_as_admin(&d, "/api/v1/archive/stats").await;
         assert_eq!(code, "200", "archive_stats: {body}");
         assert!(
             body.get("archived_total").is_some(),
@@ -11211,28 +11280,28 @@ async fn http_smoke_matrix_phases_1_3() {
 
     // /api/v1/agents — GET, must return 200 with agents list
     {
-        let (code, body) = route_get(&d, "/api/v1/agents").await;
+        let (code, body) = route_get_as_admin(&d, "/api/v1/agents").await;
         assert_eq!(code, "200", "agents: {body}");
         assert!(body.get("agents").is_some(), "agents.agents: {body}");
     }
 
     // /api/v1/pending — GET, must return 200 with pending list
     {
-        let (code, body) = route_get(&d, "/api/v1/pending").await;
+        let (code, body) = route_get_as_admin(&d, "/api/v1/pending").await;
         assert_eq!(code, "200", "pending: {body}");
         assert!(body.get("pending").is_some(), "pending.pending: {body}");
     }
 
     // /api/v1/inbox — GET, must return 200 with inbox list
     {
-        let (code, body) = route_get(&d, "/api/v1/inbox").await;
+        let (code, body) = route_get_as_admin(&d, "/api/v1/inbox").await;
         assert_eq!(code, "200", "inbox: {body}");
         assert!(body.get("messages").is_some(), "inbox.messages: {body}");
     }
 
     // /api/v1/capabilities — GET, must return 200 with capabilities object
     {
-        let (code, body) = route_get(&d, "/api/v1/capabilities").await;
+        let (code, body) = route_get_as_admin(&d, "/api/v1/capabilities").await;
         assert_eq!(code, "200", "capabilities: {body}");
         assert!(body.get("tier").is_some(), "capabilities.tier: {body}");
         assert!(
@@ -11260,19 +11329,19 @@ async fn http_smoke_matrix_phases_1_3() {
 
     // /api/v1/namespaces — GET (query-string form)
     {
-        let (code, _body) = route_get(&d, "/api/v1/namespaces?namespace=test").await;
+        let (code, _body) = route_get_as_admin(&d, "/api/v1/namespaces?namespace=test").await;
         assert!(code == "200" || code == "404", "namespaces GET");
     }
 
     // /api/v1/namespaces/{ns}/standard — GET (path form)
     {
-        let (code, _body) = route_get(&d, "/api/v1/namespaces/test-smoke/standard").await;
+        let (code, _body) = route_get_as_admin(&d, "/api/v1/namespaces/test-smoke/standard").await;
         assert!(code == "200" || code == "404", "namespaces path form GET");
     }
 
     // /api/v1/taxonomy — GET
     {
-        let (code, body) = route_get(&d, "/api/v1/taxonomy").await;
+        let (code, body) = route_get_as_admin(&d, "/api/v1/taxonomy").await;
         assert_eq!(code, "200", "taxonomy: {body}");
     }
 
@@ -11738,7 +11807,7 @@ async fn http_phase4_archive_list() {
     let d = OneshotDaemon::new();
 
     // Test GET /api/v1/archive (list archived)
-    let (code, body) = route_get(&d, "/api/v1/archive").await;
+    let (code, body) = route_get_as_admin(&d, "/api/v1/archive").await;
     assert_eq!(code, "200", "archive list status code: {body}");
     assert!(body.get("archived").is_some(), "archive.archived: {body}");
     assert!(body.get("count").is_some(), "archive.count: {body}");
@@ -11790,7 +11859,7 @@ async fn http_phase4_archive_by_ids() {
     assert_eq!(body["count"], 1, "should archive 1 memory: {body}");
 
     // Verify it's in the archive list
-    let (code, list_body) = route_get(&d, "/api/v1/archive").await;
+    let (code, list_body) = route_get_as_admin(&d, "/api/v1/archive").await;
     assert_eq!(code, "200");
     assert!(
         !list_body["archived"].as_array().unwrap().is_empty(),
@@ -11894,15 +11963,15 @@ async fn http_phase4_import_memories() {
     ];
 
     // #956 — `/api/v1/import` admin-gated; OneshotDaemon seeds
-    // `ai:phase4-admin` into the allowlist; pass via `route_post`.
-    let (code, body) = route_post(
+    // INTEGRATION_TEST_ADMIN into the allowlist (#998 swap from
+    // pre-#980 "*" wildcard).
+    let (code, body) = route_post_as_admin(
         &d,
         "/api/v1/import",
         &serde_json::json!({
             "memories": memories_to_import,
             "links": []
         }),
-        Some("ai:phase4-admin"),
     )
     .await;
     assert_eq!(code, "200", "import status code: {body}");

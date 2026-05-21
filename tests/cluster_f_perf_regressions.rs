@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
+
 //! v0.7.0 Cluster-F performance regression-pins (issue #767).
 //!
 //! Each test asserts a behavioural property the Cluster-F refactor
@@ -130,6 +132,7 @@ fn make_memory(ns: &str, title: &str, content: &str) -> Memory {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     }
 }
 

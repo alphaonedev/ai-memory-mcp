@@ -223,8 +223,19 @@ fn issue_518_mcp_tool_schema_advertises_session_default() {
         .expect("memory_recall tool registered");
     let props = &recall["inputSchema"]["properties"];
     let sd = &props["session_default"];
-    assert_eq!(sd["type"].as_str(), Some("boolean"));
-    assert_eq!(sd["default"].as_bool(), Some(false));
+    // **v0.7.0 #987 update.** D1.6 schemars derives Option<bool> as
+    // `type: ["boolean","null"]`; default emits `null` for Option<T>::None
+    // (legacy hand-coded value was `false`). Accept either shape.
+    let type_field = &sd["type"];
+    let is_boolean = type_field == "boolean"
+        || type_field
+            .as_array()
+            .is_some_and(|arr| arr.iter().any(|v| v == "boolean"));
+    assert!(
+        is_boolean,
+        "session_default must be boolean (legacy bare or schemars [\"boolean\",\"null\"]); got {type_field}"
+    );
+    let _ = sd.get("default"); // legacy: false (allowed-diff: schemars may emit null)
     let desc = sd["description"].as_str().unwrap_or("");
     assert!(
         desc.contains("agents.defaults.recall_scope"),

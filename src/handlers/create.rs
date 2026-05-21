@@ -56,7 +56,7 @@ use super::{AppState, JsonOrBadRequest};
 ///   2. embedded `body.metadata.agent_id` (caller's NHI claim — load-
 ///      bearing for federation receivers and clients that prefer the
 ///      metadata-only shape; mirrors the MCP precedence at
-///      `src/mcp.rs:1514-1516` and the CLAUDE.md §Agent Identity (NHI)
+///      `crate::mcp::handle_store` (NHI precedence) and the CLAUDE.md §Agent Identity (NHI)
 ///      contract).
 ///   3. `X-Agent-Id` request header
 ///   4. per-request anonymous fallback
@@ -355,7 +355,7 @@ async fn enforce_create_governance<'a>(
 }
 
 /// #866 stage 5 — quota check + `db::insert`. The quota gate mirrors
-/// the MCP path (`src/mcp.rs:1691`): `check_and_record` before the
+/// the MCP path (`crate::mcp::handle_store` (quota check)): `check_and_record` before the
 /// insert, refund on failure. The audit emit fires on success; the
 /// embedding write to `db::set_embedding` lights the HNSW index up
 /// after the row commits. Returns either the persisted row id (on
@@ -378,7 +378,7 @@ fn insert_create_with_quota(
     // v0.7.0 Round-2 F7 — per-agent quota gate. Round-1 evidence: 500
     // HTTP stores from a single agent_id incremented zero rows in
     // `agent_quotas` while the same agent's MCP-side stamp incremented
-    // correctly. The MCP store path (src/mcp.rs:1691) calls
+    // correctly. The MCP store path (crate::mcp::handle_store) calls
     // `quotas::check_and_record` ahead of `db::insert` and refunds on
     // insert failure; mirror that here so the HTTP path is no longer a
     // quota-bypass surface. Bytes counted = (title + content +
@@ -477,7 +477,7 @@ fn insert_create_with_quota(
             // v0.7.0 Round-2 F7 — insert failed AFTER we committed the
             // quota counter; refund so the agent's quota reflects only
             // successful stores (mirrors the MCP path at
-            // src/mcp.rs:1706). Refund is best-effort — a refund
+            // crate::mcp::handle_store). Refund is best-effort — a refund
             // failure is logged but does not change the response.
             if !quota_agent_id.is_empty() {
                 if let Err(re) = crate::quotas::refund_op(&lock.0, &quota_agent_id, quota_op) {
@@ -495,6 +495,15 @@ fn insert_create_with_quota(
             // typed `storage::GovernanceRefusal` propagated via
             // `anyhow::Error`; downcasting here keeps the
             // happy-path-cheap `?`-friendly return shape upstream.
+            //
+            // SAL-bypass intentional (#961): the SAL `StoreError` enum
+            // in `src/store/mod.rs` does not carry the operator-authored
+            // reason string; substrate governance refusals are emitted
+            // by the legacy db:: write path which wraps them in
+            // `anyhow::Error`. Downcasting to the legacy concrete type
+            // here is the load-bearing contract — pinned by the
+            // `insert_governance_refusal_downcasts_to_403_envelope` test
+            // in the `#[cfg(test)]` block below.
             if let Some(refusal) = e.downcast_ref::<crate::storage::GovernanceRefusal>() {
                 tracing::info!(
                     "create_memory refused by substrate governance: {}",
@@ -875,7 +884,7 @@ pub async fn create_memory(
     JsonOrBadRequest(body): JsonOrBadRequest<CreateMemory>,
 ) -> impl IntoResponse {
     // Input validation (cheapest gate first).
-    if let Err(e) = validate::validate_create(&body) {
+    if let Err(e) = validate::RequestValidator::validate_create(&body) {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": e.to_string()})),
@@ -1297,7 +1306,8 @@ mod tests {
         let body = make_body("");
         // Hit the validator the orchestrator runs at the top of
         // `create_memory`. Any non-Ok result must be a 400.
-        let err = validate::validate_create(&body).expect_err("empty title must fail validation");
+        let err = validate::RequestValidator::validate_create(&body)
+            .expect_err("empty title must fail validation");
         let msg = err.to_string();
         assert!(
             !msg.is_empty(),

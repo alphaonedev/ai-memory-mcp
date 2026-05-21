@@ -98,10 +98,12 @@ fn c3_tools_list_token_budget_is_under_post_859_ceiling() {
     let serialized = serde_json::to_string(&defs).expect("tool defs must serialize");
     let tokens = ai_memory::db::count_tokens_cl100k(&serialized);
 
+    // **v0.7.0 #987 update.** D1.6 schemars metadata bumps ceiling 5K → 11K.
+    // Aligned with tests/token_budget_guard.rs::TRIMMED_FULL_PROFILE_CEILING_TOKENS.
     assert!(
-        tokens <= 5000,
-        "tools/list bare payload exceeded the post-#859 budget — got {tokens} cl100k tokens, \
-         ceiling is 5000. C3 stripped inline examples; if this fires the surface grew \
+        tokens <= 11_000,
+        "tools/list bare payload exceeded the post-#987 D1.6 budget — got {tokens} cl100k tokens, \
+         ceiling is 11000. C3 stripped inline examples; if this fires the surface grew \
          elsewhere (e.g. a tool's `description` is no longer compacted, or per-property \
          prose leaked back onto the wire)."
     );

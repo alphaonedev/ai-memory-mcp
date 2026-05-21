@@ -1,6 +1,7 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
 // clippy allows (test scaffolding): pedantic lints with no behavioral impact.
 #![allow(clippy::redundant_closure_for_method_calls)]
 //! v0.7.0 K10 — `remember=forever` writes a synthetic permission rule.
@@ -84,6 +85,7 @@ async fn mcp_pending_approve_with_forever_records_rule() {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..ai_memory::models::Memory::default()
     };
     let mem_id = ai_memory::db::insert(&conn, &mem).expect("insert memory");
     let payload = json!({"reason": "k10-forever"});

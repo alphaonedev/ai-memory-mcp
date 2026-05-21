@@ -57,7 +57,7 @@
 
 use std::str::FromStr;
 
-/// A tool family. Source-anchored at `src/mcp.rs::tool_definitions()`
+/// A tool family. Source-anchored at `crate::mcp::registry::tool_definitions()`
 /// 2026-05-05. Counts must sum to 51 (the v0.6.3.1 baseline of 43 +
 /// v0.7.0 I4 `memory_replay` + v0.7 H4 `memory_verify` (both in
 /// `Family::Graph`) + v0.7 B1 `memory_load_family` and v0.7 B2
@@ -112,7 +112,7 @@ pub const ALWAYS_ON_TOOLS: &[&str] = &["memory_capabilities"];
 
 impl Family {
     /// Lookup the family that owns a given tool name. Source-anchored
-    /// at `src/mcp.rs::tool_definitions()` 2026-05-04. Every name listed
+    /// at `crate::mcp::registry::tool_definitions()` 2026-05-04. Every name listed
     /// in the v0.6.3.1 baseline is covered; `None` means the tool is
     /// either unknown to this enumeration or moved out of bounds (which
     /// should make `tool_definitions_returns_43_tools` red and force a
@@ -332,7 +332,7 @@ impl Family {
 
     /// v0.7.0 A2 — tool names belonging to this family. Forward of the
     /// `Family::for_tool` reverse map; source-anchored at
-    /// `src/mcp.rs::tool_definitions()` 2026-05-04 (same anchor as
+    /// `crate::mcp::registry::tool_definitions()` 2026-05-04 (same anchor as
     /// [`Family::for_tool`] and [`Family::expected_tool_count`]).
     /// Order is the order each tool appears in
     /// `tool_definitions_for_profile`'s registration walk, so an
@@ -1027,7 +1027,7 @@ mod tests {
 
     #[test]
     fn family_for_tool_resolves_every_baseline_name() {
-        // Source-anchored at src/mcp.rs::tool_definitions() — if any
+        // Source-anchored at crate::mcp::registry::tool_definitions() — if any
         // tool here is missing from `for_tool`, the family map is
         // out of sync and `--profile <family>` would silently miss it.
         let baseline = [

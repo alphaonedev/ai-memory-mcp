@@ -234,6 +234,75 @@ pub fn handle_atomise(
     }
 }
 
+// --- D1.5 (#986): per-tool McpTool impl for memory_atomise ---
+
+use crate::mcp::registry::McpTool;
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+/// v0.7.0 #972 D1.5 (#986) — request body for `memory_atomise`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct AtomiseRequest {
+    /// Source memory UUID.
+    pub memory_id: String,
+
+    /// Per-atom cl100k budget.
+    #[serde(default)]
+    pub max_atom_tokens: Option<i64>,
+
+    /// Skip idempotency; mint fresh atoms (old retained).
+    #[serde(default)]
+    pub force_re_atomise: Option<bool>,
+}
+
+/// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_atomise`.
+#[allow(dead_code)]
+pub struct AtomiseTool;
+
+impl McpTool for AtomiseTool {
+    fn name() -> &'static str {
+        "memory_atomise"
+    }
+    fn description() -> &'static str {
+        "Decompose a memory into 2-10 atomic propositions; source archived. Smart+ tier."
+    }
+    fn docs() -> &'static str {
+        "WT-1-C: atomise via WT-1-B engine. Atoms = Observation memories with metadata.atom_source_id + derives_from link. Source archived (atomised_into=N). Returns {source_id, atom_ids, atom_count, archived_at}. Idempotent (use force_re_atomise to mint fresh). Too-small sources => {source_too_small:true}. Failures => CURATOR_FAILED / GOVERNANCE_REFUSED envelopes."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(AtomiseRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "power"
+    }
+}
+
+#[cfg(test)]
+mod d1_5_986_tests {
+    //! D1.5 (#986) — schema parity for `memory_atomise`.
+    //! Shared helpers live at [`crate::mcp::parity_test_helpers`].
+    use super::*;
+    use crate::mcp::parity_test_helpers::{
+        assert_descriptions_match, assert_property_set_parity, derived_props_for,
+    };
+
+    #[test]
+    fn atomise_parity_986() {
+        let derived = derived_props_for::<AtomiseRequest>();
+        assert_property_set_parity("memory_atomise", &derived);
+        assert_descriptions_match("memory_atomise", &derived);
+    }
+
+    #[test]
+    fn atomise_tool_metadata_986() {
+        assert_eq!(AtomiseTool::name(), "memory_atomise");
+        assert_eq!(AtomiseTool::family(), "power");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests — focus on the argument-parsing and tier-gate branches
 // (which do NOT require a live atomiser / DB). The full happy-path

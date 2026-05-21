@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
+
 //! v0.7.0 L2-6 (issue #671) — reflection-as-skill promotion regression
 //! suite. The closing loop of the recursive-learning substrate.
 //!
@@ -70,6 +72,7 @@ fn insert_observation(conn: &rusqlite::Connection, title: &str, ns: &str, body: 
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     };
     db::insert(conn, &m).expect("insert observation")
 }
@@ -192,6 +195,7 @@ fn refuses_depth_zero_reflection() {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     };
     let id = db::insert(&conn, &m).expect("insert");
 
@@ -269,6 +273,7 @@ fn threshold_configurable_via_namespace_governance() {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     };
     let std_id = db::insert(&conn, &std_mem).expect("insert standard");
     db::set_namespace_standard(&conn, "ns-strict", &std_id, None).expect("set standard");

@@ -219,7 +219,7 @@ footer a{color:var(--text-muted)}
     <div class="feature rest">
       <div class="feature-head"><span class="feature-name">PRAGMA key</span><span class="feature-tag live">live since v0.5</span></div>
       <div class="feature-desc">When the daemon opens an encrypted DB, it issues <code>PRAGMA key = '…'</code> with the operator's passphrase. SQLCipher's libsqlcipher (drop-in libsqlite3 replacement) handles AES-256-CBC of every page + PBKDF2-HMAC-SHA512 key derivation. A wrong key → loud error at startup.</div>
-      <div class="snip"><span class="cm">// from src/db.rs::open</span>
+      <div class="snip"><span class="cm">// from src/storage/mod.rs::open</span>
 <span class="key">conn</span>.execute_batch(<span class="val">"PRAGMA key = 'YOUR_PASSPHRASE'"</span>)
     .context(<span class="val">"PRAGMA key failed (wrong passphrase or unencrypted DB?)"</span>)?;
 

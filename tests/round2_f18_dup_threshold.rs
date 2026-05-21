@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
+
 //! Round-2 F18 — `check_duplicate` exact-match short-circuit.
 //!
 //! Round-2 evidence: storing memory `M1` with content `C` and then
@@ -69,6 +71,7 @@ fn seed_with_embedding(
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..ai_memory::models::Memory::default()
     };
     let stored_id = db::insert(conn, &mem).expect("db::insert");
     db::set_embedding(conn, &stored_id, embedding).expect("db::set_embedding");

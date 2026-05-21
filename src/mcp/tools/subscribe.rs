@@ -3,7 +3,97 @@
 
 //! MCP subscription management handlers.
 
+use crate::mcp::registry::McpTool;
+use schemars::JsonSchema;
+use serde::Deserialize;
 use serde_json::{Value, json};
+
+// --- D1.4 (#985): per-tool McpTool impls for `memory_subscribe` and
+// `memory_unsubscribe` (governance family) ---
+
+/// v0.7.0 #972 D1.4 (#985) — request body for `memory_subscribe`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct SubscribeRequest {
+    /// https URL (http only for loopback). SSRF guard rejects private IPs.
+    pub url: String,
+
+    /// Comma-list or *. Events: memory_store, memory_delete, memory_promote.
+    #[serde(default)]
+    pub events: Option<String>,
+
+    /// HMAC secret. Omit for unsigned.
+    #[serde(default)]
+    pub secret: Option<String>,
+
+    /// Exact namespace match.
+    #[serde(default)]
+    pub namespace_filter: Option<String>,
+
+    /// agent_id filter.
+    #[serde(default)]
+    pub agent_filter: Option<String>,
+
+    #[schemars(description = "#912 event-type subset.")]
+    #[serde(default)]
+    pub event_types: Option<Vec<String>>,
+}
+
+/// v0.7.0 #972 D1.4 (#985) — `McpTool` impl for `memory_subscribe`.
+#[allow(dead_code)]
+pub struct SubscribeTool;
+
+impl McpTool for SubscribeTool {
+    fn name() -> &'static str {
+        "memory_subscribe"
+    }
+    fn description() -> &'static str {
+        "Register a webhook subscription for memory events."
+    }
+    fn docs() -> &'static str {
+        "Webhook subscription. HMAC-SHA256 signed via X-Ai-Memory-Signature when secret supplied. https required (http only for loopback). Secret stored hashed only."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(SubscribeRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "governance"
+    }
+}
+
+/// v0.7.0 #972 D1.4 (#985) — request body for `memory_unsubscribe`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct UnsubscribeRequest {
+    pub id: String,
+}
+
+/// v0.7.0 #972 D1.4 (#985) — `McpTool` impl for `memory_unsubscribe`.
+#[allow(dead_code)]
+pub struct UnsubscribeTool;
+
+impl McpTool for UnsubscribeTool {
+    fn name() -> &'static str {
+        "memory_unsubscribe"
+    }
+    fn description() -> &'static str {
+        "Delete a subscription by id."
+    }
+    fn docs() -> &'static str {
+        "Delete subscription. DLQ rows retained for audit."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(UnsubscribeRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "governance"
+    }
+}
+
 pub(super) fn handle_subscribe(
     conn: &rusqlite::Connection,
     params: &Value,
@@ -136,6 +226,119 @@ pub(super) fn handle_subscription_replay(
         .ok_or("since is required (RFC3339)")?;
     crate::subscriptions::memory_subscription_replay(conn, subscription_id, since)
         .map_err(|e| e.to_string())
+}
+
+// --- D1.5 (#986): per-tool McpTool impls for the in-scope subscribe tools ---
+//
+// `memory_subscribe` + `memory_unsubscribe` belong to Family::Governance
+// and are migrated by the sibling D1.4 (#985) sub-agent. Only the
+// `list_subscriptions` (other) and `subscription_replay` (power) tools
+// land here in D1.5 scope.
+//
+// #985/#986 integration: imports already brought in at the top of the
+// file by the D1.4 governance commit (`McpTool`, `JsonSchema`,
+// `Deserialize`). Duplicate `use` statements removed during cherry-pick
+// integration.
+
+/// v0.7.0 #972 D1.5 (#986) — request body for `memory_list_subscriptions`.
+/// The legacy schema is `properties: {}` — empty struct.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct ListSubscriptionsRequest {}
+
+/// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_list_subscriptions`.
+#[allow(dead_code)]
+pub struct ListSubscriptionsTool;
+
+impl McpTool for ListSubscriptionsTool {
+    fn name() -> &'static str {
+        "memory_list_subscriptions"
+    }
+    fn description() -> &'static str {
+        "List active webhook subscriptions."
+    }
+    fn docs() -> &'static str {
+        "List subscriptions. Secrets never returned."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(ListSubscriptionsRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "other"
+    }
+}
+
+/// v0.7.0 #972 D1.5 (#986) — request body for `memory_subscription_replay`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct SubscriptionReplayRequest {
+    /// Subscription id.
+    pub subscription_id: String,
+
+    /// RFC3339 inclusive lower bound.
+    pub since: String,
+}
+
+/// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_subscription_replay`.
+#[allow(dead_code)]
+pub struct SubscriptionReplayTool;
+
+impl McpTool for SubscriptionReplayTool {
+    fn name() -> &'static str {
+        "memory_subscription_replay"
+    }
+    fn description() -> &'static str {
+        "Replay subscription_events since an RFC3339 timestamp."
+    }
+    fn docs() -> &'static str {
+        "K7: replay events ordered by delivered_at asc."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(SubscriptionReplayRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "power"
+    }
+}
+
+#[cfg(test)]
+mod d1_5_986_tests {
+    //! D1.5 (#986) — schema parity for the in-scope subscribe tools.
+    //! Shared helpers live at [`crate::mcp::parity_test_helpers`].
+    use super::*;
+    use crate::mcp::parity_test_helpers::{
+        assert_descriptions_match, assert_property_set_parity, derived_props_for,
+    };
+
+    #[test]
+    fn list_subscriptions_parity_986() {
+        let derived = derived_props_for::<ListSubscriptionsRequest>();
+        assert_property_set_parity("memory_list_subscriptions", &derived);
+        assert_descriptions_match("memory_list_subscriptions", &derived);
+    }
+
+    #[test]
+    fn list_subscriptions_tool_metadata_986() {
+        assert_eq!(ListSubscriptionsTool::name(), "memory_list_subscriptions");
+        assert_eq!(ListSubscriptionsTool::family(), "other");
+    }
+
+    #[test]
+    fn subscription_replay_parity_986() {
+        let derived = derived_props_for::<SubscriptionReplayRequest>();
+        assert_property_set_parity("memory_subscription_replay", &derived);
+        assert_descriptions_match("memory_subscription_replay", &derived);
+    }
+
+    #[test]
+    fn subscription_replay_tool_metadata_986() {
+        assert_eq!(SubscriptionReplayTool::name(), "memory_subscription_replay");
+        assert_eq!(SubscriptionReplayTool::family(), "power");
+    }
 }
 
 #[cfg(test)]
@@ -297,5 +500,41 @@ mod tests {
         let err =
             handle_subscription_replay(&conn, &json!({"subscription_id": "sub-1"})).unwrap_err();
         assert!(err.contains("since"), "got: {err}");
+    }
+}
+
+#[cfg(test)]
+mod d1_4_985_tests {
+    //! D1.4 (#985) — schema-parity for `memory_subscribe` and
+    //! `memory_unsubscribe`.
+    use super::*;
+    use crate::mcp::d1_4_985_helpers::{
+        assert_descriptions_match, assert_property_set_parity, derived_props_for,
+    };
+
+    #[test]
+    fn memory_subscribe_parity_985() {
+        let derived = derived_props_for::<SubscribeRequest>();
+        assert_property_set_parity("memory_subscribe", &derived);
+        assert_descriptions_match("memory_subscribe", &derived);
+    }
+
+    #[test]
+    fn memory_subscribe_tool_metadata_985() {
+        assert_eq!(SubscribeTool::name(), "memory_subscribe");
+        assert_eq!(SubscribeTool::family(), "governance");
+    }
+
+    #[test]
+    fn memory_unsubscribe_parity_985() {
+        let derived = derived_props_for::<UnsubscribeRequest>();
+        assert_property_set_parity("memory_unsubscribe", &derived);
+        assert_descriptions_match("memory_unsubscribe", &derived);
+    }
+
+    #[test]
+    fn memory_unsubscribe_tool_metadata_985() {
+        assert_eq!(UnsubscribeTool::name(), "memory_unsubscribe");
+        assert_eq!(UnsubscribeTool::family(), "governance");
     }
 }

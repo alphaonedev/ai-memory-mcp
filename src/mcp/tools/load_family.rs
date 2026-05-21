@@ -4,9 +4,199 @@
 //! MCP `memory_load_family` and `memory_smart_load` handlers and routing helpers.
 
 use crate::embeddings::{Embed, Embedder};
+use crate::mcp::registry::McpTool;
 use crate::models::Memory;
 use crate::{db, validate};
+use schemars::JsonSchema;
+use serde::Deserialize;
 use serde_json::{Value, json};
+
+// --- D1.3 (#984): per-tool McpTool impls for the 2 v0.7.0-B loaders ---
+
+/// v0.7.0 #972 D1.3 (#984) — request body for `memory_load_family`.
+/// Schemars-derived schema replaces the hand-coded entry in
+/// [`crate::mcp::registry::tool_definitions`] (D1.6 (#987) collapses
+/// the macro).
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct LoadFamilyRequest {
+    /// MCP tool family (8 groups) — NOT the memory_kind taxonomy. See #864.
+    pub family: String,
+
+    /// Namespace filter. Default all.
+    #[serde(default)]
+    pub namespace: Option<String>,
+
+    /// Top-k cap 100.
+    #[serde(default)]
+    pub k: Option<i64>,
+}
+
+/// v0.7.0 #972 D1.3 (#984) — `McpTool` impl for `memory_load_family`.
+#[allow(dead_code)]
+pub struct LoadFamilyTool;
+
+impl McpTool for LoadFamilyTool {
+    fn name() -> &'static str {
+        "memory_load_family"
+    }
+    fn description() -> &'static str {
+        "Load top-k recent + high-priority memories from a Family."
+    }
+    fn docs() -> &'static str {
+        "B1: top-k by metadata.family. Always-on; alternative to memory_recall when family is known. \
+         Issue #864 — `family` here is the MCP tool family (8 groups: \
+         core/lifecycle/graph/governance/power/meta/archive/other), \
+         NOT the memory_kind taxonomy (Observation/Reflection/Plan/Decision/etc)."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(LoadFamilyRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "core"
+    }
+}
+
+/// v0.7.0 #972 D1.3 (#984) — request body for `memory_smart_load`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct SmartLoadRequest {
+    /// Free-text goal.
+    pub intent: String,
+
+    /// Namespace filter. Default all.
+    #[serde(default)]
+    pub namespace: Option<String>,
+
+    /// Top-k cap 100.
+    #[serde(default)]
+    pub k: Option<i64>,
+}
+
+/// v0.7.0 #972 D1.3 (#984) — `McpTool` impl for `memory_smart_load`.
+#[allow(dead_code)]
+pub struct SmartLoadTool;
+
+impl McpTool for SmartLoadTool {
+    fn name() -> &'static str {
+        "memory_smart_load"
+    }
+    fn description() -> &'static str {
+        "Intent-routed loader: free-text intent picks the best Family."
+    }
+    fn docs() -> &'static str {
+        "B2: pick best Family from free-text intent, then forward to memory_load_family. \
+         Issue #864 — `Family` here is the MCP tool family (8 groups: \
+         core/lifecycle/graph/governance/power/meta/archive/other), \
+         NOT the memory_kind taxonomy (Observation/Reflection/Plan/Decision/etc)."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(SmartLoadRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "core"
+    }
+}
+
+#[cfg(test)]
+mod d1_3_984_tests {
+    //! D1.3 (#984) — schema parity for the 2 v0.7.0-B loader tools
+    //! (`memory_load_family`, `memory_smart_load`).
+    //! Reuses the allowed-diffs catalog documented in d1_2_983_tests.
+    use super::*;
+
+    fn legacy_props(tool_name: &str) -> serde_json::Map<String, Value> {
+        let defs = crate::mcp::registry::tool_definitions();
+        let tools = defs
+            .get("tools")
+            .and_then(Value::as_array)
+            .expect("tool_definitions emits `tools` array");
+        let entry = tools
+            .iter()
+            .find(|t| t.get("name").and_then(Value::as_str) == Some(tool_name))
+            .unwrap_or_else(|| panic!("{tool_name} must be in legacy catalog"));
+        entry
+            .pointer("/inputSchema/properties")
+            .and_then(Value::as_object)
+            .unwrap_or_else(|| panic!("{tool_name}.inputSchema.properties must be object"))
+            .clone()
+    }
+
+    fn derived_props_for<T: schemars::JsonSchema>() -> serde_json::Map<String, Value> {
+        let schema = schemars::schema_for!(T);
+        let v = serde_json::to_value(schema).expect("schema → value");
+        v.get("properties")
+            .and_then(Value::as_object)
+            .or_else(|| {
+                v.pointer(&format!(
+                    "/definitions/{}/properties",
+                    std::any::type_name::<T>().rsplit("::").next().unwrap_or("")
+                ))
+                .and_then(Value::as_object)
+            })
+            .cloned()
+            .expect("schemars schema must have properties at a known path")
+    }
+
+    fn assert_property_set_parity(tool_name: &str, derived: &serde_json::Map<String, Value>) {
+        let legacy = legacy_props(tool_name);
+        let legacy_keys: std::collections::BTreeSet<&str> =
+            legacy.keys().map(String::as_str).collect();
+        let derived_keys: std::collections::BTreeSet<&str> =
+            derived.keys().map(String::as_str).collect();
+        assert_eq!(
+            legacy_keys,
+            derived_keys,
+            "{tool_name}: property set drift; diff = {:?}",
+            legacy_keys
+                .symmetric_difference(&derived_keys)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    fn assert_descriptions_match(tool_name: &str, derived: &serde_json::Map<String, Value>) {
+        let legacy = legacy_props(tool_name);
+        for (name, legacy_prop) in &legacy {
+            if let Some(want) = legacy_prop.get("description").and_then(Value::as_str) {
+                let got = derived
+                    .get(name)
+                    .and_then(|p| p.get("description"))
+                    .and_then(Value::as_str);
+                assert_eq!(
+                    got,
+                    Some(want),
+                    "{tool_name}.{name}: description must match legacy byte-for-byte"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn load_family_parity_984() {
+        let derived = derived_props_for::<LoadFamilyRequest>();
+        assert_property_set_parity("memory_load_family", &derived);
+        assert_descriptions_match("memory_load_family", &derived);
+    }
+
+    #[test]
+    fn smart_load_parity_984() {
+        let derived = derived_props_for::<SmartLoadRequest>();
+        assert_property_set_parity("memory_smart_load", &derived);
+        assert_descriptions_match("memory_smart_load", &derived);
+    }
+
+    #[test]
+    fn load_family_tool_metadata_984() {
+        assert_eq!(LoadFamilyTool::name(), "memory_load_family");
+        assert_eq!(LoadFamilyTool::family(), "core");
+        assert_eq!(SmartLoadTool::name(), "memory_smart_load");
+        assert_eq!(SmartLoadTool::family(), "core");
+    }
+}
 /// v0.7 B1 — `memory_load_family(family, namespace?, k?)`.
 ///
 /// Always-on alternative to `memory_recall` for the case where the agent

@@ -59,6 +59,67 @@ pub(super) fn handle_auto_tag(
     Ok(json!({"id": id, "new_tags": tags, "all_tags": all_tags}))
 }
 
+// --- D1.5 (#986): per-tool McpTool impl for memory_auto_tag ---
+
+use crate::mcp::registry::McpTool;
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+/// v0.7.0 #972 D1.5 (#986) — request body for `memory_auto_tag`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct AutoTagRequest {
+    /// Memory ID.
+    pub id: String,
+}
+
+/// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_auto_tag`.
+#[allow(dead_code)]
+pub struct AutoTagTool;
+
+impl McpTool for AutoTagTool {
+    fn name() -> &'static str {
+        "memory_auto_tag"
+    }
+    fn description() -> &'static str {
+        "LLM-generate tags for a memory (smart/autonomous tier)."
+    }
+    fn docs() -> &'static str {
+        "LLM auto-tagging. Smart/autonomous tier."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(AutoTagRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "power"
+    }
+}
+
+#[cfg(test)]
+mod d1_5_986_tests {
+    //! D1.5 (#986) — schema parity for `memory_auto_tag`.
+    //! Shared helpers live at [`crate::mcp::parity_test_helpers`].
+    use super::*;
+    use crate::mcp::parity_test_helpers::{
+        assert_descriptions_match, assert_property_set_parity, derived_props_for,
+    };
+
+    #[test]
+    fn auto_tag_parity_986() {
+        let derived = derived_props_for::<AutoTagRequest>();
+        assert_property_set_parity("memory_auto_tag", &derived);
+        assert_descriptions_match("memory_auto_tag", &derived);
+    }
+
+    #[test]
+    fn auto_tag_tool_metadata_986() {
+        assert_eq!(AutoTagTool::name(), "memory_auto_tag");
+        assert_eq!(AutoTagTool::family(), "power");
+    }
+}
+
 // =====================================================================
 // L0.7-5 Tier D — envelope unit tests
 //

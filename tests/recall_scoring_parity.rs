@@ -14,6 +14,7 @@
 //! stays offline.
 
 #![cfg(all(feature = "sal", feature = "sal-postgres"))]
+#![allow(clippy::needless_update)]
 
 use ai_memory::models::ConfidenceSource;
 use ai_memory::models::{Memory, Tier};
@@ -84,6 +85,7 @@ fn make_corpus(namespace: &str) -> Vec<Memory> {
                 confidence_signals: None,
                 confidence_decayed_at: None,
                 version: 1,
+                ..Memory::default()
             }
         })
         .collect()

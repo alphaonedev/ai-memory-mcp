@@ -61,6 +61,7 @@
 //! within an AGE database.
 
 #![cfg(feature = "sal-postgres")]
+#![allow(clippy::needless_update)]
 
 use ai_memory::models::ConfidenceSource;
 use ai_memory::models::{Memory, Tier};
@@ -132,6 +133,7 @@ fn make_memory(id: &str, namespace: &str, title: &str, content: &str) -> Memory 
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     }
 }
 

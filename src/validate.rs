@@ -221,16 +221,73 @@ pub fn validate_source(source: &str) -> Result<()> {
     Ok(())
 }
 
-/// Validate an agent identifier (NHI-hardened).
+/// Reserved internal agent identifiers (issue #977).
+///
+/// Each of these names is used as a `CallerContext` principal by an
+/// internal admin/system path that constructs the context DIRECTLY via
+/// [`crate::store::CallerContext::for_admin`] — bypassing
+/// [`validate_agent_id`] by design. The downstream cross-tenant
+/// ownership gates carve out these literal strings as the "internal
+/// path is exempt" signal (e.g. `caller == "daemon"` in
+/// `src/handlers/parity.rs::require_caller_owns_memory`,
+/// `src/handlers/links.rs`, `src/handlers/kg.rs`,
+/// `src/handlers/hook_subscribers.rs`, `src/mcp/tools/namespace.rs`).
+///
+/// Without this guard, a wire caller setting `X-Agent-Id: daemon` (or
+/// any of the other reserved names) — or the same via the MCP-tool
+/// `agent_id` input field, or the HTTP body `agent_id` field — would
+/// reach `CallerContext.principal == "daemon"` and bypass every cross-
+/// tenant ownership gate. The list below MUST stay in sync with the
+/// production sites that construct `CallerContext::for_admin(...)` with
+/// literal-string principals; adding a new internal sentinel requires
+/// adding the matching reserved-name entry here.
+///
+/// Sites that legitimately use these as internal callers (each calls
+/// `CallerContext::for_admin(...)` directly and never traverses this
+/// validator):
+///
+/// - `"daemon"` → `src/handlers/admin.rs:110,239,441`
+/// - `"subscription-dispatch"` → `src/handlers/subscriptions.rs::dispatch_approval_requested`
+/// - `"ai:http-internal"` → `src/handlers/{http,power,hook_subscribers}.rs`
+/// - `"ai:migrate"` → `src/migrate.rs`
+/// - `"federation-catchup"` → `src/federation/receive.rs`
+/// - `"export-internal"` → `src/store/postgres.rs::export_*`
+/// - `"governance-internal"` → `src/store/postgres.rs::governance_*`
+/// - `"system"` → `src/handlers/hook_subscribers.rs` (stamped on
+///   legacy-rewrite rows; also matched as the unowned-marker sentinel
+///   in cross-tenant gates, so wire spoofing it would let the caller
+///   silently claim ownership of legacy-unowned rows).
+const RESERVED_AGENT_IDS: &[&str] = &[
+    "daemon",
+    "system",
+    "federation-catchup",
+    "subscription-dispatch",
+    "ai:http-internal",
+    "ai:migrate",
+    "export-internal",
+    "governance-internal",
+];
+
+/// Shape-only validation for an agent identifier — the pre-#977
+/// behaviour, separated so internal callers that legitimately need to
+/// load/generate keypairs with reserved-sentinel labels (e.g. the
+/// daemon's own `"daemon"` self-signing keypair at
+/// `src/daemon_runtime.rs:1724 DAEMON_KEYPAIR_LABEL`) can opt into the
+/// looser check.
 ///
 /// Allowed characters: alphanumeric plus `_`, `-`, `:`, `@`, `.`, `/`.
-/// Length: 1..=128 bytes.
+/// Length: 1..=128 bytes. Rejects whitespace, null bytes, control
+/// chars, and shell metacharacters.
 ///
-/// This intentionally permits prefixed/scoped forms such as
-/// `ai:claude-code@host-1:pid-123`, `host:dev-1:pid-9-deadbeef`,
-/// `anonymous:req-abcdef01`, and future SPIFFE-style ids containing `/`.
-/// Rejects whitespace, null bytes, control chars, and shell metacharacters.
-pub fn validate_agent_id(agent_id: &str) -> Result<()> {
+/// New callers SHOULD prefer [`validate_agent_id`] (the wire-side
+/// function that ALSO rejects [`RESERVED_AGENT_IDS`]). Use this
+/// shape-only entry point ONLY for internal paths that operate on
+/// hardcoded-literal sentinels (the daemon's keypair load + the
+/// internal admin `CallerContext::for_admin(...)` construction sites);
+/// every wire entry point (HTTP `X-Agent-Id` header, HTTP body
+/// `agent_id`, MCP-tool `agent_id` input, CLI `--as-agent`) MUST go
+/// through [`validate_agent_id`] instead.
+pub fn validate_agent_id_shape(agent_id: &str) -> Result<()> {
     if agent_id.is_empty() {
         bail!("agent_id cannot be empty");
     }
@@ -241,6 +298,38 @@ pub fn validate_agent_id(agent_id: &str) -> Result<()> {
         if !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ':' | '@' | '.' | '/')) {
             bail!("agent_id contains invalid character '{c}' (allowed: alphanumeric, _-:@./)");
         }
+    }
+    Ok(())
+}
+
+/// Validate an agent identifier (NHI-hardened) for wire-side use.
+///
+/// Calls [`validate_agent_id_shape`] for the shape check, then rejects
+/// the [`RESERVED_AGENT_IDS`] reserved-name set (issue #977) so wire
+/// callers cannot spoof an internal `CallerContext` principal. Internal
+/// callers constructing `CallerContext::for_admin` directly do not
+/// traverse this validator and remain unaffected; internal keypair
+/// load/generate uses [`validate_agent_id_shape`] (shape-only) so the
+/// daemon's `"daemon"`-labelled self-signing keypair still loads.
+///
+/// This is the function every WIRE entry point MUST call:
+/// - HTTP `X-Agent-Id` header / body `agent_id` field
+///   ([`crate::identity::resolve_http_agent_id`])
+/// - MCP-tool `agent_id` input (validated at each tool's entry point)
+/// - HTTP admin endpoints
+/// - CLI `--as-agent` / `identity generate`
+pub fn validate_agent_id(agent_id: &str) -> Result<()> {
+    validate_agent_id_shape(agent_id)?;
+    // #977 — block wire callers from spoofing the internal sentinels
+    // that downstream gates carve out as the "internal path is exempt"
+    // signal. Internal `CallerContext::for_admin(...)` constructions +
+    // the daemon's own keypair load (via `validate_agent_id_shape`)
+    // skip this reserved-name reject by design.
+    if RESERVED_AGENT_IDS.contains(&agent_id) {
+        bail!(
+            "agent_id '{agent_id}' is reserved for internal use and cannot be supplied by wire \
+             callers"
+        );
     }
     Ok(())
 }
@@ -810,6 +899,256 @@ pub fn validate_consolidate(
     Ok(())
 }
 
+// =====================================================================
+// #966 — Shared `RequestValidator` facade (Wave-2 Tier-C1)
+// =====================================================================
+//
+// Pre-#966 every wire surface duplicated the same "validate id +
+// validate namespace + validate agent_id + ..." sequence in its own
+// handler entry. The mechanical-line duplication grew alongside the
+// 50+ HTTP routes / 73 MCP tools / 55 CLI subcommands. Refactoring
+// per-call validation chains to a single fluent surface lets all
+// three caller layers (HTTP handlers, MCP tools, CLI subcommands)
+// route field-level + cross-field checks through one canonical entry
+// point. Adding a new cross-field invariant becomes one impl method
+// instead of three audited duplicates.
+//
+// Design constraints:
+// * Backward-compatible — every free function above (validate_id,
+//   validate_namespace, ...) remains the lowest level primitive and
+//   continues to compile / pass existing tests unchanged.
+// * Zero-cost — `RequestValidator` is a unit struct with associated
+//   functions only; no allocations, no per-call state.
+// * Typed error path — [`ValidationError`] carries `field` + `reason`
+//   so HTTP/MCP can surface structured responses without parsing the
+//   `anyhow::Error` display string. `impl From<ValidationError> for
+//   anyhow::Error` keeps the existing `?`-into-`anyhow` flow working
+//   at call sites that haven't migrated to the typed variant.
+
+/// Typed validation failure surfaced by [`RequestValidator`] entry
+/// points. Carries the offending `field` name and a `reason` string
+/// matching the existing `bail!` shape so the wire-side error
+/// messages remain byte-equal to the pre-#966 surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidationError {
+    /// Symbolic field name (e.g. `"namespace"`, `"agent_id"`, `"id"`,
+    /// `"link.source_id"`). Wire callers use this for structured
+    /// error envelopes; humans use it for stack/log triage.
+    pub field: String,
+    /// Human-readable reason. Mirrors the legacy `bail!` message so
+    /// existing wire-level assertions (`error.contains("namespace")`,
+    /// etc.) continue to pass without churn.
+    pub reason: String,
+}
+
+impl ValidationError {
+    /// Compose a `ValidationError` with the canonical `<field>: <reason>`
+    /// display form.
+    #[must_use]
+    pub fn new(field: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            field: field.into(),
+            reason: reason.into(),
+        }
+    }
+
+    /// Wrap a free-function validator failure under a typed field
+    /// name. Used by the [`RequestValidator`] methods to attribute
+    /// each free-function result to the originating struct field.
+    fn from_anyhow(field: &str, err: anyhow::Error) -> Self {
+        Self::new(field, err.to_string())
+    }
+}
+
+impl std::fmt::Display for ValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Mirror the legacy `bail!` shape: surface the reason verbatim
+        // so wire-side responses don't change byte-for-byte. The field
+        // tag is exposed structurally via the public `field` member.
+        write!(f, "{}", self.reason)
+    }
+}
+
+impl std::error::Error for ValidationError {}
+
+// Note: `From<ValidationError> for anyhow::Error` is provided
+// automatically by anyhow's blanket impl over `E: Error + Send + Sync
+// + 'static`. The `validation_error_into_anyhow_preserves_reason` test
+// below pins that the blanket path keeps the reason string intact.
+
+/// Shared validation facade routed through by HTTP handlers, MCP
+/// tools, and CLI subcommands (issue #966, Wave-2 Tier-C1).
+///
+/// Each method bundles the field-level + cross-field checks for a
+/// single request shape. Behavior is identical to chaining the
+/// per-field free functions in the order they appear inside the
+/// method body — `RequestValidator` is the canonical surface for
+/// adding NEW cross-field rules without forcing every caller to
+/// re-audit its inline validator sequence.
+///
+/// # Example
+///
+/// ```ignore
+/// use crate::validate::RequestValidator;
+///
+/// // Inside an HTTP handler:
+/// RequestValidator::validate_create(&body)?;
+///
+/// // Inside an MCP tool:
+/// RequestValidator::validate_link_triple(&source_id, &target_id, &relation)
+///     .map_err(|e| e.to_string())?;
+/// ```
+pub struct RequestValidator;
+
+impl RequestValidator {
+    /// Full `CreateMemory` request validation (HTTP `POST
+    /// /api/v1/memories`, MCP `memory_store`, CLI `store`). Delegates
+    /// to the free-function [`validate_create`] to preserve the
+    /// existing field order and error wording.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first per-field failure as a [`ValidationError`].
+    pub fn validate_create(req: &CreateMemory) -> Result<(), ValidationError> {
+        validate_create(req).map_err(|e| ValidationError::from_anyhow("create", e))
+    }
+
+    /// Full `UpdateMemory` request validation (HTTP `PUT
+    /// /api/v1/memories/{id}`, MCP `memory_update`, CLI `update`).
+    /// Validates only the fields that are `Some(_)` per the
+    /// `UpdateMemory` partial-update contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first per-field failure as a [`ValidationError`].
+    pub fn validate_update(req: &UpdateMemory) -> Result<(), ValidationError> {
+        validate_update(req).map_err(|e| ValidationError::from_anyhow("update", e))
+    }
+
+    /// Full `Memory` validation (import / federation receive / admin
+    /// restore paths). Validates every required field on the row
+    /// itself — stricter than `validate_create` because the import
+    /// row carries timestamps, IDs, etc. that the create surface
+    /// stamps server-side.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first per-field failure as a [`ValidationError`].
+    pub fn validate_memory(req: &Memory) -> Result<(), ValidationError> {
+        validate_memory(req).map_err(|e| ValidationError::from_anyhow("memory", e))
+    }
+
+    /// Link creation triple validation. Matches the legacy
+    /// [`validate_link`] free function exactly.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first per-field failure as a [`ValidationError`].
+    pub fn validate_link_triple(
+        source_id: &str,
+        target_id: &str,
+        relation: &str,
+    ) -> Result<(), ValidationError> {
+        validate_link(source_id, target_id, relation)
+            .map_err(|e| ValidationError::from_anyhow("link", e))
+    }
+
+    /// Memory-consolidation request validation. Mirrors
+    /// [`validate_consolidate`] exactly.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first per-field failure as a [`ValidationError`].
+    pub fn validate_consolidate(
+        ids: &[String],
+        title: &str,
+        summary: &str,
+        namespace: &str,
+    ) -> Result<(), ValidationError> {
+        validate_consolidate(ids, title, summary, namespace)
+            .map_err(|e| ValidationError::from_anyhow("consolidate", e))
+    }
+
+    /// Single-field id validation, surfaced through the facade for
+    /// consistency with the other entry points. Used by GET/DELETE
+    /// handlers that don't have a richer DTO.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError`] tagged with `field = "id"`.
+    pub fn validate_id(id: &str) -> Result<(), ValidationError> {
+        validate_id(id).map_err(|e| ValidationError::from_anyhow("id", e))
+    }
+
+    /// Single-field namespace validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError`] tagged with `field = "namespace"`.
+    pub fn validate_namespace(ns: &str) -> Result<(), ValidationError> {
+        validate_namespace(ns).map_err(|e| ValidationError::from_anyhow("namespace", e))
+    }
+
+    /// Wire-side agent_id validation (rejects shape violations AND
+    /// the reserved internal sentinel set per issue #977).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError`] tagged with `field = "agent_id"`.
+    pub fn validate_agent_id(agent_id: &str) -> Result<(), ValidationError> {
+        validate_agent_id(agent_id).map_err(|e| ValidationError::from_anyhow("agent_id", e))
+    }
+
+    /// Two-of-a-kind bundle: validate an `id` AND a `namespace` in
+    /// one call. Saves a `?` per surface site where both come off
+    /// the same request body (the dominant duplication pattern
+    /// observed in the pre-#966 handler/MCP audit — `validate_id`
+    /// and `validate_namespace` co-occur on >20 sites).
+    ///
+    /// # Errors
+    ///
+    /// Returns the first failure (id-first, then namespace).
+    pub fn validate_id_and_namespace(id: &str, ns: &str) -> Result<(), ValidationError> {
+        Self::validate_id(id)?;
+        Self::validate_namespace(ns)?;
+        Ok(())
+    }
+
+    /// Three-of-a-kind bundle: validate `id` + `namespace` +
+    /// `agent_id` together. Pre-#966 this was the canonical
+    /// "ownership-checked write path" preamble; the facade lets new
+    /// handlers express the intent as one call.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first failure in declaration order.
+    pub fn validate_owner_write(id: &str, ns: &str, agent_id: &str) -> Result<(), ValidationError> {
+        Self::validate_id(id)?;
+        Self::validate_namespace(ns)?;
+        Self::validate_agent_id(agent_id)?;
+        Ok(())
+    }
+
+    /// Confidence (0.0..=1.0) + priority (1..=10) cross-field
+    /// bundle. Mirrors the inline pair inside `validate_create`;
+    /// surfaced here so callers that synthesize a custom DTO (e.g.
+    /// the `bulk_create` postgres handler) get the same numeric
+    /// gates without re-implementing them.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first failure (confidence-first, then priority).
+    pub fn validate_confidence_and_priority(
+        confidence: f64,
+        priority: i32,
+    ) -> Result<(), ValidationError> {
+        validate_confidence(confidence)
+            .map_err(|e| ValidationError::from_anyhow("confidence", e))?;
+        validate_priority(priority).map_err(|e| ValidationError::from_anyhow("priority", e))?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -985,6 +1324,63 @@ mod tests {
         assert!(validate_agent_id("alice\\bs").is_err());
         assert!(validate_agent_id("alice?q").is_err());
         assert!(validate_agent_id("alice*glob").is_err());
+    }
+
+    /// #977 — every reserved internal sentinel MUST be rejected by the
+    /// wire-side validator. Each name corresponds to a downstream
+    /// cross-tenant ownership gate that carves it out as the "internal
+    /// path is exempt" signal; without this guard, a wire caller could
+    /// spoof the sentinel via `X-Agent-Id` / MCP-tool `agent_id` / HTTP
+    /// body `agent_id` and bypass every such gate.
+    #[test]
+    fn test_reserved_internal_agent_ids_rejected_977() {
+        for &reserved in RESERVED_AGENT_IDS {
+            let r = validate_agent_id(reserved);
+            assert!(
+                r.is_err(),
+                "reserved agent_id '{reserved}' MUST be rejected on the wire (issue #977)",
+            );
+            // The error message must cite the reserved-name reason so
+            // wire-side log triage can tell this apart from the generic
+            // shape rejection (length / char class).
+            let msg = r.unwrap_err().to_string();
+            assert!(
+                msg.contains("reserved for internal use"),
+                "reserved-name reject must surface the dedicated reason; got: {msg}",
+            );
+        }
+    }
+
+    /// #977 — the canonical NHI shapes that operators / agents legitimately
+    /// stamp on the wire MUST continue to pass. Pins that the reserved-name
+    /// set didn't accidentally swallow a legitimate prefix family.
+    #[test]
+    fn test_legitimate_agent_ids_still_pass_after_977() {
+        // These are the shapes documented in CLAUDE.md "Agent Identity
+        // (NHI)" and exercised across the integration suite.
+        for legitimate in [
+            "alice",
+            "ai:claude-code@host-1:pid-123",
+            "host:dev-1:pid-9-deadbeef",
+            "anonymous:req-abcdef01",
+            "anonymous:pid-42-0123abcd",
+            "spiffe://example.org/ns/prod",
+            // Sibling forms that share a SUBSTRING with reserved names
+            // but are NOT themselves reserved.
+            "daemon-1",
+            "system-admin",
+            "ai:daemon-impostor",
+            "federation-catchup-v2",
+            "subscription-dispatch-replica",
+            "ai:http-internal-shadow",
+            "export-internal-tester",
+            "governance-internal-audit",
+        ] {
+            assert!(
+                validate_agent_id(legitimate).is_ok(),
+                "legitimate NHI shape '{legitimate}' MUST still pass after #977",
+            );
+        }
     }
 
     #[test]
@@ -2038,5 +2434,197 @@ mod tests {
         assert!(validate_citations(&[]).is_ok());
         let v = vec![good_citation(); 64];
         assert!(validate_citations(&v).is_ok());
+    }
+
+    // =================================================================
+    // #966 — RequestValidator fluent-surface tests (Wave-2 Tier-C1)
+    // =================================================================
+
+    fn happy_create() -> CreateMemory {
+        // Reuse the same serde-default fixture pattern as cm_valid()
+        // above so we don't depend on the private CreateMemory shape.
+        serde_json::from_value(serde_json::json!({
+            "title": "happy path",
+            "content": "memory body",
+            "namespace": "test-ns",
+            "tags": [],
+            "priority": 5,
+            "confidence": 0.5,
+            "source": "api",
+            "metadata": {}
+        }))
+        .expect("happy_create fixture deserialises")
+    }
+
+    #[test]
+    fn request_validator_validate_create_happy_path() {
+        // Happy path mirrors the legacy `validate_create` test
+        // surface; ensures the facade is a 1:1 transparent wrap.
+        let req = happy_create();
+        assert!(RequestValidator::validate_create(&req).is_ok());
+    }
+
+    #[test]
+    fn request_validator_validate_create_rejects_empty_title() {
+        // Each field-level reject path returns a ValidationError
+        // whose `reason` mirrors the legacy bail!() string.
+        let mut req = happy_create();
+        req.title = String::new();
+        let err = RequestValidator::validate_create(&req).expect_err("empty title must fail");
+        assert!(
+            err.reason.contains("title"),
+            "reason should mention `title`: {}",
+            err.reason
+        );
+        assert_eq!(err.field, "create");
+    }
+
+    #[test]
+    fn request_validator_validate_create_rejects_oob_confidence() {
+        // Cross-field range gate: confidence=2.0 (out of 0..=1).
+        let mut req = happy_create();
+        req.confidence = 2.0;
+        let err = RequestValidator::validate_create(&req)
+            .expect_err("oob confidence must fail validation");
+        assert!(
+            err.reason.contains("confidence") || err.reason.contains("between"),
+            "reason should mention confidence range: {}",
+            err.reason
+        );
+    }
+
+    #[test]
+    fn request_validator_validate_update_partial_ok() {
+        // UpdateMemory is partial; empty update should validate
+        // (no fields to check).
+        let req: UpdateMemory =
+            serde_json::from_value(serde_json::json!({})).expect("empty UpdateMemory deserialises");
+        assert!(RequestValidator::validate_update(&req).is_ok());
+    }
+
+    #[test]
+    fn request_validator_validate_update_rejects_oob_priority() {
+        let req: UpdateMemory = serde_json::from_value(serde_json::json!({
+            "priority": 99,
+        }))
+        .expect("oob-priority UpdateMemory deserialises");
+        let err =
+            RequestValidator::validate_update(&req).expect_err("priority=99 must fail validation");
+        assert!(
+            err.reason.contains("priority") || err.reason.contains("between"),
+            "reason should mention priority range: {}",
+            err.reason
+        );
+    }
+
+    #[test]
+    fn request_validator_validate_link_triple_happy_path() {
+        assert!(RequestValidator::validate_link_triple("a-id", "b-id", "related_to").is_ok(),);
+    }
+
+    #[test]
+    fn request_validator_validate_link_triple_rejects_self_link() {
+        // Cross-field rule: source_id == target_id is forbidden.
+        let err = RequestValidator::validate_link_triple("same", "same", "related_to")
+            .expect_err("self-link must fail");
+        assert!(
+            err.reason.contains("itself") || err.reason.contains("self"),
+            "self-link must surface a typed reason: {}",
+            err.reason,
+        );
+    }
+
+    #[test]
+    fn request_validator_validate_link_triple_rejects_bad_relation() {
+        let err = RequestValidator::validate_link_triple("a", "b", "BAD-CASE-RELATION")
+            .expect_err("uppercase relation must fail");
+        assert!(
+            err.reason.contains("relation") || err.reason.contains("[a-z0-9_]"),
+            "reason should mention relation: {}",
+            err.reason,
+        );
+    }
+
+    #[test]
+    fn request_validator_validate_consolidate_rejects_under_two_ids() {
+        let err = RequestValidator::validate_consolidate(
+            &["only-one".to_string()],
+            "title",
+            "summary body",
+            "test-ns",
+        )
+        .expect_err("single id must fail");
+        assert!(
+            err.reason.contains("2"),
+            "reason should cite the 2-id min: {}",
+            err.reason
+        );
+    }
+
+    #[test]
+    fn request_validator_validate_id_and_namespace_bundles_both() {
+        // Happy: both fields valid.
+        assert!(RequestValidator::validate_id_and_namespace("an-id", "a-ns").is_ok());
+        // Reject path: invalid id surfaces first (id-then-ns ordering).
+        let err = RequestValidator::validate_id_and_namespace("", "ok-ns")
+            .expect_err("empty id must fail");
+        assert_eq!(err.field, "id");
+        // Reject path: valid id, invalid ns surfaces second.
+        let err = RequestValidator::validate_id_and_namespace("ok-id", "")
+            .expect_err("empty namespace must fail");
+        assert_eq!(err.field, "namespace");
+    }
+
+    #[test]
+    fn request_validator_validate_owner_write_orders_id_ns_agent() {
+        // Happy path.
+        assert!(RequestValidator::validate_owner_write("an-id", "a-ns", "alice").is_ok());
+        // Reject path: agent_id reserved sentinel surfaces last.
+        let err = RequestValidator::validate_owner_write("an-id", "a-ns", "daemon")
+            .expect_err("reserved agent_id must fail");
+        assert_eq!(err.field, "agent_id");
+        assert!(
+            err.reason.contains("reserved"),
+            "reserved-name reject must surface: {}",
+            err.reason,
+        );
+    }
+
+    #[test]
+    fn request_validator_validate_confidence_and_priority_bundles_both() {
+        assert!(RequestValidator::validate_confidence_and_priority(0.5, 5).is_ok());
+        let err = RequestValidator::validate_confidence_and_priority(2.0, 5)
+            .expect_err("oob confidence must fail");
+        assert_eq!(err.field, "confidence");
+        let err = RequestValidator::validate_confidence_and_priority(0.5, 99)
+            .expect_err("oob priority must fail");
+        assert_eq!(err.field, "priority");
+    }
+
+    #[test]
+    fn request_validator_validate_agent_id_rejects_reserved_sentinel() {
+        // Wire-side agent_id MUST reject the reserved set (issue #977).
+        let err = RequestValidator::validate_agent_id("daemon")
+            .expect_err("reserved daemon agent_id must be rejected");
+        assert_eq!(err.field, "agent_id");
+        assert!(err.reason.contains("reserved"));
+    }
+
+    #[test]
+    fn validation_error_into_anyhow_preserves_reason() {
+        // The typed ValidationError must compose cleanly with the
+        // anyhow-based call sites that haven't migrated yet.
+        let ve = ValidationError::new("agent_id", "reserved for internal use");
+        let ae: anyhow::Error = ve.into();
+        assert!(format!("{ae}").contains("reserved for internal use"));
+    }
+
+    #[test]
+    fn validation_error_display_matches_legacy_bail_shape() {
+        // Wire-side responses still parse `error.contains("namespace")`
+        // — ensure the Display impl mirrors the legacy bail!() shape
+        // verbatim (reason only, no field prefix).
+        let ve = ValidationError::new("namespace", "namespace cannot be empty");
+        assert_eq!(format!("{ve}"), "namespace cannot be empty");
     }
 }

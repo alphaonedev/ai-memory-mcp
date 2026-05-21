@@ -29,6 +29,67 @@ pub(super) fn handle_expand_query(
     Ok(json!({"original": query, "expanded_terms": terms}))
 }
 
+// --- D1.5 (#986): per-tool McpTool impl for memory_expand_query ---
+
+use crate::mcp::registry::McpTool;
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+/// v0.7.0 #972 D1.5 (#986) — request body for `memory_expand_query`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct ExpandQueryRequest {
+    /// Query to expand.
+    pub query: String,
+}
+
+/// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_expand_query`.
+#[allow(dead_code)]
+pub struct ExpandQueryTool;
+
+impl McpTool for ExpandQueryTool {
+    fn name() -> &'static str {
+        "memory_expand_query"
+    }
+    fn description() -> &'static str {
+        "LLM-expand a search query into related terms (smart/autonomous tier)."
+    }
+    fn docs() -> &'static str {
+        "LLM query expansion. Smart/autonomous tier."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(ExpandQueryRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "power"
+    }
+}
+
+#[cfg(test)]
+mod d1_5_986_tests {
+    //! D1.5 (#986) — schema parity for `memory_expand_query`.
+    //! Shared helpers live at [`crate::mcp::parity_test_helpers`].
+    use super::*;
+    use crate::mcp::parity_test_helpers::{
+        assert_descriptions_match, assert_property_set_parity, derived_props_for,
+    };
+
+    #[test]
+    fn expand_query_parity_986() {
+        let derived = derived_props_for::<ExpandQueryRequest>();
+        assert_property_set_parity("memory_expand_query", &derived);
+        assert_descriptions_match("memory_expand_query", &derived);
+    }
+
+    #[test]
+    fn expand_query_tool_metadata_986() {
+        assert_eq!(ExpandQueryTool::name(), "memory_expand_query");
+        assert_eq!(ExpandQueryTool::family(), "power");
+    }
+}
+
 // =====================================================================
 // L0.7-5 Tier D — envelope unit tests
 //

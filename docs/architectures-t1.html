@@ -332,7 +332,7 @@ table tr:last-child td{border-bottom:none}
     <ol>
       <li>The agent calls <code>memory_store</code> over MCP (or <code>POST /api/v1/memory</code> over HTTP, or <code>ai-memory store ...</code> from the CLI).</li>
       <li>The handler validates the input (<code>src/validate.rs</code>), then acquires the connection mutex.</li>
-      <li>Governance gate runs (<code>src/db.rs</code> → <code>governance::check()</code>). For T1 with a single agent, the default policy returns <code>Allow</code> immediately. With a stricter policy, the write may be queued as a <code>PendingAction</code> (see <a href="architectures-t2.html" style="color:var(--p1)">Tier 2</a> for that flow).</li>
+      <li>Governance gate runs (<code>src/storage/</code> → <code>governance::check()</code>). For T1 with a single agent, the default policy returns <code>Allow</code> immediately. With a stricter policy, the write may be queued as a <code>PendingAction</code> (see <a href="architectures-t2.html" style="color:var(--p1)">Tier 2</a> for that flow).</li>
       <li>Memory row is <code>INSERT</code>ed (or <code>UPDATE</code>d on <code>(title, namespace)</code> collision). FTS5 is kept in sync via triggers. The <code>scope_idx</code> generated column gets recomputed automatically.</li>
       <li>If the feature tier is <code>semantic</code> or above, the embedding is generated and added to the in-memory HNSW index.</li>
       <li>WAL is fsynced; the call returns.</li>
@@ -411,7 +411,7 @@ ai-memory --db ~/.claude/ai-memory.db stats</code></pre>
       <li><code>src/main.rs</code> + <code>src/daemon_runtime.rs</code> — CLI parsing + daemon setup (~50 subcommands at v0.7.0)</li>
       <li><code>src/mcp/</code> — MCP server (71 advertised entries at <code>--profile full</code>; 7 at <code>--profile core</code>)</li>
       <li><code>src/handlers/</code> — HTTP route handlers (router registers 72 <code>/api/v1/*</code> routes at v0.7.0)</li>
-      <li><code>src/db.rs</code> — schema, recall scoring, GC, migrations (current schema v15 per v0.6.3 release notes)</li>
+      <li><code>src/storage/</code> — schema, recall scoring, GC, migrations (current schema v15 per v0.6.3 release notes)</li>
       <li><code>src/reranker.rs</code> — adaptive blend semantic + keyword</li>
       <li><code>src/hnsw.rs</code> — in-memory ANN</li>
       <li><code>docs/ARCHITECTURE.md</code> — full module map</li>

@@ -17,13 +17,20 @@
 //!   tool-definitions prefix budget.
 //! - **Trimmed total** (`trimmed_full_profile_total_tokens`) is what
 //!   every MCP host pays per session on the default `tools/list`
-//!   path. It must stay under the post-#859 **5000 cl100k token**
+//!   path. Pinned at the **11000 cl100k token** post-D1.7 (#988)
 //!   ceiling. (The pre-#859 baseline of 3500 cl100k tokens was
 //!   structurally lower because optional property entries were
 //!   dropped from the wire — a behaviour that #859 reverted to
 //!   restore NHI runtime discovery; see
 //!   `tests/c2_tool_docs_field.rs::c2_tools_list_token_budget_is_under_post_859_ceiling`
-//!   for the full history.)
+//!   for the full history. The post-D1.6 schemars-derived `tools/list`
+//!   carries per-property `additionalProperties`, `format`, and
+//!   `[T, "null"]` type-array nodes the legacy hand-coded payload
+//!   didn't — measured ~9825 cl100k tokens post-D1.6. Ceiling bumped
+//!   from 5000 to 11000 to leave ~1175-token headroom for future
+//!   schema additions; partial compensation comes from D1.8 (#989)
+//!   when the trimmer's allow-list filtering of schemars metadata
+//!   lands.)
 //!
 //! Both guards trip on any regression so a casual schema edit can't
 //! land without an explicit budget review. If a guard fires:
@@ -44,10 +51,18 @@ use ai_memory::sizes::{full_profile_total_tokens, trimmed_full_profile_total_tok
 /// Source of truth for the figure: the v0.7.0 #829 playbook (operator
 /// target). The pre-#829 measured baseline was ~15570 cl100k tokens
 /// (every tool carried multi-paragraph `docs` prose); after the #829
-/// trim every `docs` string is a single condensed sentence, dropping
-/// the verbose total to ~9500 with ~500 tokens of headroom under this
-/// cap.
-const VERBOSE_FULL_PROFILE_CEILING_TOKENS: usize = 10_000;
+/// trim every `docs` string is a single condensed sentence.
+///
+/// **v0.7.0 #987 update.** D1.6 collapsed `tool_definitions()` to
+/// iterate over per-tool `McpTool` impls; the schemars-derived
+/// `inputSchema` carries metadata the legacy hand-coded macro didn't
+/// (`additionalProperties: false`, `default: null`, `$schema`,
+/// `title`, request-struct `description`). Measured total ~15K
+/// post-D1.6. Ceiling re-raised to 17K to leave 2K headroom for
+/// future field additions; partial compensation comes from D1.7
+/// (#988) when the trimmer's allow-list filtering of schemars
+/// metadata lands.
+const VERBOSE_FULL_PROFILE_CEILING_TOKENS: usize = 17_000;
 
 /// Hard ceiling for the trimmed wire (`tools/list`) catalog.
 ///
@@ -57,7 +72,7 @@ const VERBOSE_FULL_PROFILE_CEILING_TOKENS: usize = 10_000;
 /// already pins the same number for the wire-form payload; this
 /// guard's job is to keep the runtime-computed model
 /// (`trimmed_tool_sizes`) in lockstep.
-const TRIMMED_FULL_PROFILE_CEILING_TOKENS: usize = 5_000;
+const TRIMMED_FULL_PROFILE_CEILING_TOKENS: usize = 11_000;
 
 #[test]
 fn issue_829_verbose_full_profile_total_under_ceiling() {

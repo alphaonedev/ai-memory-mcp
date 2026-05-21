@@ -239,7 +239,7 @@ archive_on_gc = <span class="err">false</span></div>
   <div class="container">
     <span class="eyebrow">The GC cycle</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">How memories get evicted.</h2>
-    <p class="lede">Garbage collection is on-demand and observable. There's no magic background daemon — the operator decides when GC runs, either via the MCP <code>memory_gc</code> tool, the HTTP <code>/api/v1/gc</code> endpoint, or the curator cycle (<code>src/curator.rs</code>). Each invocation logs how many rows it touched.</p>
+    <p class="lede">Garbage collection is on-demand and observable. There's no magic background daemon — the operator decides when GC runs, either via the MCP <code>memory_gc</code> tool, the HTTP <code>/api/v1/gc</code> endpoint, or the curator cycle (<code>src/curator/</code>). Each invocation logs how many rows it touched.</p>
     <svg class="gc-svg" viewBox="0 0 1180 380" xmlns="http://www.w3.org/2000/svg">
       <style>
         .b{stroke-width:1.8;rx:10;ry:10}
@@ -345,7 +345,7 @@ archive_on_gc = <span class="err">false</span></div>
 </section>
 
 <footer>
-  <p>ai-memory v0.6.3.1 · Apache 2.0 · TTL config in <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/src/config.rs">config.rs</a> · GC paths in <code>db.rs::gc</code> + <code>handlers.rs::forget_memories</code></p>
+  <p>ai-memory v0.7.0 · Apache 2.0 · TTL config in <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/src/config.rs">config.rs</a> · GC paths in <code>src/storage/mod.rs::gc</code> + <code>src/handlers/::forget_memories</code></p>
   <p style="margin-top:.5rem"><a href="./">← Back to ai-memory</a> · <a href="at-a-glance.html">Atlas</a> · <a href="memory-tiers.html">Tiers</a> · <a href="archival.html">Archival</a> · <a href="lifecycle.html">Lifecycle</a></p>
 </footer>
 

@@ -1500,14 +1500,27 @@ pub fn resolve_admin_agent_ids(admin_cfg: Option<&crate::config::AdminConfig>) -
             if id.is_empty() {
                 continue;
             }
-            if id == "*" {
-                out.push("*".to_string());
-                continue;
-            }
+            // #980 (2026-05-20) — the `AI_MEMORY_ADMIN_AGENT_IDS=*`
+            // wildcard carve-out is REMOVED. Pre-#980 the env var
+            // accepted `"*"` as an explicit "admit every caller"
+            // sentinel; combined with the `is_admin_caller` wildcard
+            // arm (also closed in #980), an operator who set the
+            // env var (intentionally or via a copy-paste mishap)
+            // opened every admin endpoint. Operators wanting a
+            // permissive admin posture must now enumerate the agent
+            // ids explicitly (e.g. comma-separated list of NHI
+            // principals); the wildcard entry is rejected by
+            // `validate_agent_id` (shape: `*` is not in the allowed
+            // char class) and dropped with a WARN. The previous
+            // explicit-test-only path lives behind `#[cfg(test)]` in
+            // `is_admin_caller`; production deployments cannot reach
+            // it regardless of how the allowlist is populated.
             match crate::validate::validate_agent_id(id) {
                 Ok(()) => out.push(id.to_string()),
                 Err(e) => {
-                    tracing::warn!("AI_MEMORY_ADMIN_AGENT_IDS entry '{id}' rejected: {e}; dropping")
+                    tracing::warn!(
+                        "AI_MEMORY_ADMIN_AGENT_IDS entry '{id}' rejected: {e}; dropping"
+                    );
                 }
             }
         }
@@ -2492,7 +2505,7 @@ pub async fn bootstrap_serve(
     // v0.7.0 L5 — build the LLM client for autonomy-hook capable tiers
     // (smart/autonomous). The HTTP `create_memory` handler reaches for
     // `app.llm` to call `auto_tag` (mirroring MCP `handle_store` at
-    // `src/mcp.rs:1823-1833`). When the configured tier has no
+    // `crate::mcp::handle_store` (auto-tag block)). When the configured tier has no
     // `llm_model` (keyword/semantic) or the Ollama endpoint is
     // unreachable, the client stays `None` and the hook silently
     // degrades to operator-supplied tags only.
@@ -3394,7 +3407,7 @@ pub async fn sync_cycle_once(
     {
         let conn = db::open(db_path)?;
         for mem in &pulled.memories {
-            if crate::validate::validate_memory(mem).is_ok() {
+            if crate::validate::RequestValidator::validate_memory(mem).is_ok() {
                 let _ = db::insert_if_newer(&conn, mem);
             }
         }

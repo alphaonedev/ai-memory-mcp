@@ -78,17 +78,29 @@ pub fn is_admin_caller(state: &AppState, caller: &str) -> bool {
     if caller.is_empty() {
         return false;
     }
-    // v0.7.0 #974 (lib-test rewrite, 2026-05-20) — `"*"` wildcard
-    // sentinel admits any non-empty caller. Production AdminConfig
-    // rejects `"*"` because it fails `validate_agent_id`; the
-    // wildcard exists only for the unit-test fixture
-    // `test_app_state` at `src/handlers/tests.rs:312` which seeds
+    // v0.7.0 #980 (2026-05-20) — the `"*"` wildcard sentinel is now
+    // strictly `#[cfg(test)]`-gated. Production builds NEVER admit
+    // `"*"` regardless of how the allowlist got populated; even a
+    // future config-loader regression that smuggles `"*"` past
+    // [`crate::validate::validate_agent_id`] (which rejects it for
+    // shape) cannot open every admin endpoint. The lib unit-test
+    // fixture `test_app_state` at `src/handlers/tests.rs:312` seeds
     // `vec!["*"]` so legacy lib tests that issue `Body::empty()` +
-    // no `X-Agent-Id` (synthetic `anonymous:req-<uuid>`) still
-    // exercise the admin-gated happy paths after the v0.7.0
-    // SHIP-cluster gates landed (#936/#940/#942/#946/#957/#960).
-    // Integration tests in `tests/*.rs` use the closed allowlist
-    // (`Vec::new()`) for the security-gate regression coverage.
+    // no `X-Agent-Id` (synthetic `anonymous:req-<uuid>` principal)
+    // still exercise the admin-gated happy paths after the v0.7.0
+    // SHIP-cluster gates landed (#936/#940/#942/#946/#957/#960);
+    // those tests run under the `cfg(test)` build and see the
+    // wildcard arm below. Integration tests in `tests/*.rs` use the
+    // closed allowlist (`Vec::new()`) or an explicit principal — the
+    // security-gate regression coverage exercises the production
+    // path. Pre-#980 the wildcard arm was always-on at runtime; an
+    // `AI_MEMORY_ADMIN_AGENT_IDS=*` env var (or any
+    // path that landed `"*"` in `admin_agent_ids`) admitted every
+    // caller. The accompanying change in
+    // `daemon_runtime::resolve_admin_agent_ids` drops the env-var
+    // wildcard carve-out so the production allowlist cannot contain
+    // `"*"` at all.
+    #[cfg(test)]
     if state.admin_agent_ids.iter().any(|id| id == "*") {
         return true;
     }
@@ -128,8 +140,46 @@ pub fn require_admin(
     endpoint: &'static str,
 ) -> Result<String, Response> {
     let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
-    let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
-        .unwrap_or_else(|_| "anonymous:invalid".to_string());
+    // v0.7.0 #984 — surface `resolve_http_agent_id` errors as 400
+    // BAD_REQUEST instead of papering them with the
+    // `"anonymous:invalid"` sentinel. Pre-#984 a wire caller who
+    // supplied an `X-Agent-Id` header that failed
+    // [`crate::validate::validate_agent_id`] (invalid char class,
+    // oversized, RESERVED_AGENT_IDS post-#977) reached
+    // [`is_admin_caller`] with the sentinel principal. The sentinel
+    // fails the admin allowlist check anyway (it's not in any
+    // operator's `AdminConfig`), so the wire caller still got 403
+    // — but the audit chain captured `"anonymous:invalid"` instead
+    // of the actionable validation diagnostic. Worse, post-#977 a
+    // wire spoof of `X-Agent-Id: daemon` would land in the audit
+    // chain as `"anonymous:invalid"` rather than logging the
+    // attempted spoof of a reserved name. Surfacing 400 with the
+    // validator's error message gives operators the diagnostic
+    // they need + closes the audit-pollution path.
+    let caller = match crate::identity::resolve_http_agent_id(None, header_agent_id) {
+        Ok(c) => c,
+        Err(e) => {
+            // Record a `deny` audit decision with the actual error
+            // so the forensic chain captures the rejected probe
+            // BEFORE the wire 400.
+            crate::governance::audit::record_decision(
+                "anonymous:resolve-failed",
+                "deny",
+                "admin_role",
+                "",
+                json!({
+                    "endpoint": endpoint,
+                    "outcome": "agent_id_resolve_failed",
+                    "reason": e.to_string(),
+                }),
+            );
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("invalid agent_id: {e}")})),
+            )
+                .into_response());
+        }
+    };
 
     let admitted = is_admin_caller(state, &caller);
     crate::governance::audit::record_decision(

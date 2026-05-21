@@ -498,7 +498,7 @@ pub async fn sync_push(
     // would serialize unrelated writers for hundreds of ms).
     let mut embedding_refresh: Vec<(String, String)> = Vec::new();
     for mem in &body.memories {
-        if let Err(e) = validate::validate_memory(mem) {
+        if let Err(e) = validate::RequestValidator::validate_memory(mem) {
             tracing::warn!("sync_push: skipping memory {} ({}): {e}", mem.id, mem.title);
             skipped += 1;
             continue;
@@ -600,7 +600,14 @@ pub async fn sync_push(
         // original `reflection_depth` so derived-write cap enforcement
         // (storage::reflect) sees the same value the source peer saw.
         // Non-reflection rows (depth == 0) pass through unchanged.
-        let cap_for_namespace = crate::storage::resolve_governance_policy(&lock.0, &mem.namespace)
+        //
+        // #961 (SAL-boundary cleanup): use the `db::` namespace alias
+        // (which re-exports `crate::storage` from `src/lib.rs:52`) so
+        // every sqlite-direct call in this branch reads as a single
+        // module surface — keeps the alias hygiene that the rest of
+        // this file already follows (`db::insert_if_newer`,
+        // `db::archive_memory`, etc.).
+        let cap_for_namespace = db::resolve_governance_policy(&lock.0, &mem.namespace)
             .unwrap_or_else(crate::models::GovernancePolicy::default)
             .effective_max_reflection_depth();
         let to_insert = crate::federation::reflection_bookkeeping::stamp_reflection_origin(
@@ -739,8 +746,12 @@ pub async fn sync_push(
     // `peer_attested`.
     let mut links_applied = 0usize;
     for link in &body.links {
-        if validate::validate_link(&link.source_id, &link.target_id, link.relation.as_str())
-            .is_err()
+        if validate::RequestValidator::validate_link_triple(
+            &link.source_id,
+            &link.target_id,
+            link.relation.as_str(),
+        )
+        .is_err()
         {
             skipped += 1;
             continue;

@@ -94,6 +94,120 @@ pub fn handle_deref(
     }))
 }
 
+// --- D1.5 (#986): per-tool McpTool impls for memory_offload + memory_deref ---
+
+use crate::mcp::registry::McpTool;
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+/// v0.7.0 #972 D1.5 (#986) — request body for `memory_offload`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct OffloadRequest {
+    /// Verbatim content.
+    pub content: String,
+
+    /// Namespace bucket. Default 'auto'.
+    #[serde(default)]
+    pub namespace: Option<String>,
+
+    /// Retention hint (seconds).
+    #[serde(default)]
+    pub ttl_seconds: Option<i64>,
+}
+
+/// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_offload`.
+#[allow(dead_code)]
+pub struct OffloadTool;
+
+impl McpTool for OffloadTool {
+    fn name() -> &'static str {
+        "memory_offload"
+    }
+    fn description() -> &'static str {
+        "Offload verbatim content; returns ref_id (Family::Power)."
+    }
+    fn docs() -> &'static str {
+        "QW-3 follow-up: store verbatim in offloaded_blobs. Returns {ref_id, content_sha256, stored_at}. Dereference via memory_deref. Semantic+ tier."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(OffloadRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "power"
+    }
+}
+
+/// v0.7.0 #972 D1.5 (#986) — request body for `memory_deref`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct DerefRequest {
+    /// Ref from memory_offload.
+    pub ref_id: String,
+}
+
+/// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_deref`.
+#[allow(dead_code)]
+pub struct DerefTool;
+
+impl McpTool for DerefTool {
+    fn name() -> &'static str {
+        "memory_deref"
+    }
+    fn description() -> &'static str {
+        "Dereference a memory_offload ref_id (Family::Power)."
+    }
+    fn docs() -> &'static str {
+        "QW-3 follow-up: sha256-verified lookup. Returns {ref_id, content, stored_at, sha256}. Refuses tampered rows. Semantic+ tier."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(DerefRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "power"
+    }
+}
+
+#[cfg(test)]
+mod d1_5_986_tests {
+    //! D1.5 (#986) — schema parity for `memory_offload` + `memory_deref`.
+    //! Shared helpers live at [`crate::mcp::parity_test_helpers`].
+    use super::*;
+    use crate::mcp::parity_test_helpers::{
+        assert_descriptions_match, assert_property_set_parity, derived_props_for,
+    };
+
+    #[test]
+    fn offload_parity_986() {
+        let derived = derived_props_for::<OffloadRequest>();
+        assert_property_set_parity("memory_offload", &derived);
+        assert_descriptions_match("memory_offload", &derived);
+    }
+
+    #[test]
+    fn offload_tool_metadata_986() {
+        assert_eq!(OffloadTool::name(), "memory_offload");
+        assert_eq!(OffloadTool::family(), "power");
+    }
+
+    #[test]
+    fn deref_parity_986() {
+        let derived = derived_props_for::<DerefRequest>();
+        assert_property_set_parity("memory_deref", &derived);
+        assert_descriptions_match("memory_deref", &derived);
+    }
+
+    #[test]
+    fn deref_tool_metadata_986() {
+        assert_eq!(DerefTool::name(), "memory_deref");
+        assert_eq!(DerefTool::family(), "power");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

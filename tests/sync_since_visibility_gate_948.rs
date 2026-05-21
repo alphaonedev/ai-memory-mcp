@@ -1,6 +1,7 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
 // clippy allows (test scaffolding): pedantic lints with no behavioural
 // impact on the regression we pin.
 #![allow(clippy::redundant_closure_for_method_calls)]
@@ -149,6 +150,7 @@ async fn seed_with_metadata(db: &ai_memory::handlers::Db, ns: &str, title: &str,
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..ai_memory::models::Memory::default()
     };
     ai_memory::db::insert(&lock.0, &mem).expect("seed insert");
 }

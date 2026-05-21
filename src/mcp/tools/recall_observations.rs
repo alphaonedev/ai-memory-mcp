@@ -48,6 +48,84 @@ pub fn handle_recall_observations(
     }))
 }
 
+// --- D1.5 (#986): per-tool McpTool impl for memory_recall_observations ---
+
+use crate::mcp::registry::McpTool;
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+/// v0.7.0 #972 D1.5 (#986) — request body for `memory_recall_observations`.
+///
+/// The legacy hand-coded entry in [`crate::mcp::registry::tool_definitions`]
+/// omits the `description` field on most properties (only field names
+/// + types are declared). The schemars-derived schema mirrors that
+/// shape via the field naming alone.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct RecallObservationsRequest {
+    #[serde(default)]
+    pub recall_id: Option<String>,
+
+    #[serde(default)]
+    pub consumed: Option<bool>,
+
+    #[serde(default)]
+    pub since: Option<String>,
+
+    #[serde(default)]
+    pub until: Option<String>,
+
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+/// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_recall_observations`.
+#[allow(dead_code)]
+pub struct RecallObservationsTool;
+
+impl McpTool for RecallObservationsTool {
+    fn name() -> &'static str {
+        "memory_recall_observations"
+    }
+    fn description() -> &'static str {
+        "List recall_observations (#886)."
+    }
+    fn docs() -> &'static str {
+        "Gap 3 (#886): recall-consumption ledger filter."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(RecallObservationsRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "meta"
+    }
+}
+
+#[cfg(test)]
+mod d1_5_986_tests {
+    //! D1.5 (#986) — schema parity for `memory_recall_observations`.
+    //! Shared helpers live at [`crate::mcp::parity_test_helpers`].
+    use super::*;
+    use crate::mcp::parity_test_helpers::{
+        assert_descriptions_match, assert_property_set_parity, derived_props_for,
+    };
+
+    #[test]
+    fn recall_observations_parity_986() {
+        let derived = derived_props_for::<RecallObservationsRequest>();
+        assert_property_set_parity("memory_recall_observations", &derived);
+        assert_descriptions_match("memory_recall_observations", &derived);
+    }
+
+    #[test]
+    fn recall_observations_tool_metadata_986() {
+        assert_eq!(RecallObservationsTool::name(), "memory_recall_observations");
+        assert_eq!(RecallObservationsTool::family(), "meta");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

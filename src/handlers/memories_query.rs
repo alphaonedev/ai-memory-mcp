@@ -536,7 +536,7 @@ pub async fn bulk_create(
         let mut errors: Vec<String> = Vec::new();
         let mut pending: Vec<serde_json::Value> = Vec::new();
         for body in bodies {
-            if let Err(e) = validate::validate_create(&body) {
+            if let Err(e) = validate::RequestValidator::validate_create(&body) {
                 // Issue #851: do not echo the caller's title back paired
                 // with the raw error — both are caller-influenced, and
                 // the combo can be used to verify presence/shape of
@@ -668,7 +668,7 @@ pub async fn bulk_create(
     {
         let lock = app.db.lock().await;
         for body in bodies {
-            if let Err(e) = validate::validate_create(&body) {
+            if let Err(e) = validate::RequestValidator::validate_create(&body) {
                 // Issue #851: do not echo the caller's title back paired
                 // with the raw error. Sanitize and log instead.
                 tracing::warn!("bulk_create: validate_create failed: {e}");

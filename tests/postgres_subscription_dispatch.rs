@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
+
 //! v0.7.0 Track D #932 regression test — postgres-backed daemons MUST
 //! fire HMAC-signed webhook POSTs when a `memory_store` event matches
 //! a registered subscription. Pre-#932 the postgres-create branch in
@@ -103,6 +105,7 @@ fn make_subscription_memory(
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     }
 }
 

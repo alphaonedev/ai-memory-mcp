@@ -1,6 +1,7 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
 // #825: integration test functions are unavoidably long because each
 // covers an end-to-end scenario with full setup/probe/teardown. The
 // `--features sal-postgres` build path adds extra setup lines (postgres
@@ -141,6 +142,7 @@ fn fresh_memory(title: &str, ns: &str) -> Memory {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     }
 }
 

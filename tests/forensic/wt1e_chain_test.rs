@@ -1,6 +1,7 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
 #![allow(
     clippy::doc_markdown,
     clippy::too_many_lines,
@@ -138,6 +139,7 @@ fn seed_long_source(conn: &Connection, ns: &str, keyword: &str) -> String {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     };
     db::insert(conn, &mem).expect("seed")
 }

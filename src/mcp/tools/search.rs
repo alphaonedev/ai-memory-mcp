@@ -3,9 +3,71 @@
 
 //! MCP `memory_search` handler.
 
+use crate::mcp::registry::McpTool;
 use crate::models::Tier;
 use crate::{db, validate};
+use schemars::JsonSchema;
+use serde::Deserialize;
 use serde_json::{Value, json};
+
+// --- D1.4 (#985): per-tool McpTool impl for `memory_search` (core family) ---
+
+/// v0.7.0 #972 D1.4 (#985) — request body for `memory_search`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct SearchRequest {
+    pub query: String,
+
+    #[serde(default)]
+    pub namespace: Option<String>,
+
+    #[serde(default)]
+    pub tier: Option<String>,
+
+    #[serde(default)]
+    pub limit: Option<i64>,
+
+    /// Exact metadata.agent_id filter.
+    #[serde(default)]
+    pub agent_id: Option<String>,
+
+    #[schemars(description = "#151 scope-visibility agent.")]
+    #[serde(default)]
+    pub as_agent: Option<String>,
+
+    /// WT-1-E: include atomised sources.
+    #[serde(default)]
+    pub include_archived: Option<bool>,
+
+    /// Response format. toon_compact saves 79%.
+    #[serde(default)]
+    pub format: Option<String>,
+}
+
+/// v0.7.0 #972 D1.4 (#985) — `McpTool` impl for `memory_search`.
+#[allow(dead_code)]
+pub struct SearchTool;
+
+impl McpTool for SearchTool {
+    fn name() -> &'static str {
+        "memory_search"
+    }
+    fn description() -> &'static str {
+        "Search memories by exact keyword match (AND semantics)."
+    }
+    fn docs() -> &'static str {
+        "Exact keyword AND search. Deterministic; no fuzzy/semantic. Filters: namespace, tier, agent_id, as_agent (Task 1.5 scope). WT-1-E: atomised sources hidden by default."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(SearchRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "core"
+    }
+}
+
 pub(super) fn handle_search(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
     let query = params["query"].as_str();
     let namespace = params["namespace"].as_str();
@@ -73,4 +135,26 @@ pub(super) fn handle_search(conn: &rusqlite::Connection, params: &Value) -> Resu
     )
     .map_err(|e| e.to_string())?;
     Ok(json!({"results": results, "count": results.len()}))
+}
+
+#[cfg(test)]
+mod d1_4_985_tests {
+    //! D1.4 (#985) — schema-parity for `memory_search`.
+    use super::*;
+    use crate::mcp::d1_4_985_helpers::{
+        assert_descriptions_match, assert_property_set_parity, derived_props_for,
+    };
+
+    #[test]
+    fn memory_search_parity_985() {
+        let derived = derived_props_for::<SearchRequest>();
+        assert_property_set_parity("memory_search", &derived);
+        assert_descriptions_match("memory_search", &derived);
+    }
+
+    #[test]
+    fn memory_search_tool_metadata_985() {
+        assert_eq!(SearchTool::name(), "memory_search");
+        assert_eq!(SearchTool::family(), "core");
+    }
 }

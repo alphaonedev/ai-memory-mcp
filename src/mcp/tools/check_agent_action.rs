@@ -190,6 +190,106 @@ pub fn build_action(kind: &str, arguments: &Value) -> Result<AgentAction, String
 pub const MCP_MUTATION_DISABLED_ERROR: &str = "governance.not_available_over_mcp: rule mutation is operator-only \
      (CLI `ai-memory rules` or HTTP `POST /api/v1/governance/rules`)";
 
+// --- D1.5 (#986): per-tool McpTool impl for memory_check_agent_action ---
+
+use crate::mcp::registry::McpTool;
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+/// v0.7.0 #972 D1.5 (#986) — request body for `memory_check_agent_action`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct CheckAgentActionRequest {
+    pub kind: String,
+
+    /// kind=bash.
+    #[serde(default)]
+    pub command: Option<String>,
+
+    /// kind=bash cwd.
+    #[serde(default)]
+    pub cwd: Option<String>,
+
+    /// kind=filesystem_write.
+    #[serde(default)]
+    pub path: Option<String>,
+
+    /// Bytes-to-write hint.
+    #[serde(default)]
+    pub byte_estimate: Option<i64>,
+
+    /// kind=network_request.
+    #[serde(default)]
+    pub host: Option<String>,
+
+    /// Default https.
+    #[serde(default)]
+    pub scheme: Option<String>,
+
+    /// kind=process_spawn.
+    #[serde(default)]
+    pub binary: Option<String>,
+
+    /// process_spawn argv.
+    #[serde(default)]
+    pub args: Vec<String>,
+
+    /// kind=custom.
+    #[serde(default)]
+    pub custom_kind: Option<String>,
+
+    /// Caller id (audit).
+    #[serde(default)]
+    pub agent_id: Option<String>,
+}
+
+/// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_check_agent_action`.
+#[allow(dead_code)]
+pub struct CheckAgentActionTool;
+
+impl McpTool for CheckAgentActionTool {
+    fn name() -> &'static str {
+        "memory_check_agent_action"
+    }
+    fn description() -> &'static str {
+        "Check action vs governance_rules (#691); Allow/Refuse/Warn."
+    }
+    fn docs() -> &'static str {
+        "#691: read-only rule check. Harness PreToolUse hook calls on every Bash/Write/Edit. Rule MUTATION over MCP is disabled — use `ai-memory rules --sign` CLI or signed HTTP admin endpoints."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(CheckAgentActionRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "power"
+    }
+}
+
+#[cfg(test)]
+mod d1_5_986_tests {
+    //! D1.5 (#986) — schema parity for `memory_check_agent_action`.
+    //! Shared helpers live at [`crate::mcp::parity_test_helpers`].
+    use super::*;
+    use crate::mcp::parity_test_helpers::{
+        assert_descriptions_match, assert_property_set_parity, derived_props_for,
+    };
+
+    #[test]
+    fn check_agent_action_parity_986() {
+        let derived = derived_props_for::<CheckAgentActionRequest>();
+        assert_property_set_parity("memory_check_agent_action", &derived);
+        assert_descriptions_match("memory_check_agent_action", &derived);
+    }
+
+    #[test]
+    fn check_agent_action_tool_metadata_986() {
+        assert_eq!(CheckAgentActionTool::name(), "memory_check_agent_action");
+        assert_eq!(CheckAgentActionTool::family(), "power");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

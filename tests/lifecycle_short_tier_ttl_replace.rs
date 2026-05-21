@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
+
 //! Issue #830 — regression test pinning the sliding-window-REPLACE
 //! semantics of the short-tier TTL touch operation.
 //!
@@ -48,6 +50,7 @@ fn make_short_memory(expires_at: Option<String>) -> Memory {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     }
 }
 

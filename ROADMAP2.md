@@ -994,6 +994,119 @@ distinct property the operator directive named.
 
 ---
 
+## 18. v0.9 — Vector Index Substrate Development Plan
+
+> **Issue tracker:** [#1005](https://github.com/alphaonedev/ai-memory-mcp/issues/1005). Filed 2026-05-21 per operator directive to publish the v0.9 multi-agent execution plan in the public roadmap.
+
+**Capability:** Replace the in-memory `instant-distance` HNSW with a persistent, transactionally-coherent, audit-chain-integrated vector index behind a swappable trait.
+
+**Closes (from §5.4 above):** G2 silent eviction at 100k, G3 cold-start O(N) rebuild, G4 mixed-dim silent tolerance, post-ANN namespace filter hazard (§5.2).
+
+**Primary backend:** vectorlite (hnswlib + Google Highway SIMD) as SQLite extension.
+**Fallback backend:** pure-Rust HNSW for locked-down environments.
+**Pluggable via trait** so future quantization-optimized backends (rabitq-rs, etc.) drop in without architectural change.
+
+**Execution model:** AI NHI multi-agent parallel. Wall-clock target ~7 hours; floor 4 hours, ceiling 10 hours.
+
+**Audience for starter prompts:** Claude Code, Codex, or equivalent CLI-driven coding agents working against a checkout of ai-memory-mcp on a feature branch.
+
+### 18.0 — Pre-flight gate (Task 0.1, BLOCKING)
+
+Single-agent recall-validation spike against the LongMemEval reference corpus. Pass = R@5 within 1.0 point of v0.6.3 baseline (97.8%), R@10 within 0.5 (99.0%), R@20 within 0.2 (99.8%), p95 search ≤ 35ms at 100k vectors on M2/M3. Fail → re-plan against rabitq-rs as primary backend; same trait, same hour count. Full starter prompt in #1005 §0.1.
+
+### 18.1 — Foundation layer (Tasks 1.1–1.4, parallel after gate)
+
+| Task | Owner | LOE | Deliverable |
+|---|---|---|---|
+| 1.1 | Agent A | 30 min stub + 3 h impl | `src/index/mod.rs` `VectorIndex` trait + `IndexError` + `IndexEvent` + capabilities v3 extension; transitional adapter wraps existing `instant_distance` |
+| 1.2 | Agent B | 3 h | `src/index/vectorlite.rs`; build.rs downloads + verifies vectorlite v0.2.0 extension; feature flag `vectorlite-backend` default-on; `ExtensionLoadDisabled` graceful fallback |
+| 1.3 | Agent C | 2 h | `src/index/builtin.rs` pure-Rust HNSW (hnsw_rs); WAL-then-commit persistence; identical trait surface to vectorlite |
+| 1.4 | Agent D | 1 h | `src/index/factory.rs` `--index=auto\|vectorlite\|builtin`; capabilities v3 reports active backend |
+
+### 18.2 — Audit chain integration (Tasks 2.1–2.3, parallel)
+
+| Task | Owner | LOE | Deliverable |
+|---|---|---|---|
+| 2.1 | Agent E | 2 h | Schema migration extending `signed_events` with `IndexInserted\|IndexDeleted\|IndexRebuilt\|IndexMigrationCompleted`; Ed25519 signing wired into trait insert/delete/rebuild; V08-PE-8 verifier walks index events as first-class |
+| 2.2 | Agent F | 1.5 h | Schema migration adding `embedding_dim` + `embedder_version` to `memories`; `embedder_registry` table; type-layer rejection of mismatched-dim writes (closes G4); capabilities envelope shows enforcement state |
+| 2.3 | Agent G | 2 h | Delete `filter_by_namespace_post_ann`; use `allowlist` parameter on `VectorIndex::search`; vectorlite materializes to `rowid IN (...)` predicate pushdown; builtin uses `Predicate` or over-fetch; ship-gate test pins small-namespace recall (closes §5.2 hazard) |
+
+### 18.3 — Migration + rebuild (Tasks 3.1–3.2, parallel after foundation)
+
+| Task | Owner | LOE | Deliverable |
+|---|---|---|---|
+| 3.1 | Agent H | 2 h | `src/migration/v0_8_to_v0_9_index.rs`; idempotent restartable batch walk with WAL for buffered writes; `ai-memory migrate-index --dry-run`; old `instant-distance` state retained in `<db_dir>/.archive/` for one release cycle (rollback) |
+| 3.2 | Agent I | 3 h (longest) | `VectorIndex::rebuild(new_embedder_version)` for both backends; eventually-correct reads during rebuild (never empty); atomic swap on completion; `memory_reindex` MCP tool; signed `IndexRebuilt` events at batch boundaries |
+
+### 18.4 — Verification + ship gate (Tasks 4.1–4.6, parallel after integration)
+
+| Task | Owner | LOE | Deliverable |
+|---|---|---|---|
+| 4.1 | Agent J | 1.5 h | Ship-gate Phase 1–4 against both backends; Phase 4 (chaos `kill_primary_mid_write` × 50) is the critical-coherence proof |
+| 4.2 | Agent K | 1 h | A2A-gate ironclaw-mtls 48/48 on both backends; full 3-framework × 3-transport matrix |
+| 4.3 | Agent L | 1 h | LongMemEval 6-variant disclosure (reranker × backend); default-config R@5 drop > 0.5 points = release blocker |
+| 4.4 | Agent M | 1 h | `PERFORMANCE.md` v0.9 baselines for both backends; bench CI guard verified |
+| 4.5 | Agent N | 1 h | `ai-memory doctor` + V08-PE-8 verifier extended with index-drift / embedder-violations / backend-status / rebuild-status checks |
+| 4.6 | Agent O | 1 h | `docs/v0.9.0/release-notes.md` + `CHANGELOG.md` + `docs/capabilities-v3.md`; honest regression disclosure; mark §5.4 G2/G3/G4 + §5.2 hazard as SHIPPED/RESOLVED |
+
+### 18.5 — Release (Task 5.1)
+
+| Task | Owner | LOE | Deliverable |
+|---|---|---|---|
+| 5.1 | Agent P | 30 min if healthy | GPG-signed `v0.9.0` tag; five-channel publish (crates.io, Homebrew, Fedora COPR, GHCR, APT PPA); per-channel smoke test; landing-page auto-update |
+
+### 18.6 — Critical-path timing summary
+
+```
+Hour 0.0–0.75 ┃ Task 0.1 spike (BLOCKING, single agent)
+              ┃   ├─ Gate: vectorlite recall holds
+              ┃   └─ If fail: re-plan with rabitq-rs as primary
+Hour 0.75–1.0 ┃ Task 1.1 trait stub (single agent)
+              ┃   └─ Trait stub pushed at minute 30
+Hour 1.0–4.0  ┃ PARALLEL FAN-OUT (9 agents on 9 tasks)
+Hour 4.0–5.5  ┃ INTEGRATION (single coordinator + fix agents)
+              ┃   └─ Merge order: A → C → B → D → F → E → G → H → I
+Hour 5.5–7.0  ┃ PARALLEL VERIFICATION (6 agents J–O)
+Hour 7.0–7.5  ┃ Task 5.1 release (single agent P)
+```
+
+**Floor:** 4 h if no surprises and the spike clears in 20 min.
+**Expected:** 7 h with normal integration friction (1–2 fix cycles).
+**Ceiling:** 10 h if a recall regression triggers a backend swap.
+
+### 18.7 — Risk register
+
+- **Recall regression at the spike (Task 0.1).** Mitigation: pre-planned re-run against rabitq-rs as primary, same trait, same hour count. Decision belongs to the operator, not the spike agent.
+- **vectorlite extension loading blocked in target environment.** Mitigation: Agent D's factory falls back to builtin transparently. End user sees a structured warning, not a daemon failure.
+- **Windows ARM64 vectorlite untested.** Mitigation: Agent J's ship-gate runs on Windows ARM64 CI runner if available; otherwise document gap and ship builtin as default on that platform for one release cycle.
+- **Migration interrupted on a 10M+ memory database.** Mitigation: Agent H's idempotent restartable design. State table tracks last completed memory_id; resumption automatic on next start.
+- **Audit chain hash mismatch under concurrent write load.** Mitigation: Agent E's signing emitter is sequenced through a single tokio task with bounded mpsc channel — no parallel signing, no chain race. Merkle batching is an additive future option behind the same interface.
+- **Build-time download of vectorlite extension binary fails.** Mitigation: pin the GitHub release artifact hash, fail the build loudly if SHA mismatch, document the offline-build path using a vendored binary in `vendor/vectorlite/`.
+
+### 18.8 — Out of scope for v0.9 (explicitly deferred)
+
+- Quantization backends (RaBitQ-IVF, TurboQuant, residual VQ) — pluggable via the trait but not shipped in v0.9. Belongs in v0.10 or later when corpus size demands it.
+- GPU acceleration. Not a substrate concern. Commercial-tier deployment may add this behind the same trait.
+- Per-namespace HNSW shards. §5.4 G2 fallback; the namespace pre-filter (Task 2.3) addresses the same hazard more cleanly. Revisit if filter selectivity becomes a measured problem.
+- Asymmetric distance computation (compressed corpus, full-precision query). Quantization-era concern. Defer.
+- Streaming consistency under data-dependent quantization (December 2025 paper). Research direction; not yet a production primitive.
+
+### 18.9 — Definition of done
+
+v0.9 ships when all of these hold simultaneously:
+
+1. Tasks 0.1, 1.1–1.4, 2.1–2.3, 3.1–3.2, 4.1–4.6, 5.1 closed against their gate criteria.
+2. §5.4 G2, G3, G4 marked SHIPPED with v0.9.0 references.
+3. §5.2 "post-ANN namespace filter production hazard" marked RESOLVED with v0.9.0 reference.
+4. The `VectorIndex` trait is documented, the two backends ship, the factory selects correctly under all flag combinations.
+5. Release notes honestly disclose any regressions found by Agents J–N.
+6. Five distribution channels publish v0.9.0 with passing smoke tests.
+7. Public landing pages (ship-gate, A2A-gate) reflect v0.9.0 results.
+
+Full starter prompts for every agent (A–P) live in issue #1005. The body of the issue is the authoritative source for the per-task starter text; this section is the public-facing roadmap summary.
+
+---
+
 ## 17. Net
 
 > **Doc-drift correction (Item D, issue #973, 2026-05-20):** The

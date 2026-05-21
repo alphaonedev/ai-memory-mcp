@@ -129,6 +129,18 @@ pub async fn get_memory(
             // prefix")). The substrate emits `StorageError::AmbiguousIdPrefix`
             // wrapped in anyhow; surface 400 with the typed Display body
             // (byte-identical to the legacy bail!() string).
+            //
+            // SAL-bypass intentional (#961): the SAL `StoreError` enum
+            // (`src/store/mod.rs`) does not carry the
+            // `AmbiguousIdPrefix` variant — id-prefix resolution lives
+            // on the legacy `db::resolve_id` free-function which
+            // returns `anyhow::Error`-wrapped `StorageError`. The
+            // typed downcast is required to map the 400 envelope; the
+            // pattern repeats four more times in this file (update,
+            // delete, promote, plus this get path). The postgres
+            // branch above never reaches here because it dispatches
+            // through `app.store.get` which has its own typed
+            // `StoreError::NotFound`/`InvalidInput` shape.
             if matches!(
                 e.downcast_ref::<crate::storage::StorageError>(),
                 Some(crate::storage::StorageError::AmbiguousIdPrefix { .. })
@@ -164,7 +176,7 @@ pub async fn update_memory(
         )
             .into_response();
     }
-    if let Err(e) = validate::validate_update(&body) {
+    if let Err(e) = validate::RequestValidator::validate_update(&body) {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": e.to_string()})),
@@ -302,6 +314,9 @@ pub async fn update_memory(
             // prefix")). The substrate emits `StorageError::AmbiguousIdPrefix`
             // wrapped in anyhow; surface 400 with the typed Display body
             // (byte-identical to the legacy bail!() string).
+            //
+            // SAL-bypass intentional (#961): see `get_memory` above for
+            // the rationale — `AmbiguousIdPrefix` is sqlite-legacy.
             if matches!(
                 e.downcast_ref::<crate::storage::StorageError>(),
                 Some(crate::storage::StorageError::AmbiguousIdPrefix { .. })
@@ -424,6 +439,16 @@ pub async fn update_memory(
             // surfaces as 409 with a structured envelope naming both
             // expected + current versions so callers can re-read and
             // retry with the fresh version.
+            //
+            // SAL-bypass intentional (#961): the SAL `StoreError`
+            // enum has a `Conflict { id }` variant but does not carry
+            // the typed (expected, current) version pair the
+            // `If-Match` retry-shape needs. The legacy
+            // `db::update_with_expected_version` is the canonical
+            // origin of the typed `VersionConflict`; downcasting here
+            // preserves the structured retry envelope. The postgres
+            // branch above routes through `app.store.update` which
+            // surfaces `StoreError::Conflict` via `store_err_to_response`.
             if let Some(vc) = e.downcast_ref::<crate::storage::VersionConflict>() {
                 return (
                     StatusCode::CONFLICT,
@@ -618,6 +643,9 @@ pub async fn delete_memory(
             // prefix")). The substrate emits `StorageError::AmbiguousIdPrefix`
             // wrapped in anyhow; surface 400 with the typed Display body
             // (byte-identical to the legacy bail!() string).
+            //
+            // SAL-bypass intentional (#961): see `get_memory` for the
+            // canonical rationale — `AmbiguousIdPrefix` is sqlite-legacy.
             if matches!(
                 e.downcast_ref::<crate::storage::StorageError>(),
                 Some(crate::storage::StorageError::AmbiguousIdPrefix { .. })
@@ -1014,6 +1042,9 @@ pub async fn promote_memory(
             // prefix")). The substrate emits `StorageError::AmbiguousIdPrefix`
             // wrapped in anyhow; surface 400 with the typed Display body
             // (byte-identical to the legacy bail!() string).
+            //
+            // SAL-bypass intentional (#961): see `get_memory` for the
+            // canonical rationale — `AmbiguousIdPrefix` is sqlite-legacy.
             if matches!(
                 e.downcast_ref::<crate::storage::StorageError>(),
                 Some(crate::storage::StorageError::AmbiguousIdPrefix { .. })

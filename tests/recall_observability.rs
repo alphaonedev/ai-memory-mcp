@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
+
 //! v0.6.3.1 Phase P3 — recall observability acceptance tests.
 //!
 //! Closes audit gaps G2 (HNSW silent eviction at 100k), G8 (reranker
@@ -68,6 +70,7 @@ fn make_memory(title: &str, content: &str) -> Memory {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     }
 }
 

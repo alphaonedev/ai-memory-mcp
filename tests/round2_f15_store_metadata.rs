@@ -48,9 +48,17 @@ fn f15_memory_store_input_schema_declares_metadata_object() {
     let metadata = props
         .get("metadata")
         .expect("memory_store.inputSchema.properties.metadata must be declared (Round-2 F15)");
-    assert_eq!(
-        metadata["type"], "object",
-        "metadata field must declare type=object; got: {metadata}"
+    // **#1009 fix.** D1.6 schemars derive of Option<Map<String, Value>>
+    // emits `type: ["object","null"]` (nullable via Option<T>); legacy
+    // hand-coded entry was bare `"object"`. Accept either.
+    let type_field = &metadata["type"];
+    let is_object = type_field == "object"
+        || type_field
+            .as_array()
+            .is_some_and(|arr| arr.iter().any(|v| v == "object"));
+    assert!(
+        is_object,
+        "metadata field must declare type=object (bare or nullable); got: {metadata}"
     );
 }
 
@@ -76,9 +84,15 @@ fn f15_memory_store_input_schema_declares_tier_priority_tags() {
         "memory_store.inputSchema must declare `tags`"
     );
 
-    assert_eq!(props["tier"]["type"], "string");
-    assert_eq!(props["priority"]["type"], "integer");
-    assert_eq!(props["tags"]["type"], "array");
+    // **v0.7.0 #987 update.** D1.6 schemars Option<T> emits nullable type array.
+    let type_is = |v: &serde_json::Value, want: &str| -> bool {
+        v == want
+            || v.as_array()
+                .is_some_and(|arr| arr.iter().any(|x| x == want))
+    };
+    assert!(type_is(&props["tier"]["type"], "string"));
+    assert!(type_is(&props["priority"]["type"], "integer"));
+    assert!(type_is(&props["tags"]["type"], "array"));
 }
 
 // ---------------------------------------------------------------------------
@@ -94,8 +108,19 @@ fn f15_memory_update_input_schema_declares_metadata_object() {
     let metadata = props
         .get("metadata")
         .expect("memory_update.inputSchema.properties.metadata must be declared (Round-2 F15)");
-    assert_eq!(
-        metadata["type"], "object",
+    // **#1009 fix.** Original F15 contract: type=object on the wire.
+    // D1.6 schemars derive of Option<Value> emitted permissive `{}`
+    // (no `type` field), which broke this assertion. The schema fix at
+    // src/mcp/tools/update.rs::UpdateRequest::metadata changed the Rust
+    // type to Option<Map<String, Value>> so schemars emits
+    // `type: "object"` (nullable per Option<T> still allowed).
+    let type_field = metadata["type"].clone();
+    let is_object = type_field == "object"
+        || type_field
+            .as_array()
+            .is_some_and(|arr| arr.iter().any(|v| v == "object"));
+    assert!(
+        is_object,
         "metadata field must declare type=object; got: {metadata}"
     );
 }

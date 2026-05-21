@@ -14,6 +14,7 @@
 //! `tests/g1_postgres_quota_increment_on_store.rs` skip-line convention.
 
 #![cfg(feature = "sal-postgres")]
+#![allow(clippy::needless_update)]
 
 use ai_memory::models::ConfidenceSource;
 use std::sync::Arc;
@@ -62,6 +63,7 @@ fn fresh_memory(title: &str, namespace: &str) -> Memory {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     }
 }
 

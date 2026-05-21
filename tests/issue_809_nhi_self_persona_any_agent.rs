@@ -30,6 +30,8 @@
 //! the cookbook drives; same assertions a future NHI regression PR
 //! would have to keep green.
 
+#![allow(clippy::needless_update)]
+
 use std::path::PathBuf;
 use std::sync::Once;
 
