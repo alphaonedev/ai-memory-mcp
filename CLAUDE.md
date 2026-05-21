@@ -272,6 +272,16 @@ Recall is multi-stage and **never read-only** — every recall mutates the datab
 3. **Adaptive blending** — `final = semantic_weight * cosine + (1 - semantic_weight) * norm_fts`. Semantic weight varies 0.50 (short content ≤500 chars) → 0.15 (long content ≥5000 chars) because embeddings lose information on long text
 4. **Touch operations** (atomic) — increment `access_count`, **set `expires_at = now + per-tier-TTL`** (1h short / 1d mid; this is a sliding-window **REPLACEMENT**, not a max-of-old-and-new extend — the create-time 6h short / 7d mid backstop applies only until first access, after which the per-access window takes over), auto-promote mid→long at 5 accesses, increment priority every 10 accesses. `memory_promote` jumps a memory to the highest reachable tier (long) in a single call by default; a future revision may add an optional `target_tier` parameter for stepwise control (mid as an intermediate landing zone).
 
+**Dispatch DTO (post-#967 / Wave-2 Tier-C2).** All three recall
+surfaces (HTTP, MCP, CLI) marshal their wire shape into the
+canonical `crate::models::recall_request::RecallRequest` struct once,
+then dispatch into the recall pipeline. The DTO doubles as the
+schemars-derived MCP `input_schema` for `memory_recall` (D1.3 #984
+parity contract; see `src/mcp/tools/recall.rs::RecallTool`). Adding
+a new wire field is one struct field + one constructor branch per
+surface (`from_mcp_params` / `from_http_query` / `from_http_body` /
+`from_cli_args`), not four positional-arg signatures.
+
 ### Upsert Behavior
 
 Storing a memory with the same `(title, namespace)` updates the existing one. Tier is never downgraded (takes max). Expiry is only cleared if the new memory is `long`-tier.
