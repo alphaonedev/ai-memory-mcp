@@ -77,6 +77,54 @@ deliberately swallows the failure with the "continuing unsigned"
 stderr line; the cross-row hash chain itself remains tamper-evident
 in either posture).
 
+## v0.7.0 ship-readiness session 2026-05-21 — registry refactor (Wave-2 Tier-D1)
+
+The 2026-05-21 ship-readiness session closed [#972](https://github.com/alphaonedev/ai-memory-mcp/issues/972)
+(MCP registry split) end-to-end across the D1.1 → D1.8 sub-tickets.
+The net change is structural — the wire shape is byte-identical
+modulo the documented allowed-diffs catalog — but the contributor
+recipe and the source-of-truth surface flip:
+
+- **73 of 73 MCP tools** now carry per-tool schemars-derived `McpTool`
+  impls under `src/mcp/tools/<name>.rs`. Each tool owns its
+  `<Tool>Request` DTO (`#[derive(JsonSchema)]`), a zero-sized
+  `<Tool>Tool` type, and the matching dispatch handler. The trait
+  lives at `crate::mcp::registry::McpTool`.
+- **`tool_definitions()` collapses from a ~1100-line `json!({...})`
+  macro body to a 4-line iteration** over `registered_tools()` in
+  [`src/mcp/registry.rs`](../../src/mcp/registry.rs). Adding a new
+  tool is now one file in `src/mcp/tools/` plus one
+  `RegisteredTool::of::<...>()` line in `registered_tools()`.
+- **Wire-shape parity test** (`src/mcp/registry.rs::d1_6_987_tests`)
+  pins the post-D1.6 catalog against the stored pre-D1.6 snapshot at
+  `tests/snapshots/tool_definitions_pre_d1_6.json` — same tool count
+  (73), same names, descriptions byte-for-byte equal, same
+  `required[]`. Allowed-diffs (schemars `Option<T>` → nullable union,
+  schemars `null` defaults, `additionalProperties: false` from
+  `deny_unknown_fields`, schemars-only metadata stripped by the wire
+  trimmer) are enumerated in the test-mod doc-comment.
+- **Per-profile snapshot tests** (D1.7 #988) lock the `--profile core`
+  / `--profile full` projections of `registered_tools()` so future
+  family-filter regressions are caught at compile + test time.
+- **Compile-time schema ↔ handler invariant** (D1.7 #988). The
+  per-tool module shapes the `<Tool>Request` DTO and the
+  `handle_<tool>` body in the same file, so a field rename in the
+  DTO that breaks the handler fails to build — not at runtime.
+- **Wire trimmer extended** to drop the schemars-only `inputSchema`
+  metadata that the legacy hand-coded macro never emitted: top-level
+  `description` on the request struct, `$schema`, `title`, nested
+  `definitions.*` descriptions, and long string defaults (>32 chars).
+  The full schema remains available on demand through the verbose
+  drilldown (`memory_capabilities { family=<f>, include_schema: true,
+  verbose: true }`).
+
+The contributor-facing recipe is documented in
+[`src/mcp/tools/README.md`](../../src/mcp/tools/README.md),
+[`CLAUDE.md`](../../CLAUDE.md) § "Adding New Functionality", and
+[`docs/audience/developer.html`](../audience/developer.html). The
+pre-D1.6 recipe ("add a JSON definition in `tool_definitions()` + add
+a match arm") is gone.
+
 ## What's new since v0.6.4
 
 ### HNSW async rebuild + double-buffering (Wave-2 Tier-C3, issue [#968](https://github.com/alphaonedev/ai-memory-mcp/issues/968))
