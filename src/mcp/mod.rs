@@ -525,6 +525,24 @@ pub fn tools_check_agent_action_mutation_disabled_error() -> &'static str {
     check_agent_action::MCP_MUTATION_DISABLED_ERROR
 }
 
+/// v0.7.0 #972 D1.7 (#988) — test-only re-export bundle for the
+/// per-tool `<Tool>Request` request structs that back the schemars-
+/// derived `inputSchema` published in [`registry::tool_definitions`].
+/// Consumed by `tests/mcp_schema_handler_parity.rs` to pin the
+/// compile-time schema↔handler invariant: every property advertised
+/// on the wire MUST round-trip into the `<Tool>Request` struct via
+/// `serde_json::from_value`. The bundle is `#[doc(hidden)]` so it
+/// stays out of the rustdoc surface; production wire paths still
+/// resolve through the `McpTool::input_schema()` trait method.
+#[doc(hidden)]
+pub mod schema_handler_parity_test_exports {
+    pub use super::capabilities::CapabilitiesRequest;
+    pub use super::link::LinkRequest;
+    pub use super::pending::PendingApproveRequest;
+    pub use super::store::StoreRequest;
+    pub use crate::models::recall_request::RecallRequest;
+}
+
 /// v0.7.0 WT-1-C — test-only re-export bundle for the
 /// `memory_atomise` MCP handler. Mirrors
 /// [`dispatch_handle_link_for_test`]'s rationale: the integration
