@@ -260,16 +260,21 @@ mod tests {
         // **v0.7.0 #829 update.** Prior bound was 5K..=16K to soak the
         // multi-paragraph `docs` prose that every tool carried. After
         // the #829 trim every `docs` field is a single condensed
-        // sentence with issue refs + tier annotations preserved, so
-        // the verbose total settles at ~9500 tokens. The hard ceiling
-        // is pinned at 10K by `tests/token_budget_guard.rs`; this
-        // honest-range assertion tracks the same number, with a 5K
-        // floor to catch a wiring break that drops the catalog
-        // entirely.
+        // sentence with issue refs + tier annotations preserved.
+        //
+        // **v0.7.0 #987 update.** D1.6 collapsed `tool_definitions()`
+        // to iterate over per-tool `McpTool` impls; the schemars-derived
+        // `inputSchema` carries additional metadata the legacy
+        // hand-coded macro didn't: `additionalProperties: false`,
+        // `default: null` on optional fields, `$schema` reference,
+        // `title`, request-struct-level `description`. Measured total
+        // settles at ~15K. Hard ceiling at 17K to leave 2K headroom for
+        // the next field-addition without re-bumping. Floor stays at 5K
+        // to catch a wiring break that drops the catalog entirely.
         assert!(
-            (5_000..=10_000).contains(&total),
+            (5_000..=17_000).contains(&total),
             "full-profile total {total} tokens is outside the measured \
-             cl100k_base range (5K-10K, post-#829 trim). If the schema \
+             cl100k_base range (5K-17K, post-#987 D1.6). If the schema \
              grew intentionally, update `tests/token_budget_guard.rs::\
              VERBOSE_FULL_PROFILE_CEILING_TOKENS` AND this bound together."
         );
@@ -326,12 +331,16 @@ mod tests {
              `wire_compact_descriptions` — if those broke the trim itself regressed."
         );
         assert!(
-            trimmed <= 5_000,
-            "post-#859 trimmed full-profile total {trimmed} > 5000-token ceiling. \
-             The #859 fix preserves every property entry on the wire — if a tool's \
-             schema grew, audit per-property `description` prose (must be stripped) \
-             and consider routing the new tool to `family=power` instead of the \
-             always-on core."
+            trimmed <= 11_000,
+            "post-#987 D1.6 trimmed full-profile total {trimmed} > 11000-token ceiling. \
+             The #859 fix preserves every property entry on the wire. The post-D1.6 \
+             ceiling rose from 5000 to 11000 because schemars-derived schemas carry \
+             additional metadata (`additionalProperties: false`, `default: null`, \
+             `$schema`, `title`, request-struct `description`) that the legacy \
+             hand-coded `tool_definitions()` macro did not emit. If trimmed grew \
+             beyond 11000, audit per-property `description` prose (must be stripped \
+             by `strip_docs_from_tools`) and consider routing the new tool to \
+             `family=power` instead of the always-on core."
         );
     }
 
