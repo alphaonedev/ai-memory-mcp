@@ -499,26 +499,40 @@ fn disk_free_gib_at_path(_path: &std::path::Path) -> Option<u64> {
 /// through and `log` being silent — identical semantics to the
 /// pre-refactor inline loops.
 pub struct RuleEngine {
-    rules: Vec<Rule>,
+    rules: std::sync::Arc<Vec<Rule>>,
 }
 
 impl RuleEngine {
     /// Construct an engine scoped to a single `AgentAction`'s kind.
     ///
-    /// Reads the enabled rule rows of matching `kind` from
-    /// `governance_rules` via
+    /// v0.7.0 #983 — consults the process-wide
+    /// [`crate::governance::rule_cache::global`] cache. On cache
+    /// miss the cache reads the enabled rule rows of matching `kind`
+    /// from `governance_rules` via
     /// [`crate::governance::rules_store::list_enabled_by_kind`]; the
     /// signature-verification gate (L1-6 bypass-impossibility
-    /// invariant) runs inside that helper and is preserved verbatim.
+    /// invariant) runs inside that helper and is preserved verbatim
+    /// on the miss path. Cache hits skip the SQL + signature verify
+    /// entirely.
+    ///
+    /// Invalidation is driven by
+    /// [`crate::governance::rules_store::insert`] /
+    /// [`crate::governance::rules_store::remove`] /
+    /// [`crate::governance::rules_store::update_signature`] — every
+    /// write to the rules table calls
+    /// [`crate::governance::rule_cache::global`]
+    /// `.invalidate_all()` so the next reader rebuilds against the
+    /// post-write state.
     ///
     /// # Errors
     ///
-    /// Propagates any SQLite error from `list_enabled_by_kind`.
+    /// Propagates any SQLite error from `list_enabled_by_kind` on
+    /// cache miss.
     pub fn load_for_action(conn: &Connection, action: &AgentAction) -> Result<Self> {
         let kind = action.kind();
-        let rules = crate::governance::rules_store::list_enabled_by_kind(conn, kind).with_context(
-            || format!("RuleEngine::load_for_action: list_enabled_by_kind({kind})"),
-        )?;
+        let rules = crate::governance::rule_cache::global()
+            .get_or_load(conn, kind)
+            .with_context(|| format!("RuleEngine::load_for_action: cache lookup ({kind})"))?;
         Ok(Self { rules })
     }
 
@@ -527,7 +541,9 @@ impl RuleEngine {
     /// for future callsites that already hold a cached rule list.
     #[must_use]
     pub fn from_rules(rules: Vec<Rule>) -> Self {
-        Self { rules }
+        Self {
+            rules: std::sync::Arc::new(rules),
+        }
     }
 
     /// Evaluate `action` against the loaded rules. Returns the
@@ -539,7 +555,7 @@ impl RuleEngine {
     #[must_use]
     pub fn evaluate(&self, _agent_id: &str, action: &AgentAction) -> Decision {
         let mut first_warn: Option<(String, String)> = None;
-        for rule in &self.rules {
+        for rule in self.rules.iter() {
             if !matcher_applies(rule, action) {
                 continue;
             }
@@ -574,7 +590,7 @@ impl RuleEngine {
     /// running the matcher.
     #[must_use]
     pub fn rules(&self) -> &[Rule] {
-        &self.rules
+        self.rules.as_slice()
     }
 }
 
