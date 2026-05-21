@@ -300,7 +300,10 @@ impl RecallRequest {
             include_archived: Some(args.include_archived),
             has_citations: Some(args.has_citations),
             source_uri_prefix: args.source_uri_prefix.clone(),
-            kinds: args.kind.as_deref().map(|s| KindsFilter::Csv(s.to_string())),
+            kinds: args
+                .kind
+                .as_deref()
+                .map(|s| KindsFilter::Csv(s.to_string())),
             confidence_tier: None,
             verbose_provenance: None,
             format: None,
@@ -385,7 +388,10 @@ mod tests {
         assert_eq!(req.limit, Some(25));
         assert_eq!(req.tags.as_deref(), Some("a,b"));
         assert_eq!(req.budget_tokens, Some(100));
-        assert_eq!(req.context_tokens.as_deref(), Some(&["alpha".to_string(), "beta".to_string()][..]));
+        assert_eq!(
+            req.context_tokens.as_deref(),
+            Some(&["alpha".to_string(), "beta".to_string()][..])
+        );
         assert_eq!(req.session_id.as_deref(), Some("sess-1"));
         assert!(matches!(req.kinds, Some(KindsFilter::Csv(ref s)) if s == "concept,claim"));
         assert_eq!(req.confidence_tier.as_deref(), Some("confirmed"));
