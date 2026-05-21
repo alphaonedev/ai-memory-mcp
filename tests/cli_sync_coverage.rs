@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
+
 //! Coverage uplift for `src/cli/sync.rs`.
 //!
 //! Targets the previously uncovered branches in:
@@ -91,6 +93,7 @@ fn seed(db_path: &std::path::Path, ns: &str, title: &str, content: &str) -> Stri
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..ai_memory::models::Memory::default()
     };
     db::insert(&conn, &mem).expect("db::insert")
 }
@@ -517,6 +520,7 @@ fn dry_run_classifies_update_when_remote_newer() {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..ai_memory::models::Memory::default()
     };
     let mut mem_remote = mem_local.clone();
     mem_remote.content = "new".to_string();
@@ -594,6 +598,7 @@ fn dry_run_classifies_pull_noop_and_push_update() {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..ai_memory::models::Memory::default()
     };
     // Local: newer (same id)
     let mut mem_local = mem_remote.clone();
@@ -661,6 +666,7 @@ fn restamp_agent_id_with_non_object_metadata_is_safe() {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            ..ai_memory::models::Memory::default()
         };
         // db::insert may reject non-object metadata via JSON serialization;
         // if so, fall back to inserting a row whose metadata becomes

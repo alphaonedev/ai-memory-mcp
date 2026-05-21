@@ -1,5 +1,7 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
+
+#![allow(clippy::needless_update)]
 //
 // v0.6.3.1 (P4, audit G1) — governance inheritance unit tests.
 //
@@ -69,6 +71,7 @@ fn seed_policy(
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     };
     let standard_id = db::insert(conn, &standard).unwrap();
     db::set_namespace_standard(conn, namespace, &standard_id, None).unwrap();

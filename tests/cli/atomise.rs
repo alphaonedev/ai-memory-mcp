@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
+
 //! v0.7.0 WT-1-F — integration tests for `ai-memory atomise`.
 //!
 //! Exercises the CLI handler via [`run_with_curator`], plugging in a
@@ -123,6 +125,7 @@ fn insert_long_source(conn: &rusqlite::Connection, ns: &str) -> String {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     };
     db::insert(conn, &mem).expect("seed source")
 }
@@ -430,6 +433,7 @@ fn test_cli_atomise_source_too_small_returns_informational() {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            ..Memory::default()
         };
         db::insert(&conn, &mem).expect("seed tiny")
     };

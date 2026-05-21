@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
+
 //! v0.7.0 issue #861 regression — `db::list_archived` (the read path
 //! behind the `memory_archive_list` MCP tool) had two bugs that
 //! mangled forget-archived rows:
@@ -68,6 +70,7 @@ fn seed_memory(
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     };
     db::insert(conn, &m).expect("insert memory")
 }

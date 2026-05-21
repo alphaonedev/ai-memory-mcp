@@ -1,6 +1,7 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
 // clippy allows (test scaffolding): pedantic lints with no behavioural
 // impact on the regression we pin.
 #![allow(clippy::redundant_closure_for_method_calls)]
@@ -116,6 +117,7 @@ async fn seed_two_memories(db: &ai_memory::handlers::Db) -> (String, String) {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..ai_memory::models::Memory::default()
     };
     let tgt = ai_memory::models::Memory {
         id: uuid::Uuid::new_v4().to_string(),
@@ -144,6 +146,7 @@ async fn seed_two_memories(db: &ai_memory::handlers::Db) -> (String, String) {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..ai_memory::models::Memory::default()
     };
     let src_id = ai_memory::db::insert(&lock.0, &src).expect("insert src");
     let tgt_id = ai_memory::db::insert(&lock.0, &tgt).expect("insert tgt");

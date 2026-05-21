@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
+
 //! Issue #838 — closes the residual `src/mcp/tools/store.rs` per-module
 //! coverage gap for the synthesis verdict-honouring **error / failure**
 //! branches that the sibling `tests/store_residuum_coverage.rs` does
@@ -141,6 +143,7 @@ fn seed_existing(conn: &Connection, title: &str, content: &str, namespace: &str)
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     };
     db::insert(conn, &mem).expect("seed insert")
 }
@@ -643,6 +646,7 @@ fn install_permissive_synthesis_policy(
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     };
     let sid = db::insert(conn, &standard).expect("insert standard");
     db::set_namespace_standard(conn, ns, &sid, None).expect("set standard");

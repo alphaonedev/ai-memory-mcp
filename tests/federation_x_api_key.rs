@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
+
 //! v0.7.0 fold-A2A1.4 (#702) — federation outbound `x-api-key` forwarding +
 //! mTLS bypass for inbound api-key checks on `/api/v1/sync/*`.
 //!
@@ -146,6 +148,7 @@ fn sample_memory() -> Memory {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     }
 }
 

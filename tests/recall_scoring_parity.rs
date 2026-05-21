@@ -84,6 +84,7 @@ fn make_corpus(namespace: &str) -> Vec<Memory> {
                 confidence_signals: None,
                 confidence_decayed_at: None,
                 version: 1,
+                ..Memory::default()
             }
         })
         .collect()

@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
+
 //! v0.7.0 A2A non-corpus campaign — Round 1 (Track B-light + Track C).
 //!
 //! Drives 8 A2A scenarios end-to-end in-process against the production
@@ -87,6 +89,7 @@ fn make_memory(
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     }
 }
 
@@ -779,6 +782,7 @@ async fn a2a_7_track_c_pg_parity_smoke() {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     };
     let _ = ai_memory::store::MemoryStore::store(&pg, &ctx, &mem).await;
 }

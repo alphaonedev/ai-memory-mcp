@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
+
 //! v0.7.0 #963 Phase 2 — cross-surface refusal envelope parity.
 //!
 //! Phase 1 (commit `2231e8290`) landed the typed
@@ -96,6 +98,7 @@ fn seed_policy(
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     };
     let standard_id = db::insert(conn, &standard).unwrap();
     db::set_namespace_standard(conn, namespace, &standard_id, None).unwrap();

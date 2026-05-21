@@ -1,6 +1,7 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
 #![allow(clippy::doc_markdown)]
 
 //! v0.7.0 (issue #518) — session-aware recall recency boost.
@@ -66,6 +67,7 @@ fn make_mem(id: &str, title: &str) -> Memory {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     }
 }
 

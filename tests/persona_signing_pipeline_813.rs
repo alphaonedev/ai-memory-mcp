@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
+
 //! v0.7.0 epic #813 — end-to-end persona signing pipeline regression
 //! coverage.
 //!
@@ -104,6 +106,7 @@ fn seed_two_alice_reflections(conn: &Connection, namespace: &str) -> Vec<String>
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            ..Memory::default()
         };
         ids.push(db::insert(conn, &mem).unwrap());
     }
@@ -154,6 +157,7 @@ fn issue_810_check_trigger_refuses_phantom_self_signed_insert() {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     };
     db::insert(&conn, &mk("813-a-src")).unwrap();
     db::insert(&conn, &mk("813-a-tgt")).unwrap();

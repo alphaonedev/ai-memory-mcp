@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
+
 //! v0.7.0 COV-8 (Cluster D, issue #767) — K9 governance gate on
 //! `memory_kg_invalidate`.
 //!
@@ -96,6 +98,7 @@ fn insert_memory(conn: &Connection, namespace: &str, title: &str) -> String {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     };
     db::insert(conn, &mem).expect("insert memory")
 }
@@ -511,6 +514,7 @@ fn handle_kg_invalidate_dispatches_event_with_owner_agent_id_from_metadata() {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     };
     let src_id = db::insert(&conn, &src_mem).unwrap();
     let dst_id = insert_memory(&conn, ns, "dst");

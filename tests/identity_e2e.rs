@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
+
 //! v0.7 Track H6 — identity end-to-end test.
 //!
 //! This file ties H1-H5 together into a single end-to-end assertion
@@ -173,6 +175,7 @@ fn seed(conn: &rusqlite::Connection, title: &str) -> String {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..ai_memory::models::Memory::default()
     };
     db::insert(conn, &mem).expect("db::insert")
 }

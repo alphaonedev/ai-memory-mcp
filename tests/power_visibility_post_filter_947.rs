@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
+
 //! Issue #947 — sqlite legacy path visibility post-filter on three
 //! `power.rs` + `kg.rs` handler sites that pre-fix scanned the
 //! database without a caller filter:
@@ -72,6 +74,7 @@ fn build_fixture(
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            ..Memory::default()
         };
         ai_memory::db::insert(&conn, &mem).expect("insert seed");
     }
@@ -276,6 +279,7 @@ async fn entity_get_by_alias_blocks_cross_tenant_private_entity_947() {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     };
     ai_memory::db::insert(&conn, &mem).expect("insert entity memory");
     // Register alias row pointing at the entity_id.

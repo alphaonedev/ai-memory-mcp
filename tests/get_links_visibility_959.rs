@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
+
 //! Issue #959 — `GET /api/v1/links/{id}` visibility post-filter
 //! regression coverage.
 //!
@@ -60,6 +62,7 @@ fn build_router(admin_ids: Vec<String>) -> (axum::Router, NamedTempFile, String,
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     };
     let bob = Memory {
         id: bob_id.clone(),
@@ -88,6 +91,7 @@ fn build_router(admin_ids: Vec<String>) -> (axum::Router, NamedTempFile, String,
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     };
     ai_memory::db::insert(&conn, &alice).expect("insert alice");
     ai_memory::db::insert(&conn, &bob).expect("insert bob");

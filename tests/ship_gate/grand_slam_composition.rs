@@ -1,6 +1,7 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
 // clippy allows (test scaffolding): pedantic lints with no behavioural impact.
 #![allow(
     clippy::doc_markdown,
@@ -192,6 +193,7 @@ fn insert_memory(conn: &Connection, ns: &str, title: &str, depth: i32, kind: Mem
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     };
     db::insert(conn, &m).expect("insert")
 }

@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
+
 //! v0.7.0 issue #860 regression — `db::get_links` must surface the
 //! temporal-validity columns (`valid_from`, `valid_until`, `observed_by`)
 //! and the `attest_level` column the `memory_get_links` MCP tool's
@@ -56,6 +58,7 @@ fn seed_memory(conn: &Connection, namespace: &str, title: &str) -> String {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     };
     db::insert(conn, &m).expect("insert memory")
 }

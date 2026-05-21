@@ -1,6 +1,7 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
 // clippy allows (test scaffolding): pedantic lints with no behavioral impact.
 #![allow(clippy::doc_markdown, clippy::too_many_lines)]
 
@@ -69,6 +70,7 @@ fn make_memory(namespace: &str, title: &str, depth: i32) -> Memory {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     }
 }
 
@@ -129,6 +131,7 @@ fn seed_governance_json(
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     };
     let std_id = db::insert(conn, &standard).unwrap();
     db::set_namespace_standard(conn, namespace, &std_id, None).unwrap();

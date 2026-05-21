@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
+
 //! v0.7.0 L2-8 — reflection-aware reranker boost.
 //!
 //! Pinned acceptance criteria (issue #673):
@@ -52,6 +54,7 @@ fn mk(id: &str, title: &str, content: &str, kind: MemoryKind, reflection_depth: 
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     }
 }
 

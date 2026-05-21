@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
+
 //! v0.7.0 G-PHASE-E-4 (issue #709) — `verify-forensic-bundle` and
 //! `verify-reflection-chain` exit-code hardening.
 //!
@@ -83,6 +85,7 @@ fn insert_mem(conn: &rusqlite::Connection, ns: &str, depth: i32, kind: MemoryKin
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     };
     db::insert(conn, &mem).expect("insert");
     id
@@ -165,6 +168,7 @@ fn set_cap(conn: &rusqlite::Connection, ns: &str, cap: u32) {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     };
     let id = db::insert(conn, &std_mem).expect("insert std");
     db::set_namespace_standard(conn, ns, &id, None).expect("set std");

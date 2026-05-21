@@ -1,6 +1,7 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
 // Test scaffolding: keep pedantic lints quiet where they add no value.
 #![allow(clippy::doc_markdown)]
 
@@ -72,6 +73,7 @@ fn make_mem(title: &str, content: &str, ns: &str) -> Memory {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     }
 }
 

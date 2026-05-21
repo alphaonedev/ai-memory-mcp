@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
+
 //! v0.7.0 G-PHASE-E-2 (issue #707) — `memory_namespace_set_standard`
 //! governance pass-through.
 //!
@@ -77,6 +79,7 @@ fn insert_with_metadata(
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     };
     db::insert(conn, &mem).expect("insert memory")
 }

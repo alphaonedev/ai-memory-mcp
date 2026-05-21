@@ -1,6 +1,7 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
 // clippy allows (test scaffolding): pedantic lints with no behavioral impact.
 #![allow(clippy::doc_markdown, clippy::too_many_lines)]
 //! v0.7.0 L2-3 (issue #668) — Reflection invalidation propagation
@@ -69,6 +70,7 @@ fn make_mem(title: &str, namespace: &str, kind: MemoryKind) -> Memory {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     }
 }
 
