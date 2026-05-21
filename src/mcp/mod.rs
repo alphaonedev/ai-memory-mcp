@@ -2649,7 +2649,7 @@ mod tests {
     /// registers exactly 7 family tools (5 baseline + v0.7 B1
     /// memory_load_family + v0.7 B2 memory_smart_load) + 1 always-on
     /// bootstrap (memory_capabilities) = 8 visible tools. `--profile
-    /// full` registers all 51.
+    /// full` registers all 73 (was 51 pre-v0.7.0 W6/W7).
     #[test]
     fn tool_definitions_for_profile_core_registers_7_plus_capabilities() {
         let defs = tool_definitions_for_profile(&crate::profile::Profile::core());
@@ -3514,7 +3514,7 @@ mod tests {
             "missing err outcome in: {captured}"
         );
     }
-    /// Parametrized smoke matrix for all 51 MCP tools (Justice of MCP pathway).
+    /// Parametrized smoke matrix for all 73 MCP tools (Justice of MCP pathway).
     /// v0.6.3 baseline = 43; v0.7.0 I4 added memory_replay (44);
     /// v0.7 H4 added memory_verify (45); v0.7 B1 added memory_load_family (46);
     /// v0.7 K7 added memory_subscription_replay + memory_subscription_dlq_list (48);

@@ -56,28 +56,34 @@ jobs:
           AI_MEMORY_NO_CONFIG: "1"
         run: cargo test --lib cli::doctor::tests::run_tokens_human_default_profile_is_core -- --exact
       # v0.7 C5 — hard ceiling on the full-profile tools/list payload.
-      # The ignored test must be opted into explicitly so that local
-      # `cargo test --test budget_tokens` stays green on branches that
-      # have not yet rebased over the C2-C4 schema-compaction merge.
-      # The CI gate runs it unconditionally so the ceiling is enforced
-      # at every merge.
-      - name: full-profile <= 3500 tokens (v0.7 C5 hard ceiling)
+      # Pre-D1.6 baseline: 3500 cl100k tokens (post-C2-C4 schema compaction).
+      # Post-D1.6 (#987): schemars derives added per-property descriptions
+      # + nullable type arrays, pushing the floor to ~5-6K tokens with the
+      # trimmer in place. Post-#1067 (provider-agnostic LLM substrate) +
+      # #1050 (memory_share registration): measured ~5564 tokens 2026-05-21.
+      # Operator-accepted ceiling raised to **6000 tokens** with ~400-token
+      # headroom. The lib-test sibling at `tests/token_budget_guard.rs`
+      # holds an even looser 11000-token cap as the "honest measured
+      # ceiling"; this CI gate is the tighter "we still care about token
+      # cost" guard. The post-D1.6 / post-#1067 numbers were filed and
+      # accepted via #1063 (Agent-4 F3 doc drift) closure.
+      - name: full-profile <= 6000 tokens (v0.7 C5 hard ceiling, post-D1.6 + #1067)
         env:
           AI_MEMORY_NO_CONFIG: "1"
         run: |
           cargo test --test budget_tokens \
-            full_profile_tools_list_under_3500_tokens \
+            full_profile_tools_list_under_post_859_ceiling \
             -- --exact --ignored
       # Belt-and-braces: also drive the assertion through the operator-
       # facing `doctor --tokens --json` reporter so a regression in the
       # JSON shape (renamed field, dropped key) trips the gate too. We
       # parse the documented `trimmed_full_profile_total_tokens` field
       # — the bare `tools/list` wire payload after C2/C3/C4 trims —
-      # and fail with a pointer to the C2-C4 audit if it exceeds 3500.
+      # and fail with a pointer to the C2-C4 audit if it exceeds 6000.
       # The verbose sibling `full_profile_total_tokens` is only reachable
       # via the opt-in `memory_capabilities { verbose: true, … }` path
       # and is not gated here (see tests/budget_tokens.rs rationale).
-      - name: doctor --tokens --json reports trimmed total <= 3500 (v0.7 C5)
+      - name: doctor --tokens --json reports trimmed total <= 6000 (v0.7 C5 post-D1.6)
         env:
           AI_MEMORY_NO_CONFIG: "1"
         run: |
@@ -86,10 +92,10 @@ jobs:
           PAYLOAD="$(./target/release/ai-memory doctor --tokens --json)"
           TOTAL="$(printf '%s' "$PAYLOAD" \
             | python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["trimmed_full_profile_total_tokens"])')"
-          echo "doctor --tokens --json: trimmed_full_profile_total_tokens=$TOTAL (ceiling 3500)"
-          if [ "$TOTAL" -gt 3500 ]; then
-            echo "::error::v0.7 C5 CI gate FAILED: trimmed full-profile tools/list payload is $TOTAL cl100k_base tokens (ceiling: 3500)."
-            echo "::error::C2 (split docs field), C3 (collapse schema boilerplate) and C4 (hide rare optional params) drove the wire form from ~7.4K to ~2.3K tokens; this gate locks in that win."
+          echo "doctor --tokens --json: trimmed_full_profile_total_tokens=$TOTAL (ceiling 6000, post-D1.6 + #1067)"
+          if [ "$TOTAL" -gt 6000 ]; then
+            echo "::error::v0.7 C5 CI gate FAILED: trimmed full-profile tools/list payload is $TOTAL cl100k_base tokens (ceiling: 6000, post-D1.6 + #1067)."
+            echo "::error::C2 (split docs field), C3 (collapse schema boilerplate) and C4 (hide rare optional params) drove the wire form from ~7.4K to ~3.5K tokens at v0.6.4; D1.6 schemars metadata + #1067 LLM provider docs took it back to ~5.5K. The 6000-token ceiling is the post-merge operator-accepted floor."
             echo "::error::Inspect 'cargo run --release -- doctor --tokens --raw-table' to find the offending tool (the per-tool 'tokens' column already reflects the trim). See docs/v0.7/schema-compaction-audit.md."
             exit 1
           fi

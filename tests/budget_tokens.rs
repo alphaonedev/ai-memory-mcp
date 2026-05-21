@@ -66,9 +66,14 @@ use serde_json::json;
 // Post-#859 update (was: 3500). #859 restored every property entry to
 // the wire `tools/list` payload for NHI runtime discovery — pre-fix the
 // trim dropped optional property keys entirely, which let the wire sit
-// at ~3456 tokens. The fully-discoverable wire form is ~4500-4700
-// tokens; this ceiling pins it with ~300 tokens of headroom.
-const FULL_PROFILE_TOKEN_CEILING: usize = 5_000;
+// at ~3456 tokens.
+//
+// Post-D1.6 (#987) update: schemars derives added per-property
+// descriptions + nullable type arrays; floor moved up to ~5K. Post-#1067
+// (provider-agnostic LLM substrate) + #1050 (memory_share registration):
+// measured ~5564 tokens 2026-05-21. Ceiling raised to 6000 with
+// ~400-token headroom, matching `.github/workflows/token-budget.yml`.
+const FULL_PROFILE_TOKEN_CEILING: usize = 6_000;
 
 fn mem_with_content(id: &str, content: &str) -> Memory {
     Memory {

@@ -129,6 +129,7 @@ impl RuleCache {
     /// # Errors
     ///
     /// Propagates any SQLite error from `list_enabled_by_kind`.
+    #[inline]
     pub fn get_or_load(&self, conn: &Connection, kind: &str) -> Result<Arc<Vec<Rule>>> {
         // Fast path: hold the read lock for the lookup + clone of
         // the Arc; drop the guard before any further work.
@@ -147,9 +148,17 @@ impl RuleCache {
         let rules = crate::governance::rules_store::list_enabled_by_kind(conn, kind)?;
         let arc = Arc::new(rules);
         if let Ok(mut guard) = self.by_kind.write() {
-            // Re-check under the write lock — another thread may have
-            // raced us to load. First-writer-wins; the loser's load
-            // is discarded.
+            // #1019 — check for an existing entry first (e.g., the
+            // loser of a race) BEFORE allocating a fresh String via
+            // `kind.to_string()`. Pre-#1019 the `entry(kind.to_string())`
+            // call allocated on every slow-path invocation, including
+            // the race-loser case where the allocated String was
+            // immediately dropped. The contains_key probe avoids the
+            // allocation entirely on the common race-loser path.
+            if let Some(existing) = guard.get(kind) {
+                return Ok(Arc::clone(existing));
+            }
+            // No race — we're the first to insert.
             let entry = guard
                 .entry(kind.to_string())
                 .or_insert_with(|| Arc::clone(&arc));
@@ -165,6 +174,7 @@ impl RuleCache {
     /// this path because the rules_store writers don't know the
     /// affected kind without inspecting the row;
     /// [`Self::invalidate_all`] is simpler.
+    #[inline]
     pub fn invalidate(&self, kind: &str) {
         if let Ok(mut guard) = self.by_kind.write() {
             guard.remove(kind);
@@ -174,6 +184,7 @@ impl RuleCache {
     /// Drop every cached entry. Used by the rules_store write paths
     /// (insert / remove / set_enabled / update_signature) so the next
     /// reader rebuilds against the post-write state.
+    #[inline]
     pub fn invalidate_all(&self) {
         if let Ok(mut guard) = self.by_kind.write() {
             guard.clear();
@@ -181,7 +192,14 @@ impl RuleCache {
     }
 
     /// Number of currently-cached entries — for test inspection.
+    ///
+    /// **#1018 (2026-05-21):** poison semantics changed from "lie as
+    /// empty" to "return None via [`Self::len_checked`]". The legacy
+    /// `len()` returns `0` on poison (matches the pre-#1018 contract
+    /// some tests still depend on); call sites that need to
+    /// distinguish "empty" from "poisoned" use `len_checked`.
     #[must_use]
+    #[inline]
     pub fn len(&self) -> usize {
         self.by_kind
             .read()
@@ -189,10 +207,35 @@ impl RuleCache {
             .unwrap_or_default()
     }
 
-    /// Whether the cache is empty — for test inspection.
+    /// **#1018 (2026-05-21):** poison-aware variant of [`Self::len`].
+    /// Returns `Some(len)` on a healthy lock, `None` if the `RwLock`
+    /// is poisoned. Pre-#1018 a poisoned cache reported `len() == 0`
+    /// and `is_empty() == true` — invisible to callers and test
+    /// assertions. Operator inspection paths + future health-probe
+    /// surfaces should consume this variant; legacy paths keep `len()`.
     #[must_use]
+    pub fn len_checked(&self) -> Option<usize> {
+        self.by_kind.read().ok().map(|guard| guard.len())
+    }
+
+    /// Whether the cache is empty — for test inspection.
+    ///
+    /// **#1018:** the legacy contract treats poison as "empty" (returns
+    /// `true`). Use [`Self::is_empty_checked`] when the distinction
+    /// matters.
+    #[must_use]
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// **#1018 (2026-05-21):** poison-aware variant of [`Self::is_empty`].
+    /// Returns `Some(true)` when the cache is healthy AND empty,
+    /// `Some(false)` when healthy AND populated, `None` when the
+    /// `RwLock` is poisoned. Operator inspection paths use this.
+    #[must_use]
+    pub fn is_empty_checked(&self) -> Option<bool> {
+        self.by_kind.read().ok().map(|guard| guard.is_empty())
     }
 }
 
