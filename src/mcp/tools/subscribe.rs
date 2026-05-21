@@ -234,10 +234,11 @@ pub(super) fn handle_subscription_replay(
 // and are migrated by the sibling D1.4 (#985) sub-agent. Only the
 // `list_subscriptions` (other) and `subscription_replay` (power) tools
 // land here in D1.5 scope.
-
-use crate::mcp::registry::McpTool;
-use schemars::JsonSchema;
-use serde::Deserialize;
+//
+// #985/#986 integration: imports already brought in at the top of the
+// file by the D1.4 governance commit (`McpTool`, `JsonSchema`,
+// `Deserialize`). Duplicate `use` statements removed during cherry-pick
+// integration.
 
 /// v0.7.0 #972 D1.5 (#986) — request body for `memory_list_subscriptions`.
 /// The legacy schema is `properties: {}` — empty struct.
