@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] — v0.7.x doc follow-ups + Wave-2 refactor (post-tag)
 
+### refactor(#964) — typed-errors audit on substrate-public API (Wave-2 Tier-B4, 2026-05-21)
+
+Closes #964: full audit of remaining `anyhow::Result<T>` returns on
+the substrate-public API surface (handlers, MCP tools, CLI, SAL trait,
+storage layer). The issue body's hypothesis was that ~1180 sites
+remained mechanical-conversion candidates after #962.
+
+**Audit results** — full per-category table at
+[`docs/internal/typed-errors-audit-964.md`](docs/internal/typed-errors-audit-964.md).
+
+- **0 sites converted.** The substrate-public API is already fully
+  typed at every layer-crossing boundary post-#962.
+- **35 remaining `anyhow::Result` uses** across `src/` (71 raw matches,
+  35 actual code sites after excluding `use` imports and doc
+  references) fall into four non-substrate-public categories:
+  internal helpers (file-private), trait surfaces for plug-in
+  extension points (`BackgroundSweeper`, `Embedder`, `LlmCurator`),
+  test mock impls (`#[cfg(test)]`), and boot-path entry points
+  (`run_mcp_server`, `run_embedding_backfill`, `main`).
+- **Substrate-public layer counts at audit time:** 0 `anyhow::Result`
+  in `src/handlers/*.rs` (21 files); 0 in `src/store/{mod,sqlite,postgres}.rs`
+  (SAL); 67 `StoreResult<T>` trait methods + 175 adapter
+  implementations.
+- The `anyhow::Result<T>` returns inside `src/storage/mod.rs` are
+  the OUTER WRAPPER for typed `StorageError` variants emitted via
+  `anyhow::Error::new(StorageError::…)`, downcast at the handler
+  boundary via `MemoryError::from(anyhow::Error)`. This is the
+  load-bearing pattern #962 established to preserve byte-identical
+  wire format while threading typed errors across the layer
+  boundary. Removing the wrapper would break the pin-tested
+  `.contains("ambiguous ID prefix")` / `.starts_with("link refused:
+  reflection cycle")` consumer contract.
+- Path B closure (audit + closure-as-evidence) — the issue's
+  LOW-ROI hypothesis is confirmed.
+
+**Docs:**
+
+- `docs/internal/typed-errors-audit-964.md` — canonical record of
+  the audit, per-category inventory of remaining anyhow sites, and
+  the rationale for why the conversion would be counter-productive
+  given the post-#962 design.
+
 ### refactor(#970) — enum proliferation audit (Wave-2 Tier-D3, 2026-05-21)
 
 Closes #970: full audit of `pub enum` definitions in `src/models/`,
