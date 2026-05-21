@@ -84,6 +84,17 @@ pub struct Metrics {
     /// non-zero sustained depth — a healthy mesh should drain back
     /// to 0 within one replay interval after the peer recovers.
     pub federation_push_dlq_depth: IntGauge,
+
+    /// #1032 (HIGH, 2026-05-21) — monotonic counter for DLQ rows the
+    /// replay worker has marked as quarantined (`attempt_count >=
+    /// MAX_REPLAY_ATTEMPTS`). Pre-#1032 the replay loop retried
+    /// poison messages forever; now rows past the ceiling are
+    /// skipped + this counter increments per quarantined row per
+    /// tick (the row stays in the DLQ until an operator drains it
+    /// via `ai-memory federation dlq drain --quarantined`). Operators
+    /// alert on non-zero increment rate — a healthy mesh should have
+    /// zero rows reaching the quarantine threshold.
+    pub federation_push_dlq_quarantined: IntCounter,
 }
 
 /// Lazily-built process-global metrics handle.
@@ -295,6 +306,19 @@ impl Metrics {
         )?;
         registry.register(Box::new(federation_push_dlq_depth.clone()))?;
 
+        // #1032 (HIGH, 2026-05-21) — federation push DLQ quarantine counter.
+        let federation_push_dlq_quarantined = IntCounter::new(
+            "ai_memory_federation_push_dlq_quarantined_total",
+            "Monotonic counter of federation_push_dlq rows the replay \
+             worker has skipped because their attempt_count exceeded \
+             MAX_REPLAY_ATTEMPTS (currently 100). Non-zero sustained \
+             rate indicates poison-message rows that need operator \
+             intervention via `ai-memory federation dlq drain \
+             --quarantined`. Pre-#1032 the worker retried these \
+             forever, amplifying network load against rejecting peers.",
+        )?;
+        registry.register(Box::new(federation_push_dlq_quarantined.clone()))?;
+
         Ok(Self {
             registry,
             store_total,
@@ -316,6 +340,7 @@ impl Metrics {
             corrupt_provenance_rows_total,
             auto_export_spawn_failed_total,
             federation_push_dlq_depth,
+            federation_push_dlq_quarantined,
         })
     }
 }
