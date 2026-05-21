@@ -160,7 +160,7 @@ footer a{color:var(--text-muted)}
 
 <section class="hero">
   <h1>Where data flows.</h1>
-  <p class="tagline">Three end-to-end animated diagrams: write path (memory_store), read path (memory_recall with hybrid fusion), and federation (W-of-N quorum sync). Every box is a real function in <code>src/db.rs</code> or <code>src/handlers.rs</code>; every arrow is a real call.</p>
+  <p class="tagline">Three end-to-end animated diagrams: write path (memory_store), read path (memory_recall with hybrid fusion), and federation (W-of-N quorum sync). Every box is a real function in <code>src/storage/</code> or <code>src/handlers/</code>; every arrow is a real call.</p>
 </section>
 
 <!-- =============== WRITE PATH =============== -->
@@ -177,7 +177,7 @@ footer a{color:var(--text-muted)}
 
       <!-- Group: core write -->
       <rect class="group-bg" x="200" y="10" width="600" height="320"/>
-      <text class="group-label" x="210" y="30">▸ src/db.rs::store</text>
+      <text class="group-label" x="210" y="30">▸ src/storage/mod.rs::store</text>
 
       <!-- Group: post-write -->
       <rect class="group-bg" x="810" y="10" width="360" height="320"/>
