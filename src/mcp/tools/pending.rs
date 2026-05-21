@@ -3,8 +3,123 @@
 
 //! MCP pending-approval handlers and decision recording.
 
+use crate::mcp::registry::McpTool;
 use crate::{db, validate};
+use schemars::JsonSchema;
+use serde::Deserialize;
 use serde_json::{Value, json};
+
+// --- D1.4 (#985): per-tool McpTool impls for the three governance
+// pending tools (`memory_pending_list`, `memory_pending_approve`,
+// `memory_pending_reject`) ---
+
+/// v0.7.0 #972 D1.4 (#985) — request body for `memory_pending_list`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct PendingListRequest {
+    #[serde(default)]
+    pub status: Option<String>,
+
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+/// v0.7.0 #972 D1.4 (#985) — `McpTool` impl for `memory_pending_list`.
+#[allow(dead_code)]
+pub struct PendingListTool;
+
+impl McpTool for PendingListTool {
+    fn name() -> &'static str {
+        "memory_pending_list"
+    }
+    fn description() -> &'static str {
+        "List pending governance-queued actions."
+    }
+    fn docs() -> &'static str {
+        "Task 1.9: list governance-queued actions. status filter (default pending). Limit cap 1000."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(PendingListRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "governance"
+    }
+}
+
+/// v0.7.0 #972 D1.4 (#985) — request body for `memory_pending_approve`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct PendingApproveRequest {
+    /// Pending action id.
+    pub id: String,
+
+    /// K10 persistence horizon.
+    #[serde(default)]
+    pub remember: Option<String>,
+}
+
+/// v0.7.0 #972 D1.4 (#985) — `McpTool` impl for `memory_pending_approve`.
+#[allow(dead_code)]
+pub struct PendingApproveTool;
+
+impl McpTool for PendingApproveTool {
+    fn name() -> &'static str {
+        "memory_pending_approve"
+    }
+    fn description() -> &'static str {
+        "Approve a pending action; `remember` auto-decides next time."
+    }
+    fn docs() -> &'static str {
+        "Task 1.9 approve. decided_by = caller. K10: remember (once|session|forever) writes a synthetic permit rule."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(PendingApproveRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "governance"
+    }
+}
+
+/// v0.7.0 #972 D1.4 (#985) — request body for `memory_pending_reject`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct PendingRejectRequest {
+    /// Pending action id.
+    pub id: String,
+
+    /// K10 persistence horizon.
+    #[serde(default)]
+    pub remember: Option<String>,
+}
+
+/// v0.7.0 #972 D1.4 (#985) — `McpTool` impl for `memory_pending_reject`.
+#[allow(dead_code)]
+pub struct PendingRejectTool;
+
+impl McpTool for PendingRejectTool {
+    fn name() -> &'static str {
+        "memory_pending_reject"
+    }
+    fn description() -> &'static str {
+        "Reject a pending action; `remember` auto-decides next time."
+    }
+    fn docs() -> &'static str {
+        "Task 1.9 reject. decided_by = caller. K10: remember writes a synthetic deny rule."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(PendingRejectRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "governance"
+    }
+}
+
 /// v0.7 K7 — MCP handler for `memory_subscription_dlq_list`. Wraps
 /// [`crate::subscriptions::list_dlq`] and applies the optional
 /// `limit` cap (default 100, max 1000) so an operator inspecting a
@@ -437,4 +552,53 @@ pub fn handle_pending_reject(
             crate::approvals::Remember::Forever => "forever",
         },
     }))
+}
+
+#[cfg(test)]
+mod d1_4_985_tests {
+    //! D1.4 (#985) — schema-parity for `memory_pending_list`,
+    //! `memory_pending_approve`, `memory_pending_reject`.
+    use super::*;
+    use crate::mcp::d1_4_985_helpers::{
+        assert_descriptions_match, assert_property_set_parity, derived_props_for,
+    };
+
+    #[test]
+    fn memory_pending_list_parity_985() {
+        let derived = derived_props_for::<PendingListRequest>();
+        assert_property_set_parity("memory_pending_list", &derived);
+        assert_descriptions_match("memory_pending_list", &derived);
+    }
+
+    #[test]
+    fn memory_pending_list_tool_metadata_985() {
+        assert_eq!(PendingListTool::name(), "memory_pending_list");
+        assert_eq!(PendingListTool::family(), "governance");
+    }
+
+    #[test]
+    fn memory_pending_approve_parity_985() {
+        let derived = derived_props_for::<PendingApproveRequest>();
+        assert_property_set_parity("memory_pending_approve", &derived);
+        assert_descriptions_match("memory_pending_approve", &derived);
+    }
+
+    #[test]
+    fn memory_pending_approve_tool_metadata_985() {
+        assert_eq!(PendingApproveTool::name(), "memory_pending_approve");
+        assert_eq!(PendingApproveTool::family(), "governance");
+    }
+
+    #[test]
+    fn memory_pending_reject_parity_985() {
+        let derived = derived_props_for::<PendingRejectRequest>();
+        assert_property_set_parity("memory_pending_reject", &derived);
+        assert_descriptions_match("memory_pending_reject", &derived);
+    }
+
+    #[test]
+    fn memory_pending_reject_tool_metadata_985() {
+        assert_eq!(PendingRejectTool::name(), "memory_pending_reject");
+        assert_eq!(PendingRejectTool::family(), "governance");
+    }
 }

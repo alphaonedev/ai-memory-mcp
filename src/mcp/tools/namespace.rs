@@ -3,9 +3,127 @@
 
 //! MCP namespace standard-policy handlers and governance helpers.
 
+use crate::mcp::registry::McpTool;
 use crate::models::GovernancePolicy;
 use crate::{db, validate};
+use schemars::JsonSchema;
+use serde::Deserialize;
 use serde_json::{Value, json};
+
+// --- D1.4 (#985): per-tool McpTool impls for the three namespace-
+// standard governance tools ---
+
+/// v0.7.0 #972 D1.4 (#985) — request body for `memory_namespace_set_standard`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct NamespaceSetStandardRequest {
+    /// Namespace.
+    pub namespace: String,
+
+    /// Standard memory id.
+    pub id: String,
+
+    /// Inherit-from namespace.
+    #[serde(default)]
+    pub parent: Option<String>,
+
+    /// Task 1.8 policy in metadata.governance.
+    #[serde(default)]
+    pub governance: Option<serde_json::Value>,
+}
+
+/// v0.7.0 #972 D1.4 (#985) — `McpTool` impl for `memory_namespace_set_standard`.
+#[allow(dead_code)]
+pub struct NamespaceSetStandardTool;
+
+impl McpTool for NamespaceSetStandardTool {
+    fn name() -> &'static str {
+        "memory_namespace_set_standard"
+    }
+    fn description() -> &'static str {
+        "Set a memory as the standard/policy for a namespace."
+    }
+    fn docs() -> &'static str {
+        "Standard memory auto-prepended to recall + session_start. Rule layering: global '*' + parent chain + namespace. Task 1.8: governance policy merged into metadata. P4/G1: inherit flag."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(NamespaceSetStandardRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "governance"
+    }
+}
+
+/// v0.7.0 #972 D1.4 (#985) — request body for `memory_namespace_get_standard`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct NamespaceGetStandardRequest {
+    /// Namespace.
+    pub namespace: String,
+
+    /// Task 1.6: return full inheritance chain.
+    #[serde(default)]
+    pub inherit: Option<bool>,
+}
+
+/// v0.7.0 #972 D1.4 (#985) — `McpTool` impl for `memory_namespace_get_standard`.
+#[allow(dead_code)]
+pub struct NamespaceGetStandardTool;
+
+impl McpTool for NamespaceGetStandardTool {
+    fn name() -> &'static str {
+        "memory_namespace_get_standard"
+    }
+    fn description() -> &'static str {
+        "Get the standard/policy memory for a namespace."
+    }
+    fn docs() -> &'static str {
+        "Returns the standard. inherit=true (Task 1.6) returns the resolved chain (global '*' -> ancestors -> namespace)."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(NamespaceGetStandardRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "governance"
+    }
+}
+
+/// v0.7.0 #972 D1.4 (#985) — request body for `memory_namespace_clear_standard`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct NamespaceClearStandardRequest {
+    /// Namespace.
+    pub namespace: String,
+}
+
+/// v0.7.0 #972 D1.4 (#985) — `McpTool` impl for `memory_namespace_clear_standard`.
+#[allow(dead_code)]
+pub struct NamespaceClearStandardTool;
+
+impl McpTool for NamespaceClearStandardTool {
+    fn name() -> &'static str {
+        "memory_namespace_clear_standard"
+    }
+    fn description() -> &'static str {
+        "Clear the standard/policy for a namespace."
+    }
+    fn docs() -> &'static str {
+        "Clear the namespace standard."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(NamespaceClearStandardRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "governance"
+    }
+}
+
 pub fn handle_namespace_set_standard(
     conn: &rusqlite::Connection,
     params: &Value,
@@ -688,5 +806,63 @@ mod tests {
         let conn = fresh_conn();
         // Should not panic when nothing is set up.
         auto_register_path_hierarchy(&conn, "non-existent-ns");
+    }
+}
+
+#[cfg(test)]
+mod d1_4_985_tests {
+    //! D1.4 (#985) — schema-parity for `memory_namespace_set_standard`,
+    //! `memory_namespace_get_standard`, `memory_namespace_clear_standard`.
+    use super::*;
+    use crate::mcp::d1_4_985_helpers::{
+        assert_descriptions_match, assert_property_set_parity, derived_props_for,
+    };
+
+    #[test]
+    fn memory_namespace_set_standard_parity_985() {
+        let derived = derived_props_for::<NamespaceSetStandardRequest>();
+        assert_property_set_parity("memory_namespace_set_standard", &derived);
+        assert_descriptions_match("memory_namespace_set_standard", &derived);
+    }
+
+    #[test]
+    fn memory_namespace_set_standard_tool_metadata_985() {
+        assert_eq!(
+            NamespaceSetStandardTool::name(),
+            "memory_namespace_set_standard"
+        );
+        assert_eq!(NamespaceSetStandardTool::family(), "governance");
+    }
+
+    #[test]
+    fn memory_namespace_get_standard_parity_985() {
+        let derived = derived_props_for::<NamespaceGetStandardRequest>();
+        assert_property_set_parity("memory_namespace_get_standard", &derived);
+        assert_descriptions_match("memory_namespace_get_standard", &derived);
+    }
+
+    #[test]
+    fn memory_namespace_get_standard_tool_metadata_985() {
+        assert_eq!(
+            NamespaceGetStandardTool::name(),
+            "memory_namespace_get_standard"
+        );
+        assert_eq!(NamespaceGetStandardTool::family(), "governance");
+    }
+
+    #[test]
+    fn memory_namespace_clear_standard_parity_985() {
+        let derived = derived_props_for::<NamespaceClearStandardRequest>();
+        assert_property_set_parity("memory_namespace_clear_standard", &derived);
+        assert_descriptions_match("memory_namespace_clear_standard", &derived);
+    }
+
+    #[test]
+    fn memory_namespace_clear_standard_tool_metadata_985() {
+        assert_eq!(
+            NamespaceClearStandardTool::name(),
+            "memory_namespace_clear_standard"
+        );
+        assert_eq!(NamespaceClearStandardTool::family(), "governance");
     }
 }
