@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] — v0.7.x doc follow-ups + Wave-2 refactor (post-tag)
 
+### refactor(#970) — enum proliferation audit (Wave-2 Tier-D3, 2026-05-21)
+
+Closes #970: full audit of `pub enum` definitions in `src/models/`,
+`src/governance/`, and the related `src/audit.rs` / `src/config.rs` /
+`src/approvals.rs` / `src/daemon_runtime.rs` surfaces the issue body
+implicates ("Memory tier / Memory kind / Memory link relation /
+Governance level / Action / Scope").
+
+**Audit results** — full per-enum table at
+[`docs/internal/enum-proliferation-audit-970.md`](docs/internal/enum-proliferation-audit-970.md).
+
+- 22 `pub enum` definitions in the target surface; 38 across the
+  broader sweep.
+- **Zero byte-identical variant-set pairs.** Name-similarity does
+  not imply semantic overlap: three "Tier" enums have zero variant
+  overlap (memory lifecycle vs confidence bucket vs feature
+  capability); five "Decision" enums each carry a different payload
+  on their non-`Allow` variants because each models a different
+  contract (TOML rule row, K9 pipeline output, external-action
+  engine verdict, operator submission, substrate-hook G4).
+- **Zero consolidations performed.** Path B closure (audit +
+  per-enum doc clarification) — the issue's LOW-ROI hypothesis is
+  confirmed; consolidating any pair would force one side to gain
+  unused variants or lose distinguishing variants, both make the
+  wire contracts worse.
+
+**Inline doc-comment cross-references added** to the close-call
+enums so a future reader hitting the symbol via grep doesn't
+conclude they're interchangeable:
+
+- `Tier` / `ConfidenceTier` / `FeatureTier` — three orthogonal axes
+  sharing only the descriptive `Tier` substring.
+- `governance::Decision` — full sibling-enum index in the docstring
+  linking to `RuleDecision`, `agent_action::Decision`,
+  `GovernanceDecision`, `approvals::Decision`.
+- `GovernedAction` / `governance::Op` — substrate-action vs K9-op
+  vocabulary distinction (different wire strings, different variant
+  counts, different load-bearing surfaces).
+- `audit::VerifyFailureKind` / `governance::audit::VerifyFailureKind`
+   — same name, different chain shape; the audit chain hashes line
+  bytes + line counter, the forensic chain signs rows with Ed25519
+  and has no line counter.
+
+**Docs:**
+
+- `docs/internal/enum-proliferation-audit-970.md` — canonical record
+  of the audit + the per-enum table + the "Why the issue's
+  hypothesis was wrong" rationale.
+
 ### refactor(#961) — SAL boundary cleanup (Wave-2 Tier-B1, 2026-05-21)
 
 Closes #961: handler-side audit + cleanup of `src/storage/` (legacy direct-sqlite +
