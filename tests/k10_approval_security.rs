@@ -1,6 +1,7 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
 // clippy allows (test scaffolding): pedantic lints with no behavioral impact.
 #![allow(
     clippy::collapsible_if,
@@ -142,6 +143,7 @@ async fn seed_pending_delete_row(
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..ai_memory::models::Memory::default()
     };
     let mem_id = ai_memory::db::insert(&lock.0, &mem).expect("insert memory");
     let payload = json!({"reason": "k10-security"});

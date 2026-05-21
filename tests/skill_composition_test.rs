@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
+
 //! v0.7.0 L2-7 (issue #672) — reflection-skill composition declaration.
 //!
 //! End-to-end pins:
@@ -136,6 +138,7 @@ fn seed_reflection(
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     };
     let id = db::insert(conn, &m).expect("insert reflection");
 

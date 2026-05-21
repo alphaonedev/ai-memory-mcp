@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
+
 //! v0.7.0 issue #894 — Postgres+AGE schema-parity gap closeout: cross-
 //! backend regression harness.
 //!
@@ -111,6 +113,7 @@ fn seed_memory(conn: &Connection, id: &str, ns: &str, title: &str, content: &str
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     };
     db::insert(conn, &mem).expect("seed memory");
     id.to_string()
@@ -725,6 +728,7 @@ mod postgres_side {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            ..Memory::default()
         }
     }
 }

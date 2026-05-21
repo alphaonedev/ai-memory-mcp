@@ -57,16 +57,33 @@ fn f13_capabilities_input_schema_declares_all_four_params() {
     }
 
     // Type sanity: accept enum, include_schema/verbose bool, family string.
-    assert_eq!(props["accept"]["type"], "string");
-    assert_eq!(
-        props["include_schema"]["type"], "boolean",
-        "include_schema must be boolean"
+    // **v0.7.0 #987 update.** D1.6 schemars derives Option<T> as
+    // `type: ["T","null"]`. Accept either legacy bare-type or schemars nullable.
+    let type_is = |v: &serde_json::Value, want: &str| -> bool {
+        v == want
+            || v.as_array()
+                .is_some_and(|arr| arr.iter().any(|x| x == want))
+    };
+    assert!(
+        type_is(&props["accept"]["type"], "string"),
+        "accept must be string (legacy or schemars nullable): got {}",
+        props["accept"]["type"]
     );
-    assert_eq!(
-        props["verbose"]["type"], "boolean",
-        "verbose must be boolean"
+    assert!(
+        type_is(&props["include_schema"]["type"], "boolean"),
+        "include_schema must be boolean: got {}",
+        props["include_schema"]["type"]
     );
-    assert_eq!(props["family"]["type"], "string");
+    assert!(
+        type_is(&props["verbose"]["type"], "boolean"),
+        "verbose must be boolean: got {}",
+        props["verbose"]["type"]
+    );
+    assert!(
+        type_is(&props["family"]["type"], "string"),
+        "family must be string: got {}",
+        props["family"]["type"]
+    );
 }
 
 // ---------------------------------------------------------------------------

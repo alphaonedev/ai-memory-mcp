@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
+
 //! v0.7.0 v0.7.1-fold (#687/#688, schema v33) regression suite for the
 //! SQL-side `CHECK (relation IN (...))` constraint on `memory_links`.
 //!
@@ -65,6 +67,7 @@ fn seed_two_memories(conn: &Connection) -> (String, String) {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     };
     let tgt = Memory {
         id: uuid::Uuid::new_v4().to_string(),
@@ -93,6 +96,7 @@ fn seed_two_memories(conn: &Connection) -> (String, String) {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     };
     let src_id = db::insert(conn, &src).expect("insert source");
     let tgt_id = db::insert(conn, &tgt).expect("insert target");

@@ -1,0 +1,1176 @@
+{
+  "tools": [
+    {
+      "description": "Store a memory",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "confidence": {
+            "default": null,
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "content": {
+            "type": "string"
+          },
+          "force": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "kind": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "metadata": {
+            "additionalProperties": true,
+            "default": null,
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "namespace": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "on_conflict": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "priority": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "scope": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source_uri": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tags": {
+            "default": null,
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "tier": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "content",
+          "title"
+        ],
+        "type": "object"
+      },
+      "name": "memory_store"
+    },
+    {
+      "description": "Recall memories relevant to a",
+      "inputSchema": {
+        "additionalProperties": false,
+        "definitions": {
+          "KindsFilter": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "string"
+              }
+            ]
+          }
+        },
+        "properties": {
+          "as_agent": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "budget_tokens": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "confidence_tier": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "context": {
+            "type": "string"
+          },
+          "context_tokens": {
+            "default": null,
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "format": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "has_citations": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "include_archived": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "kinds": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/KindsFilter"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "limit": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "namespace": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "session_default": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "session_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "since": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source_uri_prefix": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tags": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "until": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "verbose_provenance": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "context"
+        ],
+        "type": "object"
+      },
+      "name": "memory_recall"
+    },
+    {
+      "description": "Search memories by exact",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "as_agent": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "format": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "include_archived": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "limit": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "namespace": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "query": {
+            "type": "string"
+          },
+          "tier": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "name": "memory_search"
+    },
+    {
+      "description": "List memories, optionally",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "format": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "limit": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "namespace": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tier": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "name": "memory_list"
+    },
+    {
+      "description": "Load top-k recent +",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "family": {
+            "type": "string"
+          },
+          "k": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "namespace": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "family"
+        ],
+        "type": "object"
+      },
+      "name": "memory_load_family"
+    },
+    {
+      "description": "Intent-routed loader: free-text",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "intent": {
+            "type": "string"
+          },
+          "k": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "namespace": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "intent"
+        ],
+        "type": "object"
+      },
+      "name": "memory_smart_load"
+    },
+    {
+      "description": "Pre-write near-duplicate check",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "namespace": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "threshold": {
+            "default": null,
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "content",
+          "title"
+        ],
+        "type": "object"
+      },
+      "name": "memory_check_duplicate"
+    },
+    {
+      "description": "Get a specific memory by ID,",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_get"
+    },
+    {
+      "description": "Persist a reflection memory",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "confidence": {
+            "default": null,
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "content": {
+            "type": "string"
+          },
+          "metadata": {
+            "default": null
+          },
+          "namespace": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "priority": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "source_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "tags": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "tier": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "content",
+          "source_ids",
+          "title"
+        ],
+        "type": "object"
+      },
+      "name": "memory_reflect"
+    },
+    {
+      "description": "Render a single reflection",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "format": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "memory_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "memory_id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_export_reflection"
+    },
+    {
+      "description": "Fetch the latest Persona",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "entity_id": {
+            "type": "string"
+          },
+          "namespace": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "entity_id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_persona"
+    },
+    {
+      "description": "Generate/regen a Persona",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "entity_id": {
+            "type": "string"
+          },
+          "namespace": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "entity_id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_persona_generate"
+    },
+    {
+      "description": "Inspect the cross-peer",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "memory_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "memory_id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_reflection_origin"
+    },
+    {
+      "description": "List dependents flagged by the",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "memory_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "memory_id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_dependents_of_invalidated"
+    },
+    {
+      "description": "Consolidate multiple memories",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "namespace": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "summary": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "ids",
+          "title"
+        ],
+        "type": "object"
+      },
+      "name": "memory_consolidate"
+    },
+    {
+      "description": "Form 3 multi-step ingest:",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "namespace": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pipeline_override": {
+            "default": null
+          },
+          "pipeline_variant": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "content"
+        ],
+        "type": "object"
+      },
+      "name": "memory_ingest_multistep"
+    },
+    {
+      "description": "Decompose a memory into 2-10",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "force_re_atomise": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "max_atom_tokens": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "memory_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "memory_id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_atomise"
+    },
+    {
+      "description": "Share a memory with another",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "source_memory_id": {
+            "type": "string"
+          },
+          "target_agent_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_memory_id",
+          "target_agent_id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_share"
+    },
+    {
+      "description": "Scan",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "days": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "output_format": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "name": "memory_calibrate_confidence"
+    },
+    {
+      "description": "Discover runtime capabilities",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "accept": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "family": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "include_schema": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "verbose": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "name": "memory_capabilities"
+    },
+    {
+      "description": "LLM-expand a search query into",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "query": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "name": "memory_expand_query"
+    },
+    {
+      "description": "LLM-generate tags for a memory",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_auto_tag"
+    },
+    {
+      "description": "LLM-check whether two memories",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "id_a": {
+            "type": "string"
+          },
+          "id_b": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id_a",
+          "id_b"
+        ],
+        "type": "object"
+      },
+      "name": "memory_detect_contradiction"
+    },
+    {
+      "description": "List messages sent to an agent",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "limit": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "unread_only": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "name": "memory_inbox"
+    },
+    {
+      "description": "Replay subscription_events",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "since": {
+            "type": "string"
+          },
+          "subscription_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "since",
+          "subscription_id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_subscription_replay"
+    },
+    {
+      "description": "List subscription_dlq rows",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "limit": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "subscription_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "name": "memory_subscription_dlq_list"
+    },
+    {
+      "description": "Report per-agent quota usage",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "name": "memory_quota_status"
+    },
+    {
+      "description": "Check action vs",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "args": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "binary": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "byte_estimate": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "command": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "custom_kind": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "cwd": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "host": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "type": "string"
+          },
+          "path": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "scheme": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "type": "object"
+      },
+      "name": "memory_check_agent_action"
+    },
+    {
+      "description": "List substrate-level",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "enabled_only": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "kind": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "name": "memory_rule_list"
+    },
+    {
+      "description": "Offload verbatim content",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "namespace": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ttl_seconds": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "content"
+        ],
+        "type": "object"
+      },
+      "name": "memory_offload"
+    },
+    {
+      "description": "Dereference a memory_offload",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "ref_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "ref_id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_deref"
+    }
+  ],
+  "toolsVersion": "2026-05-06"
+}

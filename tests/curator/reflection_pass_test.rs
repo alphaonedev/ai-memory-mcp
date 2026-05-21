@@ -1,6 +1,7 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
 // clippy allows (test scaffolding): pedantic lints with no behavioral impact.
 #![allow(
     clippy::doc_markdown,
@@ -121,6 +122,7 @@ fn make_observation(ns: &str, topic: &str, idx: usize) -> Memory {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     }
 }
 
@@ -411,6 +413,7 @@ fn set_namespace_max_reflection_depth(conn: &rusqlite::Connection, namespace: &s
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     };
     let _ = db::insert(conn, &mem); // best-effort; substrate uses
     // resolve_governance_policy which

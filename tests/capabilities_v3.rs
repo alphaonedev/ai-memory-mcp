@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
+
 //! Integration tests for the **Capabilities v3 schema** — A1+A2 increments
 //! of the v0.7.0 `attested-cortex` epic (track A, issue #545).
 //!
@@ -970,6 +972,7 @@ fn seed_governance_policy(
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     };
     let standard_id = ai_memory::db::insert(conn, &standard).unwrap();
     ai_memory::db::set_namespace_standard(conn, namespace, &standard_id, None).unwrap();

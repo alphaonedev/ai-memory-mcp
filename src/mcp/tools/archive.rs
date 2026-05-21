@@ -141,6 +141,265 @@ pub(super) fn handle_gc(
     Ok(json!({"collected": count, "dry_run": false}))
 }
 
+// --- D1.5 (#986): per-tool McpTool impls for the 4 archive-family tools ---
+
+use crate::mcp::registry::McpTool;
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+/// v0.7.0 #972 D1.5 (#986) — request body for `memory_archive_list`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct ArchiveListRequest {
+    /// Namespace filter.
+    #[serde(default)]
+    pub namespace: Option<String>,
+
+    /// Default 50, max 1000.
+    #[serde(default)]
+    pub limit: Option<i64>,
+
+    /// Pagination offset.
+    #[serde(default)]
+    pub offset: Option<i64>,
+}
+
+/// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_archive_list`.
+#[allow(dead_code)]
+pub struct ArchiveListTool;
+
+impl McpTool for ArchiveListTool {
+    fn name() -> &'static str {
+        "memory_archive_list"
+    }
+    fn description() -> &'static str {
+        "List archived (expired) memories."
+    }
+    fn docs() -> &'static str {
+        "List archived memories. Filter by namespace; paginate via offset/limit."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(ArchiveListRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "archive"
+    }
+}
+
+/// v0.7.0 #972 D1.5 (#986) — request body for `memory_archive_purge`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct ArchivePurgeRequest {
+    /// Only purge entries older than N days.
+    #[serde(default)]
+    pub older_than_days: Option<i64>,
+}
+
+/// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_archive_purge`.
+#[allow(dead_code)]
+pub struct ArchivePurgeTool;
+
+impl McpTool for ArchivePurgeTool {
+    fn name() -> &'static str {
+        "memory_archive_purge"
+    }
+    fn description() -> &'static str {
+        "Permanently delete archived memories."
+    }
+    fn docs() -> &'static str {
+        "Purge archive. Scope via older_than_days. Unrecoverable."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(ArchivePurgeRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "archive"
+    }
+}
+
+/// v0.7.0 #972 D1.5 (#986) — request body for `memory_archive_restore`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct ArchiveRestoreRequest {
+    /// Archived memory id.
+    pub id: String,
+}
+
+/// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_archive_restore`.
+#[allow(dead_code)]
+pub struct ArchiveRestoreTool;
+
+impl McpTool for ArchiveRestoreTool {
+    fn name() -> &'static str {
+        "memory_archive_restore"
+    }
+    fn description() -> &'static str {
+        "Restore an archived memory back to the active store."
+    }
+    fn docs() -> &'static str {
+        "Restore archived row; expires_at cleared."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(ArchiveRestoreRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "archive"
+    }
+}
+
+/// v0.7.0 #972 D1.5 (#986) — request body for `memory_archive_stats`.
+/// Legacy schema is `properties: {}` — empty struct.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct ArchiveStatsRequest {}
+
+/// v0.7.0 #972 D1.6 (#987) — request body for `memory_gc`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct GcRequest {
+    /// Preview without deleting.
+    #[serde(default)]
+    pub dry_run: Option<bool>,
+}
+
+/// v0.7.0 #972 D1.6 (#987) — `McpTool` impl for `memory_gc`.
+#[allow(dead_code)]
+pub struct GcTool;
+
+impl McpTool for GcTool {
+    fn name() -> &'static str {
+        "memory_gc"
+    }
+    fn description() -> &'static str {
+        "Trigger garbage collection on expired memories (archives first)."
+    }
+    fn docs() -> &'static str {
+        "GC expired memories. Archives first when archive_on_gc is on (default). dry_run previews."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(GcRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "lifecycle"
+    }
+}
+
+/// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_archive_stats`.
+#[allow(dead_code)]
+pub struct ArchiveStatsTool;
+
+impl McpTool for ArchiveStatsTool {
+    fn name() -> &'static str {
+        "memory_archive_stats"
+    }
+    fn description() -> &'static str {
+        "Show archive statistics (total count and per-namespace breakdown)."
+    }
+    fn docs() -> &'static str {
+        "Archive total + per-namespace counts."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(ArchiveStatsRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "archive"
+    }
+}
+
+#[cfg(test)]
+mod d1_5_986_tests {
+    //! D1.5 (#986) — schema parity for the 4 archive-family tools.
+    //! Shared helpers live at [`crate::mcp::parity_test_helpers`].
+    use super::*;
+    use crate::mcp::parity_test_helpers::{
+        assert_descriptions_match, assert_property_set_parity, derived_props_for,
+    };
+
+    #[test]
+    fn archive_list_parity_986() {
+        let derived = derived_props_for::<ArchiveListRequest>();
+        assert_property_set_parity("memory_archive_list", &derived);
+        assert_descriptions_match("memory_archive_list", &derived);
+    }
+
+    #[test]
+    fn archive_list_tool_metadata_986() {
+        assert_eq!(ArchiveListTool::name(), "memory_archive_list");
+        assert_eq!(ArchiveListTool::family(), "archive");
+    }
+
+    #[test]
+    fn archive_purge_parity_986() {
+        let derived = derived_props_for::<ArchivePurgeRequest>();
+        assert_property_set_parity("memory_archive_purge", &derived);
+        assert_descriptions_match("memory_archive_purge", &derived);
+    }
+
+    #[test]
+    fn archive_purge_tool_metadata_986() {
+        assert_eq!(ArchivePurgeTool::name(), "memory_archive_purge");
+        assert_eq!(ArchivePurgeTool::family(), "archive");
+    }
+
+    #[test]
+    fn archive_restore_parity_986() {
+        let derived = derived_props_for::<ArchiveRestoreRequest>();
+        assert_property_set_parity("memory_archive_restore", &derived);
+        assert_descriptions_match("memory_archive_restore", &derived);
+    }
+
+    #[test]
+    fn archive_restore_tool_metadata_986() {
+        assert_eq!(ArchiveRestoreTool::name(), "memory_archive_restore");
+        assert_eq!(ArchiveRestoreTool::family(), "archive");
+    }
+
+    #[test]
+    fn archive_stats_parity_986() {
+        let derived = derived_props_for::<ArchiveStatsRequest>();
+        assert_property_set_parity("memory_archive_stats", &derived);
+        assert_descriptions_match("memory_archive_stats", &derived);
+    }
+
+    #[test]
+    fn archive_stats_tool_metadata_986() {
+        assert_eq!(ArchiveStatsTool::name(), "memory_archive_stats");
+        assert_eq!(ArchiveStatsTool::family(), "archive");
+    }
+}
+
+#[cfg(test)]
+mod d1_6_987_tests {
+    //! D1.6 (#987) — schema parity for `memory_gc`.
+    use super::*;
+    use crate::mcp::parity_test_helpers::{
+        assert_descriptions_match, assert_property_set_parity, derived_props_for,
+    };
+
+    #[test]
+    fn gc_parity_987() {
+        let derived = derived_props_for::<GcRequest>();
+        assert_property_set_parity("memory_gc", &derived);
+        assert_descriptions_match("memory_gc", &derived);
+    }
+
+    #[test]
+    fn gc_tool_metadata_987() {
+        assert_eq!(GcTool::name(), "memory_gc");
+        assert_eq!(GcTool::family(), "lifecycle");
+    }
+}
+
 // ---- C-5 (#699): unit coverage for the `pub(super)` handlers. The MCP
 // dispatch layer covers most happy paths; these target the missing-`id`,
 // invalid-id and "not in archive" branches plus the gc dry-run vs.

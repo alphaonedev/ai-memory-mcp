@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
+
 //! Round-2 F11 — `forget --pattern` / `forget --tier` without
 //! `--namespace` requires `--confirm-global` to proceed.
 //!
@@ -160,6 +162,7 @@ fn cmd_forget_proceeds_with_confirm_global() {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            ..Memory::default()
         };
         db::insert(&conn, &m).unwrap();
     }

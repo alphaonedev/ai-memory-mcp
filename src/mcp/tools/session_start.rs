@@ -83,6 +83,76 @@ pub(crate) fn handle_session_start(
     Ok(response)
 }
 
+// --- D1.5 (#986): per-tool McpTool impl for memory_session_start ---
+
+use crate::mcp::registry::McpTool;
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+/// v0.7.0 #972 D1.5 (#986) — request body for `memory_session_start`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct SessionStartRequest {
+    /// Namespace filter.
+    #[serde(default)]
+    pub namespace: Option<String>,
+
+    /// Limit cap 50; default 10.
+    #[serde(default)]
+    pub limit: Option<i64>,
+
+    /// Output envelope: `json`, `toon`, or `toon_compact` (default).
+    #[serde(default)]
+    pub format: Option<String>,
+}
+
+/// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_session_start`.
+#[allow(dead_code)]
+pub struct SessionStartTool;
+
+impl McpTool for SessionStartTool {
+    fn name() -> &'static str {
+        "memory_session_start"
+    }
+    fn description() -> &'static str {
+        "Auto-recall recent memories on session start."
+    }
+    fn docs() -> &'static str {
+        "Most-recently-accessed/updated. At smart/autonomous tier, includes LLM summary."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(SessionStartRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "meta"
+    }
+}
+
+#[cfg(test)]
+mod d1_5_986_tests {
+    //! D1.5 (#986) — schema parity for `memory_session_start`.
+    //! Shared helpers live at [`crate::mcp::parity_test_helpers`].
+    use super::*;
+    use crate::mcp::parity_test_helpers::{
+        assert_descriptions_match, assert_property_set_parity, derived_props_for,
+    };
+
+    #[test]
+    fn session_start_parity_986() {
+        let derived = derived_props_for::<SessionStartRequest>();
+        assert_property_set_parity("memory_session_start", &derived);
+        assert_descriptions_match("memory_session_start", &derived);
+    }
+
+    #[test]
+    fn session_start_tool_metadata_986() {
+        assert_eq!(SessionStartTool::name(), "memory_session_start");
+        assert_eq!(SessionStartTool::family(), "meta");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Coverage C-2 — focused tests for `handle_session_start`.

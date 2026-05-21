@@ -44,7 +44,7 @@ pub struct ConsolidateBody {
     /// axum `Json<T>` extractor to return 422 UNPROCESSABLE ENTITY for
     /// MCP-parity payloads that ship `{use_llm: true}` and rely on the
     /// daemon to materialize the summary via the LLM (matching
-    /// `handle_consolidate` at `src/mcp.rs:5008-5028`). Now optional;
+    /// `handle_consolidate` at `crate::mcp::handle_consolidate` (LLM-wired branch)). Now optional;
     /// when absent the handler asks `app.llm.summarize_memories` to
     /// produce a real summary, otherwise (no LLM wired) we synthesise
     /// a deterministic concat fallback so the row still lands.
@@ -74,7 +74,7 @@ fn default_ns() -> String {
 
 /// v0.7.0 L7 — resolve the consolidation `summary` field when the
 /// caller omits it. Mirrors the MCP `handle_consolidate` auto-summary
-/// path at `src/mcp.rs:5008-5028`: when an LLM is wired and the source
+/// path at `crate::mcp::handle_consolidate` (LLM-wired branch): when an LLM is wired and the source
 /// memories can be fetched, run `summarize_memories` on `(title,
 /// content)` pairs. When no LLM is wired (keyword / semantic tiers, or
 /// Ollama unreachable at boot), fall back to a deterministic
@@ -251,9 +251,12 @@ pub async fn consolidate_memories(
         }
     };
 
-    if let Err(e) =
-        validate::validate_consolidate(&body.ids, &body.title, &summary, &body.namespace)
-    {
+    if let Err(e) = validate::RequestValidator::validate_consolidate(
+        &body.ids,
+        &body.title,
+        &summary,
+        &body.namespace,
+    ) {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": e.to_string()})),

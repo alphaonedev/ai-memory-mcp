@@ -95,6 +95,21 @@ impl LlmModel {
 
 /// Feature tiers control which AI capabilities are active based on the
 /// available memory budget on the host machine.
+///
+/// # Disambiguation (issue #970)
+///
+/// The codebase has three enums whose names end in `Tier`.
+/// `FeatureTier` (this enum) is the **host capability tier** that
+/// gates which AI features fit in RAM (0 / 256 MB / 1 GB / 4 GB). It
+/// is unrelated to:
+///
+/// - [`crate::models::Tier`] — memory-lifecycle TTL bucket
+///   (Short/Mid/Long).
+/// - [`crate::models::ConfidenceTier`] — confidence-value bucket
+///   (Confirmed/Likely/Ambiguous).
+///
+/// They do not share variants, wire strings, or call sites. See
+/// `docs/internal/enum-proliferation-audit-970.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FeatureTier {

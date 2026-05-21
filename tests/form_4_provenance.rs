@@ -1,6 +1,7 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
 // clippy: integration suite is verbose by design — relax pedantic
 // nags that don't carry signal for hand-written test code.
 #![allow(
@@ -87,6 +88,7 @@ fn mem_with_citations(ns: &str, title: &str, content: &str, citations: Vec<Citat
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     }
 }
 

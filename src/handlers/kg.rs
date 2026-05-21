@@ -740,7 +740,11 @@ pub async fn kg_invalidate(
     headers: axum::http::HeaderMap,
     Json(body): Json<KgInvalidateBody>,
 ) -> impl IntoResponse {
-    if let Err(e) = validate::validate_link(&body.source_id, &body.target_id, &body.relation) {
+    if let Err(e) = validate::RequestValidator::validate_link_triple(
+        &body.source_id,
+        &body.target_id,
+        &body.relation,
+    ) {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": e.to_string()})),

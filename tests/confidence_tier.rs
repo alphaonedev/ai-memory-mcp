@@ -15,6 +15,8 @@
 //!    `confidence_calibration.tier_thresholds` block so callers can
 //!    filter without re-deriving the breakpoints.
 
+#![allow(clippy::needless_update)]
+
 use ai_memory::config::CapabilityConfidenceCalibration;
 use ai_memory::models::{ConfidenceTier, Memory};
 use rusqlite::params;

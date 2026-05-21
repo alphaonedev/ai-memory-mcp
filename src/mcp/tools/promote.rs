@@ -3,10 +3,79 @@
 
 //! MCP `memory_promote` handler.
 
+use crate::mcp::registry::McpTool;
 use crate::models::Tier;
 use crate::{db, validate};
+use schemars::JsonSchema;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::Path;
+
+// --- D1.6 (#987): per-tool McpTool impl for `memory_promote` (lifecycle family) ---
+
+/// v0.7.0 #972 D1.6 (#987) — request body for `memory_promote`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct PromoteRequest {
+    pub id: String,
+
+    #[schemars(
+        description = "#831: 'mid' keeps expires_at; 'long' clears it. Downgrades rejected."
+    )]
+    #[serde(default)]
+    pub target_tier: Option<String>,
+
+    /// Task 1.7: clone target (must be a proper ancestor).
+    #[serde(default)]
+    pub to_namespace: Option<String>,
+}
+
+/// v0.7.0 #972 D1.6 (#987) — `McpTool` impl for `memory_promote`.
+#[allow(dead_code)]
+pub struct PromoteTool;
+
+impl McpTool for PromoteTool {
+    fn name() -> &'static str {
+        "memory_promote"
+    }
+    fn description() -> &'static str {
+        "Promote a memory to long (or chosen tier) / ancestor namespace."
+    }
+    fn docs() -> &'static str {
+        "Default: bump to long (clears expiry); short->long and mid->long are single-call. #831: target_tier ('mid'|'long') stops on intermediate. Task 1.7: to_namespace clones to an ancestor + derived_from link."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(PromoteRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "lifecycle"
+    }
+}
+
+#[cfg(test)]
+mod d1_6_987_tests {
+    //! D1.6 (#987) — schema parity for `memory_promote`.
+    use super::*;
+    use crate::mcp::parity_test_helpers::{
+        assert_descriptions_match, assert_property_set_parity, derived_props_for,
+    };
+
+    #[test]
+    fn promote_parity_987() {
+        let derived = derived_props_for::<PromoteRequest>();
+        assert_property_set_parity("memory_promote", &derived);
+        assert_descriptions_match("memory_promote", &derived);
+    }
+
+    #[test]
+    fn promote_tool_metadata_987() {
+        assert_eq!(PromoteTool::name(), "memory_promote");
+        assert_eq!(PromoteTool::family(), "lifecycle");
+    }
+}
+
 pub(super) fn handle_promote(
     conn: &rusqlite::Connection,
     db_path: &Path,

@@ -50,9 +50,17 @@ fn memory_subscribe_input_schema_declares_event_types_912() {
         props.keys().collect::<Vec<_>>()
     );
     // Shape sanity: array of strings (P5/G9 contract).
-    assert_eq!(
-        props["event_types"]["type"], "array",
-        "event_types must be an array property"
+    // **v0.7.0 #987 update.** D1.6 schemars derives Option<Vec<String>>
+    // as `type: ["array","null"]`. Accept either the legacy bare "array"
+    // OR the schemars nullable shape.
+    let type_field = &props["event_types"]["type"];
+    let is_array = type_field == "array"
+        || type_field
+            .as_array()
+            .is_some_and(|arr| arr.iter().any(|v| v == "array"));
+    assert!(
+        is_array,
+        "event_types must be an array property (legacy \"array\" OR schemars [\"array\",\"null\"]); got {type_field}"
     );
     assert_eq!(
         props["event_types"]["items"]["type"], "string",
@@ -71,8 +79,16 @@ fn memory_replay_input_schema_declares_agent_id_912() {
          K9 permission gate). Got props: {:?}",
         props.keys().collect::<Vec<_>>()
     );
-    assert_eq!(
-        props["agent_id"]["type"], "string",
-        "agent_id must be a string property"
+    // **v0.7.0 #987 update.** D1.6 schemars derives Option<String> as
+    // `type: ["string","null"]`. Accept either the legacy bare "string"
+    // OR the schemars nullable shape.
+    let type_field = &props["agent_id"]["type"];
+    let is_string = type_field == "string"
+        || type_field
+            .as_array()
+            .is_some_and(|arr| arr.iter().any(|v| v == "string"));
+    assert!(
+        is_string,
+        "agent_id must be a string property (legacy \"string\" OR schemars [\"string\",\"null\"]); got {type_field}"
     );
 }

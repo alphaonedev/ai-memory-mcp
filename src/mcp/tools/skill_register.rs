@@ -401,6 +401,72 @@ mod hex {
     }
 }
 
+// --- D1.5 (#986): per-tool McpTool impl for memory_skill_register ---
+
+use crate::mcp::registry::McpTool;
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+/// v0.7.0 #972 D1.5 (#986) — request body for `memory_skill_register`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct SkillRegisterRequest {
+    /// Dir containing SKILL.md + optional resources/.
+    #[serde(default)]
+    pub folder_path: Option<String>,
+
+    /// Raw SKILL.md text (frontmatter + body).
+    #[serde(default)]
+    pub inline_skill: Option<String>,
+}
+
+/// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_skill_register`.
+#[allow(dead_code)]
+pub struct SkillRegisterTool;
+
+impl McpTool for SkillRegisterTool {
+    fn name() -> &'static str {
+        "memory_skill_register"
+    }
+    fn description() -> &'static str {
+        "Register an agentskills.io SKILL.md from a folder or inline text."
+    }
+    fn docs() -> &'static str {
+        "L1-5: Ed25519-attested skill registration with version chaining. Re-register same (name, namespace) supersedes prior row."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(SkillRegisterRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "other"
+    }
+}
+
+#[cfg(test)]
+mod d1_5_986_tests {
+    //! D1.5 (#986) — schema parity for `memory_skill_register`.
+    //! Shared helpers live at [`crate::mcp::parity_test_helpers`].
+    use super::*;
+    use crate::mcp::parity_test_helpers::{
+        assert_descriptions_match, assert_property_set_parity, derived_props_for,
+    };
+
+    #[test]
+    fn skill_register_parity_986() {
+        let derived = derived_props_for::<SkillRegisterRequest>();
+        assert_property_set_parity("memory_skill_register", &derived);
+        assert_descriptions_match("memory_skill_register", &derived);
+    }
+
+    #[test]
+    fn skill_register_tool_metadata_986() {
+        assert_eq!(SkillRegisterTool::name(), "memory_skill_register");
+        assert_eq!(SkillRegisterTool::family(), "other");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------

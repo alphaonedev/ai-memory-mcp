@@ -5,6 +5,7 @@
 
 use crate::embeddings::Embed;
 use crate::hnsw::VectorIndex;
+use crate::mcp::registry::McpTool;
 use crate::models::{
     AttestLevel, CandidateCounts, ConfidenceTier, Memory, MemoryKind, RecallMeta, RecallTelemetry,
 };
@@ -13,54 +14,134 @@ use crate::reranker::BatchedReranker;
 use crate::{db, validate};
 use serde_json::{Value, json};
 
-/// v0.7.x Form 6 — parse the `kinds` recall-filter parameter from the
-/// MCP params bag. Accepts:
-///   * an array of strings: `["concept", "claim"]`
-///   * a single comma-separated string: `"concept,claim"`
-///   * the literal string `"all"` (any-of-all, equivalent to omission)
-///
-/// Returns `None` when the field is absent, the string is empty /
-/// whitespace, the array is empty, or the value is `"all"` — every
-/// case maps to "no filter declared, return all kinds".
-///
-/// Returns `Some(vec![])` when the caller declared a filter (non-empty
-/// string or non-empty array) but every token was unknown
-/// (e.g. `"reflektion"`). Cluster E audit COR-4 (issue #767):
-/// collapsing this case to `None` silently inverted typo'd filters
-/// into "match all", which is the bug the v0.7.0 audit flagged.
-///
-/// Unknown tokens are dropped silently within a partially-valid
-/// filter — a future variant emitted by a newer client should not
-/// break recall on an older binary.
-fn parse_kinds_filter(params: &Value) -> Option<Vec<MemoryKind>> {
-    let raw = params.get("kinds")?;
-    if let Some(s) = raw.as_str() {
-        if s.trim().eq_ignore_ascii_case("all") {
-            return None;
-        }
-        return MemoryKind::parse_csv(s);
+// --- D1.3 (#984): per-tool McpTool impl for `memory_recall` ---
+
+// #967 — `RecallRequest` and `KindsFilter` were promoted to canonical
+// DTOs under `crate::models::recall_request`. They're re-exported here
+// so the d1_3_984 parity test (which references the local `RecallRequest`
+// symbol via `schemars::schema_for!`) keeps compiling unchanged, and so
+// `RecallTool::input_schema()` continues to derive the schema from the
+// same struct every surface marshals into. `KindsFilter` is part of the
+// public re-export so legacy `mcp::tools::recall::KindsFilter` callers
+// keep resolving even though only `RecallRequest` is touched in this
+// module.
+#[allow(unused_imports)]
+pub use crate::models::recall_request::{KindsFilter, RecallRequest};
+
+/// v0.7.0 #972 D1.3 (#984) — `McpTool` impl for `memory_recall`.
+#[allow(dead_code)]
+pub struct RecallTool;
+
+impl McpTool for RecallTool {
+    fn name() -> &'static str {
+        "memory_recall"
     }
-    if let Some(arr) = raw.as_array() {
-        // Empty array → no filter declared.
-        if arr.is_empty() {
-            return None;
-        }
-        let mut out: Vec<MemoryKind> = Vec::new();
-        for v in arr {
-            if let Some(name) = v.as_str()
-                && let Some(k) = MemoryKind::from_str(name.trim())
-                && !out.contains(&k)
-            {
-                out.push(k);
-            }
-        }
-        // Non-empty array (even all-unknown) → return Some so the
-        // downstream filter applies (COR-4 fix — see above).
-        Some(out)
-    } else {
-        None
+    fn description() -> &'static str {
+        "Recall memories relevant to a context (ranked)."
+    }
+    fn docs() -> &'static str {
+        "Fuzzy OR recall ranked by relevance + priority + access + tier. Optional: budget_tokens (cl100k cap), context_tokens (query-embed bias), session_id (+0.05 recency boost per #518), session_default (splice [agents.defaults.recall_scope]), include_archived, kinds filter. Default format toon_compact (~79% smaller)."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(RecallRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "core"
     }
 }
+
+#[cfg(test)]
+mod d1_3_984_tests {
+    //! D1.3 (#984) — schema parity for the `memory_recall` tool.
+    //! Reuses the allowed-diffs catalog documented in d1_2_983_tests.
+    use super::*;
+
+    fn legacy_props(tool_name: &str) -> serde_json::Map<String, Value> {
+        let defs = crate::mcp::registry::tool_definitions();
+        let tools = defs
+            .get("tools")
+            .and_then(Value::as_array)
+            .expect("tool_definitions emits `tools` array");
+        let entry = tools
+            .iter()
+            .find(|t| t.get("name").and_then(Value::as_str) == Some(tool_name))
+            .unwrap_or_else(|| panic!("{tool_name} must be in legacy catalog"));
+        entry
+            .pointer("/inputSchema/properties")
+            .and_then(Value::as_object)
+            .unwrap_or_else(|| panic!("{tool_name}.inputSchema.properties must be object"))
+            .clone()
+    }
+
+    fn derived_props_for<T: schemars::JsonSchema>() -> serde_json::Map<String, Value> {
+        let schema = schemars::schema_for!(T);
+        let v = serde_json::to_value(schema).expect("schema → value");
+        v.get("properties")
+            .and_then(Value::as_object)
+            .or_else(|| {
+                v.pointer(&format!(
+                    "/definitions/{}/properties",
+                    std::any::type_name::<T>().rsplit("::").next().unwrap_or("")
+                ))
+                .and_then(Value::as_object)
+            })
+            .cloned()
+            .expect("schemars schema must have properties at a known path")
+    }
+
+    fn assert_property_set_parity(tool_name: &str, derived: &serde_json::Map<String, Value>) {
+        let legacy = legacy_props(tool_name);
+        let legacy_keys: std::collections::BTreeSet<&str> =
+            legacy.keys().map(String::as_str).collect();
+        let derived_keys: std::collections::BTreeSet<&str> =
+            derived.keys().map(String::as_str).collect();
+        assert_eq!(
+            legacy_keys,
+            derived_keys,
+            "{tool_name}: property set drift; diff = {:?}",
+            legacy_keys
+                .symmetric_difference(&derived_keys)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    fn assert_descriptions_match(tool_name: &str, derived: &serde_json::Map<String, Value>) {
+        let legacy = legacy_props(tool_name);
+        for (name, legacy_prop) in &legacy {
+            if let Some(want) = legacy_prop.get("description").and_then(Value::as_str) {
+                let got = derived
+                    .get(name)
+                    .and_then(|p| p.get("description"))
+                    .and_then(Value::as_str);
+                assert_eq!(
+                    got,
+                    Some(want),
+                    "{tool_name}.{name}: description must match legacy byte-for-byte"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn recall_parity_984() {
+        let derived = derived_props_for::<RecallRequest>();
+        assert_property_set_parity("memory_recall", &derived);
+        assert_descriptions_match("memory_recall", &derived);
+    }
+
+    #[test]
+    fn recall_tool_metadata_984() {
+        assert_eq!(RecallTool::name(), "memory_recall");
+        assert_eq!(RecallTool::family(), "core");
+    }
+}
+
+// #967 — `parse_kinds_filter(params: &Value)` is removed. The DTO's
+// `kinds: Option<KindsFilter>` field carries the typed wire shape, and
+// `KindsFilter::parse()` does the OR-of-kinds + COR-4 (#767) honoured
+// resolution. See `src/models/recall_request.rs` for the canonical
+// implementation + tests (`kinds_filter_typo_array_returns_empty_some_cor4`).
 
 /// v0.7.x Form 6 — apply the parsed kinds filter to a recall result
 /// set in-place. No-op when `kinds == None`. OR-of-kinds semantics:
@@ -343,11 +424,49 @@ fn record_recall_observations(
     }
 }
 
+/// #967 — JSON-bag entry kept as a thin wrapper around
+/// [`handle_recall_dto`]. The pre-#967 surface continues to accept the
+/// `&Value` params bag so existing call sites (tests + the MCP
+/// dispatcher) compile unchanged; field extraction is delegated to
+/// [`RecallRequest::from_mcp_params`].
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_lines)]
 pub fn handle_recall(
     conn: &rusqlite::Connection,
     params: &Value,
+    embedder: Option<&dyn Embed>,
+    vector_index: Option<&VectorIndex>,
+    reranker: Option<&BatchedReranker>,
+    archive_on_gc: bool,
+    resolved_ttl: &crate::config::ResolvedTtl,
+    resolved_scoring: &crate::config::ResolvedScoring,
+    recall_scope: Option<&crate::config::RecallScope>,
+) -> Result<Value, String> {
+    let req = RecallRequest::from_mcp_params(params)?;
+    handle_recall_dto(
+        conn,
+        &req,
+        embedder,
+        vector_index,
+        reranker,
+        archive_on_gc,
+        resolved_ttl,
+        resolved_scoring,
+        recall_scope,
+    )
+}
+
+/// #967 canonical-DTO entry. The `&RecallRequest` carries every
+/// caller-supplied scalar (18 fields pre-#967 extracted one-by-one
+/// from the `params: &Value` bag). The remaining args are the
+/// substrate-side context that doesn't belong on the wire DTO:
+/// connection handle, embedder, vector index, reranker, gc-archive
+/// flag, resolved TTL / scoring configs, and the operator's
+/// `[agents.defaults.recall_scope]` defaults.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
+pub fn handle_recall_dto(
+    conn: &rusqlite::Connection,
+    req: &RecallRequest,
     embedder: Option<&dyn Embed>,
     vector_index: Option<&VectorIndex>,
     reranker: Option<&BatchedReranker>,
@@ -368,7 +487,7 @@ pub fn handle_recall(
     // reverses the default so MCP callers see the full audit trail
     // by default. Clients that want the trimmed shape can pass
     // `verbose_provenance=false`.
-    let verbose_provenance = params["verbose_provenance"].as_bool().unwrap_or(true);
+    let verbose_provenance = req.verbose_provenance.unwrap_or(true);
 
     // v0.7.0 Gap 3 (#886) — fresh per-call recall_id stamped into
     // every observation row (and echoed back in the response so the
@@ -379,8 +498,9 @@ pub fn handle_recall(
     // `"likely"` / `"ambiguous"`). When set, keeps only the matching
     // tier. Unknown / empty values fall through to "no filter" so a
     // typo on the client side doesn't silently inverter the filter.
-    let confidence_tier_filter: Option<ConfidenceTier> = params["confidence_tier"]
-        .as_str()
+    let confidence_tier_filter: Option<ConfidenceTier> = req
+        .confidence_tier
+        .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .and_then(ConfidenceTier::parse);
@@ -413,7 +533,10 @@ pub fn handle_recall(
     };
 
     let _ = db::gc_if_needed(conn, archive_on_gc);
-    let context = params["context"].as_str().ok_or("context is required")?;
+    let context = req.context.as_str();
+    if context.is_empty() {
+        return Err("context is required".to_string());
+    }
     // v0.7.0 (issue #518) — when the caller passed
     // `session_default=true` AND a given filter axis is absent,
     // splice in the corresponding `[agents.defaults.recall_scope]`
@@ -421,9 +544,9 @@ pub fn handle_recall(
     // expose a `tier` filter on the legacy `db::recall` /
     // `db::recall_hybrid` paths, so the `tier` axis is plumbed but
     // not consumed on this branch (the postgres SAL handler in
-    // `handlers.rs::recall_response` applies it via
+    // `handlers/recall.rs::recall_response` applies it via
     // `Filter.tier`).
-    let session_default = params["session_default"].as_bool().unwrap_or(false);
+    let session_default = req.session_default.unwrap_or(false);
     let scope = if session_default { recall_scope } else { None };
     // Compute owned defaults so they outlive the parse step.
     let scope_namespace: Option<String> = scope
@@ -438,22 +561,23 @@ pub fn handle_recall(
             })
         })
     });
-    let explicit_namespace = params["namespace"].as_str();
-    let explicit_since = params["since"].as_str();
+    let explicit_namespace = req.namespace.as_deref();
+    let explicit_since = req.since.as_deref();
     let namespace: Option<&str> = explicit_namespace.or(scope_namespace.as_deref());
-    let explicit_limit_raw = params["limit"].as_u64();
-    let limit = if let Some(v) = explicit_limit_raw {
+    let limit = if let Some(v) = req.limit
+        && v > 0
+    {
         usize::try_from(v).unwrap_or(usize::MAX)
     } else if let Some(v) = scope.and_then(|s| s.limit) {
         usize::try_from(v).unwrap_or(usize::MAX)
     } else {
         10
     };
-    let tags = params["tags"].as_str();
+    let tags = req.tags.as_deref();
     let since: Option<&str> = explicit_since.or(scope_since.as_deref());
-    let until = params["until"].as_str();
+    let until = req.until.as_deref();
     // #151 visibility
-    let as_agent = params["as_agent"].as_str();
+    let as_agent = req.as_agent.as_deref();
     if let Some(a) = as_agent {
         validate::validate_namespace(a).map_err(|e| e.to_string())?;
     }
@@ -464,15 +588,13 @@ pub fn handle_recall(
     // #348 hard-reject of 0; the meta block now disambiguates "user
     // asked for zero" from "buggy uninitialized counter" by always
     // round-tripping the requested budget.
-    let budget_tokens = params["budget_tokens"]
-        .as_u64()
-        .and_then(|n| usize::try_from(n).ok());
+    let budget_tokens = req.resolved_budget_tokens();
 
     // v0.7.x Form 6 — Batman-taxonomy `kinds` filter. Parsed once
     // and applied to every result vector below (keyword, hybrid,
     // hybrid+rerank). OR-of-kinds within the param, AND with the
     // other filters (namespace, tags, time window, visibility).
-    let kinds_filter = parse_kinds_filter(params);
+    let kinds_filter = req.kinds.as_ref().and_then(KindsFilter::parse);
 
     // v0.7.0 WT-1-E — atom-preference recall semantics.
     //
@@ -486,7 +608,7 @@ pub fn handle_recall(
     //
     // Composes with namespace, memory_kind (via storage filter),
     // time-window, tier, and the existing visibility predicate.
-    let include_archived = params["include_archived"].as_bool().unwrap_or(false);
+    let include_archived = req.include_archived.unwrap_or(false);
 
     // v0.7.0 Form 4 (issue #757) — fact-provenance post-filters.
     // `has_citations` keeps only memories with a non-empty citations
@@ -496,10 +618,8 @@ pub fn handle_recall(
     // Rust after the recall returns so the substrate signature
     // doesn't grow another two positional args. Tool-count baseline
     // preserved (no new MCP tool).
-    let has_citations_filter = params["has_citations"].as_bool().unwrap_or(false);
-    let source_uri_prefix: Option<String> = params["source_uri_prefix"]
-        .as_str()
-        .map(std::string::ToString::to_string);
+    let has_citations_filter = req.has_citations.unwrap_or(false);
+    let source_uri_prefix: Option<String> = req.source_uri_prefix.clone();
 
     // v0.7.0 (issue #518) — per-session "recently accessed" boost.
     // When the caller passes a non-empty `session_id`, the rerank
@@ -508,21 +628,19 @@ pub fn handle_recall(
     // boost hit set back into the buffer so the next recall in the
     // same session reuses the new context. `None` / empty preserves
     // pre-#518 recall semantics exactly.
-    let session_id: Option<String> = params["session_id"]
-        .as_str()
+    let session_id: Option<String> = req
+        .session_id
+        .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(std::string::ToString::to_string);
     let session_tracker = crate::reranker::global_session_recall_tracker();
 
     // v0.6.0.0 contextual recall — caller-supplied recent conversation tokens.
-    let context_tokens: Vec<String> = params["context_tokens"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
+    let context_tokens: Vec<String> = req
+        .context_tokens
+        .as_ref()
+        .map(|arr| arr.iter().filter(|s| !s.is_empty()).cloned().collect())
         .unwrap_or_default();
 
     // Helper: tack tokens_used / budget_tokens onto the response, plus

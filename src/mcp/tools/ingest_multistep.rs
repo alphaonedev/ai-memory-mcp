@@ -185,6 +185,79 @@ pub(crate) fn handler_with_mock_responses(
     IngestMultistepHandler::new(dispatch, tier)
 }
 
+// --- D1.5 (#986): per-tool McpTool impl for memory_ingest_multistep ---
+
+use crate::mcp::registry::McpTool;
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+/// v0.7.0 #972 D1.5 (#986) — request body for `memory_ingest_multistep`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct IngestMultistepRequest {
+    /// Content to ingest.
+    pub content: String,
+
+    /// FTS classifier hint. Default 'global'.
+    #[serde(default)]
+    pub namespace: Option<String>,
+
+    /// Named pipeline; ignored if pipeline_override set.
+    #[serde(default)]
+    pub pipeline_variant: Option<String>,
+
+    /// Custom Pipeline descriptor.
+    #[serde(default)]
+    pub pipeline_override: Option<serde_json::Value>,
+}
+
+/// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_ingest_multistep`.
+#[allow(dead_code)]
+pub struct IngestMultistepTool;
+
+impl McpTool for IngestMultistepTool {
+    fn name() -> &'static str {
+        "memory_ingest_multistep"
+    }
+    fn description() -> &'static str {
+        "Form 3 multi-step ingest: deterministic helpers + LLM stages."
+    }
+    fn docs() -> &'static str {
+        "Form 3 (#756): two_phase (FTS + Jaccard -> synthesise) or four_step (load_context -> classify -> enrich -> emit). Helpers run first; LLM stages receive helper output under explicit-trust banner + SHARED PREFIX for cache-key reuse. Response carries trace + cache-key set + final output. Smart+ tier only."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(IngestMultistepRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "power"
+    }
+}
+
+#[cfg(test)]
+mod d1_5_986_tests {
+    //! D1.5 (#986) — schema parity for `memory_ingest_multistep`.
+    //! Shared helpers live at [`crate::mcp::parity_test_helpers`].
+    use super::*;
+    use crate::mcp::parity_test_helpers::{
+        assert_descriptions_match, assert_property_set_parity, derived_props_for,
+    };
+
+    #[test]
+    fn ingest_multistep_parity_986() {
+        let derived = derived_props_for::<IngestMultistepRequest>();
+        assert_property_set_parity("memory_ingest_multistep", &derived);
+        assert_descriptions_match("memory_ingest_multistep", &derived);
+    }
+
+    #[test]
+    fn ingest_multistep_tool_metadata_986() {
+        assert_eq!(IngestMultistepTool::name(), "memory_ingest_multistep");
+        assert_eq!(IngestMultistepTool::family(), "power");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

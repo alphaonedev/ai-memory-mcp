@@ -3,9 +3,58 @@
 
 //! MCP `memory_replay` handler.
 
+use crate::mcp::registry::McpTool;
 use crate::transcripts::replay::{ReplayEntry, replay_transcript_union};
 use crate::validate;
+use schemars::JsonSchema;
+use serde::Deserialize;
 use serde_json::{Value, json};
+
+// --- D1.4 (#985): per-tool McpTool impl for `memory_replay` (graph family) ---
+
+/// v0.7.0 #972 D1.4 (#985) — request body for `memory_replay`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct ReplayRequest {
+    /// Memory ID.
+    pub memory_id: String,
+
+    /// I4: when false, >100KB transcripts truncated=true.
+    #[serde(default)]
+    pub verbose: Option<bool>,
+
+    /// L2-4 reflects_on hops. null=full, 0=self, N=self+N.
+    #[serde(default)]
+    pub depth: Option<i64>,
+
+    #[schemars(description = "#912 perm gate.")]
+    #[serde(default)]
+    pub agent_id: Option<String>,
+}
+
+/// v0.7.0 #972 D1.4 (#985) — `McpTool` impl for `memory_replay`.
+#[allow(dead_code)]
+pub struct ReplayTool;
+
+impl McpTool for ReplayTool {
+    fn name() -> &'static str {
+        "memory_replay"
+    }
+    fn description() -> &'static str {
+        "Reconstruct the conversation transcript chain that produced a memory."
+    }
+    fn docs() -> &'static str {
+        "I4: transcript chain (text + span metadata). verbose=false (default) truncates >100KB entries. L2-4 (#669): for reflections, walks reflects_on edges for transcript UNION; cap via depth (null=full, 0=self only)."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(ReplayRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "graph"
+    }
+}
 
 /// v0.7.0 I4 — single-transcript content threshold above which the
 /// replay tool omits decompressed text unless the caller opted into
@@ -340,5 +389,27 @@ mod tests {
         let entries = resp["transcripts"].as_array().unwrap();
         assert!(entries[0]["content"].is_string());
         assert!(entries[0].get("truncated").is_none());
+    }
+}
+
+#[cfg(test)]
+mod d1_4_985_tests {
+    //! D1.4 (#985) — schema-parity for `memory_replay`.
+    use super::*;
+    use crate::mcp::d1_4_985_helpers::{
+        assert_descriptions_match, assert_property_set_parity, derived_props_for,
+    };
+
+    #[test]
+    fn memory_replay_parity_985() {
+        let derived = derived_props_for::<ReplayRequest>();
+        assert_property_set_parity("memory_replay", &derived);
+        assert_descriptions_match("memory_replay", &derived);
+    }
+
+    #[test]
+    fn memory_replay_tool_metadata_985() {
+        assert_eq!(ReplayTool::name(), "memory_replay");
+        assert_eq!(ReplayTool::family(), "graph");
     }
 }

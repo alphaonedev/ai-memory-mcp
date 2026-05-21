@@ -220,7 +220,13 @@ release-notes intro lives under `docs/v0.7.0/release-notes.md`
 2. **HTTP API** (`src/handlers/`) — Axum REST server on port 9077, **72 `.route(...)` registrations in `src/lib.rs`** at `/api/v1/` (and the bare `/metrics` Prometheus surface). Handlers split per domain under `src/handlers/{http,federation_receive,hook_subscribers,transport}.rs` (#650 partially addressed at v0.7.0; full per-domain split tracked in #650).
 3. **CLI** (`src/main.rs` thin shim + `src/daemon_runtime.rs::Command`) — clap-based, **55 top-level subcommands** at v0.7.0 (was 40 at v0.6.4) with optional `--json` output
 
-All three interfaces share the same storage layer (`src/storage/`) and validation (`src/validate.rs`) layers. The sqlite legacy path uses `Arc<Mutex<(Connection, PathBuf, ResolvedTtl, bool)>>` — a single SQLite connection protected by a mutex. Lock contention is the bottleneck under concurrent HTTP + MCP load. The v0.7 SAL trait (under `src/store/`) abstracts sqlite vs. postgres+AGE adapters; `ai-memory serve --store-url postgres://…` selects the postgres path.
+All three interfaces share the same storage layer (`src/storage/`) and validation (`src/validate.rs`) layers. **Connection-sharing topology differs per interface** (post-#965 audit, 2026-05-21):
+
+- **HTTP daemon (`src/handlers/transport.rs:22`)** uses `Db = Arc<Mutex<(Connection, PathBuf, ResolvedTtl, bool)>>` — a single SQLite connection protected by a mutex. Lock contention IS the bottleneck under concurrent HTTP load (Axum admits parallel handler execution via its task pool).
+- **MCP stdio (`src/mcp/mod.rs:2013`)** uses a plain `rusqlite::Connection` — no `Arc`, no `Mutex`. The stdio loop is `for line in stdin.lock().lines()` (synchronous, single-threaded by JSON-RPC stdio protocol design — one request in, one response out), so concurrent dispatch is impossible at the protocol level and a mutex would be useless. The audit invariant is pinned by three tests in `src/mcp/mod.rs::tests::issue_965_audit_*`. The Wave-1 codebase-analysis claim that MCP serialises on `Arc<Mutex<Connection>>` (issue #842 Tier-B5 / #965) was factually incorrect; #965 closed with audit evidence rather than a no-op pool refactor.
+- **CLI** opens its own `rusqlite::Connection` per command invocation — no sharing at all.
+
+The v0.7 SAL trait (under `src/store/`) abstracts sqlite vs. postgres+AGE adapters; `ai-memory serve --store-url postgres://…` selects the postgres path.
 
 ### Key Modules
 
@@ -229,11 +235,11 @@ All three interfaces share the same storage layer (`src/storage/`) and validatio
 | `main.rs` | Thin CLI shim (W6 refactor); top-level `Command` enum lives in `src/daemon_runtime.rs` |
 | `daemon_runtime.rs` | clap top-level `Command` enum (55 subcommands), HTTP daemon `serve` bootstrap, MCP `mcp` dispatch |
 | `mcp/` | MCP server: stdin/stdout JSON-RPC loop, tool registry (`src/mcp/registry.rs`), per-tool handlers under `src/mcp/tools/` |
-| `storage/` | SAL trait + sqlite path; CRUD, FTS5 queries, recall scoring, GC, schema migrations (current `CURRENT_SCHEMA_VERSION = 48` in `src/storage/migrations.rs`) |
-| `store/` | SAL adapter implementations (sqlite + postgres + Apache AGE feature gates) |
+| `storage/` | sqlite SQL primitives + typed legacy errors (`StorageError`, `VersionConflict`, `GovernanceRefusal`); CRUD, FTS5 queries, recall scoring, GC, schema migrations (current `CURRENT_SCHEMA_VERSION = 48` in `src/storage/migrations.rs`). Post-#961 (SAL boundary cleanup): handlers reach into `crate::storage::*` ONLY for direct-db keepers (FTS trigger sync, PRAGMA, migration callouts) and for typed-error downcasts where the SAL `StoreError` enum doesn't yet carry the legacy variant; everything else routes through the SAL trait under `src/store/`. Exposed as the `db` alias (`pub use storage as db` in `src/lib.rs:52`). |
+| `store/` | SAL `MemoryStore` trait + adapter implementations (`SqliteStore` thin-wraps `crate::storage`; `PostgresStore` is sqlx+pgvector; Apache AGE feature gates). Trait surface is the canonical write path for postgres-backed daemons and the forward path for sqlite — new DB operations land here first, not in `src/storage/`. |
 | `handlers/` | HTTP request handlers split per domain (`http.rs`, `federation_receive.rs`, `hook_subscribers.rs`, `transport.rs`) — Axum extractors, error sanitization |
 | `models/` | Core data structures: `Memory` (26 fields incl. v0.7.0 recursive-learning + Batman vocabulary + Form-4 provenance + Form-5 confidence-calibration columns + the v45 `version` BIGINT for Gap-1 optimistic concurrency), `MemoryLink`, request/response types |
-| `validate.rs` | Input validation for all write paths |
+| `validate.rs` | Input validation for all write paths. Post-#966 (Wave-2 Tier-C1), HTTP handlers / MCP tools / CLI route DTO-bundling validation through `pub struct RequestValidator` (`validate_create`, `validate_update`, `validate_memory`, `validate_link_triple`, `validate_consolidate`, `validate_id_and_namespace`, `validate_owner_write`, `validate_confidence_and_priority`). The typed `ValidationError { field, reason }` carries explicit field attribution while preserving byte-equal wire-side error messages via a `Display` impl that mirrors the legacy `bail!` shape. Single-field free fns (`validate_id`, `validate_namespace`, `validate_agent_id`, …) remain the lowest level primitive. |
 | `config.rs` | Feature tier system (keyword/semantic/smart/autonomous), TTL config |
 | `reranker.rs` | Hybrid recall: blends semantic (cosine) + keyword (BM25-like FTS5) scores |
 | `embeddings.rs` | HuggingFace model loading, vector generation, cosine similarity |
@@ -268,9 +274,19 @@ All three interfaces share the same storage layer (`src/storage/`) and validatio
 Recall is multi-stage and **never read-only** — every recall mutates the database:
 
 1. **FTS5 keyword search** — fuzzy OR query, scored by `fts.rank + priority*0.5 + access_count*0.1 + confidence*2.0 + tier_bonus + recency_factor`
-2. **Semantic search** — cosine similarity via HNSW index (or linear scan fallback), threshold >0.2 (relaxed from 0.3 in v0.6.2 Patch 2 after scenario-18 caught a miss at 0.25-0.29 cosine for legitimately-related content)
+2. **Semantic search** — cosine similarity via HNSW index (or linear scan fallback), threshold >0.2 (relaxed from 0.3 in v0.6.2 Patch 2 after scenario-18 caught a miss at 0.25-0.29 cosine for legitimately-related content). The HNSW index uses an **async-rebuild double-buffer pattern** at v0.7.x post-#968 (Wave-2 Tier-C3): `active` serves reads while `warming` accepts the background-built next graph; the atomic `try_swap_warming` swap lands the new graph in microseconds without blocking the request thread. The prior v0.6 synchronous-rebuild path (which blocked search for ~3-10 s on a 100k-vector eviction-edge rebuild) is preserved as `VectorIndex::rebuild()` (now a `rebuild_async().join() + try_swap_warming()` shim for the test contract) — production write paths (`insert()` past `REBUILD_THRESHOLD`, the eviction-edge graph rebuild) dispatch through `rebuild_async` so search p95 stays under the 35 ms budget during a rebuild. See `cargo bench --bench hnsw_rebuild_async`.
 3. **Adaptive blending** — `final = semantic_weight * cosine + (1 - semantic_weight) * norm_fts`. Semantic weight varies 0.50 (short content ≤500 chars) → 0.15 (long content ≥5000 chars) because embeddings lose information on long text
 4. **Touch operations** (atomic) — increment `access_count`, **set `expires_at = now + per-tier-TTL`** (1h short / 1d mid; this is a sliding-window **REPLACEMENT**, not a max-of-old-and-new extend — the create-time 6h short / 7d mid backstop applies only until first access, after which the per-access window takes over), auto-promote mid→long at 5 accesses, increment priority every 10 accesses. `memory_promote` jumps a memory to the highest reachable tier (long) in a single call by default; a future revision may add an optional `target_tier` parameter for stepwise control (mid as an intermediate landing zone).
+
+**Dispatch DTO (post-#967 / Wave-2 Tier-C2).** All three recall
+surfaces (HTTP, MCP, CLI) marshal their wire shape into the
+canonical `crate::models::recall_request::RecallRequest` struct once,
+then dispatch into the recall pipeline. The DTO doubles as the
+schemars-derived MCP `input_schema` for `memory_recall` (D1.3 #984
+parity contract; see `src/mcp/tools/recall.rs::RecallTool`). Adding
+a new wire field is one struct field + one constructor branch per
+surface (`from_mcp_params` / `from_http_query` / `from_http_body` /
+`from_cli_args`), not four positional-arg signatures.
 
 ### Upsert Behavior
 
@@ -412,9 +428,76 @@ Tracking issue: #198.
 
 **New CLI command**: Add variant to `Command` enum → define `Args` struct → add dispatch case in `main()` → implement `cmd_*` handler taking `&Path` (db) + args.
 
-**New MCP tool**: Add JSON definition in `tool_definitions()` → add match arm in the dispatch block → implement handler taking `&Connection` + params → return `Result<Value>`.
+**New MCP tool** (post-v0.7.0 #987, the D1.6 split landed):
+
+1. Define `<ToolName>Request` in `src/mcp/tools/<name>.rs` with
+   `#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]` +
+   `#[schemars(deny_unknown_fields)]`. Per-field doc-comments become
+   the JSON-Schema `description`s. For descriptions starting with
+   `#` (markdown heading sigil), use
+   `#[schemars(description = "...")]` instead of a `///` comment.
+2. Define `pub struct <ToolName>Tool` (zero-sized) and
+   `impl McpTool for <ToolName>Tool` — return `name()`,
+   `description()`, `docs()`, `family()`, and
+   `input_schema()` (the schemars schema of the request struct).
+3. Register the tool in `registered_tools()` in
+   `src/mcp/registry.rs` by appending one line:
+   `RegisteredTool::of::<crate::mcp::<name>::<ToolName>Tool>()`.
+4. Add the handler (the `pub(super) fn handle_<name>(...)`) in the
+   same file and a dispatch arm in `src/mcp/mod.rs::handle_request`.
+5. Add a `d1_6_987_tests` mod in the same file that calls the shared
+   parity helpers at `crate::mcp::parity_test_helpers::*`
+   (`derived_props_for::<<ToolName>Request>()`,
+   `assert_property_set_parity`, `assert_descriptions_match`).
+
+The pre-#987 recipe ("add a JSON definition in `tool_definitions()`
++ add a match arm") is GONE — `tool_definitions()` is now a four-line
+iteration over `registered_tools()` and no longer carries
+hand-coded JSON. Adding a tool is one impl + one line in
+`registered_tools()`; the handler dispatch is the only piece that
+hasn't been deduplicated yet (#867 tracks that follow-up).
+
+**Wire trimmer (post-D1.6 schemars metadata strip).**
+`tools/list` is rendered through
+[`crate::mcp::registry::strip_docs_from_tools`] before it goes on the
+wire. The trimmer drops every long-form natural-language string from
+the bare payload so the C5 ≤ 3500 cl100k token ceiling holds for the
+full profile. Stripped surfaces:
+
+- Top-level `docs` field (the prose mirror of `description`).
+- Schemars-only `inputSchema` metadata that the legacy hand-coded
+  macro never emitted: the top-level `description` on the request
+  struct, `$schema`, `title`, and every nested `description` under
+  `definitions.*` (for `$ref`-resolved untagged enums like
+  `RecallKindsFilter::Many(Vec<String>) | One(String)`).
+- Per-parameter `description` strings nested under
+  `inputSchema.properties.*`.
+- Long string defaults (>32 chars of prose) under any nested
+  `default` key; short numeric / boolean / short-enum defaults stay
+  because they are load-bearing for client-side argument
+  construction.
+
+Preserved on the bare wire: the top-level short `description`
+(≤ 50 cl100k tokens) and the full `inputSchema` shape (`type`,
+`enum`, `default`, `minimum`, `maximum`, `required`, `items`) so
+callers can still construct valid arguments. NHI agents that need
+the full prose surface call `memory_capabilities { family=<f>,
+include_schema: true, verbose: true }` — the verbose drilldown
+returns the un-trimmed schemars schema.
 
 **New HTTP endpoint**: Add route in `main.rs` router → implement handler in `handlers.rs` using `Db` extractor.
+
+**New database operation** (post-#961, SAL boundary cleanup): land the
+operation on the `MemoryStore` trait in `src/store/mod.rs` FIRST. Implement it
+on `SqliteStore` (`src/store/sqlite.rs` — typically a thin delegate to an
+existing `crate::storage::*` free-function) AND on `PostgresStore`
+(`src/store/postgres.rs` — sqlx-native). Then call it from handlers as
+`app.store.<method>(...).await`. Do NOT add the operation as a fresh
+`crate::storage::*` free-function only — the postgres adapter will not pick
+it up and the postgres-route-gate will surface 501. The legacy `storage/`
+free-function surface continues to host primitives that the sqlite adapter
+delegates to (FTS sync, schema migrations, rusqlite-Connection-bound helpers),
+but new public operations live on the trait.
 
 ## Code Style
 

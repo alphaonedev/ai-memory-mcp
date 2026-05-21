@@ -3,8 +3,59 @@
 
 //! MCP `memory_verify` handler.
 
+use crate::mcp::registry::McpTool;
 use crate::{db, validate};
+use schemars::JsonSchema;
+use serde::Deserialize;
 use serde_json::{Value, json};
+
+// --- D1.4 (#985): per-tool McpTool impl for `memory_verify` (graph family) ---
+
+/// v0.7.0 #972 D1.4 (#985) — request body for `memory_verify`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct VerifyRequest {
+    /// Composite id 'source_id--relation-->target_id'.
+    #[serde(default)]
+    pub link_id: Option<String>,
+
+    /// Required when link_id omitted.
+    #[serde(default)]
+    pub source_id: Option<String>,
+
+    /// Required when link_id omitted.
+    #[serde(default)]
+    pub target_id: Option<String>,
+
+    /// Default related_to.
+    #[serde(default)]
+    pub relation: Option<String>,
+}
+
+/// v0.7.0 #972 D1.4 (#985) — `McpTool` impl for `memory_verify`.
+#[allow(dead_code)]
+pub struct VerifyTool;
+
+impl McpTool for VerifyTool {
+    fn name() -> &'static str {
+        "memory_verify"
+    }
+    fn description() -> &'static str {
+        "Re-verify a stored memory_links row's Ed25519 signature on demand."
+    }
+    fn docs() -> &'static str {
+        "H4: re-verify link signature. Returns {signature_verified, attest_level, signed_by, signed_at}. Pass link_id composite ('source--relation-->target') or explicit triple."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(VerifyRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "graph"
+    }
+}
+
 /// v0.7 H4 — `memory_verify` MCP tool handler.
 ///
 /// Looks up the named link by composite PK, re-derives the canonical
@@ -74,7 +125,8 @@ pub fn handle_verify(conn: &rusqlite::Connection, params: &Value) -> Result<Valu
     // Validate the IDs / relation through the same gate `memory_link`
     // uses on the write path — keeps the verify surface from being a
     // back-door past the validator.
-    validate::validate_link(&source_id, &target_id, &relation).map_err(|e| e.to_string())?;
+    validate::RequestValidator::validate_link_triple(&source_id, &target_id, &relation)
+        .map_err(|e| e.to_string())?;
 
     let record = db::get_link_for_verify(conn, &source_id, &target_id, &relation)
         .map_err(|e| e.to_string())?
@@ -171,4 +223,26 @@ pub fn handle_verify(conn: &rusqlite::Connection, params: &Value) -> Result<Valu
         "signed_by": signed_by,
         "signed_at": signed_at,
     }))
+}
+
+#[cfg(test)]
+mod d1_4_985_tests {
+    //! D1.4 (#985) — schema-parity for `memory_verify`.
+    use super::*;
+    use crate::mcp::d1_4_985_helpers::{
+        assert_descriptions_match, assert_property_set_parity, derived_props_for,
+    };
+
+    #[test]
+    fn memory_verify_parity_985() {
+        let derived = derived_props_for::<VerifyRequest>();
+        assert_property_set_parity("memory_verify", &derived);
+        assert_descriptions_match("memory_verify", &derived);
+    }
+
+    #[test]
+    fn memory_verify_tool_metadata_985() {
+        assert_eq!(VerifyTool::name(), "memory_verify");
+        assert_eq!(VerifyTool::family(), "graph");
+    }
 }

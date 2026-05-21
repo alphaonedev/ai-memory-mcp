@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
+
 //! Storage Abstraction Layer (SAL) **adapter contract tests**.
 //!
 //! v0.6.3 W11 / S11a. Both `SqliteStore` and `PostgresStore` implement
@@ -79,6 +81,7 @@ fn make_memory(namespace: &str, title: &str, content: &str) -> Memory {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     }
 }
 

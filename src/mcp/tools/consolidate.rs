@@ -57,7 +57,8 @@ pub(super) fn handle_consolidate(
         );
     };
 
-    validate::validate_consolidate(&ids, title, &summary, namespace).map_err(|e| e.to_string())?;
+    validate::RequestValidator::validate_consolidate(&ids, title, &summary, namespace)
+        .map_err(|e| e.to_string())?;
 
     // v0.7.0 K9 — unified permission pipeline (consolidate-side).
     {
@@ -189,6 +190,86 @@ pub(super) fn handle_consolidate(
     );
 
     Ok(result)
+}
+
+// --- D1.5 (#986): per-tool McpTool impl for memory_consolidate ---
+
+use crate::mcp::registry::McpTool;
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+/// v0.7.0 #972 D1.5 (#986) — request body for `memory_consolidate`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct ConsolidateRequest {
+    /// Source ids (2-100).
+    pub ids: Vec<String>,
+
+    /// Consolidated title.
+    pub title: String,
+
+    /// Optional summary; LLM auto-generates at smart/autonomous tier.
+    #[serde(default)]
+    pub summary: Option<String>,
+
+    #[serde(default)]
+    pub namespace: Option<String>,
+
+    // The legacy description leads with "#908" which schemars's
+    // markdown-heading stripper would otherwise interpret as an H1
+    // and route into `title` instead of `description`. Use the
+    // `#[schemars(description = ...)]` attribute to force schemars to
+    // emit the string as `description` byte-for-byte.
+    #[schemars(description = "#908 consolidator agent_id.")]
+    #[serde(default)]
+    pub agent_id: Option<String>,
+}
+
+/// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_consolidate`.
+#[allow(dead_code)]
+pub struct ConsolidateTool;
+
+impl McpTool for ConsolidateTool {
+    fn name() -> &'static str {
+        "memory_consolidate"
+    }
+    fn description() -> &'static str {
+        "Consolidate multiple memories into one long-term summary."
+    }
+    fn docs() -> &'static str {
+        "Merge 2-100 sources into one long-tier memory; deletes sources, adds derived_from links. LLM auto-generates summary if omitted (smart/autonomous tier)."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(ConsolidateRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "power"
+    }
+}
+
+#[cfg(test)]
+mod d1_5_986_tests {
+    //! D1.5 (#986) — schema parity for `memory_consolidate`.
+    //! Shared helpers live at [`crate::mcp::parity_test_helpers`].
+    use super::*;
+    use crate::mcp::parity_test_helpers::{
+        assert_descriptions_match, assert_property_set_parity, derived_props_for,
+    };
+
+    #[test]
+    fn consolidate_parity_986() {
+        let derived = derived_props_for::<ConsolidateRequest>();
+        assert_property_set_parity("memory_consolidate", &derived);
+        assert_descriptions_match("memory_consolidate", &derived);
+    }
+
+    #[test]
+    fn consolidate_tool_metadata_986() {
+        assert_eq!(ConsolidateTool::name(), "memory_consolidate");
+        assert_eq!(ConsolidateTool::family(), "power");
+    }
 }
 
 // ---------------------------------------------------------------------------

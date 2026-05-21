@@ -5,10 +5,116 @@
 
 use crate::embeddings::Embed;
 use crate::hnsw::VectorIndex;
+use crate::mcp::registry::McpTool;
 use crate::models::{EditSource, Tier};
 use crate::storage::VersionConflict;
 use crate::{db, validate};
+use schemars::JsonSchema;
+use serde::Deserialize;
 use serde_json::{Value, json};
+
+// --- D1.6 (#987): per-tool McpTool impl for `memory_update` (lifecycle family) ---
+
+/// v0.7.0 #972 D1.6 (#987) — request body for `memory_update`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct UpdateRequest {
+    /// Memory ID.
+    pub id: String,
+
+    #[serde(default)]
+    pub title: Option<String>,
+
+    #[serde(default)]
+    pub content: Option<String>,
+
+    #[serde(default)]
+    pub tier: Option<String>,
+
+    #[serde(default)]
+    pub namespace: Option<String>,
+
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+
+    #[serde(default)]
+    pub priority: Option<i64>,
+
+    #[serde(default)]
+    pub confidence: Option<f64>,
+
+    /// RFC3339 or null to clear.
+    #[serde(default)]
+    pub expires_at: Option<String>,
+
+    /// JSON metadata.
+    ///
+    /// **#1009 fix:** typed as `Map<String, Value>` (same as
+    /// StoreRequest::metadata — emits `type: "object"` on the wire,
+    /// aligns the implementation with the pinned F15 #859/#912 discovery
+    /// contract).
+    #[serde(default)]
+    pub metadata: Option<serde_json::Map<String, Value>>,
+
+    #[schemars(description = "#884 If-Match; mismatch → 409 envelope.")]
+    #[serde(default)]
+    pub expected_version: Option<i64>,
+
+    #[schemars(description = "#888 'human'=in-place; 'llm'/'hook'=archive+supersede.")]
+    #[serde(default)]
+    pub edit_source: Option<String>,
+
+    #[schemars(description = "#906 update source_uri.")]
+    #[serde(default)]
+    pub source_uri: Option<String>,
+}
+
+/// v0.7.0 #972 D1.6 (#987) — `McpTool` impl for `memory_update`.
+#[allow(dead_code)]
+pub struct UpdateTool;
+
+impl McpTool for UpdateTool {
+    fn name() -> &'static str {
+        "memory_update"
+    }
+    fn description() -> &'static str {
+        "Update an existing memory by ID (only provided fields change)."
+    }
+    fn docs() -> &'static str {
+        "Partial update by id. Omitted fields preserved. Tier monotone-only. metadata.agent_id preserved."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(UpdateRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "lifecycle"
+    }
+}
+
+#[cfg(test)]
+mod d1_6_987_tests {
+    //! D1.6 (#987) — schema parity for `memory_update`.
+    use super::*;
+    use crate::mcp::parity_test_helpers::{
+        assert_descriptions_match, assert_property_set_parity, derived_props_for,
+    };
+
+    #[test]
+    fn update_parity_987() {
+        let derived = derived_props_for::<UpdateRequest>();
+        assert_property_set_parity("memory_update", &derived);
+        assert_descriptions_match("memory_update", &derived);
+    }
+
+    #[test]
+    fn update_tool_metadata_987() {
+        assert_eq!(UpdateTool::name(), "memory_update");
+        assert_eq!(UpdateTool::family(), "lifecycle");
+    }
+}
+
 pub(super) fn handle_update(
     conn: &rusqlite::Connection,
     params: &Value,

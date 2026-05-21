@@ -60,6 +60,7 @@
 //! the CI matrix without live PG green.
 
 #![cfg(feature = "sal-postgres")]
+#![allow(clippy::needless_update)]
 
 use ai_memory::models::{ConfidenceSource, Memory, MemoryKind, Tier};
 use ai_memory::store::postgres::PostgresStore;
@@ -103,6 +104,7 @@ fn fresh_memory(title: &str, namespace: &str) -> Memory {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     }
 }
 

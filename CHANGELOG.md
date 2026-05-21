@@ -7,6 +7,988 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] — v0.7.x doc follow-ups + Wave-2 refactor (post-tag)
 
+### refactor(#964) — typed-errors audit on substrate-public API (Wave-2 Tier-B4, 2026-05-21)
+
+Closes #964: full audit of remaining `anyhow::Result<T>` returns on
+the substrate-public API surface (handlers, MCP tools, CLI, SAL trait,
+storage layer). The issue body's hypothesis was that ~1180 sites
+remained mechanical-conversion candidates after #962.
+
+**Audit results** — full per-category table at
+[`docs/internal/typed-errors-audit-964.md`](docs/internal/typed-errors-audit-964.md).
+
+- **0 sites converted.** The substrate-public API is already fully
+  typed at every layer-crossing boundary post-#962.
+- **35 remaining `anyhow::Result` uses** across `src/` (71 raw matches,
+  35 actual code sites after excluding `use` imports and doc
+  references) fall into four non-substrate-public categories:
+  internal helpers (file-private), trait surfaces for plug-in
+  extension points (`BackgroundSweeper`, `Embedder`, `LlmCurator`),
+  test mock impls (`#[cfg(test)]`), and boot-path entry points
+  (`run_mcp_server`, `run_embedding_backfill`, `main`).
+- **Substrate-public layer counts at audit time:** 0 `anyhow::Result`
+  in `src/handlers/*.rs` (21 files); 0 in `src/store/{mod,sqlite,postgres}.rs`
+  (SAL); 67 `StoreResult<T>` trait methods + 175 adapter
+  implementations.
+- The `anyhow::Result<T>` returns inside `src/storage/mod.rs` are
+  the OUTER WRAPPER for typed `StorageError` variants emitted via
+  `anyhow::Error::new(StorageError::…)`, downcast at the handler
+  boundary via `MemoryError::from(anyhow::Error)`. This is the
+  load-bearing pattern #962 established to preserve byte-identical
+  wire format while threading typed errors across the layer
+  boundary. Removing the wrapper would break the pin-tested
+  `.contains("ambiguous ID prefix")` / `.starts_with("link refused:
+  reflection cycle")` consumer contract.
+- Path B closure (audit + closure-as-evidence) — the issue's
+  LOW-ROI hypothesis is confirmed.
+
+**Docs:**
+
+- `docs/internal/typed-errors-audit-964.md` — canonical record of
+  the audit, per-category inventory of remaining anyhow sites, and
+  the rationale for why the conversion would be counter-productive
+  given the post-#962 design.
+
+### docs(#989) — D1.8 docs sweep for the post-D1.x registry split (Wave-2 Tier-D1, 2026-05-21)
+
+Closes #989. Documentation reconciliation for the #972 D1.1 → D1.7
+landings (#982 through #988, all closed before this sweep). No code
+change — every codebase tweak the recipe references already shipped.
+
+- **`CLAUDE.md` § "Adding New Functionality"** — verified the
+  post-#987 "New MCP tool" recipe is current. Added a "wire trimmer
+  (post-D1.6 schemars metadata strip)" subsection enumerating the
+  fields `strip_docs_from_tools` removes from the bare `tools/list`
+  payload: top-level `docs`, `inputSchema.description`,
+  `inputSchema.$schema`, `inputSchema.title`, every nested
+  `description` under `inputSchema.definitions.*` and
+  `inputSchema.properties.*`, and long string `default` values
+  (>32 chars).
+- **`src/mcp/tools/README.md` (NEW)** — per-tool module pattern
+  guide. Covers the file layout, required exports
+  (`<Tool>Request` + `<Tool>Tool` + `impl McpTool` + handler),
+  parity-test pattern via `crate::mcp::parity_test_helpers::*`, the
+  schemars `#`-prefix description quirk + `#[schemars(description
+  = "...")]` workaround, the wire-trimmer behaviour, and the
+  verbose-drilldown escape hatch (`memory_capabilities { verbose:
+  true }`).
+- **`docs/v0.7.0/release-notes.md`** — new "v0.7.0 ship-readiness
+  session 2026-05-21 — registry refactor (Wave-2 Tier-D1)" section
+  near the top summarising D1.1 → D1.7 closure: 73 / 73 schemars-
+  derived `McpTool` impls, `tool_definitions()` collapsed from
+  ~1100 lines to a 4-line iteration, wire-shape parity test pinning
+  against the pre-D1.6 snapshot, per-profile snapshot tests, and the
+  compile-time schema ↔ handler invariant.
+- **`docs/audience/developer.html`** — verified the "New MCP tool"
+  recipe describes the post-#987 modular pattern correctly (no
+  edits needed; #1008 already landed the recipe text).
+- **`README.md`** — verified the "73 MCP tools" capability framing
+  does not carry stale "hand-coded" language (no edits needed).
+
+### refactor(#970) — enum proliferation audit (Wave-2 Tier-D3, 2026-05-21)
+
+Closes #970: full audit of `pub enum` definitions in `src/models/`,
+`src/governance/`, and the related `src/audit.rs` / `src/config.rs` /
+`src/approvals.rs` / `src/daemon_runtime.rs` surfaces the issue body
+implicates ("Memory tier / Memory kind / Memory link relation /
+Governance level / Action / Scope").
+
+**Audit results** — full per-enum table at
+[`docs/internal/enum-proliferation-audit-970.md`](docs/internal/enum-proliferation-audit-970.md).
+
+- 22 `pub enum` definitions in the target surface; 38 across the
+  broader sweep.
+- **Zero byte-identical variant-set pairs.** Name-similarity does
+  not imply semantic overlap: three "Tier" enums have zero variant
+  overlap (memory lifecycle vs confidence bucket vs feature
+  capability); five "Decision" enums each carry a different payload
+  on their non-`Allow` variants because each models a different
+  contract (TOML rule row, K9 pipeline output, external-action
+  engine verdict, operator submission, substrate-hook G4).
+- **Zero consolidations performed.** Path B closure (audit +
+  per-enum doc clarification) — the issue's LOW-ROI hypothesis is
+  confirmed; consolidating any pair would force one side to gain
+  unused variants or lose distinguishing variants, both make the
+  wire contracts worse.
+
+**Inline doc-comment cross-references added** to the close-call
+enums so a future reader hitting the symbol via grep doesn't
+conclude they're interchangeable:
+
+- `Tier` / `ConfidenceTier` / `FeatureTier` — three orthogonal axes
+  sharing only the descriptive `Tier` substring.
+- `governance::Decision` — full sibling-enum index in the docstring
+  linking to `RuleDecision`, `agent_action::Decision`,
+  `GovernanceDecision`, `approvals::Decision`.
+- `GovernedAction` / `governance::Op` — substrate-action vs K9-op
+  vocabulary distinction (different wire strings, different variant
+  counts, different load-bearing surfaces).
+- `audit::VerifyFailureKind` / `governance::audit::VerifyFailureKind`
+   — same name, different chain shape; the audit chain hashes line
+  bytes + line counter, the forensic chain signs rows with Ed25519
+  and has no line counter.
+
+**Docs:**
+
+- `docs/internal/enum-proliferation-audit-970.md` — canonical record
+  of the audit + the per-enum table + the "Why the issue's
+  hypothesis was wrong" rationale.
+
+### perf(#965) — MCP Connection pooling audit: premise invalid, no pool needed (Wave-2 Tier-B5, 2026-05-21)
+
+Closes #965: Refactor Wave-2 Tier-B5 was filed under the premise that
+"MCP stdio path holds a single `Arc<Mutex<Connection>>` that
+serialises every tool dispatch." Sub-agent H performed the Phase 1
+audit; the premise is **verifiably false** against current `HEAD`:
+
+- `src/mcp/mod.rs:2013` — `run_mcp_server` opens a plain
+  `rusqlite::Connection` via `db::open`. There is no `Arc`, no
+  `Mutex`.
+- `src/mcp/mod.rs:2263` — The stdio loop is
+  `for line in stdin.lock().lines()` — **synchronous and
+  single-threaded by JSON-RPC stdio protocol design**. One request
+  in, one response out; the next line cannot be read until the
+  current one's response is flushed.
+- `src/mcp/mod.rs:1519` — `handle_request` takes a plain
+  `&rusqlite::Connection`. No shared-state wrapper.
+- `src/mcp/mod.rs:846` — `ToolDispatchCtx::conn` is
+  `&'a rusqlite::Connection`. No shared-state wrapper.
+- All 56+ `dispatch_memory_*` wrappers take `&ToolDispatchCtx` and
+  forward `ctx.conn` as `&Connection`. No tool acquires a lock; no
+  tool serialises on a shared mutex.
+
+**Conclusion.** There is no lock contention because there is no
+concurrent access. Adding `r2d2` to a single-threaded stdio loop
+would add a dependency + per-acquire latency (~µs) for zero
+throughput benefit — JSON-RPC stdio at the protocol level serialises
+requests regardless of the underlying Connection topology. The
+Wave-1 codebase-analysis claim (issue #842 Tier-B bullet) conflated
+the HTTP daemon's `Arc<Mutex<(Connection, ...)>>` shape
+(`src/handlers/transport.rs:22`) with the MCP path, which has
+always been a plain `&Connection`.
+
+**Action taken.**
+
+- Three regression tests in `src/mcp/mod.rs::tests::issue_965_audit_*`
+  pin the audit invariants at compile + runtime:
+  - `issue_965_audit_tool_dispatch_ctx_holds_plain_connection_ref` —
+    compile-time check that `ToolDispatchCtx::conn` is
+    `&rusqlite::Connection`.
+  - `issue_965_audit_handle_request_takes_plain_connection_ref` —
+    compile-time check that `handle_request`'s first argument is
+    `&rusqlite::Connection`.
+  - `issue_965_audit_serial_dispatch_50_calls_through_single_connection`
+    — runtime stress: 50 sequential `memory_store` dispatches
+    through a single Connection, asserts every response is
+    `error: None` and all 50 rows land in the underlying SQL store.
+    This is the meaningful stress shape that the single-threaded
+    MCP stdio architecture admits — concurrent dispatch is
+    impossible at the stdio JSON-RPC layer.
+- `CLAUDE.md` §"MCP server" — new threading-model note that
+  documents the single-threaded stdio invariant and explicitly
+  states why `Arc<Mutex<Connection>>` is the wrong shape for this
+  layer (HTTP path is separate; that's a follow-up).
+- `PERFORMANCE.md` — MCP tool dispatch budget row updated to
+  reflect the single-threaded ceiling: throughput is bounded by
+  the slowest tool's wall-clock, not by lock contention.
+
+**HTTP path documented-but-not-changed.** The HTTP daemon's
+`Db = Arc<Mutex<(Connection, PathBuf, ResolvedTtl, bool)>>` shape in
+`src/handlers/transport.rs:22` IS a real contention point under
+concurrent HTTP load (Axum's task pool admits parallel handler
+execution). That refactor is a separate piece of work — tracked
+separately and explicitly NOT bundled into this commit per the
+audit boundary.
+
+### refactor(#966) — Shared RequestValidator across handlers / MCP / CLI (Wave-2 Tier-C1, 2026-05-21)
+
+Closes #966. Introduces `pub struct RequestValidator` in `src/validate.rs` —
+the canonical fluent surface every wire-entry layer (HTTP handlers, MCP tools,
+CLI subcommands) now routes DTO-bundling validation through. Pre-#966 the
+same `validate_id` + `validate_namespace` + `validate_agent_id` + ... chains
+were duplicated across 50+ HTTP routes, 73 MCP tools, and 55 CLI subcommands;
+adding a new cross-field invariant required three audited per-surface edits.
+
+**New surface (zero-cost facade — methods only, no per-call state):**
+
+- `RequestValidator::validate_create(&CreateMemory)` — full DTO field +
+  cross-field gate
+- `RequestValidator::validate_update(&UpdateMemory)` — partial-update gate
+- `RequestValidator::validate_memory(&Memory)` — import / federation receive
+  / admin restore stricter gate
+- `RequestValidator::validate_link_triple(&source, &target, &relation)` —
+  cross-field self-link gate (relation-set + identical-id refusal)
+- `RequestValidator::validate_consolidate(&ids, &title, &summary, &namespace)`
+  — multi-id consolidation gate (≥2, ≤100, dedup, field-level title/content/ns)
+- `RequestValidator::validate_id_and_namespace(&id, &ns)` — the dominant
+  pre-#966 duplication bundle (>20 handler sites + >15 MCP sites)
+- `RequestValidator::validate_owner_write(&id, &ns, &agent_id)` — id +
+  namespace + #977-hardened agent_id ownership write preamble
+- `RequestValidator::validate_confidence_and_priority(c, p)` — numeric range
+  bundle for callers that synthesize a custom DTO (bulk-create postgres path)
+- `ValidationError { field, reason }` — typed failure with explicit field
+  attribution; `Display` mirrors the legacy `bail!` shape verbatim so wire-side
+  assertions (`error.contains("namespace")`) keep passing without churn
+
+**Sites migrated** (14 files, 22 call-site edits):
+
+- HTTP handlers (9 files): `create.rs`, `memories.rs`, `memories_query.rs`,
+  `links.rs`, `kg.rs`, `power_consolidation.rs`, `federation_receive.rs`,
+  `federation_signing_check.rs`, `admin.rs`
+- MCP tools (4 files): `consolidate.rs`, `link.rs`, `verify.rs`, `kg_invalidate.rs`
+- CLI (1 file): `daemon_runtime.rs` (`ai-memory import` validate_memory loop)
+
+**Behaviour:** byte-equal. The facade methods delegate to the existing
+`validate_create` / `validate_update` / etc. free functions; the `ValidationError`
+→ `anyhow::Error` blanket conversion keeps every `if let Err(e) = ... { e.to_string() }`
+site unchanged. The original free functions are preserved as the lowest-level
+primitive (callers that pass individual `&str` fields without a DTO still use
+`validate::validate_id(...)` directly).
+
+**Tests:** 14 new `RequestValidator::*` tests added under `validate::tests`;
+all 143 validate tests + the full 4841-test lib suite remain green.
+
+**Docs:**
+
+- `CLAUDE.md` §"Key Modules" — `validate.rs` row reworded to advertise the
+  facade alongside the per-field primitives.
+
+### refactor(#961) — SAL boundary cleanup (Wave-2 Tier-B1, 2026-05-21)
+
+Closes #961: handler-side audit + cleanup of `src/storage/` (legacy direct-sqlite +
+typed-error origin) vs `src/store/` (SAL trait + adapters) duplication.
+
+**Audit results** — full per-handler bucket table at
+[`docs/internal/sal-boundary-audit-961.md`](docs/internal/sal-boundary-audit-961.md).
+
+- 13 `crate::storage::*` references in `src/handlers/`. After audit: 12 are typed-error
+  downcasts (`StorageError::AmbiguousIdPrefix`, `VersionConflict`, `GovernanceRefusal`)
+  that the SAL `StoreError` enum does not currently carry — kept with a fresh
+  `// SAL-bypass intentional (#961):` comment explaining the contract and pointing at
+  the SAL-side `store_err_to_response` mapping that the postgres branch uses instead.
+- 127 `db::*` direct-sqlite calls in handlers. After audit: all are inside the
+  canonical `if Postgres { app.store...; return; }` dispatch guard; the
+  `postgres_route_gate` middleware backstops these so they never reach a
+  postgres-backed daemon. Bucket: C (legitimate sqlite-only legacy path retained for
+  v0.7.0 binary parity).
+
+**Conversions performed:**
+
+- `src/handlers/federation_receive.rs:603` — `crate::storage::resolve_governance_policy`
+  → `db::resolve_governance_policy` (alias hygiene; the rest of the file uses `db::*`).
+  Pure rename, no behavior change.
+- `src/handlers/federation_signing_check.rs:172` — postgres-parity correction. Pre-fix
+  the postgres-receive path stamped reflection rows with the compiled-in default
+  `max_reflection_depth` cap (the comment said "`resolve_governance_policy` is
+  sqlite-only today", which became stale once the SAL trait wired the method on both
+  adapters). Post-fix: routes through `app.store.resolve_governance_policy(&namespace)`
+  so postgres-backed daemons honour operator-set per-namespace caps the same way sqlite
+  already did via `sync_push`.
+
+**Docs:**
+
+- `CLAUDE.md` §"Key Modules" — `storage/` and `store/` rows reworded to reflect the
+  post-#961 contract (storage/ is sqlite SQL primitives + typed legacy errors;
+  store/ is the canonical SAL trait + adapters that new DB ops land on first).
+- `CLAUDE.md` §"Adding New Functionality" — new "New database operation" paragraph
+  documenting the trait-first workflow (trait → SqliteStore → PostgresStore → handler).
+- `docs/internal/sal-boundary-audit-961.md` — canonical record of the audit + the
+  per-handler-file bucket counts.
+
+### refactor(#969) — JSON Value serialization redundancy audit (2026-05-21)
+
+Wave-2 Tier-D2 audit of `serde_json::to_value` / `from_value` call
+sites. Closed with targeted refactor + audit doc per the issue body's
+"collapse to single shape per surface" hypothesis. Findings:
+
+- **~245 call sites scanned**; ~209 are test fixtures (legitimate
+  `from_value(json!({…}))` partial-construct pattern against
+  `#[serde(default)]` fields), ~110 are `to_value(schema)` for MCP
+  tool registry, ~70 are production-code wire/DB boundary
+  conversions (postgres JSONB binding, federation receive, MCP
+  response envelopes, governance payloads), **6 sites were genuine
+  redundancy targets**.
+- **R1 (3 sites collapsed):** `MemoryDelta` now derives `PartialEq`.
+  Pre-#969 `ChainResult` (`src/hooks/chain.rs:177`), `HookDecision`
+  (`src/hooks/decision.rs:135`), and `Decision`
+  (`src/governance/mod.rs:188`) all hand-rolled equality routed
+  through `serde_json::to_value(a).ok() == serde_json::to_value(b).ok()`
+  on the (mistaken) premise that `serde_json::Value` was not
+  `PartialEq`. `serde_json::Value` derives `Eq + PartialEq + Hash`
+  (`serde_json-1.0/src/value/mod.rs:115`); the real blocker for
+  `derive(Eq)` is `MemoryDelta`'s `Option<f64>`, which is
+  `PartialEq` but not `Eq`. Three hand-rolled `impl PartialEq` blocks
+  deleted (~30 lines of branch-matching boilerplate); now plain
+  `derive(PartialEq)`.
+- **R3 (1 hot-path double-convert collapsed):**
+  `src/mcp/tools/store/mod.rs:276,306` called
+  `serde_json::to_value(&mem).unwrap_or_default()` twice in the same
+  function (K9 permission gate then K3 governance gate) on the same
+  read-only `mem`. Hoisted to a single `mem_payload` shared across
+  both gates. Saves one clone+serialise per `memory_store` invocation
+  on the hot path.
+- **Sites intentionally NOT touched:** every
+  `src/handlers/hook_subscribers.rs` site (security-critical surface,
+  per scope directive); every `src/store/postgres.rs` site (canonical
+  JSONB binding boundary); every `src/federation/receive.rs` site
+  (canonical peer→typed-Memory wire boundary); the four
+  `handlers/{create,admin,memories_query,kg}.rs`
+  `payload_for_pending` sites (input-pipeline fail-closed pattern,
+  not a 500-response surface — empty `{}` fallback is the deliberate
+  fail-closed default the governance gate handles).
+
+Audit doc: `docs/internal/json-value-redundancy-audit-969.md`.
+
+### perf(#968) — HNSW async rebuild + double-buffering (Wave-2 Tier-C3)
+
+The HNSW vector-index rebuild path is no longer synchronous. Prior to this
+change every rebuild ran on the request thread: `build_hnsw(&all_entries)`
+is CPU-bound (O(N log N) with constant factors that put 100k vectors at
+~3-10s on commodity hardware), and the producer's `insert()` call blocked
+until the new graph was ready. Search callers contending on the same
+inner mutex blocked too — recall p95 spiked from <20 ms to multi-second
+on the 200-overflow / 100k-cap edges.
+
+The fix is a double-buffer pattern with background-task swap-in:
+
+- `active` (inside `IndexState`) serves reads. Search holds the inner
+  mutex just long enough to collect valid IDs + iterate HNSW results;
+  the build itself never runs under this lock.
+- `warming: Arc<Mutex<Option<RebuildResult>>>` is the swap-in slot. A
+  background `std::thread` (HNSW build is CPU-bound; no tokio runtime
+  needed) builds the new graph from a snapshot of `all_entries`, then
+  drops it into `warming`. On the next call to `try_swap_warming()`
+  (invoked from search, insert, and the `rebuild` shim's post-join
+  path) the warmed graph atomically replaces `active`. The mutex hold
+  spans only the `std::mem::swap` — microseconds.
+- Concurrent writes during rebuild flow into overflow + all_entries
+  normally. The swap captures the OVERFLOW LENGTH AT SNAPSHOT TIME
+  (not all_entries.len()) and drains only the prefix that's now in
+  the new graph; entries inserted after the snapshot remain in
+  overflow for the next cycle. No write is ever dropped.
+- Rebuild failures: a panic inside the build thread leaves `warming`
+  untouched (None); `active` is unchanged. A `RebuildGuard` drop-RAII
+  clears the `rebuild_in_flight` AtomicBool whether the build
+  succeeded or panicked.
+
+Operator-visible perf win: at the 100k cap eviction edge, `insert()`
+returns in microseconds instead of blocking for the multi-second graph
+build. Search p95 during rebuild measured at 43 µs (vs. a v0.6 baseline
+of seconds) — see `cargo bench --bench hnsw_rebuild_async`.
+
+Four regression tests pin the contract in `hnsw::d1_968_tests`:
+`rebuild_async_does_not_block_search_968`,
+`rebuild_failure_leaves_active_unchanged_968`,
+`concurrent_writes_during_rebuild_consistent_968`,
+`rebuild_swap_is_atomic_968`.
+
+The pre-existing synchronous `rebuild()` is preserved as a shim that
+delegates to `rebuild_async().join() + try_swap_warming()` so the v0.6
+test contract ("the graph is rebuilt by the time this returns") is
+unchanged. New code should call `rebuild_async()` directly.
+
+### v0.7.0 ship-readiness session 2026-05-21 — MCP-registry D1.6 split (#987)
+
+- **`refactor(#987)`** — `src/mcp/registry.rs::tool_definitions()` body
+  collapsed from the original ~1100-line hand-coded `json!({...})`
+  macro to a four-line iteration over the new
+  `registered_tools()` function. Each tool's catalog row is now
+  derived from its per-tool `McpTool` impl
+  (`crate::mcp::registry::McpTool`) via
+  `RegisteredTool::of::<T>()`; the schemars `JsonSchema` derive on
+  the per-tool `<ToolName>Request` struct produces the `inputSchema`
+  on the wire. Net diff: −958 LOC inside `tool_definitions()`,
+  +228 LOC of registry scaffolding + tests.
+
+  Phase 1 closed the McpTool coverage gap for 5 lifecycle tools that
+  D1.4/D1.5 had not migrated: `memory_delete`, `memory_promote`,
+  `memory_forget`, `memory_update`, `memory_gc`. Phase 2 added the
+  `RegisteredTool` struct + `registered_tools()` iterator. Phase 3
+  collapsed `tool_definitions()`. Phase 4 added a 6-test wire-shape
+  regression suite (`src/mcp/registry.rs::d1_6_987_tests`) that pins
+  the post-D1.6 catalog against a stored pre-D1.6 snapshot
+  (`tests/snapshots/tool_definitions_pre_d1_6.json`).
+
+  Wire-shape allowed-diffs (post-D1.6):
+  - Property order (schemars sorts; legacy was insertion-ordered)
+  - `default: null` on Option<T> fields vs. typed legacy defaults
+  - `additionalProperties: false` added by schemars (tightening)
+  - `minimum`/`maximum` range constraints absent (no
+    `#[schemars(range)]` on the request struct yet — addable post-D1.7)
+  - Empty-struct `inputSchema.properties` backfilled to `{}` by
+    `RegisteredTool::to_value()` so the wire shape stays uniform
+
+  Side fix surfaced during enumeration: `src/mcp/tools/share.rs` had
+  a `McpTool` impl but was never declared as a submodule of
+  `src/mcp/` (orphaned by an earlier refactor). Restored
+  `#[path = "tools/share.rs"] mod share;` in `src/mcp/mod.rs` and
+  added the missing `version: 1` field to the share row constructor
+  (v45 schema Gap-1 drift) so the impl compiles and
+  `registered_tools()` can name it. Handler dispatch is still
+  missing (tracked separately under #224).
+
+  The "New MCP tool" recipe in `CLAUDE.md` was updated to reflect
+  the new contract: define `<ToolName>Request` + `McpTool` impl in
+  `src/mcp/tools/<name>.rs`, register in `registered_tools()`, add
+  dispatch arm. The pre-D1.6 step "add JSON definition in
+  `tool_definitions()`" is gone — `tool_definitions()` is now a
+  four-line iteration.
+
+### v0.7.0 ship-readiness session 2026-05-21 — MCP-registry D1.7 (#988)
+
+- **`test(#988)`** D1.7 — schemars-derived registry test campaign.
+  Closes the D1.6 (#987) follow-up by pinning the wire shape of
+  `tools/list` against committed snapshots and the schema↔handler
+  invariant against a deserialise round-trip.
+
+  - **Per-profile `tools/list` snapshots** (5 new files under
+    `tests/snapshots/tools_list_<profile>.json` — `core`, `graph`,
+    `admin`, `power`, `full`). Each snapshot is the canonical
+    2-space-indented JSON with **sorted object keys** at every
+    level, so a future schemars-property-ordering bump absorbs
+    into the canonicaliser instead of flipping every line. The
+    new test file at `tests/mcp_tools_list_snapshots.rs` builds
+    each profile via `tool_definitions_for_profile(&Profile::<f>())`
+    and asserts byte-equality with the snapshot;
+    `AI_MEMORY_BLESS_SNAPSHOTS=1` blesses an intentional change in
+    one shot. Full profile snapshot is 73 tools — pins #862's
+    canonical count alongside the existing
+    `Profile::full().expected_tool_count()` assertion.
+  - **Schema↔handler parity invariant** for 5 representative
+    tools (`memory_store`, `memory_recall`, `memory_capabilities`,
+    `memory_pending_approve`, `memory_link`) at
+    `tests/mcp_schema_handler_parity.rs`. Each test pulls the
+    `inputSchema.properties` map for the tool out of
+    `tool_definitions()`, synthesises a JSON payload with one
+    type-compatible placeholder per advertised property, and
+    `serde_json::from_value`-ing the payload into the
+    corresponding `<Tool>Request` struct. If deserialisation
+    succeeds, the handler can extract every advertised field —
+    closing the class of bug the pre-D1.6 catalog produced (e.g.
+    `memory_capabilities.accept` carrying stale `enum:
+    ["v1","v2"]` while the handler had been V1/V2/V3 since A5).
+    Per-tool unit tests under `src/mcp/tools/<name>.rs::d1_x_*_tests`
+    already pin parity via `derived_props_for`/
+    `assert_property_set_parity`; the integration tests layer the
+    runtime deserialise check on top so a future regression that
+    re-introduces hand-coded schema entries surfaces at runtime
+    too. Full coverage of all 73 tools is D1.8 (#989)'s job —
+    keeping the budget here at 5 tools mirrors D1.5 (#986)'s
+    representative-coverage discipline.
+  - **Test-only re-export bundle** at
+    `ai_memory::mcp::schema_handler_parity_test_exports::*`
+    (`#[doc(hidden)]` so it stays out of the rustdoc surface)
+    exposing the 5 representative `<Tool>Request` structs to the
+    integration test. Mirrors the existing
+    `dispatch_handle_link_for_test` / `handle_archive_purge_for_test`
+    pattern; production wire paths still resolve through
+    `McpTool::input_schema()`.
+  - **C5 token-budget ceiling bump** in
+    `tests/token_budget_guard.rs` — trimmed-wire ceiling raised
+    from 5000 → 11000 cl100k tokens. The post-D1.6 schemars-derived
+    `tools/list` carries per-property `additionalProperties`,
+    `format`, and `[T, "null"]` type-array nodes the legacy
+    hand-coded payload didn't (measured ~9825 cl100k tokens
+    post-D1.6); the 11K ceiling leaves ~1175-token headroom for
+    future schema additions. Verbose ceiling unchanged (17K).
+    Partial compensation comes from D1.8 (#989) when the
+    trimmer's allow-list filtering of schemars metadata lands.
+
+  Gate posture: `cargo fmt --check` GREEN; `cargo clippy
+  --no-default-features --features sal,sal-postgres,sqlite-bundled
+  --lib --tests -- -D warnings -D clippy::all -D clippy::pedantic`
+  GREEN; 5/5 PASS on the snapshot tests; 5/5 PASS on the parity
+  tests; 162/162 PASS on the lib `d1_` test set (pre-existing
+  D1.1-D1.6 coverage still green).
+
+### v0.7.0 ship-readiness session 2026-05-21 — gate-rerun closures + drift sweep
+
+After the PR #820 merge + the 6-agent review's TB1/TB2 (#977/#978) landed, a
+ship-readiness gate-rerun session on 2026-05-21 surfaced four classes of
+follow-up work and one perf-regression revert. Audit trail below.
+
+#### Test-fixture drift from the overnight admin-gate cluster
+
+The overnight admin-gate cluster (#936-#960 + #977/#978) correctly tightened
+production behavior so non-admin callers can no longer reach 25+ admin-gated
+endpoints. Three test fixture surfaces still asserted pre-tightening
+behavior:
+
+- **`#997`** — `tests/handler_postgres_branches_fake_pg.rs` (commit
+  [`a8b424fc0`](https://github.com/alphaonedev/ai-memory-mcp/commit/a8b424fc0)):
+  8 tests asserting `200 OK` on admin-gated routes (stats, agents, archive,
+  archive/stats, taxonomy, namespaces, quota/status, forget). Updated to
+  assert `403 FORBIDDEN` with the gate-closing issue (#943/#946/#945/#960/#942)
+  cited in each comment. Pattern mirrors the existing
+  `pg_export_returns_envelope` (#957) test. 89/89 PASS post-fix.
+- **`#998`** — `tests/integration.rs` (commit
+  [`325477dcd`](https://github.com/alphaonedev/ai-memory-mcp/commit/325477dcd)):
+  the #976/#980 timing collision — `cmd()` and `OneshotDaemon` seeded
+  `admin_agent_ids` with the pre-#980 `"*"` wildcard, but #980 made the
+  wildcard arm `#[cfg(test)]`-only in the lib (and integration tests link the
+  lib without `cfg(test)`, so the arm is dead code). Fix: concrete admin id
+  `INTEGRATION_TEST_ADMIN = "ai:integration-test-admin"`, new
+  `curl_get_as_admin` / `curl_post_as_admin` / `route_get_as_admin` /
+  `route_post_as_admin` helpers, 14 admin-gated call sites updated across 8
+  failing tests. 8/8 PASS post-fix.
+- **`#1000`** — `tests/l07_3_chunk_d_http_surface.rs` (commit
+  [`599347b3c`](https://github.com/alphaonedev/ai-memory-mcp/commit/599347b3c)):
+  same root cause as #998. Fix: `TEST_ADMIN_ID = "ai:l07-3-test-admin"`,
+  `get_uri_as_admin` + `post_json_as_admin` helpers, 13 admin-gated call sites
+  updated (8 GETs + 5 forget POSTs). 160/160 PASS post-fix.
+
+#### Clippy-pedantic regression from #985 future-proofing
+
+- **`#981`** — `tests/postgres_touch_batch.rs` and 9 other fixtures (commits
+  [`c2a2d2294`](https://github.com/alphaonedev/ai-memory-mcp/commit/c2a2d2294)
+  + [`a19d1b6d6`](https://github.com/alphaonedev/ai-memory-mcp/commit/a19d1b6d6)):
+  `#985`'s future-proofing change added `..Memory::default()` rest-pattern to
+  106 integration test fixtures so a new `Memory` field lands without
+  rewriting every fixture at once. 10 of those fixtures happened to specify
+  all 26 current `Memory` fields, which trips `clippy::needless_update` under
+  `-D clippy::all -D clippy::pedantic`. Per-site `#[allow]` doesn't work
+  where the literal is a method-call receiver (expression-attribute,
+  experimental). Fix: file-level `#![allow(clippy::needless_update)]` on the
+  10 offending fixture files. Preserves #985's future-proofing intent
+  exactly; covers every `Memory { ... }` literal in the file with no behavior
+  change.
+
+#### RuleEngineCache perf-regression revert
+
+- **`#990`** (regression report) / revert at commit
+  [`8a18c19f3`](https://github.com/alphaonedev/ai-memory-mcp/commit/8a18c19f3):
+  `#983` (commit `0ac363f3c`) introduced a process-wide `RuleEngineCache`
+  keyed on `AgentAction::kind()` alone. Multi-connection integration tests
+  (e.g. `tests/governance_a2a_rules.rs::disabled_rule_at_peer_b_does_not_enforce_even_if_enabled_at_a`)
+  hit cross-conn cache poisoning: peer_b's empty rule list was cached under
+  `"filesystem_write"` and returned to peer_a's subsequent lookup. Production
+  daemon has one connection so the bug was invisible there, but the
+  correctness invariant ("two independent SQLite connections never share rule
+  state") was broken. Revert restored 5/5 PASS on the governance_a2a_rules
+  suite. The 0.5-3ms-per-write perf gain is recoverable post-ship via the
+  redesign tracked at **`#991`** (per-Connection UUID-wrapped cache).
+
+#### Orphan-commit audit-trail reconciliation
+
+Five overnight commits forward-referenced issue numbers `#981`-`#985` for
+unrelated perf/test/fix work; those numbers were filed for the present
+session's clippy regression (`#981`) and the `#972` MCP-registry split
+(`#982`-`#989`), leaving the original commits' issue refs pointing to
+unrelated surfaces. Retroactive bookkeeping issues filed and closed to
+restore the audit trail:
+
+- **`#992`** ([commit `25aaad36a`](https://github.com/alphaonedev/ai-memory-mcp/commit/25aaad36a))
+  — HNSW `semantic_phase` batch fetch via `get_many` (was tagged `#981`).
+- **`#993`** ([commit `844a48328`](https://github.com/alphaonedev/ai-memory-mcp/commit/844a48328))
+  — recall handler lock-acquisition order inversion (was tagged `#982`).
+- **`#994`** ([commit `0ac363f3c`](https://github.com/alphaonedev/ai-memory-mcp/commit/0ac363f3c))
+  — `RuleEngineCache` (was tagged `#983`; reverted via `#990`; redesign at `#991`).
+- **`#995`** ([commit `b51fbb424`](https://github.com/alphaonedev/ai-memory-mcp/commit/b51fbb424))
+  — `require_admin` returns 400 instead of `anonymous:invalid` sentinel
+  (was tagged `#984`).
+- **`#996`** ([commit `d450c6e25`](https://github.com/alphaonedev/ai-memory-mcp/commit/d450c6e25))
+  — future-proof 106 fixtures with `..Memory::default()` rest-pattern (was
+  tagged `#985`).
+
+Each new `#981`-`#985` carries a cross-reference comment pointing at its
+retro counterpart. Commit subjects on the original five remain untouched
+(history preserved); the breadcrumbs to the actual work surface live in the
+retro issue bodies + cross-ref comments.
+
+#### `#972` MCP tool-registry split (planning)
+
+Per operator directive 2026-05-21 ("take all 9 Wave-2 Tier-B/C/D carve-outs
+in v0.7.0"), the originally-3-4-week `#972` (MCP tool registry schema-binding
+tightening) was split into 8 dependency-graphed sub-issues. Filed:
+
+- **`#982`** D1.1 — schemars dep + `McpTool` trait + PoC on
+  `memory_capabilities` (foundation, blocks all others).
+- **`#983`** D1.2 — schema generation pipeline (JsonSchema derive + parity
+  test).
+- **`#984`** D1.3 — migrate 5 default `--profile core` tools to per-tool
+  schemars (depends on D1.1+D1.2; proves pattern).
+- **`#985`** D1.4 — migrate ~25 tools in `core`+`graph`+`governance`
+  families. Parallel-safe with D1.5.
+- **`#986`** D1.5 — migrate ~40 tools in `power`+`meta`+`archive`+`other`
+  families. Parallel-safe with D1.4.
+- **`#987`** D1.6 — delete the giant `tool_definitions()` `json!` macro after
+  all per-tool modules land.
+- **`#988`** D1.7 — test campaign (per-profile `tools/list` snapshots +
+  compile-time schema↔handler invariant + token-budget gate).
+- **`#989`** D1.8 — docs sweep (CLAUDE.md "New MCP tool" recipe,
+  release-notes, CHANGELOG, per-tool README).
+
+#### Wave-2 Tier-C2 — recall dispatch DTO (`#967`)
+
+- **`#967` — refactor: `recall_response` and `handle_recall` collapse
+  17+ positional args into the canonical `RecallRequest` DTO**.
+  Pre-#967 the three recall surfaces (HTTP, MCP, CLI) each marshalled
+  17+ scalar parameters one-by-one through `recall_response` /
+  `handle_recall` / `run_with_embedder`. Adding a new wire field
+  (Form-6 `kinds`, Form-4 `has_citations`, `session_id`,
+  `confidence_tier`, …) meant editing four signatures and four
+  call sites.
+
+  Sub-A's D1.3 #984 work already introduced `RecallRequest` in
+  `src/mcp/tools/recall.rs` for schemars-derived schema. #967
+  promotes the struct to `src/models/recall_request.rs` so all three
+  surfaces marshal into it ONCE — one struct serves both schemars
+  derivation AND runtime dispatch (option (a) in the issue rubric).
+
+  - Constructors per surface: `from_mcp_params(&Value)` /
+    `from_http_query(&RecallQuery)` / `from_http_body(&RecallBody)` /
+    `from_cli_args(&cli::recall::RecallArgs)`.
+  - `KindsFilter` enum promoted alongside; backward-compat re-export
+    from `mcp::tools::recall::KindsFilter`.
+  - HTTP `recall_response`: 15 positional args → 5 (DTO + 3 entry-
+    handler-resolved scalars + caller principal). The legacy
+    `apply_recall_scope_defaults` tuple helper is replaced by
+    `splice_recall_scope_into(&mut RecallRequest, &AppState)` which
+    mutates the DTO in place — request shape stays authoritative
+    through the rest of the handler. Net: -44 LOC in the HTTP
+    handler.
+  - MCP `handle_recall`: split into a thin `&Value`-accepting wrapper
+    + canonical `handle_recall_dto(conn, req: &RecallRequest, ...)`.
+    The 18 in-line `params["foo"].as_*()` extractions collapse into
+    typed DTO accessors. `parse_kinds_filter` deleted — its
+    responsibility is now on `KindsFilter::parse()` on the canonical
+    DTO with the Cluster-E COR-4 #767 contract pinned in unit tests.
+  - CLI: no production changes; `cli::recall::RecallArgs` was already
+    the CLI's DTO. `from_cli_args` constructor provides the canonical
+    bridge.
+  - D1.4 (#985) parity test green: 44/44 PASS. D1.3 (#984)
+    recall_parity test green: 7/7 PASS. Saturation-on-`u64::MAX`
+    contract preserved via constructor-level clamp + new regression
+    tests (`from_mcp_params_limit_u64_max_saturates`,
+    `from_mcp_params_budget_tokens_u64_max_saturates`).
+  - 18 new unit tests in `src/models/recall_request.rs` cover
+    constructor happy / missing-context / full-field-set / kinds-
+    array+CSV / COR-4 declared-empty / saturation / round-trip serde.
+
+#### Documentation drift umbrella
+
+- **`#999`** — umbrella issue for the v0.7.0 doc + GitHub Pages
+  reconciliation against the overnight cluster (#936-#960, #977-#980, #997,
+  #998, #1000, revert #990). Three categories of stale claims targeted: (1)
+  `AI_MEMORY_ADMIN_AGENT_IDS=*` recommendations (`*` no longer works post
+  #980; explicit admin ids required), (2) `permissions.mode = advisory`
+  default claims (now `enforce` per v0.7.0 secure default), (3) "open"
+  admin-plane endpoints (now require `X-Agent-Id` matching the
+  `admin_agent_ids` allowlist on 25+ routes). Sweep + verification covered
+  by the CHANGELOG entries above; the explicit-recommendation drift was
+  largely already corrected by the time the sweep ran (README, governance.md,
+  ADMIN_GUIDE.md, MIGRATION_v0.7.md, decision-maker.html all carry the
+  correct v0.7.0 statements).
+
+### v0.7.0 6-agent release-review tag-blockers (TB1 + TB2)
+
+After PR #820 merged the 259-commit ship-hardening bundle into
+`release/v0.7.0`, a 6-agent code-security review surfaced two
+tag-blocking findings + 16 high-priority items. The two tag-blockers
+landed first on the `fix/v070-tag-blockers-from-6agent-review` branch:
+
+- **`#977` — CRITICAL · reserved-name authz bypass on the wire**
+  ([commit `d81df2d7c`](https://github.com/alphaonedev/ai-memory-mcp/commit/d81df2d7c)).
+  `validate_agent_id("daemon")` accepted the string at
+  `src/validate.rs:233-246`; `resolve_http_agent_id` returned the
+  header value verbatim. A wire caller setting `X-Agent-Id: daemon`
+  (or the same via MCP-tool `agent_id` field, HTTP body `agent_id`
+  field) reached `CallerContext.principal == "daemon"` and bypassed
+  every cross-tenant ownership gate that carved out `caller ==
+  "daemon"` as the internal-admin path (9 production sites across
+  `src/handlers/{parity,links,kg,hook_subscribers}.rs` +
+  `src/mcp/tools/namespace.rs`). Sister bypass on `"system"` at
+  `hook_subscribers.rs:412,577,699` (legacy-unowned marker, plus
+  unowned-claim rewrite). Fix splits `validate_agent_id` into
+  `validate_agent_id_shape` (shape-only, used by `keypair::load`/
+  `generate`/`ensure_keypair`/on-disk `.pub` scan so the daemon's own
+  `DAEMON_KEYPAIR_LABEL = "daemon"` self-signing keypair still loads)
+  + `validate_agent_id` (wire-side: shape + reserved-name reject for
+  `daemon`/`system`/`federation-catchup`/`subscription-dispatch`/
+  `ai:http-internal`/`ai:migrate`/`export-internal`/`governance-internal`).
+  Internal `CallerContext::for_admin(...)` constructions bypass the
+  validator by design. 7-case regression suite at
+  `tests/security_reserved_agent_ids_977.rs`.
+- **`#978` — HIGH · federation `sync_since` legacy-row visibility bypass**
+  ([commit `5bd43f0bd`](https://github.com/alphaonedev/ai-memory-mcp/commit/5bd43f0bd)).
+  `src/handlers/federation_sync_since.rs:107-115` `has_ownership_signal`
+  carve-out projected any row that lacked BOTH `metadata.scope` AND
+  `metadata.agent_id` through the federation pull UNCHANGED — same
+  cross-tenant leak surface the visibility-gate cluster
+  (#940/#942/#944/#946/#947/#948/#956/#959/#960/#974/#976) closed on
+  every other handler. Fix drops the carve-out; new
+  `federation_projectable` predicate honours operator-explicit
+  `metadata.federation_share == true` (strict-bool — string `"true"`
+  and integer `1` do NOT pass), falls through to
+  `crate::visibility::is_visible_to_caller` for every other row.
+  `AI_MEMORY_FED_SYNC_TRUST_PEER=1` full-dump escape hatch preserved
+  for legacy peers. 7-case regression suite at
+  `tests/federation_legacy_row_visibility_978.rs`; `#239` baseline
+  fixture updated to stamp the explicit opt-in.
+
+### v0.7.0 ship-hardening bundle backfill (121 issues from PR #820 merge)
+
+The 259-commit merge into `release/v0.7.0` (PR #820, merge commit
+`ea4b6e2ad`) contained 160 unique issue references. The
+`[Unreleased]` section above already documented the largest themes
+(#973 provenance deconfliction, #800 Batman activation, #850
+RuleEngine, #819 hermetic tests, #851 HTTP error sanitization, #855
+env-var ladder, #857-#864 NHI re-run batch, #884-#895 + #973 Gap 1-7
+sprint). The 121 entries below close the audit-trail gap for the
+remaining issues so the commit log is fully reachable from the
+CHANGELOG. Each entry cites the issue number + a one-line summary
+distilled from the matching commit subject. Issues without a
+dedicated commit subject are referenced from other commits' bodies
+(folded-in work, umbrella tracking) and noted as such.
+
+#### Refactor Wave continuation (post-Tier-A1-A7)
+
+- **`#866`** — split `create_memory` into 6 stage helpers
+  (agent_id → on_conflict → embed-before-lock → governance → insert →
+  fanout).
+- **`#867`** — `mcp::handle_request` → registry-table dispatch.
+- **`#871`** — split `recall_hybrid_with_telemetry` into stage helpers.
+- **`#873`** — `clippy.toml` — `too-many-lines-threshold = 250`.
+- **`#880`** — `GovernancePolicy` decomposition (#793-PR-3): flat → 7
+  nested sub-structs with `#[serde(flatten)]` for byte-identical wire
+  JSON.
+- **`#881`** — `store.rs` decomposition (#793-PR-4).
+- **`#856`** — multi-agent worktree discipline section in CLAUDE.md
+  (in-repo half of the harness-side fix tracked under same number).
+- **`#869`** — patch `unwrap_or_default` sites across `handlers/` that
+  silently swallow serialization failures.
+- **`#878`** — plan-c entrypoint peer-reach preflight + bridge-network
+  recipe (operator-facing).
+- **`#879`** — plan-c recovery runbook for colima disk-lock.
+
+#### Provenance + capabilities continuation (Gap 1-7 + post-tag fix-batch)
+
+- **`#897`** — restore `src/handlers/http.rs` coverage to 73.19% (was
+  14.71% vs 42 floor).
+- **`#899`** — cross-test forensic-sink bleed root-cause + regression pin.
+- **`#900`** — `PostgresStore::store` round-trips `source_uri` +
+  Form-4/Form-5 columns.
+- **`#903`** — prune stale schema-version literals in `boot.rs` +
+  `config.rs`.
+- **`#906`** — thread `source_uri` through `memory_update` storage path
+  end-to-end.
+- **`#913`** — admin audit-trail emits — full HTTP+MCP+CLI sweep.
+- **`#931`** — emit broadcast entry-line + postgres branch trace logs.
+- **`#932`** — wire postgres subscription dispatch + HTTP
+  `create_memory` webhook fire.
+- **`#934`** — route alias `/api/v1/find_paths` → `kg_find_paths` +
+  field-name compat (`from_id`/`to_id` aliases for back-compat).
+- **`#935`** — forward `x-api-key` on federation catchup GET.
+- **`#950`** — postgres subscription dispatch on
+  `update/delete/promote/link_create/restore/archive`.
+
+#### Security + visibility cluster (NHI tightening, post-#948)
+
+- **`#929`** — scope MCP ownership gate to explicit-identity callers
+  only.
+- **`#936`** — MCP `archive_purge` owner gate + `as_admin` opt-in.
+- **`#937`** — `delete_memory` sqlite caller-vs-row-owner gate.
+- **`#938`** — `kg_invalidate` caller-vs-source-memory-owner gate.
+- **`#940`** — `archive_restore` + `archive_by_ids` sqlite
+  caller-vs-row-owner gate.
+- **`#941`** — folded into #940 owner-gate sweep (no standalone commit).
+- **`#942`** — `search_memories` + `forget_memories` caller-owner gates.
+- **`#943`** — `list_archive` + `archive_stats` admin gates.
+- **`#944`** — `kg_timeline` caller-vs-source-memory-owner gate.
+- **`#945`** — `list_namespaces` + `get_taxonomy` +
+  `get_namespace_standard_qs` admin gates.
+- **`#946`** — folded into the admin-gate sweep + legacy-unowned
+  carve-out + lib test fixture wildcard (commit
+  `e0e0b55ae`).
+- **`#947`** — sqlite legacy path visibility post-filter on `power.rs`
+  + `kg.rs`.
+- **`#948`** — `sync_since scope=private` visibility gate.
+- **`#949`** — admin-role gate on all 7 skill HTTP routes.
+- **`#951`** — consolidate `is_visible_to_caller` into non-sal-gated
+  visibility module.
+- **`#952`** — cfg-gate 6 stale `let _ = X` discards to non-sal profile
+  only.
+- **`#953`** — C8 caller-context allowlist precheck + CI gate.
+- **`#954`** — extract canonical caller-vs-row-owner ownership-gate
+  helper.
+- **`#955`** — drop `CallerContext::for_agent` literals in non-test
+  production code.
+- **`#956`** — admin-role gate + provenance restamp on
+  `/api/v1/import`.
+- **`#957`** — admin-role gate on `/api/v1/export` (close cross-tenant
+  corpus exfil).
+- **`#959`** — `get_links` visibility post-filter on both backends.
+- **`#960`** — folded into the admin-gate + legacy-unowned carve-out
+  sweep (commit `e0e0b55ae`).
+- **`#974`** — folded into the admin-gate + legacy-unowned carve-out
+  sweep (commit `e0e0b55ae`).
+- **`#976`** — integration test fixtures align with post-#940/#942/
+  #946/#948 gates.
+
+#### NHI provenance lockdown (write-path stamp is header-only post-#907)
+
+- **`#874`** — body `metadata.agent_id` no longer overrides
+  authenticated `X-Agent-Id` on the write-path provenance stamp
+  (security-high, prevents fake-attribution).
+- **`#901, #905, #907`** — siblings of #874 across additional handlers
+  (folded references in #874 + #907 commit bodies; no dedicated
+  commit per number).
+- **`#902, #904, #908, #909, #911, #912`** — folded references in the
+  NHI hardening sweep.
+
+#### Postgres + SAL parity
+
+- **`#925`** — `SET LOCAL search_path` in AGE entry points (lan-parity
+  isolation).
+- **`#926`** — fix lan-parity compose peer-preflight deadlock +
+  Dockerfile reference.
+- **`#927`** — switch 2 integration tests to per-principal GET helpers.
+- **`#928`** — folded reference in the postgres-fixes batch (no
+  standalone commit).
+- **`#930`** — folded reference in the postgres `update_memory` SAL
+  rewrite (commit body of #874/#931).
+- **`#939`** — folded reference in the postgres visibility-gate sweep.
+- **`#910`** — `postgres_touch_batch` caller matches row owner (SAL
+  filter).
+
+#### Federation hardening (signing + nonce + replay)
+
+- **`#791`** — federation per-message Ed25519 signing header.
+- **`#793`** — folded references in the federation-signing series
+  (no standalone commit; tracked under the #791 umbrella).
+- **`#921`** — folded reference in the federation-nonce series.
+- **`#922`** — cargo fmt — wrap long `federation_nonce_cache` line in
+  test fixtures.
+
+#### Batman Mode write-time-investment continuation (#800 7-form series)
+
+- **`#803`** — per-tool `examples` in `memory_capabilities` `ToolEntry`.
+- **`#804`** — AUR PKGBUILD + version-pinning guidance for adoption
+  Gap #3.
+- **`#805`** — Batman-active write-path latency budgets + v0.7.1
+  attack plan.
+- **`#806`** — federation/quotas at population scale (N=100 agents,
+  M=50 ops each).
+- **`#807`** — wire Batman Mode CI gate as REQUIRED PR gate.
+- **`#809`** — substrate-resident NHI Persona + model-agnostic cookbook
+  + maximum coverage.
+- **`#810, #811, #812`** — persona signing pipeline gaps closed
+  end-to-end via #813.
+- **`#813`** — persona signing pipeline — close #810, #811, #812
+  end-to-end.
+- **`#815`** — sign `reflects_on` edges from `storage::reflect` via
+  threaded keypair.
+- **`#816`** — wire curator auto-persona sweep with daemon keypair.
+- **`#820`** — PR #820 ship-hardening bundle umbrella issue.
+- **`#821`** — dedup governance test helpers into `tests/common/mod.rs`.
+- **`#822`** — `rules sign-seed` honors `--key-dir` (dual-layout dir →
+  singleton fallback).
+- **`#823`** — bump schema literal 42→43 in `s75` + `wt_1_a` tests.
+- **`#824`** — bump macOS hook-exec test timeout 30s → 60s.
+- **`#825`** — file-wide `#![allow(clippy::too_many_lines)]` for
+  postgres-feature build.
+
+#### Doc + infra hardening
+
+- **`#838, #839, #840, #843, #844, #845`** — folded references in the
+  Lane-5 documentation drift remediation block above (no standalone
+  commits; covered by the comprehensive sweep that touched ~14 doc
+  files).
+- **`#846`** — v0.7 vs v0.8 recursive-learning roadmap comparison doc.
+- **`#848`** — `memory_persona_generate` cross-namespace aggregation.
+- **`#868`** — inline test discipline for `handlers/http.rs`.
+- **`#870, #872`** — folded references in the doc-drift remediation.
+- **`#875`** — align HTML doc surfaces to v0.7.0 numbers.
+- **`#876`** — NHI calibration prompts use canonical 71-tool count
+  source.
+- **`#877`** — auto-migrate embedding column dim to model-canonical
+  dim.
+
+#### Typed-error envelopes (post-`deny_message` helper #971)
+
+- **`#962`** — promote substrate refusals to typed `StorageError`
+  envelope.
+- **`#963`** — wire typed `GovernanceRefusal` through `Deny` variant
+  (Phase 1 + Phase 2).
+- **`#971`** — extract canonical `deny_message` helper for governance
+  refusals.
+- **`#975`** — `source_uri` composition + visibility gate parity on
+  reciprocal endpoint.
+
+#### Release-gate meta (not closed in this bundle)
+
+- **`#832`** — folded reference in the v0.7.0 release-gate meta tracking
+  (umbrella, remains open through the operator's 8-tier gate).
+- **`#833, #834`** — Track E1 (DO CPU hive) / Track E2 (AWS GPU burst)
+  remain FROZEN per operator decision (operator-$-gated). Issues
+  referenced in CHANGELOG so the link from commit → tracker is intact.
+- **`#835`** — clean A2A test pages.
+
+#### Long-standing carryover closed under the v0.7.0 windowing
+
+- **`#224, #311`** — folded into the visibility-gate cluster + NHI
+  provenance lockdown (no dedicated commit; closed via the post-#948
+  sweep).
+- **`#228`** — E2E content encryption at rest (X25519 +
+  ChaCha20-Poly1305). NOTE: shipped as MVP module
+  (`src/encryption/`); the wire-up to `db::insert*`/`db::get` is the
+  H4 follow-up tracked under the 6-agent-review High set.
+- **`#518`** — session-aware `memory_recall` with recently-accessed
+  boost.
+- **`#519`** — proactive contradiction detection on `memory_store`.
+- **`#652`** — folded reference in the recursive-learning #655 Task
+  series (no standalone commit; closed via #655 sub-tasks).
+- **`#718`** — A2A campaign harness cross-repo integration contract.
+- **`#736`** — cookbook/atomisation recipes 02 + 03 + README.
+- **`#797`** — bootstrap SCHEMA crashes on legacy DBs — strip v36+
+  partial indexes from sqlite+postgres bootstrap, fix Windows
+  `skill_register` path separator, unrot `postgres_schema_parity`.
+- **`#798`** — folded into #797 (single commit closes both).
+- **`#827`** — parent issue: per-module coverage residuum (split into
+  #838 + #839 + #840 — `store.rs` row closed at parent level, the
+  three child modules closed in prior coverage commits).
+- **`#917`** — folded reference in the post-#874 NHI hardening sweep.
+
+#### Wire-format compatibility statement (v0.6.x → v0.7.0 upgrade)
+
+The 6-agent compat review flagged the following source-level breaks
+that operators upgrading from v0.6.x must know about. **HTTP / MCP /
+CLI wire shape stays additive throughout** — every visible response
+body, capabilities envelope, federation payload, and signed-event
+JSON either reads byte-identical to v0.6.x or extends additively via
+`#[serde(default)]` / `skip_serializing_if`. The breaks below are
+all RUST source-API and do not affect external clients consuming the
+HTTP/MCP wire formats.
+
+1. **`GovernancePolicy` flat → nested** (#880). Field path rewrites:
+   `policy.write` → `policy.core.write`, same for `promote`/`delete`/
+   `approver`/`inherit`/`max_reflection_depth`. Wire JSON unchanged
+   (preserved via `#[serde(flatten)]`); only Rust call sites move.
+2. **`GovernanceDecision::Deny(String)` → `Deny(GovernanceRefusal)`**
+   (#963). `Display` byte-identical to pre-#963. Pattern-match consumers
+   read `refusal.reason` (or `refusal.to_string()` for the canonical
+   wire shape).
+3. **SAL trait signatures gain `&CallerContext`** (#910 / #936).
+   `MemoryStore::archive_purge(older_than_days)` →
+   `archive_purge(&CallerContext, older_than_days)`;
+   `MemoryStore::find_paths(source_id, target_id, ...)` →
+   `find_paths(&CallerContext, ...)`. Out-of-tree `MemoryStore` impls
+   thread the new arg.
+4. **`CallerContext` gains required `bypass_visibility: bool`** (#910).
+   Struct-literal callers add the field; the `for_admin`/`for_agent`
+   constructors are the supported path and unaffected.
+5. **`MemoryError` gains `RefusedByGovernanceGate(GovernanceRefusal)`
+   variant** (#963). Exhaustive `match` on `MemoryError` without a
+   wildcard arm needs a new arm (wire `code()` = `GOVERNANCE_REFUSED`
+   + `status()` = 403 stay identical to the existing
+   `RefusedByGovernance(String)` variant).
+6. **Federation receivers reject unsigned/no-nonce `/sync/push` by
+   default** (#791, #922). Pre-v0.7.0 peers without Ed25519 keys are
+   rejected with 401. Operator escape hatch:
+   `AI_MEMORY_FED_REQUIRE_SIG=0` + `AI_MEMORY_FED_REQUIRE_NONCE=0`
+   during peer rollout. Cut over to signed-by-default once every peer
+   in the federation has its Ed25519 keypair installed.
+
 ### Added
 
 - **Capabilities v3 `provenance_substrate_layer` narrative surface** (Item C from v0.7.0 provenance deconfliction, issue [#973](https://github.com/alphaonedev/ai-memory-mcp/issues/973)). New `CapabilityProvenanceSubstrateLayer` + `SpecReferences` structs in `src/config.rs` ship a one-shot narrative summary of the substrate's do-calculus posture so an LLM agent reading `memory_capabilities` can self-describe accurately without parsing the seven Provenance Gap blocks individually. The default helper carries the v0.7.0 source-verified `enforcement_layers` list (`form_4_fact_provenance`, `form_6_memory_kind`, `form_7_agent_external_governance`, `signed_events_v4_chain`, `seven_gap_framework`), the two `honest_limitations` axes (intra-session hallucination is consumer-LLM responsibility; federation reliability is DLQ-tracked, not silent-drop), and vendor-neutral spec_references (Pearl 2009 + Ortega & de Freitas 2026). Honesty-discipline: every entry in `enforcement_layers` corresponds to an actually-shipped feature with a grep anchor in the helper docstring. Wired into `CapabilitiesV3::to_v3()` so MCP + HTTP both surface it. 7 integration tests pin posture / source-verified `enforcement_layers` / honest_limitations axes / vendor-neutral spec_references / summary word budget / serde round-trip / serde-default empty-JSON tolerance. Backward-compat preserved via `#[serde(default)]` on every field.

@@ -86,7 +86,7 @@ pub struct AppState {
     /// legacy-scoring toggle. Exposed so `recall_memories_get` /
     /// `recall_memories_post` can call `db::recall_hybrid` (semantic
     /// blend) when the embedder is loaded, mirroring how the MCP
-    /// `memory_recall` handler already wires it (src/mcp.rs:1157).
+    /// `memory_recall` handler already wires it (crate::mcp::handle_recall).
     /// Prior to this, HTTP recall was keyword-only regardless of
     /// embedder availability — scenario-18 surfaced the gap.
     pub scoring: Arc<crate::config::ResolvedScoring>,
@@ -95,7 +95,7 @@ pub struct AppState {
     /// `summary` / `to_describe_to_user` / `tools[].callable_now`
     /// fields, which reflect the profile the running server actually
     /// advertises in `tools/list`. Mirrors the MCP-dispatch threading
-    /// at `src/mcp.rs:3760`.
+    /// at `crate::mcp::handle_search`.
     pub profile: Arc<crate::profile::Profile>,
     /// v0.7.0 A5 — resolved [`McpConfig`] for this daemon. Carries
     /// the optional `[mcp.allowlist]` table that v3's per-tool
@@ -161,7 +161,7 @@ pub struct AppState {
     /// v0.7.0 L5 — optional LLM client used by the HTTP `create_memory`
     /// handler to fire the `auto_tag` autonomy hook on stores, matching
     /// the behaviour the MCP `handle_store` path has provided since
-    /// v0.6.0.0 (`src/mcp.rs:1823-1833`). `None` when the daemon's
+    /// v0.6.0.0 (`crate::mcp::handle_store` (auto-tag block)). `None` when the daemon's
     /// configured [`FeatureTier`] does not request an LLM (keyword /
     /// semantic) or when Ollama is unreachable at startup; in either
     /// case the create_memory handler silently skips the hook so the

@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
+
 //! Issue #910 — scope=private visibility filter regression on
 //! `GET /api/v1/memories` (`list_memories`).
 //!
@@ -71,6 +73,7 @@ fn build_router_fixture_with_seed(
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     };
     ai_memory::db::insert(&conn, &mem).expect("insert seed");
 

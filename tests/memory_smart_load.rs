@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
+
 //! v0.7 Track B2 — `memory_smart_load` MCP tool integration tests.
 //!
 //! B2 ships an always-on intent-routed front door over
@@ -77,6 +79,7 @@ fn seed_family_memory(
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     };
     db::insert(conn, &mem).expect("db::insert")
 }

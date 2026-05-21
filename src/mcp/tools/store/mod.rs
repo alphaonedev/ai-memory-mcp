@@ -30,10 +30,196 @@ use crate::db;
 use crate::embeddings::Embed;
 use crate::hnsw::VectorIndex;
 use crate::llm::OllamaClient;
+use crate::mcp::registry::McpTool;
+use schemars::JsonSchema;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::Path;
 
 use self::validation::OnConflict;
+
+// --- D1.3 (#984): per-tool McpTool impl for `memory_store` ---
+
+/// v0.7.0 #972 D1.3 (#984) — request body for `memory_store`.
+/// Schemars-derived schema replaces the hand-coded entry in
+/// [`crate::mcp::registry::tool_definitions`] (D1.6 (#987) collapses
+/// the macro). Every doc-comment description is byte-equal to the
+/// legacy `description` text — see the d1_3_984_tests parity contract
+/// at the bottom of this file.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct StoreRequest {
+    /// Short title
+    pub title: String,
+
+    /// Memory content
+    pub content: String,
+
+    #[serde(default)]
+    pub tier: Option<String>,
+
+    /// Namespace
+    #[serde(default)]
+    pub namespace: Option<String>,
+
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+
+    #[serde(default)]
+    pub priority: Option<i64>,
+
+    #[serde(default)]
+    pub confidence: Option<f64>,
+
+    #[serde(default)]
+    pub source: Option<String>,
+
+    /// JSON metadata
+    ///
+    /// **#1009 fix:** typed as `Map<String, Value>` rather than the
+    /// permissive `Value` so the schemars derive emits
+    /// `"type": "object"` on the wire (the pinned #859/#912/F15
+    /// discovery contract). Behavior change: callers must now send a
+    /// JSON object for `metadata`; scalars/arrays/nulls were never the
+    /// documented shape, so this aligns the implementation with the
+    /// existing contract.
+    #[serde(default)]
+    pub metadata: Option<serde_json::Map<String, Value>>,
+
+    /// NHI agent_id; synthesized if omitted.
+    #[serde(default)]
+    pub agent_id: Option<String>,
+
+    /// Task 1.5 visibility. Default private.
+    #[serde(default)]
+    pub scope: Option<String>,
+
+    /// P2/G6 (title,ns) collision: error=v2 default; merge=v1; version='(N)'.
+    #[serde(default)]
+    pub on_conflict: Option<String>,
+
+    /// Form 6 (#759) memory-kind. Default observation.
+    #[serde(default)]
+    pub kind: Option<String>,
+
+    #[serde(default)]
+    #[schemars(description = "#519 bypass proactive contradiction detection.")]
+    pub force: Option<bool>,
+
+    #[serde(default)]
+    #[schemars(description = "#885 Source URI (doc:/uri:/file:); indexed for #889.")]
+    pub source_uri: Option<String>,
+}
+
+/// v0.7.0 #972 D1.3 (#984) — `McpTool` impl for `memory_store`.
+#[allow(dead_code)]
+pub struct StoreTool;
+
+impl McpTool for StoreTool {
+    fn name() -> &'static str {
+        "memory_store"
+    }
+    fn description() -> &'static str {
+        "Store a memory; deduplicates by title+namespace."
+    }
+    fn docs() -> &'static str {
+        "Store a memory. Dedupes by (title, namespace). Tier defaults to mid (7d TTL); long is permanent. on_conflict: error|merge|version. scope: Task 1.5 visibility. force (#519): bypass proactive contradiction detection on near-duplicate writes."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(StoreRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "core"
+    }
+}
+
+#[cfg(test)]
+mod d1_3_984_tests {
+    //! D1.3 (#984) — schema parity for the `memory_store` tool.
+    //! Reuses the allowed-diffs catalog documented in d1_2_983_tests.
+    use super::*;
+
+    fn legacy_props(tool_name: &str) -> serde_json::Map<String, Value> {
+        let defs = crate::mcp::registry::tool_definitions();
+        let tools = defs
+            .get("tools")
+            .and_then(Value::as_array)
+            .expect("tool_definitions emits `tools` array");
+        let entry = tools
+            .iter()
+            .find(|t| t.get("name").and_then(Value::as_str) == Some(tool_name))
+            .unwrap_or_else(|| panic!("{tool_name} must be in legacy catalog"));
+        entry
+            .pointer("/inputSchema/properties")
+            .and_then(Value::as_object)
+            .unwrap_or_else(|| panic!("{tool_name}.inputSchema.properties must be object"))
+            .clone()
+    }
+
+    fn derived_props_for<T: schemars::JsonSchema>() -> serde_json::Map<String, Value> {
+        let schema = schemars::schema_for!(T);
+        let v = serde_json::to_value(schema).expect("schema → value");
+        v.get("properties")
+            .and_then(Value::as_object)
+            .or_else(|| {
+                v.pointer(&format!(
+                    "/definitions/{}/properties",
+                    std::any::type_name::<T>().rsplit("::").next().unwrap_or("")
+                ))
+                .and_then(Value::as_object)
+            })
+            .cloned()
+            .expect("schemars schema must have properties at a known path")
+    }
+
+    fn assert_property_set_parity(tool_name: &str, derived: &serde_json::Map<String, Value>) {
+        let legacy = legacy_props(tool_name);
+        let legacy_keys: std::collections::BTreeSet<&str> =
+            legacy.keys().map(String::as_str).collect();
+        let derived_keys: std::collections::BTreeSet<&str> =
+            derived.keys().map(String::as_str).collect();
+        assert_eq!(
+            legacy_keys,
+            derived_keys,
+            "{tool_name}: property set drift; diff = {:?}",
+            legacy_keys
+                .symmetric_difference(&derived_keys)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    fn assert_descriptions_match(tool_name: &str, derived: &serde_json::Map<String, Value>) {
+        let legacy = legacy_props(tool_name);
+        for (name, legacy_prop) in &legacy {
+            if let Some(want) = legacy_prop.get("description").and_then(Value::as_str) {
+                let got = derived
+                    .get(name)
+                    .and_then(|p| p.get("description"))
+                    .and_then(Value::as_str);
+                assert_eq!(
+                    got,
+                    Some(want),
+                    "{tool_name}.{name}: description must match legacy byte-for-byte"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn store_parity_984() {
+        let derived = derived_props_for::<StoreRequest>();
+        assert_property_set_parity("memory_store", &derived);
+        assert_descriptions_match("memory_store", &derived);
+    }
+
+    #[test]
+    fn store_tool_metadata_984() {
+        assert_eq!(StoreTool::name(), "memory_store");
+        assert_eq!(StoreTool::family(), "core");
+    }
+}
 
 // --- Tool handlers ---
 
@@ -86,6 +272,13 @@ pub(crate) fn handle_store(
         .and_then(|p| p.kind_class.auto_classify_kind);
     crate::hooks::pre_store::maybe_auto_classify(&mut mem, auto_classify_policy);
 
+    // #969 — single `to_value(&mem)` shared across the K9 permission
+    // gate and the K3 governance gate below. Pre-fix the two scoped
+    // blocks each called `to_value(&mem).unwrap_or_default()` against
+    // the same (read-only between gates) `mem`. Hoisting saves one
+    // clone+serialise per `memory_store` invocation on the hot path.
+    let mem_payload = serde_json::to_value(&mem).unwrap_or_default();
+
     // v0.7.0 K9 — unified permission pipeline. The K9 evaluator
     // composes declarative `[permissions.rules]` matchers + the K3
     // `[permissions].mode` knob + (when wired) hook decisions into
@@ -95,12 +288,11 @@ pub(crate) fn handle_store(
     // gate so legacy `[governance]` policies continue to work.
     {
         use crate::permissions::{Op, PermissionContext, Permissions};
-        let payload = serde_json::to_value(&mem).unwrap_or_default();
         let ctx = PermissionContext {
             op: Op::MemoryStore,
             namespace: mem.namespace.clone(),
             agent_id: agent_id.clone(),
-            payload,
+            payload: mem_payload.clone(),
         };
         match Permissions::evaluate(&ctx, &[]) {
             crate::permissions::Decision::Allow | crate::permissions::Decision::Modify(_) => {}
@@ -125,7 +317,6 @@ pub(crate) fn handle_store(
     // Task 1.9: governance enforcement (store-side).
     {
         use crate::models::{GovernanceDecision, GovernedAction};
-        let payload = serde_json::to_value(&mem).unwrap_or_default();
         match db::enforce_governance(
             conn,
             GovernedAction::Store,
@@ -133,7 +324,7 @@ pub(crate) fn handle_store(
             &agent_id,
             None,
             None,
-            &payload,
+            &mem_payload,
         )
         .map_err(|e| e.to_string())?
         {

@@ -179,7 +179,7 @@ CREATE TABLE IF NOT EXISTS memories (
 
 -- v0.6.0 blocker #294 fix: upsert contract is `(title, namespace)`.
 -- SQLite enforces this with `CREATE UNIQUE INDEX idx_memories_title_ns`
--- (src/db.rs:132); Postgres matches here so both adapters agree on
+-- (crate::storage (schema bootstrap)); Postgres matches here so both adapters agree on
 -- upsert semantics.
 CREATE UNIQUE INDEX IF NOT EXISTS memories_title_ns_uidx
     ON memories (title, namespace);
@@ -276,7 +276,7 @@ CREATE INDEX IF NOT EXISTS memories_embedding_hnsw ON memories
 -- memory_links — directional typed links between memories.
 --
 -- v0.6.3 Stream B: temporal columns + entity_aliases side table
--- mirror SQLite schema v15 (see src/db.rs::migrate). Forward-compatible
+-- mirror SQLite schema v15 (see crate::storage::migrations::migrate). Forward-compatible
 -- with v0.7 Apache AGE acceleration: same columns get projected as
 -- AGE graph edges. Existing PG installs at v0.6.2 will not gain the
 -- new columns automatically — the Postgres path is currently a fresh-

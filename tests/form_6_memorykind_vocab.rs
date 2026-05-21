@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
+
 //! v0.7.x Form 6 (issue #759) — MemoryKind Batman-vocabulary
 //! integration tests.
 //!
@@ -71,6 +73,7 @@ fn make_mem(namespace: &str, title: &str, content: &str, kind: MemoryKind) -> Me
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     }
 }
 

@@ -128,6 +128,28 @@ pub enum GovernanceDecision {
 
 /// Actions that governance gates. Used as the `action_type` column value in
 /// `pending_actions` and as the discriminator for enforcement calls.
+///
+/// # Disambiguation (issue #970)
+///
+/// `GovernedAction` is the **approval-queue discriminator** —
+/// `pending_actions.action_type` and `enforce_governance` consult it
+/// to decide which substrate action is being approved. It is
+/// related-but-distinct from [`crate::governance::Op`], which is the
+/// **K9 permission-rule op discriminator**:
+///
+/// - `GovernedAction` wire strings: `"store"`, `"delete"`,
+///   `"promote"`, `"reflect"` (4 variants — the substrate actions
+///   that can be queued for approval).
+/// - `Op` wire strings: `"memory_store"`, `"memory_link"`,
+///   `"memory_delete"`, `"memory_archive"`, `"memory_consolidate"`,
+///   `"memory_replay"` (6 variants — every K9-gated tool, including
+///   ones that can never be queued for approval like
+///   `memory_replay`).
+///
+/// They look like the same vocabulary; they aren't. Consolidating
+/// would require breaking one of the two on-wire string sets. See
+/// `docs/internal/enum-proliferation-audit-970.md` for the full
+/// audit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GovernedAction {

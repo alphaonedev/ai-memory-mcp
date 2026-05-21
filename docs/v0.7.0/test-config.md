@@ -104,9 +104,10 @@ For ai-memory's standard 15-scenario evaluation:
 - `grok-4.3` `"high"` effort: ~40-80× baseline tokens
 - `grok-4.20-multi-agent` `"high"` (16 agents): ~150-300× baseline
 
-These are rough multipliers — operator should size budget at
-~$3-5 USD per cross-LLM 15-scenario run on `grok-4.3` `"medium"` at
-v0.7.0 release pricing.
+Budget guidance: ~$3-5 USD per cross-LLM 15-scenario run on
+`grok-4.3` `"medium"` at v0.7.0 release pricing. The multipliers above
+are the load drivers; the dollar figure is the operating cap a
+campaign run should size against.
 
 ## Future test runs that will use grok-4.3 @ medium
 

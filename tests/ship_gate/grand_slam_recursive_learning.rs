@@ -1,6 +1,7 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
 // clippy allows (test scaffolding): pedantic lints with no behavioural impact.
 #![allow(
     clippy::doc_markdown,
@@ -135,6 +136,7 @@ fn make_observation(namespace: &str, topic: &str, idx: usize) -> Memory {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     }
 }
 
@@ -178,6 +180,7 @@ fn seed_policy(conn: &Connection, namespace: &str, policy: &GovernancePolicy) {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     };
     let std_id = db::insert(conn, &standard).expect("seed_policy insert");
     db::set_namespace_standard(conn, namespace, &std_id, None).expect("set_namespace_standard");
@@ -216,6 +219,7 @@ fn seed_governance_json(conn: &Connection, namespace: &str, governance: &serde_j
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     };
     let std_id = db::insert(conn, &standard).expect("seed_governance_json insert");
     db::set_namespace_standard(conn, namespace, &std_id, None).expect("set_namespace_standard");

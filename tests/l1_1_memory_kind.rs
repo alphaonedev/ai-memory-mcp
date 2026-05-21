@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
+
 //! L1-1 (v0.7.0) — `MemoryKind::Reflection` typed enum integration tests.
 //!
 //! Pins the four externally-observable contracts added in this PR:
@@ -63,6 +65,7 @@ fn make_obs(namespace: &str, title: &str) -> Memory {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     }
 }
 
@@ -164,6 +167,7 @@ fn memory_kind_serde_roundtrip_reflection() {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     };
 
     let json = serde_json::to_string(&mem).expect("serialize");
