@@ -89,7 +89,7 @@ ai-memory ships substrate-attested forensic surfaces:
 
 Vulnerability reports involving the audit chain are CRITICAL severity by default.
 
-The v1.0 release (Q2 2027) will be audited by a named third-party firm. Audit firm selection criteria and dispute-resolution process are documented in [`ROADMAP2.md`](ROADMAP2.md) §7.7.
+The v1.0 release (Q2 2027) will be audited by a named third-party firm. Audit firm selection criteria and dispute-resolution process are documented in [`ROADMAP.md`](ROADMAP.md) §7.7.
 
 ## Cryptographic implementations
 
@@ -103,7 +103,7 @@ Cryptographic protocol issues are HIGH severity at minimum. Implementation issue
 
 ## OSS commitment
 
-Per [`ROADMAP2.md`](ROADMAP2.md) §15: ai-memory is Apache 2.0 forever. Security fixes ship under the same license; no commercial-only patches. AgenticMem's commercial offerings build on the OSS substrate but do not paywall security fixes.
+Per [`ROADMAP.md`](ROADMAP.md) §15: ai-memory is Apache 2.0 forever. Security fixes ship under the same license; no commercial-only patches. AgenticMem's commercial offerings build on the OSS substrate but do not paywall security fixes.
 
 ---
 

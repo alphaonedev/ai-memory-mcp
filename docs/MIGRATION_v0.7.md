@@ -1,6 +1,6 @@
 # Migrating from v0.6.4 to v0.7.0
 
-**v0.7.0 — `attested-cortex`** rolls together the v0.6.5 cortex-fluent legibility work with ROADMAP2 §7.3's full v0.7 trust + A2A maturity scope, **plus** (per operator directive 2026-05-09) the originally-v0.7.1 postgres+AGE first-class work, **plus** the post-grand-slam ship-readiness wave (Batman Forms 1-6 + 7th-form Option-B foundation + QW-1/2/3 + reconciliation security sweep). The substrate becomes both **more articulate** (capabilities v3, named loaders, compacted schemas, Batman `MemoryKind` vocabulary, persona/atomisation/multistep-ingest primitives) and **cryptographically trustworthy** (Ed25519 attestation, sidechain transcripts, programmable 25-event hook pipeline, enforced namespace inheritance, V-4 cross-row signed-events hash chain).
+**v0.7.0 — `attested-cortex`** rolls together the v0.6.5 cortex-fluent legibility work with ROADMAP §7.3's full v0.7 trust + A2A maturity scope, **plus** (per operator directive 2026-05-09) the originally-v0.7.1 postgres+AGE first-class work, **plus** the post-grand-slam ship-readiness wave (Batman Forms 1-6 + 7th-form Option-B foundation + QW-1/2/3 + reconciliation security sweep). The substrate becomes both **more articulate** (capabilities v3, named loaders, compacted schemas, Batman `MemoryKind` vocabulary, persona/atomisation/multistep-ingest primitives) and **cryptographically trustworthy** (Ed25519 attestation, sidechain transcripts, programmable 25-event hook pipeline, enforced namespace inheritance, V-4 cross-row signed-events hash chain).
 
 > **Status:** Released 2026-05-15 at HEAD `c9472c1`. v0.7.0 closes the `attested-cortex` epic at 69/69 tasks across 11 tracks (A/B/C/D/E/F/G/H/I/J/K), plus the grand-slam recursive-learning + Agent Skills + L1-6 substrate-rules wave, plus the post-grand-slam Forms 1-6 + 7th-form + QW closeout (PRs [#761](https://github.com/alphaonedev/ai-memory-mcp/pull/761)-[#766](https://github.com/alphaonedev/ai-memory-mcp/pull/766)). See [`CHANGELOG.md`](../CHANGELOG.md) for the full release entry and [`docs/v0.7.0/release-notes.md`](v0.7.0/release-notes.md) for the per-area walk-through. The canonical post-grand-slam feature truth lives at [`docs/internal/v070-feature-inventory.md`](internal/v070-feature-inventory.md).
 
@@ -262,7 +262,7 @@ ai-memory verify-signed-events-chain --format json
 
 Operator doc: [`docs/signed-events-v4.md`](signed-events-v4.md).
 
-> **Hardware-backed key storage** (TPM / HSM / Secure Enclave) is **out of OSS scope** per ROADMAP2; available in the AgenticMem commercial layer.
+> **Hardware-backed key storage** (TPM / HSM / Secure Enclave) is **out of OSS scope** per ROADMAP; available in the AgenticMem commercial layer.
 
 ---
 
@@ -428,5 +428,5 @@ Schema migrations (sqlite v20 → v34, postgres 0012 → 0020) run automatically
 - [`docs/MIGRATION_v0.6.4.md`](MIGRATION_v0.6.4.md) — predecessor migration guide.
 - [`docs/MIGRATION-v0.6.2-to-v0.6.3.md`](MIGRATION-v0.6.2-to-v0.6.3.md) — earlier migration.
 - [`docs/migration-v0.7.0-postgres.md`](migration-v0.7.0-postgres.md) — sqlite → postgres migration runbook.
-- [`ROADMAP2.md §7.3`](../ROADMAP2.md) — original v0.7 spec.
+- [`ROADMAP.md §7.3`](../ROADMAP.md) — original v0.7 spec.
 - [`CHANGELOG.md`](../CHANGELOG.md) — full v0.7.0 entry.

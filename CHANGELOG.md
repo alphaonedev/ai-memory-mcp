@@ -998,7 +998,7 @@ HTTP/MCP wire formats.
 
 ### Changed
 
-- **`ROADMAP2.md` — doc-drift correction blocks on §7.3 and §17** (Item D, issue [#973](https://github.com/alphaonedev/ai-memory-mcp/issues/973)). Both sections were dated 2026-04-29 and 5+ weeks stale. Added explicit doc-drift notes citing live schema v48 on both ladders (in lockstep), 73 MCP tools at `--profile full` per `Profile::full().expected_tool_count()`, 7-level Provenance Gap framework #884-#890 all shipped, Batman Forms 1-6 + Form 7 implemented (with the canonical-bytes signing fix `3cdec59`), recursive learning #655 Tasks 1-8 all shipped, federation push DLQ + replay worker. Authoritative-references discipline: read from `src/storage/migrations.rs` + `src/store/postgres.rs:391` + `Profile::full().expected_tool_count()` + `docs/v0.7.0/release-notes.md` + this CHANGELOG `[Unreleased]` section, not from hardcoded numbers in the body of ROADMAP2.md (which go stale).
+- **`ROADMAP.md` — doc-drift correction blocks on §7.3 and §17** (Item D, issue [#973](https://github.com/alphaonedev/ai-memory-mcp/issues/973)). Both sections were dated 2026-04-29 and 5+ weeks stale. Added explicit doc-drift notes citing live schema v48 on both ladders (in lockstep), 73 MCP tools at `--profile full` per `Profile::full().expected_tool_count()`, 7-level Provenance Gap framework #884-#890 all shipped, Batman Forms 1-6 + Form 7 implemented (with the canonical-bytes signing fix `3cdec59`), recursive learning #655 Tasks 1-8 all shipped, federation push DLQ + replay worker. Authoritative-references discipline: read from `src/storage/migrations.rs` + `src/store/postgres.rs:391` + `Profile::full().expected_tool_count()` + `docs/v0.7.0/release-notes.md` + this CHANGELOG `[Unreleased]` section, not from hardcoded numbers in the body of ROADMAP.md (which go stale).
 - **`CLAUDE.md` — `CURRENT_SCHEMA_VERSION` references v47 → v48**. Two stale references in the Key Modules table + Database section updated to reflect the #933 federation_push_dlq schema bump.
 
 
@@ -1343,7 +1343,7 @@ human escalation (adds `Decision::Escalate`), TPM-bound binary
 integrity, refuse-by-default profile, and the
 `ai-memory verify-audit-trail` completeness verifier. Effort:
 22-28 sessions · 3-4 weeks wall-clock. Full sub-task detail in
-ROADMAP2 §16. Operator directive of 2026-05-14 verbatim — "Every
+ROADMAP §16. Operator directive of 2026-05-14 verbatim — "Every
 tool call passes through a policy engine; the engine logs every
 refusal cryptographically; severity-classified rules can escalate
 to human" — is the property v0.8.0 closes literally.
@@ -2337,7 +2337,7 @@ originally triaged for v0.7.0.1 fold into v0.7.0 directly.
   KMS adapters are intentionally **not** implemented in this crate. The
   OSS path stops at file-based 0600 storage; certified hardware-backed
   deployments live in the AgenticMem™ commercial layer per
-  `ROADMAP2.md`. The OSS code never imports a hardware-token library.
+  `ROADMAP.md`. The OSS code never imports a hardware-token library.
 - **New deps (pure-Rust, MIT/Apache):** `ed25519-dalek = "2"` (with
   the `rand_core` feature for `SigningKey::generate`), `rand_core =
   "0.6"` (CSPRNG bound — we use `OsRng`), `base64 = "0.22"` (for the

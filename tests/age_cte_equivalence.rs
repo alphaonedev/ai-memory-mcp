@@ -605,7 +605,7 @@ fn assert_no_match(row: &KgInvalidateRow) {
 // Pre-S6-M3, `kg_query_with_history`, `kg_timeline`, and `kg_invalidate`
 // always routed to the CTE branch regardless of `kg_backend`. The three
 // tests below pin the dispatcher contract: the public-facing entry point
-// MUST route to AGE when the extension is present (so the ROADMAP2 §7.4.4
+// MUST route to AGE when the extension is present (so the ROADMAP §7.4.4
 // 30%-faster-at-depth-5 claim is actually reachable) and MUST route to
 // CTE when the extension is absent.
 // ---------------------------------------------------------------------------

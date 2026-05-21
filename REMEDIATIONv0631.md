@@ -2,7 +2,7 @@
 
 > **Scope:** Everything required to fully remediate v0.6.3 (shipped 2026-04-27) so the published capabilities, architectures, and tier claims are honest, complete, and load-bearing across T1–T5.
 > **Vehicle:** v0.6.3.1 patch release (Q2 2026, ~4 weeks).
-> **Companion docs:** `ROADMAP2.md` (forward plan v0.6.3.1 → v1.0), `audits/v063-source-code-audit.md` (this audit), `architectures.html` + T1–T5 pages.
+> **Companion docs:** `ROADMAP.md` (forward plan v0.6.3.1 → v1.0), `audits/v063-source-code-audit.md` (this audit), `architectures.html` + T1–T5 pages.
 > **Date:** 2026-04-29.
 > **Authoring posture:** Brass tacks. No fluff. Every fix names files, lines, success criteria, and a copy-paste AI NHI prompt starter.
 
@@ -84,8 +84,8 @@ What each tier page advertises as "ships today" vs what the audit found:
 | T4 claim | v0.6.3 reality | Action |
 |---|---|---|
 | "Postgres + pgvector behind `sal-postgres` Cargo feature; correctness fixed in v0.6.x" | True | none |
-| "v0.7 GA targets: shared distributed store, Postgres replicas, shared vector index" | Future commitment | tracked in ROADMAP2 |
-| "Cryptographic agent attestation (`signature` field reserved T3; v0.7 T4)" | Column reserved, dead | tracked in ROADMAP2 v0.7 Bucket 1 |
+| "v0.7 GA targets: shared distributed store, Postgres replicas, shared vector index" | Future commitment | tracked in ROADMAP |
+| "Cryptographic agent attestation (`signature` field reserved T3; v0.7 T4)" | Column reserved, dead | tracked in ROADMAP v0.7 Bucket 1 |
 
 ### T5 — claims vs reality
 
@@ -760,7 +760,7 @@ Role: Senior Rust engineer on ai-memory-mcp. Performance-conscious.
 Context: The prior phased ROADMAP.md (Phase 1d) committed to a budget_tokens
 parameter on memory_recall: "Give me the most relevant memories that fit in
 4K tokens." It was framed as the killer feature ("no competitor has this").
-The new charter set silently dropped it. ROADMAP2.md (R1) recovers it for
+The new charter set silently dropped it. ROADMAP.md (R1) recovers it for
 v0.6.3.1.
 
 Letta has it. We don't. We need it.
@@ -857,7 +857,7 @@ Role: Senior Rust engineer + operator-experience-aware on ai-memory-mcp.
 Context: The prior phased ROADMAP.md (Phase 4) committed to "ai-memory
 doctor" — a memory-health dashboard reporting fragmentation, stale memories,
 unresolved contradictions, sync lag. It vanished in the new charter set.
-ROADMAP2.md (R7) recovers it for v0.6.3.1.
+ROADMAP.md (R7) recovers it for v0.6.3.1.
 
 The doctor reads three new surfaces that earlier phases land:
   - Capabilities v2 (P1) — feature truth.
@@ -931,7 +931,7 @@ Stop after step 3 (report sections defined) and present for review.
 - Document the export format (JSON + TOON) for memories, links, namespace metadata, archived memories, agents, entities, subscriptions.
 - Document the migration v17 schema (post-P2) as the canonical reference schema.
 - Versioned at `memory.dev/spec/v1` (or equivalent on the project's GitHub Pages site).
-- Two reference implementations required for v1.0 (deferred per ROADMAP2 §7.6); for v0.6.3.1 the spec itself is the deliverable.
+- Two reference implementations required for v1.0 (deferred per ROADMAP §7.6); for v0.6.3.1 the spec itself is the deliverable.
 
 **Files:**
 - `benchmarks/longmemeval/run_variants.sh` (new)
@@ -1291,7 +1291,7 @@ Role: Architecture analyst on ai-memory-mcp at T4/T5.
 Context: T4 (rack-scale) targets v0.7 GA with Postgres. T5 (multi-region)
 is v1.0+ vision. v0.6.3.1 does NOT address T4/T5 capability gaps —
 attestation (G12), distributed consensus, hardware key custody. Those are
-ROADMAP2.md items.
+ROADMAP.md items.
 
 Goal: Verify v0.6.3.1 doesn't regress the T4/T5 substrate.
 
@@ -1336,7 +1336,7 @@ Use this at v0.6.3.1 RC time.
 - [ ] A2A-gate ironclaw-mtls 48/48 + any new scenarios — green
 - [ ] All 5 distribution channels build cleanly
 - [ ] CHANGELOG.md updated
-- [ ] ROADMAP2.md "v0.6.3.1" section marked SHIPPED with date
+- [ ] ROADMAP.md "v0.6.3.1" section marked SHIPPED with date
 - [ ] Public-surface landing pages auto-update from new summary.json
 
 ### Post-ship
@@ -1359,10 +1359,10 @@ The single highest-leverage move is **P4 — namespace inheritance enforcement (
 
 Every phase has a copy-paste AI NHI prompt starter sized so an AI coding agent can pick it up cold, hit a "stop after step N" checkpoint for human review, and finish the work under the existing CODEOWNERS gate. The prompt starters embed the file paths, line numbers, anti-goals, and acceptance criteria so review can focus on judgment rather than archaeology.
 
-After v0.6.3.1: T1 is honest, T2 has real inheritance, T3 has full webhook event coverage, T4 substrate is preserved for v0.7 GA, T5 vision is unchanged. The OSS substrate is correct. The architecture pages stop carrying implicit caveats. The next milestone is v0.7 Trust + A2A Maturity per ROADMAP2.md §7.3.
+After v0.6.3.1: T1 is honest, T2 has real inheritance, T3 has full webhook event coverage, T4 substrate is preserved for v0.7 GA, T5 vision is unchanged. The OSS substrate is correct. The architecture pages stop carrying implicit caveats. The next milestone is v0.7 Trust + A2A Maturity per ROADMAP.md §7.3.
 
 ---
 
 *Document classification: Public-facing. Intended location: `github.com/alphaonedev/ai-memory-mcp/blob/main/REMEDIATIONv0631.md`.*
 
-*Companion: ROADMAP2.md (forward plan). audits/v063-source-code-audit.md (audit detail). architectures.html + T1–T5 (architectural ground truth).*
+*Companion: ROADMAP.md (forward plan). audits/v063-source-code-audit.md (audit detail). architectures.html + T1–T5 (architectural ground truth).*

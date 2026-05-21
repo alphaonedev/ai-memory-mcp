@@ -77,5 +77,5 @@ Three reasons:
 - [`../longmemeval/README.md`](../longmemeval/README.md) — single-stack LongMemEval harness (already shipped; the corpus this directory reuses)
 - [`expected_output.md`](expected_output.md) — comparison-table format the launch-day runner targets
 - [`harness.sh`](harness.sh) — driver script skeleton
-- ROADMAP2 §12 — gap F1 line item (issue #692)
+- ROADMAP §12 — gap F1 line item (issue #692)
 - Issue [#692](https://github.com/alphaonedev/ai-memory-mcp/issues/692) — the gap audit this directory closes

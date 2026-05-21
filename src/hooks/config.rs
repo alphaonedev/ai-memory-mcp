@@ -139,7 +139,7 @@ pub const MAX_TIMEOUT_MS: u32 = 30_000;
 
 /// v0.7.0 R3-S3 — default execution mode for a given event.
 ///
-/// CLAUDE.md and ROADMAP2 §4.7 both call out that hot-path events
+/// CLAUDE.md and ROADMAP §4.7 both call out that hot-path events
 /// must default to `mode = "daemon"` so a configured-but-unspecified
 /// hook does not pay subprocess spawn cost on every recall / search.
 /// Pre-R3 this was a documentation-only assertion: `HookConfig.mode`
@@ -648,7 +648,7 @@ namespace = "*"
 
     /// `test_post_recall_default_mode_is_daemon` — when a `post_recall`
     /// hook block omits `mode`, the loader fills it in with `Daemon`
-    /// per CLAUDE.md + ROADMAP2 §4.7. Pre-R3 this was a doc-only
+    /// per CLAUDE.md + ROADMAP §4.7. Pre-R3 this was a doc-only
     /// claim: `mode` was a required field, so an unspecified `mode`
     /// produced a parse error rather than the documented daemon
     /// default. R3-S3 closes the gap.

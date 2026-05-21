@@ -30,7 +30,7 @@
 //!
 //! # Hardware-backed key storage is OUT of OSS scope
 //!
-//! Per [`ROADMAP2.md`](../../../ROADMAP2.md) and
+//! Per [`ROADMAP.md`](../../../ROADMAP.md) and
 //! [`docs/v0.7/V0.7-EPIC.md`](../../../docs/v0.7/V0.7-EPIC.md), the
 //! OSS path stops at file-based 0600 storage. TPM 2.0, PKCS#11 HSMs,
 //! Apple Secure Enclave / TEE, AWS KMS / GCP KMS / Azure Key Vault

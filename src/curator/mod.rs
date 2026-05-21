@@ -76,7 +76,7 @@ pub const MIN_CONTENT_LEN: usize = 50;
 
 /// Per-namespace compaction configuration.
 ///
-/// Defaults to `enabled = false` to match ROADMAP2 §7.5: compaction is
+/// Defaults to `enabled = false` to match ROADMAP §7.5: compaction is
 /// opt-in because it depends on the Ollama LLM being available at
 /// consolidation time.  Operators enable it per-namespace in
 /// `ai-memory.toml` once they have confirmed Ollama is reachable.
@@ -131,7 +131,7 @@ pub struct CuratorConfig {
     /// Namespaces to skip. Exact match. Always also skips `_`-prefixed.
     pub exclude_namespaces: Vec<String>,
     /// Per-namespace compaction configuration.  Defaults to
-    /// `enabled = false` per ROADMAP2 §7.5 (opt-in due to Ollama dep).
+    /// `enabled = false` per ROADMAP §7.5 (opt-in due to Ollama dep).
     #[serde(default)]
     pub compaction: CompactionConfig,
 }
