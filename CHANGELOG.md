@@ -7,6 +7,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] — v0.7.x doc follow-ups + Wave-2 refactor (post-tag)
 
+### perf(#965) — MCP Connection pooling audit: premise invalid, no pool needed (Wave-2 Tier-B5, 2026-05-21)
+
+Closes #965: Refactor Wave-2 Tier-B5 was filed under the premise that
+"MCP stdio path holds a single `Arc<Mutex<Connection>>` that
+serialises every tool dispatch." Sub-agent H performed the Phase 1
+audit; the premise is **verifiably false** against current `HEAD`:
+
+- `src/mcp/mod.rs:2013` — `run_mcp_server` opens a plain
+  `rusqlite::Connection` via `db::open`. There is no `Arc`, no
+  `Mutex`.
+- `src/mcp/mod.rs:2263` — The stdio loop is
+  `for line in stdin.lock().lines()` — **synchronous and
+  single-threaded by JSON-RPC stdio protocol design**. One request
+  in, one response out; the next line cannot be read until the
+  current one's response is flushed.
+- `src/mcp/mod.rs:1519` — `handle_request` takes a plain
+  `&rusqlite::Connection`. No shared-state wrapper.
+- `src/mcp/mod.rs:846` — `ToolDispatchCtx::conn` is
+  `&'a rusqlite::Connection`. No shared-state wrapper.
+- All 56+ `dispatch_memory_*` wrappers take `&ToolDispatchCtx` and
+  forward `ctx.conn` as `&Connection`. No tool acquires a lock; no
+  tool serialises on a shared mutex.
+
+**Conclusion.** There is no lock contention because there is no
+concurrent access. Adding `r2d2` to a single-threaded stdio loop
+would add a dependency + per-acquire latency (~µs) for zero
+throughput benefit — JSON-RPC stdio at the protocol level serialises
+requests regardless of the underlying Connection topology. The
+Wave-1 codebase-analysis claim (issue #842 Tier-B bullet) conflated
+the HTTP daemon's `Arc<Mutex<(Connection, ...)>>` shape
+(`src/handlers/transport.rs:22`) with the MCP path, which has
+always been a plain `&Connection`.
+
+**Action taken.**
+
+- Three regression tests in `src/mcp/mod.rs::tests::issue_965_audit_*`
+  pin the audit invariants at compile + runtime:
+  - `issue_965_audit_tool_dispatch_ctx_holds_plain_connection_ref` —
+    compile-time check that `ToolDispatchCtx::conn` is
+    `&rusqlite::Connection`.
+  - `issue_965_audit_handle_request_takes_plain_connection_ref` —
+    compile-time check that `handle_request`'s first argument is
+    `&rusqlite::Connection`.
+  - `issue_965_audit_serial_dispatch_50_calls_through_single_connection`
+    — runtime stress: 50 sequential `memory_store` dispatches
+    through a single Connection, asserts every response is
+    `error: None` and all 50 rows land in the underlying SQL store.
+    This is the meaningful stress shape that the single-threaded
+    MCP stdio architecture admits — concurrent dispatch is
+    impossible at the stdio JSON-RPC layer.
+- `CLAUDE.md` §"MCP server" — new threading-model note that
+  documents the single-threaded stdio invariant and explicitly
+  states why `Arc<Mutex<Connection>>` is the wrong shape for this
+  layer (HTTP path is separate; that's a follow-up).
+- `PERFORMANCE.md` — MCP tool dispatch budget row updated to
+  reflect the single-threaded ceiling: throughput is bounded by
+  the slowest tool's wall-clock, not by lock contention.
+
+**HTTP path documented-but-not-changed.** The HTTP daemon's
+`Db = Arc<Mutex<(Connection, PathBuf, ResolvedTtl, bool)>>` shape in
+`src/handlers/transport.rs:22` IS a real contention point under
+concurrent HTTP load (Axum's task pool admits parallel handler
+execution). That refactor is a separate piece of work — tracked
+separately and explicitly NOT bundled into this commit per the
+audit boundary.
+
 ### refactor(#961) — SAL boundary cleanup (Wave-2 Tier-B1, 2026-05-21)
 
 Closes #961: handler-side audit + cleanup of `src/storage/` (legacy direct-sqlite +

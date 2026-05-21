@@ -220,7 +220,13 @@ release-notes intro lives under `docs/v0.7.0/release-notes.md`
 2. **HTTP API** (`src/handlers/`) — Axum REST server on port 9077, **72 `.route(...)` registrations in `src/lib.rs`** at `/api/v1/` (and the bare `/metrics` Prometheus surface). Handlers split per domain under `src/handlers/{http,federation_receive,hook_subscribers,transport}.rs` (#650 partially addressed at v0.7.0; full per-domain split tracked in #650).
 3. **CLI** (`src/main.rs` thin shim + `src/daemon_runtime.rs::Command`) — clap-based, **55 top-level subcommands** at v0.7.0 (was 40 at v0.6.4) with optional `--json` output
 
-All three interfaces share the same storage layer (`src/storage/`) and validation (`src/validate.rs`) layers. The sqlite legacy path uses `Arc<Mutex<(Connection, PathBuf, ResolvedTtl, bool)>>` — a single SQLite connection protected by a mutex. Lock contention is the bottleneck under concurrent HTTP + MCP load. The v0.7 SAL trait (under `src/store/`) abstracts sqlite vs. postgres+AGE adapters; `ai-memory serve --store-url postgres://…` selects the postgres path.
+All three interfaces share the same storage layer (`src/storage/`) and validation (`src/validate.rs`) layers. **Connection-sharing topology differs per interface** (post-#965 audit, 2026-05-21):
+
+- **HTTP daemon (`src/handlers/transport.rs:22`)** uses `Db = Arc<Mutex<(Connection, PathBuf, ResolvedTtl, bool)>>` — a single SQLite connection protected by a mutex. Lock contention IS the bottleneck under concurrent HTTP load (Axum admits parallel handler execution via its task pool).
+- **MCP stdio (`src/mcp/mod.rs:2013`)** uses a plain `rusqlite::Connection` — no `Arc`, no `Mutex`. The stdio loop is `for line in stdin.lock().lines()` (synchronous, single-threaded by JSON-RPC stdio protocol design — one request in, one response out), so concurrent dispatch is impossible at the protocol level and a mutex would be useless. The audit invariant is pinned by three tests in `src/mcp/mod.rs::tests::issue_965_audit_*`. The Wave-1 codebase-analysis claim that MCP serialises on `Arc<Mutex<Connection>>` (issue #842 Tier-B5 / #965) was factually incorrect; #965 closed with audit evidence rather than a no-op pool refactor.
+- **CLI** opens its own `rusqlite::Connection` per command invocation — no sharing at all.
+
+The v0.7 SAL trait (under `src/store/`) abstracts sqlite vs. postgres+AGE adapters; `ai-memory serve --store-url postgres://…` selects the postgres path.
 
 ### Key Modules
 
