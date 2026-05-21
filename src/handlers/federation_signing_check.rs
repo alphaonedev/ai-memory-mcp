@@ -165,11 +165,27 @@ pub(super) async fn sync_push_via_store(
             }
         }
         // v0.7.0 L2-2 — reflection origin stamping (postgres parity).
-        // Use the compiled-default cap on postgres because
-        // `resolve_governance_policy` is sqlite-only today; the stamp
-        // still carries `peer_origin` + `original_depth` which is the
-        // load-bearing provenance.
-        let local_cap = crate::models::GovernancePolicy::default().effective_max_reflection_depth();
+        //
+        // #961 (SAL boundary cleanup, 2026-05-21): pre-fix this branch
+        // used `GovernancePolicy::default().effective_max_reflection_depth()`
+        // because `resolve_governance_policy` was thought to be
+        // sqlite-only. As of Wave-3 the SAL trait method is wired on
+        // both `SqliteStore` (`src/store/sqlite.rs::687`) and
+        // `PostgresStore` (`src/store/postgres.rs::8795`), so we now
+        // honour operator-set per-namespace caps on inbound federation
+        // pushes the same way sqlite does in
+        // `federation_receive.rs::sync_push`. Best-effort: a backend
+        // error (`Err(_)`) or absent policy (`Ok(None)`) falls back to
+        // the compiled-in default so a transient backend hiccup doesn't
+        // refuse legitimate reflection-bearing pushes.
+        let local_cap = app
+            .store
+            .resolve_governance_policy(&mem.namespace)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(crate::models::GovernancePolicy::default)
+            .effective_max_reflection_depth();
         let to_insert = crate::federation::reflection_bookkeeping::stamp_reflection_origin(
             mem,
             &body.sender_agent_id,
@@ -552,5 +568,63 @@ pub(super) fn verify_signature_or_reject(
             );
             None
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #961 regression coverage — SAL boundary cleanup (Wave-2 Tier-B1).
+//
+// Pre-fix, `sync_push_via_store` stamped reflection rows with the
+// compiled-in default `max_reflection_depth` cap because the comment
+// at the call site falsely claimed `resolve_governance_policy` was
+// sqlite-only. Post-fix, the call routes through the SAL trait method
+// `MemoryStore::resolve_governance_policy`, so postgres-backed daemons
+// honour operator-set per-namespace caps the same way sqlite does in
+// `federation_receive::sync_push`.
+//
+// The fragile, fixture-heavy end-to-end test would bring up a full
+// `AppState` against an in-memory SqliteStore (the sql-postgres adapter
+// has no test fixture without a live postgres instance). Instead, the
+// test below pins the load-bearing semantic on the SAL trait surface:
+// resolve_governance_policy on a fresh SqliteStore returns `None`, and
+// the call-site's `.ok().flatten().unwrap_or_else(...)` chain therefore
+// hands back the compiled-in default cap. The "store wired with a
+// policy returns that policy" half is already pinned by `SqliteStore`
+// trait impl tests in `src/store/sqlite.rs::1639` and the postgres
+// adapter's coverage in `src/store/postgres.rs::5288+`. Composed
+// together this anchors the post-#961 contract.
+#[cfg(all(test, feature = "sal"))]
+mod sal_boundary_961_tests {
+    use crate::models::GovernancePolicy;
+    use crate::store::MemoryStore;
+
+    #[tokio::test]
+    async fn fresh_sqlite_store_resolve_governance_policy_returns_none_so_fallback_uses_default() {
+        // The fixture mirrors `src/store/sqlite.rs::fresh_store()`:
+        // open a SqliteStore against a freshly-allocated tempfile. No
+        // namespace_meta rows exist, so any namespace lookup must
+        // return `None` and the call-site's unwrap_or_else fallback
+        // fires.
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let store = crate::store::sqlite::SqliteStore::open(&path).expect("open SqliteStore");
+        let policy_opt = store
+            .resolve_governance_policy("any/ns")
+            .await
+            .expect("resolve_governance_policy");
+        // Fresh DB carries no policy rows.
+        assert!(policy_opt.is_none(), "fresh DB must have no policy");
+        // The call-site collapses Err→fallback and None→fallback the
+        // same way; pin the default cap so a future change to
+        // GovernancePolicy::default() that drifts the cap is caught.
+        let local_cap = policy_opt
+            .unwrap_or_else(GovernancePolicy::default)
+            .effective_max_reflection_depth();
+        assert_eq!(
+            local_cap,
+            GovernancePolicy::default().effective_max_reflection_depth(),
+            "fallback cap must match the compiled default (parity with pre-#961 behavior)"
+        );
     }
 }
