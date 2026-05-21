@@ -716,7 +716,7 @@ pub async fn import_memories(
         for mut mem in body.memories {
             // #956 — restamp before validate / governance / store.
             restamp_agent_id(&mut mem);
-            if let Err(e) = validate::validate_memory(&mem) {
+            if let Err(e) = validate::RequestValidator::validate_memory(&mem) {
                 // Issue #851: never echo the raw `e` to the wire paired
                 // with the user-supplied id (the combo reflects the
                 // caller's request). Sanitize + log instead.
@@ -805,8 +805,12 @@ pub async fn import_memories(
         // import payload carried no links. Empty-vec default produces
         // a zero-iteration loop, which is the documented behaviour.
         for link in body.links.unwrap_or_default() {
-            if validate::validate_link(&link.source_id, &link.target_id, link.relation.as_str())
-                .is_err()
+            if validate::RequestValidator::validate_link_triple(
+                &link.source_id,
+                &link.target_id,
+                link.relation.as_str(),
+            )
+            .is_err()
             {
                 continue;
             }
@@ -827,7 +831,7 @@ pub async fn import_memories(
     for mut mem in body.memories {
         // #956 — restamp before validate / insert.
         restamp_agent_id(&mut mem);
-        if let Err(e) = validate::validate_memory(&mem) {
+        if let Err(e) = validate::RequestValidator::validate_memory(&mem) {
             // Issue #851: never echo `<id>: <validate error>` paired —
             // the combo reflects the caller's request and the inner
             // string can carry validate template detail. Sanitize + log.
@@ -851,8 +855,12 @@ pub async fn import_memories(
     // #869 audit (Category B — safe default): sqlite branch mirror of
     // the postgres-branch links loop above; same empty-vec semantics.
     for link in body.links.unwrap_or_default() {
-        if validate::validate_link(&link.source_id, &link.target_id, link.relation.as_str())
-            .is_err()
+        if validate::RequestValidator::validate_link_triple(
+            &link.source_id,
+            &link.target_id,
+            link.relation.as_str(),
+        )
+        .is_err()
         {
             continue;
         }

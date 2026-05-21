@@ -300,7 +300,9 @@ pub async fn create_link(
     // S82's wire shape uses `{from, to, rel_type}`; resolve canonical
     // (source_id, target_id, relation) from either field set.
     let (source_id, target_id, relation) = body.resolved();
-    if let Err(e) = validate::validate_link(&source_id, &target_id, &relation) {
+    if let Err(e) =
+        validate::RequestValidator::validate_link_triple(&source_id, &target_id, &relation)
+    {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": e.to_string()})),
@@ -672,7 +674,9 @@ pub async fn delete_link(
         }
     };
     let (source_id, target_id, relation) = body.resolved();
-    if let Err(e) = validate::validate_link(&source_id, &target_id, &relation) {
+    if let Err(e) =
+        validate::RequestValidator::validate_link_triple(&source_id, &target_id, &relation)
+    {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": e.to_string()})),
