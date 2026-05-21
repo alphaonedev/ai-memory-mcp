@@ -76,6 +76,118 @@ pub(super) fn messages_namespace_for(agent_id: &str) -> String {
     format!("_messages/{agent_id}")
 }
 
+// --- D1.5 (#986): per-tool McpTool impls for the 2 meta-family agent tools ---
+
+use crate::mcp::registry::McpTool;
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+/// v0.7.0 #972 D1.5 (#986) — request body for `memory_agent_register`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct AgentRegisterRequest {
+    /// Agent id (same validation as metadata.agent_id).
+    pub agent_id: String,
+
+    /// Curated: human, system, ai:<model>. Open-form: any ai:<name>.
+    pub agent_type: String,
+
+    /// Capability tags.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
+/// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_agent_register`.
+#[allow(dead_code)]
+pub struct AgentRegisterTool;
+
+impl McpTool for AgentRegisterTool {
+    fn name() -> &'static str {
+        "memory_agent_register"
+    }
+    fn description() -> &'static str {
+        "Register an agent in the reserved _agents namespace."
+    }
+    fn docs() -> &'static str {
+        "Register agent (agent_type, capabilities) in _agents. Refreshes last_seen_at; preserves registered_at. agent_id is CLAIMED, not attested — pair with attestation for security boundary."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(AgentRegisterRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "meta"
+    }
+}
+
+/// v0.7.0 #972 D1.5 (#986) — request body for `memory_agent_list`. The
+/// legacy schema is `properties: {}` — empty struct.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct AgentListRequest {}
+
+/// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_agent_list`.
+#[allow(dead_code)]
+pub struct AgentListTool;
+
+impl McpTool for AgentListTool {
+    fn name() -> &'static str {
+        "memory_agent_list"
+    }
+    fn description() -> &'static str {
+        "List every registered agent."
+    }
+    fn docs() -> &'static str {
+        "List agents (ordered by registered_at)."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(AgentListRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "meta"
+    }
+}
+
+#[cfg(test)]
+mod d1_5_986_tests {
+    //! D1.5 (#986) — schema parity for the agent-family tools
+    //! (`memory_agent_register`, `memory_agent_list`).
+    //! Shared helpers live at [`crate::mcp::parity_test_helpers`].
+    use super::*;
+    use crate::mcp::parity_test_helpers::{
+        assert_descriptions_match, assert_property_set_parity, derived_props_for,
+    };
+
+    #[test]
+    fn agent_register_parity_986() {
+        let derived = derived_props_for::<AgentRegisterRequest>();
+        assert_property_set_parity("memory_agent_register", &derived);
+        assert_descriptions_match("memory_agent_register", &derived);
+    }
+
+    #[test]
+    fn agent_register_tool_metadata_986() {
+        assert_eq!(AgentRegisterTool::name(), "memory_agent_register");
+        assert_eq!(AgentRegisterTool::family(), "meta");
+    }
+
+    #[test]
+    fn agent_list_parity_986() {
+        let derived = derived_props_for::<AgentListRequest>();
+        assert_property_set_parity("memory_agent_list", &derived);
+        assert_descriptions_match("memory_agent_list", &derived);
+    }
+
+    #[test]
+    fn agent_list_tool_metadata_986() {
+        assert_eq!(AgentListTool::name(), "memory_agent_list");
+        assert_eq!(AgentListTool::family(), "meta");
+    }
+}
+
 // ---- C-5 (#699): unit coverage for the `pub(super)` handlers. The MCP
 // dispatch layer covers the happy paths; these focus on the validator
 // `.map_err(...)` arms that map domain errors into `Err(String)` for the
