@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] — v0.7.x doc follow-ups + Wave-2 refactor (post-tag)
 
+### refactor(#966) — Shared RequestValidator across handlers / MCP / CLI (Wave-2 Tier-C1, 2026-05-21)
+
+Closes #966. Introduces `pub struct RequestValidator` in `src/validate.rs` —
+the canonical fluent surface every wire-entry layer (HTTP handlers, MCP tools,
+CLI subcommands) now routes DTO-bundling validation through. Pre-#966 the
+same `validate_id` + `validate_namespace` + `validate_agent_id` + ... chains
+were duplicated across 50+ HTTP routes, 73 MCP tools, and 55 CLI subcommands;
+adding a new cross-field invariant required three audited per-surface edits.
+
+**New surface (zero-cost facade — methods only, no per-call state):**
+
+- `RequestValidator::validate_create(&CreateMemory)` — full DTO field +
+  cross-field gate
+- `RequestValidator::validate_update(&UpdateMemory)` — partial-update gate
+- `RequestValidator::validate_memory(&Memory)` — import / federation receive
+  / admin restore stricter gate
+- `RequestValidator::validate_link_triple(&source, &target, &relation)` —
+  cross-field self-link gate (relation-set + identical-id refusal)
+- `RequestValidator::validate_consolidate(&ids, &title, &summary, &namespace)`
+  — multi-id consolidation gate (≥2, ≤100, dedup, field-level title/content/ns)
+- `RequestValidator::validate_id_and_namespace(&id, &ns)` — the dominant
+  pre-#966 duplication bundle (>20 handler sites + >15 MCP sites)
+- `RequestValidator::validate_owner_write(&id, &ns, &agent_id)` — id +
+  namespace + #977-hardened agent_id ownership write preamble
+- `RequestValidator::validate_confidence_and_priority(c, p)` — numeric range
+  bundle for callers that synthesize a custom DTO (bulk-create postgres path)
+- `ValidationError { field, reason }` — typed failure with explicit field
+  attribution; `Display` mirrors the legacy `bail!` shape verbatim so wire-side
+  assertions (`error.contains("namespace")`) keep passing without churn
+
+**Sites migrated** (14 files, 22 call-site edits):
+
+- HTTP handlers (9 files): `create.rs`, `memories.rs`, `memories_query.rs`,
+  `links.rs`, `kg.rs`, `power_consolidation.rs`, `federation_receive.rs`,
+  `federation_signing_check.rs`, `admin.rs`
+- MCP tools (4 files): `consolidate.rs`, `link.rs`, `verify.rs`, `kg_invalidate.rs`
+- CLI (1 file): `daemon_runtime.rs` (`ai-memory import` validate_memory loop)
+
+**Behaviour:** byte-equal. The facade methods delegate to the existing
+`validate_create` / `validate_update` / etc. free functions; the `ValidationError`
+→ `anyhow::Error` blanket conversion keeps every `if let Err(e) = ... { e.to_string() }`
+site unchanged. The original free functions are preserved as the lowest-level
+primitive (callers that pass individual `&str` fields without a DTO still use
+`validate::validate_id(...)` directly).
+
+**Tests:** 14 new `RequestValidator::*` tests added under `validate::tests`;
+all 143 validate tests + the full 4841-test lib suite remain green.
+
+**Docs:**
+
+- `CLAUDE.md` §"Key Modules" — `validate.rs` row reworded to advertise the
+  facade alongside the per-field primitives.
+
 ### refactor(#961) — SAL boundary cleanup (Wave-2 Tier-B1, 2026-05-21)
 
 Closes #961: handler-side audit + cleanup of `src/storage/` (legacy direct-sqlite +
