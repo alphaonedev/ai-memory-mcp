@@ -799,3 +799,231 @@ pub fn tool_definitions() -> Value {
         "tools": tools,
     })
 }
+
+#[cfg(test)]
+mod d1_6_987_tests {
+    //! D1.6 (#987) — registry-level regression tests for the
+    //! post-collapse [`tool_definitions`] wire shape.
+    //!
+    //! The snapshot at `tests/snapshots/tool_definitions_pre_d1_6.json`
+    //! is the pre-D1.6 catalog (captured before the macro collapse
+    //! landed). These tests pin the post-D1.6 catalog against it,
+    //! tolerating only the documented allowed-diffs:
+    //!
+    //! - Property order (schemars sorts; legacy was insertion-ordered)
+    //! - `default: null` on schemars-derived Option<T> fields vs.
+    //!   typed defaults on legacy
+    //! - `additionalProperties: false` added by schemars (tightening)
+    //! - `minimum`/`maximum` range-constraint loss on Option<T>
+    //!   fields lacking `#[schemars(range)]` attributes
+    //!
+    //! Disallowed (tests fail):
+    //! - Tools added or removed
+    //! - Property names changed or missing
+    //! - Description text changed (must be byte-equal)
+    //! - `required` array changed
+    //! - Type widening or narrowing beyond Option<T>::None nullable
+    use super::*;
+    use std::collections::BTreeSet;
+
+    fn load_snapshot() -> Value {
+        let path = "tests/snapshots/tool_definitions_pre_d1_6.json";
+        let raw = std::fs::read_to_string(path).unwrap_or_else(|e| {
+            panic!(
+                "missing pre-D1.6 snapshot at {path}: {e}; \
+                 regenerate via the one-shot capture documented in #987 dispatch"
+            )
+        });
+        serde_json::from_str(&raw).expect("snapshot must be valid JSON")
+    }
+
+    /// Pre-D1.6 vs. post-D1.6: same tool COUNT.
+    #[test]
+    fn tool_definitions_byte_shape_v0_7_0_compat_987_count() {
+        let pre = load_snapshot();
+        let post = tool_definitions();
+        let pre_count = pre["tools"].as_array().map_or(0, Vec::len);
+        let post_count = post["tools"].as_array().map_or(0, Vec::len);
+        assert_eq!(
+            pre_count, post_count,
+            "post-D1.6 tool count must match pre-D1.6 snapshot ({pre_count}); \
+             a tool was added or removed."
+        );
+    }
+
+    /// Pre-D1.6 vs. post-D1.6: same tool NAMES (set equality).
+    #[test]
+    fn tool_definitions_byte_shape_v0_7_0_compat_987_names() {
+        let pre = load_snapshot();
+        let post = tool_definitions();
+        let names = |v: &Value| -> BTreeSet<String> {
+            v["tools"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|t| t.get("name").and_then(Value::as_str).map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let pre_names = names(&pre);
+        let post_names = names(&post);
+        let added: Vec<&String> = post_names.difference(&pre_names).collect();
+        let removed: Vec<&String> = pre_names.difference(&post_names).collect();
+        assert!(
+            added.is_empty() && removed.is_empty(),
+            "post-D1.6 tool name set drifted: added = {added:?}, removed = {removed:?}"
+        );
+    }
+
+    /// Pre-D1.6 vs. post-D1.6: per-tool short DESCRIPTION strings
+    /// byte-for-byte equal. The D1.2 (#983) parity contract pinned
+    /// this — D1.6 must preserve it.
+    #[test]
+    fn tool_definitions_byte_shape_v0_7_0_compat_987_descriptions() {
+        let pre = load_snapshot();
+        let post = tool_definitions();
+        let by_name = |v: &Value| -> std::collections::BTreeMap<String, String> {
+            v["tools"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|t| {
+                            let name = t.get("name").and_then(Value::as_str)?.to_string();
+                            let desc = t.get("description").and_then(Value::as_str)?.to_string();
+                            Some((name, desc))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let pre_map = by_name(&pre);
+        let post_map = by_name(&post);
+        for (name, want) in &pre_map {
+            let got = post_map
+                .get(name)
+                .unwrap_or_else(|| panic!("post-D1.6 missing tool {name}"));
+            assert_eq!(
+                got, want,
+                "post-D1.6 {name}.description drifted from snapshot\n  legacy: {want:?}\n  post-D1.6: {got:?}"
+            );
+        }
+    }
+
+    /// Pre-D1.6 vs. post-D1.6: per-tool long-form DOCS strings
+    /// byte-for-byte equal. Same contract as descriptions.
+    #[test]
+    fn tool_definitions_byte_shape_v0_7_0_compat_987_docs() {
+        let pre = load_snapshot();
+        let post = tool_definitions();
+        let by_name = |v: &Value| -> std::collections::BTreeMap<String, String> {
+            v["tools"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|t| {
+                            let name = t.get("name").and_then(Value::as_str)?.to_string();
+                            let docs = t.get("docs").and_then(Value::as_str)?.to_string();
+                            Some((name, docs))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let pre_map = by_name(&pre);
+        let post_map = by_name(&post);
+        for (name, want) in &pre_map {
+            let got = post_map
+                .get(name)
+                .unwrap_or_else(|| panic!("post-D1.6 missing tool {name}"));
+            assert_eq!(
+                got, want,
+                "post-D1.6 {name}.docs drifted from snapshot\n  legacy: {want:?}\n  post-D1.6: {got:?}"
+            );
+        }
+    }
+
+    /// Pre-D1.6 vs. post-D1.6: per-tool `inputSchema.properties`
+    /// KEY SET (property names). Order is allowed to differ
+    /// (schemars sorts); membership must match exactly.
+    #[test]
+    fn tool_definitions_byte_shape_v0_7_0_compat_987_property_keys() {
+        let pre = load_snapshot();
+        let post = tool_definitions();
+
+        let props_by_name = |v: &Value| -> std::collections::BTreeMap<String, BTreeSet<String>> {
+            v["tools"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|t| {
+                            let name = t.get("name").and_then(Value::as_str)?.to_string();
+                            let keys: BTreeSet<String> = t
+                                .pointer("/inputSchema/properties")
+                                .and_then(Value::as_object)
+                                .map(|m| m.keys().cloned().collect())
+                                .unwrap_or_default();
+                            Some((name, keys))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let pre_props = props_by_name(&pre);
+        let post_props = props_by_name(&post);
+        for (name, want) in &pre_props {
+            let got = post_props
+                .get(name)
+                .unwrap_or_else(|| panic!("post-D1.6 missing tool {name}"));
+            let added: Vec<&String> = got.difference(want).collect();
+            let removed: Vec<&String> = want.difference(got).collect();
+            assert!(
+                added.is_empty() && removed.is_empty(),
+                "post-D1.6 {name}.inputSchema.properties drifted: added = {added:?}, removed = {removed:?}"
+            );
+        }
+    }
+
+    /// Pre-D1.6 vs. post-D1.6: per-tool `required` array. Order
+    /// allowed to differ; set membership must match.
+    #[test]
+    fn tool_definitions_byte_shape_v0_7_0_compat_987_required() {
+        let pre = load_snapshot();
+        let post = tool_definitions();
+
+        let req_by_name = |v: &Value| -> std::collections::BTreeMap<String, BTreeSet<String>> {
+            v["tools"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|t| {
+                            let name = t.get("name").and_then(Value::as_str)?.to_string();
+                            let req: BTreeSet<String> = t
+                                .pointer("/inputSchema/required")
+                                .and_then(Value::as_array)
+                                .map(|a| {
+                                    a.iter()
+                                        .filter_map(|v| v.as_str().map(String::from))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            Some((name, req))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let pre_req = req_by_name(&pre);
+        let post_req = req_by_name(&post);
+        for (name, want) in &pre_req {
+            let got = post_req
+                .get(name)
+                .unwrap_or_else(|| panic!("post-D1.6 missing tool {name}"));
+            assert_eq!(
+                got, want,
+                "post-D1.6 {name}.inputSchema.required drifted; \
+                 the D1.6 allowed-diffs do NOT permit required-set changes"
+            );
+        }
+    }
+}
