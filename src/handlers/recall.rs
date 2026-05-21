@@ -20,7 +20,7 @@ use axum::{
 use serde_json::json;
 
 use crate::db;
-use crate::models::{RecallBody, RecallQuery};
+use crate::models::{RecallBody, RecallQuery, RecallRequest};
 use crate::validate;
 
 use super::AppState;
@@ -31,62 +31,55 @@ use super::store_err_to_response;
 
 /// v0.7.0 (issue #518) — when `session_default == true` AND the
 /// caller omitted a given filter axis, splice in the configured
-/// `[agents.defaults.recall_scope]` value. Always returns the
-/// (namespace, since, tier, limit) tuple that subsequent handler
-/// code uses, regardless of whether the splice fired. The
-/// `recall_scope_tier` value is plumbed through to the postgres
-/// SAL path (which carries a `Filter.tier`) — sqlite recall does
-/// not currently expose a tier filter, so this field is a no-op on
-/// the legacy path.
+/// `[agents.defaults.recall_scope]` value IN-PLACE on the canonical
+/// [`RecallRequest`] DTO. Returns the spliced `recall_scope_tier`
+/// (which has no field on the DTO — it's a postgres-SAL-only filter
+/// applied via `Filter.tier`) so the postgres branch in
+/// [`recall_response`] can consume it without re-reading the
+/// `app.recall_scope` state.
 ///
 /// Resolution: explicit args > recall_scope defaults > compiled
 /// defaults.
-#[allow(clippy::type_complexity)]
-fn apply_recall_scope_defaults(
-    app: &AppState,
-    session_default: Option<bool>,
-    explicit_namespace: Option<String>,
-    explicit_since: Option<String>,
-    explicit_limit: Option<usize>,
-) -> (Option<String>, Option<String>, Option<String>, usize) {
-    let want_splice = session_default.unwrap_or(false);
+///
+/// #967 — replaces the legacy `apply_recall_scope_defaults` that
+/// returned a `(namespace, since, tier, limit)` tuple. Mutating
+/// the DTO in place keeps the (already-marshalled) request shape
+/// authoritative through the rest of the handler.
+fn splice_recall_scope_into(req: &mut RecallRequest, app: &AppState) -> Option<String> {
+    let want_splice = req.session_default.unwrap_or(false);
     let scope_opt: Option<&crate::config::RecallScope> = if want_splice {
         app.recall_scope.as_ref().as_ref()
     } else {
         None
     };
 
-    let namespace = explicit_namespace.or_else(|| {
-        scope_opt
+    if req.namespace.is_none() {
+        req.namespace = scope_opt
             .and_then(|s| s.namespaces.as_ref())
             .and_then(|v| v.first())
-            .cloned()
-    });
+            .cloned();
+    }
 
-    let since = explicit_since.or_else(|| {
-        scope_opt.and_then(|s| {
+    if req.since.is_none() {
+        req.since = scope_opt.and_then(|s| {
             s.since.as_deref().and_then(|d| {
                 crate::config::parse_duration_string(d).map(|dur| {
                     let cutoff = chrono::Utc::now() - dur;
                     cutoff.to_rfc3339()
                 })
             })
-        })
-    });
+        });
+    }
 
     let tier = scope_opt.and_then(|s| s.tier.clone());
 
-    let limit_explicit = explicit_limit;
-    let resolved_limit = match limit_explicit {
-        Some(v) => v,
-        None => match scope_opt.and_then(|s| s.limit) {
-            Some(v) => v as usize,
-            None => 10,
-        },
-    };
-    let resolved_limit = resolved_limit.min(50);
+    if req.limit.is_none()
+        && let Some(v) = scope_opt.and_then(|s| s.limit)
+    {
+        req.limit = Some(i64::from(v));
+    }
 
-    (namespace, since, tier, resolved_limit)
+    tier
 }
 
 pub async fn recall_memories_get(
@@ -94,6 +87,12 @@ pub async fn recall_memories_get(
     headers: axum::http::HeaderMap,
     Query(p): Query<RecallQuery>,
 ) -> impl IntoResponse {
+    // #967 — marshal once into the canonical `RecallRequest`. The
+    // entry handler still gates on `context` (or its aliases) being
+    // non-empty BEFORE constructing the DTO so the typed
+    // `400 BAD_REQUEST` envelope stays byte-stable with the v0.7.0
+    // wire contract.
+    //
     // Accept `context` (canonical), `query` (cert harness alias —
     // S79 uses `?query=…`), or `q` (search-style alias — the parity
     // suite uses `?q=…`). Cert oracles continue to work.
@@ -101,13 +100,8 @@ pub async fn recall_memories_get(
     // #869 audit (Category B — safe default): empty `String` collapses
     // straight into the `is_empty()` guard below, which returns a typed
     // 400 with "context (or query) is required".
-    let ctx = p
-        .context
-        .clone()
-        .or_else(|| p.query.clone())
-        .or_else(|| p.q.clone())
-        .unwrap_or_default();
-    if ctx.trim().is_empty() {
+    let mut req = RecallRequest::from_http_query(&p);
+    if req.context.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": "context (or query) is required"})),
@@ -119,7 +113,7 @@ pub async fn recall_memories_get(
     // earlier Ultrareview #348 hard-reject is replaced by always
     // round-tripping the requested budget in the response so a
     // genuinely buggy uninitialised counter is still observable.
-    if let Some(ref a) = p.as_agent
+    if let Some(ref a) = req.as_agent
         && let Err(e) = validate::validate_namespace(a)
     {
         return (
@@ -131,13 +125,7 @@ pub async fn recall_memories_get(
     // v0.7.0 (issue #518) — splice `[agents.defaults.recall_scope]`
     // when `session_default=true` AND the caller omitted the
     // matching filter axis. Resolution: explicit args win.
-    let (ns_resolved, since_resolved, tier_resolved, limit) = apply_recall_scope_defaults(
-        &app,
-        p.session_default,
-        p.namespace.clone(),
-        p.since.clone(),
-        p.limit,
-    );
+    let scope_tier = splice_recall_scope_into(&mut req, &app);
     let kinds = p.resolved_kinds();
     // v0.7.0 ship-hardening (2026-05-19): resolve the caller principal
     // from the X-Agent-Id header (synthesizes anonymous on miss) so
@@ -149,7 +137,7 @@ pub async fn recall_memories_get(
     let caller_principal = match crate::handlers::parity::resolve_caller_agent_id(
         None,
         &headers,
-        p.as_agent.as_deref(),
+        req.as_agent.as_deref(),
     ) {
         Ok(p) => p,
         Err(e) => {
@@ -158,20 +146,10 @@ pub async fn recall_memories_get(
     };
     recall_response(
         &app,
-        &ctx,
-        ns_resolved.as_deref(),
-        limit,
-        p.tags.as_deref(),
-        since_resolved.as_deref(),
-        p.until.as_deref(),
-        p.as_agent.as_deref(),
+        &req,
         Some(caller_principal.as_str()),
-        p.budget_tokens,
-        tier_resolved.as_deref(),
-        p.has_citations.unwrap_or(false),
-        p.source_uri_prefix.as_deref(),
+        scope_tier.as_deref(),
         kinds.as_deref(),
-        p.session_id.as_deref(),
     )
     .await
 }
@@ -181,10 +159,11 @@ pub async fn recall_memories_post(
     headers: axum::http::HeaderMap,
     Json(body): Json<RecallBody>,
 ) -> impl IntoResponse {
-    // Accept either `context` (canonical) or `query` (cert harness
-    // alias used by S79). Reject only when both are missing/empty.
-    let ctx_val = body.resolved_query();
-    if ctx_val.is_empty() {
+    // #967 — same DTO marshal-once shape as the GET path; the body
+    // `resolved_query` precedence (`context > query > q`) is
+    // applied inside the constructor.
+    let mut req = RecallRequest::from_http_body(&body);
+    if req.context.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": "context (or query) is required"})),
@@ -193,7 +172,7 @@ pub async fn recall_memories_post(
     }
     // Phase P6 (R1): `budget_tokens=0` is now a valid request — see
     // the matching note on the GET handler above.
-    if let Some(ref a) = body.as_agent
+    if let Some(ref a) = req.as_agent
         && let Err(e) = validate::validate_namespace(a)
     {
         return (
@@ -203,19 +182,13 @@ pub async fn recall_memories_post(
             .into_response();
     }
     // v0.7.0 (issue #518) — see GET handler for the resolution rule.
-    let (ns_resolved, since_resolved, tier_resolved, limit) = apply_recall_scope_defaults(
-        &app,
-        body.session_default,
-        body.namespace.clone(),
-        body.since.clone(),
-        body.limit,
-    );
+    let scope_tier = splice_recall_scope_into(&mut req, &app);
     let kinds = body.resolved_kinds();
     // See GET handler for the caller-resolution rationale.
     let caller_principal = match crate::handlers::parity::resolve_caller_agent_id(
         None,
         &headers,
-        body.as_agent.as_deref(),
+        req.as_agent.as_deref(),
     ) {
         Ok(p) => p,
         Err(e) => {
@@ -224,20 +197,10 @@ pub async fn recall_memories_post(
     };
     recall_response(
         &app,
-        &ctx_val,
-        ns_resolved.as_deref(),
-        limit,
-        body.tags.as_deref(),
-        since_resolved.as_deref(),
-        body.until.as_deref(),
-        body.as_agent.as_deref(),
+        &req,
         Some(caller_principal.as_str()),
-        body.budget_tokens,
-        tier_resolved.as_deref(),
-        body.has_citations.unwrap_or(false),
-        body.source_uri_prefix.as_deref(),
+        scope_tier.as_deref(),
         kinds.as_deref(),
-        body.session_id.as_deref(),
     )
     .await
 }
@@ -259,51 +222,44 @@ pub async fn recall_memories_post(
 /// FTS surface, which is functionally equivalent for the keyword half
 /// and surfaces a `mode=keyword` envelope so clients can detect the
 /// degraded mode without an out-of-band feature probe.
-#[allow(clippy::too_many_arguments)]
+/// #967 canonical-DTO entry. Pre-#967 this took 15 positional
+/// args (one per wire field) — now takes a `&RecallRequest` plus
+/// the three values the entry handler resolves OUTSIDE the wire
+/// shape:
+///
+///  1. `caller_principal` — derived from the `X-Agent-Id` header
+///     (v0.7.0 ship-hardening 2026-05-19, see comment below).
+///  2. `recall_scope_tier` — spliced from `app.recall_scope.tier`
+///     by the entry handler; has no DTO field because the wire
+///     surface does not expose a `tier` filter directly (postgres
+///     SAL path applies it via `Filter.tier`).
+///  3. `kinds_filter` — the parsed `Vec<MemoryKind>` from the DTO's
+///     `kinds: Option<KindsFilter>` field. Pre-parsing here keeps
+///     the recall path free of `KindsFilter::parse()` churn on
+///     every result-set iteration; the entry handler runs it once.
+///
+/// All other knobs (namespace, limit, tags, since/until, budget,
+/// has_citations, source_uri_prefix, session_id, as_agent) come
+/// off the DTO directly.
 async fn recall_response(
     app: &AppState,
-    context: &str,
-    namespace: Option<&str>,
-    limit: usize,
-    tags: Option<&str>,
-    since: Option<&str>,
-    until: Option<&str>,
-    as_agent: Option<&str>,
-    // v0.7.0 ship-hardening (2026-05-19): caller principal resolved
-    // from the X-Agent-Id header by the GET/POST entry. When `Some`,
-    // overrides the legacy `as_agent.unwrap_or("daemon")` shape used
-    // for the SAL CallerContext — required so the #910 scope=private
-    // visibility filter sees the actual request principal. `None`
-    // preserves the legacy default for callers that haven't migrated
-    // (e.g. in-test direct invocations of recall_response).
+    req: &RecallRequest,
     caller_principal: Option<&str>,
-    budget_tokens: Option<usize>,
-    // v0.7.0 (issue #518) — spliced
-    // `[agents.defaults.recall_scope].tier` when the caller passed
-    // `session_default=true`. Applied on the postgres SAL path
-    // (`Filter.tier`); ignored on the sqlite path because the legacy
-    // `db::recall` / `db::recall_hybrid` functions do not expose a
-    // tier filter parameter.
     recall_scope_tier: Option<&str>,
-    // v0.7.0 Form 4 (issue #757) — fact-provenance post-filters.
-    // Applied in Rust after the substrate-level recall returns so
-    // the existing `db::recall` / `db::recall_hybrid` signatures
-    // stay stable. Composes with every other filter.
-    has_citations: bool,
-    source_uri_prefix: Option<&str>,
-    // v0.7.x Form 6 (issue #759) — Batman-taxonomy memory-kind
-    // filter. Applied post-fetch on both the sqlite and postgres
-    // branches. `None` preserves the pre-Form-6 "no kind filter"
-    // semantics.
     kinds_filter: Option<&[crate::models::MemoryKind]>,
-    // v0.7.0 (issue #518) — per-session recently-accessed boost.
-    // When `Some(non-empty)`, the rerank post-step adds +0.05 to any
-    // recall candidate already in this session's ring (cap 50 ids,
-    // FIFO eviction) and appends the post-boost hit set back into the
-    // ring so subsequent recalls in the same session reuse the new
-    // context. `None`/empty preserves pre-#518 recall semantics.
-    session_id: Option<&str>,
 ) -> axum::response::Response {
+    let context = req.context.as_str();
+    let namespace = req.namespace.as_deref();
+    let limit = req.resolved_limit().min(50);
+    let tags = req.tags.as_deref();
+    let since = req.since.as_deref();
+    let until = req.until.as_deref();
+    let as_agent = req.as_agent.as_deref();
+    let budget_tokens = req.resolved_budget_tokens();
+    let has_citations = req.has_citations.unwrap_or(false);
+    let source_uri_prefix = req.source_uri_prefix.as_deref();
+    let session_id = req.session_id.as_deref();
+
     let session_tracker = crate::reranker::global_session_recall_tracker();
     // `recall_scope_tier` is consumed only on the postgres SAL branch
     // (line 3026). Suppress the unused-variable lint when the sal
