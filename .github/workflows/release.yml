@@ -185,6 +185,275 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   # --------------------------------------------------------------------
+  # v0.7.0 Posture-1a (issue #1068) — iOS xcframework artifact.
+  #
+  # Produces `ai-memory-ios.xcframework.tar.gz` containing a multi-arch
+  # `.xcframework` directory that an iOS app can drop into its Xcode
+  # project. The xcframework bundles three slices:
+  #
+  #   1. `aarch64-apple-ios`        → real iOS devices (iPhone, iPad)
+  #   2. `aarch64-apple-ios-sim`    → Simulator on Apple-silicon Macs
+  #   3. `x86_64-apple-ios`         → Simulator on Intel Macs
+  #
+  # Each slice is a `libai_memory.a` static library. They are combined
+  # via `xcodebuild -create-xcframework` (Apple's official tool for
+  # multi-arch FFI distribution; replaces the older "fat .a"
+  # convention that Xcode 13+ rejects).
+  #
+  # The C header is generated via `cbindgen` against `cbindgen.toml`
+  # at the repo root. Until `#[no_mangle] extern "C"` items land in
+  # `src/lib.rs` (Layer 2 v0.7.x follow-up), the header is a stub —
+  # the xcframework still produces correctly, and downstream
+  # consumers can declare the FFI surface by hand against the same
+  # name + crate-type pair.
+  #
+  # Skipped on pre-release tags (`is_prerelease=true`) so dry-run
+  # tag dispatches don't burn ~10 min of macOS runner time.
+  # --------------------------------------------------------------------
+  mobile-ios:
+    name: Mobile artifact (iOS xcframework)
+    needs: [preflight]
+    if: needs.preflight.outputs.is_prerelease == 'false'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.preflight.outputs.tag }}
+
+      - name: Install Rust stable + iOS targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: mobile-ios-${{ needs.preflight.outputs.tag }}
+
+      - name: Install cbindgen
+        run: cargo install --locked cbindgen
+
+      - name: Build static libraries (release, --features sqlite-bundled)
+        run: |
+          set -euo pipefail
+          for TARGET in aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios; do
+            echo "::group::cargo build --target $TARGET"
+            cargo build \
+              --release \
+              --target "$TARGET" \
+              --no-default-features \
+              --features sqlite-bundled \
+              --lib
+            echo "::endgroup::"
+            test -f "target/$TARGET/release/libai_memory.a" || {
+              echo "::error::libai_memory.a not produced for $TARGET"
+              ls -la "target/$TARGET/release/" || true
+              exit 1
+            fi
+          done
+
+      - name: Generate C header (cbindgen)
+        run: |
+          set -euo pipefail
+          mkdir -p include
+          cbindgen --config cbindgen.toml --crate ai-memory --output include/ai_memory.h
+          echo "--- include/ai_memory.h ---"
+          head -50 include/ai_memory.h
+
+      - name: Assemble .xcframework
+        run: |
+          set -euo pipefail
+          mkdir -p dist/headers
+          cp include/ai_memory.h dist/headers/
+          # Apple requires a module map alongside the umbrella header
+          # so Swift can `import AiMemory` directly. Minimal map —
+          # one module, one header, no submodule mapping.
+          cat > dist/headers/module.modulemap <<'MODULEMAP'
+          framework module AiMemory {
+              umbrella header "ai_memory.h"
+              export *
+          }
+          MODULEMAP
+          xcodebuild -create-xcframework \
+            -library target/aarch64-apple-ios/release/libai_memory.a -headers dist/headers \
+            -library target/aarch64-apple-ios-sim/release/libai_memory.a -headers dist/headers \
+            -library target/x86_64-apple-ios/release/libai_memory.a -headers dist/headers \
+            -output dist/AiMemory.xcframework
+          ls -la dist/AiMemory.xcframework/
+
+      - name: Tar + sha256 the xcframework
+        run: |
+          set -euo pipefail
+          cd dist
+          tar czf ai-memory-ios.xcframework.tar.gz AiMemory.xcframework
+          shasum -a 256 ai-memory-ios.xcframework.tar.gz > ai-memory-ios.xcframework.tar.gz.sha256
+          ls -la ai-memory-ios.xcframework.tar.gz*
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.preflight.outputs.tag }}
+          files: |
+            dist/ai-memory-ios.xcframework.tar.gz
+            dist/ai-memory-ios.xcframework.tar.gz.sha256
+          prerelease: ${{ needs.preflight.outputs.is_prerelease == 'true' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload workflow artifact (for cross-job inspection)
+        uses: actions/upload-artifact@v5
+        with:
+          name: ai-memory-ios-xcframework
+          path: dist/ai-memory-ios.xcframework.tar.gz*
+
+  # --------------------------------------------------------------------
+  # v0.7.0 Posture-1a (issue #1068) — Android AAR-compatible artifact.
+  #
+  # Produces `ai-memory-android.tar.gz` containing a `jniLibs/<abi>/`
+  # directory tree that maps 1:1 onto Android Gradle's AAR layout. An
+  # Android app can either:
+  #   - drop the unpacked directory into its `src/main/jniLibs/`, OR
+  #   - consume the `.aar` published in the follow-up Maven artifact.
+  #
+  # Four ABIs match the Android Architectures the v0.7.0 Posture-1a
+  # row supports:
+  #
+  #   * `aarch64-linux-android`        → arm64-v8a   (modern devices)
+  #   * `armv7-linux-androideabi`      → armeabi-v7a (older devices, ~5%)
+  #   * `x86_64-linux-android`         → x86_64      (emulator on x64)
+  #   * `i686-linux-android`           → x86         (legacy emulators)
+  #
+  # The Android NDK clang toolchain is pointed at via CC_*/AR_* env
+  # vars so the rusqlite bundled SQLite C blob links against the
+  # Android sysroot, not the host's glibc.
+  # --------------------------------------------------------------------
+  mobile-android:
+    name: Mobile artifact (Android AAR-compatible)
+    needs: [preflight]
+    if: needs.preflight.outputs.is_prerelease == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.preflight.outputs.tag }}
+
+      - name: Install Rust stable + Android targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: mobile-android-${{ needs.preflight.outputs.tag }}
+
+      - name: Install Android NDK r26d
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26d
+          add-to-path: false
+
+      - name: Configure NDK toolchain envs (all 4 ABIs)
+        shell: bash
+        run: |
+          set -euo pipefail
+          NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
+          TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          # min-sdk 24 (Android 7.0+). Same floor as the cross-compile
+          # gate in ci.yml.
+          {
+            echo "CC_aarch64_linux_android=$TC/aarch64-linux-android24-clang"
+            echo "CXX_aarch64_linux_android=$TC/aarch64-linux-android24-clang++"
+            echo "AR_aarch64_linux_android=$TC/llvm-ar"
+            echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$TC/aarch64-linux-android24-clang"
+            echo "CC_armv7_linux_androideabi=$TC/armv7a-linux-androideabi24-clang"
+            echo "CXX_armv7_linux_androideabi=$TC/armv7a-linux-androideabi24-clang++"
+            echo "AR_armv7_linux_androideabi=$TC/llvm-ar"
+            echo "CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER=$TC/armv7a-linux-androideabi24-clang"
+            echo "CC_x86_64_linux_android=$TC/x86_64-linux-android24-clang"
+            echo "CXX_x86_64_linux_android=$TC/x86_64-linux-android24-clang++"
+            echo "AR_x86_64_linux_android=$TC/llvm-ar"
+            echo "CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER=$TC/x86_64-linux-android24-clang"
+            echo "CC_i686_linux_android=$TC/i686-linux-android24-clang"
+            echo "CXX_i686_linux_android=$TC/i686-linux-android24-clang++"
+            echo "AR_i686_linux_android=$TC/llvm-ar"
+            echo "CARGO_TARGET_I686_LINUX_ANDROID_LINKER=$TC/i686-linux-android24-clang"
+          } >> "$GITHUB_ENV"
+
+      - name: Build .so for each ABI
+        run: |
+          set -euo pipefail
+          declare -A ABI_OF=(
+            [aarch64-linux-android]=arm64-v8a
+            [armv7-linux-androideabi]=armeabi-v7a
+            [x86_64-linux-android]=x86_64
+            [i686-linux-android]=x86
+          )
+          mkdir -p dist/aar/jniLibs
+          for TARGET in aarch64-linux-android armv7-linux-androideabi x86_64-linux-android i686-linux-android; do
+            ABI="${ABI_OF[$TARGET]}"
+            echo "::group::cargo build --target $TARGET ($ABI)"
+            cargo build \
+              --release \
+              --target "$TARGET" \
+              --no-default-features \
+              --features sqlite-bundled \
+              --lib
+            echo "::endgroup::"
+            mkdir -p "dist/aar/jniLibs/$ABI"
+            cp "target/$TARGET/release/libai_memory.so" "dist/aar/jniLibs/$ABI/"
+          done
+          ls -la dist/aar/jniLibs/*/
+
+      - name: Tar + sha256 the AAR-compatible bundle
+        run: |
+          set -euo pipefail
+          # Drop a minimal AndroidManifest.xml stub alongside the jniLibs
+          # tree so the archive maps 1:1 onto AGP's expected layout.
+          # The real manifest is supplied by the consuming app; this is
+          # informational so `tar tf` makes the layout self-describing.
+          cat > dist/aar/README.md <<'README'
+          # ai-memory Android JNI bundle (v0.7.0 Posture-1a, issue #1068)
+
+          Drop the `jniLibs/` directory into your Android app at:
+
+              src/main/jniLibs/
+
+          Or unpack into a Gradle module's `src/main/jniLibs/` (the
+          standard AGP layout). Four ABIs are bundled:
+
+          - `arm64-v8a/libai_memory.so`   — modern devices
+          - `armeabi-v7a/libai_memory.so` — older devices
+          - `x86_64/libai_memory.so`      — emulator on x64
+          - `x86/libai_memory.so`         — legacy emulators
+
+          The C-callable FFI surface itself lands in a v0.7.x follow-up
+          (#1068 Layer 2 wrap-up); v0.7.0 ships the BUILD pipeline +
+          artifact layout. Until the FFI surface is declared, link the
+          .so into a JNI wrapper that calls a stub `Java_*` entry point.
+          README
+          cd dist
+          tar czf ai-memory-android.tar.gz aar/
+          shasum -a 256 ai-memory-android.tar.gz > ai-memory-android.tar.gz.sha256
+          ls -la ai-memory-android.tar.gz*
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.preflight.outputs.tag }}
+          files: |
+            dist/ai-memory-android.tar.gz
+            dist/ai-memory-android.tar.gz.sha256
+          prerelease: ${{ needs.preflight.outputs.is_prerelease == 'true' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload workflow artifact (for cross-job inspection)
+        uses: actions/upload-artifact@v5
+        with:
+          name: ai-memory-android-aar
+          path: dist/ai-memory-android.tar.gz*
+
+  # --------------------------------------------------------------------
   # crates.io publish (stable releases only).
   # --------------------------------------------------------------------
   crates-io:

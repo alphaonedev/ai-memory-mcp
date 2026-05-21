@@ -1,0 +1,248 @@
+name: Mobile runtime (iOS Simulator + Android emulator)
+
+# v0.7.0 Posture-1a (issue #1068 Layer 3) — runtime tests on the iOS
+# Simulator and Android emulator. The scoped test subset under
+# `tests/mobile/` exercises platform-sensitive surface (sandbox
+# semantics, FTS5 + WAL on device sqlite, HNSW CPU-only correctness,
+# embedder CPU-path, LLM client TLS handshake) that the Layer-1
+# cross-compile gate cannot catch.
+#
+# Why two arms:
+#   - iOS Simulator runs on `macos-latest` (Xcode + Simulator
+#     preinstalled). Fast(ish) — boot is ~30s, test execution is
+#     dominated by build time.
+#   - Android emulator runs on `ubuntu-latest` via
+#     `reactivecircus/android-emulator-runner@v2`, which sets up
+#     KVM, an AVD, and boots an x86_64 emulator. Boot is ~5-8 min
+#     so this is the slowest job in the matrix; gated to
+#     `workflow_dispatch` + `release/**` only by default.
+#
+# Trigger matrix (cost-conscious):
+#   - `push` to `release/**`     → run both arms
+#   - `pull_request` to `main`   → run iOS Simulator only (Android
+#                                  is too expensive per-PR)
+#   - `workflow_dispatch`        → run both arms on demand
+#
+# Estimated cost: ~$0.40 / iOS run + ~$0.04 / Android run when both
+# arms execute. With release/** push frequency of ~5 / month + a
+# weekly manual dispatch, total is ~$10/month — well under the
+# $50-150 ceiling the #1068 spec set.
+
+on:
+  push:
+    branches: ["release/**"]
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/mobile-runtime.yml"
+      - "tests/mobile/**"
+      - "src/lib.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  workflow_dispatch:
+    inputs:
+      run_android:
+        description: "Run the Android emulator arm (slow, default true)."
+        required: false
+        default: "true"
+
+# Cancel in-flight runs on the same branch/PR if a new push lands.
+# Mobile-runtime is the slowest workflow we have; superseded runs
+# burn $0.30+ on average if we let them complete.
+concurrency:
+  group: mobile-runtime-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # --------------------------------------------------------------------
+  # iOS Simulator runtime.
+  # --------------------------------------------------------------------
+  ios-simulator:
+    name: iOS Simulator runtime
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust stable + iOS-sim target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # `aarch64-apple-ios-sim` matches the Apple-silicon GH macOS
+          # runner (macos-latest is M1 / M2). Intel-sim would need
+          # `x86_64-apple-ios`; we don't run that arm in CI because
+          # the macos-13 Intel runner image is on its EOL path.
+          targets: aarch64-apple-ios-sim
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: mobile-ios-sim
+
+      # Build the mobile-runtime test binary for the simulator.
+      # `cargo test --no-run` produces the binary under
+      # target/<triple>/debug/deps/ — we locate it dynamically since
+      # the file name carries a content hash.
+      - name: Build mobile_runtime test binary for iOS Simulator
+        run: |
+          set -euo pipefail
+          cargo test \
+            --no-run \
+            --no-default-features \
+            --features sqlite-bundled \
+            --target aarch64-apple-ios-sim \
+            --test mobile_runtime
+          # cargo emits artifacts under
+          # target/aarch64-apple-ios-sim/debug/deps/mobile_runtime-<hash>
+          BIN=$(ls -t target/aarch64-apple-ios-sim/debug/deps/mobile_runtime-* | grep -v '\.d$' | head -1)
+          test -x "$BIN" || {
+            echo "::error::mobile_runtime test binary not produced"
+            ls -la target/aarch64-apple-ios-sim/debug/deps/ | tail -20
+            exit 1
+          }
+          echo "MOBILE_TEST_BIN=$BIN" >> "$GITHUB_ENV"
+          echo "::notice::built $BIN ($(du -h "$BIN" | cut -f1))"
+
+      - name: Boot iOS Simulator (iPhone 15)
+        run: |
+          set -euo pipefail
+          # Find the latest available iPhone 15 runtime. Hardcoding a
+          # name like "iPhone 15" works across Xcode 15+; if Apple
+          # ever drops it from the default device set, fail fast with
+          # the available list so the next agent can pick a new one.
+          xcrun simctl list devices --json | python3 -c '
+          import json, sys
+          data = json.load(sys.stdin)
+          for runtime, devs in data["devices"].items():
+              for d in devs:
+                  if d["name"] == "iPhone 15" and d["isAvailable"]:
+                      print(d["udid"]); sys.exit(0)
+          sys.exit(1)' > .udid || {
+            echo "::error::no iPhone 15 simulator available"
+            xcrun simctl list devices | head -30
+            exit 1
+          }
+          UDID=$(cat .udid)
+          echo "UDID=$UDID" >> "$GITHUB_ENV"
+          xcrun simctl boot "$UDID" || {
+            # Already booted is fine.
+            xcrun simctl list devices | grep "$UDID"
+          }
+          xcrun simctl bootstatus "$UDID" -b
+
+      - name: Run mobile_runtime tests on iOS Simulator
+        run: |
+          set -euo pipefail
+          UDID="${UDID}"
+          BIN="${MOBILE_TEST_BIN}"
+          # `xcrun simctl spawn` runs an executable inside the
+          # simulator's address space, with the simulator's file
+          # system view + sandbox. Stdout / stderr flow through to
+          # the runner log.
+          xcrun simctl spawn "$UDID" "$BIN" --test-threads=1 || {
+            echo "::error::mobile_runtime tests failed on iOS Simulator"
+            exit 1
+          }
+          echo "::notice::iOS Simulator mobile_runtime — all tests green"
+
+      - name: Shut down simulator
+        if: always()
+        run: |
+          xcrun simctl shutdown "${UDID:-all}" || true
+
+  # --------------------------------------------------------------------
+  # Android emulator runtime.
+  # --------------------------------------------------------------------
+  android-emulator:
+    name: Android emulator runtime
+    runs-on: ubuntu-latest
+    # PR triggers skip this arm (it's the slow one). workflow_dispatch
+    # honors the run_android input. release/** push always runs.
+    if: |
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && (inputs.run_android == 'true' || inputs.run_android == ''))
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust stable + Android x86_64 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: mobile-android-emu
+
+      - name: Install Android NDK r26d
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26d
+          add-to-path: false
+
+      - name: Configure NDK toolchain for cargo
+        shell: bash
+        run: |
+          set -euo pipefail
+          NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
+          TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          {
+            echo "CC_x86_64_linux_android=$TC/x86_64-linux-android24-clang"
+            echo "CXX_x86_64_linux_android=$TC/x86_64-linux-android24-clang++"
+            echo "AR_x86_64_linux_android=$TC/llvm-ar"
+            echo "CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER=$TC/x86_64-linux-android24-clang"
+          } >> "$GITHUB_ENV"
+
+      # Enable KVM so the AVD boots in <2 min instead of ~12 min on
+      # an unaccelerated runner. reactivecircus/android-emulator-runner
+      # handles the rest.
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Build mobile_runtime test binary for Android (x86_64)
+        run: |
+          set -euo pipefail
+          cargo test \
+            --no-run \
+            --no-default-features \
+            --features sqlite-bundled \
+            --target x86_64-linux-android \
+            --test mobile_runtime
+          BIN=$(ls -t target/x86_64-linux-android/debug/deps/mobile_runtime-* | grep -v '\.d$' | head -1)
+          test -x "$BIN" || {
+            echo "::error::mobile_runtime test binary not produced"
+            ls -la target/x86_64-linux-android/debug/deps/ | tail -20
+            exit 1
+          }
+          echo "MOBILE_TEST_BIN=$BIN" >> "$GITHUB_ENV"
+          echo "::notice::built $BIN ($(du -h "$BIN" | cut -f1))"
+
+      - name: Boot Android emulator + run tests
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 30
+          target: google_apis
+          arch: x86_64
+          force-avd-creation: false
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          script: |
+            set -euo pipefail
+            # Push the test binary into the emulator's filesystem.
+            adb push "$MOBILE_TEST_BIN" /data/local/tmp/mobile_runtime
+            adb shell chmod 755 /data/local/tmp/mobile_runtime
+            # Run with ANDROID_DATA_DIR pointing at a writable
+            # subdir so the harness can place its sandbox DB.
+            adb shell "ANDROID_DATA_DIR=/data/local/tmp/ai-memory-sandbox \
+                       mkdir -p /data/local/tmp/ai-memory-sandbox && \
+                       /data/local/tmp/mobile_runtime --test-threads=1" || {
+              echo "::error::mobile_runtime tests failed on Android emulator"
+              exit 1
+            }
+            echo "::notice::Android emulator mobile_runtime — all tests green"
