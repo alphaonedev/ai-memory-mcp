@@ -457,6 +457,34 @@ hand-coded JSON. Adding a tool is one impl + one line in
 `registered_tools()`; the handler dispatch is the only piece that
 hasn't been deduplicated yet (#867 tracks that follow-up).
 
+**Wire trimmer (post-D1.6 schemars metadata strip).**
+`tools/list` is rendered through
+[`crate::mcp::registry::strip_docs_from_tools`] before it goes on the
+wire. The trimmer drops every long-form natural-language string from
+the bare payload so the C5 ≤ 3500 cl100k token ceiling holds for the
+full profile. Stripped surfaces:
+
+- Top-level `docs` field (the prose mirror of `description`).
+- Schemars-only `inputSchema` metadata that the legacy hand-coded
+  macro never emitted: the top-level `description` on the request
+  struct, `$schema`, `title`, and every nested `description` under
+  `definitions.*` (for `$ref`-resolved untagged enums like
+  `RecallKindsFilter::Many(Vec<String>) | One(String)`).
+- Per-parameter `description` strings nested under
+  `inputSchema.properties.*`.
+- Long string defaults (>32 chars of prose) under any nested
+  `default` key; short numeric / boolean / short-enum defaults stay
+  because they are load-bearing for client-side argument
+  construction.
+
+Preserved on the bare wire: the top-level short `description`
+(≤ 50 cl100k tokens) and the full `inputSchema` shape (`type`,
+`enum`, `default`, `minimum`, `maximum`, `required`, `items`) so
+callers can still construct valid arguments. NHI agents that need
+the full prose surface call `memory_capabilities { family=<f>,
+include_schema: true, verbose: true }` — the verbose drilldown
+returns the un-trimmed schemars schema.
+
 **New HTTP endpoint**: Add route in `main.rs` router → implement handler in `handlers.rs` using `Db` extractor.
 
 **New database operation** (post-#961, SAL boundary cleanup): land the

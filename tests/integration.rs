@@ -7659,7 +7659,9 @@ fn test_budget_mcp_tool_schema_and_response() {
     // **v0.7.0 #987 update.** D1.6 schemars derives Option<i64> as
     // `type: ["integer","null"]` (no longer a bare "integer" string).
     // Accept either legacy bare-type OR the schemars nullable array.
-    let type_field = budget_tokens.get("type").expect("budget_tokens must have `type`");
+    let type_field = budget_tokens
+        .get("type")
+        .expect("budget_tokens must have `type`");
     let is_integer = type_field == "integer"
         || type_field
             .as_array()
