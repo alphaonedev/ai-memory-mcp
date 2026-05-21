@@ -13,7 +13,7 @@ The Postgres SAL adapter runs the four knowledge-graph endpoints
 
 The relational `memory_links` table is the durable source of truth in
 both cases — every AGE write is mirrored back to it. The AGE branch
-exists purely as the ~30% speedup path advertised in ROADMAP2 §7.4.4.
+exists purely as the ~30% speedup path advertised in ROADMAP §7.4.4.
 
 ## Fallback contract
 

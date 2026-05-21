@@ -66,7 +66,7 @@ level = "info"        # tracing::EnvFilter syntax
 
 The appender writes rotated files (`ai-memory.log.YYYY-MM-DD`) under the resolved path. Path precedence: CLI flag `--log-dir` > `AI_MEMORY_LOG_DIR` env > `[logging] path` config > platform default. The substrate refuses world-writable log directories — set `chmod 750` on the parent. Shipped in v0.7.0 at 98.98% test coverage; see `src/logging.rs` and the SIEM ingestion runbook at [`security/audit-trail.md`](security/audit-trail.md).
 
-**OpenTelemetry OTLP exporter (forward-looking).** The substrate's span shape is intentionally OTel-compatible. An OTLP exporter that reads `OTEL_EXPORTER_OTLP_ENDPOINT` (and the standard `OTEL_*` companion variables) is a v1.0 commitment — see ROADMAP2 §7.6. Until then, the file-sink path with `structured = true` produces JSON that any OTel-aware collector can ingest as a log-receiver input.
+**OpenTelemetry OTLP exporter (forward-looking).** The substrate's span shape is intentionally OTel-compatible. An OTLP exporter that reads `OTEL_EXPORTER_OTLP_ENDPOINT` (and the standard `OTEL_*` companion variables) is a v1.0 commitment — see ROADMAP §7.6. Until then, the file-sink path with `structured = true` produces JSON that any OTel-aware collector can ingest as a log-receiver input.
 
 ---
 
@@ -100,7 +100,7 @@ All seven sections are computed locally against the SQLite or PostgreSQL store. 
 
 ## 6. v1.0 OpenTelemetry standardization — forward-looking commitment
 
-Per ROADMAP2 §7.6, every internal tracing span converts to canonical OTel spans at v1.0:
+Per ROADMAP §7.6, every internal tracing span converts to canonical OTel spans at v1.0:
 
 - Span attributes match the OTel semantic conventions where they exist (`code.namespace`, `code.function`, `db.system`, etc.).
 - An OTLP exporter ships in-tree, with the standard env-var configuration surface (`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_SERVICE_NAME`).
@@ -116,4 +116,4 @@ Operators who want to forward-compatibly capture spans today can run the file si
 - [`SECURITY.md`](../SECURITY.md) — threat model and disclosure policy
 - [`security/audit-trail.md`](security/audit-trail.md) — SIEM ingestion runbook for the file sink
 - `src/logging.rs` — implementation of the rotating file appender (98.98% test coverage)
-- ROADMAP2 §7.6 — v1.0 OTel standardization commitment
+- ROADMAP §7.6 — v1.0 OTel standardization commitment

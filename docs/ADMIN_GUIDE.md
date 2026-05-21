@@ -446,7 +446,7 @@ Keys live at `~/.config/ai-memory/keys/<agent_id>.{pub,priv}` with mode `0644` /
 
 The `memory_verify(link_id)` MCP tool returns `{signature_verified, attest_level, signed_by, signed_at}` for any link on demand. Use it as a verification gate in any decision path that previously trusted `metadata.agent_id` alone.
 
-**Hardware-backed key storage** (TPM / HSM / Secure Enclave) is **out of OSS scope** per ROADMAP2 — available only in the AgenticMem commercial layer. Software-only Ed25519 with file-mode 0600 is the OSS contract. See [MIGRATION § Ed25519 attestation](MIGRATION_v0.7.md#ed25519-attestation-opt-in) and the [`attested-cortex` RFC § Decision 1](v0.7/rfc-attested-cortex.md#decision-1--why-ed25519-over-x25519--chacha20) for the threat model and the X25519 / ChaCha20 deferral rationale.
+**Hardware-backed key storage** (TPM / HSM / Secure Enclave) is **out of OSS scope** per ROADMAP — available only in the AgenticMem commercial layer. Software-only Ed25519 with file-mode 0600 is the OSS contract. See [MIGRATION § Ed25519 attestation](MIGRATION_v0.7.md#ed25519-attestation-opt-in) and the [`attested-cortex` RFC § Decision 1](v0.7/rfc-attested-cortex.md#decision-1--why-ed25519-over-x25519--chacha20) for the threat model and the X25519 / ChaCha20 deferral rationale.
 
 ## Transcripts & Replay (v0.7+)
 
@@ -544,7 +544,7 @@ ai-memory governance migrate-to-permissions --apply       # commit
 
 Re-running is safe — already-migrated rows are skipped. The dry-run output is the authoritative diff to review before `--apply`.
 
-**A2A approval API** (Track K10) — three surfaces, all HMAC-signed (mandatory, non-optional per ROADMAP2 §7.3):
+**A2A approval API** (Track K10) — three surfaces, all HMAC-signed (mandatory, non-optional per ROADMAP §7.3):
 
 | Surface | Endpoint / tool |
 |---|---|

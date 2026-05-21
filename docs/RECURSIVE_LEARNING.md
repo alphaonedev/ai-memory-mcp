@@ -644,6 +644,6 @@ that elides the wiring gap as inaccurate.
 - Task 6 commit: [`fbf093c`](https://github.com/alphaonedev/ai-memory-mcp/commit/fbf093c)
 - L2 merge commits: [`c3f6e82`](https://github.com/alphaonedev/ai-memory-mcp/commit/c3f6e82) (L2-1), [`0b1c9cc`](https://github.com/alphaonedev/ai-memory-mcp/commit/0b1c9cc) (L2-2), [`3f419be`](https://github.com/alphaonedev/ai-memory-mcp/commit/3f419be) (L2-3), [`a50b34c`](https://github.com/alphaonedev/ai-memory-mcp/commit/a50b34c) (L2-4), [`bb870b3`](https://github.com/alphaonedev/ai-memory-mcp/commit/bb870b3) (L2-5), [`505c538`](https://github.com/alphaonedev/ai-memory-mcp/commit/505c538) (L2-6), [`0966b57`](https://github.com/alphaonedev/ai-memory-mcp/commit/0966b57) (L2-7), [`90291c0`](https://github.com/alphaonedev/ai-memory-mcp/commit/90291c0) (L2-8)
 - v0.7.0 epic scope: [`v0.7/V0.7-EPIC.md`](v0.7/V0.7-EPIC.md)
-- ROADMAP context: [`../ROADMAP2.md`](../ROADMAP2.md) §7.4 (recursive
+- ROADMAP context: [`../ROADMAP.md`](../ROADMAP.md) §7.4 (recursive
   learning) and §Pillar 2.5 (reflection-pass curator + cascade rollback)
 - Reproducibility script: [`../scripts/reproduce-recursive-learning.sh`](../scripts/reproduce-recursive-learning.sh)

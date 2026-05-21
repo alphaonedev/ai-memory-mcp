@@ -11,7 +11,7 @@ companion_docs:
   - V0.7-EPIC.md
   - v0.7-nhi-prompts.md
   - ../MIGRATION_v0.7.md
-  - ../../ROADMAP2.md (§7.3)
+  - ../../ROADMAP.md (§7.3)
 authors: AlphaOne (synthesis)
 reading_time: ~25 min
 ---
@@ -39,7 +39,7 @@ v0.7.0 ships **five interlocking substrates** under one release banner:
 
 Plus the **legibility** rollup absorbed from the canceled v0.6.5 epic: capabilities v3, named loader tools, schema compaction, per-harness positioning.
 
-This RFC records the **four explicit architectural decisions** the V0.7-EPIC calls out, plus the design principles, the substrate dependency graph, the attestation threat model, the performance-budget rationale, the v0.6.x → v0.7 compatibility matrix, the explicit out-of-scope set, and the pointers back to V0.7-EPIC.md / ROADMAP2.md / MIGRATION_v0.7.md / the GitHub issues for the major tracks.
+This RFC records the **four explicit architectural decisions** the V0.7-EPIC calls out, plus the design principles, the substrate dependency graph, the attestation threat model, the performance-budget rationale, the v0.6.x → v0.7 compatibility matrix, the explicit out-of-scope set, and the pointers back to V0.7-EPIC.md / ROADMAP.md / MIGRATION_v0.7.md / the GitHub issues for the major tracks.
 
 ---
 
@@ -91,7 +91,7 @@ The gap wasn't a bug; it was a labeling failure. The substrate was capable; the 
 
 When v0.7.0 absorbed the trust narrative below, the v0.6.5 epic got rolled into v0.7.0 as Tracks A / B / C / D / E. The legibility work became **half the v0.7.0 release**; the trust work is the other half.
 
-### Narrative 2 — the trust gap (`attested`, from ROADMAP2 §7.3)
+### Narrative 2 — the trust gap (`attested`, from ROADMAP §7.3)
 
 The v0.6.3 audit cataloged a set of credibility-shaped findings that all pointed at the same theme: the substrate **advertised trust capabilities it did not deliver**.
 
@@ -209,7 +209,7 @@ The V0.7-EPIC calls out four explicit architectural decisions that this RFC must
 
 ### Decision 1 — Why Ed25519 over X25519 + ChaCha20
 
-> **The decision:** v0.7.0 ships **Ed25519 signatures** for per-agent identity, link provenance, and the `signed_events` audit chain. v0.7.0 does **not** ship X25519 + ChaCha20-Poly1305 end-to-end memory encryption. The latter is a v0.8 commitment (see ROADMAP2.md §7.6 / existing issue #228).
+> **The decision:** v0.7.0 ships **Ed25519 signatures** for per-agent identity, link provenance, and the `signed_events` audit chain. v0.7.0 does **not** ship X25519 + ChaCha20-Poly1305 end-to-end memory encryption. The latter is a v0.8 commitment (see ROADMAP.md §7.6 / existing issue #228).
 
 #### What each primitive does
 
@@ -266,7 +266,7 @@ This is called out explicitly in the threat model section below.
 
 #### What about hardware-backed key storage?
 
-**Out of OSS scope** — TPM / HSM / Secure Enclave key storage is the AgenticMem commercial layer. The OSS provides the *abstraction* (a `KeyStore` trait that can be backed by file, by env var, or by a hardware module); the *certified-managed deployment* is commercial. This is consistent with ROADMAP2.md §7.3 ("Out of OSS scope") and is documented as a comment on `src/identity/keypair.rs`.
+**Out of OSS scope** — TPM / HSM / Secure Enclave key storage is the AgenticMem commercial layer. The OSS provides the *abstraction* (a `KeyStore` trait that can be backed by file, by env var, or by a hardware module); the *certified-managed deployment* is commercial. This is consistent with ROADMAP.md §7.3 ("Out of OSS scope") and is documented as a comment on `src/identity/keypair.rs`.
 
 The reason for this split: hardware-backed key storage requires per-platform PKCS#11 / TPM2-TSS / WebAuthn integrations that change frequently, require platform-specific cert chains, and have an attached compliance overhead (FIPS, Common Criteria) that the OSS project cannot maintain alongside its monthly release cadence. The OSS provides the trait surface so that commercial overlays can plug in cleanly; the OSS itself ships file-based keys with strict permissions.
 
@@ -630,7 +630,7 @@ v0.7.0 deployed
 
 ### Mandatory cutline if scope slips
 
-Per V0.7-EPIC.md "What's deferred (out of v0.7.0 scope, per agreement)" and the cutline framing in ROADMAP2.md §7.3, the **mandatory cutline** for v0.7.0 ship is:
+Per V0.7-EPIC.md "What's deferred (out of v0.7.0 scope, per agreement)" and the cutline framing in ROADMAP.md §7.3, the **mandatory cutline** for v0.7.0 ship is:
 
 ```
 K1 (G1 inheritance fix — CUTLINE)
@@ -1128,7 +1128,7 @@ The hook ships in the `ai-memory-mcp` repo under `tools/auto-link-detector/` per
 
 ### The R3 / R5 recovery pattern
 
-R3 (auto-link inference) and R5 (auto-extraction from conversations) are both v0.6.x charter commitments that vanished in earlier roadmap revisions. v0.7 recovers them by **shipping the substrate** (the hook pipeline) and **shipping the reference implementations** (G11 for R3; I5 for R5). This recovery pattern is documented in ROADMAP2.md §"Recoveries":
+R3 (auto-link inference) and R5 (auto-extraction from conversations) are both v0.6.x charter commitments that vanished in earlier roadmap revisions. v0.7 recovers them by **shipping the substrate** (the hook pipeline) and **shipping the reference implementations** (G11 for R3; I5 for R5). This recovery pattern is documented in ROADMAP.md §"Recoveries":
 
 | Recovery | Substrate | Reference impl |
 |---|---|---|
@@ -1384,7 +1384,7 @@ On sign-off, this RFC moves from `DRAFT` to `APPROVED` and becomes the historica
 
 - [`docs/v0.6.4/rfc-default-tool-surface-collapse.md`](../v0.6.4/rfc-default-tool-surface-collapse.md) — The v0.6.4 RFC; style precedent for this document.
 - [v0.6.5 epic (superseded)](../v0.6.5/V0.6.5-EPIC.md) — `cortex-fluent` epic, rolled into v0.7.0 per the V0.7-EPIC.
-- [`ROADMAP2.md §7.3`](../../ROADMAP2.md) — The original v0.7 spec (Q2 2026 target; now consolidating into `attested-cortex`).
+- [`ROADMAP.md §7.3`](../../ROADMAP.md) — The original v0.7 spec (Q2 2026 target; now consolidating into `attested-cortex`).
 - [`docs/MIGRATION_v0.6.4.md`](../MIGRATION_v0.6.4.md) — The predecessor migration guide.
 - [`docs/MIGRATION-v0.6.2-to-v0.6.3.md`](../MIGRATION-v0.6.2-to-v0.6.3.md) — Earlier migration.
 - [`docs/BASELINE-v0.6.3.1.md`](../BASELINE-v0.6.3.1.md) — Honest-Capabilities-v2 disclosure baseline; the document this RFC builds on.
@@ -1440,7 +1440,7 @@ This RFC records the design rationale for the trust angle (Decisions 1-4) and in
 
 ## Glossary
 
-Terms used throughout this RFC, with the v0.7 precise meaning. Cross-references to V0.7-EPIC.md / MIGRATION_v0.7.md / ROADMAP2.md preserved.
+Terms used throughout this RFC, with the v0.7 precise meaning. Cross-references to V0.7-EPIC.md / MIGRATION_v0.7.md / ROADMAP.md preserved.
 
 | Term | Meaning in v0.7 |
 |---|---|
@@ -1458,7 +1458,7 @@ Terms used throughout this RFC, with the v0.7 precise meaning. Cross-references 
 | **Ed25519** | Edwards-curve digital signature algorithm; RFC 8032; the signature primitive Track H ships |
 | **Exec mode** | Hook execution mode where a subprocess is spawned per fire (vs. `daemon` mode) |
 | **Family** | A logical grouping of MCP tools (core / graph / admin / power / full); v0.6.4 introduced; v0.7 extends with loader tools |
-| **G1** | The namespace-inheritance enforcement fix; cutline-protected per ROADMAP2 §7.3 |
+| **G1** | The namespace-inheritance enforcement fix; cutline-protected per ROADMAP §7.3 |
 | **Gate** | The decision surface that runs before a write; consults permission rules (K9) and hook chain (G5) |
 | **G12** | The v0.6.3 audit finding that `memory_links.signature` was a dead column; closed by Track H (H6) |
 | **Honest disclosure** | Principle 5: capabilities report live state, not advertised intent; v0.6.3.1 introduced; v0.7 inherits |

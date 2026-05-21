@@ -3669,7 +3669,7 @@ impl PostgresStore {
         // v0.7.0 S6-M3 — AGE Cypher dispatcher. Routes on the
         // `kg_backend` resolved at `connect()` time (J1 substrate
         // probe). The AGE path delivers the ~30% speed-up advertised
-        // in ROADMAP2 §7.4.4; the CTE path is the universal fallback
+        // in ROADMAP §7.4.4; the CTE path is the universal fallback
         // for vanilla Postgres deployments. Dual-path test discipline
         // (#648) requires identical KgQueryRow outputs from both
         // branches — `tests/postgres_kg_age_cte_parity.rs` pins that

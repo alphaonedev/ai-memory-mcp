@@ -109,7 +109,7 @@ subtle = "2"
 # RustCrypto's expectations). `base64` (URL-safe, no-padding) is the
 # wire format for `export-pub` so an operator can paste a key into a
 # remote allowlist without binary copy hazards. Hardware-backed key
-# storage (TPM/HSM/Secure Enclave) is out of OSS scope per ROADMAP2.md
+# storage (TPM/HSM/Secure Enclave) is out of OSS scope per ROADMAP.md
 # and lives in the AgenticMem commercial layer.
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand_core = { version = "0.6", features = ["std"] }
@@ -164,7 +164,7 @@ prometheus = { version = "0.13", default-features = false }
 # context-window tokenizer for budgeting purposes. Used post-rank in
 # `memory_recall` when the caller supplies `budget_tokens`. Pure Rust,
 # no C deps; the BPE table is embedded in the crate (~1.7 MB) so the
-# tokenizer is offline-deterministic across all hosts. Per ROADMAP2.md
+# tokenizer is offline-deterministic across all hosts. Per ROADMAP.md
 # R1 ("budget_tokens recall — Letta has it, we don't, we need it").
 tiktoken-rs = "0.7"
 

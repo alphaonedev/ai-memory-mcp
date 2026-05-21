@@ -56,7 +56,7 @@ pub const CONSOLIDATE_JACCARD_THRESHOLD: f64 = 0.55;
 
 /// v0.7.0 R3-S2 — cosine similarity threshold (on 384d L2-normalised
 /// MiniLM embeddings) above which two memories cluster for
-/// consolidation. Default `0.75` per playbook §2.7 + ROADMAP2 §5.2:
+/// consolidation. Default `0.75` per playbook §2.7 + ROADMAP §5.2:
 /// it captures rephrasings and semantically near-equivalent content
 /// without merging merely topically-adjacent memories.
 ///
@@ -241,7 +241,7 @@ pub fn run_autonomy_passes(
 }
 
 /// v0.7.0 R3-S2 — Two-stage clustering per playbook §2.7 /
-/// ROADMAP2 §5.2:
+/// ROADMAP §5.2:
 ///
 ///   1. **Jaccard pre-filter** (cheap, O(N) per pair) — pairs that
 ///      fail [`CONSOLIDATE_JACCARD_THRESHOLD`] are dropped without

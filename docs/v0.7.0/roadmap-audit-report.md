@@ -9,7 +9,7 @@
 
 ## Executive summary
 
-The fold-J pass cross-referenced every concrete claim in `ROADMAP2.md`,
+The fold-J pass cross-referenced every concrete claim in `ROADMAP.md`,
 `CHANGELOG.md`, `docs/v0.7.0/release-notes.md`, `docs/policy-engine.md`,
 `docs/security/audit-trail-coverage.md`, `README.md`, `CLAUDE.md`,
 `docs/agent-skills.md`, GitHub issues #691 / #693 / #694 / #695 / #696 /
@@ -100,7 +100,7 @@ All 13 doc-drift gaps closed by edits in this branch. Bound to #700 SHIP CAMPAIG
 
 ### Cluster 1 — MCP tool count drift (43 → 63)
 
-**Filed:** [#701](https://github.com/alphaonedev/ai-memory-mcp/issues/701) "v0.7.0 gap: doc drift — README + ROADMAP2 + CLAUDE.md reference 43 MCP tools (actual: 63)"
+**Filed:** [#701](https://github.com/alphaonedev/ai-memory-mcp/issues/701) "v0.7.0 gap: doc drift — README + ROADMAP + CLAUDE.md reference 43 MCP tools (actual: 63)"
 
 **Fixed in this branch:**
 
@@ -112,8 +112,8 @@ All 13 doc-drift gaps closed by edits in this branch. Bound to #700 SHIP CAMPAIG
 - `README.md` lines 722-756 — 4× "43-tool surface" → "63-tool surface"
 - `README.md` line 786 — "These 43 tools" → "These 63 tools (full profile)"
 - `CLAUDE.md` line 124 — "43 tools + 2 prompts" → "63 tools at full profile (5 default) + 2 prompts"
-- `ROADMAP2.md` line 152 (§4.7) — "52 MCP tools total" → "63 MCP tools total" with full provenance list, removed false "promote_from_reflection is v0.8.0" claim
-- `ROADMAP2.md` line 958 (§17 Net) — same correction
+- `ROADMAP.md` line 152 (§4.7) — "52 MCP tools total" → "63 MCP tools total" with full provenance list, removed false "promote_from_reflection is v0.8.0" claim
+- `ROADMAP.md` line 958 (§17 Net) — same correction
 
 ### Cluster 2 — Hook event count drift (20 → 25)
 
@@ -134,10 +134,10 @@ All 13 doc-drift gaps closed by edits in this branch. Bound to #700 SHIP CAMPAIG
 
 **Fixed in this branch:**
 
-- `ROADMAP2.md` line 71 (§4.1 schema row) — "v30" → "v34 sqlite / v33 postgres" with full ladder
-- `ROADMAP2.md` §7.4 line 623-626 — "v30 → v3X" header → "v34 → v3X"; ladder updated; "v0.8.0 lands at v3X (above v30)" → "above v34"
-- `ROADMAP2.md` §7.4 effort table line — "v30 → v3X" → "v34 → v3X"
-- `ROADMAP2.md` §17 line 958 — "schema v30" → "schema v34 sqlite / v33 postgres" + acknowledges V-4 closeout
+- `ROADMAP.md` line 71 (§4.1 schema row) — "v30" → "v34 sqlite / v33 postgres" with full ladder
+- `ROADMAP.md` §7.4 line 623-626 — "v30 → v3X" header → "v34 → v3X"; ladder updated; "v0.8.0 lands at v3X (above v30)" → "above v34"
+- `ROADMAP.md` §7.4 effort table line — "v30 → v3X" → "v34 → v3X"
+- `ROADMAP.md` §17 line 958 — "schema v30" → "schema v34 sqlite / v33 postgres" + acknowledges V-4 closeout
 - `CHANGELOG.md` line 64 (Headline) — added "terminal sqlite v34 / postgres v33 after L0.7 + L2 wave + V-4 closeout"
 - `CHANGELOG.md` line 260 — "v20 → v28" upgrade path → "v20 → v34" with ladder
 - `CHANGELOG.md` line 262 — "v15 → v28" → "v15 → v33" with ladder
@@ -188,7 +188,7 @@ The full claim map at [`.local-runs/phase-j/claim-map.md`](../../.local-runs/pha
 
 ## Final acceptance
 
-**v0.7.0 delivers 100% of its claimed deliverables** at HEAD `12a7f29` on `feat/v0.7.0-grand-slam`. The 13 doc-drift gaps surfaced by this audit are all closed in this branch (`fold-j/roadmap-audit`). The remaining work cited in ROADMAP2 §16 and `docs/policy-engine.md` §6 is reclassified to v0.8.0 epic [#697](https://github.com/alphaonedev/ai-memory-mcp/issues/697) with explicit V08-PE-1 … V08-PE-8 sub-task scopes:
+**v0.7.0 delivers 100% of its claimed deliverables** at HEAD `12a7f29` on `feat/v0.7.0-grand-slam`. The 13 doc-drift gaps surfaced by this audit are all closed in this branch (`fold-j/roadmap-audit`). The remaining work cited in ROADMAP §16 and `docs/policy-engine.md` §6 is reclassified to v0.8.0 epic [#697](https://github.com/alphaonedev/ai-memory-mcp/issues/697) with explicit V08-PE-1 … V08-PE-8 sub-task scopes:
 
 - **V08-PE-1** — Mandatory-hook profile (out-of-band channel mitigation)
 - **V08-PE-2** — Read-action gating (`AgentAction::Read` variant; closes engine-level read-visibility gap)

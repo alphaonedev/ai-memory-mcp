@@ -109,7 +109,7 @@ fn verify_failure_does_not_trigger_rollback_in_minimum_slice() {
 }
 
 // ---------------------------------------------------------------------------
-// Criterion 4 — compaction.enabled defaults to false (ROADMAP2 §7.5)
+// Criterion 4 — compaction.enabled defaults to false (ROADMAP §7.5)
 // ---------------------------------------------------------------------------
 
 /// The `compaction` sub-config must default to `enabled = false` to satisfy
@@ -119,7 +119,7 @@ fn compaction_config_defaults_to_disabled() {
     let cfg = CompactionConfig::default();
     assert!(
         !cfg.enabled,
-        "compaction.enabled must default to false (ROADMAP2 §7.5, opt-in due to Ollama dep)"
+        "compaction.enabled must default to false (ROADMAP §7.5, opt-in due to Ollama dep)"
     );
 }
 
