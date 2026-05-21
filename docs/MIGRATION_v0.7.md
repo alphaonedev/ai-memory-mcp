@@ -33,6 +33,8 @@
 | QW-1 file-backed reflection export | `memory_export_reflection` MCP tool | Opt-IN per namespace | `auto_export_reflections_to_filesystem = true` |
 | QW-2 persona-as-artifact | `memory_persona` + `memory_persona_generate` tools, `MemoryKind::Persona` | Opt-IN per namespace | `auto_persona_trigger_every_n_memories = N` ([doc](persona.md)) |
 | QW-3 context-offload primitive | `memory_offload` + `memory_deref` tools | Caller-driven | [doc](context-offload.md) |
+| Provider-agnostic LLM substrate ([#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067)) | `LlmProvider::OpenAiCompatible` wire shape, 15 vendor aliases, `OllamaClient::from_env()` | Backend defaults to `ollama` if `AI_MEMORY_LLM_BACKEND` unset — every v0.6.4 caller keeps working | Set `AI_MEMORY_LLM_BACKEND` + (alias-specific) API key env var to route the smart / autonomous tier to any of xAI / OpenAI / Anthropic / Gemini / DeepSeek / Kimi / Qwen / Mistral / Groq / Together / Cerebras / OpenRouter / Fireworks / LMStudio / vLLM / llama.cpp |
+| Mobile target CI ([#1068](https://github.com/alphaonedev/ai-memory-mcp/issues/1068)) | `aarch64-apple-ios` + `aarch64-linux-android` cross-compile gates, iOS xcframework + Android jniLibs release artifacts, simulator/emulator runtime tests | No change for desktop deploys | Consume `ai-memory-ios.xcframework.tar.gz` + `ai-memory-android.tar.gz` release artifacts; C-ABI FFI surface itself lands v0.7.x |
 
 ---
 
@@ -358,6 +360,86 @@ Honest disclosures from v0.6.3.1 close out:
 - `rule_summary` is now populated with a real ordered list of active governance rules (K5).
 
 Operator docs: [`docs/governance.md`](governance.md), [`docs/policy-engine.md`](policy-engine.md), [`docs/k10-sse-approvals.md`](k10-sse-approvals.md).
+
+---
+
+## Provider-agnostic LLM backend ([#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067))
+
+v0.7.0 promotes the LLM client to a provider-agnostic substrate. Pre-v0.7.0
+the smart and autonomous tiers required local Ollama; post-v0.7.0 the same
+tiers run against any of: local Ollama, xAI Grok, OpenAI, Anthropic (via
+the OpenAI shim), Google Gemini, DeepSeek, Kimi (Moonshot), Qwen (Alibaba),
+Mistral, Groq, Together AI, Cerebras, OpenRouter, Fireworks, LMStudio,
+vLLM, or llama.cpp server.
+
+**No action required for v0.6.4 callers** — `AI_MEMORY_LLM_BACKEND`
+defaults to `ollama` if unset, and the legacy `OLLAMA_BASE_URL` env var
+is still honoured. Every v0.6.4 setup keeps working byte-identically.
+
+**To migrate to a remote / different vendor**, set three env vars:
+
+```bash
+# Example: xAI Grok 4 for the autonomous tier
+export AI_MEMORY_LLM_BACKEND=xai           # alias — pre-fills base URL
+export AI_MEMORY_LLM_MODEL=grok-4
+export XAI_API_KEY=xai-…                    # per-vendor fallback (or AI_MEMORY_LLM_API_KEY)
+
+# Example: OpenAI gpt-4o
+export AI_MEMORY_LLM_BACKEND=openai
+export AI_MEMORY_LLM_MODEL=gpt-4o
+export OPENAI_API_KEY=sk-…
+
+# Example: Anthropic Claude via the OpenAI shim
+export AI_MEMORY_LLM_BACKEND=anthropic
+export AI_MEMORY_LLM_MODEL=claude-sonnet-4
+export ANTHROPIC_API_KEY=sk-ant-…
+
+# Example: generic OpenAI-compatible endpoint (vLLM, llama.cpp server, etc.)
+export AI_MEMORY_LLM_BACKEND=openai-compatible
+export AI_MEMORY_LLM_BASE_URL=http://your-host:8000/v1   # REQUIRED — no default URL
+export AI_MEMORY_LLM_MODEL=your-model
+export AI_MEMORY_LLM_API_KEY=…
+```
+
+**Tier independence.** Setting `AI_MEMORY_LLM_BACKEND` routes the LLM
+client through the provider-agnostic path **regardless of tier**.
+Tier still determines which other features run (embedder, reranker).
+
+Operator doc: module-level rustdoc at [`src/llm.rs`](../src/llm.rs);
+the LlmProvider table at the top of the file is the canonical
+provider × wire-shape × auth × vendor anchor.
+
+---
+
+## Mobile target CI ([#1068](https://github.com/alphaonedev/ai-memory-mcp/issues/1068))
+
+The Rust library (`crate-type = ["rlib", "staticlib", "cdylib"]`) now
+cross-compiles for iOS + Android. v0.7.0 ships the CI pipeline:
+
+- **Layer 1** — cross-compile gate on every PR: `cargo check --target
+  aarch64-apple-ios --no-default-features --features sqlite-bundled --lib`
+  (macos-latest), `cargo check --target aarch64-linux-android --no-default-features
+  --features sqlite-bundled --lib` (ubuntu-latest with NDK r26d).
+- **Layer 2** — release artifacts: `ai-memory-ios.xcframework.tar.gz`
+  (3 slices: device + sim arm64 + sim x86_64) + `ai-memory-android.tar.gz`
+  (4 ABIs in `jniLibs/<abi>/` layout) attach to every stable
+  (non-prerelease) tag.
+- **Layer 3** — simulator/emulator runtime: ~13 scoped tests run on
+  iPhone 15 (iOS Simulator) + Android API-30 emulator on every
+  `release/**` push.
+
+The C-callable FFI surface itself (`#[no_mangle] extern "C"` items)
+lands in a v0.7.x follow-up; v0.7.0 ships the BUILD pipeline +
+artifact layout. Consuming the artifacts:
+
+- **iOS** — download `ai-memory-ios.xcframework.tar.gz` from the
+  v0.7.x release page, unpack, drag `AiMemory.xcframework` into your
+  Xcode project under "Frameworks, Libraries, and Embedded Content."
+- **Android** — download `ai-memory-android.tar.gz`, unpack, copy the
+  `jniLibs/` tree into your app module's `src/main/jniLibs/`.
+
+Operator doc: [`tests/mobile/README.md`](../tests/mobile/README.md) — test
+selection rationale + ~$10/month cost-cap rationale.
 
 ---
 

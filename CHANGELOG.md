@@ -7,6 +7,219 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] — v0.7.x doc follow-ups + Wave-2 refactor (post-tag)
 
+### feat(llm, #1067) — provider-agnostic LLM substrate (2026-05-21)
+
+Closes [#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067)
+(supersedes [#1066](https://github.com/alphaonedev/ai-memory-mcp/issues/1066)).
+The historical Ollama-only `OllamaClient` is now a provider-agnostic
+LLM substrate. Two wire shapes (Ollama-native `/api/chat` + `/api/embed`
+with no auth; OpenAI-compatible `/v1/chat/completions` + `/v1/embeddings`
+with `Authorization: Bearer …`) cover every spec-compliant vendor — one
+code path each.
+
+- **New `LlmProvider` enum** — `Ollama` | `OpenAiCompatible { api_key }`.
+- **New `OllamaClient::from_env()` constructor** reads
+  `AI_MEMORY_LLM_BACKEND` (selector + 15 vendor aliases) +
+  `AI_MEMORY_LLM_BASE_URL` (per-alias override) +
+  `AI_MEMORY_LLM_API_KEY` (Bearer secret) +
+  `AI_MEMORY_LLM_MODEL` (vendor-specific identifier). Per-vendor
+  fallback API-key env vars honoured: `OPENAI_API_KEY`,
+  `XAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY` (or
+  `GOOGLE_API_KEY`), `DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY` (or
+  `KIMI_API_KEY`), `DASHSCOPE_API_KEY` (or `QWEN_API_KEY`),
+  `MISTRAL_API_KEY`, `GROQ_API_KEY`, `TOGETHER_API_KEY`,
+  `CEREBRAS_API_KEY`, `OPENROUTER_API_KEY`, `FIREWORKS_API_KEY`.
+- **`OllamaClient::new_openai_compatible(base_url, model, api_key)`**
+  constructor for direct instantiation.
+- **15 pre-filled vendor aliases**: `openai`, `xai`, `anthropic`,
+  `gemini`, `deepseek`, `kimi` (= `moonshot`), `qwen` (= `dashscope`),
+  `mistral`, `groq`, `together`, `cerebras`, `openrouter`,
+  `fireworks`, `lmstudio`, plus the generic `openai-compatible`
+  escape hatch.
+- **`generate()` / `embed_text()` / `is_available()` / `ensure_model()`
+  branch on provider.** Strict `is_success()` semantics preserved on
+  `is_available` (regression caught by
+  `wiremock_tests::test_is_available_returns_false_on_500_response`
+  during QC).
+- **`build_llm_client` consults `AI_MEMORY_LLM_BACKEND` first.** When
+  set, routes through the provider-agnostic path regardless of tier.
+  Legacy ollama-only fallback preserved when the env var is unset
+  AND the tier has a default `llm_model`. **Tier gating removed** —
+  LLM communication is now tier-independent; tier still gates
+  embedder + reranker.
+- **`infra/lan-parity-test/docker-compose.yml`** updated: `pg-age`
+  switched to `build: Dockerfile.pg-age-vector` (#1065),
+  `ic-parity-alice` + `ic-parity-bob` set `AI_MEMORY_LLM_BACKEND=xai`
+  + `AI_MEMORY_LLM_MODEL=${AI_MEMORY_LLM_MODEL:-grok-4}` +
+  `XAI_API_KEY=${XAI_API_KEY:?…}` (REQUIRED via `:?` syntax).
+  Healthcheck switched to `CMD-SHELL` with `X-API-Key` so the auth
+  middleware doesn't 401 the probe.
+
+**Adoption-funnel widener.** Pre-#1067 the autonomous tier required
+local Ollama, forcing every customer to procure / power / maintain a
+GPU. Post-#1067 customers pick from a deployment matrix that spans
+Raspberry Pi / cellphone IoT edge ($0/mo) to enterprise multi-GPU
+clusters ($10k+/mo). The substrate is identical; only the env vars
+change. ROADMAP §1067 documents the 10-posture matrix.
+
+**Auto-tag chat-shape follow-up (commit
+[`7c7c102a2`](https://github.com/alphaonedev/ai-memory-mcp/commit/7c7c102a2),
+wiremock test refresh at
+[`06c3965a8`](https://github.com/alphaonedev/ai-memory-mcp/commit/06c3965a8)).**
+The IronClaw-on-Grok-4.3 Docker runtime smoke surfaced that pre-fix
+`auto_tag` routed through `generate_with_body` (hardcoded to Ollama's
+`/api/generate` text-completion endpoint). xAI / OpenAI / DeepSeek /
+Kimi / Qwen / etc. don't expose `/api/generate` — only
+`/v1/chat/completions`. Fix routes `auto_tag` through the new
+`generate_with_model_override` helper which uses the provider-aware
+chat-shape (`/api/chat` for Ollama, `/v1/chat/completions` for
+OpenAI-compat). Model override (`gemma3:4b` → `grok-4.3`) preserved
+across both paths.
+
+Same commit also closes two unrelated 6-agent-review items:
+
+- **postgres `list.agent_id` filter** — `MemoryStore::list` now
+  honours the `agent_id` filter on postgres (was silently ignored,
+  returning every row regardless of the filter).
+- **memory ID path-traversal hardening** — `validate_memory_id`
+  rejects `/` `\` `..` `\0` and control chars defense-in-depth ahead
+  of any future export-path feature.
+
+### ci(#1068) — mobile target CI coverage (Posture-1a 3-layer ship, 2026-05-21)
+
+Closes [#1068](https://github.com/alphaonedev/ai-memory-mcp/issues/1068).
+Lands the three-layer CI coverage for the v0.7.0 Posture-1a (Edge /
+Mobile) row from [#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067) —
+ai-memory's claim to run on iPhone + Android via `aarch64-apple-ios`
+and `aarch64-linux-android`.
+
+- **Layer 1 — Cross-compile gate (`.github/workflows/ci.yml`).** New
+  `mobile-cross-compile` matrix job: `aarch64-apple-ios` on
+  macos-latest, `aarch64-linux-android` on ubuntu-latest with NDK
+  r26d via `nttld/setup-ndk` (CC/AR/LINKER env wired to android24-clang
+  so rusqlite's bundled SQLite C blob compiles against the Android
+  sysroot). Both run `cargo check --no-default-features
+  --features sqlite-bundled --lib` on every PR + push to `release/**`.
+  Skipped on docs-only PRs.
+- **Layer 2 — Release artifacts (`.github/workflows/release.yml`).**
+  `mobile-ios` job builds `aarch64-apple-ios` + `aarch64-apple-ios-sim`
+  + `x86_64-apple-ios` as static libs, combines via
+  `xcodebuild -create-xcframework` into `AiMemory.xcframework` with
+  a cbindgen-generated C header + `module.modulemap`, publishes
+  `ai-memory-ios.xcframework.tar.gz` + `.sha256`. `mobile-android`
+  job builds aarch64 / armv7 / x86_64 / i686 -linux-android `.so` files
+  in canonical `jniLibs/<abi>/` layout, publishes
+  `ai-memory-android.tar.gz` + `.sha256`. Gated on stable
+  (non-prerelease) tags. Until `#[no_mangle] extern "C"` items land
+  in `src/lib.rs` (v0.7.x follow-up), the C header is a stub.
+- **Layer 3 — Simulator / emulator runtime
+  (`.github/workflows/mobile-runtime.yml`).** `ios-simulator` runs
+  `tests/mobile_runtime.rs` on iPhone 15 via `xcrun simctl spawn`
+  (macos-latest, `aarch64-apple-ios-sim`). `android-emulator` runs
+  the same binary on a KVM-accelerated Android API-30 emulator via
+  `reactivecircus/android-emulator-runner@v2`. Gated on `release/**`
+  push + `workflow_dispatch` (PRs run iOS arm only to keep cost down).
+  13 scoped tests under `tests/mobile/` cover fs sandboxing +
+  WAL/SHM sibling cleanup, FTS5 + PRAGMA journal_mode round-trip,
+  HNSW build/query + zero-vector NaN pin, candle CPU tensor + matmul
+  smoke, reqwest + wiremock OpenAI-compat TLS round-trip.
+- **`Cargo.toml` `[lib]` `crate-type`** extended to `["rlib", "staticlib", "cdylib"]`
+  so the static lib (iOS) + dynamic lib (Android) artifacts can
+  actually link. `rlib` default preserved for every other consumer.
+- **Docs:** `README.md` new "Mobile platform support (v0.7.0 Posture-1a)"
+  section after Install; `CLAUDE.md` new "Mobile target support"
+  subsection under Architecture; `ROADMAP.md` cut-list "Mobile SDKs"
+  row cross-links #1067 + #1068.
+
+Cost-cap: ~$10/month at v0.7.0 release cadence vs. the $50-150
+ceiling the spec set (Android emulator runs gated to `release/**`
+push + `workflow_dispatch` only).
+
+### fix(ship-readiness batch, 2026-05-21) — 6-agent review #1015 / #1027 / #1050 / #1065
+
+Closes [#1015](https://github.com/alphaonedev/ai-memory-mcp/issues/1015) /
+[#1027](https://github.com/alphaonedev/ai-memory-mcp/issues/1027) /
+[#1050](https://github.com/alphaonedev/ai-memory-mcp/issues/1050) /
+[#1065](https://github.com/alphaonedev/ai-memory-mcp/issues/1065).
+Commit
+[`e10830887`](https://github.com/alphaonedev/ai-memory-mcp/commit/e10830887).
+Four discrete fixes from the 6-agent v0.7.0 code+security review.
+
+- **#1015 (MEDIUM after restatement) — `rule_cache.rs` doc drift.**
+  The module-doc claimed "every write to `governance_rules` from the
+  SAME cache-aware caller calls `RuleCache::invalidate_all`" — false.
+  No production caller of `rules_store::insert` / `remove` /
+  `set_enabled` / `update_signature` invokes `invalidate_all`. Fix:
+  module-doc replaced with the honest contract —
+  **invalidate-on-restart-only at v0.7.0**. Documents that
+  substrate `rules_store` mutators do NOT hold an `Arc<RuleCache>`,
+  rule writes happen exclusively via CLI (separate process — daemon
+  cache cannot observe sibling writes), the daemon does NOT expose
+  an HTTP / MCP rule-write surface at v0.7.0, and operators must
+  restart `ai-memory serve` for CLI-side rule changes to take effect.
+- **#1027 (CRITICAL) — `run_gc` HTTP route missing `require_admin`
+  gate.** `src/handlers/admin.rs:492` `run_gc` emitted an audit row
+  but did NOT enforce admin-allowlist membership. Any API-key holder
+  could trigger the GC sweep which permanently DELETEs every row
+  past `expires_at`. Fix: prepend
+  `require_admin(&app, &headers, "run_gc")?` matching the shape of
+  `export_memories` (#957) + `forget_memories` (#956). Non-admin
+  callers now get `403 FORBIDDEN` before any state change.
+- **#1050 (CRITICAL) — `memory_share` advertised but dispatch arm
+  missing.** Wire-contract break: `registered_tools()` shipped
+  `memory_share`, the handler at `src/mcp/share.rs::handle_share`
+  exists, capabilities v3 reports `callable_now=true` under any
+  profile containing `Family::Power` — but `TOOL_DISPATCH_TABLE`
+  (`src/mcp/mod.rs`) contained no `register_mcp_tool!("memory_share", …)`
+  arm. `tools/call memory_share` returned `-32601 unknown tool`. Fix
+  adds `dispatch_memory_share(ctx)` wrapper + `register_mcp_tool!`
+  arm + two regression tests
+  (`every_registered_tool_has_dispatch_arm_1050` +
+  `every_dispatch_arm_has_registered_tool_1050`) that pin the
+  invariant in both directions so this class of drift cannot recur.
+- **#1065 (INFRA) — lan-parity compose uses bare apache/age image.**
+  The SAL postgres adapter's `init schema` fails on
+  `extension "vector" is not available` because
+  `apache/age:release_PG16_1.6.0` doesn't carry pgvector, leaving
+  alice + bob IronClaw containers restart-on-failure indefinitely.
+  Fix: `infra/lan-parity-test/docker-compose.yml` `pg-age` service
+  now uses `build: { dockerfile: Dockerfile.pg-age-vector }` so the
+  image layers `postgresql-16-pgvector` on top via apt. Same pattern
+  applies to any postgres+AGE deployment with vector recall —
+  [`docs/postgres-age-guide.md`](docs/postgres-age-guide.md).
+
+### fix(postgres SAL, 2026-05-21) — #1024 trait update version bump + #1026 run_gc transactional
+
+Closes [#1024](https://github.com/alphaonedev/ai-memory-mcp/issues/1024) /
+[#1026](https://github.com/alphaonedev/ai-memory-mcp/issues/1026).
+Commit
+[`71baf2956`](https://github.com/alphaonedev/ai-memory-mcp/commit/71baf2956).
+
+- **#1024 (CRITICAL) — trait `update` silently skipped version
+  bump (Gap-1 contract break on postgres).** `MemoryStore::update`
+  SET list omitted `version = version + 1` on postgres. SQLite trait
+  bumps it in `src/storage/mod.rs`; the inherent helper
+  `update_with_expected_version` (NOT on the trait) was the only
+  postgres-side path that bumped version. Result: a postgres-backed
+  daemon answering `PUT /api/v1/memories/:id` WITHOUT `If-Match`
+  routed through the trait method and left `version` permanently at
+  1 — concurrent optimistic-concurrency detection silently broken on
+  postgres while the surface looked identical to sqlite. Fix:
+  append `version = version + 1` to the SET clause.
+- **#1026 (CRITICAL) — `run_gc` archive+delete was NOT transactional
+  on postgres.** Fix wraps the archive INSERT + DELETE in a single
+  transaction so partial archive+delete state cannot leak after a
+  worker panic / network hiccup mid-sweep.
+
+### infra(lan-parity, 2026-05-21) — duplicate `AI_MEMORY_LLM_MODEL` compose keys
+
+Commit
+[`360cdb769`](https://github.com/alphaonedev/ai-memory-mcp/commit/360cdb769).
+Both `ic-parity-alice` + `ic-parity-bob` carried two
+`AI_MEMORY_LLM_MODEL` keys after the #1067 env-var bundle landed,
+which broke YAML parsing under stricter parsers. Duplicates removed;
+the canonical `${AI_MEMORY_LLM_MODEL:-grok-4}` form is retained.
+
 ### refactor(#964) — typed-errors audit on substrate-public API (Wave-2 Tier-B4, 2026-05-21)
 
 Closes #964: full audit of remaining `anyhow::Result<T>` returns on

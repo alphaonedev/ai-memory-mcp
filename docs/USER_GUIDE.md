@@ -36,7 +36,7 @@ Below is an example for **Claude Code** (user scope: merge `mcpServers` into `~/
 
 > **Claude Code note:** MCP server configuration does **not** go in `settings.json` or `settings.local.json` -- those files do not support `mcpServers`.
 
-> **Tier flag:** The `--tier` flag must be passed in the args: `keyword`, `semantic` (default), `smart`, or `autonomous`. The `config.toml` tier setting is not used when launched by an AI client. Smart/autonomous tiers require [Ollama](https://ollama.com).
+> **Tier flag:** The `--tier` flag must be passed in the args: `keyword`, `semantic` (default), `smart`, or `autonomous`. The `config.toml` tier setting is not used when launched by an AI client. Smart/autonomous tiers require an LLM backend — post-[#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067) (v0.7.0) that is local [Ollama](https://ollama.com), LMStudio, vLLM, llama.cpp server, OR any OpenAI-compatible cloud vendor (xAI / OpenAI / Anthropic / Gemini / DeepSeek / Kimi / Qwen / Mistral / Groq / Together / Cerebras / OpenRouter / Fireworks), selected via `AI_MEMORY_LLM_BACKEND`.
 
 > **Other platforms** (Codex, Gemini, Cursor, Windsurf, Continue.dev, etc.): config paths vary by platform. The command and args are the same -- only the config file location differs. Refer to the [Installation Guide](INSTALL.md) for exact paths.
 

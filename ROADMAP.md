@@ -143,7 +143,7 @@ CI guard: `bench --baseline performance/baseline.json` fails any PR that exceeds
 - **43 MCP tools** (audit confirmed: zero stub handlers; three are tier-gated and return explicit `Err` when LLM/embedder absent)
 - **42 HTTP endpoints**
 - **26 CLI commands**
-- **4 feature tiers:** keyword (FTS5 only) · semantic (+ MiniLM 384d) · smart (+ Ollama LLM) · autonomous (+ nomic 768d + cross-encoder rerank)
+- **4 feature tiers:** keyword (FTS5 only) · semantic (+ MiniLM 384d) · smart (+ provider-agnostic LLM, [#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067) — Ollama-native OR any OpenAI-compatible vendor: xAI / OpenAI / Anthropic / Gemini / DeepSeek / Kimi / Qwen / Mistral / Groq / Together / Cerebras / OpenRouter / Fireworks / LMStudio / vLLM / llama.cpp server) · autonomous (+ nomic 768d + cross-encoder rerank)
 - **3 memory tiers:** short (6 h) · mid (7 d) · long (permanent)
 - **6-factor recall scoring:** FTS relevance · priority · access count · confidence · tier boost · recency decay
 
