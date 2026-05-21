@@ -49,6 +49,42 @@ remained mechanical-conversion candidates after #962.
   the rationale for why the conversion would be counter-productive
   given the post-#962 design.
 
+### docs(#989) — D1.8 docs sweep for the post-D1.x registry split (Wave-2 Tier-D1, 2026-05-21)
+
+Closes #989. Documentation reconciliation for the #972 D1.1 → D1.7
+landings (#982 through #988, all closed before this sweep). No code
+change — every codebase tweak the recipe references already shipped.
+
+- **`CLAUDE.md` § "Adding New Functionality"** — verified the
+  post-#987 "New MCP tool" recipe is current. Added a "wire trimmer
+  (post-D1.6 schemars metadata strip)" subsection enumerating the
+  fields `strip_docs_from_tools` removes from the bare `tools/list`
+  payload: top-level `docs`, `inputSchema.description`,
+  `inputSchema.$schema`, `inputSchema.title`, every nested
+  `description` under `inputSchema.definitions.*` and
+  `inputSchema.properties.*`, and long string `default` values
+  (>32 chars).
+- **`src/mcp/tools/README.md` (NEW)** — per-tool module pattern
+  guide. Covers the file layout, required exports
+  (`<Tool>Request` + `<Tool>Tool` + `impl McpTool` + handler),
+  parity-test pattern via `crate::mcp::parity_test_helpers::*`, the
+  schemars `#`-prefix description quirk + `#[schemars(description
+  = "...")]` workaround, the wire-trimmer behaviour, and the
+  verbose-drilldown escape hatch (`memory_capabilities { verbose:
+  true }`).
+- **`docs/v0.7.0/release-notes.md`** — new "v0.7.0 ship-readiness
+  session 2026-05-21 — registry refactor (Wave-2 Tier-D1)" section
+  near the top summarising D1.1 → D1.7 closure: 73 / 73 schemars-
+  derived `McpTool` impls, `tool_definitions()` collapsed from
+  ~1100 lines to a 4-line iteration, wire-shape parity test pinning
+  against the pre-D1.6 snapshot, per-profile snapshot tests, and the
+  compile-time schema ↔ handler invariant.
+- **`docs/audience/developer.html`** — verified the "New MCP tool"
+  recipe describes the post-#987 modular pattern correctly (no
+  edits needed; #1008 already landed the recipe text).
+- **`README.md`** — verified the "73 MCP tools" capability framing
+  does not carry stale "hand-coded" language (no edits needed).
+
 ### refactor(#970) — enum proliferation audit (Wave-2 Tier-D3, 2026-05-21)
 
 Closes #970: full audit of `pub enum` definitions in `src/models/`,
