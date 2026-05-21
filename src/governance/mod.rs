@@ -160,7 +160,12 @@ impl Op {
 /// promotion of Ask under [`PermissionsMode::Enforce`] turns this
 /// into Deny so callers don't accidentally approve under strict
 /// mode.
-#[derive(Debug, Clone)]
+// #969 — `PartialEq` derived. Pre-#969 hand-rolled because the
+// inner `MemoryDelta` of `Modify` was thought to lack a usable
+// equality; in fact `serde_json::Value` derives `Eq + PartialEq + Hash`
+// and `MemoryDelta` derives `PartialEq` (its `Option<f64>` blocks
+// `Eq` but not `PartialEq`).
+#[derive(Debug, Clone, PartialEq)]
 pub enum Decision {
     /// Allow the operation to proceed unchanged.
     Allow,
@@ -174,23 +179,6 @@ pub enum Decision {
     /// do with this if no caller is wired into the K10 approval API
     /// (Enforce → Deny, Advisory/Off → Allow).
     Ask(String),
-}
-
-impl PartialEq for Decision {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Decision::Allow, Decision::Allow) => true,
-            (Decision::Deny(a), Decision::Deny(b)) => a == b,
-            (Decision::Modify(a), Decision::Modify(b)) => {
-                // Same trick HookDecision::Modify uses — MemoryDelta
-                // carries a serde_json::Value (metadata) which is not
-                // Eq, so equality is canonical-JSON.
-                serde_json::to_value(a).ok() == serde_json::to_value(b).ok()
-            }
-            (Decision::Ask(a), Decision::Ask(b)) => a == b,
-            _ => false,
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1357,9 +1345,12 @@ mod tests {
 
     #[test]
     fn decision_partial_eq_same_modify_arms_compare_canonical_json() {
-        // The (Modify, Modify) arm at lines 178-183 compares via
-        // canonical JSON because MemoryDelta carries a metadata
-        // serde_json::Value that is not Eq.
+        // #969 — derived `PartialEq` (via `MemoryDelta: PartialEq`)
+        // produces the same answers the previous hand-rolled
+        // canonical-JSON comparison did. Test name preserved for
+        // grep-history continuity; previously the rationale was
+        // "MemoryDelta metadata Value is not Eq" — see #969 audit
+        // doc for the corrected rationale.
         let a = Decision::Modify(MemoryDelta::default());
         let b = Decision::Modify(MemoryDelta::default());
         assert_eq!(a, b);

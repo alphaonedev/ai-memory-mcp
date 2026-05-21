@@ -77,13 +77,12 @@ use super::events::{HookEvent, MemoryDelta};
 /// See the module-level documentation for the JSON wire contract
 /// and the runtime validation rules.
 ///
-/// `PartialEq` is hand-rolled rather than derived because
-/// [`MemoryDelta`] (the inner of `Modify`) holds a
-/// `serde_json::Value` and `Value` is not itself `Eq`. Equality
-/// for `Modify` falls back to a JSON-canonical comparison so
-/// tests can assert structural equality without caring about
-/// field ordering inside the metadata bag.
-#[derive(Debug, Clone, Serialize)]
+/// #969 — `PartialEq` is now derived. Pre-#969 it was hand-rolled
+/// on the (mistaken) premise that `serde_json::Value` was not
+/// `PartialEq`; it IS (serde_json 1.0 derives `Eq + PartialEq + Hash`
+/// on `Value`). The real blocker for `derive(Eq)` is `Option<f64>`
+/// inside `MemoryDelta`, which is `PartialEq` but not `Eq`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum HookDecision {
     /// Continue the memory operation unchanged. Wire shape:
@@ -120,45 +119,9 @@ pub enum HookDecision {
 /// [`MemoryDelta`] fields onto the decision object — keeping the
 /// delta nested means future expansions (extra metadata, hook
 /// trace ids) won't collide with `MemoryDelta` field names.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModifyPayload {
     pub delta: MemoryDelta,
-}
-
-impl PartialEq for HookDecision {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (HookDecision::Allow, HookDecision::Allow) => true,
-            (HookDecision::Modify(a), HookDecision::Modify(b)) => {
-                // MemoryDelta carries a serde_json::Value (metadata)
-                // which is not Eq; compare via canonical JSON.
-                serde_json::to_value(&a.delta).ok() == serde_json::to_value(&b.delta).ok()
-            }
-            (
-                HookDecision::Deny {
-                    reason: r1,
-                    code: c1,
-                },
-                HookDecision::Deny {
-                    reason: r2,
-                    code: c2,
-                },
-            ) => r1 == r2 && c1 == c2,
-            (
-                HookDecision::AskUser {
-                    prompt: p1,
-                    options: o1,
-                    default: d1,
-                },
-                HookDecision::AskUser {
-                    prompt: p2,
-                    options: o2,
-                    default: d2,
-                },
-            ) => p1 == p2 && o1 == o2 && d1 == d2,
-            _ => false,
-        }
-    }
 }
 
 fn default_deny_code() -> i32 {
