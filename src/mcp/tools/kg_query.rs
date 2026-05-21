@@ -3,8 +3,74 @@
 
 //! MCP `memory_kg_query` handler.
 
+use crate::mcp::registry::McpTool;
 use crate::{db, validate};
+use schemars::JsonSchema;
+use serde::Deserialize;
 use serde_json::{Value, json};
+
+// --- D1.4 (#985): per-tool McpTool impl for `memory_kg_query` (graph family) ---
+
+/// v0.7.0 #972 D1.4 (#985) — request body for `memory_kg_query`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct KgQueryRequest {
+    /// Source memory ID.
+    pub source_id: String,
+
+    /// Hops, 1..=5.
+    #[serde(default)]
+    pub max_depth: Option<i64>,
+
+    /// RFC3339; keep links valid at instant. Omit to skip temporal filter.
+    #[serde(default)]
+    pub valid_at: Option<String>,
+
+    /// Observed-by allowlist. Empty array = zero rows.
+    #[serde(default)]
+    pub allowed_agents: Option<Vec<String>>,
+
+    /// Cap across all depths [1,1000].
+    #[serde(default)]
+    pub limit: Option<i64>,
+
+    /// When true, traverse historically-invalidated edges.
+    #[serde(default)]
+    pub include_invalidated: Option<bool>,
+
+    #[schemars(description = "#889 traverse by source_uri.")]
+    #[serde(default)]
+    pub by_source_uri: Option<String>,
+
+    /// Restrict to namespace.
+    #[serde(default)]
+    pub namespace: Option<String>,
+}
+
+/// v0.7.0 #972 D1.4 (#985) — `McpTool` impl for `memory_kg_query`.
+#[allow(dead_code)]
+pub struct KgQueryTool;
+
+impl McpTool for KgQueryTool {
+    fn name() -> &'static str {
+        "memory_kg_query"
+    }
+    fn description() -> &'static str {
+        "Outbound KG traversal from a source memory (<=5 hops)."
+    }
+    fn docs() -> &'static str {
+        "Pillar 2 / Stream C: BFS/CTE traversal with cycle detection. Each row carries valid_from/valid_until/observed_by + target title/namespace. Filters chain across every hop. max_depth ceiling 5."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(KgQueryRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "graph"
+    }
+}
+
 pub(super) fn handle_kg_query(
     conn: &rusqlite::Connection,
     params: &Value,
@@ -131,4 +197,26 @@ pub(super) fn handle_kg_query(
         "paths": paths_json,
         "count": nodes.len(),
     }))
+}
+
+#[cfg(test)]
+mod d1_4_985_tests {
+    //! D1.4 (#985) — schema-parity for `memory_kg_query`.
+    use super::*;
+    use crate::mcp::d1_4_985_helpers::{
+        assert_descriptions_match, assert_property_set_parity, derived_props_for,
+    };
+
+    #[test]
+    fn memory_kg_query_parity_985() {
+        let derived = derived_props_for::<KgQueryRequest>();
+        assert_property_set_parity("memory_kg_query", &derived);
+        assert_descriptions_match("memory_kg_query", &derived);
+    }
+
+    #[test]
+    fn memory_kg_query_tool_metadata_985() {
+        assert_eq!(KgQueryTool::name(), "memory_kg_query");
+        assert_eq!(KgQueryTool::family(), "graph");
+    }
 }
