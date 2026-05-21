@@ -7,6 +7,315 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] — v0.7.x doc follow-ups + Wave-2 refactor (post-tag)
 
+### v0.7.0 6-agent release-review tag-blockers (TB1 + TB2)
+
+After PR #820 merged the 259-commit ship-hardening bundle into
+`release/v0.7.0`, a 6-agent code-security review surfaced two
+tag-blocking findings + 16 high-priority items. The two tag-blockers
+landed first on the `fix/v070-tag-blockers-from-6agent-review` branch:
+
+- **`#977` — CRITICAL · reserved-name authz bypass on the wire**
+  ([commit `d81df2d7c`](https://github.com/alphaonedev/ai-memory-mcp/commit/d81df2d7c)).
+  `validate_agent_id("daemon")` accepted the string at
+  `src/validate.rs:233-246`; `resolve_http_agent_id` returned the
+  header value verbatim. A wire caller setting `X-Agent-Id: daemon`
+  (or the same via MCP-tool `agent_id` field, HTTP body `agent_id`
+  field) reached `CallerContext.principal == "daemon"` and bypassed
+  every cross-tenant ownership gate that carved out `caller ==
+  "daemon"` as the internal-admin path (9 production sites across
+  `src/handlers/{parity,links,kg,hook_subscribers}.rs` +
+  `src/mcp/tools/namespace.rs`). Sister bypass on `"system"` at
+  `hook_subscribers.rs:412,577,699` (legacy-unowned marker, plus
+  unowned-claim rewrite). Fix splits `validate_agent_id` into
+  `validate_agent_id_shape` (shape-only, used by `keypair::load`/
+  `generate`/`ensure_keypair`/on-disk `.pub` scan so the daemon's own
+  `DAEMON_KEYPAIR_LABEL = "daemon"` self-signing keypair still loads)
+  + `validate_agent_id` (wire-side: shape + reserved-name reject for
+  `daemon`/`system`/`federation-catchup`/`subscription-dispatch`/
+  `ai:http-internal`/`ai:migrate`/`export-internal`/`governance-internal`).
+  Internal `CallerContext::for_admin(...)` constructions bypass the
+  validator by design. 7-case regression suite at
+  `tests/security_reserved_agent_ids_977.rs`.
+- **`#978` — HIGH · federation `sync_since` legacy-row visibility bypass**
+  ([commit `5bd43f0bd`](https://github.com/alphaonedev/ai-memory-mcp/commit/5bd43f0bd)).
+  `src/handlers/federation_sync_since.rs:107-115` `has_ownership_signal`
+  carve-out projected any row that lacked BOTH `metadata.scope` AND
+  `metadata.agent_id` through the federation pull UNCHANGED — same
+  cross-tenant leak surface the visibility-gate cluster
+  (#940/#942/#944/#946/#947/#948/#956/#959/#960/#974/#976) closed on
+  every other handler. Fix drops the carve-out; new
+  `federation_projectable` predicate honours operator-explicit
+  `metadata.federation_share == true` (strict-bool — string `"true"`
+  and integer `1` do NOT pass), falls through to
+  `crate::visibility::is_visible_to_caller` for every other row.
+  `AI_MEMORY_FED_SYNC_TRUST_PEER=1` full-dump escape hatch preserved
+  for legacy peers. 7-case regression suite at
+  `tests/federation_legacy_row_visibility_978.rs`; `#239` baseline
+  fixture updated to stamp the explicit opt-in.
+
+### v0.7.0 ship-hardening bundle backfill (121 issues from PR #820 merge)
+
+The 259-commit merge into `release/v0.7.0` (PR #820, merge commit
+`ea4b6e2ad`) contained 160 unique issue references. The
+`[Unreleased]` section above already documented the largest themes
+(#973 provenance deconfliction, #800 Batman activation, #850
+RuleEngine, #819 hermetic tests, #851 HTTP error sanitization, #855
+env-var ladder, #857-#864 NHI re-run batch, #884-#895 + #973 Gap 1-7
+sprint). The 121 entries below close the audit-trail gap for the
+remaining issues so the commit log is fully reachable from the
+CHANGELOG. Each entry cites the issue number + a one-line summary
+distilled from the matching commit subject. Issues without a
+dedicated commit subject are referenced from other commits' bodies
+(folded-in work, umbrella tracking) and noted as such.
+
+#### Refactor Wave continuation (post-Tier-A1-A7)
+
+- **`#866`** — split `create_memory` into 6 stage helpers
+  (agent_id → on_conflict → embed-before-lock → governance → insert →
+  fanout).
+- **`#867`** — `mcp::handle_request` → registry-table dispatch.
+- **`#871`** — split `recall_hybrid_with_telemetry` into stage helpers.
+- **`#873`** — `clippy.toml` — `too-many-lines-threshold = 250`.
+- **`#880`** — `GovernancePolicy` decomposition (#793-PR-3): flat → 7
+  nested sub-structs with `#[serde(flatten)]` for byte-identical wire
+  JSON.
+- **`#881`** — `store.rs` decomposition (#793-PR-4).
+- **`#856`** — multi-agent worktree discipline section in CLAUDE.md
+  (in-repo half of the harness-side fix tracked under same number).
+- **`#869`** — patch `unwrap_or_default` sites across `handlers/` that
+  silently swallow serialization failures.
+- **`#878`** — plan-c entrypoint peer-reach preflight + bridge-network
+  recipe (operator-facing).
+- **`#879`** — plan-c recovery runbook for colima disk-lock.
+
+#### Provenance + capabilities continuation (Gap 1-7 + post-tag fix-batch)
+
+- **`#897`** — restore `src/handlers/http.rs` coverage to 73.19% (was
+  14.71% vs 42 floor).
+- **`#899`** — cross-test forensic-sink bleed root-cause + regression pin.
+- **`#900`** — `PostgresStore::store` round-trips `source_uri` +
+  Form-4/Form-5 columns.
+- **`#903`** — prune stale schema-version literals in `boot.rs` +
+  `config.rs`.
+- **`#906`** — thread `source_uri` through `memory_update` storage path
+  end-to-end.
+- **`#913`** — admin audit-trail emits — full HTTP+MCP+CLI sweep.
+- **`#931`** — emit broadcast entry-line + postgres branch trace logs.
+- **`#932`** — wire postgres subscription dispatch + HTTP
+  `create_memory` webhook fire.
+- **`#934`** — route alias `/api/v1/find_paths` → `kg_find_paths` +
+  field-name compat (`from_id`/`to_id` aliases for back-compat).
+- **`#935`** — forward `x-api-key` on federation catchup GET.
+- **`#950`** — postgres subscription dispatch on
+  `update/delete/promote/link_create/restore/archive`.
+
+#### Security + visibility cluster (NHI tightening, post-#948)
+
+- **`#929`** — scope MCP ownership gate to explicit-identity callers
+  only.
+- **`#936`** — MCP `archive_purge` owner gate + `as_admin` opt-in.
+- **`#937`** — `delete_memory` sqlite caller-vs-row-owner gate.
+- **`#938`** — `kg_invalidate` caller-vs-source-memory-owner gate.
+- **`#940`** — `archive_restore` + `archive_by_ids` sqlite
+  caller-vs-row-owner gate.
+- **`#941`** — folded into #940 owner-gate sweep (no standalone commit).
+- **`#942`** — `search_memories` + `forget_memories` caller-owner gates.
+- **`#943`** — `list_archive` + `archive_stats` admin gates.
+- **`#944`** — `kg_timeline` caller-vs-source-memory-owner gate.
+- **`#945`** — `list_namespaces` + `get_taxonomy` +
+  `get_namespace_standard_qs` admin gates.
+- **`#946`** — folded into the admin-gate sweep + legacy-unowned
+  carve-out + lib test fixture wildcard (commit
+  `e0e0b55ae`).
+- **`#947`** — sqlite legacy path visibility post-filter on `power.rs`
+  + `kg.rs`.
+- **`#948`** — `sync_since scope=private` visibility gate.
+- **`#949`** — admin-role gate on all 7 skill HTTP routes.
+- **`#951`** — consolidate `is_visible_to_caller` into non-sal-gated
+  visibility module.
+- **`#952`** — cfg-gate 6 stale `let _ = X` discards to non-sal profile
+  only.
+- **`#953`** — C8 caller-context allowlist precheck + CI gate.
+- **`#954`** — extract canonical caller-vs-row-owner ownership-gate
+  helper.
+- **`#955`** — drop `CallerContext::for_agent` literals in non-test
+  production code.
+- **`#956`** — admin-role gate + provenance restamp on
+  `/api/v1/import`.
+- **`#957`** — admin-role gate on `/api/v1/export` (close cross-tenant
+  corpus exfil).
+- **`#959`** — `get_links` visibility post-filter on both backends.
+- **`#960`** — folded into the admin-gate + legacy-unowned carve-out
+  sweep (commit `e0e0b55ae`).
+- **`#974`** — folded into the admin-gate + legacy-unowned carve-out
+  sweep (commit `e0e0b55ae`).
+- **`#976`** — integration test fixtures align with post-#940/#942/
+  #946/#948 gates.
+
+#### NHI provenance lockdown (write-path stamp is header-only post-#907)
+
+- **`#874`** — body `metadata.agent_id` no longer overrides
+  authenticated `X-Agent-Id` on the write-path provenance stamp
+  (security-high, prevents fake-attribution).
+- **`#901, #905, #907`** — siblings of #874 across additional handlers
+  (folded references in #874 + #907 commit bodies; no dedicated
+  commit per number).
+- **`#902, #904, #908, #909, #911, #912`** — folded references in the
+  NHI hardening sweep.
+
+#### Postgres + SAL parity
+
+- **`#925`** — `SET LOCAL search_path` in AGE entry points (lan-parity
+  isolation).
+- **`#926`** — fix lan-parity compose peer-preflight deadlock +
+  Dockerfile reference.
+- **`#927`** — switch 2 integration tests to per-principal GET helpers.
+- **`#928`** — folded reference in the postgres-fixes batch (no
+  standalone commit).
+- **`#930`** — folded reference in the postgres `update_memory` SAL
+  rewrite (commit body of #874/#931).
+- **`#939`** — folded reference in the postgres visibility-gate sweep.
+- **`#910`** — `postgres_touch_batch` caller matches row owner (SAL
+  filter).
+
+#### Federation hardening (signing + nonce + replay)
+
+- **`#791`** — federation per-message Ed25519 signing header.
+- **`#793`** — folded references in the federation-signing series
+  (no standalone commit; tracked under the #791 umbrella).
+- **`#921`** — folded reference in the federation-nonce series.
+- **`#922`** — cargo fmt — wrap long `federation_nonce_cache` line in
+  test fixtures.
+
+#### Batman Mode write-time-investment continuation (#800 7-form series)
+
+- **`#803`** — per-tool `examples` in `memory_capabilities` `ToolEntry`.
+- **`#804`** — AUR PKGBUILD + version-pinning guidance for adoption
+  Gap #3.
+- **`#805`** — Batman-active write-path latency budgets + v0.7.1
+  attack plan.
+- **`#806`** — federation/quotas at population scale (N=100 agents,
+  M=50 ops each).
+- **`#807`** — wire Batman Mode CI gate as REQUIRED PR gate.
+- **`#809`** — substrate-resident NHI Persona + model-agnostic cookbook
+  + maximum coverage.
+- **`#810, #811, #812`** — persona signing pipeline gaps closed
+  end-to-end via #813.
+- **`#813`** — persona signing pipeline — close #810, #811, #812
+  end-to-end.
+- **`#815`** — sign `reflects_on` edges from `storage::reflect` via
+  threaded keypair.
+- **`#816`** — wire curator auto-persona sweep with daemon keypair.
+- **`#820`** — PR #820 ship-hardening bundle umbrella issue.
+- **`#821`** — dedup governance test helpers into `tests/common/mod.rs`.
+- **`#822`** — `rules sign-seed` honors `--key-dir` (dual-layout dir →
+  singleton fallback).
+- **`#823`** — bump schema literal 42→43 in `s75` + `wt_1_a` tests.
+- **`#824`** — bump macOS hook-exec test timeout 30s → 60s.
+- **`#825`** — file-wide `#![allow(clippy::too_many_lines)]` for
+  postgres-feature build.
+
+#### Doc + infra hardening
+
+- **`#838, #839, #840, #843, #844, #845`** — folded references in the
+  Lane-5 documentation drift remediation block above (no standalone
+  commits; covered by the comprehensive sweep that touched ~14 doc
+  files).
+- **`#846`** — v0.7 vs v0.8 recursive-learning roadmap comparison doc.
+- **`#848`** — `memory_persona_generate` cross-namespace aggregation.
+- **`#868`** — inline test discipline for `handlers/http.rs`.
+- **`#870, #872`** — folded references in the doc-drift remediation.
+- **`#875`** — align HTML doc surfaces to v0.7.0 numbers.
+- **`#876`** — NHI calibration prompts use canonical 71-tool count
+  source.
+- **`#877`** — auto-migrate embedding column dim to model-canonical
+  dim.
+
+#### Typed-error envelopes (post-`deny_message` helper #971)
+
+- **`#962`** — promote substrate refusals to typed `StorageError`
+  envelope.
+- **`#963`** — wire typed `GovernanceRefusal` through `Deny` variant
+  (Phase 1 + Phase 2).
+- **`#971`** — extract canonical `deny_message` helper for governance
+  refusals.
+- **`#975`** — `source_uri` composition + visibility gate parity on
+  reciprocal endpoint.
+
+#### Release-gate meta (not closed in this bundle)
+
+- **`#832`** — folded reference in the v0.7.0 release-gate meta tracking
+  (umbrella, remains open through the operator's 8-tier gate).
+- **`#833, #834`** — Track E1 (DO CPU hive) / Track E2 (AWS GPU burst)
+  remain FROZEN per operator decision (operator-$-gated). Issues
+  referenced in CHANGELOG so the link from commit → tracker is intact.
+- **`#835`** — clean A2A test pages.
+
+#### Long-standing carryover closed under the v0.7.0 windowing
+
+- **`#224, #311`** — folded into the visibility-gate cluster + NHI
+  provenance lockdown (no dedicated commit; closed via the post-#948
+  sweep).
+- **`#228`** — E2E content encryption at rest (X25519 +
+  ChaCha20-Poly1305). NOTE: shipped as MVP module
+  (`src/encryption/`); the wire-up to `db::insert*`/`db::get` is the
+  H4 follow-up tracked under the 6-agent-review High set.
+- **`#518`** — session-aware `memory_recall` with recently-accessed
+  boost.
+- **`#519`** — proactive contradiction detection on `memory_store`.
+- **`#652`** — folded reference in the recursive-learning #655 Task
+  series (no standalone commit; closed via #655 sub-tasks).
+- **`#718`** — A2A campaign harness cross-repo integration contract.
+- **`#736`** — cookbook/atomisation recipes 02 + 03 + README.
+- **`#797`** — bootstrap SCHEMA crashes on legacy DBs — strip v36+
+  partial indexes from sqlite+postgres bootstrap, fix Windows
+  `skill_register` path separator, unrot `postgres_schema_parity`.
+- **`#798`** — folded into #797 (single commit closes both).
+- **`#827`** — parent issue: per-module coverage residuum (split into
+  #838 + #839 + #840 — `store.rs` row closed at parent level, the
+  three child modules closed in prior coverage commits).
+- **`#917`** — folded reference in the post-#874 NHI hardening sweep.
+
+#### Wire-format compatibility statement (v0.6.x → v0.7.0 upgrade)
+
+The 6-agent compat review flagged the following source-level breaks
+that operators upgrading from v0.6.x must know about. **HTTP / MCP /
+CLI wire shape stays additive throughout** — every visible response
+body, capabilities envelope, federation payload, and signed-event
+JSON either reads byte-identical to v0.6.x or extends additively via
+`#[serde(default)]` / `skip_serializing_if`. The breaks below are
+all RUST source-API and do not affect external clients consuming the
+HTTP/MCP wire formats.
+
+1. **`GovernancePolicy` flat → nested** (#880). Field path rewrites:
+   `policy.write` → `policy.core.write`, same for `promote`/`delete`/
+   `approver`/`inherit`/`max_reflection_depth`. Wire JSON unchanged
+   (preserved via `#[serde(flatten)]`); only Rust call sites move.
+2. **`GovernanceDecision::Deny(String)` → `Deny(GovernanceRefusal)`**
+   (#963). `Display` byte-identical to pre-#963. Pattern-match consumers
+   read `refusal.reason` (or `refusal.to_string()` for the canonical
+   wire shape).
+3. **SAL trait signatures gain `&CallerContext`** (#910 / #936).
+   `MemoryStore::archive_purge(older_than_days)` →
+   `archive_purge(&CallerContext, older_than_days)`;
+   `MemoryStore::find_paths(source_id, target_id, ...)` →
+   `find_paths(&CallerContext, ...)`. Out-of-tree `MemoryStore` impls
+   thread the new arg.
+4. **`CallerContext` gains required `bypass_visibility: bool`** (#910).
+   Struct-literal callers add the field; the `for_admin`/`for_agent`
+   constructors are the supported path and unaffected.
+5. **`MemoryError` gains `RefusedByGovernanceGate(GovernanceRefusal)`
+   variant** (#963). Exhaustive `match` on `MemoryError` without a
+   wildcard arm needs a new arm (wire `code()` = `GOVERNANCE_REFUSED`
+   + `status()` = 403 stay identical to the existing
+   `RefusedByGovernance(String)` variant).
+6. **Federation receivers reject unsigned/no-nonce `/sync/push` by
+   default** (#791, #922). Pre-v0.7.0 peers without Ed25519 keys are
+   rejected with 401. Operator escape hatch:
+   `AI_MEMORY_FED_REQUIRE_SIG=0` + `AI_MEMORY_FED_REQUIRE_NONCE=0`
+   during peer rollout. Cut over to signed-by-default once every peer
+   in the federation has its Ed25519 keypair installed.
+
 ### Added
 
 - **Capabilities v3 `provenance_substrate_layer` narrative surface** (Item C from v0.7.0 provenance deconfliction, issue [#973](https://github.com/alphaonedev/ai-memory-mcp/issues/973)). New `CapabilityProvenanceSubstrateLayer` + `SpecReferences` structs in `src/config.rs` ship a one-shot narrative summary of the substrate's do-calculus posture so an LLM agent reading `memory_capabilities` can self-describe accurately without parsing the seven Provenance Gap blocks individually. The default helper carries the v0.7.0 source-verified `enforcement_layers` list (`form_4_fact_provenance`, `form_6_memory_kind`, `form_7_agent_external_governance`, `signed_events_v4_chain`, `seven_gap_framework`), the two `honest_limitations` axes (intra-session hallucination is consumer-LLM responsibility; federation reliability is DLQ-tracked, not silent-drop), and vendor-neutral spec_references (Pearl 2009 + Ortega & de Freitas 2026). Honesty-discipline: every entry in `enforcement_layers` corresponds to an actually-shipped feature with a grep anchor in the helper docstring. Wired into `CapabilitiesV3::to_v3()` so MCP + HTTP both surface it. 7 integration tests pin posture / source-verified `enforcement_layers` / honest_limitations axes / vendor-neutral spec_references / summary word budget / serde round-trip / serde-default empty-JSON tolerance. Backward-compat preserved via `#[serde(default)]` on every field.
