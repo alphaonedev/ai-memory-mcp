@@ -905,6 +905,50 @@ pub fn get(conn: &Connection, id: &str) -> Result<Option<Memory>> {
     }
 }
 
+/// Batch-fetch memories by ID. Mirrors [`get`] but issues a single
+/// `WHERE id IN (?, ?, ...)` SELECT instead of N per-id round-trips.
+///
+/// v0.7.0 #981 — used by the HNSW [`semantic_phase`] recall branch
+/// where ANN-hit batches of 50–250 IDs need to materialise as
+/// `Memory` rows; the per-id `get` loop was 5–10× slower on a warm
+/// cache and extended the DB-mutex hold (which compounds the
+/// single-connection serialization the daemon ships with on sqlite).
+///
+/// Returns a `HashMap<String, Memory>` keyed by id so the caller can
+/// re-apply the original hit ordering via the HNSW hit list.
+///
+/// Chunks ids into batches of 500 to stay well under SQLite's default
+/// `SQLITE_LIMIT_VARIABLE_NUMBER = 999` regardless of how the operator
+/// has compiled their sqlite (Debian ships 999, Alpine ships 250000;
+/// 500 is a safe middle ground that also keeps the prepared-statement
+/// plan reusable across calls).
+///
+/// Empty `ids` short-circuits to an empty map without touching the
+/// connection. Missing rows are silently skipped — the caller can
+/// observe via `fetched.get(&id).is_none()` and fall through to
+/// whatever default the original per-id path would have produced.
+pub fn get_many(conn: &Connection, ids: &[String]) -> Result<HashMap<String, Memory>> {
+    let mut out: HashMap<String, Memory> = HashMap::with_capacity(ids.len());
+    if ids.is_empty() {
+        return Ok(out);
+    }
+    const CHUNK: usize = 500;
+    for chunk in ids.chunks(CHUNK) {
+        let placeholders = std::iter::repeat("?")
+            .take(chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("SELECT * FROM memories WHERE id IN ({placeholders})");
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), row_to_memory)?;
+        for r in rows {
+            let mem = r?;
+            out.insert(mem.id.clone(), mem);
+        }
+    }
+    Ok(out)
+}
+
 /// Look up a memory by ID prefix. Returns the memory if exactly one match is found.
 /// Returns `Ok(None)` if no matches. Returns an error if the prefix is ambiguous (>1 match).
 pub fn get_by_prefix(conn: &Connection, prefix: &str) -> Result<Option<Memory>> {
@@ -6714,6 +6758,17 @@ fn semantic_phase(
     if let Some(idx) = vector_index {
         let ann_limit = (limit * 5).max(50);
         let hits = idx.search(query_embedding, ann_limit);
+        // v0.7.0 #981 — pre-#981 this branch called `get(conn, &hit.id)`
+        // per hit, producing 50-250 round-trips per recall on a warm
+        // index. The fix collects the ids that pass the
+        // `cosine > 0.2` + not-yet-scored cosine gate, batches the
+        // SELECT via `get_many`, and re-applies the row-side filter
+        // ladder against the fetched map. Net effect: one SELECT
+        // instead of N, no behavioural drift on the per-row filters
+        // because they're applied identically against `&mem`. See
+        // `tests/recall_semantic_batch_fetch_981.rs` for the pin.
+        let mut needed_ids: Vec<String> = Vec::with_capacity(hits.len());
+        let mut hit_meta: Vec<(String, f64)> = Vec::with_capacity(hits.len());
         for hit in hits {
             if scored.contains_key(&hit.id) {
                 continue;
@@ -6721,57 +6776,66 @@ fn semantic_phase(
             let cosine = f64::from(1.0 - hit.distance);
             // v0.6.2 (S18 iteration): cosine gate relaxed 0.3 → 0.2 —
             // see the matching comment in the linear-scan branch below.
-            if cosine > 0.2
-                && let Some(mem) = get(conn, &hit.id)?
-            {
-                if let Some(ns) = namespace {
-                    if prep.hierarchy_active {
-                        let ancestors = crate::models::namespace_ancestors(ns);
-                        if !ancestors.iter().any(|a| a == &mem.namespace) {
-                            continue;
-                        }
-                    } else if mem.namespace != ns {
+            if cosine > 0.2 {
+                needed_ids.push(hit.id.clone());
+                hit_meta.push((hit.id, cosine));
+            }
+        }
+        let fetched = get_many(conn, &needed_ids)?;
+        for (id, cosine) in hit_meta {
+            let Some(mem) = fetched.get(&id) else {
+                continue;
+            };
+            if let Some(ns) = namespace {
+                if prep.hierarchy_active {
+                    let ancestors = crate::models::namespace_ancestors(ns);
+                    if !ancestors.iter().any(|a| a == &mem.namespace) {
                         continue;
                     }
-                }
-                if let Some(exp) = &mem.expires_at
-                    && exp.as_str() <= now
-                {
+                } else if mem.namespace != ns {
                     continue;
                 }
-                if let Some(tf) = tags_filter
-                    && !mem.tags.iter().any(|t| t == tf)
-                {
-                    continue;
-                }
-                if let Some(s) = since
-                    && mem.created_at.as_str() < s
-                {
-                    continue;
-                }
-                if let Some(u) = until
-                    && mem.created_at.as_str() > u
-                {
-                    continue;
-                }
-                if !is_visible(&mem, &prep.prefixes) {
-                    continue;
-                }
-                if !include_archived && is_archived_source(&mem) {
-                    continue;
-                }
-                if let Some(prefix) = source_uri_prefix
-                    && !prefix.is_empty()
-                    && !mem
-                        .source_uri
-                        .as_deref()
-                        .is_some_and(|u| u.starts_with(prefix))
-                {
-                    continue;
-                }
-                scored.insert(mem.id.clone(), (mem, 0.0, cosine));
-                hnsw_candidates_count += 1;
             }
+            if let Some(exp) = &mem.expires_at
+                && exp.as_str() <= now
+            {
+                continue;
+            }
+            if let Some(tf) = tags_filter
+                && !mem.tags.iter().any(|t| t == tf)
+            {
+                continue;
+            }
+            if let Some(s) = since
+                && mem.created_at.as_str() < s
+            {
+                continue;
+            }
+            if let Some(u) = until
+                && mem.created_at.as_str() > u
+            {
+                continue;
+            }
+            if !is_visible(mem, &prep.prefixes) {
+                continue;
+            }
+            if !include_archived && is_archived_source(mem) {
+                continue;
+            }
+            if let Some(prefix) = source_uri_prefix
+                && !prefix.is_empty()
+                && !mem
+                    .source_uri
+                    .as_deref()
+                    .is_some_and(|u| u.starts_with(prefix))
+            {
+                continue;
+            }
+            // Clone is unavoidable here — `scored` owns the Memory
+            // for the final cross-phase merge, and `fetched` may be
+            // re-read for downstream phases.
+            scored.insert(mem.id.clone(), (mem.clone(), 0.0, cosine));
+            hnsw_candidates_count += 1;
         }
         return Ok(hnsw_candidates_count);
     }
@@ -9225,6 +9289,69 @@ mod tests {
 
     fn test_db() -> Connection {
         open(std::path::Path::new(":memory:")).unwrap()
+    }
+
+    /// v0.7.0 #981 — `get_many` batches the SELECTs the semantic-phase
+    /// HNSW recall branch previously issued per-id. This test pins:
+    ///   1. Empty `ids` short-circuits to an empty map without touching
+    ///      the connection.
+    ///   2. All requested + existing rows land in the result map.
+    ///   3. Missing ids are silently dropped (no error, no panic) —
+    ///      the caller observes via `map.get(&id).is_none()`.
+    ///   4. Order doesn't matter — `IN (...)` is unordered; callers
+    ///      that need original ordering re-apply via the hit list.
+    ///   5. Chunking >500 ids still returns every row.
+    #[test]
+    fn get_many_batches_and_handles_empty_missing_and_chunked_inputs_981() {
+        let conn = test_db();
+        // Seed 3 rows.
+        let m1 = make_memory("alpha", "ns/a", Tier::Long, 5);
+        let m2 = make_memory("beta", "ns/b", Tier::Long, 5);
+        let m3 = make_memory("gamma", "ns/c", Tier::Long, 5);
+        insert(&conn, &m1).unwrap();
+        insert(&conn, &m2).unwrap();
+        insert(&conn, &m3).unwrap();
+
+        // (1) Empty input.
+        assert!(get_many(&conn, &[]).unwrap().is_empty());
+
+        // (2) Existing ids.
+        let ids = vec![m1.id.clone(), m2.id.clone()];
+        let got = get_many(&conn, &ids).unwrap();
+        assert_eq!(got.len(), 2);
+        assert!(got.contains_key(&m1.id));
+        assert!(got.contains_key(&m2.id));
+        assert!(!got.contains_key(&m3.id));
+
+        // (3) Mixed existing + missing — missing silently dropped.
+        let mixed = vec![m1.id.clone(), "nope-not-a-real-id".to_string()];
+        let got = get_many(&conn, &mixed).unwrap();
+        assert_eq!(got.len(), 1);
+        assert!(got.contains_key(&m1.id));
+
+        // (4) Order doesn't matter — IN clause is set-like.
+        let reversed = vec![m3.id.clone(), m2.id.clone(), m1.id.clone()];
+        let got = get_many(&conn, &reversed).unwrap();
+        assert_eq!(got.len(), 3);
+        for id in &reversed {
+            assert!(got.contains_key(id), "id {id} missing from set-fetch");
+        }
+
+        // (5) Chunked >500 ids still returns every row.
+        let mut bulk: Vec<Memory> = Vec::with_capacity(750);
+        let mut bulk_ids: Vec<String> = Vec::with_capacity(750);
+        for i in 0..750 {
+            let m = make_memory(&format!("bulk-{i}"), "ns/bulk", Tier::Long, 1);
+            insert(&conn, &m).unwrap();
+            bulk_ids.push(m.id.clone());
+            bulk.push(m);
+        }
+        let got = get_many(&conn, &bulk_ids).unwrap();
+        assert_eq!(
+            got.len(),
+            750,
+            "chunked fetch >500 must still return every row",
+        );
     }
 
     fn make_memory(title: &str, ns: &str, tier: Tier, priority: i32) -> Memory {
