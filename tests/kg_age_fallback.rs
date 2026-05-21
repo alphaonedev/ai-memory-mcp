@@ -48,6 +48,7 @@
 //! discipline as `tests/age_cte_equivalence.rs`.
 
 #![cfg(feature = "sal-postgres")]
+#![allow(clippy::needless_update)]
 
 use ai_memory::models::ConfidenceSource;
 use ai_memory::models::{Memory, MemoryKind, Tier};

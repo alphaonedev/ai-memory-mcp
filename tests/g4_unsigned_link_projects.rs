@@ -49,6 +49,7 @@
 //! and returns cleanly.
 
 #![cfg(feature = "sal-postgres")]
+#![allow(clippy::needless_update)]
 
 use ai_memory::models::ConfidenceSource;
 use std::sync::Arc;
