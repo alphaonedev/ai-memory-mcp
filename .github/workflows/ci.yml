@@ -236,6 +236,97 @@ jobs:
         #    longer wallclock.
         run: cargo test --features sal-postgres -- --test-threads=1
 
+  # v0.7.0 Posture-1a (issue #1068) — mobile cross-compile gate.
+  # Verifies that the `--features sqlite-bundled --lib` build cross-compiles
+  # cleanly for the two mobile Rust targets the v0.7.0 §1067 Posture-1a
+  # row claims (iPhone via `aarch64-apple-ios`, Android via
+  # `aarch64-linux-android`). Catches ~80% of mobile-bit-rot risk: any
+  # crate update that drops mobile portability (introduces a pthread-only
+  # / OpenSSL / libc-gap dependency, etc.) surfaces here instead of
+  # silently breaking integration when a downstream app developer tries
+  # to consume the v0.7.x release artifacts. The job is `--lib` only —
+  # we never build a CLI binary for mobile; the consumer is FFI from an
+  # iOS / Android app. Skipped on docs-only PRs alongside the rest of
+  # the heavy matrix. CI cost: ~5-8 min per target on a cold cache, ~1
+  # min on a warm cache; well under the $5/mo budget the issue projected.
+  mobile-cross-compile:
+    name: Cross-compile (${{ matrix.target }})
+    needs: classify
+    if: needs.classify.outputs.docs_only != 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # iOS device — cross-compiled on macOS so the Apple SDK
+          # (`xcrun --sdk iphoneos --show-sdk-path`) is in place for
+          # the C bits of rusqlite's bundled SQLite.
+          - target: aarch64-apple-ios
+            os: macos-latest
+          # Android arm64 — cross-compiled on Linux with the NDK toolchain
+          # providing the `aarch64-linux-android-clang` C compiler that
+          # rusqlite-sys's build.rs invokes for the bundled SQLite C code.
+          - target: aarch64-linux-android
+            os: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust stable (target ${{ matrix.target }})
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: mobile-${{ matrix.target }}
+
+      # Android NDK r26d — provides the clang toolchain we point at via
+      # CC_aarch64_linux_android / AR_aarch64_linux_android below so the
+      # bundled SQLite C blob compiles against the Android sysroot
+      # instead of the host's. r26d is the latest LTS at the time of
+      # writing; bumps tracked alongside Rust stable cadence.
+      - name: Install Android NDK r26d
+        if: matrix.target == 'aarch64-linux-android'
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26d
+          add-to-path: false
+
+      - name: Configure NDK toolchain for cargo
+        if: matrix.target == 'aarch64-linux-android'
+        shell: bash
+        run: |
+          set -euo pipefail
+          NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
+          TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          test -x "$TC/aarch64-linux-android24-clang" || {
+            echo "::error::NDK clang for android24 not found at $TC"
+            ls "$TC" | head -40
+            exit 1
+          }
+          # Bundled SQLite (rusqlite/bundled feature) compiles its C
+          # blob via the `cc` crate, which honors the per-target
+          # CC_<target_underscores> and AR_<target_underscores> env
+          # vars. We point them at the NDK's clang + llvm-ar so the C
+          # bits link against the Android sysroot, not the host's.
+          # min-sdk 24 (Android 7.0+) — matches the floor v0.7.0
+          # Posture-1a documents in ROADMAP §1067.
+          {
+            echo "CC_aarch64_linux_android=$TC/aarch64-linux-android24-clang"
+            echo "CXX_aarch64_linux_android=$TC/aarch64-linux-android24-clang++"
+            echo "AR_aarch64_linux_android=$TC/llvm-ar"
+            echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$TC/aarch64-linux-android24-clang"
+          } >> "$GITHUB_ENV"
+
+      - name: cargo check (--lib --features sqlite-bundled)
+        run: |
+          cargo check \
+            --target ${{ matrix.target }} \
+            --no-default-features \
+            --features sqlite-bundled \
+            --lib
+
   # v0.7.0 Phase D regression closeout — `sal`-only feature gate. The
   # `check` matrix above builds the default (sqlite-bundled only) and
   # `postgres-feature` builds `sal-postgres` (which transitively enables

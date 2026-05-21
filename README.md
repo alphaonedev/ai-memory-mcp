@@ -488,6 +488,27 @@ Restart your AI assistant. If using MCP, it now has the **5-tool default surface
 
 ---
 
+## Mobile platform support (v0.7.0 Posture-1a)
+
+ai-memory is portable to iOS and Android via the standard Rust mobile cross-compile path. v0.7.0 ships CI coverage for both targets at three escalating levels:
+
+| Layer | Coverage | CI workflow |
+|---|---|---|
+| **Layer 1 — Cross-compile** | `cargo check --target aarch64-apple-ios --no-default-features --features sqlite-bundled --lib` and the matching Android cross-compile run on every PR + push to `release/**`. Catches ~80% of mobile bit-rot risk (any crate update that drops mobile portability surfaces here). | [`.github/workflows/ci.yml`](.github/workflows/ci.yml) — `mobile-cross-compile` job |
+| **Layer 2 — Release artifacts** | Release tag cuts produce `ai-memory-ios.xcframework.tar.gz` (iOS device + simulator slices via `xcodebuild -create-xcframework`) and `ai-memory-android.tar.gz` (Android arm64 / armv7 / x86_64 / x86 .so bundle in `jniLibs/<abi>/` layout). | [`.github/workflows/release.yml`](.github/workflows/release.yml) — `mobile-ios` + `mobile-android` jobs |
+| **Layer 3 — Runtime tests** | A scoped ~50-test subset (file-system sandboxing, FTS5 on device SQLite, HNSW CPU recall, embedder CPU path, LLM client TLS) runs against the iOS Simulator on every `release/**` push + a manual `workflow_dispatch`; the Android emulator arm runs on `release/**` push + `workflow_dispatch` only. Selection rationale: [`tests/mobile/README.md`](tests/mobile/README.md). | [`.github/workflows/mobile-runtime.yml`](.github/workflows/mobile-runtime.yml) |
+
+**Status at v0.7.0:** Layer 1 is the ship-gate — mobile cross-compile must be GREEN before tag-cut. Layer 2 (release artifacts) ships the BUILD pipeline + artifact layout; the C-callable FFI surface itself lands in a v0.7.x follow-up. Layer 3 runs the scoped test subset on every `release/**` push.
+
+**Consuming the release artifacts:**
+
+- **iOS** — download `ai-memory-ios.xcframework.tar.gz` from the v0.7.x release page, unpack, and drag `AiMemory.xcframework` into your Xcode project under "Frameworks, Libraries, and Embedded Content."
+- **Android** — download `ai-memory-android.tar.gz` from the v0.7.x release page, unpack, and copy the `jniLibs/` tree into your app module's `src/main/jniLibs/`.
+
+The mobile artifacts are also part of every published v0.7.x release; the Homebrew formula + APT/RPM packages (which ship the desktop binaries) include a note linking to the mobile downloads. See issue [#1068](https://github.com/alphaonedev/ai-memory-mcp/issues/1068) for the CI implementation history.
+
+---
+
 ## Quickstart
 
 Get from zero to a working memory in under two minutes.
