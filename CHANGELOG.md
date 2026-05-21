@@ -7,7 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] — v0.7.x doc follow-ups + Wave-2 refactor (post-tag)
 
-<<<<<<< HEAD
 ### refactor(#961) — SAL boundary cleanup (Wave-2 Tier-B1, 2026-05-21)
 
 Closes #961: handler-side audit + cleanup of `src/storage/` (legacy direct-sqlite +
