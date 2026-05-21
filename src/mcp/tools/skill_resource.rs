@@ -101,6 +101,70 @@ fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+// --- D1.5 (#986): per-tool McpTool impl for memory_skill_resource ---
+
+use crate::mcp::registry::McpTool;
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+/// v0.7.0 #972 D1.5 (#986) — request body for `memory_skill_resource`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct SkillResourceRequest {
+    /// Parent skill UUID.
+    pub skill_id: String,
+
+    /// Relative path (e.g. 'scripts/run.sh').
+    pub resource_path: String,
+}
+
+/// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_skill_resource`.
+#[allow(dead_code)]
+pub struct SkillResourceTool;
+
+impl McpTool for SkillResourceTool {
+    fn name() -> &'static str {
+        "memory_skill_resource"
+    }
+    fn description() -> &'static str {
+        "Fetch + digest-verify a skill resource."
+    }
+    fn docs() -> &'static str {
+        "L1-5: SHA-256-verified resource fetch. Errors on mismatch."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(SkillResourceRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "other"
+    }
+}
+
+#[cfg(test)]
+mod d1_5_986_tests {
+    //! D1.5 (#986) — schema parity for `memory_skill_resource`.
+    //! Shared helpers live at [`crate::mcp::parity_test_helpers`].
+    use super::*;
+    use crate::mcp::parity_test_helpers::{
+        assert_descriptions_match, assert_property_set_parity, derived_props_for,
+    };
+
+    #[test]
+    fn skill_resource_parity_986() {
+        let derived = derived_props_for::<SkillResourceRequest>();
+        assert_property_set_parity("memory_skill_resource", &derived);
+        assert_descriptions_match("memory_skill_resource", &derived);
+    }
+
+    #[test]
+    fn skill_resource_tool_metadata_986() {
+        assert_eq!(SkillResourceTool::name(), "memory_skill_resource");
+        assert_eq!(SkillResourceTool::family(), "other");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------

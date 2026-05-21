@@ -148,4 +148,140 @@ pub(crate) fn handle_inbox(
     }))
 }
 
+// --- D1.5 (#986): per-tool McpTool impls for the 2 other-family notify tools ---
+
+use crate::mcp::registry::McpTool;
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+/// v0.7.0 #972 D1.5 (#986) — request body for `memory_notify`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct NotifyRequest {
+    /// Recipient agent_id.
+    pub target_agent_id: String,
+
+    /// Subject (<=200 chars).
+    pub title: String,
+
+    /// Body.
+    pub payload: String,
+
+    /// Default 5; clamped 1..=10.
+    #[serde(default)]
+    pub priority: Option<i64>,
+
+    /// short=6h, mid=7d, long=no expiry.
+    #[serde(default)]
+    pub tier: Option<String>,
+}
+
+/// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_notify`.
+#[allow(dead_code)]
+pub struct NotifyTool;
+
+impl McpTool for NotifyTool {
+    fn name() -> &'static str {
+        "memory_notify"
+    }
+    fn description() -> &'static str {
+        "Send a message from the caller to another agent's inbox."
+    }
+    fn docs() -> &'static str {
+        "Send message to _messages/<target>. Sender = caller agent_id. Read via memory_inbox."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(NotifyRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "other"
+    }
+}
+
+/// v0.7.0 #972 D1.5 (#986) — request body for `memory_inbox`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct InboxRequest {
+    /// Recipient; default caller.
+    #[serde(default)]
+    pub agent_id: Option<String>,
+
+    /// access_count==0 only.
+    #[serde(default)]
+    pub unread_only: Option<bool>,
+
+    /// Default 50, cap 500.
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+/// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_inbox`.
+#[allow(dead_code)]
+pub struct InboxTool;
+
+impl McpTool for InboxTool {
+    fn name() -> &'static str {
+        "memory_inbox"
+    }
+    fn description() -> &'static str {
+        "List messages sent to an agent via memory_notify."
+    }
+    fn docs() -> &'static str {
+        "Read _messages/<agent_id>. access_count==0 is the unread marker."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(InboxRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        // Note: `memory_inbox` lives in `Family::Power` per
+        // `src/profile.rs::Family::for_tool`, not the `other` family.
+        // The legacy registry tags it Power. See D1.6 (#987) for the
+        // collapse — the per-tool family() tag here is the new
+        // source-of-truth.
+        "power"
+    }
+}
+
+#[cfg(test)]
+mod d1_5_986_tests {
+    //! D1.5 (#986) — schema parity for `memory_notify` (Family::Other)
+    //! and `memory_inbox` (Family::Power) — both handlers live in
+    //! `src/mcp/tools/notify.rs` so the per-tool parity tests sit here
+    //! together. Shared helpers live at [`crate::mcp::parity_test_helpers`].
+    use super::*;
+    use crate::mcp::parity_test_helpers::{
+        assert_descriptions_match, assert_property_set_parity, derived_props_for,
+    };
+
+    #[test]
+    fn notify_parity_986() {
+        let derived = derived_props_for::<NotifyRequest>();
+        assert_property_set_parity("memory_notify", &derived);
+        assert_descriptions_match("memory_notify", &derived);
+    }
+
+    #[test]
+    fn notify_tool_metadata_986() {
+        assert_eq!(NotifyTool::name(), "memory_notify");
+        assert_eq!(NotifyTool::family(), "other");
+    }
+
+    #[test]
+    fn inbox_parity_986() {
+        let derived = derived_props_for::<InboxRequest>();
+        assert_property_set_parity("memory_inbox", &derived);
+        assert_descriptions_match("memory_inbox", &derived);
+    }
+
+    #[test]
+    fn inbox_tool_metadata_986() {
+        assert_eq!(InboxTool::name(), "memory_inbox");
+        assert_eq!(InboxTool::family(), "power");
+    }
+}
+
 // --- v0.6.0.0 webhook subscriptions ---------------------------------------
