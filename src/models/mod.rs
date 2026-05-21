@@ -7,6 +7,7 @@ pub mod audit;
 pub mod link;
 pub mod memory;
 pub mod namespace;
+pub mod recall_request;
 pub mod reflection;
 pub mod skill;
 pub mod tag;
@@ -16,6 +17,8 @@ pub use audit::*;
 pub use link::*;
 pub use memory::*;
 pub use namespace::*;
+#[allow(unused_imports)]
+pub use recall_request::*;
 #[allow(unused_imports)]
 pub use reflection::*;
 #[allow(unused_imports)]
