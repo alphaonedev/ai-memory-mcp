@@ -124,6 +124,53 @@ tightening) was split into 8 dependency-graphed sub-issues. Filed:
 - **`#989`** D1.8 — docs sweep (CLAUDE.md "New MCP tool" recipe,
   release-notes, CHANGELOG, per-tool README).
 
+#### Wave-2 Tier-C2 — recall dispatch DTO (`#967`)
+
+- **`#967` — refactor: `recall_response` and `handle_recall` collapse
+  17+ positional args into the canonical `RecallRequest` DTO**.
+  Pre-#967 the three recall surfaces (HTTP, MCP, CLI) each marshalled
+  17+ scalar parameters one-by-one through `recall_response` /
+  `handle_recall` / `run_with_embedder`. Adding a new wire field
+  (Form-6 `kinds`, Form-4 `has_citations`, `session_id`,
+  `confidence_tier`, …) meant editing four signatures and four
+  call sites.
+
+  Sub-A's D1.3 #984 work already introduced `RecallRequest` in
+  `src/mcp/tools/recall.rs` for schemars-derived schema. #967
+  promotes the struct to `src/models/recall_request.rs` so all three
+  surfaces marshal into it ONCE — one struct serves both schemars
+  derivation AND runtime dispatch (option (a) in the issue rubric).
+
+  - Constructors per surface: `from_mcp_params(&Value)` /
+    `from_http_query(&RecallQuery)` / `from_http_body(&RecallBody)` /
+    `from_cli_args(&cli::recall::RecallArgs)`.
+  - `KindsFilter` enum promoted alongside; backward-compat re-export
+    from `mcp::tools::recall::KindsFilter`.
+  - HTTP `recall_response`: 15 positional args → 5 (DTO + 3 entry-
+    handler-resolved scalars + caller principal). The legacy
+    `apply_recall_scope_defaults` tuple helper is replaced by
+    `splice_recall_scope_into(&mut RecallRequest, &AppState)` which
+    mutates the DTO in place — request shape stays authoritative
+    through the rest of the handler. Net: -44 LOC in the HTTP
+    handler.
+  - MCP `handle_recall`: split into a thin `&Value`-accepting wrapper
+    + canonical `handle_recall_dto(conn, req: &RecallRequest, ...)`.
+    The 18 in-line `params["foo"].as_*()` extractions collapse into
+    typed DTO accessors. `parse_kinds_filter` deleted — its
+    responsibility is now on `KindsFilter::parse()` on the canonical
+    DTO with the Cluster-E COR-4 #767 contract pinned in unit tests.
+  - CLI: no production changes; `cli::recall::RecallArgs` was already
+    the CLI's DTO. `from_cli_args` constructor provides the canonical
+    bridge.
+  - D1.4 (#985) parity test green: 44/44 PASS. D1.3 (#984)
+    recall_parity test green: 7/7 PASS. Saturation-on-`u64::MAX`
+    contract preserved via constructor-level clamp + new regression
+    tests (`from_mcp_params_limit_u64_max_saturates`,
+    `from_mcp_params_budget_tokens_u64_max_saturates`).
+  - 18 new unit tests in `src/models/recall_request.rs` cover
+    constructor happy / missing-context / full-field-set / kinds-
+    array+CSV / COR-4 declared-empty / saturation / round-trip serde.
+
 #### Documentation drift umbrella
 
 - **`#999`** — umbrella issue for the v0.7.0 doc + GitHub Pages
