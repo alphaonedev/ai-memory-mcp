@@ -498,7 +498,7 @@ pub async fn sync_push(
     // would serialize unrelated writers for hundreds of ms).
     let mut embedding_refresh: Vec<(String, String)> = Vec::new();
     for mem in &body.memories {
-        if let Err(e) = validate::validate_memory(mem) {
+        if let Err(e) = validate::RequestValidator::validate_memory(mem) {
             tracing::warn!("sync_push: skipping memory {} ({}): {e}", mem.id, mem.title);
             skipped += 1;
             continue;
@@ -746,8 +746,12 @@ pub async fn sync_push(
     // `peer_attested`.
     let mut links_applied = 0usize;
     for link in &body.links {
-        if validate::validate_link(&link.source_id, &link.target_id, link.relation.as_str())
-            .is_err()
+        if validate::RequestValidator::validate_link_triple(
+            &link.source_id,
+            &link.target_id,
+            link.relation.as_str(),
+        )
+        .is_err()
         {
             skipped += 1;
             continue;
