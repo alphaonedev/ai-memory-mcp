@@ -7019,6 +7019,15 @@ impl MemoryStore for PostgresStore {
         // semantics — a patch that doesn't touch source_uri leaves the
         // stored value alone; a patch that supplies one rewrites the
         // row's source_uri verbatim.
+        // #1024 (CRITICAL, 2026-05-21): bump `version` on every trait
+        // `update`. Pre-#1024 the SET list omitted `version = version + 1`,
+        // so postgres-backed daemons answering `PUT /api/v1/memories/:id`
+        // without `If-Match` (which routes through this trait method, NOT
+        // through the inherent `update_with_expected_version` helper)
+        // left `version` permanently at 1 — concurrent optimistic-
+        // concurrency detection was silently broken on postgres while
+        // the surface looked identical to sqlite. SQLite bumps version
+        // in `src/storage/mod.rs`.
         let rows_affected = sqlx::query(
             "UPDATE memories SET
                 title = COALESCE($2, title),
@@ -7042,6 +7051,7 @@ impl MemoryStore for PostgresStore {
                     ELSE $9::JSONB
                 END,
                 source_uri = COALESCE($10, source_uri),
+                version = version + 1,
                 updated_at = NOW()
              WHERE id = $1",
         )
@@ -8395,7 +8405,21 @@ impl MemoryStore for PostgresStore {
     }
 
     async fn run_gc(&self, archive: bool) -> StoreResult<usize> {
+        // #1026 (CRITICAL, 2026-05-21): wrap archive-INSERT + live-DELETE
+        // in a single transaction. Pre-#1026 each statement auto-committed
+        // on the unwrapped pool — a crash, statement_timeout, or pool
+        // checkout failure between them could leave rows in BOTH tables
+        // (or rows archive-copied with stale data on later re-run since
+        // ON CONFLICT DO UPDATE clobbers archived_at/archive_reason).
+        // Pinned by `tests/store_parity_gaps.rs::run_gc_is_transactional_1026`
+        // (crash-injection: drop tx mid-flow, assert no orphans).
         let now = chrono::Utc::now();
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("gc begin tx", e))?;
+
         if archive {
             sqlx::query(
                 "INSERT INTO archived_memories (
@@ -8415,7 +8439,7 @@ impl MemoryStore for PostgresStore {
                     archive_reason = EXCLUDED.archive_reason",
             )
             .bind(now)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("gc archive copy", e))?;
         }
@@ -8423,9 +8447,13 @@ impl MemoryStore for PostgresStore {
         let res =
             sqlx::query("DELETE FROM memories WHERE expires_at IS NOT NULL AND expires_at < $1")
                 .bind(now)
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await
                 .map_err(|e| to_store_err("gc delete", e))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("gc commit", e))?;
 
         // Best-effort cleanup of namespace_meta dangling references.
         let _ = sqlx::query(
