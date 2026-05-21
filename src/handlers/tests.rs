@@ -533,7 +533,7 @@ async fn http_create_memory_succeeds_when_llm_is_absent_l5() {
 /// v0.7.0 L5 — `maybe_auto_tag` gate matrix. Asserts each of the
 /// short-circuit conditions returns an empty `Vec` without ever
 /// touching the (absent) LLM client, mirroring MCP's skip-reason
-/// ladder at `src/mcp.rs:1812-1822`.
+/// ladder at `crate::mcp::handle_store` (admin-allowlist ladder).
 #[tokio::test]
 async fn maybe_auto_tag_gate_matrix_l5() {
     let state = test_state();
@@ -12813,7 +12813,7 @@ async fn http_create_memory_invalid_x_agent_id_header_returns_400() {
 
 /// L11 (v0.7.0.1) — `metadata.agent_id` must be honoured as an
 /// explicit-caller source in the HTTP precedence chain, matching the
-/// MCP path (`src/mcp.rs:1514-1516`) and the CLAUDE.md §Agent Identity
+/// MCP path (`crate::mcp::handle_store` (NHI precedence)) and the CLAUDE.md §Agent Identity
 /// contract.
 ///
 /// Regression scenario (NHI-D-fed-agentid-mutation): a peer reposts a

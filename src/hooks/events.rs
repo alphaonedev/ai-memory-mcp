@@ -73,83 +73,83 @@ use crate::models::{Memory, MemoryLink, Tier};
 pub enum HookEvent {
     /// Fires before a memory is persisted. Payload: [`MemoryDelta`] (writable).
     ///
-    /// TODO(G3-G11): wire here at `src/db.rs:846` (`pub fn insert`).
+    /// TODO(G3-G11): wire here at `crate::storage::insert`.
     PreStore,
     /// Fires after a memory has been persisted. Payload: [`Memory`] (read-only).
     ///
-    /// TODO(G3-G11): wire here at `src/db.rs:846` (post-INSERT in `pub fn insert`).
+    /// TODO(G3-G11): wire here at `crate::storage::insert` (post-INSERT).
     PostStore,
     /// Fires before a recall query executes. Payload: [`RecallQuery`] (writable).
     ///
-    /// TODO(G3-G11): wire here at `src/db.rs:1657` (`pub fn recall`).
+    /// TODO(G3-G11): wire here at `crate::storage::recall`.
     PreRecall,
     /// Fires after a recall query returns. Payload: [`RecallResult`] (read-only).
     ///
-    /// TODO(G3-G11): wire here at `src/db.rs:1657` (post-return in `pub fn recall`).
+    /// TODO(G3-G11): wire here at `crate::storage::recall` (post-return).
     PostRecall,
     /// Fires before a full-text search executes. Payload: [`SearchQuery`] (writable).
     ///
-    /// TODO(G3-G11): wire here at `src/db.rs:1314` (`pub fn search`).
+    /// TODO(G3-G11): wire here at `crate::storage::search`.
     PreSearch,
     /// Fires after a full-text search returns. Payload: [`SearchResult`] (read-only).
     ///
-    /// TODO(G3-G11): wire here at `src/db.rs:1314` (post-return in `pub fn search`).
+    /// TODO(G3-G11): wire here at `crate::storage::search` (post-return).
     PostSearch,
     /// Fires before a memory is deleted. Payload: [`MemoryRef`] (writable target id).
     ///
-    /// TODO(G3-G11): wire here at `src/db.rs:1072` (`pub fn delete`).
+    /// TODO(G3-G11): wire here at `crate::storage::delete`.
     PreDelete,
     /// Fires after a memory has been deleted. Payload: [`MemoryRef`] (read-only).
     ///
-    /// TODO(G3-G11): wire here at `src/db.rs:1072` (post-DELETE in `pub fn delete`).
+    /// TODO(G3-G11): wire here at `crate::storage::delete` (post-DELETE).
     PostDelete,
     /// Fires before a tier promotion. Payload: [`PromoteDelta`] (writable target tier).
     ///
-    /// TODO(G3-G11): wire here at `src/db.rs:1764` (`pub fn promote_to_namespace`).
+    /// TODO(G3-G11): wire here at `crate::storage::promote_to_namespace`.
     PrePromote,
     /// Fires after a tier promotion. Payload: [`PromoteResult`] (read-only).
     ///
-    /// TODO(G3-G11): wire here at `src/db.rs:1764` (post-UPDATE in `pub fn promote_to_namespace`).
+    /// TODO(G3-G11): wire here at `crate::storage::promote_to_namespace` (post-UPDATE).
     PostPromote,
     /// Fires before a link is created. Payload: [`LinkDelta`] (writable).
     ///
-    /// TODO(G3-G11): wire here at `src/db.rs:1888` (`pub fn create_link`).
+    /// TODO(G3-G11): wire here at `crate::storage::create_link`.
     PreLink,
     /// Fires after a link has been created. Payload: [`Link`] (read-only).
     ///
-    /// TODO(G3-G11): wire here at `src/db.rs:1888` (post-INSERT in `pub fn create_link`).
+    /// TODO(G3-G11): wire here at `crate::storage::create_link` (post-INSERT).
     PostLink,
     /// Fires before a consolidation pass runs. Payload: [`ConsolidationDelta`] (writable).
     ///
-    /// TODO(G3-G11): wire here at `src/db.rs:1958` (`pub fn consolidate`).
+    /// TODO(G3-G11): wire here at `crate::storage::consolidate`.
     PreConsolidate,
     /// Fires after a consolidation pass completes. Payload: [`ConsolidationResult`] (read-only).
     ///
-    /// TODO(G3-G11): wire here at `src/db.rs:1958` (post-return in `pub fn consolidate`).
+    /// TODO(G3-G11): wire here at `crate::storage::consolidate` (post-return).
     PostConsolidate,
     /// Fires before a governance gate decision. Payload: [`GovernanceContext`] (writable).
     ///
-    /// TODO(G3-G11): wire here at `src/db.rs:4674` (`pub fn enforce_governance`).
+    /// TODO(G3-G11): wire here at `crate::storage::enforce_governance`.
     PreGovernanceDecision,
     /// Fires after a governance gate decision. Payload: [`GovernanceDecision`] (read-only).
     ///
-    /// TODO(G3-G11): wire here at `src/db.rs:4674` (post-return in `pub fn enforce_governance`).
+    /// TODO(G3-G11): wire here at `crate::storage::enforce_governance` (post-return).
     PostGovernanceDecision,
     /// Fires when the ANN index evicts an entry. Payload: [`EvictionEvent`] (read-only).
     ///
-    /// TODO(G3-G11): wire here at `src/hnsw.rs:182` (`hnsw.eviction` log site).
+    /// TODO(G3-G11): wire here at `crate::hnsw` (`hnsw.eviction` log site).
     OnIndexEviction,
     /// Fires before a memory is archived. Payload: [`MemoryRef`] (writable target id).
     ///
-    /// TODO(G3-G11): wire here at `src/db.rs:1097` (`pub fn archive_memory`).
+    /// TODO(G3-G11): wire here at `crate::storage::archive_memory`.
     PreArchive,
     /// Fires before a transcript is stored. Payload: [`TranscriptDelta`] (writable).
     ///
-    /// TODO(G3-G11): wire here at `src/transcripts.rs:72` (`pub fn store`).
+    /// TODO(G3-G11): wire here at `crate::transcripts::store`.
     PreTranscriptStore,
     /// Fires after a transcript has been stored. Payload: [`Transcript`] (read-only).
     ///
-    /// TODO(G3-G11): wire here at `src/transcripts.rs:72` (post-INSERT in `pub fn store`).
+    /// TODO(G3-G11): wire here at `crate::transcripts::store` (post-INSERT).
     PostTranscriptStore,
     /// G10: fires *synchronously* on the recall hot path before the
     /// embedder / DB call to allow query expansion (synonyms,
@@ -159,7 +159,7 @@ pub enum HookEvent {
     /// configure this hook in `mode = "daemon"` to amortize spawn
     /// cost. Classified as [`crate::hooks::EventClass::HotPath`].
     ///
-    /// Wires here at `src/mcp.rs:1543` (top of `pub fn handle_recall`).
+    /// Wires here at `crate::mcp::handle_recall` (top of fn).
     PreRecallExpand,
     /// v0.7.0 recursive-learning Task 6/8 — fires BEFORE the
     /// depth-cap check inside `db::reflect`. **Decision-class** hook:
@@ -172,7 +172,7 @@ pub enum HookEvent {
     /// the cap check evaluates). Classified as
     /// [`crate::hooks::EventClass::Write`].
     ///
-    /// Wires here at `src/db.rs:reflect` step 4 (after source-load /
+    /// Wires here at `crate::storage::reflect` step 4 (after source-load /
     /// depth computation, BEFORE step 5 cap check).
     PreReflect,
     /// v0.7.0 recursive-learning Task 6/8 — fires AFTER the
@@ -182,7 +182,7 @@ pub enum HookEvent {
     /// post-commit envelope mirrors the `memory_reflect` MCP
     /// response). Classified as [`crate::hooks::EventClass::Write`].
     ///
-    /// Wires here at `src/db.rs:reflect` step 7 (after COMMIT
+    /// Wires here at `crate::storage::reflect` step 7 (after COMMIT
     /// succeeds, before returning `ReflectOutcome` to the caller).
     /// Layers on top of the existing `memory_store` webhook event the
     /// MCP handler dispatches — both fire on a successful reflect.

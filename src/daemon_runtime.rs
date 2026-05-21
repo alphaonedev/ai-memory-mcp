@@ -2503,7 +2503,7 @@ pub async fn bootstrap_serve(
     // v0.7.0 L5 — build the LLM client for autonomy-hook capable tiers
     // (smart/autonomous). The HTTP `create_memory` handler reaches for
     // `app.llm` to call `auto_tag` (mirroring MCP `handle_store` at
-    // `src/mcp.rs:1823-1833`). When the configured tier has no
+    // `crate::mcp::handle_store` (auto-tag block)). When the configured tier has no
     // `llm_model` (keyword/semantic) or the Ollama endpoint is
     // unreachable, the client stays `None` and the hook silently
     // degrades to operator-supplied tags only.

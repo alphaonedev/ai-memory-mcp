@@ -216,7 +216,7 @@ mod tests {
              `memory_persona_generate` + v0.7.0 Form 3 \
              `memory_ingest_multistep` + v0.7.0 Form 5 (issue #758) \
              `memory_calibrate_confidence`, source-anchored at \
-             src/mcp.rs::tool_definitions); got {n}. If the count changed, \
+             crate::mcp::registry::tool_definitions); got {n}. If the count changed, \
              update the family map and this assertion together."
         );
     }

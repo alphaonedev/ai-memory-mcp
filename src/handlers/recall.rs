@@ -244,7 +244,7 @@ pub async fn recall_memories_post(
 
 /// v0.6.2 (S18): shared HTTP recall implementation. Uses `db::recall_hybrid`
 /// (semantic + FTS adaptive blend) when the embedder is loaded — matching
-/// how the MCP `memory_recall` handler wires recall at src/mcp.rs:1157.
+/// how the MCP `memory_recall` handler wires recall at crate::mcp::handle_recall.
 /// Gracefully falls back to `db::recall` (keyword-only) when the embedder
 /// is not present or embedding the query fails. Closes the gap where the
 /// HTTP surface was keyword-only regardless of server tier — scenario-18

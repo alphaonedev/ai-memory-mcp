@@ -247,7 +247,7 @@ const MIGRATION_V47_PERSONA_SIGNING_ATOMICITY: &str =
 const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
     include_str!("../../migrations/postgres/0030_v07_federation_push_dlq.sql");
 
-/// Current schema version. Matches SQLite CURRENT_SCHEMA_VERSION (src/db.rs:233).
+/// Current schema version. Matches SQLite CURRENT_SCHEMA_VERSION (crate::storage::migrations::CURRENT_SCHEMA_VERSION).
 /// Incremented on each migration step.
 ///
 /// v15 — Temporal-validity columns on `memory_links` + `entity_aliases`.
@@ -923,7 +923,7 @@ impl PostgresStore {
     /// Run schema migrations on the connection. Called after bootstrap schema
     /// is loaded. Reads the current schema_version, then applies all pending
     /// migrations in a transaction per version step (matching SQLite behavior
-    /// in src/db.rs::migrate).
+    /// in crate::storage::migrations::migrate).
     ///
     /// # Errors
     ///
@@ -2863,7 +2863,7 @@ impl PostgresStore {
     // bootstrap script (`postgres_schema.sql`) already creates the
     // current shape on a fresh init; these handlers exist for in-place
     // upgrades from v15-stamped or v23-stamped pre-existing deployments.
-    // Mirrors the SQLite-side ladder in `src/db.rs::migrate`.
+    // Mirrors the SQLite-side ladder in `crate::storage::migrations::migrate`.
     // ───────────────────────────────────────────────────────────────────
 
     /// v17 — Governance inheritance backfill.
@@ -3352,7 +3352,7 @@ impl PostgresStore {
 
         // Defensive ALTER TABLE for deployments that hand-rolled a
         // `subscription_events` table before K6 (mirrors the inline
-        // column add in src/db.rs::migrate v27 block).
+        // column add in crate::storage::migrations::migrate v27 block).
         add_column_if_missing(
             &mut tx,
             "subscription_events",
@@ -6743,7 +6743,7 @@ impl MemoryStore for PostgresStore {
         //
         // Agent-id immutability (blocker #295): on conflict we preserve
         // the ORIGINAL `metadata.agent_id` via `jsonb_set`, mirroring the
-        // SQLite `json_set` CASE clause in `src/db.rs::insert`. The
+        // SQLite `json_set` CASE clause in `crate::storage::insert`. The
         // caller-supplied metadata otherwise wins.
         //
         // Tier never downgrades (blocker #296 / SQLite parity): on
@@ -7175,7 +7175,7 @@ impl MemoryStore for PostgresStore {
         // v0.7.0 F6 Gap 7 — recall scoring parity with SQLite.
         //
         // SQLite's `db::recall` scores each FTS hit with a 6-factor
-        // blend (src/db.rs::recall):
+        // blend (crate::storage::recall):
         //
         //     fts.rank        * (-1)
         //   + priority        * 0.5
