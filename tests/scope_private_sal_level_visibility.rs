@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
+
 //! Issue #910 — SAL-level scope=private visibility filter, the
 //! load-bearing enforcement surface beneath every query path.
 //!
@@ -71,6 +73,7 @@ fn make_memory(title: &str, content: &str, owner: &str, scope: &str) -> Memory {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     }
 }
 

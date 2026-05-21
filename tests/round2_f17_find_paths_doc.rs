@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
+
 //! Round-2 F17 — `find_paths` surface guarantees.
 //!
 //! Two contracts are pinned here:
@@ -59,6 +61,7 @@ fn seed(conn: &rusqlite::Connection, title: &str) -> String {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..ai_memory::models::Memory::default()
     };
     db::insert(conn, &mem).expect("db::insert")
 }

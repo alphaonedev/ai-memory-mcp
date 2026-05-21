@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
+
 //! v0.7.0 Track D #933 regression test — the federation push DLQ +
 //! `replay_federation_push_dlq` worker MUST recover a peer push that
 //! failed inside `broadcast_store_quorum`'s deadline on the peer's
@@ -132,6 +134,7 @@ fn sample_memory(id: &str) -> Memory {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     }
 }
 

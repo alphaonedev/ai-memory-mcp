@@ -1,6 +1,7 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
 #![allow(clippy::doc_markdown, clippy::cast_precision_loss)]
 
 //! v0.7.0 Wave-2 A5 (issue #853) — boot embedding-backfill batched path.
@@ -130,6 +131,7 @@ fn make_memory(idx: usize) -> Memory {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     }
 }
 

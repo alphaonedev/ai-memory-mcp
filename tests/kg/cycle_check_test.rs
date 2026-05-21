@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
+
 //! Integration tests for the anti-self-reflection cycle-check gate
 //! (v0.7.0 L1-2, issue #659).
 //!
@@ -65,6 +67,7 @@ fn insert(conn: &Connection, id: &str) -> String {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     };
     db::insert(conn, &mem).expect("insert memory")
 }

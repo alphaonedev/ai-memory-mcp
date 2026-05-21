@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
+
 //! v0.7.0 S6 federation hardening — substrate-level integration tests.
 //!
 //! These tests pin the cross-peer reflection bookkeeping (L2-2 / S6-M1),
@@ -53,6 +55,7 @@ fn reflection(id: &str, depth: i32, namespace: &str) -> Memory {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     }
 }
 

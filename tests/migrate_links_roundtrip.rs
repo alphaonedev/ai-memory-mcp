@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
+
 //! v0.7.0 F6 Gap 2 — `memory_links` survive a cross-backend round trip.
 //!
 //! Seeds a `SQLite` source with 10 memories and 20 links (varied
@@ -62,6 +64,7 @@ fn seed_memory(id: &str, ns: &str, title: &str) -> Memory {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     }
 }
 

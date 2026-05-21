@@ -1,6 +1,7 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
 // v0.7.0 fix-campaign CF-3 (#690): the SQLite store + Postgres parity
 // sub-tests below transitively touch `ai_memory::store::*`, which is
 // gated behind `#[cfg(feature = "sal")]` in src/lib.rs. Without the
@@ -105,6 +106,7 @@ fn make_memory(namespace: &str, title: &str, reflection_depth: i32) -> Memory {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     }
 }
 
@@ -792,6 +794,7 @@ async fn federation_apply_remote_memory_round_trips_reflection_depth() {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     };
     let id = store
         .apply_remote_memory(&ctx, &mem)

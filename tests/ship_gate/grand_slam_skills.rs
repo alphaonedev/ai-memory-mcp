@@ -1,6 +1,7 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
 // clippy allows (test scaffolding): pedantic lints with no behavioural impact.
 #![allow(
     clippy::doc_markdown,
@@ -99,6 +100,7 @@ fn insert_observation(conn: &rusqlite::Connection, title: &str, ns: &str, body: 
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     };
     db::insert(conn, &m).expect("insert observation")
 }

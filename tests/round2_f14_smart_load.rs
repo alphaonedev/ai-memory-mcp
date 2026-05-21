@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
+
 //! Round-2 F14 — `memory_smart_load` router under-weights underscore
 //! tokens.
 //!
@@ -63,6 +65,7 @@ fn seed_family(conn: &rusqlite::Connection, family: &str) -> String {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     };
     db::insert(conn, &mem).expect("db::insert")
 }

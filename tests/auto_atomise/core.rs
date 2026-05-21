@@ -1,6 +1,7 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
 #![allow(
     clippy::doc_markdown,
     clippy::too_many_lines,
@@ -305,6 +306,7 @@ fn insert_memory(conn: &Connection, ns: &str, content: &str) -> Memory {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     };
     let id = db::insert(conn, &mem).expect("insert");
     Memory { id, ..mem }
@@ -736,6 +738,7 @@ fn test_auto_atomise_refused_memory_not_atomised() {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     };
 
     let insert_result = db::insert(&conn, &mem);

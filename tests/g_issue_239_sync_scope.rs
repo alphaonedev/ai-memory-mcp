@@ -1,6 +1,7 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
 // clippy allows (test scaffolding): pedantic lints with no behavioural
 // impact on the regression we pin.
 #![allow(clippy::redundant_closure_for_method_calls)]
@@ -124,9 +125,7 @@ async fn seed_inner(db: &ai_memory::handlers::Db, ns: &str, title: &str, federat
     let lock = db.lock().await;
     let now = chrono::Utc::now().to_rfc3339();
     let mut metadata = ai_memory::models::default_metadata();
-    if federation_share
-        && let Some(obj) = metadata.as_object_mut()
-    {
+    if federation_share && let Some(obj) = metadata.as_object_mut() {
         obj.insert(
             "federation_share".to_string(),
             serde_json::Value::Bool(true),
@@ -159,6 +158,7 @@ async fn seed_inner(db: &ai_memory::handlers::Db, ns: &str, title: &str, federat
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..ai_memory::models::Memory::default()
     };
     ai_memory::db::insert(&lock.0, &mem).expect("seed insert");
 }

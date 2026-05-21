@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
+
 //! Issue #939 + #941 — link create/delete sqlite caller-vs-source-
 //! memory-owner gates (security-high, Track A QC sweep 2026-05-20).
 
@@ -63,6 +65,7 @@ fn seed_memory(
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     };
     ai_memory::db::insert(&conn, &mem).expect("db::insert");
     id

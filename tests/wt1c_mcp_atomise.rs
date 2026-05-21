@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
+
 //! v0.7.0 WT-1-C — `memory_atomise` MCP tool acceptance suite.
 //!
 //! Eight tests pinned to the WT-1-C brief, all driving the handler
@@ -203,6 +205,7 @@ fn insert_long_source(conn: &Connection, ns: &str) -> String {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     };
     storage::insert(conn, &mem).expect("seed long source")
 }
@@ -236,6 +239,7 @@ fn insert_short_source(conn: &Connection, ns: &str) -> String {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        ..Memory::default()
     };
     storage::insert(conn, &mem).expect("seed short source")
 }
