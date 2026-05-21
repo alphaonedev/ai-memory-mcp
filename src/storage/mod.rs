@@ -7260,12 +7260,20 @@ pub fn memories_updated_since(
     since: Option<&str>,
     limit: usize,
 ) -> Result<Vec<Memory>> {
+    // #1028 (HIGH, 2026-05-21): SAL-level scope=private gate. Pre-#1028
+    // this method returned every row in the substrate including
+    // scope=private rows. Federation `/api/v1/sync/since` calls it
+    // directly; pushing the scope filter down here makes the contract
+    // defense-in-depth (a peer with valid mTLS cannot enumerate
+    // private memories). `json_extract($.scope)` defaults to 'private'
+    // when missing — matches the v0.7.0 NHI visibility contract.
     let mut stmt = conn.prepare(
         "SELECT id, tier, namespace, title, content, tags, priority, confidence, \
                 source, access_count, created_at, updated_at, last_accessed_at, \
                 expires_at, metadata \
          FROM memories \
          WHERE (?1 IS NULL OR updated_at > ?1) \
+           AND COALESCE(json_extract(metadata, '$.scope'), 'private') <> 'private' \
          ORDER BY updated_at ASC \
          LIMIT ?2",
     )?;

@@ -1803,6 +1803,13 @@ async fn http_sync_push_governance_bypass_on_peer_attested() {
 async fn http_sync_since_streams_new_memories_only() {
     // Phase 3 — GET /api/v1/sync/since?since=<ts> returns only memories
     // with updated_at > ts.
+    //
+    // #1028 (HIGH, 2026-05-21): SAL `memories_updated_since` now
+    // filters out scope=private rows (defense-in-depth federation
+    // gate). Test memories must set `scope: "shared"` explicitly to
+    // be eligible for /sync/since enumeration; without it the rows
+    // default to scope=private and the SAL refuses to ship them to
+    // peers.
     let state = test_state();
     // Seed one old + one new memory.
     let old_ts = "2020-01-01T00:00:00+00:00";
@@ -1825,7 +1832,7 @@ async fn http_sync_since_streams_new_memories_only() {
                 updated_at: ts.to_string(),
                 last_accessed_at: None,
                 expires_at: None,
-                metadata: serde_json::json!({}),
+                metadata: serde_json::json!({"scope": "shared"}),
                 reflection_depth: 0,
                 memory_kind: crate::models::MemoryKind::Observation,
                 entity_id: None,
@@ -1898,7 +1905,10 @@ async fn http_sync_since_includes_s39_diagnostic_fields() {
                 updated_at: ts.to_string(),
                 last_accessed_at: None,
                 expires_at: None,
-                metadata: serde_json::json!({}),
+                // #1028: scope=shared so SAL list_memories_updated_since
+                // ships the row to peers (defense-in-depth gate filters
+                // out scope=private federation candidates).
+                metadata: serde_json::json!({"scope": "shared"}),
                 reflection_depth: 0,
                 memory_kind: crate::models::MemoryKind::Observation,
                 entity_id: None,
