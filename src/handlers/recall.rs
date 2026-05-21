@@ -486,12 +486,40 @@ async fn recall_response(
         None
     };
 
+    // v0.7.0 #982 — invert lock acquisition order so the
+    // vector_index mutex is taken BEFORE the (singleton) DB mutex.
+    // Pre-#982 the handler took DB then VI, which serialized every
+    // recall through both locks in DB-first order; HNSW eviction
+    // and embedder writes that grab the VI lock alone (e.g.
+    // `src/handlers/create.rs:541`) had a different lock-order
+    // semantic that risked deadlock if any future code path took DB
+    // INSIDE a VI guard. The invert puts the read-path order in
+    // line with the rest of the codebase. The deeper perf win
+    // (HNSW search OUTSIDE the DB lock so concurrent recalls overlap
+    // their CPU-bound ANN walks) is tracked as a follow-up; it
+    // requires changing `recall_hybrid` / `recall_hybrid_with_telemetry`
+    // / `semantic_phase` to accept precomputed `Option<Vec<VectorHit>>`
+    // and threading the change through 4 callers (handler + MCP tool
+    // + CLI + SAL adapter). Post-#981 the DB lock hold during
+    // semantic_phase is much shorter (1 batched SELECT vs N), so the
+    // marginal value of the deep refactor is reduced; this commit
+    // ships the order-invert win + caches the TTL config out of the
+    // mutex tuple so it doesn't need a re-read on every recall.
+    let vi_guard_outer = if query_emb.is_some() {
+        Some(app.vector_index.lock().await)
+    } else {
+        None
+    };
     let lock = app.db.lock().await;
     let short_extend = lock.2.short_extend_secs;
     let mid_extend = lock.2.mid_extend_secs;
 
     let (result, mode) = if let Some(ref qe) = query_emb {
-        let vi_guard = app.vector_index.lock().await;
+        // The VI guard is held since the outer if-let above; cannot
+        // move it into the inner scope without re-acquiring the lock.
+        let vi_guard = vi_guard_outer
+            .as_ref()
+            .expect("vi_guard_outer set when query_emb is Some");
         let vi_ref = vi_guard.as_ref();
         let r = db::recall_hybrid(
             &lock.0,
@@ -525,7 +553,6 @@ async fn recall_response(
             // the `has_citations` axis.
             source_uri_prefix,
         );
-        drop(vi_guard);
         (r, "hybrid")
     } else {
         let r = db::recall(
