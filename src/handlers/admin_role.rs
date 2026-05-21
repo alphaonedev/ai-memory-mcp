@@ -140,8 +140,46 @@ pub fn require_admin(
     endpoint: &'static str,
 ) -> Result<String, Response> {
     let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
-    let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
-        .unwrap_or_else(|_| "anonymous:invalid".to_string());
+    // v0.7.0 #984 — surface `resolve_http_agent_id` errors as 400
+    // BAD_REQUEST instead of papering them with the
+    // `"anonymous:invalid"` sentinel. Pre-#984 a wire caller who
+    // supplied an `X-Agent-Id` header that failed
+    // [`crate::validate::validate_agent_id`] (invalid char class,
+    // oversized, RESERVED_AGENT_IDS post-#977) reached
+    // [`is_admin_caller`] with the sentinel principal. The sentinel
+    // fails the admin allowlist check anyway (it's not in any
+    // operator's `AdminConfig`), so the wire caller still got 403
+    // — but the audit chain captured `"anonymous:invalid"` instead
+    // of the actionable validation diagnostic. Worse, post-#977 a
+    // wire spoof of `X-Agent-Id: daemon` would land in the audit
+    // chain as `"anonymous:invalid"` rather than logging the
+    // attempted spoof of a reserved name. Surfacing 400 with the
+    // validator's error message gives operators the diagnostic
+    // they need + closes the audit-pollution path.
+    let caller = match crate::identity::resolve_http_agent_id(None, header_agent_id) {
+        Ok(c) => c,
+        Err(e) => {
+            // Record a `deny` audit decision with the actual error
+            // so the forensic chain captures the rejected probe
+            // BEFORE the wire 400.
+            crate::governance::audit::record_decision(
+                "anonymous:resolve-failed",
+                "deny",
+                "admin_role",
+                "",
+                json!({
+                    "endpoint": endpoint,
+                    "outcome": "agent_id_resolve_failed",
+                    "reason": e.to_string(),
+                }),
+            );
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("invalid agent_id: {e}")})),
+            )
+                .into_response());
+        }
+    };
 
     let admitted = is_admin_caller(state, &caller);
     crate::governance::audit::record_decision(
