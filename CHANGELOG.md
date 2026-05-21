@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] — v0.7.x doc follow-ups + Wave-2 refactor (post-tag)
 
+### refactor(#961) — SAL boundary cleanup (Wave-2 Tier-B1, 2026-05-21)
+
+Closes #961: handler-side audit + cleanup of `src/storage/` (legacy direct-sqlite +
+typed-error origin) vs `src/store/` (SAL trait + adapters) duplication.
+
+**Audit results** — full per-handler bucket table at
+[`docs/internal/sal-boundary-audit-961.md`](docs/internal/sal-boundary-audit-961.md).
+
+- 13 `crate::storage::*` references in `src/handlers/`. After audit: 12 are typed-error
+  downcasts (`StorageError::AmbiguousIdPrefix`, `VersionConflict`, `GovernanceRefusal`)
+  that the SAL `StoreError` enum does not currently carry — kept with a fresh
+  `// SAL-bypass intentional (#961):` comment explaining the contract and pointing at
+  the SAL-side `store_err_to_response` mapping that the postgres branch uses instead.
+- 127 `db::*` direct-sqlite calls in handlers. After audit: all are inside the
+  canonical `if Postgres { app.store...; return; }` dispatch guard; the
+  `postgres_route_gate` middleware backstops these so they never reach a
+  postgres-backed daemon. Bucket: C (legitimate sqlite-only legacy path retained for
+  v0.7.0 binary parity).
+
+**Conversions performed:**
+
+- `src/handlers/federation_receive.rs:603` — `crate::storage::resolve_governance_policy`
+  → `db::resolve_governance_policy` (alias hygiene; the rest of the file uses `db::*`).
+  Pure rename, no behavior change.
+- `src/handlers/federation_signing_check.rs:172` — postgres-parity correction. Pre-fix
+  the postgres-receive path stamped reflection rows with the compiled-in default
+  `max_reflection_depth` cap (the comment said "`resolve_governance_policy` is
+  sqlite-only today", which became stale once the SAL trait wired the method on both
+  adapters). Post-fix: routes through `app.store.resolve_governance_policy(&namespace)`
+  so postgres-backed daemons honour operator-set per-namespace caps the same way sqlite
+  already did via `sync_push`.
+
+**Docs:**
+
+- `CLAUDE.md` §"Key Modules" — `storage/` and `store/` rows reworded to reflect the
+  post-#961 contract (storage/ is sqlite SQL primitives + typed legacy errors;
+  store/ is the canonical SAL trait + adapters that new DB ops land on first).
+- `CLAUDE.md` §"Adding New Functionality" — new "New database operation" paragraph
+  documenting the trait-first workflow (trait → SqliteStore → PostgresStore → handler).
+- `docs/internal/sal-boundary-audit-961.md` — canonical record of the audit + the
+  per-handler-file bucket counts.
+
 ### v0.7.0 ship-readiness session 2026-05-21 — gate-rerun closures + drift sweep
 
 After the PR #820 merge + the 6-agent review's TB1/TB2 (#977/#978) landed, a
