@@ -452,7 +452,7 @@ Tier::from_str(&amp;str) -&gt; Option&lt;Tier&gt;</div>
       <div class="ty-desc">The outcome of a governance check. Callers <strong>MAY</strong> execute on <code>Allow</code>, <strong>MUST</strong> reject on <code>Deny</code>, and <strong>SHOULD</strong> queue + return the <code>pending_id</code> on <code>Pending</code>.</div>
       <div class="variants">
         <div class="v"><span class="vn">Allow</span><span class="vd">proceed with the action.</span></div>
-        <div class="v"><span class="vn">Deny(String)</span><span class="vd">reject; the wrapped string surfaces the reason to the caller.</span></div>
+        <div class="v"><span class="vn">Deny(GovernanceRefusal)</span><span class="vd">reject; the typed envelope carries the canonical wire message (<code>Display</code> reads <code>"&lt;action&gt; denied by governance: &lt;reason&gt;"</code>) plus the structured policy context (<code>denied_level</code>, <code>namespace</code>, <code>owner</code>, <code>agent_id</code>, <code>reason</code>). Wire shape byte-identical to the pre-#963 <code>Deny(String)</code> envelope; pattern-match consumers read <code>refusal.reason</code> for the bare string.</span></div>
         <div class="v"><span class="vn">Pending(String)</span><span class="vd">queued for approval; the caller receives the new <code>pending_id</code>.</span></div>
       </div>
     </div>

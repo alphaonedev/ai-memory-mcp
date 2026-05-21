@@ -205,10 +205,10 @@ footer a{color:var(--text-muted)}
         <p>Queued in <code>pending_actions</code>; caller receives the new <code>pending_id</code> and HTTP 202. The action replays once approved.</p>
       </div>
     </div>
-    <div class="snip">// src/models.rs
+    <div class="snip">// src/models/namespace.rs
 <span class="key">pub enum</span> <span class="val">GovernanceDecision</span> {
     Allow,
-    Deny(String),
+    Deny(crate::governance::GovernanceRefusal),  <span class="vd">// #963 Phase 2 — typed envelope; Display byte-identical to pre-#963 Deny(String)</span>
     Pending(String),
 }</div>
   </div>
