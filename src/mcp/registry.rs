@@ -73,6 +73,155 @@ pub trait McpTool {
     fn family() -> &'static str;
 }
 
+// --- v0.7.0 #972 D1.6 (#987) — registered_tools() iterator ---
+
+/// v0.7.0 #972 D1.6 (#987) — owned snapshot of one tool's catalog
+/// row, derived from its per-tool [`McpTool`] impl. Together with
+/// [`registered_tools`] it replaces the hand-coded `json!({...})`
+/// body of [`tool_definitions`] (D1.6 collapses the macro).
+///
+/// The row carries the tool's `name`, `description`, `docs`, family
+/// tag, and the schemars-derived `inputSchema`. [`RegisteredTool::of`]
+/// constructs the row from any `T: McpTool` so the dispatch table is
+/// authored in one place: `registered_tools()`.
+#[allow(dead_code)]
+pub struct RegisteredTool {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub docs: &'static str,
+    pub family: &'static str,
+    pub input_schema: Value,
+}
+
+#[allow(dead_code)]
+impl RegisteredTool {
+    /// Derive a catalog row from any type that implements [`McpTool`].
+    /// All five `McpTool` methods are pure / cheap; the schemars-derived
+    /// `input_schema` is recomputed each call (no caching) because the
+    /// per-request budget is dominated by the JSON serialisation below,
+    /// not by schemars reflection.
+    #[must_use]
+    pub fn of<T: McpTool>() -> Self {
+        Self {
+            name: T::name(),
+            description: T::description(),
+            docs: T::docs(),
+            family: T::family(),
+            input_schema: T::input_schema(),
+        }
+    }
+
+    /// Render the row in the wire shape `tool_definitions` emits:
+    /// `{ name, description, docs, inputSchema }`. The `family` tag is
+    /// kept out of the wire form (it's a server-side filter only) so
+    /// the post-D1.6 payload matches the pre-D1.6 payload byte-for-byte
+    /// modulo the documented allowed-diffs (property order, schemars
+    /// `default: null` on optional fields, schemars
+    /// `additionalProperties: false`).
+    #[must_use]
+    pub fn to_value(&self) -> Value {
+        json!({
+            "name": self.name,
+            "description": self.description,
+            "docs": self.docs,
+            "inputSchema": self.input_schema,
+        })
+    }
+}
+
+/// v0.7.0 #972 D1.6 (#987) — canonical iterator over every
+/// `McpTool`-impl in the codebase. Each entry pairs the tool with a
+/// closure that derives its catalog row via [`RegisteredTool::of`].
+///
+/// **One row per tool. Adding a tool = adding ONE line here + an impl
+/// in the per-tool module.** That's the post-D1.6 contract — see the
+/// "New MCP tool" recipe in `CLAUDE.md`.
+///
+/// Order matches the pre-D1.6 `tool_definitions()` macro order so
+/// callers that iterate the wire array see the same sequence they
+/// saw before the migration.
+#[must_use]
+#[allow(clippy::too_many_lines)]
+#[allow(dead_code)]
+pub fn registered_tools() -> Vec<RegisteredTool> {
+    vec![
+        RegisteredTool::of::<crate::mcp::store::StoreTool>(),
+        RegisteredTool::of::<crate::mcp::recall::RecallTool>(),
+        RegisteredTool::of::<crate::mcp::recall_observations::RecallObservationsTool>(),
+        RegisteredTool::of::<crate::mcp::search::SearchTool>(),
+        RegisteredTool::of::<crate::mcp::list::ListTool>(),
+        RegisteredTool::of::<crate::mcp::load_family::LoadFamilyTool>(),
+        RegisteredTool::of::<crate::mcp::load_family::SmartLoadTool>(),
+        RegisteredTool::of::<crate::mcp::delete::DeleteTool>(),
+        RegisteredTool::of::<crate::mcp::promote::PromoteTool>(),
+        RegisteredTool::of::<crate::mcp::forget::ForgetTool>(),
+        RegisteredTool::of::<crate::mcp::forget::StatsTool>(),
+        RegisteredTool::of::<crate::mcp::update::UpdateTool>(),
+        RegisteredTool::of::<crate::mcp::get::GetTool>(),
+        RegisteredTool::of::<crate::mcp::link::LinkTool>(),
+        RegisteredTool::of::<crate::mcp::link::GetLinksTool>(),
+        RegisteredTool::of::<crate::mcp::find_paths::FindPathsTool>(),
+        RegisteredTool::of::<crate::mcp::kg_query::KgQueryTool>(),
+        RegisteredTool::of::<crate::mcp::kg_invalidate::KgInvalidateTool>(),
+        RegisteredTool::of::<crate::mcp::kg_timeline::KgTimelineTool>(),
+        RegisteredTool::of::<crate::mcp::replay::ReplayTool>(),
+        RegisteredTool::of::<crate::mcp::dependents_of_invalidated::DependentsOfInvalidatedTool>(),
+        RegisteredTool::of::<crate::mcp::verify::VerifyTool>(),
+        RegisteredTool::of::<crate::mcp::get_taxonomy::GetTaxonomyTool>(),
+        RegisteredTool::of::<crate::mcp::entity_register::EntityRegisterTool>(),
+        RegisteredTool::of::<crate::mcp::entity_get_by_alias::EntityGetByAliasTool>(),
+        RegisteredTool::of::<crate::mcp::expand_query::ExpandQueryTool>(),
+        RegisteredTool::of::<crate::mcp::auto_tag::AutoTagTool>(),
+        RegisteredTool::of::<crate::mcp::detect_contradiction::DetectContradictionTool>(),
+        RegisteredTool::of::<crate::mcp::check_duplicate::CheckDuplicateTool>(),
+        RegisteredTool::of::<crate::mcp::consolidate::ConsolidateTool>(),
+        RegisteredTool::of::<crate::mcp::atomise::AtomiseTool>(),
+        RegisteredTool::of::<crate::mcp::ingest_multistep::IngestMultistepTool>(),
+        RegisteredTool::of::<crate::mcp::archive::GcTool>(),
+        RegisteredTool::of::<crate::mcp::session_start::SessionStartTool>(),
+        RegisteredTool::of::<crate::mcp::namespace::NamespaceSetStandardTool>(),
+        RegisteredTool::of::<crate::mcp::namespace::NamespaceGetStandardTool>(),
+        RegisteredTool::of::<crate::mcp::namespace::NamespaceClearStandardTool>(),
+        RegisteredTool::of::<crate::mcp::rule_list::RuleListTool>(),
+        RegisteredTool::of::<crate::mcp::check_agent_action::CheckAgentActionTool>(),
+        RegisteredTool::of::<crate::mcp::pending::PendingListTool>(),
+        RegisteredTool::of::<crate::mcp::pending::PendingApproveTool>(),
+        RegisteredTool::of::<crate::mcp::pending::PendingRejectTool>(),
+        RegisteredTool::of::<crate::mcp::pending::SubscriptionDlqListTool>(),
+        RegisteredTool::of::<crate::mcp::subscribe::SubscribeTool>(),
+        RegisteredTool::of::<crate::mcp::subscribe::UnsubscribeTool>(),
+        RegisteredTool::of::<crate::mcp::subscribe::ListSubscriptionsTool>(),
+        RegisteredTool::of::<crate::mcp::subscribe::SubscriptionReplayTool>(),
+        RegisteredTool::of::<crate::mcp::share::ShareTool>(),
+        RegisteredTool::of::<crate::mcp::notify::NotifyTool>(),
+        RegisteredTool::of::<crate::mcp::notify::InboxTool>(),
+        RegisteredTool::of::<crate::mcp::offload::OffloadTool>(),
+        RegisteredTool::of::<crate::mcp::offload::DerefTool>(),
+        RegisteredTool::of::<crate::mcp::quota_status::QuotaStatusTool>(),
+        RegisteredTool::of::<crate::mcp::archive::ArchiveListTool>(),
+        RegisteredTool::of::<crate::mcp::archive::ArchivePurgeTool>(),
+        RegisteredTool::of::<crate::mcp::archive::ArchiveRestoreTool>(),
+        RegisteredTool::of::<crate::mcp::archive::ArchiveStatsTool>(),
+        RegisteredTool::of::<crate::mcp::agent::AgentRegisterTool>(),
+        RegisteredTool::of::<crate::mcp::agent::AgentListTool>(),
+        RegisteredTool::of::<crate::mcp::capabilities::CapabilitiesTool>(),
+        RegisteredTool::of::<crate::mcp::reflect::ReflectTool>(),
+        RegisteredTool::of::<crate::mcp::reflection_origin::ReflectionOriginTool>(),
+        RegisteredTool::of::<crate::mcp::export_reflection::ExportReflectionTool>(),
+        RegisteredTool::of::<crate::mcp::persona::PersonaTool>(),
+        RegisteredTool::of::<crate::mcp::persona::PersonaGenerateTool>(),
+        RegisteredTool::of::<crate::mcp::calibrate_confidence::CalibrateConfidenceTool>(),
+        RegisteredTool::of::<crate::mcp::skill_register::SkillRegisterTool>(),
+        RegisteredTool::of::<crate::mcp::skill_list::SkillListTool>(),
+        RegisteredTool::of::<crate::mcp::skill_get::SkillGetTool>(),
+        RegisteredTool::of::<crate::mcp::skill_resource::SkillResourceTool>(),
+        RegisteredTool::of::<crate::mcp::skill_export::SkillExportTool>(),
+        RegisteredTool::of::<crate::mcp::skill_promote::SkillPromoteFromReflectionTool>(),
+        RegisteredTool::of::<crate::mcp::skill_compositional_context::SkillCompositionalContextTool>(
+        ),
+    ]
+}
+
 // --- Tool definitions ---
 
 /// Version tag for the `tools/list` response schema. Bumped whenever
