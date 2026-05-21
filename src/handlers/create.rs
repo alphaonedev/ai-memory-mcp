@@ -495,6 +495,15 @@ fn insert_create_with_quota(
             // typed `storage::GovernanceRefusal` propagated via
             // `anyhow::Error`; downcasting here keeps the
             // happy-path-cheap `?`-friendly return shape upstream.
+            //
+            // SAL-bypass intentional (#961): the SAL `StoreError` enum
+            // in `src/store/mod.rs` does not carry the operator-authored
+            // reason string; substrate governance refusals are emitted
+            // by the legacy db:: write path which wraps them in
+            // `anyhow::Error`. Downcasting to the legacy concrete type
+            // here is the load-bearing contract — pinned by the
+            // `insert_governance_refusal_downcasts_to_403_envelope` test
+            // in the `#[cfg(test)]` block below.
             if let Some(refusal) = e.downcast_ref::<crate::storage::GovernanceRefusal>() {
                 tracing::info!(
                     "create_memory refused by substrate governance: {}",
