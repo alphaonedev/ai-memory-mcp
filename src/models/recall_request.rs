@@ -498,6 +498,92 @@ mod tests {
     }
 
     #[test]
+    fn from_cli_args_round_trips_all_fields() {
+        // Pin the CLI surface: clap-derived `RecallArgs` collapses
+        // into the canonical DTO via `from_cli_args`. Adding a new
+        // CLI flag means extending this round-trip.
+        let cli_args = crate::cli::recall::RecallArgs {
+            context: "hello".to_string(),
+            namespace: Some("ns".to_string()),
+            limit: 7,
+            tags: Some("rust".to_string()),
+            since: Some("2026-01-01T00:00:00Z".to_string()),
+            until: Some("2026-12-31T00:00:00Z".to_string()),
+            tier: Some("keyword".to_string()),
+            as_agent: Some("ai:viewer".to_string()),
+            budget_tokens: Some(50),
+            context_tokens: Some(vec!["alpha".to_string()]),
+            session_default: true,
+            include_archived: true,
+            has_citations: true,
+            source_uri_prefix: Some("doc:".to_string()),
+            kind: Some("concept,claim".to_string()),
+        };
+        let req = RecallRequest::from_cli_args(&cli_args);
+        assert_eq!(req.context, "hello");
+        assert_eq!(req.namespace.as_deref(), Some("ns"));
+        assert_eq!(req.limit, Some(7));
+        assert_eq!(req.tags.as_deref(), Some("rust"));
+        assert_eq!(req.budget_tokens, Some(50));
+        assert_eq!(req.session_default, Some(true));
+        assert_eq!(req.include_archived, Some(true));
+        assert_eq!(req.has_citations, Some(true));
+        assert_eq!(req.source_uri_prefix.as_deref(), Some("doc:"));
+        assert!(matches!(req.kinds, Some(KindsFilter::Csv(ref s)) if s == "concept,claim"));
+        // CLI `tier` and `format` have no DTO field — they're CLI-only
+        // knobs that drive embedder construction / output formatting,
+        // not wire-level filters.
+    }
+
+    #[test]
+    fn from_http_query_minimal() {
+        let q = crate::models::RecallQuery {
+            context: Some("hello".to_string()),
+            query: None,
+            q: None,
+            namespace: None,
+            limit: Some(15),
+            tags: None,
+            since: None,
+            until: None,
+            as_agent: None,
+            budget_tokens: None,
+            session_default: None,
+            has_citations: None,
+            source_uri_prefix: None,
+            kinds: None,
+            session_id: None,
+        };
+        let req = RecallRequest::from_http_query(&q);
+        assert_eq!(req.context, "hello");
+        assert_eq!(req.limit, Some(15));
+    }
+
+    #[test]
+    fn from_http_query_aliases() {
+        // `q` → `context` fallback honoured.
+        let q = crate::models::RecallQuery {
+            context: None,
+            query: None,
+            q: Some("via-q".to_string()),
+            namespace: None,
+            limit: None,
+            tags: None,
+            since: None,
+            until: None,
+            as_agent: None,
+            budget_tokens: None,
+            session_default: None,
+            has_citations: None,
+            source_uri_prefix: None,
+            kinds: None,
+            session_id: None,
+        };
+        let req = RecallRequest::from_http_query(&q);
+        assert_eq!(req.context, "via-q");
+    }
+
+    #[test]
     fn round_trip_serialize_deserialize() {
         let req = RecallRequest {
             context: "q".to_string(),
