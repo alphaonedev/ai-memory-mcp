@@ -5,13 +5,223 @@
 
 use crate::embeddings::Embed;
 use crate::hnsw::VectorIndex;
+use crate::mcp::registry::McpTool;
 use crate::models::{
     AttestLevel, CandidateCounts, ConfidenceTier, Memory, MemoryKind, RecallMeta, RecallTelemetry,
 };
 use crate::observations;
 use crate::reranker::BatchedReranker;
 use crate::{db, validate};
+use schemars::JsonSchema;
+use serde::Deserialize;
 use serde_json::{Value, json};
+
+// --- D1.3 (#984): per-tool McpTool impl for `memory_recall` ---
+
+/// v0.7.0 #972 D1.3 (#984) — `kinds` filter shape for `memory_recall`.
+/// The legacy hand-coded schema declares this field as a `oneOf`
+/// union (array-of-strings OR a single CSV string); modelling it as
+/// an `#[serde(untagged)]` enum replicates the wire shape exactly
+/// without forcing callers to wrap their CSV in an array.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[serde(untagged)]
+pub enum KindsFilter {
+    /// Array of kind tokens, e.g. `["concept", "claim"]`.
+    Array(Vec<String>),
+    /// Comma-separated kinds string, e.g. `"concept,claim"`.
+    Csv(String),
+}
+
+/// v0.7.0 #972 D1.3 (#984) — request body for `memory_recall`.
+/// Schemars-derived schema replaces the hand-coded entry in
+/// [`crate::mcp::registry::tool_definitions`] (D1.6 (#987) collapses
+/// the macro). Every doc-comment description is byte-equal to the
+/// legacy `description` text — see the d1_3_984_tests parity contract
+/// at the bottom of this file.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct RecallRequest {
+    /// What to recall
+    pub context: String,
+
+    /// Namespace filter
+    #[serde(default)]
+    pub namespace: Option<String>,
+
+    #[serde(default)]
+    pub limit: Option<i64>,
+
+    /// Tag filter
+    #[serde(default)]
+    pub tags: Option<String>,
+
+    /// RFC3339 lower bound on created_at
+    #[serde(default)]
+    pub since: Option<String>,
+
+    /// RFC3339 upper bound on created_at
+    #[serde(default)]
+    pub until: Option<String>,
+
+    #[serde(default)]
+    #[schemars(description = "#151 scope-visibility agent.")]
+    pub as_agent: Option<String>,
+
+    /// P6/R1 cl100k content cap. 0=empty; top kept (meta.budget_overflow=true).
+    #[serde(default)]
+    pub budget_tokens: Option<i64>,
+
+    /// Recent conversation tokens; biases query embedding 70/30 (v0.6.0.0).
+    #[serde(default)]
+    pub context_tokens: Option<Vec<String>>,
+
+    /// Splice [agents.defaults.recall_scope]. explicit > scope > defaults.
+    #[serde(default)]
+    pub session_default: Option<bool>,
+
+    #[serde(default)]
+    #[schemars(description = "#518 session id; +0.05 rerank boost for in-session ring (cap 50).")]
+    pub session_id: Option<String>,
+
+    /// WT-1-E: include atomised sources alongside atoms.
+    #[serde(default)]
+    pub include_archived: Option<bool>,
+
+    /// Form 4 (#757): require non-empty citations array.
+    #[serde(default)]
+    pub has_citations: Option<bool>,
+
+    /// Form 4 (#757): restrict by source_uri prefix (e.g. 'doc:', 'uri:https://').
+    #[serde(default)]
+    pub source_uri_prefix: Option<String>,
+
+    /// Form 6 (#759) kind filter. Array/CSV. OR within; AND across.
+    #[serde(default)]
+    pub kinds: Option<KindsFilter>,
+
+    /// Gap 4 (#887) tier filter.
+    #[serde(default)]
+    pub confidence_tier: Option<String>,
+
+    /// Gap 7 (#890): per-row provenance decoration.
+    #[serde(default)]
+    pub verbose_provenance: Option<bool>,
+
+    /// Response format. toon_compact saves 79% vs json.
+    #[serde(default)]
+    pub format: Option<String>,
+}
+
+/// v0.7.0 #972 D1.3 (#984) — `McpTool` impl for `memory_recall`.
+#[allow(dead_code)]
+pub struct RecallTool;
+
+impl McpTool for RecallTool {
+    fn name() -> &'static str {
+        "memory_recall"
+    }
+    fn description() -> &'static str {
+        "Recall memories relevant to a context (ranked)."
+    }
+    fn docs() -> &'static str {
+        "Fuzzy OR recall ranked by relevance + priority + access + tier. Optional: budget_tokens (cl100k cap), context_tokens (query-embed bias), session_id (+0.05 recency boost per #518), session_default (splice [agents.defaults.recall_scope]), include_archived, kinds filter. Default format toon_compact (~79% smaller)."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(RecallRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "core"
+    }
+}
+
+#[cfg(test)]
+mod d1_3_984_tests {
+    //! D1.3 (#984) — schema parity for the `memory_recall` tool.
+    //! Reuses the allowed-diffs catalog documented in d1_2_983_tests.
+    use super::*;
+
+    fn legacy_props(tool_name: &str) -> serde_json::Map<String, Value> {
+        let defs = crate::mcp::registry::tool_definitions();
+        let tools = defs
+            .get("tools")
+            .and_then(Value::as_array)
+            .expect("tool_definitions emits `tools` array");
+        let entry = tools
+            .iter()
+            .find(|t| t.get("name").and_then(Value::as_str) == Some(tool_name))
+            .unwrap_or_else(|| panic!("{tool_name} must be in legacy catalog"));
+        entry
+            .pointer("/inputSchema/properties")
+            .and_then(Value::as_object)
+            .unwrap_or_else(|| panic!("{tool_name}.inputSchema.properties must be object"))
+            .clone()
+    }
+
+    fn derived_props_for<T: schemars::JsonSchema>() -> serde_json::Map<String, Value> {
+        let schema = schemars::schema_for!(T);
+        let v = serde_json::to_value(schema).expect("schema → value");
+        v.get("properties")
+            .and_then(Value::as_object)
+            .or_else(|| {
+                v.pointer(&format!(
+                    "/definitions/{}/properties",
+                    std::any::type_name::<T>().rsplit("::").next().unwrap_or("")
+                ))
+                .and_then(Value::as_object)
+            })
+            .cloned()
+            .expect("schemars schema must have properties at a known path")
+    }
+
+    fn assert_property_set_parity(tool_name: &str, derived: &serde_json::Map<String, Value>) {
+        let legacy = legacy_props(tool_name);
+        let legacy_keys: std::collections::BTreeSet<&str> =
+            legacy.keys().map(String::as_str).collect();
+        let derived_keys: std::collections::BTreeSet<&str> =
+            derived.keys().map(String::as_str).collect();
+        assert_eq!(
+            legacy_keys,
+            derived_keys,
+            "{tool_name}: property set drift; diff = {:?}",
+            legacy_keys
+                .symmetric_difference(&derived_keys)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    fn assert_descriptions_match(tool_name: &str, derived: &serde_json::Map<String, Value>) {
+        let legacy = legacy_props(tool_name);
+        for (name, legacy_prop) in &legacy {
+            if let Some(want) = legacy_prop.get("description").and_then(Value::as_str) {
+                let got = derived
+                    .get(name)
+                    .and_then(|p| p.get("description"))
+                    .and_then(Value::as_str);
+                assert_eq!(
+                    got,
+                    Some(want),
+                    "{tool_name}.{name}: description must match legacy byte-for-byte"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn recall_parity_984() {
+        let derived = derived_props_for::<RecallRequest>();
+        assert_property_set_parity("memory_recall", &derived);
+        assert_descriptions_match("memory_recall", &derived);
+    }
+
+    #[test]
+    fn recall_tool_metadata_984() {
+        assert_eq!(RecallTool::name(), "memory_recall");
+        assert_eq!(RecallTool::family(), "core");
+    }
+}
 
 /// v0.7.x Form 6 — parse the `kinds` recall-filter parameter from the
 /// MCP params bag. Accepts:
