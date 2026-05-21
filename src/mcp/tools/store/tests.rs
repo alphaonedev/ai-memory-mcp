@@ -651,9 +651,10 @@ async fn autonomy_hook_executes_with_llm_success() {
     // /api/generate — auto_tag returns 3 newline-separated tags;
     // detect_contradiction returns "no".
     Mock::given(method("POST"))
-        .and(path("/api/generate"))
+        .and(path("/api/chat"))
         .respond_with(
-            ResponseTemplate::new(200).set_body_json(json!({"response": "alpha\nbeta\ngamma"})),
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"message": {"content": "alpha\nbeta\ngamma"}})),
         )
         .mount(&server)
         .await;
@@ -704,7 +705,7 @@ async fn autonomy_hook_swallows_llm_error() {
         .mount(&server)
         .await;
     Mock::given(method("POST"))
-        .and(path("/api/generate"))
+        .and(path("/api/chat"))
         .respond_with(ResponseTemplate::new(500))
         .mount(&server)
         .await;
@@ -1165,16 +1166,25 @@ async fn autonomy_hook_confirmed_contradictions_reach_response() {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"models": []})))
         .mount(&server)
         .await;
-    // auto_tag uses /api/generate; detect_contradiction goes via
-    // OllamaClient::generate which posts to /api/chat. Mock both
-    // so the second hook fires Ok(true).
+    // #1067 (2026-05-21): both auto_tag AND detect_contradiction now
+    // route through the provider-agnostic /api/chat endpoint. Pre-#1067
+    // auto_tag used /api/generate which kept the two mocks distinct.
+    // Disambiguate via body_partial_json on the prompt content:
+    // auto_tag's prompt contains "Generate" + "tags";
+    // detect_contradiction's prompt contains "contradict".
+    use wiremock::matchers::body_string_contains;
     Mock::given(method("POST"))
-        .and(path("/api/generate"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"response": "alpha\nbeta"})))
+        .and(path("/api/chat"))
+        .and(body_string_contains("tags"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"message": {"content": "alpha\nbeta"}})),
+        )
         .mount(&server)
         .await;
     Mock::given(method("POST"))
         .and(path("/api/chat"))
+        .and(body_string_contains("contradict"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(json!({"message": {"content": "yes"}, "done": true})),
@@ -1764,8 +1774,11 @@ async fn legacy_classifier_handles_no_and_error_responses() {
         .mount(&server_no)
         .await;
     Mock::given(method("POST"))
-        .and(path("/api/generate"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"response": "alpha\nbeta"})))
+        .and(path("/api/chat"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"message": {"content": "alpha\nbeta"}})),
+        )
         .mount(&server_no)
         .await;
     // detect_contradiction → /api/chat → "no" → Ok(false)
@@ -1844,8 +1857,11 @@ async fn legacy_classifier_handles_no_and_error_responses() {
         .mount(&server_err)
         .await;
     Mock::given(method("POST"))
-        .and(path("/api/generate"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"response": "gamma\ndelta"})))
+        .and(path("/api/chat"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"message": {"content": "gamma\ndelta"}})),
+        )
         .mount(&server_err)
         .await;
     Mock::given(method("POST"))

@@ -273,9 +273,9 @@ mod tests {
         let server = MockServer::start().await;
         mount_tags_ok(&server).await;
         Mock::given(method("POST"))
-            .and(path("/api/generate"))
+            .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "response": "alpha\nbeta\ngamma",
+                "message": {"content": "alpha\nbeta\ngamma"},
             })))
             .mount(&server)
             .await;
@@ -316,9 +316,9 @@ mod tests {
         let server = MockServer::start().await;
         mount_tags_ok(&server).await;
         Mock::given(method("POST"))
-            .and(path("/api/generate"))
+            .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "response": "   \n  \n",
+                "message": {"content": "   \n  \n"},
             })))
             .mount(&server)
             .await;
@@ -345,7 +345,7 @@ mod tests {
         let server = MockServer::start().await;
         mount_tags_ok(&server).await;
         Mock::given(method("POST"))
-            .and(path("/api/generate"))
+            .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(500).set_body_string("oh no"))
             .mount(&server)
             .await;
@@ -373,7 +373,7 @@ mod tests {
         let server = MockServer::start().await;
         mount_tags_ok(&server).await;
         Mock::given(method("POST"))
-            .and(path("/api/generate"))
+            .and(path("/api/chat"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_string("not valid")
