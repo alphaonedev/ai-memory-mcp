@@ -2338,6 +2338,164 @@ mod tests {
     use crate::models::{Memory, Tier};
     use serde_json::json;
 
+    // ----- issue #965 audit: MCP dispatch has NO Arc<Mutex<Connection>> -----
+    //
+    // Wave-2 Tier-B5 (#965) was filed under the premise that "MCP stdio
+    // path holds a single Arc<Mutex<Connection>> that serialises every
+    // tool dispatch." Audit (sub-agent H, 2026-05-21) found this premise
+    // verifiably false:
+    //
+    //   1. `run_mcp_server` opens a plain `rusqlite::Connection` via
+    //      `db::open` (no Arc, no Mutex) — `src/mcp/mod.rs:2013`.
+    //   2. The stdio loop is `for line in stdin.lock().lines()` —
+    //      synchronous and single-threaded by JSON-RPC stdio protocol
+    //      design — `src/mcp/mod.rs:2263`.
+    //   3. `handle_request` and `ToolDispatchCtx` carry a plain
+    //      `&rusqlite::Connection` reference — no shared-state wrapper —
+    //      `src/mcp/mod.rs:1519,846`.
+    //   4. There is NO lock contention because there is NO concurrent
+    //      access. Adding r2d2 to a single-threaded loop adds dependency
+    //      + per-acquire latency for ZERO throughput benefit.
+    //
+    // The HTTP daemon path (`src/handlers/transport.rs:22`) IS the
+    // `Arc<Mutex<(Connection, ...)>>` site, but that is a separate
+    // refactor (HTTP is more contention-tolerant because Axum's task
+    // pool already gates concurrent dispatch) and out of scope for
+    // #965 per the Wave-2 Tier-B5 framing.
+    //
+    // These tests pin the invariant at compile time + at runtime so any
+    // future refactor that re-introduces an Arc<Mutex<Connection>> in
+    // the MCP layer surfaces as a test failure rather than a silent
+    // performance regression.
+
+    /// Compile-time assertion: `ToolDispatchCtx::conn` must be a plain
+    /// `&Connection` reference, NOT `&Arc<Mutex<Connection>>` or any
+    /// other shared-state wrapper. This is enforced by the type
+    /// signature itself; the test serves as a load-bearing comment for
+    /// future maintainers.
+    #[test]
+    fn issue_965_audit_tool_dispatch_ctx_holds_plain_connection_ref() {
+        // If the field type ever changes from `&'a rusqlite::Connection`
+        // to anything else, this assertion fails to compile. The
+        // helper closure captures the type via a no-op assignment.
+        fn _type_check<'a>(ctx: &ToolDispatchCtx<'a>) -> &'a rusqlite::Connection {
+            ctx.conn
+        }
+        // Runtime smoke: assertion must reach this line — proves the
+        // module compiles with the expected ctx shape.
+        let _ = _type_check;
+    }
+
+    /// Compile-time assertion: `handle_request` must take a plain
+    /// `&rusqlite::Connection`, NOT `&Arc<Mutex<Connection>>`. If a
+    /// future "concurrency refactor" pushes a Mutex back in here, this
+    /// fails to compile.
+    #[test]
+    fn issue_965_audit_handle_request_takes_plain_connection_ref() {
+        // The function pointer type tells the audit story: first arg is
+        // `&rusqlite::Connection`. Coercing the symbol into this
+        // pointer type at compile time pins the invariant.
+        let _: fn(
+            &rusqlite::Connection,
+            &Path,
+            &RpcRequest,
+            Option<&dyn Embed>,
+            Option<&OllamaClient>,
+            Option<&BatchedReranker>,
+            &TierConfig,
+            Option<&VectorIndex>,
+            &crate::config::ResolvedTtl,
+            &crate::config::ResolvedScoring,
+            bool,
+            bool,
+            Option<&str>,
+            &crate::profile::Profile,
+            Option<&crate::config::McpConfig>,
+            Option<&crate::identity::keypair::AgentKeypair>,
+            Option<&crate::harness::Harness>,
+            Option<&str>,
+            Option<&crate::config::RecallScope>,
+            Option<&atomise::AtomiseToolHandler>,
+            Option<&ingest_multistep::IngestMultistepHandler>,
+        ) -> RpcResponse = handle_request;
+    }
+
+    /// Stress probe: serially dispatch 50 MCP tool calls through the
+    /// real `handle_request` path against a single `Connection` and
+    /// confirm every response is `error: None` and that the underlying
+    /// row store reflects the writes. This is the closest analogue to
+    /// the prompt's "50 concurrent tool dispatch" stress test that the
+    /// single-threaded MCP stdio architecture admits — concurrent
+    /// dispatch is impossible at the stdio JSON-RPC layer (one line in,
+    /// one line out), so the meaningful stress shape is sustained
+    /// serial dispatch, which this test exercises.
+    #[test]
+    fn issue_965_audit_serial_dispatch_50_calls_through_single_connection() {
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let conn = db::open(tmp.path()).expect("open db");
+        let tier_config = crate::config::FeatureTier::Keyword.config();
+        let resolved_ttl = crate::config::ResolvedTtl::default();
+        let resolved_scoring = crate::config::ResolvedScoring::default();
+        let profile = crate::profile::Profile::full();
+
+        for i in 0..50 {
+            let req = RpcRequest {
+                jsonrpc: "2.0".into(),
+                id: Some(json!(i)),
+                method: "tools/call".into(),
+                params: json!({
+                    "name": "memory_store",
+                    "arguments": {
+                        "title": format!("issue-965-stress-{i}"),
+                        "content": format!("audit stress probe iteration {i}"),
+                        "tier": "short",
+                        "namespace": "issue-965-audit",
+                    },
+                }),
+            };
+            let resp = handle_request(
+                &conn,
+                tmp.path(),
+                &req,
+                None, // embedder
+                None, // llm
+                None, // reranker
+                &tier_config,
+                None, // vector_index
+                &resolved_ttl,
+                &resolved_scoring,
+                true,  // archive_on_gc
+                false, // autonomous_hooks
+                None,  // mcp_client
+                &profile,
+                None, // mcp_config
+                None, // active_keypair
+                None, // harness
+                None, // federation_forward_url
+                None, // recall_scope
+                None, // atomise_handler
+                None, // ingest_multistep_handler
+            );
+            assert!(
+                resp.error.is_none(),
+                "iter {i} surfaced error: {:?}",
+                resp.error
+            );
+        }
+
+        // All 50 writes landed in the same Connection. Count via direct
+        // SQL — proves the serial path is durable + correct without
+        // needing a connection pool to mediate.
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE namespace = 'issue-965-audit'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count query");
+        assert_eq!(n, 50, "expected 50 audit-stress rows, found {n}");
+    }
+
     // ----- issue #811 verification: load_active_keypair_for_mcp fallback -----
 
     #[test]
