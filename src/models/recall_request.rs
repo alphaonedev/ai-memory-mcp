@@ -193,8 +193,16 @@ impl RecallRequest {
     /// # Errors
     /// Returns `Err` when:
     /// * `context` is missing or not a string ("context is required")
-    /// * serde rejects an unknown field (struct is `deny_unknown_fields`)
     /// * a typed field receives the wrong JSON shape
+    ///
+    /// **Saturation semantics.** Pre-#967 the legacy code used
+    /// `params["limit"].as_u64()` + `usize::try_from(v).unwrap_or(usize::MAX)`,
+    /// which silently saturated `u64::MAX` rather than erroring. The
+    /// DTO's `limit: Option<i64>` would refuse to deserialize a value
+    /// beyond `i64::MAX`, so the constructor clamps `limit` (and
+    /// `budget_tokens`) values that exceed the signed range to
+    /// `i64::MAX` BEFORE handing the bag to serde. This preserves the
+    /// `limit_overflow_saturates` regression test contract.
     pub fn from_mcp_params(params: &Value) -> Result<Self, String> {
         // Pre-flight: legacy callers (and #984 parity tests) expect the
         // exact "context is required" error when the field is missing.
@@ -203,7 +211,24 @@ impl RecallRequest {
         if params.get("context").and_then(Value::as_str).is_none() {
             return Err("context is required".to_string());
         }
-        serde_json::from_value::<Self>(params.clone()).map_err(|e| e.to_string())
+        // Clamp `limit` / `budget_tokens` so an unsigned overflow value
+        // (e.g. `u64::MAX` per `limit_overflow_saturates`) doesn't
+        // collapse the constructor into a deserialise error. The recall
+        // pipeline caps `limit` at `min(50)` downstream anyway, so the
+        // precise value above `i64::MAX` is irrelevant to observable
+        // behaviour — only that it doesn't crash.
+        let mut owned = params.clone();
+        if let Some(obj) = owned.as_object_mut() {
+            for key in ["limit", "budget_tokens"] {
+                if let Some(v) = obj.get(key)
+                    && let Some(n) = v.as_u64()
+                    && n > i64::MAX as u64
+                {
+                    obj.insert(key.to_string(), Value::from(i64::MAX));
+                }
+            }
+        }
+        serde_json::from_value::<Self>(owned).map_err(|e| e.to_string())
     }
 
     /// HTTP GET surface: marshal a [`crate::models::RecallQuery`] into
@@ -396,6 +421,35 @@ mod tests {
         assert!(matches!(req.kinds, Some(KindsFilter::Csv(ref s)) if s == "concept,claim"));
         assert_eq!(req.confidence_tier.as_deref(), Some("confirmed"));
         assert_eq!(req.verbose_provenance, Some(false));
+    }
+
+    #[test]
+    fn from_mcp_params_limit_u64_max_saturates() {
+        // Pre-#967 the legacy code used `params["limit"].as_u64()` +
+        // `usize::try_from(v).unwrap_or(usize::MAX)`, which silently
+        // saturated `u64::MAX`. The DTO field is `Option<i64>`, so
+        // the constructor must clamp `u64::MAX` to `i64::MAX` before
+        // serde-deserialising; otherwise the existing
+        // `mcp::recall::tests::limit_overflow_saturates` regression
+        // test would surface a `Result::Err` instead of a successful
+        // recall response.
+        let req = RecallRequest::from_mcp_params(&json!({
+            "context": "q",
+            "limit": u64::MAX,
+        }))
+        .expect("u64::MAX limit must saturate, not error");
+        assert_eq!(req.limit, Some(i64::MAX));
+    }
+
+    #[test]
+    fn from_mcp_params_budget_tokens_u64_max_saturates() {
+        // Same saturation contract for budget_tokens.
+        let req = RecallRequest::from_mcp_params(&json!({
+            "context": "q",
+            "budget_tokens": u64::MAX,
+        }))
+        .expect("u64::MAX budget_tokens must saturate, not error");
+        assert_eq!(req.budget_tokens, Some(i64::MAX));
     }
 
     #[test]
