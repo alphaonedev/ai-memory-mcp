@@ -28,6 +28,14 @@ use crate::reranker::{BatchedReranker, CrossEncoder};
 
 pub(super) mod registry;
 
+// v0.7.0 #972 D1.5 (#986) — shared parity-test helpers for the
+// schemars-derived `McpTool` impls vs. the legacy hand-coded
+// `tool_definitions()` catalog. Each `d1_5_986_tests` mod under
+// `src/mcp/tools/<tool>.rs` calls into these helpers so the 4-helper
+// boilerplate isn't duplicated 30+ times across the family migration.
+#[cfg(test)]
+pub(super) mod parity_test_helpers;
+
 // L0.7-3 Tier B chunk-A — shared test-only mutex serialising tests
 // across submodules that mutate the process-wide permission rules
 // registry. The registry is a static RwLock<Vec<PermissionRule>> in
