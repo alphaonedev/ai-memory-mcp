@@ -119,8 +119,6 @@ services:
       # DNS. Per-IronClaw schema in search_path keeps alice+bob data
       # cleanly separated even though they share the same database.
       AI_MEMORY_STORE_URL: "postgres://ai_memory:ai_memory_test@pg-age:5432/ai_memory_test?options=-csearch_path%3Dic_alice%2Cag_catalog%2Cpublic&sslmode=disable"
-      OLLAMA_BASE_URL: "${OLLAMA_BASE_URL:-http://host.docker.internal:11434}"
-      AI_MEMORY_LLM_MODEL: "gemma4:e4b"
       AI_MEMORY_EMBED_MODEL: "nomic-embed-text"
       AI_MEMORY_PEER_URLS: "http://ic-parity-bob:19077"
       # Operator directive 2026-05-21 (#1067): IronClaw containers run
@@ -132,6 +130,10 @@ services:
       #   docker compose -f infra/lan-parity-test/docker-compose.yml up -d
       AI_MEMORY_LLM_BACKEND: "xai"
       AI_MEMORY_LLM_MODEL: "${AI_MEMORY_LLM_MODEL:-grok-4}"
+      # Kept for backward compat with anything that still reads OLLAMA_BASE_URL
+      # directly (e.g., tier-default fallback when AI_MEMORY_LLM_BACKEND unset
+      # in some future config path). Harmless when AI_MEMORY_LLM_BACKEND=xai.
+      OLLAMA_BASE_URL: "${OLLAMA_BASE_URL:-http://host.docker.internal:11434}"
       XAI_API_KEY: "${XAI_API_KEY:?XAI_API_KEY must be set in shell env — source ~/.env before running docker compose up}"
       # Daemon HTTP X-API-Key auth secret. Reuses the xAI key as the
       # high-entropy HTTP token (84-char random string is suitable as
@@ -182,13 +184,12 @@ services:
       AI_MEMORY_LISTEN_HOST: "0.0.0.0"
       AI_MEMORY_LISTEN_PORT: "19077"
       AI_MEMORY_STORE_URL: "postgres://ai_memory:ai_memory_test@pg-age:5432/ai_memory_test?options=-csearch_path%3Dic_bob%2Cag_catalog%2Cpublic&sslmode=disable"
-      OLLAMA_BASE_URL: "${OLLAMA_BASE_URL:-http://host.docker.internal:11434}"
-      AI_MEMORY_LLM_MODEL: "gemma4:e4b"
       AI_MEMORY_EMBED_MODEL: "nomic-embed-text"
       AI_MEMORY_PEER_URLS: "http://ic-parity-alice:19077"
       # See alice's block for the #1067 rationale.
       AI_MEMORY_LLM_BACKEND: "xai"
       AI_MEMORY_LLM_MODEL: "${AI_MEMORY_LLM_MODEL:-grok-4}"
+      OLLAMA_BASE_URL: "${OLLAMA_BASE_URL:-http://host.docker.internal:11434}"
       XAI_API_KEY: "${XAI_API_KEY:?XAI_API_KEY must be set in shell env — source ~/.env before running docker compose up}"
       AI_MEMORY_API_KEY: "${AI_MEMORY_API_KEY:-${XAI_API_KEY}}"
       RUST_LOG: "${RUST_LOG:-ai_memory=info,sqlx=warn}"
