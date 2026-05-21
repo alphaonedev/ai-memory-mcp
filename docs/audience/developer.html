@@ -167,14 +167,15 @@ ai-memory stats --json | jq .</code></pre>
 
   <h3>New MCP tool</h3>
   <ol>
-    <li>Add JSON definition in <code>tool_definitions()</code> (src/mcp.rs)</li>
-    <li>Add match arm in the dispatch block</li>
-    <li>Implement handler: <code>fn(&amp;Connection, params) -&gt; Result&lt;Value&gt;</code></li>
+    <li>Create <code>src/mcp/tools/&lt;name&gt;.rs</code> with a <code>&lt;Name&gt;Request</code> struct (<code>#[derive(JsonSchema, Deserialize)]</code>) and a zero-sized <code>&lt;Name&gt;Tool</code> implementing <code>McpTool</code> (#972 D1.x pattern)</li>
+    <li>Register the tool in <code>registered_tools()</code> in <code>src/mcp/registry.rs</code> (D1.6 #987 iterator collapses the historical <code>tool_definitions()</code> macro)</li>
+    <li>Add the handler under <code>src/mcp/tools/&lt;name&gt;.rs</code> (or an existing module): <code>fn(&amp;Connection, params) -&gt; Result&lt;Value&gt;</code></li>
+    <li>Add a parity test in the same file's <code>d1_x_NNN_tests</code> mod via <code>crate::mcp::parity_test_helpers::*</code></li>
   </ol>
 
   <h3>New CLI subcommand</h3>
   <ol>
-    <li>Add variant to <code>Command</code> enum (src/main.rs)</li>
+    <li>Add variant to the top-level <code>Command</code> enum in <code>src/daemon_runtime.rs</code> (the v0.7.0 W6 refactor moved it out of src/main.rs)</li>
     <li>Define an <code>Args</code> struct</li>
     <li>Add dispatch case in <code>main()</code></li>
     <li>Implement <code>cmd_*</code> handler taking <code>&amp;Path</code> + args</li>
