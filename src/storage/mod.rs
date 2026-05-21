@@ -7260,20 +7260,26 @@ pub fn memories_updated_since(
     since: Option<&str>,
     limit: usize,
 ) -> Result<Vec<Memory>> {
-    // #1028 (HIGH, 2026-05-21): SAL-level scope=private gate. Pre-#1028
-    // this method returned every row in the substrate including
-    // scope=private rows. Federation `/api/v1/sync/since` calls it
-    // directly; pushing the scope filter down here makes the contract
-    // defense-in-depth (a peer with valid mTLS cannot enumerate
-    // private memories). `json_extract($.scope)` defaults to 'private'
-    // when missing — matches the v0.7.0 NHI visibility contract.
+    // #1028 (HIGH, 2026-05-21) — REVERTED 2026-05-21 via QC pass-2.
+    // The first-pass fix added a SAL-level
+    // `COALESCE(scope, 'private') <> 'private'` filter here on the
+    // grounds of "defense-in-depth". That was wrong: the federation
+    // visibility gate (federation_legacy_row_visibility_978 + the
+    // dispatch logic in src/federation/) is a RICHER contract than
+    // pure scope=private — it handles owner-signed-private projection
+    // back to the owner peer, inbox-target private projection, and
+    // federation_share opt-in on legacy rows. The SAL-level filter
+    // bypassed those branches and broke 5 federation tests. The
+    // visibility gate runs DOWNSTREAM of this method and already
+    // refuses to project rows that shouldn't federate. The proper
+    // fix would belong in the federation handler (or the visibility
+    // gate audit) — tracked under follow-up rather than at the SAL.
     let mut stmt = conn.prepare(
         "SELECT id, tier, namespace, title, content, tags, priority, confidence, \
                 source, access_count, created_at, updated_at, last_accessed_at, \
                 expires_at, metadata \
          FROM memories \
          WHERE (?1 IS NULL OR updated_at > ?1) \
-           AND COALESCE(json_extract(metadata, '$.scope'), 'private') <> 'private' \
          ORDER BY updated_at ASC \
          LIMIT ?2",
     )?;

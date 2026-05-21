@@ -7433,26 +7433,18 @@ impl MemoryStore for PostgresStore {
             None => None,
             Some(s) => Some(parse_rfc3339_required(s)?),
         };
-        // #1028 (HIGH, 2026-05-21): SAL-level scope=private gate.
-        // Pre-#1028 this method returned every row in the substrate
-        // — including scope=private rows belonging to specific
-        // agents. Federation `/api/v1/sync/since` calls it directly;
-        // a peer with valid mTLS could enumerate every private
-        // memory on the leader (privacy / NHI leak per Agent-3 #4
-        // audit). The federation contract is: scope=private rows are
-        // owner-local; they never federate. Pushing the scope filter
-        // down to the SAL layer makes the contract defense-in-depth
-        // (federation handler can still filter further; SAL refuses
-        // by construction).
-        //
-        // `COALESCE(scope, 'private')` matches the sqlite default in
-        // db::insert (the column was added at v0.7.0; pre-v0.7.0 rows
-        // default to 'private' per the CLAUDE.md NHI visibility
-        // contract).
+        // #1028 (HIGH, 2026-05-21) — REVERTED via QC pass-2: the first
+        // pass added a SAL-level `metadata->>'scope' <> 'private'`
+        // filter here. That bypassed the federation visibility gate's
+        // owner-signed-private + inbox-target + federation_share
+        // branches and broke 5 federation_legacy_row_visibility_978
+        // tests. The visibility gate runs downstream of this method
+        // and already refuses to project rows that shouldn't
+        // federate. Re-fix at the federation handler layer is
+        // tracked as a follow-up.
         let rows = sqlx::query(
             "SELECT * FROM memories \
              WHERE ($1::timestamptz IS NULL OR updated_at > $1) \
-               AND COALESCE(metadata->>'scope', 'private') <> 'private' \
              ORDER BY updated_at ASC \
              LIMIT $2",
         )
