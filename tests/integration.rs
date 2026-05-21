@@ -11259,9 +11259,12 @@ async fn http_smoke_matrix_phases_1_3() {
         );
     }
 
-    // /api/v1/gc — POST, must return 200 with gc result
+    // /api/v1/gc — POST, must return 200 with gc result.
+    // #1027 (2026-05-21): the route is now admin-gated via
+    // require_admin; anonymous callers correctly receive 403. The
+    // test must call as an admin to exercise the success path.
     {
-        let (code, body) = route_post(&d, "/api/v1/gc", &serde_json::json!({}), None).await;
+        let (code, body) = route_post_as_admin(&d, "/api/v1/gc", &serde_json::json!({})).await;
         assert_eq!(code, "200", "gc: {body}");
         assert!(
             body.get("expired_deleted").is_some(),

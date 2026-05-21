@@ -498,10 +498,23 @@ fn json_rejection_to_400(rej: &JsonRejection) -> Response {
 /// error or syntax error) the returned vector is empty so the caller
 /// falls back to the generic "invalid request body" message.
 fn extract_missing_fields(msg: &str) -> Vec<String> {
+    // #1022 (LOW, 2026-05-21): cap the result vector at 16 entries.
+    // Pre-#1022 a pathologically long body returning a serde error
+    // containing N `missing field` patterns yielded an O(N)
+    // Vec<String>. Serde's own diagnostics are short in practice so
+    // the cap is belt-and-suspenders against future serde upgrades
+    // that might change diagnostic shape OR a hostile actor crafting
+    // a body that produces many missing-field reports. 16 entries is
+    // already more than any caller needs in a 400-Bad-Request
+    // envelope.
+    const MAX_MISSING_FIELDS: usize = 16;
     let needle = "missing field `";
     let mut out: Vec<String> = Vec::new();
     let mut rest = msg;
     while let Some(idx) = rest.find(needle) {
+        if out.len() >= MAX_MISSING_FIELDS {
+            break;
+        }
         let after = &rest[idx + needle.len()..];
         if let Some(end) = after.find('`') {
             let name = &after[..end];
