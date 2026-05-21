@@ -78,17 +78,29 @@ pub fn is_admin_caller(state: &AppState, caller: &str) -> bool {
     if caller.is_empty() {
         return false;
     }
-    // v0.7.0 #974 (lib-test rewrite, 2026-05-20) — `"*"` wildcard
-    // sentinel admits any non-empty caller. Production AdminConfig
-    // rejects `"*"` because it fails `validate_agent_id`; the
-    // wildcard exists only for the unit-test fixture
-    // `test_app_state` at `src/handlers/tests.rs:312` which seeds
+    // v0.7.0 #980 (2026-05-20) — the `"*"` wildcard sentinel is now
+    // strictly `#[cfg(test)]`-gated. Production builds NEVER admit
+    // `"*"` regardless of how the allowlist got populated; even a
+    // future config-loader regression that smuggles `"*"` past
+    // [`crate::validate::validate_agent_id`] (which rejects it for
+    // shape) cannot open every admin endpoint. The lib unit-test
+    // fixture `test_app_state` at `src/handlers/tests.rs:312` seeds
     // `vec!["*"]` so legacy lib tests that issue `Body::empty()` +
-    // no `X-Agent-Id` (synthetic `anonymous:req-<uuid>`) still
-    // exercise the admin-gated happy paths after the v0.7.0
-    // SHIP-cluster gates landed (#936/#940/#942/#946/#957/#960).
-    // Integration tests in `tests/*.rs` use the closed allowlist
-    // (`Vec::new()`) for the security-gate regression coverage.
+    // no `X-Agent-Id` (synthetic `anonymous:req-<uuid>` principal)
+    // still exercise the admin-gated happy paths after the v0.7.0
+    // SHIP-cluster gates landed (#936/#940/#942/#946/#957/#960);
+    // those tests run under the `cfg(test)` build and see the
+    // wildcard arm below. Integration tests in `tests/*.rs` use the
+    // closed allowlist (`Vec::new()`) or an explicit principal — the
+    // security-gate regression coverage exercises the production
+    // path. Pre-#980 the wildcard arm was always-on at runtime; an
+    // `AI_MEMORY_ADMIN_AGENT_IDS=*` env var (or any
+    // path that landed `"*"` in `admin_agent_ids`) admitted every
+    // caller. The accompanying change in
+    // `daemon_runtime::resolve_admin_agent_ids` drops the env-var
+    // wildcard carve-out so the production allowlist cannot contain
+    // `"*"` at all.
+    #[cfg(test)]
     if state.admin_agent_ids.iter().any(|id| id == "*") {
         return true;
     }
