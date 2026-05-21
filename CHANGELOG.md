@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] — v0.7.x doc follow-ups + Wave-2 refactor (post-tag)
 
+<<<<<<< HEAD
 ### refactor(#961) — SAL boundary cleanup (Wave-2 Tier-B1, 2026-05-21)
 
 Closes #961: handler-side audit + cleanup of `src/storage/` (legacy direct-sqlite +
@@ -92,6 +93,54 @@ sites. Closed with targeted refactor + audit doc per the issue body's
   fail-closed default the governance gate handles).
 
 Audit doc: `docs/internal/json-value-redundancy-audit-969.md`.
+
+### perf(#968) — HNSW async rebuild + double-buffering (Wave-2 Tier-C3)
+
+The HNSW vector-index rebuild path is no longer synchronous. Prior to this
+change every rebuild ran on the request thread: `build_hnsw(&all_entries)`
+is CPU-bound (O(N log N) with constant factors that put 100k vectors at
+~3-10s on commodity hardware), and the producer's `insert()` call blocked
+until the new graph was ready. Search callers contending on the same
+inner mutex blocked too — recall p95 spiked from <20 ms to multi-second
+on the 200-overflow / 100k-cap edges.
+
+The fix is a double-buffer pattern with background-task swap-in:
+
+- `active` (inside `IndexState`) serves reads. Search holds the inner
+  mutex just long enough to collect valid IDs + iterate HNSW results;
+  the build itself never runs under this lock.
+- `warming: Arc<Mutex<Option<RebuildResult>>>` is the swap-in slot. A
+  background `std::thread` (HNSW build is CPU-bound; no tokio runtime
+  needed) builds the new graph from a snapshot of `all_entries`, then
+  drops it into `warming`. On the next call to `try_swap_warming()`
+  (invoked from search, insert, and the `rebuild` shim's post-join
+  path) the warmed graph atomically replaces `active`. The mutex hold
+  spans only the `std::mem::swap` — microseconds.
+- Concurrent writes during rebuild flow into overflow + all_entries
+  normally. The swap captures the OVERFLOW LENGTH AT SNAPSHOT TIME
+  (not all_entries.len()) and drains only the prefix that's now in
+  the new graph; entries inserted after the snapshot remain in
+  overflow for the next cycle. No write is ever dropped.
+- Rebuild failures: a panic inside the build thread leaves `warming`
+  untouched (None); `active` is unchanged. A `RebuildGuard` drop-RAII
+  clears the `rebuild_in_flight` AtomicBool whether the build
+  succeeded or panicked.
+
+Operator-visible perf win: at the 100k cap eviction edge, `insert()`
+returns in microseconds instead of blocking for the multi-second graph
+build. Search p95 during rebuild measured at 43 µs (vs. a v0.6 baseline
+of seconds) — see `cargo bench --bench hnsw_rebuild_async`.
+
+Four regression tests pin the contract in `hnsw::d1_968_tests`:
+`rebuild_async_does_not_block_search_968`,
+`rebuild_failure_leaves_active_unchanged_968`,
+`concurrent_writes_during_rebuild_consistent_968`,
+`rebuild_swap_is_atomic_968`.
+
+The pre-existing synchronous `rebuild()` is preserved as a shim that
+delegates to `rebuild_async().join() + try_swap_warming()` so the v0.6
+test contract ("the graph is rebuilt by the time this returns") is
+unchanged. New code should call `rebuild_async()` directly.
 
 ### v0.7.0 ship-readiness session 2026-05-21 — gate-rerun closures + drift sweep
 
