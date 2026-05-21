@@ -335,6 +335,84 @@ pub fn handle_skill_promote_from_reflection(
     Ok(response)
 }
 
+// --- D1.5 (#986): per-tool McpTool impl for memory_skill_promote_from_reflection ---
+
+use crate::mcp::registry::McpTool;
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+/// v0.7.0 #972 D1.5 (#986) — request body for
+/// `memory_skill_promote_from_reflection`. The `parameters_schema`
+/// property is an opaque pass-through JSON object spliced into the
+/// generated SKILL.md `Parameters` section.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct SkillPromoteFromReflectionRequest {
+    /// Reflection-kind memory UUID.
+    pub reflection_id: String,
+
+    /// agentskills.io §3.1 name: ^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$, 1-64.
+    pub skill_name: String,
+
+    /// 1-1024 char description.
+    pub skill_description: String,
+
+    /// Optional JSON schema spliced as Parameters section.
+    #[serde(default)]
+    pub parameters_schema: Option<serde_json::Value>,
+}
+
+/// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for
+/// `memory_skill_promote_from_reflection`.
+#[allow(dead_code)]
+pub struct SkillPromoteFromReflectionTool;
+
+impl McpTool for SkillPromoteFromReflectionTool {
+    fn name() -> &'static str {
+        "memory_skill_promote_from_reflection"
+    }
+    fn description() -> &'static str {
+        "Promote a Reflection into a reusable Agent Skill."
+    }
+    fn docs() -> &'static str {
+        "L2-6 (#671): reflection (depth>=namespace.governance.skill_promotion_min_depth, default 1) -> SKILL.md. Each reflects_on source -> references/source_{i}.md. Frontmatter preserves derived_from_reflection_id + original_reflection_depth. Promote->export->register => identical SHA-256. Refuses depth-0."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(SkillPromoteFromReflectionRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "other"
+    }
+}
+
+#[cfg(test)]
+mod d1_5_986_tests {
+    //! D1.5 (#986) — schema parity for `memory_skill_promote_from_reflection`.
+    //! Shared helpers live at [`crate::mcp::parity_test_helpers`].
+    use super::*;
+    use crate::mcp::parity_test_helpers::{
+        assert_descriptions_match, assert_property_set_parity, derived_props_for,
+    };
+
+    #[test]
+    fn skill_promote_from_reflection_parity_986() {
+        let derived = derived_props_for::<SkillPromoteFromReflectionRequest>();
+        assert_property_set_parity("memory_skill_promote_from_reflection", &derived);
+        assert_descriptions_match("memory_skill_promote_from_reflection", &derived);
+    }
+
+    #[test]
+    fn skill_promote_from_reflection_tool_metadata_986() {
+        assert_eq!(
+            SkillPromoteFromReflectionTool::name(),
+            "memory_skill_promote_from_reflection"
+        );
+        assert_eq!(SkillPromoteFromReflectionTool::family(), "other");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Lib-level unit tests — exercise the depth-threshold gate at the
 // handler boundary so the failure mode is pinned without spinning up
