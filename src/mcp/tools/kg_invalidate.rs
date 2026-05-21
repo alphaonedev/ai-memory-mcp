@@ -70,7 +70,8 @@ pub fn handle_kg_invalidate(
         .as_str()
         .ok_or("target_id is required")?;
     let relation = params["relation"].as_str().ok_or("relation is required")?;
-    validate::validate_link(source_id, target_id, relation).map_err(|e| e.to_string())?;
+    validate::RequestValidator::validate_link_triple(source_id, target_id, relation)
+        .map_err(|e| e.to_string())?;
     let valid_until = params["valid_until"]
         .as_str()
         .map(str::trim)
