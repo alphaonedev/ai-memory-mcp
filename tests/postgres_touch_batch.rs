@@ -68,6 +68,11 @@ fn fresh_memory(title: &str, namespace: &str, tier: Tier, priority: i32) -> Memo
         Tier::Short => Some((chrono::Utc::now() + chrono::Duration::hours(6)).to_rfc3339()),
         Tier::Long => None,
     };
+    // Per #985: keep `..Memory::default()` rest-pattern to future-proof against
+    // new Memory fields. This one fixture happens to specify all 26 current
+    // fields, which trips clippy::needless_update; keep the allow per-site so
+    // the future-proofing pattern survives the next field addition.
+    #[allow(clippy::needless_update)]
     Memory {
         id: uuid::Uuid::new_v4().to_string(),
         tier,
