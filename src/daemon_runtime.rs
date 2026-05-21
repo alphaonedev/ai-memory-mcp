@@ -1518,7 +1518,9 @@ pub fn resolve_admin_agent_ids(admin_cfg: Option<&crate::config::AdminConfig>) -
             match crate::validate::validate_agent_id(id) {
                 Ok(()) => out.push(id.to_string()),
                 Err(e) => {
-                    tracing::warn!("AI_MEMORY_ADMIN_AGENT_IDS entry '{id}' rejected: {e}; dropping");
+                    tracing::warn!(
+                        "AI_MEMORY_ADMIN_AGENT_IDS entry '{id}' rejected: {e}; dropping"
+                    );
                 }
             }
         }
