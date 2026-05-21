@@ -129,7 +129,12 @@ services:
       #   set -a; source ~/.env; set +a
       #   docker compose -f infra/lan-parity-test/docker-compose.yml up -d
       AI_MEMORY_LLM_BACKEND: "xai"
-      AI_MEMORY_LLM_MODEL: "${AI_MEMORY_LLM_MODEL:-grok-4}"
+      AI_MEMORY_LLM_MODEL: "${AI_MEMORY_LLM_MODEL:-grok-4.3}"
+      # auto_tag uses a separate model (historically fast/cheap
+      # gemma3:4b on Ollama). On the xAI backend that's invalid;
+      # set explicitly to a Grok model. Operators with cost concerns
+      # can override to a smaller/cheaper model variant via env.
+      AI_MEMORY_AUTO_TAG_MODEL: "${AI_MEMORY_AUTO_TAG_MODEL:-grok-4.3}"
       # Kept for backward compat with anything that still reads OLLAMA_BASE_URL
       # directly (e.g., tier-default fallback when AI_MEMORY_LLM_BACKEND unset
       # in some future config path). Harmless when AI_MEMORY_LLM_BACKEND=xai.
@@ -188,7 +193,12 @@ services:
       AI_MEMORY_PEER_URLS: "http://ic-parity-alice:19077"
       # See alice's block for the #1067 rationale.
       AI_MEMORY_LLM_BACKEND: "xai"
-      AI_MEMORY_LLM_MODEL: "${AI_MEMORY_LLM_MODEL:-grok-4}"
+      AI_MEMORY_LLM_MODEL: "${AI_MEMORY_LLM_MODEL:-grok-4.3}"
+      # auto_tag uses a separate model (historically fast/cheap
+      # gemma3:4b on Ollama). On the xAI backend that's invalid;
+      # set explicitly to a Grok model. Operators with cost concerns
+      # can override to a smaller/cheaper model variant via env.
+      AI_MEMORY_AUTO_TAG_MODEL: "${AI_MEMORY_AUTO_TAG_MODEL:-grok-4.3}"
       OLLAMA_BASE_URL: "${OLLAMA_BASE_URL:-http://host.docker.internal:11434}"
       XAI_API_KEY: "${XAI_API_KEY:?XAI_API_KEY must be set in shell env — source ~/.env before running docker compose up}"
       AI_MEMORY_API_KEY: "${AI_MEMORY_API_KEY:-${XAI_API_KEY}}"

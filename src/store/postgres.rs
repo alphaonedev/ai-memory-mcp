@@ -7118,6 +7118,13 @@ impl MemoryStore for PostgresStore {
         } else {
             Some(caller)
         };
+        // #1030 (HIGH, 2026-05-21) — honor `filter.agent_id` on the
+        // postgres list path. Pre-#1030 the trait's `Filter.agent_id`
+        // was bound to no SQL parameter — `/api/v1/memories?agent_id=alice`
+        // returned every agent's rows on postgres while sqlite filtered
+        // correctly (a privacy/NHI leak + permission-by-side-effect
+        // divergence between the two backends). The new $7 binding
+        // matches sqlite's `db::list` shape.
         let rows = sqlx::query(
             "SELECT * FROM memories
              WHERE ($1::text IS NULL OR namespace = $1)
@@ -7131,6 +7138,7 @@ impl MemoryStore for PostgresStore {
                    OR metadata->>'agent_id' = $6
                    OR metadata->>'target_agent_id' = $6
                )
+               AND ($7::text IS NULL OR metadata->>'agent_id' = $7)
              ORDER BY priority DESC, updated_at DESC
              LIMIT $5",
         )
@@ -7140,6 +7148,7 @@ impl MemoryStore for PostgresStore {
         .bind(filter.until)
         .bind(limit)
         .bind(caller_opt)
+        .bind(filter.agent_id.as_ref())
         .fetch_all(&self.pool)
         .await
         .map_err(|e| to_store_err("list", e))?;

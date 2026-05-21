@@ -471,6 +471,32 @@ pub fn validate_id(id: &str) -> Result<()> {
     if !is_clean_string(id) {
         bail!("id contains invalid characters");
     }
+    // #1051 (HIGH, 2026-05-21) — tighten ID validation to reject
+    // path-traversal sequences. Pre-#1051 the loose `is_clean_string`
+    // check allowed `/`, `\`, and `..` substrings. An attacker who
+    // could federate/import a memory with id = "../../../tmp/evil"
+    // could redirect downstream file writes (export-reflections,
+    // forensic dumps) outside the requested out-dir, overwriting
+    // operator-writable files. Now restricted to a SPIFFE-style
+    // alphanumeric + `_-.:@` charset with NO `..` substring and NO
+    // `/` or `\` at all (memory ids are not paths).
+    if id.contains("..") {
+        bail!("id may not contain '..' (path-traversal guard)");
+    }
+    if id.contains('/') || id.contains('\\') {
+        bail!("id may not contain '/' or '\\' (path-traversal guard)");
+    }
+    // Per-byte sanity: only [A-Za-z0-9_:.@-] survive. Any new
+    // character class needs an explicit add here.
+    if !id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b':' | b'.' | b'@' | b'-'))
+    {
+        bail!(
+            "id contains characters outside the allowed set [A-Za-z0-9_:.@-] \
+             (path-traversal guard)"
+        );
+    }
     Ok(())
 }
 
@@ -1387,6 +1413,54 @@ mod tests {
     fn test_validate_governance_policy_default_ok() {
         let p = crate::models::GovernancePolicy::default();
         assert!(validate_governance_policy(&p).is_ok());
+    }
+
+    /// #1051 (HIGH, 2026-05-21) — path-traversal hardening for
+    /// `validate_id`. Pre-#1051 these IDs were accepted; post-#1051
+    /// every one must error. Regression pin against any future
+    /// loosening that would re-introduce the export-reflection /
+    /// forensic-dump file-overwrite attack vector.
+    #[test]
+    fn test_validate_id_rejects_path_traversal_1051() {
+        for bad in [
+            "../etc/passwd",
+            "..",
+            "../../",
+            "../../../tmp/evil",
+            "foo/../bar",
+            "foo/bar",
+            "/foo",
+            "foo/",
+            "foo//bar",
+            "foo\\bar",
+            "C:\\Users\\foo",
+            "foo bar",      // whitespace (separately, but should fail)
+            "rm -rf",       // shell meta
+            "foo;rm",       // shell meta
+            "..\\..\\evil", // windows-style traversal
+        ] {
+            assert!(
+                validate_id(bad).is_err(),
+                "validate_id('{bad}') must reject (path-traversal guard #1051)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_id_accepts_legitimate_ids_1051() {
+        for ok in [
+            "550e8400-e29b-41d4-a716-446655440000", // UUID
+            "mem.abc123",
+            "agent:claude-opus-4.7",
+            "user@example.com",
+            "namespace-foo_bar",
+            "Mem_2026.05.21_xyz",
+        ] {
+            assert!(
+                validate_id(ok).is_ok(),
+                "validate_id('{ok}') must accept (legitimate id shape #1051)"
+            );
+        }
     }
 
     #[test]
