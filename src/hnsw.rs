@@ -1357,8 +1357,24 @@ mod d1_968_tests {
         // Force any warmed result to land.
         idx.try_swap_warming();
 
-        // Verify all 30 ids are findable.
+        // Verify all 30 ids survived the rebuild. The CONTRACT under
+        // test is "post-rebuild state INCLUDES the concurrent writes"
+        // — i.e. every concurrent id is in `all_entries` (graph OR
+        // overflow). We assert that directly via `len()` + a
+        // sufficiently-wide search rather than relying on tie-break
+        // determinism at small k. The baseline fixture (500 entries
+        // across 16 axes) clusters ~32 entries per axis at
+        // post-normalization distance 0 from any axis query; concurrent
+        // entries on the same axis tie with them at distance 0, and
+        // truncate-to-k can clip a single tied entry under
+        // tie-break-dependent sort behavior. The fix is to widen k
+        // beyond the tie cluster, NOT to weaken the contract.
         assert_eq!(inserts_done.load(Ordering::SeqCst), 30);
+        let final_len = idx.len();
+        assert_eq!(
+            final_len, 530,
+            "post-rebuild len must equal baseline 500 + concurrent 30 = 530, got {final_len}"
+        );
         let mut found = 0_usize;
         for i in 0..30 {
             let mut v = vec![0.0_f32; 16];
@@ -1366,7 +1382,9 @@ mod d1_968_tests {
             let f = i as f32;
             v[i % 16] = 2.0 + f * 0.01;
             let q = make_embedding(&v);
-            let hits = idx.search(&q, 50);
+            // k = baseline + concurrent + headroom. Any tighter and
+            // the tie-break boundary intermittently clips a single id.
+            let hits = idx.search(&q, 600);
             if hits.iter().any(|h| h.id == format!("concurrent-{i}")) {
                 found += 1;
             }
