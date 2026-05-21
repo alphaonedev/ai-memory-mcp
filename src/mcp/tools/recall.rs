@@ -12,107 +12,21 @@ use crate::models::{
 use crate::observations;
 use crate::reranker::BatchedReranker;
 use crate::{db, validate};
-use schemars::JsonSchema;
-use serde::Deserialize;
 use serde_json::{Value, json};
 
 // --- D1.3 (#984): per-tool McpTool impl for `memory_recall` ---
 
-/// v0.7.0 #972 D1.3 (#984) — `kinds` filter shape for `memory_recall`.
-/// The legacy hand-coded schema declares this field as a `oneOf`
-/// union (array-of-strings OR a single CSV string); modelling it as
-/// an `#[serde(untagged)]` enum replicates the wire shape exactly
-/// without forcing callers to wrap their CSV in an array.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-#[allow(dead_code)]
-#[serde(untagged)]
-pub enum KindsFilter {
-    /// Array of kind tokens, e.g. `["concept", "claim"]`.
-    Array(Vec<String>),
-    /// Comma-separated kinds string, e.g. `"concept,claim"`.
-    Csv(String),
-}
-
-/// v0.7.0 #972 D1.3 (#984) — request body for `memory_recall`.
-/// Schemars-derived schema replaces the hand-coded entry in
-/// [`crate::mcp::registry::tool_definitions`] (D1.6 (#987) collapses
-/// the macro). Every doc-comment description is byte-equal to the
-/// legacy `description` text — see the d1_3_984_tests parity contract
-/// at the bottom of this file.
-#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
-#[allow(dead_code)]
-#[schemars(deny_unknown_fields)]
-pub struct RecallRequest {
-    /// What to recall
-    pub context: String,
-
-    /// Namespace filter
-    #[serde(default)]
-    pub namespace: Option<String>,
-
-    #[serde(default)]
-    pub limit: Option<i64>,
-
-    /// Tag filter
-    #[serde(default)]
-    pub tags: Option<String>,
-
-    /// RFC3339 lower bound on created_at
-    #[serde(default)]
-    pub since: Option<String>,
-
-    /// RFC3339 upper bound on created_at
-    #[serde(default)]
-    pub until: Option<String>,
-
-    #[serde(default)]
-    #[schemars(description = "#151 scope-visibility agent.")]
-    pub as_agent: Option<String>,
-
-    /// P6/R1 cl100k content cap. 0=empty; top kept (meta.budget_overflow=true).
-    #[serde(default)]
-    pub budget_tokens: Option<i64>,
-
-    /// Recent conversation tokens; biases query embedding 70/30 (v0.6.0.0).
-    #[serde(default)]
-    pub context_tokens: Option<Vec<String>>,
-
-    /// Splice [agents.defaults.recall_scope]. explicit > scope > defaults.
-    #[serde(default)]
-    pub session_default: Option<bool>,
-
-    #[serde(default)]
-    #[schemars(description = "#518 session id; +0.05 rerank boost for in-session ring (cap 50).")]
-    pub session_id: Option<String>,
-
-    /// WT-1-E: include atomised sources alongside atoms.
-    #[serde(default)]
-    pub include_archived: Option<bool>,
-
-    /// Form 4 (#757): require non-empty citations array.
-    #[serde(default)]
-    pub has_citations: Option<bool>,
-
-    /// Form 4 (#757): restrict by source_uri prefix (e.g. 'doc:', 'uri:https://').
-    #[serde(default)]
-    pub source_uri_prefix: Option<String>,
-
-    /// Form 6 (#759) kind filter. Array/CSV. OR within; AND across.
-    #[serde(default)]
-    pub kinds: Option<KindsFilter>,
-
-    /// Gap 4 (#887) tier filter.
-    #[serde(default)]
-    pub confidence_tier: Option<String>,
-
-    /// Gap 7 (#890): per-row provenance decoration.
-    #[serde(default)]
-    pub verbose_provenance: Option<bool>,
-
-    /// Response format. toon_compact saves 79% vs json.
-    #[serde(default)]
-    pub format: Option<String>,
-}
+// #967 — `RecallRequest` and `KindsFilter` were promoted to canonical
+// DTOs under `crate::models::recall_request`. They're re-exported here
+// so the d1_3_984 parity test (which references the local `RecallRequest`
+// symbol via `schemars::schema_for!`) keeps compiling unchanged, and so
+// `RecallTool::input_schema()` continues to derive the schema from the
+// same struct every surface marshals into. `KindsFilter` is part of the
+// public re-export so legacy `mcp::tools::recall::KindsFilter` callers
+// keep resolving even though only `RecallRequest` is touched in this
+// module.
+#[allow(unused_imports)]
+pub use crate::models::recall_request::{KindsFilter, RecallRequest};
 
 /// v0.7.0 #972 D1.3 (#984) — `McpTool` impl for `memory_recall`.
 #[allow(dead_code)]
