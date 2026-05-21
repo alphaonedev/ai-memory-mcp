@@ -1,12 +1,109 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+//! LLM client — provider-agnostic chat + embedding surface.
+//!
+//! # Providers (#1066)
+//!
+//! The historical client was Ollama-only. Post-#1066 the same struct
+//! supports two wire shapes and any vendor that speaks either:
+//!
+//! | Variant                    | Wire shape                                        | Auth                              | Vendors                                                                                                                                                                                                                       |
+//! |----------------------------|---------------------------------------------------|-----------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+//! | [`LlmProvider::Ollama`]    | `POST /api/chat`, `POST /api/embed`               | none                              | Ollama (native)                                                                                                                                                                                                                |
+//! | [`LlmProvider::OpenAiCompatible`] | `POST /v1/chat/completions`, `POST /v1/embeddings` | `Authorization: Bearer <key>`  | OpenAI, xAI Grok, Anthropic (via OpenAI shim), Google Gemini (`/v1beta/openai`), DeepSeek, Kimi (Moonshot), Qwen (Alibaba), Mistral, Groq, Together AI, Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, llama.cpp server, …  |
+//!
+//! ## Operator configuration
+//!
+//! - `AI_MEMORY_LLM_BACKEND` — selector. Accepted values:
+//!     - `ollama` (default; backward compat)
+//!     - `openai-compatible` — generic; requires `AI_MEMORY_LLM_BASE_URL` set explicitly
+//!     - alias values that pre-fill `AI_MEMORY_LLM_BASE_URL` for known vendors:
+//!       `xai`, `openai`, `anthropic`, `gemini`, `deepseek`, `kimi`, `qwen`,
+//!       `mistral`, `groq`, `together`, `cerebras`, `openrouter`,
+//!       `fireworks`, `lmstudio`
+//! - `AI_MEMORY_LLM_BASE_URL` — overrides the default per-backend URL.
+//! - `AI_MEMORY_LLM_API_KEY` — Bearer auth secret for OpenAI-compatible
+//!   backends. Some aliases also accept per-vendor env vars as a
+//!   convenience (e.g. `XAI_API_KEY` if backend=`xai`, `OPENAI_API_KEY`
+//!   if backend=`openai`, `ANTHROPIC_API_KEY` if backend=`anthropic`,
+//!   `GEMINI_API_KEY` if backend=`gemini`, etc.).
+//! - `AI_MEMORY_LLM_MODEL` — model name passed through verbatim. The
+//!   selection is vendor-specific (e.g. `grok-4` for xAI,
+//!   `deepseek-chat` for DeepSeek, `qwen-max` for Qwen).
+//! - Legacy `OLLAMA_BASE_URL` is still honored when backend=ollama.
+
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
+
+/// Per-vendor default base URLs for the OpenAI-compatible alias
+/// backends. Operator-provided `AI_MEMORY_LLM_BASE_URL` overrides
+/// these. Verified against vendor documentation as of 2026-Q2.
+fn default_base_url_for_alias(alias: &str) -> Option<&'static str> {
+    match alias {
+        "openai" => Some("https://api.openai.com/v1"),
+        "xai" => Some("https://api.x.ai/v1"),
+        "anthropic" => Some("https://api.anthropic.com/v1"),
+        "gemini" => Some("https://generativelanguage.googleapis.com/v1beta/openai"),
+        "deepseek" => Some("https://api.deepseek.com/v1"),
+        "kimi" | "moonshot" => Some("https://api.moonshot.cn/v1"),
+        "qwen" | "dashscope" => Some("https://dashscope.aliyuncs.com/compatible-mode/v1"),
+        "mistral" => Some("https://api.mistral.ai/v1"),
+        "groq" => Some("https://api.groq.com/openai/v1"),
+        "together" => Some("https://api.together.xyz/v1"),
+        "cerebras" => Some("https://api.cerebras.ai/v1"),
+        "openrouter" => Some("https://openrouter.ai/api/v1"),
+        "fireworks" => Some("https://api.fireworks.ai/inference/v1"),
+        "lmstudio" => Some("http://localhost:1234/v1"),
+        _ => None,
+    }
+}
+
+/// Per-alias environment-variable fallback for the API key. Lets
+/// operators set `XAI_API_KEY`, `OPENAI_API_KEY`, etc. (the vendor's
+/// canonical env var name) without having to alias to
+/// `AI_MEMORY_LLM_API_KEY`. Tried in the order returned.
+fn alias_api_key_env_vars(alias: &str) -> &'static [&'static str] {
+    match alias {
+        "openai" => &["OPENAI_API_KEY"],
+        "xai" => &["XAI_API_KEY"],
+        "anthropic" => &["ANTHROPIC_API_KEY"],
+        "gemini" => &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+        "deepseek" => &["DEEPSEEK_API_KEY"],
+        "kimi" | "moonshot" => &["MOONSHOT_API_KEY", "KIMI_API_KEY"],
+        "qwen" | "dashscope" => &["DASHSCOPE_API_KEY", "QWEN_API_KEY"],
+        "mistral" => &["MISTRAL_API_KEY"],
+        "groq" => &["GROQ_API_KEY"],
+        "together" => &["TOGETHER_API_KEY"],
+        "cerebras" => &["CEREBRAS_API_KEY"],
+        "openrouter" => &["OPENROUTER_API_KEY"],
+        "fireworks" => &["FIREWORKS_API_KEY"],
+        _ => &[],
+    }
+}
+
+/// LLM-provider wire-shape selector. Owned by [`OllamaClient`] (the
+/// historical name preserved post-#1066 for call-site backward
+/// compatibility — a future rename to `LlmClient` is non-breaking and
+/// tracked separately).
+#[derive(Debug, Clone)]
+pub enum LlmProvider {
+    /// Ollama native API: `POST /api/chat`, `POST /api/embed`. No
+    /// auth header. This is the historical pre-#1066 behavior and
+    /// remains the v0.7.0 default.
+    Ollama,
+    /// OpenAI-compatible API: `POST /v1/chat/completions`, `POST
+    /// /v1/embeddings`. `Authorization: Bearer <api_key>` header.
+    /// Covers xAI Grok, OpenAI, Anthropic (via OpenAI shim), Google
+    /// Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together,
+    /// Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, llama.cpp
+    /// server, and any other vendor following the spec.
+    OpenAiCompatible { api_key: String },
+}
 
 const GENERATE_TIMEOUT: Duration = Duration::from_secs(30);
 const PULL_TIMEOUT: Duration = Duration::from_secs(120);
@@ -86,6 +183,15 @@ impl BreakerState {
 }
 
 pub struct OllamaClient {
+    /// #1066 (2026-05-21) — LLM provider wire shape. `Ollama` for the
+    /// historical native API path; `OpenAiCompatible` for xAI, OpenAI,
+    /// Anthropic (OpenAI shim), Google Gemini, DeepSeek, Kimi, Qwen,
+    /// Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks,
+    /// LMStudio, vLLM, llama.cpp server, and any other vendor that
+    /// follows the OpenAI chat-completions spec. The legacy struct
+    /// name is preserved for call-site backward compatibility; a
+    /// future rename to `LlmClient` is non-breaking.
+    provider: LlmProvider,
     base_url: String,
     model: String,
     client: reqwest::blocking::Client,
@@ -111,6 +217,7 @@ impl OllamaClient {
     #[cfg(test)]
     pub fn new_for_testing(model: &str) -> Self {
         Self {
+            provider: LlmProvider::Ollama,
             base_url: DEFAULT_OLLAMA_URL.trim_end_matches('/').to_string(),
             model: model.to_string(),
             client: reqwest::blocking::Client::builder()
@@ -120,6 +227,156 @@ impl OllamaClient {
                 .expect("test reqwest client builds"),
             breaker: Mutex::new(BreakerState::new()),
         }
+    }
+
+    /// #1066 — Construct from environment variables. Returns `Ok(Some(client))`
+    /// when the env declares an LLM backend; `Ok(None)` when no backend is
+    /// configured (keyword-only deployments); `Err` on misconfiguration
+    /// (e.g. backend declared but required key missing).
+    ///
+    /// Reads:
+    /// - `AI_MEMORY_LLM_BACKEND` — `ollama` (default) | `openai-compatible`
+    ///   | one of the per-vendor aliases (`xai`, `openai`, `anthropic`,
+    ///   `gemini`, `deepseek`, `kimi`, `qwen`, `mistral`, `groq`,
+    ///   `together`, `cerebras`, `openrouter`, `fireworks`, `lmstudio`).
+    /// - `AI_MEMORY_LLM_BASE_URL` — overrides the default per-alias URL.
+    /// - `AI_MEMORY_LLM_API_KEY` — Bearer auth secret for the
+    ///   OpenAI-compatible path. Per-alias fallback env vars are also
+    ///   consulted (`XAI_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
+    ///   `GEMINI_API_KEY`, `DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY`,
+    ///   `DASHSCOPE_API_KEY`, etc.).
+    /// - `AI_MEMORY_LLM_MODEL` — model name (`grok-4`, `gpt-5`,
+    ///   `claude-opus-4.7`, `gemini-2.0-flash`, `deepseek-chat`, etc.).
+    /// - Legacy `OLLAMA_BASE_URL` is still honored when backend is
+    ///   `ollama` (or unset).
+    ///
+    /// # Errors
+    ///
+    /// - `AI_MEMORY_LLM_BACKEND` is set to an unknown alias.
+    /// - Backend is OpenAI-compatible (or an alias) but no API key is
+    ///   resolvable from `AI_MEMORY_LLM_API_KEY` or any per-alias
+    ///   fallback env var.
+    /// - Backend is the generic `openai-compatible` and
+    ///   `AI_MEMORY_LLM_BASE_URL` is unset.
+    /// - The HTTP client itself fails to build.
+    #[allow(clippy::too_many_lines)]
+    pub fn from_env() -> Result<Option<Self>> {
+        let backend = std::env::var("AI_MEMORY_LLM_BACKEND")
+            .ok()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .unwrap_or_else(|| "ollama".to_string());
+
+        let model = std::env::var("AI_MEMORY_LLM_MODEL")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| match backend.as_str() {
+                "xai" => "grok-4".to_string(),
+                "openai" => "gpt-5".to_string(),
+                "anthropic" => "claude-opus-4.7".to_string(),
+                "gemini" => "gemini-2.0-flash".to_string(),
+                "deepseek" => "deepseek-chat".to_string(),
+                "kimi" | "moonshot" => "moonshot-v1-8k".to_string(),
+                "qwen" | "dashscope" => "qwen-max".to_string(),
+                "mistral" => "mistral-large-latest".to_string(),
+                "groq" => "llama-3.3-70b-versatile".to_string(),
+                "together" => "meta-llama/Llama-3.3-70B-Instruct-Turbo".to_string(),
+                "cerebras" => "llama-3.3-70b".to_string(),
+                "openrouter" => "openai/gpt-5".to_string(),
+                "fireworks" => "accounts/fireworks/models/llama-v3p3-70b-instruct".to_string(),
+                "lmstudio" => "local-model".to_string(),
+                _ => "gemma3:4b".to_string(),
+            });
+
+        match backend.as_str() {
+            "ollama" => {
+                let base_url = std::env::var("AI_MEMORY_LLM_BASE_URL")
+                    .ok()
+                    .or_else(|| std::env::var("OLLAMA_BASE_URL").ok())
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| DEFAULT_OLLAMA_URL.to_string());
+                Self::new_with_url(&base_url, &model).map(Some)
+            }
+            "openai-compatible" => {
+                let base_url = std::env::var("AI_MEMORY_LLM_BASE_URL")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "AI_MEMORY_LLM_BACKEND=openai-compatible requires \
+                             AI_MEMORY_LLM_BASE_URL to be set (no default URL \
+                             — operator must supply the vendor's endpoint)"
+                        )
+                    })?;
+                let api_key = std::env::var("AI_MEMORY_LLM_API_KEY")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "AI_MEMORY_LLM_BACKEND=openai-compatible requires \
+                             AI_MEMORY_LLM_API_KEY to be set"
+                        )
+                    })?;
+                Self::new_openai_compatible(&base_url, &model, &api_key).map(Some)
+            }
+            alias => {
+                let Some(default_url) = default_base_url_for_alias(alias) else {
+                    return Err(anyhow!(
+                        "AI_MEMORY_LLM_BACKEND={alias} is not a recognized \
+                         backend alias. Valid values: ollama, openai-compatible, \
+                         openai, xai, anthropic, gemini, deepseek, kimi, qwen, \
+                         mistral, groq, together, cerebras, openrouter, \
+                         fireworks, lmstudio"
+                    ));
+                };
+                let base_url = std::env::var("AI_MEMORY_LLM_BASE_URL")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| default_url.to_string());
+                let api_key = std::env::var("AI_MEMORY_LLM_API_KEY")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+                    .or_else(|| {
+                        alias_api_key_env_vars(alias).iter().find_map(|name| {
+                            std::env::var(name).ok().filter(|s| !s.trim().is_empty())
+                        })
+                    })
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "AI_MEMORY_LLM_BACKEND={alias} requires an API key \
+                             — set AI_MEMORY_LLM_API_KEY or one of the \
+                             per-vendor env vars: {:?}",
+                            alias_api_key_env_vars(alias)
+                        )
+                    })?;
+                Self::new_openai_compatible(&base_url, &model, &api_key).map(Some)
+            }
+        }
+    }
+
+    /// #1066 — Construct an OpenAI-compatible client for any vendor whose
+    /// `/v1/chat/completions` endpoint follows the OpenAI spec (xAI Grok,
+    /// OpenAI, Anthropic via OpenAI shim, Google Gemini, DeepSeek, Kimi,
+    /// Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks,
+    /// LMStudio, vLLM, llama.cpp server, …).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP client fails to build.
+    pub fn new_openai_compatible(base_url: &str, model: &str, api_key: &str) -> Result<Self> {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(GENERATE_TIMEOUT)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .build()
+            .context("Failed to build HTTP client")?;
+        Ok(Self {
+            provider: LlmProvider::OpenAiCompatible {
+                api_key: api_key.to_string(),
+            },
+            base_url: base_url.trim_end_matches('/').to_string(),
+            model: model.to_string(),
+            client,
+            breaker: Mutex::new(BreakerState::new()),
+        })
     }
 
     /// Creates a new `OllamaClient` with a custom base URL.
@@ -137,6 +394,7 @@ impl OllamaClient {
             .context("Failed to build HTTP client")?;
 
         let instance = Self {
+            provider: LlmProvider::Ollama,
             base_url: base_url.trim_end_matches('/').to_string(),
             model: model.to_string(),
             client,
@@ -179,18 +437,44 @@ impl OllamaClient {
         self.breaker_is_open()
     }
 
-    /// Quick health check -- returns true if Ollama responds to GET /api/tags.
+    /// Quick health check — returns true if the backend responds 2xx.
+    ///
+    /// - Ollama: `GET /api/tags` (lists pulled models)
+    /// - OpenAI-compatible: `GET /v1/models` with Bearer auth (most
+    ///   vendors support this endpoint)
+    ///
+    /// Strict semantics: 4xx and 5xx return false. A vendor that
+    /// returns 401 on bad auth is treated as "not available" because
+    /// we cannot use it. The circuit-breaker in [`Self::generate`]
+    /// handles transient 5xx burst behavior separately. Matches the
+    /// pre-#1067 contract pinned by
+    /// `wiremock_tests::test_is_available_returns_false_on_500_response`.
     pub fn is_available(&self) -> bool {
-        let url = format!("{}/api/tags", self.base_url);
-        self.client
-            .get(&url)
-            .timeout(HEALTH_TIMEOUT)
-            .send()
-            .is_ok_and(|r| r.status().is_success())
+        let (url, bearer) = match &self.provider {
+            LlmProvider::Ollama => (format!("{}/api/tags", self.base_url), None),
+            LlmProvider::OpenAiCompatible { api_key } => {
+                (format!("{}/models", self.base_url), Some(api_key.as_str()))
+            }
+        };
+        let mut req = self.client.get(&url).timeout(HEALTH_TIMEOUT);
+        if let Some(key) = bearer {
+            req = req.bearer_auth(key);
+        }
+        req.send().is_ok_and(|r| r.status().is_success())
     }
 
-    /// Checks if the configured model is already pulled. If not, pulls it.
+    /// Ensure the configured model is available.
+    ///
+    /// - Ollama: lists `/api/tags`, pulls via `/api/pull` if missing.
+    /// - OpenAI-compatible: **no-op** — model availability is the
+    ///   vendor's concern (operator is responsible for confirming the
+    ///   model exists on the chosen vendor's plan).
     pub fn ensure_model(&self) -> Result<()> {
+        if matches!(self.provider, LlmProvider::OpenAiCompatible { .. }) {
+            // Vendor-side concern; the operator selected the model
+            // when they set AI_MEMORY_LLM_MODEL.
+            return Ok(());
+        }
         // Check if model exists by listing tags
         let url = format!("{}/api/tags", self.base_url);
         let resp = self
@@ -261,32 +545,59 @@ impl OllamaClient {
         if self.breaker_is_open() {
             return Err(anyhow!(
                 "Failed to send chat request: circuit breaker open \
-                 (last failure within {}s); ollama at {} is not responding",
+                 (last failure within {}s); LLM at {} is not responding",
                 CIRCUIT_BREAKER_COOLDOWN.as_secs(),
                 self.base_url,
             ));
         }
-        let url = format!("{}/api/chat", self.base_url);
 
-        let mut messages = Vec::new();
-        if let Some(sys) = system {
-            messages.push(json!({"role": "system", "content": sys}));
-        }
-        messages.push(json!({"role": "user", "content": prompt}));
+        // #1066 — branch on provider for endpoint path, auth header,
+        // payload shape, and response parsing.
+        let (url, payload, bearer): (String, Value, Option<&str>) = match &self.provider {
+            LlmProvider::Ollama => {
+                let mut messages = Vec::new();
+                if let Some(sys) = system {
+                    messages.push(json!({"role": "system", "content": sys}));
+                }
+                messages.push(json!({"role": "user", "content": prompt}));
+                (
+                    format!("{}/api/chat", self.base_url),
+                    json!({
+                        "model": self.model,
+                        "messages": messages,
+                        "stream": false,
+                    }),
+                    None,
+                )
+            }
+            LlmProvider::OpenAiCompatible { api_key } => {
+                let mut messages = Vec::new();
+                if let Some(sys) = system {
+                    messages.push(json!({"role": "system", "content": sys}));
+                }
+                messages.push(json!({"role": "user", "content": prompt}));
+                (
+                    format!("{}/chat/completions", self.base_url),
+                    json!({
+                        "model": self.model,
+                        "messages": messages,
+                        "stream": false,
+                    }),
+                    Some(api_key.as_str()),
+                )
+            }
+        };
 
-        let payload = json!({
-            "model": self.model,
-            "messages": messages,
-            "stream": false,
-        });
-
-        let resp = match self
+        let mut req = self
             .client
             .post(&url)
             .timeout(GENERATE_TIMEOUT)
-            .json(&payload)
-            .send()
-        {
+            .json(&payload);
+        if let Some(key) = bearer {
+            req = req.bearer_auth(key);
+        }
+
+        let resp = match req.send() {
             Ok(r) => r,
             Err(e) => {
                 self.note_failure();
@@ -297,7 +608,7 @@ impl OllamaClient {
         if !resp.status().is_success() {
             let status = resp.status();
             // 5xx is an upstream-failure signal that should trip the
-            // breaker (ollama is sick); 4xx is a request-shape problem
+            // breaker (LLM is sick); 4xx is a request-shape problem
             // and should NOT — the next call with a different prompt
             // may well succeed.
             if status.is_server_error() {
@@ -315,11 +626,25 @@ impl OllamaClient {
             }
         };
 
-        // Ollama /api/chat returns {"message": {"content": "..."}}
-        let response_text = body["message"]["content"]
-            .as_str()
-            .ok_or_else(|| anyhow!("Missing 'message.content' field in chat output"))?
-            .to_string();
+        // Parse the response per provider wire shape.
+        let response_text = match &self.provider {
+            // Ollama /api/chat → {"message": {"content": "..."}}
+            LlmProvider::Ollama => body["message"]["content"]
+                .as_str()
+                .ok_or_else(|| anyhow!("Missing 'message.content' field in chat output"))?
+                .to_string(),
+            // OpenAI-compat /v1/chat/completions →
+            // {"choices": [{"message": {"role": "assistant", "content": "..."}}]}
+            LlmProvider::OpenAiCompatible { .. } => body["choices"][0]["message"]["content"]
+                .as_str()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Missing 'choices[0].message.content' field in OpenAI-compatible \
+                         chat response; got: {body}"
+                    )
+                })?
+                .to_string(),
+        };
 
         self.note_success();
         Ok(response_text)
@@ -489,31 +814,43 @@ impl OllamaClient {
     pub fn embed_text(&self, text: &str, embed_model: &str) -> Result<Vec<f32>> {
         if self.breaker_is_open() {
             return Err(anyhow!(
-                "Failed to send embed request to Ollama: circuit breaker open \
-                 (last failure within {}s); ollama at {} is not responding",
+                "Failed to send embed request: circuit breaker open \
+                 (last failure within {}s); LLM at {} is not responding",
                 CIRCUIT_BREAKER_COOLDOWN.as_secs(),
                 self.base_url,
             ));
         }
         // v0.7.0 (issue #691 fold-1) — wire NetworkRequest gate.
         self.check_outbound()?;
-        let url = format!("{}/api/embed", self.base_url);
-        let payload = json!({
-            "model": embed_model,
-            "input": text,
-        });
 
-        let resp = match self
+        // #1066 — branch on provider for endpoint + payload + parse.
+        let (url, payload, bearer): (String, Value, Option<&str>) = match &self.provider {
+            LlmProvider::Ollama => (
+                format!("{}/api/embed", self.base_url),
+                json!({"model": embed_model, "input": text}),
+                None,
+            ),
+            LlmProvider::OpenAiCompatible { api_key } => (
+                format!("{}/embeddings", self.base_url),
+                json!({"model": embed_model, "input": text}),
+                Some(api_key.as_str()),
+            ),
+        };
+
+        let mut req = self
             .client
             .post(&url)
             .timeout(GENERATE_TIMEOUT)
-            .json(&payload)
-            .send()
-        {
+            .json(&payload);
+        if let Some(key) = bearer {
+            req = req.bearer_auth(key);
+        }
+
+        let resp = match req.send() {
             Ok(r) => r,
             Err(e) => {
                 self.note_failure();
-                return Err(anyhow::Error::new(e).context("Failed to send embed request to Ollama"));
+                return Err(anyhow::Error::new(e).context("Failed to send embed request"));
             }
         };
 
@@ -523,40 +860,59 @@ impl OllamaClient {
                 self.note_failure();
             }
             let text = resp.text().unwrap_or_default();
-            return Err(anyhow!("Ollama embed failed ({status}): {text}"));
+            return Err(anyhow!("Embed failed ({status}): {text}"));
         }
 
         let body: Value = match resp.json() {
             Ok(b) => b,
             Err(e) => {
                 self.note_failure();
-                return Err(anyhow::Error::new(e).context("Failed to parse Ollama embed response"));
+                return Err(anyhow::Error::new(e).context("Failed to parse embed response"));
             }
         };
 
-        // Ollama returns {"embeddings": [[...], ...]} — take the first one
-        let embedding = body["embeddings"]
-            .as_array()
-            .and_then(|arr| arr.first())
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| anyhow!("Missing embeddings in Ollama response"))?;
+        // Parse per provider:
+        // - Ollama: {"embeddings": [[f32, …], …]} — take first row
+        // - OpenAI-compat: {"data": [{"embedding": [f32, …], …}, …]} — take first row
+        let embedding_array = match &self.provider {
+            LlmProvider::Ollama => body["embeddings"]
+                .as_array()
+                .and_then(|arr| arr.first())
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| anyhow!("Missing 'embeddings[0]' in Ollama embed response"))?,
+            LlmProvider::OpenAiCompatible { .. } => {
+                body["data"][0]["embedding"].as_array().ok_or_else(|| {
+                    anyhow!(
+                        "Missing 'data[0].embedding' in OpenAI-compatible embed response; \
+                         got: {body}"
+                    )
+                })?
+            }
+        };
 
         #[allow(clippy::cast_possible_truncation)]
-        let floats: Vec<f32> = embedding
+        let floats: Vec<f32> = embedding_array
             .iter()
             .filter_map(|v| v.as_f64().map(|f| f as f32))
             .collect();
 
         if floats.is_empty() {
-            return Err(anyhow!("Empty embedding returned from Ollama"));
+            return Err(anyhow!("Empty embedding returned from LLM"));
         }
 
         self.note_success();
         Ok(floats)
     }
 
-    /// Ensure an embedding model is pulled in Ollama.
+    /// Ensure an embedding model is available.
+    ///
+    /// - Ollama: lists `/api/tags`, pulls via `/api/pull` if missing.
+    /// - OpenAI-compatible: **no-op** — vendor-side concern (operator
+    ///   confirms model availability on their plan).
     pub fn ensure_embed_model(&self, model: &str) -> Result<()> {
+        if matches!(self.provider, LlmProvider::OpenAiCompatible { .. }) {
+            return Ok(());
+        }
         let url = format!("{}/api/tags", self.base_url);
         let resp = self
             .client

@@ -123,7 +123,21 @@ services:
       AI_MEMORY_LLM_MODEL: "gemma4:e4b"
       AI_MEMORY_EMBED_MODEL: "nomic-embed-text"
       AI_MEMORY_PEER_URLS: "http://ic-parity-bob:19077"
-      AI_MEMORY_API_KEY: "${AI_MEMORY_API_KEY:-lan-parity-test-key}"
+      # Operator directive 2026-05-21 (#1067): IronClaw containers run
+      # with xAI Grok 4.3 as the AI NHI brain via the provider-agnostic
+      # LLM substrate. `XAI_API_KEY` comes from `~/.env` on this node;
+      # `:?` syntax fails compose with a clear error if the shell env
+      # hasn't sourced ~/.env first. Production operators run:
+      #   set -a; source ~/.env; set +a
+      #   docker compose -f infra/lan-parity-test/docker-compose.yml up -d
+      AI_MEMORY_LLM_BACKEND: "xai"
+      AI_MEMORY_LLM_MODEL: "${AI_MEMORY_LLM_MODEL:-grok-4}"
+      XAI_API_KEY: "${XAI_API_KEY:?XAI_API_KEY must be set in shell env — source ~/.env before running docker compose up}"
+      # Daemon HTTP X-API-Key auth secret. Reuses the xAI key as the
+      # high-entropy HTTP token (84-char random string is suitable as
+      # an API key). Operators wanting separate secrets set both
+      # XAI_API_KEY (LLM) and AI_MEMORY_API_KEY (HTTP) explicitly.
+      AI_MEMORY_API_KEY: "${AI_MEMORY_API_KEY:-${XAI_API_KEY}}"
       RUST_LOG: "${RUST_LOG:-ai_memory=info,sqlx=warn}"
     volumes:
       - ic-parity-alice-keys:/root/.config/ai-memory/keys
@@ -133,7 +147,15 @@ services:
     networks:
       - ic-parity-mesh
     healthcheck:
-      test: ["CMD", "curl", "-f", "-sS", "--max-time", "3", "http://127.0.0.1:19077/api/v1/capabilities"]
+      # Operator directive 2026-05-21: send X-API-Key on the healthcheck
+      # otherwise the auth middleware returns 401 and the container is
+      # reported `unhealthy` even though the daemon is fully functional.
+      # The `$$XAI_API_KEY` form double-escapes for compose-vs-shell
+      # interpolation: compose strips one `$`, the in-container shell
+      # uses the env-injected value (passed via the AI_MEMORY_API_KEY
+      # env var above so the in-container `curl` reads the same value
+      # the daemon authenticates against).
+      test: ["CMD-SHELL", "curl -f -sS --max-time 3 -H \"X-API-Key: $$AI_MEMORY_API_KEY\" http://127.0.0.1:19077/api/v1/capabilities"]
       interval: 10s
       timeout: 5s
       retries: 6
@@ -164,7 +186,11 @@ services:
       AI_MEMORY_LLM_MODEL: "gemma4:e4b"
       AI_MEMORY_EMBED_MODEL: "nomic-embed-text"
       AI_MEMORY_PEER_URLS: "http://ic-parity-alice:19077"
-      AI_MEMORY_API_KEY: "${AI_MEMORY_API_KEY:-lan-parity-test-key}"
+      # See alice's block for the #1067 rationale.
+      AI_MEMORY_LLM_BACKEND: "xai"
+      AI_MEMORY_LLM_MODEL: "${AI_MEMORY_LLM_MODEL:-grok-4}"
+      XAI_API_KEY: "${XAI_API_KEY:?XAI_API_KEY must be set in shell env — source ~/.env before running docker compose up}"
+      AI_MEMORY_API_KEY: "${AI_MEMORY_API_KEY:-${XAI_API_KEY}}"
       RUST_LOG: "${RUST_LOG:-ai_memory=info,sqlx=warn}"
     volumes:
       - ic-parity-bob-keys:/root/.config/ai-memory/keys
@@ -174,7 +200,8 @@ services:
     networks:
       - ic-parity-mesh
     healthcheck:
-      test: ["CMD", "curl", "-f", "-sS", "--max-time", "3", "http://127.0.0.1:19077/api/v1/capabilities"]
+      # See alice's block for the X-API-Key healthcheck rationale.
+      test: ["CMD-SHELL", "curl -f -sS --max-time 3 -H \"X-API-Key: $$AI_MEMORY_API_KEY\" http://127.0.0.1:19077/api/v1/capabilities"]
       interval: 10s
       timeout: 5s
       retries: 6
