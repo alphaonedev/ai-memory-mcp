@@ -402,3 +402,91 @@ async fn private_row_owned_by_other_does_not_project_978() {
         "the visibility gate must reject the non-owner-targeted private row",
     );
 }
+
+/// 8. #1028 audit-finding regression — multi-agent private enumeration.
+///
+///    The Agent-3 #4 audit finding (2026-05-21) claimed that the
+///    Postgres `list_memories_updated_since` method bypassed the #910
+///    scope=private gate, so a peer with valid mTLS could enumerate
+///    every private memory belonging to every other agent on the
+///    leader. The first-pass remediation (commit 6215f8d5b) added a
+///    SAL-level scope=private filter, which bypassed the federation
+///    visibility gate's three legitimate-projection branches
+///    (owner-signed-private, inbox-target, federation_share opt-in)
+///    and broke 5 of the 978 federation tests. The fix was reverted
+///    in ed47b4d60. This test pins the actual contract end-to-end:
+///    the audit-finding scenario MUST default-deny at the federation
+///    handler layer, NOT at the SAL layer (the SAL must continue to
+///    return every row so the handler's visibility gate has full
+///    information to evaluate the three legitimate-projection
+///    branches).
+///
+///    Scenario: 10 private rows seeded across 5 different agents in
+///    a namespace peer-1 is allowlisted into. peer-1 owns none of
+///    them, is not stamped as inbox-target on any, and none carry
+///    `federation_share=true`. Every row MUST be excluded.
+#[tokio::test]
+async fn audit_1028_mtls_peer_cannot_enumerate_other_agents_private_rows() {
+    let env_guard = ENV_LOCK.lock().await;
+    reset_env();
+    // peer-1 is mTLS-attested into the `tenants/*` namespace — the
+    // exact posture the audit warned about (valid wire identity,
+    // namespace allowlisted, should still NOT see private rows
+    // belonging to other agents).
+    set_peer1_allowlist("tenants/*");
+    let (router, db) = build_router_with_db();
+    // Seed 10 private rows across 5 distinct agents. None carry
+    // federation_share. None target peer-1. peer-1 owns none.
+    for (agent_n, row_n) in (1..=5).flat_map(|a| (0..2).map(move |r| (a, r))) {
+        let owner = format!("agent-{agent_n}");
+        let title = format!("private-{agent_n}-{row_n}");
+        let ns = format!("tenants/agent-{agent_n}");
+        let metadata = serde_json::json!({
+            "scope": "private",
+            "agent_id": owner,
+        });
+        seed_with_metadata(&db, &ns, &title, metadata).await;
+    }
+    // Also seed ONE legitimate-projection row: a scope=shared
+    // announcement in the same namespace. peer-1 SHOULD see this one
+    // — its presence in the response (and ONLY its presence) confirms
+    // the gate is row-level, not blanket-deny on the namespace.
+    seed_with_metadata(
+        &db,
+        "tenants/announcement",
+        "shared-announce",
+        serde_json::json!({"scope": "shared"}),
+    )
+    .await;
+
+    let body = sync_since_body(router, "peer-1").await;
+    unsafe {
+        std::env::remove_var(ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV);
+    }
+    drop(env_guard);
+
+    let mems = body["memories"].as_array().unwrap();
+    // The audit-pass invariant: exactly one row visible (the shared
+    // announcement). The ten private rows belonging to agent-1..5
+    // are all rejected by `is_visible_to_caller` because peer-1
+    // matches neither `metadata.agent_id` nor `metadata.target_agent_id`
+    // for any of them, and none stamp `federation_share=true`.
+    assert_eq!(
+        mems.len(),
+        1,
+        "#1028 audit-pass: a valid-mTLS allowlisted peer MUST NOT enumerate other agents' \
+         private rows via /sync/since. Expected only the scope=shared announcement; got: {body:?}",
+    );
+    assert_eq!(
+        mems[0]["title"], "shared-announce",
+        "#1028 audit-pass: the single projected row must be the scope=shared one, NOT a private leak",
+    );
+    // Pin the gate as the rejector (10 private rows excluded). If a
+    // future regression reintroduces the leak, this counter will drop
+    // below 10 while `mems.len()` rises above 1.
+    assert_eq!(
+        body["excluded_for_scope_private"], 10,
+        "#1028 audit-pass: all 10 cross-tenant private rows must be rejected by the \
+         federation visibility gate (excluded_for_scope_private counter pins the cause)",
+    );
+}
