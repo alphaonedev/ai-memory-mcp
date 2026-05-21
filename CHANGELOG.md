@@ -7,7 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] — v0.7.x doc follow-ups + Wave-2 refactor (post-tag)
 
-<<<<<<< HEAD
 ### refactor(#970) — enum proliferation audit (Wave-2 Tier-D3, 2026-05-21)
 
 Closes #970: full audit of `pub enum` definitions in `src/models/`,
