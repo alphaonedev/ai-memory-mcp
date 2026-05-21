@@ -264,6 +264,13 @@ pub(crate) fn handle_store(
         .and_then(|p| p.kind_class.auto_classify_kind);
     crate::hooks::pre_store::maybe_auto_classify(&mut mem, auto_classify_policy);
 
+    // #969 — single `to_value(&mem)` shared across the K9 permission
+    // gate and the K3 governance gate below. Pre-fix the two scoped
+    // blocks each called `to_value(&mem).unwrap_or_default()` against
+    // the same (read-only between gates) `mem`. Hoisting saves one
+    // clone+serialise per `memory_store` invocation on the hot path.
+    let mem_payload = serde_json::to_value(&mem).unwrap_or_default();
+
     // v0.7.0 K9 — unified permission pipeline. The K9 evaluator
     // composes declarative `[permissions.rules]` matchers + the K3
     // `[permissions].mode` knob + (when wired) hook decisions into
@@ -273,12 +280,11 @@ pub(crate) fn handle_store(
     // gate so legacy `[governance]` policies continue to work.
     {
         use crate::permissions::{Op, PermissionContext, Permissions};
-        let payload = serde_json::to_value(&mem).unwrap_or_default();
         let ctx = PermissionContext {
             op: Op::MemoryStore,
             namespace: mem.namespace.clone(),
             agent_id: agent_id.clone(),
-            payload,
+            payload: mem_payload.clone(),
         };
         match Permissions::evaluate(&ctx, &[]) {
             crate::permissions::Decision::Allow | crate::permissions::Decision::Modify(_) => {}
@@ -303,7 +309,6 @@ pub(crate) fn handle_store(
     // Task 1.9: governance enforcement (store-side).
     {
         use crate::models::{GovernanceDecision, GovernedAction};
-        let payload = serde_json::to_value(&mem).unwrap_or_default();
         match db::enforce_governance(
             conn,
             GovernedAction::Store,
@@ -311,7 +316,7 @@ pub(crate) fn handle_store(
             &agent_id,
             None,
             None,
-            &payload,
+            &mem_payload,
         )
         .map_err(|e| e.to_string())?
         {
