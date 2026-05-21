@@ -168,6 +168,123 @@ fn persona_error_to_string(e: PersonaError) -> String {
     e.to_string()
 }
 
+// --- D1.5 (#986): per-tool McpTool impls for memory_persona + memory_persona_generate ---
+
+use crate::mcp::registry::McpTool;
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+/// v0.7.0 #972 D1.5 (#986) — request body for `memory_persona`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct PersonaRequest {
+    /// Persona subject.
+    pub entity_id: String,
+
+    /// Default 'global'.
+    #[serde(default)]
+    pub namespace: Option<String>,
+}
+
+/// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_persona`.
+#[allow(dead_code)]
+pub struct PersonaTool;
+
+impl McpTool for PersonaTool {
+    fn name() -> &'static str {
+        "memory_persona"
+    }
+    fn description() -> &'static str {
+        "Fetch the latest Persona artefact for an entity (read-only)."
+    }
+    fn docs() -> &'static str {
+        "QW-2: latest MemoryKind::Persona for (entity_id, namespace). Returns envelope {id, entity_id, namespace, body_md, sources, generated_at, version, attest_level}. null when none. Pair with memory_persona_generate."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(PersonaRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "power"
+    }
+}
+
+/// v0.7.0 #972 D1.5 (#986) — request body for `memory_persona_generate`.
+///
+/// The legacy schema's `namespace` field is typed as `["string", "null"]`
+/// — schemars emits the equivalent shape from `Option<String>`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct PersonaGenerateRequest {
+    /// Persona subject (1-128 chars).
+    pub entity_id: String,
+
+    /// Omit/null → cross-namespace (#848); string → single-namespace.
+    #[serde(default)]
+    pub namespace: Option<String>,
+}
+
+/// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_persona_generate`.
+#[allow(dead_code)]
+pub struct PersonaGenerateTool;
+
+impl McpTool for PersonaGenerateTool {
+    fn name() -> &'static str {
+        "memory_persona_generate"
+    }
+    fn description() -> &'static str {
+        "Generate/regen a Persona artefact for an entity."
+    }
+    fn docs() -> &'static str {
+        "QW-2 / #848: synthesise MemoryKind::Persona from top-K Reflection memories. Omit namespace (or pass null) for cross-namespace aggregation (#848 — persona lands in 'global'); pass a namespace string for single-namespace scope. Response includes namespace_scope=single|cross_namespace."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(PersonaGenerateRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "power"
+    }
+}
+
+#[cfg(test)]
+mod d1_5_986_tests {
+    //! D1.5 (#986) — schema parity for `memory_persona` + `memory_persona_generate`.
+    //! Shared helpers live at [`crate::mcp::parity_test_helpers`].
+    use super::*;
+    use crate::mcp::parity_test_helpers::{
+        assert_descriptions_match, assert_property_set_parity, derived_props_for,
+    };
+
+    #[test]
+    fn persona_parity_986() {
+        let derived = derived_props_for::<PersonaRequest>();
+        assert_property_set_parity("memory_persona", &derived);
+        assert_descriptions_match("memory_persona", &derived);
+    }
+
+    #[test]
+    fn persona_tool_metadata_986() {
+        assert_eq!(PersonaTool::name(), "memory_persona");
+        assert_eq!(PersonaTool::family(), "power");
+    }
+
+    #[test]
+    fn persona_generate_parity_986() {
+        let derived = derived_props_for::<PersonaGenerateRequest>();
+        assert_property_set_parity("memory_persona_generate", &derived);
+        assert_descriptions_match("memory_persona_generate", &derived);
+    }
+
+    #[test]
+    fn persona_generate_tool_metadata_986() {
+        assert_eq!(PersonaGenerateTool::name(), "memory_persona_generate");
+        assert_eq!(PersonaGenerateTool::family(), "power");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

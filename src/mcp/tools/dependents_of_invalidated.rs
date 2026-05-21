@@ -64,6 +64,72 @@ pub(super) fn handle_dependents_of_invalidated(
     }))
 }
 
+// --- D1.5 (#986): per-tool McpTool impl for memory_dependents_of_invalidated ---
+
+use crate::mcp::registry::McpTool;
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+/// v0.7.0 #972 D1.5 (#986) — request body for
+/// `memory_dependents_of_invalidated`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct DependentsOfInvalidatedRequest {
+    /// Invalidated reflection id.
+    pub memory_id: String,
+}
+
+/// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for
+/// `memory_dependents_of_invalidated`.
+#[allow(dead_code)]
+pub struct DependentsOfInvalidatedTool;
+
+impl McpTool for DependentsOfInvalidatedTool {
+    fn name() -> &'static str {
+        "memory_dependents_of_invalidated"
+    }
+    fn description() -> &'static str {
+        "List dependents flagged by the L2-3 invalidation walker."
+    }
+    fn docs() -> &'static str {
+        "L2-3 (#668): read-only list of memories with reflects_on->memory_id. Notification, NOT cascade — dependents are flagged for curator review. Returns {memory_id, count, dependents:[{id, namespace}]}. Unknown ids => empty."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(DependentsOfInvalidatedRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "power"
+    }
+}
+
+#[cfg(test)]
+mod d1_5_986_tests {
+    //! D1.5 (#986) — schema parity for `memory_dependents_of_invalidated`.
+    //! Shared helpers live at [`crate::mcp::parity_test_helpers`].
+    use super::*;
+    use crate::mcp::parity_test_helpers::{
+        assert_descriptions_match, assert_property_set_parity, derived_props_for,
+    };
+
+    #[test]
+    fn dependents_of_invalidated_parity_986() {
+        let derived = derived_props_for::<DependentsOfInvalidatedRequest>();
+        assert_property_set_parity("memory_dependents_of_invalidated", &derived);
+        assert_descriptions_match("memory_dependents_of_invalidated", &derived);
+    }
+
+    #[test]
+    fn dependents_of_invalidated_tool_metadata_986() {
+        assert_eq!(
+            DependentsOfInvalidatedTool::name(),
+            "memory_dependents_of_invalidated"
+        );
+        assert_eq!(DependentsOfInvalidatedTool::family(), "power");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

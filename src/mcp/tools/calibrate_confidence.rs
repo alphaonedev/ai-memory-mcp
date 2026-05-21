@@ -52,6 +52,75 @@ pub(super) fn handle_calibrate_confidence(
     Ok(json!({ "report": report }))
 }
 
+// --- D1.5 (#986): per-tool McpTool impl for memory_calibrate_confidence ---
+
+use crate::mcp::registry::McpTool;
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+/// v0.7.0 #972 D1.5 (#986) — request body for `memory_calibrate_confidence`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct CalibrateConfidenceRequest {
+    /// Window days.
+    #[serde(default)]
+    pub days: Option<i64>,
+
+    /// json envelope or ASCII table.
+    #[serde(default)]
+    pub output_format: Option<String>,
+}
+
+/// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_calibrate_confidence`.
+#[allow(dead_code)]
+pub struct CalibrateConfidenceTool;
+
+impl McpTool for CalibrateConfidenceTool {
+    fn name() -> &'static str {
+        "memory_calibrate_confidence"
+    }
+    fn description() -> &'static str {
+        "Scan confidence_shadow_observations and emit per-source baselines (Form 5)."
+    }
+    fn docs() -> &'static str {
+        "Form 5 (#758): read-only calibration sweep over shadow-mode observations (AI_MEMORY_CONFIDENCE_SHADOW=1). Returns CalibrationReport {window_days, total_observations, baselines:[{namespace, source, count, median, mean, buckets}]}. Default window 30d. Family::Power — refuses on keyword tier."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(CalibrateConfidenceRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "power"
+    }
+}
+
+#[cfg(test)]
+mod d1_5_986_tests {
+    //! D1.5 (#986) — schema parity for `memory_calibrate_confidence`.
+    //! Shared helpers live at [`crate::mcp::parity_test_helpers`].
+    use super::*;
+    use crate::mcp::parity_test_helpers::{
+        assert_descriptions_match, assert_property_set_parity, derived_props_for,
+    };
+
+    #[test]
+    fn calibrate_confidence_parity_986() {
+        let derived = derived_props_for::<CalibrateConfidenceRequest>();
+        assert_property_set_parity("memory_calibrate_confidence", &derived);
+        assert_descriptions_match("memory_calibrate_confidence", &derived);
+    }
+
+    #[test]
+    fn calibrate_confidence_tool_metadata_986() {
+        assert_eq!(
+            CalibrateConfidenceTool::name(),
+            "memory_calibrate_confidence"
+        );
+        assert_eq!(CalibrateConfidenceTool::family(), "power");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -58,6 +58,67 @@ pub(super) fn handle_reflection_origin(
     }
 }
 
+// --- D1.5 (#986): per-tool McpTool impl for memory_reflection_origin ---
+
+use crate::mcp::registry::McpTool;
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+/// v0.7.0 #972 D1.5 (#986) — request body for `memory_reflection_origin`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct ReflectionOriginRequest {
+    /// Memory ID.
+    pub memory_id: String,
+}
+
+/// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_reflection_origin`.
+#[allow(dead_code)]
+pub struct ReflectionOriginTool;
+
+impl McpTool for ReflectionOriginTool {
+    fn name() -> &'static str {
+        "memory_reflection_origin"
+    }
+    fn description() -> &'static str {
+        "Inspect the cross-peer provenance of a reflection memory."
+    }
+    fn docs() -> &'static str {
+        "L2-2 (S6-M1): {memory_id, peer_origin, signing_agent, original_depth, local_depth_at_arrival, is_reflection}. Non-reflections return envelope with is_reflection=false. Unknown ids => error."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(ReflectionOriginRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "power"
+    }
+}
+
+#[cfg(test)]
+mod d1_5_986_tests {
+    //! D1.5 (#986) — schema parity for `memory_reflection_origin`.
+    //! Shared helpers live at [`crate::mcp::parity_test_helpers`].
+    use super::*;
+    use crate::mcp::parity_test_helpers::{
+        assert_descriptions_match, assert_property_set_parity, derived_props_for,
+    };
+
+    #[test]
+    fn reflection_origin_parity_986() {
+        let derived = derived_props_for::<ReflectionOriginRequest>();
+        assert_property_set_parity("memory_reflection_origin", &derived);
+        assert_descriptions_match("memory_reflection_origin", &derived);
+    }
+
+    #[test]
+    fn reflection_origin_tool_metadata_986() {
+        assert_eq!(ReflectionOriginTool::name(), "memory_reflection_origin");
+        assert_eq!(ReflectionOriginTool::family(), "power");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

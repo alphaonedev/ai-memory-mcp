@@ -124,6 +124,71 @@ fn suggested_filename(namespace: &str, id: &str, format: ExportFormat) -> String
     }
 }
 
+// --- D1.5 (#986): per-tool McpTool impl for memory_export_reflection ---
+
+use crate::mcp::registry::McpTool;
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+/// v0.7.0 #972 D1.5 (#986) — request body for `memory_export_reflection`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct ExportReflectionRequest {
+    /// Reflection-kind memory id.
+    pub memory_id: String,
+
+    /// md or json.
+    #[serde(default)]
+    pub format: Option<String>,
+}
+
+/// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_export_reflection`.
+#[allow(dead_code)]
+pub struct ExportReflectionTool;
+
+impl McpTool for ExportReflectionTool {
+    fn name() -> &'static str {
+        "memory_export_reflection"
+    }
+    fn description() -> &'static str {
+        "Render a single reflection memory as markdown or JSON (no filesystem write)."
+    }
+    fn docs() -> &'static str {
+        "QW-1: render reflection + reflects_on provenance as YAML-frontmatter md (default) or JSON envelope. Returns {content, suggested_filename}. No FS write — harness owns disk I/O."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(ExportReflectionRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "power"
+    }
+}
+
+#[cfg(test)]
+mod d1_5_986_tests {
+    //! D1.5 (#986) — schema parity for `memory_export_reflection`.
+    //! Shared helpers live at [`crate::mcp::parity_test_helpers`].
+    use super::*;
+    use crate::mcp::parity_test_helpers::{
+        assert_descriptions_match, assert_property_set_parity, derived_props_for,
+    };
+
+    #[test]
+    fn export_reflection_parity_986() {
+        let derived = derived_props_for::<ExportReflectionRequest>();
+        assert_property_set_parity("memory_export_reflection", &derived);
+        assert_descriptions_match("memory_export_reflection", &derived);
+    }
+
+    #[test]
+    fn export_reflection_tool_metadata_986() {
+        assert_eq!(ExportReflectionTool::name(), "memory_export_reflection");
+        assert_eq!(ExportReflectionTool::family(), "power");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

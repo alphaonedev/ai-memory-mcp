@@ -132,6 +132,70 @@ pub fn handle_share(conn: &rusqlite::Connection, params: &Value) -> Result<Value
     }))
 }
 
+// --- D1.5 (#986): per-tool McpTool impl for memory_share ---
+
+use crate::mcp::registry::McpTool;
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+/// v0.7.0 #972 D1.5 (#986) — request body for `memory_share`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct ShareRequest {
+    /// Memory id (full UUID or unique prefix) to share.
+    pub source_memory_id: String,
+
+    /// Recipient agent id; must satisfy validate_agent_id.
+    pub target_agent_id: String,
+}
+
+/// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_share`.
+#[allow(dead_code)]
+pub struct ShareTool;
+
+impl McpTool for ShareTool {
+    fn name() -> &'static str {
+        "memory_share"
+    }
+    fn description() -> &'static str {
+        "Share a memory with another agent (copy into _shared/<from>→<to>/)."
+    }
+    fn docs() -> &'static str {
+        "#224/#311 MVP: point-to-point copy into `_shared/<from>→<to>/` with provenance."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(ShareRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "power"
+    }
+}
+
+#[cfg(test)]
+mod d1_5_986_tests {
+    //! D1.5 (#986) — schema parity for `memory_share`.
+    //! Shared helpers live at [`crate::mcp::parity_test_helpers`].
+    use super::*;
+    use crate::mcp::parity_test_helpers::{
+        assert_descriptions_match, assert_property_set_parity, derived_props_for,
+    };
+
+    #[test]
+    fn share_parity_986() {
+        let derived = derived_props_for::<ShareRequest>();
+        assert_property_set_parity("memory_share", &derived);
+        assert_descriptions_match("memory_share", &derived);
+    }
+
+    #[test]
+    fn share_tool_metadata_986() {
+        assert_eq!(ShareTool::name(), "memory_share");
+        assert_eq!(ShareTool::family(), "power");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
