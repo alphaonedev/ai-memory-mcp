@@ -46,6 +46,7 @@
 //! returns cleanly.
 
 #![cfg(feature = "sal-postgres")]
+#![allow(clippy::needless_update)]
 
 use std::sync::Arc;
 

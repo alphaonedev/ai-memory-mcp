@@ -61,6 +61,7 @@
 //! within an AGE database.
 
 #![cfg(feature = "sal-postgres")]
+#![allow(clippy::needless_update)]
 
 use ai_memory::models::ConfidenceSource;
 use ai_memory::models::{Memory, Tier};

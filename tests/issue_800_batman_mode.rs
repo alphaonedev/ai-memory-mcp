@@ -24,6 +24,8 @@
 //! connection. Each test owns its own conn + key dir so they run in
 //! parallel safely under `cargo test`.
 
+#![allow(clippy::needless_update)]
+
 use std::path::PathBuf;
 use std::sync::Once;
 
