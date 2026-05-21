@@ -27,6 +27,68 @@ pub fn handle_quota_status(conn: &rusqlite::Connection, params: &Value) -> Resul
     }
 }
 
+// --- D1.5 (#986): per-tool McpTool impl for memory_quota_status ---
+
+use crate::mcp::registry::McpTool;
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+/// v0.7.0 #972 D1.5 (#986) — request body for `memory_quota_status`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct QuotaStatusRequest {
+    /// Restrict to one agent.
+    #[serde(default)]
+    pub agent_id: Option<String>,
+}
+
+/// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_quota_status`.
+#[allow(dead_code)]
+pub struct QuotaStatusTool;
+
+impl McpTool for QuotaStatusTool {
+    fn name() -> &'static str {
+        "memory_quota_status"
+    }
+    fn description() -> &'static str {
+        "Report per-agent quota usage. Operator-facing."
+    }
+    fn docs() -> &'static str {
+        "K8: quota usage (memories/day, storage, links/day). Omit agent_id for all."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(QuotaStatusRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "power"
+    }
+}
+
+#[cfg(test)]
+mod d1_5_986_tests {
+    //! D1.5 (#986) — schema parity for `memory_quota_status`.
+    //! Shared helpers live at [`crate::mcp::parity_test_helpers`].
+    use super::*;
+    use crate::mcp::parity_test_helpers::{
+        assert_descriptions_match, assert_property_set_parity, derived_props_for,
+    };
+
+    #[test]
+    fn quota_status_parity_986() {
+        let derived = derived_props_for::<QuotaStatusRequest>();
+        assert_property_set_parity("memory_quota_status", &derived);
+        assert_descriptions_match("memory_quota_status", &derived);
+    }
+
+    #[test]
+    fn quota_status_tool_metadata_986() {
+        assert_eq!(QuotaStatusTool::name(), "memory_quota_status");
+        assert_eq!(QuotaStatusTool::family(), "power");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Coverage C-2 — focused tests for `handle_quota_status`.

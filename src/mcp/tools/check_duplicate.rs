@@ -68,6 +68,78 @@ pub(super) fn handle_check_duplicate(
     }))
 }
 
+// --- D1.5 (#986): per-tool McpTool impl for memory_check_duplicate ---
+
+use crate::mcp::registry::McpTool;
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+/// v0.7.0 #972 D1.5 (#986) — request body for `memory_check_duplicate`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct CheckDuplicateRequest {
+    /// Candidate title.
+    pub title: String,
+
+    /// Candidate content.
+    pub content: String,
+
+    /// Namespace filter.
+    #[serde(default)]
+    pub namespace: Option<String>,
+
+    /// Cosine threshold; floor 0.5. Default 0.85 tuned for MiniLM-L6-v2.
+    #[serde(default)]
+    pub threshold: Option<f64>,
+}
+
+/// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_check_duplicate`.
+#[allow(dead_code)]
+pub struct CheckDuplicateTool;
+
+impl McpTool for CheckDuplicateTool {
+    fn name() -> &'static str {
+        "memory_check_duplicate"
+    }
+    fn description() -> &'static str {
+        "Pre-write near-duplicate check via cosine over stored embeddings."
+    }
+    fn docs() -> &'static str {
+        "Pillar 2 / Stream D: pre-write near-dup check. Embeds title+content, returns highest-cosine match + is_duplicate + suggested_merge. Threshold floor 0.5. Requires semantic tier+."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(CheckDuplicateRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "power"
+    }
+}
+
+#[cfg(test)]
+mod d1_5_986_tests {
+    //! D1.5 (#986) — schema parity for `memory_check_duplicate`.
+    //! Shared helpers live at [`crate::mcp::parity_test_helpers`].
+    use super::*;
+    use crate::mcp::parity_test_helpers::{
+        assert_descriptions_match, assert_property_set_parity, derived_props_for,
+    };
+
+    #[test]
+    fn check_duplicate_parity_986() {
+        let derived = derived_props_for::<CheckDuplicateRequest>();
+        assert_property_set_parity("memory_check_duplicate", &derived);
+        assert_descriptions_match("memory_check_duplicate", &derived);
+    }
+
+    #[test]
+    fn check_duplicate_tool_metadata_986() {
+        assert_eq!(CheckDuplicateTool::name(), "memory_check_duplicate");
+        assert_eq!(CheckDuplicateTool::family(), "power");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Coverage C-2 — focused unit tests for `handle_check_duplicate`.
