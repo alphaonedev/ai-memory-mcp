@@ -173,6 +173,27 @@ pub fn spawn_replay_federation_push_dlq(
 /// itself succeeds against a peer that's now healthy.
 pub const REPLAY_BATCH_SIZE: usize = 64;
 
+/// #1032 (HIGH, 2026-05-21) — quarantine threshold for DLQ rows.
+///
+/// Pre-#1032 the replay worker retried every pending row forever. A
+/// row that systematically rejects (peer-side schema validation
+/// refusal, leader-side key rotation invalidating the signature, or
+/// per-row size cap mismatch) would accumulate `attempt_count`
+/// indefinitely while the worker kept re-issuing HTTP POSTs to the
+/// peer every tick (network amplification) AND the `pending_dlq_count`
+/// gauge would never settle. Once `attempt_count >= MAX_REPLAY_ATTEMPTS`
+/// the row is *quarantined*: the replay worker skips it on subsequent
+/// ticks, the `federation_push_dlq_quarantined` Prometheus counter
+/// increments, and the operator gets a tracing::warn line. Operators
+/// then drain quarantined rows manually via `ai-memory federation
+/// dlq drain --quarantined` (CLI surface tracked separately).
+///
+/// 100 attempts at ~30-second tick cadence = ~50 minutes of retries
+/// before quarantine. That's generous for legitimate transient
+/// failures (peer restart, network blip) and tight enough to surface
+/// systematic-rejection footguns quickly.
+pub const MAX_REPLAY_ATTEMPTS: i32 = 100;
+
 /// Drive one replay pass. Public so the integration test in
 /// `tests/federation_dlq_replay.rs` can advance the worker manually
 /// without waiting on the `tokio::time::sleep` cadence.
@@ -204,6 +225,28 @@ pub async fn replay_once(config: &FederationConfig, sink: &dyn FederationDlqSink
     );
 
     for row in rows {
+        // #1032 — skip rows that have exceeded the replay-attempt
+        // ceiling. The row stays in the DLQ (operator can inspect /
+        // drain manually) but the worker no longer wastes network
+        // bandwidth re-issuing POSTs that systematically fail.
+        if row.attempt_count >= MAX_REPLAY_ATTEMPTS {
+            crate::metrics::registry()
+                .federation_push_dlq_quarantined
+                .inc();
+            tracing::warn!(
+                target: "ai_memory::federation::push_dlq",
+                row_id = row.id,
+                peer_id = %row.peer_id,
+                memory_id = %row.memory_id,
+                attempt_count = row.attempt_count,
+                "replay: row {} quarantined after {} attempts (ceiling {MAX_REPLAY_ATTEMPTS}); \
+                 drain manually via `ai-memory federation dlq drain --quarantined`",
+                row.id,
+                row.attempt_count,
+            );
+            continue;
+        }
+
         // Resolve the peer URL via the live FederationConfig. If the
         // peer has been removed from the config since the DLQ row was
         // written, log + bump attempt_count + leave the row for the
