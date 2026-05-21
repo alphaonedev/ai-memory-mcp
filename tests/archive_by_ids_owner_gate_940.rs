@@ -156,6 +156,7 @@ fn build_router_fixture(db_path: &std::path::Path) -> axum::Router {
         recall_scope: Arc::new(None),
         deferred_audit_queue: Arc::new(None),
         admin_agent_ids: Arc::new(vec![]),
+        rule_cache: std::sync::Arc::new(ai_memory::governance::rule_cache::RuleCache::new()),
     };
     let api_key_state = ApiKeyState {
         key: None,

@@ -89,6 +89,7 @@ mod common_admin {
             // caller would be admitted — proves the failure paths below
             // are due to the agent_id resolution, not a missing admin.
             admin_agent_ids: Arc::new(vec!["ai:operator".to_string()]),
+            rule_cache: std::sync::Arc::new(ai_memory::governance::rule_cache::RuleCache::new()),
         };
         let api_key_state = ai_memory::handlers::ApiKeyState {
             key: None,

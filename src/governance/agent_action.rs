@@ -66,11 +66,13 @@
 //! action, not that any specific rule fires by default.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
+use crate::governance::rule_cache::RuleCache;
 use crate::governance::rules_store::Rule;
 use crate::signed_events::{append_signed_event, payload_hash};
 
@@ -499,11 +501,18 @@ fn disk_free_gib_at_path(_path: &std::path::Path) -> Option<u64> {
 /// through and `log` being silent — identical semantics to the
 /// pre-refactor inline loops.
 pub struct RuleEngine {
-    rules: Vec<Rule>,
+    /// `Arc<Vec<Rule>>` so the per-instance [`RuleCache`] (#991) can
+    /// share a snapshot across many `load_for_action_cached` calls
+    /// without cloning the row data. Cache miss / un-cached path
+    /// wraps a fresh `Vec` in `Arc::new`; cache hits clone the
+    /// `Arc` (refcount bump, no row data copy).
+    rules: Arc<Vec<Rule>>,
 }
 
 impl RuleEngine {
-    /// Construct an engine scoped to a single `AgentAction`'s kind.
+    /// Construct an engine scoped to a single `AgentAction`'s kind
+    /// without consulting any cache. Equivalent to
+    /// `load_for_action_cached(conn, None, action)`.
     ///
     /// Reads the enabled rule rows of matching `kind` from
     /// `governance_rules` via
@@ -515,10 +524,37 @@ impl RuleEngine {
     ///
     /// Propagates any SQLite error from `list_enabled_by_kind`.
     pub fn load_for_action(conn: &Connection, action: &AgentAction) -> Result<Self> {
+        Self::load_for_action_cached(conn, None, action)
+    }
+
+    /// Cached variant of [`Self::load_for_action`] (#991).
+    ///
+    /// When `cache` is `Some`, consults the per-instance [`RuleCache`]
+    /// — cache hit returns the cached `Arc<Vec<Rule>>` without
+    /// re-running the SQL + Ed25519-verify path; cache miss loads via
+    /// [`crate::governance::rules_store::list_enabled_by_kind`] and
+    /// inserts. When `cache` is `None`, behaves exactly like
+    /// [`Self::load_for_action`] (no cache consultation, fresh load).
+    ///
+    /// # Errors
+    ///
+    /// Propagates any SQLite error from `list_enabled_by_kind`.
+    pub fn load_for_action_cached(
+        conn: &Connection,
+        cache: Option<&RuleCache>,
+        action: &AgentAction,
+    ) -> Result<Self> {
         let kind = action.kind();
-        let rules = crate::governance::rules_store::list_enabled_by_kind(conn, kind).with_context(
-            || format!("RuleEngine::load_for_action: list_enabled_by_kind({kind})"),
-        )?;
+        let rules = if let Some(c) = cache {
+            c.get_or_load(conn, kind).with_context(|| {
+                format!("RuleEngine::load_for_action_cached: get_or_load({kind})")
+            })?
+        } else {
+            let v = crate::governance::rules_store::list_enabled_by_kind(conn, kind).with_context(
+                || format!("RuleEngine::load_for_action: list_enabled_by_kind({kind})"),
+            )?;
+            Arc::new(v)
+        };
         Ok(Self { rules })
     }
 
@@ -527,7 +563,9 @@ impl RuleEngine {
     /// for future callsites that already hold a cached rule list.
     #[must_use]
     pub fn from_rules(rules: Vec<Rule>) -> Self {
-        Self { rules }
+        Self {
+            rules: Arc::new(rules),
+        }
     }
 
     /// Evaluate `action` against the loaded rules. Returns the
@@ -539,7 +577,7 @@ impl RuleEngine {
     #[must_use]
     pub fn evaluate(&self, _agent_id: &str, action: &AgentAction) -> Decision {
         let mut first_warn: Option<(String, String)> = None;
-        for rule in &self.rules {
+        for rule in self.rules.iter() {
             if !matcher_applies(rule, action) {
                 continue;
             }
@@ -631,14 +669,33 @@ pub fn check_agent_action(
     agent_id: &str,
     action: &AgentAction,
 ) -> Result<Decision> {
-    let engine = RuleEngine::load_for_action(conn, action)
-        .with_context(|| format!("check_agent_action: load engine for {}", action.kind()))?;
+    check_agent_action_cached(conn, None, agent_id, action)
+}
+
+/// Cached variant of [`check_agent_action`] (#991).
+///
+/// `cache: Some(...)` consults the per-instance [`RuleCache`] (cache
+/// hit returns the cached `Arc<Vec<Rule>>` without re-running the SQL
+/// + Ed25519-verify path). `cache: None` behaves exactly like
+/// [`check_agent_action`] (no cache consultation).
+///
+/// # Errors
+///
+/// Returns an error if the SQLite query fails or the audit emit fails.
+pub fn check_agent_action_cached(
+    conn: &Connection,
+    cache: Option<&RuleCache>,
+    agent_id: &str,
+    action: &AgentAction,
+) -> Result<Decision> {
+    let engine = RuleEngine::load_for_action_cached(conn, cache, action).with_context(|| {
+        format!(
+            "check_agent_action_cached: load engine for {}",
+            action.kind()
+        )
+    })?;
     let decision = engine.evaluate(agent_id, action);
     emit_check_event(conn, agent_id, action, &decision)?;
-    // v0.7.0 #697 — fire-and-forget forensic emit. The forensic sink
-    // is process-wide, independent of the in-flight Connection (it
-    // appends to its own file with no SQLite involvement), so there's
-    // no deadlock risk from inside the storage hook either.
     emit_forensic_decision(agent_id, action, &decision);
     Ok(decision)
 }
@@ -728,20 +785,29 @@ fn emit_check_event(
 ///
 /// Returns an error if the SQLite query for enabled rules fails.
 pub fn check_agent_action_no_audit(conn: &Connection, action: &AgentAction) -> Result<Decision> {
-    let engine = RuleEngine::load_for_action(conn, action).with_context(|| {
+    check_agent_action_no_audit_cached(conn, None, action)
+}
+
+/// Cached variant of [`check_agent_action_no_audit`] (#991).
+///
+/// `cache: Some(...)` consults the per-instance [`RuleCache`]; `cache:
+/// None` behaves exactly like [`check_agent_action_no_audit`].
+///
+/// # Errors
+///
+/// Returns an error if the rules-table SELECT fails.
+pub fn check_agent_action_no_audit_cached(
+    conn: &Connection,
+    cache: Option<&RuleCache>,
+    action: &AgentAction,
+) -> Result<Decision> {
+    let engine = RuleEngine::load_for_action_cached(conn, cache, action).with_context(|| {
         format!(
-            "check_agent_action_no_audit: load engine for {}",
+            "check_agent_action_no_audit_cached: load engine for {}",
             action.kind()
         )
     })?;
-    // No agent_id is available on the read-only pre-write hook path.
-    // Pass the empty string — the engine treats agent_id as opaque
-    // until a future agent-scoped matcher consults it.
     let decision = engine.evaluate("", action);
-    // v0.7.0 #697 — forensic emit even on the no-audit path. The
-    // forensic sink is process-wide and writes to its own file (not
-    // SQLite), so the deadlock concern that motivated `_no_audit`
-    // doesn't apply.
     emit_forensic_decision("", action, &decision);
     Ok(decision)
 }
@@ -785,10 +851,31 @@ pub fn check_agent_action_deferred(
     action: &AgentAction,
     queue: &crate::governance::deferred_audit::DeferredAuditQueue,
 ) -> Result<Decision> {
-    let decision = check_agent_action_no_audit(conn, action)?;
+    check_agent_action_deferred_cached(conn, None, agent_id, action, queue)
+}
+
+/// Cached variant of [`check_agent_action_deferred`] (#991).
+///
+/// `cache: Some(...)` consults the per-instance [`RuleCache`]; `cache:
+/// None` behaves exactly like [`check_agent_action_deferred`]. This is
+/// the hot-path entry point used by the substrate
+/// `GOVERNANCE_PRE_WRITE` storage hook — passing a cache here is the
+/// load-bearing win that recovers the original #983 0.5-3ms-per-write
+/// gain without the cross-connection poisoning that triggered the
+/// #990 revert.
+///
+/// # Errors
+///
+/// Returns an error if the rules-table SELECT fails.
+pub fn check_agent_action_deferred_cached(
+    conn: &Connection,
+    cache: Option<&RuleCache>,
+    agent_id: &str,
+    action: &AgentAction,
+    queue: &crate::governance::deferred_audit::DeferredAuditQueue,
+) -> Result<Decision> {
+    let decision = check_agent_action_no_audit_cached(conn, cache, action)?;
     if decision.is_refusal() {
-        // Fire-and-forget submit. Never blocks the storage write
-        // path. The queue is process-wide and clone-cheap.
         queue.submit_refusal(agent_id, action, &decision);
     }
     Ok(decision)

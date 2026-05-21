@@ -2341,12 +2341,25 @@ pub async fn bootstrap_serve(
         "policy-engine item 3: deferred-audit drainer spawned (chain-logs \
          storage refusals as `governance.refusal` rows in signed_events)"
     );
+
+    // v0.7.0 #991 — per-instance rule cache shared by the substrate
+    // `GOVERNANCE_PRE_WRITE` storage hook (below), the
+    // `wire_check::GOVERNANCE_PRE_ACTION` action hook (below), and the
+    // `AppState.rule_cache` field (HTTP handler call sites). Cloning
+    // the `Arc<RuleCache>` into each captures-by-reference; the cache
+    // is dropped when the last reference (AppState + the two hooks)
+    // goes away on daemon shutdown. Per-instance means multi-daemon
+    // test fixtures don't cross-pollute (the contract that the #990
+    // revert restored after #983 shipped a process-wide singleton).
+    let rule_cache: Arc<crate::governance::rule_cache::RuleCache> =
+        Arc::new(crate::governance::rule_cache::RuleCache::new());
     {
         use crate::governance::agent_action::{
-            AgentAction, Decision as RuleDecision, check_agent_action_deferred,
+            AgentAction, Decision as RuleDecision, check_agent_action_deferred_cached,
         };
         let rules_db_path = db_path.to_path_buf();
         let queue_for_hook = deferred_audit_queue.clone();
+        let cache_for_hook = Arc::clone(&rule_cache);
         let install_result = crate::storage::GOVERNANCE_PRE_WRITE.set(Box::new(
             move |mem: &crate::models::Memory| -> std::result::Result<(), String> {
                 let conn_for_check = match db::open(&rules_db_path) {
@@ -2382,8 +2395,9 @@ pub async fn bootstrap_serve(
                     .and_then(|v| v.as_str())
                     .unwrap_or("substrate:pre_write_hook")
                     .to_string();
-                match check_agent_action_deferred(
+                match check_agent_action_deferred_cached(
                     &conn_for_check,
+                    Some(&cache_for_hook),
                     &agent_id,
                     &action,
                     &queue_for_hook,
@@ -2437,9 +2451,10 @@ pub async fn bootstrap_serve(
     // for direct operator ops (L1-6 E operator-as-actor exemption).
     {
         use crate::governance::agent_action::{
-            AgentAction, Decision as RuleDecision, check_agent_action_no_audit,
+            AgentAction, Decision as RuleDecision, check_agent_action_no_audit_cached,
         };
         let rules_db_path = db_path.to_path_buf();
+        let cache_for_wire_check = Arc::clone(&rule_cache);
         let install_result = crate::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(
             move |action: &AgentAction| -> std::result::Result<(), String> {
                 let conn_for_check = match db::open(&rules_db_path) {
@@ -2455,7 +2470,11 @@ pub async fn bootstrap_serve(
                         return Ok(());
                     }
                 };
-                match check_agent_action_no_audit(&conn_for_check, action) {
+                match check_agent_action_no_audit_cached(
+                    &conn_for_check,
+                    Some(&cache_for_wire_check),
+                    action,
+                ) {
                     Ok(RuleDecision::Allow | RuleDecision::Warn { .. }) => Ok(()),
                     Ok(RuleDecision::Refuse { rule_id, reason }) => {
                         tracing::info!(
@@ -2888,6 +2907,10 @@ pub async fn bootstrap_serve(
         // Same `validate_agent_id` filter applies; malformed entries
         // warn + drop. Precedence: env var > `[admin]` config block.
         admin_agent_ids: Arc::new(resolve_admin_agent_ids(app_config.admin.as_ref())),
+        // v0.7.0 #991 — share the per-instance rule cache constructed
+        // above (and already wired into both hook closures) with the
+        // HTTP handler entry points. One cache per daemon lifetime.
+        rule_cache: Arc::clone(&rule_cache),
     };
 
     // v0.7.0 Policy-Engine Item 3 — register the deferred-audit
@@ -3750,6 +3773,11 @@ mod tests {
             recall_scope: Arc::new(None),
             deferred_audit_queue: Arc::new(None),
             admin_agent_ids: Arc::new(Vec::new()),
+            // v0.7.0 #991 — fresh per-test cache. No invalidation
+            // required: tests don't share this AppState across rule
+            // writes (each test that mutates rules opens its own
+            // `fresh_conn()`).
+            rule_cache: Arc::new(crate::governance::rule_cache::RuleCache::new()),
         }
     }
 
