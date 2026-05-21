@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] — v0.7.x doc follow-ups + Wave-2 refactor (post-tag)
 
+### refactor(#969) — JSON Value serialization redundancy audit (2026-05-21)
+
+Wave-2 Tier-D2 audit of `serde_json::to_value` / `from_value` call
+sites. Closed with targeted refactor + audit doc per the issue body's
+"collapse to single shape per surface" hypothesis. Findings:
+
+- **~245 call sites scanned**; ~209 are test fixtures (legitimate
+  `from_value(json!({…}))` partial-construct pattern against
+  `#[serde(default)]` fields), ~110 are `to_value(schema)` for MCP
+  tool registry, ~70 are production-code wire/DB boundary
+  conversions (postgres JSONB binding, federation receive, MCP
+  response envelopes, governance payloads), **6 sites were genuine
+  redundancy targets**.
+- **R1 (3 sites collapsed):** `MemoryDelta` now derives `PartialEq`.
+  Pre-#969 `ChainResult` (`src/hooks/chain.rs:177`), `HookDecision`
+  (`src/hooks/decision.rs:135`), and `Decision`
+  (`src/governance/mod.rs:188`) all hand-rolled equality routed
+  through `serde_json::to_value(a).ok() == serde_json::to_value(b).ok()`
+  on the (mistaken) premise that `serde_json::Value` was not
+  `PartialEq`. `serde_json::Value` derives `Eq + PartialEq + Hash`
+  (`serde_json-1.0/src/value/mod.rs:115`); the real blocker for
+  `derive(Eq)` is `MemoryDelta`'s `Option<f64>`, which is
+  `PartialEq` but not `Eq`. Three hand-rolled `impl PartialEq` blocks
+  deleted (~30 lines of branch-matching boilerplate); now plain
+  `derive(PartialEq)`.
+- **R3 (1 hot-path double-convert collapsed):**
+  `src/mcp/tools/store/mod.rs:276,306` called
+  `serde_json::to_value(&mem).unwrap_or_default()` twice in the same
+  function (K9 permission gate then K3 governance gate) on the same
+  read-only `mem`. Hoisted to a single `mem_payload` shared across
+  both gates. Saves one clone+serialise per `memory_store` invocation
+  on the hot path.
+- **Sites intentionally NOT touched:** every
+  `src/handlers/hook_subscribers.rs` site (security-critical surface,
+  per scope directive); every `src/store/postgres.rs` site (canonical
+  JSONB binding boundary); every `src/federation/receive.rs` site
+  (canonical peer→typed-Memory wire boundary); the four
+  `handlers/{create,admin,memories_query,kg}.rs`
+  `payload_for_pending` sites (input-pipeline fail-closed pattern,
+  not a 500-response surface — empty `{}` fallback is the deliberate
+  fail-closed default the governance gate handles).
+
+Audit doc: `docs/internal/json-value-redundancy-audit-969.md`.
+
 ### v0.7.0 ship-readiness session 2026-05-21 — gate-rerun closures + drift sweep
 
 After the PR #820 merge + the 6-agent review's TB1/TB2 (#977/#978) landed, a
