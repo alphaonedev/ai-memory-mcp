@@ -5,13 +5,129 @@
 
 use crate::embeddings::Embed;
 use crate::hnsw::VectorIndex;
+use crate::mcp::registry::McpTool;
 use crate::models::{
     AttestLevel, CandidateCounts, ConfidenceTier, Memory, MemoryKind, RecallMeta, RecallTelemetry,
 };
 use crate::observations;
 use crate::reranker::BatchedReranker;
 use crate::{db, validate};
+use schemars::JsonSchema;
+use serde::Deserialize;
 use serde_json::{Value, json};
+
+// --- D1.4 (#985): per-tool McpTool impl for `memory_recall` (core family) ---
+
+/// v0.7.0 #972 D1.4 (#985) — `kinds` filter union for `memory_recall`.
+/// Accepts an array of memory-kind strings OR a single comma-separated
+/// string. Untagged so schemars emits the `oneOf` shape that mirrors
+/// the legacy hand-coded entry.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(untagged)]
+#[allow(dead_code)]
+pub enum RecallKindsFilter {
+    Many(Vec<String>),
+    One(String),
+}
+
+/// v0.7.0 #972 D1.4 (#985) — request body for `memory_recall`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct RecallRequest {
+    /// What to recall
+    pub context: String,
+
+    /// Namespace filter
+    #[serde(default)]
+    pub namespace: Option<String>,
+
+    #[serde(default)]
+    pub limit: Option<i64>,
+
+    /// Tag filter
+    #[serde(default)]
+    pub tags: Option<String>,
+
+    /// RFC3339 lower bound on created_at
+    #[serde(default)]
+    pub since: Option<String>,
+
+    /// RFC3339 upper bound on created_at
+    #[serde(default)]
+    pub until: Option<String>,
+
+    #[schemars(description = "#151 scope-visibility agent.")]
+    #[serde(default)]
+    pub as_agent: Option<String>,
+
+    /// P6/R1 cl100k content cap. 0=empty; top kept (meta.budget_overflow=true).
+    #[serde(default)]
+    pub budget_tokens: Option<i64>,
+
+    /// Recent conversation tokens; biases query embedding 70/30 (v0.6.0.0).
+    #[serde(default)]
+    pub context_tokens: Option<Vec<String>>,
+
+    /// Splice [agents.defaults.recall_scope]. explicit > scope > defaults.
+    #[serde(default)]
+    pub session_default: Option<bool>,
+
+    #[schemars(description = "#518 session id; +0.05 rerank boost for in-session ring (cap 50).")]
+    #[serde(default)]
+    pub session_id: Option<String>,
+
+    /// WT-1-E: include atomised sources alongside atoms.
+    #[serde(default)]
+    pub include_archived: Option<bool>,
+
+    /// Form 4 (#757): require non-empty citations array.
+    #[serde(default)]
+    pub has_citations: Option<bool>,
+
+    /// Form 4 (#757): restrict by source_uri prefix (e.g. 'doc:', 'uri:https://').
+    #[serde(default)]
+    pub source_uri_prefix: Option<String>,
+
+    /// Form 6 (#759) kind filter. Array/CSV. OR within; AND across.
+    #[serde(default)]
+    pub kinds: Option<RecallKindsFilter>,
+
+    /// Gap 4 (#887) tier filter.
+    #[serde(default)]
+    pub confidence_tier: Option<String>,
+
+    /// Gap 7 (#890): per-row provenance decoration.
+    #[serde(default)]
+    pub verbose_provenance: Option<bool>,
+
+    /// Response format. toon_compact saves 79% vs json.
+    #[serde(default)]
+    pub format: Option<String>,
+}
+
+/// v0.7.0 #972 D1.4 (#985) — `McpTool` impl for `memory_recall`.
+#[allow(dead_code)]
+pub struct RecallTool;
+
+impl McpTool for RecallTool {
+    fn name() -> &'static str {
+        "memory_recall"
+    }
+    fn description() -> &'static str {
+        "Recall memories relevant to a context (ranked)."
+    }
+    fn docs() -> &'static str {
+        "Fuzzy OR recall ranked by relevance + priority + access + tier. Optional: budget_tokens (cl100k cap), context_tokens (query-embed bias), session_id (+0.05 recency boost per #518), session_default (splice [agents.defaults.recall_scope]), include_archived, kinds filter. Default format toon_compact (~79% smaller)."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(RecallRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "core"
+    }
+}
 
 /// v0.7.x Form 6 — parse the `kinds` recall-filter parameter from the
 /// MCP params bag. Accepts:
@@ -1312,5 +1428,30 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.contains("context"));
+    }
+}
+
+#[cfg(test)]
+mod d1_4_985_tests {
+    //! D1.4 (#985) — schema-parity for `memory_recall`.
+    //! Note: legacy `kinds` field uses a `oneOf` union (array | string);
+    //! the schemars derive emits the same shape via the untagged
+    //! `RecallKindsFilter` enum.
+    use super::*;
+    use crate::mcp::d1_4_985_helpers::{
+        assert_descriptions_match, assert_property_set_parity, derived_props_for,
+    };
+
+    #[test]
+    fn memory_recall_parity_985() {
+        let derived = derived_props_for::<RecallRequest>();
+        assert_property_set_parity("memory_recall", &derived);
+        assert_descriptions_match("memory_recall", &derived);
+    }
+
+    #[test]
+    fn memory_recall_tool_metadata_985() {
+        assert_eq!(RecallTool::name(), "memory_recall");
+        assert_eq!(RecallTool::family(), "core");
     }
 }

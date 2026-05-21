@@ -28,6 +28,93 @@ mod validation;
 
 use crate::db;
 use crate::embeddings::Embed;
+use crate::mcp::registry::McpTool;
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+// --- D1.4 (#985): per-tool McpTool impl for `memory_store` (core family) ---
+
+/// v0.7.0 #972 D1.4 (#985) — request body for `memory_store`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct StoreRequest {
+    /// Short title
+    pub title: String,
+
+    /// Memory content
+    pub content: String,
+
+    #[serde(default)]
+    pub tier: Option<String>,
+
+    /// Namespace
+    #[serde(default)]
+    pub namespace: Option<String>,
+
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+
+    #[serde(default)]
+    pub priority: Option<i64>,
+
+    #[serde(default)]
+    pub confidence: Option<f64>,
+
+    #[serde(default)]
+    pub source: Option<String>,
+
+    /// JSON metadata
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
+
+    /// NHI agent_id; synthesized if omitted.
+    #[serde(default)]
+    pub agent_id: Option<String>,
+
+    /// Task 1.5 visibility. Default private.
+    #[serde(default)]
+    pub scope: Option<String>,
+
+    /// P2/G6 (title,ns) collision: error=v2 default; merge=v1; version='(N)'.
+    #[serde(default)]
+    pub on_conflict: Option<String>,
+
+    /// Form 6 (#759) memory-kind. Default observation.
+    #[serde(default)]
+    pub kind: Option<String>,
+
+    #[schemars(description = "#519 bypass proactive contradiction detection.")]
+    #[serde(default)]
+    pub force: Option<bool>,
+
+    #[schemars(description = "#885 Source URI (doc:/uri:/file:); indexed for #889.")]
+    #[serde(default)]
+    pub source_uri: Option<String>,
+}
+
+/// v0.7.0 #972 D1.4 (#985) — `McpTool` impl for `memory_store`.
+#[allow(dead_code)]
+pub struct StoreTool;
+
+impl McpTool for StoreTool {
+    fn name() -> &'static str {
+        "memory_store"
+    }
+    fn description() -> &'static str {
+        "Store a memory; deduplicates by title+namespace."
+    }
+    fn docs() -> &'static str {
+        "Store a memory. Dedupes by (title, namespace). Tier defaults to mid (7d TTL); long is permanent. on_conflict: error|merge|version. scope: Task 1.5 visibility. force (#519): bypass proactive contradiction detection on near-duplicate writes."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(StoreRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "core"
+    }
+}
 use crate::hnsw::VectorIndex;
 use crate::llm::OllamaClient;
 use serde_json::{Value, json};
@@ -583,3 +670,25 @@ pub(crate) fn handle_store(
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod d1_4_985_tests {
+    //! D1.4 (#985) — schema-parity for `memory_store`.
+    use super::*;
+    use crate::mcp::d1_4_985_helpers::{
+        assert_descriptions_match, assert_property_set_parity, derived_props_for,
+    };
+
+    #[test]
+    fn memory_store_parity_985() {
+        let derived = derived_props_for::<StoreRequest>();
+        assert_property_set_parity("memory_store", &derived);
+        assert_descriptions_match("memory_store", &derived);
+    }
+
+    #[test]
+    fn memory_store_tool_metadata_985() {
+        assert_eq!(StoreTool::name(), "memory_store");
+        assert_eq!(StoreTool::family(), "core");
+    }
+}

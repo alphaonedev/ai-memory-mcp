@@ -3,8 +3,46 @@
 
 //! MCP `memory_get` handler.
 
+use crate::mcp::registry::McpTool;
 use crate::{db, validate};
+use schemars::JsonSchema;
+use serde::Deserialize;
 use serde_json::{Value, json};
+
+// --- D1.4 (#985): per-tool McpTool impl for `memory_get` (core family) ---
+
+/// v0.7.0 #972 D1.4 (#985) — request body for `memory_get`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct GetRequest {
+    /// Memory ID.
+    pub id: String,
+}
+
+/// v0.7.0 #972 D1.4 (#985) — `McpTool` impl for `memory_get`.
+#[allow(dead_code)]
+pub struct GetTool;
+
+impl McpTool for GetTool {
+    fn name() -> &'static str {
+        "memory_get"
+    }
+    fn description() -> &'static str {
+        "Get a specific memory by ID, including its links."
+    }
+    fn docs() -> &'static str {
+        "Memory row + linked ids (in+out). Use memory_get_links for full link rows with attestation."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(GetRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "core"
+    }
+}
+
 pub(super) fn handle_get(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
     let id = params["id"].as_str().ok_or("id is required")?;
     validate::validate_id(id).map_err(|e| e.to_string())?;
@@ -149,5 +187,28 @@ mod tests {
         let two = handle_get(&conn, &json!({"id": &id})).expect("ok 2");
         assert_eq!(one["id"], two["id"]);
         assert_eq!(one["title"], two["title"]);
+    }
+}
+
+#[cfg(test)]
+mod d1_4_985_tests {
+    //! D1.4 (#985) — schema-parity for `memory_get`.
+    //! Reuses the allowed-diffs catalog documented in d1_2_983_tests.
+    use super::*;
+    use crate::mcp::d1_4_985_helpers::{
+        assert_descriptions_match, assert_property_set_parity, derived_props_for,
+    };
+
+    #[test]
+    fn memory_get_parity_985() {
+        let derived = derived_props_for::<GetRequest>();
+        assert_property_set_parity("memory_get", &derived);
+        assert_descriptions_match("memory_get", &derived);
+    }
+
+    #[test]
+    fn memory_get_tool_metadata_985() {
+        assert_eq!(GetTool::name(), "memory_get");
+        assert_eq!(GetTool::family(), "core");
     }
 }
