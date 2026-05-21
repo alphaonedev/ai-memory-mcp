@@ -92,39 +92,67 @@ pub async fn sync_since(
         .unwrap_or("")
         .to_string();
 
-    // Federation-pull legacy carve-out: a row with NEITHER an explicit
-    // `scope` field NOR an `agent_id` field carries zero NHI-ownership
-    // signals — it's a pre-multi-tenant (v0.6-era) wire shape that
-    // federation has always projected. Applying the canonical
-    // visibility predicate to such a row would deny it (the helper
-    // defaults missing-scope to "private" and missing-owner to ""),
-    // which would over-block legitimate legacy traffic and regress
-    // the #239 sync-scope baseline. Rows with an EXPLICIT
-    // `scope=private` and/or an EXPLICIT `agent_id` ARE the #948
-    // threat surface — those go through the helper unchanged so the
-    // owner / inbox-target / non-owner decision matches every other
-    // visibility-gated handler in the codebase.
-    fn has_ownership_signal(mem: &Memory) -> bool {
-        let scope_present = mem.metadata.get("scope").is_some();
-        let owner_present = mem
+    // v0.7.0 #978 — close the legacy-unauthored cross-tenant leak.
+    // Pre-#978 a `has_ownership_signal` carve-out projected any row
+    // that lacked BOTH `metadata.scope` AND `metadata.agent_id`
+    // through unchanged, on the rationale that pre-v0.7-era rows had
+    // no NHI-ownership signals to filter against. That carve-out was
+    // the load-bearing reason every federated peer matching the
+    // namespace allowlist could see legacy operator/CLI-seeded rows
+    // — the same cross-tenant leak surface the visibility-gate
+    // cluster (#940/#942/#944/#946/#947/#948/#956/#959/#960/#974/#976)
+    // closed on every other handler in v0.7.0.
+    //
+    // The replacement predicate runs EVERY row through
+    // `crate::visibility::is_visible_to_caller`, with one named
+    // operator-explicit escape hatch:
+    //
+    //   `metadata.federation_share == true`  — the documented migration
+    //   path for legacy rows the operator KNOWS should federate (the
+    //   row text was written with broadcast intent; stamping the flag
+    //   is an explicit consent signal).
+    //
+    // Legacy rows that lack the flag default to scope=private +
+    // unowned in the canonical helper and get DENIED to non-owner
+    // federation callers, restoring the visibility invariant. The
+    // existing `AI_MEMORY_FED_SYNC_TRUST_PEER=1` full-dump escape
+    // hatch (see `allow_all_legacy` below) remains intact for legacy
+    // peers that demand the pre-#948 wire shape verbatim.
+    fn federation_projectable(mem: &Memory, federation_caller: &str) -> bool {
+        // Operator-explicit opt-in flag. The check is deliberately
+        // strict — only the literal JSON `true` boolean passes.
+        // String `"true"`, integer `1`, etc. do NOT.
+        let opt_in = mem
             .metadata
-            .get("agent_id")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|s| !s.is_empty());
-        scope_present || owner_present
-    }
-    let visibility_ok = |mem: &Memory| -> bool {
-        if !has_ownership_signal(mem) {
-            return true; // legacy unauthored row — project unchanged
+            .get("federation_share")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if opt_in {
+            return true;
         }
-        crate::visibility::is_visible_to_caller(mem, &federation_caller)
-    };
+        crate::visibility::is_visible_to_caller(mem, federation_caller)
+    }
 
     // Pre-resolved scope row: `Some(&PeerScope)` means filter by its
     // namespace allowlist; `None` + bypass means "legacy full dump";
     // `None` + no bypass means "default-deny → empty page".
     let scope = peer_header.as_deref().and_then(|p| attest_cfg.scope_for(p));
     let allow_all_legacy = scope.is_none() && trust_bypass;
+
+    let visibility_ok = |mem: &Memory| -> bool {
+        // The operator-explicit `AI_MEMORY_FED_SYNC_TRUST_PEER=1`
+        // bypass (resolved into `allow_all_legacy` above) is the
+        // documented full-dump posture for legacy peers. When it
+        // fires, every row in an allowed namespace projects unchanged
+        // — that's the contract operators rely on for v0.6 ↔ v0.7
+        // peer rollouts, and it predates the #978 cross-tenant fix.
+        // Skip the visibility predicate ONLY on that explicit-trust
+        // path; default-deny posture stays default.
+        if allow_all_legacy {
+            return true;
+        }
+        federation_projectable(mem, &federation_caller)
+    };
     if scope.is_none() && !trust_bypass {
         // Default-deny: short-circuit to an empty envelope with WARN
         // so an unauthorised peer cannot exfiltrate the DB. The
