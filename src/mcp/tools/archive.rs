@@ -260,6 +260,39 @@ impl McpTool for ArchiveRestoreTool {
 #[schemars(deny_unknown_fields)]
 pub struct ArchiveStatsRequest {}
 
+/// v0.7.0 #972 D1.6 (#987) — request body for `memory_gc`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct GcRequest {
+    /// Preview without deleting.
+    #[serde(default)]
+    pub dry_run: Option<bool>,
+}
+
+/// v0.7.0 #972 D1.6 (#987) — `McpTool` impl for `memory_gc`.
+#[allow(dead_code)]
+pub struct GcTool;
+
+impl McpTool for GcTool {
+    fn name() -> &'static str {
+        "memory_gc"
+    }
+    fn description() -> &'static str {
+        "Trigger garbage collection on expired memories (archives first)."
+    }
+    fn docs() -> &'static str {
+        "GC expired memories. Archives first when archive_on_gc is on (default). dry_run previews."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(GcRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "lifecycle"
+    }
+}
+
 /// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_archive_stats`.
 #[allow(dead_code)]
 pub struct ArchiveStatsTool;
@@ -342,6 +375,28 @@ mod d1_5_986_tests {
     fn archive_stats_tool_metadata_986() {
         assert_eq!(ArchiveStatsTool::name(), "memory_archive_stats");
         assert_eq!(ArchiveStatsTool::family(), "archive");
+    }
+}
+
+#[cfg(test)]
+mod d1_6_987_tests {
+    //! D1.6 (#987) — schema parity for `memory_gc`.
+    use super::*;
+    use crate::mcp::parity_test_helpers::{
+        assert_descriptions_match, assert_property_set_parity, derived_props_for,
+    };
+
+    #[test]
+    fn gc_parity_987() {
+        let derived = derived_props_for::<GcRequest>();
+        assert_property_set_parity("memory_gc", &derived);
+        assert_descriptions_match("memory_gc", &derived);
+    }
+
+    #[test]
+    fn gc_tool_metadata_987() {
+        assert_eq!(GcTool::name(), "memory_gc");
+        assert_eq!(GcTool::family(), "lifecycle");
     }
 }
 

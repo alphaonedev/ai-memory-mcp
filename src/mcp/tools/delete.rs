@@ -4,9 +4,69 @@
 //! MCP `memory_delete` handler.
 
 use crate::mcp::VectorIndex;
+use crate::mcp::registry::McpTool;
 use crate::{db, validate};
+use schemars::JsonSchema;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::Path;
+
+// --- D1.6 (#987): per-tool McpTool impl for `memory_delete` (lifecycle family) ---
+
+/// v0.7.0 #972 D1.6 (#987) — request body for `memory_delete`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[schemars(deny_unknown_fields)]
+pub struct DeleteRequest {
+    pub id: String,
+}
+
+/// v0.7.0 #972 D1.6 (#987) — `McpTool` impl for `memory_delete`.
+#[allow(dead_code)]
+pub struct DeleteTool;
+
+impl McpTool for DeleteTool {
+    fn name() -> &'static str {
+        "memory_delete"
+    }
+    fn description() -> &'static str {
+        "Delete a memory by ID."
+    }
+    fn docs() -> &'static str {
+        "Hard-delete by id (removes row, embedding, FTS, links). Use memory_forget for bulk pattern delete (archives first)."
+    }
+    fn input_schema() -> Value {
+        let schema = schemars::schema_for!(DeleteRequest);
+        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+    }
+    fn family() -> &'static str {
+        "lifecycle"
+    }
+}
+
+#[cfg(test)]
+mod d1_6_987_tests {
+    //! D1.6 (#987) — schema parity for `memory_delete`.
+    //! Shared helpers live at [`crate::mcp::parity_test_helpers`].
+    use super::*;
+    use crate::mcp::parity_test_helpers::{
+        assert_descriptions_match, assert_property_set_parity, derived_props_for,
+    };
+
+    #[test]
+    fn delete_parity_987() {
+        let derived = derived_props_for::<DeleteRequest>();
+        assert_property_set_parity("memory_delete", &derived);
+        assert_descriptions_match("memory_delete", &derived);
+    }
+
+    #[test]
+    fn delete_tool_metadata_987() {
+        assert_eq!(DeleteTool::name(), "memory_delete");
+        assert_eq!(DeleteTool::family(), "lifecycle");
+    }
+}
+
 pub(super) fn handle_delete(
     conn: &rusqlite::Connection,
     db_path: &Path,
