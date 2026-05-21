@@ -356,6 +356,73 @@ unchanged. New code should call `rebuild_async()` directly.
   `tool_definitions()`" is gone — `tool_definitions()` is now a
   four-line iteration.
 
+### v0.7.0 ship-readiness session 2026-05-21 — MCP-registry D1.7 (#988)
+
+- **`test(#988)`** D1.7 — schemars-derived registry test campaign.
+  Closes the D1.6 (#987) follow-up by pinning the wire shape of
+  `tools/list` against committed snapshots and the schema↔handler
+  invariant against a deserialise round-trip.
+
+  - **Per-profile `tools/list` snapshots** (5 new files under
+    `tests/snapshots/tools_list_<profile>.json` — `core`, `graph`,
+    `admin`, `power`, `full`). Each snapshot is the canonical
+    2-space-indented JSON with **sorted object keys** at every
+    level, so a future schemars-property-ordering bump absorbs
+    into the canonicaliser instead of flipping every line. The
+    new test file at `tests/mcp_tools_list_snapshots.rs` builds
+    each profile via `tool_definitions_for_profile(&Profile::<f>())`
+    and asserts byte-equality with the snapshot;
+    `AI_MEMORY_BLESS_SNAPSHOTS=1` blesses an intentional change in
+    one shot. Full profile snapshot is 73 tools — pins #862's
+    canonical count alongside the existing
+    `Profile::full().expected_tool_count()` assertion.
+  - **Schema↔handler parity invariant** for 5 representative
+    tools (`memory_store`, `memory_recall`, `memory_capabilities`,
+    `memory_pending_approve`, `memory_link`) at
+    `tests/mcp_schema_handler_parity.rs`. Each test pulls the
+    `inputSchema.properties` map for the tool out of
+    `tool_definitions()`, synthesises a JSON payload with one
+    type-compatible placeholder per advertised property, and
+    `serde_json::from_value`-ing the payload into the
+    corresponding `<Tool>Request` struct. If deserialisation
+    succeeds, the handler can extract every advertised field —
+    closing the class of bug the pre-D1.6 catalog produced (e.g.
+    `memory_capabilities.accept` carrying stale `enum:
+    ["v1","v2"]` while the handler had been V1/V2/V3 since A5).
+    Per-tool unit tests under `src/mcp/tools/<name>.rs::d1_x_*_tests`
+    already pin parity via `derived_props_for`/
+    `assert_property_set_parity`; the integration tests layer the
+    runtime deserialise check on top so a future regression that
+    re-introduces hand-coded schema entries surfaces at runtime
+    too. Full coverage of all 73 tools is D1.8 (#989)'s job —
+    keeping the budget here at 5 tools mirrors D1.5 (#986)'s
+    representative-coverage discipline.
+  - **Test-only re-export bundle** at
+    `ai_memory::mcp::schema_handler_parity_test_exports::*`
+    (`#[doc(hidden)]` so it stays out of the rustdoc surface)
+    exposing the 5 representative `<Tool>Request` structs to the
+    integration test. Mirrors the existing
+    `dispatch_handle_link_for_test` / `handle_archive_purge_for_test`
+    pattern; production wire paths still resolve through
+    `McpTool::input_schema()`.
+  - **C5 token-budget ceiling bump** in
+    `tests/token_budget_guard.rs` — trimmed-wire ceiling raised
+    from 5000 → 11000 cl100k tokens. The post-D1.6 schemars-derived
+    `tools/list` carries per-property `additionalProperties`,
+    `format`, and `[T, "null"]` type-array nodes the legacy
+    hand-coded payload didn't (measured ~9825 cl100k tokens
+    post-D1.6); the 11K ceiling leaves ~1175-token headroom for
+    future schema additions. Verbose ceiling unchanged (17K).
+    Partial compensation comes from D1.8 (#989) when the
+    trimmer's allow-list filtering of schemars metadata lands.
+
+  Gate posture: `cargo fmt --check` GREEN; `cargo clippy
+  --no-default-features --features sal,sal-postgres,sqlite-bundled
+  --lib --tests -- -D warnings -D clippy::all -D clippy::pedantic`
+  GREEN; 5/5 PASS on the snapshot tests; 5/5 PASS on the parity
+  tests; 162/162 PASS on the lib `d1_` test set (pre-existing
+  D1.1-D1.6 coverage still green).
+
 ### v0.7.0 ship-readiness session 2026-05-21 — gate-rerun closures + drift sweep
 
 After the PR #820 merge + the 6-agent review's TB1/TB2 (#977/#978) landed, a
