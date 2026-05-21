@@ -283,6 +283,30 @@ pub struct VerifyFailure {
     pub detail: String,
 }
 
+/// Why the governance forensic-bundle Ed25519-signed chain
+/// (`signed_events` rows / exported `ForensicDecision` JSONL files)
+/// failed to verify.
+///
+/// # Disambiguation (issue #970)
+///
+/// A sibling enum [`crate::audit::VerifyFailureKind`] exists for the
+/// **per-line `AuditEvent` hash chain** under `audit/`. Despite the
+/// shared name, the two enums verify different chain shapes and
+/// have different variant sets:
+///
+/// - `governance::audit::VerifyFailureKind` (this enum): `Parse`,
+///   `ChainBreak`, `Signature`. The forensic chain signs each row
+///   with an Ed25519 key (`Signature`) and verifies the cross-row
+///   hash pointer (`ChainBreak`). It has no per-line `SelfHash`
+///   variant (signature verification subsumes it).
+/// - `audit::VerifyFailureKind`: `Parse`, `SelfHash`, `ChainBreak`,
+///   `Sequence`. The audit chain hashes each line's canonical
+///   bytes (`SelfHash`) and verifies a monotonically increasing
+///   line counter (`Sequence`). It does NOT carry per-row
+///   signatures.
+///
+/// They are call-site-disambiguated by their module path. See
+/// `docs/internal/enum-proliferation-audit-970.md`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerifyFailureKind {
     Parse,
