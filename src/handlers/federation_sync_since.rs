@@ -12,7 +12,7 @@
 
 use axum::{
     Json,
-    extract::{Query, State},
+    extract::{OriginalUri, Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
@@ -25,15 +25,38 @@ use crate::validate;
 
 use super::AppState;
 use super::federation_receive::{SyncSinceQuery, extract_peer_id};
+use super::federation_signing_check::verify_get_signature_or_reject;
 #[cfg(feature = "sal")]
 use super::{StorageBackend, store_err_to_response};
 
 pub async fn sync_since(
     State(app): State<AppState>,
     headers: HeaderMap,
+    OriginalUri(original_uri): OriginalUri,
     Query(q): Query<SyncSinceQuery>,
 ) -> impl IntoResponse {
     let state = app.db.clone();
+
+    // v0.7.0 #1031 (Agent-5 #2) — gate `/sync/since` behind the same
+    // per-message Ed25519 signature posture `/sync/push` enforces.
+    // Pre-#1031 the handler accepted X-Peer-Id verbatim with NO sig
+    // check, so an attacker spoofing the header bypassed the visibility
+    // gate (`is_visible_to_caller`) and projected every
+    // `federation_share=true` row plus every `scope=private` row owned
+    // by the spoofed peer. Sign canonical bytes that bind to the
+    // request shape (method + path + query) so byte-equal replays
+    // cannot be re-used under a different peer-id.
+    let peer_header_for_sig = extract_peer_id(&headers).map(str::to_string);
+    if let Some(rejection) = verify_get_signature_or_reject(
+        "GET",
+        original_uri.path(),
+        original_uri.query().unwrap_or(""),
+        &headers,
+        peer_header_for_sig.as_deref(),
+        &app.federation_nonce_cache,
+    ) {
+        return rejection;
+    }
     // Validate `since` parses as RFC 3339 BEFORE hitting the DB so a
     // garbage timestamp returns a clear 400 instead of a 200 with the
     // entire database (red-team #247).
