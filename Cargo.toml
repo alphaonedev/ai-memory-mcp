@@ -142,7 +142,15 @@ serde_yaml = "0.9"
 candle-core = "0.10"
 candle-nn = "0.10"
 candle-transformers = "0.10"
-hf-hub = { version = "0.5", features = ["tokio"] }
+# v0.7.0 #1070 (Agent QC follow-up) — `default-features = false`
+# strips the implicit `default-tls = [native-tls]` chain that pulled
+# openssl-sys into every build, breaking the mobile-runtime Android
+# x86_64 emulator CI job (Android NDK ships no libssl by default). We
+# explicitly enable `tokio` (async client used by the async paths) +
+# `ureq` (the sync `api::sync::Api` path used by `src/embeddings.rs` +
+# `src/reranker.rs`) + `rustls-tls` for reqwest. Result: zero
+# openssl-sys in the transitive graph; rustls everywhere.
+hf-hub = { version = "0.5", default-features = false, features = ["tokio", "ureq", "rustls-tls"] }
 tokenizers = { version = "0.22" }
 instant-distance = "0.6"
 # M5 — `native-tls` removed from reqwest features. Federation + Ollama

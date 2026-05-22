@@ -205,6 +205,34 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
 
+      # v0.7.0 #1070 — pin the no-openssl-sys invariant. The Android
+      # NDK ships no libssl by default; an openssl-sys transitive
+      # would fail the `cargo test --no-run` build with `failed to
+      # run custom build command for openssl-sys`. The Cargo.toml
+      # `hf-hub = { default-features = false, features = ["tokio",
+      # "ureq", "rustls-tls"] }` declaration strips the
+      # `default-tls = [native-tls]` chain; this gate catches any
+      # future regression that re-introduces it.
+      - name: Pin no-openssl-sys invariant (#1070)
+        run: |
+          set -euo pipefail
+          if cargo tree \
+            -e normal \
+            --target x86_64-linux-android \
+            --no-default-features \
+            --features sqlite-bundled \
+            -i openssl-sys >/dev/null 2>&1; then
+            echo "::error::#1070 regression: openssl-sys is in the Android transitive graph"
+            cargo tree \
+              -e normal \
+              --target x86_64-linux-android \
+              --no-default-features \
+              --features sqlite-bundled \
+              -i openssl-sys
+            exit 1
+          fi
+          echo "::notice::#1070 no-openssl-sys invariant holds — Android build is rustls-only"
+
       - name: Build mobile_runtime test binary for Android (x86_64)
         run: |
           set -euo pipefail
