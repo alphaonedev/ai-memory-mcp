@@ -260,3 +260,66 @@ fn governance_pre_action_oncelock_has_no_replace_api() {
         "wire_check must NOT expose .replace() on GOVERNANCE_PRE_ACTION"
     );
 }
+
+#[test]
+fn governance_hooks_capture_consultation_connection_at_install_time_1017() {
+    // v0.7.0 #1017 (Agent-1 #3) — both governance hooks must NOT
+    // call `db::open(...)` inside their closure bodies. Pre-#1017
+    // each invocation opened a fresh connection (~1-2ms per call,
+    // running 4 PRAGMAs + SCHEMA execute_batch + migrate() + trigger
+    // probe). Post-#1017 the connection is captured once at install
+    // time as an `Arc<std::sync::Mutex<Connection>>` and reused for
+    // the lifetime of the daemon process.
+    //
+    // We pin this structurally by scanning daemon_runtime.rs and
+    // asserting:
+    //   1. The shared consultation handle is named
+    //      `hook_consultation_conn` and exists at install scope.
+    //   2. Both hook closures lock the shared Arc rather than calling
+    //      `db::open` per invocation — the regression catch is the
+    //      anti-pattern `db::open(&rules_db_path)` inside a
+    //      `crate::storage::GOVERNANCE_PRE_WRITE.set(Box::new(...))` or
+    //      `crate::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(...))`
+    //      block.
+    //
+    // A future change that re-introduces per-invocation `db::open`
+    // calls inside the hook closures will fail this pin.
+    let body = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/daemon_runtime.rs"
+    ))
+    .expect("read daemon_runtime.rs");
+
+    assert!(
+        body.contains("let hook_consultation_conn"),
+        "post-#1017: daemon_runtime.rs must declare a long-lived \
+         `hook_consultation_conn` Arc<Mutex<Connection>> shared by \
+         both governance hooks"
+    );
+
+    // Slice out each hook's `.set(Box::new(...))` block and assert
+    // it does NOT contain `db::open(&rules_db_path)`. We do a coarse
+    // textual scan (look for the install line, then peek the next
+    // ~40 lines of the closure body) — the closures are <30 lines
+    // each so a 40-line lookahead is comfortably sufficient.
+    for hook_marker in [
+        "crate::storage::GOVERNANCE_PRE_WRITE.set(Box::new(",
+        "crate::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(",
+    ] {
+        let install_idx = body
+            .find(hook_marker)
+            .unwrap_or_else(|| panic!("hook install line `{hook_marker}` missing from daemon_runtime.rs"));
+        // Closure bodies are bounded by the next `));` followed by
+        // matching install_result handling. Scan the next 5000 chars
+        // (closures are ~2.5KB max each) for the anti-pattern.
+        let end_idx = (install_idx + 5000).min(body.len());
+        let closure_body = &body[install_idx..end_idx];
+        assert!(
+            !closure_body.contains("db::open(&rules_db_path)"),
+            "post-#1017: `{hook_marker}` closure MUST NOT call \
+             `db::open(&rules_db_path)` per invocation — that re-introduces \
+             the ~1-2ms-per-call PRAGMA + SCHEMA + migrate cost the issue \
+             closed. Use the captured `hook_consultation_conn` Arc instead."
+        );
+    }
+}
