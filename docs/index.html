@@ -1,287 +1,653 @@
 <!--
   Copyright 2026 AlphaOne LLC
   SPDX-License-Identifier: Apache-2.0
-  Landing page redesign — issue #832.
-  Design intent: not busy. One question answered above the fold:
-  "What is ai-memory and how do I install it?"
+  Landing page redesign — DOC-A (v0.7.0 release).
+  Streamlined navigational hub. One page, short text, strong visual hierarchy,
+  clear paths into deeper docs. Mobile/IoT spotlight is a first-class section
+  per operator emphasis.
 -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>ai-memory &mdash; persistent memory for AI agents</title>
-<meta name="description" content="ai-memory is an autonomous-tier substrate for AI Non-Human Identity agents: persistent typed memory, a knowledge graph, governance rules, signed reflections. One Rust binary. Apache-2.0.">
-<meta name="theme-color" content="#0a0a0a">
+<title>ai-memory &mdash; persistent memory, knowledge graph, and governance for AI agents</title>
+<meta name="description" content="ai-memory is the autonomous-tier substrate for AI Non-Human Identity (NHI) agents. Typed memory, a knowledge graph with temporal validity, signed reflections, programmable hooks. One Rust binary. Runs on a laptop, a server rack, a region — or a cellphone. Apache-2.0.">
+<meta name="theme-color" content="#000">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/">
 <style>
 :root{
-  --bg:#0a0a0a; --panel:#121212; --border:#262626; --border-hi:#3a3a3a;
-  --text:#f5f5f5; --muted:#9a9a9a; --dim:#6b6b6b; --accent:#6ee7ff;
-  --code-bg:#161616;
+  --bg:#000; --bg-raised:#0a0a0a; --bg-card:#111; --bg-elev:#161616; --bg-code:#1a1a1a;
+  --border:#262626; --border-hl:#3d3d3d;
+  --text:#fff; --text-muted:#999; --text-dim:#666;
+  --p1:#6ee7ff; --p2:#ffb86b; --p3:#c8a2ff;
+  --good:#2ea043; --warn:#ffb86b; --bad:#f85149; --prog:#c8a2ff;
+  --accent:#6ee7ff;
+  --font-mono:"SF Mono","Cascadia Code","Fira Code",Consolas,monospace;
   --font-sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
-  --font-mono:"SF Mono","JetBrains Mono","Cascadia Code",Consolas,monospace;
-  --w-narrow:680px; --w-mid:840px; --w-wide:1080px;
+  --max-w:1200px;
+  --max-w-narrow:880px;
 }
-*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-html{scroll-behavior:smooth}
-body{background:var(--bg);color:var(--text);font-family:var(--font-sans);line-height:1.65;-webkit-font-smoothing:antialiased}
-a{color:var(--accent);text-decoration:none}
-a:hover{text-decoration:underline}
-code,pre{font-family:var(--font-mono);font-size:.88rem}
-code{background:var(--code-bg);padding:.1em .35em;border-radius:3px;color:#d4d4d4}
-pre{background:var(--code-bg);border:1px solid var(--border);border-radius:6px;padding:1rem 1.15rem;overflow-x:auto;line-height:1.55;margin:1rem 0}
-pre code{background:none;padding:0;color:#d4d4d4}
-.wrap{max-width:var(--w-wide);margin:0 auto;padding:0 1.5rem}
-.wrap-mid{max-width:var(--w-mid);margin:0 auto;padding:0 1.5rem}
-.wrap-narrow{max-width:var(--w-narrow);margin:0 auto;padding:0 1.5rem}
+*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
+html{scroll-behavior:smooth;scroll-padding-top:5rem}
+body{font-family:var(--font-sans);background:var(--bg);color:var(--text);line-height:1.6;-webkit-font-smoothing:antialiased;overflow-x:hidden}
+a{color:var(--accent);text-decoration:none;transition:filter .15s}
+a:hover{filter:brightness(1.25)}
+code{font-family:var(--font-mono);font-size:.85em;background:var(--bg-code);padding:.1em .35em;border-radius:4px;color:#d4d4d4}
+pre{font-family:var(--font-mono);font-size:.84rem;background:var(--bg-code);border:1px solid var(--border);border-radius:8px;padding:1rem 1.15rem;overflow-x:auto;line-height:1.55;margin:.75rem 0;color:#d4d4d4}
+pre code{background:none;padding:0}
+.container{max-width:var(--max-w);margin:0 auto;padding:0 1.5rem}
+.container-narrow{max-width:var(--max-w-narrow);margin:0 auto;padding:0 1.5rem}
 
-/* topnav: minimal, sparse */
-.topnav{border-bottom:1px solid var(--border);position:sticky;top:0;background:rgba(10,10,10,.92);backdrop-filter:blur(8px);z-index:50}
-.topnav .row{display:flex;align-items:center;justify-content:space-between;padding:1rem 1.5rem;max-width:var(--w-wide);margin:0 auto;font-size:.9rem}
-.topnav .brand{color:var(--text);font-weight:600;letter-spacing:-.01em}
-.topnav .links{display:flex;gap:1.5rem}
-.topnav .links a{color:var(--muted)}
-.topnav .links a:hover{color:var(--text);text-decoration:none}
-@media(max-width:600px){.topnav .links{gap:.85rem;font-size:.82rem}}
+h1,h2,h3,h4{font-weight:700;letter-spacing:-.02em;color:#fff}
+h1{font-size:clamp(2.2rem,5.5vw,3.8rem);line-height:1.05;letter-spacing:-.04em;margin-bottom:1.25rem}
+h2{font-size:clamp(1.6rem,3vw,2.1rem);margin-bottom:.6rem;letter-spacing:-.025em}
+h3{font-size:1.15rem;margin-bottom:.5rem}
+h4{font-size:1rem;margin-bottom:.4rem}
+p{color:var(--text-muted);margin-bottom:1rem}
+p.lede{color:var(--text-muted);font-size:1.05rem;max-width:780px;margin-bottom:2rem}
 
-/* hero: ONE question, ONE CTA above the fold */
-.hero{padding:7rem 0 5rem;text-align:center}
-.hero .eyebrow{font-family:var(--font-mono);font-size:.72rem;letter-spacing:.18em;color:var(--accent);text-transform:uppercase;margin-bottom:1.5rem}
-.hero h1{font-size:clamp(2.2rem,5vw,3.2rem);font-weight:700;letter-spacing:-.025em;line-height:1.1;margin-bottom:1.5rem;max-width:760px;margin-left:auto;margin-right:auto}
-.hero .lead{font-size:1.15rem;color:var(--muted);max-width:600px;margin:0 auto 2.5rem;line-height:1.6}
+/* topnav */
+.topnav{position:sticky;top:0;z-index:50;background:rgba(0,0,0,.88);backdrop-filter:blur(12px);border-bottom:1px solid var(--border)}
+.topnav .inner{display:flex;align-items:center;justify-content:space-between;max-width:var(--max-w);margin:0 auto;padding:.9rem 1.5rem;font-size:.875rem}
+.topnav .left{display:flex;align-items:center;gap:1.5rem}
+.topnav a{color:var(--text-muted)}
+.topnav a:hover{color:var(--text)}
+.topnav .brand{color:var(--text);font-weight:700;letter-spacing:-.01em;font-size:1rem}
+.topnav .right{display:flex;gap:1.25rem;align-items:center;flex-wrap:wrap}
+@media(max-width:780px){.topnav .left{gap:.85rem}.topnav .right{display:none}}
+
+/* hero */
+.hero{padding:6rem 1.5rem 4rem;text-align:center;background:radial-gradient(ellipse at 30% 0%,rgba(110,231,255,.10),transparent 55%),radial-gradient(ellipse at 70% 60%,rgba(200,162,255,.07),transparent 65%);border-bottom:1px solid var(--border)}
+.hero .badge{display:inline-block;padding:.4rem 1rem;background:rgba(110,231,255,.08);border:1px solid var(--p1);color:var(--p1);border-radius:999px;font-family:var(--font-mono);font-size:.78rem;letter-spacing:.06em;margin-bottom:1.5rem}
+.hero h1{max-width:880px;margin-left:auto;margin-right:auto}
+.hero h1 .accent{color:var(--p1)}
+.hero .subtitle{font-size:1.15rem;color:var(--text-muted);max-width:760px;margin:0 auto 2.25rem;line-height:1.55}
+.hero .subtitle strong{color:#fff;font-weight:600}
+.hero .meta{display:flex;justify-content:center;gap:1.75rem;color:var(--text-dim);font-family:var(--font-mono);font-size:.8rem;flex-wrap:wrap;margin-bottom:2.5rem}
+.hero .meta span::before{content:"› ";color:var(--p1)}
 .cta-row{display:flex;gap:.75rem;justify-content:center;flex-wrap:wrap}
-.cta{display:inline-block;padding:.85rem 1.6rem;border-radius:6px;font-weight:600;font-size:.95rem;border:1px solid var(--border-hi);transition:all .15s}
-.cta-primary{background:var(--text);color:var(--bg);border-color:var(--text)}
-.cta-primary:hover{background:var(--accent);border-color:var(--accent);text-decoration:none}
-.cta-secondary{background:transparent;color:var(--text)}
-.cta-secondary:hover{border-color:var(--text);text-decoration:none}
+.cta{display:inline-block;padding:.85rem 1.5rem;border-radius:8px;font-weight:600;font-size:.95rem;border:1px solid var(--border-hl);transition:all .15s}
+.cta.primary{background:var(--p1);color:#000;border-color:var(--p1)}
+.cta.primary:hover{filter:brightness(1.1)}
+.cta.violet{background:var(--p3);color:#000;border-color:var(--p3)}
+.cta.amber{background:transparent;color:var(--p2);border-color:var(--p2)}
+.cta.ghost{background:transparent;color:var(--text)}
+.cta.ghost:hover{border-color:var(--text)}
 
-/* section spacing — generous whitespace */
-section{padding:4.5rem 0;border-top:1px solid var(--border)}
+/* sections */
+section{padding:4.5rem 0;border-bottom:1px solid var(--border)}
 section.tight{padding:3rem 0}
-.eyebrow-h2{font-family:var(--font-mono);font-size:.7rem;letter-spacing:.18em;color:var(--dim);text-transform:uppercase;margin-bottom:.5rem}
-h2{font-size:1.65rem;font-weight:700;letter-spacing:-.015em;margin-bottom:.75rem}
-h3{font-size:1.1rem;font-weight:600;margin:1.5rem 0 .5rem}
-p{color:var(--muted);margin-bottom:1rem;max-width:680px}
-p.lede{color:var(--text);font-size:1.05rem}
+section.dark{background:var(--bg-raised)}
+.eyebrow{display:inline-block;font-size:.72rem;font-weight:600;letter-spacing:.15em;text-transform:uppercase;color:var(--text-muted);margin-bottom:.85rem;padding:.25rem .65rem;border:1px solid var(--border-hl);border-radius:999px;font-family:var(--font-mono)}
+.section-header{margin-bottom:2.5rem}
 
-/* install cards — 3 horizontal */
-.install-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:1rem;margin:2rem 0}
-.install-card{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:1.5rem;transition:border-color .15s}
-.install-card:hover{border-color:var(--border-hi)}
-.install-card .label{font-family:var(--font-mono);font-size:.72rem;color:var(--accent);text-transform:uppercase;letter-spacing:.1em;margin-bottom:.5rem}
-.install-card .name{font-weight:600;font-size:1rem;margin-bottom:.75rem;color:var(--text)}
-.install-card pre{margin:0;font-size:.78rem;padding:.7rem .85rem;background:var(--code-bg);border-radius:4px;border:none}
-@media(max-width:780px){.install-grid{grid-template-columns:1fr}}
+/* MOBILE/IOT SPOTLIGHT — major callout under hero */
+.spotlight{padding:4.5rem 0;border-bottom:1px solid var(--border);background:linear-gradient(180deg,rgba(255,184,107,.04),rgba(0,0,0,0) 70%),radial-gradient(ellipse at 50% 0%,rgba(255,184,107,.08),transparent 60%)}
+.spotlight .inner{max-width:var(--max-w-narrow);margin:0 auto;padding:0 1.5rem;display:grid;grid-template-columns:1fr;gap:2rem;align-items:center}
+.spotlight .icon{font-family:var(--font-mono);font-size:.78rem;letter-spacing:.18em;color:var(--p2);text-transform:uppercase;margin-bottom:.85rem}
+.spotlight h2{color:#fff;font-size:clamp(1.75rem,3.5vw,2.4rem);margin-bottom:1rem;letter-spacing:-.03em}
+.spotlight h2 .accent{color:var(--p2)}
+.spotlight p{color:var(--text-muted);font-size:1.05rem;max-width:780px;margin-bottom:1rem}
+.spotlight .targets{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:.85rem;margin:1.75rem 0}
+.spotlight .target{background:var(--bg-card);border:1px solid var(--border);border-radius:10px;padding:1rem 1.15rem;border-top:3px solid var(--p2)}
+.spotlight .target .name{font-weight:700;color:#fff;font-size:.95rem;margin-bottom:.2rem}
+.spotlight .target .desc{font-size:.82rem;color:var(--text-muted);font-family:var(--font-mono);line-height:1.4}
+.spotlight .cta-row{justify-content:flex-start;margin-top:1rem}
 
-/* audience picker — 3 large cards */
-.audience-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:1.25rem;margin:2.5rem 0}
-.aud-card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:2rem 1.75rem;transition:all .18s;display:block;color:inherit}
-.aud-card:hover{border-color:var(--accent);transform:translateY(-2px);text-decoration:none}
-.aud-card .role{font-family:var(--font-mono);font-size:.72rem;color:var(--accent);text-transform:uppercase;letter-spacing:.15em;margin-bottom:.75rem}
-.aud-card h3{margin:0 0 .65rem;font-size:1.15rem;color:var(--text)}
-.aud-card p{font-size:.92rem;color:var(--muted);margin:0 0 1rem}
-.aud-card .arrow{color:var(--accent);font-size:.85rem;font-weight:600}
-@media(max-width:780px){.audience-grid{grid-template-columns:1fr}}
+/* why-value-prop continuum */
+.continuum{display:grid;grid-template-columns:repeat(5,1fr);gap:.75rem;margin:1.5rem 0}
+.continuum .step{background:var(--bg-card);border:1px solid var(--border);border-radius:10px;padding:1.15rem 1rem;position:relative;transition:border-color .15s,transform .15s}
+.continuum .step:hover{border-color:var(--p1);transform:translateY(-2px)}
+.continuum .step .t-num{font-family:var(--font-mono);font-size:.72rem;color:var(--text-dim);letter-spacing:.12em}
+.continuum .step .t-name{font-weight:700;color:#fff;margin:.3rem 0;font-size:1rem}
+.continuum .step .t-desc{font-size:.82rem;color:var(--text-muted);line-height:1.45}
+@media(max-width:980px){.continuum{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:520px){.continuum{grid-template-columns:1fr}}
 
-/* essay list — clean rows */
-.essay-list{margin:2rem 0}
-.essay-row{display:flex;align-items:baseline;gap:1.25rem;padding:1.25rem 0;border-top:1px solid var(--border);text-decoration:none;color:inherit;transition:background .15s;margin:0 -1.5rem;padding-left:1.5rem;padding-right:1.5rem}
-.essay-row:hover{background:rgba(255,255,255,.02);text-decoration:none}
-.essay-row:last-child{border-bottom:1px solid var(--border)}
-.essay-num{font-family:var(--font-mono);color:var(--dim);font-size:.85rem;flex-shrink:0;width:2rem}
-.essay-body{flex:1;min-width:0}
-.essay-body h4{font-size:1.05rem;font-weight:600;color:var(--text);margin:0 0 .25rem}
-.essay-body p{color:var(--muted);margin:0;font-size:.9rem}
-.essay-arrow{color:var(--accent);flex-shrink:0;align-self:center}
+/* features grid */
+.grid-3{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:1.15rem;margin-top:1.5rem}
+.grid-2{display:grid;grid-template-columns:repeat(auto-fit,minmax(380px,1fr));gap:1.15rem;margin-top:1.5rem}
+.feat{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:1.5rem;transition:border-color .15s,transform .15s}
+.feat:hover{border-color:var(--border-hl);transform:translateY(-2px)}
+.feat .tag{font-family:var(--font-mono);font-size:.7rem;letter-spacing:.12em;color:var(--p1);text-transform:uppercase;margin-bottom:.5rem;display:block}
+.feat h3{margin-bottom:.5rem;font-size:1.05rem}
+.feat p{font-size:.9rem;color:var(--text-muted);margin-bottom:0;line-height:1.55}
+.feat.cyan{border-top:3px solid var(--p1)}
+.feat.amber{border-top:3px solid var(--p2)}
+.feat.violet{border-top:3px solid var(--p3)}
+.feat.green{border-top:3px solid var(--good)}
+.feat .tag.amber{color:var(--p2)}
+.feat .tag.violet{color:var(--p3)}
+.feat .tag.green{color:var(--good)}
 
-/* deeper links */
-.deeper{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:.6rem;margin:1.5rem 0}
-.deeper a{display:block;padding:.85rem 1rem;background:var(--panel);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:.9rem;transition:border-color .15s}
-.deeper a:hover{border-color:var(--accent);text-decoration:none}
-.deeper a .desc{display:block;color:var(--muted);font-size:.78rem;margin-top:.2rem;font-weight:400}
+/* install paths */
+.install-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:1rem;margin:1.5rem 0}
+.install-card{background:var(--bg-card);border:1px solid var(--border);border-radius:10px;padding:1.5rem;transition:border-color .15s}
+.install-card:hover{border-color:var(--p1)}
+.install-card .platform{font-family:var(--font-mono);font-size:.72rem;color:var(--p1);text-transform:uppercase;letter-spacing:.12em;margin-bottom:.4rem}
+.install-card .name{font-weight:700;font-size:1.05rem;color:#fff;margin-bottom:.75rem}
+.install-card pre{margin:.5rem 0 0;font-size:.78rem;padding:.7rem .85rem;border-radius:6px}
+
+/* integration grid */
+.integration-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:1rem;margin:1.5rem 0}
+.int-card{display:block;background:var(--bg-card);border:1px solid var(--border);border-radius:10px;padding:1.25rem 1.35rem;color:inherit;transition:border-color .15s,transform .15s}
+.int-card:hover{border-color:var(--p3);transform:translateY(-2px);text-decoration:none;filter:none}
+.int-card .label{font-family:var(--font-mono);font-size:.7rem;letter-spacing:.12em;color:var(--p3);text-transform:uppercase;margin-bottom:.4rem}
+.int-card h4{font-size:1.05rem;color:#fff;margin-bottom:.35rem}
+.int-card p{font-size:.85rem;color:var(--text-muted);margin-bottom:.5rem;line-height:1.45}
+.int-card .arrow{color:var(--p3);font-size:.85rem;font-weight:600;font-family:var(--font-mono)}
+
+/* audience picker */
+.audience-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:1.15rem;margin-top:1.5rem}
+.aud{display:block;background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:1.75rem;color:inherit;position:relative;overflow:hidden;transition:transform .18s,border-color .18s}
+.aud:hover{transform:translateY(-3px);border-color:var(--border-hl);text-decoration:none;filter:none}
+.aud::before{content:"";position:absolute;top:0;left:0;right:0;height:3px}
+.aud.cyan::before{background:var(--p1)}
+.aud.amber::before{background:var(--p2)}
+.aud.violet::before{background:var(--p3)}
+.aud .who{font-family:var(--font-mono);font-size:.7rem;letter-spacing:.14em;color:var(--text-muted);text-transform:uppercase;margin-bottom:.85rem}
+.aud h3{font-size:1.1rem;margin-bottom:.65rem;color:#fff}
+.aud p{font-size:.92rem;color:var(--text-muted);margin-bottom:1rem;line-height:1.5}
+.aud .cta{display:inline-block;font-family:var(--font-mono);font-size:.82rem;color:#fff;border-bottom:1px dashed var(--text-muted);padding-bottom:1px}
+.aud.cyan:hover{border-color:var(--p1)}
+.aud.amber:hover{border-color:var(--p2)}
+.aud.violet:hover{border-color:var(--p3)}
+
+/* reference architectures topology continuum */
+.arch-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:.8rem;margin:1.5rem 0}
+.arch{display:block;background:var(--bg-card);border:1px solid var(--border);border-radius:10px;padding:1.15rem 1.2rem;color:inherit;text-align:center;transition:border-color .15s,transform .15s}
+.arch:hover{border-color:var(--p1);transform:translateY(-2px);text-decoration:none;filter:none}
+.arch .tier{font-family:var(--font-mono);font-size:.72rem;color:var(--p1);letter-spacing:.14em;font-weight:700}
+.arch .arch-name{font-weight:700;color:#fff;margin:.4rem 0 .25rem;font-size:.95rem}
+.arch .arch-desc{font-size:.78rem;color:var(--text-muted);line-height:1.4}
+
+/* admin / deep-links grid */
+.links-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:.7rem;margin:1.5rem 0}
+.lk{display:block;padding:1rem 1.15rem;background:var(--bg-card);border:1px solid var(--border);border-radius:8px;color:inherit;font-size:.92rem;transition:border-color .15s}
+.lk:hover{border-color:var(--p1);text-decoration:none;filter:none}
+.lk strong{display:block;color:#fff;font-weight:600;margin-bottom:.2rem;font-size:.95rem}
+.lk .desc{color:var(--text-muted);font-size:.8rem;line-height:1.4}
 
 /* footer */
-footer{padding:3rem 0;border-top:1px solid var(--border);color:var(--dim);font-size:.82rem;text-align:center}
-footer a{color:var(--muted)}
-footer .links{margin-bottom:.75rem;display:flex;justify-content:center;gap:1.25rem;flex-wrap:wrap}
+footer{padding:3rem 1.5rem 2.5rem;text-align:center;color:var(--text-dim);font-size:.85rem;border-top:1px solid var(--border)}
+footer .footer-links{display:flex;justify-content:center;gap:1.5rem;flex-wrap:wrap;margin-bottom:1rem}
+footer a{color:var(--text-dim)}
+footer a:hover{color:var(--accent)}
+footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
+
+/* responsive */
+@media(max-width:600px){
+  .hero{padding:4rem 1rem 3rem}
+  .hero .meta{gap:.85rem;font-size:.72rem}
+  section{padding:3rem 0}
+  .cta{padding:.7rem 1.2rem;font-size:.88rem}
+}
 </style>
 </head>
 <body>
 
 <nav class="topnav">
-  <div class="row">
-    <a class="brand" href="./">ai-memory</a>
-    <div class="links">
+  <div class="inner">
+    <div class="left">
+      <a class="brand" href="./">ai-memory&trade;</a>
+    </div>
+    <div class="right">
+      <a href="#why">Why</a>
+      <a href="#mobile">Mobile&nbsp;/&nbsp;IoT</a>
+      <a href="#features">Features</a>
       <a href="#install">Install</a>
-      <a href="#audiences">Docs</a>
-      <a href="#essays">Essays</a>
+      <a href="#integrate">Integrate</a>
+      <a href="#architectures">Architectures</a>
+      <a href="whats-new-v07.html" style="color:var(--p3)">v0.7.0</a>
       <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub</a>
     </div>
   </div>
 </nav>
 
+<!-- ============ HERO ============ -->
 <header class="hero">
-  <div class="wrap-mid">
-    <div class="eyebrow">v0.7.0 &middot; attested-cortex</div>
-    <h1>Persistent memory, knowledge graph, and governance for AI agents.</h1>
-    <p class="lead">ai-memory is the autonomous-tier substrate for AI Non-Human Identity (NHI) agents. Typed memory. A knowledge graph with temporal validity. Signed reflections. One Rust binary, Apache-2.0.</p>
+  <div class="container">
+    <span class="badge">v0.7.0 &middot; attested-cortex &middot; Apache-2.0</span>
+    <h1>Persistent memory, a knowledge graph, and governance for <span class="accent">AI agents</span>.</h1>
+    <p class="subtitle">
+      ai-memory is the autonomous-tier substrate for AI Non-Human Identity (NHI) agents. <strong>Typed memory.</strong> A <strong>knowledge graph</strong> with temporal validity. <strong>Signed reflections</strong> on an append-only audit chain. One Rust binary &mdash; runs on a laptop, a server rack, a region, or a <strong>cellphone</strong>.
+    </p>
+    <div class="meta">
+      <span>73 MCP tools</span>
+      <span>73 HTTP routes</span>
+      <span>56 CLI subcommands</span>
+      <span>Ed25519 attested</span>
+      <span>SQLite&nbsp;+&nbsp;Postgres&#x202F;/&#x202F;AGE</span>
+    </div>
     <div class="cta-row">
-      <a class="cta cta-primary" href="#install">Install</a>
-      <a class="cta cta-secondary" href="essays/brass-tacks-1-what.html">What is it?</a>
+      <a class="cta primary" href="#install">Install in 60 seconds</a>
+      <a class="cta violet" href="whats-new-v07.html">What's new in v0.7.0</a>
+      <a class="cta ghost" href="#why">Why ai-memory?</a>
     </div>
   </div>
 </header>
 
+<!-- ============ MOBILE / IOT SPOTLIGHT — first below-the-fold section ============ -->
+<section class="spotlight" id="mobile">
+  <div class="inner">
+    <div>
+      <div class="icon">&#x1F4F1;&nbsp;&nbsp;Endpoint-class deployment &middot; new in v0.7.0</div>
+      <h2>ai-memory runs on your <span class="accent">cellphone</span>. And on your IoT.</h2>
+      <p>
+        Most "AI memory" stacks assume a cloud server, a vector database, and a network. ai-memory ships a Rust core that cross-compiles to <strong>iOS</strong>, <strong>Android</strong>, and embedded Linux &mdash; the same substrate, the same typed memory + KG + signed reflections, in your pocket. No cloud round-trip. No data leaving the device unless you say so.
+      </p>
+      <p>
+        The lib target produces an <code>xcframework</code> for iOS (device + sim arm64 + sim x86_64) and a <code>jniLibs/&lt;abi&gt;</code> layout for Android (4 ABIs). FTS5 + WAL + HNSW vector recall + embedder all run on the device CPU. CI runtime-tests on iOS Simulator and Android emulator gate every release.
+      </p>
+      <div class="targets">
+        <div class="target">
+          <div class="name">iOS</div>
+          <div class="desc">aarch64-apple-ios<br>device + sim</div>
+        </div>
+        <div class="target">
+          <div class="name">Android</div>
+          <div class="desc">aarch64-linux-android<br>4 ABIs / jniLibs</div>
+        </div>
+        <div class="target">
+          <div class="name">Embedded Linux</div>
+          <div class="desc">arm64 / armv7<br>Raspberry Pi, Jetson</div>
+        </div>
+        <div class="target">
+          <div class="name">Edge IoT</div>
+          <div class="desc">offline-first<br>opt-in federation</div>
+        </div>
+      </div>
+      <div class="cta-row">
+        <a class="cta primary" href="mobile-iot-deployment.md">Mobile &amp; IoT deployment guide &rarr;</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ WHY — value prop continuum singleton → enterprise ============ -->
+<section id="why">
+  <div class="container">
+    <span class="eyebrow">Why ai-memory</span>
+    <h2>One substrate. Five deployment scales. Identical semantics.</h2>
+    <p class="lede">
+      Most AI tooling forces a tier choice up front: a hobby SDK, a cloud SaaS, or a bespoke enterprise rollout. ai-memory is one substrate &mdash; <code>memory_store</code>, <code>memory_recall</code>, <code>memory_link</code>, <code>memory_reflect</code> &mdash; that scales from a single laptop with one AI assistant to a global hive of attesting NHI agents. Same tools. Same wire format. Same governance.
+    </p>
+    <div class="continuum">
+      <a class="step" href="architectures-t1.html">
+        <span class="t-num">T1 &middot; SINGLETON</span>
+        <div class="t-name">Laptop / phone</div>
+        <div class="t-desc">One agent, one device, one DB. Offline-first.</div>
+      </a>
+      <a class="step" href="architectures-t2.html">
+        <span class="t-num">T2 &middot; HOUSEHOLD</span>
+        <div class="t-name">LAN / server</div>
+        <div class="t-desc">Multi-agent, HTTP daemon, shared sqlite.</div>
+      </a>
+      <a class="step" href="architectures-t3.html">
+        <span class="t-num">T3 &middot; ENTERPRISE</span>
+        <div class="t-name">Rack / DC</div>
+        <div class="t-desc">Postgres + Apache AGE, mTLS, governance L1&ndash;L6.</div>
+      </a>
+      <a class="step" href="architectures-t4.html">
+        <span class="t-num">T4 &middot; REGION</span>
+        <div class="t-name">Swarm</div>
+        <div class="t-desc">Quorum federation, peer attestation, HMAC webhooks.</div>
+      </a>
+      <a class="step" href="architectures-t5.html">
+        <span class="t-num">T5 &middot; PLANET</span>
+        <div class="t-name">Global hive</div>
+        <div class="t-desc">Cross-region Ed25519-signed sync, forensic export.</div>
+      </a>
+    </div>
+    <div style="margin-top:1.25rem">
+      <a href="architectures.html" class="cta amber">Reference architectures T1&rarr;T5 &rarr;</a>
+    </div>
+  </div>
+</section>
+
+<!-- ============ FEATURES ============ -->
+<section id="features" class="dark">
+  <div class="container">
+    <span class="eyebrow">Features</span>
+    <h2>What ships in the binary.</h2>
+    <p class="lede">
+      One <code>ai-memory</code> Rust binary exposes three interfaces over a shared storage layer: MCP stdio JSON-RPC, an HTTP API on port 9077, and a clap-based CLI. Pick one or use all three.
+    </p>
+
+    <div class="grid-3">
+      <div class="feat cyan">
+        <span class="tag">Storage</span>
+        <h3>Typed memory, four tiers</h3>
+        <p>Short / mid / long lived rows with auto-promotion on access, sliding-window TTL, FTS5 keyword + HNSW semantic recall, hybrid blended scoring.</p>
+      </div>
+      <div class="feat cyan">
+        <span class="tag">Knowledge graph</span>
+        <h3>Typed links, temporal validity</h3>
+        <p>Six relation kinds (<code>related_to</code>, <code>supersedes</code>, <code>contradicts</code>, <code>derived_from</code>, <code>reflects_on</code>, <code>derives_from</code>) with <code>valid_from</code> / <code>valid_until</code>. Apache AGE acceleration on Postgres.</p>
+      </div>
+      <div class="feat amber">
+        <span class="tag amber">Attestation</span>
+        <h3>Ed25519 signed reflections</h3>
+        <p>Per-agent keypair signs every link. Append-only <code>signed_events</code> audit chain with cross-row hash chaining. Forensic-bundle export &amp; verify.</p>
+      </div>
+      <div class="feat amber">
+        <span class="tag amber">Governance</span>
+        <h3>Substrate rules L1&ndash;L6</h3>
+        <p>Operator-signed rule layer enforces policy on every write. Fail-CLOSED by default. Real permission system replaces v0.6.x advisory governance.</p>
+      </div>
+      <div class="feat violet">
+        <span class="tag violet">Hooks</span>
+        <h3>Programmable 25-event pipeline</h3>
+        <p>Subprocess JSON-stdio handlers fire on store, recall, reflect, link, GC, federation push. HMAC-signed webhooks with DLQ + replay.</p>
+      </div>
+      <div class="feat violet">
+        <span class="tag violet">Federation</span>
+        <h3>Quorum sync, peer attestation</h3>
+        <p>mTLS allowlist, per-message nonce freshness, signature bound to body+nonce. Push DLQ. Operator-controlled trust posture per peer.</p>
+      </div>
+      <div class="feat green">
+        <span class="tag green">Provider-agnostic LLM</span>
+        <h3>15+ vendor backends</h3>
+        <p>Ollama, OpenAI, xAI Grok, Anthropic, Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, LMStudio. One env var selects.</p>
+      </div>
+      <div class="feat green">
+        <span class="tag green">Capabilities v3</span>
+        <h3>Pre-computed calibration</h3>
+        <p>LLMs converge on accurate first-answer descriptions. <code>memory_capabilities</code> ships <code>summary</code>, <code>to_describe_to_user</code>, <code>callable_now</code>, <code>agent_permitted_families</code>.</p>
+      </div>
+      <div class="feat green">
+        <span class="tag green">Sidechain transcripts</span>
+        <h3>Compressed conversation replay</h3>
+        <p>zstd-3 BLOBs + <code>memory_replay</code>. Full conversation context preserved out-of-band from the memory row.</p>
+      </div>
+    </div>
+
+    <p style="margin-top:2rem"><a href="whats-new-v07.html">See what's new in v0.7.0 &rarr;</a> &middot; <a href="at-a-glance.html">Atlas: everything on one page &rarr;</a></p>
+  </div>
+</section>
+
+<!-- ============ INSTALL ============ -->
 <section id="install">
-  <div class="wrap-mid">
-    <div class="eyebrow-h2">Install</div>
-    <h2>Three install paths. Pick one.</h2>
-    <p class="lede">A single static Rust binary, no daemons required to get started. Full install matrix (Windows, Docker, .deb, .rpm, source) in the <a href="INSTALL.md">install reference</a>.</p>
+  <div class="container">
+    <span class="eyebrow">Install</span>
+    <h2>Pick your platform. Three minutes to first recall.</h2>
+    <p class="lede">
+      A single static Rust binary &mdash; no daemons required to get started. The full install matrix (Windows, Docker, .deb, .rpm, source, mobile FFI) lives in the <a href="INSTALL.md">install reference</a>.
+    </p>
 
     <div class="install-grid">
       <div class="install-card">
-        <div class="label">macOS / Linux</div>
+        <div class="platform">macOS &middot; Linux</div>
         <div class="name">Homebrew</div>
         <pre><code>brew install alphaonedev/tap/ai-memory</code></pre>
       </div>
       <div class="install-card">
-        <div class="label">Fedora / RHEL</div>
+        <div class="platform">Fedora &middot; RHEL</div>
         <div class="name">COPR</div>
         <pre><code>sudo dnf copr enable alpha-one-ai/ai-memory
 sudo dnf install ai-memory</code></pre>
       </div>
       <div class="install-card">
-        <div class="label">Any platform</div>
+        <div class="platform">Any platform &middot; Rust</div>
         <div class="name">cargo</div>
         <pre><code>cargo install ai-memory</code></pre>
       </div>
+      <div class="install-card">
+        <div class="platform">Container &middot; Plan C</div>
+        <div class="name">Docker</div>
+        <pre><code>docker run --rm -it \
+  ghcr.io/alphaonedev/ai-memory:0.7.0</code></pre>
+      </div>
+      <div class="install-card">
+        <div class="platform">iOS &middot; Android</div>
+        <div class="name">Mobile FFI</div>
+        <pre><code># release artifacts
+ai-memory-ios.xcframework.tar.gz
+ai-memory-android.tar.gz</code></pre>
+      </div>
+      <div class="install-card">
+        <div class="platform">Source</div>
+        <div class="name">Build from git</div>
+        <pre><code>git clone https://github.com/alphaonedev/ai-memory-mcp
+cd ai-memory-mcp &amp;&amp; cargo build --release</code></pre>
+      </div>
     </div>
 
-    <p>Verify:</p>
-    <pre><code>ai-memory --version
-ai-memory 0.7.0</code></pre>
+    <div style="margin-top:1.5rem">
+      <a class="cta primary" href="install-quickstart.md">Quickstart for non-technical users &rarr;</a>
+      &nbsp;
+      <a class="cta ghost" href="QUICKSTART.md">3-minute engineer quickstart</a>
+    </div>
+  </div>
+</section>
+
+<!-- ============ INTEGRATION ============ -->
+<section id="integrate" class="dark">
+  <div class="container">
+    <span class="eyebrow">Integrate</span>
+    <h2>Talk to your AI assistant of choice.</h2>
+    <p class="lede">
+      ai-memory speaks the Model Context Protocol over stdio JSON-RPC, plus an HTTP REST API for any client that prefers HTTP. Out of the box it pairs with Claude Code, Cursor, ChatGPT desktop, and any MCP-compliant harness.
+    </p>
+
+    <div class="integration-grid">
+      <a class="int-card" href="integration-guide.md">
+        <div class="label">Anthropic</div>
+        <h4>Claude Code</h4>
+        <p>Cursor-style coding agent with MCP. SessionStart hook auto-loads relevant memory.</p>
+        <span class="arrow">Configure &rarr;</span>
+      </a>
+      <a class="int-card" href="integration-guide.md#cursor">
+        <div class="label">Anysphere</div>
+        <h4>Cursor</h4>
+        <p>MCP server config. Persistent memory across editor sessions and projects.</p>
+        <span class="arrow">Configure &rarr;</span>
+      </a>
+      <a class="int-card" href="integration-guide.md#chatgpt">
+        <div class="label">OpenAI</div>
+        <h4>ChatGPT desktop</h4>
+        <p>MCP integration. Cross-session recall for the desktop client.</p>
+        <span class="arrow">Configure &rarr;</span>
+      </a>
+      <a class="int-card" href="integration-guide.md#generic-mcp">
+        <div class="label">Standard</div>
+        <h4>Generic MCP</h4>
+        <p>stdio JSON-RPC 2.0. Any harness that implements MCP works unchanged.</p>
+        <span class="arrow">Configure &rarr;</span>
+      </a>
+      <a class="int-card" href="API_REFERENCE.md">
+        <div class="label">HTTP</div>
+        <h4>REST API</h4>
+        <p>73 routes at <code>/api/v1/</code>. Axum daemon on port 9077. mTLS optional.</p>
+        <span class="arrow">API reference &rarr;</span>
+      </a>
+      <a class="int-card" href="CLI_REFERENCE.md">
+        <div class="label">CLI</div>
+        <h4>Command line</h4>
+        <p>56 subcommands, optional <code>--json</code>. For shell scripts, cron, and humans.</p>
+        <span class="arrow">CLI reference &rarr;</span>
+      </a>
+    </div>
+
+    <p style="margin-top:1.5rem"><a href="integration-guide.md">Full integration guide &mdash; any AI, any harness &rarr;</a></p>
+  </div>
+</section>
+
+<!-- ============ AUDIENCE PICKER ============ -->
+<section id="audiences">
+  <div class="container">
+    <span class="eyebrow">Docs by audience</span>
+    <h2>Pick your role. We will get to the point.</h2>
+    <p class="lede">
+      Three landing pages, each answering one question in the first paragraph. Reference material lives in the linked docs; the audience pages stay short.
+    </p>
+
+    <div class="audience-row">
+      <a class="aud cyan" href="install-quickstart.md">
+        <div class="who">End user &middot; non-technical</div>
+        <h3>I want to talk to my AI and have it remember.</h3>
+        <p>Install ai-memory in 60 seconds. Plug it into Claude Code or ChatGPT desktop. Your assistant remembers across sessions. No databases, no servers, no jargon.</p>
+        <span class="cta">Quickstart &rarr;</span>
+      </a>
+      <a class="aud amber" href="integration-guide.md">
+        <div class="who">Developer &middot; integration</div>
+        <h3>I am building with ai-memory.</h3>
+        <p>Three interfaces: MCP, HTTP, CLI. Persistent typed memory for your AI app, agent, or harness. Generic MCP works out of the box; Claude Code, Cursor, ChatGPT desktop, others have first-class recipes.</p>
+        <span class="cta">Integration guide &rarr;</span>
+      </a>
+      <a class="aud violet" href="enterprise-deployment.md">
+        <div class="who">SME engineer / architect</div>
+        <h3>I am deploying across racks, DCs, regions.</h3>
+        <p>Postgres + Apache AGE backend, mTLS daemon, federated quorum, governance L1&ndash;L6, Ed25519 attestation, swarm + hive topologies. Reproducible reference architectures T3&ndash;T5.</p>
+        <span class="cta">Enterprise deployment &rarr;</span>
+      </a>
+    </div>
+  </div>
+</section>
+
+<!-- ============ REFERENCE ARCHITECTURES ============ -->
+<section id="architectures" class="dark">
+  <div class="container">
+    <span class="eyebrow">Reference architectures</span>
+    <h2>Five topologies. One playbook each.</h2>
+    <p class="lede">
+      Each tier has a reproducible reference deployment: which interfaces are enabled, which backend is selected, which governance posture, which federation mode. Pick the tier that fits today; the upgrade path to the next tier is documented.
+    </p>
+    <div class="arch-grid">
+      <a class="arch" href="architectures-t1.html">
+        <div class="tier">T1</div>
+        <div class="arch-name">Singleton</div>
+        <div class="arch-desc">One agent &middot; one DB &middot; offline</div>
+      </a>
+      <a class="arch" href="architectures-t2.html">
+        <div class="tier">T2</div>
+        <div class="arch-name">Household</div>
+        <div class="arch-desc">LAN &middot; multi-agent &middot; sqlite</div>
+      </a>
+      <a class="arch" href="architectures-t3.html">
+        <div class="tier">T3</div>
+        <div class="arch-name">Enterprise</div>
+        <div class="arch-desc">Postgres+AGE &middot; mTLS &middot; rack</div>
+      </a>
+      <a class="arch" href="architectures-t4.html">
+        <div class="tier">T4</div>
+        <div class="arch-name">Region</div>
+        <div class="arch-desc">Swarm &middot; quorum &middot; webhooks</div>
+      </a>
+      <a class="arch" href="architectures-t5.html">
+        <div class="tier">T5</div>
+        <div class="arch-name">Planet</div>
+        <div class="arch-desc">Global hive &middot; cross-region sync</div>
+      </a>
+    </div>
 
     <div style="margin-top:2rem">
-      <a class="cta cta-primary" href="QUICKSTART.md">Get started in 3 minutes &rarr;</a>
-      &nbsp;
-      <a class="cta cta-secondary" href="API_REFERENCE.md">API reference</a>
+      <h3 style="font-size:1.1rem;margin-bottom:.85rem">Deep dives</h3>
+      <div class="links-grid">
+        <a class="lk" href="reference-architectures.md">
+          <strong>Topology diagrams</strong>
+          <span class="desc">Architecture diagrams, capacity guidance, failure-mode notes for each tier.</span>
+        </a>
+        <a class="lk" href="architectures.html">
+          <strong>T1&rarr;T5 narrative</strong>
+          <span class="desc">Walks the continuum: which capability lights up at which tier.</span>
+        </a>
+        <a class="lk" href="hierarchies.html">
+          <strong>Agent hierarchies</strong>
+          <span class="desc">Hive / swarm / mesh patterns and the NHI roles they assume.</span>
+        </a>
+        <a class="lk" href="federation.md">
+          <strong>Federation</strong>
+          <span class="desc">Quorum sync, peer attestation, mTLS allowlist, nonce + signature posture.</span>
+        </a>
+      </div>
     </div>
   </div>
 </section>
 
-<section id="audiences">
-  <div class="wrap">
-    <div class="wrap-mid" style="padding:0">
-      <div class="eyebrow-h2">Docs by audience</div>
-      <h2>Pick your role. We will get to the point.</h2>
-      <p class="lede">Three landing pages, each answering one question in the first paragraph. Reference material lives in the linked docs; no scrolling required.</p>
-    </div>
+<!-- ============ ADMIN / OPERATOR ============ -->
+<section id="admin">
+  <div class="container">
+    <span class="eyebrow">Admin &amp; operator</span>
+    <h2>Run it in production.</h2>
+    <p class="lede">
+      Operator-grade documentation for SRE, platform, and security teams. Hardening, observability, upgrade paths, governance rule signing, forensic export &mdash; everything you would expect for a substrate that holds your agents' identities.
+    </p>
 
-    <div class="audience-grid">
-      <a class="aud-card" href="audience/operator.html">
-        <div class="role">Operator / SRE</div>
-        <h3>Deploy and run ai-memory in production.</h3>
-        <p>Install, config.toml essentials, HTTP daemon, MCP stdio, observability, hardening, Plan C container, upgrade path.</p>
-        <span class="arrow">Read &rarr;</span>
+    <div class="links-grid">
+      <a class="lk" href="production-deployment.md">
+        <strong>Production deployment</strong>
+        <span class="desc">Daemon, systemd unit, TLS, mTLS, hardening, observability, Plan C container.</span>
       </a>
-      <a class="aud-card" href="audience/developer.html">
-        <div class="role">Developer</div>
-        <h3>Build with ai-memory. Three interfaces.</h3>
-        <p>MCP, HTTP, CLI. NHI agent_id semantics. Hooks and subscriptions. Adding tools, families, hooks.</p>
-        <span class="arrow">Read &rarr;</span>
+      <a class="lk" href="ADMIN_GUIDE.md">
+        <strong>Admin guide</strong>
+        <span class="desc">Backup/restore, schema migrations, GC tuning, archive policy.</span>
       </a>
-      <a class="aud-card" href="audience/decision-maker.html">
-        <div class="role">Decision maker</div>
-        <h3>Evaluate ai-memory for your team.</h3>
-        <p>What problem this solves. Measured comparison to vector-DB-only. Risk profile, total cost, roadmap v0.7&rarr;v1.0.</p>
-        <span class="arrow">Read &rarr;</span>
+      <a class="lk" href="governance.html">
+        <strong>Governance L1&ndash;L6</strong>
+        <span class="desc">Substrate rules, operator-signed policy, fail-closed posture.</span>
       </a>
-    </div>
-  </div>
-</section>
-
-<section id="essays">
-  <div class="wrap-mid">
-    <div class="eyebrow-h2">Brass-tacks essays</div>
-    <h2>Plain English. No jargon ladder.</h2>
-    <p class="lede">Three short reads on what ai-memory is, how an AI NHI uses it across a session, and why it beats sticking with a vector DB alone.</p>
-
-    <div class="essay-list">
-      <a class="essay-row" href="essays/brass-tacks-1-what.html">
-        <div class="essay-num">01</div>
-        <div class="essay-body">
-          <h4>ai-memory in 60 seconds &mdash; what it actually is</h4>
-          <p>Substrate for AI NHI agents: typed memory + KG + governance + hooks. Not a notebook.</p>
-        </div>
-        <div class="essay-arrow">&rarr;</div>
+      <a class="lk" href="encryption.html">
+        <strong>Encryption at rest</strong>
+        <span class="desc">sqlcipher build, passphrase-file discipline, key directory layout.</span>
       </a>
-      <a class="essay-row" href="essays/brass-tacks-2-how.html">
-        <div class="essay-num">02</div>
-        <div class="essay-body">
-          <h4>How an AI NHI uses ai-memory &mdash; the autonomous tier in action</h4>
-          <p>Boot &rarr; recall &rarr; store &rarr; link &rarr; consolidate &rarr; reflect &rarr; handoff, with real tool calls.</p>
-        </div>
-        <div class="essay-arrow">&rarr;</div>
+      <a class="lk" href="forensic-export.md">
+        <strong>Forensic export</strong>
+        <span class="desc">Verifiable bundle export for audit, compliance, incident response.</span>
       </a>
-      <a class="essay-row" href="essays/brass-tacks-3-why.html">
-        <div class="essay-num">03</div>
-        <div class="essay-body">
-          <h4>Why ai-memory beats vector-DB-only &mdash; with measured numbers</h4>
-          <p>Typed kinds. Temporal validity. Ed25519-signed links. Operator-signed substrate rules. Numbers.</p>
-        </div>
-        <div class="essay-arrow">&rarr;</div>
+      <a class="lk" href="TROUBLESHOOTING.md">
+        <strong>Troubleshooting</strong>
+        <span class="desc">Common errors, recovery procedures, diagnostic CLI flags.</span>
+      </a>
+      <a class="lk" href="migration-v064-to-v070.md">
+        <strong>Migration v0.6.4 &rarr; v0.7.0</strong>
+        <span class="desc">Step-by-step migration, schema changes, breaking-change list.</span>
+      </a>
+      <a class="lk" href="v0.7.0/release-notes.md">
+        <strong>v0.7.0 release notes</strong>
+        <span class="desc">What changed since v0.6.4. Track-by-track ship status.</span>
       </a>
     </div>
   </div>
 </section>
 
-<section id="dig-deeper" class="tight">
-  <div class="wrap-mid">
-    <div class="eyebrow-h2">Dig deeper</div>
-    <h2>Reference material.</h2>
-    <p>The full docs surface &mdash; concept pages, API, guides, ADRs &mdash; lives alongside the source.</p>
-    <div class="deeper">
-      <a href="USER_GUIDE.md"><strong>User guide</strong><span class="desc">End-to-end MCP tool reference</span></a>
-      <a href="ADMIN_GUIDE.md"><strong>Admin guide</strong><span class="desc">TLS, mTLS, systemd, hardening</span></a>
-      <a href="DEVELOPER_GUIDE.md"><strong>Developer guide</strong><span class="desc">Build from source, extend</span></a>
-      <a href="CLI_REFERENCE.md"><strong>CLI reference</strong><span class="desc">~50 subcommands</span></a>
-      <a href="API_REFERENCE.md"><strong>HTTP API</strong><span class="desc">72 routes at /api/v1/</span></a>
-      <a href="GLOSSARY.md"><strong>Glossary</strong><span class="desc">Every concept in one place</span></a>
-      <a href="architectures.html"><strong>Architectures</strong><span class="desc">T1 single agent &rarr; T5 global hive</span></a>
-      <a href="knowledge-graph.html"><strong>Knowledge graph</strong><span class="desc">Typed links, temporal validity</span></a>
-      <a href="governance.html"><strong>Governance</strong><span class="desc">Substrate rules L1&ndash;L6</span></a>
-      <a href="agent-identity.html"><strong>Agent identity (NHI)</strong><span class="desc">agent_id semantics</span></a>
-      <a href="TROUBLESHOOTING.md"><strong>Troubleshooting</strong><span class="desc">Common errors</span></a>
-      <a href="at-a-glance.html"><strong>Atlas</strong><span class="desc">Everything, one page</span></a>
+<!-- ============ DEEPER ============ -->
+<section id="deeper" class="tight dark">
+  <div class="container">
+    <span class="eyebrow">Reference</span>
+    <h2>Dig deeper.</h2>
+    <p class="lede">The full docs surface &mdash; concept pages, API, guides, ADRs &mdash; lives alongside the source.</p>
+    <div class="links-grid">
+      <a class="lk" href="USER_GUIDE.md"><strong>User guide</strong><span class="desc">End-to-end MCP tool reference</span></a>
+      <a class="lk" href="DEVELOPER_GUIDE.md"><strong>Developer guide</strong><span class="desc">Build from source, extend, add tools</span></a>
+      <a class="lk" href="API_REFERENCE.md"><strong>HTTP API</strong><span class="desc">73 routes at /api/v1/</span></a>
+      <a class="lk" href="CLI_REFERENCE.md"><strong>CLI reference</strong><span class="desc">56 subcommands</span></a>
+      <a class="lk" href="GLOSSARY.md"><strong>Glossary</strong><span class="desc">Every concept, one place</span></a>
+      <a class="lk" href="knowledge-graph.html"><strong>Knowledge graph</strong><span class="desc">Typed links, temporal validity</span></a>
+      <a class="lk" href="agent-identity.html"><strong>Agent identity (NHI)</strong><span class="desc">agent_id semantics</span></a>
+      <a class="lk" href="hook-pipeline.md"><strong>Hook pipeline</strong><span class="desc">25 events, JSON-stdio handlers</span></a>
+      <a class="lk" href="confidence-calibration.md"><strong>Confidence calibration</strong><span class="desc">Auto-confidence, shadow, decay</span></a>
+      <a class="lk" href="atomisation.md"><strong>Atomisation (WT-1)</strong><span class="desc">Atom rows, parent links</span></a>
+      <a class="lk" href="ENGINEERING_STANDARDS.md"><strong>Engineering standards</strong><span class="desc">Code, test, security, release</span></a>
+      <a class="lk" href="at-a-glance.html"><strong>Atlas</strong><span class="desc">Everything, one page</span></a>
     </div>
   </div>
 </section>
 
-<section id="campaigns" class="tight">
-  <div class="wrap-mid">
-    <div class="eyebrow-h2">v0.7.0 test campaigns</div>
-    <h2>Reproducible test evidence.</h2>
-    <p>The v0.7.0 release gate is gated on 100% green tests across NHI playbook (Track A), A2A 4-domain (Track B), Postgres+AGE (Track C), and cross-node (Track D). Campaign records:</p>
-    <div class="deeper">
-      <a href="v0.7.0/test-campaign-2026-05-18/"><strong>2026-05-18 &mdash; Track A re-run + fix batch</strong><span class="desc">SHIP verdict, 85 PASS / 0 FAIL, 10 issues closed in-campaign</span></a>
-      <a href="v0.7.0/test-campaign-2026-05-17/"><strong>2026-05-17 &mdash; Full-spectrum campaign</strong><span class="desc">Tracks A&ndash;D, four-audience writeup</span></a>
-      <a href="v0.7.0/release-notes.md"><strong>v0.7.0 release notes</strong><span class="desc">What changed since v0.6.4</span></a>
-    </div>
-  </div>
-</section>
-
+<!-- ============ FOOTER ============ -->
 <footer>
-  <div class="wrap-mid">
-    <div class="links">
-      <a href="https://github.com/alphaonedev/ai-memory-mcp">Source</a>
-      <a href="https://github.com/alphaonedev/ai-memory-mcp/issues">Issues</a>
-      <a href="SECURITY.md">Security</a>
-      <a href="credits.html">Credits</a>
-    </div>
-    <div>ai-memory &mdash; Apache-2.0 &mdash; &copy; 2026 AlphaOne LLC</div>
+  <div class="footer-links">
+    <a href="https://github.com/alphaonedev/ai-memory-mcp">Source</a>
+    <a href="https://github.com/alphaonedev/ai-memory-mcp/issues">Issues</a>
+    <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/CHANGELOG.md">Changelog</a>
+    <a href="SECURITY.md">Security</a>
+    <a href="credits.html">Credits</a>
+    <a href="whats-new-v07.html">v0.7.0</a>
+    <a href="whats-new-v064.html">v0.6.4</a>
   </div>
+  <div>ai-memory&trade; &middot; Apache-2.0 &middot; &copy; 2026 AlphaOne LLC</div>
+  <div class="legal">Built for AI Non-Human Identity agents that need to remember &mdash; from a phone to a planet.</div>
 </footer>
 
 </body>
