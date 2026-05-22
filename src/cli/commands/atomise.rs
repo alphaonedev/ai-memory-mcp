@@ -28,7 +28,7 @@
 //! |   2  | not_found                | source memory id does not exist               |
 //! |   3  | tier_locked              | daemon tier is `keyword`                      |
 //! |   4  | curator_failed           | LLM round-trip exhausted retries              |
-//! |   5  | governance_refused       | pre_store hook refused atom mid-batch         |
+//! |   5  | GOVERNANCE_REFUSED       | pre_store hook refused atom mid-batch         |
 //! |   6  | db_error                 | DB / signer / I/O failure                     |
 //!
 //! ## Test injection
@@ -141,7 +141,13 @@ pub fn error_slug(err: &AtomiseError) -> &'static str {
         AtomiseError::NotFound => "not_found",
         AtomiseError::TierLocked => "tier_locked",
         AtomiseError::CuratorFailed(_) => "curator_failed",
-        AtomiseError::GovernanceRefused(_) => "governance_refused",
+        // v0.7.0 #1103 — case-standardisation: MCP wire uses
+        // `GOVERNANCE_REFUSED` and HTTP envelope's `code` field uses
+        // `GOVERNANCE_REFUSED` so the CLI slug now matches. Pre-#1103
+        // this site emitted lowercase `governance_refused` which
+        // diverged from the two other surfaces; operators parsing
+        // `--json` output couldn't grep `GOVERNANCE_REFUSED` uniformly.
+        AtomiseError::GovernanceRefused(_) => "GOVERNANCE_REFUSED",
         AtomiseError::DbError(_) => "db_error",
         AtomiseError::SignerError(_) => "signer_error",
     }
@@ -417,9 +423,15 @@ mod tests {
             error_slug(&AtomiseError::CuratorFailed("x".into())),
             "curator_failed"
         );
+        // v0.7.0 #1103 — uppercase tag matches the MCP wire shape
+        // (`GOVERNANCE_REFUSED: <reason>` per
+        // `src/mcp/tools/store/mod.rs`) + the HTTP `code` field
+        // (`{"code":"GOVERNANCE_REFUSED",...}` per
+        // `src/handlers/create.rs`). Pre-#1103 the CLI slug was
+        // lowercase and diverged from the other two surfaces.
         assert_eq!(
             error_slug(&AtomiseError::GovernanceRefused("x".into())),
-            "governance_refused"
+            "GOVERNANCE_REFUSED"
         );
         assert_eq!(
             error_slug(&AtomiseError::SourceTooSmall),

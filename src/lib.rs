@@ -425,6 +425,13 @@ pub fn build_router_with_timeout(
             "/api/v1/skill/{id}/compose",
             post(handlers::skill_compose_route),
         )
+        // v0.7.0 #1095 — `POST /api/v1/share` HTTP parity for the
+        // MCP-only `memory_share` tool. Closes the SR-4 three-surface
+        // parity audit gap (#1095). Mirrors the MCP wire shape
+        // (`source_memory_id` + `target_agent_id`) and wraps the same
+        // substrate primitive (`crate::mcp::tools::share::handle_share`)
+        // so MCP / HTTP behave byte-equally.
+        .route("/api/v1/share", post(handlers::share_memory))
         .layer(axum::middleware::from_fn_with_state(
             api_key_state,
             handlers::api_key_auth,
