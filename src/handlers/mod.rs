@@ -66,6 +66,11 @@ pub mod postgres_gate;
 pub mod power;
 pub mod power_consolidation;
 pub mod recall;
+/// v0.7.0 #1111 — 14 missing HTTP routes for the MCP-only tools the
+/// SR-4 three-surface-parity audit flagged. Each handler is a thin
+/// wrapper around the existing `crate::mcp::handle_<name>` substrate
+/// primitive; wire envelopes are byte-equal across the two surfaces.
+pub mod route_1111;
 pub mod share;
 pub mod skills;
 pub mod subscriptions;
@@ -97,6 +102,7 @@ pub use postgres_gate::*;
 pub use power::*;
 pub use power_consolidation::*;
 pub use recall::*;
+pub use route_1111::*;
 pub use share::*;
 pub use skills::*;
 pub use subscriptions::*;

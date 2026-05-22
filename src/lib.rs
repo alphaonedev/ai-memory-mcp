@@ -432,6 +432,68 @@ pub fn build_router_with_timeout(
         // substrate primitive (`crate::mcp::tools::share::handle_share`)
         // so MCP / HTTP behave byte-equally.
         .route("/api/v1/share", post(handlers::share_memory))
+        // v0.7.0 #1111 — 14 HTTP routes for the MCP-only tools the
+        // SR-4 three-surface-parity audit flagged. Each route is a thin
+        // wrapper around the existing `crate::mcp::handle_<name>`
+        // substrate primitive; wire envelopes are byte-equal across
+        // the MCP and HTTP surfaces. See
+        // [`crate::handlers::route_1111`] for the per-handler module.
+        .route(
+            "/api/v1/memory_smart_load",
+            post(handlers::route_1111::handle_smart_load_http),
+        )
+        .route(
+            "/api/v1/memory_reflect",
+            post(handlers::route_1111::handle_reflect_http),
+        )
+        .route(
+            "/api/v1/memory_recall_observations",
+            post(handlers::route_1111::handle_recall_observations_http),
+        )
+        .route(
+            "/api/v1/memory_reflection_origin",
+            post(handlers::route_1111::handle_reflection_origin_http),
+        )
+        .route(
+            "/api/v1/memory_dependents_of_invalidated",
+            post(handlers::route_1111::handle_dependents_of_invalidated_http),
+        )
+        .route(
+            "/api/v1/memory_export_reflection",
+            post(handlers::route_1111::handle_export_reflection_http),
+        )
+        .route(
+            "/api/v1/memory_atomise",
+            post(handlers::route_1111::handle_atomise_http),
+        )
+        .route(
+            "/api/v1/memory_calibrate_confidence",
+            post(handlers::route_1111::handle_calibrate_confidence_http),
+        )
+        .route(
+            "/api/v1/memory_verify",
+            post(handlers::route_1111::handle_verify_http),
+        )
+        .route(
+            "/api/v1/memory_replay",
+            post(handlers::route_1111::handle_replay_http),
+        )
+        .route(
+            "/api/v1/memory_subscription_replay",
+            post(handlers::route_1111::handle_subscription_replay_http),
+        )
+        .route(
+            "/api/v1/memory_subscription_dlq_list",
+            post(handlers::route_1111::handle_subscription_dlq_list_http),
+        )
+        .route(
+            "/api/v1/memory_rule_list",
+            post(handlers::route_1111::handle_rule_list_http),
+        )
+        .route(
+            "/api/v1/memory_check_agent_action",
+            post(handlers::route_1111::handle_check_agent_action_http),
+        )
         .layer(axum::middleware::from_fn_with_state(
             api_key_state,
             handlers::api_key_auth,

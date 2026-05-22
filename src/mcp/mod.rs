@@ -478,6 +478,20 @@ pub use skill_promote::handle_skill_promote_from_reflection;
 pub use skill_register::handle_skill_register;
 pub use skill_resource::handle_skill_resource;
 
+// v0.7.0 #1111 — public re-exports for the HTTP-route closeout. The
+// six MCP handlers below were `pub(super)` so external callers couldn't
+// reach them; the HTTP routes in src/handlers/<name>.rs need a stable
+// path. Wire shape is preserved verbatim — the HTTP handlers are thin
+// wrappers around these. Pre-#1111 the HTTP routes were missing
+// entirely (SR-4 three-surface-parity audit gap).
+pub use calibrate_confidence::handle_calibrate_confidence;
+pub use dependents_of_invalidated::handle_dependents_of_invalidated;
+pub use export_reflection::handle_export_reflection;
+pub use pending::handle_subscription_dlq_list;
+pub use reflect::handle_reflect;
+pub use reflection_origin::handle_reflection_origin;
+pub use subscribe::handle_subscription_replay;
+
 /// #913 (security-medium / SOC2, 2026-05-19) — test-only dispatcher
 /// into `handle_archive_purge`. The handler is `pub(super)` in the
 /// archive module so external regression tests cannot reach it
@@ -650,14 +664,18 @@ use consolidate::handle_consolidate;
 // v0.7.0 WT-1-C — `memory_atomise` MCP tool wiring.
 use atomise::handle_atomise;
 // v0.7.0 Form 5 (issue #758) — `memory_calibrate_confidence` MCP tool wiring.
-use calibrate_confidence::handle_calibrate_confidence;
+// Note: `handle_calibrate_confidence` is `pub use`-exported above for the
+// #1111 HTTP-route closeout (src/handlers/calibrate_confidence.rs needs
+// a stable path). Avoid the duplicate `use` here; the dispatch in
+// `handle_request` below resolves it through the crate path.
 use delete::handle_delete;
-use dependents_of_invalidated::handle_dependents_of_invalidated;
+// v0.7.0 #1111 — `handle_dependents_of_invalidated` is `pub use`-
+// exported above; dispatch resolves via the crate path.
 use detect_contradiction::handle_detect_contradiction;
 use entity_get_by_alias::handle_entity_get_by_alias;
 use entity_register::handle_entity_register;
 use expand_query::handle_expand_query;
-use export_reflection::handle_export_reflection;
+// v0.7.0 #1111 — `handle_export_reflection` is `pub use`-exported above.
 use forget::{handle_forget, handle_stats};
 use get::handle_get;
 use get_taxonomy::handle_get_taxonomy;
@@ -668,7 +686,7 @@ use kg_timeline::handle_kg_timeline;
 use link::{handle_get_links, handle_link};
 use list::handle_list;
 use pending::handle_pending_list;
-use pending::handle_subscription_dlq_list;
+// v0.7.0 #1111 — `handle_subscription_dlq_list` is `pub use`-exported above.
 use persona::{handle_persona, handle_persona_generate};
 // Issue #809 — re-export handle_persona_generate as a stable pub
 // symbol so the nhi-self-persona regression test
@@ -679,8 +697,8 @@ use persona::{handle_persona, handle_persona_generate};
 // direct handler access.
 pub use persona::handle_persona_generate as persona_generate_call;
 use promote::handle_promote;
-use reflect::handle_reflect;
-use reflection_origin::handle_reflection_origin;
+// v0.7.0 #1111 — `handle_reflect` and `handle_reflection_origin` are
+// `pub use`-exported above for the HTTP-route closeout.
 use search::handle_search;
 // handle_skill_compositional_context is re-exported above via
 // `pub use skill_compositional_context::handle_skill_compositional_context`
@@ -720,7 +738,8 @@ pub fn skill_compositional_context_for_tests(
 // L1-5 / L2-6 regression suites and the CLI/HTTP surfaces can drive
 // them directly without going through the stdio JSON-RPC layer.
 use store::handle_store;
-use subscribe::{handle_list_subscriptions, handle_subscribe, handle_subscription_replay};
+// v0.7.0 #1111 — `handle_subscription_replay` is `pub use`-exported above.
+use subscribe::{handle_list_subscriptions, handle_subscribe};
 use update::handle_update;
 
 // ---------------------------------------------------------------------------

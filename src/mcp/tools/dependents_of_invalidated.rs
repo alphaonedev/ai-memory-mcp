@@ -35,7 +35,7 @@ use serde_json::{Value, json};
 /// * `memory_id is required` — caller omitted the parameter.
 /// * `memory_id cannot be empty`.
 /// * substrate errors are bubbled up verbatim.
-pub(super) fn handle_dependents_of_invalidated(
+pub fn handle_dependents_of_invalidated(
     conn: &rusqlite::Connection,
     params: &Value,
 ) -> Result<Value, String> {
