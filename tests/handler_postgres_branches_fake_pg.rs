@@ -1229,10 +1229,21 @@ async fn pg_get_stats_returns_struct() {
 }
 
 #[tokio::test]
-async fn pg_run_gc_happy() {
+async fn pg_run_gc_rejects_empty_allowlist_403() {
+    // v0.7.0 #1027 + #1107 — `/api/v1/gc` is admin-gated. Empty
+    // admin-allowlist (this fixture's default) rejects every caller.
+    // The admin-admit happy path is covered in
+    // `tests/admin_run_gc_require_admin_1027.rs` (403 reject + 200
+    // admit, end-to-end). Same convention as #946 pg_get_stats and
+    // #957 pg_export — the empty-allowlist branch lives here, the
+    // admit branch lives in its own per-issue file. (#1127)
     let (router, _f) = build_fake_pg_router();
-    let (status, _v) = post_json(&router, "/api/v1/gc", json!({})).await;
-    assert_eq!(status, StatusCode::OK);
+    let (status, v) = post_json(&router, "/api/v1/gc", json!({})).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "#1027: empty-allowlist /api/v1/gc MUST reject; body={v}"
+    );
 }
 
 // ---------------------------------------------------------------------------
