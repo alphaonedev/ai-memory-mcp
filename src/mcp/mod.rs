@@ -1539,15 +1539,27 @@ pub(crate) static TOOL_DISPATCH_TABLE: &[(&str, DispatchFn)] = &[
     register_mcp_tool!("memory_deref", dispatch_memory_deref),
 ];
 
-/// Linear-scan lookup against [`TOOL_DISPATCH_TABLE`]. Returns the
-/// matching `DispatchFn` or `None` if the tool is unknown. The caller
-/// (`handle_request`'s `tools/call` branch) maps `None` to the
-/// JSON-RPC `-32601` "method not found" envelope.
+/// v0.7.0 #1105 — O(1) HashMap-based lookup against
+/// [`TOOL_DISPATCH_TABLE`]. Pre-#1105 this was a linear scan over the
+/// 73-entry slice; the MCP stdio transport is single-threaded by
+/// protocol design so the per-call overhead is paid serially and
+/// contributes directly to dispatch latency for tools at the
+/// alphabetical end of the table.
+///
+/// Returns the matching `DispatchFn` or `None` if the tool is
+/// unknown. The caller maps `None` to the JSON-RPC `-32601` "method
+/// not found" envelope.
 pub(crate) fn lookup_dispatch(tool_name: &str) -> Option<DispatchFn> {
-    TOOL_DISPATCH_TABLE
-        .iter()
-        .find(|(name, _)| *name == tool_name)
-        .map(|(_, f)| *f)
+    static MAP: std::sync::OnceLock<std::collections::HashMap<&'static str, DispatchFn>> =
+        std::sync::OnceLock::new();
+    let map = MAP.get_or_init(|| {
+        let mut m = std::collections::HashMap::with_capacity(TOOL_DISPATCH_TABLE.len());
+        for (name, f) in TOOL_DISPATCH_TABLE {
+            m.insert(*name, *f);
+        }
+        m
+    });
+    map.get(tool_name).copied()
 }
 
 #[allow(clippy::too_many_arguments)]

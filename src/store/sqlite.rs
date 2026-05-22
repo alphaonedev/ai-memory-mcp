@@ -480,23 +480,38 @@ impl MemoryStore for SqliteStore {
             return Ok(());
         }
         let conn = self.state.lock().await;
+        // v0.7.0 #1079 — collapse the per-id `db::touch` loop
+        // (BEGIN+3UPDATE+COMMIT per id) into a single
+        // `db::touch_many` call. Pre-#1079 a 10-result recall paid
+        // 40 SQLite write-lock acquisitions; batched form pays 1
+        // outer transaction with 3N cached UPDATE statements.
+        let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        if let Err(e) = db::touch_many(&conn, &id_refs, 3600, 86_400) {
+            tracing::warn!("touch_many failed for {} memories: {e}", ids.len());
+        }
         // v0.7.0 Form 5 / Cluster G — opportunistic freshness-decay
         // update on touch. Gated on `AI_MEMORY_CONFIDENCE_DECAY=1`
         // (default-off; audit-honest contract). When enabled, the
         // recall path stamps `confidence_decayed_at`, overwrites
         // `confidence` with the decayed value, and flips
         // `confidence_source` to `'decayed'` so the forensic bundle
-        // reflects the provenance change. The pure decay math lives
-        // in `crate::confidence::decay::decayed`; this site is the
-        // substrate-side wiring (UPDATE).
-        let decay_enabled = crate::confidence::decay::decay_enabled();
-        for id in ids {
-            if let Err(e) = db::touch(&conn, id, 3600, 86_400) {
-                tracing::warn!("touch failed for memory {id}: {e}");
-            }
-            if decay_enabled && let Err(e) = crate::confidence::decay::apply_decay_touch(&conn, id)
-            {
-                tracing::warn!("confidence decay touch failed for memory {id}: {e}");
+        // reflects the provenance change.
+        //
+        // v0.7.0 #1079 — wrap the per-id decay-touch loop in a single
+        // BEGIN/COMMIT pair so each id pays only the UPDATE cost.
+        if crate::confidence::decay::decay_enabled() {
+            if let Err(e) = conn.execute_batch("BEGIN IMMEDIATE") {
+                tracing::warn!("decay-touch BEGIN failed: {e}");
+            } else {
+                for id in ids {
+                    if let Err(e) = crate::confidence::decay::apply_decay_touch(&conn, id) {
+                        tracing::warn!("confidence decay touch failed for memory {id}: {e}");
+                    }
+                }
+                if let Err(e) = conn.execute_batch("COMMIT") {
+                    tracing::warn!("decay-touch COMMIT failed: {e}");
+                    let _ = conn.execute_batch("ROLLBACK");
+                }
             }
         }
         Ok(())

@@ -6,7 +6,7 @@ use candle_core::{Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config};
 use hf_hub::{Repo, RepoType, api::sync::Api};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokenizers::Tokenizer;
 
 use crate::config::EmbeddingModel;
@@ -152,9 +152,18 @@ pub trait Embed: Send + Sync {
 /// - **Ollama**: nomic-embed-text-v1.5, 768-dim. Used at smart/autonomous tiers.
 #[derive(Clone)]
 pub enum Embedder {
-    /// Candle-based local embedding (MiniLM-L6-v2, 384-dim)
+    /// Candle-based local embedding (MiniLM-L6-v2, 384-dim).
+    ///
+    /// v0.7.0 #1084 — `model` is `Arc<BertModel>` (no mutex). The
+    /// pre-#1084 design held an `Arc<Mutex<BertModel>>` and locked
+    /// the model across the full forward pass; on a multi-tenant
+    /// HTTP daemon that serialised every embed call on a single
+    /// global mutex. Candle's `BertModel::forward(&self, ...)` is
+    /// inference-only (weights are read-only mmap'd safetensors)
+    /// so the mutex was unnecessary; parallel embed calls now run
+    /// concurrently against the same weights.
     Local {
-        model: Arc<Mutex<BertModel>>,
+        model: Arc<BertModel>,
         tokenizer: Arc<Tokenizer>,
         device: Device,
     },
@@ -209,7 +218,7 @@ impl Embedder {
         let model = BertModel::load(vb, &config).context("failed to build BertModel")?;
 
         Ok(Self::Local {
-            model: Arc::new(Mutex::new(model)),
+            model: Arc::new(model),
             tokenizer: Arc::new(tokenizer),
             device,
         })
@@ -273,10 +282,11 @@ impl Embedder {
                 tokenizer,
                 device,
             } => {
-                let model_guard = model
-                    .lock()
-                    .map_err(|e| anyhow::anyhow!("model lock poisoned: {e}"))?;
-                Self::embed_local(&model_guard, tokenizer, device, text)
+                // v0.7.0 #1084 — no mutex acquisition: `Arc<BertModel>`
+                // is shared across threads; `BertModel::forward(&self, ...)`
+                // is inference-only and safe to call concurrently
+                // against the same weights.
+                Self::embed_local(model, tokenizer, device, text)
             }
             Self::Ollama { client, model_name } => client.embed_text(text, model_name),
         }

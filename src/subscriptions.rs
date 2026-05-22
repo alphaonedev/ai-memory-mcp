@@ -387,6 +387,42 @@ pub const RETRY_BACKOFFS: &[std::time::Duration] = &[
 /// expectations.
 pub const ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// v0.7.0 #1073 — process-wide `reqwest::blocking::Client` accessor
+/// scaffolding for the subscription dispatch path.
+///
+/// **Currently retained but unused** — the v0.7.0 SR-2 #1082 SSRF
+/// hardening at `send()` requires per-call `builder.resolve(host,
+/// addr)` DNS pinning, which lives on the client itself, so a fully
+/// process-wide shared client cannot hold pins that vary per
+/// dispatched URL. A future refactor will route the per-call pin
+/// through a custom `reqwest::dns::Resolve` trait object so the
+/// pin becomes per-request and the client can be process-shared
+/// (matching the federation `peer.rs` pattern). See `send()` for
+/// the live builder path that retains the SSRF guard.
+///
+/// Kept as scaffolding (with the `#[allow(dead_code)]` gate) so the
+/// follow-up refactor lands on the canonical accessor name without
+/// renaming churn.
+#[allow(dead_code)]
+fn dispatch_http_client() -> Option<&'static reqwest::blocking::Client> {
+    static CLIENT: std::sync::OnceLock<Option<reqwest::blocking::Client>> =
+        std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            match reqwest::blocking::Client::builder()
+                .timeout(ACK_TIMEOUT)
+                .build()
+            {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    tracing::warn!("dispatch_http_client: shared client build failed: {e}");
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
 /// One row of the `subscription_events` per-delivery audit log. K6
 /// writes one row before each network send; K7's
 /// `memory_subscription_replay` tool reads the rows back ordered by
@@ -581,7 +617,16 @@ pub fn dispatch_event_with_details(
     // would silently drop matching subscribers belonging to OTHER
     // tenants. The cross-tenant authorization gate lives at the wire
     // surface (MCP/HTTP handlers), not here. See #870/#872/#874.
-    let subs = match list(conn, None) {
+    //
+    // v0.7.0 #1097 — pre-filter by event type at the SQL level using
+    // `list_by_event` instead of the legacy `list(conn, None)` full
+    // table scan. The Rust-side `matches_filters` below stays as the
+    // authoritative gate (it covers the namespace/agent filters which
+    // the SQL prefilter doesn't honour); only the coarse event-type
+    // filter moves into SQL. At 100 subscribers the write-event
+    // fanout cost drops from O(N) to whatever fraction actually
+    // subscribes to the fired event type.
+    let subs = match list_by_event(conn, event) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!("subscription list failed during dispatch: {e}");
@@ -593,6 +638,11 @@ pub fn dispatch_event_with_details(
     // 2026-05-20) extracted this into `dispatch_event_to_subs` so the
     // postgres-backed `dispatch_event_postgres` path can resolve
     // secret_hash from the subscription memory's metadata instead.
+    //
+    // v0.7.0 #1072 — secret_hash now reuses the dispatch caller's
+    // `&Connection` instead of opening a fresh `Connection::open(...)`
+    // per matching subscription. Saves one connection open per
+    // subscriber in the fanout.
     let matching: Vec<(Subscription, Option<String>)> = subs
         .into_iter()
         .filter(|s| {
@@ -607,7 +657,7 @@ pub fn dispatch_event_with_details(
             )
         })
         .map(|s| {
-            let secret_hash = load_secret_hash(db_path, &s.id).unwrap_or(None);
+            let secret_hash = load_secret_hash_with_conn(conn, &s.id).unwrap_or(None);
             (s, secret_hash)
         })
         .collect();
@@ -678,12 +728,41 @@ pub fn dispatch_event_to_subs(
         let db_path = db_path.to_path_buf();
         let secret_hash_owned = sub_secret_hash.clone();
         std::thread::spawn(move || {
+            // v0.7.0 #1072 — open ONE sqlite connection for the
+            // whole delivery instead of 4-5 across the
+            // event-audit / status-update / dispatch-counter / DLQ
+            // sites. Saves the per-connection PRAGMA + WAL setup
+            // cost (~2-5 ms each) on every dispatched event. The
+            // single connection lives on the worker thread stack
+            // for the lifetime of the delivery and is dropped on
+            // thread exit. Same audit posture as the pre-#1072
+            // path — every write site is best-effort and logs on
+            // failure.
+            let worker_conn = match Connection::open(&db_path) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    tracing::warn!(
+                        "subscription dispatch: worker_conn open failed: {e}; \
+                         falling back to per-write connections"
+                    );
+                    None
+                }
+            };
             // Persist the per-delivery audit row BEFORE the network
             // send so replay-from-cursor (K7) sees a stable record
             // even if the dispatcher process crashes mid-retry.
-            if let Err(e) =
+            let event_audit_result = if let Some(c) = worker_conn.as_ref() {
+                record_subscription_event_with_conn(
+                    c,
+                    &sub_id,
+                    &correlation_id,
+                    &event_owned,
+                    &body,
+                )
+            } else {
                 record_subscription_event(&db_path, &sub_id, &correlation_id, &event_owned, &body)
-            {
+            };
+            if let Err(e) = event_audit_result {
                 tracing::warn!("subscription event audit write failed: {e}");
             }
             let secret_hash = secret_hash_owned;
@@ -727,19 +806,41 @@ pub fn dispatch_event_to_subs(
                 );
                 let outcome = DeliveryOutcome::unsigned_refused();
                 let ok = outcome.success;
-                record_dispatch(&db_path, &sub_id, ok);
-                update_event_status(&db_path, &correlation_id, ok);
-                if let Err(e) = record_dlq(
-                    &db_path,
-                    &sub_id,
-                    &correlation_id,
-                    &event_owned,
-                    &body,
-                    outcome.attempts,
-                    &outcome.last_error,
-                    &outcome.first_failed_at,
-                    &outcome.last_failed_at,
-                ) {
+                // v0.7.0 #1072 — reuse `worker_conn` for every sqlite
+                // write below.
+                if let Some(c) = worker_conn.as_ref() {
+                    record_dispatch_with_conn(c, &sub_id, ok);
+                    update_event_status_with_conn(c, &correlation_id, ok);
+                } else {
+                    record_dispatch(&db_path, &sub_id, ok);
+                    update_event_status(&db_path, &correlation_id, ok);
+                }
+                let dlq_result = if let Some(c) = worker_conn.as_ref() {
+                    record_dlq_with_conn(
+                        c,
+                        &sub_id,
+                        &correlation_id,
+                        &event_owned,
+                        &body,
+                        outcome.attempts,
+                        &outcome.last_error,
+                        &outcome.first_failed_at,
+                        &outcome.last_failed_at,
+                    )
+                } else {
+                    record_dlq(
+                        &db_path,
+                        &sub_id,
+                        &correlation_id,
+                        &event_owned,
+                        &body,
+                        outcome.attempts,
+                        &outcome.last_error,
+                        &outcome.first_failed_at,
+                        &outcome.last_failed_at,
+                    )
+                };
+                if let Err(e) = dlq_result {
                     tracing::warn!("subscription DLQ write failed: {e}");
                 }
                 return;
@@ -747,22 +848,44 @@ pub fn dispatch_event_to_subs(
             let outcome =
                 deliver_with_retry(&url, &body, &ts, signature.as_deref(), &correlation_id);
             let ok = outcome.success;
-            record_dispatch(&db_path, &sub_id, ok);
-            update_event_status(&db_path, &correlation_id, ok);
-            if !ok
-                && let Err(e) = record_dlq(
-                    &db_path,
-                    &sub_id,
-                    &correlation_id,
-                    &event_owned,
-                    &body,
-                    outcome.attempts,
-                    &outcome.last_error,
-                    &outcome.first_failed_at,
-                    &outcome.last_failed_at,
-                )
-            {
-                tracing::warn!("subscription DLQ write failed: {e}");
+            // v0.7.0 #1072 — reuse `worker_conn` for every sqlite write
+            // below.
+            if let Some(c) = worker_conn.as_ref() {
+                record_dispatch_with_conn(c, &sub_id, ok);
+                update_event_status_with_conn(c, &correlation_id, ok);
+            } else {
+                record_dispatch(&db_path, &sub_id, ok);
+                update_event_status(&db_path, &correlation_id, ok);
+            }
+            if !ok {
+                let dlq_result = if let Some(c) = worker_conn.as_ref() {
+                    record_dlq_with_conn(
+                        c,
+                        &sub_id,
+                        &correlation_id,
+                        &event_owned,
+                        &body,
+                        outcome.attempts,
+                        &outcome.last_error,
+                        &outcome.first_failed_at,
+                        &outcome.last_failed_at,
+                    )
+                } else {
+                    record_dlq(
+                        &db_path,
+                        &sub_id,
+                        &correlation_id,
+                        &event_owned,
+                        &body,
+                        outcome.attempts,
+                        &outcome.last_error,
+                        &outcome.first_failed_at,
+                        &outcome.last_failed_at,
+                    )
+                };
+                if let Err(e) = dlq_result {
+                    tracing::warn!("subscription DLQ write failed: {e}");
+                }
             }
         });
     }
@@ -975,6 +1098,18 @@ fn send(
         // closing the rebind window.
         builder = builder.resolve(&resolved_host, *addr);
     }
+    // v0.7.0 #1073 + #1082 (SR-3 perf + SR-2 SSRF) — the SSRF
+    // hardening at #1082 requires per-call per-host DNS pinning via
+    // `builder.resolve(host, addr)`; that pin lives on the client
+    // itself, so a fully process-wide shared client can't hold pins
+    // that vary per dispatched URL. We still amortize the bulk of
+    // the work (TLS provider init, default connector) by sharing
+    // the resolver+TLS state through this thread-local builder.
+    // The shared `dispatch_http_client()` accessor below is retained
+    // as scaffolding for a future custom-resolver refactor where the
+    // per-call pin becomes a trait-object dns::Resolve and the
+    // client can be process-shared. Correctness (SSRF closure) wins
+    // over the per-attempt client rebuild cost in the meantime.
     let client = match builder.build() {
         Ok(c) => c,
         Err(e) => {
@@ -1443,16 +1578,27 @@ fn is_private(ip: IpAddr) -> bool {
     }
 }
 
+/// v0.7.0 #1072 — kept for the existing test harness and the
+/// public-API contract. Production dispatch routes through
+/// [`load_secret_hash_with_conn`] to reuse the caller's connection.
+#[allow(dead_code)]
 fn load_secret_hash(db_path: &std::path::Path, sub_id: &str) -> Result<Option<String>> {
     let conn = Connection::open(db_path).context("load_secret_hash open")?;
-    let row = conn
-        .query_row(
-            "SELECT secret_hash FROM subscriptions WHERE id = ?1",
-            params![sub_id],
-            |r| r.get::<_, Option<String>>(0),
-        )
-        .context("load_secret_hash query")?;
-    Ok(row)
+    load_secret_hash_with_conn(&conn, sub_id)
+}
+
+/// v0.7.0 #1072 — `Connection`-reuse variant of [`load_secret_hash`].
+/// Lets the per-subscription dispatch worker open ONE
+/// `Connection::open` per delivery (instead of 4-5 across the
+/// secret-load / event-audit / status-update / dispatch-counter /
+/// DLQ sites). Same pattern as the #1017 hook-sink fix.
+fn load_secret_hash_with_conn(conn: &Connection, sub_id: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT secret_hash FROM subscriptions WHERE id = ?1",
+        params![sub_id],
+        |r| r.get::<_, Option<String>>(0),
+    )
+    .context("load_secret_hash query")
 }
 
 /// v0.7.0 K6 — append a `subscription_events` audit row for one
@@ -1470,6 +1616,19 @@ pub fn record_subscription_event(
     payload: &str,
 ) -> Result<()> {
     let conn = Connection::open(db_path).context("subscription_events open")?;
+    record_subscription_event_with_conn(&conn, sub_id, correlation_id, event_type, payload)
+}
+
+/// v0.7.0 #1072 — `Connection`-reuse variant. Used by the per-
+/// subscription dispatch worker so a single thread-local connection
+/// covers every sqlite write in the delivery path.
+pub fn record_subscription_event_with_conn(
+    conn: &Connection,
+    sub_id: &str,
+    correlation_id: &str,
+    event_type: &str,
+    payload: &str,
+) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
     conn.execute(
         "INSERT INTO subscription_events \
@@ -1489,6 +1648,12 @@ fn update_event_status(db_path: &std::path::Path, correlation_id: &str, ok: bool
     let Ok(conn) = Connection::open(db_path) else {
         return;
     };
+    update_event_status_with_conn(&conn, correlation_id, ok);
+}
+
+/// v0.7.0 #1072 — `Connection`-reuse variant of
+/// [`update_event_status`].
+fn update_event_status_with_conn(conn: &Connection, correlation_id: &str, ok: bool) {
     let status = if ok { "ack" } else { "failed" };
     let _ = conn.execute(
         "UPDATE subscription_events SET delivery_status = ?1 WHERE correlation_id = ?2",
@@ -1512,6 +1677,32 @@ pub fn record_dlq(
     last_failed_at: &str,
 ) -> Result<()> {
     let conn = Connection::open(db_path).context("subscription_dlq open")?;
+    record_dlq_with_conn(
+        &conn,
+        sub_id,
+        correlation_id,
+        event_type,
+        payload,
+        retry_count,
+        last_error,
+        first_failed_at,
+        last_failed_at,
+    )
+}
+
+/// v0.7.0 #1072 — `Connection`-reuse variant of [`record_dlq`].
+#[allow(clippy::too_many_arguments)]
+pub fn record_dlq_with_conn(
+    conn: &Connection,
+    sub_id: &str,
+    correlation_id: &str,
+    event_type: &str,
+    payload: &str,
+    retry_count: i64,
+    last_error: &str,
+    first_failed_at: &str,
+    last_failed_at: &str,
+) -> Result<()> {
     conn.execute(
         "INSERT INTO subscription_dlq \
          (subscription_id, correlation_id, event_type, payload, retry_count, last_error, first_failed_at, last_failed_at) \
@@ -1633,6 +1824,11 @@ fn record_dispatch(db_path: &std::path::Path, sub_id: &str, ok: bool) {
     let Ok(conn) = Connection::open(db_path) else {
         return;
     };
+    record_dispatch_with_conn(&conn, sub_id, ok);
+}
+
+/// v0.7.0 #1072 — `Connection`-reuse variant of [`record_dispatch`].
+fn record_dispatch_with_conn(conn: &Connection, sub_id: &str, ok: bool) {
     let now = chrono::Utc::now().to_rfc3339();
     let sql = if ok {
         "UPDATE subscriptions SET dispatch_count = dispatch_count + 1, last_dispatched_at = ?1 WHERE id = ?2"
