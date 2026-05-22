@@ -609,7 +609,7 @@ pub fn tool_definitions_for_profile(profile: &crate::profile::Profile) -> Value 
 ///    whichever is shorter). The verbose drilldown
 ///    (`memory_capabilities { verbose=true }`) still carries the
 ///    full short-form description; the wire form is now even
-///    shorter so the budget gate at 3500 cl100k tokens holds.
+///    shorter so the budget gate at 11000 cl100k tokens (post-D1.6 schemars expansion, was 3500 in pre-D1.6 hand-coded macro) holds.
 /// 2. **Strip** numeric / boolean schema defaults that match the
 ///    JSON-Schema validation no-op (e.g. `"default": 0` on an
 ///    `integer` with `minimum: 0`). Currently no-op; left as a
@@ -710,7 +710,7 @@ pub fn tool_definitions_for_profile_verbose(profile: &crate::profile::Profile) -
 
 /// v0.7 C2 — strip every long-form natural-language string from a
 /// `tools[]` array so the bare `tools/list` payload stays inside the
-/// C5 token budget (≤ 3500 cl100k tokens for 50 tools).
+/// C5 token budget (≤ 11000 cl100k tokens for the full profile (post-D1.6)).
 ///
 /// Removed:
 /// - The top-level `docs` field (the long-form prose mirror of
@@ -772,10 +772,24 @@ pub(crate) fn strip_docs_from_tools(tools: &mut Vec<Value>) {
 /// #859 helper — walk a property value and drop every `description`
 /// key encountered, including inside nested `properties` maps and
 /// `oneOf` / `anyOf` / `allOf` branch arrays. Idempotent.
+///
+/// v0.7.0 #1058 (Agent-4 F4) — also drops every `default: null` key.
+/// Every `Option<T>` field on a schemars-derived request struct emits
+/// `default: null` on the wire (≈170 entries in `tools_list_full.json`,
+/// cumulative ~700-1000 cl100k tokens of pure noise — the pre-D1.6
+/// hand-coded `tool_definitions` macro never emitted these). Stripping
+/// keeps wire payloads honest about which defaults are load-bearing
+/// (numeric / boolean / short-enum defaults that callers need to
+/// construct valid arguments) while dropping the schemars-only
+/// `null` noise.
 fn strip_description_recursively(value: &mut Value) {
     match value {
         Value::Object(map) => {
             map.remove("description");
+            // v0.7.0 #1058 — drop `default: null` (schemars-only noise).
+            if let Some(Value::Null) = map.get("default") {
+                map.remove("default");
+            }
             // Drop long string defaults (>32 chars of prose) — short
             // numeric / boolean / enum defaults are load-bearing for
             // client-side argument construction so stay.
