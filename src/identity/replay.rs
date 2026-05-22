@@ -404,6 +404,33 @@ mod tests {
 use std::collections::HashMap;
 
 /// v0.7.0 #922 — per-peer LRU bound.
+///
+/// v0.7.0 #1061 (Agent-2 #8) — known limitation: the per-peer cap
+/// is 10000 fingerprints with FIFO eviction. An enrolled peer
+/// (or an attacker with a past key compromise) can submit 10001
+/// fresh-nonce signed pushes to evict `nonce-0`, then re-send the
+/// captured `(body, sig, nonce-0)` tuple — no longer in cache,
+/// accepted as fresh. With Ed25519 sigs that never expire, the
+/// replay window stays open for the lifetime of the key.
+///
+/// The v0.7.0 mitigations are:
+///   - Per-peer partitioning (#922): an attacker can only flood
+///     THEIR OWN slot, not cross-peer entries (so the threat is
+///     scoped to compromised-key scenarios, not broad DoS).
+///   - Outer LRU + peer ceiling (#1038): bounds the total memory
+///     footprint at ~320 MB worst-case.
+///   - Cache capacity bumped 10× via #1033 (10000-per-peer slot
+///     size set here).
+///
+/// The deeper v0.8 fix (per Agent-2's recommendation) is to bind
+/// nonce freshness to a strictly-monotonic peer-side counter (or
+/// include a receiver clock-window) so any nonce older than the
+/// highest-seen value for the peer is refused regardless of cache
+/// membership. That requires a protocol change (peer-side
+/// counter persistence + clock-skew handling) and is tracked as
+/// a v0.8 federation hardening follow-up. For v0.7.0 the
+/// flush-attack surface is documented as a KNOWN limitation
+/// gated by per-peer-key compromise.
 pub const FEDERATION_NONCE_CAPACITY_PER_PEER: usize = 10_000;
 
 /// v0.7.0 #1038 (Agent-5 #5) — outer-HashMap LRU bound on the

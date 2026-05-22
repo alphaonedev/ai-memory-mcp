@@ -84,6 +84,27 @@ pub fn run_check(
     kind: &str,
     action: &AgentAction,
 ) -> Result<Value, String> {
+    // v0.7.0 #1023 (Agent-1 #9) — MCP-side `memory_check_agent_action`
+    // intentionally uses the un-cached entry point. The MCP server
+    // runs as a SEPARATE process from the HTTP daemon (stdio
+    // JSON-RPC at `ai-memory mcp`) so the daemon's `Arc<RuleCache>`
+    // is not in scope; the MCP path opens its own
+    // `rusqlite::Connection` per dispatch (`ai-memory mcp` boots
+    // the connection at startup and reuses it for the loop's
+    // lifetime — see `src/mcp/mod.rs::main_loop`), but there is no
+    // long-lived RuleCache wiring through `ToolDispatchCtx` today.
+    //
+    // The cost is bounded: this entry point is operator-driven
+    // (debugging / policy verification), NOT a hot path. The
+    // wire-action hot paths (storage `GOVERNANCE_PRE_WRITE` hook
+    // + wire_check `GOVERNANCE_PRE_ACTION` hook) DO use the cache
+    // via `daemon_runtime.rs`'s hook closures (#991 + #1017), so
+    // production-rate governance evaluation is cache-served.
+    //
+    // A future change that adds `rule_cache: Option<Arc<RuleCache>>`
+    // to `ToolDispatchCtx` would let this entry point switch to
+    // `check_agent_action_cached(conn, Some(&cache), agent_id, action)`
+    // with no other call-site change. Tracked as follow-up to #1023.
     let decision = check_agent_action(conn, agent_id, action).map_err(|e| e.to_string())?;
     Ok(json!({
         "decision": decision,
