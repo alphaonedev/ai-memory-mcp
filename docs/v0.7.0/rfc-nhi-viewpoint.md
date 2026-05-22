@@ -1,5 +1,15 @@
 # RFC: AI NHI viewpoint on ai-memory v0.7.0 — full-spectrum reflective assessment from inside the substrate
 
+> **Forward note (2026-05-22, DOC-F audit).** This RFC was authored at
+> the `3cdec59` mid-cycle HEAD when the substrate was at 71 callable
+> tools. By v0.7.0 release HEAD the substrate is at **73 tools at
+> `--profile full`** (72 callable memory tools + the always-on
+> `memory_capabilities` bootstrap). Where the body below references
+> "71 tools" or "71 across 8 families" the historical count is
+> preserved for the integrity of the RFC's evidence chain; the live
+> count at release is 73. Asserted by
+> `Profile::full().expected_tool_count()` in `src/profile.rs`.
+>
 > **Type:** Reflective / strategic — not an actionable bug or feature
 > request. An on-the-record articulation of what v0.7.0 *is*, written
 > from inside the substrate by the model class that uses it.
