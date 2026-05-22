@@ -237,7 +237,12 @@ async fn postgres_archive_restore_preserves_all_v07_columns_1025() {
             return;
         }
     };
-    let ctx = ai_memory::store::CallerContext::for_agent("rt-1025-pg");
+    // #1140: use for_admin to set bypass_visibility = true so the post-
+    // #910 SAL visibility gate doesn't hide the seeded row after
+    // restore. The test exercises archive→restore lossless column
+    // carry, NOT visibility — bypass keeps the assertions focused on
+    // the v0.7.0 column-preservation contract.
+    let ctx = ai_memory::store::CallerContext::for_admin("rt-1025-pg");
     let mem = memory_with_all_26_v07_fields_populated("rt-1025-pg");
     ai_memory::store::MemoryStore::store(&pg, &ctx, &mem)
         .await
