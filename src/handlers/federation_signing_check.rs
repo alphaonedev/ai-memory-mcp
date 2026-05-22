@@ -576,6 +576,234 @@ pub(super) fn verify_signature_or_reject(
 }
 
 // ---------------------------------------------------------------------------
+// #1031 (Agent-5 #2) — verify per-message signature on GET /sync/since
+// ---------------------------------------------------------------------------
+//
+// Pre-#1031 `/sync/since` accepted `X-Peer-Id` without ever verifying a
+// signature, so an attacker who cleared api-key middleware or rode the
+// mTLS bypass at `transport.rs:644` could spoof `X-Peer-Id` and project
+// every `federation_share=true` row PLUS every `scope=private` row
+// owned by the spoofed peer — the visibility gate (`is_visible_to_caller`)
+// trusted the spoofed header as the caller identity.
+//
+// The fix mirrors `/sync/push`: require an `X-Memory-Sig` over canonical
+// GET-request bytes binding `method + path + canonical-query`, and
+// chain through the same `FederationNonceCache` for replay protection.
+// Canonical bytes:
+//
+//   "GET" || 0x0A || "/api/v1/sync/since" || 0x0A || canonical_query
+//
+// where `canonical_query` is the request's raw query string verbatim
+// (the caller fixes the param ordering before signing — a future
+// hardening can normalise + sort, but stability of the
+// signer-vs-verifier byte stream is the load-bearing property right
+// now). The same enforcement matrix that gates `/sync/push` applies:
+// `AI_MEMORY_FED_REQUIRE_SIG=1` (v0.7.0 default) enforces; `=0` reverts
+// to v0.6.x permissive for peer-rollout windows.
+
+/// v0.7.0 #1031 — build canonical bytes for a federation GET request.
+///
+/// `method` is uppercased (`"GET"`); `path` is the request URI's path
+/// component verbatim; `query` is the request's raw query string
+/// (without the leading `?`). The three components are joined by
+/// `0x0A` (newline) so a downstream verifier reproduces the same
+/// byte stream from the routing layer's `Method` + `Uri` extractors
+/// without re-parsing.
+#[must_use]
+pub(super) fn canonical_get_bytes(method: &str, path: &str, query: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(method.len() + path.len() + query.len() + 2);
+    out.extend_from_slice(method.as_bytes());
+    out.push(b'\n');
+    out.extend_from_slice(path.as_bytes());
+    out.push(b'\n');
+    out.extend_from_slice(query.as_bytes());
+    out
+}
+
+/// v0.7.0 #1031 — verify an `X-Memory-Sig` header against the
+/// canonical GET-request bytes and apply the nonce-freshness gate.
+///
+/// Returns `Some(Response)` to short-circuit the handler with a 401
+/// when verification is required and fails; `None` when verification
+/// passed OR the receiver opted out via `AI_MEMORY_FED_REQUIRE_SIG=0`.
+///
+/// Wire shape mirrors `/sync/push`:
+///   - `X-Memory-Sig: ed25519=<b64>` — signature over
+///     `canonical_get_bytes(method, path, query) || 0x00 || X-Memory-Nonce`
+///   - `X-Memory-Nonce: <opaque>` — per-message freshness token
+///   - `X-Peer-Id: <peer>` — identifies which enrolled key to verify against
+///
+/// Enforcement matrix matches `verify_signature_or_reject`:
+///
+/// | sig header | nonce | key enrolled | outcome                              |
+/// |------------|-------|--------------|--------------------------------------|
+/// | present    | any   | yes          | verify; refuse on bad sig            |
+/// | present    | any   | no           | refuse (cannot verify untrusted sig) |
+/// | absent     | any   | yes          | refuse (enrolled peer must sign)     |
+/// | absent     | any   | no           | allow + WARN (degraded permissive)   |
+///
+/// The "neither side enrolled" allow-with-warn arm keeps an
+/// unenrolled federation pair operational while the strict-deny
+/// arms fire once an operator enrols a peer key.
+/// `AI_MEMORY_FED_REQUIRE_SIG=0` bypasses every branch (mirrors the
+/// `/sync/push` env-var posture).
+pub(super) fn verify_get_signature_or_reject(
+    method: &str,
+    path: &str,
+    query: &str,
+    headers: &HeaderMap,
+    peer_id: Option<&str>,
+    federation_nonce_cache: &crate::identity::replay::FederationNonceCache,
+) -> Option<Response> {
+    if !fed_signing::require_sig() {
+        return None;
+    }
+    let sig_header = headers
+        .get(fed_signing::SIGNATURE_HEADER)
+        .and_then(|v| v.to_str().ok());
+    let nonce_header = headers
+        .get(fed_signing::NONCE_HEADER)
+        .and_then(|v| v.to_str().ok());
+    let pubkey = peer_id.and_then(|pid| {
+        crate::governance::audit::load_daemon_verifying_key(pid)
+            .ok()
+            .flatten()
+    });
+
+    let canonical = canonical_get_bytes(method, path, query);
+
+    match (sig_header, pubkey.as_ref()) {
+        (Some(sig), Some(pk)) => {
+            let verify_result = if let Some(nonce) = nonce_header {
+                fed_signing::verify_header_with_nonce(Some(sig), &canonical, nonce, pk)
+            } else {
+                fed_signing::verify_header(Some(sig), &canonical, pk)
+            };
+            if let Err(e) = verify_result {
+                tracing::warn!(
+                    target: "federation::signing",
+                    tag = e.tag(),
+                    peer_id = %peer_id.unwrap_or(""),
+                    "sync_since: X-Memory-Sig verification failed"
+                );
+                return Some(
+                    (
+                        StatusCode::UNAUTHORIZED,
+                        Json(json!({
+                            "error": e.tag(),
+                            "note": "AI_MEMORY_FED_REQUIRE_SIG=1 enforces per-message Ed25519 \
+                                     signatures on /sync/since; set =0 to revert to v0.6.x \
+                                     permissive (#1031)",
+                        })),
+                    )
+                        .into_response(),
+                );
+            }
+            // Nonce-freshness gate (same shape as /sync/push).
+            let pid_for_cache = peer_id.unwrap_or("");
+            match nonce_header {
+                Some(nonce) if !nonce.is_empty() => {
+                    match federation_nonce_cache.record_and_check(pid_for_cache, nonce) {
+                        crate::identity::replay::ReplayDecision::Fresh => None,
+                        crate::identity::replay::ReplayDecision::Replay => {
+                            tracing::warn!(
+                                target: "federation::signing",
+                                tag = fed_signing::VerifyError::ReplayedNonce.tag(),
+                                peer_id = %pid_for_cache,
+                                "sync_since: X-Memory-Nonce replay detected"
+                            );
+                            Some(
+                                (
+                                    StatusCode::UNAUTHORIZED,
+                                    Json(json!({
+                                        "error": fed_signing::VerifyError::ReplayedNonce.tag(),
+                                        "note": "AI_MEMORY_FED_REQUIRE_NONCE=1 enforces per-message nonce freshness on /sync/since (#1031).",
+                                    })),
+                                )
+                                    .into_response(),
+                            )
+                        }
+                    }
+                }
+                _ => {
+                    if fed_signing::require_nonce() {
+                        tracing::warn!(
+                            target: "federation::signing",
+                            tag = fed_signing::VerifyError::NonceMissing.tag(),
+                            peer_id = %pid_for_cache,
+                            "sync_since: X-Memory-Nonce header absent — strict refusal"
+                        );
+                        Some(
+                            (
+                                StatusCode::UNAUTHORIZED,
+                                Json(json!({
+                                    "error": fed_signing::VerifyError::NonceMissing.tag(),
+                                    "note": "AI_MEMORY_FED_REQUIRE_NONCE=1 requires X-Memory-Nonce on /sync/since (#1031); set =0 to bypass.",
+                                })),
+                            )
+                                .into_response(),
+                        )
+                    } else {
+                        tracing::warn!(
+                            target: "federation::signing",
+                            peer_id = %pid_for_cache,
+                            "sync_since: X-Memory-Nonce absent — permissive, accepting"
+                        );
+                        None
+                    }
+                }
+            }
+        }
+        (Some(_), None) => {
+            tracing::warn!(
+                target: "federation::signing",
+                peer_id = %peer_id.unwrap_or(""),
+                "sync_since: X-Memory-Sig present but no enrolled public key for peer-id (#1031)"
+            );
+            Some(
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({
+                        "error": "x_memory_sig_no_enrolled_key",
+                        "note": "AI_MEMORY_FED_REQUIRE_SIG=1 and the peer sent a signature, \
+                                 but no public key is enrolled for the peer-id; enrol via \
+                                 `ai-memory identity import` or set =0 to bypass (#1031).",
+                    })),
+                )
+                    .into_response(),
+            )
+        }
+        (None, Some(_)) => {
+            tracing::warn!(
+                target: "federation::signing",
+                peer_id = %peer_id.unwrap_or(""),
+                "sync_since: enrolled peer omitted X-Memory-Sig header (#1031)"
+            );
+            Some(
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({
+                        "error": fed_signing::VerifyError::Missing.tag(),
+                        "note": "AI_MEMORY_FED_REQUIRE_SIG=1 enforces per-message Ed25519 \
+                                 signatures on /sync/since for enrolled peers; set =0 to revert \
+                                 to v0.6.x permissive (#1031).",
+                    })),
+                )
+                    .into_response(),
+            )
+        }
+        (None, None) => {
+            tracing::warn!(
+                target: "federation::signing",
+                peer_id = %peer_id.unwrap_or(""),
+                "sync_since: unsigned (no enrolled key for peer-id) — strict enforcement skipped"
+            );
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // #961 regression coverage — SAL boundary cleanup (Wave-2 Tier-B1).
 //
 // Pre-fix, `sync_push_via_store` stamped reflection rows with the
