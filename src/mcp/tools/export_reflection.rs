@@ -44,7 +44,7 @@ use crate::models::MemoryKind;
 /// * `memory is not a reflection: <id>` — caller passed an observation.
 /// * `unsupported export format '<x>'` — `format` was neither
 ///   `md` nor `json`.
-pub(super) fn handle_export_reflection(
+pub fn handle_export_reflection(
     conn: &rusqlite::Connection,
     params: &Value,
 ) -> Result<Value, String> {

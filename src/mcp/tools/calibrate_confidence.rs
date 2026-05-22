@@ -34,7 +34,7 @@ use crate::confidence::calibrate::{DEFAULT_WINDOW_DAYS, calibrate_from_shadow};
 /// Errors:
 /// * `days must be a positive integer` — caller passed `days <= 0`.
 /// * `memory_calibrate_confidence substrate error: ...` — SQL error.
-pub(super) fn handle_calibrate_confidence(
+pub fn handle_calibrate_confidence(
     conn: &rusqlite::Connection,
     params: &Value,
 ) -> Result<Value, String> {

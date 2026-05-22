@@ -212,7 +212,7 @@ pub(super) fn handle_list_subscriptions(
 /// wrapper around [`crate::subscriptions::memory_subscription_replay`]
 /// that exposes the operator/governance reliability tool over the
 /// MCP wire. Family: `Power` (operator-scoped, not data-plane).
-pub(super) fn handle_subscription_replay(
+pub fn handle_subscription_replay(
     conn: &rusqlite::Connection,
     params: &Value,
     mcp_client: Option<&str>,

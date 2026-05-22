@@ -33,7 +33,7 @@ use serde_json::{Value, json};
 /// `-32602 "memory not found: <id>"`. Non-reflection ids return a
 /// well-formed envelope with `is_reflection = false` so callers can
 /// branch without parsing the error path.
-pub(super) fn handle_reflection_origin(
+pub fn handle_reflection_origin(
     conn: &rusqlite::Connection,
     params: &Value,
 ) -> Result<Value, String> {

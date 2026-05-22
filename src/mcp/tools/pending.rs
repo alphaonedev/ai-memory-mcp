@@ -122,7 +122,7 @@ impl McpTool for PendingRejectTool {
 /// `limit` cap (default 100, max 1000) so an operator inspecting a
 /// runaway DLQ can't blow the response size budget. Family: `Power`.
 
-pub(crate) fn handle_subscription_dlq_list(
+pub fn handle_subscription_dlq_list(
     conn: &rusqlite::Connection,
     params: &Value,
     mcp_client: Option<&str>,
