@@ -486,7 +486,36 @@ ai-memory mcp call memory_capabilities '{"schema_version":"3"}' | jq '.kg_backen
 ai-memory verify-signed-events-chain --format json
 ```
 
-Schema migrations (sqlite v20 → v34, postgres 0012 → 0020) run automatically on first start of a sqlite-backed daemon and are idempotent. Postgres schema bootstrap is via `ai-memory schema-init` per [`docs/migration-v0.7.0-postgres.md`](migration-v0.7.0-postgres.md).
+Schema migrations (sqlite v20 → v49, postgres v15 → v49 logical) run automatically on first start of a sqlite-backed daemon and are idempotent. Postgres schema bootstrap is via `ai-memory schema-init` per [`docs/migration-v0.7.0-postgres.md`](migration-v0.7.0-postgres.md). Canonical anchors: `CURRENT_SCHEMA_VERSION = 49` in both [`src/storage/migrations.rs`](../src/storage/migrations.rs) (sqlite) and [`src/store/postgres.rs`](../src/store/postgres.rs) (postgres); the highest on-disk migration files are [`migrations/sqlite/0041_v07_federation_push_dlq.sql`](../migrations/sqlite/0041_v07_federation_push_dlq.sql) (sqlite splits per-bump, file-name counter ≠ logical version) and [`migrations/postgres/0030_v07_federation_push_dlq.sql`](../migrations/postgres/0030_v07_federation_push_dlq.sql) (postgres runs a single greenfield+upgrade pair, with v34 → v49 deltas applied through in-process `migrate_v34()` … `migrate_v49()` async functions).
+
+**Per-bump narrative for the post-v34 sqlite ladder (every operator MUST back up to a sibling `.bak` before `ai-memory serve` first-touches the DB, because the daemon will silently traverse all 15 of these bumps on first open):**
+
+- **v34** — V-4 closeout (#698): `signed_events.prev_hash` + `signed_events.sequence` cross-row hash chain.
+- **v35** — shadow retention columns on calibration tables.
+- **v36** — `auto_persona_entity_id` column on `memories` (QW-2 persona artefact).
+- **v37** — persona signing atomicity (cross-table CHECK).
+- **v38** — recursive-learning `recall_observations` table.
+- **v39** — `provenance_version` column (Form-4 source URI carry).
+- **v40** — source-URI backfill (in-place data migration).
+- **v41** — federation push DLQ (Track D #933).
+- **v42** — confidence-tier nullability fix.
+- **v43** — links temporal-validity columns (`valid_from` / `valid_until` / `observed_by`).
+- **v44** — link attestation columns (`signature` / `attest_level` / `signed_at`).
+- **v45** — Gap-1 optimistic-concurrency `version` BIGINT column on `memories` (#1036).
+- **v46** — recall_observations capacity widening (Bucket-0 L2-3 #687).
+- **v47** — confidence_tier index (#1042).
+- **v48** — `federation_push_dlq` table + dispatch indices (#933).
+- **v49** — `archived_memories` full v0.7.0 column carry: 14 nullable columns added so archive → restore is lossless for the full v0.7.0 Memory shape on both backends (`reflection_depth`, `atomised_into`, `atom_of`, `memory_kind`, `entity_id`, `persona_version`, `citations`, `source_uri`, `source_span`, `confidence_source`, `confidence_signals`, `confidence_decayed_at`, `mentioned_entity_id`, `version`; #1025).
+
+**Operator advisory.** Before the first `ai-memory serve` against a v0.6.4-era DB, run:
+
+```bash
+cp ~/.local/share/ai-memory/ai-memory.db ~/.local/share/ai-memory/ai-memory.db.bak.pre-v07
+sqlite3 ~/.local/share/ai-memory/ai-memory.db.bak.pre-v07 'PRAGMA schema_version;' \
+  > /dev/null && echo "backup verified readable"
+```
+
+The ladder is idempotent on restart but not reversible — once `schema_version` reaches 49, you cannot downgrade to v34 in place; restore from the `.bak` file if you need to roll back to v0.6.4.
 
 ---
 
