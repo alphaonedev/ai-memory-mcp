@@ -110,7 +110,6 @@ use serde::Deserialize;
 /// v0.7.0 #972 D1.5 (#986) — request body for `memory_skill_resource`.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[allow(dead_code)]
-#[schemars(deny_unknown_fields)]
 pub struct SkillResourceRequest {
     /// Parent skill UUID.
     pub skill_id: String,

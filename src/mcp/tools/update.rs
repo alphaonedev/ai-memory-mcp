@@ -18,7 +18,6 @@ use serde_json::{Value, json};
 /// v0.7.0 #972 D1.6 (#987) — request body for `memory_update`.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[allow(dead_code)]
-#[schemars(deny_unknown_fields)]
 pub struct UpdateRequest {
     /// Memory ID.
     pub id: String,

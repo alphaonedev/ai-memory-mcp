@@ -16,7 +16,6 @@ use serde_json::{Value, json};
 /// v0.7.0 #972 D1.4 (#985) — request body for `memory_pending_list`.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[allow(dead_code)]
-#[schemars(deny_unknown_fields)]
 pub struct PendingListRequest {
     #[serde(default)]
     pub status: Option<String>,
@@ -51,7 +50,6 @@ impl McpTool for PendingListTool {
 /// v0.7.0 #972 D1.4 (#985) — request body for `memory_pending_approve`.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[allow(dead_code)]
-#[schemars(deny_unknown_fields)]
 pub struct PendingApproveRequest {
     /// Pending action id.
     pub id: String,
@@ -87,7 +85,6 @@ impl McpTool for PendingApproveTool {
 /// v0.7.0 #972 D1.4 (#985) — request body for `memory_pending_reject`.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[allow(dead_code)]
-#[schemars(deny_unknown_fields)]
 pub struct PendingRejectRequest {
     /// Pending action id.
     pub id: String,
@@ -300,7 +297,6 @@ pub fn handle_pending_approve(
 /// v0.7.0 #972 D1.5 (#986) — request body for `memory_subscription_dlq_list`.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[allow(dead_code)]
-#[schemars(deny_unknown_fields)]
 pub struct SubscriptionDlqListRequest {
     /// Restrict to one subscription.
     #[serde(default)]

@@ -29,7 +29,6 @@ use serde_json::Value;
 /// breaking-change semantics on existing v1/v2-pinned clients.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[allow(dead_code)] // D1.1 PoC: struct is the schemars source; handler still parses Value directly until D1.3.
-#[schemars(deny_unknown_fields)]
 pub struct CapabilitiesRequest {
     /// Schema version. v2 default; v1 legacy.
     #[serde(default)]
@@ -968,7 +967,6 @@ mod d1_2_983_tests {
     //!    A future enum-tightening pass can reintroduce them via
     //!    typed enum structs + `#[schemars(with = "...")]`.
     //! 4. `additionalProperties: false`: schemars emits it (from
-    //!    `#[schemars(deny_unknown_fields)]`); legacy doesn't. This
     //!    is a tightening — strictly safer for clients.
     //!
     //! Match-exactly contracts:

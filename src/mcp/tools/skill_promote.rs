@@ -347,7 +347,6 @@ use serde::Deserialize;
 /// generated SKILL.md `Parameters` section.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[allow(dead_code)]
-#[schemars(deny_unknown_fields)]
 pub struct SkillPromoteFromReflectionRequest {
     /// Reflection-kind memory UUID.
     pub reflection_id: String,

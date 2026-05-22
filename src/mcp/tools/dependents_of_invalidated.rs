@@ -74,7 +74,6 @@ use serde::Deserialize;
 /// `memory_dependents_of_invalidated`.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[allow(dead_code)]
-#[schemars(deny_unknown_fields)]
 pub struct DependentsOfInvalidatedRequest {
     /// Invalidated reflection id.
     pub memory_id: String,

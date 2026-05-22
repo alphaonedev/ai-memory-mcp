@@ -103,7 +103,6 @@ impl KindsFilter {
 /// derived schema matches byte-for-byte.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[allow(dead_code)]
-#[schemars(deny_unknown_fields)]
 pub struct RecallRequest {
     /// What to recall
     pub context: String,
@@ -454,22 +453,34 @@ mod tests {
 
     #[test]
     fn from_mcp_params_unknown_field_tolerated_at_runtime() {
-        // The struct carries `#[schemars(deny_unknown_fields)]` for the
-        // *schema-level* contract surfaced by `RecallTool::input_schema()`
-        // and pinned by `mcp::recall::d1_3_984_tests::recall_parity_984`.
-        // The schemars attribute does NOT bind serde at deserialise time
-        // — that would require `#[serde(deny_unknown_fields)]` too, which
-        // we intentionally omit to keep the v0.6.x compatibility contract
-        // (unknown JSON fields tolerated on the wire; clients pinning a
-        // newer field set against an older binary still work).
+        // v0.7.0 #1052 (Agent-4 F2) — pre-#1052 the struct carried
+        // `#[schemars(deny_unknown_fields)]` so the WIRE schema
+        // advertised `additionalProperties: false`, but
+        // `#[serde(deny_unknown_fields)]` was intentionally omitted so
+        // the RUNTIME silently tolerated unknowns. That asymmetry was
+        // the bug: clients OBEYING the wire schema rejected inputs the
+        // server happily accepted, and clients sending typos (e.g.
+        // `"namespce"` for `"namespace"`) had them silently dropped
+        // (no -32602) and observed surprising "no filter applied"
+        // behaviour.
         //
-        // Pinned here so a future toggle of either attribute is a
-        // visible, intentional change.
+        // The #1052 fix removes `schemars(deny_unknown_fields)` from
+        // every tool-request struct so the wire schema becomes
+        // truthful (no `additionalProperties: false` claim). The
+        // runtime continues to tolerate unknowns — wider compat for
+        // v0.6.x clients with newer field sets — but the schema no
+        // longer lies about it. The corollary contract is pinned by
+        // `tests/mcp_input_schema_no_false_strict_1052.rs`: the
+        // canonical `tool_definitions()` payload must NOT advertise
+        // `additionalProperties: false` on any tool's inputSchema.
+        //
+        // Pinned here so a future re-introduction of the attribute is
+        // a visible, intentional change.
         let req = RecallRequest::from_mcp_params(&json!({
             "context": "q",
             "completely_unknown_field": true
         }))
-        .expect("unknown fields are tolerated at runtime by design");
+        .expect("unknown fields are tolerated at runtime (post-#1052 contract is wire-truthful)");
         assert_eq!(req.context, "q");
     }
 

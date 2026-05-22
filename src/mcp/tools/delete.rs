@@ -16,7 +16,6 @@ use std::path::Path;
 /// v0.7.0 #972 D1.6 (#987) — request body for `memory_delete`.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[allow(dead_code)]
-#[schemars(deny_unknown_fields)]
 pub struct DeleteRequest {
     pub id: String,
 }

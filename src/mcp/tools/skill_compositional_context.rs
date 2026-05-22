@@ -343,7 +343,6 @@ use serde::Deserialize;
 /// `memory_skill_compositional_context`.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[allow(dead_code)]
-#[schemars(deny_unknown_fields)]
 pub struct SkillCompositionalContextRequest {
     /// Skill UUID.
     pub skill_id: String,
