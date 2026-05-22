@@ -104,13 +104,28 @@ fn signed_events_dlq_operator_replay_advances_chain_1046() {
     // Step 1: synthesize a DLQ row (in production this lands when
     // the chain-write fails). The shape mirrors
     // `deferred_audit.rs::record_dlq`.
+    //
+    // #1136: column names updated to match the actual signed_events_dlq
+    // schema (PRAGMA table_info: dlq_id, id, agent_id, event_type,
+    // payload_hash, signature, attest_level, timestamp, failure_reason,
+    // failed_at). The original pin used pre-rename column names
+    // (kind/payload/created_at); the rename landed when the chain
+    // primitives were unified with signed_events.
     let inserted = conn.execute(
-        "INSERT INTO signed_events_dlq (kind, agent_id, payload, failure_reason, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO signed_events_dlq \
+            (id, agent_id, event_type, payload_hash, signature, attest_level, \
+             timestamp, failure_reason, failed_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
-            "governance.check",
+            // Synthetic deterministic values — the pin only asserts
+            // schema-shape match; the values are not load-bearing.
+            "synth-event-1046",
             "ai:operator-test",
-            "{\"decision\":\"allow\"}",
+            "governance.check",
+            "deadbeef".repeat(8), // payload_hash (64 hex chars)
+            Vec::<u8>::new(),     // signature BLOB; empty is acceptable
+            "unsigned",
+            "2026-05-22T10:00:00Z",
             "lock_contention",
             "2026-05-22T10:00:00Z",
         ],
