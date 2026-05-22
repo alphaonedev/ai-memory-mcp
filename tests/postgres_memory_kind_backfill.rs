@@ -73,11 +73,23 @@ async fn inspection_pool(url: &str) -> PgPool {
         .expect("inspection pool connect")
 }
 
-/// Probe whether `column` exists on `memories`.
+/// Probe whether `column` exists on `public.memories`. (#1131)
+///
+/// Schema-qualified to `public` because the lan-parity container's
+/// init-age.sql sets `search_path = ag_catalog, "$user", public` — if
+/// any SAL bootstrap session creates a `memories` table while that
+/// search_path is active, the table lands in `ag_catalog`, producing
+/// a duplicate that an unqualified `WHERE table_name = 'memories'`
+/// would also match. The test's phase-2 ALTER TABLE correctly drops
+/// from `public.memories` (search_path falls through to public for
+/// the unqualified ALTER), so we filter by `table_schema = 'public'`
+/// here to keep the existence check consistent with the drop site.
 async fn column_exists(pool: &PgPool, column: &str) -> bool {
     let row: Option<(i32,)> = sqlx::query_as(
         "SELECT 1 FROM information_schema.columns
-         WHERE table_name = 'memories' AND column_name = $1",
+         WHERE table_schema = 'public'
+           AND table_name = 'memories'
+           AND column_name = $1",
     )
     .bind(column)
     .fetch_optional(pool)
@@ -86,14 +98,17 @@ async fn column_exists(pool: &PgPool, column: &str) -> bool {
     row.is_some()
 }
 
-/// Probe whether the named index exists.
+/// Probe whether the named index exists in the `public` schema. (#1131)
 async fn index_exists(pool: &PgPool, index_name: &str) -> bool {
-    let row: Option<(i32,)> =
-        sqlx::query_as("SELECT 1 FROM pg_class WHERE relname = $1 AND relkind = 'i'")
-            .bind(index_name)
-            .fetch_optional(pool)
-            .await
-            .expect("query pg_class for index");
+    let row: Option<(i32,)> = sqlx::query_as(
+        "SELECT 1 FROM pg_class c
+         JOIN pg_namespace n ON c.relnamespace = n.oid
+         WHERE c.relname = $1 AND c.relkind = 'i' AND n.nspname = 'public'",
+    )
+    .bind(index_name)
+    .fetch_optional(pool)
+    .await
+    .expect("query pg_class for index");
     row.is_some()
 }
 
