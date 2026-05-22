@@ -229,6 +229,19 @@ struct RebuildSnapshot {
     /// all-entries length) is load-bearing for correctness under
     /// concurrent writes during rebuild.
     overflow_at_snapshot: usize,
+    /// v0.7.0 #1074 (SR-2 #2, HIGH) — generation counter snapshot.
+    /// The eviction path bumps `state.overflow_generation` and
+    /// `state.clear()`s `overflow`. If a rebuild snapshot was
+    /// captured BEFORE the eviction, its `overflow_generation` will
+    /// not match the post-eviction `state.overflow_generation`, and
+    /// the swap path knows the snapshot is stale: it must NOT drain
+    /// overflow entries (those entries are post-eviction inserts not
+    /// in the snapshot's `entries`), and the warmed graph itself is
+    /// stale (it was built from pre-eviction `all_entries` that have
+    /// since been shrunk). The safe action is to drop the warmed
+    /// result without swapping AND without draining, then let the
+    /// next rebuild capture the current state.
+    overflow_generation: u64,
 }
 
 /// Drop-guard that clears the `rebuild_in_flight` flag even if the
@@ -292,6 +305,9 @@ pub struct VectorIndex {
 struct RebuildResult {
     hnsw: Option<HnswMap<EmbeddingPoint, String>>,
     overflow_at_snapshot: usize,
+    /// v0.7.0 #1074 — propagated from the snapshot so the swap path
+    /// can detect a stale-by-eviction warming result.
+    overflow_generation: u64,
 }
 
 struct IndexState {
@@ -308,6 +324,14 @@ struct IndexState {
     /// the cap per-instance (rather than as a process-wide atomic)
     /// keeps concurrent tests independent.
     max_entries: usize,
+    /// v0.7.0 #1074 (SR-2 #2, HIGH) — generation counter bumped on
+    /// every `overflow.clear()` (eviction-edge path). Snapshots
+    /// captured before a clear carry the old generation; the swap
+    /// path compares against the current generation and drops the
+    /// warming result without swapping when they don't match. Closes
+    /// the gap where an entry inserted between a snapshot capture
+    /// and the eviction-clear was incorrectly drained by the swap.
+    overflow_generation: u64,
 }
 
 /// A search result from the vector index.
@@ -327,6 +351,7 @@ impl VectorIndex {
                 overflow: Vec::new(),
                 all_entries: entries,
                 max_entries: MAX_ENTRIES,
+                overflow_generation: 0,
             }),
             eviction_sink: Mutex::new(None),
             warming: Arc::new(Mutex::new(None)),
@@ -342,6 +367,7 @@ impl VectorIndex {
                 overflow: Vec::new(),
                 all_entries: Vec::new(),
                 max_entries: MAX_ENTRIES,
+                overflow_generation: 0,
             }),
             eviction_sink: Mutex::new(None),
             warming: Arc::new(Mutex::new(None)),
@@ -364,6 +390,7 @@ impl VectorIndex {
                 overflow: Vec::new(),
                 all_entries: Vec::new(),
                 max_entries,
+                overflow_generation: 0,
             }),
             eviction_sink: Mutex::new(None),
             warming: Arc::new(Mutex::new(None)),
@@ -440,6 +467,7 @@ impl VectorIndex {
                 Some(RebuildSnapshot {
                     entries: state.all_entries.clone(),
                     overflow_at_snapshot: state.overflow.len(),
+                    overflow_generation: state.overflow_generation,
                 })
             } else {
                 None
@@ -532,6 +560,15 @@ impl VectorIndex {
             // `REBUILD_THRESHOLD` (or an explicit `rebuild_async()`
             // call) schedules the actual graph rebuild off-thread.
             state.overflow.clear();
+            // v0.7.0 #1074 (SR-2 #2, HIGH) — bump the generation
+            // counter on every overflow.clear(). Any in-flight rebuild
+            // snapshot captured BEFORE this bump now carries a stale
+            // generation; the swap path detects the mismatch and
+            // drops the warming result without draining overflow,
+            // preventing the lose-an-insert race where an entry
+            // landed between snapshot and clear() was incorrectly
+            // drained by the eventual swap.
+            state.overflow_generation = state.overflow_generation.wrapping_add(1);
             // Schedule the rebuild via the async path so the eviction
             // edge no longer blocks the writer for the multi-second
             // `build_hnsw` cost at 100k cap. The CAS skips if a
@@ -549,6 +586,7 @@ impl VectorIndex {
                     // captures an empty overflow window — anything
                     // inserted post-eviction will be a fresh suffix.
                     overflow_at_snapshot: state.overflow.len(),
+                    overflow_generation: state.overflow_generation,
                 };
                 // Release the inner lock before spawning so the
                 // background thread can take it on swap. The
@@ -779,6 +817,7 @@ impl VectorIndex {
             RebuildSnapshot {
                 entries: state.all_entries.clone(),
                 overflow_at_snapshot: state.overflow.len(),
+                overflow_generation: state.overflow_generation,
             }
         };
         self.spawn_rebuild(snapshot)
@@ -802,6 +841,7 @@ impl VectorIndex {
             let result = RebuildResult {
                 hnsw,
                 overflow_at_snapshot: snapshot.overflow_at_snapshot,
+                overflow_generation: snapshot.overflow_generation,
             };
             // Park the result in the warming slot. The next caller
             // through `try_swap_warming` will move it into `active`.
@@ -838,6 +878,25 @@ impl VectorIndex {
             Ok(s) => s,
             Err(poisoned) => poisoned.into_inner(),
         };
+        // v0.7.0 #1074 (SR-2 #2, HIGH) — generation check. If the
+        // overflow generation has bumped since the rebuild captured
+        // its snapshot, the warming graph was built from pre-eviction
+        // all_entries and the current overflow contains post-eviction
+        // inserts that are NOT in that graph. Drop the warming result
+        // entirely without swapping (the next rebuild captures the
+        // current state cleanly). Pre-#1074 the swap would have
+        // overwritten the live graph with a stale one AND drained
+        // the post-eviction inserts from overflow — silently losing
+        // them until the next rebuild.
+        if result.overflow_generation != state.overflow_generation {
+            tracing::warn!(
+                target: "hnsw.rebuild",
+                snapshot_gen = result.overflow_generation,
+                current_gen = state.overflow_generation,
+                "dropping stale warming result (eviction occurred mid-rebuild, #1074)"
+            );
+            return false;
+        }
         state.hnsw = result.hnsw;
         // Trim overflow: the first `overflow_at_snapshot` entries are
         // now in the graph; entries inserted AFTER the snapshot
@@ -1449,5 +1508,75 @@ mod d1_968_tests {
         stop.store(true, Ordering::SeqCst);
         let _ = observer.join();
         assert_eq!(idx.len(), baseline_len);
+    }
+
+    // v0.7.0 #1074 (SR-2 #2, HIGH) — eviction-then-rebuild gap.
+    // The swap path must DROP a warming result whose
+    // `overflow_generation` doesn't match the current state, so an
+    // entry inserted into overflow AFTER a clear() bump is not
+    // mistakenly drained out as if it were a captured snapshot
+    // entry. We park a stale-gen result directly in the warming
+    // slot and confirm try_swap_warming refuses to swap AND does
+    // not drain overflow.
+    #[test]
+    fn stale_warming_swap_is_dropped_1074() {
+        let idx = VectorIndex::empty();
+        // Insert a non-trivial overflow entry so we can assert
+        // try_swap_warming doesn't drain it.
+        idx.insert(
+            "alpha".to_string(),
+            make_embedding(&[1.0_f32, 0.0, 0.0, 0.0]),
+        );
+        let before_overflow = idx.inner.lock().unwrap().overflow.len();
+        assert_eq!(before_overflow, 1);
+
+        // Park a STALE-generation warming result with a swap that
+        // would otherwise drain everything.
+        {
+            let current_gen = idx.inner.lock().unwrap().overflow_generation;
+            let mut w = idx.warming.lock().unwrap();
+            *w = Some(RebuildResult {
+                hnsw: None,
+                overflow_at_snapshot: 999, // would have drained the whole overflow
+                overflow_generation: current_gen.wrapping_add(1), // mismatched
+            });
+        }
+
+        // Swap MUST refuse and leave overflow intact.
+        let swapped = idx.try_swap_warming();
+        assert!(
+            !swapped,
+            "stale-by-generation warming must NOT swap in (#1074)"
+        );
+        let after_overflow = idx.inner.lock().unwrap().overflow.len();
+        assert_eq!(
+            after_overflow, before_overflow,
+            "stale swap must NOT drain overflow (#1074 regression)"
+        );
+        // The alpha entry must still be findable via the linear
+        // overflow scan (no graph yet).
+        let hits = idx.search(&make_embedding(&[1.0_f32, 0.0, 0.0, 0.0]), 5);
+        assert!(hits.iter().any(|h| h.id == "alpha"));
+    }
+
+    // v0.7.0 #1074 — confirm overflow.clear() in the eviction path
+    // bumps the generation counter so a snapshot captured BEFORE the
+    // eviction will fail the gen check on swap. This pins the load-
+    // bearing invariant: clear() must always bump.
+    #[test]
+    fn eviction_clear_bumps_overflow_generation_1074() {
+        let idx = VectorIndex::with_max_entries_for_test(2);
+        let gen_initial = idx.inner.lock().unwrap().overflow_generation;
+        // 3 inserts past cap=2 → at least one eviction-clear fires.
+        for i in 0..3 {
+            let mut v = vec![0.0_f32; 4];
+            v[i % 4] = 1.0;
+            idx.insert(format!("e{i}"), make_embedding(&v));
+        }
+        let gen_after = idx.inner.lock().unwrap().overflow_generation;
+        assert!(
+            gen_after > gen_initial,
+            "eviction-clear path must bump overflow_generation (#1074)"
+        );
     }
 }

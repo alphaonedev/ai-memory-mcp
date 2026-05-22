@@ -175,7 +175,12 @@ pub(super) fn handle_link(
             .unwrap_or_else(GovernancePolicy::default);
         let max_depth = policy.effective_max_reflection_depth();
 
-        let check = would_create_reflection_cycle(conn, source_id, target_id, max_depth);
+        // v0.7.0 #1090 (SR-2 #5, MEDIUM) — fail-CLOSED on SQL errors
+        // during the cycle walk. Propagate the rusqlite err as a
+        // refusal envelope so the caller surfaces the failure instead
+        // of silently landing a possibly-cycle-creating edge.
+        let check = would_create_reflection_cycle(conn, source_id, target_id, max_depth)
+            .map_err(|e| format!("reflection cycle check failed (#1090 fail-CLOSED): {e}"))?;
         if check.would_cycle {
             // Append refusal to signed_events (best-effort; log on failure).
             let refusal_payload = serde_json::json!({

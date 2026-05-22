@@ -818,21 +818,28 @@ CREATE INDEX IF NOT EXISTS idx_recall_observations_observed_at
 -- Callers that want a different depth ceiling should query
 -- `PostgresStore::kg_query` directly — the view is fixed at 5 so it can
 -- be a plain `SELECT *` from psql without extra parameters.
+-- v0.7.0 #1086 (SR-2 #4, MEDIUM) — array-based cycle detection.
+-- Pre-#1086 the substring `position()` check false-positived
+-- whenever one id was a substring of another at the `->` boundary
+-- (e.g. ids `foo` and `foo-bar`). Switch to TEXT[] node accumulator
+-- matching the `kg_find_paths` pattern. `path` is preserved on the
+-- wire (`array_to_string(nodes, '->')`) for byte-stable downstream
+-- consumers.
 CREATE OR REPLACE VIEW kg_query_view AS
-WITH RECURSIVE traversal(source_id, target_id, relation, depth, path) AS (
+WITH RECURSIVE traversal(source_id, target_id, relation, depth, nodes) AS (
     SELECT ml.source_id, ml.target_id, ml.relation, 1,
-           ml.source_id || '->' || ml.target_id
+           ARRAY[ml.source_id, ml.target_id]::TEXT[]
     FROM memory_links ml
     UNION ALL
     SELECT t.source_id, ml.target_id, ml.relation, t.depth + 1,
-           t.path || '->' || ml.target_id
+           t.nodes || ml.target_id
     FROM memory_links ml
     JOIN traversal t ON ml.source_id = t.target_id
     WHERE t.depth < 5
-      AND position(('->' || ml.target_id) IN t.path) = 0
-      AND position((ml.target_id || '->') IN t.path) = 0
+      AND NOT (ml.target_id = ANY(t.nodes))
 )
-SELECT source_id, target_id, relation, depth, path
+SELECT source_id, target_id, relation, depth,
+       array_to_string(nodes, '->') AS path
 FROM traversal;
 
 -- kg_timeline_view — temporal-validity projection.
