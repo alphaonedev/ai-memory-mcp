@@ -293,6 +293,113 @@ async fn sync_since_unenrolled_peer_without_signature_is_permitted_1031() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn sync_since_mtls_bypass_still_requires_signature_under_require_sig_1040() {
+    // v0.7.0 #1040 (Agent-5 #7) — the mTLS-only api-key bypass for
+    // `/api/v1/sync/*` (transport.rs:657) lets cert-pinned peers
+    // skip `x-api-key` but does NOT exempt them from the
+    // signature gate. Pre-#1031 + #1040 an mTLS peer could spoof
+    // `X-Peer-Id` because `/sync/since` had no sig check. Post-
+    // #1031 the sig gate fires regardless of mTLS bypass — this
+    // test pins that contract.
+    //
+    // We simulate the mTLS bypass by setting `mtls_enforced = true`
+    // on the ApiKeyState. The middleware skips the api-key check;
+    // the handler still requires the sig. The pin verifies that an
+    // enrolled peer's missing-sig request is refused even when the
+    // mTLS bypass would otherwise let it past the middleware.
+    let _g = env_lock();
+    unsafe {
+        std::env::set_var(REQUIRE_SIG_ENV, "1");
+        std::env::set_var(REQUIRE_NONCE_ENV, "0");
+    }
+    // Custom setup that sets mtls_enforced=true to exercise the
+    // bypass path. Same shape as `setup()` otherwise.
+    let db_tmp = tempfile::NamedTempFile::new().expect("db tempfile");
+    let db_path = db_tmp.path().to_path_buf();
+    let _ = ai_memory::db::open(&db_path).expect("db::open");
+    let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");
+    let db: Db = Arc::new(Mutex::new((
+        conn,
+        db_path.clone(),
+        ResolvedTtl::default(),
+        true,
+    )));
+    let key_tmp = TempDir::new().expect("key tempdir");
+    unsafe {
+        std::env::set_var("AI_MEMORY_KEY_DIR", key_tmp.path());
+    }
+    let alice = kp_mod::generate("ai:peer-alice-1040").expect("generate alice keypair");
+    let alice_pub_only = kp_mod::AgentKeypair {
+        agent_id: alice.agent_id.clone(),
+        public: alice.public,
+        private: None,
+    };
+    kp_mod::save_public_only(&alice_pub_only, key_tmp.path()).expect("enrol alice pubkey");
+    // Set mtls_enforced=true to fire the api-key bypass at line 657.
+    // The api-key itself is also set so the middleware would
+    // normally reject — proving the bypass + post-#1031 sig gate
+    // are the load-bearing pieces.
+    let api_key_state = ApiKeyState {
+        key: Some("test-api-key".to_string()),
+        mtls_enforced: true,
+    };
+    let app_state = AppState {
+        db,
+        embedder: Arc::new(None),
+        vector_index: Arc::new(Mutex::new(None)),
+        federation: Arc::new(None),
+        tier_config: Arc::new(FeatureTier::Keyword.config()),
+        scoring: Arc::new(ResolvedScoring::default()),
+        profile: Arc::new(ai_memory::profile::Profile::core()),
+        mcp_config: Arc::new(None),
+        active_keypair: Arc::new(None),
+        family_embeddings: Arc::new(tokio::sync::RwLock::new(Some(Vec::new()))),
+        storage_backend: StorageBackend::Sqlite,
+        #[cfg(feature = "sal")]
+        store: Arc::new(
+            ai_memory::store::sqlite::SqliteStore::open(&db_path).expect("open SqliteStore"),
+        ),
+        llm: Arc::new(None),
+        auto_tag_model: Arc::new(None),
+        llm_call_timeout: std::time::Duration::from_secs(30),
+        replay_cache: Arc::new(ai_memory::identity::replay::ReplayCache::default()),
+        verify_require_nonce: false,
+        federation_nonce_cache: Arc::new(
+            ai_memory::identity::replay::FederationNonceCache::default(),
+        ),
+        autonomous_hooks: false,
+        recall_scope: Arc::new(None),
+        deferred_audit_queue: Arc::new(None),
+        admin_agent_ids: Arc::new(Vec::new()),
+        rule_cache: std::sync::Arc::new(ai_memory::governance::rule_cache::RuleCache::new()),
+    };
+    let router = ai_memory::build_router(api_key_state, app_state);
+
+    // Alice (enrolled, mTLS-bypassed) sends sync/since with NO
+    // X-Memory-Sig. Pre-#1040 this would 200 (mTLS bypass +
+    // sig-less /sync/since). Post-#1040 (with #1031 landed) the
+    // signature gate at the handler refuses regardless of the
+    // middleware bypass.
+    let (status, body) = sync_since_get(
+        &router,
+        "limit=10",
+        None, /* no signature */
+        None,
+        Some(&alice.agent_id),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "#1040: mTLS bypass MUST NOT exempt enrolled peers from the \
+         post-#1031 signature gate on /sync/since; body={body}"
+    );
+
+    drop(db_tmp);
+    drop(key_tmp);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn sync_since_require_sig_off_skips_all_checks_1031() {
     let _g = env_lock();
     // Operator opts out via REQUIRE_SIG=0 (legacy compat).

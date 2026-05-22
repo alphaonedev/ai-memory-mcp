@@ -653,6 +653,31 @@ pub async fn api_key_auth(
     // outbound forgets the header → 401 → quorum_not_met). The
     // bypass is scoped to `/api/v1/sync/*` so non-federation surfaces
     // still require the api-key when configured (defense in depth).
+    //
+    // v0.7.0 #1040 (Agent-5 #7) — the bypass is signature-gated
+    // downstream:
+    //
+    //   - `/api/v1/sync/push` requires `X-Memory-Sig` over the body
+    //     under `AI_MEMORY_FED_REQUIRE_SIG=1` (#791 default).
+    //   - `/api/v1/sync/since` requires `X-Memory-Sig` over canonical
+    //     GET bytes (`method || path || query`) under the same env
+    //     gate (#1031, v0.7.0).
+    //
+    // So with the v0.7.0 secure defaults (`AI_MEMORY_FED_REQUIRE_SIG=1`),
+    // an mTLS peer cannot spoof `X-Peer-Id` because the signed-message
+    // gate downstream verifies the sig against the claimed peer-id's
+    // enrolled key — the claim is bound to a cryptographic identity
+    // separate from the cert fingerprint. Operators running with
+    // `AI_MEMORY_FED_REQUIRE_SIG=0` (legacy peer-rollout posture) lose
+    // this defense and trust X-Peer-Id verbatim; that mode is
+    // explicitly documented as UNSAFE in the CLAUDE.md env-var table.
+    //
+    // A deeper hardening — extract peer-id from the client cert's
+    // Subject CN / SAN and cross-check against X-Peer-Id — requires
+    // axum to expose the peer certificate via request extensions; a
+    // focused follow-up tracks that v0.8 surface change. For v0.7.0
+    // the #1031 signed-GET gate + the env-default-secure posture
+    // close the acute exploitability surface.
     let path = req.uri().path();
     if auth.mtls_enforced && path.starts_with("/api/v1/sync/") {
         return next.run(req).await.into_response();
