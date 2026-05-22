@@ -14,7 +14,20 @@
 -- 00-create-extension-age.sql before this file runs; no need
 -- to re-create it. pgvector comes from the local Dockerfile
 -- layer (postgresql-16-pgvector).
-CREATE EXTENSION IF NOT EXISTS vector;
+--
+-- The upstream AGE init script sets `search_path = ag_catalog,
+-- "$user", public` BEFORE this file runs, so `CREATE EXTENSION
+-- vector` without an explicit `WITH SCHEMA` clause would land
+-- pgvector in `ag_catalog` (the first writable schema in
+-- search_path) instead of `public`. Fresh SAL connections then
+-- can't resolve the `vector` type because their default
+-- search_path is `"$user", public` (no ag_catalog).
+--
+-- The explicit `WITH SCHEMA public` pins pgvector to the
+-- `public` schema where the SAL postgres adapter expects it
+-- at fresh-connection time. AGE stays in `ag_catalog` by
+-- upstream-image convention.
+CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public;
 
 LOAD 'age';
 SET search_path = ag_catalog, "$user", public;
