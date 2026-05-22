@@ -406,6 +406,13 @@ pub enum Command {
     /// the same substrate handlers (re-exported under
     /// `crate::mcp::handle_skill_*`); no business logic is duplicated.
     Skill(crate::cli::commands::skill::SkillArgs),
+    /// v0.7.0 #1095 — `ai-memory share` subcommand. Closes the SR-4
+    /// three-surface-parity gap. Copies a memory into the recipient
+    /// agent's shared namespace `_shared/<from>→<to>/` via the same
+    /// substrate primitive the MCP tool (`memory_share`) and HTTP
+    /// route (`POST /api/v1/share`) consume — guaranteeing byte-equal
+    /// envelopes across the three surfaces.
+    Share(crate::cli::share::ShareArgs),
 }
 
 /// `ai-memory governance` parent argument struct.
@@ -1382,6 +1389,18 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
                 code => std::process::exit(code),
             }
         }
+        Command::Share(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            // v0.7.0 #1095 — `ai-memory share`. Wraps the same substrate
+            // primitive (`mcp::tools::share::handle_share`) the MCP +
+            // HTTP surfaces consume; wire envelope is byte-equal across
+            // the three.
+            cli::share::cmd_share(&db_path, &a, &mut out)
+        }
     };
 
     // WAL checkpoint after write commands to prevent unbounded WAL growth
@@ -1432,6 +1451,10 @@ pub fn is_write_command(cmd: &Command) -> bool {
             // but we classify the whole family as write-class so the
             // post-run WAL checkpoint runs.
             | Command::Namespace(_)
+            // v0.7.0 #1095 — `ai-memory share` copies a row into the
+            // recipient agent's `_shared/<from>→<to>/` namespace, so
+            // it must trip the post-run WAL checkpoint.
+            | Command::Share(_)
     )
 }
 
