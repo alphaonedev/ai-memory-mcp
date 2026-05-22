@@ -148,10 +148,42 @@ pub fn run(
         .map_err(|e| anyhow::anyhow!("governance check-action: {e}"))?;
 
     if args.json {
+        // v0.7.0 #1103 — structured Deny envelope. When the resolved
+        // decision is `refuse`, lift `rule_id` + `reason` to the top
+        // level and tag the payload with `error: "GOVERNANCE_REFUSED"`
+        // (uppercase, matching the HTTP error-envelope tag for
+        // governance refusals so MCP / HTTP / CLI surfaces are
+        // byte-equal under JSON parsing). Allow / warn keep emitting
+        // the unchanged envelope so existing consumers don't break.
+        let decision_obj = envelope.get("decision").cloned().unwrap_or(Value::Null);
+        let verdict = decision_obj
+            .get("decision")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let payload = if verdict == "refuse" {
+            let rule_id = decision_obj
+                .get("rule_id")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let reason = decision_obj
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            serde_json::json!({
+                "error": "GOVERNANCE_REFUSED",
+                "decision": "deny",
+                "rule_id": rule_id,
+                "reason": reason,
+                "kind": args.kind,
+                "agent_id": agent_id,
+            })
+        } else {
+            envelope.clone()
+        };
         writeln!(
             out.stdout,
             "{}",
-            serde_json::to_string(&envelope)
+            serde_json::to_string(&payload)
                 .context("governance check-action: serialise JSON envelope")?
         )?;
         return Ok(());
@@ -278,8 +310,65 @@ mod tests {
         run(tmp.path(), &args, &mut out).unwrap();
         let stdout = String::from_utf8(so).unwrap();
         let v: Value = serde_json::from_str(stdout.trim()).unwrap();
-        assert_eq!(v["decision"]["decision"], "refuse");
-        assert_eq!(v["decision"]["rule_id"], "R001");
+        // v0.7.0 #1103 — structured Deny envelope. Pre-#1103 the JSON
+        // shape was the raw `run_check` envelope (`decision.decision`,
+        // `decision.rule_id`). Post-#1103 a refuse verdict is lifted
+        // to the top-level `GOVERNANCE_REFUSED` envelope so MCP / HTTP /
+        // CLI agree on the uppercase tag + flat-fielded shape.
+        assert_eq!(
+            v["error"], "GOVERNANCE_REFUSED",
+            "#1103: refuse verdict must surface `error=GOVERNANCE_REFUSED`"
+        );
+        assert_eq!(
+            v["decision"], "deny",
+            "#1103: refuse verdict must surface `decision=deny` (CLI/HTTP parity tag)"
+        );
+        assert_eq!(
+            v["rule_id"], "R001",
+            "#1103: refuse verdict must surface flat `rule_id` at the top level"
+        );
+        assert_eq!(
+            v["kind"], "filesystem_write",
+            "#1103: refuse envelope echoes the action kind"
+        );
+        assert!(
+            v["reason"].as_str().unwrap_or("").contains("/tmp"),
+            "#1103: refuse envelope carries the substrate `reason` string"
+        );
+    }
+
+    /// v0.7.0 #1103 — Allow / warn verdicts keep the legacy envelope
+    /// shape so existing callers that parse `decision.decision` aren't
+    /// broken. Only the refuse path lifts to the `GOVERNANCE_REFUSED`
+    /// tag. Pins the back-compat half of the #1103 fix.
+    #[test]
+    fn allow_verdict_keeps_legacy_envelope_1103() {
+        let _audit_lock = crate::governance::audit::forensic_sink_test_lock().lock();
+        let _no_pubkey = crate::governance::rules_store::force_no_operator_pubkey_for_test();
+        let tmp = seed_rules_db();
+        let mut so = Vec::<u8>::new();
+        let mut se = Vec::<u8>::new();
+        let mut out = CliOutput::from_std(&mut so, &mut se);
+        let args = CheckActionArgs {
+            kind: "filesystem_write".into(),
+            command: None,
+            // Path outside /tmp — substrate rule allows.
+            path: Some("/home/user/ok.txt".into()),
+            host: None,
+            binary: None,
+            custom_kind: None,
+            agent_id: None,
+            json: true,
+        };
+        run(tmp.path(), &args, &mut out).unwrap();
+        let stdout = String::from_utf8(so).unwrap();
+        let v: Value = serde_json::from_str(stdout.trim()).unwrap();
+        // Allow path keeps the raw envelope shape.
+        assert_eq!(v["decision"]["decision"], "allow");
+        assert!(
+            v.get("error").is_none(),
+            "#1103: allow verdicts must NOT carry the GOVERNANCE_REFUSED tag"
+        );
     }
 
     #[test]
