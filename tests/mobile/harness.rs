@@ -28,8 +28,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-/// Returns a writable path for a per-test SQLite database under the
-/// platform-appropriate app-sandbox directory.
+/// Returns a writable path for a per-test `SQLite` database under the
+/// platform-appropriate app-sandbox directory. `test_name` is used
+/// to disambiguate per-test fixtures.
 ///
 /// - **iOS**: `<NSDocumentDirectory>/ai-memory-test-<test_name>.db`
 ///   on the simulator that's the simulator's per-app Documents
@@ -80,9 +81,10 @@ fn sandbox_root() -> &'static Path {
         }
         // Host fallback: project-local .local-runs to honor the
         // no-/tmp HARD RULE documented in CLAUDE.md.
-        let mut p = std::env::var_os("CARGO_MANIFEST_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
+        let mut p = std::env::var_os("CARGO_MANIFEST_DIR").map_or_else(
+            || PathBuf::from("."),
+            PathBuf::from,
+        );
         p.push(".local-runs");
         p.push("mobile-runtime-harness");
         let _ = std::fs::create_dir_all(&p);

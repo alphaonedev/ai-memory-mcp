@@ -365,7 +365,28 @@ CREATE TABLE IF NOT EXISTS archived_memories (
     embedding           vector({EMBEDDING_DIM}),
     embedding_dim       INTEGER,
     original_tier       TEXT,
-    original_expires_at TIMESTAMPTZ
+    original_expires_at TIMESTAMPTZ,
+    -- #1025 (CRITICAL, 2026-05-21) — full v0.7.0 column carry. Pre-#1025
+    -- archive→restore round-trips silently erased these 14 fields. The
+    -- columns are NULLABLE so legacy already-archived rows stay valid.
+    -- The matching v49 migration ladder arm
+    -- (PostgresStore::migrate_v49) adds them via `ALTER TABLE ADD
+    -- COLUMN IF NOT EXISTS` for upgraded installs; fresh installs get
+    -- them inline here.
+    reflection_depth      INTEGER,
+    atomised_into         INTEGER,
+    atom_of               TEXT,
+    memory_kind           TEXT,
+    entity_id             TEXT,
+    persona_version       INTEGER,
+    citations             TEXT,
+    source_uri            TEXT,
+    source_span           TEXT,
+    confidence_source     TEXT,
+    confidence_signals    TEXT,
+    confidence_decayed_at TEXT,
+    mentioned_entity_id   TEXT,
+    version               BIGINT
 );
 
 CREATE INDEX IF NOT EXISTS archived_memories_namespace_idx  ON archived_memories (namespace);

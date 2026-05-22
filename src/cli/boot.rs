@@ -72,7 +72,14 @@ pub const MIN_SUPPORTED_SCHEMA: u32 = 16;
 /// documentation-drift rule the inventory now lives in
 /// `MIGRATION_LADDER.md` (single source of truth) and this comment
 /// only carries the current value + a pointer.
-pub const MAX_SUPPORTED_SCHEMA: u32 = 48;
+///
+/// **#1025 (2026-05-21):** bumped 48 → 49 for `archived_memories` full
+/// v0.7.0 column carry migration (reflection_depth, atomised_into,
+/// atom_of, memory_kind, entity_id, persona_version, citations,
+/// source_uri, source_span, confidence_source, confidence_signals,
+/// confidence_decayed_at, mentioned_entity_id, version). Pure additive
+/// ALTER TABLE on both backends.
+pub const MAX_SUPPORTED_SCHEMA: u32 = 49;
 
 /// Pure boundary check: `true` when `v` lies within
 /// `[MIN_SUPPORTED_SCHEMA, MAX_SUPPORTED_SCHEMA]`. Extracted so the
