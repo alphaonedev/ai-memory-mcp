@@ -2136,10 +2136,54 @@ pub fn run_mcp_server(
 
     // --- Initialize LLM (smart tier and above) — before embedder so Ollama
     //     client can be shared with nomic embedder ---
-    let llm: Option<Arc<OllamaClient>> = if let Some(ref llm_model) = tier_config.llm_model {
+    //
+    // #1142: mirror src/daemon_runtime.rs:1746-1798 env-aware resolver
+    // so the MCP stdio surface honors `AI_MEMORY_LLM_BACKEND` like the
+    // HTTP `serve` daemon does. Pre-#1142 the MCP path hardcoded the
+    // legacy Ollama init, locking every MCP client (Claude Code,
+    // Cursor, Codex CLI, Continue.dev, ChatGPT Desktop, ...) to local
+    // Ollama regardless of the operator's selector. Post-#1142 the
+    // env-aware path takes priority; legacy Ollama is the fallback
+    // when no env-backend is declared.
+    let backend_env = std::env::var("AI_MEMORY_LLM_BACKEND")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let llm: Option<Arc<OllamaClient>> = if let Some(backend) = backend_env {
+        // Operator explicitly chose a backend — route via from_env.
+        // OllamaClient is the post-#1067 wire-agnostic client (it
+        // wraps both Ollama-native `/api/chat` and OpenAI-compatible
+        // `/v1/chat/completions`); the struct name pre-dates the
+        // vendor sweep.
+        match OllamaClient::from_env() {
+            Ok(Some(client)) => {
+                let model_env = std::env::var("AI_MEMORY_LLM_MODEL")
+                    .ok()
+                    .unwrap_or_else(|| "<default-for-backend>".to_string());
+                eprintln!("ai-memory: LLM ready (backend={backend}, model={model_env})");
+                Some(Arc::new(client))
+            }
+            Ok(None) => {
+                eprintln!(
+                    "ai-memory: LLM disabled — AI_MEMORY_LLM_BACKEND={backend} resolved to None"
+                );
+                None
+            }
+            Err(e) => {
+                eprintln!(
+                    "ai-memory: LLM init failed (backend={backend}): {e} (LLM features disabled)"
+                );
+                None
+            }
+        }
+    } else if let Some(ref llm_model) = tier_config.llm_model {
+        // Legacy fallback: no AI_MEMORY_LLM_BACKEND env — use the
+        // tier-default Ollama model. Backward-compatible with v0.6.x
+        // operators who never set the env vars.
         let model_id = llm_model.ollama_model_id();
         eprintln!(
-            "ai-memory: connecting to Ollama for {} ...",
+            "ai-memory: connecting to Ollama for {} (legacy tier-default; set \
+             AI_MEMORY_LLM_BACKEND for provider-agnostic access) ...",
             llm_model.display_name()
         );
         let ollama_url = app_config.effective_ollama_url();
