@@ -52,6 +52,37 @@ use serde_json::Value;
 const TRIMMED_TOKEN_CEILING: usize = 11_000;
 const VERBOSE_TOKEN_CEILING: usize = 17_000;
 
+/// v0.7.0 #1058 (Agent-4 F4) — regression pin: the trimmed wire form
+/// must not carry `default: null` keys on optional property fields.
+/// Every `Option<T>` schemars-derived request field emits
+/// `default: null` by default — pre-#1058 the wire payload carried
+/// ~170 such entries (~700-1000 cl100k tokens of pure noise). The
+/// `strip_description_recursively` helper now drops them.
+fn count_default_nulls(value: &Value) -> usize {
+    match value {
+        Value::Object(map) => {
+            let here = usize::from(matches!(map.get("default"), Some(Value::Null)));
+            here + map.values().map(count_default_nulls).sum::<usize>()
+        }
+        Value::Array(items) => items.iter().map(count_default_nulls).sum(),
+        _ => 0,
+    }
+}
+
+#[test]
+fn wire_form_drops_default_null_noise_1058() {
+    let defs = tool_definitions_for_profile(&Profile::full());
+    let tools = defs["tools"].as_array().expect("tools array");
+    let total: usize = tools.iter().map(count_default_nulls).sum();
+    assert_eq!(
+        total,
+        0,
+        "#1058: trimmed wire payload MUST carry zero `default: null` entries; \
+         got {total} occurrences across {} tools",
+        tools.len()
+    );
+}
+
 /// Look up a single tool's `inputSchema.properties` map under the
 /// full profile's trimmed wire form.
 fn wire_properties(tool_name: &str) -> serde_json::Map<String, Value> {

@@ -858,7 +858,32 @@ pub fn overlay_tool_payloads(
 
     // Build a name → (docs, inputSchema) lookup from the canonical
     // tool catalog. Done once per call; cheap (~50 entries).
-    let defs = crate::mcp::tool_definitions();
+    //
+    // v0.7.0 #1059 (Agent-4 F5) — when `verbose=false` the caller is
+    // asking for the trimmed wire shape. Pre-#1059 this function
+    // injected the FULL unstripped schemars `inputSchema` regardless
+    // of the verbose flag — including schemars-only metadata
+    // (top-level `description`, `$schema`, `title`, nested
+    // `definitions.*.description`, per-property `description`,
+    // `default: null`) that the bare `tools/list` payload strips via
+    // `strip_docs_from_tools`. The asymmetric gate meant a caller
+    // sending `include_schema=true, verbose=false` got a noisier
+    // payload than the bare `tools/list` they would have received
+    // with no overlay.
+    //
+    // Post-#1059 the lookup runs through `strip_docs_from_tools`
+    // when `verbose=false` so the overlay matches the bare wire
+    // contract. When `verbose=true` the caller is explicitly asking
+    // for the prose surface — preserve the un-stripped schemas.
+    let defs = if verbose {
+        crate::mcp::tool_definitions()
+    } else {
+        let mut defs = crate::mcp::tool_definitions();
+        if let Some(arr) = defs.get_mut("tools").and_then(Value::as_array_mut) {
+            crate::mcp::registry::strip_docs_from_tools(arr);
+        }
+        defs
+    };
     let lookup: std::collections::HashMap<String, (Option<Value>, Option<Value>)> = defs
         .get("tools")
         .and_then(Value::as_array)

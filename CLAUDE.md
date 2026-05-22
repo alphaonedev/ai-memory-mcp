@@ -480,7 +480,10 @@ hasn't been deduplicated yet (#867 tracks that follow-up).
 `tools/list` is rendered through
 [`crate::mcp::registry::strip_docs_from_tools`] before it goes on the
 wire. The trimmer drops every long-form natural-language string from
-the bare payload so the C5 ≤ 3500 cl100k token ceiling holds for the
+the bare payload so the C5 ≤ 11000 cl100k token ceiling holds for the
+(post-D1.6 schemars expansion; the pre-D1.6 hand-coded macro held the
+budget at ≤ 3500 cl100k tokens, raised to 11000 by
+`tests/token_budget_guard.rs:75` `TRIMMED_FULL_PROFILE_CEILING_TOKENS`
 full profile. Stripped surfaces:
 
 - Top-level `docs` field (the prose mirror of `description`).
