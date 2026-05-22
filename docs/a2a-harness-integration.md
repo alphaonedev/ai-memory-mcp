@@ -22,16 +22,19 @@ exercising this repo's binary.
 
 ## v0.7.0 substrate guarantees the harness can rely on
 
-- 71 MCP tools at `--profile full`; 7 at `--profile core` + always-on
+- 73 MCP tools at `--profile full`; 7 at `--profile core` + always-on
   `memory_capabilities`.
-- 72 HTTP routes registered.
-- Schema v43 (sqlite) / 41 (postgres parity ladder).
+- 73 HTTP routes registered.
+- Schema v49 (single logical version across sqlite + postgres at v0.7.0
+  release HEAD; see `src/storage/migrations.rs::CURRENT_SCHEMA_VERSION`
+  and `src/store/postgres.rs::CURRENT_SCHEMA_VERSION`).
 - Per-message Ed25519 federation signing (`X-Memory-Sig` header).
 - Per-peer attestation via `x-peer-id` header on every push.
-- 25-field `Memory` model with `reflection_depth`, `memory_kind`,
+- 26-field `Memory` model with `reflection_depth`, `memory_kind`,
   `entity_id`, `persona_version`, `citations`, `source_uri`,
   `source_span`, `confidence_source`, `confidence_signals`,
-  `confidence_decayed_at`.
+  `confidence_decayed_at`, and `version` (Gap-1 optimistic concurrency,
+  schema v45).
 
 ## v0.7.0 substrate features the harness MUST NOT depend on
 

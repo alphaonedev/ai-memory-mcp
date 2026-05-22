@@ -471,8 +471,11 @@ adapters, lands the four wire-schema + docstring fixes a 2026-05-19
 dogfood session surfaced, and ships the postgres parity work tracked
 under issue [#894](https://github.com/alphaonedev/ai-memory-mcp/issues/894).
 Tool count rises **71 → 73** (Gap 3 `memory_recall_observations` + the
-Gap 4 `confidence_tier` callable). Schema ladder advances to **sqlite v47
-/ postgres v29**. Cross-link to the full evidence bundle:
+Gap 4 `confidence_tier` callable). At v0.7.0 release HEAD the schema
+ladder reaches **v49** on both backends (single logical version after
+the #933 v48 `federation_push_dlq` table land and the #1025 v49
+14-column carry on `archived_memories`). Cross-link to the full evidence
+bundle:
 [`docs/v0.7.0/test-campaign-2026-05-18-dogfood/`](./test-campaign-2026-05-18-dogfood/).
 
 **The 7-level framework — gap × before × after × evidence.**
@@ -1213,9 +1216,11 @@ folded into the v0.7.0 tag rather than slipping to v0.7.1:
   [`docs/signed-events-v4.md`](../signed-events-v4.md).
 - **Canonical feature inventory.** The full post-grand-slam feature
   truth lives at [`docs/internal/v070-feature-inventory.md`](../internal/v070-feature-inventory.md)
-  (453 commits ahead of v0.6.4, +233,589/−23,541 lines, 71 MCP tools,
-  28 net-new since v0.6.4, 17 net-new `AI_MEMORY_*` env vars, 8 new
-  HTTP routes, 20 sqlite + 10 postgres new migrations).
+  (453 commits ahead of v0.6.4, +233,589/−23,541 lines, 73 MCP tools at
+  release HEAD, 30 net-new since v0.6.4, 17 net-new `AI_MEMORY_*` env
+  vars, 73 HTTP routes total, 32 sqlite migrations on disk + the in-
+  process v35-v49 arms that converge sqlite + postgres on the single
+  logical `CURRENT_SCHEMA_VERSION = 49`).
 
 ## Backward compatibility
 
