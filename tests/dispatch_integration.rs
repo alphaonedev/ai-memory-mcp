@@ -629,6 +629,15 @@ fn cli_db_passphrase_file_flag_accepted() {
     let tmp = TempDir::new().unwrap();
     let pass = tmp.path().join("passphrase.txt");
     std::fs::write(&pass, b"correct-horse-battery-staple\n").unwrap();
+    // v0.7.0 #1055 — production `passphrase_from_file` rejects
+    // group/world-readable passphrase files; mirror the documented
+    // operator posture (mode 0400) so the test exercises the
+    // accept-path.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&pass, std::fs::Permissions::from_mode(0o400)).unwrap();
+    }
     let db = tmp.path().join("passphrase-flag.db");
     ai_memory(&db)
         .args([
