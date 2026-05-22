@@ -151,12 +151,20 @@ fn cli_refuses_filesystem_write_to_tmp() {
     let raw = String::from_utf8(out).expect("utf-8 stdout");
     let v: serde_json::Value = serde_json::from_str(raw.trim())
         .unwrap_or_else(|e| panic!("expected JSON; got: {raw}\nerror: {e}"));
+    // Post-#1103 (commit 7d048eacf) the refuse path's --json envelope
+    // is flat: {"decision": "deny", "error": "GOVERNANCE_REFUSED",
+    // "rule_id": "...", "kind": "...", "agent_id": "...", "reason": "..."}.
+    // The allow path stays nested by design (see cli_allows_*).
     assert_eq!(
-        v["decision"]["decision"], "refuse",
-        "expected refuse for /tmp/** path; got: {v}"
+        v["decision"], "deny",
+        "expected deny for /tmp/** path; got: {v}"
     );
     assert_eq!(
-        v["decision"]["rule_id"], "R001",
+        v["error"], "GOVERNANCE_REFUSED",
+        "expected GOVERNANCE_REFUSED error tag; got: {v}"
+    );
+    assert_eq!(
+        v["rule_id"], "R001",
         "expected R001 to fire; got: {v}"
     );
     assert_eq!(v["kind"], "filesystem_write");
@@ -190,12 +198,17 @@ fn cli_refuses_process_spawn_on_binary_match() {
     let raw = String::from_utf8(out).expect("utf-8 stdout");
     let v: serde_json::Value = serde_json::from_str(raw.trim())
         .unwrap_or_else(|e| panic!("expected JSON; got: {raw}\nerror: {e}"));
+    // Post-#1103 (commit 7d048eacf) flat refuse envelope.
     assert_eq!(
-        v["decision"]["decision"], "refuse",
-        "expected refuse for forbidden-bin; got: {v}"
+        v["decision"], "deny",
+        "expected deny for forbidden-bin; got: {v}"
     );
     assert_eq!(
-        v["decision"]["rule_id"], "R004F",
+        v["error"], "GOVERNANCE_REFUSED",
+        "expected GOVERNANCE_REFUSED error tag; got: {v}"
+    );
+    assert_eq!(
+        v["rule_id"], "R004F",
         "expected R004F to fire; got: {v}"
     );
 }
