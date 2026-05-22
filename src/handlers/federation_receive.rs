@@ -30,8 +30,30 @@ use super::federation_signing_check::verify_signature_or_reject;
 /// `x-peer-id` header. Lowercase form per HTTP/2 wire convention;
 /// axum's `HeaderMap` lookup is case-insensitive so callers can send
 /// the canonical `X-Peer-Id`.
+///
+/// v0.7.0 #1049 (Agent-5 #9) — validates the header value through
+/// `validate::validate_agent_id` before returning so the raw header
+/// content cannot inject CRLF/terminal-escape sequences into
+/// downstream tracing log files or be smuggled into the
+/// `FederationNonceCache` key (where exotic bytes would create
+/// per-peer cache fragmentation an attacker could weaponise to
+/// flood-evict legitimate peer entries). Returns `None` for any
+/// header that fails the agent_id shape check — same observable
+/// outcome as the header being absent.
 pub(super) fn extract_peer_id(headers: &HeaderMap) -> Option<&str> {
-    headers.get(PEER_ID_HEADER).and_then(|v| v.to_str().ok())
+    let raw = headers.get(PEER_ID_HEADER).and_then(|v| v.to_str().ok())?;
+    // Reject anything that fails the agent_id shape per CLAUDE.md
+    // §"Agent Identity": `^[A-Za-z0-9_\-:@./]{1,128}$`. The strict
+    // shape is the load-bearing property — no whitespace, no nulls,
+    // no control chars (CRLF), no shell metacharacters.
+    if crate::validate::validate_agent_id(raw).is_err() {
+        tracing::warn!(
+            target: "federation::peer_id",
+            "extract_peer_id: dropped malformed X-Peer-Id header (#1049 validation gate)"
+        );
+        return None;
+    }
+    Some(raw)
 }
 
 /// v0.7.0 #238 — render a 403 envelope when the body-claimed
@@ -289,6 +311,39 @@ pub async fn sync_push(
     // deserialising the body. Keeps the verifier's input identical
     // to the wire bytes (signer + verifier MUST agree byte-for-byte).
     let peer_header_owned = extract_peer_id(&headers).map(str::to_string);
+
+    // v0.7.0 #1056 (Agent-2 #6) — TOFU spoofing guard. The
+    // (no sig, no enrolled key) arm of `verify_signature_or_reject`
+    // allows the request through with a WARN ("strict enforcement
+    // skipped") so an unenrolled federation pair stays operational.
+    // That permissive posture lets an attacker who knows a legitimate
+    // peer's id but has NOT yet been enrolled (heterogeneous rollout
+    // window — operator enrols half the mesh) impersonate the
+    // unenrolled half. Close the window by refusing any push whose
+    // claimed `x-peer-id` is NOT in the operator-configured peer
+    // allowlist (`AI_MEMORY_FED_PEER_ATTESTATION`). When NO allowlist
+    // is configured (the default zero-config state), this gate is a
+    // no-op and the legacy posture stands — so the security uplift
+    // only fires when the operator has explicitly enrolled peers.
+    if let Some(peer_id) = peer_header_owned.as_deref() {
+        let attest_cfg = peer_attestation::PeerAttestationConfig::from_env();
+        if attest_cfg.has_allowlist() && attest_cfg.scope_for(peer_id).is_none() {
+            tracing::warn!(
+                target: "federation::attestation",
+                peer_id = %peer_id,
+                "sync_push: x-peer-id is not in operator allowlist — refusing (#1056 TOFU guard)"
+            );
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({
+                    "error": "x_peer_id_not_in_allowlist",
+                    "note": "#1056: x-peer-id is not in AI_MEMORY_FED_PEER_ATTESTATION; \
+                             enrol the peer or unset the env to restore zero-config posture.",
+                })),
+            )
+                .into_response();
+        }
+    }
     // v0.7.0 #922 — chained nonce-freshness check after signature verifies.
     if let Some(rejection) = verify_signature_or_reject(
         &headers,
@@ -1039,4 +1094,80 @@ pub async fn sync_push(
         })),
     )
         .into_response()
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    /// v0.7.0 #1049 (Agent-5 #9) — `extract_peer_id` validates the
+    /// header value through `crate::validate::validate_agent_id`
+    /// before returning. The validator rejects whitespace, null
+    /// bytes, control characters (CR/LF), shell metacharacters,
+    /// and anything over 128 bytes. This unit suite pins both the
+    /// happy path (legitimate agent-id-shaped values pass) and
+    /// representative rejection arms.
+    fn build_headers(value: &str) -> Option<HeaderMap> {
+        // HeaderMap rejects some invalid bytes at insertion time
+        // (e.g. ASCII control chars). Use HeaderValue::from_bytes
+        // and ignore failures so the test can probe the validator
+        // path; if HeaderValue refuses the byte sequence too, the
+        // header is unreachable from the wire so we skip that case.
+        let hv = HeaderValue::from_bytes(value.as_bytes()).ok()?;
+        let mut h = HeaderMap::new();
+        h.insert(PEER_ID_HEADER, hv);
+        Some(h)
+    }
+
+    #[test]
+    fn extract_peer_id_accepts_legitimate_agent_id_1049() {
+        let h = build_headers("ai:peer-alpha").expect("legitimate value fits in HeaderValue");
+        assert_eq!(extract_peer_id(&h), Some("ai:peer-alpha"));
+    }
+
+    #[test]
+    fn extract_peer_id_accepts_hostname_form_1049() {
+        let h = build_headers("host:laptop.local:pid-42").expect("legitimate value fits");
+        assert_eq!(extract_peer_id(&h), Some("host:laptop.local:pid-42"));
+    }
+
+    #[test]
+    fn extract_peer_id_rejects_value_with_whitespace_1049() {
+        let h = build_headers("peer one").expect("space fits in HeaderValue");
+        assert_eq!(
+            extract_peer_id(&h),
+            None,
+            "#1049: whitespace in peer-id MUST be rejected by the validator"
+        );
+    }
+
+    #[test]
+    fn extract_peer_id_rejects_value_with_shell_metacharacters_1049() {
+        let h = build_headers("peer$attacker").expect("$ fits in HeaderValue");
+        assert_eq!(
+            extract_peer_id(&h),
+            None,
+            "#1049: shell metacharacters in peer-id MUST be rejected"
+        );
+    }
+
+    #[test]
+    fn extract_peer_id_rejects_oversized_value_1049() {
+        // 129-byte string exceeds the validator's 1..=128 length cap.
+        let oversized = "a".repeat(129);
+        let h = build_headers(&oversized).expect("129-byte ASCII fits in HeaderValue");
+        assert_eq!(
+            extract_peer_id(&h),
+            None,
+            "#1049: oversized peer-id (>128 bytes) MUST be rejected"
+        );
+    }
+
+    #[test]
+    fn extract_peer_id_absent_returns_none() {
+        let h = HeaderMap::new();
+        assert_eq!(extract_peer_id(&h), None);
+    }
 }
