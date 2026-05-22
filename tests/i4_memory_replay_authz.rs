@@ -43,12 +43,7 @@ static RULES_GUARD: Mutex<()> = Mutex::new(());
 /// Pre-#1075 this argument was absent (memories had no owner and
 /// visibility was unenforced on the replay path) — that's the gap
 /// #1075 closed.
-fn insert_memory(
-    conn: &rusqlite::Connection,
-    id: &str,
-    namespace: &str,
-    owner_agent_id: &str,
-) {
+fn insert_memory(conn: &rusqlite::Connection, id: &str, namespace: &str, owner_agent_id: &str) {
     let now = chrono::Utc::now().to_rfc3339();
     // v0.7.0 fix campaign R1-M2 — substrate CHECK trigger enforces
     // tier ∈ {short, mid, long}.

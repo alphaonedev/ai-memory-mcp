@@ -38,6 +38,15 @@
 //! Until then the T3 cells stand as live documentation of the expected
 //! call shape.
 
+// #1125 follow-up: the t3_use_* Memory{...} constructors fully enumerate
+// every field of the 26-column v0.7.0 Memory struct so a future field
+// addition surfaces here as a compile error. The trailing
+// `..Memory::default()` is intentional belt-and-suspenders — clippy
+// pedantic flags it as `needless_update`, but removing it would silence
+// the "new field added" diagnostic on every future schema bump. Allow
+// the lint at file scope to keep both safety nets.
+#![allow(clippy::needless_update)]
+
 use ai_memory::config::{FeatureTier, TierConfig};
 use ai_memory::mcp::handle_capabilities_with_conn_v3;
 use ai_memory::profile::Profile;
@@ -359,9 +368,8 @@ fn t3_use_memory_load_family_loads_graph_family_at_runtime() {
     let _ = models::default_metadata();
     db::insert(&conn, &seed).expect("seed graph-family memory");
 
-    let resp =
-        handle_load_family(&conn, &json!({"family": "graph", "namespace": "ns-t3"}))
-            .expect("memory_load_family must succeed");
+    let resp = handle_load_family(&conn, &json!({"family": "graph", "namespace": "ns-t3"}))
+        .expect("memory_load_family must succeed");
 
     assert_eq!(resp["family"], "graph", "family echoed; got: {resp}");
     assert_eq!(resp["namespace"], "ns-t3", "namespace echoed; got: {resp}");
@@ -389,12 +397,8 @@ fn t3_use_memory_smart_load_intent_routes_store_request_to_core_family() {
 
     let conn = fresh_conn();
 
-    let resp = handle_smart_load(
-        &conn,
-        &json!({"intent": "store a new observation"}),
-        None,
-    )
-    .expect("memory_smart_load must succeed");
+    let resp = handle_smart_load(&conn, &json!({"intent": "store a new observation"}), None)
+        .expect("memory_smart_load must succeed");
 
     assert_eq!(
         resp["chosen_family"], "core",
