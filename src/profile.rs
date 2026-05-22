@@ -32,10 +32,14 @@
 //! - `power` — adds the 8 LLM-augmented + operator tools (consolidate,
 //!   auto_tag, …, plus the v0.7 K7 subscription-reliability pair).
 //!   ~15 tools.
-//! - `full` — every family. 51 tools (v0.6.3 baseline 43 + v0.7.0 I4 `memory_replay` + v0.7 H4 `memory_verify` + v0.7 B1 `memory_load_family` + v0.7 B2 `memory_smart_load` + v0.7 K7 `memory_subscription_replay` + `memory_subscription_dlq_list` + v0.7 J7 `memory_find_paths` + v0.7 K8 `memory_quota_status`).
+//! - `full` — every family. **73 advertised entries at v0.7.0**
+//!   (72 callable "memory tools" + the always-on `memory_capabilities`
+//!   bootstrap; `Profile::full().expected_tool_count()` is the
+//!   canonical assertion).
 //! - `custom` — comma-separated family list (`core,graph,archive` …).
 //!   `core` is implicitly added if missing — there's no profile that
-//!   ships *less than* the 5 core tools.
+//!   ships *less than* the 7 core tools at v0.7.0 (the original 5 +
+//!   `memory_load_family` + `memory_smart_load`).
 //!
 //! ## Custom-profile parsing edge cases
 //!
@@ -540,9 +544,11 @@ impl Profile {
     /// **always-on** regardless of profile per RFC scenario S27. It is
     /// NOT in this family list because the registration filter
     /// (v0.6.4-002) injects it as a bootstrap tool outside the
-    /// profile-driven path. That keeps the "core profile = 5 tools"
-    /// claim accurate while still making the runtime-discovery dance
-    /// reachable.
+    /// profile-driven path. That keeps the "core profile = 7 tools at
+    /// v0.7.0" claim accurate (5 original + memory_load_family +
+    /// memory_smart_load) while still making the runtime-discovery
+    /// dance reachable. Cross-check with
+    /// `Profile::core().expected_tool_count()`.
     #[must_use]
     pub fn core() -> Self {
         Self {
@@ -582,11 +588,11 @@ impl Profile {
         }
     }
 
-    /// `full` — every family. 51 tools (v0.6.3 baseline 43 + v0.7.0 I4
-    /// `memory_replay` + v0.7 H4 `memory_verify` + v0.7 B1
-    /// `memory_load_family` + v0.7 B2 `memory_smart_load` + v0.7 K7
-    /// `memory_subscription_replay` + `memory_subscription_dlq_list` +
-    /// v0.7 J7 `memory_find_paths` + v0.7 K8 `memory_quota_status`).
+    /// `full` — every family. **73 advertised entries at v0.7.0**
+    /// (72 callable "memory tools" + the always-on `memory_capabilities`
+    /// bootstrap). Cross-check with
+    /// `Profile::full().expected_tool_count()` — the canonical
+    /// assertion.
     #[must_use]
     pub fn full() -> Self {
         Self {
@@ -889,9 +895,9 @@ mod tests {
     }
 
     #[test]
-    fn profile_full_has_fifty_one_tools() {
+    fn profile_full_has_seventy_three_tools() {
         let p = Profile::full();
-        // v0.7.0 L2 cascade (L2-3 + L2-6 + L2-7) — full surface = 43 baseline +
+        // v0.7.0 L2 cascade (L2-3 + L2-6 + L2-7) — full surface =
         // memory_replay (I4) + memory_verify (H4) + memory_load_family (B1)
         // + memory_smart_load (B2) + memory_subscription_replay (K7) +
         // memory_subscription_dlq_list (K7) + memory_find_paths (J7) +
@@ -964,7 +970,7 @@ mod tests {
     #[test]
     fn parse_custom_implicitly_includes_core() {
         // Asking for just `archive` should still load core because
-        // there is no legitimate profile smaller than the 5 core tools.
+        // there is no legitimate profile smaller than the 7 core tools at v0.7.0.
         let p = Profile::parse("archive").unwrap();
         assert!(p.includes(Family::Core));
         assert!(p.includes(Family::Archive));

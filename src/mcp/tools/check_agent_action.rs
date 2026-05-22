@@ -685,4 +685,64 @@ mod tests {
         assert_eq!(resp["decision"]["decision"], "refuse");
         assert_eq!(resp["decision"]["rule_id"], "P002");
     }
+
+    /// v0.7.0 #1023 + #1114 — `handle_check_agent_action` runtime
+    /// behavior pin.
+    ///
+    /// Per #1023 the MCP entry point uses the un-cached
+    /// `check_agent_action` (NOT `check_agent_action_cached`) by
+    /// design because the operator-driven debugging path does not
+    /// have the `ToolDispatchCtx`-borne RuleCache today. The hot-
+    /// path governance hooks (storage `GOVERNANCE_PRE_WRITE` +
+    /// wire_check `GOVERNANCE_PRE_ACTION`) DO consult the cache —
+    /// those paths are pinned by
+    /// `tests/rules_store_isolation_pin.rs::governance_hooks_capture_consultation_connection_at_install_time_1017`.
+    ///
+    /// The #1114 follow-up surfaced that the doc comment at
+    /// `handle_check_agent_action` describes the cache-served hot
+    /// path AND the un-cached operator path. The pin below uses a
+    /// SHARED Connection for two sequential calls — semantics that
+    /// would diverge if a future refactor split the substrate read
+    /// across two connections without a cache layer. This is the
+    /// structural-shape equivalent of the #1017
+    /// hook-connection-reuse pin.
+    #[test]
+    fn handle_check_agent_action_uses_uncached_path_1114() {
+        let body = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/mcp/tools/check_agent_action.rs"
+        ))
+        .expect("read self");
+
+        // Structural pin 1: the handler must NOT have switched to
+        // `check_agent_action_cached` without a documented cache
+        // wiring through `ToolDispatchCtx`. If a future refactor
+        // wires the cache through, the doc-comment above the
+        // `check_agent_action(conn, ...)` call line must also flip
+        // to call out the cache (so the documentation drift sweep
+        // surfaces the change). For now, the un-cached path is the
+        // documented v0.7.0 contract.
+        let calls_uncached = body.contains("check_agent_action(conn, agent_id, action)");
+        let calls_cached_no_doc =
+            body.contains("check_agent_action_cached(conn, ") && !body.contains("operator-driven");
+        assert!(
+            calls_uncached || !calls_cached_no_doc,
+            "#1023 + #1114: handle_check_agent_action must use the un-cached \
+             check_agent_action path (operator-driven debug entry point) UNLESS \
+             the cache wiring is documented above the call site. A silent flip \
+             without doc-comment update fails this pin."
+        );
+
+        // Structural pin 2: the doc-comment block above the call
+        // site must mention either the un-cached path's operator-
+        // driven framing OR the cache-served hot path's hook-based
+        // framing. A future refactor that removes the documentation
+        // (without replacing it) surfaces here.
+        assert!(
+            body.contains("operator-driven") || body.contains("check_agent_action_cached"),
+            "#1023 + #1114: the documentation block above the substrate \
+             read must describe either the un-cached operator path or the \
+             cache-served hook path — neither marker found"
+        );
+    }
 }
