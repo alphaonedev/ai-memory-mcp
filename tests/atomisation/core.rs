@@ -884,9 +884,7 @@ fn live_gemma_e2b_smoke() {
                 "timed out",
             ];
             if infra_signals.iter().any(|s| msg.contains(s)) {
-                println!(
-                    "skipping live_gemma_e2b_smoke: Ollama not ready for gemma4:e2b ({msg})"
-                );
+                println!("skipping live_gemma_e2b_smoke: Ollama not ready for gemma4:e2b ({msg})");
                 return;
             }
             panic!("live atomise must succeed: {e:?}");

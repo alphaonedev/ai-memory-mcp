@@ -110,8 +110,12 @@ fn reflection_with_three_sources_returns_union_of_four_transcripts() {
         link_reflects_on(&conn, "ref-1", src);
     }
 
-    let payload = mcp::handle_replay(&conn, &json!({"memory_id": "ref-1", "agent_id": TEST_AGENT}), None)
-        .expect("replay against reflection succeeds");
+    let payload = mcp::handle_replay(
+        &conn,
+        &json!({"memory_id": "ref-1", "agent_id": TEST_AGENT}),
+        None,
+    )
+    .expect("replay against reflection succeeds");
     assert_eq!(payload["count"], 4, "self + 3 source transcripts");
 
     let arr = payload["transcripts"].as_array().unwrap();
@@ -171,17 +175,30 @@ fn depth_cap_bounds_chain_walk_via_handler() {
     link_reflects_on(&conn, "ref-top", "ref-mid");
 
     // depth=null → full chain (3 transcripts).
-    let full = mcp::handle_replay(&conn, &json!({"memory_id": "ref-top", "agent_id": TEST_AGENT}), None).unwrap();
+    let full = mcp::handle_replay(
+        &conn,
+        &json!({"memory_id": "ref-top", "agent_id": TEST_AGENT}),
+        None,
+    )
+    .unwrap();
     assert_eq!(full["count"], 3);
 
     // depth=2 → still full chain (no further ancestors after obs-leaf).
-    let depth2 =
-        mcp::handle_replay(&conn, &json!({"memory_id": "ref-top", "depth": 2, "agent_id": TEST_AGENT}), None).unwrap();
+    let depth2 = mcp::handle_replay(
+        &conn,
+        &json!({"memory_id": "ref-top", "depth": 2, "agent_id": TEST_AGENT}),
+        None,
+    )
+    .unwrap();
     assert_eq!(depth2["count"], 3);
 
     // depth=1 → self + one hop = ref-top + ref-mid.
-    let depth1 =
-        mcp::handle_replay(&conn, &json!({"memory_id": "ref-top", "depth": 1, "agent_id": TEST_AGENT}), None).unwrap();
+    let depth1 = mcp::handle_replay(
+        &conn,
+        &json!({"memory_id": "ref-top", "depth": 1, "agent_id": TEST_AGENT}),
+        None,
+    )
+    .unwrap();
     assert_eq!(depth1["count"], 2);
     let ids: Vec<&str> = depth1["transcripts"]
         .as_array()
@@ -194,8 +211,12 @@ fn depth_cap_bounds_chain_walk_via_handler() {
     assert!(!ids.contains(&t_leaf.id.as_str()));
 
     // depth=0 → self only (pre-L2-4 I4 shape).
-    let depth0 =
-        mcp::handle_replay(&conn, &json!({"memory_id": "ref-top", "depth": 0, "agent_id": TEST_AGENT}), None).unwrap();
+    let depth0 = mcp::handle_replay(
+        &conn,
+        &json!({"memory_id": "ref-top", "depth": 0, "agent_id": TEST_AGENT}),
+        None,
+    )
+    .unwrap();
     assert_eq!(depth0["count"], 1);
     assert_eq!(
         depth0["transcripts"][0]["id"].as_str().unwrap(),
@@ -219,7 +240,12 @@ fn non_reflection_replay_shape_unchanged_by_l2_4() {
     let t2 = transcripts::store(&conn, "team/eng", "body-2", None).unwrap();
     transcripts::link_transcript(&conn, "obs-2", &t2.id, None, None).unwrap();
 
-    let payload = mcp::handle_replay(&conn, &json!({"memory_id": "obs-1", "agent_id": TEST_AGENT}), None).unwrap();
+    let payload = mcp::handle_replay(
+        &conn,
+        &json!({"memory_id": "obs-1", "agent_id": TEST_AGENT}),
+        None,
+    )
+    .unwrap();
     assert_eq!(payload["count"], 1);
     let arr = payload["transcripts"].as_array().unwrap();
     assert_eq!(arr[0]["id"].as_str().unwrap(), t1.id.as_str());
@@ -227,8 +253,12 @@ fn non_reflection_replay_shape_unchanged_by_l2_4() {
     assert_eq!(arr[0]["content"].as_str().unwrap(), "body-1");
 
     // `depth` is ignored on a non-reflection input.
-    let payload =
-        mcp::handle_replay(&conn, &json!({"memory_id": "obs-1", "depth": 99, "agent_id": TEST_AGENT}), None).unwrap();
+    let payload = mcp::handle_replay(
+        &conn,
+        &json!({"memory_id": "obs-1", "depth": 99, "agent_id": TEST_AGENT}),
+        None,
+    )
+    .unwrap();
     assert_eq!(payload["count"], 1);
 }
 
@@ -250,7 +280,12 @@ fn cycle_in_reflects_on_does_not_loop_forever_via_handler() {
     link_reflects_on(&conn, "ref-a", "ref-b");
     link_reflects_on(&conn, "ref-b", "ref-a");
 
-    let payload = mcp::handle_replay(&conn, &json!({"memory_id": "ref-a", "agent_id": TEST_AGENT}), None).unwrap();
+    let payload = mcp::handle_replay(
+        &conn,
+        &json!({"memory_id": "ref-a", "agent_id": TEST_AGENT}),
+        None,
+    )
+    .unwrap();
     assert_eq!(payload["count"], 2, "cycle does not inflate dedup count");
     let ids: Vec<&str> = payload["transcripts"]
         .as_array()
@@ -277,8 +312,12 @@ fn negative_depth_clamps_to_self_only() {
     transcripts::link_transcript(&conn, "ref-top", &t_top.id, None, None).unwrap();
     link_reflects_on(&conn, "ref-top", "obs-leaf");
 
-    let payload =
-        mcp::handle_replay(&conn, &json!({"memory_id": "ref-top", "depth": -3, "agent_id": TEST_AGENT}), None).unwrap();
+    let payload = mcp::handle_replay(
+        &conn,
+        &json!({"memory_id": "ref-top", "depth": -3, "agent_id": TEST_AGENT}),
+        None,
+    )
+    .unwrap();
     assert_eq!(payload["count"], 1, "negative depth clamps to 0");
     assert_eq!(
         payload["transcripts"][0]["id"].as_str().unwrap(),
@@ -293,8 +332,12 @@ fn non_integer_depth_is_a_typed_error() {
     let conn = fresh_db();
     insert_memory(&conn, "obs-1", "team/eng", "observation");
 
-    let err = mcp::handle_replay(&conn, &json!({"memory_id": "obs-1", "depth": "many", "agent_id": TEST_AGENT}), None)
-        .expect_err("non-integer depth must error");
+    let err = mcp::handle_replay(
+        &conn,
+        &json!({"memory_id": "obs-1", "depth": "many", "agent_id": TEST_AGENT}),
+        None,
+    )
+    .expect_err("non-integer depth must error");
     assert!(err.contains("depth must be an integer"), "got: {err}");
 }
 
@@ -313,7 +356,12 @@ fn verbose_truncation_applies_on_reflection_union() {
     insert_memory(&conn, "ref-top", "team/eng", "reflection");
     link_reflects_on(&conn, "ref-top", "obs-big");
 
-    let payload = mcp::handle_replay(&conn, &json!({"memory_id": "ref-top", "agent_id": TEST_AGENT}), None).unwrap();
+    let payload = mcp::handle_replay(
+        &conn,
+        &json!({"memory_id": "ref-top", "agent_id": TEST_AGENT}),
+        None,
+    )
+    .unwrap();
     assert_eq!(payload["count"], 1);
     let entry = &payload["transcripts"][0];
     assert_eq!(entry["truncated"], Value::Bool(true));

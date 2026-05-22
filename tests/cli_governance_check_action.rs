@@ -163,10 +163,7 @@ fn cli_refuses_filesystem_write_to_tmp() {
         v["error"], "GOVERNANCE_REFUSED",
         "expected GOVERNANCE_REFUSED error tag; got: {v}"
     );
-    assert_eq!(
-        v["rule_id"], "R001",
-        "expected R001 to fire; got: {v}"
-    );
+    assert_eq!(v["rule_id"], "R001", "expected R001 to fire; got: {v}");
     assert_eq!(v["kind"], "filesystem_write");
 }
 
@@ -207,10 +204,7 @@ fn cli_refuses_process_spawn_on_binary_match() {
         v["error"], "GOVERNANCE_REFUSED",
         "expected GOVERNANCE_REFUSED error tag; got: {v}"
     );
-    assert_eq!(
-        v["rule_id"], "R004F",
-        "expected R004F to fire; got: {v}"
-    );
+    assert_eq!(v["rule_id"], "R004F", "expected R004F to fire; got: {v}");
 }
 
 #[test]
