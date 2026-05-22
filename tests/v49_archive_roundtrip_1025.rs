@@ -26,7 +26,7 @@
 //! standard cross-backend convention (issue #79 — Track C/D network
 //! routing).
 
-#![allow(clippy::needless_update)]
+#![allow(clippy::needless_update, clippy::doc_markdown, clippy::missing_panics_doc, clippy::too_many_lines)]
 
 use ai_memory::db;
 use ai_memory::models::{
@@ -241,9 +241,14 @@ async fn postgres_archive_restore_preserves_all_v07_columns_1025() {
     // archive_by_ids → restore via the SAL surface. The exact method
     // names vary by adapter but the contract is the same: a row
     // archived + restored must round-trip every v0.7.0 column.
-    ai_memory::store::MemoryStore::archive(&pg, &ctx, &mem.id, Some("rt-test"))
-        .await
-        .expect("archive");
+    ai_memory::store::MemoryStore::archive_by_ids(
+        &pg,
+        &ctx,
+        std::slice::from_ref(&mem.id),
+        Some("rt-test"),
+    )
+    .await
+    .expect("archive_by_ids");
     ai_memory::store::MemoryStore::archive_restore(&pg, &ctx, &mem.id)
         .await
         .expect("restore");

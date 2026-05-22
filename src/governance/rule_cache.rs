@@ -235,8 +235,8 @@ impl RuleCache {
         // we return is cloned from the inserted entry so a concurrent
         // invalidate after this insert doesn't strand our caller with
         // a dropped snapshot.
-        let rules =
-            crate::governance::rules_store::list_enabled_by_kind(conn, kind).map_err(RuleCacheError::Load)?;
+        let rules = crate::governance::rules_store::list_enabled_by_kind(conn, kind)
+            .map_err(RuleCacheError::Load)?;
         let arc = Arc::new(rules);
         if let Ok(mut guard) = self.by_kind.write() {
             // #1019 — check for an existing entry first (e.g., the
@@ -423,14 +423,14 @@ mod tests {
         // implements std::error::Error, displays the inner anyhow
         // chain on Load, and is auto-upcastable into anyhow::Error
         // via the std::error::Error blanket impl.
-        let load_err: RuleCacheError =
-            anyhow::anyhow!("synthetic rusqlite failure").into();
+        let load_err: RuleCacheError = anyhow::anyhow!("synthetic rusqlite failure").into();
         assert!(matches!(load_err, RuleCacheError::Load(_)));
         assert!(!load_err.is_poisoned());
         // Display surfaces the inner chain.
         let display = format!("{load_err}");
         assert!(
-            display.contains("rule_cache load failed") && display.contains("synthetic rusqlite failure"),
+            display.contains("rule_cache load failed")
+                && display.contains("synthetic rusqlite failure"),
             "#1020: Load Display MUST surface the wrapped anyhow chain; got {display}"
         );
 

@@ -13,7 +13,12 @@
 //! var and runs `cargo test --features sal-postgres --ignored`.
 
 #![cfg(feature = "sal-postgres")]
-#![allow(clippy::missing_panics_doc, clippy::too_many_lines)]
+#![allow(
+    clippy::missing_panics_doc,
+    clippy::too_many_lines,
+    clippy::needless_update,
+    clippy::doc_markdown
+)]
 
 use ai_memory::models::{
     Citation, ConfidenceSignals, ConfidenceSource, Memory, MemoryKind, SourceSpan, Tier,
