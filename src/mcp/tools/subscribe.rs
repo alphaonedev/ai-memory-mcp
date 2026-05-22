@@ -215,6 +215,7 @@ pub(super) fn handle_list_subscriptions(
 pub(super) fn handle_subscription_replay(
     conn: &rusqlite::Connection,
     params: &Value,
+    mcp_client: Option<&str>,
 ) -> Result<Value, String> {
     let subscription_id = params["subscription_id"]
         .as_str()
@@ -222,6 +223,30 @@ pub(super) fn handle_subscription_replay(
     let since = params["since"]
         .as_str()
         .ok_or("since is required (RFC3339)")?;
+    // v0.7.0 #1115 (SR-1 #5, HIGH) — caller-ownership gate. Pre-#1115
+    // any MCP caller could pass an arbitrary `subscription_id` and
+    // replay every event_payload that subscription received, including
+    // cross-tenant memory snippets + namespaces. Mirrors the #872 fix
+    // on `handle_list_subscriptions`: resolve the caller, look up the
+    // subscription's `created_by`, and short-circuit with the same
+    // wire shape as a non-existent subscription so the existence of
+    // the id is not leaked.
+    let caller = crate::identity::resolve_agent_id(None, mcp_client).map_err(|e| e.to_string())?;
+    let owner =
+        crate::subscriptions::get_owner(conn, subscription_id).map_err(|e| e.to_string())?;
+    let owner_matches = owner.as_deref() == Some(caller.as_str());
+    if !owner_matches {
+        // Identical envelope shape to "subscription found but no
+        // events since cutoff" — the caller cannot distinguish "this
+        // id is owned by someone else" from "this id doesn't exist"
+        // from "this id exists but no events since `since`".
+        return Ok(json!({
+            "subscription_id": subscription_id,
+            "since": since,
+            "count": 0,
+            "events": Vec::<Value>::new(),
+        }));
+    }
     crate::subscriptions::memory_subscription_replay(conn, subscription_id, since)
         .map_err(|e| e.to_string())
 }
@@ -485,17 +510,53 @@ mod tests {
     #[test]
     fn subscription_replay_missing_id_errors() {
         let conn = fresh_conn();
-        let err = handle_subscription_replay(&conn, &json!({"since": "2026-01-01T00:00:00Z"}))
-            .unwrap_err();
+        let err =
+            handle_subscription_replay(&conn, &json!({"since": "2026-01-01T00:00:00Z"}), None)
+                .unwrap_err();
         assert!(err.contains("subscription_id"), "got: {err}");
     }
 
     #[test]
     fn subscription_replay_missing_since_errors() {
         let conn = fresh_conn();
-        let err =
-            handle_subscription_replay(&conn, &json!({"subscription_id": "sub-1"})).unwrap_err();
+        let err = handle_subscription_replay(&conn, &json!({"subscription_id": "sub-1"}), None)
+            .unwrap_err();
         assert!(err.contains("since"), "got: {err}");
+    }
+
+    // #1115 (SR-1 #5, HIGH) — cross-tenant replay is refused. Alice
+    // owns the subscription; bob calls replay with that id and
+    // receives the not-found envelope (count=0). Bob cannot
+    // distinguish this from "id doesn't exist".
+    #[test]
+    fn subscription_replay_cross_tenant_returns_not_found_1115() {
+        crate::config::set_active_hooks_hmac_secret(None);
+        let conn = fresh_conn();
+        // Seed alice's subscription with explicit created_by.
+        db::register_agent(&conn, "ai:alice", "test", &[]).expect("register alice");
+        let sid = crate::subscriptions::insert(
+            &conn,
+            &crate::subscriptions::NewSubscription {
+                url: "https://example.com/alice",
+                events: "memory_store",
+                secret: Some("sek-alice"),
+                namespace_filter: None,
+                agent_filter: None,
+                created_by: Some("ai:alice"),
+                event_types: None,
+            },
+        )
+        .expect("insert alice sub");
+
+        // Bob calls replay with alice's subscription id.
+        let resp = handle_subscription_replay(
+            &conn,
+            &json!({"subscription_id": sid, "since": "1970-01-01T00:00:00Z"}),
+            Some("ai:bob-client"),
+        )
+        .expect("ok");
+        assert_eq!(resp["count"].as_u64(), Some(0), "bob must see empty");
+        assert!(resp["events"].as_array().unwrap().is_empty());
     }
 }
 
