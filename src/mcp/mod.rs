@@ -1288,11 +1288,11 @@ fn dispatch_memory_list_subscriptions(ctx: &ToolDispatchCtx<'_>) -> Result<Value
 }
 
 fn dispatch_memory_subscription_replay(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_subscription_replay(ctx.conn, ctx.arguments)
+    handle_subscription_replay(ctx.conn, ctx.arguments, ctx.mcp_client)
 }
 
 fn dispatch_memory_subscription_dlq_list(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_subscription_dlq_list(ctx.conn, ctx.arguments)
+    handle_subscription_dlq_list(ctx.conn, ctx.arguments, ctx.mcp_client)
 }
 
 fn dispatch_memory_quota_status(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
@@ -8189,10 +8189,19 @@ mod tests {
         // v0.7.0 fix campaign R1-M2 — substrate CHECK trigger enforces
         // tier ∈ {short, mid, long}. The pre-fix label "short_term"
         // pre-dated the closed-set enum and was silently accepted.
+        //
+        // v0.7.0 #1075 (SR-1 #1, HIGH) — seed `scope: "public"` so
+        // these fixtures pass the visibility gate added to
+        // `memory_replay` regardless of which agent_id the caller
+        // resolves to (test caller resolution depends on env / PID).
+        // Real-world rows owned by a specific agent rely on the
+        // owner check; the test fixtures use the public-scope branch
+        // so they survive the gate without taking a dependency on a
+        // stable caller identity.
         conn.execute(
             "INSERT INTO memories (
-                id, tier, namespace, title, content, created_at, updated_at
-             ) VALUES (?1, 'short', 'team/eng', ?2, 'body', ?3, ?3)",
+                id, tier, namespace, title, content, created_at, updated_at, metadata
+             ) VALUES (?1, 'short', 'team/eng', ?2, 'body', ?3, ?3, '{\"scope\":\"public\"}')",
             rusqlite::params![id, format!("title-{id}"), now],
         )
         .unwrap();
@@ -10198,7 +10207,10 @@ mod tests {
             updated_at: now,
             last_accessed_at: None,
             expires_at: None,
-            metadata: json!({"agent_id": "test-agent-chunkc"}),
+            // v0.7.0 #1075 — public scope so chunkc fixtures survive
+            // the visibility gate added on memory_replay regardless of
+            // which agent_id the caller resolves to in tests.
+            metadata: json!({"agent_id": "test-agent-chunkc", "scope": "public"}),
             reflection_depth: 0,
             memory_kind: crate::models::MemoryKind::Observation,
             entity_id: None,
@@ -11066,9 +11078,11 @@ mod tests {
         // Insert a memory whose namespace doesn't matter — what
         // matters is the transcript's namespace which we control here.
         let now = chrono::Utc::now().to_rfc3339();
+        // v0.7.0 #1075 — public scope so the visibility gate passes,
+        // exercising the permission-rule branch that this test pins.
         conn.execute(
-            "INSERT INTO memories (id, tier, namespace, title, content, created_at, updated_at)
-             VALUES (?1, 'short', 'team/eng-denyrule', ?2, 'body', ?3, ?3)",
+            "INSERT INTO memories (id, tier, namespace, title, content, created_at, updated_at, metadata)
+             VALUES (?1, 'short', 'team/eng-denyrule', ?2, 'body', ?3, ?3, '{\"scope\":\"public\"}')",
             rusqlite::params!["mem-deny-uniq", "title-mem-deny-uniq", now],
         )
         .unwrap();
@@ -11100,9 +11114,11 @@ mod tests {
         }]);
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let now = chrono::Utc::now().to_rfc3339();
+        // v0.7.0 #1075 — public scope so the visibility gate passes,
+        // exercising the permission-rule Ask branch this test pins.
         conn.execute(
-            "INSERT INTO memories (id, tier, namespace, title, content, created_at, updated_at)
-             VALUES (?1, 'short', 'team/eng-askrule', ?2, 'body', ?3, ?3)",
+            "INSERT INTO memories (id, tier, namespace, title, content, created_at, updated_at, metadata)
+             VALUES (?1, 'short', 'team/eng-askrule', ?2, 'body', ?3, ?3, '{\"scope\":\"public\"}')",
             rusqlite::params!["mem-ask-uniq", "title-mem-ask-uniq", now],
         )
         .unwrap();
