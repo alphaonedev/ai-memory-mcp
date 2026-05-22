@@ -1667,6 +1667,14 @@ pub async fn build_embedder(feature_tier: FeatureTier, app_config: &AppConfig) -
         return None;
     };
     let embed_url = app_config.effective_embed_url().to_string();
+    // #1143: the daemon embed client is always Ollama-wire-shape (it
+    // talks to a local Ollama OR a compatible nomic-embed-text host).
+    // Using `new_with_url` here is correct regardless of
+    // `AI_MEMORY_LLM_BACKEND` — that env controls the CHAT client, not
+    // the embed client. The MCP path now likewise builds a dedicated
+    // Ollama embed client when the LLM is OpenAI-compatible (see
+    // `src/mcp/mod.rs` post-#1143 embed-client init).
+    //
     // The HF-Hub sync API and candle model-load are blocking CPU work that
     // internally spin their own tokio runtime. Running them directly in this
     // async context panics with "Cannot drop a runtime in a context where
@@ -3942,8 +3950,24 @@ pub async fn run_curator_daemon_with_primitives(
         exclude_namespaces,
         compaction: crate::curator::CompactionConfig::default(),
     };
-    let llm: Option<Arc<crate::llm::OllamaClient>> =
-        ollama_model.and_then(|m| crate::llm::OllamaClient::new(&m).ok().map(Arc::new));
+    // #1143: honor AI_MEMORY_LLM_BACKEND env even on the legacy
+    // primitive-args entrypoint (used by some CLI shims and tests).
+    // The explicit `ollama_model` arg still wins when env is unset, so
+    // older callers that hardcoded a model retain their behavior.
+    let llm: Option<Arc<crate::llm::OllamaClient>> = {
+        let backend_env = std::env::var("AI_MEMORY_LLM_BACKEND")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        if backend_env.is_some() {
+            crate::llm::OllamaClient::from_env()
+                .ok()
+                .flatten()
+                .map(Arc::new)
+        } else {
+            ollama_model.and_then(|m| crate::llm::OllamaClient::new(&m).ok().map(Arc::new))
+        }
+    };
 
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let shutdown_flag_for_signal = shutdown_flag.clone();

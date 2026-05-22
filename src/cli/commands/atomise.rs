@@ -311,12 +311,38 @@ pub fn run_with_curator(
     }
 }
 
-/// Build an [`LlmCurator`] backed by Ollama for the supplied tier.
+/// Build an [`LlmCurator`] backed by the configured LLM for the
+/// supplied tier.
 ///
-/// Returns an error string when the tier has no curator LLM configured
-/// (only possible for `Keyword`, which the caller has already gated)
-/// or when `OllamaClient::new` fails (network bind, missing model, …).
+/// #1143: honors `AI_MEMORY_LLM_BACKEND` like the MCP / daemon
+/// paths. Resolution order matches
+/// [`OllamaClient::build_for_init`]:
+///   1. `AI_MEMORY_LLM_BACKEND` set → route via
+///      [`OllamaClient::from_env`] (xAI Grok, OpenAI, Anthropic,
+///      Gemini, …).
+///   2. Else → tier-default Ollama model at the default URL,
+///      preserving v0.6.x behavior.
+///
+/// Returns an error string when the env arm is configured but invalid
+/// (unknown alias, missing API key, missing base URL for the generic
+/// `openai-compatible` backend), when the legacy tier has no curator
+/// LLM configured (only `Keyword`, which the caller has already
+/// gated), or when the underlying client construction fails.
 fn build_llm_curator(tier: FeatureTier) -> std::result::Result<Box<dyn Curator>, String> {
+    let backend_env = std::env::var("AI_MEMORY_LLM_BACKEND")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if let Some(backend) = backend_env {
+        return match OllamaClient::from_env() {
+            Ok(Some(client)) => Ok(Box::new(LlmCurator::new(client))),
+            Ok(None) => Err(format!(
+                "AI_MEMORY_LLM_BACKEND={backend} resolved to no LLM client — \
+                 atomise requires a curator LLM"
+            )),
+            Err(e) => Err(format!("AI_MEMORY_LLM_BACKEND={backend} init failed: {e}")),
+        };
+    }
     let llm_model = tier
         .config()
         .llm_model

@@ -353,6 +353,53 @@ impl OllamaClient {
         }
     }
 
+    /// #1143 — Sync env-aware client construction with a tier-default
+    /// legacy fallback. Centralises the pattern that #1142 ported into
+    /// `src/mcp/mod.rs` so every synchronous LLM-init site (CLI
+    /// `atomise`, CLI `curator`, MCP stdio LLM init, embed-client
+    /// fallback selection) routes through one place. The daemon's
+    /// async path (`daemon_runtime::build_llm_client`) wraps the same
+    /// resolution order in `tokio::task::spawn_blocking`; behavioural
+    /// parity with that wrapper is pinned by tests below.
+    ///
+    /// Resolution order:
+    ///   1. `AI_MEMORY_LLM_BACKEND` set + non-empty → `from_env()`.
+    ///   2. Else → `new_with_url(legacy_url, legacy_model)` so a v0.6.x
+    ///      operator who never set the env vars keeps the historical
+    ///      tier-default Ollama path.
+    ///
+    /// Returns `Ok(None)` from the env-aware arm only when the env var
+    /// chain resolves to a no-op (currently impossible for any
+    /// recognised backend alias; defensively threaded so future "alias
+    /// disabled" branches don't break callers).
+    ///
+    /// # Errors
+    ///
+    /// Mirrors [`Self::from_env`] when the env arm is taken, and
+    /// [`Self::new_with_url`] when the legacy arm is taken.
+    pub fn build_for_init(legacy_url: &str, legacy_model: &str) -> Result<Option<Self>> {
+        let backend_env = std::env::var("AI_MEMORY_LLM_BACKEND")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        if backend_env.is_some() {
+            return Self::from_env();
+        }
+        Self::new_with_url(legacy_url, legacy_model).map(Some)
+    }
+
+    /// #1143 — Wire-shape introspection for embed-client fallback.
+    /// Embed endpoints differ from chat endpoints across vendors: only
+    /// Ollama (and a couple of OpenAI-compatible vendors) expose a
+    /// usable embedding wire-shape, and the substrate's local embedder
+    /// integration only speaks the Ollama `/api/embed` shape. Callers
+    /// that consider re-using the LLM client for embeddings use this
+    /// to bail out when the client is an OpenAI-compatible vendor.
+    #[must_use]
+    pub fn is_ollama_native(&self) -> bool {
+        matches!(self.provider, LlmProvider::Ollama)
+    }
+
     /// #1066 — Construct an OpenAI-compatible client for any vendor whose
     /// `/v1/chat/completions` endpoint follows the OpenAI spec (xAI Grok,
     /// OpenAI, Anthropic via OpenAI shim, Google Gemini, DeepSeek, Kimi,
@@ -2549,6 +2596,197 @@ mod wiremock_tests {
         .unwrap();
         let tags = tags.expect("auto_tag should succeed");
         assert_eq!(tags, vec!["one".to_string(), "two".to_string()]);
+    }
+
+    // ==================================================================
+    // #1143 — env-aware client construction regression tests.
+    //
+    // Pin the invariant that every synchronous LLM-init site (MCP
+    // stdio LLM, MCP embed fallback, CLI `atomise`, CLI `curator`)
+    // routes through `OllamaClient::build_for_init` and honors
+    // `AI_MEMORY_LLM_BACKEND`. Pre-#1143 only the MCP LLM init was
+    // env-aware; #1142 fixed that one surface; #1143 closes the
+    // remaining 4 (atomise, curator, MCP embed-fallback wire-shape,
+    // daemon curator primitive entrypoint). The env-mutation tests
+    // serialise on a module-local mutex (matches the discipline in
+    // `src/federation/peer_attestation.rs::tests`).
+    // ==================================================================
+
+    static ENV_GUARD_1143: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_env_1143() -> std::sync::MutexGuard<'static, ()> {
+        ENV_GUARD_1143
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// SAFETY: env-var mutation is unsynchronised across threads at the
+    /// OS level. `lock_env_1143` serialises mutation across this test
+    /// module so the unsafe is sound for the duration of each test.
+    fn clear_llm_env_1143() {
+        for k in [
+            "AI_MEMORY_LLM_BACKEND",
+            "AI_MEMORY_LLM_MODEL",
+            "AI_MEMORY_LLM_BASE_URL",
+            "AI_MEMORY_LLM_API_KEY",
+            "OLLAMA_BASE_URL",
+            "XAI_API_KEY",
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+        ] {
+            unsafe { std::env::remove_var(k) };
+        }
+    }
+
+    #[test]
+    fn is_ollama_native_true_for_ollama_client_1143() {
+        // Pure unit assertion — no network. `new_for_testing` builds
+        // the Ollama-provider client without the /api/tags probe.
+        let client = OllamaClient::new_for_testing("gemma4:e4b");
+        assert!(
+            client.is_ollama_native(),
+            "#1143: Ollama-provider client must report is_ollama_native()=true"
+        );
+    }
+
+    #[test]
+    fn is_ollama_native_false_for_openai_compatible_1143() {
+        // OpenAI-compatible clients (xAI, OpenAI, Anthropic, …) MUST
+        // report false so the MCP embed-client fallback path knows
+        // not to reuse the chat client for embeddings (pre-#1143
+        // semantic-recall black-hole).
+        let client =
+            OllamaClient::new_openai_compatible("https://api.x.ai/v1", "grok-4.3", "fake-key")
+                .expect("openai-compatible client builds");
+        assert!(
+            !client.is_ollama_native(),
+            "#1143: OpenAI-compatible client must report is_ollama_native()=false"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn build_for_init_legacy_arm_when_env_unset_1143() {
+        let _g = lock_env_1143();
+        clear_llm_env_1143();
+
+        let server = MockServer::start().await;
+        mount_tags_ok(&server, json!({"models": []})).await;
+        let uri = server.uri();
+
+        // No env set → legacy arm → new_with_url. Constructor probes
+        // /api/tags, which the mock serves 200 OK.
+        let result =
+            tokio::task::spawn_blocking(move || OllamaClient::build_for_init(&uri, "gemma4:e4b"))
+                .await
+                .unwrap();
+
+        let client = match result {
+            Ok(Some(c)) => c,
+            Ok(None) => panic!("#1143: legacy arm must yield Ok(Some(client)); got Ok(None)"),
+            Err(e) => panic!("#1143: legacy arm must yield Ok(Some(client)); got Err({e})"),
+        };
+        assert!(
+            client.is_ollama_native(),
+            "#1143: legacy arm constructs an Ollama-provider client"
+        );
+        assert_eq!(client.model, "gemma4:e4b");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn build_for_init_env_arm_routes_to_from_env_1143() {
+        let _g = lock_env_1143();
+        clear_llm_env_1143();
+
+        // Set AI_MEMORY_LLM_BACKEND=xai with a fake key. from_env()
+        // constructs the OpenAI-compatible client (xAI default URL),
+        // which has no /api/tags probe — it returns Ok immediately.
+        unsafe { std::env::set_var("AI_MEMORY_LLM_BACKEND", "xai") };
+        unsafe { std::env::set_var("AI_MEMORY_LLM_API_KEY", "fake-xai-key") };
+        unsafe { std::env::set_var("AI_MEMORY_LLM_MODEL", "grok-4.3") };
+
+        // Legacy URL/model SHOULD be ignored when env arm is active.
+        // Use a deliberately-unreachable URL so the env arm taking
+        // priority is the only way the test can pass.
+        let result = tokio::task::spawn_blocking(|| {
+            OllamaClient::build_for_init("http://127.0.0.1:1", "ignored-legacy-model")
+        })
+        .await
+        .unwrap();
+
+        clear_llm_env_1143();
+
+        let client = match result {
+            Ok(Some(c)) => c,
+            Ok(None) => panic!(
+                "#1143: env arm with AI_MEMORY_LLM_BACKEND=xai must yield \
+                 Ok(Some(client)); got Ok(None)"
+            ),
+            Err(e) => panic!(
+                "#1143: env arm with AI_MEMORY_LLM_BACKEND=xai must yield \
+                 Ok(Some(client)); got Err({e})"
+            ),
+        };
+        assert!(
+            !client.is_ollama_native(),
+            "#1143: xai backend yields an OpenAI-compatible (non-Ollama) client"
+        );
+        assert_eq!(
+            client.model, "grok-4.3",
+            "#1143: AI_MEMORY_LLM_MODEL must override the legacy model arg"
+        );
+        assert_eq!(
+            client.base_url, "https://api.x.ai/v1",
+            "#1143: xai default base URL must override the legacy URL arg"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn build_for_init_env_arm_unknown_alias_errors_1143() {
+        let _g = lock_env_1143();
+        clear_llm_env_1143();
+        unsafe { std::env::set_var("AI_MEMORY_LLM_BACKEND", "totally-bogus-vendor") };
+
+        let result = tokio::task::spawn_blocking(|| {
+            OllamaClient::build_for_init("http://127.0.0.1:1", "ignored")
+        })
+        .await
+        .unwrap();
+
+        clear_llm_env_1143();
+        assert!(
+            result.is_err(),
+            "#1143: unknown backend alias must surface the error \
+             instead of silently falling through to the legacy arm"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn build_for_init_env_arm_empty_string_falls_back_to_legacy_1143() {
+        let _g = lock_env_1143();
+        clear_llm_env_1143();
+        // Operator sets the env var to an empty / whitespace value —
+        // must be treated as "unset" (legacy arm), not as "unknown
+        // backend ''" (error). Matches the `.filter(|s|
+        // !s.is_empty())` guard in `build_for_init`.
+        unsafe { std::env::set_var("AI_MEMORY_LLM_BACKEND", "   ") };
+
+        let server = MockServer::start().await;
+        mount_tags_ok(&server, json!({"models": []})).await;
+        let uri = server.uri();
+
+        let result =
+            tokio::task::spawn_blocking(move || OllamaClient::build_for_init(&uri, "gemma4:e2b"))
+                .await
+                .unwrap();
+
+        clear_llm_env_1143();
+        let client = result
+            .expect("legacy arm should not error on whitespace env")
+            .expect("legacy arm yields Some(client)");
+        assert!(client.is_ollama_native());
+        assert_eq!(client.model, "gemma4:e2b");
     }
 }
 
