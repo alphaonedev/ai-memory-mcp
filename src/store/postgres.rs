@@ -408,7 +408,13 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       v48 / `migrations/sqlite/0041_v07_federation_push_dlq.sql`).
 //       Pure additive CREATE TABLE IF NOT EXISTS + indexes — fully
 //       idempotent.
-const CURRENT_SCHEMA_VERSION: i32 = 48;
+//
+// v49 = #1025 (CRITICAL, 2026-05-21) — archived_memories full v0.7.0
+//       column carry. Adds 14 nullable columns to archived_memories
+//       so archive→restore round-trips preserve Form-4 / Form-5 /
+//       QW-2 / Gap-1 fields. Pure additive ALTER TABLE ADD COLUMN
+//       IF NOT EXISTS — fully idempotent + replay-safe.
+const CURRENT_SCHEMA_VERSION: i32 = 49;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -1119,6 +1125,9 @@ impl PostgresStore {
         }
         if current_version < 48 {
             self.migrate_v48().await?;
+        }
+        if current_version < 49 {
+            self.migrate_v49().await?;
         }
 
         Ok(())
@@ -1876,6 +1885,52 @@ impl PostgresStore {
         Ok(())
     }
 
+    /// v49 — #1025 (CRITICAL, 2026-05-21): archived_memories full
+    /// v0.7.0 column carry. Pre-#1025 archive→restore round-trips
+    /// silently erased 14 v0.7.0 fields. Pure additive ALTER TABLE
+    /// ADD COLUMN IF NOT EXISTS — fully idempotent + replay-safe.
+    /// Columns nullable so already-archived legacy rows stay valid.
+    async fn migrate_v49(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v49 tx", e))?;
+
+        sqlx::raw_sql(
+            "ALTER TABLE archived_memories
+                ADD COLUMN IF NOT EXISTS reflection_depth INTEGER,
+                ADD COLUMN IF NOT EXISTS atomised_into INTEGER,
+                ADD COLUMN IF NOT EXISTS atom_of TEXT,
+                ADD COLUMN IF NOT EXISTS memory_kind TEXT,
+                ADD COLUMN IF NOT EXISTS entity_id TEXT,
+                ADD COLUMN IF NOT EXISTS persona_version INTEGER,
+                ADD COLUMN IF NOT EXISTS citations TEXT,
+                ADD COLUMN IF NOT EXISTS source_uri TEXT,
+                ADD COLUMN IF NOT EXISTS source_span TEXT,
+                ADD COLUMN IF NOT EXISTS confidence_source TEXT,
+                ADD COLUMN IF NOT EXISTS confidence_signals TEXT,
+                ADD COLUMN IF NOT EXISTS confidence_decayed_at TEXT,
+                ADD COLUMN IF NOT EXISTS mentioned_entity_id TEXT,
+                ADD COLUMN IF NOT EXISTS version BIGINT",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("apply v49 archived_memories column extension", e))?;
+
+        record_schema_version(&mut tx, 49).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v49 migration", e))?;
+
+        tracing::info!(
+            target = "store::postgres",
+            "schema migration v49 applied (#1025: archived_memories full v0.7.0 column carry)"
+        );
+        Ok(())
+    }
+
     // ─────────────────────────────────────────────────────────────────
     // v0.7.0 Provenance Gap parity — postgres SAL methods (issue #894).
     //
@@ -2154,16 +2209,25 @@ impl PostgresStore {
         }
 
         // Step 1: archive the OLD row with archive_reason='superseded'.
+        // #1025 (CRITICAL, 2026-05-21) — full v0.7.0 column carry.
         let archive_rows = sqlx::query(
             "INSERT INTO archived_memories
                 (id, tier, namespace, title, content, tags, priority, confidence,
                  source, access_count, created_at, updated_at, last_accessed_at,
                  expires_at, archived_at, archive_reason, metadata,
-                 embedding, embedding_dim, original_tier, original_expires_at)
+                 embedding, embedding_dim, original_tier, original_expires_at,
+                 reflection_depth, atomised_into, atom_of, memory_kind,
+                 entity_id, persona_version, citations, source_uri, source_span,
+                 confidence_source, confidence_signals, confidence_decayed_at,
+                 mentioned_entity_id, version)
              SELECT id, tier, namespace, title, content, tags, priority, confidence,
                     source, access_count, created_at, updated_at, last_accessed_at,
                     expires_at, NOW(), 'superseded', metadata,
-                    embedding, embedding_dim, tier, expires_at
+                    embedding, embedding_dim, tier, expires_at,
+                    reflection_depth, atomised_into, atom_of, memory_kind,
+                    entity_id, persona_version, citations, source_uri, source_span,
+                    confidence_source, confidence_signals, confidence_decayed_at,
+                    mentioned_entity_id, version
              FROM memories WHERE id = $1
              ON CONFLICT (id) DO NOTHING",
         )
@@ -8284,12 +8348,21 @@ impl MemoryStore for PostgresStore {
                     id, tier, namespace, title, content, tags, priority, confidence,
                     source, access_count, created_at, updated_at, last_accessed_at,
                     expires_at, archived_at, archive_reason, metadata,
-                    embedding, embedding_dim, original_tier, original_expires_at
+                    embedding, embedding_dim, original_tier, original_expires_at,
+                    -- #1025 (CRITICAL, 2026-05-21) — full v0.7.0 column carry.
+                    reflection_depth, atomised_into, atom_of, memory_kind,
+                    entity_id, persona_version, citations, source_uri, source_span,
+                    confidence_source, confidence_signals, confidence_decayed_at,
+                    mentioned_entity_id, version
                 )
                 SELECT id, tier, namespace, title, content, tags, priority, confidence,
                        source, access_count, created_at, updated_at, last_accessed_at,
                        expires_at, $4::timestamptz, 'forget', metadata,
-                       embedding, embedding_dim, tier, expires_at
+                       embedding, embedding_dim, tier, expires_at,
+                       reflection_depth, atomised_into, atom_of, memory_kind,
+                       entity_id, persona_version, citations, source_uri, source_span,
+                       confidence_source, confidence_signals, confidence_decayed_at,
+                       mentioned_entity_id, version
                 FROM memories
                 WHERE ($1::text IS NULL OR namespace = $1)
                   AND ($2::text IS NULL OR tier = $2)
@@ -8543,12 +8616,21 @@ impl MemoryStore for PostgresStore {
                     id, tier, namespace, title, content, tags, priority, confidence,
                     source, access_count, created_at, updated_at, last_accessed_at,
                     expires_at, archived_at, archive_reason, metadata,
-                    embedding, embedding_dim, original_tier, original_expires_at
+                    embedding, embedding_dim, original_tier, original_expires_at,
+                    -- #1025 (CRITICAL, 2026-05-21) — full v0.7.0 column carry.
+                    reflection_depth, atomised_into, atom_of, memory_kind,
+                    entity_id, persona_version, citations, source_uri, source_span,
+                    confidence_source, confidence_signals, confidence_decayed_at,
+                    mentioned_entity_id, version
                 )
                 SELECT id, tier, namespace, title, content, tags, priority, confidence,
                        source, access_count, created_at, updated_at, last_accessed_at,
                        expires_at, $1::timestamptz, 'ttl_expired', metadata,
-                       embedding, embedding_dim, tier, expires_at
+                       embedding, embedding_dim, tier, expires_at,
+                       reflection_depth, atomised_into, atom_of, memory_kind,
+                       entity_id, persona_version, citations, source_uri, source_span,
+                       confidence_source, confidence_signals, confidence_decayed_at,
+                       mentioned_entity_id, version
                 FROM memories
                 WHERE expires_at IS NOT NULL AND expires_at < $1
                 ON CONFLICT (id) DO UPDATE SET
@@ -8611,16 +8693,39 @@ impl MemoryStore for PostgresStore {
         }
 
         let now = chrono::Utc::now();
+        // #1025 (CRITICAL, 2026-05-21) — full v0.7.0 column carry on
+        // archive→restore. Pre-#1025 the SELECT pulled only 17 columns
+        // from archived_memories, so the restored row landed in
+        // memories with reflection_depth=0, memory_kind='observation'
+        // (the live-table DEFAULT), citations=[], version=1, etc. —
+        // silent loss of provenance + persona + confidence calibration.
+        // Now copies all 26 v0.7.0 fields (with COALESCE defaults for
+        // pre-#1025 archived rows where the columns are NULL).
         sqlx::query(
             "INSERT INTO memories (
                 id, tier, namespace, title, content, tags, priority, confidence,
                 source, access_count, created_at, updated_at, last_accessed_at,
-                expires_at, metadata, embedding, embedding_dim
+                expires_at, metadata, embedding, embedding_dim,
+                reflection_depth, atomised_into, atom_of, memory_kind,
+                entity_id, persona_version, citations, source_uri, source_span,
+                confidence_source, confidence_signals, confidence_decayed_at,
+                mentioned_entity_id, version
             )
             SELECT id, COALESCE(original_tier, 'long'), namespace, title, content,
                    tags, priority, confidence, source, access_count, created_at,
                    $1::timestamptz, last_accessed_at, original_expires_at, metadata,
-                   embedding, embedding_dim
+                   embedding, embedding_dim,
+                   COALESCE(reflection_depth, 0),
+                   atomised_into,
+                   atom_of,
+                   COALESCE(memory_kind, 'observation'),
+                   entity_id, persona_version,
+                   COALESCE(citations, '[]'),
+                   source_uri, source_span,
+                   COALESCE(confidence_source, 'caller_provided'),
+                   confidence_signals, confidence_decayed_at,
+                   mentioned_entity_id,
+                   COALESCE(version, 1)
             FROM archived_memories WHERE id = $2",
         )
         .bind(now)
@@ -8751,12 +8856,21 @@ impl MemoryStore for PostgresStore {
                     id, tier, namespace, title, content, tags, priority, confidence,
                     source, access_count, created_at, updated_at, last_accessed_at,
                     expires_at, archived_at, archive_reason, metadata,
-                    embedding, embedding_dim, original_tier, original_expires_at
+                    embedding, embedding_dim, original_tier, original_expires_at,
+                    -- #1025 (CRITICAL, 2026-05-21) — full v0.7.0 column carry.
+                    reflection_depth, atomised_into, atom_of, memory_kind,
+                    entity_id, persona_version, citations, source_uri, source_span,
+                    confidence_source, confidence_signals, confidence_decayed_at,
+                    mentioned_entity_id, version
                 )
                 SELECT id, tier, namespace, title, content, tags, priority, confidence,
                        source, access_count, created_at, updated_at, last_accessed_at,
                        expires_at, $1::timestamptz, $2::text, metadata,
-                       embedding, embedding_dim, tier, expires_at
+                       embedding, embedding_dim, tier, expires_at,
+                       reflection_depth, atomised_into, atom_of, memory_kind,
+                       entity_id, persona_version, citations, source_uri, source_span,
+                       confidence_source, confidence_signals, confidence_decayed_at,
+                       mentioned_entity_id, version
                 FROM memories WHERE id = $3
                 ON CONFLICT (id) DO UPDATE SET
                     archived_at = EXCLUDED.archived_at,

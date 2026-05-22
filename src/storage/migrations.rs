@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 48).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 49).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -513,7 +513,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_federation_push_dlq_pending_uniq
 //       polls every N seconds and re-attempts `post_once`, stamping
 //       `replayed_at` on Ack. Pure additive CREATE TABLE IF NOT
 //       EXISTS + indexes — fully idempotent.
-const CURRENT_SCHEMA_VERSION: i64 = 48;
+const CURRENT_SCHEMA_VERSION: i64 = 49;
 
 /// v0.7.0 refactor PR-1 (#793) — schema-pins SSOT.
 ///
@@ -1980,6 +1980,62 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             // CREATE INDEX IF NOT EXISTS statements — fully
             // replay-safe.
             conn.execute_batch(MIGRATION_V48_SQLITE)?;
+        }
+        if version < 49 {
+            // #1025 (CRITICAL, 2026-05-21) — archived_memories full
+            // v0.7.0 column carry. Pre-#1025 archive→restore lost
+            // 14 v0.7.0 fields (reflection_depth, atomised_into,
+            // atom_of, memory_kind, entity_id, persona_version,
+            // citations, source_uri, source_span, confidence_source,
+            // confidence_signals, confidence_decayed_at,
+            // mentioned_entity_id, version). SQLite doesn't support
+            // `ADD COLUMN IF NOT EXISTS` so we probe each column via
+            // PRAGMA table_info and only ALTER if missing — fully
+            // idempotent + replay-safe. Columns are nullable so
+            // already-archived legacy rows stay valid.
+            //
+            // Defensive: when the archived_memories table itself
+            // doesn't exist (e.g., test fixtures that stamp an
+            // arbitrary `schema_version` past v4 without applying
+            // the v4 CREATE), `PRAGMA table_info` returns empty.
+            // Skip the ALTER block — the table will be created by
+            // the v4 arm on the next replay, or by the operator's
+            // baseline schema if they're using SCHEMA directly.
+            let existing: std::collections::HashSet<String> = conn
+                .prepare("PRAGMA table_info(archived_memories)")?
+                .query_map([], |r| r.get::<_, String>(1))?
+                .collect::<rusqlite::Result<_>>()?;
+            if existing.is_empty() {
+                tracing::debug!(
+                    target: "ai_memory::storage::migrations",
+                    "v49: archived_memories table does not exist (test fixture or \
+                     deployment-without-archive); skipping column extension"
+                );
+            } else {
+                for (col, ddl) in &[
+                    ("reflection_depth", "INTEGER"),
+                    ("atomised_into", "INTEGER"),
+                    ("atom_of", "TEXT"),
+                    ("memory_kind", "TEXT"),
+                    ("entity_id", "TEXT"),
+                    ("persona_version", "INTEGER"),
+                    ("citations", "TEXT"),
+                    ("source_uri", "TEXT"),
+                    ("source_span", "TEXT"),
+                    ("confidence_source", "TEXT"),
+                    ("confidence_signals", "TEXT"),
+                    ("confidence_decayed_at", "TEXT"),
+                    ("mentioned_entity_id", "TEXT"),
+                    ("version", "INTEGER"),
+                ] {
+                    if !existing.contains(*col) {
+                        conn.execute(
+                            &format!("ALTER TABLE archived_memories ADD COLUMN {col} {ddl}"),
+                            [],
+                        )?;
+                    }
+                }
+            }
         }
 
         conn.execute("DELETE FROM schema_version", [])?;

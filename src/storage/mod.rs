@@ -1569,11 +1569,19 @@ pub fn archive_memory(conn: &Connection, id: &str, reason: Option<&str>) -> Resu
              (id, tier, namespace, title, content, tags, priority, confidence,
               source, access_count, created_at, updated_at, last_accessed_at,
               expires_at, archived_at, archive_reason, metadata,
-              embedding, embedding_dim, original_tier, original_expires_at)
+              embedding, embedding_dim, original_tier, original_expires_at,
+              reflection_depth, atomised_into, atom_of, memory_kind,
+              entity_id, persona_version, citations, source_uri, source_span,
+              confidence_source, confidence_signals, confidence_decayed_at,
+              mentioned_entity_id, version)
              SELECT id, tier, namespace, title, content, tags, priority, confidence,
                     source, access_count, created_at, updated_at, last_accessed_at,
                     expires_at, ?1, ?2, metadata,
-                    embedding, embedding_dim, tier, expires_at
+                    embedding, embedding_dim, tier, expires_at,
+                    reflection_depth, atomised_into, atom_of, memory_kind,
+                    entity_id, persona_version, citations, source_uri, source_span,
+                    confidence_source, confidence_signals, confidence_decayed_at,
+                    mentioned_entity_id, version
              FROM memories WHERE id = ?3",
             params![now, reason, id],
         )?;
@@ -1653,11 +1661,19 @@ pub fn archive_memory_for_caller(
              (id, tier, namespace, title, content, tags, priority, confidence,
               source, access_count, created_at, updated_at, last_accessed_at,
               expires_at, archived_at, archive_reason, metadata,
-              embedding, embedding_dim, original_tier, original_expires_at)
+              embedding, embedding_dim, original_tier, original_expires_at,
+              reflection_depth, atomised_into, atom_of, memory_kind,
+              entity_id, persona_version, citations, source_uri, source_span,
+              confidence_source, confidence_signals, confidence_decayed_at,
+              mentioned_entity_id, version)
              SELECT id, tier, namespace, title, content, tags, priority, confidence,
                     source, access_count, created_at, updated_at, last_accessed_at,
                     expires_at, ?1, ?2, metadata,
-                    embedding, embedding_dim, tier, expires_at
+                    embedding, embedding_dim, tier, expires_at,
+                    reflection_depth, atomised_into, atom_of, memory_kind,
+                    entity_id, persona_version, citations, source_uri, source_span,
+                    confidence_source, confidence_signals, confidence_decayed_at,
+                    mentioned_entity_id, version
              FROM memories WHERE id = ?3",
             params![now, reason, id],
         )?;
@@ -1756,11 +1772,19 @@ pub fn forget(
                  (id, tier, namespace, title, content, tags, priority, confidence,
                   source, access_count, created_at, updated_at, last_accessed_at,
                   expires_at, archived_at, archive_reason, metadata,
-                  embedding, embedding_dim, original_tier, original_expires_at)
+                  embedding, embedding_dim, original_tier, original_expires_at,
+                  reflection_depth, atomised_into, atom_of, memory_kind,
+                  entity_id, persona_version, citations, source_uri, source_span,
+                  confidence_source, confidence_signals, confidence_decayed_at,
+                  mentioned_entity_id, version)
                  SELECT id, tier, namespace, title, content, tags, priority, confidence,
                         source, access_count, created_at, updated_at, last_accessed_at,
                         expires_at, ?4, 'forget', metadata,
-                        embedding, embedding_dim, tier, expires_at
+                        embedding, embedding_dim, tier, expires_at,
+                        reflection_depth, atomised_into, atom_of, memory_kind,
+                        entity_id, persona_version, citations, source_uri, source_span,
+                        confidence_source, confidence_signals, confidence_decayed_at,
+                        mentioned_entity_id, version
                  FROM memories WHERE rowid IN (
                     SELECT m.rowid FROM memories_fts fts
                     JOIN memories m ON m.rowid = fts.rowid
@@ -1780,11 +1804,19 @@ pub fn forget(
                  (id, tier, namespace, title, content, tags, priority, confidence,
                   source, access_count, created_at, updated_at, last_accessed_at,
                   expires_at, archived_at, archive_reason, metadata,
-                  embedding, embedding_dim, original_tier, original_expires_at)
+                  embedding, embedding_dim, original_tier, original_expires_at,
+                  reflection_depth, atomised_into, atom_of, memory_kind,
+                  entity_id, persona_version, citations, source_uri, source_span,
+                  confidence_source, confidence_signals, confidence_decayed_at,
+                  mentioned_entity_id, version)
                  SELECT id, tier, namespace, title, content, tags, priority, confidence,
                         source, access_count, created_at, updated_at, last_accessed_at,
                         expires_at, ?3, 'forget', metadata,
-                        embedding, embedding_dim, tier, expires_at
+                        embedding, embedding_dim, tier, expires_at,
+                        reflection_depth, atomised_into, atom_of, memory_kind,
+                        entity_id, persona_version, citations, source_uri, source_span,
+                        confidence_source, confidence_signals, confidence_decayed_at,
+                        mentioned_entity_id, version
                  FROM memories WHERE (?1 IS NULL OR namespace = ?1) AND (?2 IS NULL OR tier = ?2)",
                 params![namespace, tier_str, now],
             )?;
@@ -5517,11 +5549,19 @@ pub fn gc(conn: &Connection, archive: bool) -> Result<usize> {
                  (id, tier, namespace, title, content, tags, priority, confidence,
                   source, access_count, created_at, updated_at, last_accessed_at,
                   expires_at, archived_at, archive_reason, metadata,
-                  embedding, embedding_dim, original_tier, original_expires_at)
+                  embedding, embedding_dim, original_tier, original_expires_at,
+                  reflection_depth, atomised_into, atom_of, memory_kind,
+                  entity_id, persona_version, citations, source_uri, source_span,
+                  confidence_source, confidence_signals, confidence_decayed_at,
+                  mentioned_entity_id, version)
                  SELECT id, tier, namespace, title, content, tags, priority, confidence,
                         source, access_count, created_at, updated_at, last_accessed_at,
                         expires_at, ?1, 'ttl_expired', metadata,
-                        embedding, embedding_dim, tier, expires_at
+                        embedding, embedding_dim, tier, expires_at,
+                        reflection_depth, atomised_into, atom_of, memory_kind,
+                        entity_id, persona_version, citations, source_uri, source_span,
+                        confidence_source, confidence_signals, confidence_decayed_at,
+                        mentioned_entity_id, version
                  FROM memories
                  WHERE expires_at IS NOT NULL AND expires_at < ?1",
                 params![now],
@@ -5687,15 +5727,37 @@ pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
         // migration backfills `original_tier='long'` so they still restore
         // as permanent (the prior behavior — no regression for legacy data).
         // Live writes from v0.6.3.1 onward round-trip the original tier.
+        // #1025 (CRITICAL, 2026-05-21) — full v0.7.0 column carry on
+        // archive→restore. Pre-#1025 the SELECT pulled only 17 columns;
+        // restored row landed with reflection_depth=0 (DEFAULT),
+        // memory_kind='observation' (DEFAULT), citations=[] (DEFAULT),
+        // version=1 (DEFAULT) — silent loss of Form-4/5 provenance.
+        // COALESCE handles legacy already-archived rows where the
+        // v49-added columns are NULL.
         conn.execute(
             "INSERT INTO memories
              (id, tier, namespace, title, content, tags, priority, confidence,
               source, access_count, created_at, updated_at, last_accessed_at,
-              expires_at, metadata, embedding, embedding_dim)
+              expires_at, metadata, embedding, embedding_dim,
+              reflection_depth, atomised_into, atom_of, memory_kind,
+              entity_id, persona_version, citations, source_uri, source_span,
+              confidence_source, confidence_signals, confidence_decayed_at,
+              mentioned_entity_id, version)
              SELECT id, COALESCE(original_tier, 'long'), namespace, title, content,
                     tags, priority, confidence, source, access_count, created_at,
                     ?1, last_accessed_at, original_expires_at, metadata,
-                    embedding, embedding_dim
+                    embedding, embedding_dim,
+                    COALESCE(reflection_depth, 0),
+                    atomised_into,
+                    atom_of,
+                    COALESCE(memory_kind, 'observation'),
+                    entity_id, persona_version,
+                    COALESCE(citations, '[]'),
+                    source_uri, source_span,
+                    COALESCE(confidence_source, 'caller_provided'),
+                    confidence_signals, confidence_decayed_at,
+                    mentioned_entity_id,
+                    COALESCE(version, 1)
              FROM archived_memories WHERE id = ?2",
             params![now, id],
         )?;
@@ -5786,15 +5848,37 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
                 params![id],
             )?;
         }
+        // #1025 (CRITICAL, 2026-05-21) — full v0.7.0 column carry on
+        // archive→restore. Pre-#1025 the SELECT pulled only 17 columns;
+        // restored row landed with reflection_depth=0 (DEFAULT),
+        // memory_kind='observation' (DEFAULT), citations=[] (DEFAULT),
+        // version=1 (DEFAULT) — silent loss of Form-4/5 provenance.
+        // COALESCE handles legacy already-archived rows where the
+        // v49-added columns are NULL.
         conn.execute(
             "INSERT INTO memories
              (id, tier, namespace, title, content, tags, priority, confidence,
               source, access_count, created_at, updated_at, last_accessed_at,
-              expires_at, metadata, embedding, embedding_dim)
+              expires_at, metadata, embedding, embedding_dim,
+              reflection_depth, atomised_into, atom_of, memory_kind,
+              entity_id, persona_version, citations, source_uri, source_span,
+              confidence_source, confidence_signals, confidence_decayed_at,
+              mentioned_entity_id, version)
              SELECT id, COALESCE(original_tier, 'long'), namespace, title, content,
                     tags, priority, confidence, source, access_count, created_at,
                     ?1, last_accessed_at, original_expires_at, metadata,
-                    embedding, embedding_dim
+                    embedding, embedding_dim,
+                    COALESCE(reflection_depth, 0),
+                    atomised_into,
+                    atom_of,
+                    COALESCE(memory_kind, 'observation'),
+                    entity_id, persona_version,
+                    COALESCE(citations, '[]'),
+                    source_uri, source_span,
+                    COALESCE(confidence_source, 'caller_provided'),
+                    confidence_signals, confidence_decayed_at,
+                    mentioned_entity_id,
+                    COALESCE(version, 1)
              FROM archived_memories WHERE id = ?2",
             params![now, id],
         )?;
