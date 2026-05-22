@@ -63,7 +63,7 @@ use ai_memory::storage as db;
 use chrono::Utc;
 use rusqlite::Connection;
 use serde_json::{Value, json};
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 // ---------------------------------------------------------------------------
@@ -350,19 +350,25 @@ fn autonomy_hook_auto_tag_error_arm_logs_warn_and_continues() {
                 .respond_with(ResponseTemplate::new(200).set_body_json(json!({"models": []})))
                 .mount(&server)
                 .await;
-            // synthesis call (chat) — return empty verdicts so the synth path
+            // #1137: post-#1067 the OllamaClient wire unified `/api/generate`
+            // → `/api/chat`. Disambiguate by prompt content.
+            //
+            // auto_tag prompt — 500 so OllamaClient::auto_tag returns Err
+            // (exercises the L924 Err arm). The phrase "Generate 3-5 short
+            // tags" is the load-bearing AUTO_TAG_PROMPT prefix.
+            Mock::given(method("POST"))
+                .and(path("/api/chat"))
+                .and(body_string_contains("Generate 3-5 short tags"))
+                .respond_with(ResponseTemplate::new(500))
+                .mount(&server)
+                .await;
+            // synthesis call — return empty verdicts so the synth path
             // hands off cleanly to the autonomy hooks below.
             Mock::given(method("POST"))
                 .and(path("/api/chat"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(
                     json!({"message": {"content": "{\"verdicts\": []}"}, "done": true}),
                 ))
-                .mount(&server)
-                .await;
-            // auto_tag (generate) — 500 so OllamaClient::auto_tag returns Err
-            Mock::given(method("POST"))
-                .and(path("/api/generate"))
-                .respond_with(ResponseTemplate::new(500))
                 .mount(&server)
                 .await;
             server
@@ -1139,23 +1145,42 @@ fn autonomy_hook_confirmed_contradictions_only_no_auto_tags_persists_to_metadata
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"models": []})))
             .mount(&server)
             .await;
-        // synthesis (chat) — synthesis is GATED by !legacy_per_pair_classifier
-        // so it won't fire; but legacy classifier uses chat too. Return
-        // "yes" so detect_contradiction → Ok(true) → confirmed populated.
+        // #1137: post-#1067 the OllamaClient wire unified `/api/generate`
+        // → `/api/chat`. Disambiguate by prompt content.
+        //
+        // auto_tag prompt — return empty content so the parser produces
+        // 0 tags. The phrase "Generate 3-5 short tags" is the load-
+        // bearing AUTO_TAG_PROMPT prefix.
         Mock::given(method("POST"))
             .and(path("/api/chat"))
+            .and(body_string_contains("Generate 3-5 short tags"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"message": {"content": ""}, "done": true})),
+            )
+            .mount(&server)
+            .await;
+        // contradiction prompt — return "yes" so detect_contradiction →
+        // Ok(true) → confirmed populated. The phrase "Do these two
+        // statements contradict" is the load-bearing CONTRADICTION_PROMPT
+        // prefix.
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .and(body_string_contains("Do these two statements contradict"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_json(json!({"message": {"content": "yes"}, "done": true})),
             )
             .mount(&server)
             .await;
-        // auto_tag (generate) — return empty so auto_tags stays empty.
-        // OllamaClient::auto_tag parses newline-separated tokens; an
-        // empty response yields no tags.
+        // synthesis fallback — return "yes" (kept as v0.6.x catch-all
+        // for any chat path that doesn't match either matcher above).
         Mock::given(method("POST"))
-            .and(path("/api/generate"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"response": ""})))
+            .and(path("/api/chat"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"message": {"content": "yes"}, "done": true})),
+            )
             .mount(&server)
             .await;
         server
