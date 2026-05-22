@@ -854,9 +854,16 @@ mod postgres_side {
         let Some(pg) = live_pg().await else {
             return;
         };
-        let ctx = ai_memory::store::CallerContext::for_agent("parity-test-1024");
+        // #1138: the SAL get path applies is_visible_to_caller (#910);
+        // a private-scope row with no owner is invisible to every
+        // caller. The test's purpose is verifying the trait `update`
+        // bumps version, not visibility, so use for_admin (which sets
+        // bypass_visibility = true).
+        let ctx = ai_memory::store::CallerContext::for_admin("parity-test-1024");
         let mem = sample_memory("pg-1024-version");
-        let _ = ai_memory::store::MemoryStore::store(&pg, &ctx, &mem).await;
+        ai_memory::store::MemoryStore::store(&pg, &ctx, &mem)
+            .await
+            .expect("store seed");
         let after_seed = ai_memory::store::MemoryStore::get(&pg, &ctx, &mem.id)
             .await
             .expect("get after seed");
@@ -917,7 +924,11 @@ mod postgres_side {
         let Some(pg) = live_pg().await else {
             return;
         };
-        let ctx = ai_memory::store::CallerContext::for_agent("parity-test-1110");
+        // #1138: bypass_visibility (via for_admin) so the test observes
+        // both alice + bob rows. The test's purpose is verifying that
+        // the postgres WHERE clause binds the agent_id filter, NOT the
+        // visibility gate.
+        let ctx = ai_memory::store::CallerContext::for_admin("parity-test-1110");
         let mut m1 = sample_memory("pg-1030-alice");
         m1.metadata = serde_json::json!({"agent_id": "ai:alice"});
         let mut m2 = sample_memory("pg-1030-bob");
