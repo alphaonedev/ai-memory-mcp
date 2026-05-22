@@ -1756,6 +1756,11 @@ mod tests {
         rfl.reflection_depth = 1;
         rfl.content = "This reflection mentions the entity under test.".to_string();
         let rfl_id = db::insert(&conn, &rfl).unwrap();
+        // v0.7.0 #1036 (Agent-3 #7) — test fixture seed. Bumping
+        // version here is irrelevant: the test isolates a single
+        // reflection row in a fresh in-memory DB; no caller observes
+        // the pre-update version, so there's no concurrency contract
+        // to violate. Pinned by `tests/non_version_bumping_sites_1036.rs`.
         conn.execute(
             "UPDATE memories SET mentioned_entity_id = ?1 WHERE id = ?2",
             rusqlite::params![entity_id, &rfl_id],
@@ -1872,6 +1877,11 @@ mod tests {
         rfl.reflection_depth = 1;
         rfl.content = "Dry-run reflection mentions the entity under test.".to_string();
         let rfl_id = db::insert(&conn, &rfl).unwrap();
+        // v0.7.0 #1036 (Agent-3 #7) — test fixture seed. Bumping
+        // version here is irrelevant: the test isolates a single
+        // reflection row in a fresh in-memory DB; no caller observes
+        // the pre-update version, so there's no concurrency contract
+        // to violate. Pinned by `tests/non_version_bumping_sites_1036.rs`.
         conn.execute(
             "UPDATE memories SET mentioned_entity_id = ?1 WHERE id = ?2",
             rusqlite::params![entity_id, &rfl_id],

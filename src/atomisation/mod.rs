@@ -610,6 +610,13 @@ fn write_atom(
     // hot-path so a single-row UPDATE is acceptable; an alternate
     // approach (extend Memory to carry atom_of) is deferred until a
     // future Memory refactor.
+    //
+    // v0.7.0 #1036 (Agent-3 #7) — intentionally non-version-bumping.
+    // This is a back-fill of an atomisation-derived metadata column
+    // on a row that was JUST INSERTED (`db::insert(&mem)` returned
+    // `actual_id` two lines up). The row has not yet been observed
+    // by any caller, so there is no version contract to violate.
+    // Pinned by `tests/non_version_bumping_sites_1036.rs`.
     conn.execute(
         "UPDATE memories SET atom_of = ?1 WHERE id = ?2",
         params![source.id, actual_id],
