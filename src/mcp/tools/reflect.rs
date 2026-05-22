@@ -643,6 +643,10 @@ mod tests {
         // immediately falls above the threshold.
         let std_mem_id = seed_observation(&conn, "rfl-gate", "std");
         // Manually patch metadata.governance with require_approval_above_depth=0
+        // v0.7.0 #1036 (Agent-3 #7) — test fixture seed. Non-version-
+        // bumping by design: test isolates a single namespace-standard
+        // row; no caller observes the pre-update version. Pinned by
+        // `tests/non_version_bumping_sites_1036.rs`.
         let gov_metadata = json!({
             "governance": {
                 "write": "any",

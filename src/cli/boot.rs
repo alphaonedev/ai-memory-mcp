@@ -1246,6 +1246,12 @@ mod tests {
         let mut env = TestEnv::fresh();
         let id = seed_memory(&env.db_path, "other", "long-tier-row", "x");
         let conn = db::open(&env.db_path).unwrap();
+        // v0.7.0 #1036 (Agent-3 #7) — test fixture seed. The seed
+        // helper produces a default-tier row; this UPDATE flips it
+        // to long-tier so the boot fallback fires. Non-version-
+        // bumping is correct here because the test isolates a
+        // single freshly-seeded row in a fresh DB. Pinned by
+        // `tests/non_version_bumping_sites_1036.rs`.
         conn.execute(
             "UPDATE memories SET tier='long' WHERE id=?1",
             rusqlite::params![id],

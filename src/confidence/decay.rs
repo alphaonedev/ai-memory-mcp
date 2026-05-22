@@ -104,6 +104,21 @@ pub fn apply_decay_touch(conn: &Connection, id: &str) -> rusqlite::Result<bool> 
         crate::confidence::DEFAULT_HALF_LIFE_DAYS,
     );
     let stamp = now.to_rfc3339();
+    // v0.7.0 #1036 (Agent-3 #7) — intentionally non-version-bumping
+    // write. This is a periodic system sweep updating confidence
+    // calibration metadata, NOT a user-initiated content edit. The
+    // optimistic-concurrency contract (Gap-1 #884) protects against
+    // concurrent USER edits via `memories.version`. Bumping version
+    // here would cause spurious VersionConflict on the next user
+    // `update_with_expected_version` call (the user's stale `version`
+    // would diverge from the row's decay-bumped value), breaking
+    // the user-facing concurrency story without protecting any
+    // real cross-edit race (the decay sweep is monotonic + idempotent
+    // — re-running on the same row converges to the same value
+    // modulo the slow time decay).
+    //
+    // Pinned by `tests/non_version_bumping_sites_1036.rs` —
+    // a fresh `version` MUST equal the pre-decay `version` post-call.
     let n = conn.execute(
         "UPDATE memories
          SET confidence = ?1,
