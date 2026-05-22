@@ -836,7 +836,12 @@ fn live_gemma_e2b_smoke() {
     use ai_memory::atomisation::curator::LlmCurator;
     use ai_memory::llm::OllamaClient;
 
-    let client = match OllamaClient::new("gemma3:e2b") {
+    // #1121: model name MUST match the #[ignore] message above. The
+    // host running the release-gate suite is expected to have pulled
+    // `gemma4:e2b`; this test was previously `gemma3:e2b` (a typo
+    // pre-dating the v0.7.0 LLM-vendor sweep) which never resolved
+    // because no host carried a model by that name.
+    let client = match OllamaClient::new("gemma4:e2b") {
         Ok(c) if c.is_available() => c,
         _ => {
             println!("skipping live_gemma_e2b_smoke: Ollama unavailable");
@@ -852,9 +857,21 @@ fn live_gemma_e2b_smoke() {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     ensure_hook_installed();
     set_mode(HookMode::Allow);
-    let result = atomiser
-        .atomise_sync(&conn, &source_id, 200, false, "test-agent")
-        .expect("live atomise must succeed");
+    // #1121: skip cleanly when the model isn't pulled on this host
+    // (404 from /api/chat) rather than panicking. is_available() only
+    // verifies the daemon is reachable, not that the requested model
+    // is present in the local registry.
+    let result = match atomiser.atomise_sync(&conn, &source_id, 200, false, "test-agent") {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = format!("{e:?}");
+            if msg.contains("404") || msg.contains("not found") {
+                println!("skipping live_gemma_e2b_smoke: model unavailable on host ({msg})");
+                return;
+            }
+            panic!("live atomise must succeed: {e:?}");
+        }
+    };
     assert!(
         (2..=10).contains(&result.atom_count),
         "live curator must respect 2..=10 envelope"
