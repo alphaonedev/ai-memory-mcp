@@ -16,7 +16,6 @@ use serde_json::{Value, json};
 /// v0.7.0 #972 D1.4 (#985) — request body for `memory_namespace_set_standard`.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[allow(dead_code)]
-#[schemars(deny_unknown_fields)]
 pub struct NamespaceSetStandardRequest {
     /// Namespace.
     pub namespace: String,
@@ -59,7 +58,6 @@ impl McpTool for NamespaceSetStandardTool {
 /// v0.7.0 #972 D1.4 (#985) — request body for `memory_namespace_get_standard`.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[allow(dead_code)]
-#[schemars(deny_unknown_fields)]
 pub struct NamespaceGetStandardRequest {
     /// Namespace.
     pub namespace: String,
@@ -95,7 +93,6 @@ impl McpTool for NamespaceGetStandardTool {
 /// v0.7.0 #972 D1.4 (#985) — request body for `memory_namespace_clear_standard`.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[allow(dead_code)]
-#[schemars(deny_unknown_fields)]
 pub struct NamespaceClearStandardRequest {
     /// Namespace.
     pub namespace: String,

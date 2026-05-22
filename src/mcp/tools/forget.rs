@@ -47,7 +47,6 @@ use serde::Deserialize;
 /// v0.7.0 #972 D1.6 (#987) — request body for `memory_forget`.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[allow(dead_code)]
-#[schemars(deny_unknown_fields)]
 pub struct ForgetRequest {
     #[serde(default)]
     pub namespace: Option<String>,
@@ -90,7 +89,6 @@ impl McpTool for ForgetTool {
 /// legacy schema is `properties: {}` — empty struct.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[allow(dead_code)]
-#[schemars(deny_unknown_fields)]
 pub struct StatsRequest {}
 
 /// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_stats`.

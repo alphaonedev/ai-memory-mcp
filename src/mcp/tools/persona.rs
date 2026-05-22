@@ -177,7 +177,6 @@ use serde::Deserialize;
 /// v0.7.0 #972 D1.5 (#986) — request body for `memory_persona`.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[allow(dead_code)]
-#[schemars(deny_unknown_fields)]
 pub struct PersonaRequest {
     /// Persona subject.
     pub entity_id: String,
@@ -216,7 +215,6 @@ impl McpTool for PersonaTool {
 /// — schemars emits the equivalent shape from `Option<String>`.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[allow(dead_code)]
-#[schemars(deny_unknown_fields)]
 pub struct PersonaGenerateRequest {
     /// Persona subject (1-128 chars).
     pub entity_id: String,

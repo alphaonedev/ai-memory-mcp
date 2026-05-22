@@ -16,7 +16,6 @@ use std::path::Path;
 /// v0.7.0 #972 D1.4 (#985) — request body for `memory_link`.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[allow(dead_code)]
-#[schemars(deny_unknown_fields)]
 pub struct LinkRequest {
     /// Source memory ID.
     pub source_id: String,
@@ -54,7 +53,6 @@ impl McpTool for LinkTool {
 /// v0.7.0 #972 D1.4 (#985) — request body for `memory_get_links`.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[allow(dead_code)]
-#[schemars(deny_unknown_fields)]
 pub struct GetLinksRequest {
     /// Memory ID.
     pub id: String,

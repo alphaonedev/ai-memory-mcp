@@ -48,7 +48,6 @@ use self::validation::OnConflict;
 /// at the bottom of this file.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[allow(dead_code)]
-#[schemars(deny_unknown_fields)]
 pub struct StoreRequest {
     /// Short title
     pub title: String,

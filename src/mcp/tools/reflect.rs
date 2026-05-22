@@ -317,7 +317,6 @@ use serde::Deserialize;
 /// v0.7.0 #972 D1.5 (#986) — request body for `memory_reflect`.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[allow(dead_code)]
-#[schemars(deny_unknown_fields)]
 pub struct ReflectRequest {
     /// Sources reflected on; one reflects_on link per id.
     pub source_ids: Vec<String>,

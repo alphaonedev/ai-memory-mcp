@@ -16,7 +16,6 @@
 //! 2. `default`: legacy typed; schemars `null` for every `Option<T>`.
 //! 3. `enum`: schemars may drop / tighten; runtime parser tolerates.
 //! 4. `additionalProperties: false` from
-//!    `#[schemars(deny_unknown_fields)]`; legacy omits.
 //!
 //! Match-exactly contracts asserted by these helpers:
 //!

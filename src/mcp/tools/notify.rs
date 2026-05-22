@@ -157,7 +157,6 @@ use serde::Deserialize;
 /// v0.7.0 #972 D1.5 (#986) — request body for `memory_notify`.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[allow(dead_code)]
-#[schemars(deny_unknown_fields)]
 pub struct NotifyRequest {
     /// Recipient agent_id.
     pub target_agent_id: String,
@@ -203,7 +202,6 @@ impl McpTool for NotifyTool {
 /// v0.7.0 #972 D1.5 (#986) — request body for `memory_inbox`.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[allow(dead_code)]
-#[schemars(deny_unknown_fields)]
 pub struct InboxRequest {
     /// Recipient; default caller.
     #[serde(default)]

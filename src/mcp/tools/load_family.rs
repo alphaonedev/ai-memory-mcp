@@ -19,7 +19,6 @@ use serde_json::{Value, json};
 /// the macro).
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[allow(dead_code)]
-#[schemars(deny_unknown_fields)]
 pub struct LoadFamilyRequest {
     /// MCP tool family (8 groups) — NOT the memory_kind taxonomy. See #864.
     pub family: String,
@@ -62,7 +61,6 @@ impl McpTool for LoadFamilyTool {
 /// v0.7.0 #972 D1.3 (#984) — request body for `memory_smart_load`.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[allow(dead_code)]
-#[schemars(deny_unknown_fields)]
 pub struct SmartLoadRequest {
     /// Free-text goal.
     pub intent: String,

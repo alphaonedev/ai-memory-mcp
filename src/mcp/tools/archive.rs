@@ -150,7 +150,6 @@ use serde::Deserialize;
 /// v0.7.0 #972 D1.5 (#986) — request body for `memory_archive_list`.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[allow(dead_code)]
-#[schemars(deny_unknown_fields)]
 pub struct ArchiveListRequest {
     /// Namespace filter.
     #[serde(default)]
@@ -191,7 +190,6 @@ impl McpTool for ArchiveListTool {
 /// v0.7.0 #972 D1.5 (#986) — request body for `memory_archive_purge`.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[allow(dead_code)]
-#[schemars(deny_unknown_fields)]
 pub struct ArchivePurgeRequest {
     /// Only purge entries older than N days.
     #[serde(default)]
@@ -224,7 +222,6 @@ impl McpTool for ArchivePurgeTool {
 /// v0.7.0 #972 D1.5 (#986) — request body for `memory_archive_restore`.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[allow(dead_code)]
-#[schemars(deny_unknown_fields)]
 pub struct ArchiveRestoreRequest {
     /// Archived memory id.
     pub id: String,
@@ -257,13 +254,11 @@ impl McpTool for ArchiveRestoreTool {
 /// Legacy schema is `properties: {}` — empty struct.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[allow(dead_code)]
-#[schemars(deny_unknown_fields)]
 pub struct ArchiveStatsRequest {}
 
 /// v0.7.0 #972 D1.6 (#987) — request body for `memory_gc`.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[allow(dead_code)]
-#[schemars(deny_unknown_fields)]
 pub struct GcRequest {
     /// Preview without deleting.
     #[serde(default)]

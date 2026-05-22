@@ -14,7 +14,6 @@ use serde_json::{Value, json};
 /// v0.7.0 #972 D1.4 (#985) — request body for `memory_subscribe`.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[allow(dead_code)]
-#[schemars(deny_unknown_fields)]
 pub struct SubscribeRequest {
     /// https URL (http only for loopback). SSRF guard rejects private IPs.
     pub url: String,
@@ -66,7 +65,6 @@ impl McpTool for SubscribeTool {
 /// v0.7.0 #972 D1.4 (#985) — request body for `memory_unsubscribe`.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[allow(dead_code)]
-#[schemars(deny_unknown_fields)]
 pub struct UnsubscribeRequest {
     pub id: String,
 }
@@ -244,7 +242,6 @@ pub(super) fn handle_subscription_replay(
 /// The legacy schema is `properties: {}` — empty struct.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[allow(dead_code)]
-#[schemars(deny_unknown_fields)]
 pub struct ListSubscriptionsRequest {}
 
 /// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_list_subscriptions`.
@@ -273,7 +270,6 @@ impl McpTool for ListSubscriptionsTool {
 /// v0.7.0 #972 D1.5 (#986) — request body for `memory_subscription_replay`.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[allow(dead_code)]
-#[schemars(deny_unknown_fields)]
 pub struct SubscriptionReplayRequest {
     /// Subscription id.
     pub subscription_id: String,

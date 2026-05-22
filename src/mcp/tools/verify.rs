@@ -14,7 +14,6 @@ use serde_json::{Value, json};
 /// v0.7.0 #972 D1.4 (#985) — request body for `memory_verify`.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[allow(dead_code)]
-#[schemars(deny_unknown_fields)]
 pub struct VerifyRequest {
     /// Composite id 'source_id--relation-->target_id'.
     #[serde(default)]

@@ -62,7 +62,6 @@ use serde::Deserialize;
 /// shape via the field naming alone.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[allow(dead_code)]
-#[schemars(deny_unknown_fields)]
 pub struct RecallObservationsRequest {
     #[serde(default)]
     pub recall_id: Option<String>,

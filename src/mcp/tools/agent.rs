@@ -85,7 +85,6 @@ use serde::Deserialize;
 /// v0.7.0 #972 D1.5 (#986) — request body for `memory_agent_register`.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[allow(dead_code)]
-#[schemars(deny_unknown_fields)]
 pub struct AgentRegisterRequest {
     /// Agent id (same validation as metadata.agent_id).
     pub agent_id: String,
@@ -125,7 +124,6 @@ impl McpTool for AgentRegisterTool {
 /// legacy schema is `properties: {}` — empty struct.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[allow(dead_code)]
-#[schemars(deny_unknown_fields)]
 pub struct AgentListRequest {}
 
 /// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_agent_list`.
