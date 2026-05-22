@@ -36,17 +36,28 @@ use std::sync::Mutex;
 /// Mirrors the pattern in `tests/identity_e2e.rs`.
 static RULES_GUARD: Mutex<()> = Mutex::new(());
 
-/// Insert a stub `memories` row in the given namespace so the I2 join
-/// can be satisfied without dragging in the full store pipeline.
-fn insert_memory(conn: &rusqlite::Connection, id: &str, namespace: &str) {
+/// Insert a stub `memories` row owned by the given `owner_agent_id` in
+/// the given namespace. The `owner_agent_id` lands in `metadata.agent_id`
+/// so the post-#1075 visibility gate at
+/// `src/mcp/tools/replay.rs::handle_replay` can identify the owner.
+/// Pre-#1075 this argument was absent (memories had no owner and
+/// visibility was unenforced on the replay path) — that's the gap
+/// #1075 closed.
+fn insert_memory(
+    conn: &rusqlite::Connection,
+    id: &str,
+    namespace: &str,
+    owner_agent_id: &str,
+) {
     let now = chrono::Utc::now().to_rfc3339();
     // v0.7.0 fix campaign R1-M2 — substrate CHECK trigger enforces
     // tier ∈ {short, mid, long}.
+    let metadata = serde_json::json!({"agent_id": owner_agent_id}).to_string();
     conn.execute(
         "INSERT INTO memories (
-            id, tier, namespace, title, content, created_at, updated_at
-         ) VALUES (?1, 'short', ?2, ?3, 'body', ?4, ?4)",
-        params![id, namespace, format!("title-{id}"), now],
+            id, tier, namespace, title, content, metadata, created_at, updated_at
+         ) VALUES (?1, 'short', ?2, ?3, 'body', ?4, ?5, ?5)",
+        params![id, namespace, format!("title-{id}"), metadata, now],
     )
     .unwrap();
 }
@@ -60,16 +71,17 @@ fn agent_b_cannot_replay_agent_a_transcript_when_rule_denies() {
 
     let conn = db::open(std::path::Path::new(":memory:")).unwrap();
 
-    // Agent A's tenant namespace + a memory + a sensitive transcript.
-    insert_memory(&conn, "mem-a", "tenant-a/notes");
+    // Agent A's tenant namespace + a memory owned by agent-a + a
+    // sensitive transcript anchored to it.
+    insert_memory(&conn, "mem-a", "tenant-a/notes", "agent-a");
     let secret = "[user] Agent A's confidential strategy doc — do not leak.";
     let t = transcripts::store(&conn, "tenant-a/notes", secret, None).unwrap();
     transcripts::link_transcript(&conn, "mem-a", &t.id, None, None).unwrap();
 
-    // K9 rule: deny any agent NOT named `agent-a` from replaying
-    // `tenant-a/**`. The agent_pattern `*` matches everything; pair
-    // with namespace_pattern `tenant-a/**` so only this namespace's
-    // reads are gated.
+    // K9 rule: deny agent-b from replaying tenant-a/**. Kept as belt-
+    // and-suspenders even though post-#1075 the visibility gate fires
+    // first — if a future refactor inadvertently bypasses #1075, the
+    // K9 rule remains the second line of defense.
     set_active_permission_rules(vec![PermissionRule {
         namespace_pattern: "tenant-a/**".to_string(),
         op: "memory_replay".to_string(),
@@ -85,26 +97,39 @@ fn agent_b_cannot_replay_agent_a_transcript_when_rule_denies() {
         "new MemoryReplay variant must be wired into the wire matcher"
     );
 
-    // Agent B issues the replay. The handler is `pub` for this test;
-    // we pass `agent_id=agent-b` directly so the resolver doesn't
-    // fall through to the host-process default (which would not
-    // match the rule).
-    let result = mcp::handle_replay(
+    // Agent B issues the replay. Post-#1075 the visibility gate fires
+    // BEFORE the K9 permission rules and returns a silent-empty Ok
+    // (count: 0, transcripts: []) rather than a Deny error. The empty
+    // shape is identical to the "memory does not exist" response, by
+    // design — preventing an attacker from probing transcript existence
+    // via permission-error vs not-found discrimination. The K9 Deny
+    // rule above is still loaded but it's load-bearing only if a
+    // future refactor reverts the visibility gate.
+    let payload = mcp::handle_replay(
         &conn,
         &json!({
             "memory_id": "mem-a",
             "agent_id": "agent-b",
         }),
         None,
+    )
+    .expect("post-#1075 replay returns Ok with empty body on visibility-denied");
+
+    assert_eq!(
+        payload["count"], 0,
+        "agent-b must observe count=0 (silent empty per #1075); got: {payload}"
     );
-    let err = result.expect_err("denied tenant must produce an error");
+    let transcripts_arr = payload["transcripts"]
+        .as_array()
+        .expect("transcripts array present even when empty");
     assert!(
-        err.contains("denied") || err.contains("permission"),
-        "error must mention denial / permission, got: {err}"
+        transcripts_arr.is_empty(),
+        "agent-b must observe empty transcripts (post-#1075 anti-enumeration); got: {payload}"
     );
+    let raw_payload = payload.to_string();
     assert!(
-        !err.contains(secret),
-        "the secret transcript content must not leak into the error message: {err}"
+        !raw_payload.contains(secret),
+        "the secret transcript content must NOT leak via the empty response: {payload}"
     );
 
     clear_active_permission_rules_for_test();
@@ -118,7 +143,7 @@ fn agent_a_can_still_replay_own_namespace_with_same_rule_loaded() {
     clear_active_permission_rules_for_test();
 
     let conn = db::open(std::path::Path::new(":memory:")).unwrap();
-    insert_memory(&conn, "mem-a", "tenant-a/notes");
+    insert_memory(&conn, "mem-a", "tenant-a/notes", "agent-a");
     let body = "[user] Agent A's own conversation.";
     let t = transcripts::store(&conn, "tenant-a/notes", body, None).unwrap();
     transcripts::link_transcript(&conn, "mem-a", &t.id, None, None).unwrap();
