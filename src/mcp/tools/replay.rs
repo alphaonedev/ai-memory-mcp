@@ -159,6 +159,46 @@ pub fn handle_replay(
     // approval pipeline. Allow / Modify let the read proceed.
     let agent_id = crate::identity::resolve_agent_id(params["agent_id"].as_str(), mcp_client)
         .map_err(|e| e.to_string())?;
+
+    // v0.7.0 #1075 (SR-1 #1, HIGH) — visibility gate. Pre-#1075 the
+    // replay path consulted only the K9 permission rules; in the
+    // documented zero-config posture (no `[[permissions.rules]]` in
+    // `config.toml`) every transcript anchored to the chain leaked
+    // cross-tenant. The canonical `is_visible_to_caller` predicate
+    // gates every other memory-returning surface (#927 get_memory,
+    // #978 federation sync_since, #1028 list_memories_updated_since)
+    // — the I4 replay path was missed in the original #951 sweep.
+    //
+    // Failure shape: identical to the "transcript not found" path
+    // (early-return `Ok` with `transcripts: []`) so the caller cannot
+    // distinguish "memory exists but you can't see it" from "memory
+    // does not exist". A leak of existence would still be a useful
+    // probe oracle for an attacker enumerating transcript ids.
+    for entry in &entries {
+        let anchor = match crate::db::get(conn, &entry.memory_id)
+            .map_err(|e| format!("get anchor memory for replay gate: {e}"))?
+        {
+            Some(m) => m,
+            // Anchor row vanished between the substrate read and the
+            // visibility check; treat as not-found to avoid leaking
+            // sequencing information.
+            None => {
+                return Ok(json!({
+                    "memory_id": memory_id,
+                    "transcripts": Vec::<Value>::new(),
+                    "count": 0,
+                }));
+            }
+        };
+        if !crate::visibility::is_visible_to_caller(&anchor, &agent_id) {
+            return Ok(json!({
+                "memory_id": memory_id,
+                "transcripts": Vec::<Value>::new(),
+                "count": 0,
+            }));
+        }
+    }
+
     for entry in &entries {
         use crate::permissions::{Op, PermissionContext, Permissions};
         let ctx = PermissionContext {
@@ -277,7 +317,7 @@ mod tests {
             updated_at: now,
             last_accessed_at: None,
             expires_at: None,
-            metadata: json!({"agent_id": "ai:test"}),
+            metadata: json!({"agent_id": "ai:test", "scope": "public"}),
             reflection_depth: 0,
             memory_kind: MemoryKind::Observation,
             entity_id: None,
@@ -373,6 +413,73 @@ mod tests {
         let entries = resp["transcripts"].as_array().unwrap();
         assert_eq!(entries[0]["truncated"], true);
         assert!(entries[0].get("content").is_none());
+    }
+
+    // #1075 (SR-1 #1, HIGH) — cross-tenant transcript replay is denied
+    // when the anchor memory is scope=private and owned by another
+    // agent. Returns the not-found shape (count=0, transcripts=[]) so
+    // the caller cannot distinguish existence vs visibility.
+    #[test]
+    fn cross_tenant_replay_returns_empty_under_zero_config_1075() {
+        let conn = fresh_conn();
+        // Insert a private memory owned by alice.
+        let now = chrono::Utc::now().to_rfc3339();
+        let mem = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Mid,
+            namespace: "alice-ns".to_string(),
+            title: "alice-private".to_string(),
+            content: "alice-secret".to_string(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".to_string(),
+            access_count: 0,
+            created_at: now.clone(),
+            updated_at: now,
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({"agent_id": "ai:alice", "scope": "private"}),
+            reflection_depth: 0,
+            memory_kind: MemoryKind::Observation,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: crate::models::ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
+        };
+        let mid = db::insert(&conn, &mem).expect("insert alice memory");
+        let t = transcripts::store(&conn, "alice-ns", "alice-only transcript content", None)
+            .expect("store transcript");
+        transcripts::link_transcript(&conn, &mid, &t.id, None, None).expect("link");
+
+        // Bob attempts the replay. Pre-#1075 this leaked alice's
+        // transcript content; post-#1075 it returns the not-found shape.
+        let resp = handle_replay(
+            &conn,
+            &json!({"memory_id": mid, "agent_id": "ai:bob"}),
+            None,
+        )
+        .expect("ok");
+        assert_eq!(
+            resp["count"].as_u64(),
+            Some(0),
+            "bob must not see alice's transcripts"
+        );
+        assert!(resp["transcripts"].as_array().unwrap().is_empty());
+
+        // Alice can see her own — sanity check the gate is not over-broad.
+        let resp_alice = handle_replay(
+            &conn,
+            &json!({"memory_id": mid, "agent_id": "ai:alice"}),
+            None,
+        )
+        .expect("ok");
+        assert_eq!(resp_alice["count"].as_u64(), Some(1));
     }
 
     // verbose=true forces content even on large transcripts.
