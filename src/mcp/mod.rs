@@ -918,8 +918,8 @@ pub(crate) type DispatchFn = fn(&ToolDispatchCtx<'_>) -> Result<Value, String>;
 /// `inventory::submit!` (cross-module collect) without touching every
 /// call site.
 ///
-/// ```ignore
-/// register_mcp_tool!("memory_search", dispatch_memory_search),
+/// ```text
+/// register_mcp_tool!("memory_search", dispatch_memory_search)
 /// ```
 macro_rules! register_mcp_tool {
     ($name:literal, $f:path) => {
