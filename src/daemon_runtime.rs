@@ -2523,12 +2523,68 @@ pub async fn bootstrap_serve(
                         Err(reason)
                     }
                     Err(e) => {
-                        tracing::warn!(
-                            "L1-6 governance pre-write: rule consultation failed: {}; \
-                             degrading to ALLOW",
-                            e
+                        // v0.7.0 #1054 (Agent-2 #4) — fail-CLOSED on
+                        // rule-consultation error and chain-log the
+                        // refusal so an attacker who can induce
+                        // consultation errors (concurrent PRAGMA
+                        // wal_checkpoint, ATTACH-as-readonly
+                        // contention, etc.) cannot race a refused
+                        // write through the gate. The pre-#1054
+                        // posture degraded to ALLOW, which made the
+                        // gate dependent on the rule consultation
+                        // never erroring — a fragile invariant.
+                        //
+                        // Operators with a legitimate need for the
+                        // legacy fail-open posture (e.g. during a
+                        // chaos-test window where transient SQL
+                        // pressure is expected) can opt back in via
+                        // `AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1`.
+                        // The unsafe override is logged at WARN on
+                        // every fire and counts toward the
+                        // governance posture surface so an audit can
+                        // detect the legacy-permissive mode.
+                        let reason = format!(
+                            "governance:consultation_failed: {e}"
                         );
-                        Ok(())
+                        let fail_open = std::env::var(
+                            "AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR",
+                        )
+                        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                        .unwrap_or(false);
+                        // Emit a governance.refusal-shaped row to the
+                        // deferred audit queue regardless of the
+                        // open/closed decision so the audit chain
+                        // captures the consultation failure either
+                        // way. The synthetic Decision::Refuse uses
+                        // rule_id=`governance:consultation_failed` so
+                        // a downstream auditor can distinguish
+                        // "no rule fired" from "consultation broke".
+                        let synthetic_refusal = RuleDecision::Refuse {
+                            rule_id: "governance:consultation_failed".to_string(),
+                            reason: reason.clone(),
+                        };
+                        queue_for_hook.submit_refusal(
+                            &agent_id,
+                            &action,
+                            &synthetic_refusal,
+                        );
+                        if fail_open {
+                            tracing::warn!(
+                                "L1-6 governance pre-write: rule consultation failed: {}; \
+                                 AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1 — \
+                                 degrading to ALLOW (UNSAFE, legacy posture)",
+                                e
+                            );
+                            Ok(())
+                        } else {
+                            tracing::warn!(
+                                "L1-6 governance pre-write: rule consultation failed: {}; \
+                                 failing CLOSED (post-#1054 secure default — \
+                                 set AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1 to revert)",
+                                e
+                            );
+                            Err(reason)
+                        }
                     }
                 }
             },
@@ -2623,13 +2679,48 @@ pub async fn bootstrap_serve(
                         Err(reason)
                     }
                     Err(e) => {
-                        tracing::warn!(
-                            "wire_check: rule consultation failed: {}; degrading to ALLOW \
-                             for this action ({})",
-                            e,
-                            action.kind(),
+                        // v0.7.0 #1054 (Agent-2 #4) — same fail-CLOSED
+                        // posture as the storage hook above. Wire-check
+                        // refusals for daemon-internal actions
+                        // (federation push, hooks spawn, LLM call,
+                        // skill_export) are higher-stakes than storage
+                        // refusals — fail-open here would let a
+                        // consultation race smuggle a refused
+                        // network/filesystem/process action through
+                        // the gate. Same env-var escape hatch:
+                        // `AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1`.
+                        let reason = format!("governance:consultation_failed: {e}");
+                        let fail_open = std::env::var("AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR")
+                            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                            .unwrap_or(false);
+                        let synthetic_refusal = RuleDecision::Refuse {
+                            rule_id: "governance:consultation_failed".to_string(),
+                            reason: reason.clone(),
+                        };
+                        queue_for_wire_check.submit_refusal(
+                            "daemon:wire_action",
+                            action,
+                            &synthetic_refusal,
                         );
-                        Ok(())
+                        if fail_open {
+                            tracing::warn!(
+                                "wire_check: rule consultation failed: {}; \
+                                 AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1 — \
+                                 degrading to ALLOW for this action ({}) (UNSAFE, legacy posture)",
+                                e,
+                                action.kind(),
+                            );
+                            Ok(())
+                        } else {
+                            tracing::warn!(
+                                "wire_check: rule consultation failed: {}; failing CLOSED \
+                                 for this action ({}) (post-#1054 secure default — set \
+                                 AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1 to revert)",
+                                e,
+                                action.kind(),
+                            );
+                            Err(reason)
+                        }
                     }
                 }
             },

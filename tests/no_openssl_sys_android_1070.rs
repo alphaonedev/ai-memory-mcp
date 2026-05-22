@@ -58,22 +58,21 @@ fn android_transitive_graph_has_no_openssl_sys_1070() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    if output.status.success() {
-        panic!(
-            "#1070 regression: openssl-sys is in the Android transitive \
-             graph. The Android NDK ships no libssl by default so the \
-             mobile-runtime CI workflow's emulator job will fail at \
-             `cargo test --no-run`.\n\n\
-             Offending chain (stdout):\n{stdout}\n\n\
-             Reproducer:\n  \
-             cargo tree -e normal --target x86_64-linux-android \
-             --no-default-features --features sqlite-bundled \
-             -i openssl-sys\n\n\
-             Common causes: (a) hf-hub default-features re-enabled \
-             (default-tls → native-tls); (b) a new dep with \
-             native-tls enabled. Use rustls-tls everywhere."
-        );
-    }
+    assert!(
+        !output.status.success(),
+        "#1070 regression: openssl-sys is in the Android transitive \
+         graph. The Android NDK ships no libssl by default so the \
+         mobile-runtime CI workflow's emulator job will fail at \
+         `cargo test --no-run`.\n\n\
+         Offending chain (stdout):\n{stdout}\n\n\
+         Reproducer:\n  \
+         cargo tree -e normal --target x86_64-linux-android \
+         --no-default-features --features sqlite-bundled \
+         -i openssl-sys\n\n\
+         Common causes: (a) hf-hub default-features re-enabled \
+         (default-tls → native-tls); (b) a new dep with \
+         native-tls enabled. Use rustls-tls everywhere."
+    );
 
     // `cargo tree -i` with no match emits a 'did not match any packages'
     // error on stderr. Anything else is unexpected — surface it.

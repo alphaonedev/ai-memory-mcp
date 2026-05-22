@@ -111,6 +111,22 @@ impl FederationConfig {
         if let Some(ca_path) = ca_cert_path {
             let ca_pem = std::fs::read(ca_path)
                 .map_err(|e| anyhow::anyhow!("read --quorum-ca-cert: {e}"))?;
+            // v0.7.0 #1070 follow-up — `reqwest::Certificate::from_pem`
+            // post-#1070 (rustls-only backend, no native-tls fallback)
+            // accepts a file with no PEM markers as an empty cert chain
+            // without erroring. That breaks the strict-validation
+            // contract `config_build_rejects_invalid_ca_cert_pem` pins.
+            // Pre-flight the file content for a `-----BEGIN ` marker so
+            // a non-PEM operator-supplied path produces the same
+            // explicit error message the legacy native-tls parser
+            // emitted.
+            let has_pem_marker = ca_pem.windows(11).any(|w| w == b"-----BEGIN ");
+            if !has_pem_marker {
+                anyhow::bail!(
+                    "parse --quorum-ca-cert: input at {} contains no PEM `-----BEGIN ` marker",
+                    ca_path.display()
+                );
+            }
             let ca = reqwest::Certificate::from_pem(&ca_pem)
                 .map_err(|e| anyhow::anyhow!("parse --quorum-ca-cert: {e}"))?;
             client_builder = client_builder.add_root_certificate(ca);

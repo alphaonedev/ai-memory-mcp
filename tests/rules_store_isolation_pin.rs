@@ -306,9 +306,9 @@ fn governance_hooks_capture_consultation_connection_at_install_time_1017() {
         "crate::storage::GOVERNANCE_PRE_WRITE.set(Box::new(",
         "crate::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(",
     ] {
-        let install_idx = body
-            .find(hook_marker)
-            .unwrap_or_else(|| panic!("hook install line `{hook_marker}` missing from daemon_runtime.rs"));
+        let install_idx = body.find(hook_marker).unwrap_or_else(|| {
+            panic!("hook install line `{hook_marker}` missing from daemon_runtime.rs")
+        });
         // Closure bodies are bounded by the next `));` followed by
         // matching install_result handling. Scan the next 5000 chars
         // (closures are ~2.5KB max each) for the anti-pattern.
@@ -320,6 +320,75 @@ fn governance_hooks_capture_consultation_connection_at_install_time_1017() {
              `db::open(&rules_db_path)` per invocation — that re-introduces \
              the ~1-2ms-per-call PRAGMA + SCHEMA + migrate cost the issue \
              closed. Use the captured `hook_consultation_conn` Arc instead."
+        );
+    }
+}
+
+#[test]
+fn governance_hooks_fail_closed_on_rule_consultation_error_1054() {
+    // v0.7.0 #1054 (Agent-2 #4) — both governance hooks must
+    // fail-CLOSED on rule-consultation error (the Err arm of
+    // `check_agent_action_deferred_cached`). Pre-#1054 the Err arm
+    // emitted "degrading to ALLOW" with a WARN — an attacker who
+    // could induce consultation errors (concurrent PRAGMA
+    // wal_checkpoint, ATTACH-as-readonly contention, malformed
+    // payload triggering serde panic) raced refused writes through
+    // the gate.
+    //
+    // Post-#1054 the secure default is fail-CLOSED with an emitted
+    // `governance:consultation_failed` row in the deferred audit
+    // queue. Operators with a legitimate fail-open need
+    // (chaos-test windows, etc.) can opt back in via
+    // `AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1`.
+    //
+    // Structural pin: assert daemon_runtime.rs's hook bodies
+    // contain the fail-closed marker AND the env-var escape hatch
+    // — re-introduction of an unconditional "degrading to ALLOW"
+    // arm fails this pin.
+    let body = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/daemon_runtime.rs"
+    ))
+    .expect("read daemon_runtime.rs");
+
+    assert!(
+        body.contains("AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR"),
+        "post-#1054: daemon_runtime.rs must reference the \
+         `AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR` opt-in escape \
+         hatch in the hook error arm"
+    );
+    assert!(
+        body.contains("governance:consultation_failed"),
+        "post-#1054: daemon_runtime.rs must emit a synthetic \
+         `governance:consultation_failed` refusal to the audit \
+         queue so the chain captures the consultation failure"
+    );
+
+    // Both hook closures must include the fail-closed message
+    // (`failing CLOSED`) inside their Err arm. Scan each install
+    // block for the marker.
+    for hook_marker in [
+        "crate::storage::GOVERNANCE_PRE_WRITE.set(Box::new(",
+        "crate::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(",
+    ] {
+        let install_idx = body
+            .find(hook_marker)
+            .unwrap_or_else(|| panic!("hook install line `{hook_marker}` missing"));
+        let end_idx = (install_idx + 8000).min(body.len());
+        let closure_body = &body[install_idx..end_idx];
+        assert!(
+            closure_body.contains("failing CLOSED"),
+            "post-#1054: `{hook_marker}` closure Err arm MUST log \
+             'failing CLOSED' as the default secure posture. \
+             Re-introducing an unconditional ALLOW path is the \
+             regression catch."
+        );
+        assert!(
+            closure_body.contains("synthetic_refusal"),
+            "post-#1054: `{hook_marker}` closure Err arm MUST \
+             synthesise a `governance:consultation_failed` \
+             refusal and push it to the deferred audit queue so \
+             the chain-log captures the consultation failure."
         );
     }
 }
