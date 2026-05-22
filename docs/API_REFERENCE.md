@@ -760,11 +760,12 @@ agent-identity headers documented above. Wire-shape source of truth is
 | `POST` | `/api/v1/kg/find_paths` | KG chain-walk over HTTP; Cypher on AGE / recursive-CTE on SQLite. |
 | `POST` | `/api/v1/links/verify` | Ed25519 link verification surface — wire shape: `{verified, attest_level, signature_present, observed_by, source_id, target_id, relation, findings}`. |
 | `POST` | `/api/v1/memory_load_family` | HTTP parity for the always-on `memory_load_family` MCP loader. |
-| `GET`  | `/api/v1/tools/list` | MCP `tools/list` mirror for harness ops — returns the live tool surface for the daemon's profile (71 at `full`, 7 at `core`). |
+| `GET`  | `/api/v1/tools/list` | MCP `tools/list` mirror for harness ops — returns the live tool surface for the daemon's profile (73 at `full`, 7 at `core`). |
 
-> Total HTTP surface at v0.7.0: ~42 routes on the sqlite-backed daemon
-> (the v0.6.4 baseline of 34 + the 8 net-new above). Authoritative
-> count via the `.route(...)` grep in `src/lib.rs`.
+> Total HTTP surface at v0.7.0: **73 distinct route paths** on the
+> sqlite-backed daemon (and the postgres-backed daemon under
+> `--features sal-postgres`). Authoritative count:
+> `grep -oE '"/api/v1[^"]*"|"/metrics"' src/lib.rs | sort -u | wc -l`.
 
 ### v0.7.0 net-new MCP tools
 
@@ -781,8 +782,7 @@ Highlights for HTTP-equivalent surfaces:
 | `memory_verify` | `POST /api/v1/links/verify` | H4. |
 | `memory_pending_list` / `memory_pending_approve` / `memory_pending_reject` | `GET /api/v1/pending`, `POST /api/v1/pending/{id}/approve`, `POST /api/v1/pending/{id}/reject` | K10. The MCP tool names changed from the v0.7-alpha drafts (`memory_approval_pending` / `memory_approval_decide`); the HTTP paths are stable. |
 
-For the canonical 71-tool full inventory: `grep -oE '"memory_[a-z_]+"'
-src/mcp/registry.rs | sort -u`.
+For the canonical 73-tool full inventory: `grep -oE 'crate::mcp::[a-z_]+::[A-Za-z]+Tool' src/mcp/registry.rs | sort -u | wc -l` returns 73 — the `registered_tools()` iterator in `src/mcp/registry.rs:168` is the source of truth.
 
 ## See also
 
