@@ -744,13 +744,21 @@ fn emit_check_event(
     let bytes =
         serde_json::to_vec(&canonical).context("emit_check_event: serialize canonical payload")?;
     let hash = payload_hash(&bytes);
+    // v0.7.0 #1035 — sign the payload_hash with the daemon's
+    // process-wide audit key when one is installed. When `init` ran
+    // with `signing_key: None` (no key on disk), the helper returns
+    // `None` and we fall through to the legacy unsigned posture.
+    let (signature, attest_level) = match crate::governance::audit::try_sign_audit_payload(&hash) {
+        Some((sig, level)) => (Some(sig), level.to_string()),
+        None => (None, "unsigned".to_string()),
+    };
     let event = crate::signed_events::SignedEvent {
         id: uuid::Uuid::new_v4().to_string(),
         agent_id: agent_id.to_string(),
         event_type: GOVERNANCE_CHECK_EVENT_TYPE.to_string(),
         payload_hash: hash,
-        signature: None,
-        attest_level: "unsigned".to_string(),
+        signature,
+        attest_level,
         timestamp: chrono::Utc::now().to_rfc3339(),
         ..crate::signed_events::SignedEvent::default()
     };

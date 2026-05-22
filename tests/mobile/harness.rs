@@ -81,10 +81,8 @@ fn sandbox_root() -> &'static Path {
         }
         // Host fallback: project-local .local-runs to honor the
         // no-/tmp HARD RULE documented in CLAUDE.md.
-        let mut p = std::env::var_os("CARGO_MANIFEST_DIR").map_or_else(
-            || PathBuf::from("."),
-            PathBuf::from,
-        );
+        let mut p = std::env::var_os("CARGO_MANIFEST_DIR")
+            .map_or_else(|| PathBuf::from("."), PathBuf::from);
         p.push(".local-runs");
         p.push("mobile-runtime-harness");
         let _ = std::fs::create_dir_all(&p);

@@ -106,6 +106,65 @@ fn sink() -> &'static Mutex<Option<ForensicSink>> {
     SINK.get_or_init(|| Mutex::new(None))
 }
 
+// ---------------------------------------------------------------------------
+// v0.7.0 #1035 (Agent-6 #3) — process-wide signing key for the
+// `signed_events` SQL audit chain
+// ---------------------------------------------------------------------------
+//
+// The forensic JSONL chain (`ForensicSink`) already signs every row
+// with the daemon's Ed25519 key when one is enrolled (see
+// `try_record_decision` above). The SQL-side `signed_events` audit
+// chain — populated by `agent_action::emit_check_event` and
+// `deferred_audit::SqliteSignedEventsSink::append` — historically
+// committed `signature: None, attest_level: "unsigned"` on every row,
+// even when the daemon HAD a key on disk. The cross-row `prev_hash`
+// chain remained tamper-evident, but the per-row Ed25519 sig that
+// `src/signed_events.rs:53` documents as defense-in-depth was missing.
+//
+// Closing #1035: stash the daemon's signing key in a lock-free
+// `OnceLock` at `init` time and expose `try_sign_audit_payload` so
+// the four production audit-row writers can sign without taking the
+// `ForensicSink` mutex on the hot path. The key MUST be the same
+// `SigningKey` the forensic JSONL sink uses (resolved via
+// `load_daemon_signing_key` at `init_forensic_audit`) so a downstream
+// auditor verifying both chains against the same `verifying_key`
+// gets consistent results.
+//
+// When `init` is called with `signing_key: None`, the OnceLock stays
+// empty and `try_sign_audit_payload` returns `None`; the call sites
+// fall back to `signature: None, attest_level: "unsigned"` so the
+// chain stays consistent with the legacy posture (cross-row hash
+// chain still pins tamper evidence).
+
+static DAEMON_AUDIT_KEY: OnceLock<SigningKey> = OnceLock::new();
+
+/// Sign `payload_hash` with the daemon's process-wide audit key.
+///
+/// Returns `Some((sig_bytes, "daemon_signed"))` when a key is
+/// installed (i.e. `init` was called with `signing_key: Some(_)`),
+/// `None` otherwise. The caller writes the returned `sig_bytes` to
+/// `signed_events.signature` and the attestation tag to
+/// `signed_events.attest_level`; on `None` the caller writes
+/// `signature: None, attest_level: "unsigned"`.
+///
+/// Lock-free — the underlying `OnceLock` is `Sync` and `.get()` is
+/// non-blocking. The function is called on every governance audit
+/// row write, so contention on this path is load-bearing.
+#[must_use]
+pub fn try_sign_audit_payload(payload_hash: &[u8]) -> Option<(Vec<u8>, &'static str)> {
+    let key = DAEMON_AUDIT_KEY.get()?;
+    let sig: Signature = key.sign(payload_hash);
+    Some((sig.to_bytes().to_vec(), "daemon_signed"))
+}
+
+/// `true` when the daemon has installed a process-wide audit-row
+/// signing key via `init`. Used by tests + diagnostics; production
+/// code paths use `try_sign_audit_payload` directly.
+#[must_use]
+pub fn audit_key_is_installed() -> bool {
+    DAEMON_AUDIT_KEY.get().is_some()
+}
+
 struct ForensicSink {
     dir: PathBuf,
     last_hash: String,
@@ -120,6 +179,22 @@ pub fn init(dir: &Path, signing_key: Option<SigningKey>) -> Result<()> {
     std::fs::create_dir_all(dir)
         .with_context(|| format!("creating forensic audit dir {}", dir.display()))?;
     let last_hash = read_chain_tail(dir).unwrap_or_else(|| CHAIN_HEAD_PREV_HASH.to_string());
+    // v0.7.0 #1035 — install the same key into the process-wide
+    // SQL-side audit-row signer if one was provided. Cloning the
+    // ed25519 SigningKey is cheap (32-byte SecretKey copy); both
+    // sinks (forensic JSONL + SQL signed_events) sign with the same
+    // identity so a downstream auditor verifies one VerifyingKey
+    // against both chains.
+    //
+    // `OnceLock::set` is idempotent-by-design: the first install
+    // wins, every subsequent attempt returns Err which we swallow.
+    // Tests re-running `init` (after `shutdown`) reach this path
+    // repeatedly — the SqliteSignedEventsSink path keeps using the
+    // first-installed key, which is the documented v0.7 posture
+    // (one daemon == one signing identity per process lifetime).
+    if let Some(key) = signing_key.as_ref() {
+        let _ = DAEMON_AUDIT_KEY.set(key.clone());
+    }
     let new_sink = ForensicSink {
         dir: dir.to_path_buf(),
         last_hash,
