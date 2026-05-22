@@ -584,32 +584,76 @@ pub async fn kg_timeline(
     // inbox target, or the row is unowned-legacy, or caller is
     // "daemon" sentinel). Mirrors the gate shape in #938
     // kg_invalidate and #937 delete_memory.
+    //
+    // #1134: branch on storage_backend so postgres-backed daemons
+    // read the source memory from postgres instead of the empty
+    // SQLite scratch connection (which made every postgres-backed
+    // kg_timeline call return 404 regardless of the actual memory's
+    // existence in the live store).
+    let extract_owner_target = |mem: &Memory| -> (String, String) {
+        let owner = mem
+            .metadata
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let target = mem
+            .metadata
+            .get("target_agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        (owner, target)
+    };
     let source_owner: Option<(String, String)> = {
-        let lock = app.db.lock().await;
-        match db::get(&lock.0, &p.source_id) {
-            Ok(Some(mem)) => {
-                let owner = mem
-                    .metadata
-                    .get("agent_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let target = mem
-                    .metadata
-                    .get("target_agent_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                Some((owner, target))
+        #[cfg(feature = "sal")]
+        if matches!(app.storage_backend, StorageBackend::Postgres) {
+            let ctx = crate::store::CallerContext::for_agent(caller.clone());
+            match app.store.get(&ctx, &p.source_id).await {
+                Ok(mem) => Some(extract_owner_target(&mem)),
+                Err(e) => {
+                    let msg = format!("{e:?}");
+                    if msg.contains("NotFound") || msg.contains("not found") {
+                        None
+                    } else {
+                        tracing::error!("kg_timeline: source lookup failed (postgres): {e:?}");
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({"error": "internal server error"})),
+                        )
+                            .into_response();
+                    }
+                }
             }
-            Ok(None) => None,
-            Err(e) => {
-                tracing::error!("kg_timeline: source lookup failed: {e}");
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": "internal server error"})),
-                )
-                    .into_response();
+        } else {
+            let lock = app.db.lock().await;
+            match db::get(&lock.0, &p.source_id) {
+                Ok(Some(mem)) => Some(extract_owner_target(&mem)),
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::error!("kg_timeline: source lookup failed: {e}");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": "internal server error"})),
+                    )
+                        .into_response();
+                }
+            }
+        }
+        #[cfg(not(feature = "sal"))]
+        {
+            let lock = app.db.lock().await;
+            match db::get(&lock.0, &p.source_id) {
+                Ok(Some(mem)) => Some(extract_owner_target(&mem)),
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::error!("kg_timeline: source lookup failed: {e}");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": "internal server error"})),
+                    )
+                        .into_response();
+                }
             }
         }
     };

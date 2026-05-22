@@ -111,7 +111,13 @@ async fn build_postgres_app_state(url: &str) -> AppState {
         autonomous_hooks: false,
         recall_scope: Arc::new(None),
         deferred_audit_queue: Arc::new(None),
-        admin_agent_ids: Arc::new(Vec::new()),
+        // #1134: parity tests use agent_id "ai:parity-test" + various
+        // cont6_quota_* tests use freshly-uuid'd agents that need to
+        // call admin-gated routes (/api/v1/quota/status list, /taxonomy,
+        // /kg/timeline downstream of /api/v1/memories admin checks).
+        // Empty allowlist worked pre-admin-gate sweep; today the post-
+        // #946/#957/#1027 sweep requires the test agent to be allowlisted.
+        admin_agent_ids: Arc::new(vec!["ai:parity-test".to_string()]),
         rule_cache: std::sync::Arc::new(ai_memory::governance::rule_cache::RuleCache::new()),
     }
 }
