@@ -218,7 +218,7 @@ release-notes intro lives under `docs/v0.7.0/release-notes.md`
 
 1. **MCP Server** (`src/mcp/`) — stdio JSON-RPC 2.0 with **73 advertised entries at `--profile full`** at v0.7.0 (72 callable "memory tools" + the always-on `memory_capabilities` bootstrap — both numbers are intentional; see issue [#862](https://github.com/alphaonedev/ai-memory-mcp/issues/862) for the disambiguation, and `Profile::full().expected_tool_count()` in `src/profile.rs` for the canonical assertion). Default `--profile core` ships **7 tools** at v0.7.0 (the original 5 + `memory_load_family` + `memory_smart_load`) plus the always-on `memory_capabilities` bootstrap. Plus 2 prompts (`recall-first`, `memory-workflow`).
 2. **HTTP API** (`src/handlers/`) — Axum REST server on port 9077, **73 `.route(...)` registrations in `src/lib.rs`** at `/api/v1/` (verified by `grep -c '^\s*\.route(' src/lib.rs`) (and the bare `/metrics` Prometheus surface). Handlers split per domain under `src/handlers/{http,federation_receive,hook_subscribers,transport}.rs` (#650 partially addressed at v0.7.0; full per-domain split tracked in #650).
-3. **CLI** (`src/main.rs` thin shim + `src/daemon_runtime.rs::Command`) — clap-based, **56 top-level subcommands** at v0.7.0 (was 40 at v0.6.4) with optional `--json` output
+3. **CLI** (`src/main.rs` thin shim + `src/daemon_runtime.rs::Command`) — clap-based, **57 top-level subcommands** at v0.7.0 (was 40 at v0.6.4) with optional `--json` output (count: `--features sal-postgres` includes the postgres-only `schema-init` subcommand; the default build ships 55)
 
 All three interfaces share the same storage layer (`src/storage/`) and validation (`src/validate.rs`) layers. **Connection-sharing topology differs per interface** (post-#965 audit, 2026-05-21):
 
@@ -559,7 +559,7 @@ Every defect is fixed.
 
 **World-class only.** We are driving toward perfection. The
 ai-memory codebase is now substantial (73 MCP tools at `--profile
-full`, 73 HTTP endpoints, 56 CLI subcommands at v0.7.0, tens of
+full`, 73 HTTP endpoints, 57 CLI subcommands at v0.7.0, tens of
 thousands of lines of Rust); the architectural North Star is
 long-term code-base manageability so the codebase lasts for a
 very long time.
