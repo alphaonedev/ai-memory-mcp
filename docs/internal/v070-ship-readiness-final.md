@@ -19,8 +19,8 @@ forms cleanly IMPLEMENTED at the pre-wave HEAD. The closeout campaign:
 
 1. **Cataloguer** built [`v070-feature-inventory.md`](v070-feature-inventory.md)
    — 11 open questions + canonical feature truth (453 commits ahead of
-   v0.6.4, +233,589/−23,541 lines, 71 MCP tools, 17 net-new env vars,
-   8 new HTTP routes).
+   v0.6.4, +233,589/−23,541 lines, 73 MCP tools at release HEAD, 17
+   net-new env vars, 73 HTTP routes total).
 2. **6 parallel reviewers** (security / correctness / performance /
    API-UX / docs / coverage) generated 111 raw findings → dedup'd to
    **41 unique fix items** + 14 INFO / accepted-debt — see
@@ -38,16 +38,20 @@ forms cleanly IMPLEMENTED at the pre-wave HEAD. The closeout campaign:
 
 ## Final substrate state
 
-- **MCP tool count:** **71 total** (70 visible + 1 always-on
-  bootstrap). Pinned by `Profile::full().expected_tool_count()` in
+- **MCP tool count:** **73 total at release HEAD** (72 callable memory
+  tools + 1 always-on `memory_capabilities` bootstrap). Pinned by
+  `Profile::full().expected_tool_count()` in
   [`src/profile.rs`](../../src/profile.rs) — the source of truth.
-  Per-family counts: Core 7, Lifecycle 5, Meta 5, Graph 11,
-  Governance 8, **Power 22**, Archive 4, Other 9.
-- **Schema versions:** **sqlite v41** ([`src/storage/migrations.rs`](../../src/storage/migrations.rs)),
-  **postgres v40** ([`src/store/postgres.rs`](../../src/store/postgres.rs)).
-  Sqlite ladder ran one step ahead through the Form 4/5 follow-ups
-  (citations / source_uri / atom_span column adds + confidence shadow
-  retention column).
+  Per-family counts at release HEAD: Core 7, Lifecycle 5, Meta 6, Graph 11,
+  Governance 8, **Power 23**, Archive 4, Other 9 (sum = 73).
+- **Schema version:** **v49** on both backends at v0.7.0 release HEAD
+  ([`src/storage/migrations.rs::CURRENT_SCHEMA_VERSION`](../../src/storage/migrations.rs),
+  [`src/store/postgres.rs::CURRENT_SCHEMA_VERSION`](../../src/store/postgres.rs)).
+  Both adapters converged on the single logical version through the
+  in-process v35-v49 migration arms. v48 added the
+  `federation_push_dlq` table (#933); v49 added 14 nullable columns
+  on `archived_memories` so archive → restore is lossless for the full
+  v0.7.0 Memory shape (#1025).
 - **All 7 Batman forms IMPLEMENTED** at substrate-evidence level (see
   [batman-framework-audit.md §POST-CLOSEOUT STATE](batman-framework-audit.md#post-closeout-state-2026-05-15)).
 
@@ -125,9 +129,9 @@ the full text. Rolled up:
 - [x] No open CRITICAL or HIGH review findings — all 6 + 28 raw CRIT
       + HIGH findings are absorbed by Clusters A-K or resolved via
       ADRs.
-- [x] Tool-count baseline preserved (71 total, pinned by
+- [x] Tool-count baseline preserved (73 total at release HEAD, pinned by
       `Profile::full().expected_tool_count()`).
-- [x] Schema baseline preserved (sqlite v41 / postgres v40).
+- [x] Schema baseline preserved (v49 on both backends at release HEAD).
 - [x] All 7 Batman forms IMPLEMENTED (`batman-framework-audit.md`
       post-closeout section).
 - [x] CHANGELOG + release-notes + MIGRATION_v0.7.md reconciled with
