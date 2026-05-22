@@ -136,8 +136,12 @@ async fn sync_push_unknown_peer_id_refused_when_allowlist_configured_1056() {
         std::env::set_var(ai_memory::federation::signing::REQUIRE_SIG_ENV, "0");
     }
     let router = setup_router();
-    let (status, body) =
-        post_sync_push(&router, sample_body("attacker-claim"), Some("attacker-claim")).await;
+    let (status, body) = post_sync_push(
+        &router,
+        sample_body("attacker-claim"),
+        Some("attacker-claim"),
+    )
+    .await;
     unsafe {
         std::env::remove_var(PEER_ATTESTATION_ENV);
         std::env::remove_var(ai_memory::federation::signing::REQUIRE_SIG_ENV);
@@ -166,11 +170,18 @@ async fn sync_push_enrolled_peer_id_passes_tofu_gate_1056() {
         // Also set TRUST_BODY_AGENT_ID so the #238 attestation
         // doesn't reject when sender_agent_id != peer-id (we're
         // isolating the TOFU gate, not testing attestation here).
-        std::env::set_var(ai_memory::federation::peer_attestation::TRUST_BODY_AGENT_ID_ENV, "1");
+        std::env::set_var(
+            ai_memory::federation::peer_attestation::TRUST_BODY_AGENT_ID_ENV,
+            "1",
+        );
     }
     let router = setup_router();
-    let (status, _body) =
-        post_sync_push(&router, sample_body("ai:enrolled-sender"), Some("enrolled-peer")).await;
+    let (status, _body) = post_sync_push(
+        &router,
+        sample_body("ai:enrolled-sender"),
+        Some("enrolled-peer"),
+    )
+    .await;
     unsafe {
         std::env::remove_var(PEER_ATTESTATION_ENV);
         std::env::remove_var(ai_memory::federation::signing::REQUIRE_SIG_ENV);
@@ -193,7 +204,10 @@ async fn sync_push_zero_config_skips_tofu_gate_1056() {
     unsafe {
         std::env::remove_var(PEER_ATTESTATION_ENV);
         std::env::set_var(ai_memory::federation::signing::REQUIRE_SIG_ENV, "0");
-        std::env::set_var(ai_memory::federation::peer_attestation::TRUST_BODY_AGENT_ID_ENV, "1");
+        std::env::set_var(
+            ai_memory::federation::peer_attestation::TRUST_BODY_AGENT_ID_ENV,
+            "1",
+        );
     }
     let router = setup_router();
     // No allowlist configured → TOFU gate is a no-op → request
