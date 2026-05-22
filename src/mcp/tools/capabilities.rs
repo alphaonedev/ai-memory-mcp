@@ -455,9 +455,11 @@ pub fn build_capabilities_summary(profile: &crate::profile::Profile) -> String {
     // always-on bootstrap (`memory_capabilities`). Reconciles with
     // `build_capabilities_describe_to_user`'s "{n_loaded} memory
     // tool{s}" phrasing so the summary number agrees with the
-    // user-facing sentence (e.g. both report 50 for `--profile full`,
-    // not "51 of 51 tools" in the summary alongside "50 memory
-    // tools" in the describe — which was the F13 off-by-one).
+    // user-facing sentence — at v0.7.0 both report 72 for
+    // `--profile full` (72 callable memory tools + the always-on
+    // `memory_capabilities` bootstrap = 73 advertised entries). The
+    // F13 pin guards against the off-by-one where the summary count
+    // would collide with the advertised-entries count.
     let total: usize = Family::all()
         .iter()
         .map(|f| f.expected_tool_count())
