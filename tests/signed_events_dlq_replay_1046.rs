@@ -27,13 +27,12 @@
 //! for now; the operator runs the recipe by hand against the DB
 //! file). Pins (1) and (2) run unconditionally.
 
-#![allow(clippy::missing_panics_doc)]
+#![allow(clippy::missing_panics_doc, clippy::doc_markdown)]
 
 use rusqlite::params;
 
 fn fresh_db() -> rusqlite::Connection {
-    let conn = ai_memory::db::open(std::path::Path::new(":memory:")).expect("db::open");
-    conn
+    ai_memory::db::open(std::path::Path::new(":memory:")).expect("db::open")
 }
 
 /// v0.7.0 #1046 + #1116 pin 1 — the `signed_events_dlq` table MUST

@@ -137,15 +137,15 @@ fn user_update_bumps_version_pinning_the_contrast_1036() {
     db::update(
         &conn,
         &seeded.id,
-        None,                       // title
-        Some("user edit"),          // content
-        None,                       // tier
-        None,                       // namespace
-        None,                       // tags
-        None,                       // priority
-        None,                       // confidence
-        None,                       // expires_at
-        None,                       // metadata
+        None,              // title
+        Some("user edit"), // content
+        None,              // tier
+        None,              // namespace
+        None,              // tags
+        None,              // priority
+        None,              // confidence
+        None,              // expires_at
+        None,              // metadata
     )
     .expect("user update");
 
