@@ -228,6 +228,57 @@ fn modify_path_boundary_returns_allow_after_modification() {
 
 #[test]
 fn governance_install_defaults_activates_seed_rules() {
+    // #1126: isolate this test from the dev-host's operator.key.pub at
+    // `~/Library/Application Support/ai-memory/operator.key.pub` (macOS)
+    // or `~/.config/ai-memory/operator.key.pub` (Linux). The test seeds
+    // rules at attest_level=unsigned and expects install-defaults to
+    // activate them — post-#1042 that path refuses if an operator
+    // pubkey is resolved + rows are still unsigned. We redirect
+    // HOME (and XDG_CONFIG_HOME for the Linux config path) to a
+    // tempdir for the duration of the test so the resolution returns
+    // None and the activation proceeds as in the no-operator-yet
+    // first-install UX. The `_home_guard` restores the originals on
+    // drop, including via panic-unwind, so a failed assertion doesn't
+    // poison sibling tests.
+    struct HomeGuard {
+        prior_home: Option<std::ffi::OsString>,
+        prior_xdg: Option<std::ffi::OsString>,
+        _tempdir: tempfile::TempDir,
+    }
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            // SAFETY: set_var/remove_var are unsafe in Rust 2024 edition.
+            // The integration test binary runs with --test-threads=1 in
+            // CI (per the release-gate full-suite invocation), so no
+            // sibling thread can observe a torn read. The guard restores
+            // the originals byte-equal.
+            unsafe {
+                match &self.prior_home {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+                match &self.prior_xdg {
+                    Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                    None => std::env::remove_var("XDG_CONFIG_HOME"),
+                }
+            }
+        }
+    }
+    let tempdir = tempfile::tempdir().unwrap();
+    let prior_home = std::env::var_os("HOME");
+    let prior_xdg = std::env::var_os("XDG_CONFIG_HOME");
+    // SAFETY: same justification as the Drop impl above — single-threaded
+    // test binary; integration test runner serialises via --test-threads=1.
+    unsafe {
+        std::env::set_var("HOME", tempdir.path());
+        std::env::set_var("XDG_CONFIG_HOME", tempdir.path().join(".config"));
+    }
+    let _home_guard = HomeGuard {
+        prior_home,
+        prior_xdg,
+        _tempdir: tempdir,
+    };
+
     // Build a fresh DB with the four seeded rows at enabled = 0 — no
     // need to drag in the migration runner; the install-defaults verb
     // only needs the table + the four ids.
