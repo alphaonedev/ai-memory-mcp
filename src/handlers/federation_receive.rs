@@ -607,11 +607,12 @@ pub async fn sync_push(
                 // logged but does not change the refusal control flow.
                 let _ = crate::signed_events::append_signed_event(
                     &lock.0,
-                    &crate::signed_events::SignedEvent {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        agent_id: attribute_agent.clone(),
-                        event_type: "federation.quota_refused".to_string(),
-                        payload_hash: crate::signed_events::payload_hash(
+                    // v0.7.0 #1099 (SR-1 #4, HIGH) — sign the quota-
+                    // refusal audit row with the daemon's installed
+                    // signing key when one is available. Pre-#1099 the
+                    // row always landed unsigned.
+                    &crate::signed_events::SignedEvent::with_daemon_signature(
+                        crate::signed_events::payload_hash(
                             format!(
                                 "peer={} agent={} limit={} current={} max={}",
                                 body.sender_agent_id,
@@ -622,11 +623,10 @@ pub async fn sync_push(
                             )
                             .as_bytes(),
                         ),
-                        signature: None,
-                        attest_level: "unsigned".to_string(),
-                        timestamp: chrono::Utc::now().to_rfc3339(),
-                        ..crate::signed_events::SignedEvent::default()
-                    },
+                        attribute_agent.clone(),
+                        "federation.quota_refused".to_string(),
+                        chrono::Utc::now().to_rfc3339(),
+                    ),
                 );
                 quota_refused += 1;
                 if first_quota_refusal.is_none() {

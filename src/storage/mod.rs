@@ -8277,16 +8277,20 @@ fn emit_pending_action_event(
         decided_by
     };
 
-    let event = crate::signed_events::SignedEvent {
-        id: uuid::Uuid::new_v4().to_string(),
+    // v0.7.0 #1099 (SR-1 #4, HIGH) — sign pending_action audit rows
+    // with the daemon's installed signing key when one is available.
+    // Pre-#1099 every pending_action.{approved,rejected,timed_out}
+    // row landed with `signature: None, attest_level: "unsigned"`
+    // even when the daemon had loaded a signing key — breaking the
+    // procurement-grade tamper-evidence claim on the approval audit
+    // trail. Falls back to (None, "unsigned") cleanly when no key
+    // is installed (legacy posture).
+    let event = crate::signed_events::SignedEvent::with_daemon_signature(
+        crate::signed_events::payload_hash(&cbor),
         agent_id,
-        event_type: event_type.to_string(),
-        payload_hash: crate::signed_events::payload_hash(&cbor),
-        signature: None,
-        attest_level: "unsigned".to_string(),
+        event_type.to_string(),
         timestamp,
-        ..crate::signed_events::SignedEvent::default()
-    };
+    );
     if let Err(e) = crate::signed_events::append_signed_event(conn, &event) {
         tracing::warn!(
             target: "signed_events",

@@ -583,6 +583,23 @@ pub fn load_daemon_verifying_key(agent_id: &str) -> Result<Option<VerifyingKey>>
     }
 }
 
+/// v0.7.0 #1071 (SR-2 #1, HIGH) — resolve the daemon-side verifying
+/// key matching the process-installed audit signer. Mirrors
+/// [`try_sign_audit_payload`]: returns `Some` when a daemon audit
+/// signing key is installed (via [`init`]) and its public half is
+/// available; `None` otherwise.
+///
+/// Used by [`crate::signed_events::verify_chain`] to walk the
+/// SQL-side `signed_events` chain and verify each row's Ed25519
+/// `signature` against the daemon's `VerifyingKey` over the row's
+/// `payload_hash`. Pre-#1071 the verifier docstring claimed signature
+/// verification but never performed it — a tampered `signature` blob
+/// passed the chain check silently.
+#[must_use]
+pub fn resolve_daemon_verifying_key() -> Option<VerifyingKey> {
+    DAEMON_AUDIT_KEY.get().map(SigningKey::verifying_key)
+}
+
 // ---------------------------------------------------------------------------
 // Cross-module test-isolation lock (#899 root-cause fix)
 // ---------------------------------------------------------------------------
