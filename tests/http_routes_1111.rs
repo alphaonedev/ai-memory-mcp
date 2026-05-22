@@ -199,8 +199,10 @@ async fn recall_observations_http_route_1111() {
         StatusCode::OK,
         "#1111: recall_observations on empty db must 200 OK; got {status} {body}"
     );
-    assert!(body.get("observations").is_some() || body.get("count").is_some(),
-        "#1111: recall_observations envelope must carry the observations list (or count); got {body}");
+    assert!(
+        body.get("observations").is_some() || body.get("count").is_some(),
+        "#1111: recall_observations envelope must carry the observations list (or count); got {body}"
+    );
 }
 
 #[tokio::test]
@@ -365,12 +367,8 @@ async fn rule_list_http_route_1111() {
     let _dir = fresh_dir();
     let (router, _f) = build_router_fixture();
     // No rules seeded → empty list, 200 OK.
-    let (status, body) = post_json(
-        &router,
-        "/api/v1/memory_rule_list",
-        serde_json::json!({}),
-    )
-    .await;
+    let (status, body) =
+        post_json(&router, "/api/v1/memory_rule_list", serde_json::json!({})).await;
     assert_eq!(
         status,
         StatusCode::OK,

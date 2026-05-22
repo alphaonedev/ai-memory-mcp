@@ -26,7 +26,12 @@
 //! standard cross-backend convention (issue #79 — Track C/D network
 //! routing).
 
-#![allow(clippy::needless_update, clippy::doc_markdown, clippy::missing_panics_doc, clippy::too_many_lines)]
+#![allow(
+    clippy::needless_update,
+    clippy::doc_markdown,
+    clippy::missing_panics_doc,
+    clippy::too_many_lines
+)]
 
 use ai_memory::db;
 use ai_memory::models::{
