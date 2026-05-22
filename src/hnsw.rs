@@ -9,7 +9,7 @@
 //! list that is scanned linearly alongside the HNSW results — the index is
 //! rebuilt lazily once the overflow exceeds a threshold.
 
-use instant_distance::{Builder, HnswMap, Point, Search};
+use instant_distance::{Builder, HnswMap, Search};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -103,7 +103,11 @@ const EVICTION_RATE_CEILING_PER_HOUR: usize = 10;
 /// transparently evicted on push.
 const EVICTION_RATE_RING_CAP: usize = 64;
 
-static EVICTION_RATE_RING: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+/// v0.7.0 #1093 — eviction-rate ring buffer. Switched from
+/// `Mutex<Vec<u64>>` to `Mutex<VecDeque<u64>>` so the cap-eviction
+/// path is O(1) `pop_front` instead of O(N) `Vec::remove(0)`.
+static EVICTION_RATE_RING: Mutex<std::collections::VecDeque<u64>> =
+    Mutex::new(std::collections::VecDeque::new());
 
 /// Whether an eviction occurred within the trailing `window_secs`.
 ///
@@ -156,10 +160,11 @@ fn record_eviction_and_count_recent(now_nanos: u64) -> usize {
     // count reflects the trailing hour.
     ring.retain(|t| *t >= cutoff);
     if ring.len() >= EVICTION_RATE_RING_CAP {
-        // Cap reached — drop the oldest before appending.
-        ring.remove(0);
+        // v0.7.0 #1093 — VecDeque::pop_front is O(1); pre-#1093
+        // Vec::remove(0) was O(N) (backing-buffer shift).
+        ring.pop_front();
     }
-    ring.push(now_nanos);
+    ring.push_back(now_nanos);
     ring.len()
 }
 
@@ -167,12 +172,20 @@ fn record_eviction_and_count_recent(now_nanos: u64) -> usize {
 #[derive(Clone, Debug)]
 pub struct EmbeddingPoint(pub Vec<f32>);
 
+/// v0.7.0 #1087 — slice-borrow cosine-distance helper used by the
+/// overflow scan in [`VectorIndex::search`] to compute distances
+/// against the stored `Vec<f32>` without cloning each overflow
+/// embedding into a fresh `EmbeddingPoint`. Embeddings are
+/// L2-normalised so dot product = cosine similarity.
+#[inline]
+fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
+    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    1.0 - dot
+}
+
 impl instant_distance::Point for EmbeddingPoint {
     fn distance(&self, other: &Self) -> f32 {
-        // Cosine distance = 1 - cosine_similarity.
-        // Embeddings are L2-normalised so dot product = cosine similarity.
-        let dot: f32 = self.0.iter().zip(other.0.iter()).map(|(a, b)| a * b).sum();
-        1.0 - dot
+        cosine_distance(&self.0, &other.0)
     }
 }
 
@@ -332,6 +345,12 @@ struct IndexState {
     /// the gap where an entry inserted between a snapshot capture
     /// and the eviction-clear was incorrectly drained by the swap.
     overflow_generation: u64,
+    /// v0.7.0 #1087 — cached HashSet view of `all_entries` ids used
+    /// by [`VectorIndex::search`] as the stale-id filter. Built
+    /// lazily on the first search after a mutation; invalidated to
+    /// `None` on insert push, eviction drain, and remove retain.
+    /// Pre-#1087 this set was rebuilt on EVERY recall.
+    valid_ids_cache: Option<std::collections::HashSet<String>>,
 }
 
 /// A search result from the vector index.
@@ -352,6 +371,7 @@ impl VectorIndex {
                 all_entries: entries,
                 max_entries: MAX_ENTRIES,
                 overflow_generation: 0,
+                valid_ids_cache: None,
             }),
             eviction_sink: Mutex::new(None),
             warming: Arc::new(Mutex::new(None)),
@@ -368,6 +388,7 @@ impl VectorIndex {
                 all_entries: Vec::new(),
                 max_entries: MAX_ENTRIES,
                 overflow_generation: 0,
+                valid_ids_cache: None,
             }),
             eviction_sink: Mutex::new(None),
             warming: Arc::new(Mutex::new(None)),
@@ -391,6 +412,7 @@ impl VectorIndex {
                 all_entries: Vec::new(),
                 max_entries,
                 overflow_generation: 0,
+                valid_ids_cache: None,
             }),
             eviction_sink: Mutex::new(None),
             warming: Arc::new(Mutex::new(None)),
@@ -448,6 +470,9 @@ impl VectorIndex {
             };
             state.all_entries.push((id.clone(), embedding.clone()));
             state.overflow.push((id, embedding));
+            // v0.7.0 #1087 — invalidate cached valid_ids set; rebuilt
+            // lazily on the next search.
+            state.valid_ids_cache = None;
 
             // #968 — async auto-rebuild: when overflow crosses the
             // threshold, snapshot the entries and let the caller (below,
@@ -549,6 +574,9 @@ impl VectorIndex {
             INDEX_EVICTIONS_TOTAL.fetch_add(evicted, Ordering::Relaxed);
 
             state.all_entries.drain(..excess);
+            // v0.7.0 #1087 — invalidate cached valid_ids set after the
+            // eviction drain.
+            state.valid_ids_cache = None;
             // #968 — defer the post-eviction graph rebuild to the async
             // path. Correctness is preserved by the `valid_ids` filter
             // in `search()` — evicted IDs are scrubbed from results
@@ -639,6 +667,8 @@ impl VectorIndex {
         };
         state.all_entries.retain(|(eid, _)| eid != id);
         state.overflow.retain(|(eid, _)| eid != id);
+        // v0.7.0 #1087 — invalidate cached valid_ids set after remove.
+        state.valid_ids_cache = None;
         // Note: the HNSW index itself is immutable — removed IDs are filtered
         // from search results. A rebuild will fully remove them.
     }
@@ -655,7 +685,7 @@ impl VectorIndex {
         // search itself never blocks on graph construction.
         self.try_swap_warming();
 
-        let state = match self.inner.lock() {
+        let mut state = match self.inner.lock() {
             Ok(s) => s,
             Err(poisoned) => poisoned.into_inner(),
         };
@@ -663,12 +693,19 @@ impl VectorIndex {
 
         let mut results: Vec<VectorHit> = Vec::with_capacity(k * 2);
 
-        // Collect valid IDs from all_entries for filtering removed entries
-        let valid_ids: std::collections::HashSet<&str> = state
-            .all_entries
-            .iter()
-            .map(|(id, _)| id.as_str())
-            .collect();
+        // v0.7.0 #1087 — populate the cached valid_ids set on the
+        // first search after any mutation; reuse it across recalls.
+        // Pre-#1087 this set was rebuilt on EVERY recall (iterating
+        // up to 100k strings + a fresh HashSet allocation per call).
+        if state.valid_ids_cache.is_none() {
+            let set: std::collections::HashSet<String> =
+                state.all_entries.iter().map(|(id, _)| id.clone()).collect();
+            state.valid_ids_cache = Some(set);
+        }
+        let valid_ids = state
+            .valid_ids_cache
+            .as_ref()
+            .expect("valid_ids_cache populated above");
 
         // Search the HNSW index
         if let Some(ref hnsw) = state.hnsw {
@@ -687,18 +724,19 @@ impl VectorIndex {
             }
         }
 
-        // Linear scan of overflow entries
-        let mut overflow_hits: Vec<VectorHit> = state
-            .overflow
-            .iter()
-            .map(|(id, emb)| {
-                let point = EmbeddingPoint(emb.clone());
-                VectorHit {
-                    id: id.clone(),
-                    distance: query_point.distance(&point),
-                }
-            })
-            .collect();
+        // v0.7.0 #1087 — linear scan of overflow entries WITHOUT
+        // cloning the embedding vec. Pre-#1087 this constructed
+        // `EmbeddingPoint(emb.clone())` per overflow entry (~200 ×
+        // 1536 bytes = 300 KB of clone per search at the cap); the
+        // cosine-distance helper takes `&[f32]` so we inline against
+        // the stored slice instead.
+        let mut overflow_hits: Vec<VectorHit> = Vec::with_capacity(state.overflow.len());
+        for (id, emb) in &state.overflow {
+            overflow_hits.push(VectorHit {
+                id: id.clone(),
+                distance: cosine_distance(&query_point.0, emb),
+            });
+        }
         overflow_hits.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap());
 
         results.extend(overflow_hits);

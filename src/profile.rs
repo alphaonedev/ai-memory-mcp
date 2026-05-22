@@ -528,7 +528,7 @@ impl FromStr for Family {
 
 /// A resolved tool profile — the set of families to register on the
 /// MCP server.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Profile {
     families: Vec<Family>,
 }

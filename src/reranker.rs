@@ -78,6 +78,12 @@ impl SessionRecallTracker {
     /// Return the set of recently-accessed memory ids for `session_id`,
     /// or an empty set if the session is unknown. Used by the rerank
     /// boost to decide which candidates to lift.
+    ///
+    /// v0.7.0 #1091 — kept for the public API contract (test code +
+    /// callers outside the hot path use it). The boost site
+    /// [`apply_session_recency_boost`] now uses
+    /// [`SessionRecallTracker::with_recent_ids`] to avoid the
+    /// per-recall HashSet allocation.
     #[must_use]
     pub fn recent_ids(&self, session_id: &str) -> HashSet<String> {
         let Ok(guard) = self.inner.lock() else {
@@ -91,6 +97,36 @@ impl SessionRecallTracker {
             .get(session_id)
             .map(|ring| ring.iter().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// v0.7.0 #1091 — allocation-free per-id membership lookup against
+    /// the per-session ring. Used by [`apply_session_recency_boost`]
+    /// to apply the +0.05 boost without cloning the 50-deep ring into
+    /// a fresh `HashSet<String>` on every recall.
+    ///
+    /// The callback is invoked once with a membership predicate that
+    /// owns the inner mutex guard for its lifetime. Returns the
+    /// closure's result (typically a `Vec<(Memory, f64)>` of boosted
+    /// candidates). The membership predicate is O(N) per id over the
+    /// ring (capped at [`SESSION_RECENT_CAP`] = 50); the closure is
+    /// expected to call it K times for a K-result recall, giving
+    /// O(K*N) total — same complexity as the pre-#1091 path that
+    /// also did a HashSet build (O(N) construct) + K lookups
+    /// (O(1) each = O(K)).
+    pub fn with_recent_ids<R>(
+        &self,
+        session_id: &str,
+        f: impl FnOnce(&dyn Fn(&str) -> bool) -> R,
+    ) -> R {
+        let Ok(guard) = self.inner.lock() else {
+            // Poisoned mutex: every id misses the boost. Same
+            // posture as the empty-set fallback above.
+            return f(&|_id: &str| false);
+        };
+        match guard.get(session_id) {
+            None => f(&|_id: &str| false),
+            Some(ring) => f(&|id: &str| ring.iter().any(|existing| existing == id)),
+        }
     }
 
     /// Record the ids of memories returned by the just-completed
@@ -163,25 +199,32 @@ pub fn apply_session_recency_boost(
     if sid.is_empty() {
         return results;
     }
-    let recent: HashSet<String> = tracker.recent_ids(sid);
-    let mut boosted: Vec<(Memory, f64)> = results
-        .into_iter()
-        .map(|(mem, score)| {
-            let bumped = if recent.contains(&mem.id) {
-                score + SESSION_RECENCY_BOOST
-            } else {
-                score
-            };
-            (mem, bumped)
-        })
-        .collect();
+    // v0.7.0 #1091 — drop the per-recall `HashSet<String>` allocation
+    // (50 clones at the cap) by using the membership-callback variant.
+    // The closure owns the inner mutex for the boost-apply pass; the
+    // membership predicate runs O(N) per id against the (≤ 50 entry)
+    // ring, giving the same overall complexity as the pre-#1091
+    // (HashSet-build + lookup) path without the allocation.
+    let mut boosted: Vec<(Memory, f64)> = tracker.with_recent_ids(sid, |is_recent| {
+        results
+            .into_iter()
+            .map(|(mem, score)| {
+                let bumped = if is_recent(&mem.id) {
+                    score + SESSION_RECENCY_BOOST
+                } else {
+                    score
+                };
+                (mem, bumped)
+            })
+            .collect()
+    });
     // Re-sort descending — boosted candidates may move past their
     // pre-boost neighbours.
     boosted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    // Record the post-boost id list into the session ring so the next
-    // recall in this session reuses the new context.
-    let ids: Vec<String> = boosted.iter().map(|(m, _)| m.id.clone()).collect();
-    tracker.record(sid, ids);
+    // v0.7.0 #1091 — record the post-boost id list into the session
+    // ring via an iterator clone-on-demand path so we don't allocate
+    // a Vec<String> just to hand to `record` (which itself iterates).
+    tracker.record(sid, boosted.iter().map(|(m, _)| m.id.clone()));
     boosted
 }
 
@@ -316,8 +359,16 @@ pub enum CrossEncoder {
     /// prior implementation overstated.
     Lexical { degraded: bool },
     /// Neural BERT-based cross-encoder (ms-marco-MiniLM-L-6-v2).
+    ///
+    /// v0.7.0 #1084 — `model` is `Arc<BertModel>` (no mutex), same
+    /// pattern as `Embedder::Local`. The pre-#1084 design held an
+    /// `Arc<Mutex<BertModel>>` and locked across the full neural
+    /// rerank forward pass, serialising every rerank-tier recall on
+    /// a single global mutex. Candle's `BertModel::forward` takes
+    /// `&self` (inference-only; weights are read-only) so the
+    /// mutex was unnecessary.
     Neural {
-        model: Arc<Mutex<BertModel>>,
+        model: Arc<BertModel>,
         tokenizer: Arc<Tokenizer>,
         classifier_weight: Tensor,
         classifier_bias: Tensor,
@@ -423,7 +474,7 @@ impl CrossEncoder {
             .context("failed to load classifier.bias")?;
 
         Ok(Self::Neural {
-            model: Arc::new(Mutex::new(model)),
+            model: Arc::new(model),
             tokenizer: Arc::new(tokenizer),
             classifier_weight,
             classifier_bias,
@@ -444,15 +495,11 @@ impl CrossEncoder {
                 classifier_bias,
                 device,
             } => {
-                let model_guard = match model.lock() {
-                    Ok(g) => g,
-                    Err(e) => {
-                        tracing::warn!("cross-encoder model lock poisoned: {e}");
-                        return lexical_score(query, title, content);
-                    }
-                };
+                // v0.7.0 #1084 — no mutex acquisition: `Arc<BertModel>`
+                // shared across threads; `BertModel::forward(&self, ...)`
+                // is inference-only and safe to call concurrently.
                 match Self::neural_score(
-                    &model_guard,
+                    model,
                     tokenizer,
                     classifier_weight,
                     classifier_bias,
@@ -658,28 +705,15 @@ impl CrossEncoder {
                 classifier_bias,
                 device,
             } => {
-                let model_guard = match model.lock() {
-                    Ok(g) => g,
-                    Err(e) => {
-                        tracing::warn!(
-                            "cross-encoder model lock poisoned in rerank_batch: {e}, falling back to lexical per-query"
-                        );
-                        return queries
-                            .into_iter()
-                            .map(|(q, cands)| {
-                                // The fall-back here is a *runtime* degrade
-                                // (the model lock poisoned mid-flight), so
-                                // surface it as degraded lexical to mirror
-                                // R3-S2 reranker_mode semantics.
-                                let lex = Self::Lexical { degraded: true };
-                                lex.rerank_with_reflection_boost(&q, cands, boost_config)
-                            })
-                            .collect();
-                    }
-                };
-
+                // v0.7.0 #1084 — no mutex acquisition: `Arc<BertModel>`
+                // shared across threads; `BertModel::forward(&self, ...)`
+                // is inference-only and safe to call concurrently. The
+                // pre-#1084 poisoned-lock fallback is now unreachable
+                // (no lock to poison); a runtime error in
+                // `neural_rerank_batch` still falls through to the
+                // lexical degrade via the `Err(_)` arm below.
                 match Self::neural_rerank_batch(
-                    &model_guard,
+                    model,
                     tokenizer,
                     classifier_weight,
                     classifier_bias,
@@ -717,7 +751,6 @@ impl CrossEncoder {
                         tracing::warn!(
                             "neural rerank_batch failed: {e}, falling back to lexical per-query"
                         );
-                        drop(model_guard);
                         queries
                             .into_iter()
                             .map(|(q, cands)| {

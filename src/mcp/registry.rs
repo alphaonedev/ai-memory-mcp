@@ -570,29 +570,34 @@ pub fn handle_capabilities_family(
 /// trim and the C4 (optional-params) trim are orthogonal — both run
 /// on the default path; both are skipped on the verbose path.
 pub fn tool_definitions_for_profile(profile: &crate::profile::Profile) -> Value {
+    // v0.7.0 #1077 — memoize per-Profile so repeat `tools/list` calls
+    // are a single `Value::clone()` of the cached payload instead of
+    // re-running the schemars + trim + strip + compact pipeline. The
+    // catalog is build-time-fixed (schemars-derived), so no
+    // invalidation is needed across the daemon lifetime.
+    static CACHE: std::sync::OnceLock<
+        std::sync::RwLock<std::collections::HashMap<crate::profile::Profile, Value>>,
+    > = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+    if let Ok(read) = cache.read()
+        && let Some(cached) = read.get(profile)
+    {
+        return cached.clone();
+    }
+    let defs = build_tool_definitions_for_profile(profile);
+    if let Ok(mut write) = cache.write() {
+        write.entry(profile.clone()).or_insert_with(|| defs.clone());
+    }
+    defs
+}
+
+/// v0.7.0 #1077 — cache-miss path. Pulled out of
+/// [`tool_definitions_for_profile`] so the hot path is a pure
+/// hashmap-read clone.
+fn build_tool_definitions_for_profile(profile: &crate::profile::Profile) -> Value {
     let mut defs = tool_definitions_for_profile_verbose(profile);
-    // Round-4 — honor `AI_MEMORY_TOOLS_VERBOSE=1` (or `=true`) as a
-    // process-level opt-out from the C4 optional-params trim. Without
-    // this escape hatch the trim was unconditional on `tools/list`
-    // (the MCP method, not the `memory_capabilities` tool), so
-    // operators who launched the daemon expecting the full schema —
-    // e.g. for IDE autocomplete or plugin generators — got the
-    // 10 766-byte trimmed payload regardless of CLI / env / profile
-    // hints. The env var matches the existing convention used by
-    // other AI_MEMORY_* tunables (`AI_MEMORY_NO_CONFIG`, `AI_MEMORY_DB`).
     if !tools_verbose_env_enabled() {
         trim_optional_params(&mut defs);
-        // #859 — additionally compact the top-level tool description
-        // on the wire form so the post-#859 payload (which now retains
-        // every property metadata entry for client-side discovery)
-        // still fits the C5 token budget. The full `description` is
-        // reachable via `memory_capabilities { family=<f>,
-        // include_schema=true, verbose=true }` (and via
-        // [`tool_definitions_for_profile_verbose`] in-process). The
-        // wire form keeps the `name` (the discovery key) and the full
-        // `inputSchema` (the call surface); a one-sentence description
-        // is preserved as the first 28 characters of the original short
-        // description so display surfaces still have a label.
         wire_compact_descriptions(&mut defs);
     }
     defs
@@ -820,23 +825,25 @@ fn strip_description_recursively(value: &mut Value) {
 /// preserves `docs` so an NHI can drill in without reloading the
 /// full-fat catalog into context.
 pub fn tool_definitions() -> Value {
-    // v0.7.0 #972 D1.6 (#987) — body collapsed from the original
-    // ~1100-line hand-coded `json!({...})` macro into iteration over
-    // `registered_tools()`. Each tool's catalog row is now derived
-    // from its per-tool `McpTool` impl (schemars-derived inputSchema).
-    // The pre-D1.6 wire shape is preserved modulo the documented
-    // allowed-diffs catalog (property ordering — schemars sorts;
-    // `default: null` on Option<T> fields; `additionalProperties: false`
-    // tightening). See `src/mcp/registry.rs::d1_6_987_tests` for the
-    // byte-shape regression test.
-    let tools: Vec<Value> = registered_tools()
-        .iter()
-        .map(RegisteredTool::to_value)
-        .collect();
-    json!({
-        "toolsVersion": TOOLS_VERSION,
-        "tools": tools,
-    })
+    // v0.7.0 #1077 — cache the deterministic catalog Value in a
+    // `OnceLock<Value>`. `registered_tools()` is build-time static,
+    // so the full catalog is invariant across the daemon lifetime.
+    // Pre-#1077 every MCP `tools/list` request paid the full
+    // schemars expansion across all 73 tools; post-#1077 every call
+    // after boot is a single `Value::clone()` of the cached payload.
+    static CACHE: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let tools: Vec<Value> = registered_tools()
+                .iter()
+                .map(RegisteredTool::to_value)
+                .collect();
+            json!({
+                "toolsVersion": TOOLS_VERSION,
+                "tools": tools,
+            })
+        })
+        .clone()
 }
 
 #[cfg(test)]
