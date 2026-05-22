@@ -9,7 +9,11 @@
 //! regression.
 
 #![cfg(feature = "sal")]
-#![allow(clippy::missing_panics_doc, clippy::too_many_lines, clippy::doc_markdown)]
+#![allow(
+    clippy::missing_panics_doc,
+    clippy::too_many_lines,
+    clippy::doc_markdown
+)]
 
 use std::path::PathBuf;
 use std::sync::Arc;
