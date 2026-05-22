@@ -2137,24 +2137,19 @@ pub fn run_mcp_server(
     // --- Initialize LLM (smart tier and above) — before embedder so Ollama
     //     client can be shared with nomic embedder ---
     //
-    // #1142: mirror src/daemon_runtime.rs:1746-1798 env-aware resolver
-    // so the MCP stdio surface honors `AI_MEMORY_LLM_BACKEND` like the
-    // HTTP `serve` daemon does. Pre-#1142 the MCP path hardcoded the
-    // legacy Ollama init, locking every MCP client (Claude Code,
-    // Cursor, Codex CLI, Continue.dev, ChatGPT Desktop, ...) to local
-    // Ollama regardless of the operator's selector. Post-#1142 the
-    // env-aware path takes priority; legacy Ollama is the fallback
-    // when no env-backend is declared.
+    // #1142 ported the env-aware resolver from
+    // `src/daemon_runtime.rs:1746-1798` into MCP stdio. #1143 collapsed
+    // the inline env-vs-legacy match into the shared
+    // `OllamaClient::build_for_init` helper so every synchronous LLM
+    // init site (MCP stdio LLM, MCP embed fallback, CLI `atomise`,
+    // CLI `curator`) shares one resolution rule. Behavioural parity
+    // with the daemon's async wrapper is pinned by tests in
+    // `src/llm.rs::tests::build_for_init_*`.
     let backend_env = std::env::var("AI_MEMORY_LLM_BACKEND")
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
     let llm: Option<Arc<OllamaClient>> = if let Some(backend) = backend_env {
-        // Operator explicitly chose a backend — route via from_env.
-        // OllamaClient is the post-#1067 wire-agnostic client (it
-        // wraps both Ollama-native `/api/chat` and OpenAI-compatible
-        // `/v1/chat/completions`); the struct name pre-dates the
-        // vendor sweep.
         match OllamaClient::from_env() {
             Ok(Some(client)) => {
                 let model_env = std::env::var("AI_MEMORY_LLM_MODEL")
@@ -2177,9 +2172,6 @@ pub fn run_mcp_server(
             }
         }
     } else if let Some(ref llm_model) = tier_config.llm_model {
-        // Legacy fallback: no AI_MEMORY_LLM_BACKEND env — use the
-        // tier-default Ollama model. Backward-compatible with v0.6.x
-        // operators who never set the env vars.
         let model_id = llm_model.ollama_model_id();
         eprintln!(
             "ai-memory: connecting to Ollama for {} (legacy tier-default; set \
@@ -2208,19 +2200,41 @@ pub fn run_mcp_server(
     };
 
     // --- Initialize embedder (semantic tier and above) ---
-    // Use a separate embed client if embed_url is configured differently from ollama_url
+    //
+    // #1143: clone-the-LLM-client-for-embeddings only when the LLM
+    // client speaks the Ollama wire shape. Pre-#1143 the embed client
+    // unconditionally cloned `llm` when `embed_url == ollama_url`,
+    // which silently routed embedding requests through an
+    // OpenAI-compatible (xAI / OpenAI / Anthropic / …) client whose
+    // `/v1/embeddings` endpoint either doesn't exist (xAI Grok,
+    // Anthropic Messages) or uses a different model namespace.
+    // Result: operators who set `AI_MEMORY_LLM_BACKEND=xai` lost
+    // semantic recall silently. Post-#1143 we keep the clone only for
+    // Ollama-native clients; for OpenAI-compatible LLM clients we
+    // always build a dedicated local-Ollama embed client against the
+    // configured embed URL.
     let embed_client: Option<Arc<OllamaClient>> = {
         let embed_url = app_config.effective_embed_url();
         let ollama_url = app_config.effective_ollama_url();
-        if embed_url == ollama_url {
+        let llm_is_ollama = llm.as_ref().is_some_and(|c| c.is_ollama_native());
+        if embed_url == ollama_url && llm_is_ollama {
             llm.clone()
         } else {
-            // Separate embed URL configured — create a dedicated client for embeddings
-            eprintln!("ai-memory: using separate embed URL: {embed_url}");
+            if embed_url != ollama_url {
+                eprintln!("ai-memory: using separate embed URL: {embed_url}");
+            } else if !llm_is_ollama {
+                eprintln!(
+                    "ai-memory: LLM client is OpenAI-compatible (non-Ollama wire shape); \
+                     building dedicated Ollama embed client at {embed_url} (#1143)"
+                );
+            }
             match OllamaClient::new_with_url(embed_url, "nomic-embed-text") {
                 Ok(client) => Some(Arc::new(client)),
                 Err(e) => {
-                    eprintln!("ai-memory: embed client failed: {e}, falling back to LLM client");
+                    eprintln!(
+                        "ai-memory: embed client failed: {e}, falling back to LLM client \
+                         (semantic recall will be a no-op if LLM is non-Ollama)"
+                    );
                     llm.clone()
                 }
             }

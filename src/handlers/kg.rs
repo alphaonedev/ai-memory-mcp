@@ -26,6 +26,7 @@
 
 #[cfg(feature = "sal")]
 use crate::models::ConfidenceSource;
+use crate::models::Memory;
 use axum::{
     Json,
     extract::{Query, State},

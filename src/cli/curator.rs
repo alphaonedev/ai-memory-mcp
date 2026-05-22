@@ -75,7 +75,21 @@ pub struct CuratorArgs {
     pub all_namespaces: bool,
 }
 
+/// #1143: honor `AI_MEMORY_LLM_BACKEND` env so the `ai-memory curator`
+/// CLI (sweep / reflect / daemon modes) reaches xAI / OpenAI /
+/// Anthropic / Gemini / etc. The legacy arm preserves v0.6.x behavior
+/// (tier-default Ollama at the default URL). Returns `None` for the
+/// keyword tier (no curator LLM configured) and on env / construction
+/// failure — the curator falls through to keyword-only behavior so
+/// the daemon never hard-fails on an unreachable provider.
 fn build_curator_llm(tier: config::FeatureTier) -> Option<llm::OllamaClient> {
+    let backend_env = std::env::var("AI_MEMORY_LLM_BACKEND")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if backend_env.is_some() {
+        return llm::OllamaClient::from_env().ok().flatten();
+    }
     let llm_model = tier.config().llm_model?;
     let model = llm_model.ollama_model_id().to_string();
     llm::OllamaClient::new(&model).ok()
