@@ -116,6 +116,52 @@ pub fn run(
         }
     }
 
+    // v0.7.0 #1042 (Agent-6 #5) — when an operator pubkey is
+    // resolved (env `AI_MEMORY_OPERATOR_PUBKEY` set OR
+    // `operator.key.pub` present on disk), the engine's
+    // `enforced_rule_passes` silently DROPS every row whose
+    // `attest_level != "operator_signed"`. Pre-#1042 this CLI
+    // happily activated the seeded R001-R004 rows (shipped at
+    // `attest_level = "unsigned"`), printed "Activated 4 rule(s)",
+    // and left the operator believing the rules were effective —
+    // even though the engine would skip them at every wire-action.
+    // The operator-visible message was MISLEADING.
+    //
+    // Post-#1042 we detect the misconfiguration BEFORE the
+    // activation UPDATE and bail with a clear pointer to
+    // `ai-memory rules sign-seed`. The operator has two recovery
+    // paths:
+    //   1. Run `ai-memory rules sign-seed --key <path>` first to
+    //      upgrade the seed rows' attest_level to operator_signed.
+    //      Then re-run `install-defaults` with the rules properly
+    //      enrolled.
+    //   2. Temporarily unset `AI_MEMORY_OPERATOR_PUBKEY` and
+    //      remove any stored `operator.key.pub` to drop into the
+    //      no-pubkey-resolved posture where `enforced_rule_passes`
+    //      treats unsigned-enabled rows as enforceable. (Strongly
+    //      discouraged — leaves the L1-6 bypass-impossibility
+    //      story broken.)
+    let operator_pubkey = crate::governance::rules_store::resolve_operator_pubkey();
+    if operator_pubkey.is_some() {
+        let unsigned_seed_rows: Vec<&SeedRuleRow> = preview
+            .iter()
+            .filter(|r| r.attest_level != "operator_signed")
+            .collect();
+        if !unsigned_seed_rows.is_empty() {
+            let unsigned_ids: Vec<&str> = unsigned_seed_rows.iter().map(|r| r.id.as_str()).collect();
+            anyhow::bail!(
+                "governance install-defaults: refused (#1042) — operator pubkey is resolved \
+                 (AI_MEMORY_OPERATOR_PUBKEY env or operator.key.pub on disk) but the \
+                 following seed rule(s) are still attest_level=unsigned: {}. \
+                 Activating them now would print 'Activated' but the engine's \
+                 enforced_rule_passes() would silently drop every one at wire-action time. \
+                 First run `ai-memory rules sign-seed --key <path-to-private-key>` to upgrade \
+                 the seed rows to operator_signed, THEN re-run install-defaults.",
+                unsigned_ids.join(", "),
+            );
+        }
+    }
+
     // Interactive prompt unless --yes / --json was supplied.
     if !args.yes {
         // JSON-mode callers MUST pass --yes; an interactive prompt on
@@ -187,12 +233,18 @@ struct SeedRuleRow {
     matcher: String,
     severity: String,
     enabled: bool,
+    /// v0.7.0 #1042 — attest_level needed for the operator-pubkey
+    /// pre-flight check (see `run()` body). When pubkey is
+    /// resolved, only `operator_signed` rows pass
+    /// `enforced_rule_passes()`; activating an unsigned seed row
+    /// would silently fail enforcement.
+    attest_level: String,
 }
 
 fn load_seed_row(conn: &rusqlite::Connection, id: &str) -> Result<Option<SeedRuleRow>> {
     use rusqlite::OptionalExtension;
     conn.query_row(
-        "SELECT id, kind, matcher, severity, enabled \
+        "SELECT id, kind, matcher, severity, enabled, attest_level \
          FROM governance_rules WHERE id = ?1",
         params![id],
         |r| {
@@ -202,6 +254,7 @@ fn load_seed_row(conn: &rusqlite::Connection, id: &str) -> Result<Option<SeedRul
                 matcher: r.get::<_, String>(2)?,
                 severity: r.get::<_, String>(3)?,
                 enabled: r.get::<_, i64>(4)? != 0,
+                attest_level: r.get::<_, String>(5)?,
             })
         },
     )
@@ -326,8 +379,90 @@ mod tests {
         (dir, db_path)
     }
 
+    /// v0.7.0 #1042 lock — env-var manipulation in these tests races
+    /// when run in parallel. Use a process-wide mutex to serialise.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Generate a fresh Ed25519 keypair and stuff the verifying key
+    /// into `AI_MEMORY_OPERATOR_PUBKEY` so
+    /// `resolve_operator_pubkey()` returns `Some(_)`. Returns a
+    /// guard that clears the env var on drop.
+    struct TestPubkeyGuard;
+    impl Drop for TestPubkeyGuard {
+        fn drop(&mut self) {
+            // SAFETY: env mutation; the env_lock guard's lifetime
+            // brackets the test region so no sibling test races.
+            unsafe { std::env::remove_var("AI_MEMORY_OPERATOR_PUBKEY") };
+        }
+    }
+    fn install_test_pubkey() -> TestPubkeyGuard {
+        use base64::Engine;
+        use ed25519_dalek::SigningKey;
+        use rand_core::OsRng;
+        let signing = SigningKey::generate(&mut OsRng);
+        let pubkey_b64 = base64::engine::general_purpose::STANDARD
+            .encode(signing.verifying_key().to_bytes());
+        // SAFETY: serialised via env_lock by caller.
+        unsafe { std::env::set_var("AI_MEMORY_OPERATOR_PUBKEY", pubkey_b64) };
+        TestPubkeyGuard
+    }
+
+    #[test]
+    fn install_defaults_refuses_when_pubkey_resolved_seed_rows_unsigned_1042() {
+        // v0.7.0 #1042 (Agent-6 #5) — when an operator pubkey is
+        // resolved AND the seed rows are still attest_level=unsigned,
+        // install-defaults refuses with a clear pointer to
+        // `ai-memory rules sign-seed`. Pre-#1042 the command would
+        // happily activate the rows + print "Activated 4 rule(s)"
+        // even though the engine would silently drop every one.
+        let _g = env_lock();
+        let _pk = install_test_pubkey();
+        let (_dir, db_path) = fresh_db();
+
+        let mut so = Vec::<u8>::new();
+        let mut se = Vec::<u8>::new();
+        let mut out = CliOutput::from_std(&mut so, &mut se);
+        let result = run(&db_path, yes_args(), &mut out);
+        let err = result.expect_err("#1042: install-defaults MUST refuse when pubkey + unsigned seed rows");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("operator pubkey is resolved")
+                && msg.contains("attest_level=unsigned")
+                && msg.contains("sign-seed"),
+            "#1042: refusal MUST cite pubkey + unsigned + sign-seed remediation; got: {msg}"
+        );
+        // Confirm no rule was actually activated — the refusal must
+        // fire BEFORE the UPDATE.
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        for id in SEED_RULE_IDS {
+            let enabled: i64 = conn
+                .query_row(
+                    "SELECT enabled FROM governance_rules WHERE id = ?1",
+                    params![id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                enabled, 0,
+                "#1042: refusal MUST fire BEFORE the UPDATE — rule {id} must stay disabled"
+            );
+        }
+    }
+
     #[test]
     fn install_defaults_flips_enabled_on_seeded_rows() {
+        let _g = env_lock();
+        // v0.7.0 #1042 — force resolve_operator_pubkey() to return
+        // None for this test, so the dev-host pubkey gate doesn't
+        // fire on hosts where ~/Library/Application Support/ai-memory/
+        // operator.key.pub is staged.
+        let _no_pubkey = crate::governance::rules_store::force_no_operator_pubkey_for_test();
         let (_dir, db_path) = fresh_db();
         // Sanity: confirm all four start disabled.
         {
@@ -366,6 +501,8 @@ mod tests {
 
     #[test]
     fn install_defaults_idempotent_when_already_enabled() {
+        let _g = env_lock();
+        let _no_pubkey = crate::governance::rules_store::force_no_operator_pubkey_for_test();
         let (_dir, db_path) = fresh_db();
         // Pre-flip all rows to enabled = 1.
         {
@@ -389,6 +526,8 @@ mod tests {
 
     #[test]
     fn install_defaults_reports_missing_rows() {
+        let _g = env_lock();
+        let _no_pubkey = crate::governance::rules_store::force_no_operator_pubkey_for_test();
         let (_dir, db_path) = fresh_db();
         // Hand-delete R003.
         {
@@ -411,6 +550,8 @@ mod tests {
 
     #[test]
     fn json_mode_emits_envelope() {
+        let _g = env_lock();
+        let _no_pubkey = crate::governance::rules_store::force_no_operator_pubkey_for_test();
         let (_dir, db_path) = fresh_db();
         let mut so = Vec::<u8>::new();
         let mut se = Vec::<u8>::new();
@@ -432,6 +573,8 @@ mod tests {
 
     #[test]
     fn json_without_yes_refuses() {
+        let _g = env_lock();
+        let _no_pubkey = crate::governance::rules_store::force_no_operator_pubkey_for_test();
         let (_dir, db_path) = fresh_db();
         let mut so = Vec::<u8>::new();
         let mut se = Vec::<u8>::new();
@@ -466,6 +609,7 @@ mod tests {
                 matcher: r#"{"glob":"/tmp/**"}"#.into(),
                 severity: "refuse".into(),
                 enabled: false,
+                attest_level: "unsigned".into(),
             },
             SeedRuleRow {
                 id: "R002".into(),
@@ -473,6 +617,7 @@ mod tests {
                 matcher: r#"{"glob":"/var/tmp/**"}"#.into(),
                 severity: "refuse".into(),
                 enabled: true,
+                attest_level: "unsigned".into(),
             },
         ];
         let missing: Vec<String> = vec![];
@@ -536,6 +681,8 @@ mod tests {
 
     #[test]
     fn install_defaults_human_render_emits_activated_and_missing_lines() {
+        let _g = env_lock();
+        let _no_pubkey = crate::governance::rules_store::force_no_operator_pubkey_for_test();
         // Drives both `if !report.activated.is_empty()` and
         // `if !report.missing.is_empty()` writeln arms (lines ~173-178)
         // in a single run by hand-deleting one row before invoking run.
@@ -563,6 +710,8 @@ mod tests {
 
     #[test]
     fn install_defaults_json_envelope_pins_wire_shape_when_partial_missing() {
+        let _g = env_lock();
+        let _no_pubkey = crate::governance::rules_store::force_no_operator_pubkey_for_test();
         // Hand-delete two rows, run with --json --yes, parse envelope.
         let (_dir, db_path) = fresh_db();
         {
