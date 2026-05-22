@@ -483,13 +483,24 @@ impl DeferredAuditSink for SqliteSignedEventsSink {
         let bytes = event
             .canonical_bytes()
             .context("SqliteSignedEventsSink: canonical_bytes")?;
+        let hash = payload_hash(&bytes);
+        // v0.7.0 #1035 — sign the payload_hash with the daemon's
+        // process-wide audit key when installed. The forensic JSONL
+        // sink and this SQL sink share the same key (installed by
+        // `audit::init`); a downstream auditor with the daemon's
+        // verifying key validates both chains uniformly.
+        let (signature, attest_level) =
+            match crate::governance::audit::try_sign_audit_payload(&hash) {
+                Some((sig, level)) => (Some(sig), level.to_string()),
+                None => (None, "unsigned".to_string()),
+            };
         let signed = SignedEvent {
             id: uuid::Uuid::new_v4().to_string(),
             agent_id: event.agent_id.clone(),
             event_type: GOVERNANCE_REFUSAL_EVENT_TYPE.to_string(),
-            payload_hash: payload_hash(&bytes),
-            signature: None,
-            attest_level: "unsigned".to_string(),
+            payload_hash: hash,
+            signature,
+            attest_level,
             timestamp: event.timestamp.to_rfc3339(),
             ..SignedEvent::default()
         };

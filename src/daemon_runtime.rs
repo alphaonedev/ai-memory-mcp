@@ -2516,12 +2516,26 @@ pub async fn bootstrap_serve(
     // federation::sync, hooks::executor, and the LLM client. CLI
     // one-shot binaries never reach this path so the hook stays empty
     // for direct operator ops (L1-6 E operator-as-actor exemption).
+    //
+    // v0.7.0 #1034 (Agent-6 #2) — wire-check refusals now flow into the
+    // SAME deferred-audit queue the substrate pre-write hook uses, so
+    // every refusal — storage AND wire — chain-logs a `governance.refusal`
+    // row in `signed_events`. Pre-#1034 the wire-check refusals only
+    // emitted to the forensic JSONL log; the cryptographic-audit chain
+    // missed them, breaking the bypass-impossibility audit story for the
+    // four agent-EXTERNAL action variants. The closure uses the stable
+    // `daemon:wire_action` tag for `agent_id` attribution because the
+    // wire-check fires inside daemon-internal subsystems (federation,
+    // hooks, LLM, skill_export) where there is no per-request agent
+    // identity bound to the action; the storage hook's
+    // `substrate:pre_write_hook` fallback uses the same shape.
     {
         use crate::governance::agent_action::{
-            AgentAction, Decision as RuleDecision, check_agent_action_no_audit_cached,
+            AgentAction, Decision as RuleDecision, check_agent_action_deferred_cached,
         };
         let rules_db_path = db_path.to_path_buf();
         let cache_for_wire_check = Arc::clone(&rule_cache);
+        let queue_for_wire_check = deferred_audit_queue.clone();
         let install_result = crate::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(
             move |action: &AgentAction| -> std::result::Result<(), String> {
                 let conn_for_check = match db::open(&rules_db_path) {
@@ -2537,15 +2551,18 @@ pub async fn bootstrap_serve(
                         return Ok(());
                     }
                 };
-                match check_agent_action_no_audit_cached(
+                match check_agent_action_deferred_cached(
                     &conn_for_check,
                     Some(&cache_for_wire_check),
+                    "daemon:wire_action",
                     action,
+                    &queue_for_wire_check,
                 ) {
                     Ok(RuleDecision::Allow | RuleDecision::Warn { .. }) => Ok(()),
                     Ok(RuleDecision::Refuse { rule_id, reason }) => {
                         tracing::info!(
-                            "wire_check refused action kind={} rule_id={} reason={}",
+                            "wire_check refused action kind={} rule_id={} reason={} \
+                             (chain-logged via deferred audit queue)",
                             action.kind(),
                             rule_id,
                             reason,

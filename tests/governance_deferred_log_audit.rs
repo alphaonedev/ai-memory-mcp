@@ -40,7 +40,7 @@ use ai_memory::governance::deferred_audit::{
     install_deferred_audit_drainer, spawn_drainer_task, spawn_supervised_drainer,
 };
 use ai_memory::governance::rules_store::{self, Rule};
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier};
 
 mod common;
 use common::*;
@@ -454,6 +454,254 @@ async fn non_refusal_paths_do_not_chain_log() {
         )
         .unwrap();
     assert_eq!(count, 0, "Allow paths must not produce refusal rows");
+}
+
+// ---------------------------------------------------------------------------
+// Test 8 — #1034 wire-check refusals chain-log to signed_events
+// ---------------------------------------------------------------------------
+//
+// Pre-#1034 the wire_check `GOVERNANCE_PRE_ACTION` closure used
+// `check_agent_action_no_audit_cached`, which fires the forensic-JSONL
+// decision but never lands a `governance.refusal` row in `signed_events`.
+// That broke the audit-chain symmetry for the four agent-EXTERNAL action
+// variants (Bash / FilesystemWrite / NetworkRequest / ProcessSpawn) —
+// only the substrate `memory_write` (Custom) variant landed an audit row
+// on refusal. This test pins the post-#1034 behaviour: every wire-check
+// refusal lands a chain-log row, identified by the action's `kind()` in
+// the canonical payload.
+//
+// We exercise the production function (`check_agent_action_deferred_cached`)
+// the daemon_runtime wire_check closure now calls, with a NetworkRequest
+// action variant — same code path the federation::sync push, the LLM
+// client, and the skill_export NetworkRequest sites consult.
+
+fn seed_refuse_rule_raw(
+    db_path: &std::path::Path,
+    signing: &SigningKey,
+    rule_id: &str,
+    rule_kind: &str,
+    matcher_json: &str,
+    reason: &str,
+) {
+    let conn = db::open(db_path).expect("open seed db");
+    let now = chrono::Utc::now().timestamp();
+    let mut rule = Rule {
+        id: rule_id.to_string(),
+        kind: rule_kind.to_string(),
+        matcher: matcher_json.to_string(),
+        severity: "refuse".to_string(),
+        reason: reason.to_string(),
+        namespace: "_global".to_string(),
+        created_by: "test".to_string(),
+        created_at: now,
+        enabled: true,
+        signature: None,
+        attest_level: "operator_signed".to_string(),
+    };
+    let canonical =
+        rules_store::canonical_bytes_for_signing(&rule).expect("canonical_bytes_for_signing");
+    rule.signature = Some(signing.sign(&canonical).to_bytes().to_vec());
+    rules_store::insert(&conn, &rule).expect("seed rule");
+}
+
+#[tokio::test]
+async fn wire_check_network_request_refusal_lands_in_signed_events_chain_1034() {
+    use ai_memory::governance::agent_action::check_agent_action_deferred_cached;
+
+    let (signing, _env_guard) = install_test_operator_key();
+    let dir = fresh_tempdir();
+    let db_path = dir.path().join("wire-check-1034.db");
+    {
+        let _ = db::open(&db_path).expect("init schema");
+    }
+    seed_refuse_rule_raw(
+        &db_path,
+        &signing,
+        "R-wire-net-1034",
+        "network_request",
+        r#"{"host":"forbidden.example.com"}"#,
+        "no outbound HTTPS to forbidden.example.com",
+    );
+
+    let (queue, supervisor) = install_deferred_audit_drainer(&db_path);
+
+    // Exercise the production code path the daemon_runtime wire_check
+    // closure now consults — NetworkRequest is one of the four
+    // agent-EXTERNAL variants the storage path can NOT produce.
+    let conn = db::open(&db_path).expect("open consult conn");
+    let action = AgentAction::NetworkRequest {
+        host: "forbidden.example.com".to_string(),
+        scheme: "https".to_string(),
+    };
+    // `daemon:wire_action` is the stable attribution tag the
+    // daemon_runtime wire_check closure passes — see
+    // src/daemon_runtime.rs comment on the #1034 change.
+    let decision =
+        check_agent_action_deferred_cached(&conn, None, "daemon:wire_action", &action, &queue)
+            .expect("check_agent_action_deferred_cached");
+    assert!(
+        decision.is_refusal(),
+        "expected refusal verdict for NetworkRequest forbidden host"
+    );
+
+    close_and_flush(queue, supervisor)
+        .await
+        .expect("graceful drain");
+
+    // Assert exactly one governance.refusal row landed with the daemon
+    // wire-action attribution.
+    let conn = db::open(&db_path).expect("reopen db");
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM signed_events WHERE event_type = ?1 AND agent_id = ?2",
+            rusqlite::params![GOVERNANCE_REFUSAL_EVENT_TYPE, "daemon:wire_action"],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        count, 1,
+        "post-#1034: wire-check NetworkRequest refusal must chain-log exactly once"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 9 — #1035 governance.refusal rows ARE signed when daemon has a key
+// ---------------------------------------------------------------------------
+//
+// Pre-#1035 every `SqliteSignedEventsSink::append` write set
+// `signature: None, attest_level: "unsigned"` regardless of whether the
+// daemon had an Ed25519 keypair on disk. The cross-row prev_hash chain
+// stayed tamper-evident, but the per-row sig that
+// `src/signed_events.rs:53-54` advertises as defense-in-depth was
+// always missing. This test installs a daemon audit key via the public
+// `governance::audit::init` surface, drives the deferred-audit path
+// through a refusal, and asserts the resulting `signed_events.signature`
+// column is populated AND `attest_level = "daemon_signed"`.
+
+#[tokio::test]
+async fn refused_storage_insert_signs_signed_events_row_when_daemon_keyed_1035() {
+    use ai_memory::governance::audit;
+
+    let (signing, _env_guard) = install_test_operator_key();
+    let dir = fresh_tempdir();
+    let db_path = dir.path().join("signed-1035.db");
+    {
+        let _ = db::open(&db_path).expect("init schema");
+    }
+    seed_refuse_rule(&db_path, &signing, "R-1035-signed", "sign-test refuse rule");
+
+    // Install a daemon audit key via the public init surface. The
+    // OnceLock is process-wide — once set in this cargo-test binary,
+    // it stays installed for the lifetime of the process. Subsequent
+    // test cases that DON'T install a key also see this key (which
+    // matches v0.7 production posture: daemon installs the key once
+    // at boot and every audit-row write uses it for the lifetime).
+    //
+    // We use a deterministic key (different from `signing`, the rule-
+    // signing key) so the verifier path below can produce a real
+    // `VerifyingKey` and round-trip the signature.
+    let daemon_key = SigningKey::from_bytes(&[7u8; 32]);
+    let daemon_vk = daemon_key.verifying_key();
+    // Re-init with the daemon key. `init` resets the SINK + OnceLock-
+    // installs the audit key (idempotent — first install wins).
+    audit::init(dir.path(), Some(daemon_key)).expect("audit::init with daemon key");
+    assert!(
+        audit::audit_key_is_installed(),
+        "daemon audit key must be installed after init"
+    );
+
+    let (queue, supervisor) = install_deferred_audit_drainer(&db_path);
+    let conn = db::open(&db_path).expect("open consult conn");
+    let action = refusal_action();
+    let decision = check_agent_action_deferred(&conn, "agent:1035-signed", &action, &queue)
+        .expect("check_agent_action_deferred");
+    assert!(decision.is_refusal());
+
+    close_and_flush(queue, supervisor)
+        .await
+        .expect("graceful drain");
+
+    // Assert the row has both a non-empty signature AND the
+    // `daemon_signed` attest_level.
+    let conn = db::open(&db_path).expect("reopen db");
+    let (sig_bytes, attest_level, payload_hash_bytes): (Option<Vec<u8>>, String, Vec<u8>) = conn
+        .query_row(
+            "SELECT signature, attest_level, payload_hash FROM signed_events \
+             WHERE event_type = ?1 AND agent_id = ?2",
+            rusqlite::params![GOVERNANCE_REFUSAL_EVENT_TYPE, "agent:1035-signed"],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+
+    let sig_bytes = sig_bytes.expect("signature must be populated when daemon key installed");
+    assert_eq!(
+        sig_bytes.len(),
+        64,
+        "Ed25519 signature must be 64 bytes; got {}",
+        sig_bytes.len()
+    );
+    assert_eq!(
+        attest_level, "daemon_signed",
+        "attest_level must be `daemon_signed` when daemon key installed"
+    );
+
+    // Defense-in-depth — verify the signature actually validates
+    // against the daemon's verifying key over the stored payload_hash.
+    // This proves the sig binds to the row's content, not just that
+    // we wrote arbitrary bytes.
+    let sig = Signature::from_slice(&sig_bytes).expect("64-byte ed25519 signature");
+    daemon_vk
+        .verify(&payload_hash_bytes, &sig)
+        .expect("daemon verifying key must verify the stored sig over payload_hash");
+}
+
+#[tokio::test]
+async fn wire_check_process_spawn_refusal_lands_in_signed_events_chain_1034() {
+    use ai_memory::governance::agent_action::check_agent_action_deferred_cached;
+
+    let (signing, _env_guard) = install_test_operator_key();
+    let dir = fresh_tempdir();
+    let db_path = dir.path().join("wire-check-spawn-1034.db");
+    {
+        let _ = db::open(&db_path).expect("init schema");
+    }
+    seed_refuse_rule_raw(
+        &db_path,
+        &signing,
+        "R-wire-spawn-1034",
+        "process_spawn",
+        r#"{"binary":"/usr/bin/rm"}"#,
+        "no rm spawns from daemon hooks",
+    );
+
+    let (queue, supervisor) = install_deferred_audit_drainer(&db_path);
+
+    let conn = db::open(&db_path).expect("open consult conn");
+    let action = AgentAction::ProcessSpawn {
+        binary: "/usr/bin/rm".to_string(),
+        args: vec!["-rf".to_string(), "/".to_string()],
+    };
+    let decision =
+        check_agent_action_deferred_cached(&conn, None, "daemon:wire_action", &action, &queue)
+            .expect("check_agent_action_deferred_cached");
+    assert!(decision.is_refusal());
+
+    close_and_flush(queue, supervisor)
+        .await
+        .expect("graceful drain");
+
+    let conn = db::open(&db_path).expect("reopen db");
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM signed_events WHERE event_type = ?1 AND agent_id = ?2",
+            rusqlite::params![GOVERNANCE_REFUSAL_EVENT_TYPE, "daemon:wire_action"],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        count, 1,
+        "post-#1034: wire-check ProcessSpawn refusal must chain-log exactly once"
+    );
 }
 
 // ---------------------------------------------------------------------------
