@@ -1920,11 +1920,21 @@ async fn http_get_stats_returns_struct() {
 }
 
 #[tokio::test]
-async fn http_run_gc_happy() {
+async fn http_run_gc_rejects_empty_allowlist_403() {
+    // v0.7.0 #1027 + #1107 — `/api/v1/gc` is admin-gated. Empty
+    // admin-allowlist (this fixture's default) rejects every caller.
+    // The admin-admit happy path is covered in
+    // `tests/admin_run_gc_require_admin_1027.rs` (403 reject + 200
+    // admit, end-to-end). Same fix as the fake-PG sibling under #1127.
+    // (#1129)
     let (router, _f) = build_router_fixture();
     let body = json!({});
-    let (status, _payload) = post_json(&router, "/api/v1/gc", body).await;
-    assert_eq!(status, StatusCode::OK);
+    let (status, payload) = post_json(&router, "/api/v1/gc", body).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "#1027: empty-allowlist /api/v1/gc MUST reject; body={payload}"
+    );
 }
 
 #[tokio::test]
