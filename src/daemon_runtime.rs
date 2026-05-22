@@ -1443,11 +1443,68 @@ pub fn is_write_command(cmd: &Command) -> bool {
 /// newline / CRLF; rejects an empty passphrase (post-strip) with an error;
 /// preserves all other internal whitespace.
 ///
+/// v0.7.0 #1055 (Agent-2 #5) — on Unix, the function rejects the
+/// passphrase file when its mode allows ANY group or world access
+/// (`mode & 0o077 != 0`). Pre-#1055 the function accepted
+/// world-readable / group-readable files even though CLAUDE.md and
+/// the doc comment at `src/storage/connection.rs:139-141` promise the
+/// passphrase file is mode 0400. Any local user with read access to
+/// the configured path could read the `SQLCipher` passphrase and
+/// decrypt the on-disk DB offline. Operators with a legitimate need
+/// for the legacy permissive posture (shared-container deploys where
+/// the secret is already gated upstream by the orchestrator) can opt
+/// back in via `AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS=1`. The
+/// unsafe override is logged at WARN on every fire.
+///
 /// # Errors
 ///
 /// - The file cannot be read (e.g. missing, permission denied).
 /// - The passphrase, after stripping the trailing newline, is empty.
+/// - (Unix only, post-#1055) the file's mode allows group or world
+///   access without the env-var escape hatch.
 pub fn passphrase_from_file(path: &Path) -> Result<String> {
+    // v0.7.0 #1055 — Unix permission check. We use the `mode & 0o077`
+    // bitmask which fires on any group or world rwx bit. Windows
+    // has no equivalent file-mode ACL primitive; the check is
+    // compile-conditional so the function still works on cross-
+    // platform builds.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::metadata(path).with_context(|| {
+            format!(
+                "stat passphrase file {} for permission check (#1055)",
+                path.display()
+            )
+        })?;
+        let mode = meta.permissions().mode();
+        let lax_bits = mode & 0o077;
+        if lax_bits != 0 {
+            let fail_open = std::env::var("AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            if fail_open {
+                tracing::warn!(
+                    target: "ai_memory::daemon_runtime",
+                    path = %path.display(),
+                    mode = format!("{:o}", mode & 0o777),
+                    "passphrase_from_file: file is group/world-readable; \
+                     AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS=1 — accepting \
+                     (UNSAFE, legacy posture). Tighten with `chmod 0400 <path>` \
+                     and clear the env var."
+                );
+            } else {
+                anyhow::bail!(
+                    "passphrase file {} has lax permissions (mode {:o}, group/world bits set); \
+                     tighten with `chmod 0400 {}` OR set \
+                     AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS=1 to opt out (#1055)",
+                    path.display(),
+                    mode & 0o777,
+                    path.display(),
+                );
+            }
+        }
+    }
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading passphrase file {}", path.display()))?;
     let passphrase = raw.trim_end_matches(['\n', '\r']).to_string();
@@ -4420,11 +4477,27 @@ mod tests {
 
     // ----- passphrase_from_file -----------------------------------------
 
+    /// v0.7.0 #1055 helper — write a passphrase file with mode 0400
+    /// so the post-#1055 permission check accepts it. Tests calling
+    /// the unhardened `std::fs::write` would inherit the OS default
+    /// umask (typically 0644 on macOS, group/world-readable) which
+    /// the production gate now rejects.
+    #[cfg(unix)]
+    fn write_passphrase_strict(path: &std::path::Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o400)).unwrap();
+    }
+    #[cfg(not(unix))]
+    fn write_passphrase_strict(path: &std::path::Path, body: &str) {
+        std::fs::write(path, body).unwrap();
+    }
+
     #[test]
     fn test_passphrase_strips_trailing_newline() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("pass");
-        std::fs::write(&p, "secret\n").unwrap();
+        write_passphrase_strict(&p, "secret\n");
         assert_eq!(passphrase_from_file(&p).unwrap(), "secret");
     }
 
@@ -4432,7 +4505,7 @@ mod tests {
     fn test_passphrase_strips_trailing_crlf() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("pass");
-        std::fs::write(&p, "secret\r\n").unwrap();
+        write_passphrase_strict(&p, "secret\r\n");
         assert_eq!(passphrase_from_file(&p).unwrap(), "secret");
     }
 
@@ -4440,7 +4513,7 @@ mod tests {
     fn test_passphrase_empty_file_errors() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("empty");
-        std::fs::write(&p, "").unwrap();
+        write_passphrase_strict(&p, "");
         let err = passphrase_from_file(&p).unwrap_err();
         assert!(
             err.to_string().contains("empty"),
@@ -4455,7 +4528,7 @@ mod tests {
         // / "\r" alone would trigger the empty-after-strip case.
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("nl-only");
-        std::fs::write(&p, "\n").unwrap();
+        write_passphrase_strict(&p, "\n");
         let err = passphrase_from_file(&p).unwrap_err();
         assert!(err.to_string().contains("empty"));
     }
@@ -4467,6 +4540,7 @@ mod tests {
         let err = passphrase_from_file(&p).unwrap_err();
         assert!(
             err.to_string().contains("reading passphrase file")
+                || err.to_string().contains("stat passphrase file")
                 || err.chain().any(|e| e.to_string().contains("No such file"))
                 || err.chain().any(|e| e.to_string().contains("cannot find")),
             "got: {err:#}"
@@ -4477,8 +4551,69 @@ mod tests {
     fn test_passphrase_preserves_internal_whitespace() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("pass");
-        std::fs::write(&p, "my pass phrase\n").unwrap();
+        write_passphrase_strict(&p, "my pass phrase\n");
         assert_eq!(passphrase_from_file(&p).unwrap(), "my pass phrase");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_passphrase_rejects_lax_permissions_1055() {
+        // v0.7.0 #1055 — file with mode 0644 (group/world readable)
+        // is rejected by the permission gate. Pre-#1055 the function
+        // accepted any readable file regardless of mode.
+        //
+        // Serialise on the shared `env_var_lock` so the sibling
+        // `test_passphrase_lax_perms_env_overrides_1055` test can't
+        // race the `AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS` env
+        // var into a state that bypasses the rejection.
+        use std::os::unix::fs::PermissionsExt;
+        let _g = env_var_lock();
+        // SAFETY: serialised via env_var_lock; clear any stale state
+        // from a sibling test that exited mid-test.
+        unsafe { std::env::remove_var("AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS") };
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("lax");
+        std::fs::write(&p, "secret\n").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let err = passphrase_from_file(&p).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("lax permissions") && msg.contains("0400"),
+            "#1055: expected lax-permission rejection with chmod 0400 hint; got: {msg}"
+        );
+        assert!(
+            msg.contains("AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS"),
+            "#1055: failure message MUST reference the env-var escape hatch; got: {msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_passphrase_lax_perms_env_overrides_1055() {
+        // v0.7.0 #1055 — operators can opt back into the legacy
+        // permissive posture via
+        // `AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS=1`.
+        use std::os::unix::fs::PermissionsExt;
+        let _g = env_var_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("lax-with-env");
+        std::fs::write(&p, "secret\n").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        // SAFETY: serialised via env_var_lock; the lock guard's
+        // lifetime brackets the set + remove pair so no sibling
+        // test observes the intermediate state.
+        unsafe {
+            std::env::set_var("AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS", "1");
+        }
+        let result = passphrase_from_file(&p);
+        unsafe {
+            std::env::remove_var("AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS");
+        }
+        assert_eq!(
+            result.unwrap(),
+            "secret",
+            "#1055: env-var escape hatch MUST restore legacy permissive posture"
+        );
     }
 
     // ----- apply_anonymize_default --------------------------------------
@@ -5189,6 +5324,14 @@ mod tests {
         let env = TestEnv::fresh();
         let pass_path = env.db_path.with_file_name("pass");
         std::fs::write(&pass_path, "test-passphrase\n").unwrap();
+        // v0.7.0 #1055 — the production `passphrase_from_file` gate
+        // rejects group/world-readable passphrase files; mirror the
+        // operator-side 0400 mode here.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&pass_path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        }
         let cfg = AppConfig::default();
         let cli = Cli::try_parse_from([
             "ai-memory",
