@@ -194,8 +194,11 @@ fn test_migration_v36_idempotent() {
     // atomisation migration. Tracks `CURRENT_SCHEMA_VERSION` in
     // src/storage/migrations.rs — bump this assertion when the const
     // moves so schema bumps stay explicit.
-    assert_eq!(v1, 48);
-    assert_eq!(v1, v2, "v48: migrate is not idempotent — version drifted");
+    assert_eq!(v1, ai_memory::db::current_schema_version_for_tests());
+    assert_eq!(
+        v1, v2,
+        "current schema: migrate is not idempotent — version drifted"
+    );
 
     // Columns + indexes still present after replay.
     assert!(column_exists(&conn2, "memories", "atomised_into"));
@@ -478,4 +481,103 @@ async fn test_capabilities_db_schema_version_reports_36() {
 
     shutdown.notify_one();
     let _ = handle.await;
+}
+
+/// v0.7.0 #1112 — v49 archive-column-carry migration idempotency pin.
+///
+/// Per CLAUDE.md §Architecture: v49 added 14 nullable columns to
+/// `archived_memories` (`reflection_depth`, `atomised_into`,
+/// `atom_of`, `memory_kind`, `entity_id`, `persona_version`,
+/// `citations`, `source_uri`, `source_span`, `confidence_source`,
+/// `confidence_signals`, `confidence_decayed_at`,
+/// `mentioned_entity_id`, `version`) per #1025 so archive → restore
+/// is lossless for the full v0.7.0 Memory shape.
+///
+/// The audit lens (SR-6 lens 5) requires every migrate_vN to have:
+///   1. Forward migration test (existing `test_migration_v36_*` family
+///      pins the chain converging on `CURRENT_SCHEMA_VERSION`).
+///   2. Idempotent re-run on an already-stamped DB.
+///   3. No duplicate columns on `PRAGMA table_info(archived_memories)`
+///      after replay.
+///
+/// This test pins (2) + (3) for the v49 ladder specifically. A future
+/// regression that drops the `if version < 49` guard or that re-runs
+/// the `ALTER TABLE archived_memories ADD COLUMN` statements
+/// unconditionally would fail this pin.
+#[test]
+fn v49_migration_idempotent_on_replay_1112() {
+    let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    let conn1 = ai_memory::db::open(tmp.path()).expect("first open");
+    let v1: i64 = conn1
+        .query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+            [],
+            |r| r.get(0),
+        )
+        .expect("read v1");
+    assert!(
+        v1 >= 49,
+        "#1112: fresh open MUST stamp schema at v49 or higher (got {v1})"
+    );
+
+    // Snapshot archived_memories columns BEFORE replay.
+    let cols_pre = archive_columns(&conn1);
+    let count_pre = cols_pre.len();
+    drop(conn1);
+
+    // Re-open: migrate() runs again; the version-fast-path inside the
+    // ladder must short-circuit cleanly.
+    let conn2 = ai_memory::db::open(tmp.path()).expect("second open");
+    let v2: i64 = conn2
+        .query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+            [],
+            |r| r.get(0),
+        )
+        .expect("read v2");
+    assert_eq!(v1, v2, "#1112: v49 migrate is not idempotent — version drifted");
+
+    // Snapshot AFTER replay.
+    let cols_post = archive_columns(&conn2);
+    assert_eq!(
+        cols_post.len(),
+        count_pre,
+        "#1112: v49 replay duplicated columns in archived_memories. \
+         pre={count_pre} cols={cols_pre:?}; post={} cols={cols_post:?}",
+        cols_post.len()
+    );
+
+    // The 14 v49-added columns MUST all be present (regression catch
+    // if a future refactor moves the ADD COLUMN out of the v49 arm).
+    for required in [
+        "reflection_depth",
+        "atomised_into",
+        "atom_of",
+        "memory_kind",
+        "entity_id",
+        "persona_version",
+        "citations",
+        "source_uri",
+        "source_span",
+        "confidence_source",
+        "confidence_signals",
+        "confidence_decayed_at",
+        "mentioned_entity_id",
+        "version",
+    ] {
+        assert!(
+            cols_post.iter().any(|c| c == required),
+            "#1112: archived_memories must carry v49 column `{required}` \
+             after migrate; columns={cols_post:?}"
+        );
+    }
+}
+
+fn archive_columns(conn: &rusqlite::Connection) -> Vec<String> {
+    conn.prepare("PRAGMA table_info(archived_memories)")
+        .expect("prepare PRAGMA table_info")
+        .query_map([], |r| r.get::<_, String>(1))
+        .expect("query_map")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect")
 }

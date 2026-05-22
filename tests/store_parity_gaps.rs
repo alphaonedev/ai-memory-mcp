@@ -470,6 +470,104 @@ fn sqlite_parity_gap_7_get_links_columns() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// v0.7.0 #1117 — sqlite-side parity pin for the SAL trait `update`
+// version bump (#1024). Postgres parity pin lives in `postgres_side`
+// below as `trait_update_bumps_version_1024`; this is the sqlite
+// reference companion. Gated on the `sal` feature because the SAL
+// trait (`MemoryStore`, `SqliteStore`) lives behind it.
+// ─────────────────────────────────────────────────────────────────────
+
+/// v0.7.0 #1024 + #1117 — sqlite `MemoryStore::update` MUST bump
+/// `memories.version` on every call. The sqlite adapter delegates to
+/// `crate::storage::update` which has carried the version bump since
+/// schema v45 (#884 Gap-1), but there was no `_1024`-tagged regression
+/// test pinning the SAL-trait-surface behavior. A future refactor of
+/// the sqlite adapter that bypasses the version bump (e.g. an `UPDATE`
+/// helper that forgets `version = version + 1`) would silently break
+/// optimistic-concurrency parity with postgres.
+///
+/// The test mirrors the postgres `trait_update_bumps_version_1024`
+/// shape so a single grep on `_1024` surfaces both halves of the
+/// parity contract.
+#[cfg(feature = "sal")]
+#[tokio::test]
+async fn sqlite_trait_update_bumps_version_1024() {
+    use ai_memory::store::MemoryStore;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let store = ai_memory::store::sqlite::SqliteStore::open(tmp.path().join("trait-update.db"))
+        .expect("open SqliteStore");
+    // `for_admin` sets `bypass_visibility=true` so the seeded row is
+    // readable back through `store.get` regardless of the metadata
+    // agent_id visibility-gate match.
+    let ctx = ai_memory::store::CallerContext::for_admin("parity-test-1117");
+    let mem = Memory {
+        id: "sqlite-1024-version".to_string(),
+        tier: ai_memory::models::Tier::Long,
+        namespace: "parity-test".to_string(),
+        title: "title-trait-update-1024".to_string(),
+        content: "parity test content".to_string(),
+        tags: vec![],
+        priority: 5,
+        confidence: 1.0,
+        source: "test".to_string(),
+        access_count: 0,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        updated_at: chrono::Utc::now().to_rfc3339(),
+        last_accessed_at: None,
+        expires_at: None,
+        metadata: json!({"agent_id": "parity-test-1117"}),
+        reflection_depth: 0,
+        memory_kind: ai_memory::models::MemoryKind::Observation,
+        entity_id: None,
+        persona_version: None,
+        citations: Vec::new(),
+        source_uri: None,
+        source_span: None,
+        confidence_source: ai_memory::models::ConfidenceSource::CallerProvided,
+        confidence_signals: None,
+        confidence_decayed_at: None,
+        version: 1,
+        ..Memory::default()
+    };
+    store.store(&ctx, &mem).await.expect("seed");
+    let after_seed = store.get(&ctx, &mem.id).await.expect("get after seed");
+    assert_eq!(
+        after_seed.version, 1,
+        "#1024 sqlite: fresh upsert MUST land at version=1"
+    );
+
+    let patch1 = ai_memory::store::UpdatePatch {
+        content: Some("first update".to_string()),
+        ..ai_memory::store::UpdatePatch::default()
+    };
+    store
+        .update(&ctx, &mem.id, patch1)
+        .await
+        .expect("trait update #1");
+    let after_1 = store.get(&ctx, &mem.id).await.expect("get #1");
+    assert_eq!(
+        after_1.version, 2,
+        "#1024 sqlite: first trait update MUST bump version 1 → 2; got {}",
+        after_1.version
+    );
+
+    let patch2 = ai_memory::store::UpdatePatch {
+        content: Some("second update".to_string()),
+        ..ai_memory::store::UpdatePatch::default()
+    };
+    store
+        .update(&ctx, &mem.id, patch2)
+        .await
+        .expect("trait update #2");
+    let after_2 = store.get(&ctx, &mem.id).await.expect("get #2");
+    assert_eq!(
+        after_2.version, 3,
+        "#1024 sqlite: second trait update MUST bump version 2 → 3; got {}",
+        after_2.version
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // Postgres-side gate — compiles under `sal-postgres`; skipped on
 // `cargo test` by `#[ignore]` so this development node (which cannot
 // reach the 192.168.1.50 PG host per the documented Track-C/D
@@ -797,6 +895,52 @@ mod postgres_side {
             after_2.version, 3,
             "#1024: second trait update MUST bump version 2 → 3; got {}",
             after_2.version
+        );
+    }
+
+    /// v0.7.0 #1030 + #1110 — postgres `list_memories` MUST honor
+    /// `Filter.agent_id`. The #1030 close-comment cited a full lib
+    /// run but no specific regression test name; the `_1110` follow-
+    /// up files the sqlite-parity pin for the postgres-side branch.
+    ///
+    /// Pre-#1030 the postgres WHERE clause omitted the
+    /// `metadata->>'agent_id' = $7` filter binding so a postgres
+    /// daemon answering `GET /api/v1/memories?agent_id=ai:alice`
+    /// returned cross-agent rows. The fix added the binding; this
+    /// test pins the SAL trait `list` surface so a future postgres
+    /// refactor that drops the binding (e.g. moving `agent_id` out
+    /// of `metadata` into a dedicated column without updating the
+    /// WHERE clause) fails the regression.
+    #[tokio::test]
+    #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — Track C blocker per issue #79"]
+    async fn postgres_list_filters_by_agent_id_1030() {
+        let Some(pg) = live_pg().await else {
+            return;
+        };
+        let ctx = ai_memory::store::CallerContext::for_agent("parity-test-1110");
+        let mut m1 = sample_memory("pg-1030-alice");
+        m1.metadata = serde_json::json!({"agent_id": "ai:alice"});
+        let mut m2 = sample_memory("pg-1030-bob");
+        m2.metadata = serde_json::json!({"agent_id": "ai:bob"});
+        let _ = ai_memory::store::MemoryStore::store(&pg, &ctx, &m1).await;
+        let _ = ai_memory::store::MemoryStore::store(&pg, &ctx, &m2).await;
+
+        let filter = ai_memory::store::Filter {
+            agent_id: Some("ai:alice".into()),
+            limit: 100,
+            ..ai_memory::store::Filter::default()
+        };
+        let hits = ai_memory::store::MemoryStore::list(&pg, &ctx, &filter)
+            .await
+            .expect("list with agent_id filter");
+        assert!(
+            hits.iter().any(|m| m.id == "pg-1030-alice"),
+            "#1030: alice row must be present in agent_id=ai:alice filter result"
+        );
+        assert!(
+            hits.iter().all(|m| m.id != "pg-1030-bob"),
+            "#1030: bob row must NOT appear under agent_id=ai:alice filter; \
+             postgres WHERE clause must bind the agent_id parameter"
         );
     }
 
