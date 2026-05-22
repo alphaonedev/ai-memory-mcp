@@ -69,7 +69,15 @@ async fn build_postgres_app_state(url: &str) -> AppState {
         autonomous_hooks: false,
         recall_scope: Arc::new(None),
         deferred_audit_queue: Arc::new(None),
-        admin_agent_ids: Arc::new(Vec::new()),
+        // #1133: the test agent ("ai:ext-test") must be on the admin
+        // allowlist so the post-#946/#957/#1027 admin-gated routes
+        // (/api/v1/stats, /agents, /namespaces, /archive, /taxonomy)
+        // admit the test calls. Empty allowlist worked pre-admin-gate
+        // sweep; today every admin-gated handler under
+        // src/handlers/admin.rs returns 403 to non-allowlisted callers,
+        // and the 5 wire-shape tests in this file specifically exercise
+        // those routes for envelope-parity assertions.
+        admin_agent_ids: Arc::new(vec!["ai:ext-test".to_string()]),
         rule_cache: std::sync::Arc::new(ai_memory::governance::rule_cache::RuleCache::new()),
     }
 }
