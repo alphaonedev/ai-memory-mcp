@@ -605,6 +605,30 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_signed_events_sequence ON signed_events (s
 -- for the design rationale (failure-split between race-on-UNIQUE
 -- requeue and DLQ-land; non-append-only invariant carve-out).
 
+-- v0.7.0 #1044 (Agent-3 #9) — `timestamp` and `failed_at` are
+-- intentionally TEXT (not TIMESTAMPTZ) to match the SQLite-shape
+-- contract this DLQ inherits from `migrations/sqlite/0034_v07_signed_events_dlq.sql`.
+-- The drainer's `SqliteSignedEventsSink::append` writes
+-- `chrono::Utc::now().to_rfc3339()` (a String) regardless of
+-- backend; storing as TEXT keeps the insert binding identical
+-- across sqlite + postgres.
+--
+-- The cost: operators running ad-hoc DLQ queries on the postgres
+-- side cannot use TIMESTAMPTZ-only functions / intervals / ranged
+-- indexes without an explicit cast (`failed_at::TIMESTAMPTZ`).
+-- That's a query-side ergonomics gap, not a correctness gap; the
+-- DLQ is a low-traffic operational surface (signed_events_dlq
+-- entries indicate audit-chain pressure, NOT steady-state load)
+-- and the per-query cast cost is dominated by the cardinality of
+-- the DLQ itself.
+--
+-- A future v0.8 ALTER COLUMN migration may convert these to
+-- TIMESTAMPTZ with `USING ... ::TIMESTAMPTZ`; deferred from v0.7.0
+-- to avoid bumping CURRENT_SCHEMA_VERSION for a cosmetic
+-- column-type change. Tracking under follow-up; sister table
+-- `federation_push_dlq` (line ~625 below) uses TIMESTAMPTZ because
+-- that path was authored directly on the postgres side at v48 and
+-- never carried the sqlite-shape compatibility constraint.
 CREATE TABLE IF NOT EXISTS signed_events_dlq (
     dlq_id          BIGSERIAL PRIMARY KEY,
     id              TEXT NOT NULL,

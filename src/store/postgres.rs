@@ -1025,6 +1025,17 @@ impl PostgresStore {
         if current_version < 15 {
             self.migrate_v15().await?;
         }
+        // v0.7.0 #1045 (Agent-3 #10) — v16 is intentionally skipped
+        // on postgres. SQLite's v16 is `0016_v07_transcripts.sql`
+        // (Form-5 conversation-transcript substrate). The postgres
+        // adapter inlines the `transcripts` table directly into the
+        // fresh-install schema at `src/store/postgres_schema.sql`
+        // so an upgraded postgres install lands the table via the
+        // schema-init path rather than an incremental ALTER ladder.
+        // Skipping the v16 arm keeps the ladder numbering aligned
+        // with sqlite (so `CURRENT_SCHEMA_VERSION = N` stays the
+        // same value on both backends) without re-applying the
+        // transcripts DDL on already-initialised postgres deployments.
         if current_version < 17 {
             self.migrate_v17().await?;
         }
