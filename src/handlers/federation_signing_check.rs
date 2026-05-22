@@ -124,13 +124,12 @@ pub(super) async fn sync_push_via_store(
                         max = q.max,
                         "sync_push (postgres): per-agent quota exceeded"
                     );
+                    // v0.7.0 #1099 (SR-1 #4, HIGH) — sign with daemon
+                    // key on the postgres-path quota-refusal audit row.
                     let _ = crate::signed_events::append_signed_event(
                         &conn.0,
-                        &crate::signed_events::SignedEvent {
-                            id: uuid::Uuid::new_v4().to_string(),
-                            agent_id: attribute_agent.clone(),
-                            event_type: "federation.quota_refused".to_string(),
-                            payload_hash: crate::signed_events::payload_hash(
+                        &crate::signed_events::SignedEvent::with_daemon_signature(
+                            crate::signed_events::payload_hash(
                                 format!(
                                     "peer={} agent={} limit={} current={} max={}",
                                     body.sender_agent_id,
@@ -141,11 +140,10 @@ pub(super) async fn sync_push_via_store(
                                 )
                                 .as_bytes(),
                             ),
-                            signature: None,
-                            attest_level: "unsigned".to_string(),
-                            timestamp: chrono::Utc::now().to_rfc3339(),
-                            ..crate::signed_events::SignedEvent::default()
-                        },
+                            attribute_agent.clone(),
+                            "federation.quota_refused".to_string(),
+                            chrono::Utc::now().to_rfc3339(),
+                        ),
                     );
                     quota_refused += 1;
                     if first_quota_refusal.is_none() {
@@ -565,6 +563,33 @@ pub(super) fn verify_signature_or_reject(
             )
         }
         (None, None) => {
+            // v0.7.0 #1088 (SR-1 #3, MEDIUM) — fail-CLOSED on
+            // unenrolled-peer attribution spoofing when the operator
+            // opts in via `AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT=1`.
+            // Default-off at v0.7.0 so existing zero-config peers keep
+            // working; v0.8 will flip the secure default. Companion
+            // env var to `AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS` (the
+            // permissive escape hatch on the SAME arm post-#1056).
+            if require_peer_enrollment_enabled() {
+                tracing::warn!(
+                    target: "federation::signing",
+                    peer_id = %peer_id.unwrap_or(""),
+                    "sync_push: refusing unenrolled peer-id (AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT=1 #1088)"
+                );
+                return Some(
+                    (
+                        StatusCode::UNAUTHORIZED,
+                        Json(json!({
+                            "error": "peer_not_enrolled",
+                            "note": "AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT=1 refuses \
+                                     X-Peer-Id without an enrolled key (#1088). Enroll \
+                                     the peer's Ed25519 key via the operator workflow, \
+                                     or unset the env var to revert to permissive.",
+                        })),
+                    )
+                        .into_response(),
+                );
+            }
             tracing::warn!(
                 target: "federation::signing",
                 peer_id = %peer_id.unwrap_or(""),
@@ -573,6 +598,19 @@ pub(super) fn verify_signature_or_reject(
             None
         }
     }
+}
+
+/// v0.7.0 #1088 — `true` when the operator has opted into the
+/// stricter zero-config federation posture by setting
+/// `AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT=1`. Returns `false`
+/// (default permissive) otherwise. Honored by both
+/// `verify_signature_or_reject` and `verify_get_signature_or_reject`
+/// so the `(None, None)` arm fails closed on both surfaces when the
+/// operator enables it.
+fn require_peer_enrollment_enabled() -> bool {
+    std::env::var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -793,6 +831,27 @@ pub(super) fn verify_get_signature_or_reject(
             )
         }
         (None, None) => {
+            // v0.7.0 #1088 — same fail-CLOSED arm as
+            // `verify_signature_or_reject`. Honors the operator
+            // opt-in via `AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT=1`.
+            if require_peer_enrollment_enabled() {
+                tracing::warn!(
+                    target: "federation::signing",
+                    peer_id = %peer_id.unwrap_or(""),
+                    "sync_since: refusing unenrolled peer-id (AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT=1 #1088)"
+                );
+                return Some(
+                    (
+                        StatusCode::UNAUTHORIZED,
+                        Json(json!({
+                            "error": "peer_not_enrolled",
+                            "note": "AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT=1 refuses \
+                                     X-Peer-Id without an enrolled key on /sync/since (#1088).",
+                        })),
+                    )
+                        .into_response(),
+                );
+            }
             tracing::warn!(
                 target: "federation::signing",
                 peer_id = %peer_id.unwrap_or(""),

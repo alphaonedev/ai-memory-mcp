@@ -125,6 +125,49 @@ pub struct SignedEvent {
     pub sequence: i64,
 }
 
+impl SignedEvent {
+    /// v0.7.0 #1099 (SR-1 #4, HIGH) — build a `SignedEvent` that
+    /// consults the process-wide daemon audit signing key (installed
+    /// at boot via [`crate::governance::audit::init`]) and applies it
+    /// to `payload_hash`. When a key is installed, the returned row
+    /// carries `signature: Some(sig_bytes)` + `attest_level:
+    /// "daemon_signed"`; when no key is installed, falls back to
+    /// `signature: None, attest_level: "unsigned"`.
+    ///
+    /// Homogenises every production audit-row writer (pending_action
+    /// approve/reject/timeout, federation.quota_refused on both
+    /// sqlite + postgres paths, governance.check) so a downstream
+    /// auditor sees per-row signatures matching the daemon's
+    /// `VerifyingKey` and the cross-row chain head together.
+    ///
+    /// The other chain columns (`prev_hash`, `sequence`) are left at
+    /// their defaults — [`append_signed_event`] fills them at INSERT
+    /// time. Callers MUST NOT pre-populate them.
+    #[must_use]
+    pub fn with_daemon_signature(
+        payload_hash: Vec<u8>,
+        agent_id: String,
+        event_type: String,
+        timestamp: String,
+    ) -> Self {
+        let (signature, attest_level) =
+            match crate::governance::audit::try_sign_audit_payload(&payload_hash) {
+                Some((sig_bytes, tag)) => (Some(sig_bytes), tag.to_string()),
+                None => (None, "unsigned".to_string()),
+            };
+        SignedEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            agent_id,
+            event_type,
+            payload_hash,
+            signature,
+            attest_level,
+            timestamp,
+            ..SignedEvent::default()
+        }
+    }
+}
+
 /// All-zeros 32-byte digest used as `prev_hash` for the first row.
 pub const ZERO_HASH: [u8; 32] = [0u8; 32];
 
@@ -349,7 +392,16 @@ pub fn verify_chain(
 
     let mut rows_checked: u64 = 0;
     let mut chain_break: Option<i64> = None;
-    let signature_failures: Vec<i64> = Vec::new();
+    // v0.7.0 #1071 (SR-2 #1, HIGH) — actually walk Ed25519 signatures.
+    // Resolved once outside the loop so we don't re-lock the OnceLock
+    // per row. Returns `None` when the daemon process has no audit
+    // signing key installed (i.e. `governance::audit::init` was called
+    // with `signing_key: None`); in that case we record no signature
+    // failures because there is no key to verify against — the
+    // verifier is structure-only on an unsigned daemon.
+    let verifier: Option<ed25519_dalek::VerifyingKey> =
+        crate::governance::audit::resolve_daemon_verifying_key();
+    let mut signature_failures: Vec<i64> = Vec::new();
 
     let mut expected_seq = lower + 1;
     let mut prev_canonical_hash: [u8; 32] = ZERO_HASH;
@@ -423,6 +475,32 @@ pub fn verify_chain(
         if event.prev_hash.len() != 32 || event.prev_hash != prev_canonical_hash {
             if chain_break.is_none() {
                 chain_break = Some(event.sequence);
+            }
+        }
+
+        // (3) v0.7.0 #1071 — per-row Ed25519 signature verification.
+        // Only fires when a verifier is resolvable AND the row has a
+        // signature blob attached (rows written before #1035 / #1099
+        // and the legacy `attest_level == "unsigned"` rows that ship
+        // by design have `signature: None` and are skipped). On
+        // shape mismatch (signature blob not 64 bytes) or
+        // `verify_strict` failure, push the breaking sequence onto
+        // `signature_failures` and continue the walk — a signature
+        // failure is disjoint from a chain break by design (per-row
+        // forgery vs. across-row substrate tamper).
+        if let (Some(vk), Some(sig_bytes)) = (verifier.as_ref(), event.signature.as_ref()) {
+            let sig_array: Option<[u8; 64]> = sig_bytes.as_slice().try_into().ok();
+            match sig_array {
+                Some(arr) => {
+                    let sig = ed25519_dalek::Signature::from_bytes(&arr);
+                    if vk.verify_strict(&event.payload_hash, &sig).is_err() {
+                        signature_failures.push(event.sequence);
+                    }
+                }
+                None => {
+                    // Malformed signature length — record as failure.
+                    signature_failures.push(event.sequence);
+                }
             }
         }
 
