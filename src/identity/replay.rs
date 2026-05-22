@@ -406,6 +406,19 @@ use std::collections::HashMap;
 /// v0.7.0 #922 — per-peer LRU bound.
 pub const FEDERATION_NONCE_CAPACITY_PER_PEER: usize = 10_000;
 
+/// v0.7.0 #1038 (Agent-5 #5) — outer-HashMap LRU bound on the
+/// `FederationNonceCache`. Each enrolled peer's slot costs
+/// ~320 KB (10k × 32-byte fingerprints in both the HashSet and
+/// the VecDeque); a long-lived daemon that rotates peers (operator
+/// adds + removes peers in `AI_MEMORY_FED_PEER_ATTESTATION`)
+/// leaves old peer-id slots resident forever pre-#1038. The
+/// ceiling caps the worst-case footprint at ~320 KB × 1024 =
+/// ~320 MB — well within process budget for any realistic
+/// deployment (operator-scale is ~10-100 peers; we leave 10× headroom).
+/// Eviction picks the least-recently-touched peer when a new peer
+/// pushes past the ceiling.
+pub const FEDERATION_NONCE_MAX_PEERS: usize = 1024;
+
 /// v0.7.0 #1033 (federation parity) — same O(1) `HashSet + VecDeque`
 /// shape as `ReplayCacheInner`, applied per-peer so each peer's
 /// freshness check runs in O(1) instead of the pre-#1033 O(N) linear
@@ -414,16 +427,33 @@ pub const FEDERATION_NONCE_CAPACITY_PER_PEER: usize = 10_000;
 /// OWN entries — a weaker threat than the un-partitioned
 /// ReplayCache, but the perf gain matters under sustained federation
 /// load.
+///
+/// v0.7.0 #1038 — `last_touch` tracks the monotonic counter at the
+/// last `record_and_check` for this peer. The outer LRU evicts the
+/// slot with the smallest `last_touch` when at the
+/// `FEDERATION_NONCE_MAX_PEERS` ceiling. Using a u64 counter
+/// instead of `Instant` keeps the comparison O(1) and the eviction
+/// path lock-free of clock reads.
 #[derive(Debug, Default)]
 struct PeerNonceSlot {
     seen: HashSet<[u8; 32]>,
     order: VecDeque<[u8; 32]>,
+    last_touch: u64,
 }
 
 /// v0.7.0 #922 — per-peer bounded FIFO cache of `(peer_id, nonce)`.
 #[derive(Debug, Default)]
 pub struct FederationNonceCache {
     inner: Mutex<HashMap<String, PeerNonceSlot>>,
+    /// v0.7.0 #1038 — monotonic touch counter. Advances on every
+    /// `record_and_check`; each peer slot stamps its `last_touch`
+    /// with the value at insert/update time. The outer LRU
+    /// eviction picks the slot with the smallest value.
+    touch_counter: std::sync::atomic::AtomicU64,
+    /// v0.7.0 #1038 — cumulative count of peer-slot evictions
+    /// since boot. Non-zero values mean the outer LRU dropped a
+    /// peer to make room — operator-visible via `peer_evictions_since_boot()`.
+    peer_evictions: std::sync::atomic::AtomicU64,
 }
 
 impl FederationNonceCache {
@@ -435,12 +465,39 @@ impl FederationNonceCache {
 
     /// Check + record `(peer_id, nonce)`.
     pub fn record_and_check(&self, peer_id: &str, nonce: &str) -> ReplayDecision {
+        use std::sync::atomic::Ordering;
         let fp = Self::fingerprint(peer_id, nonce);
         let mut guard = match self.inner.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
+        // v0.7.0 #1038 — bound the outer HashMap to
+        // `FEDERATION_NONCE_MAX_PEERS`. When the incoming peer is a
+        // NEW entry AND the map is at the ceiling, evict the
+        // least-recently-touched peer (LRU) before inserting.
+        // Skip the eviction when the peer already exists (re-touch
+        // is free).
+        if !guard.contains_key(peer_id) && guard.len() >= FEDERATION_NONCE_MAX_PEERS {
+            // Find the smallest `last_touch` to pick the LRU peer.
+            if let Some((evict_id, _)) = guard
+                .iter()
+                .min_by_key(|(_, s)| s.last_touch)
+                .map(|(k, s)| (k.clone(), s.last_touch))
+            {
+                guard.remove(&evict_id);
+                self.peer_evictions.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    target: "ai_memory::identity::replay",
+                    evicted_peer = %evict_id,
+                    "FederationNonceCache: at peer ceiling ({}); evicted LRU peer slot to make \
+                     room. Operator-visible via peer_evictions_since_boot() (#1038).",
+                    FEDERATION_NONCE_MAX_PEERS,
+                );
+            }
+        }
+        let touch = self.touch_counter.fetch_add(1, Ordering::Relaxed);
         let slot = guard.entry(peer_id.to_string()).or_default();
+        slot.last_touch = touch;
         // v0.7.0 #1033 — O(1) HashSet membership replaces O(N) scan.
         if slot.seen.contains(&fp) {
             return ReplayDecision::Replay;
@@ -454,6 +511,16 @@ impl FederationNonceCache {
         slot.order.push_back(fp);
         slot.seen.insert(fp);
         ReplayDecision::Fresh
+    }
+
+    /// v0.7.0 #1038 — cumulative number of peer-slot evictions
+    /// (outer LRU). Non-zero means peer churn caused the outer
+    /// HashMap to hit `FEDERATION_NONCE_MAX_PEERS` and drop an
+    /// older peer's slot. Operators page on sustained growth.
+    #[must_use]
+    pub fn peer_evictions_since_boot(&self) -> u64 {
+        self.peer_evictions
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Distinct peers with at least one cached fingerprint.
@@ -524,5 +591,82 @@ mod federation_nonce_cache_tests {
         assert_eq!(cache.len_for_peer("p"), FEDERATION_NONCE_CAPACITY_PER_PEER);
         assert_eq!(cache.record_and_check("p", "n-new"), ReplayDecision::Fresh);
         assert_eq!(cache.record_and_check("p", "n-0"), ReplayDecision::Fresh);
+    }
+
+    #[test]
+    fn peer_count_evictions_counter_starts_at_zero_1038() {
+        // v0.7.0 #1038 — fresh cache reports zero peer-slot evictions.
+        let cache = FederationNonceCache::new();
+        assert_eq!(cache.peer_evictions_since_boot(), 0);
+        // Insert below the peer ceiling — no eviction.
+        for i in 0..32 {
+            let _ = cache.record_and_check(&format!("peer-{i}"), "n");
+        }
+        assert_eq!(cache.peer_count(), 32);
+        assert_eq!(cache.peer_evictions_since_boot(), 0);
+    }
+
+    #[test]
+    fn outer_lru_evicts_least_recently_touched_at_ceiling_1038() {
+        // v0.7.0 #1038 (Agent-5 #5) — when the FederationNonceCache
+        // HashMap hits FEDERATION_NONCE_MAX_PEERS, a NEW peer's
+        // insert evicts the least-recently-touched peer slot.
+        // Pre-#1038 the HashMap was unbounded; a daemon that rotated
+        // peers (operator config churn) accumulated ~320 KB per
+        // ever-enrolled peer indefinitely.
+        let cache = FederationNonceCache::new();
+        // Fill to exactly the peer ceiling.
+        for i in 0..FEDERATION_NONCE_MAX_PEERS {
+            let _ = cache.record_and_check(&format!("peer-{i}"), "n");
+        }
+        assert_eq!(cache.peer_count(), FEDERATION_NONCE_MAX_PEERS);
+        assert_eq!(cache.peer_evictions_since_boot(), 0);
+        // Touch peer-0 to make it the most-recently-touched
+        // (advances its last_touch); peer-1 is now the LRU
+        // candidate.
+        let _ = cache.record_and_check("peer-0", "n2");
+        // Push a NEW peer past the ceiling — peer-1 (the LRU)
+        // should be evicted.
+        assert_eq!(
+            cache.record_and_check("peer-new", "n"),
+            ReplayDecision::Fresh
+        );
+        assert_eq!(
+            cache.peer_count(),
+            FEDERATION_NONCE_MAX_PEERS,
+            "#1038: at ceiling the outer HashMap must stay at FEDERATION_NONCE_MAX_PEERS"
+        );
+        assert_eq!(
+            cache.peer_evictions_since_boot(),
+            1,
+            "#1038: exactly one peer-slot eviction must have fired"
+        );
+        // peer-1 (LRU) is gone — recording for it again returns
+        // Fresh (the cache forgot the prior fingerprints).
+        assert_eq!(cache.len_for_peer("peer-1"), 0);
+        // peer-0 (recently touched) is still present.
+        assert!(cache.len_for_peer("peer-0") > 0);
+    }
+
+    #[test]
+    fn re_touch_existing_peer_does_not_trigger_eviction_1038() {
+        // v0.7.0 #1038 — re-touching an existing peer at the
+        // ceiling MUST NOT trigger an eviction (LRU bookkeeping
+        // only fires on NEW peer inserts past the ceiling).
+        let cache = FederationNonceCache::new();
+        for i in 0..FEDERATION_NONCE_MAX_PEERS {
+            let _ = cache.record_and_check(&format!("peer-{i}"), "n");
+        }
+        let before = cache.peer_evictions_since_boot();
+        // Re-touch every existing peer — no NEW peer inserts.
+        for i in 0..FEDERATION_NONCE_MAX_PEERS {
+            let _ = cache.record_and_check(&format!("peer-{i}"), &format!("n2-{i}"));
+        }
+        assert_eq!(
+            cache.peer_evictions_since_boot(),
+            before,
+            "#1038: re-touching existing peers MUST NOT trigger LRU eviction"
+        );
+        assert_eq!(cache.peer_count(), FEDERATION_NONCE_MAX_PEERS);
     }
 }
