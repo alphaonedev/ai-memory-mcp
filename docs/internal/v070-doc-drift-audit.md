@@ -80,15 +80,129 @@ appended after push.
 
 ## Issues filed (with numbers + titles)
 
-See § "Issues filed" below — populated after fixes are pushed.
+- **[#1122](https://github.com/alphaonedev/ai-memory-mcp/issues/1122)** — `docs(drift): docs/index.html has '56 CLI subcommands' — code shows 57 (sal-postgres) / 55 (default-build)`. Filed because `docs/index.html` is owned by the DOC-A agent in this release-gate session and the DOC-F sweep can't touch it without creating a merge conflict.
+- **[#1123](https://github.com/alphaonedev/ai-memory-mcp/issues/1123)** — `docs(drift): CLAUDE.md says '56 CLI subcommands' but code shows 57 (sal-postgres) / 55 (default-build)`. Filed because CLAUDE.md updates are normally operator-authored and have their own cadence; the DOC-F sweep flags but does not edit.
 
 ## Verification re-run output
 
-Populated after each fix cluster.
+After each fix-cluster push, the same grep that surfaced the drift was re-run; zero residual matches across the in-scope set. Final post-batch-5 grep:
+
+```
+grep -rn -E "\b71 (MCP|tool|tools|advertised|entries)\b|\b72 (MCP|tool|tools)\b|\b70 callable\b" \
+  docs/ README.md CHANGELOG.md SECURITY.md CONTRIBUTING.md PERFORMANCE.md ROADMAP.md \
+  | grep -vE "(test-campaign|v070-truthfulness|v070-security-review|v070-feature-inventory|v070-review-synthesis|/v0.6.4/|/v0.7.1/|audit/|migration-v064-to-v070|v070-doc-drift-audit|v070-ship-readiness-adrs|initiative-9-v0.8|inference-attestation|mtp-bench|v0.7-vs-v0.8|roadmap-audit|rfc-attested-cortex|/v0.7.0/release-notes|/V0.7-EPIC|/v0.7-nhi-prompts|/CHANGELOG.md|POST-SHIP|schema-compaction|/v070-accepted-debt)"
+```
+
+Returns zero matches outside the historical RFC/audit/test-campaign corpus, where the historical numbers are preserved with a forward note in the lead paragraph (see `docs/v0.7.0/rfc-nhi-viewpoint.md` for the canonical pattern).
+
+The CLI-subcommand count is 57 (sal-postgres) / 55 (default-build) everywhere DOC-F can edit. Two sites still read 56 — `docs/index.html` (DOC-A territory, issue #1122) and `CLAUDE.md` (operator-cadence, issue #1123). Both are tracked.
 
 ## Findings ledger
 
-Populated by the auditor as each file is touched. Format:
+The full grep-resolved drift surface across the five fix-clusters, by severity. CRITICAL = wrong load-bearing number (badge, surface count, schema version). HIGH = wrong feature description (e.g. "four variants" when the truth is six). MEDIUM = wrong supporting reference (historical schema-bump number, file-name counter mismatch with logical schema version). LOW = cosmetic / phrasing.
+
+### CRITICAL — wrong load-bearing numbers
+
+| File:line | Before | After | Fix commit |
+|---|---|---|---|
+| `README.md:136` | "CLI (56 subcommands at v0.7.0)" | "CLI (57 subcommands at v0.7.0 with --features sal-postgres; 55 in the default build)" | `55c68ad2f` |
+| `README.md:598` | "complete CLI (56 subcommands at v0.7.0)" | same shape | `55c68ad2f` |
+| `README.md:630` | "56 CLI commands" | "57 CLI subcommands at v0.7.0 with --features sal-postgres (55 in the default build)" | `55c68ad2f` |
+| `README.md:909` | "56 top-level subcommands at v0.7.0" | qualified 57/55 | `55c68ad2f` |
+| `CHANGELOG.md:1362` | "71 MCP tools at full profile (Family::Power: 22)" | "73 MCP tools at full profile (Family::Power: 23 at v0.7.0 release HEAD)" | `55c68ad2f` |
+| `CHANGELOG.md:1362` | "sqlite v39 / postgres v38" | "schema v49 single logical version both backends" | `55c68ad2f` |
+| `CHANGELOG.md:1640-1641` | "sqlite … `CURRENT_SCHEMA_VERSION = 39`" + "postgres … `CURRENT_SCHEMA_VERSION = 38`" | full ladder v34 → v49 with `CURRENT_SCHEMA_VERSION = 49` on both | `7cd6b36ab` |
+| `CHANGELOG.md:1645` | "Full profile: 71 tools … Family::Power: 22 tools" | "Full profile: 73 tools at release HEAD … Family::Power: 23" | `7cd6b36ab` |
+| `CHANGELOG.md:422` | "duplicated across 50+ HTTP routes, 73 MCP tools, and 55 CLI subcommands" | "73 HTTP routes, 73 MCP tools, and 57 CLI subcommands (55 in the default build)" | `55c68ad2f` |
+| `docs/USER_GUIDE.md:77` | "71 entries at --profile full (70 callable)" | 73 / 72 | `55c68ad2f` |
+| `docs/CLI_REFERENCE.md:210` | "71 entries (70 callable memory tools + bootstrap)" | 73 / 72 | `55c68ad2f` |
+| `docs/INSTALL.md:129` | "71 advertised entries — 70 callable memory tools + bootstrap" | 73 / 72 | `55c68ad2f` |
+| `docs/ADMIN_GUIDE.md:456` | "71 advertised entries at v0.7.0 (70 callable)" | 73 / 72 | `55c68ad2f` |
+| `docs/ADMIN_GUIDE.md:1089` | "72 routes at v0.7.0" + wrong count recipe | 73 routes + correct count recipe | `55c68ad2f` |
+| `docs/DEVELOPER_GUIDE.md:9` | "72 routes at v0.7.0" | 73 | `55c68ad2f` |
+| `docs/DEVELOPER_GUIDE.md:16` | "~50 subcommands" | "57 subcommands … 55 in the default build" | `55c68ad2f` |
+| `docs/DEVELOPER_GUIDE.md:18` | "Memory (25 fields)" | "Memory (26 fields)" | `55c68ad2f` |
+| `docs/DEVELOPER_GUIDE.md:64` | "~50 top-level subcommands" | "57 with --features sal-postgres … 55 default-build" | `55c68ad2f` |
+| `docs/DEVELOPER_GUIDE.md:76` | "25 fields at v0.7.0" | "26 fields at v0.7.0" + version-column callout | `55c68ad2f` |
+| `docs/DEVELOPER_GUIDE.md:86` | "71 advertised entries (70 callable)" | 73 / 72 | `55c68ad2f` |
+| `docs/DEVELOPER_GUIDE.md:537` | "72 routes" + wrong count recipe | 73 + corrected recipe | `55c68ad2f` |
+| `docs/DEVELOPER_GUIDE.md:808` | "72 routes" | 73 | `55c68ad2f` |
+| `docs/DEVELOPER_GUIDE.md:816` | "71 entries (70 callable)" | 73 / 72 | `55c68ad2f` |
+| `docs/GLOSSARY.md:138-139` | "71 advertised entries … 70 callable" | 73 / 72 | `55c68ad2f` |
+| `docs/GLOSSARY.md:149` | "25-field record at v0.7.0" | "26-field record at v0.7.0" + version-column callout | `55c68ad2f` |
+| `docs/evidence.html:192` | "MCP tools advertised: 71 (70 callable + bootstrap)" | 73 / 72 | `4a2d507f8` |
+| `docs/evidence.html:194` | "HTTP routes: 72" | 73 + correct count recipe | `4a2d507f8` |
+| `docs/evidence.html:195` | "CLI subcommands: ~50" | "57 / 55" qualified | `4a2d507f8` |
+| `docs/evidence.html:196` | "Schema version (sqlite): v43" | "v49 single logical version both backends" | `4a2d507f8` |
+| `docs/evidence.html:198` | "Memory struct fields: 25" | 26 | `4a2d507f8` |
+| `docs/evidence.html:234` | "71 MCP tools … 72 HTTP routes … ~50 CLI subcommands" | 73 / 73 / 57 qualified | `4a2d507f8` |
+| `docs/architecture.svg:94` | "JSON-RPC · 71 tools" | "JSON-RPC · 73 tools" | `4a2d507f8` |
+| `docs/architecture.svg:98` | "REST · 72 routes · :9077" | "REST · 73 routes · :9077" | `4a2d507f8` |
+| `docs/architecture.svg:102` | "~50 subcommands · scriptable" | "57 subcommands · scriptable" | `4a2d507f8` |
+| `docs/architecture.svg:133` | "storage/ · schema v43" | "storage/ · schema v49" | `4a2d507f8` |
+| `docs/architectures.html:392` | "73 advertised … 72 HTTP routes" | "73 / 73" | `4a2d507f8` |
+| `docs/architectures-t1.html:411-414` | "~50 subcommands … 71 advertised entries … 72 /api/v1/* routes … schema v15" | qualified 57/55, 73/72, 73, "v49 per v0.7.0 release notes" | `4a2d507f8` |
+| `docs/audience/decision-maker.html:132` | "72 HTTP routes, 55 CLI subcommands" | "73 HTTP routes, 57 CLI subcommands (with --features sal-postgres; 55 in the default build)" | `4a2d507f8` |
+| `docs/audience/decision-maker.html:197` | "schema v43" | "schema v49" | `4a2d507f8` |
+| `docs/audience/developer.html:112` | "72 routes at /api/v1/" | 73 | `4a2d507f8` |
+| `docs/audience/developer.html:121` | "55 subcommands" | "57 subcommands at --features sal-postgres (55 default-build)" | `4a2d507f8` |
+| `docs/audience/developer.html:266-267` | "72 routes / 55 subcommands" | "73 / 57" | `4a2d507f8` |
+| `docs/feature-matrix.html:15` | meta description "73 MCP, 73 HTTP, 56 CLI subcommands" | "57 CLI subcommands (55 default-build)" | `4a2d507f8` |
+| `docs/feature-matrix.html:248-250` | "73 / 72 / 55" pill row | "73 / 73 / 57" | `4a2d507f8` |
+| `docs/feature-matrix.html:298` | "71 MCP Tools" eyebrow | 73 | `4a2d507f8` |
+| `docs/feature-matrix.html:644` | "56 CLI Subcommands" eyebrow | "57 / 55 default-build" | `4a2d507f8` |
+| `docs/integrations.html:159` | "all 71 tools at --profile full" | 73 | `4a2d507f8` |
+| `docs/integrations.html:197` | "all 71 tools" | 73 | `4a2d507f8` |
+| `docs/integrations.html:408` | "71 advertised entries" | 73 | `4a2d507f8` |
+| `docs/integrations.html:445` | "all 71 tool definitions" | 73 | `4a2d507f8` |
+| `docs/essays/brass-tacks-3-why.html:82` | "25-field Memory struct" | 26 | `4a2d507f8` |
+| `docs/essays/brass-tacks-3-why.html:139` | "71 MCP entries, 72 HTTP routes, ~50 CLI subcommands" | "73 MCP entries, 73 HTTP routes, 57 (sal-postgres) / 55 (default-build) CLI subcommands" | `4a2d507f8` |
+| `docs/essays/brass-tacks-3-why.html:140` | "Schema version v43, 25-field Memory" | "Schema version v49, 26-field Memory" | `4a2d507f8` |
+| `docs/v0.7.0/release-notes.md:474` | "Schema ladder advances to sqlite v47 / postgres v29" | "schema ladder reaches v49 on both backends … #933 v48 federation_push_dlq + #1025 v49 archived_memories 14-column carry" | `7cd6b36ab` |
+| `docs/v0.7.0/release-notes.md:1216` | "71 MCP tools, 28 net-new … 8 new HTTP routes, 20 sqlite + 10 postgres new migrations" | "73 MCP tools at release HEAD … 73 HTTP routes total … 32 sqlite migrations on disk + the in-process v35-v49 arms" | `7cd6b36ab` |
+| `docs/internal/v070-ship-readiness-final.md:22` | "71 MCP tools, 17 net-new env vars, 8 new HTTP routes" | "73 MCP tools at release HEAD, 17 net-new env vars, 73 HTTP routes total" | `7cd6b36ab` |
+| `docs/internal/v070-ship-readiness-final.md:41-47` | "MCP tool count: 71 total" + "sqlite v41, postgres v40" | "73 total" + "v49 on both backends at release HEAD" + per-family count refresh (Power 22→23, Meta 5→6) | `7cd6b36ab` |
+| `docs/internal/v070-ship-readiness-final.md:131-133` | tool baseline 71, schema sqlite v41 / postgres v40 | 73, v49 single-logical | `7cd6b36ab` |
+| `docs/a2a-harness-integration.md:25-31` | "71 MCP tools, 72 HTTP routes, Schema v43/v41, 25-field Memory" | "73 MCP tools, 73 HTTP routes, Schema v49, 26-field Memory" | `7cd6b36ab` |
+| `docs/batman-active-mode.md:50` | "--profile full exposes all 71 tools" | 73 | `7cd6b36ab` |
+| `docs/BASELINE-v0.6.3.1.md:75` | forward-note "71 entries (70 callable)" | 73 / 72 | `7cd6b36ab` |
+| `docs/v0.7/v0.7-nhi-prompts.md:37-38` | template string "currently 71 at v0.7.0 — 70 callable memory tools" | 73 / 72 | `7cd6b36ab` |
+| `docs/API_REFERENCE.md:763` | "71 at full, 7 at core" | "73 at full, 7 at core" | `ce1aee327` |
+| `docs/API_REFERENCE.md:765-767` | "Total HTTP surface … ~42 routes" + wrong count recipe | "73 distinct route paths" + correct count recipe | `ce1aee327` |
+| `docs/API_REFERENCE.md:784-785` | "canonical 71-tool full inventory" | "canonical 73-tool full inventory" + corrected count recipe | `ce1aee327` |
+| `docs/knowledge-graph.html:12` | meta "v0.6.3.1 KG … memory_links with 4 relations" | "v0.7.0 KG … memory_links with 6 relations" + named list | `ce1aee327` |
+| `docs/knowledge-graph.html:268-292` | "The four relations" + 4 cards | "The six relations (v0.7.0)" + 6 cards (added `reflects_on`, `derives_from`) | `ce1aee327` |
+| `docs/spec/v1.md:281` | link-relation row enumerated only 4 of 6 | full 6 with v0.7.0 provenance tags | `ce1aee327` |
+| `PERFORMANCE.md:44` | "The '71 tools serialize on a mutex' framing" | 73 (current substrate count for the audit refutation) | `7cd6b36ab` |
+
+### HIGH — wrong / incomplete feature descriptions
+
+| File:line | Before | After | Fix commit |
+|---|---|---|---|
+| `README.md:619` | link relations: "related_to, supersedes, contradicts, derived_from" (4) | full 6 with v0.7.0 provenance tags | `55c68ad2f` |
+| `docs/v0.7.0/rfc-nhi-viewpoint.md` (5 sites) | "71 tools" historical snapshot | forward-note added at L3-L13 preserving the historical-evidence-chain integrity while flagging the live count | `ce1aee327` |
+
+### MEDIUM — historic schema-version cross-references
+
+These all describe the introduction schema for a feature ("schema v36 atomisation foundation", "schema v45 Gap-1 optimistic concurrency"). The references are technically accurate as introduction-anchors. The DOC-F sweep verified each anchor matches its actual SQL migration file. No edits were necessary; the references remain accurate.
+
+| File:line | Reference | Verification |
+|---|---|---|
+| `docs/RECURSIVE_LEARNING.md:156` | "SQLite schema v29" | matches `0027_v07_memory_kind.sql` ancestry + `src/storage/migrations.rs` v29 arm |
+| `docs/signed-events-v4.md:18` | "V-4 cross-row chain columns (schema v34)" | matches `0028_v07_signed_events_chain.sql` |
+| `docs/atomisation.md:107` | "atom_of is a structural foreign key (schema v36)" | matches `0030_v07_atomisation.sql` |
+| `docs/provenance.md:57-58` | "sqlite schema v38 / postgres schema v37" | matches `0032_v07_form4_provenance.sql` (sqlite) + `0019_v07_form4_provenance.sql` (postgres) |
+| `docs/confidence-calibration.md:21` | "schema v39 sqlite / v38 postgres" | matches `0033_v07_form5_confidence_calibration.sql` (sqlite) + `0020_v07_form5_confidence_calibration.sql` (postgres) |
+| `docs/GLOSSARY.md:154` (post-fix) | "version (schema v45 Gap-1 optimistic concurrency)" | matches the v45 in-process migration arm |
+| `docs/DEVELOPER_GUIDE.md:76` (post-fix) | "version (schema v45 — Gap-1 optimistic concurrency)" | same |
+
+### LOW — cosmetic / phrasing
+
+No remaining cosmetic findings; the audit prioritised load-bearing facts.
+
+## Findings ledger format (for future audits)
+
+The format used above:
 
 ```
 <severity> | <file>:<line> | "<before>" → "<after>" | <fix commit SHA>
