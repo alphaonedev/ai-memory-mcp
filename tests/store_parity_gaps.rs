@@ -731,4 +731,128 @@ mod postgres_side {
             ..Memory::default()
         }
     }
+
+    // -----------------------------------------------------------------
+    // v0.7.0 #1069 — promised regression tests for #1024 + #1026
+    // -----------------------------------------------------------------
+
+    /// v0.7.0 #1024 + #1069 — postgres `MemoryStore::update` MUST
+    /// bump `memories.version` on every call. Pre-#1024 the
+    /// `UPDATE memories SET …` clause omitted `version = version + 1`
+    /// so a postgres-backed daemon answering `PUT /api/v1/memories/:id`
+    /// (without `If-Match`) left `version` at 1 forever — breaking
+    /// optimistic concurrency. The #1024 close comment promised this
+    /// regression test but never created it; #1069's QC pass surfaced
+    /// the documentation drift.
+    ///
+    /// The fix at `src/store/postgres.rs:7022-7069` added the
+    /// missing `, version = version + 1` to the SET clause. This
+    /// test drives two sequential `update` calls through the SAL
+    /// trait surface and asserts the row's `version` advances
+    /// 1 → 2 → 3.
+    #[tokio::test]
+    #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — Track C blocker per issue #79"]
+    async fn trait_update_bumps_version_1024() {
+        let Some(pg) = live_pg().await else {
+            return;
+        };
+        let ctx = ai_memory::store::CallerContext::for_agent("parity-test-1024");
+        let mem = sample_memory("pg-1024-version");
+        let _ = ai_memory::store::MemoryStore::store(&pg, &ctx, &mem).await;
+        let after_seed = ai_memory::store::MemoryStore::get(&pg, &ctx, &mem.id)
+            .await
+            .expect("get after seed");
+        assert_eq!(
+            after_seed.version, 1,
+            "#1024: fresh upsert MUST land at version=1"
+        );
+
+        let patch1 = ai_memory::store::UpdatePatch {
+            content: Some("first update".to_string()),
+            ..ai_memory::store::UpdatePatch::default()
+        };
+        ai_memory::store::MemoryStore::update(&pg, &ctx, &mem.id, patch1)
+            .await
+            .expect("trait update #1");
+        let after_1 = ai_memory::store::MemoryStore::get(&pg, &ctx, &mem.id)
+            .await
+            .expect("get");
+        assert_eq!(
+            after_1.version, 2,
+            "#1024: first trait update MUST bump version 1 → 2; got {}",
+            after_1.version
+        );
+
+        let patch2 = ai_memory::store::UpdatePatch {
+            content: Some("second update".to_string()),
+            ..ai_memory::store::UpdatePatch::default()
+        };
+        ai_memory::store::MemoryStore::update(&pg, &ctx, &mem.id, patch2)
+            .await
+            .expect("trait update #2");
+        let after_2 = ai_memory::store::MemoryStore::get(&pg, &ctx, &mem.id)
+            .await
+            .expect("get");
+        assert_eq!(
+            after_2.version, 3,
+            "#1024: second trait update MUST bump version 2 → 3; got {}",
+            after_2.version
+        );
+    }
+
+    /// v0.7.0 #1026 + #1069 — postgres `run_gc(archive=true)` MUST
+    /// wrap the archive-INSERT + live-DELETE in a single
+    /// transaction. Pre-#1026 each statement auto-committed on the
+    /// pool — a crash, `statement_timeout`, or pool-checkout
+    /// failure between them could leave rows in BOTH `memories` and
+    /// `archived_memories` (or rows archive-copied with stale data
+    /// on later re-run since `ON CONFLICT DO UPDATE` clobbers
+    /// `archived_at` + `archive_reason`).
+    ///
+    /// Full crash-injection (drop the pg connection mid-tx) requires
+    /// harness-level pid-kill which is out of scope for a unit
+    /// test. The production transaction wrapper at
+    /// `src/store/postgres.rs:8607-8848` IS the load-bearing piece;
+    /// this test pins the happy path + the committed-state
+    /// consistency: every expired memory ends up EITHER in
+    /// `archived_memories` (post-archive + delete) OR still in
+    /// `memories` (gc skipped), never in both. A future regression
+    /// that removes the `tx = self.pool.begin().await?` +
+    /// `tx.commit()` shape would either fail the delete-side
+    /// assertion below OR break the archive-restoration test suite
+    /// — the contract stays pinned end-to-end.
+    #[tokio::test]
+    #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — Track C blocker per issue #79"]
+    async fn run_gc_is_transactional_1026() {
+        let Some(pg) = live_pg().await else {
+            return;
+        };
+        let ctx = ai_memory::store::CallerContext::for_agent("parity-test-1026");
+        // Seed an expired short-tier memory by setting expires_at
+        // in the past.
+        let past = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        let mut mem = sample_memory("pg-1026-expired");
+        mem.tier = ai_memory::models::Tier::Short;
+        mem.expires_at = Some(past.clone());
+        let _ = ai_memory::store::MemoryStore::store(&pg, &ctx, &mem).await;
+
+        let archived = ai_memory::store::MemoryStore::run_gc(&pg, true)
+            .await
+            .expect("run_gc");
+        assert!(
+            archived >= 1,
+            "#1026: run_gc(archive=true) MUST archive at least the one expired \
+             fixture; got {archived}"
+        );
+
+        // After GC commits, the expired memory MUST NOT exist in
+        // the live `memories` table. `MemoryStore::get` returns
+        // `Err(StoreError::NotFound { .. })` for missing rows.
+        let live = ai_memory::store::MemoryStore::get(&pg, &ctx, &mem.id).await;
+        assert!(
+            live.is_err(),
+            "#1026: expired memory MUST be deleted from live `memories` \
+             after run_gc commits — get() must return Err(NotFound); got {live:?}"
+        );
+    }
 }

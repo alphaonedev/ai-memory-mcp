@@ -249,6 +249,17 @@ mod tests {
 
     #[test]
     fn refuses_filesystem_write_to_tmp() {
+        // v0.7.0 #1043 (Agent-6 #6) — acquire the forensic-sink
+        // lock alongside the pubkey guard. `run()` → `run_check`
+        // → `check_agent_action` → `emit_forensic_decision` →
+        // `record_decision` writes to the process-wide
+        // `governance::audit::SINK`. Without the lock, a sibling
+        // test in the same lib-test binary that called
+        // `audit::init` with its own tempdir could bleed decisions
+        // into our tempdir (or vice-versa). Today's lib-test
+        // scheduler keeps this benign on macOS/Linux, but the
+        // explicit lock makes the isolation invariant load-bearing.
+        let _audit_lock = crate::governance::audit::forensic_sink_test_lock().lock();
         let _no_pubkey = crate::governance::rules_store::force_no_operator_pubkey_for_test();
         let tmp = seed_rules_db();
         let mut so = Vec::<u8>::new();
@@ -273,6 +284,9 @@ mod tests {
 
     #[test]
     fn allows_filesystem_write_outside_tmp() {
+        // v0.7.0 #1043 — see comment on
+        // `refuses_filesystem_write_to_tmp` for the lock rationale.
+        let _audit_lock = crate::governance::audit::forensic_sink_test_lock().lock();
         let _no_pubkey = crate::governance::rules_store::force_no_operator_pubkey_for_test();
         let tmp = seed_rules_db();
         let mut so = Vec::<u8>::new();
@@ -295,6 +309,10 @@ mod tests {
 
     #[test]
     fn missing_required_field_errors() {
+        // v0.7.0 #1043 — even error-path tests acquire the lock so
+        // a future change that starts emitting forensic rows on the
+        // missing-field error path inherits the isolation.
+        let _audit_lock = crate::governance::audit::forensic_sink_test_lock().lock();
         let tmp = seed_rules_db();
         let mut so = Vec::<u8>::new();
         let mut se = Vec::<u8>::new();
