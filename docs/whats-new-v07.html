@@ -15,7 +15,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>What's New in v0.7.0 — attested-cortex | ai-memory</title>
-<meta name="description" content="ai-memory v0.7.0 (attested-cortex) ships capabilities v3 with pre-computed calibration strings (LLMs converge on accurate first-answer descriptions), per-agent Ed25519 attestation with an append-only signed_events audit chain, a programmable 20-event hook pipeline (subprocess JSON-stdio + daemon mode), sidechain transcripts (zstd-3 BLOBs + memory_replay), opt-in Apache AGE acceleration for Postgres KG ops, the K1/G1 namespace-inheritance fix (cutline-protected), and a real permission system replacing v0.6.x advisory governance.">
+<meta name="description" content="ai-memory v0.7.0 (attested-cortex) ships capabilities v3 with pre-computed calibration strings (LLMs converge on accurate first-answer descriptions), per-agent Ed25519 attestation with an append-only signed_events audit chain, a programmable 25-event hook pipeline (subprocess JSON-stdio + daemon mode), sidechain transcripts (zstd-3 BLOBs + memory_replay), opt-in Apache AGE acceleration for Postgres KG ops, the K1/G1 namespace-inheritance fix (cutline-protected), and a real permission system replacing v0.6.x advisory governance.">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/whats-new-v07.html">
 <style>
 :root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#6ee7ff;--p2:#ffb86b;--p3:#c8a2ff;--good:#2ea043;--warn:#ffb86b;--bad:#f85149;--prog:#c8a2ff;--accent:#6ee7ff;--green:#2ea043;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1200px}
@@ -125,7 +125,7 @@ footer a:hover{color:var(--accent)}
     <span class="badge">v0.7.0 &middot; attested-cortex &middot; in flight</span>
     <h1>More articulate.<br>Cryptographically attested.</h1>
     <p class="subtitle">
-      ai-memory v0.7.0 closes two long-standing gaps in one release. The substrate <strong>says what it can do</strong> &mdash; capabilities v3 pre-computes the calibration strings LLMs would otherwise improvise &mdash; and <strong>signs what it remembers</strong> &mdash; per-agent Ed25519 keypairs sign every memory link, with an append-only <code>signed_events</code> audit chain. Plus the K1/G1 namespace-inheritance cutline, a programmable 20-event hook pipeline, sidechain transcripts, and an opt-in Apache AGE acceleration path.
+      ai-memory v0.7.0 closes two long-standing gaps in one release. The substrate <strong>says what it can do</strong> &mdash; capabilities v3 pre-computes the calibration strings LLMs would otherwise improvise &mdash; and <strong>signs what it remembers</strong> &mdash; per-agent Ed25519 keypairs sign every memory link, with an append-only <code>signed_events</code> audit chain. Plus the K1/G1 namespace-inheritance cutline, a programmable 25-event hook pipeline, sidechain transcripts, and an opt-in Apache AGE acceleration path.
     </p>
     <div class="meta">
       <span>capabilities v2 &rarr; v3</span>
@@ -199,7 +199,7 @@ footer a:hover{color:var(--accent)}
         </tr>
         <tr>
           <td><strong>G</strong> &mdash; Hook pipeline</td>
-          <td>20 lifecycle events, exec + daemon modes, decision contract, chain ordering</td>
+          <td>25 lifecycle events, exec + daemon modes, decision contract, chain ordering</td>
           <td><strong>No hooks fire</strong> until <code>~/.config/ai-memory/hooks.toml</code> exists</td>
           <td><span class="status ok">✅ shipping</span></td>
         </tr>
@@ -255,7 +255,7 @@ ai-memory identity generate --agent-id ai:claude-code@$(hostname)</pre>
         <span class="who">🛠️ If you BUILD with AI</span>
         <h3>Programmable hooks. Real attestation. New loaders. Tighter token budget.</h3>
         <ul class="checked">
-          <li><strong>Hook pipeline:</strong> 20 lifecycle events (<code>pre_store</code>, <code>post_store</code>, <code>pre_recall</code>, <code>post_recall</code>, &hellip;), subprocess + daemon-mode IPC, <code>Allow</code>/<code>Modify</code>/<code>Deny</code>/<code>AskUser</code> decision contract, chain ordering with <strong>first-deny-wins</strong> short-circuit. Hot-path events default to daemon mode to preserve the v0.6.3 50ms recall budget.</li>
+          <li><strong>Hook pipeline:</strong> 25 lifecycle events (<code>pre_store</code>, <code>post_store</code>, <code>pre_recall</code>, <code>post_recall</code>, &hellip;), subprocess + daemon-mode IPC, <code>Allow</code>/<code>Modify</code>/<code>Deny</code>/<code>AskUser</code> decision contract, chain ordering with <strong>first-deny-wins</strong> short-circuit. Hot-path events default to daemon mode to preserve the v0.6.3 50ms recall budget.</li>
           <li><strong>Ed25519 attestation:</strong> per-agent keypair (<code>ai-memory identity generate</code>), outbound link signing, inbound verification against <code>observed_by</code>, <code>signed_events</code> append-only audit table (schema migration v20 &rarr; v22).</li>
           <li><strong>Sidechain transcripts:</strong> zstd-3 compressed BLOBs in <code>memory_transcripts</code>, joined to memories via <code>memory_transcript_links</code>, per-namespace TTL with archive&rarr;prune lifecycle, <code>memory_replay(memory_id)</code> reconstructs the chain.</li>
           <li><strong>Apache AGE:</strong> opt-in property graph backend (Postgres only); auto-detected via <code>pg_extension</code>. SQLite installs fall back to recursive CTE. Cypher implementations of <code>memory_kg_query</code>, <code>memory_kg_timeline</code>, <code>memory_kg_invalidate</code> &mdash; and the new <code>memory_find_paths(source, target, max_depth=5)</code> tool (recovers commitment R2).</li>
@@ -340,7 +340,7 @@ ai-memory identity generate --agent-id ai:claude-code@$(hostname)</pre>
 
       <div class="card amber">
         <span class="tag">Track G &middot; Hook pipeline</span>
-        <h3>20 lifecycle events, two execution modes</h3>
+        <h3>25 lifecycle events, two execution modes</h3>
         <p>Programmable extension surface at every memory operation point. <strong>Exec mode</strong>: subprocess per fire; JSON over stdin&rarr;stdout. <strong>Daemon mode</strong>: long-lived child with JSON-RPC framing, reconnect-on-crash, backpressure metrics. Decision contract: <code>Allow</code> / <code>Modify(delta)</code> (pre- events only) / <code>Deny{reason, code}</code> / <code>AskUser{prompt, options, default}</code>. Chain ordering is priority-desc; first <code>Deny</code> short-circuits. R3 (auto-link inference) and R5 (auto-extraction) ship as reference daemon-mode hooks.</p>
         <p><a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/v0.7/V0.7-EPIC.md#track-g--hook-pipeline-bucket-0">Track G tasks &rarr;</a></p>
       </div>

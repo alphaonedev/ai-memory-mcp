@@ -1,11 +1,11 @@
 # v0.7.0 Feature Inventory — Net-New from v0.6.4
 
-> Baseline: **v0.6.4** (commit `6416539a370490977a25eeabded54393b08ac87c`, tag `v0.6.4`)
-> Target:   **v0.7.0** (commit `64528b15d484c68e4352ab6798f2c39c80296032`, branch `catalogue/v0.7.0-features` @ HEAD)
-> Compiled: 2026-05-15 by the AI NHI ship-readiness initiative
+> Baseline: **v0.6.4** (tag `v0.6.4`)
+> Target:   **v0.7.0** release HEAD on `release/v0.7.0`
+> Compiled: 2026-05-15 by the AI NHI ship-readiness initiative; re-anchored 2026-05-22 against schema v49 / 73-tool surface during the SR-5 documentation drift sweep.
 > Methodology: `git diff v0.6.4..HEAD` (code & schema) + doc scan + commit-trailer issue cross-reference
-> Worktree:  `/Users/fate/v07/catalogue`
-> Scratch:   `/Users/fate/v07/v07-fixes/.local-runs/tmp/` (project no-`/tmp` HARD RULE honored)
+> Path convention: every code path below is repo-relative against the `release/v0.7.0` worktree root. The original SR-5 capture used the developer-host worktree `/Users/fate/v07/catalogue/`; those prefixes have been normalised to repo-relative paths during the 2026-05-22 re-anchor.
+> Scratch:   `.local-runs/tmp/` (project no-`/tmp` HARD RULE honored)
 > Read-only review except for this deliverable.
 
 ---
@@ -117,11 +117,11 @@ AI_MEMORY_TOOLS_VERBOSE
 | Batman 7-form closeout | **7** forms (1-6 + 7th-form agent-EXTERNAL Layer-4) | Forms 1-6 SHIPPED; 7th-form Option B foundation LANDED, full cover at v0.8.0 per `#697` |
 | Recursive-learning primitive | **8** tasks (issue `#655`) | Tasks 1-6 SHIPPED commits; Tasks 7-8 ship-gate landed on `feat/v0.7.0-recursive-learning` |
 | L1/L2 grand-slam wave | **8** L2 items + **3** L1 items (issues `#666`-`#673`, `#691`, `#693`) | SHIPPED |
-| Schema migration ladder | **20 sqlite + 10 postgres** | SHIPPED; v33 → v34 V-4 closeout pinned by `tests/signed_events_chain_v34.rs` |
+| Schema migration ladder | sqlite + postgres converge on logical schema **v49** (`CURRENT_SCHEMA_VERSION = 49` in both adapters); on-disk SQL files end at `migrations/sqlite/0041_v07_federation_push_dlq.sql` and `migrations/postgres/0030_v07_federation_push_dlq.sql`, with post-v34 deltas applied via in-process migration arms (see `docs/MIGRATION_v0.7.md` §schema-ladder for the per-bump narrative v35-v49) | SHIPPED; v33 → v34 V-4 closeout pinned by `tests/signed_events_chain_v34.rs`; v49 archived_memories full carry pinned by #1025 regression tests |
 | Security-hardening sweep | **11** late-cycle commits | SHIPPED on `release/v0.7.0`, reconciled into trunk @ `64528b1` |
 | Round-2 fixes | **F1-F18** (18 findings) | SHIPPED |
 | Capability v3 system | **7** new Capability* structs + Track A 5 tasks | SHIPPED |
-| Signed events V-4 closeout | `prev_hash + sequence` cross-row hash chain | SHIPPED (sqlite v34 / postgres v33) |
+| Signed events V-4 closeout | `prev_hash + sequence` cross-row hash chain | SHIPPED at sqlite v34 / postgres v34 (both adapters now at v49 at release HEAD; the V-4 chain has been live since v34 and is exercised by every signed_events write through v49) |
 | Forensic bundle | L2-5 (issue `#670`) | SHIPPED |
 | Federation hardening | mTLS + X-API-Key + fingerprint allowlist | SHIPPED |
 | K8 quota status tool | `memory_quota_status` | SHIPPED |
@@ -140,18 +140,18 @@ AI_MEMORY_TOOLS_VERBOSE
 - **Docs:** `docs/atomisation.md` (1,455 words)
 - **Cookbook:** `cookbook/atomisation/01-basic-flow.sh` (1 file)
 - **Code paths (absolute):**
-  - Substrate: `/Users/fate/v07/catalogue/src/atomisation/mod.rs` (29,533 bytes) + `/Users/fate/v07/catalogue/src/atomisation/curator.rs` (22,432 bytes)
-  - Curator integration: `/Users/fate/v07/catalogue/src/atomisation/curator.rs`
-  - Schema: `/Users/fate/v07/catalogue/migrations/sqlite/0030_v07_atomisation.sql`, `/Users/fate/v07/catalogue/migrations/sqlite/0031_v07_namespace_auto_atomise.sql`, `/Users/fate/v07/catalogue/migrations/postgres/0017_v07_atomisation.sql`, `/Users/fate/v07/catalogue/migrations/postgres/0018_v07_namespace_auto_atomise.sql`
-  - MCP tool: `/Users/fate/v07/catalogue/src/mcp/tools/atomise.rs`
-  - Pre-store hook: `/Users/fate/v07/catalogue/src/hooks/pre_store/auto_atomise.rs`
-  - CLI: `/Users/fate/v07/catalogue/src/cli/commands/atomise.rs`
+  - Substrate: `src/atomisation/mod.rs` (29,533 bytes) + `src/atomisation/curator.rs` (22,432 bytes)
+  - Curator integration: `src/atomisation/curator.rs`
+  - Schema: `migrations/sqlite/0030_v07_atomisation.sql`, `migrations/sqlite/0031_v07_namespace_auto_atomise.sql`, `migrations/postgres/0017_v07_atomisation.sql`, `migrations/postgres/0018_v07_namespace_auto_atomise.sql`
+  - MCP tool: `src/mcp/tools/atomise.rs`
+  - Pre-store hook: `src/hooks/pre_store/auto_atomise.rs`
+  - CLI: `src/cli/commands/atomise.rs`
 - **Tests (absolute):**
-  - Integration: `/Users/fate/v07/catalogue/tests/atomisation.rs`, `/Users/fate/v07/catalogue/tests/atomisation/core.rs`, `/Users/fate/v07/catalogue/tests/auto_atomise.rs`, `/Users/fate/v07/catalogue/tests/auto_atomise/core.rs`, `/Users/fate/v07/catalogue/tests/wt1c_mcp_atomise.rs`, `/Users/fate/v07/catalogue/tests/wt_1_a_schema_migration.rs`
-  - Form 2: `/Users/fate/v07/catalogue/tests/form_2_synchronous_atomise.rs`
+  - Integration: `tests/atomisation.rs`, `tests/atomisation/core.rs`, `tests/auto_atomise.rs`, `tests/auto_atomise/core.rs`, `tests/wt1c_mcp_atomise.rs`, `tests/wt_1_a_schema_migration.rs`
+  - Form 2: `tests/form_2_synchronous_atomise.rs`
 - **Env vars:** none new (governed via namespace policy)
 - **Namespace policy fields:** `auto_atomise`, `auto_atomise_threshold_cl100k`, `auto_atomise_max_atom_tokens`, `auto_atomise_mode` (`Off | Deferred | Synchronous`)
-- **Capability registry entry:** `CapabilityAtomisation` at `/Users/fate/v07/catalogue/src/config.rs:1164`
+- **Capability registry entry:** `CapabilityAtomisation` at `src/config.rs:1164`
 - **Public API surface:** `memory_atomise` MCP tool; `ai-memory atomise` CLI; namespace standard JSON keys
 - **Known unknowns:** WT-1 sub-task A-G fan-out — release notes claim "A-G shipped" but per-letter mapping is implicit; reviewer should cross-check `wt1c_*` / `wt_1_a_*` test names against the original WT-1 spec.
 
@@ -160,8 +160,8 @@ AI_MEMORY_TOOLS_VERBOSE
 - **Issue(s):** `#754`
 - **Status:** SHIPPED
 - **Net-new in v0.7.0:** YES
-- **Code paths:** `/Users/fate/v07/catalogue/src/synthesis/mod.rs`
-- **Tests:** `/Users/fate/v07/catalogue/tests/form_1_synthesis.rs`
+- **Code paths:** `src/synthesis/mod.rs`
+- **Tests:** `tests/form_1_synthesis.rs`
 - **Namespace policy fields:** `legacy_per_pair_classifier: Option<bool>` (opt-IN to legacy yes/no classifier; default routes to single-batch synth)
 - **Capability registry entry:** subsumed by `CapabilityAtomisation`
 - **Public API surface:** internal store-path call; no new MCP tool
@@ -171,8 +171,8 @@ AI_MEMORY_TOOLS_VERBOSE
 - **Issue(s):** `#755`
 - **Status:** SHIPPED
 - **Net-new in v0.7.0:** YES
-- **Code paths:** `/Users/fate/v07/catalogue/src/atomisation/mod.rs` + `auto_atomise_mode = Synchronous` branch in `/Users/fate/v07/catalogue/src/hooks/pre_store/auto_atomise.rs`
-- **Tests:** `/Users/fate/v07/catalogue/tests/form_2_synchronous_atomise.rs`
+- **Code paths:** `src/atomisation/mod.rs` + `auto_atomise_mode = Synchronous` branch in `src/hooks/pre_store/auto_atomise.rs`
+- **Tests:** `tests/form_2_synchronous_atomise.rs`
 - **Namespace policy fields:** `auto_atomise_mode` (`Off | Deferred | Synchronous`) at `src/models/namespace.rs:395`
 
 ### Feature: Form 3 — multi-step ingest orchestrator (prompt-cache reuse + explicit-trust helpers)
@@ -182,9 +182,9 @@ AI_MEMORY_TOOLS_VERBOSE
 - **Net-new in v0.7.0:** YES
 - **Docs:** `docs/multistep-ingest.md` (1,079 words)
 - **Cookbook:** `cookbook/multistep-ingest/01-two-phase.sh`
-- **Code paths:** `/Users/fate/v07/catalogue/src/multistep_ingest/{mod.rs,executor.rs,helpers.rs,pipeline.rs,cache.rs}`
-- **MCP tool:** `/Users/fate/v07/catalogue/src/mcp/tools/ingest_multistep.rs` → `memory_ingest_multistep`
-- **Tests:** `/Users/fate/v07/catalogue/tests/form_3_multistep_ingest.rs`
+- **Code paths:** `src/multistep_ingest/{mod.rs,executor.rs,helpers.rs,pipeline.rs,cache.rs}`
+- **MCP tool:** `src/mcp/tools/ingest_multistep.rs` → `memory_ingest_multistep`
+- **Tests:** `tests/form_3_multistep_ingest.rs`
 
 ### Feature: Form 4 — fact-provenance (citations + source-URI + atom-grain span)
 
@@ -192,8 +192,8 @@ AI_MEMORY_TOOLS_VERBOSE
 - **Status:** SHIPPED
 - **Net-new in v0.7.0:** YES
 - **Docs:** `docs/provenance.md` (983 words)
-- **Schema:** `/Users/fate/v07/catalogue/migrations/sqlite/0032_v07_form4_provenance.sql`, `/Users/fate/v07/catalogue/migrations/postgres/0019_v07_form4_provenance.sql`
-- **Tests:** `/Users/fate/v07/catalogue/tests/form_4_provenance.rs`
+- **Schema:** `migrations/sqlite/0032_v07_form4_provenance.sql`, `migrations/postgres/0019_v07_form4_provenance.sql`
+- **Tests:** `tests/form_4_provenance.rs`
 - **Known unknowns:** no dedicated MCP tool — provenance rides on the existing `memory_store` / `memory_atomise` payloads. Reviewer should verify wire-shape backward-compat with pre-v0.7.0 federation peers.
 
 ### Feature: Form 5 — auto-confidence + shadow-mode calibration + freshness decay
@@ -202,11 +202,11 @@ AI_MEMORY_TOOLS_VERBOSE
 - **Status:** SHIPPED
 - **Net-new in v0.7.0:** YES
 - **Docs:** `docs/confidence-calibration.md` (913 words)
-- **Schema:** `/Users/fate/v07/catalogue/migrations/sqlite/0033_v07_form5_confidence_calibration.sql`, `/Users/fate/v07/catalogue/migrations/postgres/0020_v07_form5_confidence_calibration.sql`
-- **Code paths:** `/Users/fate/v07/catalogue/src/confidence/{mod.rs,calibrate.rs,shadow.rs,decay.rs}`
-- **MCP tool:** `/Users/fate/v07/catalogue/src/mcp/tools/calibrate_confidence.rs` → `memory_calibrate_confidence`
-- **CLI:** `/Users/fate/v07/catalogue/src/cli/commands/calibrate_confidence.rs`
-- **Tests:** `/Users/fate/v07/catalogue/tests/form_5_confidence_calibration.rs`, `/Users/fate/v07/catalogue/tests/calibration_t0.rs`
+- **Schema:** `migrations/sqlite/0033_v07_form5_confidence_calibration.sql`, `migrations/postgres/0020_v07_form5_confidence_calibration.sql`
+- **Code paths:** `src/confidence/{mod.rs,calibrate.rs,shadow.rs,decay.rs}`
+- **MCP tool:** `src/mcp/tools/calibrate_confidence.rs` → `memory_calibrate_confidence`
+- **CLI:** `src/cli/commands/calibrate_confidence.rs`
+- **Tests:** `tests/form_5_confidence_calibration.rs`, `tests/calibration_t0.rs`
 - **Env vars:** `AI_MEMORY_AUTO_CONFIDENCE`, `AI_MEMORY_CONFIDENCE_SHADOW`, `AI_MEMORY_CONFIDENCE_SHADOW_SAMPLE_RATE`, `AI_MEMORY_CONFIDENCE_DECAY`
 - **Capability registry entry:** `CapabilityConfidenceCalibration` at `src/config.rs:1331`
 
@@ -216,12 +216,12 @@ AI_MEMORY_TOOLS_VERBOSE
 - **Status:** SHIPPED
 - **Net-new in v0.7.0:** YES (enum did not exist in v0.6.4)
 - **Docs:** `docs/memory-kind-vocab.md` (800 words)
-- **Schema:** `/Users/fate/v07/catalogue/migrations/sqlite/0025_v07_memory_kind.sql`
-- **Code paths:** `/Users/fate/v07/catalogue/src/models/memory.rs:38-200` (10-variant enum)
-- **Hooks:** `/Users/fate/v07/catalogue/src/hooks/pre_store/auto_classify_kind.rs`
+- **Schema:** `migrations/sqlite/0025_v07_memory_kind.sql`
+- **Code paths:** `src/models/memory.rs:38-200` (10-variant enum)
+- **Hooks:** `src/hooks/pre_store/auto_classify_kind.rs`
 - **Namespace policy fields:** `auto_classify_kind: Option<MemoryKindAutoClassify>` (`Off | RegexOnly | RegexThenLlm`) at `src/models/namespace.rs:421`
 - **Capability registry entry:** `CapabilityMemoryKindVocab` at `src/config.rs:1260`
-- **Tests:** `/Users/fate/v07/catalogue/tests/form_6_memorykind_vocab.rs`, `/Users/fate/v07/catalogue/tests/l1_1_memory_kind.rs`
+- **Tests:** `tests/form_6_memorykind_vocab.rs`, `tests/l1_1_memory_kind.rs`
 
 ### Feature: Form 7 (7th-form) — agent-EXTERNAL Layer-4 wiring
 
@@ -230,11 +230,11 @@ AI_MEMORY_TOOLS_VERBOSE
 - **Net-new in v0.7.0:** YES
 - **Docs:** `docs/policy-engine.md` (3,597 words), `docs/security/audit-trail-coverage.md`, `docs/governance/agent-action-rules.md`
 - **Cookbook:** `cookbook/agent-external-governance/01-deny-bash.sh`
-- **Schema:** `/Users/fate/v07/catalogue/migrations/sqlite/0024_v07_governance_rules.sql`
-- **Code paths:** `/Users/fate/v07/catalogue/src/governance/{mod.rs,agent_action.rs,deferred_audit.rs,rules_store.rs,wire_check.rs}`
-- **MCP tools:** `/Users/fate/v07/catalogue/src/mcp/tools/{check_agent_action.rs,rule_list.rs}` → `memory_check_agent_action`, `memory_rule_list`
-- **CLI:** `/Users/fate/v07/catalogue/src/cli/rules.rs`, `/Users/fate/v07/catalogue/src/cli/governance_install_defaults.rs`, `/Users/fate/v07/catalogue/src/cli/governance_migrate.rs`
-- **Tests:** `/Users/fate/v07/catalogue/tests/form_7_agent_external_wiring.rs`, `/Users/fate/v07/catalogue/tests/governance_agent_action.rs`, `/Users/fate/v07/catalogue/tests/governance_a2a_rules.rs`, `/Users/fate/v07/catalogue/tests/governance_storage_insert_hook.rs`, `/Users/fate/v07/catalogue/tests/governance_l16_activation.rs`, `/Users/fate/v07/catalogue/tests/governance_wire_points.rs`, `/Users/fate/v07/catalogue/tests/policy_engine_hostile_prompts.rs`, `/Users/fate/v07/catalogue/tests/cli_install_pretool_hook.rs`, `/Users/fate/v07/catalogue/tests/governance_deferred_log_audit.rs`
+- **Schema:** `migrations/sqlite/0024_v07_governance_rules.sql`
+- **Code paths:** `src/governance/{mod.rs,agent_action.rs,deferred_audit.rs,rules_store.rs,wire_check.rs}`
+- **MCP tools:** `src/mcp/tools/{check_agent_action.rs,rule_list.rs}` → `memory_check_agent_action`, `memory_rule_list`
+- **CLI:** `src/cli/rules.rs`, `src/cli/governance_install_defaults.rs`, `src/cli/governance_migrate.rs`
+- **Tests:** `tests/form_7_agent_external_wiring.rs`, `tests/governance_agent_action.rs`, `tests/governance_a2a_rules.rs`, `tests/governance_storage_insert_hook.rs`, `tests/governance_l16_activation.rs`, `tests/governance_wire_points.rs`, `tests/policy_engine_hostile_prompts.rs`, `tests/cli_install_pretool_hook.rs`, `tests/governance_deferred_log_audit.rs`
 - **Capability registry entry:** `CapabilityGovernance` at `src/config.rs:1083`
 - **Public API surface:** `R001..R004` seed rules; `~/.config/ai-memory/operator.key`; `ai-memory install --harness claude-code --enforce-policy`
 - **Known unknowns:** the "complete cover" 5% gap (V08-PE-1 .. V08-PE-8) is explicitly out-of-scope per `#697`. Reviewer should sanity-check that the "PE-1 / PE-2 / PE-3 all landed" claim matches code (CHANGELOG asserts this — `governance_wire_points.rs` is the pin).
@@ -246,13 +246,13 @@ AI_MEMORY_TOOLS_VERBOSE
 - **Net-new in v0.7.0:** YES
 - **Docs:** `docs/RECURSIVE_LEARNING.md` (3,782 words)
 - **Cookbook:** `cookbook/recursive-learning/*.sh` + `*.md` (5 scenarios + README, 11 files total)
-- **Schema:** `/Users/fate/v07/catalogue/migrations/postgres/0013_v0700_reflection_depth.sql` (SQLite v29 via in-tree `storage/migrations.rs` ladder)
+- **Schema:** `migrations/postgres/0013_v0700_reflection_depth.sql` (SQLite v29 via in-tree `storage/migrations.rs` ladder)
 - **Code paths:**
-  - Substrate: `/Users/fate/v07/catalogue/src/storage/reflect.rs`, `/Users/fate/v07/catalogue/src/storage/mod.rs` (reflect path + `GOVERNANCE_PRE_WRITE` OnceLock)
-  - MCP tool: `/Users/fate/v07/catalogue/src/mcp/tools/reflect.rs` → `memory_reflect`
-  - Origin tool: `/Users/fate/v07/catalogue/src/mcp/tools/reflection_origin.rs` → `memory_reflection_origin`
-  - Dependents-of-invalidated: `/Users/fate/v07/catalogue/src/mcp/tools/dependents_of_invalidated.rs`
-- **Tests:** `/Users/fate/v07/catalogue/tests/recursive_learning_task{1..7}_*.rs` (8 files), `/Users/fate/v07/catalogue/tests/ship_gate/grand_slam_recursive_learning.rs`, `/Users/fate/v07/catalogue/tests/approval_reflect.rs`, `/Users/fate/v07/catalogue/tests/federation_reflection_replication.rs`, `/Users/fate/v07/catalogue/tests/reranker_reflection_test.rs`, `/Users/fate/v07/catalogue/tests/longmemeval_reflection_bench.rs`
+  - Substrate: `src/storage/reflect.rs`, `src/storage/mod.rs` (reflect path + `GOVERNANCE_PRE_WRITE` OnceLock)
+  - MCP tool: `src/mcp/tools/reflect.rs` → `memory_reflect`
+  - Origin tool: `src/mcp/tools/reflection_origin.rs` → `memory_reflection_origin`
+  - Dependents-of-invalidated: `src/mcp/tools/dependents_of_invalidated.rs`
+- **Tests:** `tests/recursive_learning_task{1..7}_*.rs` (8 files), `tests/ship_gate/grand_slam_recursive_learning.rs`, `tests/approval_reflect.rs`, `tests/federation_reflection_replication.rs`, `tests/reranker_reflection_test.rs`, `tests/longmemeval_reflection_bench.rs`
 - **Namespace policy fields:** `max_reflection_depth: Option<u32>` (default 3, `Some(0)` is documented kill-switch)
 - **Capability registry entry:** `CapabilityReflection` at `src/config.rs:917`
 - **Public API surface:** `memory_reflect` (Family::Power); `pre_reflect` + `post_reflect` hook events (Track G grew 21 → 23)
@@ -264,10 +264,10 @@ AI_MEMORY_TOOLS_VERBOSE
 - **Status:** SHIPPED
 - **Net-new in v0.7.0:** YES
 - **Docs:** `docs/agent-skills.md` (1,641 words)
-- **Schema:** `/Users/fate/v07/catalogue/migrations/sqlite/0026_v07_agent_skills.sql`
-- **Code paths:** `/Users/fate/v07/catalogue/src/models/skill.rs`, `/Users/fate/v07/catalogue/src/parsing/skill_md.rs`
-- **MCP tools (5):** `/Users/fate/v07/catalogue/src/mcp/tools/skill_{register,list,get,resource,export,promote,compositional_context}.rs`
-- **Tests:** `/Users/fate/v07/catalogue/tests/skill_test.rs`, `/Users/fate/v07/catalogue/tests/skill_composition_test.rs`, `/Users/fate/v07/catalogue/tests/skill_promote_test.rs`, `/Users/fate/v07/catalogue/tests/ship_gate/grand_slam_skills.rs`
+- **Schema:** `migrations/sqlite/0026_v07_agent_skills.sql`
+- **Code paths:** `src/models/skill.rs`, `src/parsing/skill_md.rs`
+- **MCP tools (5):** `src/mcp/tools/skill_{register,list,get,resource,export,promote,compositional_context}.rs`
+- **Tests:** `tests/skill_test.rs`, `tests/skill_composition_test.rs`, `tests/skill_promote_test.rs`, `tests/ship_gate/grand_slam_skills.rs`
 - **Capability registry entry:** `CapabilitySkills` at `src/config.rs:975`
 
 ### Feature: L1-6 substrate rules-enforcement engine (Option B foundation)
@@ -275,15 +275,15 @@ AI_MEMORY_TOOLS_VERBOSE
 - **Issue(s):** `#691`, Deliverable E commit `1b877ce`
 - **Status:** SHIPPED (foundation; complete cover at v0.8.0)
 - **See:** Feature "Form 7 — agent-EXTERNAL Layer-4 wiring" above (same body of code)
-- **Audit deliverables:** `/Users/fate/v07/catalogue/docs/v0.7.0/validation/rules-store-isolation-audit.md`, `/Users/fate/v07/catalogue/docs/v0.7.0/validation/wire-check-bypass-audit.md`
+- **Audit deliverables:** `docs/v0.7.0/validation/rules-store-isolation-audit.md`, `docs/v0.7.0/validation/wire-check-bypass-audit.md`
 
 ### Feature: L1-7 compaction pipeline
 
 - **Issue(s):** grand-slam wave (merge commit `7451143`)
 - **Status:** SHIPPED
 - **Net-new in v0.7.0:** YES
-- **Code paths:** `/Users/fate/v07/catalogue/src/curator/{compaction.rs,pipeline.rs,cluster.rs,reflection_pass.rs,candidates.rs,persist.rs}`
-- **Tests:** `/Users/fate/v07/catalogue/tests/curator/compaction_test.rs`, `/Users/fate/v07/catalogue/tests/curator/reflection_pass_test.rs`
+- **Code paths:** `src/curator/{compaction.rs,pipeline.rs,cluster.rs,reflection_pass.rs,candidates.rs,persist.rs}`
+- **Tests:** `tests/curator/compaction_test.rs`, `tests/curator/reflection_pass_test.rs`
 - **Capability registry entry:** `CapabilityCompaction` (extends v0.6.4)
 - **Hook events added:** `pre_compaction`, `on_compaction_rollback` (Track G additions)
 
@@ -292,9 +292,9 @@ AI_MEMORY_TOOLS_VERBOSE
 - **Issue(s):** `#666`, commit `c3f6e82`
 - **Status:** SHIPPED
 - **Net-new in v0.7.0:** YES
-- **Code paths:** `/Users/fate/v07/catalogue/src/curator/reflection_pass.rs` (67,400 bytes)
-- **CLI:** `ai-memory curator --reflect` via `/Users/fate/v07/catalogue/src/cli/curator.rs` (modified)
-- **Runbook:** `/Users/fate/v07/catalogue/docs/RUNBOOK-curator-soak.md`
+- **Code paths:** `src/curator/reflection_pass.rs` (67,400 bytes)
+- **CLI:** `ai-memory curator --reflect` via `src/cli/curator.rs` (modified)
+- **Runbook:** `docs/RUNBOOK-curator-soak.md`
 - **Constants:** `MIN_CLUSTER_SIZE = 3`, `MAX_CLUSTER_SIZE = 12`, 7-day temporal window
 
 ### Feature: L2-2 federation-aware reflection coordination
@@ -302,18 +302,18 @@ AI_MEMORY_TOOLS_VERBOSE
 - **Issue(s):** `#667`, commit `0b1c9cc`
 - **Status:** SHIPPED
 - **Net-new in v0.7.0:** YES
-- **Code paths:** `/Users/fate/v07/catalogue/src/federation/reflection_bookkeeping.rs`, `/Users/fate/v07/catalogue/src/federation/receive.rs`
-- **MCP tool:** `memory_reflection_origin` → `/Users/fate/v07/catalogue/src/mcp/tools/reflection_origin.rs`
-- **Tests:** `/Users/fate/v07/catalogue/tests/federation_reflection_replication.rs`
+- **Code paths:** `src/federation/reflection_bookkeeping.rs`, `src/federation/receive.rs`
+- **MCP tool:** `memory_reflection_origin` → `src/mcp/tools/reflection_origin.rs`
+- **Tests:** `tests/federation_reflection_replication.rs`
 
 ### Feature: L2-3 reflection invalidation propagation (NOT cascade)
 
 - **Issue(s):** `#668`, commit `3f419be`
 - **Status:** SHIPPED
 - **Net-new in v0.7.0:** YES
-- **Code paths:** `/Users/fate/v07/catalogue/src/notification/invalidation.rs`
-- **MCP tool:** `memory_dependents_of_invalidated` → `/Users/fate/v07/catalogue/src/mcp/tools/dependents_of_invalidated.rs`
-- **Tests:** `/Users/fate/v07/catalogue/tests/notification/invalidation_test.rs`
+- **Code paths:** `src/notification/invalidation.rs`
+- **MCP tool:** `memory_dependents_of_invalidated` → `src/mcp/tools/dependents_of_invalidated.rs`
+- **Tests:** `tests/notification/invalidation_test.rs`
 - **Notification namespace:** `<dependent.namespace>/_invalidations`
 
 ### Feature: L2-4 transcript replay union
@@ -321,9 +321,9 @@ AI_MEMORY_TOOLS_VERBOSE
 - **Issue(s):** `#669`, commit `a50b34c`
 - **Status:** SHIPPED
 - **Net-new in v0.7.0:** YES (extends v0.6.4 transcript surface)
-- **Code paths:** `/Users/fate/v07/catalogue/src/transcripts/{mod.rs,replay.rs,storage.rs}`
-- **MCP tool:** `memory_replay` → `/Users/fate/v07/catalogue/src/mcp/tools/replay.rs`
-- **Tests:** `/Users/fate/v07/catalogue/tests/transcripts/replay_test.rs`, `/Users/fate/v07/catalogue/tests/i4_memory_replay_authz.rs`
+- **Code paths:** `src/transcripts/{mod.rs,replay.rs,storage.rs}`
+- **MCP tool:** `memory_replay` → `src/mcp/tools/replay.rs`
+- **Tests:** `tests/transcripts/replay_test.rs`, `tests/i4_memory_replay_authz.rs`
 
 ### Feature: L2-5 forensic bundle
 
@@ -332,9 +332,9 @@ AI_MEMORY_TOOLS_VERBOSE
 - **Net-new in v0.7.0:** YES
 - **Docs:** `docs/forensic-export.md` (1,756 words)
 - **Cookbook:** `cookbook/recursive-learning/04-forensic-bundle.sh`
-- **Code paths:** `/Users/fate/v07/catalogue/src/forensic/{mod.rs,bundle.rs}`
-- **CLI:** `/Users/fate/v07/catalogue/src/cli/export.rs`, `/Users/fate/v07/catalogue/src/cli/verify.rs` — `ai-memory export-forensic-bundle`, `ai-memory verify-forensic-bundle`
-- **Tests:** `/Users/fate/v07/catalogue/tests/forensic.rs`, `/Users/fate/v07/catalogue/tests/forensic/bundle_test.rs`, `/Users/fate/v07/catalogue/tests/forensic/wt1e_chain_test.rs`
+- **Code paths:** `src/forensic/{mod.rs,bundle.rs}`
+- **CLI:** `src/cli/export.rs`, `src/cli/verify.rs` — `ai-memory export-forensic-bundle`, `ai-memory verify-forensic-bundle`
+- **Tests:** `tests/forensic.rs`, `tests/forensic/bundle_test.rs`, `tests/forensic/wt1e_chain_test.rs`
 - **Capability registry entry:** `CapabilityForensic` at `src/config.rs:1038`
 - **Reproducibility property:** deterministic in-process POSIX-ustar tar with byte-identical mod timestamps
 
@@ -343,9 +343,9 @@ AI_MEMORY_TOOLS_VERBOSE
 - **Issue(s):** `#671`, commit `505c538`
 - **Status:** SHIPPED
 - **Net-new in v0.7.0:** YES
-- **MCP tool:** `memory_skill_promote_from_reflection` → `/Users/fate/v07/catalogue/src/mcp/tools/skill_promote.rs`
+- **MCP tool:** `memory_skill_promote_from_reflection` → `src/mcp/tools/skill_promote.rs`
 - **Cookbook:** `cookbook/recursive-learning/03-reflection-to-skill-promote.sh`
-- **Tests:** `/Users/fate/v07/catalogue/tests/skill_promote_test.rs`
+- **Tests:** `tests/skill_promote_test.rs`
 - **Round-trip guarantee:** promote → export → re-register produces IDENTICAL SHA-256 digest
 
 ### Feature: L2-7 skill ↔ reflection composition
@@ -353,9 +353,9 @@ AI_MEMORY_TOOLS_VERBOSE
 - **Issue(s):** `#672`, commit `0966b57`
 - **Status:** SHIPPED
 - **Net-new in v0.7.0:** YES
-- **MCP tool:** `memory_skill_compositional_context` → `/Users/fate/v07/catalogue/src/mcp/tools/skill_compositional_context.rs`
+- **MCP tool:** `memory_skill_compositional_context` → `src/mcp/tools/skill_compositional_context.rs`
 - **Cookbook:** `cookbook/recursive-learning/05-autoresearch-composition.sh`
-- **Tests:** `/Users/fate/v07/catalogue/tests/skill_composition_test.rs`, `/Users/fate/v07/catalogue/tests/ship_gate/grand_slam_composition.rs`
+- **Tests:** `tests/skill_composition_test.rs`, `tests/ship_gate/grand_slam_composition.rs`
 - **Budget bounds:** `budget_tokens` default 4000, max 32000
 
 ### Feature: L2-8 reflection-aware reranker boost
@@ -363,8 +363,8 @@ AI_MEMORY_TOOLS_VERBOSE
 - **Issue(s):** `#673`, commit `90291c0`
 - **Status:** SHIPPED
 - **Net-new in v0.7.0:** EXTENDS_v0_6_4 (reranker existed; reflection-aware boost is new)
-- **Code paths:** modified `/Users/fate/v07/catalogue/src/reranker.rs` (defaults `boost=1.2`, `per_depth_increment=0.05`, `max_depth_cap=3`)
-- **Tests:** `/Users/fate/v07/catalogue/tests/reranker_reflection_test.rs`
+- **Code paths:** modified `src/reranker.rs` (defaults `boost=1.2`, `per_depth_increment=0.05`, `max_depth_cap=3`)
+- **Tests:** `tests/reranker_reflection_test.rs`
 - **Kill-switch:** `boost=1.0`
 
 ### Feature: QW-1 file-backed reflection chain export
@@ -373,12 +373,12 @@ AI_MEMORY_TOOLS_VERBOSE
 - **Status:** SHIPPED
 - **Net-new in v0.7.0:** YES
 - **Cookbook:** `cookbook/file-backed-export/01-export-and-inspect.sh`
-- **MCP tool:** `memory_export_reflection` → `/Users/fate/v07/catalogue/src/mcp/tools/export_reflection.rs`
-- **CLI:** `/Users/fate/v07/catalogue/src/cli/commands/export_reflections.rs`
-- **Hook:** `/Users/fate/v07/catalogue/src/hooks/post_reflect/auto_export.rs`
+- **MCP tool:** `memory_export_reflection` → `src/mcp/tools/export_reflection.rs`
+- **CLI:** `src/cli/commands/export_reflections.rs`
+- **Hook:** `src/hooks/post_reflect/auto_export.rs`
 - **Namespace policy field:** `auto_export_reflections_to_filesystem: Option<bool>`
 - **Default destination:** `~/.ai-memory/reflections/<namespace>/<id>.md`
-- **Tests:** `/Users/fate/v07/catalogue/tests/cli/export_reflections.rs`
+- **Tests:** `tests/cli/export_reflections.rs`
 
 ### Feature: QW-2 persona-as-artifact
 
@@ -387,13 +387,13 @@ AI_MEMORY_TOOLS_VERBOSE
 - **Net-new in v0.7.0:** YES
 - **Docs:** `docs/persona.md` (894 words)
 - **Cookbook:** `cookbook/persona/01-build-persona-from-observations.sh`
-- **Schema:** `/Users/fate/v07/catalogue/migrations/sqlite/0031_v07_persona.sql`, `/Users/fate/v07/catalogue/migrations/postgres/0018_v07_persona.sql`
-- **Code paths:** `/Users/fate/v07/catalogue/src/persona/mod.rs` (30,003 bytes)
-- **MCP tools:** `memory_persona`, `memory_persona_generate` → `/Users/fate/v07/catalogue/src/mcp/tools/persona.rs`
-- **Hook:** `/Users/fate/v07/catalogue/src/hooks/post_reflect/auto_persona.rs`
-- **CLI:** `/Users/fate/v07/catalogue/src/cli/commands/persona.rs`
+- **Schema:** `migrations/sqlite/0031_v07_persona.sql`, `migrations/postgres/0018_v07_persona.sql`
+- **Code paths:** `src/persona/mod.rs` (30,003 bytes)
+- **MCP tools:** `memory_persona`, `memory_persona_generate` → `src/mcp/tools/persona.rs`
+- **Hook:** `src/hooks/post_reflect/auto_persona.rs`
+- **CLI:** `src/cli/commands/persona.rs`
 - **Namespace policy fields:** `auto_persona_trigger_every_n_memories: Option<u32>`, `auto_export_personas_to_filesystem: Option<bool>`
-- **Tests:** `/Users/fate/v07/catalogue/tests/persona.rs`, `/Users/fate/v07/catalogue/tests/persona/acceptance.rs`
+- **Tests:** `tests/persona.rs`, `tests/persona/acceptance.rs`
 - **Memory kind:** `MemoryKind::Persona` (paired with `entity_id` + `persona_version` columns)
 - **Default destination:** `~/.ai-memory/personas/<namespace>/<entity_id>.md`
 
@@ -404,23 +404,23 @@ AI_MEMORY_TOOLS_VERBOSE
 - **Net-new in v0.7.0:** YES
 - **Docs:** `docs/context-offload.md` (497 words)
 - **Cookbook:** `cookbook/context-offload/01-offload-large-tool-output.sh`
-- **Schema:** `/Users/fate/v07/catalogue/migrations/sqlite/0029_v07_offloaded_blobs.sql`, `/Users/fate/v07/catalogue/migrations/postgres/0016_v07_offloaded_blobs.sql`
-- **Code paths:** `/Users/fate/v07/catalogue/src/offload/mod.rs` (27,017 bytes)
-- **MCP tools:** `memory_offload`, `memory_deref` → `/Users/fate/v07/catalogue/src/mcp/tools/offload.rs`
-- **CLI:** `/Users/fate/v07/catalogue/src/cli/offload.rs`
-- **Background sweep:** `/Users/fate/v07/catalogue/src/background/offload_ttl_sweep.rs`
-- **Tests:** `/Users/fate/v07/catalogue/tests/offload.rs`, `/Users/fate/v07/catalogue/tests/offload/acceptance.rs`, `/Users/fate/v07/catalogue/tests/offload/registration.rs`, `/Users/fate/v07/catalogue/tests/l07_3_chunk_d_http_surface.rs`
+- **Schema:** `migrations/sqlite/0029_v07_offloaded_blobs.sql`, `migrations/postgres/0016_v07_offloaded_blobs.sql`
+- **Code paths:** `src/offload/mod.rs` (27,017 bytes)
+- **MCP tools:** `memory_offload`, `memory_deref` → `src/mcp/tools/offload.rs`
+- **CLI:** `src/cli/offload.rs`
+- **Background sweep:** `src/background/offload_ttl_sweep.rs`
+- **Tests:** `tests/offload.rs`, `tests/offload/acceptance.rs`, `tests/offload/registration.rs`, `tests/l07_3_chunk_d_http_surface.rs`
 
 ### Feature: Sidechain transcripts (Track I — v0.6.4 → v0.7.0 hardening)
 
 - **Issue(s):** Track I (5 tasks, Bucket 1.7)
 - **Status:** SHIPPED
 - **Net-new in v0.7.0:** YES
-- **Schema:** `/Users/fate/v07/catalogue/migrations/sqlite/0016_v07_transcripts.sql`, `0018_v07_transcript_links.sql`, `0019_v07_transcript_lifecycle.sql`
-- **Code paths:** `/Users/fate/v07/catalogue/src/transcripts/{mod.rs,replay.rs,storage.rs}`
+- **Schema:** `migrations/sqlite/0016_v07_transcripts.sql`, `0018_v07_transcript_links.sql`, `0019_v07_transcript_lifecycle.sql`
+- **Code paths:** `src/transcripts/{mod.rs,replay.rs,storage.rs}`
 - **MCP tool:** `memory_replay`
-- **Helper binary:** `/Users/fate/v07/catalogue/tools/transcript-extractor/` (R5 reference hook, intentionally excluded from crates.io upload via parent `Cargo.toml` `include` allowlist)
-- **Tests:** `/Users/fate/v07/catalogue/tests/transcripts.rs`, `/Users/fate/v07/catalogue/tests/transcripts/replay_test.rs`, `/Users/fate/v07/catalogue/tests/transcript_extractor.rs`
+- **Helper binary:** `tools/transcript-extractor/` (R5 reference hook, intentionally excluded from crates.io upload via parent `Cargo.toml` `include` allowlist)
+- **Tests:** `tests/transcripts.rs`, `tests/transcripts/replay_test.rs`, `tests/transcript_extractor.rs`
 - **Capability registry entry:** `CapabilityTranscripts` (extends v0.6.4)
 - **Security hardening (release/v0.7.0):** I1 — `TranscriptsConfig.max_decompressed_bytes` config-driven (commit `26fab06`), default 16 MiB
 
@@ -429,23 +429,23 @@ AI_MEMORY_TOOLS_VERBOSE
 - **Issue(s):** Track H (6 tasks, Bucket 1)
 - **Status:** SHIPPED
 - **Net-new in v0.7.0:** EXTENDS_v0_6_4 (v0.6.4 had `memory_links.signature` "dead column"; v0.7.0 fills it)
-- **Code paths:** `/Users/fate/v07/catalogue/src/identity/{mod.rs,keypair.rs,sign.rs,verify.rs,replay.rs}`
-- **MCP tool:** `memory_verify` → `/Users/fate/v07/catalogue/src/mcp/tools/verify.rs`
-- **CLI:** `/Users/fate/v07/catalogue/src/cli/identity.rs` — `ai-memory identity generate`
-- **Schema:** `/Users/fate/v07/catalogue/migrations/sqlite/0017_v07_link_attest_level.sql`, `0020_v07_signed_events.sql`
+- **Code paths:** `src/identity/{mod.rs,keypair.rs,sign.rs,verify.rs,replay.rs}`
+- **MCP tool:** `memory_verify` → `src/mcp/tools/verify.rs`
+- **CLI:** `src/cli/identity.rs` — `ai-memory identity generate`
+- **Schema:** `migrations/sqlite/0017_v07_link_attest_level.sql`, `0020_v07_signed_events.sql`
 - **Env vars:** `AI_MEMORY_KEY_DIR`, `AI_MEMORY_OPERATOR_PUBKEY`
 - **Round-2 fix F12:** keypair auto-generated on `serve` startup if absent
-- **Tests:** `/Users/fate/v07/catalogue/tests/identity_e2e.rs`, `/Users/fate/v07/catalogue/tests/memory_verify.rs`, `/Users/fate/v07/catalogue/tests/round2_f12_keypair_autogen.rs`, `/Users/fate/v07/catalogue/tests/federation_inbound_verify.rs`
+- **Tests:** `tests/identity_e2e.rs`, `tests/memory_verify.rs`, `tests/round2_f12_keypair_autogen.rs`, `tests/federation_inbound_verify.rs`
 
 ### Feature: Signed events V-4 closeout (cross-row hash chain)
 
 - **Issue(s):** `#698`
 - **Status:** SHIPPED (flips V-4 YELLOW → GREEN)
 - **Net-new in v0.7.0:** YES
-- **Schema:** `/Users/fate/v07/catalogue/migrations/sqlite/0020_v07_signed_events.sql`, `0028_v07_signed_events_chain.sql` (v34 cross-row chain), `/Users/fate/v07/catalogue/migrations/postgres/0015_v07_signed_events_chain.sql`
-- **Code paths:** `/Users/fate/v07/catalogue/src/signed_events.rs`, `/Users/fate/v07/catalogue/src/storage/migrations.rs` (backfill `migrate_v34_backfill_chain`)
-- **CLI:** `/Users/fate/v07/catalogue/src/cli/verify_signed_events.rs` — `ai-memory verify-signed-events-chain [--since N] [--format text|json]`
-- **Tests:** `/Users/fate/v07/catalogue/tests/signed_events_chain_v34.rs` (7 tests pinning first-row zero `prev_hash`, multi-row chaining, payload tamper, sequence tamper, concurrent drainer inserts via PE-3, backfill idempotency, backfill correctness), `/Users/fate/v07/catalogue/tests/deferred_audit_soak.rs` (5K concurrent insert chain assertion), `/Users/fate/v07/catalogue/tests/cli_verify_chain.rs`
+- **Schema:** `migrations/sqlite/0020_v07_signed_events.sql`, `0028_v07_signed_events_chain.sql` (v34 cross-row chain), `migrations/postgres/0015_v07_signed_events_chain.sql`
+- **Code paths:** `src/signed_events.rs`, `src/storage/migrations.rs` (backfill `migrate_v34_backfill_chain`)
+- **CLI:** `src/cli/verify_signed_events.rs` — `ai-memory verify-signed-events-chain [--since N] [--format text|json]`
+- **Tests:** `tests/signed_events_chain_v34.rs` (7 tests pinning first-row zero `prev_hash`, multi-row chaining, payload tamper, sequence tamper, concurrent drainer inserts via PE-3, backfill idempotency, backfill correctness), `tests/deferred_audit_soak.rs` (5K concurrent insert chain assertion), `tests/cli_verify_chain.rs`
 
 ### Feature: Apache AGE acceleration (Track J)
 
@@ -453,11 +453,11 @@ AI_MEMORY_TOOLS_VERBOSE
 - **Status:** SHIPPED
 - **Net-new in v0.7.0:** YES
 - **Docs:** `docs/postgres-age-guide.md` (4,479 words), `docs/kg-backend-fallback.md`
-- **Code paths:** `/Users/fate/v07/catalogue/src/kg/{mod.rs,cycle_check.rs}` + AGE detection in postgres storage adapter
+- **Code paths:** `src/kg/{mod.rs,cycle_check.rs}` + AGE detection in postgres storage adapter
 - **MCP tools:** `memory_find_paths`, `memory_kg_query`, `memory_kg_timeline`, `memory_kg_invalidate` (find_paths is new)
-- **Bench:** `/Users/fate/v07/catalogue/benches/age_vs_cte.rs`
+- **Bench:** `benches/age_vs_cte.rs`
 - **Env var:** `AI_MEMORY_TEST_AGE_URL` (test-side AGE pin)
-- **Tests:** `/Users/fate/v07/catalogue/tests/age_cte_equivalence.rs`, `/Users/fate/v07/catalogue/tests/kg_age_fallback.rs`, `/Users/fate/v07/catalogue/tests/kg/cycle_check_test.rs`, `/Users/fate/v07/catalogue/tests/g4_postgres_link_projects_into_age_graph.rs`, `/Users/fate/v07/catalogue/tests/g5_find_paths_cypher_no_syntax_error.rs`, `/Users/fate/v07/catalogue/tests/g2_postgres_find_paths_age_param_binding.rs`
+- **Tests:** `tests/age_cte_equivalence.rs`, `tests/kg_age_fallback.rs`, `tests/kg/cycle_check_test.rs`, `tests/g4_postgres_link_projects_into_age_graph.rs`, `tests/g5_find_paths_cypher_no_syntax_error.rs`, `tests/g2_postgres_find_paths_age_param_binding.rs`
 
 ### Feature: K1/G1 namespace-inheritance enforcement + permissions pipeline (Track K, 11 tasks)
 
@@ -465,35 +465,35 @@ AI_MEMORY_TOOLS_VERBOSE
 - **Status:** SHIPPED
 - **Net-new in v0.7.0:** YES
 - **Docs:** `docs/policy-engine.md` (3,597 words)
-- **Schema:** `/Users/fate/v07/catalogue/migrations/sqlite/0015_v07_pending_action_timeouts.sql`, `0021_v07_a2a_correlation.sql`, `0022_v07_agent_quotas.sql`
-- **Code paths:** `/Users/fate/v07/catalogue/src/approvals.rs`, `/Users/fate/v07/catalogue/src/quotas.rs`
+- **Schema:** `migrations/sqlite/0015_v07_pending_action_timeouts.sql`, `0021_v07_a2a_correlation.sql`, `0022_v07_agent_quotas.sql`
+- **Code paths:** `src/approvals.rs`, `src/quotas.rs`
 - **Env var:** `AI_MEMORY_PERMISSIONS_MODE`
 - **Round-2 fix F8:** default `permissions.mode = enforce` (was `advisory`)
 - **MCP tools:** `memory_quota_status`, `memory_subscription_dlq_list`, `memory_subscription_replay`, `memory_pending_*` (extends v0.6.4)
-- **CLI:** `/Users/fate/v07/catalogue/src/cli/governance_migrate.rs` — `ai-memory governance migrate-to-permissions`
+- **CLI:** `src/cli/governance_migrate.rs` — `ai-memory governance migrate-to-permissions`
 - **Capability registry entry:** `CapabilityPermissions` (extends v0.6.4)
-- **Tests:** `/Users/fate/v07/catalogue/tests/k7_dlq_list_tool.rs`, `/Users/fate/v07/catalogue/tests/k7_hmac.rs`, `/Users/fate/v07/catalogue/tests/k7_replay_tool.rs`, `/Users/fate/v07/catalogue/tests/k8_quota_status_tool.rs`, `/Users/fate/v07/catalogue/tests/k8_quota_enforcement.rs`, `/Users/fate/v07/catalogue/tests/k8_daily_reset.rs`, `/Users/fate/v07/catalogue/tests/k9_permission_pipeline.rs`, `/Users/fate/v07/catalogue/tests/k10_approval_http.rs`, `/Users/fate/v07/catalogue/tests/k10_approval_sse.rs`, `/Users/fate/v07/catalogue/tests/k10_approval_security.rs`, `/Users/fate/v07/catalogue/tests/k10_remember_forever.rs`, `/Users/fate/v07/catalogue/tests/k11_migrate_dry_run.rs`, `/Users/fate/v07/catalogue/tests/k11_migrate_in_place.rs`, `/Users/fate/v07/catalogue/tests/k11_migrate_to_file.rs`, `/Users/fate/v07/catalogue/tests/permissions_mode_gate.rs`
+- **Tests:** `tests/k7_dlq_list_tool.rs`, `tests/k7_hmac.rs`, `tests/k7_replay_tool.rs`, `tests/k8_quota_status_tool.rs`, `tests/k8_quota_enforcement.rs`, `tests/k8_daily_reset.rs`, `tests/k9_permission_pipeline.rs`, `tests/k10_approval_http.rs`, `tests/k10_approval_sse.rs`, `tests/k10_approval_security.rs`, `tests/k10_remember_forever.rs`, `tests/k11_migrate_dry_run.rs`, `tests/k11_migrate_in_place.rs`, `tests/k11_migrate_to_file.rs`, `tests/permissions_mode_gate.rs`
 
 ### Feature: Hook pipeline (Track G, 25 events)
 
 - **Issue(s):** Track G (11 tasks, Bucket 0)
 - **Status:** SHIPPED
 - **Net-new in v0.7.0:** YES
-- **Code paths:** `/Users/fate/v07/catalogue/src/hooks/{mod.rs,chain.rs,config.rs,decision.rs,events.rs,executor.rs,recall.rs,timeouts.rs}`, sub-trees `pre_store/`, `post_reflect/`
-- **Helper binary:** `/Users/fate/v07/catalogue/tools/auto-link-detector/` (R3 reference hook)
+- **Code paths:** `src/hooks/{mod.rs,chain.rs,config.rs,decision.rs,events.rs,executor.rs,recall.rs,timeouts.rs}`, sub-trees `pre_store/`, `post_reflect/`
+- **Helper binary:** `tools/auto-link-detector/` (R3 reference hook)
 - **Config:** `~/.config/ai-memory/hooks.toml`
 - **Capability registry entry:** `CapabilityHooks` at `src/config.rs:703` (extended)
 - **25 events:** 20 baseline + 5 grand-slam additions (`pre_recall_expand`, `pre_reflect`, `post_reflect`, `pre_compaction`, `on_compaction_rollback`)
-- **Tests:** `/Users/fate/v07/catalogue/tests/hooks_executor_test.rs`, `/Users/fate/v07/catalogue/tests/hooks_hot_reload.rs`, `/Users/fate/v07/catalogue/tests/hooks_pre_recall.rs`, `/Users/fate/v07/catalogue/tests/hooks_timeout_budget.rs`, `/Users/fate/v07/catalogue/tests/g3_hooks_stderr_drain.rs`, `/Users/fate/v07/catalogue/tests/g11_auto_link_detector.rs`
+- **Tests:** `tests/hooks_executor_test.rs`, `tests/hooks_hot_reload.rs`, `tests/hooks_pre_recall.rs`, `tests/hooks_timeout_budget.rs`, `tests/g3_hooks_stderr_drain.rs`, `tests/g11_auto_link_detector.rs`
 
 ### Feature: Capabilities v3 response shape (Track A, 5 tasks)
 
 - **Issue(s):** Track A
 - **Status:** SHIPPED
 - **Net-new in v0.7.0:** EXTENDS_v0_6_4 (v0.6.4 was v2)
-- **Code paths:** `/Users/fate/v07/catalogue/src/config.rs` (all `Capability*` structs), `/Users/fate/v07/catalogue/src/mcp/tools/capabilities.rs`
+- **Code paths:** `src/config.rs` (all `Capability*` structs), `src/mcp/tools/capabilities.rs`
 - **Docs:** `docs/v0.7/canonical-phrasings.md`
-- **Tests:** `/Users/fate/v07/catalogue/tests/capabilities_v3.rs`, `/Users/fate/v07/catalogue/tests/capabilities_v3_l3_5.rs`, `/Users/fate/v07/catalogue/tests/round2_f13_capabilities.rs`, `/Users/fate/v07/catalogue/tests/s75_capabilities_db_schema_version.rs`
+- **Tests:** `tests/capabilities_v3.rs`, `tests/capabilities_v3_l3_5.rs`, `tests/round2_f13_capabilities.rs`, `tests/s75_capabilities_db_schema_version.rs`
 - **Added fields:** `summary`, `to_describe_to_user`, `callable_now`, `agent_permitted_families`, `schema_version="3"`
 - **Round-2 fix F13:** `verbose` and `include_schema` flags fixed
 
@@ -502,9 +502,9 @@ AI_MEMORY_TOOLS_VERBOSE
 - **Issue(s):** Track B
 - **Status:** SHIPPED
 - **Net-new in v0.7.0:** YES (promoted from hidden parameter set to always-on tools)
-- **MCP tools:** `memory_load_family`, `memory_smart_load` → `/Users/fate/v07/catalogue/src/mcp/tools/load_family.rs`, `src/mcp/tools/skill_compositional_context.rs` (smart load is in registry)
+- **MCP tools:** `memory_load_family`, `memory_smart_load` → `src/mcp/tools/load_family.rs`, `src/mcp/tools/skill_compositional_context.rs` (smart load is in registry)
 - **Env var:** `AI_MEMORY_PRECOMPUTE_FAMILY_EMBEDDINGS`
-- **Tests:** `/Users/fate/v07/catalogue/tests/memory_load_family.rs`, `/Users/fate/v07/catalogue/tests/memory_smart_load.rs`, `/Users/fate/v07/catalogue/tests/b3_precompute_doesnt_block_serve.rs`, `/Users/fate/v07/catalogue/tests/b4_config_cleanup.rs`, `/Users/fate/v07/catalogue/tests/round2_f14_smart_load.rs`
+- **Tests:** `tests/memory_load_family.rs`, `tests/memory_smart_load.rs`, `tests/b3_precompute_doesnt_block_serve.rs`, `tests/b4_config_cleanup.rs`, `tests/round2_f14_smart_load.rs`
 
 ### Feature: Schema compaction (Track C, 5 tasks) — 52% MCP tool-token reduction
 
@@ -512,7 +512,7 @@ AI_MEMORY_TOOLS_VERBOSE
 - **Status:** SHIPPED
 - **Net-new in v0.7.0:** YES
 - **Audit:** `docs/v0.7/schema-compaction-audit.md`
-- **Tests:** `/Users/fate/v07/catalogue/tests/c2_tool_docs_field.rs`, `/Users/fate/v07/catalogue/tests/c3_no_inline_examples.rs`
+- **Tests:** `tests/c2_tool_docs_field.rs`, `tests/c3_no_inline_examples.rs`
 - **CI gate:** ≤ 3,500 input tokens for `--profile full` `tools/list`
 
 ### Feature: Per-harness positioning + tests (Track D, 4 tasks)
@@ -521,10 +521,10 @@ AI_MEMORY_TOOLS_VERBOSE
 - **Status:** SHIPPED
 - **Net-new in v0.7.0:** YES
 - **Docs:** `docs/v0.7/compatibility-matrix.html`, `docs/positioning.md`, `docs/integrations/networking.md`
-- **CLI:** `/Users/fate/v07/catalogue/src/cli/install.rs` (modified — emits install-time system-prompt snippet)
+- **CLI:** `src/cli/install.rs` (modified — emits install-time system-prompt snippet)
 - **Env var:** `AI_MEMORY_SYSTEM_PROMPT_DIR`
-- **Bench:** `/Users/fate/v07/catalogue/benches/harness_bench.rs`, `/Users/fate/v07/catalogue/benchmarks/competitive-benchmarks/`
-- **Tests:** `/Users/fate/v07/catalogue/tests/harness_integration.rs`
+- **Bench:** `benches/harness_bench.rs`, `benchmarks/competitive-benchmarks/`
+- **Tests:** `tests/harness_integration.rs`
 
 ### Feature: Discovery Gate + T0 calibration (Track E, 3 tasks)
 
@@ -532,8 +532,8 @@ AI_MEMORY_TOOLS_VERBOSE
 - **Status:** SHIPPED
 - **Net-new in v0.7.0:** YES
 - **Docs:** `docs/v0.7/T0-ORCHESTRATION.md`, `docs/v0.7/POST-SHIP-CONVERGENCE.md`
-- **Helper binaries:** `/Users/fate/v07/catalogue/tools/t0-orchestrate/`, `/Users/fate/v07/catalogue/tools/post-ship-converge/`
-- **Tests:** `/Users/fate/v07/catalogue/tests/discovery_gate_t1_t3.rs`, `/Users/fate/v07/catalogue/tests/e1_orchestration_dry_run.rs`, `/Users/fate/v07/catalogue/tests/e2_post_ship_dry_run.rs`
+- **Helper binaries:** `tools/t0-orchestrate/`, `tools/post-ship-converge/`
+- **Tests:** `tests/discovery_gate_t1_t3.rs`, `tests/e1_orchestration_dry_run.rs`, `tests/e2_post_ship_dry_run.rs`
 
 ### Feature: Postgres + AGE first-class (Wave 1-4)
 
@@ -541,20 +541,20 @@ AI_MEMORY_TOOLS_VERBOSE
 - **Status:** SHIPPED
 - **Net-new in v0.7.0:** YES (Storage Abstraction Layer is new; SqliteStore + PostgresStore both live)
 - **Docs:** `docs/postgres-age-guide.md` (4,479 words), `docs/migration-v0.7.0-postgres.md` (1,604 words)
-- **Code paths:** `/Users/fate/v07/catalogue/src/store/mod.rs`, `/Users/fate/v07/catalogue/src/storage/{connection.rs,migrations.rs,reflect.rs,mod.rs}`
-- **CLI:** `/Users/fate/v07/catalogue/src/cli/schema_init.rs` — `ai-memory schema-init`
+- **Code paths:** `src/store/mod.rs`, `src/storage/{connection.rs,migrations.rs,reflect.rs,mod.rs}`
+- **CLI:** `src/cli/schema_init.rs` — `ai-memory schema-init`
 - **Cargo features:** `sal-postgres` (opt-in; default sqlite build is byte-for-byte unchanged)
 - **Postgres migrations:** 10 new files `0012..0020`
-- **Tests:** `/Users/fate/v07/catalogue/tests/postgres_schema_parity.rs`, `/Users/fate/v07/catalogue/tests/sal_v07_postgres_findings.rs`, `/Users/fate/v07/catalogue/tests/serve_postgres_*.rs` (5 files), `/Users/fate/v07/catalogue/tests/recall_scoring_parity.rs`, `/Users/fate/v07/catalogue/tests/cli_schema_init.rs`, `/Users/fate/v07/catalogue/tests/migrate_links_roundtrip.rs`, `/Users/fate/v07/catalogue/tests/federation_postgres_fanout.rs`, `/Users/fate/v07/catalogue/tests/g1_postgres_quota_increment_on_store.rs`, `/Users/fate/v07/catalogue/tests/governance_postgres_inheritance.rs`, `/Users/fate/v07/catalogue/tests/s79_postgres_recall_returns_results.rs`
+- **Tests:** `tests/postgres_schema_parity.rs`, `tests/sal_v07_postgres_findings.rs`, `tests/serve_postgres_*.rs` (5 files), `tests/recall_scoring_parity.rs`, `tests/cli_schema_init.rs`, `tests/migrate_links_roundtrip.rs`, `tests/federation_postgres_fanout.rs`, `tests/g1_postgres_quota_increment_on_store.rs`, `tests/governance_postgres_inheritance.rs`, `tests/s79_postgres_recall_returns_results.rs`
 
 ### Feature: Federation hardening (mTLS + X-API-Key + fingerprint allowlist)
 
 - **Issue(s):** `#238`, `#239`, `#318` (continued), security-hardening sweep
 - **Status:** SHIPPED
 - **Net-new in v0.7.0:** EXTENDS_v0_6_4
-- **Code paths:** `/Users/fate/v07/catalogue/src/federation/{mod.rs,peer.rs,peer_attestation.rs,quorum.rs,receive.rs,sync.rs,vector_clock.rs}`
+- **Code paths:** `src/federation/{mod.rs,peer.rs,peer_attestation.rs,quorum.rs,receive.rs,sync.rs,vector_clock.rs}`
 - **Env vars:** `AI_MEMORY_FED_PEER_ATTESTATION`, `AI_MEMORY_FED_SYNC_TRUST_PEER`, `AI_MEMORY_FED_TRUST_BODY_AGENT_ID`
-- **Tests:** `/Users/fate/v07/catalogue/tests/federation_b2_hardening.rs`, `/Users/fate/v07/catalogue/tests/federation_x_api_key.rs`, `/Users/fate/v07/catalogue/tests/federation_inbound_verify.rs`, `/Users/fate/v07/catalogue/tests/federation_reflection_replication.rs`, `/Users/fate/v07/catalogue/tests/g_issue_238_sender_attestation.rs`, `/Users/fate/v07/catalogue/tests/g_issue_239_sync_scope.rs`, `/Users/fate/v07/catalogue/tests/issue_318_mcp_federation_forward.rs`
+- **Tests:** `tests/federation_b2_hardening.rs`, `tests/federation_x_api_key.rs`, `tests/federation_inbound_verify.rs`, `tests/federation_reflection_replication.rs`, `tests/g_issue_238_sender_attestation.rs`, `tests/g_issue_239_sync_scope.rs`, `tests/issue_318_mcp_federation_forward.rs`
 
 ### Feature: Security-hardening sweep (release/v0.7.0 reconciled into trunk)
 
@@ -572,7 +572,7 @@ AI_MEMORY_TOOLS_VERBOSE
   - Hooks executor secret-redaction (`cbe934c`)
   - H8 rebound-namespace `Ask` walk (`69ad41c`)
   - I1 zstd-decompression cap config-driven (`26fab06`)
-- **Tests:** `/Users/fate/v07/catalogue/tests/k10_approval_security.rs`, `/Users/fate/v07/catalogue/tests/i1_zstd_bomb.rs`, `/Users/fate/v07/catalogue/tests/h2_invalidate_link_signed.rs`
+- **Tests:** `tests/k10_approval_security.rs`, `tests/i1_zstd_bomb.rs`, `tests/h2_invalidate_link_signed.rs`
 
 ### Feature: Round-2 NHI sweep (F1-F18)
 
@@ -580,64 +580,64 @@ AI_MEMORY_TOOLS_VERBOSE
 - **Status:** SHIPPED (all 18 closed)
 - **Net-new in v0.7.0:** YES
 - **Per-finding:** see CHANGELOG `## [0.7.0]` "F-series fixes" section (lines 16-36 of CHANGELOG.md)
-- **Tests:** `/Users/fate/v07/catalogue/tests/round2_f{6,7,8,9,10,11,12,13,14,15,16,17,18}_*.rs` (13 files)
+- **Tests:** `tests/round2_f{6,7,8,9,10,11,12,13,14,15,16,17,18}_*.rs` (13 files)
 
 ### Feature: K8 quota status tool
 
 - **Issue(s):** Track K, K8 family
 - **Status:** SHIPPED
 - **Net-new in v0.7.0:** YES
-- **MCP tool:** `memory_quota_status` → `/Users/fate/v07/catalogue/src/mcp/tools/quota_status.rs`
+- **MCP tool:** `memory_quota_status` → `src/mcp/tools/quota_status.rs`
 - **HTTP route:** `/api/v1/quota/status`
-- **Code paths:** `/Users/fate/v07/catalogue/src/quotas.rs`
-- **Schema:** `/Users/fate/v07/catalogue/migrations/sqlite/0022_v07_agent_quotas.sql`
-- **Tests:** `/Users/fate/v07/catalogue/tests/k8_quota_status_tool.rs`, `/Users/fate/v07/catalogue/tests/k8_daily_reset.rs`, `/Users/fate/v07/catalogue/tests/k8_quota_enforcement.rs`
+- **Code paths:** `src/quotas.rs`
+- **Schema:** `migrations/sqlite/0022_v07_agent_quotas.sql`
+- **Tests:** `tests/k8_quota_status_tool.rs`, `tests/k8_daily_reset.rs`, `tests/k8_quota_enforcement.rs`
 
 ### Feature: Batman framework audit deliverable
 
 - **Status:** SHIPPED (audit document only)
 - **Net-new in v0.7.0:** YES
-- **Docs:** `/Users/fate/v07/catalogue/docs/internal/batman-framework-audit.md` (4,478 words)
+- **Docs:** `docs/internal/batman-framework-audit.md` (4,478 words)
 - **Code paths:** N/A — audit document
 - **Cross-reference:** anchors Forms 1-7 inventory above
 
-### Feature: Schema migration ladder v33 → v39 / postgres v17 → v38
+### Feature: Schema migration ladder — sqlite v20 → v49 / postgres v15 → v49 (logical)
 
-- **Status:** SHIPPED — final extant: sqlite up to `0033_v07_form5_confidence_calibration.sql`, postgres up to `0020_v07_form5_confidence_calibration.sql`
-- **Net-new in v0.7.0:** YES (all 20 sqlite + 10 postgres files added since v0.6.4)
-- **Per-migration evidence:** every `migrations/sqlite/0015..0033` and `migrations/postgres/0012..0020` is `git diff --name-status v0.6.4..HEAD` "A"-status
-- **Known unknowns:** the task prompt said "sqlite v33 → v39 / postgres v17 → v38" but in-tree highest migration files are sqlite 0033 / postgres 0020. The release-notes references to "v34" (V-4 closeout) and beyond are applied via the in-process ladder in `/Users/fate/v07/catalogue/src/storage/migrations.rs` rather than as additional SQL files. Reviewer should verify whether the "v34 → v39" range refers to in-process migrations or whether SQL files are still in flight.
+- **Status:** SHIPPED — `CURRENT_SCHEMA_VERSION = 49` in both `src/storage/migrations.rs:516` (sqlite) and `src/store/postgres.rs:417` (postgres). Highest on-disk migration files: `migrations/sqlite/0041_v07_federation_push_dlq.sql` (file-name counter 0041; per-bump narrative for the in-process v35-v49 deltas is in `docs/MIGRATION_v0.7.md` §schema-ladder) and `migrations/postgres/0030_v07_federation_push_dlq.sql` (postgres runs the v34-v49 deltas through async `migrate_v34() … migrate_v49()` arms in `src/store/postgres.rs`).
+- **Net-new in v0.7.0:** YES — every migration past v20 (sqlite) / v15 (postgres) landed during the v0.7.0 cycle.
+- **Per-migration evidence:** see `docs/MIGRATION_v0.7.md` §schema-ladder for the per-bump narrative covering v20 → v34 (V-4 closeout #698), v45 Gap-1 `version` column (#1036), v46 recall_observations widening, v47 confidence_tier index (#1042), v48 federation_push_dlq (#933), v49 archived_memories full column carry (#1025).
+- **Resolution of the prior "known unknowns" block:** the SR-5 sweep clarified that the file-name counters intentionally lag the logical schema version because both adapters apply post-v34 deltas via in-process migration arms, not additional SQL files. The "v34 → v39" range in the original prompt was a draft estimate; the canonical anchor is the `CURRENT_SCHEMA_VERSION` constant in each adapter.
 
 ### Feature: Adapter selection refactor + `AppState.store: Arc<dyn MemoryStore>`
 
 - **Issue(s):** Wave 3
 - **Status:** SHIPPED
 - **Net-new in v0.7.0:** YES
-- **Code paths:** `/Users/fate/v07/catalogue/src/store/mod.rs`, `/Users/fate/v07/catalogue/src/handlers/mod.rs`, `/Users/fate/v07/catalogue/src/handlers/{http.rs,transport.rs,federation_receive.rs,hook_subscribers.rs}`
+- **Code paths:** `src/store/mod.rs`, `src/handlers/mod.rs`, `src/handlers/{http.rs,transport.rs,federation_receive.rs,hook_subscribers.rs}`
 - **Public surface:** `ai-memory serve --store-url postgres://...`
 
 ### Feature: Tests pinning ship gate
 
 - **Status:** SHIPPED
 - **Net-new in v0.7.0:** YES
-- **Test files:** `/Users/fate/v07/catalogue/tests/ship_gate.rs`, `/Users/fate/v07/catalogue/tests/ship_gate/{grand_slam_recursive_learning.rs,grand_slam_skills.rs,grand_slam_composition.rs}`
+- **Test files:** `tests/ship_gate.rs`, `tests/ship_gate/{grand_slam_recursive_learning.rs,grand_slam_skills.rs,grand_slam_composition.rs}`
 
 ### Feature: Helper binaries (4 new under `tools/`)
 
 - **Status:** SHIPPED
 - **Net-new in v0.7.0:** YES
 - **Bins:**
-  - `/Users/fate/v07/catalogue/tools/auto-link-detector/` — R3 reference `pre_link` hook (775 LoC `src/main.rs`)
-  - `/Users/fate/v07/catalogue/tools/transcript-extractor/` — R5 reference `pre_store` hook (Track I)
-  - `/Users/fate/v07/catalogue/tools/t0-orchestrate/` — Track E T0 calibration driver
-  - `/Users/fate/v07/catalogue/tools/post-ship-converge/` — post-ship convergence verifier
+  - `tools/auto-link-detector/` — R3 reference `pre_link` hook (775 LoC `src/main.rs`)
+  - `tools/transcript-extractor/` — R5 reference `pre_store` hook (Track I)
+  - `tools/t0-orchestrate/` — Track E T0 calibration driver
+  - `tools/post-ship-converge/` — post-ship convergence verifier
 - **Cargo note:** kept out of crates.io upload via the parent `Cargo.toml` `include` allowlist
 
 ### Feature: Benchmarks (11 new)
 
 - **Status:** SHIPPED
 - **Net-new in v0.7.0:** YES
-- **Files:** `/Users/fate/v07/catalogue/benches/{age_vs_cte,harness_bench,longmemeval_reflection,reflect,reranker_throughput}.rs`; `/Users/fate/v07/catalogue/benchmarks/longmemeval_reflection/{dataset,runner}.rs` + `data/scenarios.jsonl`; `/Users/fate/v07/catalogue/benchmarks/competitive-benchmarks/{README.md,expected_output.md,harness.sh}`; existing `/Users/fate/v07/catalogue/benchmarks/v0.6.4-cross-harness.md`
+- **Files:** `benches/{age_vs_cte,harness_bench,longmemeval_reflection,reflect,reranker_throughput}.rs`; `benchmarks/longmemeval_reflection/{dataset,runner}.rs` + `data/scenarios.jsonl`; `benchmarks/competitive-benchmarks/{README.md,expected_output.md,harness.sh}`; existing `benchmarks/v0.6.4-cross-harness.md`
 
 ### Feature: 42 new docs
 

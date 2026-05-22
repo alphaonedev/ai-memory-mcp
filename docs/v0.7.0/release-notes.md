@@ -293,6 +293,79 @@ beyond the auto_tag chat-shape fix described in §#1067 above:
   path-traversal probe under operating-system FS layers that ai-memory
   doesn't currently expose but might in a future export-path feature.
 
+## v0.7.0 ship-readiness session 2026-05-20/05-21 — security + audit hardening
+
+The 2026-05-20 → 2026-05-21 wave closed roughly 50 agent-filed issues spanning federation/audit chain, governance fail-CLOSED postures, MCP wire honesty, postgres parity, and the v48→v49 archived_memories carry. Every fix below has a regression test pinning it. Grouped by severity.
+
+### Operator advisories (behaviour changes — read before upgrading)
+
+Three v0.7.0 postures flip from v0.6.x fail-open behaviour to v0.7.0 fail-CLOSED. Each has a one-line env-var escape hatch (documented in CLAUDE.md §Environment Variables rows 36-41) for operators who need the legacy posture during peer enrolment:
+
+- **Governance hooks fail-CLOSED on rule-consultation error** ([#1054](https://github.com/alphaonedev/ai-memory-mcp/issues/1054), commit [`bc4bc4323`](https://github.com/alphaonedev/ai-memory-mcp/commit/bc4bc4323)). Transient rule-provider errors now block the write; set `AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1` to revert to v0.6.x permissive behaviour.
+- **SSRF guard fail-CLOSED on DNS resolution failure** ([#1053](https://github.com/alphaonedev/ai-memory-mcp/issues/1053), commit [`488bdb6a8`](https://github.com/alphaonedev/ai-memory-mcp/commit/488bdb6a8)). Webhook + federation push targets that fail DNS now refuse the dispatch; set `AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL=1` to revert.
+- **`passphrase_from_file` rejects lax permissions** ([#1055](https://github.com/alphaonedev/ai-memory-mcp/issues/1055), commit [`0ef54ae64`](https://github.com/alphaonedev/ai-memory-mcp/commit/0ef54ae64)). Files with bits set in `mode & 0o077` are refused; `chmod 0400 ./passphrase.txt` before upgrade, or set `AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS=1` to revert.
+- **`hmac_secret` boot validator + fixed-length HMAC pin** ([#1039](https://github.com/alphaonedev/ai-memory-mcp/issues/1039) / [#1048](https://github.com/alphaonedev/ai-memory-mcp/issues/1048), commit [`4fd15d359`](https://github.com/alphaonedev/ai-memory-mcp/commit/4fd15d359)). Non-hex HMAC secrets are now rejected at boot rather than silently producing length-leaking comparisons. Operators with non-hex secrets must rotate to hex format pre-upgrade.
+
+### CRITICAL — schema bump + audit chain integrity
+
+- **#1025 — archived_memories full v0.7.0 column carry, schema v48 → v49** (commits [`b1b462a77`](https://github.com/alphaonedev/ai-memory-mcp/commit/b1b462a77) + [`bd74c2e2c`](https://github.com/alphaonedev/ai-memory-mcp/commit/bd74c2e2c)). v49 added 14 nullable columns to `archived_memories` on both backends so archive → restore is lossless for the full v0.7.0 Memory shape (reflection_depth / memory_kind / entity_id / persona_version / citations / source_uri / source_span / confidence_source / confidence_signals / confidence_decayed_at / mentioned_entity_id / version / atomised_into / atom_of). Both adapters now at `CURRENT_SCHEMA_VERSION = 49`.
+
+### HIGH — federation, audit chain, governance
+
+- **#1017 HookSink::write opens fresh Connection per webhook firing — connection-reuse refactor** (commit [`604b57e32`](https://github.com/alphaonedev/ai-memory-mcp/commit/604b57e32)). Reuses the long-lived hook consultation connection; ~1-2ms/write reclaimed.
+- **#1028 federation visibility-gate audit (legacy-row regression)** (commits [`6215f8d5b`](https://github.com/alphaonedev/ai-memory-mcp/commit/6215f8d5b) + [`ed47b4d60`](https://github.com/alphaonedev/ai-memory-mcp/commit/ed47b4d60) revert + [`3befc2284`](https://github.com/alphaonedev/ai-memory-mcp/commit/3befc2284) regression test). Pinned mTLS peers cannot enumerate other agents' private rows via `/sync/since`.
+- **#1029 postgres apply_remote_memory drops federation provenance** (commit [`c855a24cc`](https://github.com/alphaonedev/ai-memory-mcp/commit/c855a24cc)). Postgres apply_remote_memory now carries all 26 v0.7.0 Memory columns.
+- **#1030 postgres list ignores Filter.agent_id** (commit [`7c7c102a2`](https://github.com/alphaonedev/ai-memory-mcp/commit/7c7c102a2)).
+- **#1031 sync/since X-Peer-Id accepted without signature verification** (commit [`ecccb9c52`](https://github.com/alphaonedev/ai-memory-mcp/commit/ecccb9c52)). `/sync/since` now requires `X-Memory-Sig`.
+- **#1032 FederationPushDlqSink poison-message infinite retry** (commit [`9c6d59a8d`](https://github.com/alphaonedev/ai-memory-mcp/commit/9c6d59a8d)). Quarantines after `MAX_REPLAY_ATTEMPTS`.
+- **#1033 ReplayCache eviction never flushed to disk under sustained load** (commit [`594a178f4`](https://github.com/alphaonedev/ai-memory-mcp/commit/594a178f4)). O(1) lookup + 10× capacity + eviction metric.
+- **#1034 wire-check refusals not entered into signed_events audit chain** (commit [`b21326b60`](https://github.com/alphaonedev/ai-memory-mcp/commit/b21326b60)).
+- **#1035 governance.check writes unsigned audit rows** (commit [`b21326b60`](https://github.com/alphaonedev/ai-memory-mcp/commit/b21326b60)). Every audit row now signed.
+- **#1037 HNSW rebuild_async no-op handle race** (commit [`17e0d4a0c`](https://github.com/alphaonedev/ai-memory-mcp/commit/17e0d4a0c)). `rebuild()` sync shim now bounded-waits.
+- **#1038 FederationNonceCache outer-HashMap unbounded peer count** (commit [`8d89e8c90`](https://github.com/alphaonedev/ai-memory-mcp/commit/8d89e8c90)). Outer-HashMap LRU bound.
+- **#1039 + #1048 HMAC verify length-leak + hmac_secret boot validator** (commit [`4fd15d359`](https://github.com/alphaonedev/ai-memory-mcp/commit/4fd15d359)).
+- **#1040 mTLS bypass + sig gate composition pinned for /sync/*** (commit [`f337efb4a`](https://github.com/alphaonedev/ai-memory-mcp/commit/f337efb4a)). Sig still required.
+- **#1049 + #1056 TOFU peer-id allowlist gate + X-Peer-Id input validation** (commit [`8a808d098`](https://github.com/alphaonedev/ai-memory-mcp/commit/8a808d098)).
+- **#1052 MCP additionalProperties contract gap** (commit [`b79d1340b`](https://github.com/alphaonedev/ai-memory-mcp/commit/b79d1340b)). Dropped `schemars(deny_unknown_fields)` so wire matches the dispatch tolerance.
+- **#1053 SSRF guard fail-CLOSED on DNS failure** (commit [`488bdb6a8`](https://github.com/alphaonedev/ai-memory-mcp/commit/488bdb6a8)) — see Operator advisories.
+- **#1054 governance hooks fail-CLOSED on rule consultation error** (commit [`bc4bc4323`](https://github.com/alphaonedev/ai-memory-mcp/commit/bc4bc4323)) — see Operator advisories.
+- **#1055 passphrase_from_file rejects lax permissions** (commit [`0ef54ae64`](https://github.com/alphaonedev/ai-memory-mcp/commit/0ef54ae64)) — see Operator advisories.
+- **#1057 + #1058 + #1059 MCP wire honesty trio — token budget + default:null strip + overlay parity** (commit [`357b40873`](https://github.com/alphaonedev/ai-memory-mcp/commit/357b40873)).
+- **#1060 + #1062 constant_time_eq no len leak + for_admin_checked typed gate** (commit [`2c7356ca1`](https://github.com/alphaonedev/ai-memory-mcp/commit/2c7356ca1)).
+- **#1066 + #1067 provider-agnostic LLM substrate** (commit [`b8d94a89e`](https://github.com/alphaonedev/ai-memory-mcp/commit/b8d94a89e)). Every tier × every vendor (15 OpenAI-compatible aliases + Ollama).
+- **#1068 + #1070 mobile target CI** (commits [`29fef82aa`](https://github.com/alphaonedev/ai-memory-mcp/commit/29fef82aa) + [`6f4584daf`](https://github.com/alphaonedev/ai-memory-mcp/commit/6f4584daf)).
+
+### MEDIUM — postgres parity, audit-trail hygiene, performance
+
+- **#1018 RuleCache::is_empty returns wrong answer on poisoned lock** (commit [`71c8726d7`](https://github.com/alphaonedev/ai-memory-mcp/commit/71c8726d7)).
+- **#1019 RuleCache slow-path allocates String on every loser-of-race** (commit [`71c8726d7`](https://github.com/alphaonedev/ai-memory-mcp/commit/71c8726d7)).
+- **#1020 RuleCache::get_or_load typed error on substrate-public surface** (commit [`fcd17b560`](https://github.com/alphaonedev/ai-memory-mcp/commit/fcd17b560)).
+- **#1021 RuleCache hot-path methods missing `#[inline]`** (commit [`71c8726d7`](https://github.com/alphaonedev/ai-memory-mcp/commit/71c8726d7)).
+- **#1022 extract_missing_fields unbounded result vec** (commit [`71c8726d7`](https://github.com/alphaonedev/ai-memory-mcp/commit/71c8726d7)).
+- **#1024 postgres update trait silently skips version bump** (commit [`71baf2956`](https://github.com/alphaonedev/ai-memory-mcp/commit/71baf2956)).
+- **#1026 postgres run_gc archive+delete now transactional** (commit [`71baf2956`](https://github.com/alphaonedev/ai-memory-mcp/commit/71baf2956)).
+- **#1027 run_gc HTTP route now require_admin-gated** (commit [`e10830887`](https://github.com/alphaonedev/ai-memory-mcp/commit/e10830887)).
+- **#1036 non-version-bumping write sites documented + pinned** (commit [`fce76a4ea`](https://github.com/alphaonedev/ai-memory-mcp/commit/fce76a4ea)).
+- **#1041 + #1042 governance UI honesty — rule_list + install-defaults** (commit [`fe4e841ee`](https://github.com/alphaonedev/ai-memory-mcp/commit/fe4e841ee)).
+- **#1043 governance_check_action tests now hold forensic_sink_test_lock** (commit [`8a5136049`](https://github.com/alphaonedev/ai-memory-mcp/commit/8a5136049)).
+- **#1044 signed_events_dlq postgres column promoted to TIMESTAMPTZ** (commit [`4a8a48cb4`](https://github.com/alphaonedev/ai-memory-mcp/commit/4a8a48cb4)).
+- **#1045 migrate_v16 skipped on postgres — explanatory comment added** (commit [`4a8a48cb4`](https://github.com/alphaonedev/ai-memory-mcp/commit/4a8a48cb4)).
+- **#1046 signed_events DLQ replay-into-chain contract documented** (commit [`371a28d7d`](https://github.com/alphaonedev/ai-memory-mcp/commit/371a28d7d)).
+- **#1047 rule-cache cross-process staleness operator advisory** (commit [`4a8a48cb4`](https://github.com/alphaonedev/ai-memory-mcp/commit/4a8a48cb4)).
+- **#1051 memory_share dispatch arm restored** (commit [`e10830887`](https://github.com/alphaonedev/ai-memory-mcp/commit/e10830887)) — pre-#1050 follow-up that surfaced the dispatch-arm-missing CRITICAL early in this wave.
+- **#1061 FederationNonceCache FIFO eviction replay window documented** (commit [`371a28d7d`](https://github.com/alphaonedev/ai-memory-mcp/commit/371a28d7d)).
+- **#1063 MCP tool registry deny_unknown_fields compile-time invariant** (commit [`71c8726d7`](https://github.com/alphaonedev/ai-memory-mcp/commit/71c8726d7)).
+- **#1064 tool_definitions test comment count drift (51 → 73)** (commit [`71c8726d7`](https://github.com/alphaonedev/ai-memory-mcp/commit/71c8726d7)).
+- **#1069 backfill promised regression tests + harden test isolation** (commit [`8a5136049`](https://github.com/alphaonedev/ai-memory-mcp/commit/8a5136049)).
+
+### LOW — doc hygiene + cleanup
+
+- **#1015 rule_cache.rs doc drift** — see existing 6-agent review batch section.
+- **#1016 AppState.rule_cache dead on HTTP path** — see existing 6-agent review batch section.
+- **#1023 MCP handle_check_agent_action RuleCache bypass documented** (commit [`371a28d7d`](https://github.com/alphaonedev/ai-memory-mcp/commit/371a28d7d)).
+- **#1050 memory_share advertised but undispatched** (commit [`e10830887`](https://github.com/alphaonedev/ai-memory-mcp/commit/e10830887)).
+- **#1065 lan-parity compose missing pgvector** (commit [`e10830887`](https://github.com/alphaonedev/ai-memory-mcp/commit/e10830887)).
+
 ## v0.7.0 ship-readiness session 2026-05-21 — registry refactor (Wave-2 Tier-D1)
 
 The 2026-05-21 ship-readiness session closed [#972](https://github.com/alphaonedev/ai-memory-mcp/issues/972)
