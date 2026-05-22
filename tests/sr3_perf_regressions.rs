@@ -225,9 +225,17 @@ fn sr3_1097_dispatch_uses_list_by_event() {
         "dispatch_event_with_details must call list_by_event(conn, event) post-#1097"
     );
     // Anti-pin: the pre-#1097 `list(conn, None)` full-table scan
-    // must NOT survive.
+    // must NOT survive in executable code. Strip comment lines so
+    // doc-comment references to the legacy pattern don't fail the
+    // grep (the rationale block in the post-#1097 body deliberately
+    // names the pre-#1097 call site).
+    let code_only: String = body
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
-        !body.contains("list(conn, None)"),
+        !code_only.contains("list(conn, None)"),
         "dispatch_event_with_details must NOT use list(conn, None) post-#1097"
     );
 }
@@ -333,8 +341,15 @@ fn sr3_1087_hnsw_search_caches_valid_ids() {
         body.contains("cosine_distance(&query_point.0, emb)"),
         "overflow scan must compute distance against &[f32] slice post-#1087"
     );
+    // Strip comment lines so the rationale-block reference to the
+    // pre-#1087 pattern in the doc-block doesn't trip the anti-pin.
+    let code_only: String = body
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
-        !body.contains("EmbeddingPoint(emb.clone())"),
+        !code_only.contains("EmbeddingPoint(emb.clone())"),
         "overflow scan must NOT clone the embedding vec post-#1087"
     );
 }
