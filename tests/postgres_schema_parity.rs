@@ -60,7 +60,11 @@ use common::postgres_url;
 /// bookkeeping for this parity test. The previous cross-ladder `>=`
 /// floor assertion was retired in #797 once the namespaces inverted —
 /// see the docstring of `schema_versions_match_across_adapters`.
-const POSTGRES_CURRENT_VERSION: i64 = 48;
+// #1132: bumped 48 → 49 to match the post-#1025 `migrate_v49` Postgres
+// ladder head (`src/store/postgres.rs:417` + dispatch at line 1141).
+// #1025 introduced v49 (the archived_memories full-v0.7.0-column-carry
+// migration); this constant was previously stale.
+const POSTGRES_CURRENT_VERSION: i64 = 49;
 
 /// Open an out-of-band `sqlx` pool against the same URL the adapter
 /// uses. We deliberately bypass `PostgresStore` for the inspection
