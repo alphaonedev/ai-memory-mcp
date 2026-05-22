@@ -94,6 +94,31 @@ pub struct RecallArgs {
     /// alias for cross-interface ergonomics.
     #[arg(long = "kind", alias = "kinds", value_name = "KIND[,KIND...]")]
     pub kind: Option<String>,
+    /// v0.7.0 #1098 — restrict to memories whose confidence tier
+    /// matches one of {high, medium, low}. Wired through to
+    /// [`crate::models::RecallRequest::confidence_tier`] via
+    /// `RecallRequest::from_cli_args`; the MCP / HTTP surfaces have
+    /// accepted this filter since RC, the CLI surface closes the
+    /// three-surface parity gap.
+    #[arg(long = "confidence-tier", value_name = "TIER", value_parser = ["high", "medium", "low"])]
+    pub confidence_tier: Option<String>,
+    /// v0.7.0 #1098 — when set, emit per-row provenance decoration
+    /// (Gap-7 #890): `citations`, `source_uri`, `source_span`,
+    /// `confidence_source`, `confidence_signals`. The flag flows
+    /// through the DTO so MCP / HTTP / CLI agree on the verbose
+    /// envelope shape; the JSON renderer downstream owns the actual
+    /// expansion (today's CLI emits the full `Memory` row already,
+    /// so the flag is preserved for cross-surface parity).
+    #[arg(long = "verbose-provenance")]
+    pub verbose_provenance: bool,
+    /// v0.7.0 #1098 — response format selector: `human` (default
+    /// pretty text), `json` (the same envelope `--json` produces),
+    /// or `toon` (TOON compact format, ~79% smaller than JSON; see
+    /// [`crate::toon`]). The MCP / HTTP surfaces accept the same
+    /// vocabulary via `RecallRequest::format`. Default `human`
+    /// preserves v0.6.x CLI semantics.
+    #[arg(long = "format", value_name = "FORMAT", value_parser = ["human", "json", "toon"], default_value = "human")]
+    pub format: String,
 }
 
 /// v0.7.0 Form 4 (issue #757) — post-filter a recall result set by
@@ -509,6 +534,13 @@ mod tests {
             has_citations: false,
             source_uri_prefix: None,
             kind: None,
+            // v0.7.0 #1098 — three CLI parity flags wired in via
+            // `RecallRequest::from_cli_args`. Test fixtures default
+            // to None / false / "human" so existing tests keep their
+            // pre-#1098 semantics.
+            confidence_tier: None,
+            verbose_provenance: false,
+            format: "human".to_string(),
         }
     }
 

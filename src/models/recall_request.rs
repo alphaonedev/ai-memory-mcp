@@ -336,9 +336,19 @@ impl RecallRequest {
                 .kind
                 .as_deref()
                 .map(|s| KindsFilter::Csv(s.to_string())),
-            confidence_tier: None,
-            verbose_provenance: None,
-            format: None,
+            // v0.7.0 #1098 — CLI parity for the 3 recall flags that
+            // landed on MCP / HTTP at RC. Pre-#1098 these were hard-
+            // coded to `None`, so a CLI caller could not reach the
+            // confidence-tier filter, the verbose-provenance
+            // decoration, or the `toon` response format selector
+            // even though MCP / HTTP callers could.
+            confidence_tier: args.confidence_tier.clone(),
+            verbose_provenance: Some(args.verbose_provenance),
+            // The CLI clap parser supplies a default of `"human"` so
+            // the field is never literally absent at this point;
+            // marshal it through unchanged so the downstream DTO
+            // honours an explicit `--format json` / `--format toon`.
+            format: Some(args.format.clone()),
         }
     }
 
@@ -597,6 +607,10 @@ mod tests {
             has_citations: true,
             source_uri_prefix: Some("doc:".to_string()),
             kind: Some("concept,claim".to_string()),
+            // v0.7.0 #1098 — three new CLI parity flags.
+            confidence_tier: Some("high".to_string()),
+            verbose_provenance: true,
+            format: "toon".to_string(),
         };
         let req = RecallRequest::from_cli_args(&cli_args);
         assert_eq!(req.context, "hello");
@@ -609,9 +623,24 @@ mod tests {
         assert_eq!(req.has_citations, Some(true));
         assert_eq!(req.source_uri_prefix.as_deref(), Some("doc:"));
         assert!(matches!(req.kinds, Some(KindsFilter::Csv(ref s)) if s == "concept,claim"));
-        // CLI `tier` and `format` have no DTO field — they're CLI-only
-        // knobs that drive embedder construction / output formatting,
-        // not wire-level filters.
+        // v0.7.0 #1098 — pin the three flags wired through.
+        assert_eq!(
+            req.confidence_tier.as_deref(),
+            Some("high"),
+            "#1098: --confidence-tier marshals into DTO.confidence_tier"
+        );
+        assert_eq!(
+            req.verbose_provenance,
+            Some(true),
+            "#1098: --verbose-provenance marshals into DTO.verbose_provenance"
+        );
+        assert_eq!(
+            req.format.as_deref(),
+            Some("toon"),
+            "#1098: --format marshals into DTO.format"
+        );
+        // CLI `tier` has no DTO field — it's a CLI-only knob that
+        // drives embedder construction, not a wire-level filter.
     }
 
     #[test]
