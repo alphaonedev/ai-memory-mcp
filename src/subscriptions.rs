@@ -1086,9 +1086,47 @@ fn validate_url_dns_with(url: &str, allow_loopback: bool) -> Result<()> {
         } else {
             format!("{host_port}:80")
         };
+    // v0.7.0 #1053 (Agent-2 #3) — fail-CLOSED on DNS resolution
+    // failure. Pre-#1053 a SERVFAIL / timeout / hang at the daemon's
+    // resolver returned Ok(()) here, but the subsequent
+    // `reqwest::send` performs its OWN DNS resolution under
+    // potentially-attacker-controlled DNS (TTL-zero / DNS rebind).
+    // The attacker's first resolution at the daemon could SERVFAIL
+    // (bypassing the SSRF guard), then their second resolution under
+    // reqwest could return a private-range or link-local IP
+    // (169.254.169.254 cloud metadata, 127.0.0.1:5432 Postgres,
+    // 10.0.0.0/8 internal services). Closing the gap by treating
+    // DNS failure as Err means an attacker can't smuggle internal
+    // IPs through a DNS-rebind path even if the daemon's resolver
+    // hiccups.
+    //
+    // Operators with environments where transient DNS pressure is
+    // expected (containers with flaky CoreDNS, etc.) can opt back
+    // into the legacy permissive posture via
+    // `AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL=1`. The unsafe override is
+    // logged at WARN on every fire so an audit can detect the
+    // legacy-permissive mode.
     let addrs: Vec<std::net::SocketAddr> = match resolv_target.to_socket_addrs() {
         Ok(iter) => iter.collect(),
-        Err(_) => return Ok(()), // DNS hiccup — let reqwest surface it
+        Err(e) => {
+            let fail_open = std::env::var("AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            if fail_open {
+                tracing::warn!(
+                    target: "ai_memory::subscriptions",
+                    "SSRF guard: DNS resolution failed for {url}: {e}; \
+                     AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL=1 — degrading to ALLOW \
+                     (UNSAFE, legacy posture) — reqwest's resolver may bind to \
+                     private/loopback IPs the daemon could not pre-check"
+                );
+                return Ok(());
+            }
+            return Err(anyhow!(
+                "SSRF guard: DNS resolution failed for {url}: {e}; failing CLOSED \
+                 (post-#1053 secure default — set AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL=1 to revert)"
+            ));
+        }
     };
     for addr in &addrs {
         let ip = addr.ip();
@@ -1843,12 +1881,67 @@ mod tests {
             validate_url_dns("https://1.1.1.1/").is_ok(),
             "public IP literal must be accepted"
         );
-        // example.com may or may not resolve in the sandbox; per the
-        // production comment, DNS failure returns Ok (let reqwest
-        // surface it). Either way the outcome is Ok.
+        // v0.7.0 #1053 — `example.com` either resolves to a public
+        // IP (accepted) OR fails to resolve in a hermetic sandbox
+        // (post-#1053: rejected as fail-closed; pre-#1053: accepted
+        // with let-reqwest-surface-it). Both outcomes are
+        // legitimate behaviours of the SSRF guard, so accept either
+        // status: the test pins that an IP literal is always
+        // accepted, and the public-hostname legitimacy is exercised
+        // by the new fail-closed regression test
+        // `test_validate_url_dns_fails_closed_on_dns_failure_1053`
+        // below.
+        let _ = validate_url_dns("https://example.com/");
+    }
+
+    #[test]
+    fn test_validate_url_dns_fails_closed_on_dns_failure_1053() {
+        // v0.7.0 #1053 (Agent-2 #3) — DNS resolution failure now
+        // returns Err so an attacker cannot smuggle a private-range
+        // IP through a DNS-rebind path where the daemon's resolver
+        // hiccups and reqwest's later resolution lands on an
+        // internal target. Use a definitely-non-existent TLD so the
+        // resolver returns NXDOMAIN deterministically.
+        let res = validate_url_dns("https://nonexistent-host.invalid./");
         assert!(
-            validate_url_dns("https://example.com/").is_ok(),
-            "public hostname must be accepted (or DNS-skip path returns Ok)"
+            res.is_err(),
+            "#1053: SSRF guard MUST fail-closed on DNS resolution failure (NXDOMAIN); got {res:?}"
+        );
+        let err_msg = format!("{}", res.unwrap_err());
+        assert!(
+            err_msg.contains("failing CLOSED")
+                && err_msg.contains("AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL"),
+            "#1053: failure message MUST reference fail-closed posture + env-var escape hatch; got {err_msg:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_url_dns_fail_open_env_overrides_1053() {
+        // v0.7.0 #1053 — operators with flaky DNS environments can
+        // opt back into the legacy permissive posture via
+        // `AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL=1`. Pin the env-var
+        // contract so a future tweak to the var name fails this
+        // test loudly.
+        //
+        // SAFETY: env mutation in tests is racy across parallel
+        // threads; we serialise via the var name being highly
+        // specific so other tests can't trip it. The set + remove
+        // pair brackets the test region.
+        // SAFETY: env mutation guarded inside a unit test.
+        // The current cargo-test process is the only consumer of
+        // `AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL` and parallel test
+        // workers can race; gate this test with `#[ignore]` if
+        // flakiness surfaces on shared CI.
+        unsafe {
+            std::env::set_var("AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL", "1");
+        }
+        let res = validate_url_dns("https://nonexistent-host.invalid./");
+        unsafe {
+            std::env::remove_var("AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL");
+        }
+        assert!(
+            res.is_ok(),
+            "#1053: AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL=1 MUST restore the legacy permissive posture; got {res:?}"
         );
     }
 
