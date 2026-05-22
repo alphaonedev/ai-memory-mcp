@@ -129,7 +129,7 @@ footer a{color:var(--muted)}
     <div class="risk"><h4>Supply chain</h4><p>Rust, <code>cargo audit</code> required to be clean as a release gate. Binary is statically linkable; reproducible builds are on the v1.0 roadmap.</p></div>
     <div class="risk"><h4>Security posture</h4><p>v0.7.0 secure-default: permissions enforced by default, SSRF gate on webhooks, signed audit chain, HMAC subscriptions, optional sqlcipher for at-rest encryption.</p></div>
     <div class="risk"><h4>Operational risk</h4><p>One process, one DB file. Failure modes are SQLite failure modes (well-understood). Migrations dry-run-tested by the maintainer dogfood loop before every release tag.</p></div>
-    <div class="risk"><h4>Project maturity</h4><p>v0.7.0 is the third major release. 73 MCP entries at <code>--profile full</code>, 72 HTTP routes, 55 CLI subcommands. CI gates on Linux x64/arm64, macOS x64/arm64, Windows x64, plus iOS + Android cross-compile (Posture 1a, #1068). Test campaigns are reproducible and publicly logged under <code>docs/v0.7.0/test-campaign-*</code>.</p></div>
+    <div class="risk"><h4>Project maturity</h4><p>v0.7.0 is the third major release. 73 MCP entries at <code>--profile full</code>, 73 HTTP routes, 57 CLI subcommands (with <code>--features sal-postgres</code>; 55 in the default build). CI gates on Linux x64/arm64, macOS x64/arm64, Windows x64, plus iOS + Android cross-compile (Posture 1a, #1068). Test campaigns are reproducible and publicly logged under <code>docs/v0.7.0/test-campaign-*</code>.</p></div>
   </div>
 </section>
 
@@ -194,7 +194,7 @@ footer a{color:var(--muted)}
 <section class="wrap-mid">
   <div class="eyebrow-h2">Who is using it</div>
   <h2>The dogfooders.</h2>
-  <p>ai-memory is dogfooded by the maintainer's own multi-agent Claude Code workflow (the same workflow that builds every release). Every <code>release/v0.7.x.y</code> branch sits in real use for at least 24 hours against the operator's live MCP database before a tag cuts. Migration round-trips (now through schema v43) are tested against the operator's own DB on every commit. The project is also exercised by the IronClaw A2A 4-domain campaign on Docker against xAI Grok 4.3.</p>
+  <p>ai-memory is dogfooded by the maintainer's own multi-agent Claude Code workflow (the same workflow that builds every release). Every <code>release/v0.7.x.y</code> branch sits in real use for at least 24 hours against the operator's live MCP database before a tag cuts. Migration round-trips (now through schema v49) are tested against the operator's own DB on every commit. The project is also exercised by the IronClaw A2A 4-domain campaign on Docker against xAI Grok 4.3.</p>
   <p>External adoption is intentionally early-and-honest; if you are evaluating for production, the recommended path is to dogfood it against a non-critical agent first and reach out via GitHub issues for any gaps.</p>
 </section>
 

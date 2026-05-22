@@ -79,7 +79,7 @@ footer a{color:var(--muted)}
   <h2><span class="num">01.</span> Typed memory_kind taxonomy</h2>
   <p>A vector DB stores text + a vector. ai-memory stores text + a vector + a <strong>kind</strong>: Observation, Reflection, Persona, Concept, Entity, Claim, Relation, Event, Conversation, Decision (the Batman Form-6 vocabulary, v0.7.0). Plus an open-ended free-form kind field for project-specific taxonomies.</p>
   <p>Why this matters: an agent recalling "what policies apply here" is a different query from "what did I observe last Tuesday." Without typed kinds, you smear them together and the LLM has to disambiguate every time. With typed kinds, you filter at SQL.</p>
-  <div class="fact"><dt>Source of truth</dt><dd><code>src/models/memory.rs</code> &mdash; the 25-field Memory struct, kind is a first-class column</dd></div>
+  <div class="fact"><dt>Source of truth</dt><dd><code>src/models/memory.rs</code> &mdash; the 26-field Memory struct, kind is a first-class column</dd></div>
 
   <h2><span class="num">02.</span> Knowledge graph with temporal validity</h2>
   <p>Memories link to other memories with typed directional edges: <code>related_to</code>, <code>supersedes</code>, <code>contradicts</code>, <code>derived_from</code>, <code>reflects_on</code>, <code>derives_from</code> (six variants at v0.7.0). Each edge carries optional <code>valid_from</code> / <code>valid_until</code> so the substrate can answer "what was true on date X" instead of just "what is in the DB now."</p>
@@ -136,8 +136,8 @@ footer a{color:var(--muted)}
 
   <h2>Reproducing the claims</h2>
   <ul>
-    <li>Tool counts (71 MCP entries, 72 HTTP routes, ~50 CLI subcommands): asserted by <code>Profile::full().expected_tool_count()</code> in <code>src/profile.rs</code> and by the HTTP route registry in <code>src/lib.rs</code>; full surface lists in <a href="../USER_GUIDE.md">USER_GUIDE</a>, <a href="../API_REFERENCE.md">API_REFERENCE</a>, <a href="../CLI_REFERENCE.md">CLI_REFERENCE</a>.</li>
-    <li>Schema version v43, 25-field Memory struct, 6 link variants: <code>src/models/memory.rs</code>, <code>src/models/link.rs</code>, <code>src/storage/migrations.rs</code>.</li>
+    <li>Tool counts (73 MCP entries, 73 HTTP routes, 57 CLI subcommands with <code>--features sal-postgres</code> / 55 default-build): asserted by <code>Profile::full().expected_tool_count()</code> in <code>src/profile.rs</code> and by the HTTP route registry in <code>src/lib.rs</code>; full surface lists in <a href="../USER_GUIDE.md">USER_GUIDE</a>, <a href="../API_REFERENCE.md">API_REFERENCE</a>, <a href="../CLI_REFERENCE.md">CLI_REFERENCE</a>.</li>
+    <li>Schema version v49, 26-field Memory struct, 6 link variants: <code>src/models/memory.rs</code>, <code>src/models/link.rs</code>, <code>src/storage/migrations.rs</code>.</li>
     <li>Autonomous-tier latency p50 ~2.9 s on <code>gemma4:e4b</code>: <a href="../v0.7.0/mtp-bench-2026-05-17.md">mtp-bench-2026-05-17.md</a>.</li>
     <li>Test campaign SHIP verdict, 85 PASS / 0 FAIL across 12 phases: <a href="../v0.7.0/test-campaign-2026-05-18/">2026-05-18 Track A re-run</a>.</li>
   </ul>
