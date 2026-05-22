@@ -383,8 +383,12 @@ mod session_start;
 // Module declaration restored by D1.6 (#987) so the `McpTool` impl
 // in `tools/share.rs` compiles as part of the crate and
 // [`crate::mcp::registry::registered_tools`] can name it.
+//
+// v0.7.0 #1095 — made `pub` so the HTTP `handlers::share::share_memory`
+// handler (the SR-4 three-surface parity closeout) can call
+// `share::handle_share` against the shared substrate primitive.
 #[path = "tools/share.rs"]
-mod share;
+pub mod share;
 #[path = "tools/store/mod.rs"]
 mod store;
 #[path = "tools/subscribe.rs"]

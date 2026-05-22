@@ -1014,6 +1014,23 @@ pub struct RecallQuery {
     /// exactly.
     #[serde(default)]
     pub session_id: Option<String>,
+    /// v0.7.0 #1098 — WT-1-E include atomised sources alongside atoms.
+    /// HTTP parity with the MCP `RecallRequest`. Pre-#1098 this field
+    /// was hard-coded to `None` in `RecallRequest::from_http_query`.
+    #[serde(default)]
+    pub include_archived: Option<bool>,
+    /// v0.7.0 #1098 — Gap 4 (#887) confidence-tier filter. HTTP
+    /// parity with the MCP `RecallRequest`.
+    #[serde(default)]
+    pub confidence_tier: Option<String>,
+    /// v0.7.0 #1098 — Gap 7 (#890) per-row provenance decoration.
+    /// HTTP parity with the MCP `RecallRequest`.
+    #[serde(default)]
+    pub verbose_provenance: Option<bool>,
+    /// v0.7.0 #1098 — response format selector (e.g. `toon_compact`).
+    /// HTTP parity with the MCP `RecallRequest`.
+    #[serde(default)]
+    pub format: Option<String>,
 }
 
 #[allow(clippy::unnecessary_wraps)]
@@ -1076,6 +1093,22 @@ pub struct RecallBody {
     /// matching field on [`RecallQuery`].
     #[serde(default)]
     pub session_id: Option<String>,
+    /// v0.7.0 #1098 — WT-1-E include atomised sources alongside
+    /// atoms. HTTP parity with the MCP `RecallRequest`.
+    #[serde(default)]
+    pub include_archived: Option<bool>,
+    /// v0.7.0 #1098 — Gap 4 (#887) confidence-tier filter. HTTP
+    /// parity with the MCP `RecallRequest`.
+    #[serde(default)]
+    pub confidence_tier: Option<String>,
+    /// v0.7.0 #1098 — Gap 7 (#890) per-row provenance decoration.
+    /// HTTP parity with the MCP `RecallRequest`.
+    #[serde(default)]
+    pub verbose_provenance: Option<bool>,
+    /// v0.7.0 #1098 — response format selector (e.g. `toon_compact`).
+    /// HTTP parity with the MCP `RecallRequest`.
+    #[serde(default)]
+    pub format: Option<String>,
 }
 
 impl RecallBody {

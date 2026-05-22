@@ -535,7 +535,10 @@ fn v49_migration_idempotent_on_replay_1112() {
             |r| r.get(0),
         )
         .expect("read v2");
-    assert_eq!(v1, v2, "#1112: v49 migrate is not idempotent — version drifted");
+    assert_eq!(
+        v1, v2,
+        "#1112: v49 migrate is not idempotent — version drifted"
+    );
 
     // Snapshot AFTER replay.
     let cols_post = archive_columns(&conn2);

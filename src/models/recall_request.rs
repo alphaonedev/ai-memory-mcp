@@ -255,13 +255,19 @@ impl RecallRequest {
             context_tokens: None,
             session_default: q.session_default,
             session_id: q.session_id.clone(),
-            include_archived: None,
+            // v0.7.0 #1098 — wired through from RecallQuery; pre-
+            // #1098 these were hard-coded to `None` so HTTP callers
+            // could not reach the toon_compact format selection,
+            // verbose-provenance decoration, confidence-tier filter,
+            // or include-archived widening even though MCP callers
+            // could.
+            include_archived: q.include_archived,
             has_citations: q.has_citations,
             source_uri_prefix: q.source_uri_prefix.clone(),
             kinds: q.kinds.as_deref().map(|s| KindsFilter::Csv(s.to_string())),
-            confidence_tier: None,
-            verbose_provenance: None,
-            format: None,
+            confidence_tier: q.confidence_tier.clone(),
+            verbose_provenance: q.verbose_provenance,
+            format: q.format.clone(),
         }
     }
 
@@ -295,13 +301,15 @@ impl RecallRequest {
             context_tokens: None,
             session_default: body.session_default,
             session_id: body.session_id.clone(),
-            include_archived: None,
+            // v0.7.0 #1098 — wired through from RecallBody; pre-#1098
+            // these were hard-coded to `None`.
+            include_archived: body.include_archived,
             has_citations: body.has_citations,
             source_uri_prefix: body.source_uri_prefix.clone(),
             kinds,
-            confidence_tier: None,
-            verbose_provenance: None,
-            format: None,
+            confidence_tier: body.confidence_tier.clone(),
+            verbose_provenance: body.verbose_provenance,
+            format: body.format.clone(),
         }
     }
 
