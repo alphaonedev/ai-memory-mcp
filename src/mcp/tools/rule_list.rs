@@ -290,8 +290,8 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let signing = SigningKey::from_bytes(&[42u8; 32]);
-        let pubkey_b64 = base64::engine::general_purpose::STANDARD
-            .encode(signing.verifying_key().to_bytes());
+        let pubkey_b64 =
+            base64::engine::general_purpose::STANDARD.encode(signing.verifying_key().to_bytes());
         // SAFETY: serialised via ENV_LOCK above.
         unsafe { std::env::set_var("AI_MEMORY_OPERATOR_PUBKEY", &pubkey_b64) };
 

@@ -1096,7 +1096,6 @@ pub async fn sync_push(
         .into_response()
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

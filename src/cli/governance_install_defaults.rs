@@ -148,7 +148,8 @@ pub fn run(
             .filter(|r| r.attest_level != "operator_signed")
             .collect();
         if !unsigned_seed_rows.is_empty() {
-            let unsigned_ids: Vec<&str> = unsigned_seed_rows.iter().map(|r| r.id.as_str()).collect();
+            let unsigned_ids: Vec<&str> =
+                unsigned_seed_rows.iter().map(|r| r.id.as_str()).collect();
             anyhow::bail!(
                 "governance install-defaults: refused (#1042) — operator pubkey is resolved \
                  (AI_MEMORY_OPERATOR_PUBKEY env or operator.key.pub on disk) but the \
@@ -406,8 +407,8 @@ mod tests {
         use ed25519_dalek::SigningKey;
         use rand_core::OsRng;
         let signing = SigningKey::generate(&mut OsRng);
-        let pubkey_b64 = base64::engine::general_purpose::STANDARD
-            .encode(signing.verifying_key().to_bytes());
+        let pubkey_b64 =
+            base64::engine::general_purpose::STANDARD.encode(signing.verifying_key().to_bytes());
         // SAFETY: serialised via env_lock by caller.
         unsafe { std::env::set_var("AI_MEMORY_OPERATOR_PUBKEY", pubkey_b64) };
         TestPubkeyGuard
@@ -429,7 +430,8 @@ mod tests {
         let mut se = Vec::<u8>::new();
         let mut out = CliOutput::from_std(&mut so, &mut se);
         let result = run(&db_path, yes_args(), &mut out);
-        let err = result.expect_err("#1042: install-defaults MUST refuse when pubkey + unsigned seed rows");
+        let err = result
+            .expect_err("#1042: install-defaults MUST refuse when pubkey + unsigned seed rows");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("operator pubkey is resolved")

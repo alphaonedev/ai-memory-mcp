@@ -44,9 +44,9 @@ async fn main() -> Result<()> {
     // configured. Surface the misconfiguration at boot so the
     // operator fixes it before traffic flows.
     let resolved_hmac_secret = app_config.effective_hooks_hmac_secret();
-    if let Err(msg) = ai_memory::subscriptions::validate_hmac_secret_hex(
-        resolved_hmac_secret.as_deref(),
-    ) {
+    if let Err(msg) =
+        ai_memory::subscriptions::validate_hmac_secret_hex(resolved_hmac_secret.as_deref())
+    {
         eprintln!("ai-memory: boot refused — #1048 invalid hmac_secret\n  {msg}");
         std::process::exit(78); // EX_CONFIG per sysexits.h
     }
