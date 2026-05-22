@@ -9,7 +9,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ai-memory · Knowledge Graph — links, entities, temporal validity</title>
-<meta name="description" content="ai-memory v0.6.3.1 knowledge graph. memory_links with 4 relations, entity registry, temporal validity columns, memory_kg_query + memory_kg_timeline + memory_kg_invalidate. The structured-cognition layer that v0.6.3 Streams B+C unlock.">
+<meta name="description" content="ai-memory v0.7.0 knowledge graph. memory_links with 6 relations (related_to, supersedes, contradicts, derived_from, reflects_on, derives_from), entity registry, temporal validity columns, memory_kg_query + memory_kg_timeline + memory_kg_invalidate + memory_find_paths. The structured-cognition layer that v0.6.3 Streams B+C unlocked and v0.7.0 extended with recursive-learning + atomisation provenance.">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/knowledge-graph.html">
 <style>
 :root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#6ee7ff;--p2:#ffb86b;--p3:#c8a2ff;--good:#6ee7ff;--bad:#ff6b9d;--gold:#ffd700;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
@@ -265,9 +265,9 @@ footer a{color:var(--text-muted)}
 
 <section>
   <div class="container">
-    <span class="eyebrow">The four relations</span>
+    <span class="eyebrow">The six relations (v0.7.0)</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">Closed set — wire-format stable.</h2>
-    <p class="lede">Every <code>memory_link</code> row carries one of these four relation tags. The set is closed (validators reject anything else); adding a new relation is a wire-format change, not a content tweak.</p>
+    <p class="lede">Every <code>memory_link</code> row carries one of these six relation tags at v0.7.0 (was four at v0.6.x; <code>reflects_on</code> joined the set with recursive-learning Task 1/8 and <code>derives_from</code> joined with WT-1-A atomisation). The set is closed (validators reject anything else); adding a new relation is a wire-format change, not a content tweak.</p>
     <div class="rel-grid">
       <div class="rel r1">
         <div class="nm">related_to</div>
@@ -286,8 +286,18 @@ footer a{color:var(--text-muted)}
       </div>
       <div class="rel r4">
         <div class="nm">derived_from</div>
-        <p>Provenance. Used by <code>memory_consolidate</code> to link N source memories to the consolidated output. Audit chain stays intact.</p>
+        <p>Consolidation provenance. Used by <code>memory_consolidate</code> to link N source memories to the consolidated output. Audit chain stays intact.</p>
         <div class="ex">e.g. consolidated retro derived_from each weekly note</div>
+      </div>
+      <div class="rel r5">
+        <div class="nm">reflects_on (v0.7.0)</div>
+        <p>Recursive-learning provenance. Used by <code>memory_reflect</code> to link a reflection to the lower-depth peers it was synthesised over. Bounded by <code>reflection_depth</code> caps so the recursion can't run away.</p>
+        <div class="ex">e.g. weekly retro <code>reflects_on</code> each daily journal in the period</div>
+      </div>
+      <div class="rel r6">
+        <div class="nm">derives_from (v0.7.0)</div>
+        <p>Atomisation provenance (WT-1-A). Distinct from <code>derived_from</code> — atomisation is a finer-grained, recoverable split that emits one <code>derives_from</code> edge per atom, while consolidation merges several memories into one and emits <code>derived_from</code> edges.</p>
+        <div class="ex">e.g. each atomic proposition <code>derives_from</code> its parent long-form memory</div>
       </div>
     </div>
   </div>
