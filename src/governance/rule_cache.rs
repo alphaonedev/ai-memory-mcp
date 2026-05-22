@@ -95,10 +95,82 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use anyhow::Result;
 use rusqlite::Connection;
 
 use crate::governance::rules_store::Rule;
+
+/// v0.7.0 #1020 (Agent-1 #6) — typed error for the substrate-public
+/// [`RuleCache::get_or_load`] surface. Per CLAUDE.md #964
+/// audit-closure rule, substrate-public APIs MUST use typed errors;
+/// pre-#1020 `get_or_load` returned `anyhow::Result<Arc<Vec<Rule>>>`,
+/// leaking the untyped error type across the substrate boundary at a
+/// brand-new (#991) API.
+///
+/// Variants:
+///
+/// - [`RuleCacheError::Load`] wraps a downstream load failure from
+///   [`crate::governance::rules_store::list_enabled_by_kind`]. The
+///   inner `anyhow::Error` preserves the rusqlite + context chain
+///   for diagnostics; downstream code paths that need the chain
+///   call `.0` directly or `From::<RuleCacheError>::from` into
+///   their own anyhow surface.
+/// - [`RuleCacheError::Poisoned`] surfaces an `RwLock` poison —
+///   previously swallowed with a silent fallback to the
+///   freshly-loaded snapshot. Surfacing it lets callers decide
+///   whether to refuse, retry, or rebuild the cache.
+#[derive(Debug)]
+pub enum RuleCacheError {
+    /// `list_enabled_by_kind` failed (rusqlite error or downstream
+    /// signature-verification panic).
+    Load(anyhow::Error),
+    /// The inner `RwLock` is poisoned (another thread panicked
+    /// while holding it). The legacy fallback returned the freshly-
+    /// loaded snapshot; callers can still do so via
+    /// [`RuleCacheError::is_poisoned`] but the typed signal lets
+    /// observability paths surface the panic.
+    Poisoned,
+}
+
+impl std::fmt::Display for RuleCacheError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Load(e) => write!(f, "rule_cache load failed: {e:#}"),
+            Self::Poisoned => write!(f, "rule_cache: RwLock poisoned"),
+        }
+    }
+}
+
+impl std::error::Error for RuleCacheError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Load(e) => Some(e.as_ref()),
+            Self::Poisoned => None,
+        }
+    }
+}
+
+impl From<anyhow::Error> for RuleCacheError {
+    fn from(e: anyhow::Error) -> Self {
+        Self::Load(e)
+    }
+}
+
+// Note: `From<RuleCacheError> for anyhow::Error` is provided by
+// anyhow's blanket `impl<E: StdError + Send + Sync + 'static>
+// From<E> for anyhow::Error`, since `RuleCacheError: std::error::Error`.
+// Callers using `?` against an `anyhow::Result` automatically
+// upcast — no manual conversion needed.
+
+impl RuleCacheError {
+    /// Returns true for the [`RuleCacheError::Poisoned`] variant.
+    /// Callers that want the legacy "silent fallback" posture can
+    /// branch on this to recover the freshly-loaded snapshot from
+    /// a parallel `list_enabled_by_kind` call.
+    #[must_use]
+    pub fn is_poisoned(&self) -> bool {
+        matches!(self, Self::Poisoned)
+    }
+}
 
 /// Per-instance cache of `Vec<Rule>` keyed by `AgentAction::kind()`.
 ///
@@ -126,11 +198,29 @@ impl RuleCache {
     /// cache miss. The Ed25519 signature verify side-effect on the
     /// loader path runs on miss; cache hits skip it.
     ///
+    /// v0.7.0 #1020 (Agent-1 #6) — returns the typed
+    /// [`RuleCacheError`] enum at the substrate-public boundary
+    /// (was bare `anyhow::Result` pre-#1020).
+    /// `RuleCacheError: Into<anyhow::Error>` is implemented so
+    /// existing anyhow-chained callers can keep their `?` operator
+    /// with no signature changes.
+    ///
     /// # Errors
     ///
-    /// Propagates any SQLite error from `list_enabled_by_kind`.
+    /// - [`RuleCacheError::Load`] wraps any error from
+    ///   `list_enabled_by_kind` (rusqlite errors, signature-verify
+    ///   panics).
+    /// - [`RuleCacheError::Poisoned`] indicates the inner `RwLock`
+    ///   is poisoned by a prior thread panic. The legacy fallback
+    ///   returned a fresh snapshot anyway; callers wanting that
+    ///   posture can branch via [`RuleCacheError::is_poisoned`] and
+    ///   re-call `list_enabled_by_kind` directly.
     #[inline]
-    pub fn get_or_load(&self, conn: &Connection, kind: &str) -> Result<Arc<Vec<Rule>>> {
+    pub fn get_or_load(
+        &self,
+        conn: &Connection,
+        kind: &str,
+    ) -> std::result::Result<Arc<Vec<Rule>>, RuleCacheError> {
         // Fast path: hold the read lock for the lookup + clone of
         // the Arc; drop the guard before any further work.
         if let Some(rules) = self
@@ -145,7 +235,8 @@ impl RuleCache {
         // we return is cloned from the inserted entry so a concurrent
         // invalidate after this insert doesn't strand our caller with
         // a dropped snapshot.
-        let rules = crate::governance::rules_store::list_enabled_by_kind(conn, kind)?;
+        let rules =
+            crate::governance::rules_store::list_enabled_by_kind(conn, kind).map_err(RuleCacheError::Load)?;
         let arc = Arc::new(rules);
         if let Ok(mut guard) = self.by_kind.write() {
             // #1019 — check for an existing entry first (e.g., the
@@ -164,10 +255,14 @@ impl RuleCache {
                 .or_insert_with(|| Arc::clone(&arc));
             return Ok(Arc::clone(entry));
         }
-        // RwLock poison fallback — return the freshly-loaded snapshot
-        // so the caller proceeds with correct data even when the
-        // cache is unusable.
-        Ok(arc)
+        // v0.7.0 #1020 — RwLock poison surfaces as a typed
+        // `RuleCacheError::Poisoned`. The legacy fallback returned
+        // the freshly-loaded snapshot silently; callers wanting that
+        // posture can recover via `err.is_poisoned()` and re-call
+        // `list_enabled_by_kind` directly. Surfacing the poison lets
+        // observability paths (metrics counter, tracing::error) see
+        // the prior thread panic.
+        Err(RuleCacheError::Poisoned)
     }
 
     /// Drop the cached entry for `kind`. Currently no caller takes
@@ -320,6 +415,34 @@ mod tests {
         assert_eq!(cache_a.len(), 1);
         // cache_b never saw the insert — strict isolation.
         assert_eq!(cache_b.len(), 0);
+    }
+
+    #[test]
+    fn rule_cache_error_implements_std_error_1020() {
+        // v0.7.0 #1020 — pin the typed-error contract: RuleCacheError
+        // implements std::error::Error, displays the inner anyhow
+        // chain on Load, and is auto-upcastable into anyhow::Error
+        // via the std::error::Error blanket impl.
+        let load_err: RuleCacheError =
+            anyhow::anyhow!("synthetic rusqlite failure").into();
+        assert!(matches!(load_err, RuleCacheError::Load(_)));
+        assert!(!load_err.is_poisoned());
+        // Display surfaces the inner chain.
+        let display = format!("{load_err}");
+        assert!(
+            display.contains("rule_cache load failed") && display.contains("synthetic rusqlite failure"),
+            "#1020: Load Display MUST surface the wrapped anyhow chain; got {display}"
+        );
+
+        let poison_err = RuleCacheError::Poisoned;
+        assert!(poison_err.is_poisoned());
+        assert!(format!("{poison_err}").contains("RwLock poisoned"));
+
+        // Auto-upcast into anyhow::Error via the blanket impl on
+        // std::error::Error — confirms `?` against an anyhow::Result
+        // still works for callers post-#1020.
+        let upcast: anyhow::Error = poison_err.into();
+        assert!(format!("{upcast:#}").contains("RwLock poisoned"));
     }
 
     #[test]
