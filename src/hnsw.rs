@@ -10,6 +10,14 @@
 //! rebuilt lazily once the overflow exceeds a threshold.
 
 use instant_distance::{Builder, HnswMap, Search};
+// `instant_distance::Point` is the trait that supplies the
+// `EmbeddingPoint::distance` method; it has to be in scope for the
+// in-module tests (`embedding_point_distance_*`) to call it as a
+// method. The lib code itself goes through the slice-borrow
+// `cosine_distance` helper post-#1087 so the `Point` impl is the
+// only consumer of the trait at the bare-name level.
+#[cfg(test)]
+use instant_distance::Point;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
