@@ -3,17 +3,14 @@
     {
       "description": "Store a memory",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "agent_id": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "confidence": {
-            "default": null,
             "format": "double",
             "type": [
               "number",
@@ -24,14 +21,12 @@
             "type": "string"
           },
           "force": {
-            "default": null,
             "type": [
               "boolean",
               "null"
             ]
           },
           "kind": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -39,28 +34,24 @@
           },
           "metadata": {
             "additionalProperties": true,
-            "default": null,
             "type": [
               "object",
               "null"
             ]
           },
           "namespace": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "on_conflict": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "priority": {
-            "default": null,
             "format": "int64",
             "type": [
               "integer",
@@ -68,28 +59,24 @@
             ]
           },
           "scope": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "source": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "source_uri": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "tags": {
-            "default": null,
             "items": {
               "type": "string"
             },
@@ -99,7 +86,6 @@
             ]
           },
           "tier": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -120,7 +106,6 @@
     {
       "description": "Recall memories relevant to a",
       "inputSchema": {
-        "additionalProperties": false,
         "definitions": {
           "KindsFilter": {
             "anyOf": [
@@ -138,14 +123,12 @@
         },
         "properties": {
           "as_agent": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "budget_tokens": {
-            "default": null,
             "format": "int64",
             "type": [
               "integer",
@@ -153,7 +136,6 @@
             ]
           },
           "confidence_tier": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -163,7 +145,6 @@
             "type": "string"
           },
           "context_tokens": {
-            "default": null,
             "items": {
               "type": "string"
             },
@@ -173,21 +154,18 @@
             ]
           },
           "format": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "has_citations": {
-            "default": null,
             "type": [
               "boolean",
               "null"
             ]
           },
           "include_archived": {
-            "default": null,
             "type": [
               "boolean",
               "null"
@@ -201,11 +179,9 @@
               {
                 "type": "null"
               }
-            ],
-            "default": null
+            ]
           },
           "limit": {
-            "default": null,
             "format": "int64",
             "type": [
               "integer",
@@ -213,56 +189,48 @@
             ]
           },
           "namespace": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "session_default": {
-            "default": null,
             "type": [
               "boolean",
               "null"
             ]
           },
           "session_id": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "since": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "source_uri_prefix": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "tags": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "until": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "verbose_provenance": {
-            "default": null,
             "type": [
               "boolean",
               "null"
@@ -279,17 +247,14 @@
     {
       "description": "List recall_observations (#886).",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "consumed": {
-            "default": null,
             "type": [
               "boolean",
               "null"
             ]
           },
           "limit": {
-            "default": null,
             "format": "int64",
             "type": [
               "integer",
@@ -297,21 +262,18 @@
             ]
           },
           "recall_id": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "since": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "until": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -325,38 +287,32 @@
     {
       "description": "Search memories by exact",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "agent_id": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "as_agent": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "format": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "include_archived": {
-            "default": null,
             "type": [
               "boolean",
               "null"
             ]
           },
           "limit": {
-            "default": null,
             "format": "int64",
             "type": [
               "integer",
@@ -364,7 +320,6 @@
             ]
           },
           "namespace": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -374,7 +329,6 @@
             "type": "string"
           },
           "tier": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -391,24 +345,20 @@
     {
       "description": "List memories, optionally",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "agent_id": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "format": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "limit": {
-            "default": null,
             "format": "int64",
             "type": [
               "integer",
@@ -416,14 +366,12 @@
             ]
           },
           "namespace": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "tier": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -437,13 +385,11 @@
     {
       "description": "Load top-k recent +",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "family": {
             "type": "string"
           },
           "k": {
-            "default": null,
             "format": "int64",
             "type": [
               "integer",
@@ -451,7 +397,6 @@
             ]
           },
           "namespace": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -468,13 +413,11 @@
     {
       "description": "Intent-routed loader: free-text",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "intent": {
             "type": "string"
           },
           "k": {
-            "default": null,
             "format": "int64",
             "type": [
               "integer",
@@ -482,7 +425,6 @@
             ]
           },
           "namespace": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -499,10 +441,8 @@
     {
       "description": "Return a hierarchical tree of",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "depth": {
-            "default": null,
             "format": "int64",
             "type": [
               "integer",
@@ -510,7 +450,6 @@
             ]
           },
           "limit": {
-            "default": null,
             "format": "int64",
             "type": [
               "integer",
@@ -518,7 +457,6 @@
             ]
           },
           "namespace_prefix": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -532,20 +470,17 @@
     {
       "description": "Pre-write near-duplicate check",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "content": {
             "type": "string"
           },
           "namespace": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "threshold": {
-            "default": null,
             "format": "double",
             "type": [
               "number",
@@ -567,17 +502,14 @@
     {
       "description": "Register an entity (canonical",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "agent_id": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "aliases": {
-            "default": null,
             "items": {
               "type": "string"
             },
@@ -589,9 +521,7 @@
           "canonical_name": {
             "type": "string"
           },
-          "metadata": {
-            "default": null
-          },
+          "metadata": {},
           "namespace": {
             "type": "string"
           }
@@ -607,13 +537,11 @@
     {
       "description": "Resolve an alias to its",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "alias": {
             "type": "string"
           },
           "namespace": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -630,10 +558,8 @@
     {
       "description": "Ordered fact timeline for an",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "limit": {
-            "default": null,
             "format": "int64",
             "type": [
               "integer",
@@ -641,7 +567,6 @@
             ]
           },
           "since": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -651,7 +576,6 @@
             "type": "string"
           },
           "until": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -668,7 +592,6 @@
     {
       "description": "Mark a KG link as superseded by",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "relation": {
             "type": "string"
@@ -680,7 +603,6 @@
             "type": "string"
           },
           "valid_until": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -699,10 +621,8 @@
     {
       "description": "Outbound KG traversal from a",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "allowed_agents": {
-            "default": null,
             "items": {
               "type": "string"
             },
@@ -712,21 +632,18 @@
             ]
           },
           "by_source_uri": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "include_invalidated": {
-            "default": null,
             "type": [
               "boolean",
               "null"
             ]
           },
           "limit": {
-            "default": null,
             "format": "int64",
             "type": [
               "integer",
@@ -734,7 +651,6 @@
             ]
           },
           "max_depth": {
-            "default": null,
             "format": "int64",
             "type": [
               "integer",
@@ -742,7 +658,6 @@
             ]
           },
           "namespace": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -752,7 +667,6 @@
             "type": "string"
           },
           "valid_at": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -769,17 +683,14 @@
     {
       "description": "Enumerate up to N paths through",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "include_invalidated": {
-            "default": null,
             "type": [
               "boolean",
               "null"
             ]
           },
           "max_depth": {
-            "default": null,
             "format": "int64",
             "type": [
               "integer",
@@ -787,7 +698,6 @@
             ]
           },
           "max_results": {
-            "default": null,
             "format": "int64",
             "type": [
               "integer",
@@ -812,7 +722,6 @@
     {
       "description": "Delete a memory by ID.",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "id": {
             "type": "string"
@@ -828,20 +737,17 @@
     {
       "description": "Promote a memory to long (or",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "id": {
             "type": "string"
           },
           "target_tier": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "to_namespace": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -858,31 +764,26 @@
     {
       "description": "Bulk delete memories matching a",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "dry_run": {
-            "default": null,
             "type": [
               "boolean",
               "null"
             ]
           },
           "namespace": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "pattern": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "tier": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -896,7 +797,6 @@
     {
       "description": "Get memory store statistics",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {},
         "type": "object"
       },
@@ -905,10 +805,8 @@
     {
       "description": "Update an existing memory by ID",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "confidence": {
-            "default": null,
             "format": "double",
             "type": [
               "number",
@@ -916,21 +814,18 @@
             ]
           },
           "content": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "edit_source": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "expected_version": {
-            "default": null,
             "format": "int64",
             "type": [
               "integer",
@@ -938,7 +833,6 @@
             ]
           },
           "expires_at": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -949,21 +843,18 @@
           },
           "metadata": {
             "additionalProperties": true,
-            "default": null,
             "type": [
               "object",
               "null"
             ]
           },
           "namespace": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "priority": {
-            "default": null,
             "format": "int64",
             "type": [
               "integer",
@@ -971,14 +862,12 @@
             ]
           },
           "source_uri": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "tags": {
-            "default": null,
             "items": {
               "type": "string"
             },
@@ -988,14 +877,12 @@
             ]
           },
           "tier": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "title": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -1012,7 +899,6 @@
     {
       "description": "Get a specific memory by ID,",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "id": {
             "type": "string"
@@ -1028,10 +914,8 @@
     {
       "description": "Create a typed link between two",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "relation": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -1055,7 +939,6 @@
     {
       "description": "Get all links for a memory",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "id": {
             "type": "string"
@@ -1071,31 +954,26 @@
     {
       "description": "Re-verify a stored memory_links",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "link_id": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "relation": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "source_id": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "target_id": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -1109,17 +987,14 @@
     {
       "description": "Reconstruct the conversation",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "agent_id": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "depth": {
-            "default": null,
             "format": "int64",
             "type": [
               "integer",
@@ -1130,7 +1005,6 @@
             "type": "string"
           },
           "verbose": {
-            "default": null,
             "type": [
               "boolean",
               "null"
@@ -1147,17 +1021,14 @@
     {
       "description": "Persist a reflection memory",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "agent_id": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "confidence": {
-            "default": null,
             "format": "double",
             "type": [
               "number",
@@ -1167,18 +1038,14 @@
           "content": {
             "type": "string"
           },
-          "metadata": {
-            "default": null
-          },
+          "metadata": {},
           "namespace": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "priority": {
-            "default": null,
             "format": "int64",
             "type": [
               "integer",
@@ -1199,7 +1066,6 @@
             "type": "array"
           },
           "tier": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -1221,10 +1087,8 @@
     {
       "description": "Render a single reflection",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "format": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -1244,13 +1108,11 @@
     {
       "description": "Fetch the latest Persona",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "entity_id": {
             "type": "string"
           },
           "namespace": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -1267,13 +1129,11 @@
     {
       "description": "Generate/regen a Persona",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "entity_id": {
             "type": "string"
           },
           "namespace": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -1290,7 +1150,6 @@
     {
       "description": "Inspect the cross-peer",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "memory_id": {
             "type": "string"
@@ -1306,7 +1165,6 @@
     {
       "description": "List dependents flagged by the",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "memory_id": {
             "type": "string"
@@ -1322,10 +1180,8 @@
     {
       "description": "Consolidate multiple memories",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "agent_id": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -1338,14 +1194,12 @@
             "type": "array"
           },
           "namespace": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "summary": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -1366,23 +1220,18 @@
     {
       "description": "Form 3 multi-step ingest:",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "content": {
             "type": "string"
           },
           "namespace": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
-          "pipeline_override": {
-            "default": null
-          },
+          "pipeline_override": {},
           "pipeline_variant": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -1399,17 +1248,14 @@
     {
       "description": "Decompose a memory into 2-10",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "force_re_atomise": {
-            "default": null,
             "type": [
               "boolean",
               "null"
             ]
           },
           "max_atom_tokens": {
-            "default": null,
             "format": "int64",
             "type": [
               "integer",
@@ -1430,7 +1276,6 @@
     {
       "description": "Share a memory with another",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "source_memory_id": {
             "type": "string"
@@ -1450,10 +1295,8 @@
     {
       "description": "Scan",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "days": {
-            "default": null,
             "format": "int64",
             "type": [
               "integer",
@@ -1461,7 +1304,6 @@
             ]
           },
           "output_format": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -1475,31 +1317,26 @@
     {
       "description": "Discover runtime capabilities",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "accept": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "family": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "include_schema": {
-            "default": null,
             "type": [
               "boolean",
               "null"
             ]
           },
           "verbose": {
-            "default": null,
             "type": [
               "boolean",
               "null"
@@ -1513,7 +1350,6 @@
     {
       "description": "LLM-expand a search query into",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "query": {
             "type": "string"
@@ -1529,7 +1365,6 @@
     {
       "description": "LLM-generate tags for a memory",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "id": {
             "type": "string"
@@ -1545,7 +1380,6 @@
     {
       "description": "LLM-check whether two memories",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "id_a": {
             "type": "string"
@@ -1565,10 +1399,8 @@
     {
       "description": "List archived (expired)",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "limit": {
-            "default": null,
             "format": "int64",
             "type": [
               "integer",
@@ -1576,14 +1408,12 @@
             ]
           },
           "namespace": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "offset": {
-            "default": null,
             "format": "int64",
             "type": [
               "integer",
@@ -1598,7 +1428,6 @@
     {
       "description": "Restore an archived memory back",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "id": {
             "type": "string"
@@ -1614,10 +1443,8 @@
     {
       "description": "Permanently delete archived",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "older_than_days": {
-            "default": null,
             "format": "int64",
             "type": [
               "integer",
@@ -1632,7 +1459,6 @@
     {
       "description": "Show archive statistics (total",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {},
         "type": "object"
       },
@@ -1641,10 +1467,8 @@
     {
       "description": "Trigger garbage collection on",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "dry_run": {
-            "default": null,
             "type": [
               "boolean",
               "null"
@@ -1658,17 +1482,14 @@
     {
       "description": "Auto-recall recent memories on",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "format": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "limit": {
-            "default": null,
             "format": "int64",
             "type": [
               "integer",
@@ -1676,7 +1497,6 @@
             ]
           },
           "namespace": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -1690,11 +1510,8 @@
     {
       "description": "Set a memory as the",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
-          "governance": {
-            "default": null
-          },
+          "governance": {},
           "id": {
             "type": "string"
           },
@@ -1702,7 +1519,6 @@
             "type": "string"
           },
           "parent": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -1720,10 +1536,8 @@
     {
       "description": "Get the standard/policy memory",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "inherit": {
-            "default": null,
             "type": [
               "boolean",
               "null"
@@ -1743,7 +1557,6 @@
     {
       "description": "Clear the standard/policy for a",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "namespace": {
             "type": "string"
@@ -1759,10 +1572,8 @@
     {
       "description": "List pending governance-queued",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "limit": {
-            "default": null,
             "format": "int64",
             "type": [
               "integer",
@@ -1770,7 +1581,6 @@
             ]
           },
           "status": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -1784,13 +1594,11 @@
     {
       "description": "Approve a pending action",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "id": {
             "type": "string"
           },
           "remember": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -1807,13 +1615,11 @@
     {
       "description": "Reject a pending action",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "id": {
             "type": "string"
           },
           "remember": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -1830,7 +1636,6 @@
     {
       "description": "Register an agent in the",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "agent_id": {
             "type": "string"
@@ -1857,7 +1662,6 @@
     {
       "description": "List every registered agent.",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {},
         "type": "object"
       },
@@ -1866,13 +1670,11 @@
     {
       "description": "Send a message from the caller",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "payload": {
             "type": "string"
           },
           "priority": {
-            "default": null,
             "format": "int64",
             "type": [
               "integer",
@@ -1883,7 +1685,6 @@
             "type": "string"
           },
           "tier": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -1905,17 +1706,14 @@
     {
       "description": "List messages sent to an agent",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "agent_id": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "limit": {
-            "default": null,
             "format": "int64",
             "type": [
               "integer",
@@ -1923,7 +1721,6 @@
             ]
           },
           "unread_only": {
-            "default": null,
             "type": [
               "boolean",
               "null"
@@ -1937,17 +1734,14 @@
     {
       "description": "Register a webhook subscription",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "agent_filter": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "event_types": {
-            "default": null,
             "items": {
               "type": "string"
             },
@@ -1957,21 +1751,18 @@
             ]
           },
           "events": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "namespace_filter": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "secret": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -1991,7 +1782,6 @@
     {
       "description": "Delete a subscription by id.",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "id": {
             "type": "string"
@@ -2007,7 +1797,6 @@
     {
       "description": "List active webhook",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {},
         "type": "object"
       },
@@ -2016,7 +1805,6 @@
     {
       "description": "Replay subscription_events",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "since": {
             "type": "string"
@@ -2036,10 +1824,8 @@
     {
       "description": "List subscription_dlq rows",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "limit": {
-            "default": null,
             "format": "int64",
             "type": [
               "integer",
@@ -2047,7 +1833,6 @@
             ]
           },
           "subscription_id": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -2061,10 +1846,8 @@
     {
       "description": "Report per-agent quota usage",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "agent_id": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -2078,10 +1861,8 @@
     {
       "description": "Check action vs",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "agent_id": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -2095,14 +1876,12 @@
             "type": "array"
           },
           "binary": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "byte_estimate": {
-            "default": null,
             "format": "int64",
             "type": [
               "integer",
@@ -2110,28 +1889,24 @@
             ]
           },
           "command": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "custom_kind": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "cwd": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "host": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -2141,14 +1916,12 @@
             "type": "string"
           },
           "path": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "scheme": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -2165,17 +1938,14 @@
     {
       "description": "List substrate-level",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "enabled_only": {
-            "default": null,
             "type": [
               "boolean",
               "null"
             ]
           },
           "kind": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -2189,17 +1959,14 @@
     {
       "description": "Register an agentskills",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "folder_path": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "inline_skill": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -2213,17 +1980,14 @@
     {
       "description": "List current (non-superseded)",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "filter": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "namespace": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -2237,7 +2001,6 @@
     {
       "description": "Get full skill activation",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "skill_id": {
             "type": "string"
@@ -2253,7 +2016,6 @@
     {
       "description": "Fetch + digest-verify a skill",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "resource_path": {
             "type": "string"
@@ -2273,7 +2035,6 @@
     {
       "description": "Export a skill to a folder",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "skill_id": {
             "type": "string"
@@ -2293,11 +2054,8 @@
     {
       "description": "Promote a Reflection into a",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
-          "parameters_schema": {
-            "default": null
-          },
+          "parameters_schema": {},
           "reflection_id": {
             "type": "string"
           },
@@ -2320,10 +2078,8 @@
     {
       "description": "Skill body +",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "budget_tokens": {
-            "default": null,
             "format": "int64",
             "type": [
               "integer",
@@ -2344,20 +2100,17 @@
     {
       "description": "Offload verbatim content",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "content": {
             "type": "string"
           },
           "namespace": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "ttl_seconds": {
-            "default": null,
             "format": "int64",
             "type": [
               "integer",
@@ -2375,7 +2128,6 @@
     {
       "description": "Dereference a memory_offload",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "ref_id": {
             "type": "string"
