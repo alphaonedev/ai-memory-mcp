@@ -632,6 +632,11 @@ mod tests {
             source_uri_prefix: None,
             kinds: None,
             session_id: None,
+            // v0.7.0 #1098 — fields wired through from HTTP wire shape.
+            include_archived: None,
+            confidence_tier: None,
+            verbose_provenance: None,
+            format: None,
         };
         let req = RecallRequest::from_http_query(&q);
         assert_eq!(req.context, "hello");
@@ -657,6 +662,11 @@ mod tests {
             source_uri_prefix: None,
             kinds: None,
             session_id: None,
+            // v0.7.0 #1098 — fields wired through from HTTP wire shape.
+            include_archived: None,
+            confidence_tier: None,
+            verbose_provenance: None,
+            format: None,
         };
         let req = RecallRequest::from_http_query(&q);
         assert_eq!(req.context, "via-q");
