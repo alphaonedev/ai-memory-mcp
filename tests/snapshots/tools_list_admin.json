@@ -3,17 +3,14 @@
     {
       "description": "Store a memory",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "agent_id": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "confidence": {
-            "default": null,
             "format": "double",
             "type": [
               "number",
@@ -24,14 +21,12 @@
             "type": "string"
           },
           "force": {
-            "default": null,
             "type": [
               "boolean",
               "null"
             ]
           },
           "kind": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -39,28 +34,24 @@
           },
           "metadata": {
             "additionalProperties": true,
-            "default": null,
             "type": [
               "object",
               "null"
             ]
           },
           "namespace": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "on_conflict": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "priority": {
-            "default": null,
             "format": "int64",
             "type": [
               "integer",
@@ -68,28 +59,24 @@
             ]
           },
           "scope": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "source": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "source_uri": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "tags": {
-            "default": null,
             "items": {
               "type": "string"
             },
@@ -99,7 +86,6 @@
             ]
           },
           "tier": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -120,7 +106,6 @@
     {
       "description": "Recall memories relevant to a",
       "inputSchema": {
-        "additionalProperties": false,
         "definitions": {
           "KindsFilter": {
             "anyOf": [
@@ -138,14 +123,12 @@
         },
         "properties": {
           "as_agent": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "budget_tokens": {
-            "default": null,
             "format": "int64",
             "type": [
               "integer",
@@ -153,7 +136,6 @@
             ]
           },
           "confidence_tier": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -163,7 +145,6 @@
             "type": "string"
           },
           "context_tokens": {
-            "default": null,
             "items": {
               "type": "string"
             },
@@ -173,21 +154,18 @@
             ]
           },
           "format": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "has_citations": {
-            "default": null,
             "type": [
               "boolean",
               "null"
             ]
           },
           "include_archived": {
-            "default": null,
             "type": [
               "boolean",
               "null"
@@ -201,11 +179,9 @@
               {
                 "type": "null"
               }
-            ],
-            "default": null
+            ]
           },
           "limit": {
-            "default": null,
             "format": "int64",
             "type": [
               "integer",
@@ -213,56 +189,48 @@
             ]
           },
           "namespace": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "session_default": {
-            "default": null,
             "type": [
               "boolean",
               "null"
             ]
           },
           "session_id": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "since": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "source_uri_prefix": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "tags": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "until": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "verbose_provenance": {
-            "default": null,
             "type": [
               "boolean",
               "null"
@@ -279,38 +247,32 @@
     {
       "description": "Search memories by exact",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "agent_id": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "as_agent": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "format": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "include_archived": {
-            "default": null,
             "type": [
               "boolean",
               "null"
             ]
           },
           "limit": {
-            "default": null,
             "format": "int64",
             "type": [
               "integer",
@@ -318,7 +280,6 @@
             ]
           },
           "namespace": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -328,7 +289,6 @@
             "type": "string"
           },
           "tier": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -345,24 +305,20 @@
     {
       "description": "List memories, optionally",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "agent_id": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "format": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "limit": {
-            "default": null,
             "format": "int64",
             "type": [
               "integer",
@@ -370,14 +326,12 @@
             ]
           },
           "namespace": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "tier": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -391,13 +345,11 @@
     {
       "description": "Load top-k recent +",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "family": {
             "type": "string"
           },
           "k": {
-            "default": null,
             "format": "int64",
             "type": [
               "integer",
@@ -405,7 +357,6 @@
             ]
           },
           "namespace": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -422,13 +373,11 @@
     {
       "description": "Intent-routed loader: free-text",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "intent": {
             "type": "string"
           },
           "k": {
-            "default": null,
             "format": "int64",
             "type": [
               "integer",
@@ -436,7 +385,6 @@
             ]
           },
           "namespace": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -453,7 +401,6 @@
     {
       "description": "Delete a memory by ID.",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "id": {
             "type": "string"
@@ -469,20 +416,17 @@
     {
       "description": "Promote a memory to long (or",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "id": {
             "type": "string"
           },
           "target_tier": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "to_namespace": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -499,31 +443,26 @@
     {
       "description": "Bulk delete memories matching a",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "dry_run": {
-            "default": null,
             "type": [
               "boolean",
               "null"
             ]
           },
           "namespace": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "pattern": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "tier": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -537,10 +476,8 @@
     {
       "description": "Update an existing memory by ID",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "confidence": {
-            "default": null,
             "format": "double",
             "type": [
               "number",
@@ -548,21 +485,18 @@
             ]
           },
           "content": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "edit_source": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "expected_version": {
-            "default": null,
             "format": "int64",
             "type": [
               "integer",
@@ -570,7 +504,6 @@
             ]
           },
           "expires_at": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -581,21 +514,18 @@
           },
           "metadata": {
             "additionalProperties": true,
-            "default": null,
             "type": [
               "object",
               "null"
             ]
           },
           "namespace": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "priority": {
-            "default": null,
             "format": "int64",
             "type": [
               "integer",
@@ -603,14 +533,12 @@
             ]
           },
           "source_uri": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "tags": {
-            "default": null,
             "items": {
               "type": "string"
             },
@@ -620,14 +548,12 @@
             ]
           },
           "tier": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "title": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -644,7 +570,6 @@
     {
       "description": "Get a specific memory by ID,",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "id": {
             "type": "string"
@@ -660,31 +585,26 @@
     {
       "description": "Discover runtime capabilities",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "accept": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "family": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "include_schema": {
-            "default": null,
             "type": [
               "boolean",
               "null"
             ]
           },
           "verbose": {
-            "default": null,
             "type": [
               "boolean",
               "null"
@@ -698,10 +618,8 @@
     {
       "description": "Trigger garbage collection on",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "dry_run": {
-            "default": null,
             "type": [
               "boolean",
               "null"
@@ -715,11 +633,8 @@
     {
       "description": "Set a memory as the",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
-          "governance": {
-            "default": null
-          },
+          "governance": {},
           "id": {
             "type": "string"
           },
@@ -727,7 +642,6 @@
             "type": "string"
           },
           "parent": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -745,10 +659,8 @@
     {
       "description": "Get the standard/policy memory",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "inherit": {
-            "default": null,
             "type": [
               "boolean",
               "null"
@@ -768,7 +680,6 @@
     {
       "description": "Clear the standard/policy for a",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "namespace": {
             "type": "string"
@@ -784,10 +695,8 @@
     {
       "description": "List pending governance-queued",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "limit": {
-            "default": null,
             "format": "int64",
             "type": [
               "integer",
@@ -795,7 +704,6 @@
             ]
           },
           "status": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -809,13 +717,11 @@
     {
       "description": "Approve a pending action",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "id": {
             "type": "string"
           },
           "remember": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -832,13 +738,11 @@
     {
       "description": "Reject a pending action",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "id": {
             "type": "string"
           },
           "remember": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -855,17 +759,14 @@
     {
       "description": "Register a webhook subscription",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "agent_filter": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "event_types": {
-            "default": null,
             "items": {
               "type": "string"
             },
@@ -875,21 +776,18 @@
             ]
           },
           "events": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "namespace_filter": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "secret": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -909,7 +807,6 @@
     {
       "description": "Delete a subscription by id.",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "id": {
             "type": "string"

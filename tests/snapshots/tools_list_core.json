@@ -3,17 +3,14 @@
     {
       "description": "Store a memory",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "agent_id": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "confidence": {
-            "default": null,
             "format": "double",
             "type": [
               "number",
@@ -24,14 +21,12 @@
             "type": "string"
           },
           "force": {
-            "default": null,
             "type": [
               "boolean",
               "null"
             ]
           },
           "kind": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -39,28 +34,24 @@
           },
           "metadata": {
             "additionalProperties": true,
-            "default": null,
             "type": [
               "object",
               "null"
             ]
           },
           "namespace": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "on_conflict": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "priority": {
-            "default": null,
             "format": "int64",
             "type": [
               "integer",
@@ -68,28 +59,24 @@
             ]
           },
           "scope": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "source": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "source_uri": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "tags": {
-            "default": null,
             "items": {
               "type": "string"
             },
@@ -99,7 +86,6 @@
             ]
           },
           "tier": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -120,7 +106,6 @@
     {
       "description": "Recall memories relevant to a",
       "inputSchema": {
-        "additionalProperties": false,
         "definitions": {
           "KindsFilter": {
             "anyOf": [
@@ -138,14 +123,12 @@
         },
         "properties": {
           "as_agent": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "budget_tokens": {
-            "default": null,
             "format": "int64",
             "type": [
               "integer",
@@ -153,7 +136,6 @@
             ]
           },
           "confidence_tier": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -163,7 +145,6 @@
             "type": "string"
           },
           "context_tokens": {
-            "default": null,
             "items": {
               "type": "string"
             },
@@ -173,21 +154,18 @@
             ]
           },
           "format": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "has_citations": {
-            "default": null,
             "type": [
               "boolean",
               "null"
             ]
           },
           "include_archived": {
-            "default": null,
             "type": [
               "boolean",
               "null"
@@ -201,11 +179,9 @@
               {
                 "type": "null"
               }
-            ],
-            "default": null
+            ]
           },
           "limit": {
-            "default": null,
             "format": "int64",
             "type": [
               "integer",
@@ -213,56 +189,48 @@
             ]
           },
           "namespace": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "session_default": {
-            "default": null,
             "type": [
               "boolean",
               "null"
             ]
           },
           "session_id": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "since": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "source_uri_prefix": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "tags": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "until": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "verbose_provenance": {
-            "default": null,
             "type": [
               "boolean",
               "null"
@@ -279,38 +247,32 @@
     {
       "description": "Search memories by exact",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "agent_id": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "as_agent": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "format": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "include_archived": {
-            "default": null,
             "type": [
               "boolean",
               "null"
             ]
           },
           "limit": {
-            "default": null,
             "format": "int64",
             "type": [
               "integer",
@@ -318,7 +280,6 @@
             ]
           },
           "namespace": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -328,7 +289,6 @@
             "type": "string"
           },
           "tier": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -345,24 +305,20 @@
     {
       "description": "List memories, optionally",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "agent_id": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "format": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "limit": {
-            "default": null,
             "format": "int64",
             "type": [
               "integer",
@@ -370,14 +326,12 @@
             ]
           },
           "namespace": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "tier": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -391,13 +345,11 @@
     {
       "description": "Load top-k recent +",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "family": {
             "type": "string"
           },
           "k": {
-            "default": null,
             "format": "int64",
             "type": [
               "integer",
@@ -405,7 +357,6 @@
             ]
           },
           "namespace": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -422,13 +373,11 @@
     {
       "description": "Intent-routed loader: free-text",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "intent": {
             "type": "string"
           },
           "k": {
-            "default": null,
             "format": "int64",
             "type": [
               "integer",
@@ -436,7 +385,6 @@
             ]
           },
           "namespace": {
-            "default": null,
             "type": [
               "string",
               "null"
@@ -453,7 +401,6 @@
     {
       "description": "Get a specific memory by ID,",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "id": {
             "type": "string"
@@ -469,31 +416,26 @@
     {
       "description": "Discover runtime capabilities",
       "inputSchema": {
-        "additionalProperties": false,
         "properties": {
           "accept": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "family": {
-            "default": null,
             "type": [
               "string",
               "null"
             ]
           },
           "include_schema": {
-            "default": null,
             "type": [
               "boolean",
               "null"
             ]
           },
           "verbose": {
-            "default": null,
             "type": [
               "boolean",
               "null"
