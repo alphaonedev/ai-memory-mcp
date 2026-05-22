@@ -296,13 +296,16 @@ pub async fn purge_archive(
 
     // v0.7.0 Wave-3 Continuation 3 (Phase 19) — postgres-backed daemons
     // route through the SAL trait. Wire shape preserved: `{purged}`.
+    //
+    // v0.7.0 #1062 (Agent-2 #9) — use `for_admin_checked` (not the
+    // raw `for_admin` literal) so the admin posture is a typed
+    // dependency of the construction call. A future refactor that
+    // moves the construction earlier in the function (or removes
+    // the gate) cannot accidentally hand an admin context to a
+    // non-admin caller — `is_admin` MUST be threaded through.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        let ctx = if is_admin {
-            crate::store::CallerContext::for_admin(caller.clone())
-        } else {
-            crate::store::CallerContext::for_agent(caller.clone())
-        };
+        let ctx = crate::store::CallerContext::for_admin_checked(caller.clone(), is_admin);
         return match app.store.archive_purge(&ctx, q.older_than_days).await {
             Ok(n) => Json(json!({
                 "purged": n,

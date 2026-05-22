@@ -285,6 +285,16 @@ impl CallerContext {
     /// operator surfaces that must round-trip every row regardless
     /// of `metadata.scope`. Never call this from a tenant-facing
     /// handler.
+    ///
+    /// v0.7.0 #1062 (Agent-2 #9) — `for_admin_checked` (below) is
+    /// the preferred constructor for handler-side use because it
+    /// requires the caller to thread the `is_admin` bool from the
+    /// handler's admin gate, surfacing the dependency in the type
+    /// signature instead of relying on the CodeGraph allowlist
+    /// precheck (which can't match a dynamic `caller.clone()`
+    /// argument). The literal-arg form is still used by
+    /// background paths (federation catchup, GC sweeps) where the
+    /// admin posture is structural, not request-gated.
     #[must_use]
     pub fn for_admin(agent_id: impl Into<String>) -> Self {
         Self {
@@ -292,6 +302,25 @@ impl CallerContext {
             as_agent: None,
             request_id: None,
             bypass_visibility: true,
+        }
+    }
+
+    /// v0.7.0 #1062 (Agent-2 #9) — admin-context constructor that
+    /// REQUIRES the caller to thread an `is_admin` bool. Returns
+    /// the admin-bypass context when `is_admin` is true and a
+    /// tenant-scoped agent context when false. Use this from
+    /// tenant-facing handlers that may need admin-mode access for
+    /// admin-tagged callers — the `is_admin` argument forces the
+    /// type-level dependency so a future refactor that moves the
+    /// `for_admin` call earlier in the function (or removes the
+    /// gate) becomes a compile error rather than a silent
+    /// privilege escalation.
+    #[must_use]
+    pub fn for_admin_checked(agent_id: impl Into<String>, is_admin: bool) -> Self {
+        if is_admin {
+            Self::for_admin(agent_id)
+        } else {
+            Self::for_agent(agent_id)
         }
     }
 
