@@ -53,24 +53,31 @@ pub struct CycleCheckResult {
 /// when a cycle is found, or `would_cycle = false` with an empty path
 /// otherwise.
 ///
-/// # Errors (non-panicking)
+/// # Errors
 ///
-/// SQL failures during the walk are treated as "no cycle" (fail-open) with a
-/// `tracing::warn!` so a transient DB error never silently blocks a valid link
-/// write.  The caller is responsible for surfacing the refusal on `true`.
+/// v0.7.0 #1090 (SR-2 #5, MEDIUM): SQL failures during the walk now
+/// propagate as `Err` (fail-CLOSED) to match the #1053 / #1054
+/// policy. Pre-#1090 a transient `SQLITE_BUSY` during the walk was
+/// silently treated as "no cycle, continue" — letting the substrate
+/// land a `reflects_on` edge that closes a cycle when the DB was
+/// briefly stressed. The cycle check is a substrate-level governance
+/// gate; under load it MUST fail-CLOSED so an adversary cannot ride
+/// transient DB pressure to slip a logically-invalid edge past the
+/// gate. Callers wrap the err in a refusal envelope (`db::create_link`
+/// surfaces it directly via `?`).
 pub fn would_create_reflection_cycle(
     conn: &Connection,
     source_id: &str,
     target_id: &str,
     max_depth: u32,
-) -> CycleCheckResult {
+) -> rusqlite::Result<CycleCheckResult> {
     // Direct self-link is already blocked by `validate_link`; handle it
     // defensively here too so the audit path is always consistent.
     if source_id == target_id {
-        return CycleCheckResult {
+        return Ok(CycleCheckResult {
             would_cycle: true,
             cycle_path: vec![source_id.to_string(), target_id.to_string()],
-        };
+        });
     }
 
     let bound = if max_depth == 0 {
@@ -97,28 +104,20 @@ pub fn would_create_reflection_cycle(
         let mut next_frontier: Vec<String> = Vec::new();
 
         for current in &frontier {
-            // Walk forward: find all nodes reachable from `current` via
-            // `reflects_on` edges where `current` is the source.
-            let neighbors = match forward_neighbors(conn, current) {
-                Ok(ns) => ns,
-                Err(e) => {
-                    tracing::warn!(
-                        target: "kg::cycle_check",
-                        node = %current, error = %e,
-                        "SQL error during reflects_on forward walk; treating as no cycle"
-                    );
-                    continue;
-                }
-            };
+            // v0.7.0 #1090 — propagate SQL errors as Err. The forward
+            // walk is a substrate-level governance gate; a transient
+            // BUSY/LOCKED here MUST surface so the caller refuses the
+            // write rather than landing a logically-invalid edge.
+            let neighbors = forward_neighbors(conn, current)?;
 
             for neighbor in neighbors {
                 if neighbor == source_id {
                     // Cycle found: reconstruct path.
                     let path = reconstruct_path(source_id, target_id, current, &predecessor);
-                    return CycleCheckResult {
+                    return Ok(CycleCheckResult {
                         would_cycle: true,
                         cycle_path: path,
-                    };
+                    });
                 }
                 if visited.insert(neighbor.clone()) {
                     predecessor.insert(neighbor.clone(), current.clone());
@@ -130,10 +129,10 @@ pub fn would_create_reflection_cycle(
         frontier = next_frontier;
     }
 
-    CycleCheckResult {
+    Ok(CycleCheckResult {
         would_cycle: false,
         cycle_path: vec![],
-    }
+    })
 }
 
 /// Return the set of nodes reachable from `node` via `reflects_on` edges
@@ -239,7 +238,7 @@ mod tests {
         insert_memory(&conn, "a");
         insert_memory(&conn, "b");
         // No links yet — adding A→B is safe.
-        let result = would_create_reflection_cycle(&conn, "a", "b", 8);
+        let result = would_create_reflection_cycle(&conn, "a", "b", 8).expect("ok");
         assert!(!result.would_cycle);
         assert!(result.cycle_path.is_empty());
     }
@@ -252,7 +251,7 @@ mod tests {
         insert_memory(&conn, "b");
         add_reflects_on(&conn, "b", "a"); // B reflects_on A
 
-        let result = would_create_reflection_cycle(&conn, "a", "b", 8);
+        let result = would_create_reflection_cycle(&conn, "a", "b", 8).expect("ok");
         assert!(
             result.would_cycle,
             "direct cycle A→B with B→A must be detected"
@@ -274,7 +273,7 @@ mod tests {
         add_reflects_on(&conn, "b", "c"); // B reflects_on C
 
         // Proposed: C reflects_on A
-        let result = would_create_reflection_cycle(&conn, "c", "a", 8);
+        let result = would_create_reflection_cycle(&conn, "c", "a", 8).expect("ok");
         assert!(
             result.would_cycle,
             "indirect cycle C→A with A→B→C must be detected"
@@ -294,7 +293,7 @@ mod tests {
         add_reflects_on(&conn, "a", "b"); // A reflects_on B (existing)
 
         // Adding C→B: walk backward from B finds A, not C. Safe.
-        let result = would_create_reflection_cycle(&conn, "c", "b", 8);
+        let result = would_create_reflection_cycle(&conn, "c", "b", 8).expect("ok");
         assert!(
             !result.would_cycle,
             "C→B with only A→B existing is not a cycle"
@@ -318,14 +317,14 @@ mod tests {
 
         // With bound=2: walk from E backward visits D (hop 1) and C (hop 2).
         // B and A are beyond the bound; A is not found → returns false.
-        let bounded = would_create_reflection_cycle(&conn, "a", "e", 2);
+        let bounded = would_create_reflection_cycle(&conn, "a", "e", 2).expect("ok");
         assert!(
             !bounded.would_cycle,
             "bounded walk (depth=2) must not reach A"
         );
 
         // With bound=5: full chain is reachable → cycle found.
-        let unbounded = would_create_reflection_cycle(&conn, "a", "e", 5);
+        let unbounded = would_create_reflection_cycle(&conn, "a", "e", 5).expect("ok");
         assert!(
             unbounded.would_cycle,
             "walk with depth=5 must detect the cycle"
@@ -345,7 +344,7 @@ mod tests {
         let conn = open_db();
         insert_memory(&conn, "self");
 
-        let result = would_create_reflection_cycle(&conn, "self", "self", 8);
+        let result = would_create_reflection_cycle(&conn, "self", "self", 8).expect("ok");
         assert!(
             result.would_cycle,
             "direct self-link must be flagged as a cycle"
@@ -367,11 +366,39 @@ mod tests {
         add_reflects_on(&conn, "b", "a"); // B reflects_on A
 
         // Pass 0 to invoke the fallback branch.
-        let result = would_create_reflection_cycle(&conn, "a", "b", 0);
+        let result = would_create_reflection_cycle(&conn, "a", "b", 0).expect("ok");
         assert!(
             result.would_cycle,
             "max_depth=0 should fall back to DEFAULT_MAX_DEPTH and still detect the cycle"
         );
         assert!(!result.cycle_path.is_empty());
+    }
+
+    // v0.7.0 #1090 (SR-2 #5, MEDIUM) — fail-CLOSED: a forced SQL
+    // error during the forward walk propagates as Err rather than
+    // returning the misleading `would_cycle = false`.
+    //
+    // We seed a real cycle (B → A exists; proposed A → B) on a
+    // fresh DB so the walk WOULD detect it if it ran cleanly. Then
+    // we drop the `memory_links` table before the call so the
+    // walk's prepared SELECT hits a "no such table" rusqlite error
+    // — exactly the shape a transient corruption / BUSY / LOCKED
+    // would surface. Pre-#1090 the function would have logged
+    // `tracing::warn!` and returned `would_cycle = false` — letting
+    // the substrate land the cycle-creating edge under load. Post-
+    // #1090 the err propagates, the caller refuses the write.
+    #[test]
+    fn sql_error_fails_closed_1090() {
+        let conn = open_db();
+        insert_memory(&conn, "a");
+        insert_memory(&conn, "b");
+        // Drop the table the forward walk reads from. The next
+        // forward_neighbors call must surface the error.
+        conn.execute("DROP TABLE memory_links", []).expect("drop");
+        let result = would_create_reflection_cycle(&conn, "a", "b", 8);
+        assert!(
+            result.is_err(),
+            "SQL error during cycle walk must propagate as Err (#1090 fail-CLOSED)"
+        );
     }
 }

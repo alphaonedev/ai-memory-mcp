@@ -92,7 +92,7 @@ fn direct_cycle_is_refused() {
     add_edge(&conn, &a, &b);
 
     // Proposed: B reflects_on A — would close A→B→A cycle.
-    let result = would_create_reflection_cycle(&conn, &b, &a, 8);
+    let result = would_create_reflection_cycle(&conn, &b, &a, 8).expect("ok");
     assert!(
         result.would_cycle,
         "direct cycle B→A with A→B existing must be detected"
@@ -131,7 +131,7 @@ fn indirect_cycle_is_refused() {
     add_edge(&conn, &b, &c);
 
     // Proposed: C reflects_on A — would close C→A→B→C cycle.
-    let result = would_create_reflection_cycle(&conn, &c, &a, 8);
+    let result = would_create_reflection_cycle(&conn, &c, &a, 8).expect("ok");
     assert!(
         result.would_cycle,
         "indirect cycle C→A with A→B→C must be detected"
@@ -172,7 +172,7 @@ fn non_cycle_succeeds() {
     add_edge(&conn, &a, &b);
 
     // Proposed: C reflects_on B — C is unrelated to A; no cycle.
-    let result = would_create_reflection_cycle(&conn, &c, &b, 8);
+    let result = would_create_reflection_cycle(&conn, &c, &b, 8).expect("ok");
     assert!(
         !result.would_cycle,
         "C→B with only A→B existing must not be detected as a cycle"
@@ -204,7 +204,7 @@ fn refusal_recorded_in_signed_events_with_full_path() {
     add_edge(&conn, &b, &a);
 
     // Run the cycle check (as handle_link does).
-    let check = would_create_reflection_cycle(&conn, &a, &b, 8);
+    let check = would_create_reflection_cycle(&conn, &a, &b, 8).expect("ok");
     assert!(check.would_cycle, "pre-condition: cycle must be detected");
 
     // Emit the audit row exactly as handle_link does.

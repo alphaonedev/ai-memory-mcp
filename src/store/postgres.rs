@@ -2852,22 +2852,33 @@ impl PostgresStore {
         // Re-create the views in case operators dropped them between
         // connects. Bodies match postgres_schema.sql verbatim — kept
         // here as an inline copy so the migration is self-contained.
+        // v0.7.0 #1086 (SR-2 #4, MEDIUM) — array-based cycle
+        // detection. Pre-#1086 the cycle predicate used
+        // `position('->' || ml.target_id IN t.path) = 0` against a
+        // concatenated string `path`, which false-positives whenever
+        // one id is a substring of another at the `->` boundary
+        // (e.g. ids `foo` and `foo-bar`). Switch to a TEXT[] node
+        // accumulator + `NOT (ml.target_id = ANY(t.nodes))`, matching
+        // the correct pattern already in use by `kg_find_paths`.
+        // `path` is preserved on the wire (as `array_to_string(nodes,
+        // '->')`) for byte-stable downstream consumers.
         sqlx::query(
             "CREATE OR REPLACE VIEW kg_query_view AS
-             WITH RECURSIVE traversal(source_id, target_id, relation, depth, path) AS (
+             WITH RECURSIVE traversal(source_id, target_id, relation, depth, nodes) AS (
                  SELECT ml.source_id, ml.target_id, ml.relation, 1,
-                        ml.source_id || '->' || ml.target_id
+                        ARRAY[ml.source_id, ml.target_id]::TEXT[]
                  FROM memory_links ml
                  UNION ALL
                  SELECT t.source_id, ml.target_id, ml.relation, t.depth + 1,
-                        t.path || '->' || ml.target_id
+                        t.nodes || ml.target_id
                  FROM memory_links ml
                  JOIN traversal t ON ml.source_id = t.target_id
                  WHERE t.depth < 5
-                   AND position(('->' || ml.target_id) IN t.path) = 0
-                   AND position((ml.target_id || '->') IN t.path) = 0
+                   AND NOT (ml.target_id = ANY(t.nodes))
              )
-             SELECT source_id, target_id, relation, depth, path FROM traversal",
+             SELECT source_id, target_id, relation, depth,
+                    array_to_string(nodes, '->') AS path
+             FROM traversal",
         )
         .execute(&mut *tx)
         .await
@@ -3966,24 +3977,28 @@ impl PostgresStore {
         } else {
             "(ml.valid_until IS NULL OR ml.valid_until > NOW())"
         };
+        // v0.7.0 #1086 (SR-2 #4, MEDIUM) — array-based cycle
+        // detection in the runtime kg_query CTE. Mirrors the view
+        // fix; closes the substring false-positive when one id is a
+        // substring of another at the `->` boundary.
         let sql = format!(
-            "WITH RECURSIVE traversal(target_id, relation, depth, path) AS (
+            "WITH RECURSIVE traversal(target_id, relation, depth, nodes) AS (
                 SELECT ml.target_id, ml.relation, 1,
-                       ml.source_id || '->' || ml.target_id
+                       ARRAY[ml.source_id, ml.target_id]::TEXT[]
                 FROM memory_links ml
                 WHERE ml.source_id = $1
                   AND {valid_filter}
                 UNION ALL
                 SELECT ml.target_id, ml.relation, t.depth + 1,
-                       t.path || '->' || ml.target_id
+                       t.nodes || ml.target_id
                 FROM memory_links ml
                 JOIN traversal t ON ml.source_id = t.target_id
                 WHERE t.depth < $2
-                  AND position(('->' || ml.target_id) IN t.path) = 0
-                  AND position((ml.target_id || '->') IN t.path) = 0
+                  AND NOT (ml.target_id = ANY(t.nodes))
                   AND {valid_filter}
             )
-            SELECT target_id, relation, depth, path
+            SELECT target_id, relation, depth,
+                   array_to_string(nodes, '->') AS path
             FROM traversal
             ORDER BY depth ASC, target_id ASC"
         );
@@ -10053,41 +10068,95 @@ impl PostgresStore {
         .await
         .map_err(|e| to_store_err("list archived memories", e))?;
 
+        // v0.7.0 #1080 (SR-2 #3, MEDIUM) — propagate row-decode
+        // errors instead of substituting silent defaults. Pre-#1080
+        // every column decode used `.unwrap_or(default)` /
+        // `.unwrap_or_else(|_| <fake>)`, which on any sqlx decode
+        // failure (schema drift, NULL where NOT NULL was expected,
+        // JSONB shape drift) silently minted fake column values and
+        // serialised them into the audit-trail-facing payload. The
+        // SQLite-side `list_archived` propagates via `?` — the
+        // postgres adapter must match. NOT NULL columns
+        // (id/tier/namespace/title/content/tags/priority/
+        // confidence/source/access_count/created_at/updated_at/
+        // archived_at/archive_reason/metadata) hard-propagate;
+        // genuinely-nullable columns (last_accessed_at, expires_at)
+        // decode as Option<T>.
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
             use sqlx::Row;
-            let tags_jsonb: serde_json::Value =
-                row.try_get("tags").unwrap_or(serde_json::json!([]));
+            let tags_jsonb: serde_json::Value = row
+                .try_get("tags")
+                .map_err(|e| to_store_err("list_archived tags decode", e))?;
             let tags_string =
-                serde_json::to_string(&tags_jsonb).unwrap_or_else(|_| "[]".to_string());
-            let metadata: serde_json::Value =
-                row.try_get("metadata").unwrap_or(serde_json::json!({}));
-            let last_accessed_at: Option<DateTime<Utc>> =
-                row.try_get("last_accessed_at").unwrap_or(None);
-            let expires_at: Option<DateTime<Utc>> = row.try_get("expires_at").unwrap_or(None);
-            let archived_at: DateTime<Utc> =
-                row.try_get("archived_at").unwrap_or_else(|_| Utc::now());
-            let created_at: DateTime<Utc> =
-                row.try_get("created_at").unwrap_or_else(|_| Utc::now());
-            let updated_at: DateTime<Utc> =
-                row.try_get("updated_at").unwrap_or_else(|_| Utc::now());
+                serde_json::to_string(&tags_jsonb).map_err(|e| StoreError::InvalidInput {
+                    detail: format!("list_archived tags serialise: {e}"),
+                })?;
+            let metadata: serde_json::Value = row
+                .try_get("metadata")
+                .map_err(|e| to_store_err("list_archived metadata decode", e))?;
+            let last_accessed_at: Option<DateTime<Utc>> = row
+                .try_get("last_accessed_at")
+                .map_err(|e| to_store_err("list_archived last_accessed_at decode", e))?;
+            let expires_at: Option<DateTime<Utc>> = row
+                .try_get("expires_at")
+                .map_err(|e| to_store_err("list_archived expires_at decode", e))?;
+            let archived_at: DateTime<Utc> = row
+                .try_get("archived_at")
+                .map_err(|e| to_store_err("list_archived archived_at decode", e))?;
+            let created_at: DateTime<Utc> = row
+                .try_get("created_at")
+                .map_err(|e| to_store_err("list_archived created_at decode", e))?;
+            let updated_at: DateTime<Utc> = row
+                .try_get("updated_at")
+                .map_err(|e| to_store_err("list_archived updated_at decode", e))?;
+            let id: String = row
+                .try_get("id")
+                .map_err(|e| to_store_err("list_archived id decode", e))?;
+            let tier: String = row
+                .try_get("tier")
+                .map_err(|e| to_store_err("list_archived tier decode", e))?;
+            let namespace: String = row
+                .try_get("namespace")
+                .map_err(|e| to_store_err("list_archived namespace decode", e))?;
+            let title: String = row
+                .try_get("title")
+                .map_err(|e| to_store_err("list_archived title decode", e))?;
+            let content: String = row
+                .try_get("content")
+                .map_err(|e| to_store_err("list_archived content decode", e))?;
+            let priority: i32 = row
+                .try_get("priority")
+                .map_err(|e| to_store_err("list_archived priority decode", e))?;
+            let confidence: f64 = row
+                .try_get("confidence")
+                .map_err(|e| to_store_err("list_archived confidence decode", e))?;
+            let source: String = row
+                .try_get("source")
+                .map_err(|e| to_store_err("list_archived source decode", e))?;
+            let access_count: i64 = row
+                .try_get("access_count")
+                .map_err(|e| to_store_err("list_archived access_count decode", e))?;
+            let archive_reason: String = row
+                .try_get("archive_reason")
+                .map_err(|e| to_store_err("list_archived archive_reason decode", e))?;
             out.push(serde_json::json!({
-                "id": row.try_get::<String, _>("id").unwrap_or_default(),
-                "tier": row.try_get::<String, _>("tier").unwrap_or_default(),
-                "namespace": row.try_get::<String, _>("namespace").unwrap_or_default(),
-                "title": row.try_get::<String, _>("title").unwrap_or_default(),
-                "content": row.try_get::<String, _>("content").unwrap_or_default(),
+                "id": id,
+                "tier": tier,
+                "namespace": namespace,
+                "title": title,
+                "content": content,
                 "tags": tags_string,
-                "priority": row.try_get::<i32, _>("priority").unwrap_or(5),
-                "confidence": row.try_get::<f64, _>("confidence").unwrap_or(0.5),
-                "source": row.try_get::<String, _>("source").unwrap_or_default(),
-                "access_count": row.try_get::<i64, _>("access_count").unwrap_or(0),
+                "priority": priority,
+                "confidence": confidence,
+                "source": source,
+                "access_count": access_count,
                 "created_at": created_at.to_rfc3339(),
                 "updated_at": updated_at.to_rfc3339(),
                 "last_accessed_at": last_accessed_at.map(|d| d.to_rfc3339()),
                 "expires_at": expires_at.map(|d| d.to_rfc3339()),
                 "archived_at": archived_at.to_rfc3339(),
-                "archive_reason": row.try_get::<String, _>("archive_reason").unwrap_or_else(|_| "ttl_expired".to_string()),
+                "archive_reason": archive_reason,
                 "metadata": metadata,
             }));
         }
