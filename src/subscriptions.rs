@@ -215,6 +215,29 @@ pub fn list(conn: &Connection, caller_agent_id: Option<&str>) -> Result<Vec<Subs
     rows.context("subscription row decode failed")
 }
 
+/// Look up a subscription's owner (`created_by`) by id.
+///
+/// v0.7.0 #1115 / #1118 (SR-1 #5 / #6, HIGH) — used by the MCP +
+/// HTTP authz gates on `memory_subscription_replay` and
+/// `memory_subscription_dlq_list` to refuse cross-tenant reads of
+/// other agents' subscriptions. Returns `Ok(None)` when the
+/// subscription does not exist; callers map this to the same
+/// not-found envelope as a real miss so the existence of the id is
+/// not leaked.
+///
+/// # Errors
+/// - SQL prepare / query / decode failure.
+pub fn get_owner(conn: &Connection, id: &str) -> Result<Option<String>> {
+    let mut stmt = conn.prepare("SELECT created_by FROM subscriptions WHERE id = ?1")?;
+    let mut rows = stmt.query(params![id])?;
+    if let Some(row) = rows.next().context("subscription owner row")? {
+        let owner: Option<String> = row.get(0)?;
+        Ok(owner)
+    } else {
+        Ok(None)
+    }
+}
+
 /// P5 (G9): list subscriptions matching a specific event type. Returns
 /// rows where either:
 ///   - `event_types` is NULL (= all events; backward-compat default), OR
@@ -925,19 +948,34 @@ fn send(
         tracing::warn!("SSRF guard rejected webhook URL {url}: {e}");
         return Err(format!("ssrf-rejected: {e}"));
     }
-    // DNS-resolution guard (#301 item 2). We rely on reqwest to
-    // perform the connect, but pre-check by resolving the host here
-    // and rejecting if any returned address is private / loopback /
-    // link-local. Prevents DNS-rebind SSRF against attacker-controlled
-    // domains that resolve to internal IPs.
-    if let Err(e) = validate_url_dns(url) {
-        tracing::warn!("DNS SSRF guard rejected webhook URL {url}: {e}");
-        return Err(format!("dns-ssrf-rejected: {e}"));
+    // v0.7.0 #1082 (SR-1 #2, HIGH) — DNS-rebind TOCTOU fix. Resolve
+    // the host once via the SSRF guard AND capture the validated
+    // addresses, then bind reqwest's resolver to exactly those
+    // addresses via `Client::builder().resolve(host, addr)`. Pre-
+    // #1082 reqwest did its own independent DNS query at send time,
+    // letting an attacker-controlled DNS server (TTL=0 / split-
+    // horizon) return a public IP on the daemon's first lookup
+    // (passing the guard) and a private IP on reqwest's second
+    // lookup (the webhook payload posted internally). The new
+    // resolver override pins reqwest's connect to the daemon's
+    // already-validated IP set; reqwest's own DNS query never
+    // happens for this client.
+    let (resolved_host, validated_addrs) =
+        match validate_url_dns_resolved(url, crate::config::allow_loopback_webhooks()) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("DNS SSRF guard rejected webhook URL {url}: {e}");
+                return Err(format!("dns-ssrf-rejected: {e}"));
+            }
+        };
+    let mut builder = reqwest::blocking::Client::builder().timeout(ACK_TIMEOUT);
+    for addr in &validated_addrs {
+        // Pin reqwest's per-host override. The override SHADOWS
+        // reqwest's own DNS query for this host on this client,
+        // closing the rebind window.
+        builder = builder.resolve(&resolved_host, *addr);
     }
-    let client = match reqwest::blocking::Client::builder()
-        .timeout(ACK_TIMEOUT)
-        .build()
-    {
+    let client = match builder.build() {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!("webhook client build failed: {e}");
@@ -1104,20 +1142,68 @@ pub fn validate_hmac_secret_hex(secret: Option<&str>) -> Result<(), String> {
 /// we let reqwest surface the error rather than fail closed, because
 /// transient DNS outages should not silently drop webhook delivery.
 pub fn validate_url_dns(url: &str) -> Result<()> {
-    validate_url_dns_with(url, crate::config::allow_loopback_webhooks())
+    validate_url_dns_with(url, crate::config::allow_loopback_webhooks()).map(|_| ())
+}
+
+/// v0.7.0 #1082 (SR-1 #2, HIGH) — DNS-rebind TOCTOU fix. Returns
+/// the validated host + the pre-resolved `Vec<SocketAddr>` so the
+/// caller can pin reqwest's resolver to the SAME addresses the
+/// SSRF guard cleared. Pre-#1082 the guard resolved once,
+/// validated, and discarded the addresses — reqwest then did its
+/// OWN independent resolve at send time, opening a DNS-rebind
+/// window where the second resolve could return a private IP that
+/// the daemon never saw.
+///
+/// # Errors
+/// - URL has no scheme.
+/// - DNS resolution failed AND `AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL`
+///   is not set (post-#1053 fail-CLOSED).
+/// - Any resolved address is private / link-local (or loopback when
+///   `allow_loopback` is false).
+pub(crate) fn validate_url_dns_resolved(
+    url: &str,
+    allow_loopback: bool,
+) -> Result<(String, Vec<std::net::SocketAddr>)> {
+    validate_url_dns_with(url, allow_loopback)
 }
 
 /// H11 inner helper: takes `allow_loopback` explicitly so tests can
 /// assert both branches without poking the process-wide atomic
 /// (which would race with parallel tests). Production callers go
 /// through `validate_url_dns`.
-fn validate_url_dns_with(url: &str, allow_loopback: bool) -> Result<()> {
+///
+/// v0.7.0 #1082 — returns the resolved `(host, addresses)` so the
+/// `send` path can install a reqwest `Client::builder().resolve()`
+/// override pinning the connect to exactly the IPs the guard
+/// cleared. Closes the DNS-rebind TOCTOU window.
+fn validate_url_dns_with(
+    url: &str,
+    allow_loopback: bool,
+) -> Result<(String, Vec<std::net::SocketAddr>)> {
     let lower = url.to_ascii_lowercase();
     let (_scheme, rest) = lower
         .split_once("://")
         .ok_or_else(|| anyhow!("webhook URL missing scheme: {url}"))?;
     let host_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let host_port = &rest[..host_end];
+    // v0.7.0 #1082 — extract the host (sans port + brackets) for the
+    // reqwest `Client::builder().resolve(host, addr)` override the
+    // caller installs. The override matches by host string the
+    // reqwest URL parser produces, so we strip the brackets / port
+    // here to match.
+    let resolved_host = {
+        let s = host_port;
+        if let Some(close_idx) = s.strip_prefix('[').and(s.find(']')) {
+            // [ipv6]:port or [ipv6] — return the inner ipv6 text.
+            s[1..close_idx].to_string()
+        } else if let Some(idx) = s.rfind(':') {
+            // Hostname:port — strip the port. (IPv4-with-port. Bare
+            // ipv4 has no `:` so falls through to the else branch.)
+            s[..idx].to_string()
+        } else {
+            s.to_string()
+        }
+    };
     // Supply a default port so ToSocketAddrs resolves correctly.
     // SSRF fix (W11): bracketed IPv6 without an explicit port ("[fe80::1]"
     // with no trailing ":N") was previously passed to ToSocketAddrs as-is,
@@ -1175,7 +1261,10 @@ fn validate_url_dns_with(url: &str, allow_loopback: bool) -> Result<()> {
                      (UNSAFE, legacy posture) — reqwest's resolver may bind to \
                      private/loopback IPs the daemon could not pre-check"
                 );
-                return Ok(());
+                // Empty address list — caller's resolver-override
+                // loop is a no-op and reqwest falls back to its
+                // own DNS query (the explicit UNSAFE legacy posture).
+                return Ok((resolved_host, Vec::new()));
             }
             return Err(anyhow!(
                 "SSRF guard: DNS resolution failed for {url}: {e}; failing CLOSED \
@@ -1202,7 +1291,9 @@ fn validate_url_dns_with(url: &str, allow_loopback: bool) -> Result<()> {
             ));
         }
     }
-    Ok(())
+    // v0.7.0 #1082 — return the resolved host + addr list so the
+    // caller can pin reqwest's connect to exactly these addresses.
+    Ok((resolved_host, addrs))
 }
 
 /// SSRF guard. Rejects URLs that would cause the daemon to connect

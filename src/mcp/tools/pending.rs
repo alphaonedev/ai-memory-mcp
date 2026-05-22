@@ -125,13 +125,76 @@ impl McpTool for PendingRejectTool {
 pub(crate) fn handle_subscription_dlq_list(
     conn: &rusqlite::Connection,
     params: &Value,
+    mcp_client: Option<&str>,
 ) -> Result<Value, String> {
     let subscription_id = params["subscription_id"].as_str();
     let limit = usize::try_from(params["limit"].as_u64().unwrap_or(100))
         .unwrap_or(100)
         .clamp(1, 1000);
-    let mut rows =
+
+    // v0.7.0 #1118 (SR-1 #6, HIGH) — caller-ownership gate.
+    //
+    // Two attack shapes the gate closes:
+    // 1. Targeted: an attacker who knows a victim's subscription_id
+    //    (logs, prior cross-talk) replays the DLQ payload bodies,
+    //    which carry the same memory snippets the subscriber would
+    //    have received.
+    // 2. Untargeted full-tenant scan: with `subscription_id=None`,
+    //    pre-#1118 list_dlq returned every tenant's DLQ rows.
+    //
+    // Fix:
+    //   - When `subscription_id` is `Some`: look up the owner; if it
+    //     does not match the caller, return the not-found envelope.
+    //   - When `subscription_id` is `None`: filter the returned rows
+    //     to only those whose subscription owner == caller. This
+    //     preserves the per-tenant operator inventory use-case while
+    //     refusing to leak cross-tenant payloads.
+    let caller = crate::identity::resolve_agent_id(None, mcp_client).map_err(|e| e.to_string())?;
+
+    let rows_all =
         crate::subscriptions::list_dlq(conn, subscription_id).map_err(|e| e.to_string())?;
+    let rows: Vec<_> = if let Some(sid) = subscription_id {
+        let owner = crate::subscriptions::get_owner(conn, sid).map_err(|e| e.to_string())?;
+        if owner.as_deref() != Some(caller.as_str()) {
+            // Identical wire shape to "no DLQ entries since the
+            // subscription rolled over". Cannot distinguish from
+            // not-found.
+            return Ok(json!({
+                "count": 0,
+                "subscription_id": subscription_id,
+                "limit": limit,
+                "entries": Vec::<Value>::new(),
+            }));
+        }
+        rows_all
+    } else {
+        // Filter cross-tenant rows by resolving each row's
+        // subscription owner. Owners that don't match the caller are
+        // dropped. We cache the per-id ownership lookup so we don't
+        // re-query the same subscription_id repeatedly on a
+        // multi-event sub.
+        let mut owners: std::collections::HashMap<String, Option<String>> =
+            std::collections::HashMap::new();
+        let mut out = Vec::with_capacity(rows_all.len());
+        for row in rows_all {
+            let sid = row.subscription_id.clone();
+            let owner = match owners.get(&sid) {
+                Some(o) => o.clone(),
+                None => {
+                    let o =
+                        crate::subscriptions::get_owner(conn, &sid).map_err(|e| e.to_string())?;
+                    owners.insert(sid.clone(), o.clone());
+                    o
+                }
+            };
+            if owner.as_deref() == Some(caller.as_str()) {
+                out.push(row);
+            }
+        }
+        out
+    };
+
+    let mut rows = rows;
     if rows.len() > limit {
         rows.truncate(limit);
     }
@@ -434,7 +497,7 @@ mod tests {
     #[test]
     fn subscription_dlq_list_empty() {
         let conn = fresh_conn();
-        let resp = handle_subscription_dlq_list(&conn, &json!({})).expect("ok");
+        let resp = handle_subscription_dlq_list(&conn, &json!({}), None).expect("ok");
         assert_eq!(resp["count"].as_u64(), Some(0));
         assert!(resp["entries"].is_array());
     }
@@ -443,7 +506,7 @@ mod tests {
     #[test]
     fn subscription_dlq_list_limit_clamped() {
         let conn = fresh_conn();
-        let resp = handle_subscription_dlq_list(&conn, &json!({"limit": 0u64})).expect("ok");
+        let resp = handle_subscription_dlq_list(&conn, &json!({"limit": 0u64}), None).expect("ok");
         // limit=0 clamps to 1; 0 is below the min so it should not error.
         assert!(resp["limit"].as_u64().unwrap() >= 1);
     }
@@ -452,9 +515,56 @@ mod tests {
     #[test]
     fn subscription_dlq_list_with_filter() {
         let conn = fresh_conn();
-        let resp =
-            handle_subscription_dlq_list(&conn, &json!({"subscription_id": "sub-x"})).expect("ok");
+        let resp = handle_subscription_dlq_list(&conn, &json!({"subscription_id": "sub-x"}), None)
+            .expect("ok");
         assert_eq!(resp["subscription_id"].as_str(), Some("sub-x"));
+    }
+
+    // #1118 (SR-1 #6, HIGH) — cross-tenant DLQ list is refused.
+    // Alice's subscription has DLQ entries; bob filters on alice's
+    // sub_id and receives the empty envelope.
+    #[test]
+    fn subscription_dlq_list_cross_tenant_refused_1118() {
+        let conn = fresh_conn();
+        db::register_agent(&conn, "ai:alice", "test", &[]).expect("register alice");
+        let sid = crate::subscriptions::insert(
+            &conn,
+            &crate::subscriptions::NewSubscription {
+                url: "https://example.com/alice",
+                events: "memory_store",
+                secret: Some("sek-alice"),
+                namespace_filter: None,
+                agent_filter: None,
+                created_by: Some("ai:alice"),
+                event_types: None,
+            },
+        )
+        .expect("insert alice sub");
+        // Insert a DLQ entry against alice's subscription. Hand-rolled
+        // SQL because `record_dlq` opens a fresh `Connection`; the
+        // in-memory test conn is the one our `list_dlq` query reads.
+        conn.execute(
+            "INSERT INTO subscription_dlq \
+             (subscription_id, correlation_id, event_type, payload, retry_count, last_error, first_failed_at, last_failed_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![&sid, "alice-corr-1", "memory_store", "{\"id\":\"m1\"}", 3i64, "5xx", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"],
+        ).expect("record dlq");
+
+        // Bob hits the filter.
+        let resp = handle_subscription_dlq_list(
+            &conn,
+            &json!({"subscription_id": sid}),
+            Some("ai:bob-client"),
+        )
+        .expect("ok");
+        assert_eq!(resp["count"].as_u64(), Some(0));
+        assert!(resp["entries"].as_array().unwrap().is_empty());
+
+        // Bob with no subscription_id filter also sees no entries —
+        // the filter-by-owner branch drops the cross-tenant row.
+        let resp_unfiltered =
+            handle_subscription_dlq_list(&conn, &json!({}), Some("ai:bob-client")).expect("ok");
+        assert_eq!(resp_unfiltered["count"].as_u64(), Some(0));
     }
 
     // handle_pending_list — happy + count.
