@@ -209,6 +209,16 @@ before the #1067 / #1068 substrate work.
   changes via CLI to take effect. `invalidate_all` / `invalidate`
   remain exposed for test fixtures and future SIGHUP / admin-endpoint
   use.
+  - **Operator advisory** ([#1047](https://github.com/alphaonedev/ai-memory-mcp/issues/1047)
+    cross-reference): the `ai-memory rules add` / `enable` / `disable`
+    CLI subcommands write to a **separate process** from the running
+    daemon. The daemon's in-memory `RuleCache` does NOT observe those
+    sibling writes. After any `ai-memory rules <verb>` invocation,
+    restart the daemon (`systemctl restart ai-memory` or equivalent)
+    for the rule change to take effect on the wire-check / pre-write
+    governance gates. A future v0.8 admin-endpoint or `SIGHUP` handler
+    will close this gap by calling `invalidate_all` over the running
+    daemon's IPC; until then, restart is the load-bearing remediation.
 - **[#1027](https://github.com/alphaonedev/ai-memory-mcp/issues/1027)
   (CRITICAL) — `run_gc` HTTP route missing `require_admin` gate.**
   `src/handlers/admin.rs:492` `run_gc` emitted an audit row but did
