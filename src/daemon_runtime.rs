@@ -2420,6 +2420,40 @@ pub async fn bootstrap_serve(
     // revert restored after #983 shipped a process-wide singleton).
     let rule_cache: Arc<crate::governance::rule_cache::RuleCache> =
         Arc::new(crate::governance::rule_cache::RuleCache::new());
+
+    // v0.7.0 #1017 (Agent-1 #3) — long-lived consultation connection
+    // shared between the storage `GOVERNANCE_PRE_WRITE` hook and the
+    // `wire_check::GOVERNANCE_PRE_ACTION` action hook. Pre-#1017 each
+    // hook invocation called `db::open(&rules_db_path)` which runs
+    // 4 PRAGMAs + SCHEMA execute_batch + migrate() + trigger probe —
+    // ~1-2ms per write that paid the cost unconditionally even on
+    // RuleCache hits. The #991 rule cache made the OPEN overhead the
+    // dominant remaining hot-path cost; #1017 closes the gap by
+    // opening the connection ONCE at install time and reusing it
+    // across all hook invocations. The connection is wrapped in
+    // `std::sync::Mutex` because hooks fire from both sync paths
+    // (`storage::insert` is sync; wire-check is consulted from sync
+    // `governance::wire_check::check` regardless of caller context).
+    //
+    // If `db::open` fails at install time, we install hooks that
+    // degrade to ALLOW on every call with a WARN — same posture as
+    // the pre-#1017 per-call open-failure leg. The operator sees the
+    // diagnostic in daemon logs and can re-attempt.
+    let hook_consultation_conn: Option<Arc<std::sync::Mutex<rusqlite::Connection>>> =
+        match db::open(db_path) {
+            Ok(c) => Some(Arc::new(std::sync::Mutex::new(c))),
+            Err(e) => {
+                tracing::warn!(
+                    target: "ai_memory::daemon_runtime",
+                    "v0.7.0 #1017: failed to open hook consultation connection at {}: {}; \
+                     governance hooks will degrade to ALLOW on every invocation",
+                    db_path.display(),
+                    e,
+                );
+                None
+            }
+        };
+
     {
         use crate::governance::agent_action::{
             AgentAction, Decision as RuleDecision, check_agent_action_deferred_cached,
@@ -2427,20 +2461,28 @@ pub async fn bootstrap_serve(
         let rules_db_path = db_path.to_path_buf();
         let queue_for_hook = deferred_audit_queue.clone();
         let cache_for_hook = Arc::clone(&rule_cache);
+        let conn_for_hook = hook_consultation_conn.clone();
         let install_result = crate::storage::GOVERNANCE_PRE_WRITE.set(Box::new(
             move |mem: &crate::models::Memory| -> std::result::Result<(), String> {
-                let conn_for_check = match db::open(&rules_db_path) {
-                    Ok(c) => c,
-                    Err(e) => {
+                let Some(conn_arc) = conn_for_hook.as_ref() else {
+                    tracing::warn!(
+                        "L1-6 governance pre-write: hook consultation connection unavailable (rules DB at {}); \
+                         degrading to ALLOW for this write",
+                        rules_db_path.display(),
+                    );
+                    return Ok(());
+                };
+                let conn_guard = match conn_arc.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => {
                         tracing::warn!(
-                            "L1-6 governance pre-write: failed to open rules DB at {}: {}; \
-                             degrading to ALLOW for this write",
-                            rules_db_path.display(),
-                            e,
+                            "L1-6 governance pre-write: consultation connection mutex poisoned; \
+                             recovering inner connection and continuing"
                         );
-                        return Ok(());
+                        poisoned.into_inner()
                     }
                 };
+                let conn_for_check: &rusqlite::Connection = &conn_guard;
                 let action = AgentAction::Custom {
                     custom_kind: "memory_write".to_string(),
                     payload: serde_json::json!({
@@ -2463,7 +2505,7 @@ pub async fn bootstrap_serve(
                     .unwrap_or("substrate:pre_write_hook")
                     .to_string();
                 match check_agent_action_deferred_cached(
-                    &conn_for_check,
+                    conn_for_check,
                     Some(&cache_for_hook),
                     &agent_id,
                     &action,
@@ -2536,23 +2578,34 @@ pub async fn bootstrap_serve(
         let rules_db_path = db_path.to_path_buf();
         let cache_for_wire_check = Arc::clone(&rule_cache);
         let queue_for_wire_check = deferred_audit_queue.clone();
+        // v0.7.0 #1017 — share the same long-lived consultation
+        // connection introduced above. Hook installs are serial so
+        // there's no race on the Arc clone.
+        let conn_for_wire_check = hook_consultation_conn.clone();
         let install_result = crate::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(
             move |action: &AgentAction| -> std::result::Result<(), String> {
-                let conn_for_check = match db::open(&rules_db_path) {
-                    Ok(c) => c,
-                    Err(e) => {
+                let Some(conn_arc) = conn_for_wire_check.as_ref() else {
+                    tracing::warn!(
+                        "wire_check: hook consultation connection unavailable (rules DB at {}); \
+                         degrading to ALLOW for this action ({})",
+                        rules_db_path.display(),
+                        action.kind(),
+                    );
+                    return Ok(());
+                };
+                let conn_guard = match conn_arc.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => {
                         tracing::warn!(
-                            "wire_check: failed to open rules DB at {}: {}; \
-                             degrading to ALLOW for this action ({})",
-                            rules_db_path.display(),
-                            e,
-                            action.kind(),
+                            "wire_check: consultation connection mutex poisoned; \
+                             recovering inner connection and continuing"
                         );
-                        return Ok(());
+                        poisoned.into_inner()
                     }
                 };
+                let conn_for_check: &rusqlite::Connection = &conn_guard;
                 match check_agent_action_deferred_cached(
-                    &conn_for_check,
+                    conn_for_check,
                     Some(&cache_for_wire_check),
                     "daemon:wire_action",
                     action,
