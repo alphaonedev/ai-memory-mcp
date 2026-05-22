@@ -1002,11 +1002,35 @@ pub(crate) fn sha256_hex(s: &str) -> String {
 /// primitive.
 pub(crate) fn hmac_sha256_hex(key_hex: &str, body: &str) -> String {
     const BLOCK: usize = 64;
-    // Decode key — if invalid hex, fall back to the raw bytes (which
-    // keeps the signature stable for operators who set bad secrets;
-    // verification will fail equally at receive time, which is loud
-    // enough).
-    let mut key = hex_decode(key_hex).unwrap_or_else(|| key_hex.as_bytes().to_vec());
+    // v0.7.0 #1048 (Agent-5 #8) — decode the operator-supplied
+    // `hmac_secret` as hex. The pre-#1048 behaviour silently fell
+    // back to using the raw config bytes as HMAC key material when
+    // the hex decode failed, which produced a stable-but-WEAK key
+    // (`HMAC(b"not-a-hex-key!!", body)` instead of the intended
+    // hex-decoded bytes). The fallback is preserved for wire
+    // compatibility because both sender and receiver are typically
+    // configured from the same secret string — flipping the
+    // fallback would silently break running federations — but
+    // every invalid-hex compute emits a WARN so an operator
+    // running with a misconfigured secret sees the diagnostic on
+    // every webhook dispatch. The boot-time validator
+    // [`validate_hmac_secret_hex`] surfaces this BEFORE the daemon
+    // accepts traffic; operators who want strict hex enforcement
+    // call the validator at startup.
+    let mut key = match hex_decode(key_hex) {
+        Some(k) => k,
+        None => {
+            tracing::warn!(
+                target: "ai_memory::subscriptions",
+                "hmac_sha256_hex: hmac_secret is not valid hex (len={}); falling back to raw \
+                 bytes as key material — this produces a STABLE BUT WEAK key. Re-encode the \
+                 secret as hex (e.g. `openssl rand -hex 32`) and restart the daemon. \
+                 See #1048.",
+                key_hex.len(),
+            );
+            key_hex.as_bytes().to_vec()
+        }
+    };
     if key.len() > BLOCK {
         let mut h = Sha256::new();
         h.update(&key);
@@ -1037,6 +1061,37 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
         .step_by(2)
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
         .collect()
+}
+
+/// v0.7.0 #1048 (Agent-5 #8) — boot-time hex validator for the
+/// operator-supplied `hmac_secret`. Returns `Ok(())` when the value
+/// is `None` (no secret configured) OR is valid hex; returns
+/// `Err(String)` with a descriptive operator-facing message when
+/// the value is non-hex. Callers MUST surface the error before the
+/// daemon accepts traffic; the runtime `hmac_sha256_hex` will
+/// otherwise silently degrade to a stable-but-WEAK key (raw bytes
+/// of the misconfigured secret) on every dispatch.
+///
+/// # Errors
+///
+/// Returns the validation error string when the input is
+/// `Some(secret)` and `secret` fails the hex parse. The message
+/// includes recommended remediation (`openssl rand -hex 32`).
+pub fn validate_hmac_secret_hex(secret: Option<&str>) -> Result<(), String> {
+    let Some(secret) = secret else {
+        return Ok(());
+    };
+    if hex_decode(secret).is_some() {
+        return Ok(());
+    }
+    Err(format!(
+        "[hooks.subscription] hmac_secret is not valid hex (len={}): expected an even-length \
+         hex string. Generate a fresh secret with `openssl rand -hex 32` and update the \
+         config. The runtime still computes a (weak) HMAC under the misconfigured value for \
+         wire compatibility, but the boot validator refuses to start so the operator sees \
+         the diagnostic immediately. See #1048.",
+        secret.len(),
+    ))
 }
 
 /// SSRF guard with DNS resolution (#301 item 2). Resolves the host
@@ -2229,6 +2284,71 @@ mod tests {
         assert!(hex_decode("abc").is_none());
         // Non-hex chars must return None.
         assert!(hex_decode("zz").is_none());
+    }
+
+    #[test]
+    fn validate_hmac_secret_hex_accepts_none_1048() {
+        // v0.7.0 #1048 — no secret configured = no-op (Ok).
+        assert!(validate_hmac_secret_hex(None).is_ok());
+    }
+
+    #[test]
+    fn validate_hmac_secret_hex_accepts_valid_hex_1048() {
+        // v0.7.0 #1048 — even-length all-hex string passes.
+        assert!(validate_hmac_secret_hex(Some("deadbeef")).is_ok());
+        assert!(validate_hmac_secret_hex(Some("0123456789abcdef")).is_ok());
+        // 64-char (32 byte) — the recommended `openssl rand -hex 32` shape.
+        let long = "a".repeat(64);
+        assert!(validate_hmac_secret_hex(Some(&long)).is_ok());
+    }
+
+    #[test]
+    fn validate_hmac_secret_hex_rejects_non_hex_1048() {
+        // v0.7.0 #1048 — non-hex secret (operator typo / passphrase
+        // instead of hex) is rejected at boot validator. The
+        // production `main.rs` boot path treats this as fatal.
+        let err = validate_hmac_secret_hex(Some("not-a-hex-key!!"))
+            .expect_err("non-hex MUST fail validation");
+        assert!(
+            err.contains("not valid hex") && err.contains("openssl rand -hex 32"),
+            "#1048: failure msg MUST reference invalid hex + remediation; got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_hmac_secret_hex_rejects_odd_length_1048() {
+        // v0.7.0 #1048 — odd-length hex is not parseable; rejected.
+        let err = validate_hmac_secret_hex(Some("abc")).expect_err("odd-length MUST fail");
+        assert!(err.contains("not valid hex"));
+    }
+
+    #[test]
+    fn hmac_sha256_hex_output_is_fixed_64_chars_1039() {
+        // v0.7.0 #1039 (Agent-5 #6) — HMAC-SHA256 output is ALWAYS
+        // 32 bytes = 64 hex chars regardless of input. The
+        // `constant_time_eq` early-return on length mismatch in
+        // `src/handlers/transport.rs` (used by /api/v1/approvals
+        // signature verification) leaks the length of the EXPECTED
+        // sig — but the expected sig is the fixed 64-char output
+        // of this function, so the leak conveys zero attacker-
+        // useful entropy. This test pins the fixed-length contract
+        // so a future hash-agility refactor doesn't accidentally
+        // produce variable-length output that re-opens the timing
+        // oracle.
+        for body in &["", "x", "x".repeat(1024).as_str(), "🦀"] {
+            let sig = hmac_sha256_hex("deadbeef", body);
+            assert_eq!(
+                sig.len(),
+                64,
+                "#1039: HMAC-SHA256 hex output MUST be fixed 64 chars; got len={} for body={:?}",
+                sig.len(),
+                body
+            );
+            assert!(
+                sig.chars().all(|c| c.is_ascii_hexdigit()),
+                "#1039: HMAC hex output MUST be all-hex; got {sig}"
+            );
+        }
     }
 
     #[test]

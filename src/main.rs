@@ -35,7 +35,22 @@ async fn main() -> Result<()> {
     // Idempotent; the dispatcher reads via
     // `crate::config::active_hooks_hmac_secret` and falls back to the
     // per-subscription secret when unset.
-    config::set_active_hooks_hmac_secret(app_config.effective_hooks_hmac_secret());
+    //
+    // v0.7.0 #1048 (Agent-5 #8) — validate that the operator-supplied
+    // `hmac_secret` is valid hex BEFORE installing it. The runtime
+    // `subscriptions::hmac_sha256_hex` falls back to using the raw
+    // config bytes as HMAC key material when the hex decode fails —
+    // wire-stable but the WEAK-key posture is not what the operator
+    // configured. Surface the misconfiguration at boot so the
+    // operator fixes it before traffic flows.
+    let resolved_hmac_secret = app_config.effective_hooks_hmac_secret();
+    if let Err(msg) = ai_memory::subscriptions::validate_hmac_secret_hex(
+        resolved_hmac_secret.as_deref(),
+    ) {
+        eprintln!("ai-memory: boot refused — #1048 invalid hmac_secret\n  {msg}");
+        std::process::exit(78); // EX_CONFIG per sysexits.h
+    }
+    config::set_active_hooks_hmac_secret(resolved_hmac_secret);
 
     // v0.7.0 H11 (#628 blocker) — pin the loopback-webhook opt-in. The
     // SSRF guard in `validate_url` rejects loopback URLs by default;
