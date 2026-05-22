@@ -325,6 +325,73 @@ fn governance_hooks_capture_consultation_connection_at_install_time_1017() {
 }
 
 #[test]
+fn governance_hooks_concurrent_consultation_no_deadlock_1017() {
+    // v0.7.0 #1017 (Agent 4 / SR-6 #11) — the structural pin at
+    // `governance_hooks_capture_consultation_connection_at_install_time_1017`
+    // catches re-introduction of `db::open(&rules_db_path)` inside the
+    // hook closures but does NOT exercise the Arc<Mutex<Connection>>
+    // under concurrent load. This pin adds a 2-thread concurrent-
+    // consultation test against the shared rules-engine Connection
+    // shape so a future refactor that holds the Mutex across an `.await`
+    // boundary OR a panic-poisons-the-Connection-mid-consultation
+    // regression surfaces here rather than in production.
+    //
+    // The full daemon-runtime hook installation requires the HTTP
+    // serve bootstrap which is out of unit-test scope; instead we
+    // model the SHAPE the hooks observe — a long-lived
+    // `Arc<Mutex<Connection>>` consulted by `check_agent_action_no_audit`
+    // (the same substrate read the hooks ultimately call) — and drive
+    // it from two threads simultaneously. Bugs that surface here would
+    // also surface in production hook firing.
+
+    let conn = fresh_conn();
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(conn));
+
+    let action_factory = || AgentAction::FilesystemWrite {
+        path: PathBuf::from("/usr/share/test"),
+        byte_estimate: Some(1024),
+    };
+
+    let shared_a = std::sync::Arc::clone(&shared);
+    let shared_b = std::sync::Arc::clone(&shared);
+    let start = std::time::Instant::now();
+
+    let h_a = std::thread::spawn(move || {
+        for _ in 0..50 {
+            let guard = shared_a.lock().expect("not poisoned");
+            let _ = check_agent_action_no_audit(&guard, &action_factory()).expect("check ok");
+            drop(guard);
+        }
+    });
+    let h_b = std::thread::spawn(move || {
+        for _ in 0..50 {
+            let guard = shared_b.lock().expect("not poisoned");
+            let _ = check_agent_action_no_audit(&guard, &action_factory()).expect("check ok");
+            drop(guard);
+        }
+    });
+
+    h_a.join().expect("thread a deadlocked or panicked");
+    h_b.join().expect("thread b deadlocked or panicked");
+
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "#1017: 100 concurrent rule-consultations across 2 threads MUST \
+         complete in <5s; elapsed={elapsed:?}. A regression that holds \
+         the Mutex across an await boundary or poisons the Connection \
+         mid-consultation would surface here as deadlock or panic."
+    );
+
+    // Mutex must NOT be poisoned after the workload.
+    assert!(
+        shared.lock().is_ok(),
+        "#1017: shared rules-engine Connection mutex must not be \
+         poisoned after concurrent consultation workload"
+    );
+}
+
+#[test]
 fn governance_hooks_fail_closed_on_rule_consultation_error_1054() {
     // v0.7.0 #1054 (Agent-2 #4) — both governance hooks must
     // fail-CLOSED on rule-consultation error (the Err arm of

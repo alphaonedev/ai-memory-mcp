@@ -1105,6 +1105,82 @@ mod tests {
     fn test_default_url() {
         assert_eq!(DEFAULT_OLLAMA_URL, "http://localhost:11434");
     }
+
+    /// v0.7.0 #1067 + #1113 — per-alias default base URL pin. Walks
+    /// every vendor alias the v0.7.0 LLM client advertises and asserts
+    /// `default_base_url_for_alias` returns the documented host.
+    #[test]
+    fn default_base_url_for_alias_covers_all_15_aliases_1067() {
+        let cases: &[(&str, Option<&str>)] = &[
+            ("openai", Some("https://api.openai.com/v1")),
+            ("xai", Some("https://api.x.ai/v1")),
+            ("anthropic", Some("https://api.anthropic.com/v1")),
+            (
+                "gemini",
+                Some("https://generativelanguage.googleapis.com/v1beta/openai"),
+            ),
+            ("deepseek", Some("https://api.deepseek.com/v1")),
+            ("kimi", Some("https://api.moonshot.cn/v1")),
+            ("moonshot", Some("https://api.moonshot.cn/v1")),
+            (
+                "qwen",
+                Some("https://dashscope.aliyuncs.com/compatible-mode/v1"),
+            ),
+            (
+                "dashscope",
+                Some("https://dashscope.aliyuncs.com/compatible-mode/v1"),
+            ),
+            ("mistral", Some("https://api.mistral.ai/v1")),
+            ("groq", Some("https://api.groq.com/openai/v1")),
+            ("together", Some("https://api.together.xyz/v1")),
+            ("cerebras", Some("https://api.cerebras.ai/v1")),
+            ("openrouter", Some("https://openrouter.ai/api/v1")),
+            ("fireworks", Some("https://api.fireworks.ai/inference/v1")),
+            ("lmstudio", Some("http://localhost:1234/v1")),
+            ("openai-compatible", None),
+            ("totally-unknown-vendor", None),
+        ];
+        for (alias, expected) in cases {
+            let got = default_base_url_for_alias(alias);
+            assert_eq!(
+                got, *expected,
+                "#1067: alias `{alias}` must resolve to {expected:?}; got {got:?}"
+            );
+        }
+    }
+
+    /// v0.7.0 #1067 + #1113 — per-alias API-key env var preference list.
+    #[test]
+    fn alias_api_key_env_vars_per_alias_pins_1067() {
+        let cases: &[(&str, &[&str])] = &[
+            ("openai", &["OPENAI_API_KEY"]),
+            ("xai", &["XAI_API_KEY"]),
+            ("anthropic", &["ANTHROPIC_API_KEY"]),
+            ("gemini", &["GEMINI_API_KEY", "GOOGLE_API_KEY"]),
+            ("deepseek", &["DEEPSEEK_API_KEY"]),
+            ("kimi", &["MOONSHOT_API_KEY", "KIMI_API_KEY"]),
+            ("moonshot", &["MOONSHOT_API_KEY", "KIMI_API_KEY"]),
+            ("qwen", &["DASHSCOPE_API_KEY", "QWEN_API_KEY"]),
+            ("dashscope", &["DASHSCOPE_API_KEY", "QWEN_API_KEY"]),
+            ("mistral", &["MISTRAL_API_KEY"]),
+            ("groq", &["GROQ_API_KEY"]),
+            ("together", &["TOGETHER_API_KEY"]),
+            ("cerebras", &["CEREBRAS_API_KEY"]),
+            ("openrouter", &["OPENROUTER_API_KEY"]),
+            ("fireworks", &["FIREWORKS_API_KEY"]),
+            ("ollama", &[]),
+            ("lmstudio", &[]),
+            ("openai-compatible", &[]),
+            ("totally-unknown-vendor", &[]),
+        ];
+        for (alias, expected) in cases {
+            let got = alias_api_key_env_vars(alias);
+            assert_eq!(
+                got, *expected,
+                "#1067: alias `{alias}` env-var preference list must be {expected:?}; got {got:?}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
