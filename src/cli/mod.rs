@@ -69,6 +69,12 @@ pub mod rules;
 pub mod schema_init;
 pub mod search;
 pub mod serve_banner;
+/// v0.7.0 #1095 — `ai-memory share` subcommand. Closes the SR-4
+/// three-surface-parity gap by shipping the CLI counterpart to the
+/// MCP tool `memory_share` and the HTTP route `POST /api/v1/share`.
+/// All three surfaces dispatch through the same substrate primitive
+/// (`crate::mcp::tools::share::handle_share`).
+pub mod share;
 pub mod shell;
 pub mod store;
 pub mod sync;
