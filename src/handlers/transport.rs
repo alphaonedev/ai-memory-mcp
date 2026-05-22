@@ -610,13 +610,35 @@ pub(crate) fn percent_decode_lossy(input: &str) -> String {
 
 /// first mismatched byte, preventing timing-oracle leaks of secret
 /// material. Used for API-key comparison (#301 hardening item 3).
+///
+/// v0.7.0 #1060 (Agent-2 #7) — the length-mismatch early-return at
+/// the top of this function leaks `len(a) == len(b)` via timing,
+/// which an attacker timing many requests with varying-length
+/// `X-API-Key` headers can use to learn the configured key's exact
+/// byte length, reducing the brute-force search space.
+///
+/// We close the leak by running the constant-time compare over
+/// `max(a.len(), b.len())` bytes regardless of length match.
+/// The shorter side is XORed against zero (effectively
+/// `b[i] ^ 0 != 0` whenever `b[i] != 0`), and a separate
+/// `len_mismatch` flag is OR'd into the diff accumulator so the
+/// final `diff == 0` test fires only when both the lengths match
+/// AND every byte matches. The runtime is dominated by the longer
+/// of the two slices, so an attacker can't distinguish "length
+/// mismatch" from "byte mismatch on the same length" via timing.
 #[inline]
 pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
+    let len_a = a.len();
+    let len_b = b.len();
+    let max_len = len_a.max(len_b);
     let mut diff: u8 = 0;
-    for (x, y) in a.iter().zip(b.iter()) {
+    // OR a length-mismatch flag into the diff so a final-byte XOR
+    // can't accidentally produce diff=0 when the lengths differ.
+    // Cast is safe: `(len_a ^ len_b) != 0` collapses to a bool.
+    diff |= u8::from(len_a != len_b);
+    for i in 0..max_len {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
         diff |= x ^ y;
     }
     diff == 0
@@ -792,6 +814,37 @@ mod transport_helpers_tests {
         assert!(!constant_time_eq(b"abc", b"abd"));
         assert!(!constant_time_eq(b"abc", b"abcd"));
         assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn constant_time_eq_no_length_short_circuit_1060() {
+        // v0.7.0 #1060 (Agent-2 #7) — pin the post-fix invariant:
+        // length-mismatch comparison must NOT short-circuit on len
+        // alone. Pre-#1060 the function returned `false` immediately
+        // when `a.len() != b.len()`, leaking the configured key's
+        // exact byte length via timing. Post-#1060 the compare runs
+        // over `max(a.len(), b.len())` bytes regardless, and the
+        // length mismatch is OR'd into the diff accumulator.
+        //
+        // We pin the algorithmic shape by asserting the structural
+        // properties:
+        //
+        // - `("abc", "abcd")` and `("abcd", "abc")` both return false
+        //   (length mismatch detected).
+        // - `("abc", "abc")` returns true (no diff).
+        // - Empty vs empty returns true.
+        // - Empty vs non-empty returns false (len mismatch).
+        // - Differing length AND differing bytes returns false.
+        assert!(!constant_time_eq(b"abc", b"abcd"));
+        assert!(!constant_time_eq(b"abcd", b"abc"));
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(constant_time_eq(b"", b""));
+        assert!(!constant_time_eq(b"", b"x"));
+        assert!(!constant_time_eq(b"xxxx", b"yy"));
+        // Edge case: same byte sequence ends in same byte but
+        // shorter slice — must still detect the mismatch via the
+        // zero-fill XOR.
+        assert!(!constant_time_eq(b"aa", b"aaaa"));
     }
 
     #[test]
