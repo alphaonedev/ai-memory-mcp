@@ -11509,11 +11509,18 @@ mod tests {
         //   v46 = memory_links temporal columns (Gap 7 / #860)
         //   v47 = memory_links persona-signing atomicity CHECK (#902)
         //   v48 = federation_push_dlq table (Track D #933)
+        //   v49 = archived_memories full v0.7.0 column carry (#1025) —
+        //         adds 14 columns (reflection_depth, atomised_into, atom_of,
+        //         memory_kind, entity_id, persona_version, citations,
+        //         source_uri, source_span, confidence_source,
+        //         confidence_signals, confidence_decayed_at,
+        //         mentioned_entity_id, version) so archive → restore is
+        //         lossless for the full v0.7.0 Memory shape.
         //
         // A future bump on either side without the corresponding port
         // re-trips this assertion before the migration runner gets a
         // chance to write a partial schema to disk.
-        assert_eq!(CURRENT_SCHEMA_VERSION, 48);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 49);
     }
 
     #[tokio::test]
