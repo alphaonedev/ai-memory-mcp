@@ -43,9 +43,30 @@ pub fn handle_rule_list(conn: &rusqlite::Connection, arguments: &Value) -> Resul
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
+    // v0.7.0 #1041 (Agent-6 #4) — `enabled_only=true` previously
+    // post-filtered the `list(conn)` result with `r.enabled` only.
+    // That contract lied to the operator: with an operator pubkey
+    // resolved, the enforcement engine silently drops every row
+    // whose `attest_level != "operator_signed"` (via
+    // `enforced_rule_passes`), but the MCP `memory_rule_list` tool
+    // reported those rows as enabled regardless. An operator
+    // diffing "what does memory_rule_list say is enabled" against
+    // "what does the engine actually enforce" would see a
+    // mismatch.
+    //
+    // Post-#1041 the `enabled_only=true` filter additionally
+    // consults `enforced_rule_passes` so the response only carries
+    // rows the engine would actually enforce. The pubkey lookup is
+    // O(1) (`resolve_operator_pubkey` reads a process-wide
+    // `OnceLock`) so the perf cost is negligible.
+    let operator_pubkey = rules_store::resolve_operator_pubkey();
     let rules: Vec<Rule> = if let Some(kind) = kind_filter {
         if enabled_only {
-            rules_store::list_enabled_by_kind(conn, kind).map_err(|e| e.to_string())?
+            rules_store::list_enabled_by_kind(conn, kind)
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .filter(|r| rules_store::enforced_rule_passes(r, operator_pubkey.as_ref()))
+                .collect()
         } else {
             // No "list_by_kind" helper today — we filter in-memory
             // from `list` to keep the store surface small. The
@@ -61,7 +82,7 @@ pub fn handle_rule_list(conn: &rusqlite::Connection, arguments: &Value) -> Resul
         rules_store::list(conn)
             .map_err(|e| e.to_string())?
             .into_iter()
-            .filter(|r| r.enabled)
+            .filter(|r| r.enabled && rules_store::enforced_rule_passes(r, operator_pubkey.as_ref()))
             .collect()
     } else {
         rules_store::list(conn).map_err(|e| e.to_string())?
@@ -231,12 +252,62 @@ mod tests {
 
     #[test]
     fn enabled_only_skips_disabled() {
+        // v0.7.0 #1041 — `enabled_only=true` now also drops rows
+        // the engine's `enforced_rule_passes` would skip (unsigned
+        // when pubkey resolved). Suppress pubkey resolution so the
+        // unsigned R1 fixture surfaces regardless of dev-host
+        // state.
+        let _no_pubkey = crate::governance::rules_store::force_no_operator_pubkey_for_test();
         let conn = fresh_conn();
         insert(&conn, "R1", "bash", true);
         insert(&conn, "R2", "bash", false);
         let r = handle_rule_list(&conn, &json!({"enabled_only":true})).unwrap();
         assert_eq!(r["count"], 1);
         assert_eq!(r["rules"][0]["id"], "R1");
+    }
+
+    #[test]
+    fn enabled_only_drops_unsigned_when_pubkey_resolved_1041() {
+        // v0.7.0 #1041 (Agent-6 #4) — when an operator pubkey is
+        // resolved, the engine's `enforced_rule_passes` drops every
+        // row whose `attest_level != "operator_signed"`. Pre-#1041
+        // the MCP `memory_rule_list` tool reported those rows as
+        // enabled regardless — an operator UI lie. Post-#1041 the
+        // `enabled_only=true` branch consults `enforced_rule_passes`
+        // and returns the same set the engine would actually enforce.
+        //
+        // We install a deterministic test pubkey, insert one unsigned-
+        // enabled row, and assert the response excludes it.
+        use base64::Engine;
+        use ed25519_dalek::SigningKey;
+
+        // Lock the process-wide env state for the duration of the
+        // test so a sibling test can't race the env var.
+        static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        let _g = ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        let pubkey_b64 = base64::engine::general_purpose::STANDARD
+            .encode(signing.verifying_key().to_bytes());
+        // SAFETY: serialised via ENV_LOCK above.
+        unsafe { std::env::set_var("AI_MEMORY_OPERATOR_PUBKEY", &pubkey_b64) };
+
+        let conn = fresh_conn();
+        insert(&conn, "R-unsigned", "bash", true);
+        let r = handle_rule_list(&conn, &json!({"enabled_only": true})).unwrap();
+        let count = r["count"].as_i64().unwrap();
+
+        // SAFETY: serialised via ENV_LOCK above.
+        unsafe { std::env::remove_var("AI_MEMORY_OPERATOR_PUBKEY") };
+
+        assert_eq!(
+            count, 0,
+            "#1041: enabled_only=true MUST drop unsigned-enabled rows when pubkey resolved; \
+             pre-#1041 would report count=1 (operator UI lie)"
+        );
     }
 
     #[test]
