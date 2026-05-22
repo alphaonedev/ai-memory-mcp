@@ -203,6 +203,16 @@ impl PeerAttestationConfig {
     pub fn scope_for(&self, peer_id: &str) -> Option<&PeerScope> {
         self.peers.get(peer_id)
     }
+
+    /// v0.7.0 #1056 — whether the operator has enrolled at least
+    /// one peer in the allowlist. Used by the federation handlers
+    /// to distinguish the zero-config posture (no allowlist set =
+    /// trust signed peer-ids on faith) from the configured posture
+    /// (allowlist set = refuse any peer-id not in the map).
+    #[must_use]
+    pub fn has_allowlist(&self) -> bool {
+        !self.peers.is_empty()
+    }
 }
 
 /// Whether the operator has explicitly opted out of #238 attestation
@@ -536,6 +546,41 @@ mod tests {
         unsafe { std::env::remove_var(PEER_ATTESTATION_ENV) };
         let cfg = PeerAttestationConfig::from_env();
         assert!(cfg.peers.is_empty());
+    }
+
+    #[test]
+    fn has_allowlist_false_when_zero_config_1056() {
+        // v0.7.0 #1056 — zero-config (no env var) means no allowlist,
+        // so `has_allowlist()` returns false and the federation
+        // handlers fall through to the legacy permissive posture.
+        let _g = lock_env();
+        unsafe { std::env::remove_var(PEER_ATTESTATION_ENV) };
+        let cfg = PeerAttestationConfig::from_env();
+        assert!(
+            !cfg.has_allowlist(),
+            "#1056: zero-config PeerAttestationConfig MUST report has_allowlist()=false"
+        );
+    }
+
+    #[test]
+    fn has_allowlist_true_when_peers_enrolled_1056() {
+        // v0.7.0 #1056 — once an operator enrols at least one peer,
+        // `has_allowlist()` flips to true, and the federation
+        // handlers' TOFU gate refuses any x-peer-id NOT in the map.
+        let _g = lock_env();
+        let body = r#"{"enrolled-peer": {"allowed_namespaces": ["ns/*"]}}"#;
+        unsafe { std::env::set_var(PEER_ATTESTATION_ENV, body) };
+        let cfg = PeerAttestationConfig::from_env();
+        unsafe { std::env::remove_var(PEER_ATTESTATION_ENV) };
+        assert!(
+            cfg.has_allowlist(),
+            "#1056: configured PeerAttestationConfig MUST report has_allowlist()=true"
+        );
+        assert!(cfg.scope_for("enrolled-peer").is_some());
+        assert!(
+            cfg.scope_for("not-in-map").is_none(),
+            "#1056: unknown peer MUST return None (handlers refuse)"
+        );
     }
 
     #[test]
