@@ -6,16 +6,16 @@
 
 1. **MCP tool server** -- stdio JSON-RPC server exposing 43 memory tools + 2 MCP prompts for any MCP-compatible AI client (Claude AI, OpenAI ChatGPT, xAI Grok, META Llama, and others)
 2. **CLI tool** -- direct SQLite operations for store, recall, search, list, etc. (completely AI-agnostic)
-3. **HTTP daemon** -- an Axum web server exposing the same operations as a REST API with 72 routes at v0.7.0 (completely AI-agnostic)
+3. **HTTP daemon** -- an Axum web server exposing the same operations as a REST API with 73 routes at v0.7.0 (completely AI-agnostic)
 
 **Key architectural features:** Zero token cost (no context loaded until recall), TOON compact default response format (79% smaller than JSON), MCP prompts capability (`recall-first` behavioral rules + `memory-workflow` reference card), 4 feature tiers with optional local LLMs via Ollama, true dedup on title+namespace, 6-factor recall scoring with score field in responses.
 
 All three interfaces share the same database layer (`db.rs`) and validation layer (`validate.rs`). The daemon adds automatic garbage collection (every 30 minutes) and graceful shutdown with WAL checkpointing.
 
 ```
-main.rs            -- Thin CLI shim (W6 refactor); top-level Command enum now lives in daemon_runtime.rs (~50 subcommands at v0.7.0)
+main.rs            -- Thin CLI shim (W6 refactor); top-level Command enum now lives in daemon_runtime.rs (57 subcommands at v0.7.0 with --features sal-postgres, 55 in the default build)
 daemon_runtime.rs  -- HTTP daemon `serve` bootstrap, MCP `mcp` dispatch, top-level clap Command enum
-models/            -- Data structures: Memory (25 fields at v0.7.0), MemoryLink (6 relations at v0.7.0), MemoryKind (Batman Form-6 vocab), Citation/SourceSpan (Form-4), query types, constants
+models/            -- Data structures: Memory (26 fields at v0.7.0), MemoryLink (6 relations at v0.7.0), MemoryKind (Batman Form-6 vocab), Citation/SourceSpan (Form-4), query types, constants
 handlers/          -- HTTP request handlers split per domain (http.rs, federation_receive.rs, hook_subscribers.rs, transport.rs); Axum extractors + JSON responses; error sanitization
 storage/           -- SAL trait + sqlite path; CRUD, FTS5, recall scoring, GC, migration (CURRENT_SCHEMA_VERSION = 43)
 store/             -- SAL adapter implementations (sqlite + postgres + AGE feature gates)
@@ -61,7 +61,7 @@ When running at the `semantic` tier or higher, ai-memory loads a HuggingFace emb
 ### `src/main.rs`
 
 - `Cli` struct with `clap` derive -- defines all CLI commands and global flags (`--db`, `--json`). Lives in `src/daemon_runtime.rs` (W6 refactor moved it off `src/main.rs`).
-- `Command` enum (in `src/daemon_runtime.rs`) -- at v0.7.0 the enum carries **~50 top-level subcommands** (was 40 at v0.6.3.1): the v0.6.x core (`Serve`, `Mcp`, `Store`, `Update`, `Recall`, `Search`, `Get`, `List`, `Delete`, `Promote`, `Forget`, `Link`, `Consolidate`, `Resolve`, `Shell`, `Sync`, `SyncDaemon`, `AutoConsolidate`, `Gc`, `Stats`, `Namespaces`, `Namespace`, `Export`, `Import`, `Completions`, `Man`, `Mine`, `Archive`, `Agents`, `Pending`, `Backup`, `Restore`, `Curator`, `Bench`, `Migrate` (gated `--features sal`), `SchemaInit` (gated `--features sal`), `Doctor`, `Boot`, `Install`, `Wrap`, `Logs`, `Audit`) plus the v0.7 additions (`Identity`, `Offload`, `Deref`, `Rules`, `Governance`, `VerifyReflectionChain`, `VerifySignedEventsChain`, `ExportForensicBundle`, `VerifyForensicBundle`, `ExportReflections`, `Atomise`, `Persona`, `Calibrate`, `Skill`). Run `ai-memory --help` for the live list.
+- `Command` enum (in `src/daemon_runtime.rs`) -- at v0.7.0 the enum carries **57 top-level subcommands** with `--features sal-postgres` (55 in the default build; the gap is the two sal-gated variants `Migrate` + `SchemaInit`; was 40 at v0.6.3.1): the v0.6.x core (`Serve`, `Mcp`, `Store`, `Update`, `Recall`, `Search`, `Get`, `List`, `Delete`, `Promote`, `Forget`, `Link`, `Consolidate`, `Resolve`, `Shell`, `Sync`, `SyncDaemon`, `AutoConsolidate`, `Gc`, `Stats`, `Namespaces`, `Namespace`, `Export`, `Import`, `Completions`, `Man`, `Mine`, `Archive`, `Agents`, `Pending`, `Backup`, `Restore`, `Curator`, `Bench`, `Migrate` (gated `--features sal`), `SchemaInit` (gated `--features sal`), `Doctor`, `Boot`, `Install`, `Wrap`, `Logs`, `Audit`) plus the v0.7 additions (`Identity`, `Offload`, `Deref`, `Rules`, `Governance`, `VerifyReflectionChain`, `VerifySignedEventsChain`, `ExportForensicBundle`, `VerifyForensicBundle`, `ExportReflections`, `Atomise`, `Persona`, `Calibrate`, `Skill`). Run `ai-memory --help` for the live list.
 - `StoreArgs` includes `--expires-at` and `--ttl-secs` flags for custom expiration
 - `UpdateArgs` includes `--expires-at` flag for setting expiration on existing memories
 - `ListArgs` includes `--offset` flag for pagination
@@ -73,7 +73,7 @@ When running at the `semantic` tier or higher, ai-memory loads a HuggingFace emb
 ### `src/models/`
 
 - `Tier` enum (`Short`, `Mid`, `Long`) with TTL defaults: 6h, 7d, none
-- `Memory` struct -- the core data type with **25 fields at v0.7.0** (was 15 at v0.6.x): adds `reflection_depth` (Task 1/8), `memory_kind` (Batman Form-6 vocabulary), `entity_id` + `persona_version` (QW-2), `citations` + `source_uri` + `source_span` (Form-4 fact provenance), `confidence_source` + `confidence_signals` + `confidence_decayed_at` (Form-5 calibration). Extensible `metadata` JSON column still present. Canonical truth in `src/models/memory.rs`.
+- `Memory` struct -- the core data type with **26 fields at v0.7.0** (was 15 at v0.6.x): adds `reflection_depth` (Task 1/8), `memory_kind` (Batman Form-6 vocabulary), `entity_id` + `persona_version` (QW-2), `citations` + `source_uri` + `source_span` (Form-4 fact provenance), `confidence_source` + `confidence_signals` + `confidence_decayed_at` (Form-5 calibration), and `version` (schema v45 — Gap-1 optimistic concurrency for `memory_update`). Extensible `metadata` JSON column still present. Canonical truth in `src/models/memory.rs`.
 - `MemoryLink` struct -- typed directional links between memories. **Six relation variants at v0.7.0** (was four at v0.6.x): `related_to`, `supersedes`, `contradicts`, `derived_from`, `reflects_on`, `derives_from`. Carries v0.7 temporal-validity (`valid_from`, `valid_until`, `observed_by`) and attestation (`signature`, `attest_level`, `signed_at`) columns.
 - Request types: `CreateMemory`, `UpdateMemory`, `SearchQuery`, `ListQuery`, `RecallQuery`, `RecallBody`, `LinkBody`, `ForgetQuery`, `ConsolidateBody`, `ImportBody`
 - Response types: `Stats`, `TierCount`, `NamespaceCount`
@@ -83,7 +83,7 @@ When running at the `semantic` tier or higher, ai-memory loads a HuggingFace emb
 
 ### `src/mcp.rs`
 
-The MCP (Model Context Protocol) server implementation. MCP is an open standard -- this server works with any MCP-compatible AI client. Runs over stdio, processing one JSON-RPC message per line. **At v0.7.0 the registry exposes 71 advertised entries at `--profile full`** (70 callable "memory tools" + the always-on `memory_capabilities` bootstrap; both numbers are intentional, see issue [#862](https://github.com/alphaonedev/ai-memory-mcp/issues/862)). Default `--profile core` ships 7 tools (the original 5 + `memory_load_family` + `memory_smart_load`) plus the always-on bootstrap.
+The MCP (Model Context Protocol) server implementation. MCP is an open standard -- this server works with any MCP-compatible AI client. Runs over stdio, processing one JSON-RPC message per line. **At v0.7.0 the registry exposes 73 advertised entries at `--profile full`** (72 callable "memory tools" + the always-on `memory_capabilities` bootstrap; both numbers are intentional, see issue [#862](https://github.com/alphaonedev/ai-memory-mcp/issues/862)). Default `--profile core` ships 7 tools (the original 5 + `memory_load_family` + `memory_smart_load`) plus the always-on bootstrap.
 
 The module is now split: `src/mcp/registry.rs` owns the new `registered_tools()` iterator + `tool_definitions()` view; `src/mcp/tools/*.rs` host per-tool handlers AND each tool's `<ToolName>Request` schemars struct + `McpTool` impl; `src/mcp/mod.rs` wires the JSON-RPC dispatch loop.
 
@@ -534,7 +534,7 @@ Base URL: `http://127.0.0.1:9077/api/v1`
 
 All responses are JSON. Error responses include `{"error": "message"}`. Database errors are sanitized -- clients receive `"Internal server error"` instead of raw SQLite error details.
 
-The HTTP API exposes **72 routes** at v0.7.0 (canonical count via `grep -cE "^\s*\.route\(" src/lib.rs`; v0.6.3.1 baseline of 50 and v0.6.3 baseline of 42 are frozen on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html)).
+The HTTP API exposes **73 routes** at v0.7.0 (canonical count via `grep -oE '"/api/v1[^"]*"\|"/metrics"' src/lib.rs \| sort -u \| wc -l`; v0.6.3.1 baseline of 50 and v0.6.3 baseline of 42 are frozen on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html)).
 
 ### Health Check
 
@@ -805,7 +805,7 @@ Global flags:
 
 ### `serve`
 
-Start the HTTP daemon (72 routes at v0.7.0).
+Start the HTTP daemon (73 routes at v0.7.0).
 
 ```bash
 ai-memory serve --host 127.0.0.1 --port 9077
@@ -813,7 +813,7 @@ ai-memory serve --host 127.0.0.1 --port 9077
 
 ### `mcp`
 
-Run as an MCP tool server over stdio. This is the primary integration path for any MCP-compatible AI client. At v0.7.0, the `--profile full` surface advertises 71 entries (70 callable memory tools + the always-on `memory_capabilities` bootstrap); the default `--profile core` ships 7 + the bootstrap.
+Run as an MCP tool server over stdio. This is the primary integration path for any MCP-compatible AI client. At v0.7.0, the `--profile full` surface advertises 73 entries (72 callable memory tools + the always-on `memory_capabilities` bootstrap); the default `--profile core` ships 7 + the bootstrap.
 
 ```bash
 ai-memory mcp

@@ -133,7 +133,7 @@ ai-memory integrates with any AI platform that supports the **Model Context Prot
 | **OpenClaw** | MCP stdio | JSON (`mcp.servers` in config) | Fully supported |
 | **Any MCP client** | MCP stdio or HTTP | Varies | Universal |
 
-MCP is the primary integration layer. For AI platforms that do not yet support MCP natively, the **HTTP API** (73 routes on localhost at v0.7.0) and the **CLI** (56 subcommands at v0.7.0) provide universal access -- any AI, script, or automation that can make HTTP calls or run shell commands can use ai-memory.
+MCP is the primary integration layer. For AI platforms that do not yet support MCP natively, the **HTTP API** (73 routes on localhost at v0.7.0) and the **CLI** (57 subcommands at v0.7.0 with `--features sal-postgres`; 55 in the default build) provide universal access -- any AI, script, or automation that can make HTTP calls or run shell commands can use ai-memory.
 
 ---
 
@@ -595,7 +595,7 @@ It runs as an MCP (Model Context Protocol) tool server -- a background process t
 
 Memories that keep getting accessed automatically promote from mid to long-term. Each recall extends the TTL. Priority increases with usage. The system is self-curating.
 
-Beyond MCP, ai-memory also exposes a full HTTP REST API (73 routes on port 9077 at v0.7.0) and a complete CLI (56 subcommands at v0.7.0) for direct interaction, scripting, and integration with any AI platform or tool.
+Beyond MCP, ai-memory also exposes a full HTTP REST API (73 routes on port 9077 at v0.7.0) and a complete CLI (57 subcommands at v0.7.0 with `--features sal-postgres`; 55 in the default build) for direct interaction, scripting, and integration with any AI platform or tool.
 
 ---
 
@@ -616,7 +616,7 @@ Beyond MCP, ai-memory also exposes a full HTTP REST API (73 routes on port 9077 
 
 ### Organization
 - **Namespaces** -- isolate memories per project (auto-detected from git remote)
-- **Memory linking** -- typed relations: related_to, supersedes, contradicts, derived_from
+- **Memory linking** -- typed relations: related_to, supersedes, contradicts, derived_from, reflects_on (recursive-learning Task 1/8), derives_from (WT-1-A atomisation) -- six variants at v0.7.0
 - **Consolidation** -- merge multiple memories into a single long-term summary
 - **Auto-consolidation** -- group by namespace+tag, auto-merge groups above threshold
 - **Contradiction resolution** -- mark one memory as superseding another, demote the loser
@@ -627,7 +627,7 @@ Beyond MCP, ai-memory also exposes a full HTTP REST API (73 routes on port 9077 
 
 ### Interfaces
 - **73 HTTP endpoints** -- full REST API on 127.0.0.1:9077 (works with any AI or tool)
-- **56 CLI commands** -- complete CLI with identical capabilities at v0.7.0
+- **57 CLI subcommands at v0.7.0 with `--features sal-postgres`** (55 in the default build) -- complete CLI with identical capabilities
 - **73 MCP tools** at full profile (7 default at v0.7.0; verified against `Profile::full().expected_tool_count()`) -- native integration for any MCP-compatible AI
 - **Interactive REPL shell** -- recall, search, list, get, stats, namespaces, delete with color output
 - **JSON output** -- `--json` flag on all CLI commands
@@ -906,7 +906,7 @@ These 73 tools (full profile at v0.7.0; canonical count via `Profile::full().exp
 
 ## CLI Commands
 
-56 top-level subcommands at v0.7.0 (was 40 at v0.6.4). Run `ai-memory <command> --help` for details on any command, or `ai-memory --help` for the full list.
+57 top-level subcommands at v0.7.0 with `--features sal-postgres` (55 in the default build; the 2-variant gap is `Migrate` + `SchemaInit`, both sal-gated; was 40 at v0.6.4). Run `ai-memory <command> --help` for details on any command, or `ai-memory --help` for the full list.
 
 | Command | Description |
 |---------|-------------|

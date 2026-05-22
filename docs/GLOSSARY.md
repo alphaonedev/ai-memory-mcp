@@ -135,8 +135,8 @@ embeddings lose information on long text.
 ## MCP (Model Context Protocol)
 
 Anthropic's JSON-RPC protocol for AI-tool integration. ai-memory ships
-an MCP server via `ai-memory mcp` exposing **71 advertised entries at
-`--profile full` at v0.7.0** (70 callable "memory tools" + the always-on
+an MCP server via `ai-memory mcp` exposing **73 advertised entries at
+`--profile full` at v0.7.0** (72 callable "memory tools" + the always-on
 `memory_capabilities` bootstrap — both numbers are intentional; see
 issue [#862](https://github.com/alphaonedev/ai-memory-mcp/issues/862))
 plus 2 prompts over stdio. Default `--profile core` exposes 7 tools (the
@@ -146,12 +146,13 @@ Codex, Grok, Gemini, Llama Stack. See `docs/USER_GUIDE.md`.
 
 ## Memory
 
-The core data unit. **A 25-field record at v0.7.0** (was 15 at v0.6.x) —
+The core data unit. **A 26-field record at v0.7.0** (was 15 at v0.6.x) —
 adds `reflection_depth` (Task 1/8 recursive-learning), `memory_kind`
 (Batman Form-6 vocabulary), `entity_id`/`persona_version` (QW-2 persona
 artefact), `citations`/`source_uri`/`source_span` (Form-4 fact
 provenance), `confidence_source`/`confidence_signals`/`confidence_decayed_at`
-(Form-5 calibration). Original v0.6.x fields still present: `id`,
+(Form-5 calibration), and `version` (schema v45 Gap-1 optimistic
+concurrency). Original v0.6.x fields still present: `id`,
 `tier`, `namespace`, `title`, `content`, `tags`, `priority`,
 `confidence`, `source`, `access_count`, timestamps, `expires_at`,
 `metadata`. `(title, namespace)` is a unique key — storing a duplicate
