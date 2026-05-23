@@ -6995,4 +6995,340 @@ legacy_scoring = false
         assert!((surface.tier_thresholds.likely - 0.7).abs() < f64::EPSILON);
         assert!((surface.tier_thresholds.ambiguous - 0.0).abs() < f64::EPSILON);
     }
+
+    // ---------------------------------------------------------------------
+    // v0.7.x enterprise-config tests (#1146)
+    //
+    // Pin: precedence ladder per resolver (CLI > env > config > legacy >
+    // compiled), inline-key rejection at parse time, api_key_env /
+    // api_key_file resolution, Once-gated legacy-drift WARN.
+    // ---------------------------------------------------------------------
+
+    fn empty_app_config() -> AppConfig {
+        AppConfig {
+            schema_version: Some(2),
+            ..AppConfig::default()
+        }
+    }
+
+    fn scrub_llm_env() {
+        for k in [
+            "AI_MEMORY_LLM_BACKEND",
+            "AI_MEMORY_LLM_MODEL",
+            "AI_MEMORY_LLM_BASE_URL",
+            "AI_MEMORY_LLM_API_KEY",
+            "XAI_API_KEY",
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "AI_MEMORY_EMBED_BACKFILL_BATCH",
+            "AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS",
+        ] {
+            unsafe {
+                std::env::remove_var(k);
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_llm_1146_compiled_default_when_nothing_configured() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        let cfg = empty_app_config();
+        let resolved = cfg.resolve_llm(None, None, None);
+        assert_eq!(resolved.backend, "ollama");
+        assert_eq!(resolved.model, "gemma3:4b");
+        assert_eq!(resolved.base_url, "http://localhost:11434");
+        assert_eq!(resolved.source, ConfigSource::CompiledDefault);
+        assert_eq!(resolved.api_key_source, KeySource::None);
+        assert!(resolved.api_key().is_none());
+    }
+
+    #[test]
+    fn resolve_llm_1146_env_overrides_config_section() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        unsafe {
+            std::env::set_var("AI_MEMORY_LLM_BACKEND", "xai");
+            std::env::set_var("AI_MEMORY_LLM_MODEL", "grok-99");
+            std::env::set_var("AI_MEMORY_LLM_API_KEY", "env-key");
+        }
+        let mut cfg = empty_app_config();
+        cfg.llm = Some(LlmSection {
+            backend: Some("openai".into()),
+            model: Some("gpt-4".into()),
+            ..LlmSection::default()
+        });
+        let resolved = cfg.resolve_llm(None, None, None);
+        assert_eq!(resolved.backend, "xai", "env must beat config");
+        assert_eq!(resolved.model, "grok-99");
+        assert_eq!(resolved.source, ConfigSource::Env);
+        assert_eq!(resolved.api_key_source, KeySource::ProcessEnv);
+        assert_eq!(resolved.api_key(), Some("env-key"));
+        scrub_llm_env();
+    }
+
+    #[test]
+    fn resolve_llm_1146_cli_overrides_env() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        unsafe {
+            std::env::set_var("AI_MEMORY_LLM_BACKEND", "ollama");
+            std::env::set_var("AI_MEMORY_LLM_MODEL", "ollama-model");
+        }
+        let cfg = empty_app_config();
+        let resolved = cfg.resolve_llm(Some("xai"), Some("grok-4.3"), Some("https://x"));
+        assert_eq!(resolved.backend, "xai", "CLI flag must beat env");
+        assert_eq!(resolved.model, "grok-4.3");
+        assert_eq!(resolved.base_url, "https://x");
+        assert_eq!(resolved.source, ConfigSource::Cli);
+        scrub_llm_env();
+    }
+
+    #[test]
+    fn resolve_llm_1146_config_section_when_no_env() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        let mut cfg = empty_app_config();
+        cfg.llm = Some(LlmSection {
+            backend: Some("xai".into()),
+            model: Some("grok-4.3".into()),
+            ..LlmSection::default()
+        });
+        let resolved = cfg.resolve_llm(None, None, None);
+        assert_eq!(resolved.backend, "xai");
+        assert_eq!(resolved.model, "grok-4.3");
+        assert_eq!(
+            resolved.base_url, "https://api.x.ai/v1",
+            "vendor-default base_url applied"
+        );
+        assert_eq!(resolved.source, ConfigSource::Config);
+    }
+
+    #[test]
+    fn resolve_llm_1146_alias_fallback_key_for_xai() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        unsafe {
+            std::env::set_var("AI_MEMORY_LLM_BACKEND", "xai");
+            std::env::set_var("XAI_API_KEY", "alias-fallback-key");
+        }
+        let cfg = empty_app_config();
+        let resolved = cfg.resolve_llm(None, None, None);
+        assert_eq!(resolved.backend, "xai");
+        assert_eq!(resolved.api_key(), Some("alias-fallback-key"));
+        match &resolved.api_key_source {
+            KeySource::AliasFallback(name) => assert_eq!(name, "XAI_API_KEY"),
+            other => panic!("expected AliasFallback(XAI_API_KEY), got {other:?}"),
+        }
+        scrub_llm_env();
+    }
+
+    #[test]
+    fn resolve_llm_1146_legacy_llm_model_feeds_resolver() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        let mut cfg = AppConfig::default();
+        cfg.llm_model = Some("gemma4:e4b".into());
+        cfg.ollama_url = Some("http://localhost:11434".into());
+        let resolved = cfg.resolve_llm(None, None, None);
+        assert_eq!(resolved.backend, "ollama");
+        assert_eq!(resolved.model, "gemma4:e4b");
+        assert_eq!(resolved.source, ConfigSource::Legacy);
+    }
+
+    #[test]
+    fn validate_secret_handling_1146_rejects_inline_api_key() {
+        let mut cfg = empty_app_config();
+        cfg.llm = Some(LlmSection {
+            backend: Some("xai".into()),
+            api_key: Some("xai-INLINE-SECRET".into()),
+            ..LlmSection::default()
+        });
+        let err = cfg
+            .validate_secret_handling()
+            .expect_err("inline api_key must be rejected");
+        assert!(
+            err.contains("api_key") && err.contains("forbidden"),
+            "error must name the field and the policy: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_secret_handling_1146_rejects_env_and_file_both_set() {
+        let mut cfg = empty_app_config();
+        cfg.llm = Some(LlmSection {
+            backend: Some("xai".into()),
+            api_key_env: Some("XAI_API_KEY".into()),
+            api_key_file: Some("/etc/key".into()),
+            ..LlmSection::default()
+        });
+        let err = cfg
+            .validate_secret_handling()
+            .expect_err("env+file mutex must be enforced");
+        assert!(
+            err.contains("api_key_env") && err.contains("api_key_file"),
+            "error must call out the mutex: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_llm_1146_api_key_env_reads_named_env_var() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        unsafe {
+            std::env::set_var("MY_CUSTOM_LLM_KEY", "via-config-env-var");
+        }
+        let mut cfg = empty_app_config();
+        cfg.llm = Some(LlmSection {
+            backend: Some("xai".into()),
+            model: Some("grok-4.3".into()),
+            api_key_env: Some("MY_CUSTOM_LLM_KEY".into()),
+            ..LlmSection::default()
+        });
+        let resolved = cfg.resolve_llm(None, None, None);
+        assert_eq!(resolved.api_key(), Some("via-config-env-var"));
+        match &resolved.api_key_source {
+            KeySource::ConfigEnvVar(name) => assert_eq!(name, "MY_CUSTOM_LLM_KEY"),
+            other => panic!("expected ConfigEnvVar(MY_CUSTOM_LLM_KEY), got {other:?}"),
+        }
+        unsafe {
+            std::env::remove_var("MY_CUSTOM_LLM_KEY");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolve_llm_1146_api_key_file_rejects_lax_perms() {
+        use std::os::unix::fs::PermissionsExt;
+        let _g = env_var_lock();
+        scrub_llm_env();
+        // Tempdir under .local-runs (project HARD rule: no /tmp).
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(".local-runs")
+            .join(format!("test-1146-perms-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let key_path = base.join("xai.key");
+        std::fs::write(&key_path, "shhh").unwrap();
+        // World-readable mode 0644 — must be rejected.
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let mut cfg = empty_app_config();
+        cfg.llm = Some(LlmSection {
+            backend: Some("xai".into()),
+            api_key_file: Some(key_path.display().to_string()),
+            ..LlmSection::default()
+        });
+        let resolved = cfg.resolve_llm(None, None, None);
+        match &resolved.api_key_source {
+            KeySource::Error(reason) => {
+                assert!(
+                    reason.contains("lax permissions") && reason.contains("0400"),
+                    "error must name the perm policy: {reason}"
+                );
+            }
+            other => panic!("expected KeySource::Error(lax perms), got {other:?}"),
+        }
+        // Cleanup.
+        let _ = std::fs::remove_file(&key_path);
+        let _ = std::fs::remove_dir(&base);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolve_llm_1146_api_key_file_accepts_0400() {
+        use std::os::unix::fs::PermissionsExt;
+        let _g = env_var_lock();
+        scrub_llm_env();
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(".local-runs")
+            .join(format!("test-1146-perms-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let key_path = base.join("xai.key");
+        std::fs::write(&key_path, "the-actual-key\n").unwrap();
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o400)).unwrap();
+
+        let mut cfg = empty_app_config();
+        cfg.llm = Some(LlmSection {
+            backend: Some("xai".into()),
+            api_key_file: Some(key_path.display().to_string()),
+            ..LlmSection::default()
+        });
+        let resolved = cfg.resolve_llm(None, None, None);
+        assert_eq!(
+            resolved.api_key(),
+            Some("the-actual-key"),
+            "first line is the key"
+        );
+        assert!(matches!(resolved.api_key_source, KeySource::ConfigFile(_)));
+
+        let _ = std::fs::remove_file(&key_path);
+        let _ = std::fs::remove_dir(&base);
+    }
+
+    #[test]
+    fn resolve_embeddings_1146_legacy_alias_canonicalised() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        let mut cfg = AppConfig::default();
+        cfg.embedding_model = Some("nomic_embed_v15".into());
+        let resolved = cfg.resolve_embeddings();
+        assert_eq!(
+            resolved.model, "nomic-embed-text-v1.5",
+            "legacy alias must be canonicalised"
+        );
+        assert_eq!(resolved.source, ConfigSource::Legacy);
+        assert_eq!(resolved.backfill_batch, 100, "compiled default applied");
+    }
+
+    #[test]
+    fn resolve_embeddings_1146_backfill_batch_env_overrides_config() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        unsafe {
+            std::env::set_var("AI_MEMORY_EMBED_BACKFILL_BATCH", "500");
+        }
+        let mut cfg = empty_app_config();
+        cfg.embeddings = Some(EmbeddingsSection {
+            backfill_batch: Some(50),
+            ..EmbeddingsSection::default()
+        });
+        let resolved = cfg.resolve_embeddings();
+        assert_eq!(resolved.backfill_batch, 500, "env must beat config");
+        scrub_llm_env();
+    }
+
+    #[test]
+    fn resolve_reranker_1146_folds_legacy_cross_encoder() {
+        let _g = env_var_lock();
+        let mut cfg = AppConfig::default();
+        cfg.cross_encoder = Some(true);
+        let resolved = cfg.resolve_reranker();
+        assert!(resolved.enabled);
+        assert_eq!(resolved.model, "ms-marco-MiniLM-L-6-v2");
+        assert_eq!(resolved.source, ConfigSource::Legacy);
+    }
+
+    #[test]
+    fn resolved_llm_1146_debug_redacts_api_key() {
+        let resolved = ResolvedLlm {
+            backend: "xai".into(),
+            model: "grok-4.3".into(),
+            base_url: "https://api.x.ai/v1".into(),
+            api_key: Some("SUPER-SECRET-DONT-LEAK".into()),
+            api_key_source: KeySource::ProcessEnv,
+            source: ConfigSource::Env,
+        };
+        let dbg = format!("{resolved:?}");
+        assert!(
+            !dbg.contains("SUPER-SECRET-DONT-LEAK"),
+            "Debug impl must redact the api_key: {dbg}"
+        );
+        assert!(
+            dbg.contains("<redacted>"),
+            "Debug impl must show <redacted> placeholder: {dbg}"
+        );
+    }
 }
