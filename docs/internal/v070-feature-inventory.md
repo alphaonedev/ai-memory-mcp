@@ -2,7 +2,7 @@
 
 > Baseline: **v0.6.4** (tag `v0.6.4`)
 > Target:   **v0.7.0** release HEAD on `release/v0.7.0`
-> Compiled: 2026-05-15 by the AI NHI ship-readiness initiative; re-anchored 2026-05-22 against schema v49 / 73-tool surface during the SR-5 documentation drift sweep.
+> Compiled: 2026-05-15 by the AI NHI ship-readiness initiative; re-anchored 2026-05-22 against schema v49 / 73-tool surface during the SR-5 documentation drift sweep; bumped to schema v50 on 2026-05-23 after #1156 per-namespace K8 quota dimension extension landed.
 > Methodology: `git diff v0.6.4..HEAD` (code & schema) + doc scan + commit-trailer issue cross-reference
 > Path convention: every code path below is repo-relative against the `release/v0.7.0` worktree root. The original SR-5 capture used the developer-host worktree `/Users/fate/v07/catalogue/`; those prefixes have been normalised to repo-relative paths during the 2026-05-22 re-anchor.
 > Scratch:   `.local-runs/tmp/` (project no-`/tmp` HARD RULE honored)
@@ -117,11 +117,11 @@ AI_MEMORY_TOOLS_VERBOSE
 | Batman 7-form closeout | **7** forms (1-6 + 7th-form agent-EXTERNAL Layer-4) | Forms 1-6 SHIPPED; 7th-form Option B foundation LANDED, full cover at v0.8.0 per `#697` |
 | Recursive-learning primitive | **8** tasks (issue `#655`) | Tasks 1-6 SHIPPED commits; Tasks 7-8 ship-gate landed on `feat/v0.7.0-recursive-learning` |
 | L1/L2 grand-slam wave | **8** L2 items + **3** L1 items (issues `#666`-`#673`, `#691`, `#693`) | SHIPPED |
-| Schema migration ladder | sqlite + postgres converge on logical schema **v49** (`CURRENT_SCHEMA_VERSION = 49` in both adapters); on-disk SQL files end at `migrations/sqlite/0041_v07_federation_push_dlq.sql` and `migrations/postgres/0030_v07_federation_push_dlq.sql`, with post-v34 deltas applied via in-process migration arms (see `docs/MIGRATION_v0.7.md` §schema-ladder for the per-bump narrative v35-v49) | SHIPPED; v33 → v34 V-4 closeout pinned by `tests/signed_events_chain_v34.rs`; v49 archived_memories full carry pinned by #1025 regression tests |
+| Schema migration ladder | sqlite + postgres converge on logical schema **v50** (`CURRENT_SCHEMA_VERSION = 50` in both adapters); on-disk SQL files end at `migrations/sqlite/0042_v50_per_namespace_quota.sql` (sqlite) and the in-process `migrate_v50()` arm (postgres), with post-v34 deltas applied via in-process migration arms (see `docs/MIGRATION_v0.7.md` §schema-ladder for the per-bump narrative v35-v50) | SHIPPED; v33 → v34 V-4 closeout pinned by `tests/signed_events_chain_v34.rs`; v49 archived_memories full carry pinned by #1025 regression tests; v50 per-namespace K8 quota dimension pinned by `tests/per_namespace_quota.rs` (#1156) |
 | Security-hardening sweep | **11** late-cycle commits | SHIPPED on `release/v0.7.0`, reconciled into trunk @ `64528b1` |
 | Round-2 fixes | **F1-F18** (18 findings) | SHIPPED |
 | Capability v3 system | **7** new Capability* structs + Track A 5 tasks | SHIPPED |
-| Signed events V-4 closeout | `prev_hash + sequence` cross-row hash chain | SHIPPED at sqlite v34 / postgres v34 (both adapters now at v49 at release HEAD; the V-4 chain has been live since v34 and is exercised by every signed_events write through v49) |
+| Signed events V-4 closeout | `prev_hash + sequence` cross-row hash chain | SHIPPED at sqlite v34 / postgres v34 (both adapters now at v50 at release HEAD; the V-4 chain has been live since v34 and is exercised by every signed_events write through v50) |
 | Forensic bundle | L2-5 (issue `#670`) | SHIPPED |
 | Federation hardening | mTLS + X-API-Key + fingerprint allowlist | SHIPPED |
 | K8 quota status tool | `memory_quota_status` | SHIPPED |
@@ -601,11 +601,11 @@ AI_MEMORY_TOOLS_VERBOSE
 - **Code paths:** N/A — audit document
 - **Cross-reference:** anchors Forms 1-7 inventory above
 
-### Feature: Schema migration ladder — sqlite v20 → v49 / postgres v15 → v49 (logical)
+### Feature: Schema migration ladder — sqlite v20 → v50 / postgres v15 → v50 (logical)
 
-- **Status:** SHIPPED — `CURRENT_SCHEMA_VERSION = 49` in both `src/storage/migrations.rs:516` (sqlite) and `src/store/postgres.rs:417` (postgres). Highest on-disk migration files: `migrations/sqlite/0041_v07_federation_push_dlq.sql` (file-name counter 0041; per-bump narrative for the in-process v35-v49 deltas is in `docs/MIGRATION_v0.7.md` §schema-ladder) and `migrations/postgres/0030_v07_federation_push_dlq.sql` (postgres runs the v34-v49 deltas through async `migrate_v34() … migrate_v49()` arms in `src/store/postgres.rs`).
+- **Status:** SHIPPED — `CURRENT_SCHEMA_VERSION = 50` in both `src/storage/migrations.rs` (sqlite) and `src/store/postgres.rs` (postgres). Highest on-disk migration files: `migrations/sqlite/0042_v50_per_namespace_quota.sql` (file-name counter 0042; per-bump narrative for the in-process v35-v50 deltas is in `docs/MIGRATION_v0.7.md` §schema-ladder) and the in-process `migrate_v50()` arm (postgres runs the v34-v50 deltas through async `migrate_v34() … migrate_v50()` arms in `src/store/postgres.rs`).
 - **Net-new in v0.7.0:** YES — every migration past v20 (sqlite) / v15 (postgres) landed during the v0.7.0 cycle.
-- **Per-migration evidence:** see `docs/MIGRATION_v0.7.md` §schema-ladder for the per-bump narrative covering v20 → v34 (V-4 closeout #698), v45 Gap-1 `version` column (#1036), v46 recall_observations widening, v47 confidence_tier index (#1042), v48 federation_push_dlq (#933), v49 archived_memories full column carry (#1025).
+- **Per-migration evidence:** see `docs/MIGRATION_v0.7.md` §schema-ladder for the per-bump narrative covering v20 → v34 (V-4 closeout #698), v45 Gap-1 `version` column (#1036), v46 recall_observations widening, v47 confidence_tier index (#1042), v48 federation_push_dlq (#933), v49 archived_memories full column carry (#1025), v50 per-namespace K8 quota dimension extension (#1156).
 - **Resolution of the prior "known unknowns" block:** the SR-5 sweep clarified that the file-name counters intentionally lag the logical schema version because both adapters apply post-v34 deltas via in-process migration arms, not additional SQL files. The "v34 → v39" range in the original prompt was a draft estimate; the canonical anchor is the `CURRENT_SCHEMA_VERSION` constant in each adapter.
 
 ### Feature: Adapter selection refactor + `AppState.store: Arc<dyn MemoryStore>`

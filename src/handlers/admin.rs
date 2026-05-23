@@ -298,9 +298,16 @@ pub async fn list_agents(
 ///
 /// `agent_id` is required when the caller wants a single-agent
 /// snapshot; omitting it returns the full table (operator surface).
-/// `namespace` is accepted for forward-compat — quotas today are
-/// agent-scoped, but the wire shape leaves room for namespace-scoped
-/// caps in a future wave.
+///
+/// `namespace` (v0.7.0 #1156 — per-namespace K8 dimension):
+/// - Supplied with `agent_id`: returns the single
+///   `(agent_id, namespace)` row.
+/// - Supplied without `agent_id`: returns every agent's row in that
+///   namespace (operator-scoped, admin-gated).
+/// - Omitted with `agent_id` supplied: returns the **aggregate**
+///   view, summing counters across every namespace the agent has
+///   written into (preserves pre-#1156 single-row response shape).
+/// - Omitted with `agent_id` also omitted: full-substrate listing.
 #[derive(Debug, Deserialize)]
 pub struct QuotaStatusBody {
     #[serde(default)]
@@ -369,8 +376,17 @@ pub async fn quota_status_handler(
             };
         }
 
+        // v0.7.0 #1156 — per-namespace K8 dimension. When the caller
+        // supplies an explicit `namespace`, return the single
+        // `(agent_id, namespace)` row; otherwise roll up the aggregate
+        // view across every namespace the agent has written into so
+        // the pre-#1156 single-row response shape is preserved.
         let lock = app.db.lock().await;
-        return match crate::quotas::get_status(&lock.0, agent_id) {
+        let result = match body.namespace.as_deref() {
+            Some(ns) => crate::quotas::get_status(&lock.0, agent_id, ns),
+            None => crate::quotas::get_aggregate_status(&lock.0, agent_id),
+        };
+        return match result {
             Ok(status) => Json(json!(status)).into_response(),
             Err(e) => {
                 tracing::error!("quota_status handler error: {e}");
@@ -402,8 +418,11 @@ pub async fn quota_status_handler(
         };
     }
 
+    // v0.7.0 #1156 — optional `?namespace=` filter on the operator
+    // listing path. When supplied, restricts the response to rows
+    // in that namespace; otherwise returns the full table.
     let lock = app.db.lock().await;
-    match crate::quotas::list_status(&lock.0) {
+    match crate::quotas::list_status(&lock.0, body.namespace.as_deref()) {
         Ok(rows) => {
             let count = rows.len();
             Json(json!({"quotas": rows, "count": count})).into_response()

@@ -111,8 +111,12 @@ async fn http_store(
 }
 
 fn read_quota_count(db_path: &Path, agent_id: &str) -> i64 {
+    // v0.7.0 #1156 — counters are now per-(agent, namespace). The HTTP
+    // POST store path charges against the memory's namespace, so the
+    // aggregate rollup (sum across namespaces) preserves the pre-#1156
+    // counter shape this test pins.
     let conn = Connection::open(db_path).expect("open for quota read");
-    ai_memory::quotas::get_status(&conn, agent_id)
+    ai_memory::quotas::get_aggregate_status(&conn, agent_id)
         .expect("quota row")
         .current_memories_today
 }
@@ -181,7 +185,8 @@ async fn http_post_memories_quota_storage_bytes_advance() {
     assert_eq!(s, StatusCode::CREATED);
 
     let conn = Connection::open(&db_path).unwrap();
-    let status = ai_memory::quotas::get_status(&conn, agent_id).unwrap();
+    // v0.7.0 #1156 — aggregate rollup preserves pre-#1156 wire shape.
+    let status = ai_memory::quotas::get_aggregate_status(&conn, agent_id).unwrap();
     assert_eq!(status.current_memories_today, 1);
     assert!(
         status.current_storage_bytes > 0,

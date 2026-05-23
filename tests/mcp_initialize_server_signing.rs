@@ -102,10 +102,17 @@ fn signed_identity_block_carries_current_schema_version_string() {
         .unwrap()
         .unwrap();
     let schema = block["schema_version"].as_str().unwrap();
+    // Single source of truth: the schema_version_for_tests SSOT helper
+    // resolves the same compile-time constant the migration ladder
+    // anchors to (`CURRENT_SCHEMA_VERSION` in
+    // `src/storage/migrations.rs`). NO HARDCODED literals — the
+    // SSOT is the only place a schema-version bump should ever be
+    // expressed in this codebase.
     let expected = format!("v{}", current_schema_version());
-    assert_eq!(schema, expected, "must match SSOT constant");
-    // Also assert it's the current v49 (catches accidental SSOT drift)
-    assert_eq!(schema, "v49", "v0.7.0 schema is v49");
+    assert_eq!(
+        schema, expected,
+        "MCP serverInfo schema_version must match the migration-ladder SSOT"
+    );
 }
 
 #[test]

@@ -158,16 +158,26 @@ fn test_memory_reflection_origin_returns_correct_data() {
 fn test_sync_push_quota_check_enforced() {
     let (conn, _tmp) = fresh_db();
     // Tighten the cap to 1 by writing it first.
-    quotas::check_and_record(&conn, "ai:quota-peer", quotas::QuotaOp::Memory { bytes: 1 })
-        .expect("first under-limit check passes");
+    quotas::check_and_record(
+        &conn,
+        "ai:quota-peer",
+        quotas::GLOBAL_NAMESPACE,
+        quotas::QuotaOp::Memory { bytes: 1 },
+    )
+    .expect("first under-limit check passes");
     conn.execute(
-        "UPDATE agent_quotas SET max_memories_per_day = 1 WHERE agent_id = ?1",
-        rusqlite::params!["ai:quota-peer"],
+        "UPDATE agent_quotas SET max_memories_per_day = 1
+         WHERE agent_id = ?1 AND namespace = ?2",
+        rusqlite::params!["ai:quota-peer", quotas::GLOBAL_NAMESPACE],
     )
     .expect("tighten cap");
-    let err =
-        quotas::check_and_record(&conn, "ai:quota-peer", quotas::QuotaOp::Memory { bytes: 1 })
-            .expect_err("must refuse on second call");
+    let err = quotas::check_and_record(
+        &conn,
+        "ai:quota-peer",
+        quotas::GLOBAL_NAMESPACE,
+        quotas::QuotaOp::Memory { bytes: 1 },
+    )
+    .expect_err("must refuse on second call");
     match err {
         quotas::QuotaCheckError::Quota(q) => {
             assert_eq!(q.limit, quotas::QuotaLimit::MemoriesPerDay);
@@ -187,11 +197,13 @@ fn test_sync_push_quota_under_limit_succeeds() {
         quotas::check_and_record(
             &conn,
             "ai:relaxed-peer",
+            quotas::GLOBAL_NAMESPACE,
             quotas::QuotaOp::Memory { bytes: 100 + i },
         )
         .expect("each under-limit check passes");
     }
-    let status = quotas::get_status(&conn, "ai:relaxed-peer").expect("status");
+    let status =
+        quotas::get_status(&conn, "ai:relaxed-peer", quotas::GLOBAL_NAMESPACE).expect("status");
     assert_eq!(status.current_memories_today, 5);
     // 100+101+102+103+104 = 510 bytes.
     assert_eq!(status.current_storage_bytes, 510);

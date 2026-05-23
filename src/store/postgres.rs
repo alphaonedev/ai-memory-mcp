@@ -414,7 +414,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       so archive→restore round-trips preserve Form-4 / Form-5 /
 //       QW-2 / Gap-1 fields. Pure additive ALTER TABLE ADD COLUMN
 //       IF NOT EXISTS — fully idempotent + replay-safe.
-const CURRENT_SCHEMA_VERSION: i32 = 49;
+const CURRENT_SCHEMA_VERSION: i32 = 50;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -1139,6 +1139,9 @@ impl PostgresStore {
         }
         if current_version < 49 {
             self.migrate_v49().await?;
+        }
+        if current_version < 50 {
+            self.migrate_v50().await?;
         }
 
         Ok(())
@@ -1938,6 +1941,93 @@ impl PostgresStore {
         tracing::info!(
             target = "store::postgres",
             "schema migration v49 applied (#1025: archived_memories full v0.7.0 column carry)"
+        );
+        Ok(())
+    }
+
+    /// v50 — #1156 (2026-05-23): per-namespace K8 quota dimension
+    /// extension. Extends the `agent_quotas` PRIMARY KEY from
+    /// `(agent_id)` to `(agent_id, namespace)` so per-namespace
+    /// allotments hold even when a single agent operates across many
+    /// namespaces. Pre-v50 rows backfill to the `_global` namespace
+    /// sentinel so historical accounting is preserved verbatim;
+    /// callers that don't supply a namespace continue to land on
+    /// `_global`, preserving pre-#1156 byte-for-byte behaviour at
+    /// the public-API boundary.
+    ///
+    /// Postgres allows altering an existing PRIMARY KEY in place
+    /// (unlike SQLite), so the migration is a straight `ADD COLUMN`
+    /// + `DROP CONSTRAINT` + `ADD CONSTRAINT` sequence guarded by
+    /// `IF NOT EXISTS` / `IF EXISTS` clauses for idempotency. The
+    /// supporting `idx_agent_quotas_namespace` index lights up the
+    /// per-namespace query path used by the new MCP tool / HTTP
+    /// route surface.
+    ///
+    /// NSA CSI MCP mapping: recommendation (c) — defense-in-depth
+    /// blast-radius controls on a compromised or misbehaving agent.
+    async fn migrate_v50(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v50 tx", e))?;
+
+        // 1. Add the `namespace` column with the `_global` sentinel
+        //    default so pre-existing rows backfill in one statement.
+        //    `NOT NULL DEFAULT '_global'` is safe because the column
+        //    is new — every existing row gets the default during the
+        //    ALTER.
+        sqlx::raw_sql(
+            "ALTER TABLE agent_quotas
+                ADD COLUMN IF NOT EXISTS namespace TEXT NOT NULL DEFAULT '_global'",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("apply v50 add namespace column", e))?;
+
+        // 2. Swap the PRIMARY KEY: drop the old `(agent_id)` PK and
+        //    add the compound `(agent_id, namespace)` PK. Postgres
+        //    auto-names the original PK `agent_quotas_pkey`. Wrap in
+        //    a DO block so the migration is idempotent on replay.
+        sqlx::raw_sql(
+            "DO $$
+             BEGIN
+                 IF EXISTS (
+                     SELECT 1 FROM pg_constraint
+                     WHERE conname = 'agent_quotas_pkey'
+                       AND conrelid = 'agent_quotas'::regclass
+                       AND pg_get_constraintdef(oid) NOT LIKE '%namespace%'
+                 ) THEN
+                     ALTER TABLE agent_quotas DROP CONSTRAINT agent_quotas_pkey;
+                     ALTER TABLE agent_quotas
+                         ADD CONSTRAINT agent_quotas_pkey
+                         PRIMARY KEY (agent_id, namespace);
+                 END IF;
+             END $$",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("apply v50 swap PK to (agent_id, namespace)", e))?;
+
+        // 3. Index the per-namespace query path (the new MCP tool's
+        //    `namespace` arg + the HTTP route's `?namespace=` query).
+        sqlx::raw_sql(
+            "CREATE INDEX IF NOT EXISTS idx_agent_quotas_namespace
+                ON agent_quotas (namespace, agent_id)",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("create idx_agent_quotas_namespace", e))?;
+
+        record_schema_version(&mut tx, 50).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v50 migration", e))?;
+
+        tracing::info!(
+            target = "store::postgres",
+            "schema migration v50 applied (#1156: agent_quotas per-namespace dimension)"
         );
         Ok(())
     }
@@ -6725,49 +6815,54 @@ fn memory_storage_bytes(memory: &Memory) -> i64 {
     i64::try_from(raw).unwrap_or(i64::MAX)
 }
 
-/// v0.7.0.1 G1 — increment `agent_quotas.current_memories_today` and
-/// `current_storage_bytes` inside an active transaction, auto-rolling
-/// the daily counters at UTC midnight. Mirrors the SQLite parity laid
-/// out in `quotas::check_and_record`'s memory-op branch.
+/// v0.7.0.1 G1 / v0.7.0 #1156 — increment
+/// `agent_quotas.current_memories_today` and `current_storage_bytes`
+/// inside an active transaction, auto-rolling the daily counters at
+/// UTC midnight. Mirrors the SQLite parity laid out in
+/// `quotas::check_and_record`'s memory-op branch.
 ///
-/// Issued as a single statement so a concurrent writer cannot race the
-/// counter — the underlying `INSERT ... ON CONFLICT DO UPDATE` runs
-/// atomically against the `agent_id` PRIMARY KEY. The day-rollover
-/// detection projects the stored `day_started_at` against UTC `now` and
-/// resets `current_memories_today` / `current_links_today` in the same
+/// Issued as a single statement so a concurrent writer cannot race
+/// the counter — the underlying `INSERT ... ON CONFLICT DO UPDATE`
+/// runs atomically against the `(agent_id, namespace)` PRIMARY KEY
+/// (v50 PK extension; #1156). The day-rollover detection projects the
+/// stored `day_started_at` against UTC `now` and resets
+/// `current_memories_today` / `current_links_today` in the same
 /// statement.
 async fn record_memory_quota_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     agent_id: &str,
+    namespace: &str,
     bytes_added: i64,
 ) -> StoreResult<()> {
     let now = Utc::now();
     sqlx::query(
         "INSERT INTO agent_quotas (
-             agent_id, max_memories_per_day, max_storage_bytes, max_links_per_day,
+             agent_id, namespace,
+             max_memories_per_day, max_storage_bytes, max_links_per_day,
              current_memories_today, current_storage_bytes, current_links_today,
              day_started_at, created_at, updated_at
-         ) VALUES ($1, $2, $3, $4, 1, $5, 0, $6, $6, $6)
-         ON CONFLICT (agent_id) DO UPDATE SET
+         ) VALUES ($1, $2, $3, $4, $5, 1, $6, 0, $7, $7, $7)
+         ON CONFLICT (agent_id, namespace) DO UPDATE SET
              current_memories_today = CASE
-                 WHEN date_trunc('day', agent_quotas.day_started_at) = date_trunc('day', $6)
+                 WHEN date_trunc('day', agent_quotas.day_started_at) = date_trunc('day', $7)
                      THEN agent_quotas.current_memories_today + 1
                  ELSE 1
              END,
              current_links_today = CASE
-                 WHEN date_trunc('day', agent_quotas.day_started_at) = date_trunc('day', $6)
+                 WHEN date_trunc('day', agent_quotas.day_started_at) = date_trunc('day', $7)
                      THEN agent_quotas.current_links_today
                  ELSE 0
              END,
              current_storage_bytes = agent_quotas.current_storage_bytes + EXCLUDED.current_storage_bytes,
              day_started_at = CASE
-                 WHEN date_trunc('day', agent_quotas.day_started_at) = date_trunc('day', $6)
+                 WHEN date_trunc('day', agent_quotas.day_started_at) = date_trunc('day', $7)
                      THEN agent_quotas.day_started_at
-                 ELSE $6
+                 ELSE $7
              END,
-             updated_at = $6",
+             updated_at = $7",
     )
     .bind(agent_id)
+    .bind(namespace)
     .bind(DEFAULT_MAX_MEMORIES_PER_DAY)
     .bind(DEFAULT_MAX_STORAGE_BYTES)
     .bind(DEFAULT_MAX_LINKS_PER_DAY)
@@ -6944,12 +7039,14 @@ impl MemoryStore for PostgresStore {
         .try_get::<String, _>("id")
         .map_err(|e| to_store_err("read returned id", e))?;
 
-        // v0.7.0.1 G1 — record quota usage in the same tx. Best-effort
-        // resolution of agent_id; a missing claim falls back to the SAL
-        // `CallerContext::agent_id` so we never lose the count.
+        // v0.7.0.1 G1 / v0.7.0 #1156 — record quota usage in the same
+        // tx against the per-namespace accounting row (v50 PK
+        // extension). Best-effort resolution of agent_id; a missing
+        // claim falls back to the SAL `CallerContext::agent_id` so
+        // we never lose the count.
         let quota_agent_id = resolve_quota_agent_id(ctx, &memory.metadata);
         let bytes_added = memory_storage_bytes(memory);
-        record_memory_quota_in_tx(&mut tx, &quota_agent_id, bytes_added).await?;
+        record_memory_quota_in_tx(&mut tx, &quota_agent_id, &memory.namespace, bytes_added).await?;
 
         tx.commit()
             .await
@@ -7044,9 +7141,10 @@ impl MemoryStore for PostgresStore {
         .try_get::<String, _>("id")
         .map_err(|e| to_store_err("read returned id", e))?;
 
+        // v0.7.0 #1156 — per-namespace quota dimension (v50 PK).
         let quota_agent_id = resolve_quota_agent_id(ctx, &memory.metadata);
         let bytes_added = memory_storage_bytes(memory);
-        record_memory_quota_in_tx(&mut tx, &quota_agent_id, bytes_added).await?;
+        record_memory_quota_in_tx(&mut tx, &quota_agent_id, &memory.namespace, bytes_added).await?;
 
         tx.commit()
             .await
@@ -9557,51 +9655,123 @@ impl MemoryStore for PostgresStore {
     // -----------------------------------------------------------------
 
     async fn quota_status(&self, agent_id: &str) -> StoreResult<QuotaStatus> {
-        // Auto-insert a default row when none exists, then read it back.
-        // Mirrors the SQLite `quotas::ensure_row` posture so the wire
-        // shape is byte-identical across backends.
+        // v0.7.0 #1156 — aggregate rollup across every namespace the
+        // agent has written into. Auto-inserts a `_global` row when
+        // the agent has no rows at all (matches SQLite parity in
+        // `quotas::get_aggregate_status`).
         let now = Utc::now();
         sqlx::query(
             "INSERT INTO agent_quotas (
-                agent_id, max_memories_per_day, max_storage_bytes, max_links_per_day,
+                agent_id, namespace,
+                max_memories_per_day, max_storage_bytes, max_links_per_day,
                 current_memories_today, current_storage_bytes, current_links_today,
                 day_started_at, created_at, updated_at
-            ) VALUES ($1, $2, $3, $4, 0, 0, 0, $5, $5, $5)
-            ON CONFLICT (agent_id) DO NOTHING",
+            ) VALUES ($1, $2, $3, $4, $5, 0, 0, 0, $6, $6, $6)
+            ON CONFLICT (agent_id, namespace) DO NOTHING",
         )
         .bind(agent_id)
+        .bind(crate::quotas::GLOBAL_NAMESPACE)
         .bind(DEFAULT_MAX_MEMORIES_PER_DAY)
         .bind(DEFAULT_MAX_STORAGE_BYTES)
         .bind(DEFAULT_MAX_LINKS_PER_DAY)
         .bind(now)
         .execute(&self.pool)
         .await
-        .map_err(|e| to_store_err("ensure agent_quotas row", e))?;
+        .map_err(|e| to_store_err("ensure aggregate _global agent_quotas row", e))?;
 
+        // Aggregate rollup: sum counters across every namespace.
         let row = sqlx::query(
-            "SELECT agent_id, max_memories_per_day, max_storage_bytes, max_links_per_day,
-                    current_memories_today, current_storage_bytes, current_links_today,
-                    day_started_at, created_at, updated_at
+            "SELECT
+                $1::text AS agent_id,
+                '_global'::text AS namespace,
+                COALESCE(MAX(max_memories_per_day), 0) AS max_memories_per_day,
+                COALESCE(MAX(max_storage_bytes), 0) AS max_storage_bytes,
+                COALESCE(MAX(max_links_per_day), 0) AS max_links_per_day,
+                COALESCE(SUM(current_memories_today), 0)::BIGINT AS current_memories_today,
+                COALESCE(SUM(current_storage_bytes), 0)::BIGINT AS current_storage_bytes,
+                COALESCE(SUM(current_links_today), 0)::BIGINT AS current_links_today,
+                COALESCE(MIN(day_started_at), $2) AS day_started_at,
+                COALESCE(MIN(created_at), $2) AS created_at,
+                COALESCE(MAX(updated_at), $2) AS updated_at
              FROM agent_quotas WHERE agent_id = $1",
         )
         .bind(agent_id)
+        .bind(now)
         .fetch_one(&self.pool)
         .await
-        .map_err(|e| to_store_err("read agent_quotas row", e))?;
+        .map_err(|e| to_store_err("read aggregate agent_quotas row", e))?;
 
-        Ok(row_to_quota_status(&row)?)
+        row_to_quota_status(&row)
+    }
+
+    async fn quota_status_ns(&self, agent_id: &str, namespace: &str) -> StoreResult<QuotaStatus> {
+        // v0.7.0 #1156 — per-(agent, namespace) single-row lookup.
+        // Auto-inserts a default row when none exists.
+        let now = Utc::now();
+        sqlx::query(
+            "INSERT INTO agent_quotas (
+                agent_id, namespace,
+                max_memories_per_day, max_storage_bytes, max_links_per_day,
+                current_memories_today, current_storage_bytes, current_links_today,
+                day_started_at, created_at, updated_at
+            ) VALUES ($1, $2, $3, $4, $5, 0, 0, 0, $6, $6, $6)
+            ON CONFLICT (agent_id, namespace) DO NOTHING",
+        )
+        .bind(agent_id)
+        .bind(namespace)
+        .bind(DEFAULT_MAX_MEMORIES_PER_DAY)
+        .bind(DEFAULT_MAX_STORAGE_BYTES)
+        .bind(DEFAULT_MAX_LINKS_PER_DAY)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| to_store_err("ensure (agent, namespace) agent_quotas row", e))?;
+
+        let row = sqlx::query(
+            "SELECT agent_id, namespace,
+                    max_memories_per_day, max_storage_bytes, max_links_per_day,
+                    current_memories_today, current_storage_bytes, current_links_today,
+                    day_started_at, created_at, updated_at
+             FROM agent_quotas WHERE agent_id = $1 AND namespace = $2",
+        )
+        .bind(agent_id)
+        .bind(namespace)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| to_store_err("read (agent, namespace) agent_quotas row", e))?;
+
+        row_to_quota_status(&row)
     }
 
     async fn quota_status_list(&self) -> StoreResult<Vec<QuotaStatus>> {
         let rows = sqlx::query(
-            "SELECT agent_id, max_memories_per_day, max_storage_bytes, max_links_per_day,
+            "SELECT agent_id, namespace,
+                    max_memories_per_day, max_storage_bytes, max_links_per_day,
                     current_memories_today, current_storage_bytes, current_links_today,
                     day_started_at, created_at, updated_at
-             FROM agent_quotas ORDER BY agent_id ASC",
+             FROM agent_quotas ORDER BY agent_id ASC, namespace ASC",
         )
         .fetch_all(&self.pool)
         .await
         .map_err(|e| to_store_err("list agent_quotas rows", e))?;
+
+        rows.iter().map(row_to_quota_status).collect()
+    }
+
+    async fn quota_status_list_ns(&self, namespace: &str) -> StoreResult<Vec<QuotaStatus>> {
+        let rows = sqlx::query(
+            "SELECT agent_id, namespace,
+                    max_memories_per_day, max_storage_bytes, max_links_per_day,
+                    current_memories_today, current_storage_bytes, current_links_today,
+                    day_started_at, created_at, updated_at
+             FROM agent_quotas
+             WHERE namespace = $1
+             ORDER BY agent_id ASC, namespace ASC",
+        )
+        .bind(namespace)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| to_store_err("list (namespace) agent_quotas rows", e))?;
 
         rows.iter().map(row_to_quota_status).collect()
     }
@@ -9846,6 +10016,12 @@ fn row_to_quota_status(row: &sqlx::postgres::PgRow) -> StoreResult<QuotaStatus> 
     let agent_id: String = row
         .try_get("agent_id")
         .map_err(|e| to_store_err("read quota agent_id", e))?;
+    // v0.7.0 #1156 — namespace column added in schema v50. Tolerate
+    // its absence (returns `_global` sentinel) so rollup queries that
+    // synthesise columns can reuse this helper.
+    let namespace: String = row
+        .try_get("namespace")
+        .unwrap_or_else(|_| crate::quotas::GLOBAL_NAMESPACE.to_string());
     let max_memories_per_day: i64 = row
         .try_get("max_memories_per_day")
         .map_err(|e| to_store_err("read max_memories_per_day", e))?;
@@ -9875,6 +10051,7 @@ fn row_to_quota_status(row: &sqlx::postgres::PgRow) -> StoreResult<QuotaStatus> 
         .map_err(|e| to_store_err("read updated_at", e))?;
     Ok(QuotaStatus {
         agent_id,
+        namespace,
         max_memories_per_day,
         max_storage_bytes,
         max_links_per_day,
@@ -11596,11 +11773,25 @@ mod tests {
         //         confidence_signals, confidence_decayed_at,
         //         mentioned_entity_id, version) so archive → restore is
         //         lossless for the full v0.7.0 Memory shape.
+        //   v50 = per-namespace K8 quota dimension (#1156) — extends
+        //         `agent_quotas` PRIMARY KEY from `(agent_id)` to
+        //         `(agent_id, namespace)` so per-namespace allotments
+        //         hold even when a single agent operates across many
+        //         namespaces.
         //
         // A future bump on either side without the corresponding port
         // re-trips this assertion before the migration runner gets a
-        // chance to write a partial schema to disk.
-        assert_eq!(CURRENT_SCHEMA_VERSION, 49);
+        // chance to write a partial schema to disk. No hardcoded
+        // literal — the cross-adapter SSOT tripwire pins
+        // `postgres::CURRENT_SCHEMA_VERSION` against the sqlite
+        // `storage::migrations::current_schema_version()` accessor.
+        assert_eq!(
+            i64::from(CURRENT_SCHEMA_VERSION),
+            crate::storage::migrations::current_schema_version(),
+            "postgres CURRENT_SCHEMA_VERSION must track the sqlite SSOT \
+             (storage::migrations::CURRENT_SCHEMA_VERSION). A bump on either \
+             side without the corresponding port re-trips this assertion."
+        );
     }
 
     #[tokio::test]

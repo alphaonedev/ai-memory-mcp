@@ -583,9 +583,14 @@ pub async fn sync_push(
         let bytes_estimate =
             i64::try_from(mem.title.len() + mem.content.len() + mem.metadata.to_string().len())
                 .unwrap_or(i64::MAX);
+        // v0.7.0 #1156 — charge against the per-namespace accounting
+        // row. Federation peers can no longer drain an agent's cap by
+        // fanning across namespaces (the per-namespace dimension keeps
+        // each namespace's allotment intact).
         match crate::quotas::check_and_record(
             &lock.0,
             &attribute_agent,
+            &mem.namespace,
             crate::quotas::QuotaOp::Memory {
                 bytes: bytes_estimate,
             },
@@ -679,9 +684,12 @@ pub async fn sync_push(
                 // Best-effort refund so a downstream insert failure
                 // doesn't leak quota counters. `refund_op` saturates at
                 // zero so a buggy double-refund cannot poison the row.
+                // #1156 — refund on the same `(agent_id, namespace)`
+                // row the check_and_record above incremented.
                 let _ = crate::quotas::refund_op(
                     &lock.0,
                     &attribute_agent,
+                    &mem.namespace,
                     crate::quotas::QuotaOp::Memory {
                         bytes: bytes_estimate,
                     },

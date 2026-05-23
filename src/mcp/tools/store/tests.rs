@@ -1708,12 +1708,18 @@ fn store_quota_exhausted_returns_quota_exceeded_error() {
     // used by base_params (ai:alice). Direct SQL is the most
     // surgical way to drive the quota gate without standing up the
     // full daemon `Quotas` config surface.
+    //
+    // v0.7.0 #1156 — quota rows are keyed by `(agent_id, namespace)`.
+    // base_params() targets namespace="test-ns", so seed against that
+    // tuple so the K8 check trips against the zero-budget row instead
+    // of auto-inserting a fresh default row.
     conn.execute(
         "INSERT INTO agent_quotas
-         (agent_id, max_memories_per_day, max_storage_bytes, max_links_per_day,
+         (agent_id, namespace,
+          max_memories_per_day, max_storage_bytes, max_links_per_day,
           current_memories_today, current_storage_bytes, current_links_today,
           day_started_at, created_at, updated_at)
-         VALUES ('ai:alice', 0, 0, 0, 0, 0, 0, ?1, ?2, ?2)",
+         VALUES ('ai:alice', 'test-ns', 0, 0, 0, 0, 0, 0, ?1, ?2, ?2)",
         rusqlite::params![day, now],
     )
     .expect("seed zero quota row");

@@ -226,18 +226,33 @@ pub(super) fn handle_link(
     // (source memory not found) the quota check is skipped:
     // db::create_link_signed will surface its own FK error in that
     // case, which is the more actionable failure.
-    let link_agent_id = db::get(conn, source_id).ok().flatten().and_then(|mem| {
+    //
+    // v0.7.0 #1156 — also resolve the source memory's namespace so
+    // the link is charged against the correct per-namespace
+    // accounting row. Falls back to `_global` (the v50 backwards-compat
+    // sentinel) when the source memory can't be resolved.
+    let link_owner = db::get(conn, source_id).ok().flatten();
+    let link_agent_id = link_owner.as_ref().and_then(|mem| {
         mem.metadata
             .get("agent_id")
             .and_then(|v| v.as_str())
             .map(str::to_string)
     });
+    let link_namespace = link_owner.as_ref().map_or_else(
+        || crate::quotas::GLOBAL_NAMESPACE.to_string(),
+        |mem| mem.namespace.clone(),
+    );
     // H12 (#628 blocker): combine the link quota check + counter
     // increment in a single atomic transaction. The check + record
     // pair was previously a TOCTOU window; `check_and_record` closes
     // it.
     if let Some(ref aid) = link_agent_id {
-        if let Err(e) = crate::quotas::check_and_record(conn, aid, crate::quotas::QuotaOp::Link) {
+        if let Err(e) = crate::quotas::check_and_record(
+            conn,
+            aid,
+            &link_namespace,
+            crate::quotas::QuotaOp::Link,
+        ) {
             return Err(e.to_string());
         }
     }
@@ -251,11 +266,16 @@ pub(super) fn handle_link(
             Ok(v) => v,
             Err(e) => {
                 // Refund the link counter we already committed: insert
-                // failed downstream of the quota commit.
+                // failed downstream of the quota commit. Refund lands
+                // on the same `(agent_id, namespace)` row the
+                // check_and_record above incremented (v50, #1156).
                 if let Some(ref aid) = link_agent_id {
-                    if let Err(re) =
-                        crate::quotas::refund_op(conn, aid, crate::quotas::QuotaOp::Link)
-                    {
+                    if let Err(re) = crate::quotas::refund_op(
+                        conn,
+                        aid,
+                        &link_namespace,
+                        crate::quotas::QuotaOp::Link,
+                    ) {
                         tracing::warn!("quota refund_op failed for agent {}: {}", aid, re);
                     }
                 }

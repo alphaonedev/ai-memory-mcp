@@ -375,11 +375,11 @@
     },
     {
       "description": "Load top-k recent + high-priority memories from a Family.",
-      "docs": "B1: top-k by metadata.family. Always-on; alternative to memory_recall when family is known. Issue #864 — `family` here is the MCP tool family (8 groups: core/lifecycle/graph/governance/power/meta/archive/other), NOT the memory_kind taxonomy (Observation/Reflection/Plan/Decision/etc).",
+      "docs": "B1: top-k by metadata.family. Always-on; alternative to memory_recall when family is known. Issue #864 \u2014 `family` here is the MCP tool family (8 groups: core/lifecycle/graph/governance/power/meta/archive/other), NOT the memory_kind taxonomy (Observation/Reflection/Plan/Decision/etc).",
       "inputSchema": {
         "properties": {
           "family": {
-            "description": "MCP tool family (8 groups) — NOT the memory_kind taxonomy. See #864.",
+            "description": "MCP tool family (8 groups) \u2014 NOT the memory_kind taxonomy. See #864.",
             "enum": [
               "core",
               "lifecycle",
@@ -413,7 +413,7 @@
     },
     {
       "description": "Intent-routed loader: free-text intent picks the best Family.",
-      "docs": "B2: pick best Family from free-text intent, then forward to memory_load_family. Issue #864 — `Family` here is the MCP tool family (8 groups: core/lifecycle/graph/governance/power/meta/archive/other), NOT the memory_kind taxonomy (Observation/Reflection/Plan/Decision/etc).",
+      "docs": "B2: pick best Family from free-text intent, then forward to memory_load_family. Issue #864 \u2014 `Family` here is the MCP tool family (8 groups: core/lifecycle/graph/governance/power/meta/archive/other), NOT the memory_kind taxonomy (Observation/Reflection/Plan/Decision/etc).",
       "inputSchema": {
         "properties": {
           "intent": {
@@ -823,7 +823,7 @@
             "type": "string"
           },
           "expected_version": {
-            "description": "#884 If-Match; mismatch → 409 envelope.",
+            "description": "#884 If-Match; mismatch \u2192 409 envelope.",
             "type": "integer"
           },
           "expires_at": {
@@ -1013,7 +1013,7 @@
     },
     {
       "description": "Persist a reflection memory plus reflects_on provenance links to each source.",
-      "docs": "Task 4/8 (#655): substrate-native recursive-learning primitive. reflection_depth = max(source_depths)+1; gated by namespace governance.max_reflection_depth (Task 2/8) — refusal returns REFLECTION_DEPTH_EXCEEDED. New memory + N reflects_on links land in one atomic txn.",
+      "docs": "Task 4/8 (#655): substrate-native recursive-learning primitive. reflection_depth = max(source_depths)+1; gated by namespace governance.max_reflection_depth (Task 2/8) \u2014 refusal returns REFLECTION_DEPTH_EXCEEDED. New memory + N reflects_on links land in one atomic txn.",
       "inputSchema": {
         "properties": {
           "agent_id": {
@@ -1084,7 +1084,7 @@
     },
     {
       "description": "Render a single reflection memory as markdown or JSON (no filesystem write).",
-      "docs": "QW-1: render reflection + reflects_on provenance as YAML-frontmatter md (default) or JSON envelope. Returns {content, suggested_filename}. No FS write — harness owns disk I/O.",
+      "docs": "QW-1: render reflection + reflects_on provenance as YAML-frontmatter md (default) or JSON envelope. Returns {content, suggested_filename}. No FS write \u2014 harness owns disk I/O.",
       "inputSchema": {
         "properties": {
           "format": {
@@ -1131,7 +1131,7 @@
     },
     {
       "description": "Generate/regen a Persona artefact for an entity.",
-      "docs": "QW-2 / #848: synthesise MemoryKind::Persona from top-K Reflection memories. Omit namespace (or pass null) for cross-namespace aggregation (#848 — persona lands in 'global'); pass a namespace string for single-namespace scope. Response includes namespace_scope=single|cross_namespace.",
+      "docs": "QW-2 / #848: synthesise MemoryKind::Persona from top-K Reflection memories. Omit namespace (or pass null) for cross-namespace aggregation (#848 \u2014 persona lands in 'global'); pass a namespace string for single-namespace scope. Response includes namespace_scope=single|cross_namespace.",
       "inputSchema": {
         "properties": {
           "entity_id": {
@@ -1139,7 +1139,7 @@
             "type": "string"
           },
           "namespace": {
-            "description": "Omit/null → cross-namespace (#848); string → single-namespace.",
+            "description": "Omit/null \u2192 cross-namespace (#848); string \u2192 single-namespace.",
             "type": [
               "string",
               "null"
@@ -1172,7 +1172,7 @@
     },
     {
       "description": "List dependents flagged by the L2-3 invalidation walker.",
-      "docs": "L2-3 (#668): read-only list of memories with reflects_on->memory_id. Notification, NOT cascade — dependents are flagged for curator review. Returns {memory_id, count, dependents:[{id, namespace}]}. Unknown ids => empty.",
+      "docs": "L2-3 (#668): read-only list of memories with reflects_on->memory_id. Notification, NOT cascade \u2014 dependents are flagged for curator review. Returns {memory_id, count, dependents:[{id, namespace}]}. Unknown ids => empty.",
       "inputSchema": {
         "properties": {
           "memory_id": {
@@ -1290,8 +1290,8 @@
       "name": "memory_atomise"
     },
     {
-      "description": "Share a memory with another agent (copy into _shared/<from>→<to>/).",
-      "docs": "#224/#311 MVP: point-to-point copy into `_shared/<from>→<to>/` with provenance.",
+      "description": "Share a memory with another agent (copy into _shared/<from>\u2192<to>/).",
+      "docs": "#224/#311 MVP: point-to-point copy into `_shared/<from>\u2192<to>/` with provenance.",
       "inputSchema": {
         "properties": {
           "source_memory_id": {
@@ -1313,7 +1313,7 @@
     },
     {
       "description": "Scan confidence_shadow_observations and emit per-source baselines (Form 5).",
-      "docs": "Form 5 (#758): read-only calibration sweep over shadow-mode observations (AI_MEMORY_CONFIDENCE_SHADOW=1). Returns CalibrationReport {window_days, total_observations, baselines:[{namespace, source, count, median, mean, buckets}]}. Default window 30d. Family::Power — refuses on keyword tier.",
+      "docs": "Form 5 (#758): read-only calibration sweep over shadow-mode observations (AI_MEMORY_CONFIDENCE_SHADOW=1). Returns CalibrationReport {window_days, total_observations, baselines:[{namespace, source, count, median, mean, buckets}]}. Default window 30d. Family::Power \u2014 refuses on keyword tier.",
       "inputSchema": {
         "properties": {
           "days": {
@@ -1726,7 +1726,7 @@
     },
     {
       "description": "Register an agent in the reserved _agents namespace.",
-      "docs": "Register agent (agent_type, capabilities) in _agents. Refreshes last_seen_at; preserves registered_at. agent_id is CLAIMED, not attested — pair with attestation for security boundary.",
+      "docs": "Register agent (agent_type, capabilities) in _agents. Refreshes last_seen_at; preserves registered_at. agent_id is CLAIMED, not attested \u2014 pair with attestation for security boundary.",
       "inputSchema": {
         "properties": {
           "agent_id": {
@@ -1939,12 +1939,16 @@
       "name": "memory_subscription_dlq_list"
     },
     {
-      "description": "Report per-agent quota usage. Operator-facing.",
-      "docs": "K8: quota usage (memories/day, storage, links/day). Omit agent_id for all.",
+      "description": "Report per-agent + per-namespace quota usage. Operator-facing.",
+      "docs": "K8/#1156: per-agent + per-namespace quota usage (memories/day, storage bytes, links/day). Omit agent_id for all. Omit namespace for the aggregate view (sum across namespaces). Supply both for the single row.",
       "inputSchema": {
         "properties": {
           "agent_id": {
             "description": "Restrict to one agent.",
+            "type": "string"
+          },
+          "namespace": {
+            "description": "Restrict to one namespace (v0.7.0 #1156 \u2014 per-namespace K8 dimension). When supplied with `agent_id`, returns the single (agent_id, namespace) row. When supplied without `agent_id`, returns every agent's row in that namespace. When omitted, the aggregate view is returned for an agent_id or the full substrate listing otherwise.",
             "type": "string"
           }
         },
@@ -1954,7 +1958,7 @@
     },
     {
       "description": "Check action vs governance_rules (#691); Allow/Refuse/Warn.",
-      "docs": "#691: read-only rule check. Harness PreToolUse hook calls on every Bash/Write/Edit. Rule MUTATION over MCP is disabled — use `ai-memory rules --sign` CLI or signed HTTP admin endpoints.",
+      "docs": "#691: read-only rule check. Harness PreToolUse hook calls on every Bash/Write/Edit. Rule MUTATION over MCP is disabled \u2014 use `ai-memory rules --sign` CLI or signed HTTP admin endpoints.",
       "inputSchema": {
         "properties": {
           "agent_id": {
@@ -2151,7 +2155,7 @@
             "type": "string"
           },
           "skill_name": {
-            "description": "agentskills.io §3.1 name: ^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$, 1-64.",
+            "description": "agentskills.io \u00a73.1 name: ^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$, 1-64.",
             "type": "string"
           }
         },

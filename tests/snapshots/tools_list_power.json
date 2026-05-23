@@ -893,10 +893,16 @@
       "name": "memory_subscription_dlq_list"
     },
     {
-      "description": "Report per-agent quota usage",
+      "description": "Report per-agent +",
       "inputSchema": {
         "properties": {
           "agent_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "namespace": {
             "type": [
               "string",
               "null"

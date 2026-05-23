@@ -766,13 +766,29 @@ impl MemoryStore for SqliteStore {
     // -------- v0.7.0 Wave-3 Continuation 6 — quota + verify-link ---------
 
     async fn quota_status(&self, agent_id: &str) -> StoreResult<QuotaStatus> {
+        // v0.7.0 #1156 — SAL trait keeps the legacy single-arg shape;
+        // the rollup view is the agent-wide aggregate so postgres-
+        // backed callers see the same response shape pre-#1156
+        // returned. Callers that want a single-`(agent, namespace)`
+        // row land on the new `quota_status_ns` SAL method (added in
+        // the same change so wire shape parity holds across adapters).
         let conn = self.state.lock().await;
-        quotas::get_status(&conn, agent_id).map_err(box_err)
+        quotas::get_aggregate_status(&conn, agent_id).map_err(box_err)
+    }
+
+    async fn quota_status_ns(&self, agent_id: &str, namespace: &str) -> StoreResult<QuotaStatus> {
+        let conn = self.state.lock().await;
+        quotas::get_status(&conn, agent_id, namespace).map_err(box_err)
     }
 
     async fn quota_status_list(&self) -> StoreResult<Vec<QuotaStatus>> {
         let conn = self.state.lock().await;
-        quotas::list_status(&conn).map_err(box_err)
+        quotas::list_status(&conn, None).map_err(box_err)
+    }
+
+    async fn quota_status_list_ns(&self, namespace: &str) -> StoreResult<Vec<QuotaStatus>> {
+        let conn = self.state.lock().await;
+        quotas::list_status(&conn, Some(namespace)).map_err(box_err)
     }
 
     async fn verify_link(&self, filter: VerifyFilter) -> StoreResult<VerifyLinkReport> {

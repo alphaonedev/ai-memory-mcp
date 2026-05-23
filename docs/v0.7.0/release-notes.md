@@ -309,6 +309,7 @@ Three v0.7.0 postures flip from v0.6.x fail-open behaviour to v0.7.0 fail-CLOSED
 ### CRITICAL — schema bump + audit chain integrity
 
 - **#1025 — archived_memories full v0.7.0 column carry, schema v48 → v49** (commits [`b1b462a77`](https://github.com/alphaonedev/ai-memory-mcp/commit/b1b462a77) + [`bd74c2e2c`](https://github.com/alphaonedev/ai-memory-mcp/commit/bd74c2e2c)). v49 added 14 nullable columns to `archived_memories` on both backends so archive → restore is lossless for the full v0.7.0 Memory shape (reflection_depth / memory_kind / entity_id / persona_version / citations / source_uri / source_span / confidence_source / confidence_signals / confidence_decayed_at / mentioned_entity_id / version / atomised_into / atom_of). Both adapters now at `CURRENT_SCHEMA_VERSION = 49`.
+- **#1156 — per-namespace K8 quota dimension extension, schema v49 → v50**. v50 extends `agent_quotas` PRIMARY KEY from `(agent_id)` to `(agent_id, namespace)` so per-namespace allotments hold even when a single agent operates across many namespaces. Pre-v50 rows backfill to the `_global` sentinel. NSA CSI MCP recommendation (c) — defense-in-depth blast-radius controls. Both adapters now at `CURRENT_SCHEMA_VERSION = 50`.
 
 ### HIGH — federation, audit chain, governance
 
@@ -1218,9 +1219,9 @@ folded into the v0.7.0 tag rather than slipping to v0.7.1:
   truth lives at [`docs/internal/v070-feature-inventory.md`](../internal/v070-feature-inventory.md)
   (453 commits ahead of v0.6.4, +233,589/−23,541 lines, 73 MCP tools at
   release HEAD, 30 net-new since v0.6.4, 17 net-new `AI_MEMORY_*` env
-  vars, 73 HTTP routes total, 32 sqlite migrations on disk + the in-
-  process v35-v49 arms that converge sqlite + postgres on the single
-  logical `CURRENT_SCHEMA_VERSION = 49`).
+  vars, 73 HTTP routes total, 33 sqlite migrations on disk + the in-
+  process v35-v50 arms that converge sqlite + postgres on the single
+  logical `CURRENT_SCHEMA_VERSION = 50`).
 
 ## Backward compatibility
 

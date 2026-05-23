@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 49).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 50).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -513,7 +513,19 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_federation_push_dlq_pending_uniq
 //       polls every N seconds and re-attempts `post_once`, stamping
 //       `replayed_at` on Ack. Pure additive CREATE TABLE IF NOT
 //       EXISTS + indexes — fully idempotent.
-const CURRENT_SCHEMA_VERSION: i64 = 49;
+//
+//   * v50 — #1156, per-namespace K8 quota dimension extension. Extends
+//       the `agent_quotas` table PRIMARY KEY from `(agent_id)` to
+//       `(agent_id, namespace)` via the canonical SQLite shadow-table
+//       swap idiom. Pre-existing rows backfill to the `_global`
+//       namespace sentinel so the historical accounting is preserved
+//       verbatim. The `_global` sentinel is outside the validated
+//       namespace charset so no caller-supplied namespace can collide.
+//       Idempotent via `PRAGMA table_info` probe for the `namespace`
+//       column in the migration arm. NSA CSI mapping: recommendation
+//       (c) — defense-in-depth blast-radius controls on a compromised
+//       or misbehaving agent.
+const CURRENT_SCHEMA_VERSION: i64 = 50;
 
 /// v0.7.0 refactor PR-1 (#793) — schema-pins SSOT.
 ///
@@ -850,6 +862,17 @@ const MIGRATION_V47_SQLITE: &str =
 // peer doesn't stack duplicate pending rows). Fully replay-safe.
 const MIGRATION_V48_SQLITE: &str =
     include_str!("../../migrations/sqlite/0041_v07_federation_push_dlq.sql");
+// v0.7.0 #1156 — per-namespace K8 quota dimension extension (schema
+// v50). Shadow-table swap: builds `agent_quotas_v50_shadow` with the
+// new compound PK `(agent_id, namespace)`, copies every existing row
+// into the `_global` namespace sentinel, drops the old table, renames
+// the shadow into place, and rebuilds the supporting indexes. The
+// shipping arm guards this against replay via a `PRAGMA table_info`
+// probe for the `namespace` column — already-migrated DBs skip the
+// swap entirely. NSA CSI MCP recommendation (c) — defense-in-depth
+// blast-radius controls.
+const MIGRATION_V50_SQLITE: &str =
+    include_str!("../../migrations/sqlite/0042_v50_per_namespace_quota.sql");
 
 // COVERAGE: per-version ALTER/CREATE branches inside this function
 // are guarded by `has_X` column-existence probes and `IF NOT EXISTS`
@@ -2045,6 +2068,45 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
                         )?;
                     }
                 }
+            }
+        }
+        if version < 50 {
+            // v0.7.0 #1156 — per-namespace K8 quota dimension extension.
+            // Extends `agent_quotas` PRIMARY KEY from `(agent_id)` to
+            // `(agent_id, namespace)` via the SQLite shadow-table swap
+            // idiom (SQLite cannot ALTER an existing PK in place).
+            // Pre-v50 rows backfill to the `_global` namespace sentinel
+            // so historical accounting is preserved verbatim. Callers
+            // that don't supply a namespace continue to land on
+            // `_global`, so the pre-#1156 public-API behaviour is
+            // byte-for-byte preserved.
+            //
+            // Idempotent: probe for the `namespace` column on
+            // `agent_quotas` and skip the swap when it's already
+            // present. The probe also gracefully handles the case
+            // where `agent_quotas` doesn't exist yet (test fixtures
+            // that stamp `schema_version` past v28 without applying
+            // the v28 CREATE) — `PRAGMA table_info` returns an empty
+            // set, no `namespace` column is reported, and the swap
+            // SQL fails open against the missing table. We additionally
+            // guard against the missing-table case so those fixtures
+            // continue to migrate cleanly.
+            //
+            // NSA CSI MCP mapping: recommendation (c) — defense-in-
+            // depth blast-radius controls (per-namespace allotments
+            // bound a compromised agent's reach).
+            let cols: std::collections::HashSet<String> = conn
+                .prepare("PRAGMA table_info(agent_quotas)")?
+                .query_map([], |r| r.get::<_, String>(1))?
+                .collect::<rusqlite::Result<_>>()?;
+            if cols.is_empty() {
+                tracing::debug!(
+                    target: "ai_memory::storage::migrations",
+                    "v50: agent_quotas table does not exist (test fixture or \
+                     deployment-without-quotas); skipping shadow-table swap"
+                );
+            } else if !cols.contains("namespace") {
+                conn.execute_batch(MIGRATION_V50_SQLITE)?;
             }
         }
 

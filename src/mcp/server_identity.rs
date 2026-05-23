@@ -35,9 +35,9 @@
 //! {
 //!   "serverInfo": {
 //!     "name": "ai-memory",
-//!     "version": "0.7.0",
+//!     "version": "<binary>",         // populated from `CARGO_PKG_VERSION` (SSOT)
 //!     "ai_memory_identity": {
-//!       "schema_version": "v49",
+//!       "schema_version": "v<current>",   // populated from `current_schema_version()` (SSOT)
 //!       "daemon_id": "ai:nhi@host",
 //!       "public_key": "<URL-safe base64 of 32-byte Ed25519 verifying key>",
 //!       "signed_at": "2026-05-23T16:30:22Z",
@@ -107,9 +107,13 @@ use crate::storage::migrations::current_schema_version;
 /// The signature itself is excluded from the signed bytes.
 #[derive(Debug, Clone)]
 pub struct DaemonIdentityToSign<'a> {
-    /// Substrate schema version the daemon is running — e.g. `"v49"`.
-    /// Allows the TOFU-pinning client to detect a schema rollback /
-    /// rollforward separately from a key rotation.
+    /// Substrate schema version the daemon is running. Stamped at
+    /// runtime from
+    /// [`crate::storage::migrations::current_schema_version()`] (the
+    /// SSOT — see also `CURRENT_SCHEMA_VERSION` in
+    /// `src/storage/migrations.rs`). Allows the TOFU-pinning client
+    /// to detect a schema rollback / rollforward separately from a
+    /// key rotation.
     pub schema_version: &'a str,
     /// Resolved daemon `agent_id` — the same identifier used for V-4
     /// signed-events row attribution and outbound link signing.
@@ -310,10 +314,18 @@ mod tests {
 
     // --- canonical_bytes_for_identity tests -----------------------------------
 
+    // NOTE: schema-version values in this test module are synthetic
+    // fixtures (`vTEST_*`) — they exist only to exercise the canonical-
+    // bytes determinism + divergence properties and DO NOT track the
+    // real `CURRENT_SCHEMA_VERSION`. Hardcoded production schema
+    // literals are banned in this codebase; the runtime path consumes
+    // `crate::storage::migrations::current_schema_version()` as the
+    // single source of truth.
+
     #[test]
     fn canonical_bytes_are_deterministic() {
         let id = DaemonIdentityToSign {
-            schema_version: "v49",
+            schema_version: "vTEST_BASE",
             daemon_id: "ai:nhi@host",
             public_key: "abc123",
             signed_at: fixed_timestamp(),
@@ -329,7 +341,7 @@ mod tests {
     #[test]
     fn canonical_bytes_diverge_on_any_field_change() {
         let base = DaemonIdentityToSign {
-            schema_version: "v49",
+            schema_version: "vTEST_BASE",
             daemon_id: "ai:nhi@host",
             public_key: "abc123",
             signed_at: fixed_timestamp(),
@@ -338,7 +350,7 @@ mod tests {
 
         let cases = [
             DaemonIdentityToSign {
-                schema_version: "v50",
+                schema_version: "vTEST_CHANGED",
                 ..base.clone()
             },
             DaemonIdentityToSign {

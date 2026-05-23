@@ -553,9 +553,13 @@ pub(crate) fn handle_store(
     // increment in a single atomic transaction so concurrent writers
     // cannot each pass the check and then both bump the counter past
     // the cap.
+    // v0.7.0 #1156 — charge against the per-namespace accounting row
+    // (the v50 PK extension). Per-namespace allotments hold even when
+    // a single agent writes across many namespaces.
     if let Err(e) = crate::quotas::check_and_record(
         conn,
         &agent_id,
+        &mem.namespace,
         crate::quotas::QuotaOp::Memory {
             bytes: payload_bytes,
         },
@@ -567,10 +571,13 @@ pub(crate) fn handle_store(
         Ok(id) => id,
         Err(e) => {
             // Insert failed AFTER we committed quota — refund so the
-            // counter reflects only successful stores.
+            // counter reflects only successful stores. Refund lands on
+            // the same `(agent_id, namespace)` row the check_and_record
+            // above incremented (v50, #1156).
             if let Err(re) = crate::quotas::refund_op(
                 conn,
                 &agent_id,
+                &mem.namespace,
                 crate::quotas::QuotaOp::Memory {
                     bytes: payload_bytes,
                 },

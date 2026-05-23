@@ -18,7 +18,7 @@
 
 ## 1. TL;DR migration verdict
 
-- **What changes.** The sqlite schema jumps from **v15 → v49** — 11 new columns
+- **What changes.** The sqlite schema jumps from **v15 → v50** — 11 new columns
   on the `memories` table (citations, source URIs, byte-range spans, memory
   kind, entity id, persona version, confidence provenance + signals + decay
   stamp, optimistic-concurrency `version`, plus the QW-2 `auto_persona_entity_id`
@@ -136,7 +136,7 @@ ai-memory start
 ```
 
 That's it. The first `ai-memory start` after the upgrade walks the schema
-ladder v15 → v49 against your DB in place. It's idempotent — if you Ctrl-C
+ladder v15 → v50 against your DB in place. It's idempotent — if you Ctrl-C
 during the migration, restart and the unfinished bumps resume from where they
 stopped.
 
@@ -325,13 +325,13 @@ AGE projection prime, and the cutover dance.
      --store-url postgres://aimemory:PASSWORD@HOST:5432/aimemory \
      --upgrade
    ```
-   This walks the postgres ladder up to schema v49 idempotently, preserving
+   This walks the postgres ladder up to schema v50 idempotently, preserving
    data.
 5. **Verify schema parity:**
    ```bash
    psql 'postgres://aimemory:PASSWORD@HOST:5432/aimemory' \
      -tAc "SELECT version FROM _ai_memory_schema_version ORDER BY version DESC LIMIT 1;"
-   # → 49
+   # → 50
    ```
 6. **Restart and validate:**
    ```bash
@@ -346,7 +346,7 @@ AGE projection prime, and the cutover dance.
 The v0.7.0 SAL trait makes sqlite ↔ postgres a one-command migration.
 Run `ai-memory migrate --from sqlite:///path/to/memory.db --to postgres://...`
 per the postgres guide. You can do it before OR after the v0.7.0 upgrade —
-the SAL boundary is byte-stable across both backends at schema v49.
+the SAL boundary is byte-stable across both backends at schema v50.
 
 ---
 
@@ -406,7 +406,7 @@ And new tables (opt-in / empty if you never use the feature): `signed_events` (V
 
 **6.11 `version`** (v45, Provenance Gap 1 / #884). Optimistic-concurrency counter. Bumped on every `memory_update`. Two callers writing against the same `expected_version` race one winner; the loser receives a typed CONFLICT envelope naming the current version. v0.6.4 was last-writer-wins and quietly destroyed concurrent edits.
 
-The bump-by-bump v34 → v49 narrative lives in
+The bump-by-bump v34 → v50 narrative lives in
 [`MIGRATION_v0.7.md` §"Upgrade steps"](MIGRATION_v0.7.md).
 
 ---

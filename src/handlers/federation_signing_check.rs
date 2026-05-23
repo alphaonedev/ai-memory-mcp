@@ -106,9 +106,12 @@ pub(super) async fn sync_push_via_store(
                 .unwrap_or(i64::MAX);
         {
             let conn = app.db.lock().await;
+            // v0.7.0 #1156 — charge against the per-namespace
+            // accounting row on the postgres-receive path too.
             match crate::quotas::check_and_record(
                 &conn.0,
                 &attribute_agent,
+                &mem.namespace,
                 crate::quotas::QuotaOp::Memory {
                     bytes: bytes_estimate,
                 },
@@ -239,9 +242,12 @@ pub(super) async fn sync_push_via_store(
                 // failure doesn't leak counters (saturating; safe).
                 {
                     let conn = app.db.lock().await;
+                    // #1156 — refund on the same `(agent_id,
+                    // namespace)` row check_and_record incremented.
                     let _ = crate::quotas::refund_op(
                         &conn.0,
                         &attribute_agent,
+                        &mem.namespace,
                         crate::quotas::QuotaOp::Memory {
                             bytes: bytes_estimate,
                         },

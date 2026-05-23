@@ -14,7 +14,7 @@
 
 use ai_memory::quotas::{
     self, DEFAULT_MAX_LINKS_PER_DAY, DEFAULT_MAX_MEMORIES_PER_DAY, DEFAULT_MAX_STORAGE_BYTES,
-    QuotaCheckError, QuotaLimit, QuotaOp,
+    GLOBAL_NAMESPACE, QuotaCheckError, QuotaLimit, QuotaOp,
 };
 use rusqlite::{Connection, params};
 
@@ -22,6 +22,12 @@ mod common;
 use common::fresh_db_tempfile_path as fresh_db;
 
 /// Tighten a row's caps so the test can hit the wall in O(1) calls.
+///
+/// v0.7.0 #1156 — quota rows are now keyed by `(agent_id, namespace)`.
+/// These legacy tests exercise the `_global` sentinel namespace so the
+/// pre-#1156 behaviour is preserved byte-for-byte; per-namespace
+/// isolation regression coverage lives in
+/// `tests/per_namespace_quota.rs` and `src/quotas.rs::tests`.
 fn tighten_caps(
     conn: &Connection,
     agent_id: &str,
@@ -34,12 +40,13 @@ fn tighten_caps(
            max_memories_per_day = ?1,
            max_storage_bytes    = ?2,
            max_links_per_day    = ?3
-         WHERE agent_id = ?4",
+         WHERE agent_id = ?4 AND namespace = ?5",
         params![
             max_memories_per_day,
             max_storage_bytes,
             max_links_per_day,
-            agent_id
+            agent_id,
+            GLOBAL_NAMESPACE,
         ],
     )
     .expect("tighten caps");
@@ -52,10 +59,15 @@ fn k8_store_under_limit_returns_ok() {
 
     // First call inserts the default row with the generous compiled
     // defaults; under those defaults a single 100-byte store passes.
-    quotas::check_quota(&conn, "agent-under-limit", QuotaOp::Memory { bytes: 100 })
-        .expect("under limit must succeed");
+    quotas::check_quota(
+        &conn,
+        "agent-under-limit",
+        GLOBAL_NAMESPACE,
+        QuotaOp::Memory { bytes: 100 },
+    )
+    .expect("under limit must succeed");
 
-    let status = quotas::get_status(&conn, "agent-under-limit").unwrap();
+    let status = quotas::get_status(&conn, "agent-under-limit", GLOBAL_NAMESPACE).unwrap();
     assert_eq!(status.max_memories_per_day, DEFAULT_MAX_MEMORIES_PER_DAY);
     assert_eq!(status.max_storage_bytes, DEFAULT_MAX_STORAGE_BYTES);
     assert_eq!(status.max_links_per_day, DEFAULT_MAX_LINKS_PER_DAY);
@@ -68,12 +80,29 @@ fn k8_store_at_memories_per_day_limit_returns_quota_exceeded() {
 
     // Seed the row by passing a check, then tighten the cap to 1 and
     // record one op so the next check trips memories_per_day.
-    quotas::check_quota(&conn, "agent-mem", QuotaOp::Memory { bytes: 1 }).unwrap();
+    quotas::check_quota(
+        &conn,
+        "agent-mem",
+        GLOBAL_NAMESPACE,
+        QuotaOp::Memory { bytes: 1 },
+    )
+    .unwrap();
     tighten_caps(&conn, "agent-mem", 1, DEFAULT_MAX_STORAGE_BYTES, 1000);
-    quotas::record_op(&conn, "agent-mem", QuotaOp::Memory { bytes: 1 }).unwrap();
+    quotas::record_op(
+        &conn,
+        "agent-mem",
+        GLOBAL_NAMESPACE,
+        QuotaOp::Memory { bytes: 1 },
+    )
+    .unwrap();
 
-    let err = quotas::check_quota(&conn, "agent-mem", QuotaOp::Memory { bytes: 1 })
-        .expect_err("expected QUOTA_EXCEEDED");
+    let err = quotas::check_quota(
+        &conn,
+        "agent-mem",
+        GLOBAL_NAMESPACE,
+        QuotaOp::Memory { bytes: 1 },
+    )
+    .expect_err("expected QUOTA_EXCEEDED");
 
     match err {
         QuotaCheckError::Quota(q) => {
@@ -99,11 +128,22 @@ fn k8_store_at_storage_bytes_limit_returns_quota_exceeded() {
 
     // Seed the row, tighten the storage cap, then attempt a write that
     // would push current_storage_bytes past the cap.
-    quotas::check_quota(&conn, "agent-bytes", QuotaOp::Memory { bytes: 1 }).unwrap();
+    quotas::check_quota(
+        &conn,
+        "agent-bytes",
+        GLOBAL_NAMESPACE,
+        QuotaOp::Memory { bytes: 1 },
+    )
+    .unwrap();
     tighten_caps(&conn, "agent-bytes", 1000, 50, 1000);
 
-    let err = quotas::check_quota(&conn, "agent-bytes", QuotaOp::Memory { bytes: 200 })
-        .expect_err("expected QUOTA_EXCEEDED");
+    let err = quotas::check_quota(
+        &conn,
+        "agent-bytes",
+        GLOBAL_NAMESPACE,
+        QuotaOp::Memory { bytes: 200 },
+    )
+    .expect_err("expected QUOTA_EXCEEDED");
     match err {
         QuotaCheckError::Quota(q) => {
             assert_eq!(q.limit, QuotaLimit::StorageBytes);
@@ -118,11 +158,11 @@ fn k8_link_at_links_per_day_limit_returns_quota_exceeded() {
     let (_keep, db_path) = fresh_db();
     let conn = Connection::open(&db_path).unwrap();
 
-    quotas::check_quota(&conn, "agent-links", QuotaOp::Link).unwrap();
+    quotas::check_quota(&conn, "agent-links", GLOBAL_NAMESPACE, QuotaOp::Link).unwrap();
     tighten_caps(&conn, "agent-links", 1000, DEFAULT_MAX_STORAGE_BYTES, 1);
-    quotas::record_op(&conn, "agent-links", QuotaOp::Link).unwrap();
+    quotas::record_op(&conn, "agent-links", GLOBAL_NAMESPACE, QuotaOp::Link).unwrap();
 
-    let err = quotas::check_quota(&conn, "agent-links", QuotaOp::Link)
+    let err = quotas::check_quota(&conn, "agent-links", GLOBAL_NAMESPACE, QuotaOp::Link)
         .expect_err("expected QUOTA_EXCEEDED");
     match err {
         QuotaCheckError::Quota(q) => {
@@ -149,16 +189,21 @@ fn k8_check_and_record_serialises_concurrent_writers_h12() {
     // commit a count of 1; every other thread must see QUOTA_EXCEEDED.
     {
         let conn = Connection::open(&db_path).unwrap();
-        ai_memory::quotas::check_and_record(&conn, "race-agent", QuotaOp::Memory { bytes: 1 })
-            .expect("seed insert");
+        ai_memory::quotas::check_and_record(
+            &conn,
+            "race-agent",
+            GLOBAL_NAMESPACE,
+            QuotaOp::Memory { bytes: 1 },
+        )
+        .expect("seed insert");
         // Reset the counter back to zero so the cap-1 race below can
         // play out from a clean slate.
         conn.execute(
             "UPDATE agent_quotas SET
                max_memories_per_day = 1,
                current_memories_today = 0
-             WHERE agent_id = ?1",
-            params!["race-agent"],
+             WHERE agent_id = ?1 AND namespace = ?2",
+            params!["race-agent", GLOBAL_NAMESPACE],
         )
         .unwrap();
     }
@@ -187,6 +232,7 @@ fn k8_check_and_record_serialises_concurrent_writers_h12() {
                 ai_memory::quotas::check_and_record(
                     &conn,
                     "race-agent",
+                    GLOBAL_NAMESPACE,
                     QuotaOp::Memory { bytes: 1 },
                 ),
                 Ok(()),
@@ -216,7 +262,7 @@ fn k8_check_and_record_serialises_concurrent_writers_h12() {
     // The persisted counter must read exactly 1 — no double-increment
     // could have slipped past the BEGIN IMMEDIATE lock.
     let conn = Connection::open(&db_path).unwrap();
-    let s = ai_memory::quotas::get_status(&conn, "race-agent").unwrap();
+    let s = ai_memory::quotas::get_status(&conn, "race-agent", GLOBAL_NAMESPACE).unwrap();
     assert_eq!(
         s.current_memories_today, 1,
         "counter should be exactly 1 after the race"
@@ -231,20 +277,37 @@ fn k8_refund_op_decrements_counters_h12() {
     let (_keep, db_path) = fresh_db();
     let conn = Connection::open(&db_path).unwrap();
 
-    ai_memory::quotas::check_and_record(&conn, "refund-agent", QuotaOp::Memory { bytes: 100 })
-        .unwrap();
-    let pre = ai_memory::quotas::get_status(&conn, "refund-agent").unwrap();
+    ai_memory::quotas::check_and_record(
+        &conn,
+        "refund-agent",
+        GLOBAL_NAMESPACE,
+        QuotaOp::Memory { bytes: 100 },
+    )
+    .unwrap();
+    let pre = ai_memory::quotas::get_status(&conn, "refund-agent", GLOBAL_NAMESPACE).unwrap();
     assert_eq!(pre.current_memories_today, 1);
     assert_eq!(pre.current_storage_bytes, 100);
 
-    ai_memory::quotas::refund_op(&conn, "refund-agent", QuotaOp::Memory { bytes: 100 }).unwrap();
-    let post = ai_memory::quotas::get_status(&conn, "refund-agent").unwrap();
+    ai_memory::quotas::refund_op(
+        &conn,
+        "refund-agent",
+        GLOBAL_NAMESPACE,
+        QuotaOp::Memory { bytes: 100 },
+    )
+    .unwrap();
+    let post = ai_memory::quotas::get_status(&conn, "refund-agent", GLOBAL_NAMESPACE).unwrap();
     assert_eq!(post.current_memories_today, 0);
     assert_eq!(post.current_storage_bytes, 0);
 
     // Saturating: extra refunds must not push counters below zero.
-    ai_memory::quotas::refund_op(&conn, "refund-agent", QuotaOp::Memory { bytes: 100 }).unwrap();
-    let saturated = ai_memory::quotas::get_status(&conn, "refund-agent").unwrap();
+    ai_memory::quotas::refund_op(
+        &conn,
+        "refund-agent",
+        GLOBAL_NAMESPACE,
+        QuotaOp::Memory { bytes: 100 },
+    )
+    .unwrap();
+    let saturated = ai_memory::quotas::get_status(&conn, "refund-agent", GLOBAL_NAMESPACE).unwrap();
     assert_eq!(saturated.current_memories_today, 0);
     assert_eq!(saturated.current_storage_bytes, 0);
 }
@@ -256,14 +319,26 @@ fn k8_record_op_after_check_increments_counters() {
 
     // Three memory writes + two link writes against the same agent.
     for _ in 0..3 {
-        quotas::check_quota(&conn, "agent-record", QuotaOp::Memory { bytes: 10 }).unwrap();
-        quotas::record_op(&conn, "agent-record", QuotaOp::Memory { bytes: 10 }).unwrap();
+        quotas::check_quota(
+            &conn,
+            "agent-record",
+            GLOBAL_NAMESPACE,
+            QuotaOp::Memory { bytes: 10 },
+        )
+        .unwrap();
+        quotas::record_op(
+            &conn,
+            "agent-record",
+            GLOBAL_NAMESPACE,
+            QuotaOp::Memory { bytes: 10 },
+        )
+        .unwrap();
     }
     for _ in 0..2 {
-        quotas::check_quota(&conn, "agent-record", QuotaOp::Link).unwrap();
-        quotas::record_op(&conn, "agent-record", QuotaOp::Link).unwrap();
+        quotas::check_quota(&conn, "agent-record", GLOBAL_NAMESPACE, QuotaOp::Link).unwrap();
+        quotas::record_op(&conn, "agent-record", GLOBAL_NAMESPACE, QuotaOp::Link).unwrap();
     }
-    let status = quotas::get_status(&conn, "agent-record").unwrap();
+    let status = quotas::get_status(&conn, "agent-record", GLOBAL_NAMESPACE).unwrap();
     assert_eq!(status.current_memories_today, 3);
     assert_eq!(status.current_storage_bytes, 30);
     assert_eq!(status.current_links_today, 2);

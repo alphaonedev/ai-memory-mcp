@@ -344,9 +344,9 @@ footer a{color:var(--text-muted)}
         </tr>
         <tr>
           <td class="col-name">c · Validate parameters</td>
-          <td>RequestValidator + per-field free functions (validate_id, validate_namespace, validate_agent_id, validate_source_uri, validate_citation, validate_source_span)</td>
-          <td><code>request_validator_input_validation</code></td>
-          <td><code>src/validate.rs:1027</code> · <code>src/validate.rs:784/808/852</code></td>
+          <td>RequestValidator + per-field free functions (validate_id, validate_namespace, validate_agent_id, validate_source_uri, validate_citation, validate_source_span) + per-namespace K8 quota dimension (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1156">#1156</a>, schema v50: <code>agent_quotas</code> PK <code>(agent_id, namespace)</code>) as defense-in-depth blast-radius control</td>
+          <td><code>request_validator_input_validation</code>, <code>per_namespace_quota_dimension</code></td>
+          <td><code>src/validate.rs:1027</code> · <code>src/validate.rs:784/808/852</code> · <code>migrations/sqlite/0042_v50_per_namespace_quota.sql</code> · <code>tests/per_namespace_quota.rs</code></td>
           <td><span class="status ok">implemented</span></td>
         </tr>
         <tr>
@@ -808,7 +808,7 @@ grep -n 'DefaultBodyLimit' src/lib.rs
     <p style="margin-bottom:.5rem"><strong>ai-memory v0.7.0</strong> · NSA CSI MCP Security Compliance · public-facing procurement-grade evidence · maintained by AlphaOne LLC under Apache 2.0.</p>
     <p style="margin-bottom:.5rem">Verification commit: <code>4add7a8528d4c16d696b391ec6e2890269669a84</code> on <code>release/v0.7.0</code> · Inventory: <a href="_inventory/v0.7.0-capabilities.json">v0.7.0-capabilities.json</a> · Summary: <a href="_inventory/v0.7.0-summary.md">v0.7.0-summary.md</a> · Companion: <a href="honest-limitations.md">honest-limitations.md</a></p>
     <p style="margin-bottom:.5rem">Reference: National Security Agency, <em>Model Context Protocol (MCP): Security Design Considerations for AI-Driven Automation</em>, Cybersecurity Information, U/OO/6030316-26 | PP-26-1834, Version 1.0, May 2026. The mapping above is one-directional: ai-memory's posture relative to NSA-issued guidance. NSA, DoD, and the United States Government do not endorse, certify, or recommend ai-memory, AgenticMem, AlphaOne LLC, or any commercial product.</p>
-    <p>Audit issue: <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1153">#1153</a> · Follow-up issues: #1154 (daemon serverInfo signing), #1155 (Accept-Provenance), #1156 (per-namespace rate limit).</p>
+    <p>Audit issue: <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1153">#1153</a> · Follow-up issues: #1154 (daemon serverInfo signing), #1155 (Accept-Provenance), #1156 (per-namespace K8 quota dimension, shipped at schema v50 — defense-in-depth blast-radius control under recommendation c).</p>
   </div>
 </footer>
 
