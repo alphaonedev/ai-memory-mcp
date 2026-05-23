@@ -148,8 +148,7 @@ pub async fn recall_memories_get(
     // decoration on the HTTP recall envelope. Default HTTP shape is
     // bare (v0.6.x backwards compat); the header opts callers into
     // the verbose decoration that already ships by default on MCP.
-    let provenance_shape =
-        crate::handlers::accept_provenance::resolve_from_headers(&headers);
+    let provenance_shape = crate::handlers::accept_provenance::resolve_from_headers(&headers);
     recall_response(
         &app,
         &req,
@@ -203,8 +202,7 @@ pub async fn recall_memories_post(
         }
     };
     // v0.7.x #1155 — same Accept-Provenance gating as the GET path.
-    let provenance_shape =
-        crate::handlers::accept_provenance::resolve_from_headers(&headers);
+    let provenance_shape = crate::handlers::accept_provenance::resolve_from_headers(&headers);
     recall_response(
         &app,
         &req,

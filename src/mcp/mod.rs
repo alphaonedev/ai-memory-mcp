@@ -1671,8 +1671,7 @@ fn handle_request(
                 "name": "ai-memory",
                 "version": env!("CARGO_PKG_VERSION"),
             });
-            let now_rfc3339 = chrono::Utc::now()
-                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            let now_rfc3339 = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
             if let Ok(Some(identity_block)) =
                 server_identity::build_signed_identity(active_keypair, &now_rfc3339)
                 && let Some(obj) = server_info.as_object_mut()

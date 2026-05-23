@@ -203,7 +203,10 @@ fn legacy_no_keypair_handshake_shape_is_unchanged() {
         "version": "0.7.0",
     });
     assert!(
-        !server_info.as_object().unwrap().contains_key("ai_memory_identity"),
+        !server_info
+            .as_object()
+            .unwrap()
+            .contains_key("ai_memory_identity"),
         "no keypair → exact v0.7.0 wire shape"
     );
 }
