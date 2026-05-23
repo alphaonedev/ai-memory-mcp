@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] — v0.7.x doc follow-ups + Wave-2 refactor (post-tag)
 
+### feat(mcp, #1154) — daemon serverInfo Ed25519 signing at MCP initialize handshake (2026-05-23)
+
+Closes [#1154](https://github.com/alphaonedev/ai-memory-mcp/issues/1154) (the last remaining partial-coverage edge on the NSA CSI MCP security framework). Substrate-side cryptographic identity attestation at the MCP handshake boundary — the second half of the defense against NSA CSI concern (j) Tool invocation path confusion.
+
+- **New module** `src/mcp/server_identity.rs` (≈360 LOC including doc-comments + 20 unit tests) — declares `DaemonIdentityToSign` struct, `canonical_bytes_for_identity` deterministic JSON canonicaliser, `build_signed_identity` Ed25519 signer, and `verify_signed_identity` round-trip helper. Canonical-bytes discipline mirrors the existing governance-rule signing pattern at `src/governance/rules_store.rs:541`.
+- **MCP initialize arm** (`src/mcp/mod.rs`) now constructs and signs an `ai_memory_identity` block on every initialize response when the daemon has an Ed25519 keypair on disk. The block carries `schema_version` (per the SSOT `CURRENT_SCHEMA_VERSION` constant at `src/storage/migrations.rs:516`), `daemon_id` (the resolved daemon `agent_id`), `public_key` (URL-safe base64 of the Ed25519 verifying key), `signed_at` (RFC3339 handshake timestamp), and `signature` (Ed25519 over the canonical bytes of the four preceding fields).
+- **TOFU pin workflow** — clients capture the `signature` on first connect and refuse subsequent connects that present a different signature. Closes the tool-name collision attack surface where a misconfigured or adversarial second memory server advertises the same MCP tool names as the legitimate ai-memory daemon.
+- **Backwards compatibility — purely additive.** Per MCP / JSON-RPC convention clients ignore unknown response fields. v0.6.4 / v0.7.0 clients continue to function identically. When the daemon has NO keypair on disk (`load_daemon_signing_key` returns `None`), the `ai_memory_identity` block is OMITTED — preserving the v0.7.0 "continuing unsigned" posture from `src/main.rs:96-98`.
+- **Zero hot-path impact.** Initialize fires ONCE per MCP session, not on the recall hot path. The Ed25519 sign over ~150 bytes of canonical identity costs ~10-50µs on modern hardware — the 50ms recall p95 budget is untouched.
+- **`pub const fn current_schema_version()`** added to `src/storage/migrations.rs` as the production-facing alias of the `_for_tests` SSOT accessor. The new module reads this to publish the schema version in the signed identity block.
+- **Test coverage** — 47 dedicated tests pin the contract: 20 module-level unit tests + 27 integration tests in `tests/mcp_initialize_server_signing.rs`. Coverage breakdown:
+  - Happy path: signed block present, signature verifies, all five fields well-formed
+  - Field-level assertions: schema_version matches SSOT, daemon_id matches resolved agent_id, public_key matches `kp.public_base64()`, signed_at matches input timestamp
+  - No-keypair fallback: omitted block when keypair argument is `None` or public-only
+  - Backwards compatibility: legacy v0.6.x clients can still parse `serverInfo.name` and `serverInfo.version`
+  - Tampering rejection: any post-sign mutation of daemon_id, schema_version, public_key, signed_at, or signature byte breaks verification
+  - Malformed-input rejection: non-object inputs, missing required fields, non-string field types, garbage base64, wrong-length keys
+  - Cross-rotation TOFU detection: different daemon keypair → distinguishable signature
+  - Determinism: identical inputs produce byte-identical canonical bytes and signatures
+  - Performance smoke: single sign sub-5ms, 1000 signs under 1 second, 10k no-keypair calls under 10ms
+  - Schema-version drift: published schema_version always tracks `CURRENT_SCHEMA_VERSION` constant
+- **Zero regression on existing handshake tests** — `mcp_initialize_handshake_succeeds`, `mcp_call_memory_store_then_memory_recall_roundtrip`, `mcp_list_tools_returns_expected_count`, `test_mcp_initialize` (legacy), and all 8 `d4_*_initialize_round_trip` harness coverage tests continue to pass unchanged.
+- **Cargo gates green** — `cargo build --lib`, `cargo clippy --lib --tests -- -D warnings -D clippy::all -D clippy::pedantic`, all targeted test suites.
+
+This closure moves the substrate's NSA CSI MCP coverage from **9 of 10 + 1 partial** at v0.7.0 baseline to **10 of 10 structurally addressed** at v0.7.x. All public-facing compliance documentation (docs/compliance/nsa-csi-mcp.html, docs/compliance/nsa-csi-mcp-security-mapping.md, docs/compliance/honest-limitations.md, docs/compliance/index.html, docs/at-a-glance.html, docs/index.html, README.md badge) has been updated to reflect the 10/10 milestone.
+
 ### docs(compliance, #1153) — NSA CSI MCP Security Compliance evidence pair (2026-05-23)
 
 Closes [#1153](https://github.com/alphaonedev/ai-memory-mcp/issues/1153) (NSA CSI MCP Security Audit — AI NHI Start Prompts). Procurement-grade public-facing compliance documentation mapping ai-memory v0.7.0 substrate-level primitives to the National Security Agency Cybersecurity Information document on Model Context Protocol security (U/OO/6030316-26 | PP-26-1834, Version 1.0, May 2026).

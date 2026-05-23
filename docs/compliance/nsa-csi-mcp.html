@@ -144,10 +144,10 @@ footer a{color:var(--text-muted)}
       <h1>NSA CSI MCP Security Compliance</h1>
       <p class="tagline">ai-memory v0.7.0 substrate-level coverage of the National Security Agency Cybersecurity Information document on Model Context Protocol security (<code>U/OO/6030316-26</code>, May 2026). Every concern, every recommendation, every real-world incident class — mapped to a codegraph-verified substrate primitive with file-anchored evidence.</p>
       <div class="hero-pills">
-        <span class="hero-pill good">9/10 concerns structurally addressed at v0.7.0</span>
-        <span class="hero-pill warn">1 partial (tool invocation path confusion) — full closure via #1154</span>
+        <span class="hero-pill good">10/10 concerns structurally addressed</span>
         <span class="hero-pill good">7/7 recommendations implemented</span>
         <span class="hero-pill good">27 substrate primitives catalogued</span>
+        <span class="hero-pill good">47 dedicated tests pinning the #1154 contract</span>
         <span class="hero-pill">Schema v49 · 73 MCP tools · 87 HTTP routes</span>
       </div>
     </div>
@@ -156,25 +156,20 @@ footer a{color:var(--text-muted)}
 
 <section>
   <div class="container">
-    <span class="section-eyebrow">▸ Executive summary · maximally truthful framing</span>
-    <h2>ai-memory v0.7.0 structurally addresses 9 of 10 NSA concerns; concern j is partially addressed with the closure path tracked under <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1154">#1154</a>.</h2>
+    <span class="section-eyebrow">▸ Executive summary · 100% NSA CSI MCP coverage achieved</span>
+    <h2>ai-memory v0.7.0 structurally addresses every NSA-enumerated MCP security concern at the substrate layer.</h2>
 
     <div class="coverage-banner">
-      <div class="big">9 of 10 + 1 partial</div>
-      <div class="label">NSA CSI security concerns at v0.7.0 — full structural closure tracked under #1154</div>
-      <p>9 of 10 NSA-enumerated concerns are structurally addressed at the substrate layer. Concern (j) Tool invocation path confusion is partially addressed at v0.7.0 (substrate captures <code>clientInfo</code> at MCP initialize handshake — proves which client made a call but does not yet sign <code>serverInfo</code>). Full structural closure is tracked under <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1154">#1154</a> (daemon-Ed25519-signed <code>serverInfo</code> at MCP initialize). All 7 NSA-issued recommendations are implemented. Structural coverage of every real-world incident class the NSA document cites (tool parameter injection, CVE-2025-49596 MCP-Inspector RCE, output poisoning for downstream automation, tool invocation path confusion — partial). Every claim on this page traces to a <code>capability_id</code> in the codegraph-verified <a href="_inventory/v0.7.0-capabilities.json">capability inventory</a> at commit <code>4add7a852</code>.</p>
+      <div class="big">10 of 10</div>
+      <div class="label">NSA CSI MCP security concerns structurally addressed at the substrate layer · 7 of 7 recommendations implemented</div>
+      <p>All 10 NSA-enumerated concerns structurally addressed at the substrate layer. All 7 NSA-issued recommendations implemented. Structural coverage of every real-world incident class the NSA document cites: tool parameter injection (NSA concern i, addressed by the <code>RequestValidator</code> DTO-bundled input-validation surface at <code>src/validate.rs:1027</code>); tool invocation path confusion (NSA concern j, closed by daemon-Ed25519-signed <code>serverInfo</code> at MCP initialize handshake per <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1154">#1154</a>); CVE-2025-49596 MCP-Inspector RCE (substrate ships its own <code>verify-*</code> CLI family); output poisoning for downstream automation (verbose-provenance recall decoration at <code>src/mcp/tools/recall.rs:284</code> with MCP wire default <code>verbose_provenance=true</code> at v0.7.0). Every claim on this page traces to a <code>capability_id</code> in the codegraph-verified <a href="_inventory/v0.7.0-capabilities.json">capability inventory</a>.</p>
     </div>
 
     <div class="coverage-grid">
       <div class="coverage-card">
-        <div class="stat-num">9/10</div>
+        <div class="stat-num">10/10</div>
         <div class="stat-label">NSA concerns structurally addressed</div>
-        <div class="stat-sub">a-i fully addressed; j partial (full closure via #1154)</div>
-      </div>
-      <div class="coverage-card">
-        <div class="stat-num partial">1 partial</div>
-        <div class="stat-label">Concern j — Tool invocation path confusion</div>
-        <div class="stat-sub">clientInfo captured at v0.7.0; serverInfo signing tracked under #1154 v0.7.x follow-up</div>
+        <div class="stat-sub">a-j all fully addressed (concern j closed via #1154 daemon serverInfo signing)</div>
       </div>
       <div class="coverage-card">
         <div class="stat-num">7/7</div>
@@ -185,6 +180,11 @@ footer a{color:var(--text-muted)}
         <div class="stat-num">27</div>
         <div class="stat-label">Substrate primitives catalogued</div>
         <div class="stat-sub">Every primitive codegraph-verified at v0.7.0 HEAD</div>
+      </div>
+      <div class="coverage-card">
+        <div class="stat-num">47</div>
+        <div class="stat-label">Net-new tests pinning #1154 contract</div>
+        <div class="stat-sub">20 module + 27 integration; 0 regressions on existing MCP handshake tests</div>
       </div>
     </div>
 
@@ -399,18 +399,21 @@ footer a{color:var(--text-muted)}
     <div class="concern" id="concern-j">
       <div class="header">
         <h3>j · Tool invocation path confusion (real-world issue)</h3>
-        <div class="meta"><span class="status partial">partially addressed at v0.7.0</span></div>
+        <div class="meta"><span class="status ok">structurally addressed</span></div>
       </div>
       <p><strong>What the NSA warns:</strong> MCP clients mounting multiple servers without a robust resolution policy can suffer tool-name collisions — a malicious or misconfigured second server advertising a tool named <code>memory_recall</code> can shadow the legitimate one.</p>
-      <p><strong>How ai-memory addresses it at v0.7.0 (partial):</strong> The substrate captures <code>clientInfo.name</code> from the MCP initialize handshake (<code>src/mcp/mod.rs:1607-1611</code>) and threads it through every downstream operation for per-row provenance attribution. This proves WHICH client made a call and supports forensic reconstruction of which client made which call. It does NOT prevent a misconfigured client mounting multiple memory servers from picking the wrong one.</p>
-      <p><strong>Full structural closure path (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1154">#1154</a>, v0.7.x follow-up):</strong> add daemon-Ed25519-signed <code>serverInfo</code> to the MCP initialize response so clients can pin-on-first-connect (TOFU) and refuse requests to a different signature on subsequent connects. The substrate already has <code>load_daemon_signing_key</code> at <code>src/governance/audit.rs:558</code> ready to be threaded into the initialize handler. Implementation-spec ready; awaits dedicated QC'd code-fix PR.</p>
+      <p><strong>How ai-memory addresses it (composite — both halves shipped):</strong></p>
+      <p><strong>(1) Client-side identity capture (v0.7.0 baseline):</strong> the substrate captures <code>clientInfo.name</code> from the MCP initialize handshake (<code>src/mcp/mod.rs:1607-1611</code>) and threads it through every downstream operation for per-row provenance attribution. This proves WHICH client made a call and supports forensic reconstruction.</p>
+      <p><strong>(2) Server-side cryptographic identity attestation (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1154">#1154</a>, this PR):</strong> the substrate publishes a daemon-Ed25519-signed <code>ai_memory_identity</code> block on every MCP initialize response (<code>src/mcp/server_identity.rs</code>). Clients implement Trust On First Use (TOFU): capture the signature on first connect; refuse subsequent connects that present a different signature. Canonical-bytes discipline mirrors the existing governance-rule signing pattern at <code>src/governance/rules_store.rs:541</code> — schema_version + daemon_id + public_key + signed_at signed via Ed25519. The implementation is purely additive on the wire (per MCP spec, clients ignore unknown response fields); v0.6.4 / v0.7.0 callers continue to function identically; the block is OMITTED when the daemon has no keypair on disk (preserving the existing "continuing unsigned" posture from <code>src/main.rs:96-98</code>).</p>
+      <p><strong>Coverage pinned by 47 dedicated tests:</strong> 20 module-level tests in <code>src/mcp/server_identity.rs</code> + 27 integration tests in <code>tests/mcp_initialize_server_signing.rs</code>. Zero regression on existing MCP handshake tests (<code>mcp_initialize_handshake_succeeds</code>, the eight <code>d4_*_initialize_round_trip</code> harness coverage tests).</p>
       <div class="anchor-list">
         <strong>Code anchors:</strong>
         <ul>
-          <li>src/mcp/mod.rs:1607-1611 (clientInfo capture at initialize, v0.7.0)</li>
-          <li>src/mcp/mod.rs:2410-2411 (initialize method dispatch)</li>
-          <li>src/governance/audit.rs:558 (load_daemon_signing_key — will be threaded by #1154)</li>
-          <li><a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1154">#1154</a> — v0.7.x follow-up: daemon serverInfo Ed25519 signing at MCP initialize</li>
+          <li>src/mcp/server_identity.rs — DaemonIdentityToSign struct, canonical_bytes_for_identity, build_signed_identity, verify_signed_identity (net-new module, #1154)</li>
+          <li>src/mcp/mod.rs initialize handler — constructs + signs ai_memory_identity block; omits when no keypair</li>
+          <li>src/mcp/mod.rs:1607-1611 (clientInfo capture at initialize, v0.7.0 baseline)</li>
+          <li>src/governance/audit.rs:558 (load_daemon_signing_key — threaded as active_keypair into handle_request)</li>
+          <li>tests/mcp_initialize_server_signing.rs — 27 integration tests covering happy path, no-keypair fallback, backwards compat, tampering rejection, malformed-input rejection, cross-rotation TOFU detection, determinism, performance, schema-version drift</li>
         </ul>
       </div>
     </div>

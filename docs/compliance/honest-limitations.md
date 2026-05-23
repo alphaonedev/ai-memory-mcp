@@ -8,9 +8,9 @@
 
 ## Statement of intent — what this document is and is not
 
-The [NSA CSI MCP Security mapping](nsa-csi-mcp-security-mapping.md) claims ai-memory v0.7.0 addresses every one of the ten NSA-enumerated MCP security concerns and every one of the seven NSA recommendations structurally at the substrate layer. That claim is grep-verifiable against the codegraph-derived [capability inventory](_inventory/v0.7.0-capabilities.json).
+The [NSA CSI MCP Security mapping](nsa-csi-mcp-security-mapping.md) claims ai-memory v0.7.x addresses every one of the ten NSA-enumerated MCP security concerns and every one of the seven NSA recommendations structurally at the substrate layer. That claim is grep-verifiable against the codegraph-derived [capability inventory](_inventory/v0.7.0-capabilities.json).
 
-**This document is NOT a list of NSA CSI gaps.** There are none at v0.7.0 (after #1154 daemon serverInfo signing lands; partial coverage at v0.7.0 alone).
+**This document is NOT a list of NSA CSI gaps.** There are none — concern j (tool invocation path confusion) was the last partial-coverage edge at v0.7.0 and is now closed via #1154 (daemon-Ed25519-signed `ai_memory_identity` block at MCP initialize handshake, shipped in `src/mcp/server_identity.rs` with 47 dedicated regression tests).
 
 **This document IS a list of substrate boundaries** — things the substrate fundamentally cannot defend against regardless of which compliance framework is in front of it. Operating system kernel vulnerabilities, side-channel attacks on cryptographic primitives, large language model hallucination on the consumer side of the substrate, operator-authored permissive policy. These boundaries exist whether NSA CSI exists or not. They define the substrate's honest perimeter.
 
@@ -104,11 +104,11 @@ During Task I deep-verification of issue #1153, three substrate-level gap-fix ca
 
 | # | Candidate | NSA-CSI-related concern tightened | Current posture | v0.7.x landing |
 |---|---|---|---|---|
-| 1 | **Daemon `serverInfo` Ed25519 signing at MCP initialize handshake** | Tool invocation path confusion (NSA concern j) | clientInfo captured; serverInfo not yet signed | #1154, this PR |
-| 2 | **`Accept-Provenance: verbose` capability negotiation flag** | Filter/monitor output pipelines (NSA recommendation f) — closes consumer-default friction | `verbose_provenance=false` is the wire default for backwards compat | #1155, this PR |
+| 1 | **Daemon `serverInfo` Ed25519 signing at MCP initialize handshake** | Tool invocation path confusion (NSA concern j) | ✅ **CLOSED via #1154 in this PR** — `src/mcp/server_identity.rs` ships daemon-Ed25519-signed `ai_memory_identity` block at MCP initialize handshake; 47 dedicated tests pin the contract | #1154 SHIPPED |
+| 2 | **`Accept-Provenance: verbose` capability negotiation flag** | Filter/monitor output pipelines (NSA recommendation f) — closes consumer-default friction | MCP wire default `verbose_provenance=true` already ships at v0.7.0 per `src/mcp/tools/recall.rs:490`. Only the HTTP `Accept-Provenance` header remains as net-new wire surface — minor polish, NOT a coverage gap. | #1155, v0.7.x follow-up |
 | 3 | **Per-namespace rate-limit dimension extension (K8 quota → (agent_id, namespace) compound)** | Denial of service (NSA concern h) — defense-in-depth | K8 quota dimension is per-agent only | #1156, v0.7.x follow-up (requires schema v50 migration) |
 
-After #1154 + #1155 land in this PR (#1157), the substrate's structural NSA CSI coverage reaches 100% with no partial-coverage edges. #1156 is a defense-in-depth improvement scheduled for v0.7.x follow-up; it does not block 100% structural coverage of the NSA framework.
+After #1154 landed in this PR, the substrate's structural NSA CSI MCP coverage reached 100% (10/10 concerns + 7/7 recommendations, zero partial-coverage edges). #1155 and #1156 are defense-in-depth + polish improvements scheduled for v0.7.x follow-up; neither blocks the 100% structural coverage claim of the NSA framework.
 
 ---
 

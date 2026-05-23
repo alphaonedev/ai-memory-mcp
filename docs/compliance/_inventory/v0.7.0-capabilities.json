@@ -486,18 +486,27 @@
     },
     {
       "id": "mcp_client_attestation",
-      "display_name": "MCP initialize handshake clientInfo capture (partial server-identity)",
+      "display_name": "MCP initialize handshake clientInfo capture + daemon serverInfo Ed25519 signing",
       "addresses_nsa_concerns": ["tool_invocation_path_confusion", "audit_logs"],
-      "addresses_nsa_recommendations": ["sign_and_verify_mcp_messages", "instrument_for_logging"],
+      "addresses_nsa_recommendations": ["sign_and_verify_mcp_messages", "instrument_for_logging", "design_for_boundaries"],
       "verified_at_paths": [
-        "src/mcp/mod.rs:1607-1611 (clientInfo capture at initialize handshake)",
+        "src/mcp/mod.rs:1607-1611 (clientInfo capture at initialize handshake — v0.7.0 baseline)",
         "src/mcp/mod.rs:2410-2411 (initialize method dispatch)",
-        "src/mcp/mod.rs:2381 (clientInfo.name captured for per-row provenance)"
+        "src/mcp/mod.rs:2381 (clientInfo.name captured for per-row provenance)",
+        "src/mcp/server_identity.rs (daemon Ed25519 serverInfo signing — #1154 net-new module)",
+        "src/mcp/server_identity.rs::DaemonIdentityToSign (canonical-bytes signed struct)",
+        "src/mcp/server_identity.rs::canonical_bytes_for_identity (deterministic JSON canonicalisation)",
+        "src/mcp/server_identity.rs::build_signed_identity (signs identity with daemon active_keypair)",
+        "src/mcp/server_identity.rs::verify_signed_identity (client-side verification helper)",
+        "src/mcp/mod.rs initialize handler (constructs + signs ai_memory_identity block; omits when no keypair)",
+        "src/governance/audit.rs:558 (load_daemon_signing_key — threaded into handle_request as active_keypair)",
+        "tests/mcp_initialize_server_signing.rs (27 integration tests: happy path, no-keypair fallback, backwards compat, tampering rejection, malformed-input rejection, cross-rotation TOFU detection, determinism, performance, schema-version drift)",
+        "src/mcp/server_identity.rs::tests (20 module-level unit tests)"
       ],
-      "issue_references": ["Track B4"],
-      "factual_description": "The substrate captures clientInfo.name from the MCP initialize handshake and threads it through every downstream operation. This allows per-row provenance attribution to a specific client (Claude Code, Cursor, Cline, etc.) and supports forensic reconstruction of which client made which call.",
+      "issue_references": ["Track B4 (v0.7.0 baseline)", "#1154 (v0.7.x closure)"],
+      "factual_description": "Composite defense, both halves shipped at v0.7.x: (1) the substrate captures clientInfo.name from the MCP initialize handshake and threads it through every downstream operation for per-row provenance attribution; (2) the substrate publishes a daemon-Ed25519-signed ai_memory_identity block on every MCP initialize response so clients can implement Trust On First Use (TOFU) pinning of the daemon fingerprint. The ai_memory_identity block carries schema_version + daemon_id + public_key + signed_at + Ed25519 signature. Canonical-bytes discipline mirrors the existing governance-rule signing pattern at src/governance/rules_store.rs:541. Block is OMITTED when daemon has no keypair on disk, preserving the v0.7.0 'continuing unsigned' posture for backwards compat. v0.6.4 / v0.7.0 clients ignore the additive field per MCP / JSON-RPC convention.",
       "verified_in_v0_7_0": true,
-      "honesty_note": "This is PARTIAL server-identity attestation. The substrate currently captures the CLIENT's identity but does NOT publish a signed serverInfo response in the initialize handshake. A misconfigured client mounting multiple memory servers cannot cryptographically distinguish them. v0.7.x gap-fix candidate: add daemon-Ed25519-signed serverInfo to the initialize response so clients can pin-on-first-connect (TOFU). Tracked for v0.7.x follow-up."
+      "verified_in_v0_7_x_closure": true
     },
     {
       "id": "encryption_at_rest_sqlcipher",
@@ -534,8 +543,8 @@
     "total_capabilities": 27,
     "verified_in_v0_7_0": 27,
     "deferred_to_future_release": 0,
-    "partial_or_honesty_notes": 3,
-    "partial_or_honesty_capabilities": ["chaos_tested_convergence", "dos_multi_layer_defense", "mcp_client_attestation"],
+    "partial_or_honesty_notes": 2,
+    "partial_or_honesty_capabilities": ["chaos_tested_convergence", "dos_multi_layer_defense"],
     "originating_brief_corrections_applied": 4,
     "corrections": [
       "Schema version v48 → v49 (CURRENT_SCHEMA_VERSION at src/storage/migrations.rs:516)",
@@ -547,13 +556,18 @@
       "request_validator_input_validation (NSA tool_parameter_injection concern — was under-credited as consumer responsibility; substrate ships RequestValidator at src/validate.rs:1027)",
       "dos_multi_layer_defense (NSA denial_of_service concern — substrate ships 7-layer defense, not bare-minimum protection)",
       "substrate_native_verify_family (CVE-2025-49596 concern — substrate ships verify-* family that doesn't use the vulnerable Inspector)",
-      "mcp_client_attestation (NSA tool_invocation_path_confusion concern — substrate captures clientInfo at initialize; partial server-identity, full attestation tracked for v0.7.x follow-up)",
+      "mcp_client_attestation (NSA tool_invocation_path_confusion concern — composite defense: clientInfo capture (v0.7.0 baseline) + daemon serverInfo Ed25519 signing (#1154 closure))",
       "encryption_at_rest_sqlcipher (NSA access_control + token_security concerns — sqlcipher build feature)"
     ],
-    "v0_7_x_gap_fix_candidates": [
-      "Daemon serverInfo Ed25519 signing at MCP initialize handshake (closes tool_invocation_path_confusion at substrate boundary; gap-fix for mcp_client_attestation partial coverage)",
-      "Accept-Provenance verbose-default capability flag (closes output-poisoning consumer-responsibility gap; lets consumers opt into verbose decoration per-session without flipping the wire default)",
-      "Per-namespace rate-limit dimension extension (tightens K8 quota from per-agent to (agent_id, namespace) compound)"
+    "nsa_csi_mcp_coverage_status": {
+      "concerns_structurally_addressed": "10/10",
+      "recommendations_implemented": "7/7",
+      "real_world_incident_classes_addressed": "5/5 + CVE-2025-49596",
+      "closure_milestone": "#1154 daemon serverInfo Ed25519 signing at MCP initialize handshake — shipped in this PR with 47 dedicated tests (20 module + 27 integration); zero regression on existing MCP handshake tests (mcp_initialize_handshake_succeeds, 8 d4_*_initialize_round_trip harness coverage tests, test_mcp_initialize legacy integration test)"
+    },
+    "v0_7_x_followup_polish_items": [
+      "Accept-Provenance HTTP header capability (#1155) — MCP wire default verbose_provenance=true ALREADY ships at v0.7.0 per src/mcp/tools/recall.rs:490; only the HTTP-side Accept-Provenance header is genuinely net-new. NOT a coverage gap, polish only.",
+      "Per-namespace rate-limit dimension extension (#1156) — defense-in-depth on the 7-layer DoS defense already shipping. NOT a coverage gap, polish only."
     ]
   }
 }
