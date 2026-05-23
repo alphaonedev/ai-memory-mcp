@@ -451,10 +451,16 @@ jobs:
     if: needs.classify.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     env:
-      # v0.7.x (#1148) — mold linker + `[profile.coverage]` keep peak
+      # v0.7.x (#1148) — mold linker + line-only DWARF keep peak
       # linker RSS under the 7 GB ubuntu-latest ceiling for the
-      # instrumented `--features sal` build.
+      # instrumented `--features sal` build. We apply the trim via
+      # CARGO_PROFILE_DEV_* env vars (NOT `--profile coverage`) so the
+      # post-build `cargo llvm-cov report` step finds the object
+      # files under the default `target/llvm-cov-target/debug/` path
+      # the `[profile.coverage]` artifact dir would have shifted.
       RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+      CARGO_PROFILE_DEV_DEBUG: "1"
+      CARGO_PROFILE_DEV_LTO: "false"
     permissions:
       contents: read
       pull-requests: write
@@ -487,13 +493,14 @@ jobs:
       - name: Generate coverage report
         env:
           AI_MEMORY_NO_CONFIG: "1"
-        # v0.7.x (#1148) — `--profile coverage` selects the
-        # purpose-built `[profile.coverage]` in Cargo.toml
-        # (debug = 1, lto = false, codegen-units = 16) which trims
-        # ~30% off the instrumented binary size and keeps the linker
-        # working set well under the 7 GB runner ceiling.
+        # v0.7.x (#1148) — dev profile WITH env-var overrides
+        # (debuginfo=1, lto=false from the job-level env block above)
+        # keeps artifacts under target/llvm-cov-target/debug/ where
+        # the report step expects them, while still trimming the
+        # instrumented binary enough that mold can link it under the
+        # 7 GB runner ceiling.
         run: |
-          cargo llvm-cov --profile coverage --features sal --no-fail-fast --html --output-dir coverage -- --test-threads=2
+          cargo llvm-cov --features sal --no-fail-fast --html --output-dir coverage -- --test-threads=2
           # `cargo llvm-cov report` reads the saved profile data and does
           # not accept `--features` (would error: "invalid option
           # '--features' for subcommand 'report'"). The earlier pipe-to-

@@ -77,6 +77,11 @@ jobs:
       # ubuntu-latest runner under the heavy `--features
       # sal,sal-postgres` instrumented build.
       RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+      # Trim DWARF + LTO via env-var overrides on the dev profile
+      # (NOT `--profile coverage`) so cargo-llvm-cov's report step
+      # finds the artifact dir at its default `debug/` path.
+      CARGO_PROFILE_DEV_DEBUG: "1"
+      CARGO_PROFILE_DEV_LTO: "false"
     steps:
       - uses: actions/checkout@v5
 
@@ -121,16 +126,16 @@ jobs:
           psql -h 127.0.0.1 -p 5432 -U ai_memory -d ai_memory_test -c "SELECT extname FROM pg_extension ORDER BY extname;"
 
       - name: Generate coverage JSON
-        # v0.7.x (#1148) — `--profile coverage` selects the
-        # purpose-built `[profile.coverage]` in Cargo.toml
-        # (debug = 1, lto = false, codegen-units = 16) so the
-        # instrumented binary is ~30% smaller through the linker.
-        # Combined with mold (RUSTFLAGS above), this brings peak
-        # linker RSS comfortably under the 7 GB runner ceiling.
+        # v0.7.x (#1148) — dev profile (default) WITH env-var
+        # overrides from the job-level `env:` block above
+        # (debuginfo=1, lto=false). Keeps artifacts under the default
+        # `target/llvm-cov-target/debug/` path so downstream report
+        # tooling (and the threshold checker) finds them, while still
+        # trimming the instrumented binary enough that mold can link
+        # it under the 7 GB runner ceiling.
         run: |
           mkdir -p coverage
           cargo llvm-cov \
-            --profile coverage \
             --features sal,sal-postgres \
             --lib --tests \
             --json \
