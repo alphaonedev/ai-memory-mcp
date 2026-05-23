@@ -73,6 +73,8 @@ memory on every conversation start), see
 > documented in
 > [`docs/CLI_REFERENCE.md`](CLI_REFERENCE.md) § `mcp`.
 
+> **Using `--tier smart` or `--tier autonomous` with a non-default LLM backend?** Extend the `env` block above with `AI_MEMORY_LLM_BACKEND`, `AI_MEMORY_LLM_API_KEY`, and `AI_MEMORY_LLM_MODEL`. **Do not** rely on shell exports — MCP-spawned subprocesses don't see your interactive shell's environment ([#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144)). Copy-pasteable recipes for every supported provider (Ollama, LMStudio, vLLM, llama.cpp server, xAI Grok, OpenAI, Anthropic, Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks): [`integrations/llm-backends.md`](integrations/llm-backends.md).
+
 ## 3. Cursor
 
 ```bash
@@ -105,7 +107,9 @@ Restart Cursor. Verify under Settings → Tools & MCP — a green dot
 next to `ai-memory` means it's live. Full recipe (including the
 project-rules `.cursorrules` directive that nudges Cursor to recall
 on session start):
-[`docs/integrations/cursor.md`](integrations/cursor.md).
+[`docs/integrations/cursor.md`](integrations/cursor.md). LLM-backend
+env-block recipe for smart / autonomous tiers:
+[`integrations/llm-backends.md`](integrations/llm-backends.md).
 
 > **Cursor has a ~40 tool cap across all MCP servers.** Stick to
 > `--profile core` (the default — 7 tools) unless you really need

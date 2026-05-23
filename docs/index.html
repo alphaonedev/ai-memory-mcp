@@ -419,6 +419,30 @@ cd ai-memory-mcp &amp;&amp; cargo build --release</code></pre>
       &nbsp;
       <a class="cta ghost" href="QUICKSTART.md">3-minute engineer quickstart</a>
     </div>
+
+    <div style="margin-top:3rem; padding-top:1.5rem; border-top:1px solid var(--border)">
+      <span class="eyebrow">Configure the LLM backend</span>
+      <h3 style="margin-top:0.5rem">Plug ai-memory's <code>smart</code> / <code>autonomous</code> tier into any LLM.</h3>
+      <p class="lede" style="margin-top:0.5rem">
+        v0.7.0 ships a provider-agnostic LLM client. Any of 16+ backends &mdash; local
+        <a href="https://ollama.com">Ollama</a>, LMStudio, vLLM, llama.cpp server,
+        <strong>xAI Grok</strong>, OpenAI, Anthropic, Google Gemini, DeepSeek, Kimi (Moonshot), Qwen
+        (DashScope), Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks
+        &mdash; selected by the <code>AI_MEMORY_LLM_BACKEND</code> env var.
+      </p>
+      <p>
+        <strong>Critical for MCP usage:</strong> shell exports do NOT reach the MCP-spawned subprocess.
+        The LLM env vars MUST live inside your AI client's MCP server-config <code>env:</code> block.
+        Copy-pasteable per-backend recipes (Claude Code <code>~/.claude.json</code>, Cursor
+        <code>~/.cursor/mcp.json</code>, Codex <code>~/.codex/config.toml</code>, etc.) live in the
+        canonical recipe page:
+      </p>
+      <div style="margin-top:1rem">
+        <a class="cta primary" href="integrations/llm-backends.md">LLM-backend MCP recipes &rarr;</a>
+        &nbsp;
+        <a class="cta ghost" href="ADMIN_GUIDE.md#llm-backend-setup-smart--autonomous-tiers">Standalone CLI / HTTP daemon setup</a>
+      </div>
+    </div>
   </div>
 </section>
 

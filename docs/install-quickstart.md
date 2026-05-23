@@ -1,13 +1,21 @@
-# ai-memory v0.7.0 — install quickstart
+# ai-memory v0.7.0 — install quickstart (Path A: super simple)
 
 A friendly, no-jargon install guide. If you can use a terminal, you can
 get ai-memory running in under five minutes. No software engineering
 background required.
 
+> **This is Path A — the singleton, single-laptop case.** One AI
+> client, one user, defaults work. If you're standing up a production
+> deployment (multi-agent on one node, multi-server, multi-DC, swarm,
+> hive, postgres + Apache AGE storage), this is the wrong page —
+> jump to [Path B: production / fleet deployment](#path-b--need-to-go-deeper-fleet-postgres-tuning)
+> at the bottom of this file, or directly to
+> [`production-deployment.md`](production-deployment.md).
+
 For the wire-it-up-to-an-AI step, see
 [`docs/integration-guide.md`](integration-guide.md).
 
-For the full reference (every flag, every package channel, every
+For the full SME reference (every flag, every package channel, every
 production knob) see [`docs/INSTALL.md`](INSTALL.md).
 
 ## 1. What is ai-memory, in one paragraph
@@ -156,7 +164,7 @@ might want to set once and forget:
 |---|---|---|
 | Database path | `export AI_MEMORY_DB=/path/to/db` | Move the SQLite file anywhere on disk. |
 | Default agent ID | `export AI_MEMORY_AGENT_ID=alice` | Stamps every memory `alice` wrote with that ID (instead of the leaky `host:<hostname>:pid-<pid>-<uuid>` fallback). Recommended on shared machines. |
-| LLM backend | `export AI_MEMORY_LLM_BACKEND=ollama` | Picks which LLM the `smart` and `autonomous` tiers talk to. Aliases for `openai`, `xai`, `anthropic`, `gemini`, `deepseek`, `kimi`, `qwen`, `mistral`, `groq`, `together`, `cerebras`, `openrouter`, `fireworks`, `lmstudio` are recognized. Pair with `AI_MEMORY_LLM_API_KEY` for hosted providers; `ollama` and `lmstudio` need no key. |
+| LLM backend | `export AI_MEMORY_LLM_BACKEND=ollama` | Picks which LLM the `smart` and `autonomous` tiers talk to. Aliases for `openai`, `xai`, `anthropic`, `gemini`, `deepseek`, `kimi`, `qwen`, `mistral`, `groq`, `together`, `cerebras`, `openrouter`, `fireworks`, `lmstudio` are recognized. Pair with `AI_MEMORY_LLM_API_KEY` for hosted providers; `ollama` and `lmstudio` need no key. **For MCP usage (Claude Code / Cursor / Codex / etc.) these shell exports are NOT visible to the MCP-spawned subprocess — the same vars MUST also live inside the MCP config's `env:` block.** See [`integrations/llm-backends.md`](integrations/llm-backends.md) for per-backend MCP env-block recipes, and [#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144) for the operator paper-cut history. |
 | Permissions mode | `export AI_MEMORY_PERMISSIONS_MODE=advisory` | Loosens v0.7.0's enforced governance gate to the v0.6.x permissive posture. Default is `enforce` and you should leave it on unless you're debugging. |
 | Encrypted DB | `export AI_MEMORY_ENCRYPT_AT_REST=1` | Requires a sqlcipher build + `--db-passphrase-file`. See [`docs/INSTALL.md`](INSTALL.md) § encrypted-at-rest. |
 
@@ -188,6 +196,21 @@ This writes the right config into `~/.claude.json`, registers the
 SessionStart hook so every new conversation boots memory-aware, and
 backs up your existing settings to a timestamped file first. Restart
 Claude Code and you're done.
+
+> **Using `smart` or `autonomous` tier with a non-Ollama LLM?** The
+> installer writes a default MCP block without LLM-backend env vars
+> (so the default Ollama path keeps working out of the box). To wire
+> xAI Grok / OpenAI / Anthropic / Gemini / DeepSeek / Kimi / Qwen /
+> Mistral / Groq / Together / Cerebras / OpenRouter / Fireworks /
+> LMStudio / vLLM / llama.cpp server, after `--apply`, hand-edit
+> `~/.claude.json`'s `memory` server block and add an `env` map with
+> `AI_MEMORY_LLM_BACKEND`, `AI_MEMORY_LLM_API_KEY`, and
+> `AI_MEMORY_LLM_MODEL`. **Do NOT** rely on shell exports — MCP-spawned
+> subprocesses don't see your interactive shell's env. Copy-pasteable
+> per-backend recipes: [`integrations/llm-backends.md`](integrations/llm-backends.md).
+> Issue [#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144)
+> tracks operator-side ergonomics so future installer revisions wire
+> this for you on first run.
 
 ## 9. Uninstall
 
@@ -250,6 +273,62 @@ the full output.
 | `Error: governance refused` on a write | Permissions mode defaults to `enforce` at v0.7.0. Either approve the pending action (`ai-memory pending list` then `ai-memory pending approve <id>`) or temporarily set `AI_MEMORY_PERMISSIONS_MODE=advisory` while you debug. |
 | `Error: no MCP tools advertised` in the AI client | The AI client started ai-memory with the wrong `--profile` or no `--tier` flag. Confirm the args in the client's MCP config match the snippets in [`docs/integration-guide.md`](integration-guide.md). |
 | Memories from one session don't appear in another | The two clients are pointing at different DB files. Set `AI_MEMORY_DB` to the same path in every client's MCP config, or use `--db <shared-path>` consistently. |
+
+## Path B — Need to go deeper? (fleet, postgres, tuning)
+
+If Path A above met your needs, you're done. Use ai-memory as documented
+above; nothing else in this section applies.
+
+Read on **only if** any of these is true:
+
+- You're running **more than one AI agent on one machine** (Batman /
+  swarm / hive on a single node).
+- You're standing up ai-memory on a **server** with multiple agents
+  connecting over the network, or behind a service mesh.
+- You're deploying across **multiple servers, racks, data centers, or
+  regions**.
+- You need **PostgreSQL + Apache AGE** as the storage backend (multi-
+  tenant, multi-writer, >10M memories, or graph-heavy workloads).
+- You want every **tuning knob** exposed (TTL per tier, governance
+  modes, federation auth layers, hook pipeline, sidechain transcripts,
+  signed-events V-4 chain, …).
+
+The Path-B doc set, in reading order:
+
+1. **[`INSTALL.md`](INSTALL.md)** — full SME install reference. Every
+   package channel, every flag, every Windows / Docker / Kubernetes
+   variant.
+2. **[`production-deployment.md`](production-deployment.md)** — 10-min
+   hardening checklist: keypair provisioning, mTLS allowlist, backup
+   discipline, schema migrations, observability, topology (single-
+   instance / hub-spoke / W-of-N).
+3. **[`ADMIN_GUIDE.md`](ADMIN_GUIDE.md)** — every env var, every
+   `config.toml` field, the full LLM-backend matrix, the embedder /
+   reranker tuning surface.
+4. **[`enterprise-deployment.md`](enterprise-deployment.md)** — 60–90
+   min planning artefact. 8 deployment topologies from singleton on a
+   laptop to multi-region federated fleet; capacity envelope and
+   graduation triggers for each.
+5. **[`postgres-age-guide.md`](postgres-age-guide.md)** — PostgreSQL +
+   Apache AGE first-class storage backend. When to switch off sqlite,
+   how to provision pgvector + AGE, the `ai-memory schema-init` CLI,
+   migration runbook, AGE Cypher KG.
+6. **[`federation.md`](federation.md)** — mTLS, peer attestation,
+   `X-API-Key`, per-message Ed25519 signing + nonce freshness, signed-
+   events V-4 cross-row hash chain.
+7. **[`integrations/llm-backends.md`](integrations/llm-backends.md)** —
+   MCP env-block recipes for every supported LLM provider (Ollama /
+   LMStudio / vLLM / llama.cpp server / xAI / OpenAI / Anthropic /
+   Gemini / DeepSeek / Kimi / Qwen / Mistral / Groq / Together /
+   Cerebras / OpenRouter / Fireworks). Includes a fleet / multi-agent
+   / multi-DC considerations section.
+8. **[`batman-active-mode.md`](batman-active-mode.md)** — multi-agent
+   coordination on one node (Batman A2A); operator how-to for turning
+   Forms 1–6 + 7th from capable → active.
+9. **[`a2a-harness-integration.md`](a2a-harness-integration.md)** —
+   agent-to-agent across nodes (full A2A wire shape).
+10. **[`mobile-iot-deployment.md`](mobile-iot-deployment.md)** — iOS,
+    Android, edge / IoT, resource-constrained deployment.
 
 ## See also
 

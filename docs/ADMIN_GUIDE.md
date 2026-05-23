@@ -171,6 +171,16 @@ ai-memory serve --host 127.0.0.1 --port 9077
 
 The `smart` and `autonomous` tiers require an LLM backend. **Post-[#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067) (v0.7.0)** the backend is provider-agnostic — pick from local Ollama OR any OpenAI-compatible vendor (xAI Grok, OpenAI, Anthropic via OpenAI shim, Google Gemini, DeepSeek, Kimi/Moonshot, Qwen/Dashscope, Mistral, Groq, Together AI, Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, llama.cpp server).
 
+> **Important — MCP clients do NOT inherit your interactive shell** ([#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144)). The shell-level `export AI_MEMORY_LLM_BACKEND=…` setup documented below is sufficient for:
+>
+> - the standalone `ai-memory` CLI (`ai-memory store / recall / search / list / …`)
+> - the standalone HTTP daemon (`ai-memory serve …`)
+> - any process you launch yourself from an interactive shell that inherits the exports
+>
+> It is **NOT sufficient** for MCP usage — Claude Code, Claude Desktop, Cursor, Codex CLI, Cline, Continue, Zed, Windsurf, Goose, Roo Code, etc. spawn the MCP server as a **fresh subprocess** with only the `env:` keys explicitly declared in the MCP server config. Shell exports from your `.zshrc` / `.bashrc` / `.profile` are invisible to that subprocess.
+>
+> For MCP usage, the same `AI_MEMORY_LLM_BACKEND` / `AI_MEMORY_LLM_API_KEY` / `AI_MEMORY_LLM_MODEL` variables MUST also live inside the MCP server config's `env:` block. Copy-pasteable per-backend recipes (Ollama, LMStudio, vLLM, llama.cpp server, xAI, OpenAI, Anthropic, Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks): see [`integrations/llm-backends.md`](integrations/llm-backends.md).
+
 **Selection by env var.** Set `AI_MEMORY_LLM_BACKEND` to one of: `ollama` (default), `openai-compatible` (generic; requires `AI_MEMORY_LLM_BASE_URL`), or a pre-filled vendor alias (`openai`, `xai`, `anthropic`, `gemini`, `deepseek`, `kimi`/`moonshot`, `qwen`/`dashscope`, `mistral`, `groq`, `together`, `cerebras`, `openrouter`, `fireworks`, `lmstudio`).
 
 ```bash
