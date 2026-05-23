@@ -23,6 +23,12 @@ Signed-events V-4 cross-row hash chain from
 [`signed-events-v4.md`](signed-events-v4.md). Threat model + disclosure
 policy from [`../SECURITY.md`](../SECURITY.md). v0.7.0 feature inventory
 from [`internal/v070-feature-inventory.md`](internal/v070-feature-inventory.md).
+**LLM backend wiring for smart / autonomous tiers — including the
+MCP env-block vs. shell-export distinction, per-vendor recipes, and
+fleet / multi-agent / multi-DC considerations** — from
+[`integrations/llm-backends.md`](integrations/llm-backends.md). The
+multi-agent / fleet / multi-DC section of that doc is the canonical
+cross-reference for "how do I wire the LLM at T2+ topologies."
 
 **Hard-rule reminders that hold across every topology in this guide:**
 

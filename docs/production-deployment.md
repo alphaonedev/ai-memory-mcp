@@ -130,6 +130,62 @@ Sizing guide (Apple M2, 16 GB, SQLite reference):
 
 ---
 
+## 7b. LLM backend wiring (smart / autonomous tier)
+
+If your deployment uses `--tier smart` or `--tier autonomous`, the
+substrate needs an LLM backend. Two wire shapes apply, with **different
+discoverability stories** for the env vars:
+
+- **HTTP daemon (`ai-memory serve`).** The daemon inherits the env of
+  the user / systemd unit / Docker container that launched it. Setting
+  `AI_MEMORY_LLM_BACKEND` / `AI_MEMORY_LLM_API_KEY` / `AI_MEMORY_LLM_MODEL`
+  in the unit file's `Environment=` / `EnvironmentFile=` directives (or
+  in the container's `ENV` / `--env-file`) is the canonical pattern.
+  Shell exports work for interactive launch but not for systemd /
+  Docker / Kubernetes — those have their own env contracts.
+- **MCP servers (`ai-memory mcp`).** Spawned by AI clients (Claude
+  Code, Claude Desktop, Cursor, Codex CLI, Cline, Continue, Zed,
+  Windsurf, Goose, Roo Code, etc.) as a **fresh subprocess** with only
+  the `env:` keys declared in the MCP server config. Shell exports
+  from `.zshrc` / `.bashrc` / `.profile` are NOT visible. This was the
+  operator paper-cut behind [#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144).
+
+For MCP usage, the LLM env vars MUST live inside the MCP server
+config's `env:` block. Copy-pasteable per-backend recipes (Ollama,
+LMStudio, vLLM, llama.cpp server, xAI, OpenAI, Anthropic, Gemini,
+DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter,
+Fireworks) + multi-agent / multi-DC / fleet considerations:
+[`integrations/llm-backends.md`](integrations/llm-backends.md).
+
+Fleet rollout pattern (systemd):
+
+```
+# /etc/systemd/system/ai-memory.service
+[Service]
+EnvironmentFile=/etc/ai-memory/llm.env
+ExecStart=/usr/local/bin/ai-memory serve --tier autonomous --store-url postgres://...
+User=ai-memory
+Group=ai-memory
+```
+
+```
+# /etc/ai-memory/llm.env  (chmod 0640, owned by root:ai-memory)
+AI_MEMORY_LLM_BACKEND=xai
+AI_MEMORY_LLM_API_KEY=xai-...
+AI_MEMORY_LLM_MODEL=grok-4.3
+```
+
+For fleet deployments managed via Ansible / Chef / Puppet / Salt / Nix,
+render `/etc/ai-memory/llm.env` from a template and pull the secret
+from your vault. Rotation = vault rotate + `systemctl restart
+ai-memory`.
+
+For multi-DC deployments with regional cloud LLM endpoints, override
+the per-alias default URL with `AI_MEMORY_LLM_BASE_URL`. See
+[`integrations/llm-backends.md` § Multi-DC / multi-region](integrations/llm-backends.md#multi-dc--multi-region--regional-cloud-endpoints).
+
+---
+
 ## 8. Upgrades
 
 The canonical upgrade sequence:

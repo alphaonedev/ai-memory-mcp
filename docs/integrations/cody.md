@@ -2,6 +2,8 @@
 
 **Category 3 (programmatic).** 100% reliable when implemented.
 
+> **Cross-reference — using Cody as the AI client vs. running ai-memory's smart/autonomous tier behind Cody.** This doc covers Cody reading ai-memory boot output (Cody as client). For wiring an LLM backend to ai-memory's own smart/autonomous tier (which calls out to an LLM internally for query expansion, auto-tag, etc.), see [`llm-backends.md`](llm-backends.md) — the MCP-config env-block recipe applies to any MCP-host AI client; shell exports do NOT reach MCP-spawned subprocesses ([#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144)).
+
 [Cody](https://sourcegraph.com/cody) is Sourcegraph's AI coding
 assistant. It ships as VS Code / JetBrains extensions and a CLI
 (`cody`), and exposes a programmatic chat API for Sourcegraph

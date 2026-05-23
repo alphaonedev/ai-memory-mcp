@@ -9,6 +9,8 @@ boundary. The pattern is the same regardless of runtime: the front-end app
 or wrapper script prepends `ai-memory boot` output to the system message
 before the first request.
 
+> **Cross-reference — using a local model as ai-memory's own LLM backend.** This doc covers local models as the AI client (reading ai-memory boot output). For the inverse direction — ai-memory's smart / autonomous tier calling out to a local LMStudio / vLLM / llama.cpp server / Ollama endpoint for query expansion, auto-tag, etc. — see [`llm-backends.md`](llm-backends.md) §§ Ollama / LMStudio / Generic OpenAI-compatible (self-hosted). MCP env-block recipes cover the full matrix; shell exports do NOT reach MCP-spawned subprocesses ([#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144)).
+
 ## Or for the simple wrapper case — `ai-memory wrap`
 
 PR-6 of issue #487 ships a built-in cross-platform Rust subcommand

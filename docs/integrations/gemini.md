@@ -10,6 +10,8 @@ integration is at the application boundary: shell out to `ai-memory boot`
 and prepend the result to the system instruction (or the first message
 of the conversation when no system slot exists).
 
+> **Cross-reference — using Gemini as ai-memory's own LLM backend?** That's the inverse direction (ai-memory's smart/autonomous tiers calling out to Gemini for query expansion / auto-tag / contradiction detection). MCP-config recipe for that case: [`llm-backends.md` § Google Gemini](llm-backends.md#google-gemini). The shell-out pattern below uses Gemini as the AI client; that's a separate concern.
+
 The canonical Rust-native cross-platform replacement for the wrapper
 script below is `ai-memory wrap gemini` (PR-6 of issue #487) — same
 semantics, no shell required, works on Windows / Docker / Kubernetes.

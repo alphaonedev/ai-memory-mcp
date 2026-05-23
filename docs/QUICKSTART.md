@@ -4,6 +4,16 @@ This guide gets you from zero to a working ai-memory install and your
 first stored + recalled memory. Choose one of three paths depending
 on how you want to use it.
 
+> **Looking for a friendlier walkthrough?** This page is the
+> single-developer / single-laptop CLI + MCP + HTTP comparison. For a
+> super-simple, copy-paste install + config walkthrough with zero
+> jargon, see [`install-quickstart.md`](install-quickstart.md).
+>
+> **Standing up a fleet / multi-DC / postgres+AGE deployment?** This
+> page is the wrong starting point — see
+> [`production-deployment.md`](production-deployment.md) and
+> [`enterprise-deployment.md`](enterprise-deployment.md).
+
 ## Install
 
 ```bash
@@ -48,7 +58,7 @@ That's it. Memories live in `~/ai-memory.db` (override with `--db` or
 ai-memory is an MCP server. Wire it into your AI IDE and every
 conversation gets persistent memory across sessions.
 
-**Claude Code** — add to `~/.claude/mcp_servers.json`:
+**Claude Code** — add to `~/.claude.json` (user scope):
 
 ```json
 {
@@ -77,6 +87,35 @@ conversation gets persistent memory across sessions.
 Command: ai-memory
 Args: mcp --tier semantic
 ```
+
+**Smart / autonomous tier with a cloud LLM** (any of xAI Grok, OpenAI,
+Anthropic, Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together,
+Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, llama.cpp server) —
+add an `env` block to the MCP server entry. Example for xAI Grok:
+
+```json
+{
+  "mcpServers": {
+    "ai-memory": {
+      "command": "ai-memory",
+      "args": ["mcp", "--tier", "autonomous"],
+      "env": {
+        "AI_MEMORY_LLM_BACKEND": "xai",
+        "AI_MEMORY_LLM_API_KEY": "xai-...",
+        "AI_MEMORY_LLM_MODEL": "grok-4.3"
+      }
+    }
+  }
+}
+```
+
+> **MCP clients do not inherit your shell.** Setting `export
+> AI_MEMORY_LLM_BACKEND=xai` in `.zshrc` works for the standalone CLI
+> but **not** for MCP usage — Claude Code / Cursor / Codex spawn the
+> MCP server as a fresh subprocess. Put the LLM env vars inside the
+> MCP config's `env:` block. Full per-backend recipes:
+> [`integrations/llm-backends.md`](integrations/llm-backends.md)
+> (issue [#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144)).
 
 Restart the IDE. You'll now see 23 `memory_*` tools in the tool list.
 Ask the assistant "remember that my preferred deploy target is
