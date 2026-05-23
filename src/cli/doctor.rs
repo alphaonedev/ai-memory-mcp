@@ -526,6 +526,7 @@ fn run_local(db_path: &Path) -> Report {
     sections.push(section_webhook(&conn));
     sections.push(section_capabilities_local());
     sections.push(section_reflection_health(&conn));
+    sections.push(section_llm_reachability_1146());
 
     Report {
         mode: "local".into(),
@@ -833,6 +834,179 @@ fn section_capabilities_local() -> ReportSection {
             "use --remote <url> to query the live capabilities endpoint".into(),
         )],
         note: None,
+    }
+}
+
+/// v0.7.x (#1146) — LLM reachability probe.
+///
+/// Resolves the canonical LLM configuration via
+/// [`crate::config::AppConfig::resolve_llm`] (the same path used by
+/// MCP, HTTP daemon, atomise, curator, and the boot banner) and
+/// fires a lightweight HTTP probe at the resolved `base_url`. Maps
+/// the response to a Severity per the #1146 spec:
+///
+/// | Status   | HTTP outcomes                          |
+/// |----------|----------------------------------------|
+/// | INFO     | 200 (vendor reachable + auth OK)       |
+/// | WARN     | 401 / 403 (auth issue; URL reachable)  |
+/// | WARN     | 429 (rate-limited; reachable)          |
+/// | WARN     | 5xx (vendor outage; reachable)         |
+/// | CRIT     | 4xx other (likely wrong base_url)      |
+/// | CRIT     | network/DNS/connect-refused/TLS error  |
+///
+/// Probe endpoint per backend:
+/// - `ollama` → `GET <base_url>/api/tags` (no auth)
+/// - any OpenAI-compatible → `GET <base_url>/models` (Bearer auth)
+///
+/// The section's `facts` carry the resolver's full provenance
+/// (`backend`, `model`, `base_url`, `config_source`, `key_source`)
+/// plus the HTTP status code + observed latency, so operators can
+/// see WHERE the wiring came from and WHY the probe lands where it
+/// does.
+fn section_llm_reachability_1146() -> ReportSection {
+    use crate::config::{AppConfig, ConfigSource, KeySource};
+
+    let app_config = AppConfig::load();
+    let resolved = app_config.resolve_llm(None, None, None);
+
+    let mut facts = vec![
+        ("backend".into(), resolved.backend.clone()),
+        ("model".into(), resolved.model.clone()),
+        ("base_url".into(), resolved.base_url.clone()),
+        ("config_source".into(), resolved.source.as_str().to_string()),
+        (
+            "key_source".into(),
+            resolved.api_key_source.as_str().to_string(),
+        ),
+    ];
+
+    // If the key resolution surfaced an error during resolve (file
+    // perms / missing env / etc.), call it out — but still try the
+    // probe so the operator sees if the URL is at least reachable.
+    if let KeySource::Error(reason) = &resolved.api_key_source {
+        facts.push(("key_error".into(), reason.clone()));
+    }
+
+    // Compiled-default warning — operator has no LLM configuration
+    // anywhere; the resolver's last-resort fallback won.
+    if matches!(resolved.source, ConfigSource::CompiledDefault) {
+        return ReportSection {
+            name: "LLM Reachability (#1146)".into(),
+            severity: Severity::Warning,
+            facts,
+            note: Some(
+                "no operator LLM configuration found (CLI / env / [llm] section / \
+                 legacy flat fields all absent); resolver fell through to the \
+                 compiled default. Set AI_MEMORY_LLM_BACKEND or write a [llm] \
+                 section in config.toml to enable LLM-powered features."
+                    .into(),
+            ),
+        };
+    }
+
+    // Build the probe URL.
+    let (probe_url, bearer) = if resolved.is_ollama_native() {
+        (format!("{}/api/tags", resolved.base_url), None)
+    } else {
+        (
+            format!("{}/models", resolved.base_url),
+            resolved.api_key().map(str::to_string),
+        )
+    };
+    facts.push(("probe_url".into(), probe_url.clone()));
+
+    let started = std::time::Instant::now();
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            facts.push(("error".into(), format!("http client build failed: {e}")));
+            return ReportSection {
+                name: "LLM Reachability (#1146)".into(),
+                severity: Severity::Critical,
+                facts,
+                note: Some("could not build HTTP client for probe".into()),
+            };
+        }
+    };
+
+    let mut req = client.get(&probe_url);
+    if let Some(k) = bearer {
+        req = req.bearer_auth(k);
+    }
+
+    let (severity, note) = match req.send() {
+        Ok(resp) => {
+            let status = resp.status();
+            let elapsed_ms = started.elapsed().as_millis();
+            facts.push(("http_status".into(), status.as_u16().to_string()));
+            facts.push(("latency_ms".into(), elapsed_ms.to_string()));
+
+            if status.is_success() {
+                (Severity::Info, None)
+            } else if status.as_u16() == 401 || status.as_u16() == 403 {
+                (
+                    Severity::Warning,
+                    Some(format!(
+                        "auth failed (status {}); URL is reachable but the \
+                         resolved API key was rejected — check api_key_env / \
+                         api_key_file / process env",
+                        status.as_u16()
+                    )),
+                )
+            } else if status.as_u16() == 429 {
+                (
+                    Severity::Warning,
+                    Some("rate-limited (status 429); vendor reachable but throttling".into()),
+                )
+            } else if status.is_server_error() {
+                (
+                    Severity::Warning,
+                    Some(format!(
+                        "vendor 5xx (status {}); reachable but currently degraded",
+                        status.as_u16()
+                    )),
+                )
+            } else {
+                (
+                    Severity::Critical,
+                    Some(format!(
+                        "unexpected status {} from {} — verify base_url + endpoint shape",
+                        status.as_u16(),
+                        probe_url
+                    )),
+                )
+            }
+        }
+        Err(e) => {
+            let elapsed_ms = started.elapsed().as_millis();
+            facts.push(("latency_ms".into(), elapsed_ms.to_string()));
+            facts.push(("error".into(), e.to_string()));
+            let kind = if e.is_timeout() {
+                "timeout"
+            } else if e.is_connect() {
+                "connect"
+            } else {
+                "transport"
+            };
+            (
+                Severity::Critical,
+                Some(format!(
+                    "network/{kind} error contacting {probe_url} — verify \
+                     base_url and connectivity"
+                )),
+            )
+        }
+    };
+
+    ReportSection {
+        name: "LLM Reachability (#1146)".into(),
+        severity,
+        facts,
+        note,
     }
 }
 
@@ -1358,12 +1532,13 @@ mod tests {
     }
 
     #[test]
-    fn local_run_on_empty_db_produces_eight_sections() {
+    fn local_run_on_empty_db_produces_nine_sections() {
         let env = TestEnv::fresh();
         let report = run_local_collect(&env.db_path);
         assert_eq!(report.mode, "local");
-        // L1-4 adds "Reflection Health" — total is now 8.
-        assert_eq!(report.sections.len(), 8);
+        // L1-4 added "Reflection Health"; #1146 added
+        // "LLM Reachability (#1146)" — total is now 9.
+        assert_eq!(report.sections.len(), 9);
         let names: Vec<&str> = report.sections.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
             names,
@@ -1376,6 +1551,7 @@ mod tests {
                 "Webhook",
                 "Capabilities",
                 "Reflection Health",
+                "LLM Reachability (#1146)",
             ]
         );
     }
