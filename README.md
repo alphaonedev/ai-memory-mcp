@@ -662,8 +662,8 @@ Beyond MCP, ai-memory also exposes a full HTTP REST API (73 routes on port 9077 
 - **Tagging** -- comma-separated tags with filter support
 
 ### Interfaces
-- **73 HTTP endpoints** -- full REST API on 127.0.0.1:9077 (works with any AI or tool)
-- **57 CLI subcommands at v0.7.0 with `--features sal-postgres`** (55 in the default build) -- complete CLI with identical capabilities
+- **88 HTTP routes (43 unique paths)** -- full REST API on 127.0.0.1:9077 (works with any AI or tool)
+- **58 CLI subcommands at v0.7.0 with `--features sal-postgres`** (55 in the default build) -- complete CLI with identical capabilities
 - **73 MCP tools** at full profile (7 default at v0.7.0; verified against `Profile::full().expected_tool_count()`) -- native integration for any MCP-compatible AI
 - **Interactive REPL shell** -- recall, search, list, get, stats, namespaces, delete with color output
 - **JSON output** -- `--json` flag on all CLI commands
@@ -956,7 +956,7 @@ These 73 tools (full profile at v0.7.0; canonical count via `Profile::full().exp
 
 ## CLI Commands
 
-57 top-level subcommands at v0.7.0 with `--features sal-postgres` (55 in the default build; the 2-variant gap is `Migrate` + `SchemaInit`, both sal-gated; was 40 at v0.6.4). Run `ai-memory <command> --help` for details on any command, or `ai-memory --help` for the full list.
+58 top-level subcommands at v0.7.0 with `--features sal-postgres` (55 in the default build; the 2-variant gap is `Migrate` + `SchemaInit`, both sal-gated; was 40 at v0.6.4). Run `ai-memory <command> --help` for details on any command, or `ai-memory --help` for the full list.
 
 | Command | Description |
 |---------|-------------|

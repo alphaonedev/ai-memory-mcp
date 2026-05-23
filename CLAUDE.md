@@ -217,8 +217,8 @@ release-notes intro lives under `docs/v0.7.0/release-notes.md`
 **ai-memory** is a Rust-based persistent memory system exposing three interfaces over a shared SQLite database layer:
 
 1. **MCP Server** (`src/mcp/`) — stdio JSON-RPC 2.0 with **73 advertised entries at `--profile full`** at v0.7.0 (72 callable "memory tools" + the always-on `memory_capabilities` bootstrap — both numbers are intentional; see issue [#862](https://github.com/alphaonedev/ai-memory-mcp/issues/862) for the disambiguation, and `Profile::full().expected_tool_count()` in `src/profile.rs` for the canonical assertion). Default `--profile core` ships **7 tools** at v0.7.0 (the original 5 + `memory_load_family` + `memory_smart_load`) plus the always-on `memory_capabilities` bootstrap. Plus 2 prompts (`recall-first`, `memory-workflow`).
-2. **HTTP API** (`src/handlers/`) — Axum REST server on port 9077, **73 `.route(...)` registrations in `src/lib.rs`** at `/api/v1/` (verified by `grep -c '^\s*\.route(' src/lib.rs`) (and the bare `/metrics` Prometheus surface). Handlers split per domain under `src/handlers/{http,federation_receive,hook_subscribers,transport}.rs` (#650 partially addressed at v0.7.0; full per-domain split tracked in #650).
-3. **CLI** (`src/main.rs` thin shim + `src/daemon_runtime.rs::Command`) — clap-based, **57 top-level subcommands** at v0.7.0 (was 40 at v0.6.4) with optional `--json` output (count: `--features sal-postgres` includes the postgres-only `schema-init` subcommand; the default build ships 55)
+2. **HTTP API** (`src/handlers/`) — Axum REST server on port 9077, **88 `.route(...)` registrations in `src/lib.rs`** at `/api/v1/` (43 unique URL paths × multiple HTTP methods per path; verified by `grep -c '^\s*\.route(' src/lib.rs` = 88, `grep -Eo '\.route\("/api/v1[^"]*' src/lib.rs | sort -u | wc -l` = 43 — count grew from v0.6.4's 73 via the #1146 sectioned-config + `config migrate` HTTP paths and the v0.7 atomisation / persona / skills / kg surface additions) (plus the bare `/metrics` Prometheus surface). Handlers split per domain under `src/handlers/{http,federation_receive,hook_subscribers,transport}.rs` (#650 partially addressed at v0.7.0; full per-domain split tracked in #650).
+3. **CLI** (`src/main.rs` thin shim + `src/daemon_runtime.rs::Command`) — clap-based, **58 top-level subcommands** at v0.7.0 release (was 40 at v0.6.4; 58 verified via `awk '/^pub enum Command/,/^}/' src/daemon_runtime.rs | grep -E '^    [A-Z]' | wc -l` — count grew from 57 at v0.7.0 dev tip via #1146 adding the `Config` subcommand for `ai-memory config migrate`) with optional `--json` output (count: `--features sal-postgres` includes the postgres-only `schema-init` subcommand; the default build ships 56)
 
 All three interfaces share the same storage layer (`src/storage/`) and validation (`src/validate.rs`) layers. **Connection-sharing topology differs per interface** (post-#965 audit, 2026-05-21):
 
@@ -665,7 +665,7 @@ Every defect is fixed.
 
 **World-class only.** We are driving toward perfection. The
 ai-memory codebase is now substantial (73 MCP tools at `--profile
-full`, 73 HTTP endpoints, 57 CLI subcommands at v0.7.0, tens of
+full`, 88 HTTP route registrations / 43 unique URL paths, 58 CLI subcommands at v0.7.0, tens of
 thousands of lines of Rust); the architectural North Star is
 long-term code-base manageability so the codebase lasts for a
 very long time.
