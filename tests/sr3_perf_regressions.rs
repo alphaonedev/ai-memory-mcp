@@ -34,6 +34,16 @@
 
 #![allow(clippy::doc_markdown)]
 
+/// v0.7.x (#1146 PR #1147 cycle 5) — normalise CRLF → LF on Windows
+/// checkouts so the source-pattern matchers below (which use `\n`
+/// literals) match regardless of platform line-ending posture. The
+/// gates pre-#1146 were Linux-only via the matrix; the rebased PR
+/// surfaced the gap. Pure transform — no behaviour change on Linux
+/// / macOS where `\r\n` does not appear.
+fn lf(source: &str) -> String {
+    source.replace("\r\n", "\n")
+}
+
 // -----------------------------------------------------------------
 // #1077 — tool_definitions() memoization (source-level pin)
 // -----------------------------------------------------------------
@@ -47,7 +57,7 @@
 
 #[test]
 fn sr3_1077_tool_definitions_has_oncelock_cache() {
-    let source = include_str!("../src/mcp/registry.rs");
+    let source = lf(include_str!("../src/mcp/registry.rs"));
     // The bare `tool_definitions()` function must memoize the catalog.
     assert!(
         source.contains("static CACHE: std::sync::OnceLock<Value> = std::sync::OnceLock::new();"),
@@ -88,7 +98,7 @@ fn sr3_1093_eviction_ring_is_vecdeque_not_vec() {
     // Source-level pin via the static declaration. A regression
     // that switches back to `Vec<u64>` would change the declared
     // type and break this grep-flavored read.
-    let source = include_str!("../src/hnsw.rs");
+    let source = lf(include_str!("../src/hnsw.rs"));
     assert!(
         source.contains("Mutex<std::collections::VecDeque<u64>>"),
         "EVICTION_RATE_RING must be Mutex<VecDeque<u64>> post-#1093"
@@ -111,7 +121,7 @@ fn sr3_1093_eviction_ring_is_vecdeque_not_vec() {
 
 #[test]
 fn sr3_1105_mcp_dispatch_is_hashmap_lookup() {
-    let source = include_str!("../src/mcp/mod.rs");
+    let source = lf(include_str!("../src/mcp/mod.rs"));
     // The post-#1105 implementation builds a `HashMap` via
     // `OnceLock` and looks up via `map.get(tool_name).copied()`.
     assert!(
@@ -144,7 +154,7 @@ fn sr3_1105_mcp_dispatch_is_hashmap_lookup() {
 
 #[test]
 fn sr3_1072_subscription_dispatch_reuses_worker_conn() {
-    let source = include_str!("../src/subscriptions.rs");
+    let source = lf(include_str!("../src/subscriptions.rs"));
     // The post-#1072 worker thread opens ONE Connection at entry and
     // routes all four sqlite writes (record_subscription_event,
     // update_event_status, record_dispatch, record_dlq) through the
@@ -193,7 +203,7 @@ fn sr3_1073_dispatch_http_client_scaffolding_exists() {
     // SSRF correctness gate wins over the per-attempt builder cost;
     // this pin documents that the accessor exists and the OnceLock
     // shape is correct for the future swap-in.
-    let source = include_str!("../src/subscriptions.rs");
+    let source = lf(include_str!("../src/subscriptions.rs"));
     assert!(
         source.contains("fn dispatch_http_client() -> Option<&'static reqwest::blocking::Client>"),
         "dispatch_http_client() scaffolding must exist post-#1073"
@@ -210,7 +220,7 @@ fn sr3_1073_dispatch_http_client_scaffolding_exists() {
 
 #[test]
 fn sr3_1097_dispatch_uses_list_by_event() {
-    let source = include_str!("../src/subscriptions.rs");
+    let source = lf(include_str!("../src/subscriptions.rs"));
     let dispatch_fn = source
         .split("pub fn dispatch_event_with_details(")
         .nth(1)
@@ -246,7 +256,7 @@ fn sr3_1097_dispatch_uses_list_by_event() {
 
 #[test]
 fn sr3_1079_touch_after_recall_uses_touch_many() {
-    let source = include_str!("../src/store/sqlite.rs");
+    let source = lf(include_str!("../src/store/sqlite.rs"));
     let fn_body = source
         .split("async fn touch_after_recall(")
         .nth(1)
@@ -271,7 +281,7 @@ fn sr3_1079_touch_after_recall_uses_touch_many() {
 
 #[test]
 fn sr3_1084_embedder_local_no_mutex() {
-    let source = include_str!("../src/embeddings.rs");
+    let source = lf(include_str!("../src/embeddings.rs"));
     let local_variant = source
         .split("    Local {")
         .nth(1)
@@ -290,7 +300,7 @@ fn sr3_1084_embedder_local_no_mutex() {
 
 #[test]
 fn sr3_1084_crossencoder_neural_no_mutex() {
-    let source = include_str!("../src/reranker.rs");
+    let source = lf(include_str!("../src/reranker.rs"));
     let neural_variant = source
         .split("    Neural {\n        model:")
         .nth(1)
@@ -315,7 +325,7 @@ fn sr3_1084_crossencoder_neural_no_mutex() {
 
 #[test]
 fn sr3_1087_hnsw_search_caches_valid_ids() {
-    let source = include_str!("../src/hnsw.rs");
+    let source = lf(include_str!("../src/hnsw.rs"));
     assert!(
         source.contains("valid_ids_cache: Option<std::collections::HashSet<String>>"),
         "IndexState must carry a cached valid_ids set post-#1087"
@@ -360,7 +370,7 @@ fn sr3_1087_hnsw_search_caches_valid_ids() {
 
 #[test]
 fn sr3_1091_session_recency_uses_callback_membership() {
-    let source = include_str!("../src/reranker.rs");
+    let source = lf(include_str!("../src/reranker.rs"));
     assert!(
         source.contains("pub fn with_recent_ids<R>("),
         "with_recent_ids callback API must exist post-#1091"
