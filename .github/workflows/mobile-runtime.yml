@@ -293,6 +293,21 @@ jobs:
 
       - name: Boot Android emulator + run tests
         uses: reactivecircus/android-emulator-runner@v2
+        env:
+          # v0.7.0 ship-readiness fix (#1159, post-shell-syntax fixes
+          # in PRs #1161/#1162) — pass the NDK's libc++_shared.so path
+          # into the action's `script:` block so the test binary's
+          # dynamic linker can find its C++ runtime on the emulator.
+          # The Rust cdylib for x86_64-linux-android dynamically links
+          # against `libc++_shared.so` (NDK r26d default); without
+          # pushing it alongside the test binary the emulator's
+          # dynamic linker reports `CANNOT LINK EXECUTABLE: library
+          # "libc++_shared.so" not found: needed by main executable`
+          # → exit 1 → workflow failure. Pre-PR #1162's shell-syntax
+          # fixes, the workflow never got to actually running the
+          # binary, so this pre-existing Layer-3 substrate test
+          # infrastructure gap was latent.
+          NDK_LIB_PATH: ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/x86_64-linux-android
         with:
           api-level: 30
           target: google_apis
@@ -314,13 +329,18 @@ jobs:
             #  (2) The dash shell also rejects `set -o pipefail`
             #      ("Illegal option -o pipefail") so we keep the
             #      script entirely posix-sh-safe.
+            #  (3) The Rust cdylib test binary for x86_64-linux-android
+            #      dynamically links against `libc++_shared.so` from
+            #      the NDK. Push it to the emulator alongside the
+            #      binary and set `LD_LIBRARY_PATH=/data/local/tmp` so
+            #      the dynamic linker resolves it at process startup.
             # Solution: collapse the multi-line adb-shell invocation
             # into a single line (no continuations), drop the
             # outer `set -eu` since each line is its own subprocess
-            # anyway, and use the action's built-in exit-code
-            # propagation (any non-zero exit on any line fails the
-            # whole step).
+            # anyway, push the NDK libc++_shared.so alongside the test
+            # binary, and prepend LD_LIBRARY_PATH at run time.
+            adb push "$NDK_LIB_PATH/libc++_shared.so" /data/local/tmp/libc++_shared.so
             adb push "$MOBILE_TEST_BIN" /data/local/tmp/mobile_runtime
             adb shell chmod 755 /data/local/tmp/mobile_runtime
-            adb shell "mkdir -p /data/local/tmp/ai-memory-sandbox && ANDROID_DATA_DIR=/data/local/tmp/ai-memory-sandbox /data/local/tmp/mobile_runtime --test-threads=1"
+            adb shell "mkdir -p /data/local/tmp/ai-memory-sandbox && cd /data/local/tmp && LD_LIBRARY_PATH=/data/local/tmp ANDROID_DATA_DIR=/data/local/tmp/ai-memory-sandbox ./mobile_runtime --test-threads=1"
             echo "::notice::Android emulator mobile_runtime — all tests green"
