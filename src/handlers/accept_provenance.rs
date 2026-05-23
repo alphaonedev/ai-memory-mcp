@@ -101,7 +101,10 @@ mod tests {
 
     fn hm(name: &str, value: &str) -> HeaderMap {
         let mut h = HeaderMap::new();
-        h.insert(name.parse::<axum::http::HeaderName>().unwrap(), HeaderValue::from_str(value).unwrap());
+        h.insert(
+            name.parse::<axum::http::HeaderName>().unwrap(),
+            HeaderValue::from_str(value).unwrap(),
+        );
         h
     }
 
@@ -162,7 +165,13 @@ mod tests {
 
     #[test]
     fn whitespace_tolerated() {
-        for value in ["verbose", " verbose", "verbose ", "  verbose  ", "\tverbose"] {
+        for value in [
+            "verbose",
+            " verbose",
+            "verbose ",
+            "  verbose  ",
+            "\tverbose",
+        ] {
             let h = hm("accept-provenance", value);
             assert_eq!(
                 resolve_from_headers(&h),
@@ -183,7 +192,11 @@ mod tests {
         // HTTP header names are case-insensitive per RFC 7230. Axum
         // normalises during HeaderMap insertion so this test verifies
         // the contract holds end-to-end.
-        for name in ["Accept-Provenance", "accept-provenance", "ACCEPT-PROVENANCE"] {
+        for name in [
+            "Accept-Provenance",
+            "accept-provenance",
+            "ACCEPT-PROVENANCE",
+        ] {
             let h = hm(name, "verbose");
             assert_eq!(
                 resolve_from_headers(&h),

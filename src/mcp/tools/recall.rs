@@ -364,7 +364,10 @@ pub(crate) fn freshness_state(mem: &Memory) -> &'static str {
 /// self_signed > unsigned`. Returns `None` when no links exist.
 /// Best-effort: a SQL error returns `None` so the recall row keeps
 /// its remaining decoration.
-pub(crate) fn latest_link_attest_level(conn: &rusqlite::Connection, memory_id: &str) -> Option<String> {
+pub(crate) fn latest_link_attest_level(
+    conn: &rusqlite::Connection,
+    memory_id: &str,
+) -> Option<String> {
     let links = db::get_links(conn, memory_id).ok()?;
     let mut best: Option<AttestLevel> = None;
     for link in &links {

@@ -227,14 +227,33 @@ pub fn verify_signed_identity(block: &Value) -> Result<(), ed25519_dalek::Signat
     let make_err = ed25519_dalek::SignatureError::new;
 
     let obj = block.as_object().ok_or_else(make_err)?;
-    let schema_version = obj.get("schema_version").and_then(Value::as_str).ok_or_else(make_err)?;
-    let daemon_id = obj.get("daemon_id").and_then(Value::as_str).ok_or_else(make_err)?;
-    let public_key_b64 = obj.get("public_key").and_then(Value::as_str).ok_or_else(make_err)?;
-    let signed_at = obj.get("signed_at").and_then(Value::as_str).ok_or_else(make_err)?;
-    let signature_b64 = obj.get("signature").and_then(Value::as_str).ok_or_else(make_err)?;
+    let schema_version = obj
+        .get("schema_version")
+        .and_then(Value::as_str)
+        .ok_or_else(make_err)?;
+    let daemon_id = obj
+        .get("daemon_id")
+        .and_then(Value::as_str)
+        .ok_or_else(make_err)?;
+    let public_key_b64 = obj
+        .get("public_key")
+        .and_then(Value::as_str)
+        .ok_or_else(make_err)?;
+    let signed_at = obj
+        .get("signed_at")
+        .and_then(Value::as_str)
+        .ok_or_else(make_err)?;
+    let signature_b64 = obj
+        .get("signature")
+        .and_then(Value::as_str)
+        .ok_or_else(make_err)?;
 
-    let public_key_bytes = URL_SAFE_NO_PAD.decode(public_key_b64).map_err(|_| make_err())?;
-    let signature_bytes = URL_SAFE_NO_PAD.decode(signature_b64).map_err(|_| make_err())?;
+    let public_key_bytes = URL_SAFE_NO_PAD
+        .decode(public_key_b64)
+        .map_err(|_| make_err())?;
+    let signature_bytes = URL_SAFE_NO_PAD
+        .decode(signature_b64)
+        .map_err(|_| make_err())?;
 
     if public_key_bytes.len() != ed25519_dalek::PUBLIC_KEY_LENGTH {
         return Err(make_err());
@@ -301,7 +320,10 @@ mod tests {
         };
         let bytes_a = canonical_bytes_for_identity(&id).unwrap();
         let bytes_b = canonical_bytes_for_identity(&id).unwrap();
-        assert_eq!(bytes_a, bytes_b, "canonical bytes must be deterministic across calls");
+        assert_eq!(
+            bytes_a, bytes_b,
+            "canonical bytes must be deterministic across calls"
+        );
     }
 
     #[test]
@@ -315,10 +337,22 @@ mod tests {
         let base_bytes = canonical_bytes_for_identity(&base).unwrap();
 
         let cases = [
-            DaemonIdentityToSign { schema_version: "v50", ..base.clone() },
-            DaemonIdentityToSign { daemon_id: "ai:other@host", ..base.clone() },
-            DaemonIdentityToSign { public_key: "abc124", ..base.clone() },
-            DaemonIdentityToSign { signed_at: "2026-05-24T00:00:00Z", ..base.clone() },
+            DaemonIdentityToSign {
+                schema_version: "v50",
+                ..base.clone()
+            },
+            DaemonIdentityToSign {
+                daemon_id: "ai:other@host",
+                ..base.clone()
+            },
+            DaemonIdentityToSign {
+                public_key: "abc124",
+                ..base.clone()
+            },
+            DaemonIdentityToSign {
+                signed_at: "2026-05-24T00:00:00Z",
+                ..base.clone()
+            },
         ];
 
         for (i, mutated) in cases.iter().enumerate() {
@@ -385,7 +419,8 @@ mod tests {
             .expect("signing keypair must yield Some");
         let pk_b64 = block["public_key"].as_str().unwrap();
         assert_eq!(
-            pk_b64, kp.public_base64(),
+            pk_b64,
+            kp.public_base64(),
             "public_key must round-trip kp.public_base64()"
         );
     }
@@ -519,7 +554,13 @@ mod tests {
             .unwrap()
             .expect("signing keypair must yield Some");
 
-        for field in &["schema_version", "daemon_id", "public_key", "signed_at", "signature"] {
+        for field in &[
+            "schema_version",
+            "daemon_id",
+            "public_key",
+            "signed_at",
+            "signature",
+        ] {
             let mut block = full_block.clone();
             block.as_object_mut().unwrap().remove(*field);
             assert!(
