@@ -15,7 +15,7 @@
 //! 3. The stale row's daily counters are zeroed; the fresh row is untouched.
 //! 4. `current_storage_bytes` (lifetime) is preserved on both.
 
-use ai_memory::quotas::{self, QuotaOp};
+use ai_memory::quotas::{self, GLOBAL_NAMESPACE, QuotaOp};
 use rusqlite::{Connection, params};
 
 mod common;
@@ -32,10 +32,10 @@ fn k8_daily_reset_zeros_stale_rows_only() {
         QuotaOp::Link,
         QuotaOp::Memory { bytes: 23 },
     ] {
-        quotas::record_op(&conn, "agent-stale", op).unwrap();
+        quotas::record_op(&conn, "agent-stale", GLOBAL_NAMESPACE, op).unwrap();
     }
     for op in [QuotaOp::Memory { bytes: 99 }, QuotaOp::Link] {
-        quotas::record_op(&conn, "agent-fresh", op).unwrap();
+        quotas::record_op(&conn, "agent-fresh", GLOBAL_NAMESPACE, op).unwrap();
     }
 
     // Roll agent-stale's day_started_at back to a deterministic
@@ -43,17 +43,17 @@ fn k8_daily_reset_zeros_stale_rows_only() {
     // against today, so any pre-2026 RFC3339 is unambiguously "stale".
     conn.execute(
         "UPDATE agent_quotas SET day_started_at = '2020-01-01T00:00:00+00:00'
-         WHERE agent_id = ?1",
-        params!["agent-stale"],
+         WHERE agent_id = ?1 AND namespace = ?2",
+        params!["agent-stale", GLOBAL_NAMESPACE],
     )
     .unwrap();
 
-    let stale_before = quotas::get_status(&conn, "agent-stale").unwrap();
+    let stale_before = quotas::get_status(&conn, "agent-stale", GLOBAL_NAMESPACE).unwrap();
     assert!(
         stale_before.current_memories_today > 0,
         "precondition: stale row must have non-zero current_memories_today before reset"
     );
-    let fresh_before = quotas::get_status(&conn, "agent-fresh").unwrap();
+    let fresh_before = quotas::get_status(&conn, "agent-fresh", GLOBAL_NAMESPACE).unwrap();
     assert_eq!(fresh_before.current_memories_today, 1);
     assert_eq!(fresh_before.current_links_today, 1);
 
@@ -65,7 +65,7 @@ fn k8_daily_reset_zeros_stale_rows_only() {
     );
 
     // agent-stale: daily counters zeroed; storage preserved (lifetime).
-    let stale_after = quotas::get_status(&conn, "agent-stale").unwrap();
+    let stale_after = quotas::get_status(&conn, "agent-stale", GLOBAL_NAMESPACE).unwrap();
     assert_eq!(stale_after.current_memories_today, 0);
     assert_eq!(stale_after.current_links_today, 0);
     assert_eq!(
@@ -81,7 +81,7 @@ fn k8_daily_reset_zeros_stale_rows_only() {
     );
 
     // agent-fresh: untouched.
-    let fresh_after = quotas::get_status(&conn, "agent-fresh").unwrap();
+    let fresh_after = quotas::get_status(&conn, "agent-fresh", GLOBAL_NAMESPACE).unwrap();
     assert_eq!(fresh_after.current_memories_today, 1);
     assert_eq!(fresh_after.current_links_today, 1);
     assert_eq!(fresh_after.current_storage_bytes, 99);
@@ -92,16 +92,22 @@ fn k8_daily_reset_idempotent_when_no_rows_stale() {
     let (_keep, db_path) = fresh_db();
     let conn = Connection::open(&db_path).unwrap();
 
-    quotas::record_op(&conn, "agent-x", QuotaOp::Memory { bytes: 1 }).unwrap();
-    quotas::record_op(&conn, "agent-y", QuotaOp::Link).unwrap();
+    quotas::record_op(
+        &conn,
+        "agent-x",
+        GLOBAL_NAMESPACE,
+        QuotaOp::Memory { bytes: 1 },
+    )
+    .unwrap();
+    quotas::record_op(&conn, "agent-y", GLOBAL_NAMESPACE, QuotaOp::Link).unwrap();
 
     let n1 = quotas::reset_daily(&conn).unwrap();
     let n2 = quotas::reset_daily(&conn).unwrap();
     assert_eq!(n1, 0, "no stale rows on first sweep");
     assert_eq!(n2, 0, "still no stale rows on the immediate re-sweep");
 
-    let x = quotas::get_status(&conn, "agent-x").unwrap();
+    let x = quotas::get_status(&conn, "agent-x", GLOBAL_NAMESPACE).unwrap();
     assert_eq!(x.current_memories_today, 1);
-    let y = quotas::get_status(&conn, "agent-y").unwrap();
+    let y = quotas::get_status(&conn, "agent-y", GLOBAL_NAMESPACE).unwrap();
     assert_eq!(y.current_links_today, 1);
 }

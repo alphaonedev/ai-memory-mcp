@@ -22,7 +22,7 @@
 
 use ai_memory::mcp::handle_quota_status;
 use ai_memory::profile::{Family, Profile};
-use ai_memory::quotas::{self, QuotaOp};
+use ai_memory::quotas::{self, GLOBAL_NAMESPACE, QuotaOp};
 use rusqlite::Connection;
 use serde_json::json;
 
@@ -68,7 +68,13 @@ fn k8_quota_status_with_agent_id_returns_single_row_envelope() {
     let (_keep, db_path) = fresh_db();
     let conn = Connection::open(&db_path).unwrap();
 
-    quotas::record_op(&conn, "agent-status", QuotaOp::Memory { bytes: 42 }).unwrap();
+    quotas::record_op(
+        &conn,
+        "agent-status",
+        GLOBAL_NAMESPACE,
+        QuotaOp::Memory { bytes: 42 },
+    )
+    .unwrap();
 
     let envelope = handle_quota_status(&conn, &json!({"agent_id": "agent-status"}))
         .expect("quota_status with agent_id should succeed");
@@ -92,7 +98,7 @@ fn k8_quota_status_without_agent_id_returns_list_envelope_sorted() {
 
     // Seed three agents in non-alphabetical order so the sort is observable.
     for aid in ["zeta-agent", "alpha-agent", "mu-agent"] {
-        quotas::record_op(&conn, aid, QuotaOp::Memory { bytes: 1 }).unwrap();
+        quotas::record_op(&conn, aid, GLOBAL_NAMESPACE, QuotaOp::Memory { bytes: 1 }).unwrap();
     }
 
     let envelope =

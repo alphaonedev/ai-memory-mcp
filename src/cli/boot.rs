@@ -79,7 +79,14 @@ pub const MIN_SUPPORTED_SCHEMA: u32 = 16;
 /// source_uri, source_span, confidence_source, confidence_signals,
 /// confidence_decayed_at, mentioned_entity_id, version). Pure additive
 /// ALTER TABLE on both backends.
-pub const MAX_SUPPORTED_SCHEMA: u32 = 49;
+///
+/// **#1156 (2026-05-23):** bumped 49 → 50 for the per-namespace K8
+/// quota dimension. Extends `agent_quotas` PRIMARY KEY from
+/// `(agent_id)` to `(agent_id, namespace)` so per-namespace
+/// allotments hold even when a single agent operates across many
+/// namespaces. Pre-v50 rows backfill to the `_global` sentinel
+/// namespace so the historical accounting is preserved verbatim.
+pub const MAX_SUPPORTED_SCHEMA: u32 = 50;
 
 /// Pure boundary check: `true` when `v` lies within
 /// `[MIN_SUPPORTED_SCHEMA, MAX_SUPPORTED_SCHEMA]`. Extracted so the
