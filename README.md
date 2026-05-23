@@ -16,6 +16,7 @@
 [![Discovery Gate](https://img.shields.io/badge/discovery--gate-6%2F6_PASS_%E2%80%A2_GATE_GREEN-2ea043?logo=githubpages)](https://alphaonedev.github.io/ai-memory-discovery-gate/)
 [![v0.6.4 Cert](https://img.shields.io/badge/v0.6.4_cert-CERT_GREEN-2ea043?logo=githubpages)](https://github.com/alphaonedev/ai-memory-test-hub/blob/main/campaigns/v0.6.4.md)
 [![MCP](https://img.shields.io/badge/MCP-7_default_%E2%80%A2_73_full-blueviolet)]()
+[![NSA CSI](https://img.shields.io/badge/NSA_CSI_MCP-9%2F10_%2B_1_partial_%E2%80%A2_7%2F7_recs-2ea043)](https://alphaonedev.github.io/ai-memory-mcp/compliance/nsa-csi-mcp.html)
 [![Evidence v0.6.4](https://img.shields.io/badge/claims-frozen_v0.6.4-c8a2ff)](https://alphaonedev.github.io/ai-memory-mcp/evidence.html)
 [![Evidence v0.7.0](https://img.shields.io/badge/claims-frozen_v0.7.0-7e57c2)](docs/v0.7.0/release-notes.md)
 [![Crates.io Version](https://img.shields.io/crates/v/ai-memory)](https://crates.io/crates/ai-memory)
