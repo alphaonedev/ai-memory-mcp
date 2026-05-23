@@ -1012,6 +1012,25 @@ impl std::error::Error for ValidationError {}
 /// adding NEW cross-field rules without forcing every caller to
 /// re-audit its inline validator sequence.
 ///
+/// # NSA CSI MCP Security mapping
+///
+/// Primary defense against **NSA concern (i) Tool parameter injection**
+/// (real-world issue) and implementation of **NSA recommendation (c)
+/// Validate parameters** per the NSA Cybersecurity Information document
+/// on MCP security (U/OO/6030316-26 \| PP-26-1834, May 2026, Version
+/// 1.0). Every wire-entry layer — 87 production HTTP routes, 73 MCP
+/// tools, 58 CLI subcommands — routes DTO-bundling validation through
+/// `RequestValidator` so adding a new cross-field invariant is one
+/// struct-method edit rather than 3+ audited per-surface edits. The
+/// typed `ValidationError { field, reason }` carries explicit field
+/// attribution while preserving byte-equal wire-side error messages
+/// for v0.6.x backwards compatibility. Mapping anchor:
+/// `request_validator_input_validation` in
+/// [`docs/compliance/_inventory/v0.7.0-capabilities.json`](../docs/compliance/_inventory/v0.7.0-capabilities.json);
+/// narrative in
+/// [`docs/compliance/nsa-csi-mcp.html`](../docs/compliance/nsa-csi-mcp.html)
+/// §3.9 (concern i) and §4.3 (recommendation c).
+///
 /// # Example
 ///
 /// ```ignore

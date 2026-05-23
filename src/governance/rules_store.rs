@@ -535,6 +535,20 @@ pub fn canonical_bytes(rule: &Rule) -> Result<Vec<u8>> {
 /// "when the seed row landed". A future rotation-policy verb can layer
 /// timestamp commitments on top without changing this primitive.
 ///
+/// # NSA CSI MCP Security mapping
+///
+/// Addresses **NSA recommendation (e) Sign and verify MCP messages** and
+/// **NSA concern (b) Insecure context or data serialization** per the
+/// NSA Cybersecurity Information document on MCP security
+/// (U/OO/6030316-26 \| PP-26-1834, May 2026, Version 1.0). The canonical
+/// bytes discipline is the substrate's primary cryptographic-integrity
+/// primitive — every signed governance rule traces back to this
+/// function. The mapping is documented in
+/// [`docs/compliance/nsa-csi-mcp.html`](../../docs/compliance/nsa-csi-mcp.html)
+/// §3.2 (NSA concern b) and §4.5 (NSA recommendation e); the
+/// capability inventory anchor is `form_7_canonical_bytes_signing` in
+/// [`docs/compliance/_inventory/v0.7.0-capabilities.json`](../../docs/compliance/_inventory/v0.7.0-capabilities.json).
+///
 /// # Errors
 ///
 /// Propagates `serde_json` encoding errors.

@@ -460,6 +460,19 @@ pub struct Memory {
     /// array — legacy rows default to an empty vector via the SQL
     /// `DEFAULT '[]'` clause and the serde default below. Validator
     /// surface lives at `crate::validate::validate_citation`.
+    ///
+    /// **NSA CSI MCP Security mapping.** Part of the Form 4
+    /// fact-provenance triple (`citations` + `source_uri` +
+    /// `source_span`) that addresses NSA concerns (b) Insecure
+    /// context or data serialization + (g) Poor or missing audit
+    /// logs, and contributes to NSA recommendations (c) Validate
+    /// parameters + (f) Filter and monitor output pipelines per the
+    /// National Security Agency Cybersecurity Information document
+    /// on MCP security (U/OO/6030316-26 | PP-26-1834, May 2026
+    /// Version 1.0). Capability inventory anchor:
+    /// `form_4_fact_provenance`. The mapping is described — without
+    /// implying NSA endorsement of ai-memory or AlphaOne LLC — at
+    /// `docs/compliance/nsa-csi-mcp.html` §3.2 / §3.7 / §4.3 / §4.6.
     #[serde(default)]
     pub citations: Vec<Citation>,
     /// v0.7.0 Form 4 (issue #757) — first-class URI-form pointer to

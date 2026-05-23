@@ -4,6 +4,25 @@
 //! v0.7.0 / H-track substrate — append-only `signed_events` audit
 //! table.
 //!
+//! # NSA CSI MCP Security mapping
+//!
+//! Primary defense against **NSA concern (g) Poor or missing audit
+//! logs** and contributing implementation of **NSA recommendation (e)
+//! Sign and verify MCP messages** + **(g) Instrument for logging and
+//! detection** per the NSA Cybersecurity Information document on MCP
+//! security (U/OO/6030316-26 \| PP-26-1834, May 2026, Version 1.0).
+//! The V-4 cross-row hash chain (`prev_hash` SHA-256 over the prior
+//! row's canonical bytes plus monotonic `sequence` counter) makes the
+//! audit log tamper-evident even when individual row signatures are
+//! valid: tampering with row N's content breaks row N+1's `prev_hash`
+//! verification; tampering with `sequence` breaks the contiguity
+//! check. Capability inventory anchor:
+//! `v4_signed_events_chain` in
+//! [`docs/compliance/_inventory/v0.7.0-capabilities.json`](../../docs/compliance/_inventory/v0.7.0-capabilities.json);
+//! narrative in
+//! [`docs/compliance/nsa-csi-mcp.html`](../../docs/compliance/nsa-csi-mcp.html)
+//! §3.7 (concern g) and §4.7 (recommendation g).
+//!
 //! Each identity-bearing write (today: every `memory_link` insert
 //! through `db::create_link` / `db::create_link_signed`) appends one
 //! row to `signed_events` so a downstream auditor can replay the
