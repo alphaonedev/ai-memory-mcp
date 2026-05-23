@@ -104,27 +104,67 @@ jobs:
           echo "MOBILE_TEST_BIN=$BIN" >> "$GITHUB_ENV"
           echo "::notice::built $BIN ($(du -h "$BIN" | cut -f1))"
 
-      - name: Boot iOS Simulator (iPhone 15)
+      - name: Boot iOS Simulator (best-available iPhone)
         run: |
           set -euo pipefail
-          # Find the latest available iPhone 15 runtime. Hardcoding a
-          # name like "iPhone 15" works across Xcode 15+; if Apple
-          # ever drops it from the default device set, fail fast with
-          # the available list so the next agent can pick a new one.
+          # v0.7.0 ship-readiness fix — GHA macos-latest runner image
+          # bumped to Xcode 16 (iOS 18.5/18.6) and dropped "iPhone 15"
+          # from the default device set. The hardcoded "iPhone 15"
+          # boot step was failing every release/v0.7.0 run since the
+          # image rollover. Switch to a robust preference list that
+          # finds the best-available device on whatever Xcode the
+          # runner ships, fail-fast with the device list if NOTHING
+          # in the preference list is available.
+          #
+          # Preference order: iPhone 16 (latest stable) → iPhone 16 Pro
+          # → iPhone 15 (back-compat for older Xcode) → iPhone SE
+          # (3rd generation) → ANY available iPhone. Tests don't need
+          # device-specific features; any modern iPhone simulator
+          # under the supported iOS version is acceptable.
           xcrun simctl list devices --json | python3 -c '
           import json, sys
           data = json.load(sys.stdin)
+          preference = [
+              "iPhone 16",
+              "iPhone 16 Pro",
+              "iPhone 16 Plus",
+              "iPhone 15",
+              "iPhone 15 Pro",
+              "iPhone SE (3rd generation)",
+          ]
+          # Build a lookup of name → first available UDID
+          available = {}
           for runtime, devs in data["devices"].items():
               for d in devs:
-                  if d["name"] == "iPhone 15" and d["isAvailable"]:
-                      print(d["udid"]); sys.exit(0)
+                  if d["isAvailable"] and d["name"] not in available:
+                      available[d["name"]] = d["udid"]
+          # Walk preference list in order
+          for name in preference:
+              if name in available:
+                  print(available[name]); sys.exit(0)
+          # Last-resort: any iPhone simulator
+          for name, udid in available.items():
+              if name.startswith("iPhone"):
+                  print(udid); sys.exit(0)
           sys.exit(1)' > .udid || {
-            echo "::error::no iPhone 15 simulator available"
-            xcrun simctl list devices | head -30
+            echo "::error::no iPhone simulator available on this Xcode image"
+            echo "::group::Available devices"
+            xcrun simctl list devices
+            echo "::endgroup::"
             exit 1
           }
           UDID=$(cat .udid)
           echo "UDID=$UDID" >> "$GITHUB_ENV"
+          DEVICE_NAME=$(xcrun simctl list devices --json | python3 -c "
+          import json, sys, os
+          udid = os.environ.get('TARGET_UDID', '')
+          data = json.load(sys.stdin)
+          for runtime, devs in data['devices'].items():
+              for d in devs:
+                  if d['udid'] == udid:
+                      print(d['name']); sys.exit(0)
+          " TARGET_UDID="$UDID" || echo "unknown")
+          echo "::notice::booting iOS Simulator: $DEVICE_NAME ($UDID)"
           xcrun simctl boot "$UDID" || {
             # Already booted is fine.
             xcrun simctl list devices | grep "$UDID"
