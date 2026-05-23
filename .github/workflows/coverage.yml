@@ -69,6 +69,14 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 12
+    env:
+      # v0.7.x (#1148) — route every Rust link step through `mold`
+      # instead of the default `ld.bfd`. mold uses 2-4× less RSS than
+      # ld.bfd, eliminating the `collect2: signal 7 [Bus error]`
+      # linker-OOM that previously failed this gate on the 7 GB
+      # ubuntu-latest runner under the heavy `--features
+      # sal,sal-postgres` instrumented build.
+      RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
     steps:
       - uses: actions/checkout@v5
 
@@ -76,6 +84,12 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
+
+      - name: Install mold linker (#1148)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold
+          mold --version
 
       - uses: Swatinem/rust-cache@v2
 
@@ -107,9 +121,16 @@ jobs:
           psql -h 127.0.0.1 -p 5432 -U ai_memory -d ai_memory_test -c "SELECT extname FROM pg_extension ORDER BY extname;"
 
       - name: Generate coverage JSON
+        # v0.7.x (#1148) — `--profile coverage` selects the
+        # purpose-built `[profile.coverage]` in Cargo.toml
+        # (debug = 1, lto = false, codegen-units = 16) so the
+        # instrumented binary is ~30% smaller through the linker.
+        # Combined with mold (RUSTFLAGS above), this brings peak
+        # linker RSS comfortably under the 7 GB runner ceiling.
         run: |
           mkdir -p coverage
           cargo llvm-cov \
+            --profile coverage \
             --features sal,sal-postgres \
             --lib --tests \
             --json \

@@ -162,6 +162,17 @@ jobs:
     needs: classify
     if: needs.classify.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
+    env:
+      # v0.7.x (#1148) — mold linker + line-only DWARF to keep peak
+      # linker RSS under the 7 GB ubuntu-latest ceiling for the heavy
+      # `--features sal-postgres` build (sqlx + sqlx-postgres + AGE +
+      # pgvector = massive symbol table).
+      RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+      # Downgrade dev-profile debug info from level 2 (full DWARF)
+      # to level 1 (line tables only). The Postgres feature gate
+      # uses the dev profile via `cargo test`, not the `coverage`
+      # profile, so the env-var override is the cleanest knob.
+      CARGO_PROFILE_DEV_DEBUG: "1"
     services:
       postgres:
         # pgvector/pgvector:pg16 ships postgres 16 with pgvector already
@@ -188,6 +199,12 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+
+      - name: Install mold linker (#1148)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold
+          mold --version
 
       - uses: Swatinem/rust-cache@v2
 
@@ -433,6 +450,11 @@ jobs:
     needs: classify
     if: needs.classify.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
+    env:
+      # v0.7.x (#1148) — mold linker + `[profile.coverage]` keep peak
+      # linker RSS under the 7 GB ubuntu-latest ceiling for the
+      # instrumented `--features sal` build.
+      RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
     permissions:
       contents: read
       pull-requests: write
@@ -443,6 +465,12 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy, llvm-tools-preview
+
+      - name: Install mold linker (#1148)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold
+          mold --version
 
       - uses: Swatinem/rust-cache@v2
 
@@ -459,8 +487,13 @@ jobs:
       - name: Generate coverage report
         env:
           AI_MEMORY_NO_CONFIG: "1"
+        # v0.7.x (#1148) — `--profile coverage` selects the
+        # purpose-built `[profile.coverage]` in Cargo.toml
+        # (debug = 1, lto = false, codegen-units = 16) which trims
+        # ~30% off the instrumented binary size and keeps the linker
+        # working set well under the 7 GB runner ceiling.
         run: |
-          cargo llvm-cov --features sal --no-fail-fast --html --output-dir coverage -- --test-threads=2
+          cargo llvm-cov --profile coverage --features sal --no-fail-fast --html --output-dir coverage -- --test-threads=2
           # `cargo llvm-cov report` reads the saved profile data and does
           # not accept `--features` (would error: "invalid option
           # '--features' for subcommand 'report'"). The earlier pipe-to-
