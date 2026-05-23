@@ -374,11 +374,28 @@ footer a{color:var(--text-muted)}
 <span class="cm"># or for the smaller Smart-tier model:</span>
 <span class="ok">$</span> ollama pull gemma4:e2b
 
-<span class="cm"># 3. Configure ai-memory for autonomous tier</span>
+<span class="cm"># 3. Configure ai-memory for autonomous tier (canonical v0.7.x schema-v2</span>
+<span class="cm">#    sectioned form, per CONFIG_SCHEMA.md / #1146). The legacy flat shape</span>
+<span class="cm">#    (`ollama_url = "..."` / `cross_encoder = true` at the top level) still</span>
+<span class="cm">#    parses for backward compat — run `ai-memory config migrate` to rewrite</span>
+<span class="cm">#    in v2 shape (`.bak.&lt;ts&gt;` saved); legacy fields are removed in v0.8.0.</span>
 <span class="ok">$</span> cat &gt; ~/.config/ai-memory/config.toml &lt;&lt;EOF
+schema_version = <span class="num">2</span>
 tier = <span class="val">"autonomous"</span>
-ollama_url = <span class="val">"http://localhost:11434"</span>
-cross_encoder = <span class="ok">true</span>
+
+[llm]
+backend = <span class="val">"ollama"</span>
+model   = <span class="val">"gemma3:4b"</span>
+base_url = <span class="val">"http://localhost:11434"</span>
+
+[embeddings]
+backend = <span class="val">"ollama"</span>
+url     = <span class="val">"http://localhost:11434"</span>
+model   = <span class="val">"nomic-embed-text-v1.5"</span>
+
+[reranker]
+enabled = <span class="ok">true</span>
+model   = <span class="val">"ms-marco-MiniLM-L-6-v2"</span>
 EOF
 
 <span class="cm"># 4. Start the daemon</span>

@@ -172,7 +172,7 @@ footer a{color:var(--text-muted)}
     <span class="pill">5 enums</span>
     <span class="pill">22 structs</span>
     <span class="pill">5 consts</span>
-    <span class="pill">v0.6.3 schema</span>
+    <span class="pill">v0.7.0 — Memory 26 fields / MemoryLink 6 relations</span>
   </div>
 </section>
 
@@ -234,9 +234,9 @@ Tier::from_str(&amp;str) -&gt; Option&lt;Tier&gt;</div>
     </div>
 
     <div class="ty k-struct" id="memory">
-      <div class="ty-head"><span class="ty-name">Memory</span><span class="ty-kind struct">struct</span><span class="ty-since">since v0.1</span></div>
+      <div class="ty-head"><span class="ty-name">Memory</span><span class="ty-kind struct">struct</span><span class="ty-since">since v0.1 · grew to 26 fields at v0.7.0</span></div>
       <div class="ty-derive"><code>#[derive(Debug, Clone, Serialize, Deserialize)]</code></div>
-      <div class="ty-desc">The stored record returned by HTTP <code>GET /memories/:id</code> and MCP <code>memory_get</code>. Persisted into the <code>memories</code> table; mirrored to FTS5 + HNSW vector index.</div>
+      <div class="ty-desc">The stored record returned by HTTP <code>GET /memories/:id</code> and MCP <code>memory_get</code>. Persisted into the <code>memories</code> table; mirrored to FTS5 + HNSW vector index. <strong>26 fields at v0.7.0</strong> (was 15 at v0.6.x; canonical truth in <code>src/models/memory.rs:401</code>) — adds <code>reflection_depth</code> (Task 1/8 recursive learning), <code>memory_kind</code> (Batman Form-6 vocabulary), <code>entity_id</code> + <code>persona_version</code> (QW-2 persona artefact), <code>citations</code> + <code>source_uri</code> + <code>source_span</code> (Form-4 fact provenance), <code>confidence_source</code> + <code>confidence_signals</code> + <code>confidence_decayed_at</code> (Form-5 calibration), and the <code>version</code> BIGINT (Gap-1 optimistic concurrency, schema v45).</div>
       <table class="fld"><thead><tr><th>field</th><th>type</th><th>notes</th></tr></thead><tbody>
         <tr><td class="fname">id</td><td class="ftype">String</td><td class="fnote"><span class="flag req">REQ</span>UUIDv4 primary key.</td></tr>
         <tr><td class="fname">tier</td><td class="ftype">Tier</td><td class="fnote"><span class="flag req">REQ</span>One of <code>short</code> · <code>mid</code> · <code>long</code>.</td></tr>
@@ -253,17 +253,28 @@ Tier::from_str(&amp;str) -&gt; Option&lt;Tier&gt;</div>
         <tr><td class="fname">last_accessed_at</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote"><span class="flag opt">OPT</span>RFC3339; <code>skip_serializing_if = None</code>.</td></tr>
         <tr><td class="fname">expires_at</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote"><span class="flag opt">OPT</span>RFC3339; computed from <code>ttl_secs</code> or tier default.</td></tr>
         <tr><td class="fname">metadata</td><td class="ftype">serde_json::Value</td><td class="fnote"><span class="flag def">DEF</span>Default <code>{}</code>; carries <code>governance</code>, <code>scope</code>, <code>agent_id</code>, taxonomy fields.</td></tr>
+        <tr><td class="fname">reflection_depth</td><td class="ftype">i32</td><td class="fnote"><span class="flag def">DEF</span><strong>v0.7.0 Task 1/8</strong>: recursion depth in the substrate-native reflection tree. <code>0</code> for caller-minted (or legacy) rows; positive for reflection-pass outputs. Stored on <code>memories.reflection_depth</code> NOT NULL DEFAULT 0 (schema v29 sqlite / v31 postgres).</td></tr>
+        <tr><td class="fname">memory_kind</td><td class="ftype">MemoryKind</td><td class="fnote"><span class="flag def">DEF</span><strong>v0.7.0 L1-1</strong>: Batman Form-6 typed discriminator (<code>observation</code> / <code>reflection</code> / <code>persona</code> / <code>concept</code> / <code>entity</code> / <code>claim</code> / <code>relation</code> / <code>event</code> / <code>conversation</code> / <code>decision</code>). Schema v30 column default <code>'observation'</code> for pre-v30 rows.</td></tr>
+        <tr><td class="fname">entity_id</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote"><span class="flag opt">OPT</span><strong>v0.7.0 QW-2</strong>: persona artefact subject. Populated only when <code>memory_kind == Persona</code>. Stored on <code>memories.entity_id</code> NULL (schema v36).</td></tr>
+        <tr><td class="fname">persona_version</td><td class="ftype">Option&lt;i32&gt;</td><td class="fnote"><span class="flag opt">OPT</span><strong>v0.7.0 QW-2</strong>: monotonic <code>(entity_id, namespace)</code> version counter; <code>PersonaGenerator::generate</code> bumps. Older rows remain queryable for audit/rollback.</td></tr>
+        <tr><td class="fname">citations</td><td class="ftype">Vec&lt;Citation&gt;</td><td class="fnote"><span class="flag def">DEF</span><strong>v0.7.0 Form 4 (#757)</strong>: fact-provenance citation array. Each entry: <code>{ uri, accessed_at, hash?, span? }</code>. Schema v38 column; legacy rows default to <code>'[]'</code>. Validator: <code>validate_citation</code>.</td></tr>
+        <tr><td class="fname">source_uri</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote"><span class="flag opt">OPT</span><strong>v0.7.0 Form 4 (#757)</strong>: first-class URI pointer (<code>uri:</code> / <code>doc:</code> / <code>file:</code> schemes). Distinct from the role-label <code>source</code> column. Schema v38; validator: <code>validate_source_uri</code>.</td></tr>
+        <tr><td class="fname">source_span</td><td class="ftype">Option&lt;SourceSpan&gt;</td><td class="fnote"><span class="flag opt">OPT</span><strong>v0.7.0 Form 4 (#757)</strong>: byte-range into the parent source body, JSON <code>{start, end}</code>. Populated by the WT-1-B atomisation writer per atom. Validator: <code>validate_source_span</code>.</td></tr>
+        <tr><td class="fname">confidence_source</td><td class="ftype">ConfidenceSource</td><td class="fnote"><span class="flag def">DEF</span><strong>v0.7.0 Form 5 (#758)</strong>: typed discriminator naming the provenance of <code>confidence</code>. Defaults to <code>CallerProvided</code>. Schema v39 sqlite / v38 postgres column default <code>'caller_provided'</code>.</td></tr>
+        <tr><td class="fname">confidence_signals</td><td class="ftype">Option&lt;ConfidenceSignals&gt;</td><td class="fnote"><span class="flag opt">OPT</span><strong>v0.7.0 Form 5</strong>: JSON snapshot of the signals that produced an auto-derived or calibrated confidence. NULL on legacy rows and on <code>CallerProvided</code> writes.</td></tr>
+        <tr><td class="fname">confidence_decayed_at</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote"><span class="flag opt">OPT</span><strong>v0.7.0 Form 5</strong>: RFC3339 stamp of the last decay-sweep touch. NULL on legacy / never-decayed rows.</td></tr>
+        <tr><td class="fname">version</td><td class="ftype">i64</td><td class="fnote"><span class="flag def">DEF</span><strong>v0.7.0 Provenance Gap 1 (#884, schema v45 sqlite)</strong>: optimistic-concurrency counter. Bumped on every <code>storage::update</code>; two writers against the same <code>expected_version</code> race; loser receives a typed <code>CONFLICT</code> envelope. Legacy rows land at <code>version = 1</code> via SQL <code>DEFAULT</code> + serde <code>default_memory_version</code>.</td></tr>
       </tbody></table>
     </div>
 
     <div class="ty k-struct" id="memorylink">
-      <div class="ty-head"><span class="ty-name">MemoryLink</span><span class="ty-kind struct">struct</span><span class="ty-since">since v0.1</span></div>
+      <div class="ty-head"><span class="ty-name">MemoryLink</span><span class="ty-kind struct">struct</span><span class="ty-since">since v0.1 · 6 relations at v0.7.0</span></div>
       <div class="ty-derive"><code>#[derive(Debug, Clone, Serialize, Deserialize)]</code></div>
-      <div class="ty-desc">A directed edge between two memories. The KG primitive — every typed-cognition / supersession relationship is one row in <code>memory_links</code>.</div>
+      <div class="ty-desc">A directed edge between two memories. The KG primitive — every typed-cognition / supersession relationship is one row in <code>memory_links</code>. <strong>6 <code>MemoryLinkRelation</code> variants at v0.7.0</strong> (was 4 at v0.6.x); canonical enum in <code>src/models/link.rs::MemoryLinkRelation</code>.</div>
       <table class="fld"><thead><tr><th>field</th><th>type</th><th>notes</th></tr></thead><tbody>
         <tr><td class="fname">source_id</td><td class="ftype">String</td><td class="fnote"><span class="flag req">REQ</span>FK to <code>memories.id</code>.</td></tr>
         <tr><td class="fname">target_id</td><td class="ftype">String</td><td class="fnote"><span class="flag req">REQ</span>FK to <code>memories.id</code>.</td></tr>
-        <tr><td class="fname">relation</td><td class="ftype">String</td><td class="fnote"><span class="flag req">REQ</span>One of: <code>related_to</code> · <code>supersedes</code> · <code>contradicts</code> · <code>derived_from</code>.</td></tr>
+        <tr><td class="fname">relation</td><td class="ftype">String</td><td class="fnote"><span class="flag req">REQ</span>One of: <code>related_to</code> · <code>supersedes</code> · <code>contradicts</code> · <code>derived_from</code> · <code>reflects_on</code> (v0.7.0 Task 1/8 recursive learning) · <code>derives_from</code> (v0.7.0 WT-1-A atomisation atom→parent, schema v36 sqlite / v35 postgres).</td></tr>
         <tr><td class="fname">created_at</td><td class="ftype">String</td><td class="fnote">RFC3339; server-stamped.</td></tr>
       </tbody></table>
     </div>
