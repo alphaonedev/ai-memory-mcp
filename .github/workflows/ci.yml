@@ -41,7 +41,7 @@ jobs:
     outputs:
       docs_only: ${{ steps.cls.outputs.docs_only }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
         with: { fetch-depth: 2 }
       - id: cls
         shell: bash
@@ -85,7 +85,7 @@ jobs:
     if: needs.classify.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -110,7 +110,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
 
       - name: docs-only short-circuit
         if: needs.classify.outputs.docs_only == 'true'
@@ -201,7 +201,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
 
       - name: Free disk + add swap (#1148 belt-and-suspenders)
         run: |
@@ -313,7 +313,7 @@ jobs:
           - target: aarch64-linux-android
             os: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
 
       - name: Install Rust stable (target ${{ matrix.target }})
         uses: dtolnay/rust-toolchain@stable
@@ -392,7 +392,7 @@ jobs:
     if: needs.classify.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -434,7 +434,7 @@ jobs:
     # Skip on tag pushes — the docker job below handles those (with push).
     if: ${{ !startsWith(github.ref, 'refs/tags/v') && needs.classify.outputs.docs_only != 'true' }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -492,7 +492,7 @@ jobs:
       contents: read
       pull-requests: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
 
       - name: Free disk + add swap (#1148 belt-and-suspenders)
         run: |

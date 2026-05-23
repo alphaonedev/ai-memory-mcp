@@ -44,7 +44,7 @@ jobs:
       sha: ${{ steps.check.outputs.sha }}
       is_prerelease: ${{ steps.check.outputs.is_prerelease }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           ref: ${{ github.event.inputs.tag }}
@@ -104,7 +104,7 @@ jobs:
             os: windows-latest
             artifact: ai-memory.exe
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
         with:
           ref: ${{ needs.preflight.outputs.tag }}
 
@@ -216,7 +216,7 @@ jobs:
     if: needs.preflight.outputs.is_prerelease == 'false'
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
         with:
           ref: ${{ needs.preflight.outputs.tag }}
 
@@ -332,7 +332,7 @@ jobs:
     if: needs.preflight.outputs.is_prerelease == 'false'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
         with:
           ref: ${{ needs.preflight.outputs.tag }}
 
@@ -462,7 +462,7 @@ jobs:
     if: needs.preflight.outputs.is_prerelease == 'false'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
         with:
           ref: ${{ needs.preflight.outputs.tag }}
 
@@ -522,7 +522,7 @@ jobs:
           done
 
       - name: Checkout Homebrew tap
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
         with:
           repository: alphaonedev/homebrew-tap
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
@@ -613,7 +613,7 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
         with:
           ref: ${{ needs.preflight.outputs.tag }}
 
@@ -656,7 +656,7 @@ jobs:
     if: needs.preflight.outputs.is_prerelease == 'false'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
         with:
           ref: ${{ needs.preflight.outputs.tag }}
 

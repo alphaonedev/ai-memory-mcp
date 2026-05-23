@@ -88,7 +88,7 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "1"
       CARGO_PROFILE_DEV_LTO: "false"
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
 
       - name: Free disk + add swap (#1148 belt-and-suspenders)
         run: |
