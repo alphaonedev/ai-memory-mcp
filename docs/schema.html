@@ -162,11 +162,11 @@ footer a{color:var(--text-muted)}
 
 <section class="hero">
   <h1>The schema, table by table.</h1>
-  <p class="tagline">Every SQLite table ai-memory creates, every column, every index, every foreign key. Postgres mirror via the SAL adapter (<code>--features sal</code>). Schema version: <strong>v19</strong> (Patch 1; ladder v15→v17→v18→v19 is automatic on first run).</p>
+  <p class="tagline">Every SQLite table ai-memory creates, every column, every index, every foreign key. Postgres mirror via the SAL adapter (<code>--features sal,sal-postgres</code>; Apache AGE Cypher graph backend). <strong>Schema version: v49 at v0.7.0</strong> (was v33 at v0.6.4; ladder v34 → v49 includes V-4 cross-row hash chain, recursive-learning depth columns, Batman Form-4/5 provenance + confidence, optimistic-concurrency <code>version</code> column at v45, <code>federation_push_dlq</code> table at v48, archive_memories +14 columns at v49). Migration is automatic on first daemon start.</p>
   <div class="pills">
-    <span class="pill">9 tables</span>
-    <span class="pill">15+ indexes</span>
-    <span class="pill">v19 schema</span>
+    <span class="pill">12+ tables</span>
+    <span class="pill">20+ indexes</span>
+    <span class="pill">v49 schema</span>
     <span class="pill">SQLite + Postgres mirror</span>
   </div>
 </section>
@@ -337,20 +337,22 @@ footer a{color:var(--text-muted)}
       <div class="tbl-head">
         <span class="tbl-name">memory_links</span>
         <span class="tbl-tag">▸ KNOWLEDGE GRAPH</span>
-        <span class="tbl-since">extended in v0.6.3 (4 new columns)</span>
+        <span class="tbl-since">extended v0.6.3 (temporal) + v0.7.0 (6 variants, Ed25519 populated)</span>
       </div>
-      <div class="tbl-desc">Typed directed links between memories. The KG primitive. v0.6.3 added <span class="flag new">NEW</span> temporal-validity columns (valid_from, valid_until, observed_by, signature placeholder) for time-aware traversal.</div>
+      <div class="tbl-desc">Typed directed links between memories. The KG primitive. v0.6.3 added temporal-validity columns (<code>valid_from</code>, <code>valid_until</code>, <code>observed_by</code>, <code>signature</code>); <strong>v0.7.0 populates <code>signature</code> with Ed25519 per-link attestation</strong> (was placeholder pre-v0.7). <strong>6 link variants at v0.7.0</strong> (was 4 at v0.6.x).</div>
       <table class="cols">
         <thead><tr><th>Column</th><th>Type</th><th>Notes</th></tr></thead>
         <tbody>
           <tr><td class="col"><span class="flag fk">FK</span>source_id</td><td class="type">TEXT NOT NULL</td><td class="note">→ <code>memories(id)</code> ON DELETE CASCADE</td></tr>
           <tr><td class="col"><span class="flag fk">FK</span>target_id</td><td class="type">TEXT NOT NULL</td><td class="note">→ <code>memories(id)</code> ON DELETE CASCADE</td></tr>
-          <tr><td class="col">relation</td><td class="type">TEXT NOT NULL</td><td class="note">One of: <code>related_to</code>, <code>supersedes</code>, <code>refines</code>, <code>contradicts</code>, <code>derived_from</code>, <code>superseded_duplicate</code>, plus arbitrary user-defined.</td></tr>
+          <tr><td class="col">relation</td><td class="type">TEXT NOT NULL</td><td class="note"><strong>6 variants at v0.7.0</strong>: <code>related_to</code>, <code>supersedes</code>, <code>contradicts</code>, <code>derived_from</code>, <code>reflects_on</code> (v0.7 recursive learning Task 1/8), <code>derives_from</code> (v0.7 atomisation atom→parent). Canonical enum in <code>src/models/link.rs::MemoryLinkRelation</code>.</td></tr>
           <tr><td class="col">created_at</td><td class="type">TEXT NOT NULL</td><td class="note">RFC3339 UTC.</td></tr>
-          <tr><td class="col"><span class="flag new">NEW</span>valid_from</td><td class="type">TIMESTAMP NULL</td><td class="note">v0.6.3: when the assertion became true. Backfilled to source's created_at on migration.</td></tr>
-          <tr><td class="col"><span class="flag new">NEW</span>valid_until</td><td class="type">TIMESTAMP NULL</td><td class="note">v0.6.3: when the assertion was superseded. NULL = still valid.</td></tr>
-          <tr><td class="col"><span class="flag new">NEW</span>observed_by</td><td class="type">TEXT NULL</td><td class="note">v0.6.3: agent_id of the observer. Powers per-agent visibility filter.</td></tr>
-          <tr><td class="col"><span class="flag new">NEW</span>signature</td><td class="type">BLOB NULL</td><td class="note">v0.6.3 placeholder · v0.7 will populate with Ed25519 signature for attested provenance.</td></tr>
+          <tr><td class="col">valid_from</td><td class="type">TIMESTAMP NULL</td><td class="note">v0.6.3: when the assertion became true. Backfilled to source's created_at on migration.</td></tr>
+          <tr><td class="col">valid_until</td><td class="type">TIMESTAMP NULL</td><td class="note">v0.6.3: when the assertion was superseded. NULL = still valid.</td></tr>
+          <tr><td class="col">observed_by</td><td class="type">TEXT NULL</td><td class="note">v0.6.3: agent_id of the observer. Powers per-agent visibility filter.</td></tr>
+          <tr><td class="col"><span class="flag new">v0.7</span>signature</td><td class="type">BLOB NULL</td><td class="note"><strong>v0.7.0 POPULATED</strong>: Ed25519 signature for attested provenance (was v0.6.3 placeholder). Per-row Ed25519 <code>sig</code> population gated on the resolved daemon <code>agent_id</code> having a <code>*.priv</code> keypair on disk.</td></tr>
+          <tr><td class="col"><span class="flag new">v0.7</span>attest_level</td><td class="type">TEXT NULL</td><td class="note">v0.7.0: one of <code>"unsigned" / "agent" / "operator"</code>. Indicates the attestation tier of the link.</td></tr>
+          <tr><td class="col"><span class="flag new">v0.7</span>signed_at</td><td class="type">TIMESTAMP NULL</td><td class="note">v0.7.0: when the signature was applied. Pairs with <code>signature</code>.</td></tr>
         </tbody>
       </table>
       <div class="idx-list"><span class="idx-name">▸ idx_links_temporal_src</span> (source_id, valid_from, valid_until) · <span class="idx-name">▸ idx_links_temporal_tgt</span> · <span class="idx-name">▸ idx_links_relation</span></div>
@@ -361,10 +363,10 @@ footer a{color:var(--text-muted)}
         <span class="tbl-name">schema_version</span>
         <span class="tbl-tag">▸ MIGRATION</span>
       </div>
-      <div class="tbl-desc">Single-row table. Tracks current schema version. Daemon checks at startup; runs forward migrations idempotently. Current version: <strong>15</strong> (Stream B hierarchy + KG additions).</div>
+      <div class="tbl-desc">Single-row table. Tracks current schema version. Daemon checks at startup; runs forward migrations idempotently. <strong>Current version: 49 at v0.7.0</strong> (was 33 at v0.6.4 — the v34 → v49 ladder spans 16 migrations).</div>
       <table class="cols">
         <tbody>
-          <tr><td class="col">version</td><td class="type">INTEGER NOT NULL</td><td class="note">Currently 19 (Patch 1). Bumped only on additive migrations. Migration ladder v15→v17→v18→v19 runs automatically at daemon start.</td></tr>
+          <tr><td class="col">version</td><td class="type">INTEGER NOT NULL</td><td class="note"><strong>Currently 49 (v0.7.0)</strong>. Canonical: <code>CURRENT_SCHEMA_VERSION = 49</code> in <code>src/storage/migrations.rs</code>. Bumped only on additive migrations. v34 → v49 covers V-4 cross-row hash chain, recursive-learning depth columns, Batman Form-4/5 provenance + confidence, optimistic-concurrency <code>version</code> column at v45, <code>federation_push_dlq</code> table at v48, archive_memories +14 columns at v49.</td></tr>
         </tbody>
       </table>
     </div>
@@ -519,6 +521,15 @@ footer a{color:var(--text-muted)}
           <tr><td class="col">11-13</td><td class="type">v0.6.0-0.6.1</td><td class="note">pending_actions; sync_state; namespace_meta; governance policy in metadata; agent_id resolution.</td></tr>
           <tr><td class="col">14</td><td class="type">v0.6.2</td><td class="note">SAL adapter prep; postgres_schema.sql; chunked_from metadata.</td></tr>
           <tr><td class="col">15</td><td class="type">v0.6.3</td><td class="note"><strong>Hierarchy + KG additions.</strong> 4 new memory_links columns; entity_aliases table; 3 temporal indexes. <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/migrations/sqlite/0010_v063_hierarchy_kg.sql" style="color:var(--p1)">Migration file →</a></td></tr>
+          <tr><td class="col">16-19</td><td class="type">v0.6.3.1</td><td class="note">governance.inherit backfill; embedding_dim guard; archive lossless; webhook event_types column.</td></tr>
+          <tr><td class="col">20-33</td><td class="type">v0.6.4</td><td class="note">Hooks pipeline (25 events); sidechain transcripts (zstd-3 BLOB); subscription DLQ; consolidated_from_agents array; KG temporal-index v2; tier-promotion metadata; A2A correlation; smart-load veto; agent quotas; signed_events audit table.</td></tr>
+          <tr><td class="col">34</td><td class="type">v0.7.0</td><td class="note"><strong>V-4 closeout (#698)</strong>: <code>signed_events.prev_hash</code> + <code>sequence</code> cross-row SHA-256 hash chain (tamper-evident audit log).</td></tr>
+          <tr><td class="col">35-37</td><td class="type">v0.7.0</td><td class="note">Shadow retention columns on calibration tables; <code>memory_kind</code> Batman Form-6 vocabulary column on memories; <code>entity_id</code> + <code>persona_version</code> (QW-2 persona artefact); <code>citations</code> + <code>source_uri</code> + <code>source_span</code> (Form-4 fact provenance).</td></tr>
+          <tr><td class="col">38-44</td><td class="type">v0.7.0</td><td class="note"><code>reflection_depth</code> column on memories (recursive-learning Task 1/8); <code>atomised_into</code> + <code>atom_of</code> columns (atomisation links); <code>confidence_source</code> + <code>confidence_signals</code> + <code>confidence_decayed_at</code> (Form-5 auto-confidence + shadow + decay); <code>mentioned_entity_id</code> column; link <code>attest_level</code> enum + <code>signed_at</code> column.</td></tr>
+          <tr><td class="col">45</td><td class="type">v0.7.0</td><td class="note"><strong>Gap-1 optimistic concurrency</strong>: <code>version BIGINT</code> column on memories (defaults to 1 on legacy rows via SQL DEFAULT + serde default). Powers <code>memory_update</code> expected_version race-detection.</td></tr>
+          <tr><td class="col">46-47</td><td class="type">v0.7.0</td><td class="note">Per-namespace transcript lifecycle TTL + auto-extract policy columns; KG temporal-index v3; subscription HMAC-signed-only enforcement (R3-S1.HMAC; unsigned dispatch DISABLED).</td></tr>
+          <tr><td class="col">48</td><td class="type">v0.7.0</td><td class="note"><strong>federation_push_dlq table</strong> (Track D #933): captures peer-rejected federation writes with retry-with-backoff replay. Pairs with <code>memory_subscription_dlq_list</code> / <code>memory_subscription_replay</code> MCP tools.</td></tr>
+          <tr><td class="col">49</td><td class="type">v0.7.0 release</td><td class="note"><strong>archived_memories +14 nullable columns</strong> (#1025): reflection_depth, atomised_into, atom_of, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, version. Archive → restore is now LOSSLESS for the full v0.7.0 Memory shape on both backends.</td></tr>
         </tbody>
       </table>
     </div>

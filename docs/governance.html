@@ -174,12 +174,31 @@ footer a{color:var(--text-muted)}
 
 <section class="hero">
   <h1>The governance gate.</h1>
-  <p class="tagline">Three decisions: <strong style="color:var(--good)">Allow</strong>, <strong style="color:var(--bad)">Deny</strong>, <strong style="color:var(--warn)">Pending</strong>. Three actions: <code>store</code>, <code>delete</code>, <code>promote</code>. Four levels: Any, Registered, Owner, Approve. Three approver types: Human, Agent, Consensus. Every governed write either returns immediately or queues for approval — never silently succeeds.</p>
+  <p class="tagline">Three decisions: <strong style="color:var(--good)">Allow</strong>, <strong style="color:var(--bad)">Deny</strong>, <strong style="color:var(--warn)">Pending</strong>. Three actions: <code>store</code>, <code>delete</code>, <code>promote</code>. Four levels: Any, Registered, Owner, Approve. Three approver types: Human, Agent, Consensus. Every governed write either returns immediately or queues for approval — never silently succeeds. <strong>v0.7.0 adds the K9 permission system</strong> on top: <code>enforce</code> / <code>advisory</code> / <code>off</code> modes with declarative <code>[[permissions.rules]]</code> overlays + fail-CLOSED defaults across SSRF, governance-error, and federation signature paths.</p>
   <div class="pills">
     <span class="pill">Task 1.8 — policy shape</span>
     <span class="pill">Task 1.9 — enforcement</span>
     <span class="pill">Task 1.10 — approver types</span>
     <span class="pill">v0.6.2 S34 — federation propagation</span>
+    <span class="pill">v0.7.0 K1 — inheritance enforcement</span>
+    <span class="pill">v0.7.0 K9 — permissions mode (enforce default)</span>
+    <span class="pill">v0.7.0 #1054 — fail-CLOSED on rule-consult error</span>
+    <span class="pill">v0.7.0 #1053 — SSRF fail-CLOSED on DNS-fail</span>
+    <span class="pill">v0.7.0 R3-S1.HMAC — webhook dispatch MANDATORY-signed</span>
+  </div>
+
+  <!-- v0.7.0 callout block: secure-default flips + migration command -->
+  <div style="background:rgba(243,156,18,.08);border-left:4px solid var(--warn);padding:1.25rem 1.5rem;margin-top:1.5rem;border-radius:6px;max-width:820px;margin-left:auto;margin-right:auto">
+    <p style="margin:0;font-size:.95rem"><strong>v0.7.0 secure-default posture flips</strong> (operators upgrading from v0.6.x):</p>
+    <ul style="margin:.75rem 0 0 0;font-size:.9rem;color:var(--text-muted);padding-left:1.5rem">
+      <li><code>permissions.mode</code> default <code>advisory</code> → <strong><code>enforce</code></strong>. Opt-out: <code>AI_MEMORY_PERMISSIONS_MODE=advisory</code>.</li>
+      <li><code>AI_MEMORY_FED_REQUIRE_SIG=1</code> + <code>AI_MEMORY_FED_REQUIRE_NONCE=1</code> default-on (federation HMAC sig + anti-replay nonce required). Set <code>=0</code> during peer Ed25519 enrolment.</li>
+      <li><code>AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=0</code> (governance fail-CLOSED on rule-consultation error). #1054.</li>
+      <li><code>AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS=0</code> (passphrase file mode 0400 required). #1055.</li>
+      <li><code>AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL=0</code> (SSRF guard fail-CLOSED on DNS NXDOMAIN). #1053.</li>
+      <li>Webhook dispatch: <strong>HMAC-signed only</strong> (unsigned dispatch DISABLED per R3-S1.HMAC).</li>
+    </ul>
+    <p style="margin:.75rem 0 0 0;font-size:.9rem"><strong>Operator-facing tools:</strong> <code>ai-memory governance migrate-to-permissions [--apply]</code> (translate legacy <code>[governance]</code> policies into the v0.7 <code>[[permissions.rules]]</code> shape). See <a href="MIGRATION_QUICKSTART.md" style="color:var(--p1)">MIGRATION_QUICKSTART.md</a> for the tiered upgrade recipe with staged-rollout env-var opt-outs.</p>
   </div>
 </section>
 
