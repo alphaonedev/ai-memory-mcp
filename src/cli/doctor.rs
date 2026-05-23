@@ -887,18 +887,23 @@ fn section_llm_reachability_1146() -> ReportSection {
         facts.push(("key_error".into(), reason.clone()));
     }
 
-    // Compiled-default warning — operator has no LLM configuration
-    // anywhere; the resolver's last-resort fallback won.
+    // Compiled-default — operator has no LLM configuration anywhere
+    // (a fresh install or a keyword-tier-only deployment). This is a
+    // legitimate state, not a misconfiguration: emit INFO with a
+    // pointer at how to enable LLM features rather than WARN (which
+    // would break the "fresh-DB doctor report = all INFO" invariant
+    // pinned by `tests/doctor_cli.rs::doctor_reports_clean_on_fresh_db`).
     if matches!(resolved.source, ConfigSource::CompiledDefault) {
         return ReportSection {
             name: "LLM Reachability (#1146)".into(),
-            severity: Severity::Warning,
+            severity: Severity::Info,
             facts,
             note: Some(
                 "no operator LLM configuration found (CLI / env / [llm] section / \
-                 legacy flat fields all absent); resolver fell through to the \
-                 compiled default. Set AI_MEMORY_LLM_BACKEND or write a [llm] \
-                 section in config.toml to enable LLM-powered features."
+                 legacy flat fields all absent); LLM-powered features will be \
+                 inactive. To enable, set AI_MEMORY_LLM_BACKEND in the process \
+                 env or write a [llm] section in config.toml. See \
+                 docs/CONFIG_SCHEMA.md for the canonical schema."
                     .into(),
             ),
         };
