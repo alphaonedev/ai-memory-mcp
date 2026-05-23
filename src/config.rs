@@ -4335,6 +4335,12 @@ fn resolve_api_key(backend: &str, llm: Option<&LlmSection>) -> (Option<String>, 
     {
         let path = expand_tilde(raw_path);
         let path_display = path.display().to_string();
+
+        // Mode 0400 enforcement (#1055-style escape hatch).
+        if let Err(reason) = enforce_api_key_file_perms(&path) {
+            return (None, KeySource::Error(reason));
+        }
+
         return match std::fs::read_to_string(&path) {
             Ok(contents) => {
                 let key = contents.lines().next().unwrap_or("").trim().to_string();
@@ -4357,6 +4363,65 @@ fn resolve_api_key(backend: &str, llm: Option<&LlmSection>) -> (Option<String>, 
     }
 
     (None, KeySource::None)
+}
+
+/// v0.7.x (#1146) — enforce mode 0400 (or stricter) on the file
+/// referenced by `[llm].api_key_file`. The check mirrors the existing
+/// `AI_MEMORY_DB_PASSPHRASE_FILE` enforcement (issue #1055): any bits
+/// set in `mode & 0o077` (group / world readable / executable) cause
+/// the daemon to refuse the file, unless the operator opts out via
+/// `AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS=1`.
+///
+/// On non-Unix platforms (the `staticlib` mobile target, future
+/// Windows builds) the check is a no-op — the perm bits are not
+/// expressible on those platforms.
+fn enforce_api_key_file_perms(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = std::fs::metadata(path).map_err(|e| {
+            format!(
+                "[llm].api_key_file = {:?} could not be stat'd for perms check: {}",
+                path.display(),
+                e
+            )
+        })?;
+        let mode = metadata.permissions().mode();
+        if mode & 0o077 != 0 {
+            // Allow lax perms only when the operator explicitly opts in
+            // (mirroring #1055 for AI_MEMORY_DB_PASSPHRASE_FILE).
+            let opt_in = std::env::var("AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS")
+                .ok()
+                .is_some_and(|s| {
+                    let t = s.trim().to_ascii_lowercase();
+                    matches!(t.as_str(), "1" | "true" | "yes" | "on")
+                });
+            if !opt_in {
+                return Err(format!(
+                    "[llm].api_key_file = {:?} has lax permissions \
+                     (mode = {:o}; expected 0400 or stricter). Run \
+                     `chmod 0400 {}` to fix, or set \
+                     `AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS=1` to \
+                     bypass (NOT recommended for production).",
+                    path.display(),
+                    mode & 0o777,
+                    path.display()
+                ));
+            }
+            tracing::warn!(
+                "[llm].api_key_file = {:?} has lax permissions (mode = {:o}); \
+                 accepted because AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS=1",
+                path.display(),
+                mode & 0o777
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // Permission bits do not apply on non-Unix platforms.
+        let _ = path;
+    }
+    Ok(())
 }
 
 fn expand_tilde(s: &str) -> PathBuf {
