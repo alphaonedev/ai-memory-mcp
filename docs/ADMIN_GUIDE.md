@@ -1,10 +1,10 @@
 # Admin Guide
 
-> **Upgrading to v0.7?** Read [`MIGRATION_v0.7.md`](MIGRATION_v0.7.md) **before** you upgrade. v0.7.0 (`attested-cortex`) adds Ed25519 link attestation, a 20-event hook pipeline, sidechain transcripts + `memory_replay`, optional Apache AGE acceleration, capabilities v3 (with the new `memory_load_family` / `memory_smart_load` loaders), and a refactored permissions + A2A approval system. Most v0.6.4 callers see **no behavior change** — but pre-v0.6.3.1 v0.6.x users hit the G1 namespace-inheritance fix. Companion docs: [What's new in v0.7](whats-new-v07.html), [`attested-cortex` RFC](v0.7/rfc-attested-cortex.md), [v0.7 compatibility matrix](v0.7/compatibility-matrix.html), and [canonical phrasings](v0.7/canonical-phrasings.md) for the agent-facing strings.
+> **Upgrading to v0.7?** Read [`MIGRATION_v0.7.md`](MIGRATION_v0.7.md) **before** you upgrade. v0.7.0 (`attested-cortex`) adds Ed25519 link attestation, a 25-event hook pipeline (20 baseline lifecycle events + 5 v0.7.0 additions: PreRecallExpand, PreReflect, PostReflect, PreCompaction, OnCompactionRollback), sidechain transcripts + `memory_replay`, optional Apache AGE acceleration, capabilities v3 (with the new `memory_load_family` / `memory_smart_load` loaders), and a refactored permissions + A2A approval system. Most v0.6.4 callers see **no behavior change** — but pre-v0.6.3.1 v0.6.x users hit the G1 namespace-inheritance fix. Companion docs: [What's new in v0.7](whats-new-v07.html), [`attested-cortex` RFC](v0.7/rfc-attested-cortex.md), [v0.7 compatibility matrix](v0.7/compatibility-matrix.html), and [canonical phrasings](v0.7/canonical-phrasings.md) for the agent-facing strings.
 
 `ai-memory` is an AI-agnostic memory management system. It works with **any MCP-compatible AI client** -- including Claude AI, OpenAI ChatGPT, xAI Grok, META Llama, and others. The HTTP API and CLI are completely platform-independent.
 
-**Key features for admins:** Zero token cost until recall (replaces built-in auto-memory), TOON compact default response format (79% smaller than JSON), MCP prompts for proactive AI behavior (`recall-first`, `memory-workflow`), 4 feature tiers (keyword → autonomous with local LLMs via Ollama), and the v0.7.0 `attested-cortex` substrates (Ed25519 link attestation, hook pipeline, sidechain transcripts, optional AGE acceleration, capabilities v3, permissions + A2A approvals). 1,886 lib tests + 49+ integration tests at 93.84% line coverage (v0.6.3.1). v0.6.3 baseline numbers (1,600 lib / 93.08%) are frozen on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html); v0.6.3.1 and v0.7.0 deltas are documented in `CHANGELOG.md` and the per-release notes.
+**Key features for admins:** Zero token cost until recall (replaces built-in auto-memory), TOON compact default response format (79% smaller than JSON), MCP prompts for proactive AI behavior (`recall-first`, `memory-workflow`), 4 feature tiers (keyword → autonomous, with any LLM backend post-#1067 — local Ollama, xAI Grok, OpenAI, Anthropic, Gemini, DeepSeek, etc.), and the v0.7.0 `attested-cortex` substrates (Ed25519 link attestation, 25-event hook pipeline, sidechain transcripts, optional AGE acceleration, capabilities v3, permissions + A2A approvals). v0.7.0 ships ~2,400 tests across the full surface with line coverage held above the ≥92% project bar; v0.6.3.1 baseline numbers (1,886 lib / 93.84%) and v0.6.3 baselines (1,600 lib / 93.08%) are frozen on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html); v0.7.0 deltas live in `CHANGELOG.md` and the per-release notes.
 
 > **Maturity framing (v0.7).** The single-machine primitive (T1/T2 in the [architectures matrix](https://alphaonedev.github.io/ai-memory-mcp/architectures.html)) is **production-ready**. Federation (T3 multi-node quorum cluster) is **beta** — the code is shipped and tested but not recommended for unattended production fleets. The Postgres+pgvector backend reaches **GA in v0.7** (with optional **Apache AGE acceleration** for KG ops behind a bench gate). Ed25519 attestation, the hook pipeline, sidechain transcripts, and the permissions/A2A surfaces are all **opt-in** — a v0.7.0 install with no `hooks.toml`, no keypair, and no `[transcripts]` config behaves identically to v0.6.4 at the lifecycle layer. Multi-region distributed consensus (T5 "global hive") is **vision** at v1.0+. See the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html) for the canonical maturity labels — use those labels in all customer-facing materials.
 
@@ -45,7 +45,7 @@ Run the HTTP daemon directly in the foreground:
 ai-memory --db /path/to/ai-memory.db serve
 ```
 
-The daemon listens on `127.0.0.1:9077` by default and exposes 88 HTTP route registrations (44 unique URL paths) (canonical count on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html)).
+The daemon listens on `127.0.0.1:9077` by default and exposes 87 HTTP route registrations (73 unique URL paths) (canonical count on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html)).
 
 ### Systemd (Production HTTP Daemon)
 
@@ -524,7 +524,7 @@ The `--profile` flag **must** be passed in the MCP args — `config.toml` has no
 
 ## Hooks (v0.7+)
 
-The hook pipeline (Track G of `attested-cortex`) adds **20 lifecycle events** at every memory operation point, turning the substrate into a programmable extension surface. Hooks are **default off** — a v0.7 install with no `~/.config/ai-memory/hooks.toml` behaves identically to v0.6.4.
+The hook pipeline (Track G of `attested-cortex`) adds **25 lifecycle events** at every memory operation point, turning the substrate into a programmable extension surface. 20 baseline events (PreStore/PostStore/PreRecall/PostRecall/PreSearch/PostSearch/PreDelete/PostDelete/PrePromote/PostPromote/PreLink/PostLink/PreConsolidate/PostConsolidate/PreGovernanceDecision/PostGovernanceDecision/OnIndexEviction/PreArchive/PreTranscriptStore/PostTranscriptStore) plus 5 v0.7.0 additions (PreRecallExpand, PreReflect, PostReflect, PreCompaction, OnCompactionRollback). Authoritative enum: `src/hooks/events.rs::HookEvent`. Hooks are **default off** — a v0.7 install with no `~/.config/ai-memory/hooks.toml` behaves identically to v0.6.4.
 
 ```toml
 # ~/.config/ai-memory/hooks.toml
@@ -1143,7 +1143,7 @@ Both are cleaned up on graceful shutdown (the daemon runs `PRAGMA wal_checkpoint
 
 Maximum request body size: 50 MB.
 
-The HTTP daemon exposes **73 routes** at v0.7.0 (canonical count via `grep -oE '"/api/v1[^"]*"\|"/metrics"' src/lib.rs \| sort -u \| wc -l`; the table below lists the high-traffic surfaces — see [`docs/API_REFERENCE.md`](API_REFERENCE.md) for the complete enumeration):
+The HTTP daemon exposes **87 production `.route(...)` registrations / 73 unique URL paths** at v0.7.0 (canonical count via codegraph `codegraph_search kind=route limit=100` filtered to `src/lib.rs` excluding the `#[cfg(test)]`-gated `/slow` route at line 582; multi-line-aware path extraction via `awk '/\.route\(/{in=1}in&&/"\/[^"]*"/{match($0,/"\/[^"]*"/);print substr($0,RSTART,RLENGTH);in=0}' src/lib.rs | sort -u`. The table below lists the high-traffic surfaces — see [`docs/API_REFERENCE.md`](API_REFERENCE.md) for the complete enumeration):
 
 | Method | Path | Description |
 |--------|------|-------------|
