@@ -364,7 +364,7 @@ table tr:last-child td{border-bottom:none}
     <h2>Postgres + pgvector backbone.</h2>
     <p>The single-SQLite-per-node ceiling bites at T4 scale (>10⁶ memories per node, hot writers). The structural fix is a <strong>shared store</strong>.</p>
     <p><strong>Today (v0.6.x):</strong> <code>sal-postgres</code> Cargo feature flag exists; <code>sqlx</code> + <code>pgvector</code> deps wired. The Postgres adapter compiles and runs; correctness fixes shipped in v0.6.0 pre-tag (#294 SAL upsert key alignment, #295 <code>metadata.agent_id</code> immutability via <code>jsonb_set</code>, #296 tier-downgrade protection via SQL <code>tier_rank()</code>, #297 schema parity with 6 tables + generated <code>scope_idx</code> column). That work is the foundation.</p>
-    <p><strong>v0.7 GA:</strong> Performance maturation, migration tool for SQLite→Postgres on existing fleets, pgvector index tuning at &gt;10⁷ memories, official deployment recipes.</p>
+    <p><strong>v0.7.0 SHIPPED:</strong> Performance maturation complete, <code>ai-memory migrate --from sqlite:// --to postgres://</code> migration tool wired, pgvector + Apache AGE recipes in <a href="migration-v0.7.0-postgres.html">docs/migration-v0.7.0-postgres.md</a>, official deployment via <code>--features sal-postgres</code>.</p>
     <p>What the shared store unlocks at GA:</p>
     <ul>
       <li>Horizontal read scaling (Postgres read replicas).</li>
@@ -396,7 +396,7 @@ table tr:last-child td{border-bottom:none}
     <h2>Honest ceilings.</h2>
     <table>
       <thead>
-        <tr><th>Dimension</th><th>Today (v0.6.3)</th><th>v0.7 GA</th></tr>
+        <tr><th>Dimension</th><th>v0.6.4</th><th>v0.7.0 SHIPPED</th></tr>
       </thead>
       <tbody>
         <tr><td>Total memories per cluster</td><td>bounded by per-node HNSW RAM</td><td>pgvector → 10⁸+</td></tr>
@@ -430,7 +430,7 @@ ai-memory --db /var/lib/ai-memory/store.db serve \
   --quorum-ca-cert /etc/ai-memory/ca.crt \
   --catchup-interval-secs 15</code></pre>
 
-    <p>v0.7 GA target — same node, swap to Postgres-backed store:</p>
+    <p>v0.7.0 — same node, swap to Postgres-backed store:</p>
 <pre><code>ai-memory serve \
   --store-url postgres://ai-memory@pg-cluster.svc.cluster.local:5432/store \
   --bind 0.0.0.0:9077 \

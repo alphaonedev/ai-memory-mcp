@@ -86,7 +86,7 @@ v0.7.0 closes the `attested-cortex` epic (69/69 across 11 tracks A–K), folds i
 **One binary, four operational modes** (v0.6.4). The `ai-memory` Rust binary (tokio + axum) can run any of these in isolation or simultaneously, sharing a single SQLite database:
 
 1. **stdio MCP server** -- 73 native tools over JSON-RPC at full profile (v0.7.0; verified against `Profile::full().expected_tool_count()`). Default `--profile core` advertises 7 (the original 5 + `memory_load_family` + `memory_smart_load`) plus the always-on `memory_capabilities` bootstrap. `ai-memory mcp` / `ai-memory mcp --profile full`
-2. **HTTP / mTLS daemon** -- 42 REST endpoints on `127.0.0.1:9077`, TLS + optional mTLS allowlist + API-key auth, background GC loop. `ai-memory serve`
+2. **HTTP / mTLS daemon** -- 88 REST route registrations (44 unique URL paths) on `127.0.0.1:9077`, TLS + optional mTLS allowlist + API-key auth, background GC loop. `ai-memory serve`
 3. **Autonomous curator daemon** -- self-scheduling loop (default 1h cadence) that auto-tags, surfaces contradictions across namespace siblings, consolidates near-duplicates, and adjusts priority by access pattern. Every action goes to a rollback log; destructive ops can be gated behind a governance approval flow. `ai-memory curator --daemon`
 4. **Sync daemon** -- quorum-based peer federation across instances. W-of-N writes (default majority), vector-clock CRDT-lite merge, mTLS allowlist between peers. `ai-memory sync-daemon`
 
@@ -662,7 +662,7 @@ Beyond MCP, ai-memory also exposes a full HTTP REST API (73 routes on port 9077 
 - **Tagging** -- comma-separated tags with filter support
 
 ### Interfaces
-- **88 HTTP routes (43 unique paths)** -- full REST API on 127.0.0.1:9077 (works with any AI or tool)
+- **88 HTTP routes (44 unique paths)** -- full REST API on 127.0.0.1:9077 (works with any AI or tool)
 - **58 CLI subcommands at v0.7.0 with `--features sal-postgres`** (55 in the default build) -- complete CLI with identical capabilities
 - **73 MCP tools** at full profile (7 default at v0.7.0; verified against `Profile::full().expected_tool_count()`) -- native integration for any MCP-compatible AI
 - **Interactive REPL shell** -- recall, search, list, get, stats, namespaces, delete with color output

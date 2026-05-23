@@ -45,7 +45,7 @@ Run the HTTP daemon directly in the foreground:
 ai-memory --db /path/to/ai-memory.db serve
 ```
 
-The daemon listens on `127.0.0.1:9077` by default and exposes 42 HTTP endpoints (canonical count on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html)).
+The daemon listens on `127.0.0.1:9077` by default and exposes 88 HTTP route registrations (44 unique URL paths) (canonical count on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html)).
 
 ### Systemd (Production HTTP Daemon)
 
@@ -189,14 +189,14 @@ export AI_MEMORY_LLM_BACKEND=xai
 export AI_MEMORY_LLM_MODEL=grok-4
 export XAI_API_KEY=xai-…
 
-# Example 2: OpenAI gpt-4o
+# Example 2: OpenAI gpt-5
 export AI_MEMORY_LLM_BACKEND=openai
-export AI_MEMORY_LLM_MODEL=gpt-4o
+export AI_MEMORY_LLM_MODEL=gpt-5
 export OPENAI_API_KEY=sk-…
 
 # Example 3: Anthropic Claude (via OpenAI shim)
 export AI_MEMORY_LLM_BACKEND=anthropic
-export AI_MEMORY_LLM_MODEL=claude-sonnet-4
+export AI_MEMORY_LLM_MODEL=claude-opus-4.7
 export ANTHROPIC_API_KEY=sk-ant-…
 
 # Example 4: Generic OpenAI-compatible (vLLM, llama.cpp server, LMStudio at custom port)
@@ -273,7 +273,7 @@ At the `semantic` tier and above, ai-memory downloads a sentence-transformer mod
 | `AI_MEMORY_LLM_BACKEND` | `ollama` (legacy default) | **[#1067, v0.7.0]** LLM backend selector. Accepts `ollama`, `openai-compatible`, or a pre-filled vendor alias (`openai`, `xai`, `anthropic`, `gemini`, `deepseek`, `kimi`/`moonshot`, `qwen`/`dashscope`, `mistral`, `groq`, `together`, `cerebras`, `openrouter`, `fireworks`, `lmstudio`). When set, the LLM client is tier-independent. |
 | `AI_MEMORY_LLM_BASE_URL` | per-alias default; `http://localhost:11434` for `ollama` | **[#1067, v0.7.0]** Overrides default per-backend URL. REQUIRED with `AI_MEMORY_LLM_BACKEND=openai-compatible`. Legacy `OLLAMA_BASE_URL` still honoured when `BACKEND=ollama`. |
 | `AI_MEMORY_LLM_API_KEY` | unset | **[#1067, v0.7.0, secret]** Bearer secret for OpenAI-compatible backends. Per-vendor fallback env vars honoured (`OPENAI_API_KEY`, `XAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY` or `GOOGLE_API_KEY`, `DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY` or `KIMI_API_KEY`, `DASHSCOPE_API_KEY` or `QWEN_API_KEY`, `MISTRAL_API_KEY`, `GROQ_API_KEY`, `TOGETHER_API_KEY`, `CEREBRAS_API_KEY`, `OPENROUTER_API_KEY`, `FIREWORKS_API_KEY`). Never echoed in capabilities / banners / audit. |
-| `AI_MEMORY_LLM_MODEL` | tier-/vendor-specific | **[#1067, v0.7.0]** Model identifier (e.g. `grok-4` for xAI, `gpt-4o` for OpenAI, `deepseek-chat` for DeepSeek, `gemma3:4b` for Ollama). |
+| `AI_MEMORY_LLM_MODEL` | tier-/vendor-specific | **[#1067, v0.7.0]** Model identifier (e.g. `grok-4.3` for xAI, `gpt-5` for OpenAI, `deepseek-chat` for DeepSeek, `gemma3:4b` for Ollama). |
 | `OLLAMA_BASE_URL` | unset | Legacy escape hatch honoured ONLY when `AI_MEMORY_LLM_BACKEND` is unset or `ollama`. Pre-#1067 callers using the old env var keep working. |
 | `RUST_LOG` | (none) | Logging filter (e.g., `ai_memory=info,tower_http=debug`) |
 | `AI_MEMORY_NO_CONFIG` | (none) | Set to `1` to skip config file loading (useful for testing) |
@@ -436,9 +436,9 @@ Below is a complete example showing every supported field with explanatory comme
 #   "gemma4:e2b"  — Google Gemma 4 Effective 2B, ~1 GB Q4 (smart tier default)
 #   "gemma4:e4b"  — Google Gemma 4 Effective 4B, ~2.3 GB Q4 (autonomous tier default)
 # Post-#1067, the model is vendor-specific. Examples:
-#   "grok-4"          — xAI
-#   "gpt-4o"          — OpenAI
-#   "claude-sonnet-4" — Anthropic (via OpenAI shim)
+#   "grok-4.3"        — xAI
+#   "gpt-5"          — OpenAI
+#   "claude-opus-4.7" — Anthropic (via OpenAI shim)
 #   "deepseek-chat"   — DeepSeek
 #   "qwen-max"        — Qwen / Dashscope
 # Default: tier-dependent (gemma4:e2b for smart, gemma4:e4b for autonomous).

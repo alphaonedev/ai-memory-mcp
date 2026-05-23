@@ -433,7 +433,7 @@ ai-memory namespace set-standard agents/secops \
     <ul>
       <li><strong>Governance</strong> — Live and enforced. <code>GovernancePolicy</code> (<code>src/models/mod.rs</code>) per namespace, hierarchical with parent inheritance, supports <code>any</code> / <code>registered</code> / <code>owner</code> / <code>approve</code> for each of <code>write</code> / <code>promote</code> / <code>delete</code>. Namespace metadata lives in <code>namespace_meta</code> and is the source of truth for the gate.</li>
       <li><strong>Skills</strong> — Skills register themselves as agents (<code>mcp__memory__memory_agent_register</code>). Auto-tagging, contradiction detection, query expansion, and consolidation all run through the same scope visibility — a skill at <code>skills/auto-tag</code> with <code>team</code> scope only sees memories its team published. Skills can be subject to the same governance policies as humans-in-the-loop.</li>
-      <li><strong>Attestations</strong> — Field-level reservation only. <code>memory_links.signature</code> (schema v15) is populated with claimed identity at v0.6.3; v0.7 will sign with the agent's keypair and verify on read.</li>
+      <li><strong>Attestations</strong> — Field-level reservation only. <code>memory_links.signature</code> (schema v15 column) is now POPULATED at v0.7.0 with Ed25519 per-link attestation — see <code>src/signed_events.rs</code> + the V-4 cross-row hash chain at schema v34. Peers verify signatures on receive.</li>
     </ul>
   </div>
 </section>
