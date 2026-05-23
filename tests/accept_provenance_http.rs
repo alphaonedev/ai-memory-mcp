@@ -34,9 +34,7 @@
 //!    HTTP backwards-compat) and documented in
 //!    `src/handlers/accept_provenance.rs`.
 
-use ai_memory::handlers::accept_provenance::{
-    ProvenanceShape, parse_value, resolve_from_headers,
-};
+use ai_memory::handlers::accept_provenance::{ProvenanceShape, parse_value, resolve_from_headers};
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
 
 // ============================================================================
