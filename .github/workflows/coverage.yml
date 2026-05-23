@@ -30,6 +30,11 @@ on:
   push:
     branches: [main, develop, "feat/v0.7.0-grand-slam", "release/**"]
 
+# v0.7.x (#1148) — cancel stale runs on a PR when a new push lands.
+concurrency:
+  group: cov-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   AI_MEMORY_NO_CONFIG: "1"
@@ -69,13 +74,59 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 12
+    env:
+      # v0.7.x (#1148) — route every Rust link step through `mold`
+      # instead of the default `ld.bfd`. mold uses 2-4× less RSS than
+      # ld.bfd, eliminating the `collect2: signal 7 [Bus error]`
+      # linker-OOM that previously failed this gate on the 7 GB
+      # ubuntu-latest runner under the heavy `--features
+      # sal,sal-postgres` instrumented build.
+      RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+      # Trim DWARF + LTO via env-var overrides on the dev profile
+      # (NOT `--profile coverage`) so cargo-llvm-cov's report step
+      # finds the artifact dir at its default `debug/` path.
+      CARGO_PROFILE_DEV_DEBUG: "1"
+      CARGO_PROFILE_DEV_LTO: "false"
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
+
+      - name: Free disk + add swap (#1148 belt-and-suspenders, aggressive)
+        run: |
+          # Aggressive cleanup — the sal+sal-postgres instrumented
+          # coverage build's target/llvm-cov-target/ can exceed 20 GB
+          # under heavy integration-test instrumentation. Free
+          # everything we don't need before building.
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/.ghcup \
+                      /usr/local/share/powershell /usr/local/share/chromium \
+                      /usr/local/share/boost /usr/local/lib/node_modules \
+                      /opt/google /usr/lib/jvm /opt/microsoft \
+                      /usr/share/swift /usr/share/miniconda || true
+          sudo docker system prune -af --volumes || true
+          sudo apt-get autoremove --purge -y || true
+          sudo apt-get clean
+          # Swap on /mnt (the ephemeral data disk, ~70 GB) so the 8 GB
+          # doesn't eat into the root partition.
+          sudo fallocate -l 8G /mnt/swapfile-1148
+          sudo chmod 600 /mnt/swapfile-1148
+          sudo mkswap /mnt/swapfile-1148
+          sudo swapon /mnt/swapfile-1148
+          echo "::group::memory + disk after"
+          free -h
+          df -h /
+          df -h /mnt
+          echo "::endgroup::"
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
+
+      - name: Install mold linker (#1148)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold
+          mold --version
 
       - uses: Swatinem/rust-cache@v2
 
@@ -107,6 +158,13 @@ jobs:
           psql -h 127.0.0.1 -p 5432 -U ai_memory -d ai_memory_test -c "SELECT extname FROM pg_extension ORDER BY extname;"
 
       - name: Generate coverage JSON
+        # v0.7.x (#1148) — dev profile (default) WITH env-var
+        # overrides from the job-level `env:` block above
+        # (debuginfo=1, lto=false). Keeps artifacts under the default
+        # `target/llvm-cov-target/debug/` path so downstream report
+        # tooling (and the threshold checker) finds them, while still
+        # trimming the instrumented binary enough that mold can link
+        # it under the 7 GB runner ceiling.
         run: |
           mkdir -p coverage
           cargo llvm-cov \

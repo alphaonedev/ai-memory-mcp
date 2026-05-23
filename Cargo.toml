@@ -410,6 +410,35 @@ opt-level = 3
 strip = true
 lto = "thin"
 
+# v0.7.x (#1148) — purpose-built profile for `cargo llvm-cov` runs in CI.
+# Inherits `dev` (debug-assertions on, opt-level=0, etc.) but trims the
+# linker working set so the GitHub-hosted `ubuntu-latest` runner (7 GB
+# RAM + 14 GB swap) does not SIGBUS on the heavy
+# `--features sal,sal-postgres` instrumented link step. Three knobs:
+#
+#   * `debug = 1`  — line-only DWARF instead of the full v2 table. The
+#                    instrumentation map still works for source-based
+#                    coverage; the per-region inline tree drops out. ~30%
+#                    smaller instrumented binary.
+#   * `lto = false` — coverage measurement does not need cross-crate
+#                    optimisation; LTO compounds memory pressure under
+#                    instrumentation.
+#   * `codegen-units = 16` — smaller per-TU object files keep peak
+#                    linker RSS lower. Counter-intuitively, higher units
+#                    is BETTER for linker memory: many small objects vs
+#                    one giant one. Matches the v0.6.x release profile
+#                    posture.
+#
+# Activated via `CARGO_PROFILE_COVERAGE_*` env or by explicitly passing
+# `--profile coverage` to `cargo llvm-cov`. See `.github/workflows/ci.yml`
+# §"Code Coverage" + `.github/workflows/coverage.yml` for the call sites.
+[profile.coverage]
+inherits = "dev"
+debug = 1
+lto = false
+codegen-units = 16
+incremental = false
+
 # v0.7.0 #873 — codify the per-function size budget so future PRs cannot
 # silently grow new god-functions past the threshold. 250 lines is the
 # discipline anchor (any tool body that needs more than 250 lines is

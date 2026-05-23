@@ -2237,6 +2237,20 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "v0.7.x (#1148): RFC 6761 reserves the .invalid TLD for \
+                  NXDOMAIN guarantees, but Windows' built-in DNS resolver \
+                  does not fully honor it — NetBIOS / WINS / DNS search \
+                  suffixes can synthesize a 'success' that bypasses the \
+                  fail-closed expectation. This test exercises a security \
+                  invariant on the production HTTP daemon, which only ships \
+                  on Linux + macOS (see docs/integrations/platforms.md); the \
+                  Windows runner exists for the lib-build contract, not the \
+                  daemon. Ignoring on target_os = windows keeps the \
+                  Linux/macOS guarantee enforced without false-failing the \
+                  Windows lib-build."
+    )]
     fn test_validate_url_dns_fails_closed_on_dns_failure_1053() {
         // v0.7.0 #1053 (Agent-2 #3) — DNS resolution failure now
         // returns Err so an attacker cannot smuggle a private-range

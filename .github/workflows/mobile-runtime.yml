@@ -65,7 +65,7 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
 
       - name: Install Rust stable + iOS-sim target
         uses: dtolnay/rust-toolchain@stable
@@ -164,7 +164,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' && (inputs.run_android == 'true' || inputs.run_android == ''))
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
 
       - name: Install Rust stable + Android x86_64 target
         uses: dtolnay/rust-toolchain@stable
