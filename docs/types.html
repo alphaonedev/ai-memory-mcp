@@ -98,7 +98,7 @@ footer a{color:var(--text-muted)}
     <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Types</span></a>
     <div class="right">
       <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
-      <a href="whats-new-v063.html" style="color:#ffb86b">v0.6.3</a>
+      <a href="whats-new-v07.html" style="color:#ffb86b">v0.7.0</a>
       <div class="menu">
         <button class="menu-btn">Audiences<span class="caret">▾</span></button>
         <div class="menu-pane">
@@ -326,7 +326,7 @@ Tier::from_str(&amp;str) -&gt; Option&lt;Tier&gt;</div>
     <div class="ty k-struct" id="forgetquery">
       <div class="ty-head"><span class="ty-name">ForgetQuery</span><span class="ty-kind struct">struct</span><span class="ty-since">since v0.1</span></div>
       <div class="ty-derive"><code>#[derive(Debug, Deserialize)]</code></div>
-      <div class="ty-desc">Body of <code>POST /memories/forget</code> and <code>memory_forget</code>. Pattern-based delete; archives matched memories rather than hard-deleting.</div>
+      <div class="ty-desc">Body of <code>POST /api/v1/forget</code> and <code>memory_forget</code> (v0.7.0: route registered at /api/v1/forget, not /api/v1/memories/forget). Pattern-based delete; archives matched memories rather than hard-deleting.</div>
       <table class="fld"><thead><tr><th>field</th><th>type</th><th>notes</th></tr></thead><tbody>
         <tr><td class="fname">namespace</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote"><span class="flag opt">OPT</span>Restricts the sweep to a namespace.</td></tr>
         <tr><td class="fname">pattern</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote"><span class="flag opt">OPT</span>FTS5 pattern; matches title+content.</td></tr>

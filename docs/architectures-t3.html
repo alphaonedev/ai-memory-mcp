@@ -385,8 +385,8 @@ table tr:last-child td{border-bottom:none}
     <h2>Honest about the remaining gaps.</h2>
     <ul>
       <li><strong>Strong consensus on the governance plane</strong> — Quorum writes give bounded staleness, not strong consistency. Two operators on opposite sides of a partition can each approve a pending action; reconciliation is last-decision-wins on rejoin. Distributed consensus (Raft/Paxos) is v1.0+ territory and only makes sense for the governance plane, not the memory write path.</li>
-      <li><strong>Cryptographic attestation</strong> — Agent identity is claimed (<code>metadata.agent_id</code> from clap or <code>AI_MEMORY_AGENT_ID</code> env), not signed. The <code>signature</code> column on <code>memory_links</code> (v0.6.3 schema v15) is reserved for the v0.7 attestation track that signs every link with the originating agent's keypair.</li>
-      <li><strong>Postgres + pgvector backbone</strong> — Compiles today behind <code>--features sal-postgres</code>; correctness fixes shipped in v0.6.x (#294-#297). Performance maturation and GA targeted v0.7.</li>
+      <li><strong>Cryptographic attestation</strong> — Agent identity is claimed (<code>metadata.agent_id</code> from clap or <code>AI_MEMORY_AGENT_ID</code> env), not signed. The <code>signature</code> column on <code>memory_links</code> (v0.6.3 schema v15) is POPULATED at v0.7.0 with Ed25519 per-link attestation. Plus <code>attest_level</code> + <code>signed_at</code> columns landed at v0.7.0.</li>
+      <li><strong>Postgres + pgvector backbone</strong> — <strong>SHIPPED at v0.7.0 GA</strong> via <code>--features sal-postgres</code>. Apache AGE Cypher graph backend auto-detected when pg_extension installed. SAL trait abstracts sqlite vs postgres+AGE; <code>ai-memory serve --store-url postgres://…</code> selects the postgres path.</li>
       <li><strong>CRDT-lite link tombstones</strong> — Delete-link fanout is deferred; the CHANGELOG (#325) tracks it for v0.7. Local <code>DELETE /api/v1/links</code> works today.</li>
     </ul>
     <p>If your fleet needs strong cross-region governance consensus, that's v1.0+. Everything else listed is shipping.</p>
@@ -464,7 +464,7 @@ ai-memory --db /var/lib/ai-memory/store.db serve \
     <ul>
       <li><strong>Governance</strong> — Federated, eventually consistent. A policy change on one node propagates to all peers. Pending decisions also propagate. <strong>Caveat:</strong> during a partition, two operators on different sides can both approve/reject the same pending action; reconciliation is last-decision-wins on rejoin.</li>
       <li><strong>Skills</strong> — Skills running as registered agents (<code>memory_agent_register</code>) get the same scope visibility on every node. Auto-tagging on node-A produces tags that are stored as memory metadata and replicated to all peers — every node sees the same enriched view.</li>
-      <li><strong>Attestations</strong> — Claimed identity only. The v0.7 attestation track will sign every memory and link with the originating agent's keypair; peers will refuse syncs that fail signature verification.</li>
+      <li><strong>Attestations</strong> — <strong>Ed25519 SHIPPED at v0.7.0</strong>. Per-agent keypair signs every link; peers refuse syncs with invalid signatures (AI_MEMORY_FED_REQUIRE_SIG=1 default). V-4 cross-row hash chain (schema v34) seals the signed_events audit log against tampering.</li>
     </ul>
   </div>
 </section>

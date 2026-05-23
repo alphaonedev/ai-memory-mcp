@@ -479,7 +479,7 @@ Closes #966. Introduces `pub struct RequestValidator` in `src/validate.rs` —
 the canonical fluent surface every wire-entry layer (HTTP handlers, MCP tools,
 CLI subcommands) now routes DTO-bundling validation through. Pre-#966 the
 same `validate_id` + `validate_namespace` + `validate_agent_id` + ... chains
-were duplicated across 73 HTTP routes, 73 MCP tools, and 57 CLI subcommands (55 in the default build, 57 with `--features sal-postgres`);
+were duplicated across 88 HTTP routes (44 unique URL paths), 73 MCP tools, and 58 CLI subcommands (56 in the default build, 58 with `--features sal-postgres`);
 adding a new cross-field invariant required three audited per-surface edits.
 
 **New surface (zero-cost facade — methods only, no per-call state):**

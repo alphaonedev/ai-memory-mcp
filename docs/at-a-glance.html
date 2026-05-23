@@ -909,9 +909,9 @@ footer.site-foot a { color: var(--text-muted); }
 <div class="stats-strip">
   <div class="container" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:1.5rem;">
     <div class="stat-item"><span class="stat-num">73</span><span class="stat-label">MCP tools (--profile full)</span></div>
-    <div class="stat-item"><span class="stat-num">73</span><span class="stat-label">HTTP endpoints</span></div>
-    <div class="stat-item"><span class="stat-num">57</span><span class="stat-label">CLI commands</span></div>
-    <div class="stat-item"><span class="stat-num">7</span><span class="stat-label">Platforms (incl. iOS + Android)</span></div>
+    <div class="stat-item"><span class="stat-num">88</span><span class="stat-label">HTTP routes (44 unique paths)</span></div>
+    <div class="stat-item"><span class="stat-num">58</span><span class="stat-label">CLI commands</span></div>
+    <div class="stat-item"><span class="stat-num">5</span><span class="stat-label">Platforms (macOS·Linux·Windows·iOS·Android)</span></div>
     <div class="stat-item"><span class="stat-num">15+</span><span class="stat-label">LLM vendors (Ollama + cloud)</span></div>
     <div class="stat-item"><span class="stat-num">v49</span><span class="stat-label">Schema version (v0.7.0)</span></div>
   </div>
@@ -1792,13 +1792,13 @@ footer.site-foot a { color: var(--text-muted); }
         <div class="dash-sub">--profile full (7 core / 73 full) · Claude / Cursor / Codex / Continue</div>
       </div>
       <div class="dash-tile p2">
-        <div class="dash-label">HTTP endpoints</div>
-        <div class="dash-num">73</div>
-        <div class="dash-sub">REST + SSE + mTLS + HMAC-signed webhooks</div>
+        <div class="dash-label">HTTP routes</div>
+        <div class="dash-num">88</div>
+        <div class="dash-sub">88 .route(…) bindings · 44 unique URL paths · REST + SSE + mTLS + HMAC-signed webhooks</div>
       </div>
       <div class="dash-tile p2">
         <div class="dash-label">CLI commands</div>
-        <div class="dash-num">57</div>
+        <div class="dash-num">58</div>
         <div class="dash-sub">store, recall, sync, config migrate, doctor, ...</div>
       </div>
       <div class="dash-tile p3">
@@ -1932,7 +1932,7 @@ footer.site-foot a { color: var(--text-muted); }
         <div class="card p2" style="height:100%;display:flex;flex-direction:column">
           <div class="card-eyebrow" style="color:var(--pillar-2)">▸ COMPLETE SURFACE AREA</div>
           <div class="card-title">Feature Matrix</div>
-          <p class="card-body">Every MCP tool, every HTTP endpoint, every CLI command — categorized, cross-referenced. 73 + 73 + 57 = 203 operations at v0.7.0. The SME's full reference.</p>
+          <p class="card-body">Every MCP tool, every HTTP route, every CLI command — categorized, cross-referenced. <strong>73 MCP tools + 88 HTTP routes (44 unique paths) + 58 CLI subcommands</strong> at v0.7.0. The SME's full reference.</p>
           <div style="margin-top:.85rem;font-family:var(--font-mono);font-size:.78rem;color:var(--pillar-2)">feature-matrix.html →</div>
         </div>
       </a>
@@ -2039,7 +2039,7 @@ footer.site-foot a { color: var(--text-muted); }
         <div class="card p2" style="height:100%;display:flex;flex-direction:column">
           <div class="card-eyebrow" style="color:var(--pillar-2)">▸ STRUCTURED COGNITION</div>
           <div class="card-title">Knowledge Graph</div>
-          <p class="card-body">6 relation variants (related_to / supersedes / contradicts / derived_from / reflects_on / derives_from). Entity registry with alias resolution. Temporal validity columns + Ed25519 signature column populated. 4 KG MCP tools: memory_kg_query / kg_timeline / kg_invalidate / find_paths. Apache AGE acceleration on Postgres backend.</p>
+          <p class="card-body">6 relation variants (related_to / supersedes / contradicts / derived_from / reflects_on / derives_from). Entity registry with alias resolution. Temporal validity columns + Ed25519 signature column populated. <strong>11 graph-family MCP tools</strong>: memory_kg_query / memory_kg_timeline / memory_kg_invalidate / memory_find_paths / memory_link / memory_get_links / memory_entity_register / memory_entity_get_by_alias / memory_get_taxonomy / memory_replay / memory_verify. Apache AGE acceleration on Postgres backend.</p>
           <div style="margin-top:.85rem;font-family:var(--font-mono);font-size:.78rem;color:var(--pillar-2)">knowledge-graph.html →</div>
         </div>
       </a>
