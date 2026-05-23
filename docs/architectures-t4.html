@@ -9,7 +9,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ai-memory · T4 — Data-center swarm</title>
-<meta name="description" content="Multi-rack deployment with Postgres+pgvector backbone, mTLS peer mesh, per-rack governance — agents swarm across pods. v0.7 roadmap, with shipping primitives called out.">
+<meta name="description" content="Multi-rack deployment with Postgres+pgvector backbone + Apache AGE Cypher graph + mTLS peer mesh + per-rack governance — agents swarm across pods. Shipped at v0.7.0 via --features sal-postgres.">
 <meta property="og:title" content="ai-memory · T4 — Data-center swarm">
 <meta property="og:description" content="Multi-rack swarm. Quorum writes ship today; Postgres+pgvector backbone GA v0.7.">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/architectures-t4.html">
@@ -100,7 +100,7 @@ table tr:last-child td{border-bottom:none}
     <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Architectures · T4</span></a>
     <div class="right">
       <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
-      <a href="whats-new-v063.html" style="color:#ffb86b">v0.6.3</a>
+      <a href="whats-new-v07.html" style="color:#ffb86b">v0.7.0</a>
       <div class="menu">
         <button class="menu-btn">Audiences<span class="caret">▾</span></button>
         <div class="menu-pane">
@@ -168,8 +168,8 @@ table tr:last-child td{border-bottom:none}
 </nav>
 
 <section class="hero">
-  <span class="cap-badge cap-today">CORE TODAY · v0.6.3</span>
-  <span class="cap-badge cap-roadmap">PG+pgvector GA · v0.7</span>
+  <span class="cap-badge cap-today">CORE TODAY · v0.7.0</span>
+  <span class="cap-badge cap-today">PG+pgvector + Apache AGE · v0.7.0 SHIPPED</span>
   <h1>Tier 4 — Data-center swarm</h1>
   <p class="tagline">Hundreds of nodes. Thousands of agents. Multiple racks. <strong>One coherent memory fabric.</strong> The core fabric ships in v0.6.3; the piece still maturing toward GA at this scale is the shared distributed store (Postgres + pgvector).</p>
   <div class="pills">
@@ -182,18 +182,18 @@ table tr:last-child td{border-bottom:none}
 
 <section>
   <div class="container">
-    <p>The core fabric ships in v0.6.3: the peer mesh, <strong>W-of-N quorum-writes</strong>, mTLS with fingerprint allowlist, federated governance, pending decisions, namespace metadata, capabilities introspection v2. The piece still maturing toward GA at this scale is the <strong>shared distributed store</strong> (Postgres + pgvector, behind the <code>sal-postgres</code> Cargo feature today, GA targeted v0.7).</p>
-    <p>The diagram distinguishes shipping vs roadmap: solid edges = today, indigo dashed = v0.7 GA piece.</p>
+    <p>The core fabric ships in v0.6.3: the peer mesh, <strong>W-of-N quorum-writes</strong>, mTLS with fingerprint allowlist, federated governance, pending decisions, namespace metadata, capabilities introspection v2. The piece still maturing toward GA at this scale is the <strong>shared distributed store</strong> (Postgres + pgvector, behind the <code>sal-postgres</code> Cargo feature today, SHIPPED at v0.7.0 via `--features sal-postgres`).</p>
+    <p>The diagram distinguishes layers: solid edges = always-on at v0.7.0; the Postgres + Apache AGE + pgvector layer ships at v0.7.0 via `--features sal-postgres`.</p>
   </div>
 </section>
 
 <section>
   <div class="container">
     <span class="eyebrow">Architecture diagram</span>
-    <h2>Multi-rack swarm · pgvector backbone (roadmap).</h2>
+    <h2>Multi-rack swarm · pgvector + Apache AGE backbone (shipped at v0.7.0).</h2>
 
     <div class="arch-diagram">
-      <div class="arch-diagram-title">T4 · Multi-rack swarm · pgvector backbone (roadmap) · quorum writes (today)</div>
+      <div class="arch-diagram-title">T4 · Multi-rack swarm · pgvector + Apache AGE backbone (shipped at v0.7.0) · quorum writes (always-on)</div>
 
       <svg class="arch-svg" viewBox="0 0 940 620" role="img" aria-label="Multi-rack ai-memory data center swarm with Postgres pgvector backbone">
 
@@ -286,7 +286,7 @@ table tr:last-child td{border-bottom:none}
           <text x="490" y="533" text-anchor="middle" class="node-label" style="font-size: 12px">Postgres + pgvector</text>
           <text x="490" y="550" text-anchor="middle" class="sub-label">--features sal-postgres</text>
           <text x="490" y="565" text-anchor="middle" class="sub-label">shared store · shared HNSW</text>
-          <text x="490" y="580" text-anchor="middle" class="sub-label" font-weight="700" fill="#a78bfa">ROADMAP · v0.7 Track B</text>
+          <text x="490" y="580" text-anchor="middle" class="sub-label" font-weight="700" fill="#a78bfa">SHIPPED · v0.7.0 sal-postgres + Apache AGE</text>
         </g>
 
         <use href="#t4-RaPg" class="edge-roadmap" marker-end="url(#t4-arrow)" style="color: #a78bfa" />
@@ -331,7 +331,7 @@ table tr:last-child td{border-bottom:none}
       <div class="arch-legend">
         <span class="arch-legend-item"><span class="arch-legend-dot" style="background: #a78bfa"></span>sync_push mesh (today)</span>
         <span class="arch-legend-item"><span class="arch-legend-dot" style="background: #facc15"></span>federated control plane</span>
-        <span class="arch-legend-item"><span class="arch-legend-dot" style="background: #a78bfa; opacity: 0.5"></span>pgvector / quorum (roadmap)</span>
+        <span class="arch-legend-item"><span class="arch-legend-dot" style="background: #a78bfa; opacity: 0.5"></span>pgvector / quorum / Apache AGE (shipped v0.7.0)</span>
         <span class="arch-legend-item"><span class="arch-legend-dot" style="background: #2dd4bf"></span>mTLS peer transport</span>
       </div>
 
@@ -360,7 +360,7 @@ table tr:last-child td{border-bottom:none}
 
 <section>
   <div class="container">
-    <span class="eyebrow">Track B roadmap</span>
+    <span class="eyebrow">Track B — SHIPPED v0.7.0</span>
     <h2>Postgres + pgvector backbone.</h2>
     <p>The single-SQLite-per-node ceiling bites at T4 scale (>10⁶ memories per node, hot writers). The structural fix is a <strong>shared store</strong>.</p>
     <p><strong>Today (v0.6.x):</strong> <code>sal-postgres</code> Cargo feature flag exists; <code>sqlx</code> + <code>pgvector</code> deps wired. The Postgres adapter compiles and runs; correctness fixes shipped in v0.6.0 pre-tag (#294 SAL upsert key alignment, #295 <code>metadata.agent_id</code> immutability via <code>jsonb_set</code>, #296 tier-downgrade protection via SQL <code>tier_rank()</code>, #297 schema parity with 6 tables + generated <code>scope_idx</code> column). That work is the foundation.</p>
@@ -473,7 +473,7 @@ ai-memory --db /var/lib/ai-memory/store.db serve \
 </section>
 
 <footer>
-  <p>© 2026 AlphaOne LLC. Licensed Apache-2.0. ai-memory v0.6.3.1 — <a href="https://github.com/alphaonedev/ai-memory-mcp">source on GitHub</a> · <a href="./">home</a></p>
+  <p>© 2026 AlphaOne LLC. Licensed Apache-2.0. ai-memory v0.7.0 — <a href="https://github.com/alphaonedev/ai-memory-mcp">source on GitHub</a> · <a href="./">home</a></p>
 </footer>
 
 </body>

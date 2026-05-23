@@ -100,7 +100,7 @@ table tr:last-child td{border-bottom:none}
     <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Architectures · T5</span></a>
     <div class="right">
       <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
-      <a href="whats-new-v063.html" style="color:#ffb86b">v0.6.3</a>
+      <a href="whats-new-v07.html" style="color:#ffb86b">v0.7.0</a>
       <div class="menu">
         <button class="menu-btn">Audiences<span class="caret">▾</span></button>
         <div class="menu-pane">
@@ -229,7 +229,7 @@ table tr:last-child td{border-bottom:none}
                 fill="url(#t5-attest-grad)" stroke="#f472b6" stroke-width="1.6" />
           <text x="470" y="55" text-anchor="middle" class="node-label" style="font-size: 13px">Federated identity &amp; attestation root</text>
           <text x="470" y="73" text-anchor="middle" class="sub-label">agent keypairs · signed memories · signed links</text>
-          <text x="470" y="88" text-anchor="middle" class="sub-label">memory_links.signature (v0.6.3 reserved · v0.7 wired)</text>
+          <text x="470" y="88" text-anchor="middle" class="sub-label">memory_links.signature (v0.7.0 WIRED with Ed25519 attestation)</text>
           <text x="470" y="103" text-anchor="middle" class="sub-label" font-weight="700" fill="#be185d">v1.0+ · zero-trust cross-org</text>
         </g>
 
@@ -319,7 +319,7 @@ table tr:last-child td{border-bottom:none}
       </svg>
 
       <div class="arch-legend">
-        <span class="arch-legend-item"><span class="arch-legend-dot" style="background: #a78bfa"></span>inter-region sync (eventually consistent today, quorum v0.7)</span>
+        <span class="arch-legend-item"><span class="arch-legend-dot" style="background: #a78bfa"></span>inter-region sync (HMAC-signed + nonce-required at v0.7.0)</span>
         <span class="arch-legend-item"><span class="arch-legend-dot" style="background: #f472b6"></span>attested identity (v0.7 wired, v1.0 fleet-trust)</span>
         <span class="arch-legend-item"><span class="arch-legend-dot" style="background: #a78bfa; opacity: 0.5"></span>consensus rail (v1.0+ vision)</span>
         <span class="arch-legend-item"><span class="arch-legend-dot" style="background: #2dd4bf"></span>regional cluster (T4 pattern)</span>
@@ -343,7 +343,7 @@ table tr:last-child td{border-bottom:none}
     <p>At T1–T4, an agent's identity is <strong>claimed</strong> via <code>metadata.agent_id</code>. At T5 it must be <strong>proven</strong>.</p>
     <p>The plumbing is already in v0.6.3 schema:</p>
     <ul>
-      <li><code>memory_links.signature</code> column (schema v15) — reserved at v0.6.3, populated with claimed identity, will be cryptographically signed at v0.7.</li>
+      <li><code>memory_links.signature</code> column (schema v15) — reserved at v0.6.3 placeholder; populated at v0.7.0 with Ed25519 per-link attestation.</li>
       <li>The <code>observed_by</code> column on <code>memory_links</code> records which agent observed the relationship — paired with <code>signature</code> this becomes provable provenance.</li>
     </ul>
     <p>What's needed to reach the T5 trust model:</p>
@@ -462,7 +462,7 @@ table tr:last-child td{border-bottom:none}
 </section>
 
 <footer>
-  <p>© 2026 AlphaOne LLC. Licensed Apache-2.0. ai-memory v0.6.3.1 — <a href="https://github.com/alphaonedev/ai-memory-mcp">source on GitHub</a> · <a href="./">home</a></p>
+  <p>© 2026 AlphaOne LLC. Licensed Apache-2.0. ai-memory v0.7.0 — <a href="https://github.com/alphaonedev/ai-memory-mcp">source on GitHub</a> · <a href="./">home</a></p>
 </footer>
 
 </body>

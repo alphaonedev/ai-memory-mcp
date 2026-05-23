@@ -245,7 +245,7 @@ WantedBy=multi-user.target</code></pre>
 <section class="wrap-mid">
   <div class="eyebrow-h2">7. Upgrade</div>
   <h2>Schema-versioned, migration-tested.</h2>
-  <p>The SQLite store carries an integer schema version (currently v43). Migrations run on first open of the new binary; the migration set is dry-run-tested against the operator's own DB by the project's dogfood script before a release ships.</p>
+  <p>The SQLite store carries an integer schema version (<strong>currently v49 at v0.7.0</strong>; was v33 at v0.6.4). Migrations run on first open of the new binary; the migration set is dry-run-tested against the operator's own DB by the project's dogfood script before a release ships.</p>
   <ul>
     <li>Backup the DB before upgrade: <code>cp ai-memory.db ai-memory.db.bak</code>.</li>
     <li>Stop the daemon, install the new binary, restart. Migrations run automatically.</li>
