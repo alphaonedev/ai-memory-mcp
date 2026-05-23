@@ -1774,22 +1774,26 @@ pub async fn build_llm_client(
     // shows which precedence layer won.
     let resolved = app_config.resolve_llm(None, None, None);
 
-    // Keyword tier short-circuit: when there is no explicit operator
-    // intent (no CLI flag, no env var, no [llm] section, no legacy
-    // flat fields — i.e. source == CompiledDefault), the resolver's
-    // Ollama-default-fallback should NOT pull a client into existence
-    // for a keyword-tier daemon. Operators who explicitly want LLM
-    // on keyword tier set AI_MEMORY_LLM_BACKEND (or write a [llm]
-    // section), which moves `source` off the CompiledDefault arm.
-    if matches!(feature_tier, FeatureTier::Keyword)
+    // No-preset-tier short-circuit: when the tier has no compiled
+    // `llm_model` preset (Keyword + Semantic at v0.7.0) AND there is
+    // no explicit operator intent (resolver `source == CompiledDefault`),
+    // the resolver's Ollama-default-fallback should NOT pull a client
+    // into existence. This matches pre-#1146 v0.6.x behaviour and
+    // avoids paying a blocking reqwest call to a (likely-absent)
+    // Ollama under tokio test contexts. Operators who explicitly
+    // want an LLM on Keyword/Semantic set AI_MEMORY_LLM_BACKEND or
+    // write a [llm] section, which moves `source` off the
+    // CompiledDefault arm.
+    if feature_tier.config().llm_model.is_none()
         && matches!(
             resolved.source,
             crate::config::ConfigSource::CompiledDefault
         )
     {
         tracing::debug!(
-            "L5: llm client disabled — keyword tier with no operator LLM config; \
-             set AI_MEMORY_LLM_BACKEND or [llm] section to enable"
+            "L5: llm client disabled — tier={} has no llm_model preset AND no \
+             operator LLM config; set AI_MEMORY_LLM_BACKEND or [llm] section to enable",
+            feature_tier.as_str()
         );
         return None;
     }

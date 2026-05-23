@@ -42,7 +42,7 @@ use uuid::Uuid;
 
 use crate::db;
 #[cfg(feature = "sal")]
-use crate::models::{Memory, Tier};
+use crate::models::Tier;
 use crate::validate;
 
 use super::AppState;
