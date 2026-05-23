@@ -28,6 +28,12 @@ use crate::reranker::{BatchedReranker, CrossEncoder};
 
 pub(super) mod registry;
 
+// v0.7.x (#1154) — daemon-side Ed25519-signed `serverInfo` block for
+// the MCP initialize handshake. Closes NSA CSI MCP Security concern
+// (j) Tool invocation path confusion. See module docs for the threat
+// model + canonical-bytes discipline.
+pub mod server_identity;
+
 // v0.7.0 #972 D1.5 (#986) — shared parity-test helpers for the
 // schemars-derived `McpTool` impls vs. the legacy hand-coded
 // `tool_definitions()` catalog. Each `d1_5_986_tests` mod under
@@ -1643,17 +1649,41 @@ fn handle_request(
     }
 
     match req.method.as_str() {
-        "initialize" => ok_response(
-            id,
-            json!({
-                "protocolVersion": "2024-11-05",
-                "capabilities": { "tools": {}, "prompts": {} },
-                "serverInfo": {
-                    "name": "ai-memory",
-                    "version": env!("CARGO_PKG_VERSION")
-                }
-            }),
-        ),
+        "initialize" => {
+            // v0.7.x (#1154) — daemon serverInfo Ed25519 signing.
+            // Closes NSA CSI MCP Security concern (j) Tool invocation
+            // path confusion at the substrate boundary. When the
+            // daemon has an Ed25519 keypair on disk (loaded by
+            // `crate::governance::audit::load_daemon_signing_key`
+            // at startup and threaded as `active_keypair`), the
+            // `serverInfo` block carries a signed `ai_memory_identity`
+            // sub-block clients can pin via Trust On First Use. When
+            // no keypair is present, the sub-block is OMITTED — same
+            // wire shape as v0.7.0, preserving the "continuing
+            // unsigned" posture documented at `src/main.rs:96-98`.
+            // Per MCP / JSON-RPC convention, clients ignore unknown
+            // response fields, so this is zero-risk on wire compat.
+            let mut server_info = json!({
+                "name": "ai-memory",
+                "version": env!("CARGO_PKG_VERSION"),
+            });
+            let now_rfc3339 = chrono::Utc::now()
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            if let Ok(Some(identity_block)) =
+                server_identity::build_signed_identity(active_keypair, &now_rfc3339)
+                && let Some(obj) = server_info.as_object_mut()
+            {
+                obj.insert("ai_memory_identity".to_string(), identity_block);
+            }
+            ok_response(
+                id,
+                json!({
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": { "tools": {}, "prompts": {} },
+                    "serverInfo": server_info,
+                }),
+            )
+        }
         "notifications/initialized" | "ping" => ok_response(id, json!({})),
         "tools/list" => ok_response(id, tool_definitions_for_profile(profile)),
         "prompts/list" => ok_response(id, prompt_definitions()),

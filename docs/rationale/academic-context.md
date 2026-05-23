@@ -8,6 +8,13 @@
 - Ortega, P. A., & de Freitas, N. (2026). *Causal interactive LLM agents that tell the truth*. Manuscript.
 - de Freitas, N. et al. (2026). *Intelligence via generation and selection: A tutorial on reinforcement learning with LLMs and tools*. Manuscript.
 - de Freitas, N. et al. (2026). *Diffusion and flow matching tutorial: How we generate images, video, speech and protein structures*. Manuscript.
+- National Security Agency. (2026). *Model Context Protocol (MCP): Security Design Considerations for AI-Driven Automation*. Cybersecurity Information, U/OO/6030316-26 | PP-26-1834, Version 1.0, May 2026. (Procurement-grade companion to the academic citations above.)
+
+## Procurement-grade companion citation
+
+The procurement-grade companion to the academic intervention/observation discipline above is the National Security Agency's Cybersecurity Information document on Model Context Protocol security (`U/OO/6030316-26`, May 2026). The NSA document enumerates ten security concerns and seven recommendations for MCP implementations operating in high-assurance environments. The do-calculus (Pearl 2009) says *why* substrate-level provenance discipline matters; the Ortega and de Freitas (2026) paper says *what* breaks when training-layer SFT loses the distinction; the NSA document says *where* the procurement requirement lives — what federal evaluators look for when assessing an MCP substrate for deployment in regulated environments.
+
+ai-memory's substrate-level mapping to the NSA document is documented at [`docs/compliance/nsa-csi-mcp-security-mapping.md`](../compliance/nsa-csi-mcp-security-mapping.md); the honest-limitations companion at [`docs/compliance/honest-limitations.md`](../compliance/honest-limitations.md) documents the substrate boundaries that exist regardless of any framework. The pair forms the procurement-grade evidence pair federal reviewers consume.
 
 ---
 

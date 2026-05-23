@@ -40,6 +40,17 @@ the substrate (intra-session reasoning) is its own responsibility.
 See `docs/rationale/academic-context.md` for the procurement-
 audience version.
 
+The procurement-grade requirements for these layers in high-assurance
+MCP deployments are enumerated in the National Security Agency's
+Cybersecurity Information document on Model Context Protocol
+security (`U/OO/6030316-26`, May 2026). Substrate compliance with
+those requirements is documented at
+[`docs/compliance/nsa-csi-mcp-security-mapping.md`](compliance/nsa-csi-mcp-security-mapping.md)
+(10 of 10 NSA concerns + 7 of 7 NSA recommendations structurally
+addressed at v0.7.0); the honest-limitations framing for what the
+substrate does NOT defend against is at
+[`docs/compliance/honest-limitations.md`](compliance/honest-limitations.md).
+
 ---
 
 > **Status (2026-05-14):** The recursive-learning grand-slam ships in
