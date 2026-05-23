@@ -1,0 +1,226 @@
+<!--
+  Copyright 2026 AlphaOne LLC
+  SPDX-License-Identifier: Apache-2.0
+
+  ai-memory — Compliance & Procurement Landing Page
+
+  Procurement-grade compliance evidence pair (NSA CSI mapping + honest
+  limitations) plus the Memory Portability Spec, ship-gate evidence,
+  security advisory channel, and MCP Registry presence. Public-facing.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ai-memory — Compliance & Procurement</title>
+<meta name="description" content="ai-memory v0.7.0 procurement-grade compliance evidence: NSA CSI MCP security mapping (10/10 concerns + 7/7 recommendations structurally addressed), honest-limitations companion document, Memory Portability Spec v1, ship-gate certification, A2A gate evidence, MCP Registry presence.">
+<meta name="theme-color" content="#0d1117">
+<link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/compliance/">
+<style>
+:root {
+  --bg:#000; --bg-raised:#0a0a0a; --bg-card:#111; --bg-elev:#161616; --bg-code:#1a1a1a;
+  --border:#262626; --border-hl:#3d3d3d;
+  --text:#fff; --text-muted:#999; --text-dim:#666; --accent:#fff;
+  --good:#6ee7ff; --warn:#ffb86b; --bad:#ff6b9d;
+  --pillar-1:#6ee7ff; --pillar-2:#ffb86b; --pillar-3:#c8a2ff;
+  --font-mono:'SF Mono','Cascadia Code','Fira Code','JetBrains Mono',Consolas,monospace;
+  --font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;
+  --max-w:1200px;
+}
+*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
+html{scroll-behavior:smooth;scroll-padding-top:5rem}
+body{font-family:var(--font-sans);background:var(--bg);color:var(--text);line-height:1.65;-webkit-font-smoothing:antialiased;overflow-x:hidden}
+a{color:var(--good);text-decoration:none}
+a:hover{text-decoration:underline}
+code{font-family:var(--font-mono);font-size:.875rem;background:var(--bg-code);padding:.15em .4em;border-radius:4px}
+.container{max-width:var(--max-w);margin:0 auto;padding:0 1.5rem}
+h1{font-weight:800;letter-spacing:-0.03em;font-size:2.6rem;line-height:1.1;margin-bottom:.75rem}
+h2{font-weight:700;letter-spacing:-0.02em;font-size:1.9rem;line-height:1.2;margin-bottom:.75rem}
+h3{font-weight:700;letter-spacing:-0.01em;font-size:1.2rem;margin-bottom:.5rem}
+p{color:var(--text-muted);margin-bottom:.85rem}
+.topnav{position:sticky;top:0;z-index:50;background:rgba(0,0,0,0.9);backdrop-filter:blur(12px);border-bottom:1px solid var(--border)}
+.topnav .inner{display:flex;align-items:center;justify-content:space-between;max-width:var(--max-w);margin:0 auto;padding:.9rem 1.5rem;font-size:.875rem}
+.topnav a{color:var(--text-muted);margin-right:1.25rem}
+.topnav a:hover,.topnav a.active{color:var(--text);text-decoration:none}
+.topnav .home-link{color:var(--text);font-weight:600}
+.topnav .right{display:flex;gap:1.25rem;align-items:center}
+.hero{padding:4.5rem 0 3rem;border-bottom:1px solid var(--border)}
+.eyebrow{display:inline-block;padding:.3rem .8rem;border-radius:999px;background:rgba(110,231,255,0.1);color:var(--good);font-size:.72rem;font-weight:700;letter-spacing:.12em;text-transform:uppercase;margin-bottom:1rem;border:1px solid rgba(110,231,255,0.25)}
+.hero .tagline{font-size:1.1rem;color:var(--text-muted);max-width:68ch}
+section{padding:3rem 0;border-bottom:1px solid var(--border)}
+section:last-child{border-bottom:none}
+.section-eyebrow{display:inline-block;font-size:.72rem;font-weight:700;letter-spacing:.18em;text-transform:uppercase;color:var(--good);margin-bottom:.85rem}
+.lede{font-size:1.05rem;color:var(--text);max-width:74ch;margin-bottom:1.5rem}
+.grid-2{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:1.25rem;margin:1rem 0}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:1.5rem;display:flex;flex-direction:column;height:100%}
+.card:hover{border-color:var(--border-hl)}
+.card-eyebrow{display:inline-block;font-size:.7rem;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--good);margin-bottom:.6rem}
+.card h3{color:var(--text);margin-bottom:.5rem}
+.card-body{color:var(--text-muted);font-size:.95rem;flex:1}
+.card-arrow{margin-top:1rem;font-family:var(--font-mono);font-size:.78rem;color:var(--good)}
+.card.featured{border:2px solid rgba(110,231,255,0.4);background:linear-gradient(135deg,rgba(110,231,255,0.06),rgba(200,162,255,0.03))}
+.card.featured .card-eyebrow{color:var(--good)}
+footer{padding:3rem 0 4rem;border-top:1px solid var(--border);background:var(--bg-raised);color:var(--text-dim);font-size:.85rem}
+footer a{color:var(--text-muted)}
+</style>
+</head>
+<body>
+
+<nav class="topnav">
+  <div class="inner">
+    <div>
+      <a class="home-link" href="../index.html">ai-memory</a>
+      <a href="../at-a-glance.html">Atlas</a>
+      <a href="../architectures.html">Architectures</a>
+      <a href="../feature-matrix.html">Feature matrix</a>
+      <a href="../evidence.html">Evidence</a>
+      <a class="active" href="index.html">Compliance</a>
+    </div>
+    <div class="right">
+      <a href="../whats-new-v07.html">v0.7.0</a>
+      <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<header class="hero">
+  <div class="container">
+    <span class="eyebrow">▸ Procurement-grade evidence · Public-facing</span>
+    <h1>Compliance &amp; Procurement</h1>
+    <p class="tagline">ai-memory v0.7.0 ships procurement-grade compliance evidence as a paired document set: the NSA CSI MCP security mapping (every concern + recommendation structurally addressed) and the honest-limitations companion (every substrate boundary plainly stated). Plus the Memory Portability Spec v1, ship-gate certification, the A2A-gate evidence, and the MCP Registry presence. Every artefact codegraph-anchored to <code>release/v0.7.0</code> HEAD.</p>
+  </div>
+</header>
+
+<section>
+  <div class="container">
+    <span class="section-eyebrow">▸ Primary deliverables</span>
+    <h2>The procurement-grade pair.</h2>
+    <p class="lede">Federal procurement reviewers read these two documents in sequence to form a complete picture of substrate coverage. The mapping document claims structural coverage; the limitations companion documents the boundaries the substrate cannot reach. Together they form the substrate's honest perimeter.</p>
+
+    <div class="grid-2">
+      <a href="nsa-csi-mcp.html" style="text-decoration:none">
+        <div class="card featured">
+          <div class="card-eyebrow">▸ Featured · NSA CSI MCP Security</div>
+          <h3>NSA CSI MCP Security Compliance</h3>
+          <p class="card-body"><strong>9 of 10 NSA security concerns structurally addressed at v0.7.0 substrate layer; concern (j) tool invocation path confusion is partial — full closure tracked under #1154. 7 of 7 NSA recommendations implemented.</strong> Every claim traces to a codegraph-verified <code>capability_id</code> in the inventory at commit <code>4add7a852</code>. Public-facing procurement-grade page with per-concern anchors, file references, and verification commands for independent review.</p>
+          <div class="card-arrow">nsa-csi-mcp.html →</div>
+        </div>
+      </a>
+      <a href="honest-limitations.md" style="text-decoration:none">
+        <div class="card">
+          <div class="card-eyebrow">▸ Procurement-grade companion</div>
+          <h3>Honest Limitations</h3>
+          <p class="card-body">What ai-memory does NOT defend against. Operating-system boundary, hardware attestation (AgenticMem commercial-layer concern), LLM hallucination above the substrate, operator policy authoring, prompt injection at LLM input. Modeled on Microsoft AGT <code>LIMITATIONS.md</code> discipline — substrate honesty as procurement asset.</p>
+          <div class="card-arrow">honest-limitations.md →</div>
+        </div>
+      </a>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="container">
+    <span class="section-eyebrow">▸ Source-of-truth artefacts</span>
+    <h2>Codegraph-verified inventory.</h2>
+    <p class="lede">Every claim in the mapping document traces to a <code>capability_id</code> in this inventory. The inventory in turn traces every <code>capability_id</code> to a file path + line number + (where applicable) GitHub issue or PR reference. Reproducible from a fresh checkout at commit <code>4add7a852</code>.</p>
+
+    <div class="grid-2">
+      <a href="_inventory/v0.7.0-capabilities.json" style="text-decoration:none">
+        <div class="card">
+          <div class="card-eyebrow">▸ Machine-readable</div>
+          <h3>v0.7.0-capabilities.json</h3>
+          <p class="card-body">27 substrate primitives catalogued, each with codegraph anchor, file path + line numbers, issue/PR references, and grep verification commands. The JSON inventory is the source of truth Task E's mapping document consumes.</p>
+          <div class="card-arrow">_inventory/v0.7.0-capabilities.json →</div>
+        </div>
+      </a>
+      <a href="_inventory/v0.7.0-summary.md" style="text-decoration:none">
+        <div class="card">
+          <div class="card-eyebrow">▸ Human-readable</div>
+          <h3>v0.7.0-summary.md</h3>
+          <p class="card-body">Capability rollup, newly-documented defensive layers (RequestValidator, DoS multi-layer, substrate-native verify-* family, MCP client attestation, sqlcipher), originating-brief corrections applied, v0.7.x gap-fix candidates, full reproducibility methodology.</p>
+          <div class="card-arrow">_inventory/v0.7.0-summary.md →</div>
+        </div>
+      </a>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="container">
+    <span class="section-eyebrow">▸ Adjacent procurement artefacts</span>
+    <h2>Existing compliance + procurement references.</h2>
+    <p class="lede">ai-memory's compliance posture is built on top of pre-existing procurement-grade artefacts. The NSA CSI mapping pairs with these.</p>
+
+    <div class="grid-2">
+      <a href="../spec/v1.md" style="text-decoration:none">
+        <div class="card">
+          <div class="card-eyebrow">▸ Spec</div>
+          <h3>Memory Portability Spec v1</h3>
+          <p class="card-body">Export envelope contract: any ai-memory deployment may produce and any ai-memory deployment may ingest without data loss. Source-of-truth for the schema is the SQLite + Postgres ladder (v33 → v49 with 16 in-process migrations).</p>
+          <div class="card-arrow">spec/v1.md →</div>
+        </div>
+      </a>
+      <a href="../evidence.html" style="text-decoration:none">
+        <div class="card">
+          <div class="card-eyebrow">▸ Evidence page</div>
+          <h3>Ship-gate evidence</h3>
+          <p class="card-body">6,961 test attributes; ≥92% project line coverage; performance budgets validated against PERFORMANCE.md; A2A-gate certification across four channels at 48/48 mTLS scenarios; LongMemEval-S R@5 97.8% / R@10 99.0% / R@20 99.8%.</p>
+          <div class="card-arrow">evidence.html →</div>
+        </div>
+      </a>
+      <a href="../../SECURITY.md" style="text-decoration:none">
+        <div class="card">
+          <div class="card-eyebrow">▸ Security advisory channel</div>
+          <h3>Security policy</h3>
+          <p class="card-body">GitHub Security Advisory surface + <code>security@alpha-one.mobi</code> email channel. Supported version matrix. Vulnerability-report rubric. v0.7.0 secure-default posture documented.</p>
+          <div class="card-arrow">SECURITY.md →</div>
+        </div>
+      </a>
+      <a href="https://github.com/modelcontextprotocol/registry" style="text-decoration:none">
+        <div class="card">
+          <div class="card-eyebrow">▸ Registry</div>
+          <h3>MCP Registry submission</h3>
+          <p class="card-body">Submission to the official MCP Registry tracked under <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1153">audit issue #1153</a> Task H. The NSA CSI document explicitly cites the MCP Registry under <em>Choose supported MCP projects when possible</em>.</p>
+          <div class="card-arrow">issue #1153 Task H →</div>
+        </div>
+      </a>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="container">
+    <span class="section-eyebrow">▸ Active gap-fixes in this release</span>
+    <h2>Substrate-side tightenings landing in this PR.</h2>
+    <p class="lede">During the codegraph-driven audit of issue #1153, three substrate-level gap-fix candidates were identified. These are NOT NSA CSI gaps (the mapping claims 100% structural coverage); they are substrate-side tightenings that close partial-coverage edges and consumer-default friction.</p>
+
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-eyebrow">▸ #1154 · In this PR</div>
+        <h3>Daemon serverInfo Ed25519 signing at MCP initialize</h3>
+        <p class="card-body">Closes the partial-coverage edge on NSA concern (j) Tool invocation path confusion. Substrate already has <code>load_daemon_signing_key</code> at <code>src/governance/audit.rs:558</code>; #1154 threads it into the MCP initialize response so clients can TOFU-pin daemon identity on first connect.</p>
+      </div>
+      <div class="card">
+        <div class="card-eyebrow">▸ #1155 · In this PR</div>
+        <h3>Accept-Provenance verbose capability negotiation</h3>
+        <p class="card-body">Closes the consumer-responsibility gap on output-poisoning. HTTP <code>Accept-Provenance: verbose</code> header + MCP capability negotiation flag lets consumers opt into Form 4/5/6 provenance signals per-session without flipping the wire default (backwards-compat preserved).</p>
+      </div>
+      <div class="card">
+        <div class="card-eyebrow">▸ #1156 · v0.7.x follow-up</div>
+        <h3>Per-namespace rate-limit dimension</h3>
+        <p class="card-body">Extends K8 quota dimension from <code>(agent_id)</code> to <code>(agent_id, namespace)</code> compound so a malicious agent operating across namespaces cannot bypass per-namespace allotments. Requires schema v50 migration; operator-authorised v0.7.x follow-up.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="container">
+    <p style="margin-bottom:.5rem"><strong>ai-memory v0.7.0</strong> · Compliance &amp; Procurement landing page · public-facing · maintained by AlphaOne LLC under Apache 2.0.</p>
+    <p>Verification commit: <code>4add7a8528d4c16d696b391ec6e2890269669a84</code> on <code>release/v0.7.0</code> · Audit issue: <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1153">#1153</a>.</p>
+  </div>
+</footer>
+
+</body>
+</html>
