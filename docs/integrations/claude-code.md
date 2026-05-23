@@ -58,6 +58,8 @@ existing `SessionStart` array.
 That's it. Restart Claude Code. The next session will see your most-recent
 memory context as part of its system prompt.
 
+> **Running ai-memory's `--tier smart` or `--tier autonomous` with a non-default LLM backend?** The MCP server entry in `~/.claude.json` (separate from this SessionStart hook) needs an `env` block declaring `AI_MEMORY_LLM_BACKEND`, `AI_MEMORY_LLM_API_KEY`, and `AI_MEMORY_LLM_MODEL`. **Shell exports do not reach Claude Code's MCP-spawned subprocess** ([#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144)). See [`llm-backends.md`](llm-backends.md) for copy-pasteable recipes covering xAI Grok, OpenAI, Anthropic, Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, llama.cpp server, and Ollama.
+
 ## Why these flags
 
 - `--quiet`: a DB-unavailable failure becomes silent on stderr (so it

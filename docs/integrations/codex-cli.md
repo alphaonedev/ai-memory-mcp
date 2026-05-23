@@ -7,6 +7,8 @@ mechanism. The integration is at the application boundary: prepend
 `ai-memory boot` output to the system message before each new
 conversation.
 
+> **Codex DOES launch ai-memory as an MCP server when configured in `~/.codex/config.toml` (`mcp_servers.memory`).** If you're using that path AND running `--tier smart` or `--tier autonomous` with a non-default LLM backend, see [`llm-backends.md` § Codex CLI TOML shape](llm-backends.md#codex-cli-toml-shape) for the TOML env-block recipe. Shell exports do NOT reach the MCP-spawned subprocess ([#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144)).
+
 ## Use `ai-memory wrap` (recommended — pure Rust, cross-platform)
 
 PR-6 of issue #487 ships a built-in subcommand that does the wrapping
