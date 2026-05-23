@@ -222,6 +222,15 @@ pub enum Command {
     /// Batman Forms 2 + 6 dormant on most installs by replacing the
     /// MCP-stdio JSON-RPC dance with first-class CLI surface.
     Namespace(crate::cli::namespace::NamespaceArgs),
+    /// v0.7.x (#1146) — enterprise configuration tooling.
+    /// `ai-memory config migrate` rewrites a legacy v1 (flat-field)
+    /// `config.toml` to the v2 sectioned shape (`[llm]`, `[embeddings]`,
+    /// `[reranker]`, `[storage]`) with a timestamped `.bak` backup.
+    /// `--dry-run` prints the diff without writing.
+    /// `--also-clean-claude-json` additionally removes the
+    /// `mcpServers.<*>.env` block from `~/.claude.json` after the
+    /// operator has verified the new config.
+    Config(crate::cli::commands::config::ConfigCliArgs),
     /// Export all memories as JSON
     Export,
     /// Import memories from JSON (stdin)
@@ -922,6 +931,20 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
             let mut se = stderr.lock();
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::namespace::run(&db_path, a, j, &mut out)
+        }
+        Command::Config(a) => {
+            // v0.7.x (#1146) — enterprise configuration tooling.
+            // `ai-memory config migrate` rewrites a legacy v1
+            // (flat-field) `config.toml` to the v2 sectioned shape.
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            match cli::commands::config::run(&db_path, a, &mut out)? {
+                0 => Ok(()),
+                code => std::process::exit(code),
+            }
         }
         Command::Export => {
             let stdout = std::io::stdout();
