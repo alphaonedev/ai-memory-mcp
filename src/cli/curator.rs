@@ -83,16 +83,27 @@ pub struct CuratorArgs {
 /// failure — the curator falls through to keyword-only behavior so
 /// the daemon never hard-fails on an unreachable provider.
 fn build_curator_llm(tier: config::FeatureTier) -> Option<llm::OllamaClient> {
-    let backend_env = std::env::var("AI_MEMORY_LLM_BACKEND")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    if backend_env.is_some() {
-        return llm::OllamaClient::from_env().ok().flatten();
+    // v0.7.x (#1146) — route through the canonical resolver. Two
+    // short-circuits preserve pre-#1146 semantics:
+    //   1. Tiers with no `llm_model` preset (Keyword, Semantic) AND
+    //      no operator intent (env / config / legacy field absent —
+    //      resolver `source == CompiledDefault`) return None without
+    //      attempting client construction. Avoids paying a blocking
+    //      reqwest call to a (likely-absent) Ollama under tokio test
+    //      contexts and matches pre-#1146 v0.6.x behaviour.
+    //   2. With operator intent, the resolver folds CLI / env /
+    //      config / legacy / compiled through the uniform precedence
+    //      ladder.
+    let app_config = config::AppConfig::load();
+    let resolved = app_config.resolve_llm(None, None, None);
+    if matches!(resolved.source, config::ConfigSource::CompiledDefault)
+        && tier.config().llm_model.is_none()
+    {
+        return None;
     }
-    let llm_model = tier.config().llm_model?;
-    let model = llm_model.ollama_model_id().to_string();
-    llm::OllamaClient::new(&model).ok()
+    llm::OllamaClient::build_from_resolved(&resolved)
+        .ok()
+        .flatten()
 }
 
 fn print_curator_report(r: &curator::CuratorReport, out: &mut CliOutput<'_>) -> Result<()> {

@@ -2570,6 +2570,66 @@ pub struct AppConfig {
     /// non-admin callers — the safe-by-default posture per CLAUDE.md
     /// `pm-v3`. See [`AdminConfig`] for the full role-gate semantics.
     pub admin: Option<AdminConfig>,
+
+    // ------------------------------------------------------------------
+    // v0.7.x enterprise configuration sections (issue #1146).
+    //
+    // These four sectioned blocks (`[llm]` / `[embeddings]` /
+    // `[reranker]` / `[storage]`) consolidate the previously-flat
+    // LLM / embedder / reranker / storage knobs into named tables with
+    // a uniform canonical resolver. Legacy flat fields above
+    // (`llm_model`, `ollama_url`, `embed_url`, `embedding_model`,
+    // `cross_encoder`, `default_namespace`, `archive_on_gc`,
+    // `archive_max_days`, `max_memory_mb`) continue to parse and feed
+    // the resolver's legacy arm with a one-shot deprecation WARN until
+    // v0.8.0 removes them.
+    //
+    // The `schema_version` field carries the explicit shape version.
+    // Absent / `1` selects the legacy parse path; `>= 2` selects the
+    // sectioned parse path and warns when legacy fields are also
+    // present (so an operator who hand-edited the file knows the
+    // legacy fields are dead weight).
+    // ------------------------------------------------------------------
+    /// v0.7.x (#1146) — explicit configuration schema version. `None`
+    /// or `1` selects the v0.6.x flat-field parse path; `2` selects
+    /// the sectioned parse path (`[llm]`, `[embeddings]`, `[reranker]`,
+    /// `[storage]`) and emits a WARN if any legacy flat field is also
+    /// present. Future bumps (`3`, `4`, …) introduce additional schema
+    /// transitions and are gated through `ai-memory config migrate`.
+    pub schema_version: Option<u32>,
+
+    /// v0.7.x (#1146) — `[llm]` sectioned LLM configuration. Carries
+    /// the canonical backend / model / base_url / api_key references
+    /// consumed by every LLM-init surface (MCP stdio, HTTP daemon,
+    /// `ai-memory atomise`, `ai-memory curator`, embed-client
+    /// disambiguator, the boot banner). Resolved via
+    /// [`AppConfig::resolve_llm`]; the resolver applies the uniform
+    /// precedence ladder (CLI flag > `AI_MEMORY_LLM_*` env > `[llm]`
+    /// section > legacy flat fields > compiled default).
+    ///
+    /// Includes an optional `[llm.auto_tag]` sub-table for the fast
+    /// structured-output sibling that handles `auto_tag`, query
+    /// expansion, and contradiction detection — see [`LlmSection`].
+    pub llm: Option<LlmSection>,
+
+    /// v0.7.x (#1146) — `[embeddings]` sectioned embedding-model
+    /// configuration. Consumed by the embedder bootstrap in
+    /// `daemon_runtime` and the MCP embed-client fallback path.
+    /// Resolved via [`AppConfig::resolve_embeddings`].
+    pub embeddings: Option<EmbeddingsSection>,
+
+    /// v0.7.x (#1146) — `[reranker]` sectioned cross-encoder
+    /// configuration. Folds the legacy `cross_encoder = bool` knob
+    /// into a `{ enabled, model }` table with explicit model
+    /// selection. Resolved via [`AppConfig::resolve_reranker`].
+    pub reranker: Option<RerankerSection>,
+
+    /// v0.7.x (#1146) — `[storage]` sectioned storage configuration.
+    /// Carries `default_namespace`, `archive_on_gc`, `archive_max_days`,
+    /// `max_memory_mb` (folded from the previously-flat top-level
+    /// fields). The `db` path stays top-level per the I4 carve-out in
+    /// #1146 (path expansion semantics pinned by #507).
+    pub storage: Option<StorageSection>,
 }
 
 /// v0.7.0 SEC-2 (Cluster D, issue #767) — `[governance]` top-level
@@ -2672,6 +2732,442 @@ impl AdminConfig {
         }
         out
     }
+}
+
+// ---------------------------------------------------------------------------
+// v0.7.x enterprise configuration sections (issue #1146)
+//
+// `[llm]` / `[embeddings]` / `[reranker]` / `[storage]` consolidate
+// previously-flat LLM / embedder / reranker / storage knobs into a
+// uniform sectioned shape consumed by the canonical resolvers in
+// `impl AppConfig`. See the issue for the full design rationale,
+// migration plan, and acceptance criteria.
+// ---------------------------------------------------------------------------
+
+/// v0.7.x (#1146) — `[llm]` sectioned LLM configuration.
+///
+/// Wire format:
+/// ```toml
+/// [llm]
+/// backend     = "xai"          # ollama | openai | xai | anthropic | gemini | …
+/// model       = "grok-4.3"     # vendor-specific identifier
+/// base_url    = "https://api.x.ai/v1"   # optional; vendor-default if unset
+/// api_key_env = "XAI_API_KEY"           # env var name (mutually exclusive
+///                                        # with api_key_file)
+/// # api_key_file = "/etc/ai-memory/keys/xai.key"   # mode 0400 enforced
+///
+/// [llm.auto_tag]
+/// # Fast structured-output sibling (auto_tag, query expansion,
+/// # contradiction detection). Fields fall back to parent [llm]
+/// # field-by-field when unset; commonly only `model` is overridden.
+/// model = "gemma3:4b"
+/// ```
+///
+/// **Secret handling discipline.** Inline `api_key = "<literal>"` is
+/// REJECTED at parse time — operators MUST use either
+/// `api_key_env = "<ENV_VAR_NAME>"` (resolved at runtime) or
+/// `api_key_file = "/path/to/key"` (mode 0400 enforced, override via
+/// `AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS=1`). Both unset selects
+/// the per-vendor-alias env-var fallback chain (see `src/llm.rs`
+/// `alias_api_key_env_vars`).
+///
+/// **Precedence.** Resolved via [`AppConfig::resolve_llm`] through the
+/// uniform precedence ladder: CLI flag > `AI_MEMORY_LLM_*` env vars >
+/// `[llm]` section > legacy flat fields (`llm_model`, `ollama_url`) >
+/// compiled default (warn-logged once on the resolver's `CompiledDefault`
+/// arm).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LlmSection {
+    /// Backend selector. One of: `ollama` (native `/api/chat` +
+    /// `/api/embed`, no auth), `openai-compatible` (generic; requires
+    /// explicit `base_url`), or an alias that pre-fills `base_url`
+    /// (`openai`, `xai`, `anthropic`, `gemini`, `deepseek`, `kimi`,
+    /// `qwen`, `mistral`, `groq`, `together`, `cerebras`, `openrouter`,
+    /// `fireworks`, `lmstudio`). Unset = inherit legacy resolution
+    /// (treated as `ollama`).
+    pub backend: Option<String>,
+
+    /// Model identifier passed verbatim to the chat endpoint.
+    /// Vendor-specific (e.g., `grok-4.3`, `gpt-5`, `claude-opus-4.7`).
+    /// Unset = backend-specific default (see `OllamaClient::from_env`).
+    pub model: Option<String>,
+
+    /// Optional base-URL override. Required when `backend =
+    /// "openai-compatible"`; ignored otherwise (vendor-default
+    /// applies). For `backend = "ollama"`, defaults to
+    /// `http://localhost:11434`.
+    pub base_url: Option<String>,
+
+    /// Name of the environment variable to read at runtime for the
+    /// API-key Bearer auth secret. Mutually exclusive with
+    /// `api_key_file`. Example: `api_key_env = "XAI_API_KEY"`. The
+    /// `AI_MEMORY_LLM_API_KEY` process-env override (and the
+    /// per-vendor fallback chain at `src/llm.rs`
+    /// `alias_api_key_env_vars`) take precedence over this field per
+    /// the uniform precedence ladder.
+    pub api_key_env: Option<String>,
+
+    /// Path to a file whose first line is the API-key Bearer secret.
+    /// Mutually exclusive with `api_key_env`. File must be `mode 0400`
+    /// or stricter (overridable via
+    /// `AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS=1` per #1055). Tilde
+    /// expansion applies.
+    pub api_key_file: Option<String>,
+
+    /// **REJECTED AT PARSE TIME.** Accepting the field name here lets
+    /// the validator emit a clear "use api_key_env or api_key_file"
+    /// error instead of serde's generic "unknown field". Operators
+    /// inlining secrets in the config file see the security-rationale
+    /// message at load time.
+    #[serde(default)]
+    pub api_key: Option<String>,
+
+    /// `[llm.auto_tag]` sub-table for the fast structured-output
+    /// sibling (`auto_tag`, query expansion, contradiction detection).
+    /// Unset = inherit every field from the parent [`LlmSection`].
+    /// When set, only the explicitly-provided fields override; unset
+    /// fields fall back to the parent.
+    #[serde(default)]
+    pub auto_tag: Option<LlmAutoTagSection>,
+}
+
+/// v0.7.x (#1146) — `[llm.auto_tag]` sub-table. Fast structured-output
+/// sibling of [`LlmSection`]. Fields fall back to the parent `[llm]`
+/// section field-by-field when unset; commonly only `model` is
+/// overridden to point at a faster model (default `gemma3:4b`,
+/// ~0.7s p50 vs ~15s p50 for thinking-mode Gemma 4 per L15 patch).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LlmAutoTagSection {
+    /// Backend override. Unset = inherit `[llm].backend`.
+    pub backend: Option<String>,
+    /// Model override. Unset = inherit `[llm].model`. Compiled default
+    /// at the resolver level is `gemma3:4b` (L15 fast-structured-output
+    /// model selection).
+    pub model: Option<String>,
+    /// Base-URL override. Unset = inherit `[llm].base_url`.
+    pub base_url: Option<String>,
+    /// Env-var-name override for the API key. Unset = inherit
+    /// `[llm].api_key_env` (or `[llm].api_key_file`).
+    pub api_key_env: Option<String>,
+    /// File-path override for the API key. Unset = inherit
+    /// `[llm].api_key_file` (or `[llm].api_key_env`).
+    pub api_key_file: Option<String>,
+}
+
+/// v0.7.x (#1146) — `[embeddings]` sectioned embedding-model
+/// configuration.
+///
+/// Wire format:
+/// ```toml
+/// [embeddings]
+/// backend        = "ollama"                    # only backend at v0.7.0
+/// url            = "http://localhost:11434"
+/// model          = "nomic-embed-text-v1.5"
+/// backfill_batch = 100                         # 1-10000 (env override:
+///                                              # AI_MEMORY_EMBED_BACKFILL_BATCH)
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EmbeddingsSection {
+    /// Embedding backend. At v0.7.0 only `ollama` is supported (the
+    /// `nomic-embed-text-v1.5` and `all-MiniLM-L6-v2` models both
+    /// speak Ollama's `/api/embed` wire shape). Field is present for
+    /// forward compatibility with future OpenAI-compatible embedding
+    /// vendors.
+    pub backend: Option<String>,
+
+    /// Embedding endpoint URL. Defaults to `http://localhost:11434`
+    /// when unset.
+    pub url: Option<String>,
+
+    /// Embedding model identifier. Legacy values `nomic_embed_v15`
+    /// (alias for `nomic-embed-text-v1.5`) and `mini_lm_l6_v2` (alias
+    /// for `sentence-transformers/all-MiniLM-L6-v2`) are honored at
+    /// parse time.
+    pub model: Option<String>,
+
+    /// Backfill batch size. Bounded `1..=10000`; out-of-range values
+    /// fall back to the compiled default (100) with a WARN. Env
+    /// override: `AI_MEMORY_EMBED_BACKFILL_BATCH` (#38).
+    pub backfill_batch: Option<u32>,
+}
+
+/// v0.7.x (#1146) — `[reranker]` sectioned cross-encoder
+/// configuration.
+///
+/// Wire format:
+/// ```toml
+/// [reranker]
+/// enabled = true
+/// model   = "ms-marco-MiniLM-L-6-v2"   # v0.7.0 has one variant;
+///                                       # field reserved for future
+///                                       # bake-offs.
+/// ```
+///
+/// Folds the legacy `cross_encoder = bool` top-level flag. Migration
+/// (via `ai-memory config migrate`) writes the explicit `enabled` +
+/// `model` fold; the legacy field continues to be honored at parse
+/// time until v0.8.0.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RerankerSection {
+    /// Whether the cross-encoder rerank stage runs in the recall
+    /// pipeline. Folded from `cross_encoder: Option<bool>` at the
+    /// resolver layer.
+    pub enabled: Option<bool>,
+
+    /// Cross-encoder model identifier. Defaults to
+    /// `ms-marco-MiniLM-L-6-v2` when unset. Field reserved for future
+    /// model bake-offs (e.g., `bge-reranker-v2-m3`,
+    /// `mxbai-rerank-large-v2`).
+    pub model: Option<String>,
+}
+
+/// v0.7.x (#1146) — `[storage]` sectioned storage configuration.
+///
+/// Wire format:
+/// ```toml
+/// [storage]
+/// default_namespace = "alphaone"
+/// archive_on_gc     = true
+/// archive_max_days  = 90
+/// max_memory_mb     = 4096
+/// ```
+///
+/// Carries the previously-flat top-level fields `default_namespace`,
+/// `archive_on_gc`, `archive_max_days`, `max_memory_mb`. The `db`
+/// path stays top-level per the #1146 I4 carve-out (path expansion
+/// semantics pinned by #507).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StorageSection {
+    /// Default namespace for new memories when the caller's request
+    /// omits one. Folded from the previously-flat top-level
+    /// `default_namespace` field.
+    pub default_namespace: Option<String>,
+
+    /// Whether to archive memories before GC deletion. Folded from
+    /// `archive_on_gc`. Default `true`.
+    pub archive_on_gc: Option<bool>,
+
+    /// Archive retention ceiling in days. `None` (default) disables
+    /// the automatic purge. Folded from `archive_max_days`.
+    pub archive_max_days: Option<i64>,
+
+    /// Memory budget in MB for the auto tier selector. Folded from
+    /// `max_memory_mb`.
+    pub max_memory_mb: Option<usize>,
+}
+
+// ---------------------------------------------------------------------------
+// Resolved-config shapes (#1146)
+//
+// Every surface that needs LLM / embedder / reranker / storage config
+// consumes one of the `Resolved*` shapes below. The resolver methods on
+// `AppConfig` (`resolve_llm` / `resolve_embeddings` / `resolve_reranker`
+// / `resolve_storage`) produce them by applying the uniform precedence
+// ladder:
+//
+//   CLI flag  >  AI_MEMORY_* env var  >  config.toml section
+//             >  legacy flat fields (with deprecation WARN once)
+//             >  compiled default (CompiledDefault arm, WARN once)
+//
+// Resolvers are PURE (no network I/O). File reads for `api_key_file`
+// happen at resolve time and surface errors via the `KeySource::Error`
+// variant rather than panicking, so the daemon can boot and report the
+// problem via the doctor reachability probe rather than failing at
+// load time.
+// ---------------------------------------------------------------------------
+
+/// Provenance tag for a resolved `Resolved*` field's value, surfaced by
+/// the boot banner and `ai-memory doctor` so operators can see WHICH
+/// source won the precedence ladder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigSource {
+    /// CLI flag (highest precedence).
+    Cli,
+    /// `AI_MEMORY_*` process environment variable.
+    Env,
+    /// `[llm]` / `[embeddings]` / `[reranker]` / `[storage]` section
+    /// in `~/.config/ai-memory/config.toml`.
+    Config,
+    /// Legacy flat field in `~/.config/ai-memory/config.toml` (e.g.
+    /// `llm_model = "gemma4:e4b"`). Triggers a one-shot deprecation
+    /// WARN on `Config::load`.
+    Legacy,
+    /// Compiled-in default (no operator configuration). Triggers a
+    /// one-shot WARN at resolve time so silent misconfigurations are
+    /// loud.
+    CompiledDefault,
+}
+
+impl ConfigSource {
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Cli => "cli",
+            Self::Env => "env",
+            Self::Config => "config",
+            Self::Legacy => "legacy",
+            Self::CompiledDefault => "compiled-default",
+        }
+    }
+}
+
+/// Provenance tag for a resolved API-key value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeySource {
+    /// `AI_MEMORY_LLM_API_KEY` process env var (highest precedence).
+    ProcessEnv,
+    /// Per-vendor process env-var fallback (`XAI_API_KEY`,
+    /// `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, etc.). The string field
+    /// carries the name of the var that won (for observability).
+    AliasFallback(String),
+    /// `[llm].api_key_env` config-pointed env var. The string field
+    /// carries the resolved env-var name.
+    ConfigEnvVar(String),
+    /// `[llm].api_key_file` config-pointed file path. The string field
+    /// carries the resolved (tilde-expanded) path.
+    ConfigFile(String),
+    /// No API key resolved. Correct for `backend = "ollama"`
+    /// (no auth); a misconfiguration for OpenAI-compatible vendors.
+    None,
+    /// Error reading the resolved key source. The string carries the
+    /// human-readable error for the doctor probe to surface.
+    Error(String),
+}
+
+impl KeySource {
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ProcessEnv => "process-env",
+            Self::AliasFallback(_) => "alias-fallback",
+            Self::ConfigEnvVar(_) => "config-env-var",
+            Self::ConfigFile(_) => "config-file",
+            Self::None => "none",
+            Self::Error(_) => "error",
+        }
+    }
+
+    /// True when the key was resolved from any source.
+    #[must_use]
+    pub fn is_present(&self) -> bool {
+        !matches!(self, Self::None | Self::Error(_))
+    }
+}
+
+/// Canonical resolved-LLM configuration. Produced by
+/// [`AppConfig::resolve_llm`]. Every LLM-init surface (MCP stdio,
+/// HTTP daemon, `ai-memory atomise`, `ai-memory curator`,
+/// embed-client fallback, boot banner) consumes this struct rather
+/// than reading raw config / env / tier presets.
+///
+/// **Secret handling.** The `api_key` field is private; access via
+/// `api_key()`. The `Debug` impl redacts the value (`<redacted>`).
+#[derive(Clone, PartialEq, Eq)]
+pub struct ResolvedLlm {
+    /// Backend alias / wire-shape selector (e.g. `"ollama"`, `"xai"`,
+    /// `"openai-compatible"`).
+    pub backend: String,
+    /// Model identifier passed verbatim to the chat endpoint.
+    pub model: String,
+    /// Base URL of the chat endpoint (vendor-default or operator
+    /// override).
+    pub base_url: String,
+    /// Resolved API key. `None` for `backend = "ollama"` and for
+    /// misconfigured backends; `Some` otherwise. Private — access via
+    /// [`Self::api_key`] to keep accidental `{:?}` prints from
+    /// leaking the value.
+    api_key: Option<String>,
+    /// Provenance of the resolved API key for boot-banner /
+    /// doctor-probe display.
+    pub api_key_source: KeySource,
+    /// Provenance of the resolved configuration (CLI / env / config /
+    /// legacy / compiled-default).
+    pub source: ConfigSource,
+}
+
+impl ResolvedLlm {
+    /// Access the resolved API key. Use this only when constructing
+    /// the LLM client; do NOT log or `{:?}` the result.
+    #[must_use]
+    pub fn api_key(&self) -> Option<&str> {
+        self.api_key.as_deref()
+    }
+
+    /// True when the resolved backend uses the Ollama-native wire
+    /// shape (`/api/chat`, `/api/embed`, no auth). False for any
+    /// OpenAI-compatible vendor.
+    #[must_use]
+    pub fn is_ollama_native(&self) -> bool {
+        self.backend == "ollama"
+    }
+
+    /// Display string for the boot banner: `<backend>:<model>`.
+    #[must_use]
+    pub fn display_label(&self) -> String {
+        format!("{}:{}", self.backend, self.model)
+    }
+}
+
+impl std::fmt::Debug for ResolvedLlm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedLlm")
+            .field("backend", &self.backend)
+            .field("model", &self.model)
+            .field("base_url", &self.base_url)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("api_key_source", &self.api_key_source)
+            .field("source", &self.source)
+            .finish()
+    }
+}
+
+/// Canonical resolved-embedder configuration. Produced by
+/// [`AppConfig::resolve_embeddings`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedEmbeddings {
+    /// Embedding backend selector. At v0.7.0 only `"ollama"` is
+    /// produced (the substrate's nomic-embed + minilm models both
+    /// speak Ollama's `/api/embed` wire shape).
+    pub backend: String,
+    /// Embedding endpoint URL.
+    pub url: String,
+    /// Embedding model identifier (canonicalised — legacy aliases
+    /// `nomic_embed_v15` / `mini_lm_l6_v2` are mapped to the
+    /// `EmbeddingModel` enum's canonical HF id at resolve time).
+    pub model: String,
+    /// Backfill batch size. Bounded `1..=10000`; out-of-range values
+    /// fall back to 100 with a WARN.
+    pub backfill_batch: u32,
+    /// Provenance of the resolved configuration.
+    pub source: ConfigSource,
+}
+
+/// Canonical resolved-reranker configuration. Produced by
+/// [`AppConfig::resolve_reranker`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedReranker {
+    /// Whether the cross-encoder rerank stage runs.
+    pub enabled: bool,
+    /// Cross-encoder model identifier.
+    pub model: String,
+    /// Provenance of the resolved configuration.
+    pub source: ConfigSource,
+}
+
+/// Canonical resolved-storage configuration. Produced by
+/// [`AppConfig::resolve_storage`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedStorage {
+    /// Default namespace for new memories when the caller omits one.
+    pub default_namespace: String,
+    /// Whether to archive memories before GC deletion.
+    pub archive_on_gc: bool,
+    /// Archive retention ceiling in days (`None` = disabled).
+    pub archive_max_days: Option<i64>,
+    /// Memory budget in MB for the auto tier selector.
+    pub max_memory_mb: Option<usize>,
+    /// Provenance of the resolved configuration.
+    pub source: ConfigSource,
 }
 
 /// v0.7.0 (issue #518) — `[agents]` top-level block. Today only carries
@@ -3688,6 +4184,246 @@ pub fn parse_duration_string(s: &str) -> Option<chrono::Duration> {
 /// unset (no-home environments like some CI containers), the tilde is left
 /// untouched so the existing failure mode (path not found) is preserved
 /// rather than silently rewriting to an empty prefix.
+// ---------------------------------------------------------------------------
+// Resolver helpers (#1146)
+// ---------------------------------------------------------------------------
+
+/// Backend-specific default model identifier. Used by
+/// [`AppConfig::resolve_llm`] when no model is configured at any
+/// precedence layer.
+fn backend_default_model(backend: &str) -> &'static str {
+    match backend {
+        "xai" => "grok-4.3",
+        "openai" => "gpt-5",
+        "anthropic" => "claude-opus-4.7",
+        "gemini" => "gemini-2.0-flash",
+        "deepseek" => "deepseek-chat",
+        "kimi" | "moonshot" => "moonshot-v1-8k",
+        "qwen" | "dashscope" => "qwen-max",
+        "mistral" => "mistral-large-latest",
+        "groq" => "llama-3.3-70b-versatile",
+        "together" => "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+        "cerebras" => "llama-3.3-70b",
+        "openrouter" => "openai/gpt-5",
+        "fireworks" => "accounts/fireworks/models/llama-v3p3-70b-instruct",
+        "lmstudio" => "local-model",
+        // ollama / openai-compatible / any unknown alias → legacy default.
+        _ => "gemma3:4b",
+    }
+}
+
+/// Backend-specific default base URL. Used by
+/// [`AppConfig::resolve_llm`] when no base_url is configured at any
+/// precedence layer. `openai-compatible` returns the empty string (the
+/// resolver does not validate this — surface plumbing surfaces the
+/// misconfiguration via the reachability probe in `ai-memory doctor`).
+fn backend_default_base_url(backend: &str) -> &'static str {
+    match backend {
+        "openai" => "https://api.openai.com/v1",
+        "xai" => "https://api.x.ai/v1",
+        "anthropic" => "https://api.anthropic.com/v1",
+        "gemini" => "https://generativelanguage.googleapis.com/v1beta/openai",
+        "deepseek" => "https://api.deepseek.com/v1",
+        "kimi" | "moonshot" => "https://api.moonshot.cn/v1",
+        "qwen" | "dashscope" => "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "mistral" => "https://api.mistral.ai/v1",
+        "groq" => "https://api.groq.com/openai/v1",
+        "together" => "https://api.together.xyz/v1",
+        "cerebras" => "https://api.cerebras.ai/v1",
+        "openrouter" => "https://openrouter.ai/api/v1",
+        "fireworks" => "https://api.fireworks.ai/inference/v1",
+        "lmstudio" => "http://localhost:1234/v1",
+        // ollama / openai-compatible / unknown → localhost ollama.
+        _ => "http://localhost:11434",
+    }
+}
+
+/// Per-alias environment variable fallback chain for the API key.
+/// Mirrors `crate::llm::alias_api_key_env_vars` (kept duplicated to
+/// avoid a circular dependency between the resolver and the LLM
+/// client; both lists must stay in sync — pinned by a test in
+/// commit 12/13).
+fn alias_api_key_env_vars_for_resolver(alias: &str) -> &'static [&'static str] {
+    match alias {
+        "openai" => &["OPENAI_API_KEY"],
+        "xai" => &["XAI_API_KEY"],
+        "anthropic" => &["ANTHROPIC_API_KEY"],
+        "gemini" => &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+        "deepseek" => &["DEEPSEEK_API_KEY"],
+        "kimi" | "moonshot" => &["MOONSHOT_API_KEY", "KIMI_API_KEY"],
+        "qwen" | "dashscope" => &["DASHSCOPE_API_KEY", "QWEN_API_KEY"],
+        "mistral" => &["MISTRAL_API_KEY"],
+        "groq" => &["GROQ_API_KEY"],
+        "together" => &["TOGETHER_API_KEY"],
+        "cerebras" => &["CEREBRAS_API_KEY"],
+        "openrouter" => &["OPENROUTER_API_KEY"],
+        "fireworks" => &["FIREWORKS_API_KEY"],
+        _ => &[],
+    }
+}
+
+/// Canonicalise legacy embedding-model aliases to the HF-id form. Lets
+/// existing config.toml files with `embedding_model = "nomic_embed_v15"`
+/// continue to work while the resolver returns the canonical id used
+/// throughout the substrate.
+fn canonicalise_embedding_model(raw: String) -> String {
+    match raw.trim() {
+        "nomic_embed_v15" => "nomic-embed-text-v1.5".to_string(),
+        "mini_lm_l6_v2" => "sentence-transformers/all-MiniLM-L6-v2".to_string(),
+        _ => raw,
+    }
+}
+
+/// Resolve the API key + provenance tag for the configured backend.
+///
+/// Precedence:
+///   1. `AI_MEMORY_LLM_API_KEY` process env → `KeySource::ProcessEnv`
+///   2. Per-vendor process env-var fallback (e.g. `XAI_API_KEY`)
+///      → `KeySource::AliasFallback(name)`
+///   3. `[llm].api_key_env` → `KeySource::ConfigEnvVar(name)`
+///   4. `[llm].api_key_file` → `KeySource::ConfigFile(path)`
+///   5. None resolved → `KeySource::None` (correct for `backend =
+///      "ollama"`; a misconfiguration for OpenAI-compatible vendors —
+///      surfaced by the reachability probe).
+///
+/// File reads do NOT enforce permission bits at this commit; the 0400
+/// enforcement lands in a follow-up commit and surfaces errors via
+/// `KeySource::Error(reason)` so the daemon can boot and report the
+/// problem through `ai-memory doctor` rather than failing at config load.
+fn resolve_api_key(backend: &str, llm: Option<&LlmSection>) -> (Option<String>, KeySource) {
+    // 1. Process env (highest).
+    if let Some(k) = std::env::var("AI_MEMORY_LLM_API_KEY")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    {
+        return (Some(k), KeySource::ProcessEnv);
+    }
+
+    // 2. Per-vendor alias fallback.
+    for name in alias_api_key_env_vars_for_resolver(backend) {
+        if let Some(k) = std::env::var(name).ok().filter(|s| !s.trim().is_empty()) {
+            return (Some(k), KeySource::AliasFallback((*name).to_string()));
+        }
+    }
+
+    // 3. config-pointed env var.
+    if let Some(name) = llm
+        .and_then(|l| l.api_key_env.as_ref())
+        .filter(|s| !s.trim().is_empty())
+    {
+        return match std::env::var(name) {
+            Ok(v) if !v.trim().is_empty() => (Some(v), KeySource::ConfigEnvVar(name.clone())),
+            Ok(_) => (
+                None,
+                KeySource::Error(format!(
+                    "[llm].api_key_env = {name:?} resolves to an empty env var"
+                )),
+            ),
+            Err(_) => (
+                None,
+                KeySource::Error(format!(
+                    "[llm].api_key_env = {name:?} is not set in the process env"
+                )),
+            ),
+        };
+    }
+
+    // 4. config-pointed file.
+    if let Some(raw_path) = llm
+        .and_then(|l| l.api_key_file.as_ref())
+        .filter(|s| !s.trim().is_empty())
+    {
+        let path = expand_tilde(raw_path);
+        let path_display = path.display().to_string();
+
+        // Mode 0400 enforcement (#1055-style escape hatch).
+        if let Err(reason) = enforce_api_key_file_perms(&path) {
+            return (None, KeySource::Error(reason));
+        }
+
+        return match std::fs::read_to_string(&path) {
+            Ok(contents) => {
+                let key = contents.lines().next().unwrap_or("").trim().to_string();
+                if key.is_empty() {
+                    (
+                        None,
+                        KeySource::Error(format!("[llm].api_key_file = {path_display:?} is empty")),
+                    )
+                } else {
+                    (Some(key), KeySource::ConfigFile(path_display))
+                }
+            }
+            Err(e) => (
+                None,
+                KeySource::Error(format!(
+                    "[llm].api_key_file = {path_display:?} could not be read: {e}"
+                )),
+            ),
+        };
+    }
+
+    (None, KeySource::None)
+}
+
+/// v0.7.x (#1146) — enforce mode 0400 (or stricter) on the file
+/// referenced by `[llm].api_key_file`. The check mirrors the existing
+/// `AI_MEMORY_DB_PASSPHRASE_FILE` enforcement (issue #1055): any bits
+/// set in `mode & 0o077` (group / world readable / executable) cause
+/// the daemon to refuse the file, unless the operator opts out via
+/// `AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS=1`.
+///
+/// On non-Unix platforms (the `staticlib` mobile target, future
+/// Windows builds) the check is a no-op — the perm bits are not
+/// expressible on those platforms.
+fn enforce_api_key_file_perms(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = std::fs::metadata(path).map_err(|e| {
+            format!(
+                "[llm].api_key_file = {:?} could not be stat'd for perms check: {}",
+                path.display(),
+                e
+            )
+        })?;
+        let mode = metadata.permissions().mode();
+        if mode & 0o077 != 0 {
+            // Allow lax perms only when the operator explicitly opts in
+            // (mirroring #1055 for AI_MEMORY_DB_PASSPHRASE_FILE).
+            let opt_in = std::env::var("AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS")
+                .ok()
+                .is_some_and(|s| {
+                    let t = s.trim().to_ascii_lowercase();
+                    matches!(t.as_str(), "1" | "true" | "yes" | "on")
+                });
+            if !opt_in {
+                return Err(format!(
+                    "[llm].api_key_file = {:?} has lax permissions \
+                     (mode = {:o}; expected 0400 or stricter). Run \
+                     `chmod 0400 {}` to fix, or set \
+                     `AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS=1` to \
+                     bypass (NOT recommended for production).",
+                    path.display(),
+                    mode & 0o777,
+                    path.display()
+                ));
+            }
+            tracing::warn!(
+                "[llm].api_key_file = {:?} has lax permissions (mode = {:o}); \
+                 accepted because AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS=1",
+                path.display(),
+                mode & 0o777
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // Permission bits do not apply on non-Unix platforms.
+        let _ = path;
+    }
+    Ok(())
+}
+
 fn expand_tilde(s: &str) -> PathBuf {
     if s == "~" {
         return std::env::var("HOME").map_or_else(|_| PathBuf::from(s), PathBuf::from);
@@ -3734,11 +4470,25 @@ impl AppConfig {
                 // (`[memory]`, `[autonomous]`, `[governance]`, `[federation]`)
                 // can no longer silently neutralise an operator's intent.
                 Self::warn_unknown_top_level_keys(path, &contents);
-                match toml::from_str(&contents) {
-                    Ok(cfg) => {
-                        eprintln!("ai-memory: loaded config from {}", path.display());
-                        cfg
-                    }
+                match toml::from_str::<Self>(&contents) {
+                    Ok(cfg) => match cfg.validate_secret_handling() {
+                        Ok(()) => {
+                            eprintln!("ai-memory: loaded config from {}", path.display());
+                            cfg.warn_legacy_schema_drift(path);
+                            cfg
+                        }
+                        Err(reason) => {
+                            eprintln!(
+                                "ai-memory: config rejected ({}): {}\n\
+                                 ai-memory: falling back to default config — \
+                                 fix the issue and restart. \
+                                 See https://github.com/alphaonedev/ai-memory-mcp/issues/1146",
+                                path.display(),
+                                reason
+                            );
+                            Self::default()
+                        }
+                    },
                     Err(e) => {
                         eprintln!("ai-memory: config parse error ({}): {}", path.display(), e);
                         Self::default()
@@ -3747,6 +4497,129 @@ impl AppConfig {
             }
             Err(_) => Self::default(),
         }
+    }
+
+    /// v0.7.x (#1146) — emit a one-shot deprecation WARN to stderr
+    /// when the loaded config carries legacy v1 flat fields that have
+    /// been superseded by the sectioned v2 schema.
+    ///
+    /// Two posture WARNs:
+    ///
+    /// - **Legacy-only** (no `schema_version` OR `schema_version = 1`,
+    ///   AND any of `llm_model`, `ollama_url`, `embed_url`,
+    ///   `embedding_model`, `cross_encoder`, `default_namespace`,
+    ///   `archive_on_gc`, `archive_max_days`, `max_memory_mb`,
+    ///   `auto_tag_model` set): operator running pre-#1146 config
+    ///   shape — point them at `ai-memory config migrate`.
+    ///
+    /// - **Drift** (`schema_version >= 2` AND any legacy field set):
+    ///   operator has migrated but left legacy fields in place —
+    ///   legacy fields are ignored under v2, point them at
+    ///   `ai-memory config migrate` to clean up the dead weight.
+    ///
+    /// The WARN is gated by [`std::sync::Once`] so re-loading the
+    /// config in the same process (e.g. tests that call
+    /// [`AppConfig::load_from`] in a loop) does not spam stderr.
+    fn warn_legacy_schema_drift(&self, path: &Path) {
+        use std::sync::Once;
+        static WARN_ONCE: Once = Once::new();
+
+        let has_legacy = self.llm_model.is_some()
+            || self.ollama_url.is_some()
+            || self.embed_url.is_some()
+            || self.embedding_model.is_some()
+            || self.cross_encoder.is_some()
+            || self.default_namespace.is_some()
+            || self.archive_on_gc.is_some()
+            || self.archive_max_days.is_some()
+            || self.max_memory_mb.is_some()
+            || self.auto_tag_model.is_some();
+
+        if !has_legacy {
+            return;
+        }
+
+        let v2 = matches!(self.schema_version, Some(v) if v >= 2);
+
+        WARN_ONCE.call_once(|| {
+            if v2 {
+                eprintln!(
+                    "ai-memory: WARN — schema_version = {:?} but legacy v1 fields \
+                     are still present in {} (llm_model / ollama_url / embed_url / \
+                     embedding_model / cross_encoder / default_namespace / \
+                     archive_on_gc / archive_max_days / max_memory_mb / \
+                     auto_tag_model). Under v2 the legacy fields are IGNORED in \
+                     favor of [llm] / [embeddings] / [reranker] / [storage] \
+                     sections. Run `ai-memory config migrate` to remove them.",
+                    self.schema_version,
+                    path.display(),
+                );
+            } else {
+                eprintln!(
+                    "ai-memory: WARN — legacy v1 flat-field configuration shape \
+                     detected in {}. The [llm] / [embeddings] / [reranker] / \
+                     [storage] sectioned schema (v2) is the canonical shape; \
+                     legacy fields continue to work in v0.7.x but will be \
+                     removed in v0.8.0. Run `ai-memory config migrate` to \
+                     upgrade in place (a timestamped .bak is written). See \
+                     https://github.com/alphaonedev/ai-memory-mcp/issues/1146",
+                    path.display(),
+                );
+            }
+        });
+    }
+
+    /// v0.7.x (#1146) — validate secret-handling discipline in the
+    /// `[llm]` (and `[llm.auto_tag]`) sections after parse. Three
+    /// rejections fire at load time so misconfigurations are loud
+    /// rather than silent:
+    ///
+    /// 1. Inline `api_key = "<literal>"` in `[llm]`. Operators MUST
+    ///    use `api_key_env = "<ENV_VAR_NAME>"` or `api_key_file =
+    ///    "/path/to/key"` instead. Closes the v0.6.x posture where
+    ///    inline secrets in `~/.config/ai-memory/config.toml` were
+    ///    silently accepted even though the file is typically
+    ///    world-readable.
+    ///
+    /// 2. Both `api_key_env` and `api_key_file` set on `[llm]`.
+    ///    Mutually exclusive — operator must pick one.
+    ///
+    /// 3. Both `api_key_env` and `api_key_file` set on
+    ///    `[llm.auto_tag]`. Same mutex.
+    ///
+    /// On any rejection, [`Self::load_from`] surfaces the message to
+    /// stderr and falls back to [`Self::default`] so the daemon boots
+    /// without the misconfigured secret rather than refusing to start
+    /// entirely.
+    fn validate_secret_handling(&self) -> Result<(), String> {
+        if let Some(llm) = &self.llm {
+            // Rejection 1 — inline api_key literal.
+            if llm.api_key.is_some() {
+                return Err("inline `api_key = \"<literal>\"` in [llm] is forbidden — \
+                     use `api_key_env = \"<ENV_VAR_NAME>\"` to reference a \
+                     process env var, or `api_key_file = \"/path/to/key\"` to \
+                     reference a file (mode 0400 enforced). Inline secrets in \
+                     config.toml (typically world-readable) are a credential \
+                     leak."
+                    .to_string());
+            }
+            // Rejection 2 — env vs file mutex.
+            if llm.api_key_env.is_some() && llm.api_key_file.is_some() {
+                return Err("[llm].api_key_env and [llm].api_key_file are mutually \
+                     exclusive — set exactly one (or neither, to fall back \
+                     to the per-vendor env-var chain)."
+                    .to_string());
+            }
+            // Rejection 3 — auto_tag env vs file mutex.
+            if let Some(auto_tag) = &llm.auto_tag {
+                if auto_tag.api_key_env.is_some() && auto_tag.api_key_file.is_some() {
+                    return Err("[llm.auto_tag].api_key_env and \
+                         [llm.auto_tag].api_key_file are mutually exclusive."
+                        .to_string());
+                }
+            }
+        }
+        Ok(())
     }
 
     /// L1 fix (v0.7.0): enumerate top-level keys in `contents` and emit a
@@ -3793,6 +4666,12 @@ impl AppConfig {
             "governance",
             "confidence",
             "admin",
+            // v0.7.x (#1146) — enterprise configuration sections.
+            "schema_version",
+            "llm",
+            "embeddings",
+            "reranker",
+            "storage",
         ];
 
         let value: toml::Value = match toml::from_str(contents) {
@@ -4035,6 +4914,325 @@ impl AppConfig {
             .as_deref()
             .or(self.ollama_url.as_deref())
             .unwrap_or("http://localhost:11434")
+    }
+
+    // ------------------------------------------------------------------
+    // Canonical resolvers (#1146). Every LLM / embedder / reranker /
+    // storage surface MUST consume the corresponding `Resolved*` shape
+    // produced by these methods rather than reading raw config / env
+    // / tier presets.
+    //
+    // Precedence (uniform across all four):
+    //   CLI flag > AI_MEMORY_* env > config.toml section
+    //            > legacy flat fields (Legacy source) > compiled default
+    //
+    // Resolvers are PURE (no network I/O). `resolve_llm` reads the
+    // `api_key_file` content at call time if configured; perm checks
+    // land in a follow-up commit and surface via `KeySource::Error`
+    // without panicking.
+    // ------------------------------------------------------------------
+
+    /// v0.7.x (#1146) — resolve the canonical LLM configuration.
+    ///
+    /// `cli_backend` / `cli_model` / `cli_base_url` carry CLI-flag
+    /// overrides (pass `None` for `ai-memory mcp` / `ai-memory serve`
+    /// which currently expose no CLI override; the CLI plumbing lands
+    /// in a follow-up commit).
+    #[must_use]
+    pub fn resolve_llm(
+        &self,
+        cli_backend: Option<&str>,
+        cli_model: Option<&str>,
+        cli_base_url: Option<&str>,
+    ) -> ResolvedLlm {
+        // ------- 1. backend selection ----------------------------------
+        let env_backend = std::env::var("AI_MEMORY_LLM_BACKEND")
+            .ok()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty());
+        let cfg_backend = self
+            .llm
+            .as_ref()
+            .and_then(|l| l.backend.as_ref())
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty());
+
+        let (backend, source) = if let Some(b) = cli_backend.map(str::to_ascii_lowercase) {
+            (b, ConfigSource::Cli)
+        } else if let Some(b) = env_backend.clone() {
+            (b, ConfigSource::Env)
+        } else if let Some(b) = cfg_backend {
+            (b, ConfigSource::Config)
+        } else if self.llm_model.is_some() || self.ollama_url.is_some() {
+            // Legacy flat fields imply Ollama.
+            ("ollama".to_string(), ConfigSource::Legacy)
+        } else {
+            // Compiled default = tier preset (Ollama-native).
+            ("ollama".to_string(), ConfigSource::CompiledDefault)
+        };
+
+        // ------- 2. model selection ------------------------------------
+        let model = cli_model
+            .map(str::to_string)
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                std::env::var("AI_MEMORY_LLM_MODEL")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+            })
+            .or_else(|| {
+                self.llm
+                    .as_ref()
+                    .and_then(|l| l.model.clone())
+                    .filter(|s| !s.trim().is_empty())
+            })
+            .or_else(|| self.llm_model.clone().filter(|s| !s.trim().is_empty()))
+            .unwrap_or_else(|| backend_default_model(&backend).to_string());
+
+        // ------- 3. base_url selection ---------------------------------
+        let base_url = cli_base_url
+            .map(str::to_string)
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                std::env::var("AI_MEMORY_LLM_BASE_URL")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+            })
+            .or_else(|| {
+                self.llm
+                    .as_ref()
+                    .and_then(|l| l.base_url.clone())
+                    .filter(|s| !s.trim().is_empty())
+            })
+            .or_else(|| {
+                if backend == "ollama" {
+                    self.ollama_url.clone()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| backend_default_base_url(&backend).to_string());
+
+        // ------- 4. api_key selection ----------------------------------
+        let (api_key, api_key_source) = resolve_api_key(&backend, self.llm.as_ref());
+
+        ResolvedLlm {
+            backend,
+            model,
+            base_url,
+            api_key,
+            api_key_source,
+            source,
+        }
+    }
+
+    /// v0.7.x (#1146) — resolve the `[llm.auto_tag]` fast-structured-
+    /// output sibling. Fields fall back to [`Self::resolve_llm`] field-
+    /// by-field; commonly only `model` is overridden (defaults to
+    /// `gemma3:4b` per the L15 fast-structured-output policy).
+    #[must_use]
+    pub fn resolve_llm_auto_tag(&self) -> ResolvedLlm {
+        let parent = self.resolve_llm(None, None, None);
+        let sub = self.llm.as_ref().and_then(|l| l.auto_tag.as_ref());
+
+        let backend = sub
+            .and_then(|s| s.backend.clone())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| parent.backend.clone());
+
+        let model = sub
+            .and_then(|s| s.model.clone())
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| self.auto_tag_model.clone().filter(|s| !s.trim().is_empty()))
+            .unwrap_or_else(|| {
+                // L15 default: gemma3:4b for fast structured output,
+                // regardless of parent backend.
+                if backend == "ollama" {
+                    "gemma3:4b".to_string()
+                } else {
+                    // For non-Ollama backends, use the parent model
+                    // (no sane way to pick a "fast" model across vendors).
+                    parent.model.clone()
+                }
+            });
+
+        let base_url = sub
+            .and_then(|s| s.base_url.clone())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| {
+                if backend == parent.backend {
+                    parent.base_url.clone()
+                } else {
+                    backend_default_base_url(&backend).to_string()
+                }
+            });
+
+        // api_key: inherit from parent if backend matches, else fresh resolve.
+        let (api_key, api_key_source) = if backend == parent.backend {
+            (parent.api_key.clone(), parent.api_key_source.clone())
+        } else {
+            // Synthesise a transient LlmSection-like view from the sub-table
+            // for fresh API-key resolution.
+            let synthetic = sub.map(|s| LlmSection {
+                backend: Some(backend.clone()),
+                model: None,
+                base_url: None,
+                api_key_env: s.api_key_env.clone(),
+                api_key_file: s.api_key_file.clone(),
+                api_key: None,
+                auto_tag: None,
+            });
+            resolve_api_key(&backend, synthetic.as_ref())
+        };
+
+        ResolvedLlm {
+            backend,
+            model,
+            base_url,
+            api_key,
+            api_key_source,
+            source: parent.source,
+        }
+    }
+
+    /// v0.7.x (#1146) — resolve the canonical embedder configuration.
+    #[must_use]
+    pub fn resolve_embeddings(&self) -> ResolvedEmbeddings {
+        let cfg = self.embeddings.as_ref();
+
+        let backend = cfg
+            .and_then(|e| e.backend.clone())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "ollama".to_string());
+
+        let url = cfg
+            .and_then(|e| e.url.clone())
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| self.embed_url.clone().filter(|s| !s.trim().is_empty()))
+            .or_else(|| self.ollama_url.clone().filter(|s| !s.trim().is_empty()))
+            .unwrap_or_else(|| "http://localhost:11434".to_string());
+
+        let model = cfg
+            .and_then(|e| e.model.clone())
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                self.embedding_model
+                    .clone()
+                    .filter(|s| !s.trim().is_empty())
+            })
+            .map(canonicalise_embedding_model)
+            .unwrap_or_else(|| "nomic-embed-text-v1.5".to_string());
+
+        let backfill_batch_env = std::env::var("AI_MEMORY_EMBED_BACKFILL_BATCH")
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok());
+        let backfill_batch_cfg = cfg.and_then(|e| e.backfill_batch);
+        let backfill_batch_raw = backfill_batch_env.or(backfill_batch_cfg);
+        let backfill_batch = match backfill_batch_raw {
+            Some(n) if (1..=10000).contains(&n) => n,
+            Some(_) | None => 100,
+        };
+
+        let source = if cfg.is_some() {
+            ConfigSource::Config
+        } else if self.embed_url.is_some()
+            || self.embedding_model.is_some()
+            || self.ollama_url.is_some()
+        {
+            ConfigSource::Legacy
+        } else {
+            ConfigSource::CompiledDefault
+        };
+
+        ResolvedEmbeddings {
+            backend,
+            url,
+            model,
+            backfill_batch,
+            source,
+        }
+    }
+
+    /// v0.7.x (#1146) — resolve the canonical reranker configuration.
+    /// Folds the legacy `cross_encoder: Option<bool>` flag into the
+    /// `enabled` field; `model` defaults to `ms-marco-MiniLM-L-6-v2`.
+    #[must_use]
+    pub fn resolve_reranker(&self) -> ResolvedReranker {
+        let cfg = self.reranker.as_ref();
+
+        let enabled = cfg
+            .and_then(|r| r.enabled)
+            .or(self.cross_encoder)
+            // Default reranker-on for the autonomous tier; off otherwise.
+            // Boot wires the actual tier-default at the resolver call
+            // site (it's already keyed off `tier_config.cross_encoder`).
+            .unwrap_or(false);
+
+        let model = cfg
+            .and_then(|r| r.model.clone())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "ms-marco-MiniLM-L-6-v2".to_string());
+
+        let source = if cfg.is_some() {
+            ConfigSource::Config
+        } else if self.cross_encoder.is_some() {
+            ConfigSource::Legacy
+        } else {
+            ConfigSource::CompiledDefault
+        };
+
+        ResolvedReranker {
+            enabled,
+            model,
+            source,
+        }
+    }
+
+    /// v0.7.x (#1146) — resolve the canonical storage configuration.
+    #[must_use]
+    pub fn resolve_storage(&self) -> ResolvedStorage {
+        let cfg = self.storage.as_ref();
+
+        let default_namespace = cfg
+            .and_then(|s| s.default_namespace.clone())
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                self.default_namespace
+                    .clone()
+                    .filter(|s| !s.trim().is_empty())
+            })
+            .unwrap_or_else(|| "global".to_string());
+
+        let archive_on_gc = cfg
+            .and_then(|s| s.archive_on_gc)
+            .or(self.archive_on_gc)
+            .unwrap_or(true);
+
+        let archive_max_days = cfg
+            .and_then(|s| s.archive_max_days)
+            .or(self.archive_max_days);
+
+        let max_memory_mb = cfg.and_then(|s| s.max_memory_mb).or(self.max_memory_mb);
+
+        let source = if cfg.is_some() {
+            ConfigSource::Config
+        } else if self.default_namespace.is_some()
+            || self.archive_on_gc.is_some()
+            || self.archive_max_days.is_some()
+            || self.max_memory_mb.is_some()
+        {
+            ConfigSource::Legacy
+        } else {
+            ConfigSource::CompiledDefault
+        };
+
+        ResolvedStorage {
+            default_namespace,
+            archive_on_gc,
+            archive_max_days,
+            max_memory_mb,
+            source,
+        }
     }
 
     /// Write a default config file if one doesn't exist yet.
@@ -5310,6 +6508,12 @@ legacy_scoring = false
             governance: Some(GovernanceConfig::default()),
             confidence: Some(ConfidenceConfig::default()),
             admin: Some(AdminConfig::default()),
+            // v0.7.x (#1146) — enterprise configuration sections.
+            schema_version: Some(2),
+            llm: Some(LlmSection::default()),
+            embeddings: Some(EmbeddingsSection::default()),
+            reranker: Some(RerankerSection::default()),
+            storage: Some(StorageSection::default()),
         };
 
         let serialised = toml::to_string(&cfg).expect("serialise AppConfig to TOML");
@@ -5355,6 +6559,12 @@ legacy_scoring = false
             "governance",
             "confidence",
             "admin",
+            // v0.7.x (#1146) — enterprise configuration sections.
+            "schema_version",
+            "llm",
+            "embeddings",
+            "reranker",
+            "storage",
         ];
 
         for key in table.keys() {
@@ -5784,5 +6994,341 @@ legacy_scoring = false
         assert!((surface.tier_thresholds.confirmed - 0.95).abs() < f64::EPSILON);
         assert!((surface.tier_thresholds.likely - 0.7).abs() < f64::EPSILON);
         assert!((surface.tier_thresholds.ambiguous - 0.0).abs() < f64::EPSILON);
+    }
+
+    // ---------------------------------------------------------------------
+    // v0.7.x enterprise-config tests (#1146)
+    //
+    // Pin: precedence ladder per resolver (CLI > env > config > legacy >
+    // compiled), inline-key rejection at parse time, api_key_env /
+    // api_key_file resolution, Once-gated legacy-drift WARN.
+    // ---------------------------------------------------------------------
+
+    fn empty_app_config() -> AppConfig {
+        AppConfig {
+            schema_version: Some(2),
+            ..AppConfig::default()
+        }
+    }
+
+    fn scrub_llm_env() {
+        for k in [
+            "AI_MEMORY_LLM_BACKEND",
+            "AI_MEMORY_LLM_MODEL",
+            "AI_MEMORY_LLM_BASE_URL",
+            "AI_MEMORY_LLM_API_KEY",
+            "XAI_API_KEY",
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "AI_MEMORY_EMBED_BACKFILL_BATCH",
+            "AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS",
+        ] {
+            unsafe {
+                std::env::remove_var(k);
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_llm_1146_compiled_default_when_nothing_configured() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        let cfg = empty_app_config();
+        let resolved = cfg.resolve_llm(None, None, None);
+        assert_eq!(resolved.backend, "ollama");
+        assert_eq!(resolved.model, "gemma3:4b");
+        assert_eq!(resolved.base_url, "http://localhost:11434");
+        assert_eq!(resolved.source, ConfigSource::CompiledDefault);
+        assert_eq!(resolved.api_key_source, KeySource::None);
+        assert!(resolved.api_key().is_none());
+    }
+
+    #[test]
+    fn resolve_llm_1146_env_overrides_config_section() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        unsafe {
+            std::env::set_var("AI_MEMORY_LLM_BACKEND", "xai");
+            std::env::set_var("AI_MEMORY_LLM_MODEL", "grok-99");
+            std::env::set_var("AI_MEMORY_LLM_API_KEY", "env-key");
+        }
+        let mut cfg = empty_app_config();
+        cfg.llm = Some(LlmSection {
+            backend: Some("openai".into()),
+            model: Some("gpt-4".into()),
+            ..LlmSection::default()
+        });
+        let resolved = cfg.resolve_llm(None, None, None);
+        assert_eq!(resolved.backend, "xai", "env must beat config");
+        assert_eq!(resolved.model, "grok-99");
+        assert_eq!(resolved.source, ConfigSource::Env);
+        assert_eq!(resolved.api_key_source, KeySource::ProcessEnv);
+        assert_eq!(resolved.api_key(), Some("env-key"));
+        scrub_llm_env();
+    }
+
+    #[test]
+    fn resolve_llm_1146_cli_overrides_env() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        unsafe {
+            std::env::set_var("AI_MEMORY_LLM_BACKEND", "ollama");
+            std::env::set_var("AI_MEMORY_LLM_MODEL", "ollama-model");
+        }
+        let cfg = empty_app_config();
+        let resolved = cfg.resolve_llm(Some("xai"), Some("grok-4.3"), Some("https://x"));
+        assert_eq!(resolved.backend, "xai", "CLI flag must beat env");
+        assert_eq!(resolved.model, "grok-4.3");
+        assert_eq!(resolved.base_url, "https://x");
+        assert_eq!(resolved.source, ConfigSource::Cli);
+        scrub_llm_env();
+    }
+
+    #[test]
+    fn resolve_llm_1146_config_section_when_no_env() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        let mut cfg = empty_app_config();
+        cfg.llm = Some(LlmSection {
+            backend: Some("xai".into()),
+            model: Some("grok-4.3".into()),
+            ..LlmSection::default()
+        });
+        let resolved = cfg.resolve_llm(None, None, None);
+        assert_eq!(resolved.backend, "xai");
+        assert_eq!(resolved.model, "grok-4.3");
+        assert_eq!(
+            resolved.base_url, "https://api.x.ai/v1",
+            "vendor-default base_url applied"
+        );
+        assert_eq!(resolved.source, ConfigSource::Config);
+    }
+
+    #[test]
+    fn resolve_llm_1146_alias_fallback_key_for_xai() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        unsafe {
+            std::env::set_var("AI_MEMORY_LLM_BACKEND", "xai");
+            std::env::set_var("XAI_API_KEY", "alias-fallback-key");
+        }
+        let cfg = empty_app_config();
+        let resolved = cfg.resolve_llm(None, None, None);
+        assert_eq!(resolved.backend, "xai");
+        assert_eq!(resolved.api_key(), Some("alias-fallback-key"));
+        match &resolved.api_key_source {
+            KeySource::AliasFallback(name) => assert_eq!(name, "XAI_API_KEY"),
+            other => panic!("expected AliasFallback(XAI_API_KEY), got {other:?}"),
+        }
+        scrub_llm_env();
+    }
+
+    #[test]
+    fn resolve_llm_1146_legacy_llm_model_feeds_resolver() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        let mut cfg = AppConfig::default();
+        cfg.llm_model = Some("gemma4:e4b".into());
+        cfg.ollama_url = Some("http://localhost:11434".into());
+        let resolved = cfg.resolve_llm(None, None, None);
+        assert_eq!(resolved.backend, "ollama");
+        assert_eq!(resolved.model, "gemma4:e4b");
+        assert_eq!(resolved.source, ConfigSource::Legacy);
+    }
+
+    #[test]
+    fn validate_secret_handling_1146_rejects_inline_api_key() {
+        let mut cfg = empty_app_config();
+        cfg.llm = Some(LlmSection {
+            backend: Some("xai".into()),
+            api_key: Some("xai-INLINE-SECRET".into()),
+            ..LlmSection::default()
+        });
+        let err = cfg
+            .validate_secret_handling()
+            .expect_err("inline api_key must be rejected");
+        assert!(
+            err.contains("api_key") && err.contains("forbidden"),
+            "error must name the field and the policy: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_secret_handling_1146_rejects_env_and_file_both_set() {
+        let mut cfg = empty_app_config();
+        cfg.llm = Some(LlmSection {
+            backend: Some("xai".into()),
+            api_key_env: Some("XAI_API_KEY".into()),
+            api_key_file: Some("/etc/key".into()),
+            ..LlmSection::default()
+        });
+        let err = cfg
+            .validate_secret_handling()
+            .expect_err("env+file mutex must be enforced");
+        assert!(
+            err.contains("api_key_env") && err.contains("api_key_file"),
+            "error must call out the mutex: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_llm_1146_api_key_env_reads_named_env_var() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        unsafe {
+            std::env::set_var("MY_CUSTOM_LLM_KEY", "via-config-env-var");
+        }
+        let mut cfg = empty_app_config();
+        cfg.llm = Some(LlmSection {
+            backend: Some("xai".into()),
+            model: Some("grok-4.3".into()),
+            api_key_env: Some("MY_CUSTOM_LLM_KEY".into()),
+            ..LlmSection::default()
+        });
+        let resolved = cfg.resolve_llm(None, None, None);
+        assert_eq!(resolved.api_key(), Some("via-config-env-var"));
+        match &resolved.api_key_source {
+            KeySource::ConfigEnvVar(name) => assert_eq!(name, "MY_CUSTOM_LLM_KEY"),
+            other => panic!("expected ConfigEnvVar(MY_CUSTOM_LLM_KEY), got {other:?}"),
+        }
+        unsafe {
+            std::env::remove_var("MY_CUSTOM_LLM_KEY");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolve_llm_1146_api_key_file_rejects_lax_perms() {
+        use std::os::unix::fs::PermissionsExt;
+        let _g = env_var_lock();
+        scrub_llm_env();
+        // Tempdir under .local-runs (project HARD rule: no /tmp).
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(".local-runs")
+            .join(format!("test-1146-perms-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let key_path = base.join("xai.key");
+        std::fs::write(&key_path, "shhh").unwrap();
+        // World-readable mode 0644 — must be rejected.
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let mut cfg = empty_app_config();
+        cfg.llm = Some(LlmSection {
+            backend: Some("xai".into()),
+            api_key_file: Some(key_path.display().to_string()),
+            ..LlmSection::default()
+        });
+        let resolved = cfg.resolve_llm(None, None, None);
+        match &resolved.api_key_source {
+            KeySource::Error(reason) => {
+                assert!(
+                    reason.contains("lax permissions") && reason.contains("0400"),
+                    "error must name the perm policy: {reason}"
+                );
+            }
+            other => panic!("expected KeySource::Error(lax perms), got {other:?}"),
+        }
+        // Cleanup.
+        let _ = std::fs::remove_file(&key_path);
+        let _ = std::fs::remove_dir(&base);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolve_llm_1146_api_key_file_accepts_0400() {
+        use std::os::unix::fs::PermissionsExt;
+        let _g = env_var_lock();
+        scrub_llm_env();
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(".local-runs")
+            .join(format!("test-1146-perms-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let key_path = base.join("xai.key");
+        std::fs::write(&key_path, "the-actual-key\n").unwrap();
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o400)).unwrap();
+
+        let mut cfg = empty_app_config();
+        cfg.llm = Some(LlmSection {
+            backend: Some("xai".into()),
+            api_key_file: Some(key_path.display().to_string()),
+            ..LlmSection::default()
+        });
+        let resolved = cfg.resolve_llm(None, None, None);
+        assert_eq!(
+            resolved.api_key(),
+            Some("the-actual-key"),
+            "first line is the key"
+        );
+        assert!(matches!(resolved.api_key_source, KeySource::ConfigFile(_)));
+
+        let _ = std::fs::remove_file(&key_path);
+        let _ = std::fs::remove_dir(&base);
+    }
+
+    #[test]
+    fn resolve_embeddings_1146_legacy_alias_canonicalised() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        let mut cfg = AppConfig::default();
+        cfg.embedding_model = Some("nomic_embed_v15".into());
+        let resolved = cfg.resolve_embeddings();
+        assert_eq!(
+            resolved.model, "nomic-embed-text-v1.5",
+            "legacy alias must be canonicalised"
+        );
+        assert_eq!(resolved.source, ConfigSource::Legacy);
+        assert_eq!(resolved.backfill_batch, 100, "compiled default applied");
+    }
+
+    #[test]
+    fn resolve_embeddings_1146_backfill_batch_env_overrides_config() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        unsafe {
+            std::env::set_var("AI_MEMORY_EMBED_BACKFILL_BATCH", "500");
+        }
+        let mut cfg = empty_app_config();
+        cfg.embeddings = Some(EmbeddingsSection {
+            backfill_batch: Some(50),
+            ..EmbeddingsSection::default()
+        });
+        let resolved = cfg.resolve_embeddings();
+        assert_eq!(resolved.backfill_batch, 500, "env must beat config");
+        scrub_llm_env();
+    }
+
+    #[test]
+    fn resolve_reranker_1146_folds_legacy_cross_encoder() {
+        let _g = env_var_lock();
+        let mut cfg = AppConfig::default();
+        cfg.cross_encoder = Some(true);
+        let resolved = cfg.resolve_reranker();
+        assert!(resolved.enabled);
+        assert_eq!(resolved.model, "ms-marco-MiniLM-L-6-v2");
+        assert_eq!(resolved.source, ConfigSource::Legacy);
+    }
+
+    #[test]
+    fn resolved_llm_1146_debug_redacts_api_key() {
+        let resolved = ResolvedLlm {
+            backend: "xai".into(),
+            model: "grok-4.3".into(),
+            base_url: "https://api.x.ai/v1".into(),
+            api_key: Some("SUPER-SECRET-DONT-LEAK".into()),
+            api_key_source: KeySource::ProcessEnv,
+            source: ConfigSource::Env,
+        };
+        let dbg = format!("{resolved:?}");
+        assert!(
+            !dbg.contains("SUPER-SECRET-DONT-LEAK"),
+            "Debug impl must redact the api_key: {dbg}"
+        );
+        assert!(
+            dbg.contains("<redacted>"),
+            "Debug impl must show <redacted> placeholder: {dbg}"
+        );
     }
 }

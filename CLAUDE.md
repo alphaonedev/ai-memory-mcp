@@ -399,6 +399,112 @@ are pinned by `tests/config_precedence.rs`:
 If you add a new env var, update the table above AND extend
 `tests/config_precedence.rs` so the invariant is mechanically enforced.
 
+### Config schema v0.7.x (#1146) — sectioned `[llm]` / `[embeddings]` / `[reranker]` / `[storage]`
+
+**Canonical shape.** As of v0.7.x (#1146), `~/.config/ai-memory/config.toml`
+uses a schema-versioned, sectioned shape:
+
+```toml
+schema_version = 2
+
+tier = "autonomous"
+db = "/Users/fate/.claude/ai-memory.db"
+
+[llm]
+backend     = "xai"          # ollama | openai | xai | anthropic | gemini |
+                             # deepseek | kimi | qwen | mistral | groq |
+                             # together | cerebras | openrouter |
+                             # fireworks | lmstudio | openai-compatible
+model       = "grok-4.3"     # vendor-specific
+base_url    = "https://api.x.ai/v1"   # optional; vendor-default if unset
+api_key_env = "XAI_API_KEY"            # env-var name reference (mutually
+                                       # exclusive with api_key_file)
+# api_key_file = "/etc/ai-memory/keys/xai.key"   # alt — mode 0400 enforced
+
+[llm.auto_tag]
+# Fast structured-output sibling of [llm] (auto_tag, query expansion,
+# contradiction detection). Field-by-field fallback to parent [llm];
+# operators commonly override only `model` to point at a fast local
+# Ollama variant.
+backend = "ollama"
+model   = "gemma3:4b"
+
+[embeddings]
+backend        = "ollama"
+url            = "http://localhost:11434"
+model          = "nomic-embed-text-v1.5"
+backfill_batch = 100
+
+[reranker]
+enabled = true
+model   = "ms-marco-MiniLM-L-6-v2"
+
+[storage]
+default_namespace = "alphaone"
+archive_on_gc     = true
+
+[mcp]
+profile = "full"
+```
+
+**Canonical resolver.** Every LLM-init surface (MCP stdio, HTTP daemon,
+`ai-memory atomise`, `ai-memory curator`, the boot banner, the
+`ai-memory doctor` reachability probe) consumes the `ResolvedLlm`
+shape produced by `AppConfig::resolve_llm(cli_backend, cli_model,
+cli_base_url)`. The resolver applies the uniform precedence ladder:
+
+```
+CLI flag  >  AI_MEMORY_LLM_* env  >  [llm] section  >  legacy flat fields  >  compiled default
+```
+
+Sister resolvers `resolve_llm_auto_tag`, `resolve_embeddings`,
+`resolve_reranker`, and `resolve_storage` follow the same ladder for
+their respective concerns. The `ResolvedLlm` struct's `Debug` impl
+redacts the resolved `api_key` to `<redacted>` so accidental `{:?}`
+prints never leak credentials.
+
+**Inline-key rejection.** `[llm].api_key = "<literal>"` is rejected at
+parse time with a clear stderr error and the daemon falls back to
+`AppConfig::default()` so it still boots. Operators must use either
+`[llm].api_key_env = "<ENV_VAR_NAME>"` (process env reference) or
+`[llm].api_key_file = "/path/to/key"` (file; mode 0400 enforced via
+`AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS` escape hatch from #1055).
+
+**Legacy v0.6.x flat fields** (`llm_model`, `ollama_url`, `embed_url`,
+`embedding_model`, `cross_encoder`, `default_namespace`,
+`archive_on_gc`, `archive_max_days`, `max_memory_mb`, `auto_tag_model`)
+continue to parse and feed the resolver's `Legacy` arm. Loading a
+legacy config emits a `Once`-gated stderr WARN pointing at
+`ai-memory config migrate`. Legacy fields will be removed in v0.8.0.
+
+**Migration tool.**
+
+```bash
+ai-memory config migrate              # write <file>.bak.<ts> + rewrite in v2 shape
+ai-memory config migrate --dry-run    # print diff to stderr, no writes
+ai-memory config migrate \
+    --also-clean-claude-json          # additionally remove
+                                      # mcpServers.<*>.env from
+                                      # ~/.claude.json after the
+                                      # operator has verified the
+                                      # new config works
+```
+
+Idempotent — running against a v2 file is a no-op INFO log.
+
+**Reachability probe.** `ai-memory doctor` emits a section
+`LLM Reachability (#1146)` that probes `<base_url>/api/tags` (Ollama)
+or `<base_url>/models` (OpenAI-compatible) with the resolved Bearer
+key and reports PASS / WARN (401/403/429/5xx) / CRIT (4xx other,
+network, DNS, TLS) plus the resolved provenance facts so operators
+can see WHICH precedence layer won.
+
+**Test pins.** Resolver precedence + secret-handling discipline are
+pinned by 19 tests under `src/config::tests::*1146*` and
+`src/cli/commands/config::tests::migrate_*`. Adding a new resolver
+field requires updating both the resolver function and the precedence
+test for that resolver (CLI > env > config > legacy > default).
+
 ### Agent Identity (NHI) — `metadata.agent_id`
 
 Every stored memory carries `metadata.agent_id` — a best-effort Non-Human Identity

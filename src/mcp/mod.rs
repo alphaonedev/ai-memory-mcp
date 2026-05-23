@@ -2145,58 +2145,62 @@ pub fn run_mcp_server(
     // CLI `curator`) shares one resolution rule. Behavioural parity
     // with the daemon's async wrapper is pinned by tests in
     // `src/llm.rs::tests::build_for_init_*`.
-    let backend_env = std::env::var("AI_MEMORY_LLM_BACKEND")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    let llm: Option<Arc<OllamaClient>> = if let Some(backend) = backend_env {
-        match OllamaClient::from_env() {
+    // v0.7.x (#1146) — single canonical entry through the resolver.
+    // The resolver folds CLI flags (none at MCP boot), AI_MEMORY_LLM_*
+    // env vars, the [llm] config section, the legacy
+    // `llm_model`/`ollama_url` flat fields, and the compiled tier
+    // preset. The provenance fields on `ResolvedLlm` (`source`,
+    // `api_key_source`) surface in the startup banner so the operator
+    // can see WHICH layer won.
+    let resolved_llm = app_config.resolve_llm(None, None, None);
+    let llm: Option<Arc<OllamaClient>> = if tier_config.llm_model.is_none()
+        && resolved_llm.source == crate::config::ConfigSource::CompiledDefault
+    {
+        // Keyword tier with no operator config: LLM intentionally disabled.
+        None
+    } else {
+        match OllamaClient::build_from_resolved(&resolved_llm) {
             Ok(Some(client)) => {
-                let model_env = std::env::var("AI_MEMORY_LLM_MODEL")
-                    .ok()
-                    .unwrap_or_else(|| "<default-for-backend>".to_string());
-                eprintln!("ai-memory: LLM ready (backend={backend}, model={model_env})");
-                Some(Arc::new(client))
-            }
-            Ok(None) => {
                 eprintln!(
-                    "ai-memory: LLM disabled — AI_MEMORY_LLM_BACKEND={backend} resolved to None"
+                    "ai-memory: LLM ready (backend={}, model={}, source={}, key_source={})",
+                    resolved_llm.backend,
+                    resolved_llm.model,
+                    resolved_llm.source.as_str(),
+                    resolved_llm.api_key_source.as_str(),
                 );
-                None
-            }
-            Err(e) => {
-                eprintln!(
-                    "ai-memory: LLM init failed (backend={backend}): {e} (LLM features disabled)"
-                );
-                None
-            }
-        }
-    } else if let Some(ref llm_model) = tier_config.llm_model {
-        let model_id = llm_model.ollama_model_id();
-        eprintln!(
-            "ai-memory: connecting to Ollama for {} (legacy tier-default; set \
-             AI_MEMORY_LLM_BACKEND for provider-agnostic access) ...",
-            llm_model.display_name()
-        );
-        let ollama_url = app_config.effective_ollama_url();
-        match OllamaClient::new_with_url(ollama_url, model_id) {
-            Ok(client) => {
-                eprintln!("ai-memory: Ollama connected, ensuring model {model_id} is available...");
-                if let Err(e) = client.ensure_model() {
-                    eprintln!("ai-memory: model pull failed: {e} (LLM features disabled)");
-                    None
+                // For ollama backends, exercise the legacy ensure_model
+                // pull step so first-run UX (model not on disk) still
+                // emits the pull-progress hint.
+                if resolved_llm.backend == "ollama" {
+                    if let Err(e) = client.ensure_model() {
+                        eprintln!("ai-memory: model pull failed: {e} (LLM features disabled)");
+                        None
+                    } else {
+                        Some(Arc::new(client))
+                    }
                 } else {
-                    eprintln!("ai-memory: LLM ready ({})", llm_model.display_name());
                     Some(Arc::new(client))
                 }
             }
+            Ok(None) => {
+                eprintln!(
+                    "ai-memory: LLM disabled — resolver returned no client \
+                     (backend={}, source={})",
+                    resolved_llm.backend,
+                    resolved_llm.source.as_str(),
+                );
+                None
+            }
             Err(e) => {
-                eprintln!("ai-memory: Ollama not available: {e} (LLM features disabled)");
+                eprintln!(
+                    "ai-memory: LLM init failed (backend={}, source={}): {e} \
+                     (LLM features disabled)",
+                    resolved_llm.backend,
+                    resolved_llm.source.as_str(),
+                );
                 None
             }
         }
-    } else {
-        None
     };
 
     // --- Initialize embedder (semantic tier and above) ---

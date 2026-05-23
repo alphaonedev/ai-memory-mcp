@@ -381,19 +381,46 @@ impl BootManifest {
         latency_ms: u128,
         schema_supported: bool,
     ) -> Self {
-        // Resolve the *configured* tier. Boot doesn't materialize the
-        // embedder / LLM / reranker handles, so these reflect what would
-        // load — not what actually loaded.
+        // v0.7.x (#1146) — Boot reports the SAME resolved configuration
+        // that the live MCP / HTTP / CLI surfaces will use, instead of
+        // the compiled tier preset. The resolver folds CLI flags (none
+        // at boot time), AI_MEMORY_LLM_* env vars, the `[llm]` /
+        // `[embeddings]` / `[reranker]` config sections, the legacy
+        // flat fields, and the compiled fallback through the uniform
+        // precedence ladder. The banner emits `backend:model` so the
+        // operator can verify wiring at a glance (`llm=xai:grok-4.3`
+        // vs `llm=ollama:gemma3:4b` vs `llm=ollama:none`).
         let feature_tier = app_config.effective_tier(None);
-        let tier_config = feature_tier.config();
-        let embedder = tier_config
-            .embedding_model
-            .map_or_else(|| "none".to_string(), |m| m.hf_model_id().to_string());
-        let llm = tier_config
-            .llm_model
-            .map_or_else(|| "none".to_string(), |m| m.ollama_model_id().to_string());
-        let reranker = if tier_config.cross_encoder {
-            "ms-marco-MiniLM-L-6-v2".to_string()
+        let resolved_llm = app_config.resolve_llm(None, None, None);
+        let resolved_emb = app_config.resolve_embeddings();
+        let resolved_rer = app_config.resolve_reranker();
+
+        // Embedder: report the resolver's view UNLESS the tier preset
+        // disables embeddings entirely (keyword tier), in which case
+        // we keep the historical "none" string so existing scrapers
+        // continue to recognise a tier-disabled embedder posture.
+        let embedder = if feature_tier.config().embedding_model.is_none() {
+            "none".to_string()
+        } else {
+            resolved_emb.model.clone()
+        };
+
+        // LLM: `backend:model` provenance. When backend == "ollama" we
+        // emit just the model (legacy banner shape) so existing
+        // grep'ing tools that match `llm=gemma3:4b` continue to work;
+        // when backend != "ollama" the full `xai:grok-4.3` shape is
+        // emitted so the operator-facing disambiguation is loud.
+        let llm = if resolved_llm.backend == "ollama" {
+            resolved_llm.model.clone()
+        } else {
+            resolved_llm.display_label()
+        };
+
+        // Reranker: respect the resolver (which folds `[reranker]` +
+        // legacy `cross_encoder`); fall back to tier preset only when
+        // neither configured the field.
+        let reranker = if resolved_rer.enabled || feature_tier.config().cross_encoder {
+            resolved_rer.model.clone()
         } else {
             "none".to_string()
         };

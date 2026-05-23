@@ -839,10 +839,10 @@ Every capability mapped to its minimum tier. Each tier includes all capabilities
 
 **Semantic tier** (default) bundles the Candle ML framework and downloads the all-MiniLM-L6-v2 model on first run (~90 MB). **Smart** and **autonomous** tiers require an LLM backend — post-[#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067) (v0.7.0) that can be local ([Ollama](https://ollama.com), LMStudio, vLLM, llama.cpp server) or any OpenAI-compatible remote endpoint (xAI, OpenAI, Anthropic via OpenAI shim, Google Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks). Selection is by `AI_MEMORY_LLM_BACKEND` env var; per-vendor API keys via `XAI_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` / `DEEPSEEK_API_KEY` / `MOONSHOT_API_KEY` / `DASHSCOPE_API_KEY` / etc. or the canonical `AI_MEMORY_LLM_API_KEY`.
 
-**Tiers gate features, not models — and post-[#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067) (v0.7.0), tiers gate features, not vendors either.** The `--tier` flag controls which tools are exposed. The LLM backend + model are independently configurable via `AI_MEMORY_LLM_BACKEND` + `AI_MEMORY_LLM_MODEL` env vars (or the `llm_model` field in `~/.config/ai-memory/config.toml` for legacy Ollama setups). For example, run autonomous tier (full 73-tool surface (v0.7.0) + reranker) against xAI Grok 4 via the OpenAI-compatible alias:
+**Tiers gate features, not models — and post-[#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067) (v0.7.0), tiers gate features, not vendors either.** The `--tier` flag controls which tools are exposed. The LLM backend + model are independently configurable via `AI_MEMORY_LLM_BACKEND` + `AI_MEMORY_LLM_MODEL` env vars (or via the canonical `[llm]` section in `~/.config/ai-memory/config.toml` — see [docs/CONFIG_SCHEMA.md](docs/CONFIG_SCHEMA.md) for the v0.7.x enterprise schema and the migration tool). For example, run autonomous tier (full 73-tool surface (v0.7.0) + reranker) against xAI Grok 4 via the OpenAI-compatible alias:
 
 ```bash
-# Remote LLM via env (post-#1067)
+# Quick path: env vars
 export AI_MEMORY_LLM_BACKEND=xai
 export AI_MEMORY_LLM_MODEL=grok-4
 export XAI_API_KEY=xai-…   # or AI_MEMORY_LLM_API_KEY
@@ -850,8 +850,22 @@ ai-memory mcp --tier autonomous
 ```
 
 ```toml
-# ~/.config/ai-memory/config.toml — legacy local Ollama
-tier = "autonomous"        # all features enabled
+# Enterprise path: ~/.config/ai-memory/config.toml (v0.7.x schema v2, #1146)
+schema_version = 2
+tier = "autonomous"
+
+[llm]
+backend     = "xai"
+model       = "grok-4.3"
+base_url    = "https://api.x.ai/v1"
+api_key_env = "XAI_API_KEY"          # mutually exclusive with api_key_file;
+                                     # inline `api_key = "..."` is REJECTED.
+```
+
+```toml
+# Legacy v0.6.x shape — still works, deprecation WARN at load; run
+# `ai-memory config migrate` to upgrade in place.
+tier = "autonomous"
 llm_model = "gemma4:e2b"   # faster model (46 tok/s vs 26 tok/s for e4b)
 ```
 

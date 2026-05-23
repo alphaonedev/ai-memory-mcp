@@ -7,6 +7,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] — v0.7.x doc follow-ups + Wave-2 refactor (post-tag)
 
+### feat(config, #1146) — enterprise configuration standard (2026-05-22)
+
+Closes [#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146)
+(subsumes [#1143](https://github.com/alphaonedev/ai-memory-mcp/issues/1143)).
+Consolidates the previously-fragmented configuration surface
+(legacy flat fields, `~/.claude.json` `mcpServers.*.env` block,
+SessionStart hook env, compiled tier presets, process env) into a
+single canonical sectioned schema with one resolver every surface
+consumes.
+
+- **Schema v2** — `[llm]` / `[llm.auto_tag]` / `[embeddings]` /
+  `[reranker]` / `[storage]` sections in `~/.config/ai-memory/config.toml`,
+  plus an explicit `schema_version = 2` field. Legacy v0.6.x flat
+  fields continue to parse (deprecation WARN on first load) and will
+  be removed in v0.8.0.
+- **Canonical resolvers** — `AppConfig::resolve_llm` /
+  `resolve_llm_auto_tag` / `resolve_embeddings` / `resolve_reranker` /
+  `resolve_storage`. Uniform precedence: CLI > AI_MEMORY_LLM_* env >
+  section > legacy fields > compiled default. Resolved shapes carry
+  provenance tags (`ConfigSource`, `KeySource`) surfaced by the boot
+  banner and `ai-memory doctor`.
+- **Single-entry LLM constructor** — `OllamaClient::build_from_resolved`
+  replaces every inline env-vs-tier-preset match across 6 LLM-init
+  sites (MCP stdio, HTTP daemon, curator-primitives entrypoint,
+  atomise CLI, curator CLI, boot banner).
+- **Inline-key rejection at parse time** — `[llm].api_key = "<literal>"`,
+  `api_key_env + api_key_file` mutex, and the same mutex on
+  `[llm.auto_tag]` are all refused. Loader falls back to
+  `AppConfig::default()` on rejection so the daemon still boots.
+- **`api_key_file` mode 0400 enforcement** — reuses #1055 escape hatch
+  (`AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS=1`).
+- **New CLI**: `ai-memory config migrate [--dry-run]
+  [--also-clean-claude-json]` — rewrites a legacy v1 config to v2
+  shape with a timestamped `.bak`. Idempotent.
+- **`ai-memory doctor` LLM reachability probe** — new section
+  `LLM Reachability (#1146)` resolves the canonical LLM config and
+  probes the endpoint with the resolved Bearer key. 7-bucket severity
+  partition: INFO (200), WARN (401/403/429/5xx), CRIT (4xx other /
+  network / DNS / TLS).
+- **Boot banner upgrade** — reports `llm=<backend>:<model>` (e.g.
+  `llm=xai:grok-4.3`) when backend is non-Ollama; the historic
+  `llm=<model>` shape is preserved for Ollama backends so existing
+  scrapers continue to match. Closes the operator-visible defect that
+  triggered the campaign (boot banner reporting compiled tier preset
+  `gemma4:e4b` while the MCP server was actually routing to
+  `xai/grok-4.3`).
+- **`ResolvedLlm::Debug` redacts api_key** to `<redacted>`.
+- **19 unit tests** pin resolver precedence, inline-key rejection,
+  mutex enforcement, alias-fallback API-key resolution, `api_key_env`
+  and `api_key_file` paths (incl. 0400 perms check), legacy alias
+  canonicalisation, backfill-batch env override, reranker bool→table
+  fold, Debug redaction, and v1→v2 migration shape.
+
+Migration: existing v0.6.x deployments boot unchanged with a one-line
+WARN nudging them to run `ai-memory config migrate`. Operators who
+previously inlined `AI_MEMORY_LLM_API_KEY` in `~/.claude.json`
+`mcpServers.memory.env` can migrate the key to `config.toml`
+`[llm].api_key_env = "XAI_API_KEY"` (referencing a shell-injected env
+var) or `[llm].api_key_file = "/path/to/key"` (mode 0400 file).
+
 ### feat(llm, #1067) — provider-agnostic LLM substrate (2026-05-21)
 
 Closes [#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067)

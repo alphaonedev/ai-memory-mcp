@@ -11,6 +11,8 @@
 
 /// v0.7.0 WT-1-F — `ai-memory atomise` CLI subcommand.
 pub mod atomise;
+/// v0.7.x (#1146) — `ai-memory config <subcommand>` CLI surface.
+pub mod config;
 pub mod export_reflections;
 // v0.7.0 QW-2 — Persona-as-artifact CLI surface. `ai-memory persona
 // <entity_id> [--namespace NS] [--regenerate] [--json]`.

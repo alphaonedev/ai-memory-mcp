@@ -388,6 +388,66 @@ impl OllamaClient {
         Self::new_with_url(legacy_url, legacy_model).map(Some)
     }
 
+    /// v0.7.x (#1146) — Construct an `OllamaClient` from a fully-resolved
+    /// LLM configuration produced by [`crate::config::AppConfig::resolve_llm`].
+    /// This is the enterprise-class single-entry-point that replaces
+    /// every call to [`Self::build_for_init`] /
+    /// [`Self::new_with_url`] / [`Self::from_env`] /
+    /// [`Self::new_openai_compatible`] in the surface plumbing.
+    ///
+    /// The resolver has already done all precedence + provenance work
+    /// (CLI flag > env > [llm] config section > legacy fields >
+    /// compiled default) and produced a [`ResolvedLlm`] carrying the
+    /// authoritative `(backend, model, base_url, api_key)` quad. This
+    /// constructor just maps it onto the appropriate wire-shape
+    /// client.
+    ///
+    /// Returns `Ok(None)` when the resolved `api_key_source` is
+    /// `KeySource::Error(_)` and the backend is non-Ollama (so we
+    /// can't even attempt to construct an OpenAI-compatible client).
+    /// The error surfaces through the `ai-memory doctor` LLM
+    /// reachability probe rather than panicking at construct time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP client itself fails to build, or
+    /// if the Ollama-backend reachability check fails the same way
+    /// [`Self::new_with_url`] already fails.
+    pub fn build_from_resolved(resolved: &crate::config::ResolvedLlm) -> Result<Option<Self>> {
+        // Surface the resolved provenance for operator-facing debugging
+        // (RUST_LOG=ai_memory=debug ai-memory <cmd>).
+        tracing::debug!(
+            "LLM client construction via #1146 resolver — backend={}, model={}, base_url={}, key_source={}, source={}",
+            resolved.backend,
+            resolved.model,
+            resolved.base_url,
+            resolved.api_key_source.as_str(),
+            resolved.source.as_str(),
+        );
+
+        if resolved.backend == "ollama" {
+            return Self::new_with_url(&resolved.base_url, &resolved.model).map(Some);
+        }
+
+        // Non-Ollama backends require an API key. If the resolver
+        // could not produce one, surface the error via a returned
+        // `Err` (consistent with the pre-#1143 `from_env` posture).
+        let Some(api_key) = resolved.api_key() else {
+            return Err(anyhow!(
+                "LLM backend `{}` requires an API key but the resolver \
+                 produced none. KeySource = {}. Configure either \
+                 AI_MEMORY_LLM_API_KEY, a per-vendor env var (e.g. \
+                 XAI_API_KEY), [llm].api_key_env, or [llm].api_key_file \
+                 in config.toml. See \
+                 https://github.com/alphaonedev/ai-memory-mcp/issues/1146",
+                resolved.backend,
+                resolved.api_key_source.as_str(),
+            ));
+        };
+
+        Self::new_openai_compatible(&resolved.base_url, &resolved.model, api_key).map(Some)
+    }
+
     /// #1143 — Wire-shape introspection for embed-client fallback.
     /// Embed endpoints differ from chat endpoints across vendors: only
     /// Ollama (and a couple of OpenAI-compatible vendors) expose a
