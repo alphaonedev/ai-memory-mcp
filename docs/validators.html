@@ -302,12 +302,14 @@ footer a{color:var(--text-muted)}
 
     <div class="v" id="validate_relation">
       <div class="v-head"><span class="v-name">validate_relation</span><span class="v-sig">(relation: &amp;str) → Result&lt;()&gt;</span><span class="v-when">LinkBody · sync_push links receive</span></div>
-      <div class="v-desc">Closed set — KG relationship type. New relations are a wire-format change.</div>
-      <div class="v-rules"><div class="lbl">Accepted values</div><ul>
+      <div class="v-desc">Closed canonical set <strong>+ user-defined</strong> identifiers. The 6 canonical names below always pass; v0.7.0 Wave-3 Continuation 5 also accepts any caller-supplied lowercase <code>[a-z0-9_]+</code> identifier (mirrors the AGE Cypher edge-label convention so cert harnesses can use <code>next</code> / <code>mentions</code> / <code>parent_of</code>). Whitespace / control chars / shell metacharacters are rejected. Canonical truth: <code>VALID_RELATIONS</code> in <code>src/validate.rs</code>; enum in <code>src/models/link.rs::MemoryLinkRelation</code>.</div>
+      <div class="v-rules"><div class="lbl">Canonical values (6 at v0.7.0)</div><ul>
         <li><code>related_to</code> — generic association (default for <code>memory_link</code>)</li>
         <li><code>supersedes</code> — newer memory replaces older (typed cognition)</li>
-        <li><code>contradicts</code> — explicit disagreement (Task: contradiction detection)</li>
+        <li><code>contradicts</code> — explicit disagreement (contradiction detection)</li>
         <li><code>derived_from</code> — provenance (consolidation outputs)</li>
+        <li><code>reflects_on</code> — <strong>v0.7.0 Task 1/8</strong>: recursive-learning provenance edge (reflection → reflected-upon memory)</li>
+        <li><code>derives_from</code> — <strong>v0.7.0 WT-1-A</strong>: atomisation atom → parent memory; the typed, signable, federation-safe expression of the structural <code>memories.atom_of</code> FK (schema v36 sqlite / v35 postgres). Distinct from <code>derived_from</code> (consolidation provenance).</li>
       </ul></div>
     </div>
 

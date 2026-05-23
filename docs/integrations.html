@@ -376,9 +376,9 @@ curl https://memory.local:9077/api/v1/recall \
             <span class="client-tier t2">▸ TIER 2 · TESTED</span>
           </div>
         </div>
-        <p class="client-desc">Local LLM hosts. ai-memory uses Ollama itself for the smart/autonomous tier; same Ollama instance can also be the agent host.</p>
-        <pre class="client-config"><span class="cmt"># Smart tier requires Ollama running with gemma4:e2b</span>
-ollama pull gemma4:e2b
+        <p class="client-desc">Local LLM hosts. Post-#1067 (v0.7.0), any of 15 OpenAI-compatible vendors or local Ollama works; Ollama shown here for zero-network installs.</p>
+        <pre class="client-config"><span class="cmt"># Smart/autonomous tier — any LLM backend post-#1067; default Ollama model is gemma3:4b</span>
+ollama pull gemma3:4b
 ai-memory mcp --tier smart</pre>
       </div>
 

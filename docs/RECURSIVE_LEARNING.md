@@ -253,10 +253,11 @@ the substrate logs at `WARN` via
 `tracing::warn!(target: "signed_events", ...)` but the cap refusal
 still propagates to the caller with the same
 `ReflectError::DepthExceeded` shape. The wire contract is unchanged
-by audit-write success/failure — operators reading
-`/api/v1/audit/signed_events` reconcile gaps against the daemon's
-`signed_events` warn-log target rather than the caller observing a
-different error.
+by audit-write success/failure — operators verify the audit chain via
+`ai-memory verify-signed-events-chain` CLI (there is no HTTP endpoint
+for the `signed_events` surface at v0.7.0) to reconcile gaps against
+the daemon's `signed_events` warn-log target rather than the caller
+observing a different error.
 
 ## Hook integration
 

@@ -235,7 +235,7 @@ footer a{color:var(--text-muted)}
 {
   <span class="key">"url"</span>:               <span class="val">"https://hooks.example.com/ai-memory"</span>,
   <span class="key">"secret"</span>:            <span class="val">"32+ random bytes (you generate)"</span>,
-  <span class="key">"events"</span>:            [<span class="val">"memory_store"</span>, <span class="val">"memory_promote"</span>, <span class="val">"memory_consolidate"</span>],
+  <span class="key">"event_types"</span>:       [<span class="val">"memory_store"</span>, <span class="val">"memory_promote"</span>, <span class="val">"memory_consolidate"</span>],   <span class="cm">// v0.7.0 #912 typed array; legacy `events` field still accepted as comma-list/`*`</span>
   <span class="key">"namespace_filter"</span>:  <span class="val">"alphaone/eng/platform/*"</span>,    <span class="cm">// optional</span>
   <span class="key">"agent_filter"</span>:      <span class="val">"alphaone/eng/platform/*"</span>     <span class="cm">// optional</span>
 }
@@ -355,7 +355,7 @@ X-AI-Memory-Signature: <span class="val">sha256=a1b2c3d4e5f6…</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">Patterns operators ship.</h2>
     <div class="snip" style="font-family:var(--font-sans);white-space:normal;line-height:1.7">
       <div><strong style="color:var(--good)">AI-supervisor pattern</strong> — Junior agent <code>memory_notify</code>'s the supervisor on every store. Supervisor reads <code>memory_inbox</code> at start of each turn, decides if intervention needed.</div>
-      <div style="margin-top:.7rem"><strong style="color:var(--good)">Slack ops integration</strong> — <code>memory_subscribe</code> a Slack-bot URL with <code>events: ["memory_promote", "memory_consolidate"]</code>. Bot posts "Alice promoted X to Long" to a #memories channel.</div>
+      <div style="margin-top:.7rem"><strong style="color:var(--good)">Slack ops integration</strong> — <code>memory_subscribe</code> a Slack-bot URL with <code>event_types: ["memory_promote", "memory_consolidate"]</code> (v0.7.0 #912 typed array form). Bot posts "Alice promoted X to Long" to a #memories channel.</div>
       <div style="margin-top:.7rem"><strong style="color:var(--good)">Cross-team coordination</strong> — Team-A's PM <code>memory_notify</code>'s Team-B's PM when a shared OKR memory is updated. Federation propagates so it works whichever node either PM is on.</div>
       <div style="margin-top:.7rem"><strong style="color:var(--good)">Approval queue alerts</strong> — Subscribe to events that produce <code>Pending(id)</code> verdicts. Webhook routes to ops dashboard or pager so approvers don't sit on requests.</div>
       <div style="margin-top:.7rem"><strong style="color:var(--good)">Memory-driven workflows</strong> — Webhook triggers downstream automation (CI, deployment, ticket creation) when a specific memory pattern matches.</div>

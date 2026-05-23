@@ -94,7 +94,7 @@ This recipe will be updated in place once the hook lands.
 
 ```bash
 # 1. Quit OpenClaw
-# 2. cd /tmp && openclaw
+# 2. cd ~ && openclaw
 # 3. Ask: "what do you remember?"
 # 4. Expected (with Part 1 + Part 2 in place): the model calls
 #    memory_session_start, sees recent memory rows, and references them in

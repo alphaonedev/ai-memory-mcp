@@ -379,19 +379,19 @@ is still honoured. Every v0.6.4 setup keeps working byte-identically.
 **To migrate to a remote / different vendor**, set three env vars:
 
 ```bash
-# Example: xAI Grok 4 for the autonomous tier
+# Example: xAI Grok 4.3 for the autonomous tier (v0.7.0 compiled default for xai backend)
 export AI_MEMORY_LLM_BACKEND=xai           # alias — pre-fills base URL
-export AI_MEMORY_LLM_MODEL=grok-4
+export AI_MEMORY_LLM_MODEL=grok-4.3
 export XAI_API_KEY=xai-…                    # per-vendor fallback (or AI_MEMORY_LLM_API_KEY)
 
-# Example: OpenAI gpt-4o
+# Example: OpenAI gpt-5 (v0.7.0 compiled default for openai backend)
 export AI_MEMORY_LLM_BACKEND=openai
-export AI_MEMORY_LLM_MODEL=gpt-4o
+export AI_MEMORY_LLM_MODEL=gpt-5
 export OPENAI_API_KEY=sk-…
 
-# Example: Anthropic Claude via the OpenAI shim
+# Example: Anthropic Claude Opus 4.7 (v0.7.0 compiled default for anthropic backend)
 export AI_MEMORY_LLM_BACKEND=anthropic
-export AI_MEMORY_LLM_MODEL=claude-sonnet-4
+export AI_MEMORY_LLM_MODEL=claude-opus-4.7
 export ANTHROPIC_API_KEY=sk-ant-…
 
 # Example: generic OpenAI-compatible endpoint (vLLM, llama.cpp server, etc.)

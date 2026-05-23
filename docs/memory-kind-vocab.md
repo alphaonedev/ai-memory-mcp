@@ -68,11 +68,11 @@ an older binary.
 ### HTTP
 
 ```http
-GET /api/v1/memories/recall?q=policy+rotation&kinds=claim,decision
+GET /api/v1/recall?q=policy+rotation&kinds=claim,decision
 ```
 
 ```jsonc
-POST /api/v1/memories/recall
+POST /api/v1/recall
 {
   "context": "policy on token rotation",
   "kinds": ["claim", "decision"]
