@@ -45,6 +45,7 @@
 //! - [`parity`]      — cross-cutting HTTP-parity helpers.
 //! - [`approvals`]   — v0.7.0 K10 approval API.
 
+pub mod accept_provenance;
 pub mod admin;
 pub mod admin_role;
 pub mod approvals;

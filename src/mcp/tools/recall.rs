@@ -281,7 +281,15 @@ pub async fn handle_recall_with_pre_recall_hook(
 /// values). The token-budget guards (`tests/token_budget_guard.rs`)
 /// pin the catalog totals; the per-row decoration grows with `count`
 /// not catalog size, so the guards remain accurate.
-fn decorate_memory(
+///
+/// v0.7.x (#1155) — exposed as `pub(crate)` so the HTTP recall handler
+/// at `src/handlers/recall.rs` can apply the same verbose-decoration
+/// shape under operator opt-in via the `Accept-Provenance: verbose`
+/// HTTP header. MCP wire default is `verbose_provenance=true`
+/// (set inline at `handle_recall_dto`); HTTP default is
+/// `verbose_provenance=false` for v0.6.x wire-shape backwards compat
+/// (consumers opt in via header).
+pub(crate) fn decorate_memory(
     mem: &Memory,
     score: f64,
     verbose_provenance: bool,
@@ -329,7 +337,7 @@ fn decorate_memory(
 /// `"warm"` (the substrate sees activity recently enough to surface
 /// it via recall, so blocking it on a timestamp parse would be
 /// hostile). Pure function; no DB queries.
-fn freshness_state(mem: &Memory) -> &'static str {
+pub(crate) fn freshness_state(mem: &Memory) -> &'static str {
     let now = chrono::Utc::now();
     if let Some(exp) = mem.expires_at.as_deref()
         && let Ok(dt) = chrono::DateTime::parse_from_rfc3339(exp)
@@ -356,7 +364,7 @@ fn freshness_state(mem: &Memory) -> &'static str {
 /// self_signed > unsigned`. Returns `None` when no links exist.
 /// Best-effort: a SQL error returns `None` so the recall row keeps
 /// its remaining decoration.
-fn latest_link_attest_level(conn: &rusqlite::Connection, memory_id: &str) -> Option<String> {
+pub(crate) fn latest_link_attest_level(conn: &rusqlite::Connection, memory_id: &str) -> Option<String> {
     let links = db::get_links(conn, memory_id).ok()?;
     let mut best: Option<AttestLevel> = None;
     for link in &links {

@@ -144,12 +144,19 @@ pub async fn recall_memories_get(
             return (axum::http::StatusCode::FORBIDDEN, Json(json!({"error": e}))).into_response();
         }
     };
+    // v0.7.x #1155 — Accept-Provenance header gates Gap 7 derived
+    // decoration on the HTTP recall envelope. Default HTTP shape is
+    // bare (v0.6.x backwards compat); the header opts callers into
+    // the verbose decoration that already ships by default on MCP.
+    let provenance_shape =
+        crate::handlers::accept_provenance::resolve_from_headers(&headers);
     recall_response(
         &app,
         &req,
         Some(caller_principal.as_str()),
         scope_tier.as_deref(),
         kinds.as_deref(),
+        provenance_shape,
     )
     .await
 }
@@ -195,12 +202,16 @@ pub async fn recall_memories_post(
             return (axum::http::StatusCode::FORBIDDEN, Json(json!({"error": e}))).into_response();
         }
     };
+    // v0.7.x #1155 — same Accept-Provenance gating as the GET path.
+    let provenance_shape =
+        crate::handlers::accept_provenance::resolve_from_headers(&headers);
     recall_response(
         &app,
         &req,
         Some(caller_principal.as_str()),
         scope_tier.as_deref(),
         kinds.as_deref(),
+        provenance_shape,
     )
     .await
 }
@@ -247,6 +258,16 @@ async fn recall_response(
     caller_principal: Option<&str>,
     recall_scope_tier: Option<&str>,
     kinds_filter: Option<&[crate::models::MemoryKind]>,
+    // v0.7.x #1155 — operator opt-in gate for the Gap 7 derived
+    // decoration on the HTTP envelope. Defaults to `Minimal`
+    // (bare serde shape, v0.6.x backwards-compat default) when the
+    // caller omits the `Accept-Provenance` header; flips to
+    // `Verbose` (adds `confidence_tier`, `freshness_state`,
+    // `latest_link_attest_level` per row) when the header is sent.
+    // Asymmetry with MCP (which defaults to verbose=true) is
+    // intentional and documented at
+    // `src/handlers/accept_provenance.rs`.
+    provenance_shape: crate::handlers::accept_provenance::ProvenanceShape,
 ) -> axum::response::Response {
     let context = req.context.as_str();
     let namespace = req.namespace.as_deref();
@@ -384,6 +405,27 @@ async fn recall_response(
                 // client would parse as a real memory with every field
                 // null. `filter_map` + log preserves the rest of the
                 // batch and lets operators investigate the bad row.
+                //
+                // v0.7.x #1155 — `Accept-Provenance: verbose` is
+                // honoured on the sqlite branch (decorate_memory adds
+                // the Gap 7 derived fields). The postgres branch
+                // currently ships the bare serde-roundtripped Memory
+                // shape regardless of the header — Form 4/5/6 columns
+                // (citations, source_uri, source_span, confidence_source,
+                // memory_kind) are still present via serde derives, but
+                // the latest_link_attest_level derivation requires a
+                // rusqlite::Connection which the postgres SAL branch
+                // does not hold. Postgres-side verbose decoration is a
+                // tracked follow-up; the substrate's structural NSA
+                // CSI MCP coverage at v0.7.x stands at 10/10 with
+                // sqlite as the canonical default backend.
+                if provenance_shape.is_verbose() {
+                    tracing::info!(
+                        "recall (postgres): Accept-Provenance: verbose received; \
+                         postgres-side verbose decoration not yet implemented — \
+                         shipping bare Form 4/5/6 envelope. Sqlite path supports verbose."
+                    );
+                }
                 let scored: Vec<serde_json::Value> = scored_pairs
                     .iter()
                     .filter_map(|(m, s)| match serde_json::to_value(m) {
@@ -554,21 +596,43 @@ async fn recall_response(
             // branch above; sqlite branch needs the identical
             // filter_map + log so an encoder regression cannot silently
             // drop fields from a recall row to look like a real null.
+            //
+            // v0.7.x #1155 — when `Accept-Provenance: verbose` was
+            // sent, route through `crate::mcp::tools::recall::decorate_memory`
+            // so the HTTP envelope carries the Gap 7 derived
+            // decoration (confidence_tier, freshness_state,
+            // latest_link_attest_level) — same shape MCP defaults to.
+            // Pre-#1155 the bare serde-roundtripped Memory shape
+            // (still carrying Form 4/5/6 columns) was the HTTP
+            // default; that legacy shape remains the default for
+            // backwards compat with v0.6.x HTTP clients that have not
+            // yet adopted the verbose envelope. Procurement-grade
+            // closure of the consumer-default friction documented in
+            // `docs/compliance/honest-limitations.md` §3.2.
             let scored: Vec<serde_json::Value> = r
                 .iter()
-                .filter_map(|(m, s)| match serde_json::to_value(m) {
-                    Ok(mut v) => {
-                        if let Some(obj) = v.as_object_mut() {
-                            obj.insert("score".to_string(), json!((*s * 1000.0).round() / 1000.0));
+                .filter_map(|(m, s)| {
+                    if provenance_shape.is_verbose() {
+                        Some(crate::mcp::decorate_memory(m, *s, true, &lock.0))
+                    } else {
+                        match serde_json::to_value(m) {
+                            Ok(mut v) => {
+                                if let Some(obj) = v.as_object_mut() {
+                                    obj.insert(
+                                        "score".to_string(),
+                                        json!((*s * 1000.0).round() / 1000.0),
+                                    );
+                                }
+                                Some(v)
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    memory_id = %m.id,
+                                    "recall (sqlite): serialise Memory failed, skipping row: {e}"
+                                );
+                                None
+                            }
                         }
-                        Some(v)
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            memory_id = %m.id,
-                            "recall (sqlite): serialise Memory failed, skipping row: {e}"
-                        );
-                        None
                     }
                 })
                 .collect();
