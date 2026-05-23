@@ -128,15 +128,42 @@ block.
 **Symptom**: `ai-memory curator --once --json` report shows
 `"errors": ["no LLM client configured"]` and zero operations.
 
-**Cause**: The feature tier doesn't wire an LLM, or Ollama is
-unreachable.
+**Cause**: The feature tier doesn't wire an LLM, or the configured
+backend is unreachable.
 
-**Fix**:
+**Fix (v0.7.x — preferred)**:
 
-1. Check feature tier: `ai-memory curator --tier smart` or
+1. **Run `ai-memory doctor` and inspect the `LLM Reachability
+   (#1146)` section.** It probes the configured backend (Ollama,
+   xAI, OpenAI, Anthropic, etc.) and reports the resolved
+   `backend`/`model`/`base_url`/`config_source`/`key_source` plus
+   HTTP status. The severity tag (INFO / WARN / CRIT) tells you
+   whether the issue is auth (401), rate-limit (429), vendor
+   outage (5xx), wrong base_url (4xx-other), or network/DNS/TLS.
+2. If `config_source = compiled-default`, no operator LLM config is
+   present anywhere. Either set `AI_MEMORY_LLM_BACKEND` (env) or
+   write a `[llm]` section in `~/.config/ai-memory/config.toml`
+   (see [`docs/CONFIG_SCHEMA.md`](CONFIG_SCHEMA.md)).
+3. If `key_source = error(...)`, the resolved API key
+   (`api_key_env` / `api_key_file`) couldn't be read — fix the
+   referenced env var or file perms (0400 required for
+   `api_key_file` by default).
+4. Check feature tier: `ai-memory curator --tier smart` or
    `autonomous` (CLI flag reads the tier from config if unset).
-2. Verify Ollama is running: `curl http://localhost:11434/api/tags`.
-3. Pull the model: `ollama pull gemma4:e2b` (for `smart` tier).
+
+**Fix (legacy v0.6.x flat-field config)**:
+
+If you're still on v0.6.x flat fields (`llm_model`, `ollama_url`),
+the deprecation WARN at config-load tells you it's time to migrate:
+
+```bash
+ai-memory config migrate --dry-run    # preview the v2 shape
+ai-memory config migrate              # apply with timestamped .bak
+ai-memory doctor                      # verify LLM Reachability
+```
+
+The legacy fields continue to work in v0.7.x but will be removed in
+v0.8.0.
 
 ### Curator cycle times are long (> 10 min)
 

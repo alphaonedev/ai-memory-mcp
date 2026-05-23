@@ -342,17 +342,68 @@ Below is a complete example showing every supported field with explanatory comme
 # db = "~/.claude/ai-memory.db"
 
 # ---------------------------------------------------------------------------
-# LLM backend URLs (smart and autonomous tiers only)
+# v0.7.x (#1146) — schema_version + sectioned config (CANONICAL)
 # ---------------------------------------------------------------------------
-# Legacy ollama_url field — honored only when AI_MEMORY_LLM_BACKEND is unset
-# or set to "ollama". Post-#1067 (v0.7.0), prefer the AI_MEMORY_LLM_BASE_URL
-# env var which is provider-aware.
+# As of v0.7.x, config.toml uses the sectioned schema-v2 shape below.
+# See docs/CONFIG_SCHEMA.md for the full reference. Upgrading from
+# v0.6.x flat fields? Run `ai-memory config migrate --dry-run` to
+# preview, then `ai-memory config migrate --also-clean-claude-json` to
+# rewrite in place with a timestamped .bak. The legacy flat-field
+# shape (shown LOWER in this file as commented-out defaults) continues
+# to work in v0.7.x with a one-line deprecation WARN at load time and
+# will be removed in v0.8.0.
+#
+#   schema_version = 2
+#
+#   [llm]
+#   backend     = "xai"          # ollama | openai | xai | anthropic | gemini | …
+#   model       = "grok-4.3"
+#   base_url    = "https://api.x.ai/v1"      # optional; vendor-default if unset
+#   api_key_env = "XAI_API_KEY"              # mutually exclusive with api_key_file
+#   # api_key_file = "/etc/ai-memory/keys/xai.key"   # mode 0400 enforced
+#
+#   [llm.auto_tag]                            # fast structured-output sibling
+#   backend = "ollama"
+#   model   = "gemma3:4b"
+#
+#   [embeddings]
+#   backend        = "ollama"
+#   url            = "http://localhost:11434"
+#   model          = "nomic-embed-text-v1.5"
+#   backfill_batch = 100
+#
+#   [reranker]
+#   enabled = true
+#   model   = "ms-marco-MiniLM-L-6-v2"
+#
+#   [storage]
+#   default_namespace = "global"
+#   archive_on_gc     = true
+#   archive_max_days  = 90
+#   max_memory_mb     = 4096
+#
+# Inline `[llm].api_key = "<literal>"` is REJECTED at parse time — use
+# api_key_env (process env var reference) or api_key_file (mode 0400
+# enforced) instead. Verify wiring with `ai-memory doctor` (the
+# "LLM Reachability (#1146)" section probes the resolved endpoint).
+#
+# ---------------------------------------------------------------------------
+# LEGACY v0.6.x flat fields (deprecated, removed in v0.8.0)
+# ---------------------------------------------------------------------------
+# The fields below are honored at v0.7.x but emit a single-line
+# deprecation WARN on config load. Run `ai-memory config migrate` to
+# upgrade in place. Each field's v2 sectioned equivalent is noted.
+# ---------------------------------------------------------------------------
+
+# LEGACY → v2: [llm].base_url (when backend = "ollama")
+# Honored only when AI_MEMORY_LLM_BACKEND is unset or set to "ollama".
 # Default: "http://localhost:11434"
 # ollama_url = "http://localhost:11434"
 
-# Separate URL for embedding requests. Falls back to ollama_url if unset.
-# Embedder is Ollama-only at v0.7.0 — there is no OpenAI-compatible
-# embedder path on the substrate side yet (tracked for v0.7.x).
+# LEGACY → v2: [embeddings].url
+# Falls back to ollama_url if unset. Embedder is Ollama-only at
+# v0.7.0 — there is no OpenAI-compatible embedder path yet (v0.7.x
+# follow-up).
 # Default: same as ollama_url
 # embed_url = "http://localhost:11434"
 
@@ -370,15 +421,15 @@ Below is a complete example showing every supported field with explanatory comme
 #   AI_MEMORY_LLM_MODEL     — vendor-specific model identifier
 
 # ---------------------------------------------------------------------------
-# Model selection
+# LEGACY → v2 mapping (model selection)
 # ---------------------------------------------------------------------------
-# Embedding model for semantic search (semantic tier and above).
-# Valid values:
-#   "mini_lm_l6_v2"   — sentence-transformers/all-MiniLM-L6-v2, 384-dim, ~90 MB
-#   "nomic_embed_v15"  — nomic-ai/nomic-embed-text-v1.5, 768-dim, ~270 MB
+# LEGACY → v2: [embeddings].model (legacy aliases auto-canonicalised:
+#   "nomic_embed_v15" → "nomic-embed-text-v1.5",
+#   "mini_lm_l6_v2" → "sentence-transformers/all-MiniLM-L6-v2").
 # Default: tier-dependent (mini_lm_l6_v2 for semantic, nomic_embed_v15 for smart/autonomous)
 # embedding_model = "mini_lm_l6_v2"
 
+# LEGACY → v2: [llm].model
 # LLM model identifier (smart and autonomous tiers).
 # Pre-#1067 default values (still valid when AI_MEMORY_LLM_BACKEND is unset
 # or "ollama"):
@@ -395,31 +446,27 @@ Below is a complete example showing every supported field with explanatory comme
 # llm_model = "gemma4:e2b"
 
 # ---------------------------------------------------------------------------
-# Cross-encoder reranking
+# LEGACY → v2: [reranker].enabled
 # ---------------------------------------------------------------------------
 # Enable neural cross-encoder reranking for improved recall precision.
-# NOTE: This is a boolean, NOT a string. Use bare true/false without quotes.
 # Default: false (true for autonomous tier)
 # cross_encoder = true
 
 # ---------------------------------------------------------------------------
-# Namespace and memory limits
+# LEGACY → v2: [storage].default_namespace + [storage].max_memory_mb
 # ---------------------------------------------------------------------------
 # Default namespace applied to new memories when none is specified.
 # Default: "global"
 # default_namespace = "global"
 
-# Maximum memory budget in MB. Used for automatic tier selection when tier
-# is not explicitly set — the highest tier that fits within this budget is chosen.
+# Maximum memory budget in MB for the automatic tier selector.
 # Default: tier-dependent (0/256/1024/4096 for keyword/semantic/smart/autonomous)
 # max_memory_mb = 4096
 
 # ---------------------------------------------------------------------------
-# Garbage collection
+# LEGACY → v2: [storage].archive_on_gc
 # ---------------------------------------------------------------------------
 # Archive expired memories before GC permanently deletes them.
-# When true, expired memories are moved to the archive table and can be
-# restored later. When false, GC permanently deletes expired memories.
 # Default: true
 # archive_on_gc = true
 
