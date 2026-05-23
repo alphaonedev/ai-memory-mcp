@@ -761,7 +761,7 @@ footer.site-foot a { color: var(--text-muted); }
     <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ At a Glance</span></a>
     <div class="right">
       <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
-      <a href="whats-new-v063.html" style="color:#ffb86b">v0.6.3</a>
+      <a href="whats-new-v07.html" style="color:#ffb86b">v0.7.0</a>
       <div class="menu">
         <button class="menu-btn active">Audiences<span class="caret">▾</span></button>
         <div class="menu-pane">
@@ -908,12 +908,12 @@ footer.site-foot a { color: var(--text-muted); }
      ============================================================= -->
 <div class="stats-strip">
   <div class="container" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:1.5rem;">
-    <div class="stat-item"><span class="stat-num">73</span><span class="stat-label">MCP tools</span></div>
-    <div class="stat-item"><span class="stat-num">72</span><span class="stat-label">HTTP endpoints</span></div>
-    <div class="stat-item"><span class="stat-num">55</span><span class="stat-label">CLI commands</span></div>
+    <div class="stat-item"><span class="stat-num">73</span><span class="stat-label">MCP tools (--profile full)</span></div>
+    <div class="stat-item"><span class="stat-num">73</span><span class="stat-label">HTTP endpoints</span></div>
+    <div class="stat-item"><span class="stat-num">57</span><span class="stat-label">CLI commands</span></div>
     <div class="stat-item"><span class="stat-num">7</span><span class="stat-label">Platforms (incl. iOS + Android)</span></div>
     <div class="stat-item"><span class="stat-num">15+</span><span class="stat-label">LLM vendors (Ollama + cloud)</span></div>
-    <div class="stat-item"><span class="stat-num">0</span><span class="stat-label">Mandatory cloud deps</span></div>
+    <div class="stat-item"><span class="stat-num">v49</span><span class="stat-label">Schema version (v0.7.0)</span></div>
   </div>
 </div>
 
@@ -1587,7 +1587,7 @@ footer.site-foot a { color: var(--text-muted); }
             <li>Hierarchical namespace paths (<code>projects/alpha/decisions</code>)</li>
             <li>Temporal-validity knowledge graph (recursive CTE today, AGE-ready for v0.7)</li>
             <li>Published p95/p99 budgets + CI guard (<code>bench.yml</code>)</li>
-            <li>93.84% test coverage (1,886 lib tests + 49+ integration, across the ubuntu/macos/windows CI matrix; v0.6.3.1)</li>
+            <li>92.59% test coverage (4,699 lib + integration tests, across the ubuntu/macos/windows CI matrix; v0.7.0)</li>
             <li>Two SSRF defects discovered during campaign — fixed before tag</li>
           </ul>
         </div>
@@ -1783,23 +1783,23 @@ footer.site-foot a { color: var(--text-muted); }
       </div>
       <div class="dash-tile good">
         <div class="dash-label">Tests passing</div>
-        <div class="dash-num">1,809</div>
-        <div class="dash-sub">1,600 lib + 209 integration · 0 failed · 0 ignored</div>
+        <div class="dash-num">4,699</div>
+        <div class="dash-sub">v0.7.0 lib + integration suite · 0 failed · 0 ignored</div>
       </div>
       <div class="dash-tile p2">
         <div class="dash-label">MCP tools</div>
-        <div class="dash-num">26</div>
-        <div class="dash-sub">Claude / Cursor / Codex / Continue</div>
+        <div class="dash-num">73</div>
+        <div class="dash-sub">--profile full (7 core / 73 full) · Claude / Cursor / Codex / Continue</div>
       </div>
       <div class="dash-tile p2">
         <div class="dash-label">HTTP endpoints</div>
-        <div class="dash-num">39</div>
-        <div class="dash-sub">REST + SSE + mTLS</div>
+        <div class="dash-num">73</div>
+        <div class="dash-sub">REST + SSE + mTLS + HMAC-signed webhooks</div>
       </div>
       <div class="dash-tile p2">
         <div class="dash-label">CLI commands</div>
-        <div class="dash-num">28</div>
-        <div class="dash-sub">store, recall, sync, ...</div>
+        <div class="dash-num">57</div>
+        <div class="dash-sub">store, recall, sync, config migrate, doctor, ...</div>
       </div>
       <div class="dash-tile p3">
         <div class="dash-label">Session-start p95</div>
@@ -1932,7 +1932,7 @@ footer.site-foot a { color: var(--text-muted); }
         <div class="card p2" style="height:100%;display:flex;flex-direction:column">
           <div class="card-eyebrow" style="color:var(--pillar-2)">▸ COMPLETE SURFACE AREA</div>
           <div class="card-title">Feature Matrix</div>
-          <p class="card-body">Every MCP tool, every HTTP endpoint, every CLI command — categorized, cross-referenced. 26 + 39 + 28 = 93 operations. The SME's full reference.</p>
+          <p class="card-body">Every MCP tool, every HTTP endpoint, every CLI command — categorized, cross-referenced. 73 + 73 + 57 = 203 operations at v0.7.0. The SME's full reference.</p>
           <div style="margin-top:.85rem;font-family:var(--font-mono);font-size:.78rem;color:var(--pillar-2)">feature-matrix.html →</div>
         </div>
       </a>
@@ -1977,7 +1977,7 @@ footer.site-foot a { color: var(--text-muted); }
     <div style="margin-top:3rem;padding-top:2rem;border-top:1px solid var(--border)">
       <span class="eyebrow">Feature Deep-Dive Atlas</span>
       <h2 style="margin-top:.5rem">Eleven big-sell features, one page each.</h2>
-      <p class="lede">The grand-slam features. Tiers + TTLs (the retention story). Rules (per-namespace policy stack). Archival (two-stage soft-then-hard delete). Encryption (SQLCipher, mTLS, HMAC). Hierarchies (8-level memory trees). Knowledge Graph (4 relations + temporal validity). Autonomous (provider-agnostic LLM substrate &mdash; Ollama local OR 15+ cloud vendors via #1067). A2A messaging. Full lifecycle. Performance + bench tool. Credits (Google for Gemma, Nomic, Hugging Face, Ollama, xAI / OpenAI / Anthropic / DeepSeek / Kimi / Qwen / Mistral / Groq / Together / Cerebras / OpenRouter / Fireworks / LMStudio, SQLite, Rust ecosystem).</p>
+      <p class="lede">The grand-slam features. Tiers + TTLs (the retention story). Rules (per-namespace policy stack). Archival (two-stage soft-then-hard delete). Encryption (SQLCipher, mTLS, HMAC-mandatory webhooks). Hierarchies (8-level memory trees). Knowledge Graph (<strong>6 relation variants</strong> incl. reflects_on + derives_from + temporal validity). Autonomous (provider-agnostic LLM substrate &mdash; Ollama local OR 15+ cloud vendors via #1067). A2A messaging. Full lifecycle. Performance + bench tool. Credits (Google for Gemma, Nomic, Hugging Face, Ollama, xAI / OpenAI / Anthropic / DeepSeek / Kimi / Qwen / Mistral / Groq / Together / Cerebras / OpenRouter / Fireworks / LMStudio, SQLite, Rust ecosystem).</p>
     </div>
 
     <div class="grid-3" style="gap:1rem;margin-top:1.5rem">
@@ -2039,7 +2039,7 @@ footer.site-foot a { color: var(--text-muted); }
         <div class="card p2" style="height:100%;display:flex;flex-direction:column">
           <div class="card-eyebrow" style="color:var(--pillar-2)">▸ STRUCTURED COGNITION</div>
           <div class="card-title">Knowledge Graph</div>
-          <p class="card-body">4 relation types. Entity registry with alias resolution. Temporal validity columns. memory_kg_query / kg_timeline / kg_invalidate. v0.6.3 Streams B + C.</p>
+          <p class="card-body">6 relation variants (related_to / supersedes / contradicts / derived_from / reflects_on / derives_from). Entity registry with alias resolution. Temporal validity columns + Ed25519 signature column populated. 4 KG MCP tools: memory_kg_query / kg_timeline / kg_invalidate / find_paths. Apache AGE acceleration on Postgres backend.</p>
           <div style="margin-top:.85rem;font-family:var(--font-mono);font-size:.78rem;color:var(--pillar-2)">knowledge-graph.html →</div>
         </div>
       </a>
@@ -2101,7 +2101,7 @@ footer.site-foot a { color: var(--text-muted); }
         <div class="card p1" style="height:100%;display:flex;flex-direction:column">
           <div class="card-eyebrow" style="color:var(--pillar-1)">▸ SQL ATLAS</div>
           <div class="card-title">Schema</div>
-          <p class="card-body">Every SQLite table column-by-column. 9 tables, 15+ indexes, 6 foreign keys, v15 migration timeline. Postgres mirror via SAL. The persistence contract.</p>
+          <p class="card-body">Every SQLite table column-by-column. <strong>Schema v49</strong> (was v33 at v0.6.4). <strong>26-field Memory struct</strong> (was 15) incl. reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, version. <strong>6 MemoryLink variants</strong> with Ed25519 attestation columns. Postgres mirror via SAL with Apache AGE Cypher graph backend. The persistence contract.</p>
           <div style="margin-top:.85rem;font-family:var(--font-mono);font-size:.78rem;color:var(--pillar-1)">schema.html →</div>
         </div>
       </a>
@@ -2166,7 +2166,7 @@ footer.site-foot a { color: var(--text-muted); }
 
 <footer class="site-foot">
   <div>
-    Apache 2.0 · <a href="https://github.com/alphaonedev/ai-memory-mcp">github.com/alphaonedev/ai-memory-mcp</a> · ai-memory-mcp <strong style="color:var(--text)">v0.6.3.1</strong> · Built with the AI NHI by <a href="https://alphaonedev.com">AlphaOne LLC</a>
+    Apache 2.0 · <a href="https://github.com/alphaonedev/ai-memory-mcp">github.com/alphaonedev/ai-memory-mcp</a> · ai-memory-mcp <strong style="color:var(--text)">v0.7.0</strong> · Built with the AI NHI by <a href="https://alphaonedev.com">AlphaOne LLC</a>
   </div>
   <div style="margin-top:.5rem; font-size:.75rem;">
     All measurements on Apple M4 / 32 GB / NVMe SSD · numbers from <code>cargo llvm-cov --features sal --no-fail-fast --json</code>

@@ -104,7 +104,7 @@ table tr:last-child td{border-bottom:none}
     <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Architectures · T1</span></a>
     <div class="right">
       <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
-      <a href="whats-new-v063.html" style="color:#ffb86b">v0.6.3</a>
+      <a href="whats-new-v07.html" style="color:#ffb86b">v0.7.0</a>
       <div class="menu">
         <button class="menu-btn">Audiences<span class="caret">▾</span></button>
         <div class="menu-pane">
@@ -172,7 +172,7 @@ table tr:last-child td{border-bottom:none}
 </nav>
 
 <section class="hero">
-  <span class="cap-badge cap-today">SHIPS TODAY · v0.6.3</span>
+  <span class="cap-badge cap-today">SHIPS TODAY · v0.7.0</span>
   <h1>Tier 1 — Single node, single agent</h1>
   <p class="tagline">The bedrock primitive. <strong>One process. One consumer. Zero network.</strong> SQLite + WAL, FTS5 keyword recall, in-process HNSW vector index, no replication, no peers.</p>
   <div class="pills">
@@ -378,7 +378,7 @@ ai-memory --db ~/.claude/ai-memory.db stats</code></pre>
     <ul>
       <li><strong>Governance</strong> — Default policy is <code>write: any, promote: any, delete: owner</code>. Override per-namespace via <code>memory_namespace_set_standard</code> if you want pending-approval behavior for sensitive memories. The same governance machinery as T2+ is present; you just rarely use it with one agent.</li>
       <li><strong>Skills</strong> — Auto-tagging (<code>memory_auto_tag</code>) and contradiction detection (<code>memory_detect_contradiction</code>) require the <code>smart</code> or <code>autonomous</code> feature tier (Ollama backend). Capabilities introspection v2 (v0.6.3) lets the agent ask the server which skills are available before invoking them.</li>
-      <li><strong>Attestations</strong> — Not enforced at T1; the <code>signature</code> column on <code>memory_links</code> (added schema v15 / v0.6.3) is reserved for v0.7 attested identity.</li>
+      <li><strong>Attestations</strong> — Not enforced at T1; the <code>signature</code> column on <code>memory_links</code> (added schema v15 / v0.6.3) is populated at v0.7.0 with Ed25519 attestation.</li>
     </ul>
   </div>
 </section>
@@ -420,7 +420,7 @@ ai-memory --db ~/.claude/ai-memory.db stats</code></pre>
 </section>
 
 <footer>
-  <p>© 2026 AlphaOne LLC. Licensed Apache-2.0. ai-memory v0.6.3.1 — <a href="https://github.com/alphaonedev/ai-memory-mcp">source on GitHub</a> · <a href="./">home</a></p>
+  <p>© 2026 AlphaOne LLC. Licensed Apache-2.0. ai-memory v0.7.0 — <a href="https://github.com/alphaonedev/ai-memory-mcp">source on GitHub</a> · <a href="./">home</a></p>
 </footer>
 
 </body>

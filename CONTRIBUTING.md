@@ -107,6 +107,55 @@ cargo llvm-cov --features sal,sal-postgres --lib --tests --json \
 bash coverage/check-thresholds.sh
 ```
 
+## CI infrastructure (v0.7.x — #1148)
+
+The `Code Coverage`, `Per-Module Coverage Thresholds`, and
+`Postgres feature gate` jobs run on GitHub-hosted `ubuntu-latest`
+(7 GB RAM + 14 GB swap). Without belt-and-suspenders these workloads
+hit `collect2: signal 7 [Bus error]` linker-OOM under the
+`--features sal,sal-postgres` instrumented build. Issue
+[#1148](https://github.com/alphaonedev/ai-memory-mcp/issues/1148)
+landed a 12-layer mitigation stack you inherit automatically:
+
+- **mold linker** (`apt-get install -y mold` step) routes every
+  Rust link step through mold instead of `ld.bfd` (~3× less RSS).
+- **`[profile.coverage]`** in [`Cargo.toml`](Cargo.toml)
+  (`inherits = "dev"`, `debug = 1`, `lto = false`,
+  `codegen-units = 16`, `incremental = false`) — purpose-built
+  profile for `cargo llvm-cov` runs. Activated via
+  `CARGO_PROFILE_DEV_DEBUG=1` + `CARGO_PROFILE_DEV_LTO=false`
+  env-var overrides in the workflow (not via `--profile coverage`,
+  which would shift artifacts from `debug/` to `coverage/` and
+  break the report step).
+- **Aggressive runner cleanup** — `sudo rm -rf` 14 pre-installed
+  toolchains (dotnet, Android SDK, GHC, CodeQL, ghcup, powershell,
+  chromium, boost, node_modules, jvm, microsoft, swift,
+  miniconda) + `docker system prune -af --volumes` +
+  `apt-get autoremove --purge -y`. Frees ~30 GB before the build.
+- **Swap file on `/mnt`** (the ephemeral data disk, ~70 GB free)
+  instead of `/` — 8 GB extra virtual memory without eating into
+  the root partition where `target/` lives.
+- **`actions/checkout@v4`** pinned across all 8 workflows. The
+  upstream `actions/checkout@v5` has an intermittent auth-race
+  flake under runner-side network load; v4 is the LTS line.
+- **`concurrency: cancel-in-progress`** group on both `ci.yml`
+  and `coverage.yml` so force-push during PR iteration cancels
+  the stale run and frees the runner pool.
+- **`--test-threads=1`** on the Code Coverage job (was 2) caps
+  memory-parallel test execution under the trimmed profile.
+
+If you fork the repo and run CI on your own GitHub-hosted runners,
+these mitigations apply unchanged. If you self-host the runner, you
+can relax the cleanup + swap steps once you've sized the host
+appropriately (≥ 16 GB RAM + ≥ 50 GB disk recommended for the heavy
+gates).
+
+The 13 per-module coverage thresholds (`coverage/thresholds.toml`)
+were re-pinned to `floor(measured - 0.5)` post-#1146 to absorb the
+~1500 new LOC the enterprise-config campaign landed; future PRs
+ratchet UP from those new floors per the standing
+thresholds-rise-NEVER-fall discipline.
+
 ## Pull Request Process
 
 1. Fork the repository (external contributors) or branch directly (collaborators).

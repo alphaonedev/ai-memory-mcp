@@ -461,30 +461,63 @@ Operator doc: [`docs/federation.md`](federation.md).
 # 1. Stop the running daemon
 ai-memory stop
 
-# 2. Backup your DB before the schema migration
-cp ~/.local/share/ai-memory/memory.db ~/.local/share/ai-memory/memory.db.v0.6.4.bak
+# 2. Backup your DB before the schema migration. Default DB filename
+#    is `ai-memory.db` (NOT `memory.db`); confirm via `ai-memory --help`.
+cp ~/.claude/ai-memory.db ~/.claude/ai-memory.db.v0.6.4.bak
 
-# 3. Upgrade the binary (pick your channel)
-brew upgrade ai-memory                                    # Homebrew
-cargo install --git https://github.com/alphaonedev/ai-memory-mcp ai-memory --locked  # crates.io / source
+# 3. Upgrade the binary. UNTIL v0.7.0 IS PUBLISHED to the
+#    alphaonedev/homebrew-tap formula AND crates.io, prefer the
+#    GitHub Releases tarball or the --tag v0.7.0 source build:
+ARCH=$(uname -m); OS=$(uname -s | tr A-Z a-z)
+curl -fsSL "https://github.com/alphaonedev/ai-memory-mcp/releases/download/v0.7.0/ai-memory-${ARCH}-${OS}.tar.gz" \
+  | tar -xz -C ~/.local/bin
+# OR from source (locks the tag explicitly):
+cargo install --git https://github.com/alphaonedev/ai-memory-mcp \
+  --tag v0.7.0 --locked ai-memory
+# Once the tap formula + crates.io publication land:
+# brew upgrade ai-memory   /   cargo install ai-memory
 
-# 4. Preview the permissions migration
+# 4. Migrate config.toml (v0.6.x flat fields → v2 sectioned shape)
+ai-memory config migrate --dry-run        # preview
+ai-memory config migrate                  # apply with timestamped .bak
+ai-memory config migrate --also-clean-claude-json   # OPT-IN: also strip
+                                                     # mcpServers.<*>.env
+                                                     # from ~/.claude.json
+                                                     # (only direct
+                                                     # `ai-memory` launchers
+                                                     # — wrapper-script
+                                                     # launchers need manual
+                                                     # audit: `grep -l
+                                                     # AI_MEMORY_LLM
+                                                     # ~/.claude.json`)
+
+# 5. Preview the permissions migration (governance v0.6.4 → permissions v0.7.0)
 ai-memory governance migrate-to-permissions               # dry-run
 
-# 5. Apply if happy
+# 6. Apply if happy
 ai-memory governance migrate-to-permissions --apply
 
-# 6. (Optional) Generate an Ed25519 keypair for outbound link signing
+# 7. (Optional) Generate an Ed25519 keypair for outbound link signing
 ai-memory identity generate --agent-id "$(ai-memory identity suggest-id)"
 
-# 7. Restart
+# 8. Restart
 ai-memory start
 
-# 8. Verify
+# 9. Verify — `ai-memory doctor` now reports 9 sections incl. the new
+#    "LLM Reachability (#1146)" section that probes the resolved backend.
+ai-memory doctor
 ai-memory doctor --tokens
 ai-memory mcp call memory_capabilities '{"schema_version":"3"}' | jq '.kg_backend'
-ai-memory verify-signed-events-chain --format json
+ai-memory verify-signed-events-chain --format json | jq -e .ok
 ```
+
+**For the comprehensive 3-tier walkthrough** (non-technical /
+SME-fleet / DevOps-idempotent recipes), see
+[`docs/MIGRATION_QUICKSTART.md`](MIGRATION_QUICKSTART.md). The
+QUICKSTART covers the security-posture default flips (federation
+sig+nonce, permissions enforce, SSRF DNS-fail-CLOSED, governance
+fail-CLOSED, passphrase strict-perms) with their staged-rollout
+opt-out env vars.
 
 Schema migrations (sqlite v20 → v49, postgres v15 → v49 logical) run automatically on first start of a sqlite-backed daemon and are idempotent. Postgres schema bootstrap is via `ai-memory schema-init` per [`docs/migration-v0.7.0-postgres.md`](migration-v0.7.0-postgres.md). Canonical anchors: `CURRENT_SCHEMA_VERSION = 49` in both [`src/storage/migrations.rs`](../src/storage/migrations.rs) (sqlite) and [`src/store/postgres.rs`](../src/store/postgres.rs) (postgres); the highest on-disk migration files are [`migrations/sqlite/0041_v07_federation_push_dlq.sql`](../migrations/sqlite/0041_v07_federation_push_dlq.sql) (sqlite splits per-bump, file-name counter ≠ logical version) and [`migrations/postgres/0030_v07_federation_push_dlq.sql`](../migrations/postgres/0030_v07_federation_push_dlq.sql) (postgres runs a single greenfield+upgrade pair, with v34 → v49 deltas applied through in-process `migrate_v34()` … `migrate_v49()` async functions).
 

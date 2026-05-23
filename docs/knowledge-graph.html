@@ -164,13 +164,14 @@ footer a{color:var(--text-muted)}
 
 <section class="hero">
   <h1>Knowledge Graph — structured cognition.</h1>
-  <p class="tagline">Memories aren't a flat blob — they're a graph. <strong>4 relation types</strong>, an entity registry that resolves alias-to-canonical-name, <strong>temporal validity</strong> on every edge so the past stays queryable, and three new MCP tools (<code>memory_kg_query</code>, <code>memory_kg_timeline</code>, <code>memory_kg_invalidate</code>) that turn the graph into a first-class API surface. Shipped in v0.6.3 Streams B + C — the foundation v0.7's Apache AGE acceleration replaces the dual-path stubs of.</p>
+  <p class="tagline">Memories aren't a flat blob — they're a graph. <strong>6 relation variants at v0.7.0</strong> (related_to, supersedes, contradicts, derived_from, plus the v0.7 additions <code>reflects_on</code> for recursive-learning + <code>derives_from</code> for atomisation atom→parent links), an entity registry that resolves alias-to-canonical-name, <strong>temporal validity</strong> on every edge so the past stays queryable + Ed25519 per-link attestation populated, and <strong>four KG MCP tools at v0.7.0</strong> (<code>memory_kg_query</code>, <code>memory_kg_timeline</code>, <code>memory_kg_invalidate</code>, <code>memory_find_paths</code>). v0.6.3 Streams B + C laid the foundation; <strong>v0.7.0 ships the Apache AGE Cypher backend</strong> (auto-detected when the AGE Postgres extension is installed) — what was "planned" in v0.6.x is now a feature gate.</p>
   <div class="pills">
-    <span class="pill">4 relations</span>
+    <span class="pill">6 relations (v0.7.0)</span>
     <span class="pill">entity registry (Stream C)</span>
     <span class="pill">temporal validity (Stream B)</span>
-    <span class="pill">3 KG MCP tools</span>
-    <span class="pill">v0.7: Apache AGE acceleration</span>
+    <span class="pill">Ed25519 attestation (v0.7.0)</span>
+    <span class="pill">4 KG MCP tools</span>
+    <span class="pill">Apache AGE Cypher (shipped)</span>
   </div>
 </section>
 
@@ -307,7 +308,7 @@ footer a{color:var(--text-muted)}
   <div class="container">
     <span class="eyebrow">Temporal validity — v0.6.3 Stream B</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">Edges with a window.</h2>
-    <p class="lede">Schema v15 (v0.6.3) adds four nullable columns to <code>memory_links</code>: <code>valid_from</code>, <code>valid_until</code>, <code>observed_by</code>, and <code>signature</code> (placeholder for v0.7 attested identity). Edges now carry a window — "this relation was true between Mar 15 and Apr 20." Past states stay queryable via <code>memory_kg_timeline</code>; the present query (<code>memory_kg_query</code>) walks only currently-valid edges.</p>
+    <p class="lede">Schema v15 (v0.6.3) added four nullable columns to <code>memory_links</code>: <code>valid_from</code>, <code>valid_until</code>, <code>observed_by</code>, and <code>signature</code>. <strong>v0.7.0 populates the <code>signature</code> column with Ed25519 per-link attestation</strong> (was placeholder pre-v0.7) — links now carry cryptographic provenance + <code>attest_level</code> (<code>unsigned</code> / <code>agent</code> / <code>operator</code>) + <code>signed_at</code>. Edges carry a temporal window — "this relation was true between Mar 15 and Apr 20." Past states stay queryable via <code>memory_kg_timeline</code>; the present query (<code>memory_kg_query</code>) walks only currently-valid edges.</p>
     <div class="snip"><span class="cm">// SQL — schema v15 memory_links columns</span>
 CREATE TABLE memory_links (
   source_id    TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
@@ -317,7 +318,9 @@ CREATE TABLE memory_links (
   <span class="ok">valid_from   TEXT</span>,        <span class="cm">// when the edge started being true (default = source.created_at)</span>
   <span class="ok">valid_until  TEXT</span>,        <span class="cm">// NULL = still valid; non-null = invalidated at this time</span>
   <span class="ok">observed_by  TEXT</span>,        <span class="cm">// agent_id of the observer (provenance)</span>
-  <span class="ok">signature    BLOB</span>,        <span class="cm">// v0.7 placeholder for Ed25519 attestation</span>
+  <span class="ok">signature    BLOB</span>,        <span class="cm">// v0.7.0 POPULATED with Ed25519 per-link attestation</span>
+  <span class="ok">attest_level TEXT</span>,        <span class="cm">// v0.7.0: "unsigned" | "agent" | "operator"</span>
+  <span class="ok">signed_at    TIMESTAMP</span>,   <span class="cm">// v0.7.0: when the signature was applied</span>
   PRIMARY KEY (source_id, target_id, relation)
 );
 
@@ -430,7 +433,7 @@ WITH RECURSIVE walk(source, target, depth) <span class="key">AS</span> (
 )
 <span class="key">SELECT</span> * <span class="key">FROM</span> walk;
 
-<span class="cm">// v0.7 — Apache AGE Cypher (planned)</span>
+<span class="cm">// v0.7.0 — Apache AGE Cypher (SHIPPED — auto-detected when pg_extension installed)</span>
 MATCH (m:Memory {id: $id})-[r:RELATED_TO|SUPERSEDES*1..8]-&gt;(target)
 WHERE r.valid_until IS NULL OR r.valid_until &gt; datetime()
 RETURN target, r;</div>
@@ -451,7 +454,7 @@ RETURN target, r;</div>
 </section>
 
 <footer>
-  <p>ai-memory v0.6.3.1 · Apache 2.0 · KG schema in <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/migrations/sqlite/0010_v063_hierarchy_kg.sql">migrations/sqlite/0010</a> · query layer in <code>db.rs</code> · v0.7 AGE wrapper planned per v0.7 charter Bucket 2</p>
+  <p>ai-memory v0.7.0 · Apache 2.0 · KG schema in <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/migrations/sqlite/0010_v063_hierarchy_kg.sql">migrations/sqlite/0010</a> · query layer in <code>src/kg/</code> + <code>src/handlers/kg.rs</code> · Apache AGE wrapper SHIPPED at v0.7.0 (auto-detected via pg_extension; <code>--features sal-postgres</code>)</p>
   <p style="margin-top:.5rem"><a href="./">← Back to ai-memory</a> · <a href="at-a-glance.html">Atlas</a> · <a href="schema.html">Schema</a> · <a href="hierarchies.html">Hierarchies</a></p>
 </footer>
 

@@ -504,8 +504,10 @@ see the `*[advisory]*` rows in `PERFORMANCE.md`.
 
 ### `doctor`
 
-7-section health dashboard: Storage / Index / Recall / Governance /
-Sync / Webhook / Capabilities. Each section is severity-tagged.
+**9-section** health dashboard (v0.7.x post-#1146): Storage / Index /
+Recall / Governance / Sync / Webhook / Capabilities / Reflection
+Health / **LLM Reachability (#1146)**. Each section is
+severity-tagged.
 
 | Flag | Type | Default | Notes |
 |------|------|---------|-------|
@@ -521,6 +523,55 @@ ai-memory doctor
 ai-memory doctor --json | jq '.sections[] | select(.severity != "ok")'
 ai-memory doctor --remote https://memory.prod.example.com
 ```
+
+**`LLM Reachability (#1146)` section.** Resolves the canonical LLM
+configuration via `AppConfig::resolve_llm` (the same path used by
+MCP, HTTP daemon, atomise, curator, boot banner) and probes the
+endpoint:
+
+- Ollama backends → `GET <base_url>/api/tags` (no auth)
+- OpenAI-compatible backends → `GET <base_url>/models` (Bearer auth)
+
+7-bucket severity partition: INFO = 200 OK; WARN = 401/403 auth
+failure, 429 rate-limited, 5xx vendor outage; CRIT = 4xx-other
+(likely wrong `base_url`), network/DNS/TLS error. Surfaces the
+resolved provenance facts (`backend`, `model`, `base_url`,
+`config_source`, `key_source`). See
+[`docs/CONFIG_SCHEMA.md`](CONFIG_SCHEMA.md) for the full resolver
+contract.
+
+### `config migrate` (v0.7.x #1146)
+
+One-shot rewrite of legacy v1 `~/.config/ai-memory/config.toml`
+(flat fields: `llm_model`, `ollama_url`, `embed_url`,
+`embedding_model`, `cross_encoder`, `default_namespace`,
+`archive_on_gc`, `archive_max_days`, `max_memory_mb`,
+`auto_tag_model`) into the v2 sectioned shape (`[llm]`,
+`[llm.auto_tag]`, `[embeddings]`, `[reranker]`, `[storage]`).
+Idempotent — running against a v2 file is a no-op INFO log.
+
+| Flag | Type | Default | Notes |
+|------|------|---------|-------|
+| `--dry-run` | bool | `false` | Print the diff to stderr, no writes. |
+| `--also-clean-claude-json` | bool | `false` | Additionally remove `mcpServers.<*>.env` blocks from `~/.claude.json` whose `command` resolves to `ai-memory`. Opt-in — operator verifies the new `config.toml` works first. |
+
+Exit codes: `0` success or already-v2; `1` dry-run (informational);
+`2` file not found at `~/.config/ai-memory/config.toml`; `3` parse
+error (invalid TOML); `4` write error.
+
+```bash
+ai-memory config migrate              # write <file>.bak.<ts> + rewrite
+ai-memory config migrate --dry-run    # preview diff, no writes
+ai-memory config migrate \
+    --also-clean-claude-json          # also strip MCP env block
+```
+
+The migrator never lowers security posture or removes secrets.
+Inline `[llm].api_key = "<literal>"` in the source file is REJECTED
+at v0.7.x parse time — operators must use `api_key_env` or
+`api_key_file` instead. See
+[`docs/CONFIG_SCHEMA.md`](CONFIG_SCHEMA.md) for the secret-handling
+discipline.
 
 ## v0.7 feature-gated commands
 

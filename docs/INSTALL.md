@@ -738,6 +738,11 @@ sudo systemctl enable --now ai-memory
 # Check the binary
 ai-memory --help
 
+# v0.7.x — comprehensive health check (Storage / Index / Recall /
+# Governance / Sync / Webhook / Capabilities / Reflection Health /
+# LLM Reachability (#1146)). 9-section operator-visible dashboard.
+ai-memory doctor
+
 # If running as MCP server, test manually:
 echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' | ai-memory mcp
 # Expected: JSON-RPC response with serverInfo
@@ -752,6 +757,44 @@ ai-memory store -T "Installation test" -c "It works." --tier short
 # Recall it
 ai-memory recall "installation"
 ```
+
+## Post-install: migrate from v0.6.x (if upgrading)
+
+**If you're upgrading from v0.6.x**, run the one-shot config
+migrator to rewrite `~/.config/ai-memory/config.toml` from the
+legacy flat-field shape (`llm_model`, `ollama_url`, `embed_url`,
+`embedding_model`, `cross_encoder`, `default_namespace`, ...) into
+the v0.7.x sectioned schema (`[llm]`, `[llm.auto_tag]`,
+`[embeddings]`, `[reranker]`, `[storage]`):
+
+```bash
+# 1. Preview the rewrite (no writes)
+ai-memory config migrate --dry-run
+
+# 2. Apply with a timestamped .bak backup
+ai-memory config migrate
+
+# 3. (Optional, opt-in) — also strip the now-redundant
+#    mcpServers.<*>.env block from ~/.claude.json (only entries
+#    whose `command` resolves to ai-memory are touched)
+ai-memory config migrate --also-clean-claude-json
+
+# 4. Verify wiring end-to-end
+ai-memory doctor
+```
+
+The migrator is **idempotent** — running against an already-v2
+file is a no-op INFO log. Legacy v0.6.x flat fields continue to
+work in v0.7.x with a single-line deprecation WARN at load time;
+they will be removed in v0.8.0.
+
+The DB schema migration is **automatic** — the daemon walks v33 →
+v49 on first open of an existing v0.6.x DB. No operator action
+required.
+
+For a comprehensive walkthrough (security-posture defaults that
+changed, tiered admin / DevOps recipes, NFS-shared config fleets),
+see [`docs/MIGRATION_QUICKSTART.md`](MIGRATION_QUICKSTART.md).
 
 ## Man Page
 
