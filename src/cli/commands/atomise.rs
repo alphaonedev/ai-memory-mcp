@@ -329,28 +329,30 @@ pub fn run_with_curator(
 /// LLM configured (only `Keyword`, which the caller has already
 /// gated), or when the underlying client construction fails.
 fn build_llm_curator(tier: FeatureTier) -> std::result::Result<Box<dyn Curator>, String> {
-    let backend_env = std::env::var("AI_MEMORY_LLM_BACKEND")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    if let Some(backend) = backend_env {
-        return match OllamaClient::from_env() {
-            Ok(Some(client)) => Ok(Box::new(LlmCurator::new(client))),
-            Ok(None) => Err(format!(
-                "AI_MEMORY_LLM_BACKEND={backend} resolved to no LLM client — \
-                 atomise requires a curator LLM"
-            )),
-            Err(e) => Err(format!("AI_MEMORY_LLM_BACKEND={backend} init failed: {e}")),
-        };
+    // v0.7.x (#1146) — route through the canonical resolver. The
+    // resolver folds CLI flags (none here), AI_MEMORY_LLM_* env vars,
+    // the [llm] config section, the legacy `llm_model`/`ollama_url`
+    // fields, and the compiled tier preset through the uniform
+    // precedence ladder. Atomise's tier gate already refused
+    // `Keyword`; for the other three tiers the resolver always
+    // produces a usable backend/model pair.
+    let _ = tier;
+    let app_config = AppConfig::load();
+    let resolved = app_config.resolve_llm(None, None, None);
+    match OllamaClient::build_from_resolved(&resolved) {
+        Ok(Some(client)) => Ok(Box::new(LlmCurator::new(client))),
+        Ok(None) => Err(format!(
+            "atomise: LLM resolver returned no client \
+             (backend={}, source={}); atomise requires a curator LLM",
+            resolved.backend,
+            resolved.source.as_str()
+        )),
+        Err(e) => Err(format!(
+            "atomise: LLM init failed (backend={}, source={}): {e}",
+            resolved.backend,
+            resolved.source.as_str()
+        )),
     }
-    let llm_model = tier
-        .config()
-        .llm_model
-        .ok_or_else(|| format!("tier '{tier}' has no curator LLM configured"))?;
-    let model_id = llm_model.ollama_model_id().to_string();
-    let client =
-        OllamaClient::new(&model_id).map_err(|e| format!("OllamaClient::new({model_id}): {e}"))?;
-    Ok(Box::new(LlmCurator::new(client)))
 }
 
 /// Best-effort keypair load — returns `None` if no key exists or the
