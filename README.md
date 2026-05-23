@@ -422,7 +422,7 @@ curl https://api.x.ai/v1/responses \
   -H "Authorization: Bearer $XAI_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "grok-3",
+    "model": "grok-4.3",
     "tools": [{
       "type": "mcp",
       "server_url": "https://your-server.example.com/mcp",
@@ -829,7 +829,7 @@ Every capability mapped to its minimum tier. Each tier includes all capabilities
 | Autonomous memory reflection | -- | -- | -- | Yes |
 | **Models** | | | | |
 | Embedding model | -- | MiniLM-L6-v2 (384d) | nomic-embed-text (768d) | nomic-embed-text (768d) |
-| LLM | -- | -- | operator-selected (#1067) — default `gemma3:4b` or `gemma4:e2b` local; remote endpoints carry no local footprint | operator-selected (#1067) — default `gemma4:e4b` local; remote endpoints carry no local footprint |
+| LLM | -- | -- | operator-selected (#1067) — default `gemma3:4b` local; remote endpoints carry no local footprint | operator-selected (#1067) — default `gemma3:4b` local; remote endpoints carry no local footprint |
 | **Resources** | | | | |
 | RAM | 0 MB | ~256 MB | ~1 GB | ~4 GB |
 | External dependencies | None | None | LLM backend (Ollama / xAI / OpenAI / Anthropic / Gemini / DeepSeek / Kimi / Qwen / Mistral / Groq / Together / Cerebras / OpenRouter / Fireworks / LMStudio / vLLM / llama.cpp — #1067) | LLM backend (same choices as smart) |
@@ -866,7 +866,7 @@ api_key_env = "XAI_API_KEY"          # mutually exclusive with api_key_file;
 # Legacy v0.6.x shape — still works, deprecation WARN at load; run
 # `ai-memory config migrate` to upgrade in place.
 tier = "autonomous"
-llm_model = "gemma4:e2b"   # faster model (46 tok/s vs 26 tok/s for e4b)
+llm_model = "gemma3:4b"   # default Ollama model at v0.7.0
 ```
 
 The `--tier` flag **must** be passed in the MCP args -- the `config.toml` tier setting is not used when the server is launched by an AI client.

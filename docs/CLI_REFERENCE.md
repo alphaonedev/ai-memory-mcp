@@ -659,7 +659,7 @@ AGE projection. Supports `--skip-age` for the CTE fallback. See
 
 | Subcommand | Notes |
 |---|---|
-| `ai-memory rules sign <rule.json>` | Sign a rule with the operator key for `attest_level = "signed"`. |
+| `ai-memory rules sign-seed --key <path>` | Sign the seed R001-R004 governance rules with the operator key (rules ship unsigned + disabled by design; sign-seed is the first-time operator-attestation step). For a single new rule, use `ai-memory rules add ... --sign`. |
 | `ai-memory rules list` | List the active rule corpus (CLI equivalent of `memory_rule_list`). |
 
 ### `export-forensic-bundle` / `verify-forensic-bundle` — L2-5

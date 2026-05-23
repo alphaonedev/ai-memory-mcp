@@ -96,11 +96,15 @@ the host config.
 
 **Schema-drift detection.** From v0.6.3.1, boot also surfaces a
 `# ai-memory boot: warn` header when the DB's `schema_version` lies
-outside the binary's supported `[v16, v19]` range — an agent or human
-running an older `ai-memory` binary against a newer DB (or vice versa)
-sees the drift directly in their session log instead of having boot
-silently degrade. The JSON variant carries `schema_supported: bool`
-as a top-level key for SIEM / fleet-dashboard ingest.
+outside the binary's supported range. At v0.7.0 the canonical
+schema is **v49** (verified via `CURRENT_SCHEMA_VERSION` in
+`src/storage/migrations.rs`); the ladder runs v33 → v49 with 16
+in-process migrations applied on first daemon start. An agent or
+human running an older `ai-memory` binary against a newer DB (or
+vice versa) sees the drift directly in their session log instead of
+having boot silently degrade. The JSON variant carries
+`schema_supported: bool` as a top-level key for SIEM /
+fleet-dashboard ingest.
 
 ## End-user diagnostic — how to know boot fired
 
@@ -111,12 +115,18 @@ no black-box behaviour:
 
 ```text
 # ai-memory boot: ok
-#   version:    0.6.3+patch.1
-#   db:         /home/u/.claude/ai-memory.db (schema=v19, 161 memories)
-#   tier:       autonomous (embedder=nomic-ai/nomic-embed-text-v1.5, reranker=ms-marco-MiniLM-L-6-v2, llm=gemma4:e4b)
+#   version:    0.7.0
+#   db:         /home/u/.claude/ai-memory.db (schema=v49, 161 memories)
+#   tier:       autonomous (embedder=nomic-embed-text-v1.5, reranker=ms-marco-MiniLM-L-6-v2, llm=xai:grok-4.3)
 #   latency:    12ms
 #   namespace:  ai-memory-mcp (loaded 10 memories)
 ```
+
+Post-#1146, the `llm=` field uses the `<backend>:<model>` display
+format produced by `ResolvedLlm::display_label()` for any
+non-Ollama backend (e.g. `llm=xai:grok-4.3`, `llm=openai:gpt-5`,
+`llm=anthropic:claude-opus-4.7`). For the Ollama backend the bare
+model name continues to display (`llm=gemma3:4b`).
 
 The first line's status word is one of `ok` / `info` / `warn`; the
 `namespace:` line's parenthetical varies by status. The four variants:
@@ -308,7 +318,7 @@ must not be able to weaken its own constraints. See
 
 ### Operator workflow (end-to-end)
 
-1. **Keygen** — `ai-memory keygen --out operator` writes `operator.priv` +
+1. **Keygen** — `ai-memory rules keygen --out operator` writes `operator.priv` +
    `operator.pub` (the operator's signing keypair).
 2. **Sign-seed** — `ai-memory rules sign-seed --key operator.priv` signs
    the four seed rules (they ship unsigned + disabled by design).
