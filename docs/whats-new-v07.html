@@ -129,8 +129,8 @@ footer a:hover{color:var(--accent)}
     </p>
     <div class="meta">
       <span>capabilities v2 &rarr; v3</span>
-      <span>schema v20 &rarr; v22</span>
-      <span>20 hook events</span>
+      <span>schema v33 &rarr; v49</span>
+      <span>25 hook events</span>
       <span>Ed25519 attestation</span>
     </div>
     <div class="cta-row">
@@ -256,7 +256,7 @@ ai-memory identity generate --agent-id ai:claude-code@$(hostname)</pre>
         <h3>Programmable hooks. Real attestation. New loaders. Tighter token budget.</h3>
         <ul class="checked">
           <li><strong>Hook pipeline:</strong> 25 lifecycle events (<code>pre_store</code>, <code>post_store</code>, <code>pre_recall</code>, <code>post_recall</code>, &hellip;), subprocess + daemon-mode IPC, <code>Allow</code>/<code>Modify</code>/<code>Deny</code>/<code>AskUser</code> decision contract, chain ordering with <strong>first-deny-wins</strong> short-circuit. Hot-path events default to daemon mode to preserve the v0.6.3 50ms recall budget.</li>
-          <li><strong>Ed25519 attestation:</strong> per-agent keypair (<code>ai-memory identity generate</code>), outbound link signing, inbound verification against <code>observed_by</code>, <code>signed_events</code> append-only audit table (schema migration v20 &rarr; v22).</li>
+          <li><strong>Ed25519 attestation:</strong> per-agent keypair (<code>ai-memory identity generate</code>), outbound link signing, inbound verification against <code>observed_by</code>, <code>signed_events</code> append-only audit table with V-4 cross-row hash chain (schema v34, part of the v33 &rarr; v49 migration ladder).</li>
           <li><strong>Sidechain transcripts:</strong> zstd-3 compressed BLOBs in <code>memory_transcripts</code>, joined to memories via <code>memory_transcript_links</code>, per-namespace TTL with archive&rarr;prune lifecycle, <code>memory_replay(memory_id)</code> reconstructs the chain.</li>
           <li><strong>Apache AGE:</strong> opt-in property graph backend (Postgres only); auto-detected via <code>pg_extension</code>. SQLite installs fall back to recursive CTE. Cypher implementations of <code>memory_kg_query</code>, <code>memory_kg_timeline</code>, <code>memory_kg_invalidate</code> &mdash; and the new <code>memory_find_paths(source, target, max_depth=5)</code> tool (recovers commitment R2).</li>
           <li><strong>New permission system:</strong> replaces v0.6.x advisory governance. Rules + modes (<code>enforce</code>/<code>advisory</code>/<code>off</code>) + hooks &rarr; <code>Decision</code>; deny-first semantics. Migration tool: <code>ai-memory governance migrate-to-permissions</code> (idempotent, dry-run by default).</li>
@@ -334,7 +334,7 @@ ai-memory identity generate --agent-id ai:claude-code@$(hostname)</pre>
       <div class="card violet">
         <span class="tag">Track H &middot; Ed25519 attestation</span>
         <h3>The dead column gets filled</h3>
-        <p>The <code>signature</code> column shipped in v0.6.3 finally carries real Ed25519 signatures. Per-agent keypairs at <code>~/.config/ai-memory/keys/&lt;agent_id&gt;.{pub,priv}</code> (mode 0600 / 0644). Outbound link writes sign canonical-CBOR-encoded link content. <code>attest_level</code> enum: <code>unsigned</code> / <code>self_signed</code> / <code>peer_attested</code>. Append-only <code>signed_events</code> audit table (schema migration v20 &rarr; v22).</p>
+        <p>The <code>signature</code> column shipped in v0.6.3 finally carries real Ed25519 signatures. Per-agent keypairs at <code>~/.config/ai-memory/keys/&lt;agent_id&gt;.{pub,priv}</code> (mode 0600 / 0644). Outbound link writes sign canonical-CBOR-encoded link content. <code>attest_level</code> enum: <code>unsigned</code> / <code>self_signed</code> / <code>peer_attested</code>. Append-only <code>signed_events</code> audit table with V-4 cross-row hash chain (<code>prev_hash</code> + <code>sequence</code>) landed at schema v34 as part of the v33 &rarr; v49 migration ladder.</p>
         <p><a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/v0.7/rfc-attested-cortex.md">RFC &sect;Why Ed25519 over X25519+ChaCha20 &rarr;</a></p>
       </div>
 
@@ -355,7 +355,7 @@ ai-memory identity generate --agent-id ai:claude-code@$(hostname)</pre>
       <div class="card cyan">
         <span class="tag">Track I &middot; Sidechain transcripts</span>
         <h3>Compressed reasoning trails, replayable</h3>
-        <p>Raw conversation/reasoning trail in zstd-3 BLOBs. <code>memory_transcripts</code> table (schema v22) joined to memories via <code>memory_transcript_links(memory_id, transcript_id, span_start, span_end)</code>. Per-namespace TTL with archive&rarr;prune sweeper. <code>memory_replay(memory_id)</code> traverses the join and reconstructs the chain. Substrate for R5 auto-extraction.</p>
+        <p>Raw conversation/reasoning trail in zstd-3 BLOBs. <code>memory_transcripts</code> table joined to memories via <code>memory_transcript_links(memory_id, transcript_id, span_start, span_end)</code>. Per-namespace TTL with archive&rarr;prune sweeper. <code>memory_replay(memory_id)</code> traverses the join and reconstructs the chain. Substrate for R5 auto-extraction.</p>
         <p><a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/v0.7/V0.7-EPIC.md#track-i--sidechain-transcripts-bucket-17">Track I tasks &rarr;</a></p>
       </div>
 
@@ -419,10 +419,10 @@ ai-memory identity generate --agent-id ai:claude-code@$(hostname)</pre>
         <tr><td>Pre-computed capabilities calibration</td><td>n/a (v2)</td><td>✅ v3 default (<code>summary</code>, <code>to_describe_to_user</code>)</td></tr>
         <tr><td>Named loader tools</td><td>via <code>memory_capabilities --include-schema</code></td><td>✅ <code>memory_load_family</code>, <code>memory_smart_load(intent)</code></td></tr>
         <tr><td>Per-agent capability allowlist</td><td>✅ phase 1 (<code>[mcp.allowlist]</code>)</td><td>✅ + <code>callable_now</code> + <code>agent_permitted_families</code></td></tr>
-        <tr><td>Capability-expansion audit log</td><td>✅ schema v20 (<code>audit_log</code>)</td><td>✅ + <code>signed_events</code> append-only chain (schema v22)</td></tr>
+        <tr><td>Capability-expansion audit log</td><td>✅ v0.6.3 baseline (<code>audit_log</code>)</td><td>✅ + <code>signed_events</code> append-only chain with V-4 cross-row hash chain (schema v34, part of v33 &rarr; v49 migration ladder)</td></tr>
         <tr><td>Ed25519 link signing</td><td>❌ dead column</td><td>✅ filled (per-agent keypair, canonical-CBOR signing)</td></tr>
         <tr><td>Inbound signature verification</td><td>❌</td><td>✅ verified against <code>observed_by</code> claim</td></tr>
-        <tr><td>Programmable lifecycle hooks</td><td>❌ (subscriptions only)</td><td>✅ 20 events, exec + daemon modes, decision contract</td></tr>
+        <tr><td>Programmable lifecycle hooks</td><td>❌ (subscriptions only)</td><td>✅ 25 events, exec + daemon modes, decision contract</td></tr>
         <tr><td>Sidechain transcripts (zstd-3)</td><td>❌</td><td>✅ <code>memory_transcripts</code> + <code>memory_replay</code></td></tr>
         <tr><td>Apache AGE Cypher backend</td><td>❌</td><td>✅ opt-in (Postgres only); SQLite/CTE fallback unchanged</td></tr>
         <tr><td>Namespace policy inheritance enforcement</td><td>❌ leaf-only</td><td>✅ walks the chain (K1/G1 cutline)</td></tr>

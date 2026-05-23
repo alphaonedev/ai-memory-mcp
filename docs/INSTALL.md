@@ -46,7 +46,7 @@
    **Ubuntu/Debian (.deb manual install):**
    ```bash
    # Download from https://github.com/alphaonedev/ai-memory-mcp/releases/latest
-   sudo dpkg -i ai-memory_0.5.1_amd64.deb   # or arm64
+   sudo dpkg -i ai-memory_0.7.0_amd64.deb   # or arm64
    ```
 
    **Fedora/RHEL (COPR — recommended):**
@@ -58,7 +58,7 @@
    **Fedora/RHEL (.rpm manual install):**
    ```bash
    # Download from https://github.com/alphaonedev/ai-memory-mcp/releases/latest
-   sudo rpm -i ai-memory-0.5.1-1.x86_64.rpm    # or aarch64
+   sudo rpm -i ai-memory-0.7.0-1.x86_64.rpm    # or aarch64
    ```
 
    **Arch Linux (AUR — v0.7.0 Gap #3 / issue #804):**
@@ -200,6 +200,8 @@ That's it. Everything below is optional detail.
 
 ## Install from Source (One-Liner)
 
+For the postgres + Apache AGE storage backend, append `--features sal,sal-postgres` to the `cargo install` command (adds the `migrate` + `schema-init` CLI subcommands and the `ai-memory serve --store-url postgres://…` daemon path).
+
 ```bash
 cargo install --git https://github.com/alphaonedev/ai-memory-mcp.git
 ```
@@ -258,7 +260,7 @@ sudo mv ai-memory /usr/local/bin/
 ## Network Requirements
 
 - **First run with `semantic` tier (or above)**: Downloads a ~100MB embedding model from HuggingFace. No account or API key is required. The model is cached in `~/.cache/huggingface/` for subsequent runs. After the initial download, no network access is needed for keyword or semantic tiers.
-- **Smart/autonomous tiers**: Require a running Ollama instance (local network only, no external calls).
+- **Smart/autonomous tiers**: Require an LLM backend. Post-#1067 (v0.7.0) any of 15 OpenAI-compatible vendors (xAI, OpenAI, Anthropic, Gemini, DeepSeek, Kimi/Moonshot, Qwen/DashScope, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, LMStudio) or local Ollama works — selected via `AI_MEMORY_LLM_BACKEND`. Local Ollama is the default for zero-network installs; cloud backends require their respective API key.
 
 ## Disk Space
 
@@ -515,7 +517,7 @@ curl https://api.x.ai/v1/responses \
   -H "Authorization: Bearer $XAI_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "grok-3",
+    "model": "grok-4.3",
     "tools": [{
       "type": "mcp",
       "server_url": "https://your-server.example.com/mcp",
@@ -657,7 +659,7 @@ If `ai-memory` is not in your PATH, use the full path to the binary in any of th
 
 ### Step 2: Verify
 
-Restart your AI client. You should see 21 new tools available: `memory_store`, `memory_recall`, `memory_search`, `memory_list`, `memory_delete`, `memory_promote`, `memory_forget`, `memory_stats`, `memory_update`, `memory_get`, `memory_link`, `memory_get_links`, `memory_consolidate`, `memory_capabilities`, `memory_expand_query`, `memory_auto_tag`, `memory_detect_contradiction`, `memory_archive_list`, `memory_archive_restore`, `memory_archive_purge`, `memory_archive_stats`.
+Restart your AI client. With `--profile core` (default at v0.7.0) you should see 7 tools available (`memory_store`, `memory_recall`, `memory_search`, `memory_list`, `memory_get`, `memory_load_family`, `memory_smart_load`) plus the always-on `memory_capabilities` bootstrap. With `--profile full` you get all 73 advertised entries (72 callable memory tools + `memory_capabilities`). Other profiles: `graph` (18 tools), `admin` (20 tools), `power` (16 tools). The full advertised inventory is asserted by `Profile::full().expected_tool_count() = 73` in `src/profile.rs`; the canonical surface list lives in `docs/USER_GUIDE.md`.
 
 ### Step 3: Test
 
@@ -854,8 +856,8 @@ brew install ollama
 ollama serve &
 
 # Pull the model for your tier
-ollama pull gemma4:e2b    # Smart tier (~1GB)
-ollama pull gemma4:e4b    # Autonomous tier (~2.3GB)
+ollama pull gemma3:4b     # Default LLM model for ai-memory (~3 GB) — handles smart-tier auto-tag + contradict + query expansion
+ollama pull nomic-embed-text:v1.5  # Default embedder (~280 MB) — semantic + autonomous tiers
 ```
 
 ### Linux
@@ -872,8 +874,8 @@ sudo systemctl start ollama
 ollama serve &
 
 # Pull the model for your tier
-ollama pull gemma4:e2b    # Smart tier (~1GB)
-ollama pull gemma4:e4b    # Autonomous tier (~2.3GB)
+ollama pull gemma3:4b     # Default LLM model for ai-memory (~3 GB) — handles smart-tier auto-tag + contradict + query expansion
+ollama pull nomic-embed-text:v1.5  # Default embedder (~280 MB) — semantic + autonomous tiers
 ```
 
 ### Windows
@@ -886,8 +888,8 @@ ollama pull gemma4:e4b    # Autonomous tier (~2.3GB)
 winget install Ollama.Ollama
 
 # Pull the model (in PowerShell or Command Prompt)
-ollama pull gemma4:e2b    # Smart tier (~1GB)
-ollama pull gemma4:e4b    # Autonomous tier (~2.3GB)
+ollama pull gemma3:4b     # Default LLM model for ai-memory (~3 GB) — handles smart-tier auto-tag + contradict + query expansion
+ollama pull nomic-embed-text:v1.5  # Default embedder (~280 MB) — semantic + autonomous tiers
 ```
 
 ### Verify Ollama is Running

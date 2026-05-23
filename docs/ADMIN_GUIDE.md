@@ -1,10 +1,10 @@
 # Admin Guide
 
-> **Upgrading to v0.7?** Read [`MIGRATION_v0.7.md`](MIGRATION_v0.7.md) **before** you upgrade. v0.7.0 (`attested-cortex`) adds Ed25519 link attestation, a 20-event hook pipeline, sidechain transcripts + `memory_replay`, optional Apache AGE acceleration, capabilities v3 (with the new `memory_load_family` / `memory_smart_load` loaders), and a refactored permissions + A2A approval system. Most v0.6.4 callers see **no behavior change** — but pre-v0.6.3.1 v0.6.x users hit the G1 namespace-inheritance fix. Companion docs: [What's new in v0.7](whats-new-v07.html), [`attested-cortex` RFC](v0.7/rfc-attested-cortex.md), [v0.7 compatibility matrix](v0.7/compatibility-matrix.html), and [canonical phrasings](v0.7/canonical-phrasings.md) for the agent-facing strings.
+> **Upgrading to v0.7?** Read [`MIGRATION_v0.7.md`](MIGRATION_v0.7.md) **before** you upgrade. v0.7.0 (`attested-cortex`) adds Ed25519 link attestation, a 25-event hook pipeline (20 baseline lifecycle events + 5 v0.7.0 additions: PreRecallExpand, PreReflect, PostReflect, PreCompaction, OnCompactionRollback), sidechain transcripts + `memory_replay`, optional Apache AGE acceleration, capabilities v3 (with the new `memory_load_family` / `memory_smart_load` loaders), and a refactored permissions + A2A approval system. Most v0.6.4 callers see **no behavior change** — but pre-v0.6.3.1 v0.6.x users hit the G1 namespace-inheritance fix. Companion docs: [What's new in v0.7](whats-new-v07.html), [`attested-cortex` RFC](v0.7/rfc-attested-cortex.md), [v0.7 compatibility matrix](v0.7/compatibility-matrix.html), and [canonical phrasings](v0.7/canonical-phrasings.md) for the agent-facing strings.
 
 `ai-memory` is an AI-agnostic memory management system. It works with **any MCP-compatible AI client** -- including Claude AI, OpenAI ChatGPT, xAI Grok, META Llama, and others. The HTTP API and CLI are completely platform-independent.
 
-**Key features for admins:** Zero token cost until recall (replaces built-in auto-memory), TOON compact default response format (79% smaller than JSON), MCP prompts for proactive AI behavior (`recall-first`, `memory-workflow`), 4 feature tiers (keyword → autonomous with local LLMs via Ollama), and the v0.7.0 `attested-cortex` substrates (Ed25519 link attestation, hook pipeline, sidechain transcripts, optional AGE acceleration, capabilities v3, permissions + A2A approvals). 1,886 lib tests + 49+ integration tests at 93.84% line coverage (v0.6.3.1). v0.6.3 baseline numbers (1,600 lib / 93.08%) are frozen on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html); v0.6.3.1 and v0.7.0 deltas are documented in `CHANGELOG.md` and the per-release notes.
+**Key features for admins:** Zero token cost until recall (replaces built-in auto-memory), TOON compact default response format (79% smaller than JSON), MCP prompts for proactive AI behavior (`recall-first`, `memory-workflow`), 4 feature tiers (keyword → autonomous, with any LLM backend post-#1067 — local Ollama, xAI Grok, OpenAI, Anthropic, Gemini, DeepSeek, etc.), and the v0.7.0 `attested-cortex` substrates (Ed25519 link attestation, 25-event hook pipeline, sidechain transcripts, optional AGE acceleration, capabilities v3, permissions + A2A approvals). v0.7.0 ships ~2,400 tests across the full surface with line coverage held above the ≥92% project bar; v0.6.3.1 baseline numbers (1,886 lib / 93.84%) and v0.6.3 baselines (1,600 lib / 93.08%) are frozen on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html); v0.7.0 deltas live in `CHANGELOG.md` and the per-release notes.
 
 > **Maturity framing (v0.7).** The single-machine primitive (T1/T2 in the [architectures matrix](https://alphaonedev.github.io/ai-memory-mcp/architectures.html)) is **production-ready**. Federation (T3 multi-node quorum cluster) is **beta** — the code is shipped and tested but not recommended for unattended production fleets. The Postgres+pgvector backend reaches **GA in v0.7** (with optional **Apache AGE acceleration** for KG ops behind a bench gate). Ed25519 attestation, the hook pipeline, sidechain transcripts, and the permissions/A2A surfaces are all **opt-in** — a v0.7.0 install with no `hooks.toml`, no keypair, and no `[transcripts]` config behaves identically to v0.6.4 at the lifecycle layer. Multi-region distributed consensus (T5 "global hive") is **vision** at v1.0+. See the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html) for the canonical maturity labels — use those labels in all customer-facing materials.
 
@@ -45,7 +45,7 @@ Run the HTTP daemon directly in the foreground:
 ai-memory --db /path/to/ai-memory.db serve
 ```
 
-The daemon listens on `127.0.0.1:9077` by default and exposes 88 HTTP route registrations (44 unique URL paths) (canonical count on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html)).
+The daemon listens on `127.0.0.1:9077` by default and exposes 87 HTTP route registrations (73 unique URL paths) (canonical count on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html)).
 
 ### Systemd (Production HTTP Daemon)
 
@@ -184,9 +184,9 @@ The `smart` and `autonomous` tiers require an LLM backend. **Post-[#1067](https:
 **Selection by env var.** Set `AI_MEMORY_LLM_BACKEND` to one of: `ollama` (default), `openai-compatible` (generic; requires `AI_MEMORY_LLM_BASE_URL`), or a pre-filled vendor alias (`openai`, `xai`, `anthropic`, `gemini`, `deepseek`, `kimi`/`moonshot`, `qwen`/`dashscope`, `mistral`, `groq`, `together`, `cerebras`, `openrouter`, `fireworks`, `lmstudio`).
 
 ```bash
-# Example 1: xAI Grok 4 (remote, no GPU required)
+# Example 1: xAI Grok 4.3 (remote, no GPU required) — v0.7.0 compiled default for xai backend
 export AI_MEMORY_LLM_BACKEND=xai
-export AI_MEMORY_LLM_MODEL=grok-4
+export AI_MEMORY_LLM_MODEL=grok-4.3
 export XAI_API_KEY=xai-…
 
 # Example 2: OpenAI gpt-5
@@ -217,8 +217,8 @@ If you want a fully local LLM, install [Ollama](https://ollama.com) and pull a m
 brew install ollama
 # Or download from https://ollama.com/download/mac
 ollama serve &
-ollama pull gemma4:e2b    # Smart tier (~1GB)
-ollama pull gemma4:e4b    # Autonomous tier (~2.3GB)
+ollama pull gemma3:4b     # v0.7.0 compiled default for Ollama backend (~3 GB) — smart + autonomous LLM
+ollama pull nomic-embed-text:v1.5  # Default embedder for semantic + autonomous tiers (~280 MB)
 ```
 
 #### Linux
@@ -226,22 +226,22 @@ ollama pull gemma4:e4b    # Autonomous tier (~2.3GB)
 curl -fsSL https://ollama.com/install.sh | sh
 sudo systemctl enable ollama
 sudo systemctl start ollama
-ollama pull gemma4:e2b    # Smart tier (~1GB)
-ollama pull gemma4:e4b    # Autonomous tier (~2.3GB)
+ollama pull gemma3:4b     # v0.7.0 compiled default for Ollama backend (~3 GB) — smart + autonomous LLM
+ollama pull nomic-embed-text:v1.5  # Default embedder for semantic + autonomous tiers (~280 MB)
 ```
 
 #### Windows
 ```powershell
 # Download from https://ollama.com/download/windows, or:
 winget install Ollama.Ollama
-ollama pull gemma4:e2b    # Smart tier (~1GB)
-ollama pull gemma4:e4b    # Autonomous tier (~2.3GB)
+ollama pull gemma3:4b     # v0.7.0 compiled default for Ollama backend (~3 GB) — smart + autonomous LLM
+ollama pull nomic-embed-text:v1.5  # Default embedder for semantic + autonomous tiers (~280 MB)
 ```
 
 #### Verify
 ```bash
 curl http://localhost:11434/api/tags
-ollama run gemma4:e2b "Hello, world"
+ollama run gemma3:4b "Hello, world"
 ```
 
 ai-memory connects to Ollama at `http://localhost:11434` by default when `AI_MEMORY_LLM_BACKEND` is unset or `ollama`. Set `OLLAMA_BASE_URL` (legacy) or `AI_MEMORY_LLM_BASE_URL` (post-#1067) to override. If the LLM endpoint is unreachable, ai-memory gracefully falls back to the semantic tier and the circuit breaker pins fast-fail behaviour after 3 consecutive failures within a 30s window.
@@ -288,14 +288,17 @@ At the `semantic` tier and above, ai-memory downloads a sentence-transformer mod
 |-----|------|---------|--------------|-------------|
 | `tier` | String | `"semantic"` | `"keyword"`, `"semantic"`, `"smart"`, `"autonomous"` | Feature tier controlling which AI capabilities are active |
 | `db` | String | `"ai-memory.db"` | Any valid file path | Path to the SQLite database file |
-| `ollama_url` | String | `"http://localhost:11434"` | Any URL | Ollama base URL for LLM generation (smart/autonomous tiers) |
-| `embed_url` | String | Value of `ollama_url` | Any URL | Separate URL for the embedding service; falls back to `ollama_url` if unset |
-| `embedding_model` | String | Tier-dependent | `"mini_lm_l6_v2"` (384-dim, ~90 MB), `"nomic_embed_v15"` (768-dim, ~270 MB) | HuggingFace sentence-transformer model for semantic search |
-| `llm_model` | String | Tier-dependent | `"gemma4:e2b"` (~1 GB Q4), `"gemma4:e4b"` (~2.3 GB Q4) | Ollama LLM model tag for smart/autonomous features |
-| `cross_encoder` | **Bool** | `false` (`true` for autonomous tier) | `true`, `false` | Enable neural cross-encoder reranking (not a string -- must be bare `true`/`false` without quotes) |
-| `default_namespace` | String | `"global"` | Any valid namespace (max 128 bytes, no slashes/spaces/nulls) | Default namespace applied to new memories |
+
+> **Note (#1146, v0.7.x):** The fields below — `ollama_url`, `embed_url`, `embedding_model`, `llm_model`, `cross_encoder`, `default_namespace`, `max_memory_mb`, `archive_on_gc` — are the **legacy v0.6.x flat-field shape**. They continue to parse and emit a `Once`-gated deprecation WARN. The canonical v0.7.x shape is the sectioned `[llm]` / `[llm.auto_tag]` / `[embeddings]` / `[reranker]` / `[storage]` form documented in [`CONFIG_SCHEMA.md`](CONFIG_SCHEMA.md). Run `ai-memory config migrate` to rewrite a legacy config in the v2 shape (with a `.bak` backup). Legacy fields will be removed in v0.8.0.
+
+| `ollama_url` | String | `"http://localhost:11434"` | Any URL | **[LEGACY]** Ollama base URL for LLM generation. Canonical v2: `[llm].base_url`. |
+| `embed_url` | String | Value of `ollama_url` | Any URL | **[LEGACY]** Separate embedder URL. Canonical v2: `[embeddings].url`. |
+| `embedding_model` | String | `"nomic-embed-text-v1.5"` | `"mini_lm_l6_v2"` (384-dim, ~90 MB), `"nomic-embed-text-v1.5"` (768-dim, ~280 MB) | **[LEGACY]** Sentence-transformer / Ollama embedder model. Canonical v2: `[embeddings].model`. |
+| `llm_model` | String | Backend-dependent | `"gemma3:4b"` (Ollama default), `"grok-4.3"` (xai), `"gpt-5"` (openai), `"claude-opus-4.7"` (anthropic), `"deepseek-chat"`, `"qwen-max"`, … | **[LEGACY]** LLM model tag. Canonical v2: `[llm].model`. Default resolution lives in `src/config.rs::backend_default_model`. |
+| `cross_encoder` | **Bool** | `false` (`true` for autonomous tier) | `true`, `false` | **[LEGACY]** Enable neural cross-encoder reranking. Canonical v2: `[reranker].enabled`. |
+| `default_namespace` | String | `"global"` | Any valid namespace (max 128 bytes, no slashes/spaces/nulls) | **[LEGACY]** Default namespace applied to new memories. Canonical v2: `[storage].default_namespace`. |
 | `max_memory_mb` | Integer | Tier-dependent | Any positive integer | Maximum memory budget in MB; used for automatic tier selection via `from_memory_budget()` |
-| `archive_on_gc` | Bool | `true` | `true`, `false` | Archive expired memories instead of permanently deleting them during GC |
+| `archive_on_gc` | Bool | `true` | `true`, `false` | **[LEGACY]** Archive expired memories on GC. Canonical v2: `[storage].archive_on_gc`. |
 | `[ttl]` | Section | -- | -- | Per-tier TTL overrides (all sub-fields are integers in seconds) |
 | `ttl.short_ttl_secs` | Integer | `21600` (6 hours) | `0` = never expires, or positive integer | TTL for short-tier memories in seconds |
 | `ttl.mid_ttl_secs` | Integer | `604800` (7 days) | `0` = never expires, or positive integer | TTL for mid-tier memories in seconds |
@@ -431,19 +434,24 @@ Below is a complete example showing every supported field with explanatory comme
 
 # LEGACY → v2: [llm].model
 # LLM model identifier (smart and autonomous tiers).
-# Pre-#1067 default values (still valid when AI_MEMORY_LLM_BACKEND is unset
-# or "ollama"):
-#   "gemma4:e2b"  — Google Gemma 4 Effective 2B, ~1 GB Q4 (smart tier default)
-#   "gemma4:e4b"  — Google Gemma 4 Effective 4B, ~2.3 GB Q4 (autonomous tier default)
-# Post-#1067, the model is vendor-specific. Examples:
-#   "grok-4.3"        — xAI
-#   "gpt-5"          — OpenAI
-#   "claude-opus-4.7" — Anthropic (via OpenAI shim)
-#   "deepseek-chat"   — DeepSeek
-#   "qwen-max"        — Qwen / Dashscope
-# Default: tier-dependent (gemma4:e2b for smart, gemma4:e4b for autonomous).
+# v0.7.0 compiled defaults per backend (resolved by src/config.rs::backend_default_model):
+#   "gemma3:4b"         — Ollama (default fallback when backend is unset or "ollama")
+#   "grok-4.3"          — xAI
+#   "gpt-5"             — OpenAI
+#   "claude-opus-4.7"   — Anthropic (via OpenAI shim)
+#   "gemini-2.0-flash"  — Google Gemini
+#   "deepseek-chat"     — DeepSeek
+#   "moonshot-v1-8k"    — Kimi / Moonshot
+#   "qwen-max"          — Qwen / Dashscope
+#   "mistral-large-latest" — Mistral
+#   "llama-3.3-70b-versatile" — Groq
+#   "meta-llama/Llama-3.3-70B-Instruct-Turbo" — Together AI
+#   "llama-3.3-70b"     — Cerebras
+#   "openai/gpt-5"      — OpenRouter
+#   "accounts/fireworks/models/llama-v3p3-70b-instruct" — Fireworks
+#   "local-model"       — LMStudio
 # Prefer AI_MEMORY_LLM_MODEL env var over this config field at v0.7.0.
-# llm_model = "gemma4:e2b"
+# llm_model = "gemma3:4b"
 
 # ---------------------------------------------------------------------------
 # LEGACY → v2: [reranker].enabled
@@ -524,7 +532,7 @@ The `--profile` flag **must** be passed in the MCP args — `config.toml` has no
 
 ## Hooks (v0.7+)
 
-The hook pipeline (Track G of `attested-cortex`) adds **20 lifecycle events** at every memory operation point, turning the substrate into a programmable extension surface. Hooks are **default off** — a v0.7 install with no `~/.config/ai-memory/hooks.toml` behaves identically to v0.6.4.
+The hook pipeline (Track G of `attested-cortex`) adds **25 lifecycle events** at every memory operation point, turning the substrate into a programmable extension surface. 20 baseline events (PreStore/PostStore/PreRecall/PostRecall/PreSearch/PostSearch/PreDelete/PostDelete/PrePromote/PostPromote/PreLink/PostLink/PreConsolidate/PostConsolidate/PreGovernanceDecision/PostGovernanceDecision/OnIndexEviction/PreArchive/PreTranscriptStore/PostTranscriptStore) plus 5 v0.7.0 additions (PreRecallExpand, PreReflect, PostReflect, PreCompaction, OnCompactionRollback). Authoritative enum: `src/hooks/events.rs::HookEvent`. Hooks are **default off** — a v0.7 install with no `~/.config/ai-memory/hooks.toml` behaves identically to v0.6.4.
 
 ```toml
 # ~/.config/ai-memory/hooks.toml
@@ -1143,7 +1151,7 @@ Both are cleaned up on graceful shutdown (the daemon runs `PRAGMA wal_checkpoint
 
 Maximum request body size: 50 MB.
 
-The HTTP daemon exposes **73 routes** at v0.7.0 (canonical count via `grep -oE '"/api/v1[^"]*"\|"/metrics"' src/lib.rs \| sort -u \| wc -l`; the table below lists the high-traffic surfaces — see [`docs/API_REFERENCE.md`](API_REFERENCE.md) for the complete enumeration):
+The HTTP daemon exposes **87 production `.route(...)` registrations / 73 unique URL paths** at v0.7.0 (canonical count via codegraph `codegraph_search kind=route limit=100` filtered to `src/lib.rs` excluding the `#[cfg(test)]`-gated `/slow` route at line 582; multi-line-aware path extraction via `awk '/\.route\(/{in=1}in&&/"\/[^"]*"/{match($0,/"\/[^"]*"/);print substr($0,RSTART,RLENGTH);in=0}' src/lib.rs | sort -u`. The table below lists the high-traffic surfaces — see [`docs/API_REFERENCE.md`](API_REFERENCE.md) for the complete enumeration):
 
 | Method | Path | Description |
 |--------|------|-------------|

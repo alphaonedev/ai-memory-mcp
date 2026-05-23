@@ -2,7 +2,7 @@
 
 **Audience:** operators wiring ai-memory's `smart` / `autonomous` tiers to a specific LLM provider via an MCP-capable AI client (Claude Code, Claude Desktop, Cursor, Codex CLI, Cline, Continue, Zed, Windsurf, Goose, Roo Code, Aider, Cody, Gemini CLI, OpenClaw, …).
 
-**Why this page exists.** ai-memory v0.7.0 (#1067 / #1142 / #1143) ships a provider-agnostic LLM client. Any of 16+ backends can power the smart/autonomous tiers — local Ollama, LMStudio, vLLM, llama.cpp server, xAI Grok, OpenAI, Anthropic, Google Gemini, DeepSeek, Kimi/Moonshot, Qwen/Dashscope, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, plus the generic `openai-compatible` escape hatch for anything else that speaks the OpenAI wire shape.
+**Why this page exists.** ai-memory v0.7.0 (#1067 / #1142 / #1143) ships a provider-agnostic LLM client. **15 vendor aliases + the generic `openai-compatible` escape hatch + native Ollama = 17 acceptable values** for `AI_MEMORY_LLM_BACKEND` — local Ollama, LMStudio, vLLM, llama.cpp server, xAI Grok, OpenAI, Anthropic, Google Gemini, DeepSeek, Kimi/Moonshot, Qwen/Dashscope, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks. Authoritative selector list lives in `src/llm.rs::resolve_backend_alias`; compiled default models per backend live in `src/config.rs::backend_default_model`.
 
 The selector is the `AI_MEMORY_LLM_BACKEND` environment variable, paired with `AI_MEMORY_LLM_API_KEY` (or a per-vendor fallback like `XAI_API_KEY`) and `AI_MEMORY_LLM_MODEL`. **Setting those vars in `.zshrc` / `.bashrc` / `.profile` is sufficient for the standalone `ai-memory` CLI and the HTTP daemon — but it is NOT sufficient for MCP usage.**
 
@@ -18,7 +18,7 @@ export XAI_API_KEY=xai-...
 export AI_MEMORY_LLM_MODEL=grok-4.3
 ```
 
-…will let `ai-memory mcp --tier autonomous` produce `LLM ready (backend=xai, model=grok-4.3)` when you run it manually from that shell. It will silently fall back to the legacy Ollama default (`gemma4:e4b`) when Claude Code / Cursor / etc. spawn the same binary.
+…will let `ai-memory mcp --tier autonomous` produce `LLM ready (backend=xai, model=grok-4.3)` when you run it manually from that shell. It will silently fall back to the legacy Ollama default (`gemma3:4b`) when Claude Code / Cursor / etc. spawn the same binary.
 
 The fix: **the LLM env vars MUST live inside the MCP server config's `env:` block.** Recipes below show this for every supported backend.
 
@@ -32,7 +32,7 @@ ai-memory: LLM client is OpenAI-compatible (non-Ollama wire shape);
            building dedicated Ollama embed client at http://localhost:11434 (#1143)
 ```
 
-The second line appears only when `backend` is non-Ollama and confirms the embed-client wire-shape disambiguation from #1143 is taking effect (semantic recall still uses Ollama-native embed at `localhost:11434` while chat goes to the cloud vendor). If you see `llm=gemma4:e4b` or another local Ollama tag when you intended a cloud backend, the `env:` block didn't land — re-check the path of the MCP config file your AI client actually reads.
+The second line appears only when `backend` is non-Ollama and confirms the embed-client wire-shape disambiguation from #1143 is taking effect (semantic recall still uses Ollama-native embed at `localhost:11434` while chat goes to the cloud vendor). If you see `llm=gemma3:4b` or another local Ollama tag when you intended a cloud backend, the `env:` block didn't land — re-check the path of the MCP config file your AI client actually reads.
 
 ## The canonical recipe shape
 
@@ -74,7 +74,7 @@ No env block is required — Ollama at `http://localhost:11434` is the default. 
       "args": ["--db", "~/.claude/ai-memory.db", "mcp", "--tier", "autonomous"],
       "env": {
         "AI_MEMORY_LLM_BACKEND": "ollama",
-        "AI_MEMORY_LLM_MODEL": "gemma4:e4b",
+        "AI_MEMORY_LLM_MODEL": "gemma3:4b",
         "AI_MEMORY_LLM_BASE_URL": "http://localhost:11434"
       }
     }
@@ -85,13 +85,13 @@ No env block is required — Ollama at `http://localhost:11434` is the default. 
 | Knob | Default | Notes |
 |---|---|---|
 | `AI_MEMORY_LLM_BACKEND` | `ollama` | Implied when unset. |
-| `AI_MEMORY_LLM_MODEL` | `gemma4:e2b` (smart) / `gemma4:e4b` (autonomous) | Any locally-pulled Ollama tag. `ollama pull <tag>` first. |
+| `AI_MEMORY_LLM_MODEL` | `gemma3:4b` (v0.7.0 compiled default for Ollama backend per `src/config.rs::backend_default_model`) | Any locally-pulled Ollama tag. `ollama pull <tag>` first. |
 | `AI_MEMORY_LLM_BASE_URL` | `http://localhost:11434` | Override for remote Ollama on the LAN. Legacy `OLLAMA_BASE_URL` is still honoured. |
 
 Pull the model once before first MCP session:
 
 ```bash
-ollama pull gemma4:e4b   # ~2.3 GB Q4 — autonomous default
+ollama pull gemma3:4b   # v0.7.0 compiled default for Ollama backend
 ```
 
 ## LMStudio (local)
@@ -170,14 +170,14 @@ Fallback env var: `XAI_API_KEY` is honoured if `AI_MEMORY_LLM_API_KEY` is unset.
       "env": {
         "AI_MEMORY_LLM_BACKEND": "openai",
         "AI_MEMORY_LLM_API_KEY": "sk-...",
-        "AI_MEMORY_LLM_MODEL": "gpt-4o"
+        "AI_MEMORY_LLM_MODEL": "gpt-5"
       }
     }
   }
 }
 ```
 
-Fallback env var: `OPENAI_API_KEY`. Common tags: `gpt-4o`, `gpt-4o-mini`, `o1-mini`.
+Fallback env var: `OPENAI_API_KEY`. v0.7.0 compiled default: `gpt-5`. Common tags: `gpt-5`, `gpt-5-mini`, `gpt-4o`, `o1-mini`.
 
 ## Anthropic
 
@@ -192,14 +192,14 @@ ai-memory talks to Anthropic via the OpenAI-compatible shim at `https://api.anth
       "env": {
         "AI_MEMORY_LLM_BACKEND": "anthropic",
         "AI_MEMORY_LLM_API_KEY": "sk-ant-...",
-        "AI_MEMORY_LLM_MODEL": "claude-sonnet-4-6"
+        "AI_MEMORY_LLM_MODEL": "claude-opus-4.7"
       }
     }
   }
 }
 ```
 
-Fallback env var: `ANTHROPIC_API_KEY`. Common tags: `claude-opus-4-7`, `claude-sonnet-4-6`, `claude-haiku-4-5-20251001`.
+Fallback env var: `ANTHROPIC_API_KEY`. v0.7.0 compiled default: `claude-opus-4.7`. Common tags: `claude-opus-4.7`, `claude-sonnet-4-6`, `claude-haiku-4-5-20251001`.
 
 ## Google Gemini
 
@@ -334,7 +334,7 @@ Fallback env var: `GROQ_API_KEY`. Common tags: `llama-3.3-70b-versatile`, `mixtr
       "env": {
         "AI_MEMORY_LLM_BACKEND": "together",
         "AI_MEMORY_LLM_API_KEY": "...",
-        "AI_MEMORY_LLM_MODEL": "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo"
+        "AI_MEMORY_LLM_MODEL": "meta-llama/Llama-3.3-70B-Instruct-Turbo"
       }
     }
   }
@@ -376,7 +376,7 @@ OpenRouter is a unified gateway — use `<vendor>/<model>` slugs.
       "env": {
         "AI_MEMORY_LLM_BACKEND": "openrouter",
         "AI_MEMORY_LLM_API_KEY": "sk-or-...",
-        "AI_MEMORY_LLM_MODEL": "anthropic/claude-sonnet-4-6"
+        "AI_MEMORY_LLM_MODEL": "openai/gpt-5"
       }
     }
   }
@@ -496,7 +496,7 @@ ai-memory: atomisation engine ready (curator=LlmCurator)
 ai-memory MCP server started (stdio, tier=autonomous)
 ```
 
-If you see `llm=gemma4:e4b` or `llm=gemma4:e2b` when you intended a non-Ollama backend, the `env:` block isn't being picked up — re-check the path of the config file your AI client actually reads (see [`platforms.md`](platforms.md) for the per-client path table).
+If you see `llm=gemma3:4b` or another local Ollama tag when you intended a non-Ollama backend, the `env:` block isn't being picked up — re-check the path of the config file your AI client actually reads (see [`platforms.md`](platforms.md) for the per-client path table).
 
 ## Multi-agent / fleet / multi-DC considerations
 
@@ -618,7 +618,7 @@ default base URL with `AI_MEMORY_LLM_BASE_URL`:
     "AI_MEMORY_LLM_BACKEND": "openai",
     "AI_MEMORY_LLM_BASE_URL": "https://your-azure-openai-resource.openai.azure.com/v1",
     "AI_MEMORY_LLM_API_KEY": "...",
-    "AI_MEMORY_LLM_MODEL": "gpt-4o"
+    "AI_MEMORY_LLM_MODEL": "gpt-5"
   }
 }
 ```

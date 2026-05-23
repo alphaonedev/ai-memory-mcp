@@ -169,7 +169,7 @@ api_key_file = "/etc/ai-memory/api.key"  # mode 0400, owned by service user</cod
     <dt>stdio MCP</dt>
     <dd><code>ai-memory mcp</code> &mdash; long-lived stdio subprocess, launched by the AI client. Best for single-developer local use.</dd>
     <dt>HTTP daemon</dt>
-    <dd><code>ai-memory serve</code> &mdash; Axum REST on port 9077, 88 route registrations / 44 unique URL paths. Best for shared org deployments with mTLS or API-key gating.</dd>
+    <dd><code>ai-memory serve</code> &mdash; Axum REST on port 9077, 87 route registrations / 73 unique URL paths. Best for shared org deployments with mTLS or API-key gating.</dd>
     <dt>autonomous curator</dt>
     <dd><code>ai-memory curate</code> &mdash; long-running consolidation + reflection loop. Provider-agnostic (#1067): backs onto Ollama (local) or any OpenAI-compatible vendor via <code>AI_MEMORY_LLM_BACKEND</code> &mdash; xAI Grok, OpenAI, Anthropic, Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, llama.cpp-server. Best as a sidecar to the HTTP daemon.</dd>
     <dt>quorum sync</dt>

@@ -407,17 +407,22 @@ ai-memory --db /var/lib/ai-memory/store.db serve \
   --bind 127.0.0.1:9077 \
   --tier semantic
 
-# Each agent is a separate MCP client (or HTTP client) pointing at the same store
+# Each agent is a separate MCP client (or HTTP client) pointing at the same store.
+# MCP is stdio JSON-RPC, not an HTTP endpoint — spawn ai-memory mcp directly.
 # In .mcp.json for each agent's Claude Code config:
 {
   "mcpServers": {
     "memory": {
-      "command": "curl",
-      "args": ["-s", "-X", "POST", "http://127.0.0.1:9077/api/v1/mcp"],
+      "command": "ai-memory",
+      "args": ["mcp", "--profile", "full"],
       "env": {"AI_MEMORY_AGENT_ID": "agents/planner"}
     }
   }
 }
+
+# HTTP clients (non-MCP agents) connect to the daemon's REST surface:
+#   curl -s -X POST http://127.0.0.1:9077/api/v1/recall \
+#     -H "X-Agent-Id: agents/planner" -d '{"context": "..."}'
 
 # Agents pass as_agent=agents/&lt;role&gt; on every recall
 # Per-namespace policies set once, enforced forever:

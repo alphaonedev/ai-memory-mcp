@@ -12,7 +12,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ai-memory · Feature Matrix — every tool, endpoint, command</title>
-<meta name="description" content="Complete surface-area atlas: 73 MCP tools at --profile full (7 at --profile core), 88 HTTP routes (44 unique paths) at /api/v1/, 58 CLI subcommands (55 in the default build; canonical counts on the evidence page). Every operation cross-referenced across the three protocol fronts.">
+<meta name="description" content="Complete surface-area atlas: 73 MCP tools at --profile full (7 at --profile core), 87 HTTP routes (73 unique paths) at /api/v1/, 58 CLI subcommands (56 in the default build; canonical counts on the evidence page). Every operation cross-referenced across the three protocol fronts.">
 <meta name="theme-color" content="#0d1117">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/feature-matrix.html">
 <style>
@@ -581,7 +581,7 @@ footer a{color:var(--text-muted)}
           <tr><td><span class="method POST">POST</span></td><td>/api/v1/forget</td><td>Bulk delete by query.</td></tr>
           <tr><td><span class="method POST">POST</span></td><td>/api/v1/consolidate</td><td>Merge N memories into 1.</td></tr>
           <tr><td><span class="method GET">GET</span></td><td>/api/v1/contradictions</td><td>List detected contradiction pairs.</td></tr>
-          <tr><td><span class="method GET">GET</span></td><td>/api/v1/check_duplicate</td><td>Pre-write similarity check.</td></tr>
+          <tr><td><span class="method POST">POST</span></td><td>/api/v1/check_duplicate</td><td>Pre-write similarity check.</td></tr>
 
           <tr><td colspan="3" style="background:var(--bg-raised);font-size:.75rem;letter-spacing:.1em;color:var(--text-muted);text-transform:uppercase;text-align:center;padding:.5rem">— Knowledge graph —</td></tr>
           <tr><td><span class="method POST">POST</span></td><td>/api/v1/links</td><td>Create typed link.</td></tr>
@@ -719,7 +719,7 @@ footer a{color:var(--text-muted)}
           <tr><td class="op">Bulk forget</td><td class="tool">memory_forget</td><td class="endpoint">POST /api/v1/forget</td><td class="cli">forget --pattern</td></tr>
           <tr><td class="op">Consolidate</td><td class="tool">memory_consolidate</td><td class="endpoint">POST /api/v1/consolidate</td><td class="cli">consolidate --ids</td></tr>
           <tr><td class="op">Detect contradiction</td><td class="tool">memory_detect_contradiction</td><td class="endpoint">GET /api/v1/contradictions</td><td class="cli"><span class="none">via curator</span></td></tr>
-          <tr><td class="op">Check duplicate</td><td class="tool">memory_check_duplicate</td><td class="endpoint">GET /api/v1/check_duplicate</td><td class="cli"><span class="none">via store --check</span></td></tr>
+          <tr><td class="op">Check duplicate</td><td class="tool">memory_check_duplicate</td><td class="endpoint">POST /api/v1/check_duplicate</td><td class="cli"><span class="none">via store --check</span></td></tr>
           <tr><td class="op">Create link</td><td class="tool">memory_link</td><td class="endpoint">POST /api/v1/links</td><td class="cli">link &lt;src&gt; &lt;tgt&gt;</td></tr>
           <tr><td class="op">Get links</td><td class="tool">memory_get_links</td><td class="endpoint">GET /api/v1/links/{id}</td><td class="cli"><span class="none">via get (auto-includes)</span></td></tr>
           <tr><td class="op">Taxonomy</td><td class="tool">memory_get_taxonomy</td><td class="endpoint">GET /api/v1/taxonomy</td><td class="cli"><span class="none">via stats</span></td></tr>
