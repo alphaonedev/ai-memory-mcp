@@ -301,24 +301,26 @@ jobs:
           disable-animations: true
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           script: |
-            # v0.7.0 ship-readiness fix (#1159 blocker) — drop
-            # `-o pipefail` because `reactivecircus/android-emulator-runner@v2`
-            # runs this `script:` block under `/usr/bin/sh` (dash on
-            # ubuntu-latest), which rejects pipefail with
-            # "Illegal option -o pipefail" → exit code 2 → workflow
-            # failure on every release/v0.7.0 push. `set -eu` is
-            # sufficient here because the script contains no pipe;
-            # we want fast-fail on any non-zero exit + unbound var.
-            set -eu
-            # Push the test binary into the emulator's filesystem.
+            # v0.7.0 ship-readiness fixes (#1159 blockers):
+            #  (1) `reactivecircus/android-emulator-runner@v2` invokes
+            #      EACH line of this `script:` block as its own
+            #      `/usr/bin/sh -c` invocation. That breaks both
+            #      (a) `set -eu` propagation (each line is independent
+            #      so the flag from line N doesn't apply to line N+1)
+            #      and (b) backslash line-continuations in multi-line
+            #      `adb shell "..."` commands, which dash parses
+            #      per-line and rejects with `Syntax error:
+            #      Unterminated quoted string` on the `\` at EOL.
+            #  (2) The dash shell also rejects `set -o pipefail`
+            #      ("Illegal option -o pipefail") so we keep the
+            #      script entirely posix-sh-safe.
+            # Solution: collapse the multi-line adb-shell invocation
+            # into a single line (no continuations), drop the
+            # outer `set -eu` since each line is its own subprocess
+            # anyway, and use the action's built-in exit-code
+            # propagation (any non-zero exit on any line fails the
+            # whole step).
             adb push "$MOBILE_TEST_BIN" /data/local/tmp/mobile_runtime
             adb shell chmod 755 /data/local/tmp/mobile_runtime
-            # Run with ANDROID_DATA_DIR pointing at a writable
-            # subdir so the harness can place its sandbox DB.
-            adb shell "ANDROID_DATA_DIR=/data/local/tmp/ai-memory-sandbox \
-                       mkdir -p /data/local/tmp/ai-memory-sandbox && \
-                       /data/local/tmp/mobile_runtime --test-threads=1" || {
-              echo "::error::mobile_runtime tests failed on Android emulator"
-              exit 1
-            }
+            adb shell "mkdir -p /data/local/tmp/ai-memory-sandbox && ANDROID_DATA_DIR=/data/local/tmp/ai-memory-sandbox /data/local/tmp/mobile_runtime --test-threads=1"
             echo "::notice::Android emulator mobile_runtime — all tests green"
