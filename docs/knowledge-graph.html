@@ -95,7 +95,7 @@ footer a{color:var(--text-muted)}
     <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Knowledge Graph</span></a>
     <div class="right">
       <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
-      <a href="whats-new-v063.html" style="color:#ffb86b">v0.6.3</a>
+      <a href="whats-new-v07.html" style="color:#ffb86b">v0.7.0</a>
       <div class="menu">
         <button class="menu-btn">Audiences<span class="caret">▾</span></button>
         <div class="menu-pane">
@@ -372,9 +372,9 @@ CREATE INDEX idx_links_relation     (relation, valid_from);</div>
       <div class="tool-desc">Walks currently-valid edges from a starting memory or entity. Recursive CTE in v0.6.3, replaced by Apache AGE Cypher in v0.7. Supports filters by relation type, depth, and namespace.</div>
       <div class="snip"><span class="cm">// MCP — memory_kg_query</span>
 {
-  <span class="key">"start_id"</span>:  <span class="val">"550e8400-…"</span>,
+  <span class="key">"source_id"</span>:  <span class="val">"550e8400-…"</span>,
   <span class="key">"relations"</span>: [<span class="val">"supersedes"</span>, <span class="val">"derived_from"</span>],   <span class="cm">// optional filter</span>
-  <span class="key">"depth"</span>:     <span class="num">3</span>,                              <span class="cm">// optional · default 3 · max 8</span>
+  <span class="key">"max_depth"</span>: <span class="num">1</span>,                              <span class="cm">// optional · default 1 · max 5</span>
   <span class="key">"as_of"</span>:     <span class="val">"2026-04-15T00:00:00Z"</span>            <span class="cm">// optional · point-in-time (default: now)</span>
 }
 

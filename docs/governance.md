@@ -48,7 +48,9 @@ ai-memory governance migrate-to-permissions --apply
 ai-memory governance install-defaults
 
 # Sign a rule with the operator key (7th-form `attest_level = "signed"`)
-ai-memory rules sign rule.json
+# Seed-signing (v0.7.0): the verb is `rules sign-seed`, not `rules sign`.
+# Per-rule signing is via --sign flag on `rules add/enable/disable/remove`.
+ai-memory rules sign-seed rule-seed.json
 
 # List the active rule corpus (CLI equivalent of memory_rule_list)
 ai-memory rules list
