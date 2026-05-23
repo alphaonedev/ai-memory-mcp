@@ -203,23 +203,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Free disk + add swap (#1148 belt-and-suspenders)
+      - name: Free disk + add swap (#1148 belt-and-suspenders, aggressive)
         run: |
-          # Free ~10 GB of pre-installed cruft we don't need (dotnet
-          # toolchain, Android SDK, GHC, CodeQL) — reduces inode cache
-          # + working-set pressure during heavy link steps.
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          # Aggressive cleanup — the sal+sal-postgres instrumented
+          # coverage build's target/llvm-cov-target/ can exceed 20 GB
+          # under heavy integration-test instrumentation. Free
+          # everything we don't need before building.
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/.ghcup \
+                      /usr/local/share/powershell /usr/local/share/chromium \
+                      /usr/local/share/boost /usr/local/lib/node_modules \
+                      /opt/google /usr/lib/jvm /opt/microsoft \
+                      /usr/share/swift /usr/share/miniconda || true
+          sudo docker system prune -af --volumes || true
+          sudo apt-get autoremove --purge -y || true
           sudo apt-get clean
-          # Add 8 GB swap on top of the 14 GB the runner ships with.
-          # mold + dev-profile trim should fit under physical RAM, but
-          # the extra swap is a guard against unexpected peaks.
-          sudo fallocate -l 8G /swapfile-1148
-          sudo chmod 600 /swapfile-1148
-          sudo mkswap /swapfile-1148
-          sudo swapon /swapfile-1148
+          # Swap on /mnt (the ephemeral data disk, ~70 GB) so the 8 GB
+          # doesn't eat into the root partition.
+          sudo fallocate -l 8G /mnt/swapfile-1148
+          sudo chmod 600 /mnt/swapfile-1148
+          sudo mkswap /mnt/swapfile-1148
+          sudo swapon /mnt/swapfile-1148
           echo "::group::memory + disk after"
           free -h
           df -h /
+          df -h /mnt
           echo "::endgroup::"
 
       - name: Install Rust stable
