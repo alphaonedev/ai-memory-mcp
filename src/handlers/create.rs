@@ -427,7 +427,12 @@ fn insert_create_with_quota(
         bytes: payload_bytes,
     };
     if !quota_agent_id.is_empty() {
-        if let Err(e) = crate::quotas::check_and_record(&lock.0, &quota_agent_id, quota_op) {
+        // v0.7.0 #1156 — charge against the per-namespace accounting
+        // row (the v50 PK extension). Per-namespace allotments hold
+        // even when a single agent writes across many namespaces.
+        if let Err(e) =
+            crate::quotas::check_and_record(&lock.0, &quota_agent_id, &mem.namespace, quota_op)
+        {
             // Map QuotaCheckError to the same wire shape the rest of
             // the daemon uses for quota breaches: 429 with a
             // `code: "QUOTA_EXCEEDED"` envelope so callers can switch
@@ -480,7 +485,11 @@ fn insert_create_with_quota(
             // crate::mcp::handle_store). Refund is best-effort — a refund
             // failure is logged but does not change the response.
             if !quota_agent_id.is_empty() {
-                if let Err(re) = crate::quotas::refund_op(&lock.0, &quota_agent_id, quota_op) {
+                // #1156 — refund lands on the same `(agent_id,
+                // namespace)` row check_and_record above incremented.
+                if let Err(re) =
+                    crate::quotas::refund_op(&lock.0, &quota_agent_id, &mem.namespace, quota_op)
+                {
                     tracing::warn!(
                         "quota refund_op failed for agent {}: {}",
                         &quota_agent_id,

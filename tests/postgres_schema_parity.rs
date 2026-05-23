@@ -64,7 +64,13 @@ use common::postgres_url;
 // ladder head (`src/store/postgres.rs:417` + dispatch at line 1141).
 // #1025 introduced v49 (the archived_memories full-v0.7.0-column-carry
 // migration); this constant was previously stale.
-const POSTGRES_CURRENT_VERSION: i64 = 49;
+//
+// #1156: bumped 49 → 50 to match the post-#1156 `migrate_v50` Postgres
+// ladder head. #1156 introduced v50 (the per-namespace K8 quota
+// dimension extending `agent_quotas` PK from `(agent_id)` to
+// `(agent_id, namespace)`). The constant is kept in lock-step with
+// `src/store/postgres.rs::CURRENT_SCHEMA_VERSION`.
+const POSTGRES_CURRENT_VERSION: i64 = 50;
 
 /// Open an out-of-band `sqlx` pool against the same URL the adapter
 /// uses. We deliberately bypass `PostgresStore` for the inspection

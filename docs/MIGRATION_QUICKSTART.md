@@ -18,12 +18,12 @@ All three converge on the **same underlying steps**:
 
 The differences are only in fleet orchestration, security-posture
 staging, and idempotency framing. **The DB schema migration
-(v33 → v49) is fully automatic on first open** — no operator
+(v33 → v50) is fully automatic on first open** — no operator
 action required for the database itself.
 
 > **Compatibility statement.** v0.7.0 is **backward-incompatible
 > at the DB schema layer past v34** (sqlite). Once a v0.7.0 binary
-> opens a v0.6.x DB and walks it to v49, a v0.6.x binary will refuse
+> opens a v0.6.x DB and walks it to v50, a v0.6.x binary will refuse
 > to open it. **Always back up the DB before upgrading.** Cross-binary
 > alternation is not supported.
 
@@ -96,7 +96,7 @@ The `LLM Reachability (#1146)` section reports the resolved
 HTTP status. If you see WARN or CRIT there, see
 [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md) §"no LLM client configured".
 
-**That's it.** The DB schema walks v33 → v49 automatically when
+**That's it.** The DB schema walks v33 → v50 automatically when
 the v0.7.0 binary opens the DB. Your legacy config.toml's flat
 fields have been rewritten to the v2 sectioned shape; a
 timestamped backup lives next to the original.
@@ -167,7 +167,7 @@ EOF
 ai-memory governance migrate-to-permissions    # dry-run
 ai-memory governance migrate-to-permissions --apply
 
-# 7. Start the fleet — DB walks v33 → v49 on first open
+# 7. Start the fleet — DB walks v33 → v50 on first open
 for H in $FLEET; do ssh "$H" 'ai-memory start'; done
 
 # 8. Verify per host
@@ -198,7 +198,7 @@ for H in $FLEET; do ssh "$H" 'ai-memory restart && ai-memory doctor'; done
 If you run `ai-memory serve --store-url postgres://…` with the
 `sal-postgres` feature, the schema upgrade happens via
 `ai-memory schema-init --upgrade` walking the in-process
-`migrate_v34()…migrate_v49()` async ladder. Apache AGE
+`migrate_v34()…migrate_v50()` async ladder. Apache AGE
 (`memory_graph`) is provisioned by the same command if missing.
 See [`docs/migration-v0.7.0-postgres.md`](migration-v0.7.0-postgres.md)
 for the postgres-specific recipe.

@@ -4,10 +4,10 @@
   "verification_timestamp_utc": "2026-05-23T16:30:22Z",
   "verification_commit_sha": "4add7a8528d4c16d696b391ec6e2890269669a84",
   "verification_branch": "release/v0.7.0",
-  "schema_version_sqlite": 49,
-  "schema_version_postgres": 49,
+  "schema_version_sqlite": 50,
+  "schema_version_postgres": 50,
   "parity_test": "tests/postgres_schema_parity.rs::schema_versions_match_across_adapters",
-  "schema_authority_source": "src/storage/migrations.rs:516 — const CURRENT_SCHEMA_VERSION: i64 = 49",
+  "schema_authority_source": "src/storage/migrations.rs — const CURRENT_SCHEMA_VERSION: i64 = 50",
   "test_counts": {
     "total_test_attributes": 6961,
     "lib_tests": 4830,

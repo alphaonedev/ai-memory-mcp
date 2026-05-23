@@ -54,7 +54,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ai_memory::quotas::{
-    self, DEFAULT_MAX_LINKS_PER_DAY, DEFAULT_MAX_MEMORIES_PER_DAY, QuotaCheckError, QuotaOp,
+    self, DEFAULT_MAX_LINKS_PER_DAY, DEFAULT_MAX_MEMORIES_PER_DAY, GLOBAL_NAMESPACE,
+    QuotaCheckError, QuotaOp,
 };
 use rusqlite::Connection;
 use tokio::sync::Mutex;
@@ -105,7 +106,7 @@ async fn federation_scale_no_deadlock_no_overshoot_no_loss() {
                 let conn = db.lock().await;
                 let op = QuotaOp::Memory { bytes: 1024 };
                 let call_start = std::time::Instant::now();
-                let res = quotas::check_and_record(&conn, &agent_id, op);
+                let res = quotas::check_and_record(&conn, &agent_id, GLOBAL_NAMESPACE, op);
                 (res.map(|()| ()), call_start.elapsed())
             }));
         }
@@ -178,7 +179,7 @@ async fn federation_scale_no_deadlock_no_overshoot_no_loss() {
     // -----------------------------------------------------------------
 
     let conn = db.lock().await;
-    let all_status = quotas::list_status(&conn).expect("list_status");
+    let all_status = quotas::list_status(&conn, None).expect("list_status");
     assert_eq!(
         all_status.len(),
         N_AGENTS,
@@ -236,7 +237,8 @@ async fn federation_scale_links_axis_no_overshoot() {
             let agent_id = agent_id.clone();
             handles.push(tokio::spawn(async move {
                 let conn = db.lock().await;
-                quotas::check_and_record(&conn, &agent_id, QuotaOp::Link).map(|()| ())
+                quotas::check_and_record(&conn, &agent_id, GLOBAL_NAMESPACE, QuotaOp::Link)
+                    .map(|()| ())
             }));
         }
     }
@@ -266,7 +268,7 @@ async fn federation_scale_links_axis_no_overshoot() {
     );
 
     let conn = db.lock().await;
-    let all_status = quotas::list_status(&conn).expect("list_status");
+    let all_status = quotas::list_status(&conn, None).expect("list_status");
     for status in &all_status {
         assert_eq!(
             status.current_links_today, M_OPS_PER_AGENT as i64,

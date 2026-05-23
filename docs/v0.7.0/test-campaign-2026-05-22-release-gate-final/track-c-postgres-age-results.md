@@ -1,5 +1,16 @@
 # Track C — Postgres + Apache AGE Full Regression Results (2026-05-22)
 
+> **Post-campaign update (2026-05-23):** #1156 (per-namespace K8 quota
+> dimension extension) bumped both adapters to schema **v50** after this
+> campaign closed. The v49 references below reflect the state at the
+> 2026-05-22 gate; the v50 bump is additive (`agent_quotas` PK
+> `(agent_id)` → `(agent_id, namespace)`) and does not invalidate any
+> of the C.1-C.11 results. The current v15 → v50 ladder is exercised
+> by `tests/per_namespace_quota.rs` + the existing
+> `tests/postgres_schema_parity.rs::current_version_matches_canonical`
+> assertion (now pinned to 50). See `CHANGELOG.md` [Unreleased] for
+> the full v50 narrative.
+
 Track C is the postgres + Apache AGE backend regression at the v0.7.0
 release-gate tip. Two surfaces are exercised under one matrix:
 

@@ -1184,11 +1184,11 @@ pub trait MemoryStore: Send + Sync {
     // ==================================================================
 
     /// Read the agent's quota row, auto-inserting a default row when
-    /// none exists. Mirrors `crate::quotas::get_status` on the SQLite
-    /// path but operates against the adapter-specific `agent_quotas`
-    /// table so postgres-backed daemons surface the same wire shape
-    /// without falling through to the empty `app.db` scratch
-    /// connection.
+    /// none exists. Mirrors `crate::quotas::get_aggregate_status` on
+    /// the SQLite path (v0.7.0 #1156 — returns the agent-wide
+    /// aggregate, summing counters across every namespace the agent
+    /// has written into so the pre-#1156 single-row response shape is
+    /// preserved at the SAL boundary).
     ///
     /// Default returns `UnsupportedCapability`.
     async fn quota_status(&self, _agent_id: &str) -> StoreResult<QuotaStatus> {
@@ -1197,14 +1197,38 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// v0.7.0 #1156 — read the agent's quota row for one specific
+    /// namespace, auto-inserting a default row when none exists.
+    /// Drives the namespace-scoped form of `memory_quota_status` /
+    /// `POST /api/v1/quota/status {agent_id, namespace}`.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    async fn quota_status_ns(&self, _agent_id: &str, _namespace: &str) -> StoreResult<QuotaStatus> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "QUOTA_STATUS_NS".to_string(),
+        })
+    }
+
     /// List every quota row in the substrate, sorted ascending by
-    /// `agent_id`. Operator-facing surface that backs `quota_status`'s
-    /// "no agent_id supplied" path.
+    /// `(agent_id, namespace)`. Operator-facing surface that backs
+    /// `quota_status`'s "no agent_id supplied" path.
     ///
     /// Default returns `UnsupportedCapability`.
     async fn quota_status_list(&self) -> StoreResult<Vec<QuotaStatus>> {
         Err(StoreError::UnsupportedCapability {
             capability: "QUOTA_STATUS_LIST".to_string(),
+        })
+    }
+
+    /// v0.7.0 #1156 — list every quota row in one namespace, sorted
+    /// ascending by `agent_id`. Drives the namespace-scoped form of
+    /// the operator-facing list path (`POST /api/v1/quota/status
+    /// {namespace}` with admin-gate).
+    ///
+    /// Default returns `UnsupportedCapability`.
+    async fn quota_status_list_ns(&self, _namespace: &str) -> StoreResult<Vec<QuotaStatus>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "QUOTA_STATUS_LIST_NS".to_string(),
         })
     }
 

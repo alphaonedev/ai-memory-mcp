@@ -35,23 +35,24 @@ identically on either backend.
 ## Schema parity status (v0.7.0)
 
 As of v0.7.0 release (post Wave 2 + ship-readiness cascade), both
-backends sit at **schema_version=49**. The full v16 → v49 ladder
+backends sit at **schema_version=50**. The full v16 → v50 ladder
 on the postgres side covers: governance inheritance, webhook
 subscriptions, audit chain, transcripts, signed events with the
 V-4 cross-row hash chain (#698), agent quotas, link `attest_level`,
 A2A correlation, smart-load veto, KG temporal-index v2,
 tier-promotion metadata, subscription DLQ, `consolidated_from_agents`
-array, plus the v34 → v49 deltas (recursive-learning depth
+array, plus the v34 → v50 deltas (recursive-learning depth
 columns, Batman Form-4/5 provenance + confidence-calibration
 columns, optimistic-concurrency `version` column at v45,
 `federation_push_dlq` table at v48, archive_memories +14
-columns at v49). The v34 → v49 deltas land via in-process
-`migrate_v34() … migrate_v49()` async functions invoked by
+columns at v49, per-namespace K8 quota dimension at v50 #1156).
+The v34 → v50 deltas land via in-process
+`migrate_v34() … migrate_v50()` async functions invoked by
 `schema-init --upgrade`; they are NOT separate `.sql` files.
 
 If you migrated from sqlite to postgres on v0.7-alpha, your
 postgres db is at v15. Run `ai-memory schema-init --upgrade`
-against v0.7.0 (see "In-place v15 → v49" below) before
+against v0.7.0 (see "In-place v15 → v50" below) before
 pointing a v0.7.0 daemon at it.
 
 ## Pre-flight checklist
@@ -228,7 +229,7 @@ Same dry-run / verify dance. Useful for:
   surfaces (the migration is lossless either direction at v0.7.0
   schema parity).
 
-## In-place v15 → v49 (postgres → postgres on the same host)
+## In-place v15 → v50 (postgres → postgres on the same host)
 
 If you're upgrading an existing v0.7-alpha postgres db (schema v15)
 to v0.7.0.s v49 parity:
@@ -239,7 +240,7 @@ ai-memory schema-init \
   --upgrade
 ```
 
-`schema-init --upgrade` walks the v15 → v49 deltas idempotently (the v34 → v49 layer lands via in-process `migrate_v34()…migrate_v49()` async functions invoked by `--upgrade`).
+`schema-init --upgrade` walks the v15 → v50 deltas idempotently (the v34 → v50 layer lands via in-process `migrate_v34()…migrate_v50()` async functions invoked by `--upgrade`).
 Existing data is preserved; only DDL changes. The migration tool's
 `--in-place` mode is the moral equivalent — pick whichever fits your
 workflow.

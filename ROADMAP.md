@@ -68,7 +68,7 @@ This is the floor every plan below builds on. Numbers are sourced from the publi
 | Modules ≥ 90% coverage (v0.6.3 baseline) | 39 of 47 (7 at 100%) | evidence.html |
 | Platform CI matrix | ubuntu-latest, macos-latest, windows-latest | evidence.html |
 | Schema version (v0.6.3.1) | v19 (was v15 on v0.6.3; ladder v15→v17→v18→v19) | release notes |
-| Schema version (v0.7.0 release HEAD) | **v49** (sqlite) / **v49** (postgres) — ladder v19 → v20 (v0.6.4 audit log) → v22 (v0.7.0 RC: attestation + recursive-learning inclusion) → v29 (L0.7-1 base, recursive-learning Task 1/8 reflection_depth) → v30 (L1-1) → v33 (L2 wave `memory_links.relation` CHECK constraint, commit `58877c7`) → v34 (V-4 closeout #698: `signed_events.prev_hash` + `signed_events.sequence` cross-row chain) → v35 (shadow retention) → v36 (auto_persona_entity_id) → v37 (persona signing atomicity) → v38 (recall_observations) → v39 (provenance_version) → v40 (source-URI backfill) → v41 (federation_push_dlq, #933) → v42 (confidence_tier nullability) → v43 (links temporal columns) → v44 (link attestation columns) → v45 (Gap-1 `version` optimistic-concurrency, #1036) → v46-v48 (capacity / index / DLQ refinements) → v49 (archived_memories full column carry, #1025). Canonical anchors: `CURRENT_SCHEMA_VERSION = 49` in `src/storage/migrations.rs:516` (sqlite) and `src/store/postgres.rs:417` (postgres). | release/v0.7.0 HEAD |
+| Schema version (v0.7.0 release HEAD) | **v50** (sqlite) / **v50** (postgres) — ladder v19 → v20 (v0.6.4 audit log) → v22 (v0.7.0 RC: attestation + recursive-learning inclusion) → v29 (L0.7-1 base, recursive-learning Task 1/8 reflection_depth) → v30 (L1-1) → v33 (L2 wave `memory_links.relation` CHECK constraint, commit `58877c7`) → v34 (V-4 closeout #698: `signed_events.prev_hash` + `signed_events.sequence` cross-row chain) → v35 (shadow retention) → v36 (auto_persona_entity_id) → v37 (persona signing atomicity) → v38 (recall_observations) → v39 (provenance_version) → v40 (source-URI backfill) → v41 (federation_push_dlq, #933) → v42 (confidence_tier nullability) → v43 (links temporal columns) → v44 (link attestation columns) → v45 (Gap-1 `version` optimistic-concurrency, #1036) → v46-v48 (capacity / index / DLQ refinements) → v49 (archived_memories full column carry, #1025) → v50 (per-namespace K8 quota dimension extension, #1156: `agent_quotas` PK `(agent_id)` → `(agent_id, namespace)`, pre-v50 rows backfill to the `_global` sentinel). Canonical anchors: `CURRENT_SCHEMA_VERSION = 50` in `src/storage/migrations.rs` (sqlite) and `src/store/postgres.rs` (postgres). | release/v0.7.0 HEAD |
 
 > **Doc-vs-substrate qualifier.** Schema versions can advance ahead of this document during in-flight work; the doc is updated at every layer §16 gate. Numbers in this row are "as of" the named commit on the named integration branch.
 
@@ -644,6 +644,78 @@ Investment A from issue #654. Train a small model (300M-700M) on Gemma 4 teacher
 
 Optional axum subroute on the HTTP daemon (`ai-memory serve --viewer`) exposing WebSocket stream of memory events + namespace tree + active leases/signals/checkpoints + recent `signed_events`. Default off (security-by-default — no listening port unless explicitly enabled). Protected by an operator-supplied secret when on. Belongs in the next minor after Pillar 1 lands; not blocking v0.8.0.
 
+##### §7.4.G Mature schema-change methodology (sqlite + postgres) (+2 sessions) — v0.8.0 prerequisite, operator-requested 2026-05-23
+
+**Why now.** The v0.7.0 release campaign exposed sustained friction in the
+schema-bump path. Each bump (v34 → v50, sixteen steps across the cycle)
+required mechanical updates across **two** `CURRENT_SCHEMA_VERSION`
+constants (sqlite + postgres), a `MAX_SUPPORTED_SCHEMA` boot-banner
+ceiling, a `POSTGRES_CURRENT_VERSION` parity test, **two** migration
+arms (the sqlite `if version < N` block + the postgres `migrate_vN()`
+async fn), an on-disk `.sql` file (sqlite-only — postgres runs inline),
+greenfield SCHEMA constant edits where applicable, MCP `serverInfo`
+schema-version test fixtures, MCP tools/list snapshot files, the wire
+shape contract snapshot, and ~25+ documentation references across
+README / ROADMAP / CHANGELOG / docs/* / GitHub Pages. The #1156 ship
+hit every layer.
+
+**The methodology gap.** Today the bump discipline is encoded in
+prose comments in the constant declaration + the migration-arm
+docstrings; nothing **mechanically enforces** the lockstep. Drift
+between adapters is caught only by an integration-test assertion
+(`current_schema_version_matches_sqlite_ladder` at
+`src/store/postgres.rs:11789`) — useful as a tripwire but reactive,
+not preventive.
+
+**Scope (v0.8.0 prerequisite).** Land a single-source-of-truth
+schema-version registry that:
+
+1. **One file. One bump.** Move `CURRENT_SCHEMA_VERSION` declaration
+   to a `schema/manifest.toml` (or equivalent build-script-readable
+   source) so a bump is a single-line edit. Both sqlite and postgres
+   constants resolve from that file via `build.rs` at compile time,
+   eliminating the current two-constant drift surface.
+2. **Migration-arm registry.** Per-version migration metadata
+   (file path, narrative, NSA CSI mapping, postgres mirror status)
+   declared in the same manifest. The migration ladder is generated
+   from the manifest rather than maintained by hand in each adapter.
+3. **Adapter-parity preflight.** A `scripts/schema-preflight.sh`
+   that asserts every manifest entry has a sqlite arm AND a postgres
+   arm AND a test pinning the bump. Runs in CI as a gate; fails the
+   build if any are missing. Replaces the current `assert_eq!`
+   tripwire with a structural check.
+4. **Boot-banner ceiling auto-derived.** `MAX_SUPPORTED_SCHEMA` and
+   the boot-banner ceiling derive from the manifest's max version,
+   not a hand-maintained constant.
+5. **Doc-drift surfacing.** A `scripts/schema-doc-drift.sh` greps
+   for hardcoded schema-version literals (`v[0-9]+`,
+   `CURRENT_SCHEMA_VERSION = [0-9]+`, etc.) outside the manifest's
+   own files + an allowlist of historical-context references, and
+   warns or fails the build on drift. Operator-tunable threshold.
+6. **Codegraph integration.** Schema-version queries land as
+   first-class codegraph node attributes so a sub-agent can resolve
+   "what's the current schema?" via the index rather than the
+   constant declaration.
+
+**Stretch goals (deferred unless surfaced as v0.8.0 blockers):**
+- Schema downgrade discipline (currently undefined — migrations are
+  forward-only; v0.8.0 may need rollback support for the federation
+  expansion).
+- Cross-adapter schema diff tool (`ai-memory schema diff --from
+  postgres --to sqlite`).
+- Schema-attestation pinning: every bumped schema_version stamps a
+  signed audit row so a downstream client can verify it's talking to
+  a daemon at the expected schema without trusting the wire-shape
+  declaration.
+
+**Provenance.** Operator-requested 2026-05-23 alongside #1156: "longer
+term is there a better design to handle future schema changes in
+sqlite and postgresql that we can put on the roadmap - for a mature
+methodology to handle schema changes". This subsection is the
+roadmap entry that closes that loop. Implementation tracked under
+issue #1156's follow-up bucket (filed at v0.7.0 → v0.8.0 cycle
+boundary).
+
 #### Hook pipeline expansion — v0.7.0 → v0.8.0
 
 v0.7.0 grand-slam ships **25 lifecycle events** on `feat/v0.7.0-layer-1` (20 plan baseline + `pre_recall_expand` G10 + `pre_reflect` + `post_reflect` recursive-learning Task 6/8 + `pre_compaction` + `on_compaction_rollback` L1-7). v0.8.0 adds 10 events for coordination substrate on top of that. Backward compatible.
@@ -1210,7 +1282,7 @@ Full starter prompts for every agent (A–P) live in issue #1005. The body of th
 > - `docs/v0.7.0/release-notes.md`
 > - CHANGELOG.md `[Unreleased]` section
 
-ai-memory v0.6.3 shipped clean: 1,809 tests, 93.08% coverage, ship-gate 4/4, A2A 48/48 mTLS, 5/5 channels, LongMemEval R@5 97.8% / R@10 99.0% / R@20 99.8%, 43 MCP tools, schema v15. v0.6.3.1 then landed (2026-04-30) with the never-lose-context release: 1,886 lib tests (+281), 93.84% line coverage, schema v19 (ladder v15→v17→v18→v19), 7 new CLI surfaces (boot/install/wrap/logs/audit/doctor/bench), and 17 documented integrations across 10 platforms. v0.7.0 ship state (release/v0.7.0 HEAD): schema **v49 sqlite + v49 postgres in lockstep** (CURRENT_SCHEMA_VERSION = 49; ladder v33 → v49 includes V-4 closeout #698 `signed_events` cross-row hash chain at v34, federation_push_dlq at v48, archive_memories +14 columns at v49), **73 MCP tools at `--profile full` / 7 at `--profile core`** (per `Profile::full().expected_tool_count()` and `Profile::core().expected_tool_count()` in src/profile.rs), 7 Agent Skills tools (L1-5 register/list/get/resource/export + L2-6 `promote_from_reflection` + L2-7 `compositional_context`), **25 hook lifecycle events** (20 baseline + 5 v0.7.0 additions PreRecallExpand / PreReflect / PostReflect / PreCompaction / OnCompactionRollback per src/hooks/events.rs::HookEvent), 87 production HTTP route registrations / 73 unique URL paths, 58 CLI subcommands (56 in default build), and Policy Engine Option B foundation (L1-6 substrate rules + PE-1/PE-2/PE-3 all merged).
+ai-memory v0.6.3 shipped clean: 1,809 tests, 93.08% coverage, ship-gate 4/4, A2A 48/48 mTLS, 5/5 channels, LongMemEval R@5 97.8% / R@10 99.0% / R@20 99.8%, 43 MCP tools, schema v15. v0.6.3.1 then landed (2026-04-30) with the never-lose-context release: 1,886 lib tests (+281), 93.84% line coverage, schema v19 (ladder v15→v17→v18→v19), 7 new CLI surfaces (boot/install/wrap/logs/audit/doctor/bench), and 17 documented integrations across 10 platforms. v0.7.0 ship state (release/v0.7.0 HEAD): schema **v50 sqlite + v50 postgres in lockstep** (CURRENT_SCHEMA_VERSION = 50; ladder v33 → v50 includes V-4 closeout #698 `signed_events` cross-row hash chain at v34, federation_push_dlq at v48, archive_memories +14 columns at v49, per-namespace K8 quota dimension extension at v50, #1156), **73 MCP tools at `--profile full` / 7 at `--profile core`** (per `Profile::full().expected_tool_count()` and `Profile::core().expected_tool_count()` in src/profile.rs), 7 Agent Skills tools (L1-5 register/list/get/resource/export + L2-6 `promote_from_reflection` + L2-7 `compositional_context`), **25 hook lifecycle events** (20 baseline + 5 v0.7.0 additions PreRecallExpand / PreReflect / PostReflect / PreCompaction / OnCompactionRollback per src/hooks/events.rs::HookEvent), 87 production HTTP route registrations / 73 unique URL paths, 58 CLI subcommands (56 in default build), and Policy Engine Option B foundation (L1-6 substrate rules + PE-1/PE-2/PE-3 all merged).
 
 The audit found 22 distinct gaps. None block the published v0.6.3 claims. One (G1 — namespace-inheritance enforcement) is a security-shaped bug that gets a cutline-protected slot in v0.7 Bucket 3. Eight are capabilities-JSON theater that v0.6.3.1 Capabilities v2 makes honest. The remaining thirteen distribute cleanly across v0.6.3.1 / v0.7 / v0.8 / v0.9 / v1.0.
 
