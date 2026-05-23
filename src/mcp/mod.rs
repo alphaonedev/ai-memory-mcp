@@ -456,6 +456,10 @@ pub use quota_status::handle_quota_status;
 pub use check_agent_action::handle_check_agent_action;
 pub use recall::handle_recall;
 pub use recall::handle_recall_with_pre_recall_hook;
+// v0.7.x #1155 — exposed for the HTTP recall handler at
+// `src/handlers/recall.rs` so the Gap 7 verbose decoration is shared
+// between the MCP and HTTP wire paths.
+pub(crate) use recall::decorate_memory;
 // v0.7.0 Provenance Gap 3 (#886) — recall-consumption observation tier.
 // `handle_recall_observations` lives in `src/mcp/tools/recall_observations.rs`
 // (sibling-agent landing); the function is dispatched via
