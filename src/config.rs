@@ -4474,6 +4474,7 @@ impl AppConfig {
                     Ok(cfg) => match cfg.validate_secret_handling() {
                         Ok(()) => {
                             eprintln!("ai-memory: loaded config from {}", path.display());
+                            cfg.warn_legacy_schema_drift(path);
                             cfg
                         }
                         Err(reason) => {
@@ -4496,6 +4497,76 @@ impl AppConfig {
             }
             Err(_) => Self::default(),
         }
+    }
+
+    /// v0.7.x (#1146) — emit a one-shot deprecation WARN to stderr
+    /// when the loaded config carries legacy v1 flat fields that have
+    /// been superseded by the sectioned v2 schema.
+    ///
+    /// Two posture WARNs:
+    ///
+    /// - **Legacy-only** (no `schema_version` OR `schema_version = 1`,
+    ///   AND any of `llm_model`, `ollama_url`, `embed_url`,
+    ///   `embedding_model`, `cross_encoder`, `default_namespace`,
+    ///   `archive_on_gc`, `archive_max_days`, `max_memory_mb`,
+    ///   `auto_tag_model` set): operator running pre-#1146 config
+    ///   shape — point them at `ai-memory config migrate`.
+    ///
+    /// - **Drift** (`schema_version >= 2` AND any legacy field set):
+    ///   operator has migrated but left legacy fields in place —
+    ///   legacy fields are ignored under v2, point them at
+    ///   `ai-memory config migrate` to clean up the dead weight.
+    ///
+    /// The WARN is gated by [`std::sync::Once`] so re-loading the
+    /// config in the same process (e.g. tests that call
+    /// [`AppConfig::load_from`] in a loop) does not spam stderr.
+    fn warn_legacy_schema_drift(&self, path: &Path) {
+        use std::sync::Once;
+        static WARN_ONCE: Once = Once::new();
+
+        let has_legacy = self.llm_model.is_some()
+            || self.ollama_url.is_some()
+            || self.embed_url.is_some()
+            || self.embedding_model.is_some()
+            || self.cross_encoder.is_some()
+            || self.default_namespace.is_some()
+            || self.archive_on_gc.is_some()
+            || self.archive_max_days.is_some()
+            || self.max_memory_mb.is_some()
+            || self.auto_tag_model.is_some();
+
+        if !has_legacy {
+            return;
+        }
+
+        let v2 = matches!(self.schema_version, Some(v) if v >= 2);
+
+        WARN_ONCE.call_once(|| {
+            if v2 {
+                eprintln!(
+                    "ai-memory: WARN — schema_version = {:?} but legacy v1 fields \
+                     are still present in {} (llm_model / ollama_url / embed_url / \
+                     embedding_model / cross_encoder / default_namespace / \
+                     archive_on_gc / archive_max_days / max_memory_mb / \
+                     auto_tag_model). Under v2 the legacy fields are IGNORED in \
+                     favor of [llm] / [embeddings] / [reranker] / [storage] \
+                     sections. Run `ai-memory config migrate` to remove them.",
+                    self.schema_version,
+                    path.display(),
+                );
+            } else {
+                eprintln!(
+                    "ai-memory: WARN — legacy v1 flat-field configuration shape \
+                     detected in {}. The [llm] / [embeddings] / [reranker] / \
+                     [storage] sectioned schema (v2) is the canonical shape; \
+                     legacy fields continue to work in v0.7.x but will be \
+                     removed in v0.8.0. Run `ai-memory config migrate` to \
+                     upgrade in place (a timestamped .bak is written). See \
+                     https://github.com/alphaonedev/ai-memory-mcp/issues/1146",
+                    path.display(),
+                );
+            }
+        });
     }
 
     /// v0.7.x (#1146) — validate secret-handling discipline in the
