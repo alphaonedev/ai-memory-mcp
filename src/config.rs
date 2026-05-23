@@ -4405,11 +4405,24 @@ impl AppConfig {
                 // (`[memory]`, `[autonomous]`, `[governance]`, `[federation]`)
                 // can no longer silently neutralise an operator's intent.
                 Self::warn_unknown_top_level_keys(path, &contents);
-                match toml::from_str(&contents) {
-                    Ok(cfg) => {
-                        eprintln!("ai-memory: loaded config from {}", path.display());
-                        cfg
-                    }
+                match toml::from_str::<Self>(&contents) {
+                    Ok(cfg) => match cfg.validate_secret_handling() {
+                        Ok(()) => {
+                            eprintln!("ai-memory: loaded config from {}", path.display());
+                            cfg
+                        }
+                        Err(reason) => {
+                            eprintln!(
+                                "ai-memory: config rejected ({}): {}\n\
+                                 ai-memory: falling back to default config — \
+                                 fix the issue and restart. \
+                                 See https://github.com/alphaonedev/ai-memory-mcp/issues/1146",
+                                path.display(),
+                                reason
+                            );
+                            Self::default()
+                        }
+                    },
                     Err(e) => {
                         eprintln!("ai-memory: config parse error ({}): {}", path.display(), e);
                         Self::default()
@@ -4418,6 +4431,59 @@ impl AppConfig {
             }
             Err(_) => Self::default(),
         }
+    }
+
+    /// v0.7.x (#1146) — validate secret-handling discipline in the
+    /// `[llm]` (and `[llm.auto_tag]`) sections after parse. Three
+    /// rejections fire at load time so misconfigurations are loud
+    /// rather than silent:
+    ///
+    /// 1. Inline `api_key = "<literal>"` in `[llm]`. Operators MUST
+    ///    use `api_key_env = "<ENV_VAR_NAME>"` or `api_key_file =
+    ///    "/path/to/key"` instead. Closes the v0.6.x posture where
+    ///    inline secrets in `~/.config/ai-memory/config.toml` were
+    ///    silently accepted even though the file is typically
+    ///    world-readable.
+    ///
+    /// 2. Both `api_key_env` and `api_key_file` set on `[llm]`.
+    ///    Mutually exclusive — operator must pick one.
+    ///
+    /// 3. Both `api_key_env` and `api_key_file` set on
+    ///    `[llm.auto_tag]`. Same mutex.
+    ///
+    /// On any rejection, [`Self::load_from`] surfaces the message to
+    /// stderr and falls back to [`Self::default`] so the daemon boots
+    /// without the misconfigured secret rather than refusing to start
+    /// entirely.
+    fn validate_secret_handling(&self) -> Result<(), String> {
+        if let Some(llm) = &self.llm {
+            // Rejection 1 — inline api_key literal.
+            if llm.api_key.is_some() {
+                return Err("inline `api_key = \"<literal>\"` in [llm] is forbidden — \
+                     use `api_key_env = \"<ENV_VAR_NAME>\"` to reference a \
+                     process env var, or `api_key_file = \"/path/to/key\"` to \
+                     reference a file (mode 0400 enforced). Inline secrets in \
+                     config.toml (typically world-readable) are a credential \
+                     leak."
+                    .to_string());
+            }
+            // Rejection 2 — env vs file mutex.
+            if llm.api_key_env.is_some() && llm.api_key_file.is_some() {
+                return Err("[llm].api_key_env and [llm].api_key_file are mutually \
+                     exclusive — set exactly one (or neither, to fall back \
+                     to the per-vendor env-var chain)."
+                    .to_string());
+            }
+            // Rejection 3 — auto_tag env vs file mutex.
+            if let Some(auto_tag) = &llm.auto_tag {
+                if auto_tag.api_key_env.is_some() && auto_tag.api_key_file.is_some() {
+                    return Err("[llm.auto_tag].api_key_env and \
+                         [llm.auto_tag].api_key_file are mutually exclusive."
+                        .to_string());
+                }
+            }
+        }
+        Ok(())
     }
 
     /// L1 fix (v0.7.0): enumerate top-level keys in `contents` and emit a
