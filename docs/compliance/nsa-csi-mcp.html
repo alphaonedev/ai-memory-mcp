@@ -216,11 +216,185 @@ footer a{color:var(--text-muted)}
         <li><a href="#rec-a">Recommendations a-g</a></li>
         <li><a href="#real-world">Real-world incident classes</a></li>
         <li><a href="#verify">For procurement reviewers</a></li>
+        <li><a href="#control-feature-matrix">Control → Feature matrix</a></li>
         <li><a href="#boundaries">Honest boundaries</a></li>
         <li><a href="honest-limitations.md">Honest-limitations companion</a></li>
         <li><a href="_inventory/v0.7.0-capabilities.json">Capability inventory JSON</a></li>
       </ul>
     </div>
+  </div>
+</section>
+
+<section id="control-feature-matrix">
+  <div class="container">
+    <span class="section-eyebrow">▸ One-page reference</span>
+    <h2>NSA CSI MCP Security Control → ai-memory Feature mapping.</h2>
+    <p class="lede">Single-page procurement-grade table mapping every NSA CSI MCP control requirement to the ai-memory tool, primitive, or substrate feature that addresses it. Each row carries the capability identifier from the codegraph-verified <a href="_inventory/v0.7.0-capabilities.json">inventory</a> and the substrate file path operators or auditors can grep against to confirm the feature is wired and present.</p>
+
+    <h3 style="margin-top:1.5rem;color:var(--text)">Concerns (10/10 structurally addressed)</h3>
+    <table>
+      <thead>
+        <tr>
+          <th style="width:14ch">NSA Concern</th>
+          <th>ai-memory tool / feature</th>
+          <th style="width:24ch">Capability identifier</th>
+          <th style="width:26ch">Substrate anchor</th>
+          <th style="width:10ch">Status</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="col-name">a · Access control</td>
+          <td>Namespace isolation + Form 7 agent-EXTERNAL governance + admin-role gate + per-tenant authorisation</td>
+          <td><code>namespace_isolation</code>, <code>form_7_agent_external_governance</code></td>
+          <td><code>src/governance/mod.rs::check_agent_action</code> · <code>src/handlers/admin_role.rs:97</code></td>
+          <td><span class="status ok">addressed</span></td>
+        </tr>
+        <tr>
+          <td class="col-name">b · Insecure context or data serialization</td>
+          <td>Form 4 fact-provenance (citations, source_uri, source_span) + canonical-bytes Ed25519 signing + capabilities v3 envelope + RequestValidator</td>
+          <td><code>form_4_fact_provenance</code>, <code>form_7_canonical_bytes_signing</code>, <code>capabilities_v3_envelope</code>, <code>request_validator_input_validation</code></td>
+          <td><code>src/models/memory.rs:464</code> · <code>src/governance/rules_store.rs:541</code> · <code>src/validate.rs:1027</code></td>
+          <td><span class="status ok">addressed</span></td>
+        </tr>
+        <tr>
+          <td class="col-name">c · Poor approval workflows</td>
+          <td>Track G 25-event hook pipeline (Allow/Modify/Deny/AskUser) + K10 pending-actions SSE stream + HMAC-mandatory webhook dispatch</td>
+          <td><code>track_g_hook_pipeline</code></td>
+          <td><code>src/hooks/events.rs:73</code> · <code>src/subscriptions.rs:521-548</code></td>
+          <td><span class="status ok">addressed</span></td>
+        </tr>
+        <tr>
+          <td class="col-name">d · Token or session security</td>
+          <td>mTLS A2A transport + per-agent Ed25519 attestation + federation nonce-replay defense + SQLCipher encryption-at-rest</td>
+          <td><code>mtls_a2a_transport</code>, <code>ed25519_agent_attestation</code>, <code>encryption_at_rest_sqlcipher</code></td>
+          <td><code>src/tls.rs:1175</code> · <code>src/governance/audit.rs:558</code> · <code>src/federation/signing.rs:42</code></td>
+          <td><span class="status ok">addressed</span></td>
+        </tr>
+        <tr>
+          <td class="col-name">e · Misconfigurations and poor implementation</td>
+          <td>Capabilities v3 envelope + namespace isolation + 6 fail-CLOSED secure-default env vars (#1053/#1054/#1055/#791/#922/governance)</td>
+          <td><code>capabilities_v3_envelope</code>, <code>namespace_isolation</code></td>
+          <td><code>src/config.rs</code> (env-var resolvers) · <code>CLAUDE.md §Environment Variables</code></td>
+          <td><span class="status ok">addressed</span></td>
+        </tr>
+        <tr>
+          <td class="col-name">f · Inconsistent behaviors</td>
+          <td>Seven-Gap Gap 1 optimistic-concurrency versioned writes + capabilities v3 envelope + Form 6 MemoryKind discriminator</td>
+          <td><code>seven_gap_versioned_writes</code>, <code>capabilities_v3_envelope</code>, <code>form_6_memory_kind</code></td>
+          <td><code>src/models/memory.rs:521</code> · <code>src/storage/mod.rs:1132/1185</code> · <code>tests/http_if_match_concurrency.rs</code></td>
+          <td><span class="status ok">addressed</span></td>
+        </tr>
+        <tr>
+          <td class="col-name">g · Poor or missing audit logs</td>
+          <td>V-4 signed-events cross-row hash chain + substrate-native verify-* CLI family + Form 4 fact-provenance + Seven-Gap Gap 3 causal recall observations</td>
+          <td><code>v4_signed_events_chain</code>, <code>substrate_native_verify_family</code>, <code>seven_gap_causal_recall</code></td>
+          <td><code>src/signed_events.rs:100-119</code> · <code>src/cli/verify_signed_events.rs</code> · <code>src/observations/mod.rs:65</code></td>
+          <td><span class="status ok">addressed</span></td>
+        </tr>
+        <tr>
+          <td class="col-name">h · Denial of service and fatigue-based techniques</td>
+          <td>7-layer DoS defense: K8 quota + cl100k token budget + HMAC fail-CLOSED webhook + SSRF guard + DLQ MAX_REPLAY_ATTEMPTS + 2 MB HTTP body cap + federation nonce-replay</td>
+          <td><code>dos_multi_layer_defense</code>, <code>token_budget_guards</code>, <code>federation_push_dlq</code></td>
+          <td><code>src/profile.rs:419</code> · <code>src/subscriptions.rs:791-803</code> · <code>src/federation/push_dlq.rs:195</code> · <code>src/lib.rs:512</code></td>
+          <td><span class="status ok">addressed</span></td>
+        </tr>
+        <tr>
+          <td class="col-name">i · Tool parameter injection (real-world)</td>
+          <td>RequestValidator DTO-bundled input-validation surface (87 HTTP routes + 73 MCP tools + 58 CLI subcommands)</td>
+          <td><code>request_validator_input_validation</code>, <code>form_4_fact_provenance</code></td>
+          <td><code>src/validate.rs:1027</code> (RequestValidator) · <code>src/validate.rs:784/808/852</code> (free-fn primitives)</td>
+          <td><span class="status ok">addressed</span></td>
+        </tr>
+        <tr>
+          <td class="col-name">j · Tool invocation path confusion (real-world)</td>
+          <td>Composite defense: (1) clientInfo capture at MCP initialize + (2) daemon-Ed25519-signed serverInfo at MCP initialize (TOFU pin)</td>
+          <td><code>mcp_client_attestation</code></td>
+          <td><code>src/mcp/server_identity.rs</code> · <code>src/mcp/mod.rs:1607-1611</code> · <code>tests/mcp_initialize_server_signing.rs</code></td>
+          <td><span class="status ok">addressed</span></td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3 style="margin-top:2rem;color:var(--text)">Recommendations (7/7 implemented + 2 meta)</h3>
+    <table>
+      <thead>
+        <tr>
+          <th style="width:18ch">NSA Recommendation</th>
+          <th>ai-memory tool / feature</th>
+          <th style="width:24ch">Capability identifier</th>
+          <th style="width:26ch">Substrate anchor</th>
+          <th style="width:10ch">Status</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="col-name">a · Choose supported MCP projects when possible</td>
+          <td>MCP Registry submission + Apache 2.0 + AlphaOne LLC maintainer + public release cadence + LongMemEval benchmark + security advisory channel</td>
+          <td><code>memory_portability_spec</code>, <code>longmemeval_benchmark</code></td>
+          <td><code>SECURITY.md</code> · <code>docs/spec/v1.md</code> · MCP Registry submission metadata at <code>docs/compliance/_inventory/mcp-registry-submission.json</code></td>
+          <td><span class="status ok">implemented</span></td>
+        </tr>
+        <tr>
+          <td class="col-name">b · Design for boundaries</td>
+          <td>Namespace isolation + Form 7 governance + SAL trait boundary + federation peer allowlist + K9 permissions + capabilities v3 envelope</td>
+          <td><code>namespace_isolation</code>, <code>form_7_agent_external_governance</code>, <code>capabilities_v3_envelope</code></td>
+          <td><code>src/store/mod.rs</code> · <code>src/governance/mod.rs</code> · <code>src/handlers/admin_role.rs</code></td>
+          <td><span class="status ok">implemented</span></td>
+        </tr>
+        <tr>
+          <td class="col-name">c · Validate parameters</td>
+          <td>RequestValidator + per-field free functions (validate_id, validate_namespace, validate_agent_id, validate_source_uri, validate_citation, validate_source_span)</td>
+          <td><code>request_validator_input_validation</code></td>
+          <td><code>src/validate.rs:1027</code> · <code>src/validate.rs:784/808/852</code></td>
+          <td><span class="status ok">implemented</span></td>
+        </tr>
+        <tr>
+          <td class="col-name">d · Constrain and sandbox tool execution</td>
+          <td>Track G hook pipeline (Allow/Modify/Deny/AskUser) + per-namespace standard policy + K9 permissions engine + Form 7 governance</td>
+          <td><code>track_g_hook_pipeline</code>, <code>namespace_isolation</code>, <code>form_7_agent_external_governance</code></td>
+          <td><code>src/hooks/events.rs:73</code> · <code>src/governance/agent_action.rs:99</code></td>
+          <td><span class="status ok">implemented</span></td>
+        </tr>
+        <tr>
+          <td class="col-name">e · Sign and verify MCP messages</td>
+          <td>Per-agent Ed25519 attestation + canonical-bytes signing discipline + V-4 signed-events hash chain + federation nonce-replay + daemon serverInfo Ed25519 signing at MCP initialize</td>
+          <td><code>ed25519_agent_attestation</code>, <code>form_7_canonical_bytes_signing</code>, <code>v4_signed_events_chain</code>, <code>mcp_client_attestation</code></td>
+          <td><code>src/governance/rules_store.rs:541</code> · <code>src/signed_events.rs:100-119</code> · <code>src/mcp/server_identity.rs</code></td>
+          <td><span class="status ok">implemented</span></td>
+        </tr>
+        <tr>
+          <td class="col-name">f · Filter and monitor output pipelines and chained execution</td>
+          <td>Seven-Gap Gap 7 verbose-provenance recall decoration + Track G post_recall / post_search hooks + Accept-Provenance HTTP header (v0.7.x #1155)</td>
+          <td><code>seven_gap_verbose_decoration</code>, <code>track_g_hook_pipeline</code></td>
+          <td><code>src/mcp/tools/recall.rs:284</code> · <code>src/handlers/accept_provenance.rs</code></td>
+          <td><span class="status ok">implemented</span></td>
+        </tr>
+        <tr>
+          <td class="col-name">g · Instrument for logging and detection</td>
+          <td>V-4 signed-events chain + Prometheus DLQ depth gauge + capabilities v3 envelope + Track G 25-event hook pipeline + bare /metrics surface</td>
+          <td><code>v4_signed_events_chain</code>, <code>dos_multi_layer_defense</code>, <code>capabilities_v3_envelope</code>, <code>track_g_hook_pipeline</code></td>
+          <td><code>src/signed_events.rs</code> · <code>src/federation/push_dlq.rs:334</code> · <code>src/lib.rs</code></td>
+          <td><span class="status ok">implemented</span></td>
+        </tr>
+        <tr>
+          <td class="col-name">meta · Track and patch MCP-related vulnerabilities</td>
+          <td>Apache 2.0 release process + CHANGELOG per-release surface + GitHub Security Advisory channel + Cargo.lock dependency tracking + cargo-audit CI gate</td>
+          <td>—</td>
+          <td><code>SECURITY.md</code> · <code>Cargo.lock</code> · <code>.github/workflows/ci.yml</code></td>
+          <td><span class="status ok">implemented</span></td>
+        </tr>
+        <tr>
+          <td class="col-name">meta · Scan local network for open or vulnerable MCP servers</td>
+          <td>Substrate-native verify-* CLI family (not vulnerable to CVE-2025-49596 MCP-Inspector); operator-side network scanning out of substrate scope</td>
+          <td><code>substrate_native_verify_family</code></td>
+          <td><code>src/cli/verify_signed_events.rs</code> · <code>src/forensic/bundle.rs</code></td>
+          <td><span class="status consumer">operator-side</span></td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p style="margin-top:1.5rem;color:var(--text-dim);font-size:.85rem">Every <code>Capability identifier</code> in the tables above corresponds to a row in the codegraph-verified <a href="_inventory/v0.7.0-capabilities.json">capability inventory JSON</a>. Every <code>Substrate anchor</code> is a real file:line in the v0.7.x codebase. Procurement reviewers can run the verification commands in §<a href="#verify">For procurement reviewers</a> to reproduce the mapping from a fresh checkout.</p>
   </div>
 </section>
 
