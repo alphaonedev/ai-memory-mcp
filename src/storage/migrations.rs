@@ -529,6 +529,16 @@ pub const fn current_schema_version_for_tests() -> i64 {
     CURRENT_SCHEMA_VERSION
 }
 
+/// v0.7.x (#1154) — production-facing alias exposing the same SSOT
+/// constant. Used by [`crate::mcp::server_identity`] to publish the
+/// schema version in the MCP-initialize-handshake signed identity
+/// block. The `_for_tests` variant above remains for backwards
+/// compatibility with existing test call sites.
+#[must_use]
+pub const fn current_schema_version() -> i64 {
+    CURRENT_SCHEMA_VERSION
+}
+
 const MIGRATION_V15_SQLITE: &str =
     include_str!("../../migrations/sqlite/0010_v063_hierarchy_kg.sql");
 // v0.6.3.1 (P4, audit G1): backfill `metadata.governance.inherit = true`
