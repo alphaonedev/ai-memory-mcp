@@ -1765,113 +1765,81 @@ pub async fn build_llm_client(
     feature_tier: FeatureTier,
     app_config: &AppConfig,
 ) -> Option<llm::OllamaClient> {
-    // #1067 (2026-05-21) — LLM availability is no longer gated on
-    // `tier_config.llm_model`. Per operator directive every tier
-    // (keyword, semantic, smart, autonomous) can communicate with an
-    // LLM whenever the operator sets the `AI_MEMORY_LLM_*` env vars.
-    // Tier still determines *which features* run (embedder, reranker,
-    // autonomous curator), but the chat-completion path is tier-
-    // independent.
-    //
-    // Resolution order:
-    // 1. `AI_MEMORY_LLM_BACKEND` + companion env vars (handled by
-    //    `OllamaClient::from_env`). This is the universal escape hatch
-    //    — picks Ollama (default), any per-vendor alias, or the
-    //    generic `openai-compatible` for custom URLs.
-    // 2. Legacy fallback: if no env declares a backend AND the tier
-    //    has a default `llm_model`, build the Ollama client against
-    //    the tier-default URL + model. Preserves backward compat for
-    //    operators who don't set any LLM env.
-    // 3. Else: return None (LLM features are no-ops, but the daemon
-    //    boots fine).
-    let backend_env = std::env::var("AI_MEMORY_LLM_BACKEND").ok();
-    if backend_env
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .is_some()
-    {
-        // Operator explicitly chose a backend — route via `from_env`.
-        let backend = backend_env.unwrap_or_default();
-        let build = match tokio::task::spawn_blocking(llm::OllamaClient::from_env).await {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!("L5: build_llm_client from_env join failed: {e}");
-                return None;
-            }
-        };
-        return match build {
-            Ok(Some(client)) => {
-                tracing::info!(
-                    "L5: llm client ready — tier={} backend={backend} — \
-                     auto_tag/expand_query/contradiction-detection/reflection \
-                     hooks armed",
-                    feature_tier.as_str(),
-                );
-                Some(client)
-            }
-            Ok(None) => {
-                tracing::warn!(
-                    "L5: llm client disabled — AI_MEMORY_LLM_BACKEND={backend} \
-                     resolved to None (no client built); LLM-powered hooks are \
-                     no-ops"
-                );
-                None
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "L5: llm client init failed (backend={backend}, tier={}); \
-                     LLM-powered hooks are no-ops: {e}",
-                    feature_tier.as_str()
-                );
-                None
-            }
-        };
-    }
+    // v0.7.x (#1146) — single canonical entry through the resolver.
+    // The resolver folds CLI flags (none here — `ai-memory serve`
+    // exposes no CLI LLM override), AI_MEMORY_LLM_* env vars, the
+    // [llm] config section, the legacy llm_model/ollama_url flat
+    // fields, and the compiled tier preset. The provenance fields
+    // surface via the tracing log line so RUST_LOG=ai_memory=debug
+    // shows which precedence layer won.
+    let resolved = app_config.resolve_llm(None, None, None);
 
-    // Legacy fallback: no AI_MEMORY_LLM_BACKEND set.
-    let tier_config = feature_tier.config();
-    let Some(llm_model) = tier_config.llm_model else {
+    // Keyword tier short-circuit: when there is no explicit operator
+    // intent (no CLI flag, no env var, no [llm] section, no legacy
+    // flat fields — i.e. source == CompiledDefault), the resolver's
+    // Ollama-default-fallback should NOT pull a client into existence
+    // for a keyword-tier daemon. Operators who explicitly want LLM
+    // on keyword tier set AI_MEMORY_LLM_BACKEND (or write a [llm]
+    // section), which moves `source` off the CompiledDefault arm.
+    if matches!(feature_tier, FeatureTier::Keyword)
+        && matches!(
+            resolved.source,
+            crate::config::ConfigSource::CompiledDefault
+        )
+    {
         tracing::debug!(
-            "llm client disabled — no AI_MEMORY_LLM_BACKEND env AND tier={} has \
-             no default llm_model; auto_tag hook will be a no-op (set \
-             AI_MEMORY_LLM_BACKEND=ollama / xai / openai / deepseek / kimi / qwen \
-             / etc. to enable)",
-            feature_tier.as_str()
+            "L5: llm client disabled — keyword tier with no operator LLM config; \
+             set AI_MEMORY_LLM_BACKEND or [llm] section to enable"
         );
         return None;
-    };
-    let model_id = app_config
-        .llm_model
-        .clone()
-        .unwrap_or_else(|| llm_model.ollama_model_id().to_string());
-    let ollama_url = app_config.effective_ollama_url().to_string();
+    }
+
+    let backend = resolved.backend.clone();
+    let model = resolved.model.clone();
+    let source = resolved.source.as_str().to_string();
+    let key_source = resolved.api_key_source.as_str().to_string();
+    let tier_str = feature_tier.as_str().to_string();
+
+    // The resolver pin is sync, but the actual client construction
+    // (which spins reqwest::blocking inside the http builder chain)
+    // must still run in `spawn_blocking` to avoid panicking the
+    // tokio executor.
     let build = match tokio::task::spawn_blocking(move || {
-        llm::OllamaClient::new_with_url(&ollama_url, &model_id)
+        llm::OllamaClient::build_from_resolved(&resolved)
     })
     .await
     {
         Ok(b) => b,
         Err(e) => {
-            tracing::warn!("L5: build_llm_client spawn_blocking join failed: {e}");
+            tracing::warn!(
+                "L5: build_llm_client spawn_blocking join failed (tier={tier_str}): {e}"
+            );
             return None;
         }
     };
+
     match build {
-        Ok(client) => {
+        Ok(Some(client)) => {
             tracing::info!(
-                "L5: llm client ready — tier={} model={} (legacy ollama fallback; \
-                 set AI_MEMORY_LLM_BACKEND for provider-agnostic access) — \
-                 auto_tag hook armed for HTTP create_memory",
-                feature_tier.as_str(),
-                llm_model.ollama_model_id(),
+                "L5: llm client ready — tier={tier_str} backend={backend} \
+                 model={model} source={source} key_source={key_source} \
+                 — auto_tag/expand_query/contradiction-detection/reflection \
+                 hooks armed (#1146 resolver path)"
             );
             Some(client)
         }
+        Ok(None) => {
+            tracing::warn!(
+                "L5: llm client disabled — resolver returned no client \
+                 (tier={tier_str} backend={backend} source={source}); \
+                 LLM-powered hooks are no-ops"
+            );
+            None
+        }
         Err(e) => {
             tracing::warn!(
-                "L5: llm client init failed (tier={}); auto_tag hook will be a no-op: {e}",
-                feature_tier.as_str()
+                "L5: llm client init failed (tier={tier_str} backend={backend} \
+                 source={source}); LLM-powered hooks are no-ops: {e}"
             );
             None
         }
@@ -3973,23 +3941,18 @@ pub async fn run_curator_daemon_with_primitives(
         exclude_namespaces,
         compaction: crate::curator::CompactionConfig::default(),
     };
-    // #1143: honor AI_MEMORY_LLM_BACKEND env even on the legacy
-    // primitive-args entrypoint (used by some CLI shims and tests).
-    // The explicit `ollama_model` arg still wins when env is unset, so
-    // older callers that hardcoded a model retain their behavior.
+    // v0.7.x (#1146) — route through the canonical resolver.
+    // `ollama_model` retained as a CLI/test override for the model
+    // field only; backend / base_url / api_key still flow through the
+    // resolver. If the caller passed an explicit `ollama_model`, the
+    // resolver honors it via the CLI-flag arm of the precedence ladder.
     let llm: Option<Arc<crate::llm::OllamaClient>> = {
-        let backend_env = std::env::var("AI_MEMORY_LLM_BACKEND")
+        let app_config = AppConfig::load();
+        let resolved = app_config.resolve_llm(None, ollama_model.as_deref(), None);
+        crate::llm::OllamaClient::build_from_resolved(&resolved)
             .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-        if backend_env.is_some() {
-            crate::llm::OllamaClient::from_env()
-                .ok()
-                .flatten()
-                .map(Arc::new)
-        } else {
-            ollama_model.and_then(|m| crate::llm::OllamaClient::new(&m).ok().map(Arc::new))
-        }
+            .flatten()
+            .map(Arc::new)
     };
 
     let shutdown_flag = Arc::new(AtomicBool::new(false));
