@@ -2570,6 +2570,66 @@ pub struct AppConfig {
     /// non-admin callers — the safe-by-default posture per CLAUDE.md
     /// `pm-v3`. See [`AdminConfig`] for the full role-gate semantics.
     pub admin: Option<AdminConfig>,
+
+    // ------------------------------------------------------------------
+    // v0.7.x enterprise configuration sections (issue #1146).
+    //
+    // These four sectioned blocks (`[llm]` / `[embeddings]` /
+    // `[reranker]` / `[storage]`) consolidate the previously-flat
+    // LLM / embedder / reranker / storage knobs into named tables with
+    // a uniform canonical resolver. Legacy flat fields above
+    // (`llm_model`, `ollama_url`, `embed_url`, `embedding_model`,
+    // `cross_encoder`, `default_namespace`, `archive_on_gc`,
+    // `archive_max_days`, `max_memory_mb`) continue to parse and feed
+    // the resolver's legacy arm with a one-shot deprecation WARN until
+    // v0.8.0 removes them.
+    //
+    // The `schema_version` field carries the explicit shape version.
+    // Absent / `1` selects the legacy parse path; `>= 2` selects the
+    // sectioned parse path and warns when legacy fields are also
+    // present (so an operator who hand-edited the file knows the
+    // legacy fields are dead weight).
+    // ------------------------------------------------------------------
+    /// v0.7.x (#1146) — explicit configuration schema version. `None`
+    /// or `1` selects the v0.6.x flat-field parse path; `2` selects
+    /// the sectioned parse path (`[llm]`, `[embeddings]`, `[reranker]`,
+    /// `[storage]`) and emits a WARN if any legacy flat field is also
+    /// present. Future bumps (`3`, `4`, …) introduce additional schema
+    /// transitions and are gated through `ai-memory config migrate`.
+    pub schema_version: Option<u32>,
+
+    /// v0.7.x (#1146) — `[llm]` sectioned LLM configuration. Carries
+    /// the canonical backend / model / base_url / api_key references
+    /// consumed by every LLM-init surface (MCP stdio, HTTP daemon,
+    /// `ai-memory atomise`, `ai-memory curator`, embed-client
+    /// disambiguator, the boot banner). Resolved via
+    /// [`AppConfig::resolve_llm`]; the resolver applies the uniform
+    /// precedence ladder (CLI flag > `AI_MEMORY_LLM_*` env > `[llm]`
+    /// section > legacy flat fields > compiled default).
+    ///
+    /// Includes an optional `[llm.auto_tag]` sub-table for the fast
+    /// structured-output sibling that handles `auto_tag`, query
+    /// expansion, and contradiction detection — see [`LlmSection`].
+    pub llm: Option<LlmSection>,
+
+    /// v0.7.x (#1146) — `[embeddings]` sectioned embedding-model
+    /// configuration. Consumed by the embedder bootstrap in
+    /// `daemon_runtime` and the MCP embed-client fallback path.
+    /// Resolved via [`AppConfig::resolve_embeddings`].
+    pub embeddings: Option<EmbeddingsSection>,
+
+    /// v0.7.x (#1146) — `[reranker]` sectioned cross-encoder
+    /// configuration. Folds the legacy `cross_encoder = bool` knob
+    /// into a `{ enabled, model }` table with explicit model
+    /// selection. Resolved via [`AppConfig::resolve_reranker`].
+    pub reranker: Option<RerankerSection>,
+
+    /// v0.7.x (#1146) — `[storage]` sectioned storage configuration.
+    /// Carries `default_namespace`, `archive_on_gc`, `archive_max_days`,
+    /// `max_memory_mb` (folded from the previously-flat top-level
+    /// fields). The `db` path stays top-level per the I4 carve-out in
+    /// #1146 (path expansion semantics pinned by #507).
+    pub storage: Option<StorageSection>,
 }
 
 /// v0.7.0 SEC-2 (Cluster D, issue #767) — `[governance]` top-level
@@ -2672,6 +2732,228 @@ impl AdminConfig {
         }
         out
     }
+}
+
+// ---------------------------------------------------------------------------
+// v0.7.x enterprise configuration sections (issue #1146)
+//
+// `[llm]` / `[embeddings]` / `[reranker]` / `[storage]` consolidate
+// previously-flat LLM / embedder / reranker / storage knobs into a
+// uniform sectioned shape consumed by the canonical resolvers in
+// `impl AppConfig`. See the issue for the full design rationale,
+// migration plan, and acceptance criteria.
+// ---------------------------------------------------------------------------
+
+/// v0.7.x (#1146) — `[llm]` sectioned LLM configuration.
+///
+/// Wire format:
+/// ```toml
+/// [llm]
+/// backend     = "xai"          # ollama | openai | xai | anthropic | gemini | …
+/// model       = "grok-4.3"     # vendor-specific identifier
+/// base_url    = "https://api.x.ai/v1"   # optional; vendor-default if unset
+/// api_key_env = "XAI_API_KEY"           # env var name (mutually exclusive
+///                                        # with api_key_file)
+/// # api_key_file = "/etc/ai-memory/keys/xai.key"   # mode 0400 enforced
+///
+/// [llm.auto_tag]
+/// # Fast structured-output sibling (auto_tag, query expansion,
+/// # contradiction detection). Fields fall back to parent [llm]
+/// # field-by-field when unset; commonly only `model` is overridden.
+/// model = "gemma3:4b"
+/// ```
+///
+/// **Secret handling discipline.** Inline `api_key = "<literal>"` is
+/// REJECTED at parse time — operators MUST use either
+/// `api_key_env = "<ENV_VAR_NAME>"` (resolved at runtime) or
+/// `api_key_file = "/path/to/key"` (mode 0400 enforced, override via
+/// `AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS=1`). Both unset selects
+/// the per-vendor-alias env-var fallback chain (see `src/llm.rs`
+/// `alias_api_key_env_vars`).
+///
+/// **Precedence.** Resolved via [`AppConfig::resolve_llm`] through the
+/// uniform precedence ladder: CLI flag > `AI_MEMORY_LLM_*` env vars >
+/// `[llm]` section > legacy flat fields (`llm_model`, `ollama_url`) >
+/// compiled default (warn-logged once on the resolver's `CompiledDefault`
+/// arm).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LlmSection {
+    /// Backend selector. One of: `ollama` (native `/api/chat` +
+    /// `/api/embed`, no auth), `openai-compatible` (generic; requires
+    /// explicit `base_url`), or an alias that pre-fills `base_url`
+    /// (`openai`, `xai`, `anthropic`, `gemini`, `deepseek`, `kimi`,
+    /// `qwen`, `mistral`, `groq`, `together`, `cerebras`, `openrouter`,
+    /// `fireworks`, `lmstudio`). Unset = inherit legacy resolution
+    /// (treated as `ollama`).
+    pub backend: Option<String>,
+
+    /// Model identifier passed verbatim to the chat endpoint.
+    /// Vendor-specific (e.g., `grok-4.3`, `gpt-5`, `claude-opus-4.7`).
+    /// Unset = backend-specific default (see `OllamaClient::from_env`).
+    pub model: Option<String>,
+
+    /// Optional base-URL override. Required when `backend =
+    /// "openai-compatible"`; ignored otherwise (vendor-default
+    /// applies). For `backend = "ollama"`, defaults to
+    /// `http://localhost:11434`.
+    pub base_url: Option<String>,
+
+    /// Name of the environment variable to read at runtime for the
+    /// API-key Bearer auth secret. Mutually exclusive with
+    /// `api_key_file`. Example: `api_key_env = "XAI_API_KEY"`. The
+    /// `AI_MEMORY_LLM_API_KEY` process-env override (and the
+    /// per-vendor fallback chain at `src/llm.rs`
+    /// `alias_api_key_env_vars`) take precedence over this field per
+    /// the uniform precedence ladder.
+    pub api_key_env: Option<String>,
+
+    /// Path to a file whose first line is the API-key Bearer secret.
+    /// Mutually exclusive with `api_key_env`. File must be `mode 0400`
+    /// or stricter (overridable via
+    /// `AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS=1` per #1055). Tilde
+    /// expansion applies.
+    pub api_key_file: Option<String>,
+
+    /// **REJECTED AT PARSE TIME.** Accepting the field name here lets
+    /// the validator emit a clear "use api_key_env or api_key_file"
+    /// error instead of serde's generic "unknown field". Operators
+    /// inlining secrets in the config file see the security-rationale
+    /// message at load time.
+    #[serde(default)]
+    pub api_key: Option<String>,
+
+    /// `[llm.auto_tag]` sub-table for the fast structured-output
+    /// sibling (`auto_tag`, query expansion, contradiction detection).
+    /// Unset = inherit every field from the parent [`LlmSection`].
+    /// When set, only the explicitly-provided fields override; unset
+    /// fields fall back to the parent.
+    #[serde(default)]
+    pub auto_tag: Option<LlmAutoTagSection>,
+}
+
+/// v0.7.x (#1146) — `[llm.auto_tag]` sub-table. Fast structured-output
+/// sibling of [`LlmSection`]. Fields fall back to the parent `[llm]`
+/// section field-by-field when unset; commonly only `model` is
+/// overridden to point at a faster model (default `gemma3:4b`,
+/// ~0.7s p50 vs ~15s p50 for thinking-mode Gemma 4 per L15 patch).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LlmAutoTagSection {
+    /// Backend override. Unset = inherit `[llm].backend`.
+    pub backend: Option<String>,
+    /// Model override. Unset = inherit `[llm].model`. Compiled default
+    /// at the resolver level is `gemma3:4b` (L15 fast-structured-output
+    /// model selection).
+    pub model: Option<String>,
+    /// Base-URL override. Unset = inherit `[llm].base_url`.
+    pub base_url: Option<String>,
+    /// Env-var-name override for the API key. Unset = inherit
+    /// `[llm].api_key_env` (or `[llm].api_key_file`).
+    pub api_key_env: Option<String>,
+    /// File-path override for the API key. Unset = inherit
+    /// `[llm].api_key_file` (or `[llm].api_key_env`).
+    pub api_key_file: Option<String>,
+}
+
+/// v0.7.x (#1146) — `[embeddings]` sectioned embedding-model
+/// configuration.
+///
+/// Wire format:
+/// ```toml
+/// [embeddings]
+/// backend        = "ollama"                    # only backend at v0.7.0
+/// url            = "http://localhost:11434"
+/// model          = "nomic-embed-text-v1.5"
+/// backfill_batch = 100                         # 1-10000 (env override:
+///                                              # AI_MEMORY_EMBED_BACKFILL_BATCH)
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EmbeddingsSection {
+    /// Embedding backend. At v0.7.0 only `ollama` is supported (the
+    /// `nomic-embed-text-v1.5` and `all-MiniLM-L6-v2` models both
+    /// speak Ollama's `/api/embed` wire shape). Field is present for
+    /// forward compatibility with future OpenAI-compatible embedding
+    /// vendors.
+    pub backend: Option<String>,
+
+    /// Embedding endpoint URL. Defaults to `http://localhost:11434`
+    /// when unset.
+    pub url: Option<String>,
+
+    /// Embedding model identifier. Legacy values `nomic_embed_v15`
+    /// (alias for `nomic-embed-text-v1.5`) and `mini_lm_l6_v2` (alias
+    /// for `sentence-transformers/all-MiniLM-L6-v2`) are honored at
+    /// parse time.
+    pub model: Option<String>,
+
+    /// Backfill batch size. Bounded `1..=10000`; out-of-range values
+    /// fall back to the compiled default (100) with a WARN. Env
+    /// override: `AI_MEMORY_EMBED_BACKFILL_BATCH` (#38).
+    pub backfill_batch: Option<u32>,
+}
+
+/// v0.7.x (#1146) — `[reranker]` sectioned cross-encoder
+/// configuration.
+///
+/// Wire format:
+/// ```toml
+/// [reranker]
+/// enabled = true
+/// model   = "ms-marco-MiniLM-L-6-v2"   # v0.7.0 has one variant;
+///                                       # field reserved for future
+///                                       # bake-offs.
+/// ```
+///
+/// Folds the legacy `cross_encoder = bool` top-level flag. Migration
+/// (via `ai-memory config migrate`) writes the explicit `enabled` +
+/// `model` fold; the legacy field continues to be honored at parse
+/// time until v0.8.0.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RerankerSection {
+    /// Whether the cross-encoder rerank stage runs in the recall
+    /// pipeline. Folded from `cross_encoder: Option<bool>` at the
+    /// resolver layer.
+    pub enabled: Option<bool>,
+
+    /// Cross-encoder model identifier. Defaults to
+    /// `ms-marco-MiniLM-L-6-v2` when unset. Field reserved for future
+    /// model bake-offs (e.g., `bge-reranker-v2-m3`,
+    /// `mxbai-rerank-large-v2`).
+    pub model: Option<String>,
+}
+
+/// v0.7.x (#1146) — `[storage]` sectioned storage configuration.
+///
+/// Wire format:
+/// ```toml
+/// [storage]
+/// default_namespace = "alphaone"
+/// archive_on_gc     = true
+/// archive_max_days  = 90
+/// max_memory_mb     = 4096
+/// ```
+///
+/// Carries the previously-flat top-level fields `default_namespace`,
+/// `archive_on_gc`, `archive_max_days`, `max_memory_mb`. The `db`
+/// path stays top-level per the #1146 I4 carve-out (path expansion
+/// semantics pinned by #507).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StorageSection {
+    /// Default namespace for new memories when the caller's request
+    /// omits one. Folded from the previously-flat top-level
+    /// `default_namespace` field.
+    pub default_namespace: Option<String>,
+
+    /// Whether to archive memories before GC deletion. Folded from
+    /// `archive_on_gc`. Default `true`.
+    pub archive_on_gc: Option<bool>,
+
+    /// Archive retention ceiling in days. `None` (default) disables
+    /// the automatic purge. Folded from `archive_max_days`.
+    pub archive_max_days: Option<i64>,
+
+    /// Memory budget in MB for the auto tier selector. Folded from
+    /// `max_memory_mb`.
+    pub max_memory_mb: Option<usize>,
 }
 
 /// v0.7.0 (issue #518) — `[agents]` top-level block. Today only carries
@@ -3793,6 +4075,12 @@ impl AppConfig {
             "governance",
             "confidence",
             "admin",
+            // v0.7.x (#1146) — enterprise configuration sections.
+            "schema_version",
+            "llm",
+            "embeddings",
+            "reranker",
+            "storage",
         ];
 
         let value: toml::Value = match toml::from_str(contents) {
@@ -5310,6 +5598,12 @@ legacy_scoring = false
             governance: Some(GovernanceConfig::default()),
             confidence: Some(ConfidenceConfig::default()),
             admin: Some(AdminConfig::default()),
+            // v0.7.x (#1146) — enterprise configuration sections.
+            schema_version: Some(2),
+            llm: Some(LlmSection::default()),
+            embeddings: Some(EmbeddingsSection::default()),
+            reranker: Some(RerankerSection::default()),
+            storage: Some(StorageSection::default()),
         };
 
         let serialised = toml::to_string(&cfg).expect("serialise AppConfig to TOML");
@@ -5355,6 +5649,12 @@ legacy_scoring = false
             "governance",
             "confidence",
             "admin",
+            // v0.7.x (#1146) — enterprise configuration sections.
+            "schema_version",
+            "llm",
+            "embeddings",
+            "reranker",
+            "storage",
         ];
 
         for key in table.keys() {
