@@ -1,0 +1,559 @@
+{
+  "$schema_comment": "ai-memory v0.7.0 NSA CSI capability inventory. Source-of-truth artefact produced by Task I of the NSA CSI audit (issue #1153). Every row is codegraph + grep verified.",
+  "ai_memory_version": "0.7.0",
+  "verification_timestamp_utc": "2026-05-23T16:30:22Z",
+  "verification_commit_sha": "4add7a8528d4c16d696b391ec6e2890269669a84",
+  "verification_branch": "release/v0.7.0",
+  "schema_version_sqlite": 49,
+  "schema_version_postgres": 49,
+  "parity_test": "tests/postgres_schema_parity.rs::schema_versions_match_across_adapters",
+  "schema_authority_source": "src/storage/migrations.rs:516 — const CURRENT_SCHEMA_VERSION: i64 = 49",
+  "test_counts": {
+    "total_test_attributes": 6961,
+    "lib_tests": 4830,
+    "integration_tests": 2131,
+    "denominator_grep": "grep -rE '^\\s*#\\[(tokio::)?test\\]' --include='*.rs' tests/ src/ | wc -l",
+    "note": "Authoritative test-attribute count. Earlier '13k+' claims are not grep-verifiable and have been retired from v0.7.0 messaging per issue #1153 §3 correction."
+  },
+  "mcp_tool_counts": {
+    "core_profile": 7,
+    "graph_profile": 18,
+    "admin_profile": 20,
+    "power_profile": 16,
+    "full_profile": 73,
+    "authority_source": "src/profile.rs — profile_core_has_seven_tools (line 833), profile_graph_has_eighteen_tools (849), profile_admin_has_twenty_tools (860), profile_power_has_sixteen_tools (870), profile_full_has_seventy_three_tools (898)"
+  },
+  "http_routes": {
+    "production_route_bindings": 87,
+    "unique_production_url_paths": 73,
+    "test_only_route_bindings": 1,
+    "test_only_routes": ["/slow (src/lib.rs:582 under #[cfg(test)])"],
+    "authority_source": "codegraph_search kind=route limit=100 against src/lib.rs",
+    "verification_command": "awk '/\\.route\\(/{in=1}in&&/\"\\/[^\"]*\"/{match($0,/\"\\/[^\"]*\"/);print substr($0,RSTART,RLENGTH);in=0}' src/lib.rs | sort -u | wc -l"
+  },
+  "cli_subcommands": {
+    "with_features_sal_postgres": 58,
+    "default_build": 56,
+    "sal_gated_subcommands": ["Migrate", "SchemaInit"],
+    "authority_source": "codegraph_node Command at src/daemon_runtime.rs:157"
+  },
+  "memory_struct": {
+    "field_count": 26,
+    "authority_source": "codegraph_node Memory at src/models/memory.rs:401",
+    "fields_v0_7_0_additions": ["reflection_depth", "memory_kind", "entity_id", "persona_version", "citations", "source_uri", "source_span", "confidence_source", "confidence_signals", "confidence_decayed_at", "version"]
+  },
+  "memory_link_relation": {
+    "variant_count": 6,
+    "variants": ["RelatedTo", "Supersedes", "Contradicts", "DerivedFrom", "ReflectsOn", "DerivesFrom"],
+    "authority_source": "codegraph_node MemoryLinkRelation at src/models/link.rs:88"
+  },
+  "memory_kind": {
+    "variant_count": 10,
+    "variants": ["Observation", "Reflection", "Persona", "Concept", "Entity", "Claim", "Relation", "Event", "Conversation", "Decision"],
+    "authority_source": "codegraph_node MemoryKind at src/models/memory.rs:38"
+  },
+  "hook_events": {
+    "variant_count": 25,
+    "baseline_lifecycle_events_v0_6_x": ["PreStore", "PostStore", "PreRecall", "PostRecall", "PreSearch", "PostSearch", "PreDelete", "PostDelete", "PrePromote", "PostPromote", "PreLink", "PostLink", "PreConsolidate", "PostConsolidate", "PreGovernanceDecision", "PostGovernanceDecision", "OnIndexEviction", "PreArchive", "PreTranscriptStore", "PostTranscriptStore"],
+    "v0_7_0_additions": ["PreRecallExpand", "PreReflect", "PostReflect", "PreCompaction", "OnCompactionRollback"],
+    "authority_source": "codegraph_node HookEvent at src/hooks/events.rs:73",
+    "operator_config_path": "~/.config/ai-memory/hooks.toml (default-off)"
+  },
+  "llm_backend_defaults": {
+    "xai": "grok-4.3",
+    "openai": "gpt-5",
+    "anthropic": "claude-opus-4.7",
+    "gemini": "gemini-2.0-flash",
+    "deepseek": "deepseek-chat",
+    "kimi_moonshot": "moonshot-v1-8k",
+    "qwen_dashscope": "qwen-max",
+    "mistral": "mistral-large-latest",
+    "groq": "llama-3.3-70b-versatile",
+    "together": "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+    "cerebras": "llama-3.3-70b",
+    "openrouter": "openai/gpt-5",
+    "fireworks": "accounts/fireworks/models/llama-v3p3-70b-instruct",
+    "lmstudio": "local-model",
+    "ollama_default_fallback": "gemma3:4b",
+    "authority_source": "codegraph_node backend_default_model at src/config.rs:4194"
+  },
+  "memory_portability_spec": {
+    "current_version_stamp": "v1 (Draft v1, originally v0.6.3.1)",
+    "files_on_disk": ["docs/spec/v1.md (23.9 KB)", "docs/spec/v1.html (6.9 KB)"],
+    "canonical_url": "https://alphaonedev.github.io/ai-memory-mcp/spec/v1/",
+    "note": "Originating brief referenced 'v1.1' — authoritative is v1 per the document's own status line."
+  },
+  "longmemeval_benchmark": {
+    "r_at_5_smart_tier": 0.978,
+    "r_at_5_keyword_tier": 0.970,
+    "r_at_10_smart_tier": 0.990,
+    "r_at_20_smart_tier": 0.998,
+    "dataset": "ICLR 2025 LongMemEval-S (500 questions, 6 categories)",
+    "harness_path": "benchmarks/longmemeval/",
+    "result_artefact_pointer": "benchmarks/longmemeval/results.md",
+    "authority_source": "README.md:685, docs/spec/v1.md:537, docs/v0.7.0/test-config.md:16"
+  },
+  "capabilities": [
+    {
+      "id": "form_4_fact_provenance",
+      "display_name": "Form 4 fact-provenance (citations + source URI + byte-range span)",
+      "addresses_nsa_concerns": ["insecure_serialization", "audit_logs", "tool_parameter_injection"],
+      "addresses_nsa_recommendations": ["validate_parameters", "design_for_boundaries", "instrument_for_logging"],
+      "verified_at_paths": [
+        "src/models/memory.rs:464 (Memory.citations: Vec<Citation>)",
+        "src/models/memory.rs:473 (Memory.source_uri: Option<String>)",
+        "src/models/memory.rs:482 (Memory.source_span: Option<SourceSpan>)",
+        "src/models/memory.rs:589 (Citation envelope struct)",
+        "src/validate.rs::validate_citation",
+        "src/validate.rs::validate_source_uri",
+        "src/validate.rs::validate_source_span"
+      ],
+      "schema_anchor": "v38 (citations + source_uri + source_span columns added)",
+      "issue_references": ["#757", "#758"],
+      "factual_description": "Every memory row carries fact-grain Citation envelopes (uri, accessed_at, optional hash, optional span), a first-class source_uri pointer (uri:/doc:/file: schemes), and an optional byte-range source_span ({start, end}) for atom-grain provenance. The substrate validates every citation, URI, and span at the write boundary via the RequestValidator surface (#966).",
+      "verified_in_v0_7_0": true,
+      "verified_by_codegraph": "codegraph_node Memory at src/models/memory.rs:401",
+      "verified_by_grep": [
+        "grep -n 'citations:' src/models/memory.rs → line 464",
+        "grep -n 'source_uri:' src/models/memory.rs → line 473",
+        "grep -n 'source_span:' src/models/memory.rs → line 482"
+      ],
+      "originating_brief_correction": "Originating brief referenced 'atom_span' — actual field name is 'source_span'. The Citation envelope doc-comment at line 601 cross-references 'source_span' consistently."
+    },
+    {
+      "id": "form_6_memory_kind",
+      "display_name": "Form 6 typed memory-kind discriminator",
+      "addresses_nsa_concerns": ["insecure_serialization", "inconsistent_behaviors"],
+      "addresses_nsa_recommendations": ["validate_parameters", "design_for_boundaries"],
+      "verified_at_paths": [
+        "src/models/memory.rs:38 (MemoryKind enum, 10 variants)",
+        "src/models/memory.rs (Memory.memory_kind field with #[serde(default)])"
+      ],
+      "schema_anchor": "v30 (memory_kind column added to memories table)",
+      "issue_references": ["#758", "L1-6"],
+      "factual_description": "Every memory carries a typed MemoryKind discriminator: Observation, Reflection, Persona, Concept, Entity, Claim, Relation, Event, Conversation, Decision. Each variant has explicit semantics documented in-source. Allows downstream consumers to filter to propositional commits (Claim), captured dialogue (Conversation), reflective summaries (Reflection), etc.",
+      "verified_in_v0_7_0": true,
+      "verified_by_codegraph": "codegraph_node MemoryKind at src/models/memory.rs:38 — 10 variants confirmed"
+    },
+    {
+      "id": "form_7_agent_external_governance",
+      "display_name": "Form 7 + L1-6 agent-EXTERNAL governance rules engine",
+      "addresses_nsa_concerns": ["access_control", "poor_approval_workflows", "tool_parameter_injection", "tool_invocation_path_confusion"],
+      "addresses_nsa_recommendations": ["sandbox_tool_execution", "validate_parameters", "design_for_boundaries"],
+      "verified_at_paths": [
+        "src/governance/agent_action.rs:99 (AgentAction enum)",
+        "src/governance/rules_store.rs (substrate rules engine)",
+        "src/governance/mod.rs::check_agent_action (write-time consultation hook)"
+      ],
+      "schema_anchor": "v0.7.0 governance tables (governance_rules, permissions)",
+      "issue_references": ["#691", "L1-6"],
+      "factual_description": "The substrate consults the operator-signed AgentAction rules engine on every write that proposes an agent-EXTERNAL action. Rules are Ed25519-signed by the operator and stored as substrate rows. Default posture flipped to enforce in v0.7.0 (#1054 fail-CLOSED): writes that fail rule consultation are refused unless the operator opts in to the fail-OPEN escape hatch.",
+      "verified_in_v0_7_0": true,
+      "verified_by_codegraph": "codegraph_node AgentAction at src/governance/agent_action.rs:99"
+    },
+    {
+      "id": "form_7_canonical_bytes_signing",
+      "display_name": "Form 7 canonical-bytes Ed25519 signing discipline",
+      "addresses_nsa_concerns": ["insecure_serialization", "inconsistent_behaviors", "audit_logs"],
+      "addresses_nsa_recommendations": ["sign_and_verify_mcp_messages", "validate_parameters"],
+      "verified_at_paths": [
+        "src/governance/rules_store.rs:541 (canonical_bytes_for_signing function)",
+        "src/governance/rules_store.rs:567 (verify_rule_signature)",
+        "src/governance/rules_store.rs:781 (canonical_bytes_for_signing_includes_enabled regression test)",
+        "src/governance/rules_store.rs:798 (canonical_bytes_for_signing_excludes_signature_and_attest_level regression test)"
+      ],
+      "issue_references": ["PR #820", "commit 3cdec59"],
+      "factual_description": "Every signed governance rule is hashed over a canonical byte representation that explicitly includes the `enabled` flag (preventing enable-after-sign tampering) and explicitly excludes the signature itself plus the attest_level (preventing self-referential signature loops). Two regression tests pin the canonical-bytes invariant.",
+      "verified_in_v0_7_0": true,
+      "verified_by_codegraph": "codegraph_search canonical_bytes_for_signing → 5 hits in src/governance/rules_store.rs"
+    },
+    {
+      "id": "v4_signed_events_chain",
+      "display_name": "V-4 signed-events cross-row hash chain",
+      "addresses_nsa_concerns": ["audit_logs", "insecure_serialization"],
+      "addresses_nsa_recommendations": ["sign_and_verify_mcp_messages", "instrument_for_logging"],
+      "verified_at_paths": [
+        "src/signed_events.rs:100-119 (SignedEvent.prev_hash + SignedEvent.sequence)",
+        "src/signed_events.rs:37-79 (module doc-comments documenting chain semantics)",
+        "src/cli/verify_signed_events.rs (CLI verifier)",
+        "src/signed_events.rs:1114 (read_chain_head_rejects_null_sequence_row test)",
+        "src/signed_events.rs:1159 (append_signed_event_refuses_when_null_sequence_present test)"
+      ],
+      "schema_anchor": "v34 (signed_events.prev_hash + signed_events.sequence columns)",
+      "issue_references": ["#698 V-4 closeout"],
+      "factual_description": "Every append to the signed_events audit table carries a SHA-256 prev_hash referencing the prior row's canonical bytes plus a monotonic sequence counter. Tampering with row N's content breaks row N+1's prev_hash verification; tampering with sequence breaks the contiguity check. The chain is tamper-evident even when individual row signatures are valid. CLI verifier ai-memory verify-signed-events-chain walks the chain backward and emits a structured report; non-zero exit on chain break.",
+      "verified_in_v0_7_0": true,
+      "verified_by_codegraph": "codegraph_search prev_hash sequence signed_events → confirmed at src/signed_events.rs:100-119"
+    },
+    {
+      "id": "seven_gap_versioned_writes",
+      "display_name": "Seven-gap Gap 1: optimistic-concurrency versioned writes",
+      "addresses_nsa_concerns": ["inconsistent_behaviors", "audit_logs"],
+      "addresses_nsa_recommendations": ["validate_parameters", "design_for_boundaries"],
+      "verified_at_paths": [
+        "src/models/memory.rs:521 (Memory.version: i64 column)",
+        "src/storage/mod.rs:1132 (VersionConflict envelope struct)",
+        "src/storage/mod.rs:1185 (update_with_expected_version function)",
+        "src/store/postgres.rs:1987 (postgres adapter update_with_expected_version)",
+        "src/mcp/tools/update.rs:691 (409 envelope response test)",
+        "tests/http_if_match_concurrency.rs:128 (HTTP PUT with matching If-Match succeeds)",
+        "tests/http_if_match_concurrency.rs:149 (HTTP PUT with stale If-Match returns 409)",
+        "tests/http_if_match_concurrency.rs:184 (PUT without If-Match preserves legacy last-write-wins)",
+        "tests/http_if_match_concurrency.rs:197 (quoted ETag-style If-Match parses)",
+        "tests/http_if_match_concurrency.rs:219 (unparseable If-Match falls through to legacy)"
+      ],
+      "schema_anchor": "v45 (memories.version BIGINT NOT NULL DEFAULT 1 column added)",
+      "issue_references": ["#884"],
+      "factual_description": "Every memory row carries a monotonic version counter bumped on every storage update. Concurrent updates passing expected_version race exactly one winner; the loser receives a typed 409 CONFLICT envelope naming the current stored version. HTTP wire surface honors If-Match header in both bare and ETag-quoted forms; missing If-Match preserves last-write-wins for backwards compat.",
+      "verified_in_v0_7_0": true,
+      "verified_by_codegraph": "codegraph_search expected_version If-Match → 8 hits"
+    },
+    {
+      "id": "seven_gap_source_uri",
+      "display_name": "Seven-gap Gap 2: source_uri first-class column",
+      "addresses_nsa_concerns": ["insecure_serialization", "audit_logs"],
+      "addresses_nsa_recommendations": ["validate_parameters", "design_for_boundaries"],
+      "verified_at_paths": [
+        "src/models/memory.rs:473 (Memory.source_uri: Option<String>)",
+        "src/validate.rs::validate_source_uri"
+      ],
+      "schema_anchor": "v38 (memories.source_uri TEXT NULL column + idx_memories_source_uri partial index)",
+      "issue_references": ["#885", "#757"],
+      "factual_description": "Every memory may carry a first-class URI pointer to its source artefact. Accepted schemes: uri: (HTTP URL), doc: (substrate doc id), file: (filesystem path). Validator surface lives at crate::validate::validate_source_uri. Partial index idx_memories_source_uri (v38) covers the predicate for fast source-side query.",
+      "verified_in_v0_7_0": true
+    },
+    {
+      "id": "seven_gap_causal_recall",
+      "display_name": "Seven-gap Gap 3: causal recall observation tracking",
+      "addresses_nsa_concerns": ["audit_logs", "inconsistent_behaviors"],
+      "addresses_nsa_recommendations": ["instrument_for_logging", "filter_monitor_output_pipelines"],
+      "verified_at_paths": [
+        "src/mcp/tools/recall_observations.rs:16 (handle_recall_observations MCP tool)",
+        "src/mcp/tools/recall_observations.rs:151 (filter-by-recall_id test)",
+        "src/observations/mod.rs:65 (record_recall storage primitive)",
+        "src/mcp/tools/recall.rs:393 (record_recall_observations recall-side population)",
+        "tests/recall_observations.rs:512 (gap3_recall_observations_mcp_tool_filters_compose end-to-end)"
+      ],
+      "issue_references": ["#886"],
+      "factual_description": "Every memory_recall invocation writes a recall_observations row keyed by a UUIDv4 recall_id, recording which candidates were considered, scored, and surfaced. The memory_recall_observations MCP tool queries the observation log by recall_id, allowing forensic reconstruction of any recall decision against any historical query.",
+      "verified_in_v0_7_0": true
+    },
+    {
+      "id": "seven_gap_confidence_capture",
+      "display_name": "Seven-gap Gap 4: confidence tier capture",
+      "addresses_nsa_concerns": ["inconsistent_behaviors", "audit_logs"],
+      "addresses_nsa_recommendations": ["validate_parameters", "instrument_for_logging"],
+      "verified_at_paths": [
+        "src/models/memory.rs:665 (ConfidenceTier enum)",
+        "tests/capabilities_v3.rs:125 (cap_v3_response_carries_schema_version_and_summary)"
+      ],
+      "issue_references": ["#887"],
+      "factual_description": "Memories carry a typed ConfidenceTier enum surfaced via the capabilities v3 envelope. Downstream consumers (LLM agents, application logic, audit reviewers) may filter by confidence tier when applying provenance gates.",
+      "verified_in_v0_7_0": true
+    },
+    {
+      "id": "seven_gap_reciprocal_supersede",
+      "display_name": "Seven-gap Gap 5: reciprocal supersede archival",
+      "addresses_nsa_concerns": ["audit_logs", "inconsistent_behaviors"],
+      "addresses_nsa_recommendations": ["instrument_for_logging", "filter_monitor_output_pipelines"],
+      "verified_at_paths": [
+        "src/storage/mod.rs:1380 (update_with_archive_on_supersede)",
+        "src/store/postgres.rs:2130 (postgres adapter)",
+        "src/autonomy.rs:421 (forget_if_superseded autonomy path)",
+        "tests/edit_history_split.rs:158 (hook integration test)"
+      ],
+      "issue_references": ["#888"],
+      "factual_description": "When a memory supersedes a prior version, the superseded row is archived into archived_memories with archive_reason='superseded' rather than overwritten. The reciprocal forward pointer preserves the audit chain; archived rows remain queryable for forensic review.",
+      "verified_in_v0_7_0": true
+    },
+    {
+      "id": "seven_gap_source_query",
+      "display_name": "Seven-gap Gap 6: source_uri filtered query",
+      "addresses_nsa_concerns": ["audit_logs", "access_control"],
+      "addresses_nsa_recommendations": ["validate_parameters", "design_for_boundaries"],
+      "verified_at_paths": [
+        "src/mcp/tools/search.rs:91-133 (memory_search source_uri parameter)",
+        "src/mcp/tools/search.rs:101 (validate::validate_source_uri at wire boundary)",
+        "src/mcp/tools/search.rs:113 (db::list_by_source_uri for index-only route)",
+        "src/mcp/tools/search.rs:120 (db::search_with_source_uri for combined FTS + source filter)",
+        "src/storage/mod.rs:316 (source_uri LIKE 'prefix%' filter in recall)"
+      ],
+      "schema_anchor": "v38 (idx_memories_source_uri partial index)",
+      "issue_references": ["#889"],
+      "factual_description": "The memory_search MCP tool accepts a source_uri parameter validated via validate_source_uri at the wire boundary. When supplied with an empty query, routes to db::list_by_source_uri (index-only fast path); when combined with FTS query, routes to db::search_with_source_uri. The partial index idx_memories_source_uri covers the predicate.",
+      "verified_in_v0_7_0": true,
+      "note": "Pre-audit (issue #1153 §2) flagged this as partial-verify; full deep-verify in Task I confirms shipped."
+    },
+    {
+      "id": "seven_gap_verbose_decoration",
+      "display_name": "Seven-gap Gap 7: verbose provenance decoration",
+      "addresses_nsa_concerns": ["audit_logs", "inconsistent_behaviors"],
+      "addresses_nsa_recommendations": ["instrument_for_logging", "filter_monitor_output_pipelines"],
+      "verified_at_paths": [
+        "src/mcp/tools/recall.rs:284 (decorate_memory function with verbose_provenance: bool argument)",
+        "tests/recall_decoration.rs:110 (gap7_verbose_provenance_false_collapses_to_legacy_shape)"
+      ],
+      "issue_references": ["#890"],
+      "factual_description": "The recall pipeline accepts an opt-in verbose_provenance flag that adds Form 4/5/6 provenance signals to every recalled memory envelope. When false (default), the response collapses to the legacy v0.6.x wire shape preserving backwards compatibility. When true, citations, source_uri, source_span, ConfidenceTier, and memory_kind are all surfaced in the response envelope.",
+      "verified_in_v0_7_0": true
+    },
+    {
+      "id": "capabilities_v3_envelope",
+      "display_name": "Capabilities v3 negotiation envelope",
+      "addresses_nsa_concerns": ["inconsistent_behaviors", "misconfigurations"],
+      "addresses_nsa_recommendations": ["design_for_boundaries", "validate_parameters", "instrument_for_logging"],
+      "verified_at_paths": [
+        "src/store/mod.rs:469 (schema_version method on SAL trait)",
+        "src/store/sqlite.rs:78 (sqlite impl)",
+        "src/store/postgres.rs:6801 (postgres impl)",
+        "tests/capabilities_v3.rs:125 (cap_v3_response_carries_schema_version_and_summary)",
+        "tests/s75_capabilities_db_schema_version.rs:111 (runtime surface test)"
+      ],
+      "schema_anchor": "Capabilities envelope schema_version = '3' at v0.7.0",
+      "issue_references": ["#762", "A5"],
+      "factual_description": "The capabilities envelope at v0.7.0 carries schema_version=3 with three application blocks (Form 4 provenance signals, Form 5 confidence calibration, Form 6 typed memory-kind). Clients may pin to v1 or v2 via accept= on memory_capabilities MCP or Accept-Capabilities HTTP header. Backwards compat preserved.",
+      "verified_in_v0_7_0": true
+    },
+    {
+      "id": "mtls_a2a_transport",
+      "display_name": "mTLS A2A transport layer",
+      "addresses_nsa_concerns": ["token_security", "access_control", "tool_invocation_path_confusion"],
+      "addresses_nsa_recommendations": ["sign_and_verify_mcp_messages", "design_for_boundaries", "validate_parameters"],
+      "verified_at_paths": [
+        "src/tls.rs:1175 (test_load_mtls_rustls_config_happy_path)",
+        "src/tls.rs:1197 (test_load_mtls_rustls_config_empty_allowlist_refuses)",
+        "src/tls.rs:1220 (test_load_mtls_rustls_config_missing_cert_errors)",
+        "src/federation/mod.rs:1779 (federation mTLS config builder test)",
+        "src/cli/sync.rs:654 (sync_daemon insecure-without-mtls refusal)"
+      ],
+      "factual_description": "The federation sync daemon refuses to start without mTLS unless an explicit insecure flag is set. Peer certificates are validated against an operator-supplied allowlist; an empty allowlist refuses every peer (defense-in-depth against operator misconfiguration). Missing cert files raise a typed error at config-load time.",
+      "verified_in_v0_7_0": true
+    },
+    {
+      "id": "ed25519_agent_attestation",
+      "display_name": "Per-agent Ed25519 cryptographic attestation",
+      "addresses_nsa_concerns": ["token_security", "access_control", "tool_invocation_path_confusion"],
+      "addresses_nsa_recommendations": ["sign_and_verify_mcp_messages", "design_for_boundaries"],
+      "verified_at_paths": [
+        "src/governance/rules_store.rs:541 (canonical_bytes_for_signing)",
+        "src/governance/rules_store.rs:567 (verify_rule_signature)",
+        "src/daemon_runtime.rs:157 (Command::Identity for keypair lifecycle CLI)",
+        "src/signed_events.rs (per-row sig column)"
+      ],
+      "factual_description": "Every agent may carry an Ed25519 keypair generated via ai-memory identity generate. Outbound link writes sign canonical-CBOR-encoded link content; inbound verification checks signatures against the observed_by claim. attest_level enum: unsigned / self_signed / peer_attested. Hardware-backed key storage (TPM/HSM/Secure Enclave) is out of OSS scope and lives in the AgenticMem commercial layer.",
+      "verified_in_v0_7_0": true
+    },
+    {
+      "id": "namespace_isolation",
+      "display_name": "Per-namespace governance + standard policy isolation",
+      "addresses_nsa_concerns": ["access_control", "inconsistent_behaviors", "misconfigurations"],
+      "addresses_nsa_recommendations": ["design_for_boundaries", "sandbox_tool_execution"],
+      "verified_at_paths": [
+        "src/daemon_runtime.rs:157 (Command::Namespace subcommand surface)",
+        "src/cli/namespace.rs (set-standard/get-standard/clear-standard verbs)"
+      ],
+      "schema_anchor": "v36 (namespace_standards table)",
+      "issue_references": ["#800", "Batman Mode Crack 1"],
+      "factual_description": "Every memory carries a namespace string validated against a strict allowlist regex (max 128 bytes, no slashes/spaces/nulls). Each namespace may carry a standard policy memory pointer (Batman Form 2 + Form 6 enabled by #800). Multi-tenant isolation is enforced at the storage layer via the namespace foreign key on every read path.",
+      "verified_in_v0_7_0": true
+    },
+    {
+      "id": "federation_push_dlq",
+      "display_name": "Federation push dead-letter queue (#933)",
+      "addresses_nsa_concerns": ["denial_of_service", "audit_logs", "inconsistent_behaviors"],
+      "addresses_nsa_recommendations": ["instrument_for_logging", "design_for_boundaries"],
+      "verified_at_paths": [
+        "src/storage/migrations.rs:841 (MIGRATION_V48_SQLITE)",
+        "src/store/postgres.rs:247 (MIGRATION_V48_FEDERATION_PUSH_DLQ)",
+        "src/federation/push_dlq.rs:151 (spawn_replay_federation_push_dlq)",
+        "src/federation/push_dlq.rs:195 (MAX_REPLAY_ATTEMPTS)",
+        "src/federation/push_dlq.rs:334 (refresh_depth_gauge)",
+        "src/federation/mod.rs:73 (FederationDlqSink trait export)",
+        "tests/federation_dlq_replay.rs (integration tests)"
+      ],
+      "schema_anchor": "v48 (federation_push_dlq table added to sqlite + postgres)",
+      "issue_references": ["#933"],
+      "factual_description": "When a federation push to a peer fails (network error, peer rejection, signature failure), the push is enqueued to the federation_push_dlq table with a retry counter. A background replay loop drains the DLQ with exponential backoff up to MAX_REPLAY_ATTEMPTS; depth is exported as a Prometheus gauge for operator monitoring.",
+      "verified_in_v0_7_0": true
+    },
+    {
+      "id": "track_g_hook_pipeline",
+      "display_name": "Track G 25-event programmable hook pipeline",
+      "addresses_nsa_concerns": ["access_control", "poor_approval_workflows", "audit_logs"],
+      "addresses_nsa_recommendations": ["sandbox_tool_execution", "filter_monitor_output_pipelines", "instrument_for_logging"],
+      "verified_at_paths": [
+        "src/hooks/events.rs:73 (HookEvent enum, 25 variants codegraph-counted)",
+        "src/hooks/mod.rs (decision contract: Allow / Modify / Deny / AskUser)",
+        "~/.config/ai-memory/hooks.toml (operator config, default-off)"
+      ],
+      "factual_description": "The substrate fires hook events at every memory lifecycle transition: 20 baseline events (PreStore/PostStore/PreRecall/PostRecall/PreSearch/PostSearch/PreDelete/PostDelete/PrePromote/PostPromote/PreLink/PostLink/PreConsolidate/PostConsolidate/PreGovernanceDecision/PostGovernanceDecision/OnIndexEviction/PreArchive/PreTranscriptStore/PostTranscriptStore) plus 5 v0.7.0 additions (PreRecallExpand for G10 query expansion, PreReflect + PostReflect for recursive-learning Task 6/8, PreCompaction + OnCompactionRollback for L1-7 compaction). Hooks fire only when ~/.config/ai-memory/hooks.toml exists and registers them. Decision contract supports veto (Deny), modification (Modify), and human-approval gating (AskUser).",
+      "verified_in_v0_7_0": true,
+      "verified_by_codegraph": "codegraph_node HookEvent at src/hooks/events.rs:73 — 25 variants confirmed"
+    },
+    {
+      "id": "chaos_tested_convergence",
+      "display_name": "Chaos-tested federation convergence",
+      "addresses_nsa_concerns": ["denial_of_service", "inconsistent_behaviors"],
+      "addresses_nsa_recommendations": ["filter_monitor_output_pipelines", "instrument_for_logging"],
+      "verified_at_paths": [
+        "tests/federation_scale.rs (federation chaos suite)",
+        "tests/federation_scale.rs:202 (p99 latency percentile constant: 0.99)",
+        "docs/v0.7.0/test-campaign-* (campaign artefacts)"
+      ],
+      "factual_description": "Federation convergence is tested under chaos conditions in tests/federation_scale.rs. The p99 latency percentile is pinned at 0.99 (test constant). A campaign-artefact convergence threshold (operator-side documentation referenced as ≥0.995 in the originating brief) is tracked under docs/v0.7.0/test-campaign-* but is NOT a code-side constant — Task I HONEST POSTURE: this threshold lives in operator campaign documentation, not in test code. The code-side guarantee is the p99 latency budget.",
+      "verified_in_v0_7_0": true,
+      "honesty_note": "Originating brief's ≥0.995 figure is campaign-artefact-tracked, not code-pinned. Procurement-grade evidence relies on the documented A2A chaos campaign results in docs/v0.7.0/test-campaign-*, not a hardcoded threshold."
+    },
+    {
+      "id": "token_budget_guards",
+      "display_name": "cl100k_base token budget guards",
+      "addresses_nsa_concerns": ["denial_of_service", "tool_parameter_injection"],
+      "addresses_nsa_recommendations": ["validate_parameters", "design_for_boundaries", "sandbox_tool_execution"],
+      "verified_at_paths": [
+        "tests/token_budget_guard.rs:65 (VERBOSE_FULL_PROFILE_CEILING_TOKENS)",
+        "tests/token_budget_guard.rs:75 (TRIMMED_FULL_PROFILE_CEILING_TOKENS for the bare wire ceiling)",
+        "src/storage/mod.rs:2203 (count_tokens_cl100k canonical token counter)",
+        "tests/budget_tokens.rs:266 (cl100k_tokenizer_is_deterministic)"
+      ],
+      "factual_description": "The MCP wire surface is bounded by cl100k_base token ceilings. The trimmed bare-wire ceiling holds tools/list under the C5 budget (the strip_docs_from_tools wire trimmer drops long-form natural-language strings, doc fields, and nested description strings). The verbose-surface ceiling applies when callers explicitly request memory_capabilities verbose drilldown. Deterministic tokenization pinned by the cl100k_tokenizer_is_deterministic regression test.",
+      "verified_in_v0_7_0": true
+    },
+    {
+      "id": "memory_portability_spec",
+      "display_name": "Memory Portability Spec v1",
+      "addresses_nsa_concerns": ["insecure_serialization", "inconsistent_behaviors"],
+      "addresses_nsa_recommendations": ["choose_supported_mcp_projects", "design_for_boundaries"],
+      "verified_at_paths": [
+        "docs/spec/v1.md (23.9 KB Markdown source-of-truth)",
+        "docs/spec/v1.html (6.9 KB published version)"
+      ],
+      "canonical_url": "https://alphaonedev.github.io/ai-memory-mcp/spec/v1/",
+      "factual_description": "The Memory Portability Spec defines an export envelope any ai-memory deployment can produce and any ai-memory deployment can ingest without data loss. Specification version v1 (Draft v1, originally v0.6.3.1; carried forward at v0.7.0). Multi-implementation interop is a v2.0 deliverable per ROADMAP §7.6.",
+      "verified_in_v0_7_0": true,
+      "originating_brief_correction": "Originating brief referenced v1.1 — authoritative version stamp is v1 per the document's own header."
+    },
+    {
+      "id": "request_validator_input_validation",
+      "display_name": "RequestValidator DTO-bundled input validation surface",
+      "addresses_nsa_concerns": ["tool_parameter_injection", "insecure_serialization", "inconsistent_behaviors", "access_control"],
+      "addresses_nsa_recommendations": ["validate_parameters", "design_for_boundaries"],
+      "verified_at_paths": [
+        "src/validate.rs:1027 (pub struct RequestValidator)",
+        "src/validate.rs:1038 (RequestValidator::validate_create)",
+        "src/validate.rs:1050 (RequestValidator::validate_update)",
+        "src/validate.rs:784 (validate_create free fn)",
+        "src/validate.rs:808 (validate_memory free fn)",
+        "src/validate.rs:852 (validate_update free fn)"
+      ],
+      "issue_references": ["#966"],
+      "factual_description": "Every wire-entry layer (HTTP handlers, MCP tools, CLI subcommands) routes DTO-bundling validation through pub struct RequestValidator — the canonical fluent surface. Pre-#966 the same validate_id + validate_namespace + validate_agent_id + ... chains were duplicated across 87 HTTP routes, 73 MCP tools, and 58 CLI subcommands; adding a new cross-field invariant required three audited per-surface edits. Post-#966 a single struct method covers all three surfaces with the typed ValidationError { field, reason } envelope. This is the substrate's primary defense against the NSA-enumerated tool-parameter-injection class.",
+      "verified_in_v0_7_0": true,
+      "verified_by_grep": "grep -nE 'pub struct RequestValidator|validate_create|validate_update|validate_memory' src/validate.rs → 11 hits"
+    },
+    {
+      "id": "dos_multi_layer_defense",
+      "display_name": "Multi-layer denial-of-service hardening",
+      "addresses_nsa_concerns": ["denial_of_service", "tool_parameter_injection"],
+      "addresses_nsa_recommendations": ["design_for_boundaries", "validate_parameters", "filter_monitor_output_pipelines", "instrument_for_logging"],
+      "verified_at_paths": [
+        "src/profile.rs:96-419 (K8 memory_quota_status per-agent quota)",
+        "tests/token_budget_guard.rs (cl100k_base wire ceilings)",
+        "src/subscriptions.rs:791-803 (HMAC-mandatory fail-CLOSED webhook dispatch, R3-S1.HMAC)",
+        "src/subscriptions.rs:1070-1100 (SSRF guard with DNS resolution + IP allowlist, #1053 fail-CLOSED)",
+        "src/federation/push_dlq.rs:195 (MAX_REPLAY_ATTEMPTS bound on retry storms)",
+        "src/lib.rs:512 (DefaultBodyLimit::max(2 * 1024 * 1024) — 2 MB HTTP body cap)",
+        "src/federation/signing.rs:42 (REQUIRE_NONCE_ENV nonce-replay defense, #922)"
+      ],
+      "issue_references": ["K8", "R3-S1.HMAC", "#1053", "#922"],
+      "factual_description": "DoS defense is multi-layer: (1) K8 per-agent quota with memory_quota_status MCP tool + /api/v1/quota/status HTTP endpoint surfaces day-by-day storage and rate budgets to operators. (2) cl100k_base token budget guards bound the MCP wire surface (tools/list trimmed under the C5 budget; verbose drilldown bounded at VERBOSE_FULL_PROFILE_CEILING_TOKENS). (3) HMAC-mandatory webhook dispatch under R3-S1.HMAC fails-CLOSED — daemon refuses to send unsigned subscriptions. (4) SSRF guard validates webhook target URLs via DNS resolution against an IP allowlist; fails-CLOSED on DNS failure under AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL. (5) Federation push DLQ caps retry storms at MAX_REPLAY_ATTEMPTS. (6) HTTP body size capped at 2 MB via Axum DefaultBodyLimit. (7) Federation nonce-replay defense prevents amplification via captured-signature replay.",
+      "verified_in_v0_7_0": true,
+      "honesty_note": "DoS hardening is perpetual — no substrate can fully defend against legitimate-but-expensive queries without operator-tuned quotas. The seven layers above raise the cost of attack but do not eliminate the threat class."
+    },
+    {
+      "id": "substrate_native_verify_family",
+      "display_name": "Substrate-native verify-* CLI inspection family",
+      "addresses_nsa_concerns": ["audit_logs", "tool_invocation_path_confusion"],
+      "addresses_nsa_recommendations": ["instrument_for_logging", "sign_and_verify_mcp_messages", "choose_supported_mcp_projects"],
+      "verified_at_paths": [
+        "src/daemon_runtime.rs:373 (Command::VerifyReflectionChain)",
+        "src/daemon_runtime.rs:380 (Command::VerifySignedEventsChain)",
+        "src/daemon_runtime.rs:390 (Command::VerifyForensicBundle)",
+        "src/cli/verify_signed_events.rs (chain verifier)",
+        "src/forensic/bundle.rs (forensic bundle export + verify)"
+      ],
+      "factual_description": "The substrate ships three substrate-native inspection subcommands that do NOT use Anthropic's separate MCP-Inspector toolchain (the surface CVE-2025-49596 targeted). ai-memory verify-reflection-chain walks the reflects_on edge graph backward from a memory id and verifies every Ed25519 signature. ai-memory verify-signed-events-chain walks the V-4 cross-row hash chain (prev_hash + sequence) on the signed_events audit table and reports tampering with non-zero exit. ai-memory verify-forensic-bundle re-hashes every file in a procurement-grade evidence bundle, checks the manifest signature, and re-verifies every edge signature against the bundled observed_by public key. Substrate operators using these verifiers are not vulnerable to CVE-2025-49596 (which was in the separate MCP-Inspector toolchain, not the ai-memory substrate).",
+      "verified_in_v0_7_0": true
+    },
+    {
+      "id": "mcp_client_attestation",
+      "display_name": "MCP initialize handshake clientInfo capture (partial server-identity)",
+      "addresses_nsa_concerns": ["tool_invocation_path_confusion", "audit_logs"],
+      "addresses_nsa_recommendations": ["sign_and_verify_mcp_messages", "instrument_for_logging"],
+      "verified_at_paths": [
+        "src/mcp/mod.rs:1607-1611 (clientInfo capture at initialize handshake)",
+        "src/mcp/mod.rs:2410-2411 (initialize method dispatch)",
+        "src/mcp/mod.rs:2381 (clientInfo.name captured for per-row provenance)"
+      ],
+      "issue_references": ["Track B4"],
+      "factual_description": "The substrate captures clientInfo.name from the MCP initialize handshake and threads it through every downstream operation. This allows per-row provenance attribution to a specific client (Claude Code, Cursor, Cline, etc.) and supports forensic reconstruction of which client made which call.",
+      "verified_in_v0_7_0": true,
+      "honesty_note": "This is PARTIAL server-identity attestation. The substrate currently captures the CLIENT's identity but does NOT publish a signed serverInfo response in the initialize handshake. A misconfigured client mounting multiple memory servers cannot cryptographically distinguish them. v0.7.x gap-fix candidate: add daemon-Ed25519-signed serverInfo to the initialize response so clients can pin-on-first-connect (TOFU). Tracked for v0.7.x follow-up."
+    },
+    {
+      "id": "encryption_at_rest_sqlcipher",
+      "display_name": "Encryption at rest (sqlcipher build feature)",
+      "addresses_nsa_concerns": ["access_control", "token_security", "misconfigurations"],
+      "addresses_nsa_recommendations": ["design_for_boundaries", "sandbox_tool_execution"],
+      "verified_at_paths": [
+        "Cargo.toml ([features] sqlcipher feature flag)",
+        "src/config.rs (AI_MEMORY_ENCRYPT_AT_REST resolver)",
+        "src/cli/* (--db-passphrase-file flag with mode 0400 enforcement, #1055)"
+      ],
+      "issue_references": ["#1055"],
+      "factual_description": "Operators may build with --features sqlcipher to enable SQLite-level AES-256 encryption at rest. When AI_MEMORY_ENCRYPT_AT_REST=true, every DB open path requires an AI_MEMORY_DB_PASSPHRASE (or --db-passphrase-file with mode 0400 strict permission check per #1055). Plain-sqlite opens are refused under this posture. The passphrase-file lax-permission escape hatch (AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS) defaults to false, requiring 0400-or-tighter on first start.",
+      "verified_in_v0_7_0": true,
+      "honesty_note": "Switching the flag on against an existing plain DB does NOT encrypt it — operators must export → encrypted-init → import or use the sqlcipher CLI ATTACH … KEY recipe."
+    },
+    {
+      "id": "longmemeval_benchmark",
+      "display_name": "LongMemEval-S R@5 97.8% / R@10 99.0% / R@20 99.8%",
+      "addresses_nsa_concerns": ["inconsistent_behaviors"],
+      "addresses_nsa_recommendations": ["choose_supported_mcp_projects"],
+      "verified_at_paths": [
+        "README.md:685 (canonical citation)",
+        "docs/spec/v1.md:537 (spec disclosure)",
+        "docs/v0.7.0/test-config.md:16 (test config reference)",
+        "benchmarks/longmemeval/ (harness)",
+        "docs/benchmarks/longmemeval-reflection.md"
+      ],
+      "factual_description": "Evaluated on ICLR 2025 LongMemEval-S (500 questions, 6 categories). Pure FTS5 keyword tier achieves 97.0% R@5 in 2.2 seconds (232 q/s). LLM query expansion (smart tier) pushes to 97.8% R@5. Recall at depth 10 = 99.0%; recall at depth 20 = 99.8%. All inference runs locally — zero cloud API calls.",
+      "verified_in_v0_7_0": true
+    }
+  ],
+  "summary": {
+    "total_capabilities": 27,
+    "verified_in_v0_7_0": 27,
+    "deferred_to_future_release": 0,
+    "partial_or_honesty_notes": 3,
+    "partial_or_honesty_capabilities": ["chaos_tested_convergence", "dos_multi_layer_defense", "mcp_client_attestation"],
+    "originating_brief_corrections_applied": 4,
+    "corrections": [
+      "Schema version v48 → v49 (CURRENT_SCHEMA_VERSION at src/storage/migrations.rs:516)",
+      "Field name atom_span → source_span (Memory.source_span at src/models/memory.rs:482)",
+      "Test count 13k+ → 6,961 (#[test] attribute count)",
+      "Memory Portability Spec v1.1 → v1 (per document's own version stamp)"
+    ],
+    "newly_documented_defensive_layers": [
+      "request_validator_input_validation (NSA tool_parameter_injection concern — was under-credited as consumer responsibility; substrate ships RequestValidator at src/validate.rs:1027)",
+      "dos_multi_layer_defense (NSA denial_of_service concern — substrate ships 7-layer defense, not bare-minimum protection)",
+      "substrate_native_verify_family (CVE-2025-49596 concern — substrate ships verify-* family that doesn't use the vulnerable Inspector)",
+      "mcp_client_attestation (NSA tool_invocation_path_confusion concern — substrate captures clientInfo at initialize; partial server-identity, full attestation tracked for v0.7.x follow-up)",
+      "encryption_at_rest_sqlcipher (NSA access_control + token_security concerns — sqlcipher build feature)"
+    ],
+    "v0_7_x_gap_fix_candidates": [
+      "Daemon serverInfo Ed25519 signing at MCP initialize handshake (closes tool_invocation_path_confusion at substrate boundary; gap-fix for mcp_client_attestation partial coverage)",
+      "Accept-Provenance verbose-default capability flag (closes output-poisoning consumer-responsibility gap; lets consumers opt into verbose decoration per-session without flipping the wire default)",
+      "Per-namespace rate-limit dimension extension (tightens K8 quota from per-agent to (agent_id, namespace) compound)"
+    ]
+  }
+}

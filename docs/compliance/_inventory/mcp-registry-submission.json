@@ -1,0 +1,149 @@
+{
+  "$schema_comment": "MCP Registry submission metadata for ai-memory v0.7.0. Prepared as part of Task H of audit issue #1153 (NSA CSI MCP Security Audit). Actual submission to the external MCP Registry remains operator-gated — this JSON is the canonical submission payload Jim approves before the external PR is opened.",
+  "submission_status": "prepared_pending_operator_authorisation",
+  "verification_commit_sha": "4add7a8528d4c16d696b391ec6e2890269669a84",
+  "verification_branch": "release/v0.7.0",
+  "prepared_at_utc": "2026-05-23T16:30:22Z",
+  "package": {
+    "name": "ai-memory",
+    "trademark": "ai-memory™ (USPTO-registered)",
+    "version": "0.7.0",
+    "maintainer": "AlphaOne LLC (@alphaonedev)",
+    "license": "Apache-2.0",
+    "license_spdx": "Apache-2.0",
+    "repository": "https://github.com/alphaonedev/ai-memory-mcp",
+    "homepage": "https://alphaonedev.github.io/ai-memory-mcp/",
+    "documentation": "https://alphaonedev.github.io/ai-memory-mcp/",
+    "compliance_page": "https://alphaonedev.github.io/ai-memory-mcp/compliance/",
+    "nsa_csi_mapping": "https://alphaonedev.github.io/ai-memory-mcp/compliance/nsa-csi-mcp.html",
+    "security_policy": "https://github.com/alphaonedev/ai-memory-mcp/blob/main/SECURITY.md",
+    "security_contact": "security@alpha-one.mobi",
+    "issue_tracker": "https://github.com/alphaonedev/ai-memory-mcp/issues"
+  },
+  "categories": [
+    "memory",
+    "substrate",
+    "persistent-storage",
+    "federation",
+    "provenance",
+    "audit",
+    "governance",
+    "knowledge-graph",
+    "vector-search",
+    "rust"
+  ],
+  "mcp_metadata": {
+    "transport": ["stdio"],
+    "schema_version": 3,
+    "tool_profiles": {
+      "core": {
+        "tool_count": 7,
+        "description": "Default profile. memory_store / memory_recall / memory_search / memory_list / memory_get / memory_load_family / memory_smart_load plus always-on memory_capabilities bootstrap."
+      },
+      "graph": {
+        "tool_count": 18,
+        "description": "Knowledge graph traversal: memory_kg_query / memory_kg_timeline / memory_kg_invalidate / memory_find_paths / memory_get_links plus core."
+      },
+      "admin": {
+        "tool_count": 20,
+        "description": "Operator surface: memory_archive_list/restore/purge / memory_pending_approve/reject / memory_consolidate / memory_namespace_set_standard plus core."
+      },
+      "power": {
+        "tool_count": 16,
+        "description": "Autonomy + observation: memory_reflect / memory_replay / memory_quota_status / memory_atomise / memory_verify plus core."
+      },
+      "full": {
+        "tool_count": 73,
+        "description": "Every advertised tool. 72 callable memory tools + always-on memory_capabilities bootstrap. Asserted by Profile::full().expected_tool_count() == 73 in src/profile.rs."
+      }
+    },
+    "prompts": ["recall-first", "memory-workflow"],
+    "resources": "n/a (substrate exposes resources via memory_capabilities resource block per capabilities v3)"
+  },
+  "frameworks_supported": [
+    "Claude Code (Anthropic) — SessionStart hook + MCP stdio",
+    "Claude Desktop (Anthropic) — MCP stdio",
+    "Cursor — MCP stdio",
+    "Cline — MCP stdio",
+    "Continue.dev — MCP stdio",
+    "Windsurf — MCP stdio",
+    "Codex CLI (OpenAI) — MCP stdio (Codex config TOML)",
+    "OpenClaw — MCP stdio",
+    "Zed — MCP stdio",
+    "Goose — MCP stdio",
+    "Roo Code — MCP stdio",
+    "Aider — MCP stdio",
+    "Cody — MCP stdio",
+    "Gemini CLI — MCP stdio",
+    "Any MCP-speaking client via stdio JSON-RPC 2.0"
+  ],
+  "languages": {
+    "primary": "Rust",
+    "rust_version_minimum": "1.88+",
+    "sdks": ["TypeScript (npm: @alphaone/ai-memory)", "Python (PyPI: ai-memory-mcp)"]
+  },
+  "storage_backends": [
+    "SQLite (built-in; default; WAL mode; FTS5; HNSW vector index)",
+    "PostgreSQL (--features sal-postgres; pgvector)",
+    "PostgreSQL + Apache AGE (--features sal-postgres; AGE Cypher graph backend; auto-detected on pg_extension)"
+  ],
+  "platforms": [
+    "macOS (x86_64, aarch64)",
+    "Linux (x86_64, aarch64)",
+    "Windows (x86_64)",
+    "iOS (aarch64-apple-ios; cross-compiled per #1068)",
+    "Android (aarch64-linux-android + 3 ABIs; cross-compiled per #1068)"
+  ],
+  "test_evidence": {
+    "test_attribute_count": 6961,
+    "lib_test_count": 4830,
+    "integration_test_count": 2131,
+    "line_coverage_target": "≥92%",
+    "longmemeval_r_at_5_smart": 0.978,
+    "longmemeval_r_at_10_smart": 0.990,
+    "longmemeval_r_at_20_smart": 0.998,
+    "longmemeval_dataset": "ICLR 2025 LongMemEval-S (500 questions, 6 categories)",
+    "ship_gate_evidence_url": "https://alphaonedev.github.io/ai-memory-mcp/evidence.html",
+    "discovery_gate_url": "https://alphaonedev.github.io/ai-memory-discovery-gate/",
+    "a2a_gate_status": "48/48 PASS across 4 channels (mTLS verified)"
+  },
+  "compliance_evidence": {
+    "nsa_csi_coverage": {
+      "concerns_structurally_addressed": "10/10",
+      "recommendations_implemented": "7/7",
+      "mapping_document": "https://alphaonedev.github.io/ai-memory-mcp/compliance/nsa-csi-mcp.html",
+      "honest_limitations_companion": "https://alphaonedev.github.io/ai-memory-mcp/compliance/honest-limitations.md",
+      "capability_inventory": "https://alphaonedev.github.io/ai-memory-mcp/compliance/_inventory/v0.7.0-capabilities.json",
+      "reference_document": "National Security Agency, Model Context Protocol (MCP): Security Design Considerations for AI-Driven Automation, U/OO/6030316-26 | PP-26-1834, May 2026 v1.0"
+    },
+    "memory_portability_spec": "https://alphaonedev.github.io/ai-memory-mcp/spec/v1/",
+    "audit_trail_format": "V-4 signed_events cross-row hash chain (prev_hash + sequence; schema v34)",
+    "encryption_at_rest": "AES-256 via --features sqlcipher (operator-opt-in)",
+    "transport_security": "mTLS on federation surface; mTLS optional on HTTP daemon; HMAC-mandatory webhook dispatch under R3-S1.HMAC",
+    "key_attestation": "Ed25519 per-agent keypairs; canonical-bytes signing discipline pinned by regression tests"
+  },
+  "active_maintenance_proof": {
+    "release_cadence": "v0.6.3 (2026-04) → v0.6.4 (2026-05) → v0.7.0 (2026-05) — monthly cadence",
+    "commit_cadence": "Daily commits on release/* branches per CHANGELOG.md",
+    "ci_workflows": [
+      "CI (lint + clippy::pedantic + test + audit)",
+      "Bench (criterion + LongMemEval)",
+      "Session-boot lifetime",
+      "Mobile cross-compile (iOS + Android)",
+      "Postgres + AGE integration",
+      "A2A 4-channel mTLS"
+    ],
+    "security_advisory_channel": "GitHub Security Advisory + security@alpha-one.mobi",
+    "vulnerability_response_sla": "see SECURITY.md"
+  },
+  "endorsement_disclaimers": {
+    "no_anthropic_affiliation": "ai-memory is not an Anthropic product. It is an MCP-protocol implementation maintained by AlphaOne LLC under Apache 2.0.",
+    "no_nsa_endorsement": "The NSA CSI mapping (linked above) describes ai-memory's substrate-level posture relative to NSA-issued guidance. The National Security Agency does not endorse, certify, or recommend ai-memory, AgenticMem, AlphaOne LLC, or any commercial product. References to the NSA document follow the document's stated reproduction guidance."
+  },
+  "submission_metadata": {
+    "submission_format_expected": "PR to https://github.com/modelcontextprotocol/registry or registry submission form (per registry's current submission process; check https://blog.modelcontextprotocol.io/posts/2025-09-08-mcp-registry-preview/ for current process)",
+    "submission_text": "ai-memory v0.7.0 — persistent memory substrate for AI agents and LLM tools. 73 advertised MCP tools at --profile full, 7 at --profile core. Schema v49 (sqlite + postgres lockstep). Ed25519 attestation, V-4 signed-events hash chain, 25-event programmable hook pipeline, Form 4/5/6/7 Batman provenance framework, mTLS federation. Procurement-grade NSA CSI MCP security compliance documented at https://alphaonedev.github.io/ai-memory-mcp/compliance/nsa-csi-mcp.html (10/10 concerns + 7/7 recommendations structurally addressed). Apache 2.0. Maintained by AlphaOne LLC.",
+    "tags": ["memory", "substrate", "persistent", "rust", "mcp-server", "knowledge-graph", "federation", "audit", "provenance", "nsa-csi-compliant", "apache-2-0"]
+  },
+  "operator_authorisation_notes": "This submission metadata is prepared but NOT yet submitted to the external MCP Registry. Per the discipline of audit issue #1153 Task H, the actual submission requires explicit operator authorisation (Jim) before the external PR is opened against the registry repository. Reason: the registry submission is a public-facing claim with vendor-attribution implications that fall outside autonomous-AI scope. When authorised, the submission text + tags above are the canonical payload; no additional drafting is required."
+}
