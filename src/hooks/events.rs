@@ -68,6 +68,24 @@ use crate::models::{Memory, MemoryLink, Tier};
 ///
 /// Serde uses snake_case so the on-disk and on-wire spelling
 /// matches the table in `docs/v0.7/V0.7-EPIC.md` § Track G2.
+///
+/// # NSA CSI MCP Security mapping
+///
+/// Primary defense against **NSA concern (c) Poor approval workflows**
+/// and implementation of **NSA recommendation (d) Constrain and
+/// sandbox tool execution** + **(f) Filter and monitor output
+/// pipelines and chained execution** per U/OO/6030316-26 (May 2026
+/// v1.0). 25 lifecycle events (20 baseline + 5 v0.7.0 additions:
+/// `PreRecallExpand`, `PreReflect`, `PostReflect`, `PreCompaction`,
+/// `OnCompactionRollback`) give operators a substrate-side hook for
+/// every memory operation, with the four-way decision contract
+/// (`Allow` / `Modify` / `Deny` / `AskUser`) and chain ordering
+/// (priority-desc, first-Deny short-circuits). Default-off — a v0.7
+/// install with no `~/.config/ai-memory/hooks.toml` behaves
+/// identically to v0.6.4. Capability inventory anchor:
+/// `track_g_hook_pipeline`. Mapping narrative in
+/// `docs/compliance/nsa-csi-mcp.html` §3.3 (concern c), §4.4
+/// (recommendation d), and §4.6 (recommendation f).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HookEvent {
