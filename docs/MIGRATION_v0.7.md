@@ -363,7 +363,7 @@ Operator docs: [`docs/governance.md`](governance.md), [`docs/policy-engine.md`](
 
 ---
 
-## Provider-agnostic LLM backend ([#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067))
+## Provider-agnostic LLM backend ([#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067) + [#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146))
 
 v0.7.0 promotes the LLM client to a provider-agnostic substrate. Pre-v0.7.0
 the smart and autonomous tiers required local Ollama; post-v0.7.0 the same
@@ -376,7 +376,103 @@ vLLM, or llama.cpp server.
 defaults to `ollama` if unset, and the legacy `OLLAMA_BASE_URL` env var
 is still honoured. Every v0.6.4 setup keeps working byte-identically.
 
-**To migrate to a remote / different vendor**, set three env vars:
+### Recommended path — `[llm]` section in `~/.config/ai-memory/config.toml` (#1146)
+
+v0.7.x ships a **single source of truth** for LLM / embeddings /
+reranker / storage configuration. Every surface (MCP stdio, HTTP daemon,
+`ai-memory atomise`, `ai-memory curator`, the boot banner, the
+`ai-memory doctor` reachability probe) consumes the same resolver
+output, so the boot banner and the live MCP server are guaranteed to
+report the same backend.
+
+```toml
+# ~/.config/ai-memory/config.toml
+schema_version = 2
+
+tier = "autonomous"
+db   = "/Users/<you>/.claude/ai-memory.db"
+
+[llm]
+backend     = "xai"                    # ollama | openai | xai | anthropic | gemini |
+                                       # deepseek | kimi | qwen | mistral | groq |
+                                       # together | cerebras | openrouter |
+                                       # fireworks | lmstudio | openai-compatible
+model       = "grok-4.3"               # vendor-specific identifier
+base_url    = "https://api.x.ai/v1"   # optional; vendor-default if unset
+api_key_env = "XAI_API_KEY"            # process-env-var name (NOT the literal key)
+
+# Alternative to api_key_env — file (mode 0400 enforced).
+# api_key_file = "/etc/ai-memory/keys/xai.key"
+```
+
+**Secret-handling discipline.** Inline `api_key = "<literal>"` in
+config.toml is **rejected at parse time** — `config.toml` is typically
+world-readable, so literal keys would be a credential leak. Operators
+MUST use either `api_key_env` (process-env reference) or `api_key_file`
+(file path; mode 0400 enforced, `AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS=1`
+escape hatch available per [#1055](https://github.com/alphaonedev/ai-memory-mcp/issues/1055)).
+`api_key_env` and `api_key_file` are mutually exclusive.
+
+**Why this is the recommended path.** Pre-#1146 operators routed LLM
+config through the `mcpServers.<name>.env` block of `~/.claude.json`
+(or the equivalent per AI client). That works but has three
+operator-hostile properties:
+
+1. The `ai-memory boot` SessionStart hook reads from the **parent shell
+   env**, not the MCP-spawned subprocess env, so the boot banner
+   reported the legacy Ollama default while the live MCP server
+   correctly used the configured backend — two sources of truth, one
+   confused operator.
+2. Every AI client (Claude Code, Cursor, Codex CLI, Cline, Continue,
+   Zed, Windsurf, Goose, Roo Code, Aider, Cody, openclaw, …) needed
+   its own duplicate env block to behave consistently.
+3. API keys lived inline in `~/.claude.json` — typically world-readable
+   in `$HOME`.
+
+`[llm]` in `config.toml` retires all three. The same file is consulted
+by every surface; the resolver enforces no-inline-keys; the boot banner
+reports `llm=<backend>:<model>` matching the live MCP server.
+
+### Migration tool
+
+```bash
+# Rewrite legacy v0.6.x flat-field config.toml into v2 sectioned shape.
+ai-memory config migrate              # writes config.toml.bak.<ts> + rewrites in place
+ai-memory config migrate --dry-run    # prints the diff to stderr, writes nothing
+
+# After verifying the new config works, sweep stale env blocks from claude.json.
+ai-memory config migrate --also-clean-claude-json
+```
+
+Idempotent — running against an already-v2 file is a no-op INFO log.
+
+### Verification
+
+```bash
+# Boot banner — should now report your configured backend, not the legacy default.
+ai-memory boot --quiet --limit 1
+
+# Reachability probe — DNS + TLS + auth round-trip against the resolved base_url.
+ai-memory doctor | grep -A8 "LLM Reachability (#1146)"
+```
+
+The doctor probe emits PASS / WARN / CRIT with the resolved provenance
+facts (`backend`, `model`, `base_url`, `config_source`, `key_source`)
+so operators can see WHICH precedence layer won.
+
+### Precedence ladder (uniform across all four resolvers)
+
+```
+CLI flag  >  AI_MEMORY_LLM_* env  >  [llm] section  >  legacy flat fields  >  compiled default
+```
+
+Same ladder applies to `resolve_llm_auto_tag`, `resolve_embeddings`,
+`resolve_reranker`, and `resolve_storage`.
+
+### Override path — `AI_MEMORY_LLM_*` env vars
+
+Env vars still work — they're the override layer ABOVE the config file.
+Useful for CI / per-session tweaks. Same examples in env-var form:
 
 ```bash
 # Example: xAI Grok 4.3 for the autonomous tier (v0.7.0 compiled default for xai backend)
@@ -401,13 +497,19 @@ export AI_MEMORY_LLM_MODEL=your-model
 export AI_MEMORY_LLM_API_KEY=…
 ```
 
-**Tier independence.** Setting `AI_MEMORY_LLM_BACKEND` routes the LLM
-client through the provider-agnostic path **regardless of tier**.
-Tier still determines which other features run (embedder, reranker).
+**Tier independence.** Setting `AI_MEMORY_LLM_BACKEND` (or `[llm].backend`)
+routes the LLM client through the provider-agnostic path **regardless
+of tier**. Tier still determines which other features run (embedder,
+reranker).
 
-Operator doc: module-level rustdoc at [`src/llm.rs`](../src/llm.rs);
-the LlmProvider table at the top of the file is the canonical
-provider × wire-shape × auth × vendor anchor.
+### Operator references
+
+- [`docs/CONFIG_SCHEMA.md`](CONFIG_SCHEMA.md) — canonical schema reference (`[llm]`, `[llm.auto_tag]`, `[embeddings]`, `[reranker]`, `[storage]`).
+- [`docs/ADMIN_GUIDE.md` § "LLM Backend Setup"](ADMIN_GUIDE.md#llm-backend-setup-smart--autonomous-tiers) — config-file + env-var matrix.
+- [`docs/integrations/llm-backends.md`](integrations/llm-backends.md) — per-vendor recipes.
+- [`src/llm.rs`](../src/llm.rs) — module-level rustdoc; the LlmProvider
+  table at the top of the file is the canonical
+  provider × wire-shape × auth × vendor anchor.
 
 ---
 

@@ -6,7 +6,7 @@ The Claude Agent SDK is programmatic by design — the developer constructs
 the messages array. Prepend `ai-memory boot` output to the system message
 on session/conversation start.
 
-> **Note on ai-memory's own LLM backend.** This doc covers the Claude Agent SDK reading ai-memory boot output (SDK as the client). For wiring ai-memory's smart/autonomous tier — which calls out to an LLM internally — see [`llm-backends.md`](llm-backends.md). The SDK invokes `ai-memory boot` as a subprocess in its own process tree, so the env it inherits depends on how the SDK process itself was started: an interactive-shell launch inherits exports; a systemd / Docker / Kubernetes launch needs the env vars declared in the unit / image / pod spec ([#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144)).
+> **Note on ai-memory's own LLM backend.** This doc covers the Claude Agent SDK reading ai-memory boot output (SDK as the client). For wiring ai-memory's smart/autonomous tier — which calls out to an LLM internally — the recommended path post-[#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146) (v0.7.0) is a `[llm]` section in `~/.config/ai-memory/config.toml` ([`../CONFIG_SCHEMA.md`](../CONFIG_SCHEMA.md)); the override is the MCP env-block recipe in [`llm-backends.md`](llm-backends.md). The SDK invokes `ai-memory boot` as a subprocess in its own process tree, so the env it inherits depends on how the SDK process itself was started: an interactive-shell launch inherits exports; a systemd / Docker / Kubernetes launch needs the env vars declared in the unit / image / pod spec ([#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144)).
 
 ## Or for the simple wrapper case — `ai-memory wrap`
 
