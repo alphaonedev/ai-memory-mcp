@@ -49,6 +49,17 @@ pub struct ToolSize {
     pub total_tokens: usize,
 }
 
+/// pm-v3.1 PR8 (issue #1174) — shared one-shot cache for the verbose
+/// table. Replaces the prior pair of function-local `static TABLE`
+/// declarations (one in `tool_sizes`, one in `trimmed_tool_sizes`)
+/// with a single module-level slot per shape. The cache is computed
+/// lazily on first use and reused forever after.
+static VERBOSE_TABLE: OnceLock<Vec<ToolSize>> = OnceLock::new();
+
+/// pm-v3.1 PR8 (issue #1174) — shared cache for the trimmed (wire-
+/// form) table, matching `VERBOSE_TABLE` above.
+static TRIMMED_TABLE: OnceLock<Vec<ToolSize>> = OnceLock::new();
+
 /// Runtime-computed table of every tool's tokenized schema cost
 /// **at the verbose ceiling** — every optional param, every default,
 /// every per-property description. This is the upper bound a host
@@ -59,8 +70,9 @@ pub struct ToolSize {
 /// Returns a static slice on every call after the first invocation
 /// (which performs the one-time BPE pass).
 pub fn tool_sizes() -> &'static [ToolSize] {
-    static TABLE: OnceLock<Vec<ToolSize>> = OnceLock::new();
-    TABLE.get_or_init(|| compute_table(false)).as_slice()
+    VERBOSE_TABLE
+        .get_or_init(|| compute_table(false))
+        .as_slice()
 }
 
 /// v0.7 C4 + #859 — runtime-computed table of every tool's tokenized
@@ -79,8 +91,7 @@ pub fn tool_sizes() -> &'static [ToolSize] {
 /// pins the sum at ≤ 5000 cl100k tokens (post-#859 floor; was 3500
 /// pre-#859 when the trim hid optional property keys entirely).
 pub fn trimmed_tool_sizes() -> &'static [ToolSize] {
-    static TABLE: OnceLock<Vec<ToolSize>> = OnceLock::new();
-    TABLE.get_or_init(|| compute_table(true)).as_slice()
+    TRIMMED_TABLE.get_or_init(|| compute_table(true)).as_slice()
 }
 
 /// Highest-cost tool in the verbose table. Used by the CI gate.

@@ -20,7 +20,7 @@ use instant_distance::{Builder, HnswMap, Search};
 use instant_distance::Point;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::thread::JoinHandle;
 
@@ -57,19 +57,26 @@ const MAX_ENTRIES: usize = 100_000;
 // invisibly. The two counters below + the structured `hnsw.eviction`
 // tracing event close that gap:
 //
-//   - `INDEX_EVICTIONS_TOTAL` — cumulative count surfaced via
-//     `db::stats().index_evictions_total` (and capabilities).
-//   - `LAST_EVICTION_AT_NANOS` — wall-clock UNIX nanoseconds of the most
-//     recent eviction; capabilities derive `hnsw.evicted_recently` from
-//     this with a 60 s rolling window.
+//   - eviction count — cumulative count surfaced via
+//     `db::stats().index_evictions_total` (and capabilities) AND at
+//     `/metrics` as `ai_memory_hnsw_evictions_total`.
+//   - last-eviction wall clock — UNIX nanoseconds of the most recent
+//     eviction; capabilities derive `hnsw.evicted_recently` from this
+//     with a 60 s rolling window.
+//
+// **pm-v3.1 PR8 (issue #1174).** Pre-PR8 the counters were two free
+// `static AtomicU64`s at the top of this file. PR8 sank both into the
+// metrics registry (`src/metrics.rs::HNSW_EVICTIONS_TOTAL` +
+// `HNSW_LAST_EVICTION_AT_NANOS`, plus matching Prometheus
+// `IntCounter` / `IntGauge` handles on `Metrics`) so the eviction
+// signal is `/metrics`-scrape-visible without a separate observer
+// thread. The accessor signatures here are preserved verbatim for
+// call-site backward compat.
 //
 // Process-local. The counters reset on restart because the index itself
 // resets on restart. Both atomics are touched only on the eviction edge
 // (rare: requires >100k vectors), so there is no measurable hot-path cost.
 // ---------------------------------------------------------------------------
-
-static INDEX_EVICTIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
-static LAST_EVICTION_AT_NANOS: AtomicU64 = AtomicU64::new(0);
 
 /// Cumulative HNSW oldest-eviction count since process start.
 ///
@@ -77,9 +84,11 @@ static LAST_EVICTION_AT_NANOS: AtomicU64 = AtomicU64::new(0);
 /// index has hit `MAX_ENTRIES` and dropped older embeddings; recall
 /// quality may have degraded for evicted ids until they are re-inserted
 /// (e.g. on next access via `recall` touch path).
+///
+/// pm-v3.1 PR8: thin shim over `crate::metrics::hnsw_evictions_total()`.
 #[must_use]
 pub fn index_evictions_total() -> u64 {
-    INDEX_EVICTIONS_TOTAL.load(Ordering::Relaxed)
+    crate::metrics::hnsw_evictions_total()
 }
 
 // ---------------------------------------------------------------------------
@@ -124,7 +133,7 @@ static EVICTION_RATE_RING: Mutex<std::collections::VecDeque<u64>> =
 /// Returns `false` when no evictions have ever happened in this process.
 #[must_use]
 pub fn evicted_recently(window_secs: u64) -> bool {
-    let last = LAST_EVICTION_AT_NANOS.load(Ordering::Relaxed);
+    let last = crate::metrics::hnsw_last_eviction_at_nanos();
     if last == 0 {
         return false;
     }
@@ -142,10 +151,12 @@ pub fn evicted_recently(window_secs: u64) -> bool {
 /// `pub(crate)`) so the integration-test crate at `tests/` can drive it
 /// alongside the public `index_evictions_total()` accessor; renaming
 /// keeps the intent obvious at every call site.
+///
+/// pm-v3.1 PR8: thin shim over
+/// `crate::metrics::reset_hnsw_eviction_counters_for_test()`.
 #[doc(hidden)]
 pub fn reset_eviction_counters_for_test() {
-    INDEX_EVICTIONS_TOTAL.store(0, Ordering::Relaxed);
-    LAST_EVICTION_AT_NANOS.store(0, Ordering::Relaxed);
+    crate::metrics::reset_hnsw_eviction_counters_for_test();
     if let Ok(mut g) = EVICTION_RATE_RING.lock() {
         g.clear();
     }
@@ -579,7 +590,11 @@ impl VectorIndex {
             drop(sink_guard);
             #[allow(clippy::cast_possible_truncation)]
             let evicted = excess as u64;
-            INDEX_EVICTIONS_TOTAL.fetch_add(evicted, Ordering::Relaxed);
+            // pm-v3.1 PR8 (issue #1174): counter sink moved to the
+            // metrics registry. We defer the actual `record_hnsw_eviction`
+            // call until `now_nanos_u64` is computed below so the
+            // counter and last-eviction timestamp move in lockstep.
+            let evicted_count_to_record = evicted;
 
             state.all_entries.drain(..excess);
             // v0.7.0 #1087 — invalidate cached valid_ids set after the
@@ -647,7 +662,12 @@ impl VectorIndex {
                 .map(|d| d.as_nanos())
                 .unwrap_or(0);
             let now_nanos_u64 = u64::try_from(now_nanos).unwrap_or(u64::MAX);
-            LAST_EVICTION_AT_NANOS.store(now_nanos_u64, Ordering::Relaxed);
+            // pm-v3.1 PR8 (issue #1174): single sink call covers both
+            // the cumulative counter and the last-eviction timestamp,
+            // mirroring both onto the Prometheus handles so `/metrics`
+            // scrapes see the eviction event without polling
+            // `memory_stats`.
+            crate::metrics::record_hnsw_eviction(evicted_count_to_record, now_nanos_u64);
 
             // M8 (v0.7.0 round-2) — rolling-hour rate observer. Push
             // a stamp on this eviction, then count stamps in the
