@@ -8696,7 +8696,11 @@ fn execute_reflect_from_payload(conn: &Connection, pa: &PendingAction) -> Result
         tags,
         priority,
         confidence,
-        source: "claude".to_string(),
+        // v0.7.x (issue #1175): vendor-neutral substrate default.
+        // Mirrors the MCP-side default at `src/mcp/tools/reflect.rs`
+        // — see the comment there for the heterogeneous-NHI rationale.
+        // Vendor identity stays in `metadata.agent_id`.
+        source: crate::validate::DEFAULT_NHI_SOURCE.to_string(),
         agent_id,
         metadata,
     };
