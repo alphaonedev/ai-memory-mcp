@@ -117,7 +117,7 @@ pub struct StoreTool;
 
 impl McpTool for StoreTool {
     fn name() -> &'static str {
-        "memory_store"
+        crate::mcp::registry::tool_names::MEMORY_STORE
     }
     fn description() -> &'static str {
         "Store a memory; deduplicates by title+namespace."
@@ -673,7 +673,7 @@ pub(crate) fn handle_store(
     // response here does not wait on any webhook dispatch.
     crate::subscriptions::dispatch_event(
         conn,
-        "memory_store",
+        crate::mcp::registry::tool_names::MEMORY_STORE,
         &actual_id,
         &mem.namespace,
         Some(&agent_id),

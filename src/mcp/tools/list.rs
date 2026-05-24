@@ -40,7 +40,7 @@ pub struct ListTool;
 
 impl McpTool for ListTool {
     fn name() -> &'static str {
-        "memory_list"
+        crate::mcp::registry::tool_names::MEMORY_LIST
     }
     fn description() -> &'static str {
         "List memories, optionally filtered by namespace or tier."

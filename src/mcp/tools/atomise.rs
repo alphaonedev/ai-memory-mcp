@@ -262,7 +262,7 @@ pub struct AtomiseTool;
 
 impl McpTool for AtomiseTool {
     fn name() -> &'static str {
-        "memory_atomise"
+        crate::mcp::registry::tool_names::MEMORY_ATOMISE
     }
     fn description() -> &'static str {
         "Decompose a memory into 2-10 atomic propositions; source archived. Smart+ tier."

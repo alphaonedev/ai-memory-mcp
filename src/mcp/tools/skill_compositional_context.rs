@@ -359,7 +359,7 @@ pub struct SkillCompositionalContextTool;
 
 impl McpTool for SkillCompositionalContextTool {
     fn name() -> &'static str {
-        "memory_skill_compositional_context"
+        crate::mcp::registry::tool_names::MEMORY_SKILL_COMPOSITIONAL_CONTEXT
     }
     fn description() -> &'static str {
         "Skill body + composes_with_reflections (bounded by max_reflection_depth)."

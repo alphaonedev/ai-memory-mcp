@@ -68,7 +68,7 @@ pub struct ForgetTool;
 
 impl McpTool for ForgetTool {
     fn name() -> &'static str {
-        "memory_forget"
+        crate::mcp::registry::tool_names::MEMORY_FORGET
     }
     fn description() -> &'static str {
         "Bulk delete memories matching a pattern, namespace, or tier (archives first)."
@@ -97,7 +97,7 @@ pub struct StatsTool;
 
 impl McpTool for StatsTool {
     fn name() -> &'static str {
-        "memory_stats"
+        crate::mcp::registry::tool_names::MEMORY_STATS
     }
     fn description() -> &'static str {
         "Get memory store statistics (counts, tier breakdown, sizes)."

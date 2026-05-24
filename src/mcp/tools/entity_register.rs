@@ -40,7 +40,7 @@ pub struct EntityRegisterTool;
 
 impl McpTool for EntityRegisterTool {
     fn name() -> &'static str {
-        "memory_entity_register"
+        crate::mcp::registry::tool_names::MEMORY_ENTITY_REGISTER
     }
     fn description() -> &'static str {
         "Register an entity (canonical name + aliases) under a namespace."

@@ -25,7 +25,7 @@ pub struct GetTool;
 
 impl McpTool for GetTool {
     fn name() -> &'static str {
-        "memory_get"
+        crate::mcp::registry::tool_names::MEMORY_GET
     }
     fn description() -> &'static str {
         "Get a specific memory by ID, including its links."

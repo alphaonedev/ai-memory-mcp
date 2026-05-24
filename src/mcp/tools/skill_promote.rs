@@ -369,7 +369,7 @@ pub struct SkillPromoteFromReflectionTool;
 
 impl McpTool for SkillPromoteFromReflectionTool {
     fn name() -> &'static str {
-        "memory_skill_promote_from_reflection"
+        crate::mcp::registry::tool_names::MEMORY_SKILL_PROMOTE_FROM_REFLECTION
     }
     fn description() -> &'static str {
         "Promote a Reflection into a reusable Agent Skill."

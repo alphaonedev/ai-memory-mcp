@@ -112,7 +112,7 @@ pub struct SessionStartTool;
 
 impl McpTool for SessionStartTool {
     fn name() -> &'static str {
-        "memory_session_start"
+        crate::mcp::registry::tool_names::MEMORY_SESSION_START
     }
     fn description() -> &'static str {
         "Auto-recall recent memories on session start."

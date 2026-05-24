@@ -192,7 +192,7 @@ pub struct PersonaTool;
 
 impl McpTool for PersonaTool {
     fn name() -> &'static str {
-        "memory_persona"
+        crate::mcp::registry::tool_names::MEMORY_PERSONA
     }
     fn description() -> &'static str {
         "Fetch the latest Persona artefact for an entity (read-only)."
@@ -230,7 +230,7 @@ pub struct PersonaGenerateTool;
 
 impl McpTool for PersonaGenerateTool {
     fn name() -> &'static str {
-        "memory_persona_generate"
+        crate::mcp::registry::tool_names::MEMORY_PERSONA_GENERATE
     }
     fn description() -> &'static str {
         "Generate/regen a Persona artefact for an entity."

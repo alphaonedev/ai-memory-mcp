@@ -49,7 +49,7 @@ pub struct ExpandQueryTool;
 
 impl McpTool for ExpandQueryTool {
     fn name() -> &'static str {
-        "memory_expand_query"
+        crate::mcp::registry::tool_names::MEMORY_EXPAND_QUERY
     }
     fn description() -> &'static str {
         "LLM-expand a search query into related terms (smart/autonomous tier)."

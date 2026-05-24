@@ -231,7 +231,7 @@ pub struct ConsolidateTool;
 
 impl McpTool for ConsolidateTool {
     fn name() -> &'static str {
-        "memory_consolidate"
+        crate::mcp::registry::tool_names::MEMORY_CONSOLIDATE
     }
     fn description() -> &'static str {
         "Consolidate multiple memories into one long-term summary."

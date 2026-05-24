@@ -38,7 +38,7 @@ pub struct VerifyTool;
 
 impl McpTool for VerifyTool {
     fn name() -> &'static str {
-        "memory_verify"
+        crate::mcp::registry::tool_names::MEMORY_VERIFY
     }
     fn description() -> &'static str {
         "Re-verify a stored memory_links row's Ed25519 signature on demand."

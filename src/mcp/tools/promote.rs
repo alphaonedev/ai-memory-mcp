@@ -36,7 +36,7 @@ pub struct PromoteTool;
 
 impl McpTool for PromoteTool {
     fn name() -> &'static str {
-        "memory_promote"
+        crate::mcp::registry::tool_names::MEMORY_PROMOTE
     }
     fn description() -> &'static str {
         "Promote a memory to long (or chosen tier) / ancestor namespace."
@@ -168,7 +168,7 @@ pub(super) fn handle_promote(
         .ok();
         crate::subscriptions::dispatch_event_with_details(
             conn,
-            "memory_promote",
+            crate::mcp::registry::tool_names::MEMORY_PROMOTE,
             &resolved_id,
             &snapshot_namespace,
             snapshot_owner.as_deref(),
