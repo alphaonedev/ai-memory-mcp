@@ -10,11 +10,91 @@
 //! metrics-backend swap stays internal.
 
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use prometheus::{
     Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Registry,
     TextEncoder,
 };
+
+// =====================================================================
+// pm-v3.1 PR8 (issue #1174) — HNSW eviction observability.
+//
+// Pre-PR8 lived as two free `static AtomicU64`s at the top of
+// `src/hnsw.rs`. Class A "SHOULD" extraction: the counters are
+// metrics-bound (surfaced in `/metrics`, `memory_capabilities`,
+// `memory_stats`) so the metrics registry is the natural owner.
+//
+// The Prometheus handles (`hnsw_evictions_total` IntCounter +
+// `hnsw_last_eviction_at_nanos` IntGauge in `Metrics`) carry the
+// scrape-side wiring. The atomics below carry the read-side logic
+// (`evicted_recently` 60s window) AND the test-only reset path that
+// prometheus's monotonic-counter discipline does not support. Both
+// kept-in-lockstep by the `record_hnsw_eviction` sink and the
+// `reset_hnsw_eviction_counters_for_test` resetter.
+//
+// Process-local. The counters reset on restart because the index
+// itself resets on restart. Both atomics are touched only on the
+// eviction edge (rare: requires >100k vectors), so there is no
+// measurable hot-path cost.
+// =====================================================================
+
+static HNSW_EVICTIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static HNSW_LAST_EVICTION_AT_NANOS: AtomicU64 = AtomicU64::new(0);
+
+/// Record one HNSW eviction event. Bumps the process-local cumulative
+/// counter by `count`, sets the last-eviction wall-clock nanos to
+/// `now_nanos`, and mirrors both onto the Prometheus registry handles
+/// so `/metrics` scrapes see the same signal without a separate
+/// observer thread.
+pub fn record_hnsw_eviction(count: u64, now_nanos: u64) {
+    HNSW_EVICTIONS_TOTAL.fetch_add(count, Ordering::Relaxed);
+    HNSW_LAST_EVICTION_AT_NANOS.store(now_nanos, Ordering::Relaxed);
+    let r = registry();
+    r.hnsw_evictions_total.inc_by(count);
+    // IntGauge value is i64; nanos can exceed i64::MAX in ~292 years
+    // past the UNIX epoch — saturating clamp keeps the gauge in range
+    // for any plausible operator timeline.
+    #[allow(clippy::cast_possible_wrap)]
+    let nanos_i64 = i64::try_from(now_nanos).unwrap_or(i64::MAX);
+    r.hnsw_last_eviction_at_nanos.set(nanos_i64);
+}
+
+/// Cumulative HNSW oldest-eviction count since process start. Reads
+/// from the process-local atomic; the same value is scrape-visible at
+/// `/metrics` as `ai_memory_hnsw_evictions_total`.
+#[must_use]
+pub fn hnsw_evictions_total() -> u64 {
+    HNSW_EVICTIONS_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Wall-clock UNIX nanoseconds of the most recent HNSW eviction (0 if
+/// none have occurred this process). Reads from the process-local
+/// atomic; the same value is scrape-visible at `/metrics` as
+/// `ai_memory_hnsw_last_eviction_at_nanos`.
+#[must_use]
+pub fn hnsw_last_eviction_at_nanos() -> u64 {
+    HNSW_LAST_EVICTION_AT_NANOS.load(Ordering::Relaxed)
+}
+
+/// Reset the HNSW eviction counters. Test-only: production callers
+/// must never reach into the counter directly. The Prometheus
+/// monotonic-counter discipline does NOT permit decrement, so the
+/// scrape-side `ai_memory_hnsw_evictions_total` retains its
+/// cumulative value across the reset — only the process-local
+/// atomics (used by `hnsw_evictions_total()`, `evicted_recently`,
+/// and `memory_stats`) drop back to zero. This asymmetry is
+/// deliberate: `/metrics` scrapes are time-series consumers that
+/// expect monotonic counters; the in-process reset is a unit-test
+/// affordance.
+#[doc(hidden)]
+pub fn reset_hnsw_eviction_counters_for_test() {
+    HNSW_EVICTIONS_TOTAL.store(0, Ordering::Relaxed);
+    HNSW_LAST_EVICTION_AT_NANOS.store(0, Ordering::Relaxed);
+    // Mirror the gauge reset so scrape-side `last_eviction_at_nanos`
+    // also flips back to 0 (gauges, unlike counters, may decrement).
+    registry().hnsw_last_eviction_at_nanos.set(0);
+}
 
 /// Handles to the registered metric families. Built once on first access
 /// via `registry()`.
@@ -95,6 +175,25 @@ pub struct Metrics {
     /// alert on non-zero increment rate — a healthy mesh should have
     /// zero rows reaching the quarantine threshold.
     pub federation_push_dlq_quarantined: IntCounter,
+
+    /// pm-v3.1 PR8 (issue #1174) — cumulative HNSW oldest-eviction
+    /// count since process start. Replaces the prior process-global
+    /// `AtomicU64` `INDEX_EVICTIONS_TOTAL` in `src/hnsw.rs`.
+    /// Non-zero means the in-memory vector index has hit
+    /// `MAX_ENTRIES` and dropped older embeddings; recall quality
+    /// may have degraded for evicted ids until they are re-inserted
+    /// (e.g. on next access via the `recall` touch path). Surfaces in
+    /// `memory_capabilities` (`hnsw.evictions_total`), `/metrics`
+    /// (`ai_memory_hnsw_evictions_total`), and `memory_stats`.
+    pub hnsw_evictions_total: IntCounter,
+
+    /// pm-v3.1 PR8 (issue #1174) — wall-clock UNIX nanoseconds of the
+    /// most recent HNSW eviction (0 if none have occurred). Replaces
+    /// the prior process-global `AtomicU64` `LAST_EVICTION_AT_NANOS`
+    /// in `src/hnsw.rs`. Capabilities derives `hnsw.evicted_recently`
+    /// from this with a 60s rolling window. Surfaced as an `IntGauge`
+    /// so the value is also readable via Prometheus scraping.
+    pub hnsw_last_eviction_at_nanos: IntGauge,
 }
 
 /// Lazily-built process-global metrics handle.
@@ -329,6 +428,31 @@ impl Metrics {
         )?;
         registry.register(Box::new(federation_push_dlq_quarantined.clone()))?;
 
+        // pm-v3.1 PR8 (issue #1174) — HNSW eviction observability moved
+        // from process-global atomics in `src/hnsw.rs` into the metrics
+        // registry. The counter mirrors `INDEX_EVICTIONS_TOTAL`; the
+        // gauge mirrors `LAST_EVICTION_AT_NANOS` as a UNIX-nanosecond
+        // wall-clock timestamp (0 if no eviction has occurred). Both
+        // are surfaced at `/metrics` so the eviction signal is
+        // scrape-visible without going through `memory_stats`.
+        let hnsw_evictions_total = IntCounter::new(
+            "ai_memory_hnsw_evictions_total",
+            "Cumulative HNSW oldest-eviction count since process start. \
+             Non-zero indicates the in-memory vector index has hit \
+             MAX_ENTRIES and dropped older embeddings; recall quality \
+             may have degraded for evicted ids until they are \
+             re-inserted on next access.",
+        )?;
+        registry.register(Box::new(hnsw_evictions_total.clone()))?;
+
+        let hnsw_last_eviction_at_nanos = IntGauge::new(
+            "ai_memory_hnsw_last_eviction_at_nanos",
+            "Wall-clock UNIX nanoseconds of the most recent HNSW \
+             eviction (0 if none). Capabilities derives \
+             hnsw.evicted_recently from this with a 60s rolling window.",
+        )?;
+        registry.register(Box::new(hnsw_last_eviction_at_nanos.clone()))?;
+
         Ok(Self {
             registry,
             store_total,
@@ -351,6 +475,8 @@ impl Metrics {
             auto_export_spawn_failed_total,
             federation_push_dlq_depth,
             federation_push_dlq_quarantined,
+            hnsw_evictions_total,
+            hnsw_last_eviction_at_nanos,
         })
     }
 }

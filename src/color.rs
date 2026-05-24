@@ -2,18 +2,58 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! ANSI color output for CLI — zero dependencies.
+//!
+//! pm-v3.1 PR8 (issue #1174) — color enablement is determined ONCE at
+//! process boot from `std::io::stdout().is_terminal()` and frozen for
+//! the lifetime of the process via `OnceLock<bool>`. The pre-PR8
+//! shape used a mutable `AtomicBool` which gave production callers no
+//! protection against accidental late mutation. Tests that need to
+//! force colour off route through a thread-local override consulted
+//! by `enabled()` (compiled out of non-test builds).
 
 use std::io::IsTerminal;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 
-static COLOR_ENABLED: AtomicBool = AtomicBool::new(true);
+/// One-shot snapshot of the boot-time `stdout` is-a-terminal probe.
+/// Set exactly once by [`init`]; subsequent calls are no-ops thanks
+/// to `OnceLock::set` semantics (first-writer-wins). Production code
+/// SHOULD call [`init`] exactly once at process start (see
+/// `src/main.rs`).
+static COLOR_ENABLED: OnceLock<bool> = OnceLock::new();
 
 pub fn init() {
-    COLOR_ENABLED.store(std::io::stdout().is_terminal(), Ordering::Relaxed);
+    // `OnceLock::set` returns `Err` if already initialised; benign
+    // for double-init paths (tests, repeat embedder bootstrap), so
+    // the return value is intentionally discarded.
+    let _ = COLOR_ENABLED.set(std::io::stdout().is_terminal());
 }
 
 fn enabled() -> bool {
-    COLOR_ENABLED.load(Ordering::Relaxed)
+    #[cfg(test)]
+    if let Some(forced) = test_override::get() {
+        return forced;
+    }
+    // Default true matches the pre-PR8 `AtomicBool::new(true)` posture
+    // — if production code reads colour state before `init` runs the
+    // colourised path stays on (the prior behaviour).
+    *COLOR_ENABLED.get().unwrap_or(&true)
+}
+
+#[cfg(test)]
+mod test_override {
+    use std::cell::Cell;
+
+    thread_local! {
+        static OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn get() -> Option<bool> {
+        OVERRIDE.with(Cell::get)
+    }
+
+    pub(super) fn set(value: Option<bool>) {
+        OVERRIDE.with(|cell| cell.set(value));
+    }
 }
 
 fn wrap(code: &str, text: &str) -> String {
@@ -87,14 +127,15 @@ pub fn priority_bar(p: i32) -> String {
 mod tests {
     use super::*;
 
-    use std::sync::Mutex;
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
-
+    /// pm-v3.1 PR8 (issue #1174) — thread-local override removes the
+    /// need for a process-wide `Mutex<()>` to serialise tests. Each
+    /// `cargo test` worker gets its own override slot, so the
+    /// previously-required `--test-threads=1` style of serialisation
+    /// is gone.
     fn with_color_off<F: FnOnce()>(f: F) {
-        let _guard = TEST_LOCK.lock().unwrap();
-        COLOR_ENABLED.store(false, Ordering::Relaxed);
+        test_override::set(Some(false));
         f();
-        COLOR_ENABLED.store(true, Ordering::Relaxed);
+        test_override::set(None);
     }
 
     #[test]
@@ -148,11 +189,11 @@ mod tests {
 
     #[test]
     fn wrap_with_color_enabled() {
-        let _guard = TEST_LOCK.lock().unwrap();
-        COLOR_ENABLED.store(true, Ordering::Relaxed);
+        test_override::set(Some(true));
         let result = wrap("91", "red");
         assert!(result.contains("\x1b[91m"));
         assert!(result.contains("\x1b[0m"));
         assert!(result.contains("red"));
+        test_override::set(None);
     }
 }
