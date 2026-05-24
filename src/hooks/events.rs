@@ -1096,12 +1096,12 @@ mod tests {
         let delta = TranscriptDelta {
             namespace: Some("agent/claude".into()),
             content: Some("hello world".into()),
-            ttl_secs: Some(3_600),
+            ttl_secs: Some(crate::SECS_PER_HOUR),
         };
         let json = serde_json::to_string(&delta).expect("encode");
         let back: TranscriptDelta = serde_json::from_str(&json).expect("decode");
         assert_eq!(back.namespace.as_deref(), Some("agent/claude"));
-        assert_eq!(back.ttl_secs, Some(3_600));
+        assert_eq!(back.ttl_secs, Some(crate::SECS_PER_HOUR));
 
         // Project from the internal storage handle to the wire shape.
         let internal = crate::transcripts::Transcript {

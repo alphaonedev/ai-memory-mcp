@@ -8452,7 +8452,8 @@ mod tests {
         // Insert the OLDER transcript first, then backdate it so its
         // `created_at` is unambiguously earlier than the SECOND insert.
         let older = crate::transcripts::store(&conn, "team/eng", "older body", None).unwrap();
-        let backdate = (chrono::Utc::now() - chrono::Duration::seconds(3600)).to_rfc3339();
+        let backdate =
+            (chrono::Utc::now() - chrono::Duration::seconds(crate::SECS_PER_HOUR)).to_rfc3339();
         conn.execute(
             "UPDATE memory_transcripts SET created_at = ?1 WHERE id = ?2",
             rusqlite::params![backdate, older.id],

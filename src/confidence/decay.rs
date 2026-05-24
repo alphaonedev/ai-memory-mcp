@@ -97,7 +97,7 @@ pub fn apply_decay_touch(conn: &Connection, id: &str) -> rusqlite::Result<bool> 
     let anchor = DateTime::parse_from_rfc3339(&anchor_str)
         .map(|dt| dt.with_timezone(&Utc))
         .unwrap_or(now);
-    let age_days = (now - anchor).num_seconds() as f64 / 86_400.0;
+    let age_days = (now - anchor).num_seconds() as f64 / crate::SECS_PER_DAY as f64;
     let new_value = decayed(
         current_confidence,
         age_days,

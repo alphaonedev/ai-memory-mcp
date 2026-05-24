@@ -1761,7 +1761,7 @@ mod tests {
         let cfg = build_catchup_cfg(&url, 2000);
         let db = build_test_db();
 
-        let handle = spawn_catchup_loop(cfg, db, Duration::from_secs(3600));
+        let handle = spawn_catchup_loop(cfg, db, Duration::from_secs(crate::SECS_PER_HOUR as u64));
         // Don't let it run a full 5s startup-sleep. Abort and confirm
         // the join future resolves promptly with a Cancelled error.
         handle.abort();

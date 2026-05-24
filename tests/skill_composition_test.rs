@@ -308,7 +308,7 @@ fn five_reflections_ranked_by_recency_and_recall_count() {
         "Body of old hot reflection.",
         1,
         50,
-        30 * 24 * 3600,
+        30 * ai_memory::SECS_PER_DAY,
     );
     let id_medium = seed_reflection(
         &conn,
@@ -317,7 +317,7 @@ fn five_reflections_ranked_by_recency_and_recall_count() {
         "Body of medium reflection.",
         1,
         10,
-        7 * 24 * 3600,
+        ai_memory::SECS_PER_WEEK,
     );
     let id_ancient = seed_reflection(
         &conn,
@@ -326,7 +326,7 @@ fn five_reflections_ranked_by_recency_and_recall_count() {
         "Body of ancient cold reflection.",
         1,
         0,
-        300 * 24 * 3600,
+        300 * ai_memory::SECS_PER_DAY,
     );
 
     let resp = call_handler(&conn, &skill_id, Some(32_000));

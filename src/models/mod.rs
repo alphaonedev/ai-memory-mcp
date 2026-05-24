@@ -28,8 +28,8 @@ pub const MAX_CONTENT_SIZE: usize = 65_536;
 
 pub const PROMOTION_THRESHOLD: i64 = 5;
 /// How much to extend TTL on access (1 hour for short, 1 day for mid)
-pub const SHORT_TTL_EXTEND_SECS: i64 = 3600;
-pub const MID_TTL_EXTEND_SECS: i64 = 86400;
+pub const SHORT_TTL_EXTEND_SECS: i64 = crate::SECS_PER_HOUR;
+pub const MID_TTL_EXTEND_SECS: i64 = crate::SECS_PER_DAY;
 
 pub fn default_metadata() -> Value {
     Value::Object(serde_json::Map::new())
@@ -63,8 +63,11 @@ mod tests {
 
     #[test]
     fn tier_default_ttl() {
-        assert_eq!(Tier::Short.default_ttl_secs(), Some(6 * 3600));
-        assert_eq!(Tier::Mid.default_ttl_secs(), Some(7 * 24 * 3600));
+        assert_eq!(
+            Tier::Short.default_ttl_secs(),
+            Some(6 * crate::SECS_PER_HOUR)
+        );
+        assert_eq!(Tier::Mid.default_ttl_secs(), Some(crate::SECS_PER_WEEK));
         assert_eq!(Tier::Long.default_ttl_secs(), None);
     }
 
@@ -79,8 +82,12 @@ mod tests {
     fn constants_valid() {
         const _: () = assert!(MAX_CONTENT_SIZE > 0);
         const _: () = assert!(PROMOTION_THRESHOLD > 0);
+        // PR3 (#1174) — byte-equal preservation: the named extends
+        // resolve to the same compiled integer the v0.6.x literals did.
         assert_eq!(SHORT_TTL_EXTEND_SECS, 3600);
         assert_eq!(MID_TTL_EXTEND_SECS, 86400);
+        assert_eq!(SHORT_TTL_EXTEND_SECS, crate::SECS_PER_HOUR);
+        assert_eq!(MID_TTL_EXTEND_SECS, crate::SECS_PER_DAY);
     }
 
     #[test]

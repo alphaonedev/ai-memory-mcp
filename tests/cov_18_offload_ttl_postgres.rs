@@ -160,7 +160,7 @@ async fn cov18_offload_ttl_sweep_against_postgres() {
     // ago and ttl_seconds = 60 (so `stored_at + ttl < now`).
     // -----------------------------------------------------------------
     let now: i64 = chrono::Utc::now().timestamp();
-    let one_hour_ago = now - 3600;
+    let one_hour_ago = now - ai_memory::SECS_PER_HOUR;
     for i in 0..10 {
         insert_blob(
             &pool,
@@ -179,7 +179,7 @@ async fn cov18_offload_ttl_sweep_against_postgres() {
             &format!("ofl_cov18_fresh_{suffix}_{i}"),
             &ns,
             now,
-            Some(86_400),
+            Some(ai_memory::SECS_PER_DAY),
         )
         .await;
     }

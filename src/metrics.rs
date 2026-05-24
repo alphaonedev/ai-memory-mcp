@@ -235,7 +235,17 @@ impl Metrics {
                 "ai_memory_curator_cycle_duration_seconds",
                 "Curator sweep cycle wall-clock duration, labeled by dry_run.",
             )
-            .buckets(vec![0.1, 0.5, 1.0, 5.0, 15.0, 60.0, 300.0, 900.0, 3600.0]),
+            .buckets(vec![
+                0.1,
+                0.5,
+                1.0,
+                5.0,
+                15.0,
+                60.0,
+                300.0,
+                900.0,
+                crate::SECS_PER_HOUR as f64,
+            ]),
             &["dry_run"],
         )?;
         registry.register(Box::new(curator_cycle_duration_seconds.clone()))?;

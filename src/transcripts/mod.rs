@@ -306,7 +306,7 @@ mod tests {
             &conn,
             "team/eng",
             "expired body",
-            Some(chrono::Duration::seconds(-3600)),
+            Some(chrono::Duration::seconds(-crate::SECS_PER_HOUR)),
         )
         .unwrap();
         // One live row with future TTL.
@@ -314,7 +314,7 @@ mod tests {
             &conn,
             "team/eng",
             "live body",
-            Some(chrono::Duration::seconds(3600)),
+            Some(chrono::Duration::seconds(crate::SECS_PER_HOUR)),
         )
         .unwrap();
         // One row with no TTL — must NOT be purged.
@@ -373,8 +373,8 @@ mod tests {
     /// system clock.
     fn fast_cfg() -> TranscriptsConfig {
         TranscriptsConfig {
-            default_ttl_secs: Some(3600),
-            archive_grace_secs: Some(3600),
+            default_ttl_secs: Some(crate::SECS_PER_HOUR),
+            archive_grace_secs: Some(crate::SECS_PER_HOUR),
             namespaces: None,
             max_decompressed_bytes: None,
         }
@@ -516,14 +516,14 @@ mod tests {
         ns_table.insert(
             "team/audit".to_string(),
             TranscriptNamespaceConfig {
-                default_ttl_secs: Some(86_400),
+                default_ttl_secs: Some(crate::SECS_PER_DAY),
                 archive_grace_secs: None,
                 auto_extract: None,
             },
         );
         let cfg = TranscriptsConfig {
-            default_ttl_secs: Some(3600),
-            archive_grace_secs: Some(3600),
+            default_ttl_secs: Some(crate::SECS_PER_HOUR),
+            archive_grace_secs: Some(crate::SECS_PER_HOUR),
             namespaces: Some(ns_table),
             max_decompressed_bytes: None,
         };
@@ -560,8 +560,8 @@ mod tests {
             },
         );
         let cfg = TranscriptsConfig {
-            default_ttl_secs: Some(86_400 * 30), // 30 days global
-            archive_grace_secs: Some(86_400 * 7),
+            default_ttl_secs: Some(crate::SECS_PER_DAY * 30), // 30 days global
+            archive_grace_secs: Some(crate::SECS_PER_WEEK),
             namespaces: Some(ns_table),
             max_decompressed_bytes: None,
         };

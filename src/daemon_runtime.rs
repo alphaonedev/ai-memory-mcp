@@ -97,7 +97,7 @@ const PENDING_TIMEOUT_SWEEP_INTERVAL_SECS: u64 = 60;
 /// `default_timeout_seconds`. 24 hours — matches the operator-facing
 /// `doctor` warning window so a row already classed CRITICAL by
 /// `doctor_oldest_pending_age_secs` is also a sweeper candidate.
-const PENDING_TIMEOUT_DEFAULT_SECS: i64 = 86_400;
+const PENDING_TIMEOUT_DEFAULT_SECS: i64 = crate::SECS_PER_DAY;
 /// v0.7.0 I3 — transcript archive→prune sweeper cadence. The lifecycle
 /// scan walks every transcript row plus a per-candidate join into
 /// `memories`, so we run it less aggressively than the K2 60-second
@@ -4559,7 +4559,7 @@ mod tests {
         let h = spawn_pending_timeout_sweep_loop(
             state.clone(),
             env.db_path.clone(),
-            3_600,
+            crate::SECS_PER_HOUR,
             Duration::from_millis(50),
         );
         // Poll the row up to 2s; succeed as soon as the sweep flips it.
@@ -4877,7 +4877,7 @@ mod tests {
         args.quorum_writes = 1;
         args.quorum_peers = vec!["http://127.0.0.1:65531".to_string()];
         args.quorum_timeout_ms = 100;
-        args.catchup_interval_secs = 3600; // long enough not to fire
+        args.catchup_interval_secs = crate::SECS_PER_HOUR as u64; // long enough not to fire
         let bs = bootstrap_serve(&env.db_path, &args, &cfg).await.unwrap();
         assert!(bs.app_state.federation.is_some());
         for h in bs.task_handles {
