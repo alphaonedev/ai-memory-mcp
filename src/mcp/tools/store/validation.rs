@@ -96,7 +96,7 @@ pub(super) fn parse_and_build_memory(
 
     let title = params["title"].as_str().ok_or("title is required")?;
     let content = params["content"].as_str().ok_or("content is required")?;
-    let tier_str = params["tier"].as_str().unwrap_or("mid");
+    let tier_str = params["tier"].as_str().unwrap_or(Tier::Mid.as_str());
     let tier = Tier::from_str(tier_str).ok_or(format!("invalid tier: {tier_str}"))?;
     let namespace = params["namespace"].as_str().unwrap_or("global").to_string();
     // v0.7.x (issue #1175): vendor-neutral substrate default. The

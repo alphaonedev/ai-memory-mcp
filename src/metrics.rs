@@ -451,6 +451,7 @@ pub fn curator_cycle_completed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::Tier;
 
     #[test]
     fn registry_is_singleton() {
@@ -463,7 +464,7 @@ mod tests {
     #[test]
     fn render_includes_registered_names() {
         // Tickle every series so each one has ≥1 sample.
-        record_store("short", true);
+        record_store(Tier::Short.as_str(), true);
         record_recall("hybrid", 0.042);
         record_autonomy_hook("auto_tag", true);
         registry().contradiction_detected_total.inc();
@@ -494,7 +495,7 @@ mod tests {
 
     #[test]
     fn record_store_labels_tier() {
-        record_store("long", true);
+        record_store(Tier::Long.as_str(), true);
         let text = render();
         assert!(text.contains("ai_memory_store_total{result=\"ok\",tier=\"long\"}"));
     }
@@ -557,7 +558,7 @@ mod tests {
 
     #[test]
     fn record_store_err_path() {
-        record_store("short", false);
+        record_store(Tier::Short.as_str(), false);
         let text = render();
         assert!(text.contains("ai_memory_store_total{result=\"err\",tier=\"short\""));
     }
@@ -582,7 +583,7 @@ mod tests {
     #[test]
     fn render_emits_help_and_type_lines() {
         // Tickle one series, then render and assert prom-format HELP/TYPE lines.
-        record_store("mid", true);
+        record_store(Tier::Mid.as_str(), true);
         let text = render();
         assert!(text.contains("# HELP ai_memory_store_total"));
         assert!(text.contains("# TYPE ai_memory_store_total counter"));
@@ -640,7 +641,9 @@ mod tests {
         let m = super::Metrics::try_new().expect("fresh registry must succeed");
         // The handle must expose every metric family — touch each to
         // exercise the assignment side of the struct literal.
-        m.store_total.with_label_values(&["short", "ok"]).inc();
+        m.store_total
+            .with_label_values(&[Tier::Short.as_str(), "ok"])
+            .inc();
         m.recall_total.with_label_values(&["hybrid"]).inc();
         m.recall_latency_seconds
             .with_label_values(&["hybrid"])
@@ -676,8 +679,12 @@ mod tests {
         let a = super::Metrics::try_new().expect("first");
         let b = super::Metrics::try_new().expect("second");
         // Tickle a counter on each so the family surfaces in gather().
-        a.store_total.with_label_values(&["short", "ok"]).inc();
-        b.store_total.with_label_values(&["short", "ok"]).inc();
+        a.store_total
+            .with_label_values(&[Tier::Short.as_str(), "ok"])
+            .inc();
+        b.store_total
+            .with_label_values(&[Tier::Short.as_str(), "ok"])
+            .inc();
         let mut buf_a = Vec::new();
         let mut buf_b = Vec::new();
         let enc = TextEncoder::new();

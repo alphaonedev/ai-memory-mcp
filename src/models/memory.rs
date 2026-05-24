@@ -363,6 +363,20 @@ impl Tier {
         }
     }
 
+    /// Parse a tier wire string into the typed enum.
+    ///
+    /// The string literals in the match arms below are the **canonical
+    /// deserializer** for the `Tier` wire form. They are the one place
+    /// in the codebase where raw `"short"` / `"mid"` / `"long"` literals
+    /// legitimately appear, because this is the boundary where a
+    /// caller-supplied `&str` (HTTP body field, MCP JSON param, CLI
+    /// flag value, TOML config field) gets dispatched into the typed
+    /// enum. They are intentionally byte-equal to
+    /// [`Tier::as_str`]'s outputs so the round-trip is identity.
+    /// Anywhere else that *constructs* a tier wire value MUST route
+    /// through `Tier::<X>.as_str()` instead of restamping a fresh
+    /// literal. See pm-v3.1 PR6 (#1174) for the sweep that pinned this
+    /// invariant.
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "short" => Some(Self::Short),
@@ -1406,7 +1420,7 @@ mod tests {
         // default must populate it as 0.
         let json = serde_json::json!({
             "id": "old-mem",
-            "tier": "mid",
+            "tier": Tier::Mid.as_str(),
             "namespace": "ns",
             "title": "t",
             "content": "c",
@@ -1775,7 +1789,7 @@ mod tests {
         // serde defaults must populate them.
         let json = serde_json::json!({
             "id": "old-mem",
-            "tier": "long",
+            "tier": Tier::Long.as_str(),
             "namespace": "ns",
             "title": "t",
             "content": "c",

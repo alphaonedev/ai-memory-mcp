@@ -19,6 +19,11 @@ use std::path::Path;
 /// from main.rs verbatim in W5a — fields and attrs unchanged.
 #[derive(Args)]
 pub struct StoreArgs {
+    /// Memory tier. `default_value` must be a literal at attribute-parse
+    /// time, so the wire string is kept here verbatim; it is byte-equal
+    /// to `crate::models::Tier::Mid.as_str()` (pm-v3.1 PR6 #1174 sweep
+    /// — raw tier literals are confined to the deserializer + clap
+    /// `default_value` attrs that cannot accept const expressions).
     #[arg(long, short, default_value = "mid")]
     pub tier: String,
     #[arg(long, short)]
@@ -249,7 +254,7 @@ mod tests {
 
     fn default_args() -> StoreArgs {
         StoreArgs {
-            tier: "mid".to_string(),
+            tier: Tier::Mid.as_str().to_string(),
             namespace: Some("test-ns".to_string()),
             title: "test title".to_string(),
             content: "test content".to_string(),
@@ -305,7 +310,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
         assert!(v["id"].is_string());
         assert_eq!(v["title"].as_str().unwrap(), "test title");
-        assert_eq!(v["tier"].as_str().unwrap(), "mid");
+        assert_eq!(v["tier"].as_str().unwrap(), Tier::Mid.as_str());
         assert_eq!(v["namespace"].as_str().unwrap(), "test-ns");
     }
 

@@ -201,7 +201,7 @@ mod tests {
         let db = env.db_path.clone();
         seed_memory(&db, "test", "needle title", "content");
         let mut args = default_args();
-        args.tier = Some("long".to_string());
+        args.tier = Some(Tier::Long.as_str().to_string());
         {
             let mut out = env.output();
             run(&db, &args, true, &mut out).unwrap();

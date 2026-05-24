@@ -15,7 +15,7 @@ use super::*;
 use crate::config::ResolvedTtl;
 use crate::embeddings::test_support::MockEmbedder;
 use crate::hnsw::VectorIndex;
-use crate::models::ConfidenceSource;
+use crate::models::{ConfidenceSource, Tier};
 use crate::storage as db;
 
 fn fresh_conn() -> rusqlite::Connection {
@@ -31,7 +31,7 @@ fn base_params(title: &str) -> Value {
         "title": title,
         "content": format!("This is the body of {title}, long enough to be meaningful prose."),
         "namespace": "test-ns",
-        "tier": "mid",
+        "tier": Tier::Mid.as_str(),
         "tags": ["tag1"],
         "priority": 5,
         "confidence": 0.9,
@@ -832,10 +832,9 @@ async fn federation_forward_url_happy_returns_body() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/v1/memories"))
-        .respond_with(
-            ResponseTemplate::new(201)
-                .set_body_json(json!({"id": "ok-id", "tier": "mid", "title": "fwd-happy"})),
-        )
+        .respond_with(ResponseTemplate::new(201).set_body_json(
+            json!({"id": "ok-id", "tier": Tier::Mid.as_str(), "title": "fwd-happy"}),
+        ))
         .mount(&server)
         .await;
 
