@@ -149,6 +149,20 @@ pub fn handle_reflect(
                 if new_depth_u32 > threshold {
                     // Serialise enough of the input to reconstruct the
                     // call when the approver resolves the pending row.
+                    //
+                    // v0.7.x (issue #1176): `metadata` MUST be included
+                    // — `execute_reflect_from_payload` at
+                    // `src/storage/mod.rs:8685` reads
+                    // `payload["metadata"]` to rebuild the
+                    // `ReflectInput.metadata` field, which the
+                    // substrate then merges with the canonical
+                    // `agent_id` + `reflection_metadata` blob. The
+                    // pre-#1176 payload omitted `metadata` entirely,
+                    // so an L1-8-gated reflection bound via
+                    // `metadata.entity_id` (or any other caller-
+                    // supplied key) silently lost the binding on the
+                    // pending → execute round-trip — sibling defect
+                    // to #1172, surfaced by the Block 1 QC audit.
                     let payload = json!({
                         "source_ids": input.source_ids,
                         "title": input.title,
@@ -159,6 +173,7 @@ pub fn handle_reflect(
                         "priority": input.priority,
                         "confidence": input.confidence,
                         "agent_id": input.agent_id,
+                        "metadata": input.metadata,
                         "proposed_depth": new_depth_u32,
                     });
                     let pending_id = db::queue_pending_action(
