@@ -3835,7 +3835,7 @@ pub async fn sync_cycle_once(
                 crate::federation::peer_attestation::PEER_ID_HEADER,
                 local_agent_id,
             )
-            .header("content-type", "application/json")
+            .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
             .json(&body);
         if let Some(key) = api_key {
             req = req.header("x-api-key", key);
@@ -5840,7 +5840,7 @@ decision = "allow"
                 Request::builder()
                     .method("POST")
                     .uri("/api/v1/sync/push")
-                    .header("content-type", "application/json")
+                    .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                     .body(Body::from("{}"))
                     .unwrap(),
             )
@@ -5898,7 +5898,7 @@ decision = "allow"
                 Request::builder()
                     .method("POST")
                     .uri("/api/v1/sync/push")
-                    .header("content-type", "application/json")
+                    .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                     .body(Body::from("{}"))
                     .unwrap(),
             )

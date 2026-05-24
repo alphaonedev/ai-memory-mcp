@@ -1368,7 +1368,7 @@ mod tests {
                 // 200 OK but the body is not JSON — `resp.json::<Value>()`
                 // will return an Err on the parse step.
                 (
-                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    [(axum::http::header::CONTENT_TYPE, crate::MIME_JSON)],
                     "this is not json {{{",
                 )
                     .into_response()

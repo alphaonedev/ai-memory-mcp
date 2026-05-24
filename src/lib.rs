@@ -30,6 +30,29 @@ pub const SECS_PER_HOUR: i64 = 3_600;
 pub const SECS_PER_DAY: i64 = 86_400;
 pub const SECS_PER_WEEK: i64 = 604_800;
 
+// ---------------------------------------------------------------------------
+// v0.7.x (issue #1174 PR2 — pm-v3.1 HTTP const sweep) — canonical
+// constants for the most-used HTTP header / MIME literals. Replaces
+// ~210 inline string literals across handler tests, federation
+// requests, subscription dispatch, and the HTTP daemon bootstrap.
+//
+// Naming follows the conventional Rust HTTP-crate style:
+// SCREAMING_SNAKE_CASE, separated by the field they represent.
+//
+// Byte-equal preservation: the wire still emits exactly
+// `"content-type"` / `"application/json"`. The consts merely
+// centralise the literals so a rename or typed-header migration is
+// a one-line edit rather than a 210-site grep.
+//
+// Out of scope for these consts: `hyper::header::CONTENT_TYPE` /
+// `axum::http::header::CONTENT_TYPE` typed-header sites stay on the
+// typed constant; `#[serde(rename = "...")]` attributes stay as
+// compile-time literals.
+// ---------------------------------------------------------------------------
+
+pub const HEADER_CONTENT_TYPE: &str = "content-type";
+pub const MIME_JSON: &str = "application/json";
+
 pub mod approvals;
 // v0.7.0 WT-1-B — substrate-level atomisation engine. Decomposes
 // long-form memories into atomic propositions with full provenance
@@ -620,7 +643,7 @@ mod h7_timeout_tests {
                 Request::builder()
                     .method("POST")
                     .uri("/slow")
-                    .header("content-type", "application/json")
+                    .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                     .body(Body::from("{}"))
                     .unwrap(),
             )
