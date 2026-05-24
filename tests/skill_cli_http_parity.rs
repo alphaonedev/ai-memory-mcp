@@ -113,6 +113,7 @@ fn build_router_with_db_path(db_path: &std::path::Path) -> (axum::Router, ai_mem
         // applied for the #957 `export_memories` admin gate.
         admin_agent_ids: std::sync::Arc::new(vec!["ops:admin".to_string()]),
         rule_cache: std::sync::Arc::new(ai_memory::governance::rule_cache::RuleCache::new()),
+        resolved_models: std::sync::Arc::new(ai_memory::config::ResolvedModels::default()),
     };
     let api_key_state = ai_memory::handlers::ApiKeyState {
         key: None,

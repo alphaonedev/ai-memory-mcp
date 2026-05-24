@@ -3222,6 +3222,14 @@ pub async fn bootstrap_serve(
         // above (and already wired into both hook closures) with the
         // HTTP handler entry points. One cache per daemon lifetime.
         rule_cache: Arc::clone(&rule_cache),
+        // v0.7.x (issue #1168) — operator-resolved LLM / embeddings /
+        // reranker triple. Threaded into the HTTP `/api/v1/capabilities`
+        // handler so the wire-reported `models.*` block mirrors the
+        // running daemon's actual model wiring (matching the boot
+        // banner + the live LLM client), NOT the compiled tier preset.
+        // The resolver folds CLI / env / `[llm]` / legacy / compiled-
+        // default precedence and the resulting triple is process-stable.
+        resolved_models: Arc::new(app_config.resolve_models()),
     };
 
     // v0.7.0 Policy-Engine Item 3 — register the deferred-audit
@@ -4118,6 +4126,7 @@ mod tests {
             // writes (each test that mutates rules opens its own
             // `fresh_conn()`).
             rule_cache: Arc::new(crate::governance::rule_cache::RuleCache::new()),
+            resolved_models: Arc::new(crate::config::ResolvedModels::default()),
         }
     }
 

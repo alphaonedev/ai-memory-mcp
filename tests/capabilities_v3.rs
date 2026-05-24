@@ -32,7 +32,9 @@
 //!   so a miswired caller fails loud rather than serving a stale shape.
 //! - v2 callers see no behavior change (backward compat).
 
-use ai_memory::config::{Capabilities, CapabilitiesV3, FeatureTier, McpConfig, TierConfig};
+use ai_memory::config::{
+    Capabilities, CapabilitiesV3, FeatureTier, McpConfig, ResolvedModels, TierConfig,
+};
 use ai_memory::harness::Harness;
 use ai_memory::mcp::{
     CapabilitiesAccept, build_agent_permitted_families, build_capabilities_describe_to_user,
@@ -104,6 +106,7 @@ fn cap_v3_legacy_entry_point_refuses_v3() {
     let conn = fresh_conn();
     let err = handle_capabilities_with_conn(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false,
         Some(&conn),
@@ -127,6 +130,7 @@ fn cap_v3_response_carries_schema_version_and_summary() {
     let conn = fresh_conn();
     let val = handle_capabilities_with_conn_v3(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false,
         Some(&conn),
@@ -311,6 +315,7 @@ fn cap_v3_response_carries_to_describe_to_user() {
     let conn = fresh_conn();
     let val = handle_capabilities_with_conn_v3(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false,
         Some(&conn),
@@ -452,6 +457,7 @@ fn cap_v3_preserves_v2_sub_blocks() {
     let conn = fresh_conn();
     let val: Value = handle_capabilities_with_conn_v3(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         true, // embedder loaded
         Some(&conn),
@@ -480,6 +486,7 @@ fn cap_v3_v2_callers_unaffected_by_a1() {
     let conn = fresh_conn();
     let val = handle_capabilities_with_conn(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false,
         Some(&conn),
@@ -608,6 +615,7 @@ fn cap_v3_response_carries_tools_array_with_73_entries() {
     let conn = fresh_conn();
     let val = handle_capabilities_with_conn_v3(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false,
         Some(&conn),
@@ -680,6 +688,7 @@ fn cap_v3_a4_allowlist_disabled_omits_field() {
     let conn = fresh_conn();
     let val = handle_capabilities_with_conn_v3(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false,
         Some(&conn),
@@ -723,6 +732,7 @@ fn cap_v3_a4_allowlist_with_agent_lists_families() {
     let conn = fresh_conn();
     let val = handle_capabilities_with_conn_v3(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false,
         Some(&conn),
@@ -754,6 +764,7 @@ fn cap_v3_a4_allowlist_no_agent_id_omits_field() {
     let conn = fresh_conn();
     let val = handle_capabilities_with_conn_v3(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false,
         Some(&conn),
@@ -783,6 +794,7 @@ fn cap_v3_b4_claude_code_harness_advertises_deferred_true() {
     let harness = Harness::ClaudeCode;
     let val = handle_capabilities_with_conn_v3(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false,
         Some(&conn),
@@ -813,6 +825,7 @@ fn cap_v3_b4_codex_harness_advertises_deferred_false() {
     let harness = Harness::Codex;
     let val = handle_capabilities_with_conn_v3(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false,
         Some(&conn),
@@ -843,6 +856,7 @@ fn cap_v3_b4_no_harness_omits_field_from_wire() {
     let conn = fresh_conn();
     let val = handle_capabilities_with_conn_v3(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false,
         Some(&conn),
@@ -872,6 +886,7 @@ fn cap_v3_b4_generic_harness_defaults_deferred_false() {
     let harness = Harness::Generic("some-unknown-mcp-client".to_string());
     let val = handle_capabilities_with_conn_v3(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false,
         Some(&conn),
@@ -900,6 +915,7 @@ fn cap_v3_b4_v2_callers_unaffected() {
     let conn = fresh_conn();
     let val = handle_capabilities_with_conn(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false,
         Some(&conn),
@@ -988,6 +1004,7 @@ fn cap_v3_k5_rule_summary_empty_state_omits_field() {
     let conn = fresh_conn();
     let val = handle_capabilities_with_conn_v3(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false,
         Some(&conn),
@@ -1032,6 +1049,7 @@ fn cap_v3_k5_rule_summary_single_policy_carries_one_entry() {
 
     let val = handle_capabilities_with_conn_v3(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false,
         Some(&conn),
@@ -1120,6 +1138,7 @@ fn cap_v3_k5_rule_summary_multiple_policies_lex_ordered() {
 
     let val = handle_capabilities_with_conn_v3(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false,
         Some(&conn),
@@ -1186,6 +1205,7 @@ fn cap_v3_k5_v2_callers_see_omitted_field_when_empty() {
     let conn = fresh_conn();
     let val = handle_capabilities_with_conn(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false,
         Some(&conn),
@@ -1221,6 +1241,7 @@ fn issue_545_v3_response_carries_all_four_calibration_fields() {
     let cfg = allowlist(&[("alice", &["core", "graph"])]);
     let val = handle_capabilities_with_conn_v3(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false,
         Some(&conn),

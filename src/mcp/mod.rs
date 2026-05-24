@@ -19,7 +19,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::config::{AppConfig, FeatureTier, TierConfig};
+use crate::config::{AppConfig, FeatureTier, ResolvedModels, TierConfig};
 use crate::db;
 use crate::embeddings::{Embed, Embedder};
 use crate::hnsw::VectorIndex;
@@ -901,6 +901,14 @@ pub(crate) struct ToolDispatchCtx<'a> {
     pub llm: Option<&'a OllamaClient>,
     pub reranker: Option<&'a BatchedReranker>,
     pub tier_config: &'a TierConfig,
+    /// v0.7.x (issue #1168) — operator-resolved LLM / embeddings /
+    /// reranker triple. Threaded through `dispatch_memory_capabilities`
+    /// so `memory_capabilities.models.*` reflects the live operator
+    /// configuration (matching the boot banner + the actual LLM
+    /// client the daemon was built from), NOT the compiled tier
+    /// preset. Built once at MCP serve startup via
+    /// `AppConfig::resolve_models()` and reused for every dispatch.
+    pub resolved_models: &'a ResolvedModels,
     pub vector_index: Option<&'a VectorIndex>,
     pub resolved_ttl: &'a crate::config::ResolvedTtl,
     pub resolved_scoring: &'a crate::config::ResolvedScoring,
@@ -1184,6 +1192,7 @@ fn dispatch_memory_capabilities(ctx: &ToolDispatchCtx<'_>) -> Result<Value, Stri
     let result = match accept {
         CapabilitiesAccept::V3 => handle_capabilities_with_conn_v3(
             ctx.tier_config,
+            ctx.resolved_models,
             ctx.reranker,
             ctx.embedder.is_some(),
             Some(ctx.conn),
@@ -1194,6 +1203,7 @@ fn dispatch_memory_capabilities(ctx: &ToolDispatchCtx<'_>) -> Result<Value, Stri
         ),
         _ => handle_capabilities_with_conn(
             ctx.tier_config,
+            ctx.resolved_models,
             ctx.reranker,
             ctx.embedder.is_some(),
             Some(ctx.conn),
@@ -1601,6 +1611,11 @@ fn handle_request(
     llm: Option<&OllamaClient>,
     reranker: Option<&BatchedReranker>,
     tier_config: &TierConfig,
+    // v0.7.x (issue #1168) — operator-resolved models triple. See
+    // `ToolDispatchCtx::resolved_models` for rationale. Threaded from
+    // `run_mcp_server` (and tests) through to
+    // `dispatch_memory_capabilities`.
+    resolved_models: &ResolvedModels,
     vector_index: Option<&VectorIndex>,
     resolved_ttl: &crate::config::ResolvedTtl,
     resolved_scoring: &crate::config::ResolvedScoring,
@@ -1768,6 +1783,7 @@ fn handle_request(
                 llm,
                 reranker,
                 tier_config,
+                resolved_models,
                 vector_index,
                 resolved_ttl,
                 resolved_scoring,
@@ -2411,6 +2427,16 @@ pub fn run_mcp_server(
             None
         };
 
+    // v0.7.x (issue #1168) — resolve the operator-configured LLM /
+    // embeddings / reranker triple once. The triple is process-stable
+    // (config is loaded at boot and never mutated) so we compute it
+    // outside the per-request stdio loop and thread an immutable
+    // borrow to every `handle_request` call. Threaded into the MCP
+    // `dispatch_memory_capabilities` so `memory_capabilities.models.*`
+    // reports the same backend / model the boot banner emits and the
+    // live LLM client was built from.
+    let resolved_models = app_config.resolve_models();
+
     // Captured from the MCP `initialize` handshake's `clientInfo.name`.
     // Used by `crate::identity` to synthesize an `ai:<client>@<host>:pid-<pid>`
     // agent_id when the caller doesn't supply one explicitly.
@@ -2470,6 +2496,7 @@ pub fn run_mcp_server(
             llm.as_deref(),
             reranker.as_ref(),
             &tier_config,
+            &resolved_models,
             vector_index.as_ref(),
             &resolved_ttl,
             &resolved_scoring,
@@ -2566,6 +2593,7 @@ mod tests {
             Option<&OllamaClient>,
             Option<&BatchedReranker>,
             &TierConfig,
+            &crate::config::ResolvedModels,
             Option<&VectorIndex>,
             &crate::config::ResolvedTtl,
             &crate::config::ResolvedScoring,
@@ -2624,6 +2652,7 @@ mod tests {
                 None, // llm
                 None, // reranker
                 &tier_config,
+                &crate::config::ResolvedModels::from_tier_preset(&tier_config),
                 None, // vector_index
                 &resolved_ttl,
                 &resolved_scoring,
@@ -3548,6 +3577,7 @@ mod tests {
                 None,
                 None,
                 &tier_config,
+                &crate::config::ResolvedModels::from_tier_preset(&tier_config),
                 None,
                 &resolved_ttl,
                 &resolved_scoring,
@@ -3606,6 +3636,7 @@ mod tests {
                 None,
                 None,
                 &tier_config,
+                &crate::config::ResolvedModels::from_tier_preset(&tier_config),
                 None,
                 &resolved_ttl,
                 &resolved_scoring,
@@ -3985,6 +4016,7 @@ mod tests {
                 None,
                 None,
                 &tier_config,
+                &crate::config::ResolvedModels::from_tier_preset(&tier_config),
                 None,
                 &resolved_ttl,
                 &resolved_scoring,
@@ -4029,6 +4061,7 @@ mod tests {
                     None,
                     None,
                     &tier_config,
+                    &crate::config::ResolvedModels::from_tier_preset(&tier_config),
                     None,
                     &resolved_ttl,
                     &resolved_scoring,
@@ -4090,6 +4123,7 @@ mod tests {
             None,
             None,
             &tier_config,
+            &crate::config::ResolvedModels::from_tier_preset(&tier_config),
             None,
             &resolved_ttl,
             &resolved_scoring,
@@ -4494,6 +4528,7 @@ mod tests {
             None,
             None,
             &tier_config,
+            &crate::config::ResolvedModels::from_tier_preset(&tier_config),
             None,
             &resolved_ttl,
             &resolved_scoring,
@@ -4609,6 +4644,7 @@ mod tests {
             None,
             None,
             &tier_config,
+            &crate::config::ResolvedModels::from_tier_preset(&tier_config),
             None,
             &resolved_ttl,
             &resolved_scoring,
@@ -11396,6 +11432,7 @@ mod tests {
         let tier = crate::config::FeatureTier::Keyword.config();
         let res = crate::mcp::handle_capabilities_with_conn(
             &tier,
+            &crate::config::ResolvedModels::from_tier_preset(&tier),
             None,
             false,
             None,
@@ -11411,6 +11448,7 @@ mod tests {
         let tier = crate::config::FeatureTier::Keyword.config();
         let v = crate::mcp::handle_capabilities_with_conn(
             &tier,
+            &crate::config::ResolvedModels::from_tier_preset(&tier),
             None,
             false,
             None,
@@ -11752,6 +11790,7 @@ mod tests {
         let harness = Harness::detect("claude-code");
         let v = handle_capabilities_with_conn_v3(
             &tier,
+            &crate::config::ResolvedModels::from_tier_preset(&tier),
             None,
             false,
             Some(&conn),
@@ -11776,9 +11815,15 @@ mod tests {
         use crate::mcp::{CapabilitiesAccept, handle_capabilities_with_conn};
         let tier = FeatureTier::Keyword.config();
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
-        let v =
-            handle_capabilities_with_conn(&tier, None, false, Some(&conn), CapabilitiesAccept::V2)
-                .unwrap();
+        let v = handle_capabilities_with_conn(
+            &tier,
+            &crate::config::ResolvedModels::from_tier_preset(&tier),
+            None,
+            false,
+            Some(&conn),
+            CapabilitiesAccept::V2,
+        )
+        .unwrap();
         assert_eq!(v["schema_version"], "2");
         assert!(v["permissions"]["active_rules"].as_u64().is_some());
         assert!(v["hooks"]["registered_count"].as_u64().is_some());
@@ -12104,6 +12149,7 @@ mod tests {
         let tier = FeatureTier::Keyword.config();
         let v = handle_capabilities_with_conn(
             &tier,
+            &crate::config::ResolvedModels::from_tier_preset(&tier),
             None, // reranker None
             false,
             None,
@@ -12126,6 +12172,7 @@ mod tests {
         let lexical = BatchedReranker::new(CrossEncoder::new());
         let v = handle_capabilities_with_conn(
             &tier,
+            &crate::config::ResolvedModels::from_tier_preset(&tier),
             Some(&lexical),
             false,
             None,
@@ -12145,6 +12192,7 @@ mod tests {
         let tier = FeatureTier::Semantic.config();
         let v = handle_capabilities_with_conn(
             &tier,
+            &crate::config::ResolvedModels::from_tier_preset(&tier),
             None,
             true, // embedder_loaded
             None,
@@ -12163,6 +12211,7 @@ mod tests {
         let tier = FeatureTier::Semantic.config();
         let v = handle_capabilities_with_conn(
             &tier,
+            &crate::config::ResolvedModels::from_tier_preset(&tier),
             None,
             false, // embedder NOT loaded
             None,

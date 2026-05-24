@@ -394,6 +394,7 @@ mod cov897_tests {
             deferred_audit_queue: Arc::new(None),
             admin_agent_ids: Arc::new(Vec::new()),
             rule_cache: std::sync::Arc::new(crate::governance::rule_cache::RuleCache::new()),
+            resolved_models: std::sync::Arc::new(crate::config::ResolvedModels::default()),
         };
         (app, tmp)
     }

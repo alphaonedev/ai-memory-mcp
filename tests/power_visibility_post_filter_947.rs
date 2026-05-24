@@ -116,6 +116,7 @@ fn build_fixture(
         deferred_audit_queue: Arc::new(None),
         admin_agent_ids: Arc::new(admin_ids),
         rule_cache: std::sync::Arc::new(ai_memory::governance::rule_cache::RuleCache::new()),
+        resolved_models: std::sync::Arc::new(ai_memory::config::ResolvedModels::default()),
     };
     let api_key_state = ApiKeyState {
         key: None,
@@ -331,6 +332,7 @@ async fn entity_get_by_alias_blocks_cross_tenant_private_entity_947() {
         deferred_audit_queue: Arc::new(None),
         admin_agent_ids: Arc::new(Vec::new()),
         rule_cache: std::sync::Arc::new(ai_memory::governance::rule_cache::RuleCache::new()),
+        resolved_models: std::sync::Arc::new(ai_memory::config::ResolvedModels::default()),
     };
     let api_key_state = ApiKeyState {
         key: None,

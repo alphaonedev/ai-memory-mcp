@@ -3,7 +3,7 @@
 
 //! MCP `memory_capabilities` handlers, CapabilitiesAccept, and capability-summary helpers.
 
-use crate::config::{RerankerMode, TierConfig};
+use crate::config::{RerankerMode, ResolvedModels, TierConfig};
 use crate::db;
 use crate::mcp::registry::McpTool;
 use crate::reranker::BatchedReranker;
@@ -228,12 +228,19 @@ impl CapabilitiesAccept {
 /// legacy shape for backward compat (see [`Capabilities::to_v1`]).
 pub fn handle_capabilities_with_conn(
     tier_config: &TierConfig,
+    resolved_models: &ResolvedModels,
     reranker: Option<&BatchedReranker>,
     embedder_loaded: bool,
     conn: Option<&rusqlite::Connection>,
     accept: CapabilitiesAccept,
 ) -> Result<Value, String> {
-    let caps = build_capabilities_overlay(tier_config, reranker, embedder_loaded, conn);
+    let caps = build_capabilities_overlay(
+        tier_config,
+        resolved_models,
+        reranker,
+        embedder_loaded,
+        conn,
+    );
 
     // --- Schema selection ---
     match accept {
@@ -261,6 +268,7 @@ pub fn handle_capabilities_with_conn(
 /// `AppState`); A1 lights up the MCP dispatch path only.
 pub fn handle_capabilities_with_conn_v3(
     tier_config: &TierConfig,
+    resolved_models: &ResolvedModels,
     reranker: Option<&BatchedReranker>,
     embedder_loaded: bool,
     conn: Option<&rusqlite::Connection>,
@@ -275,7 +283,13 @@ pub fn handle_capabilities_with_conn_v3(
     // from the wire via `skip_serializing_if = Option::is_none`.
     harness: Option<&crate::harness::Harness>,
 ) -> Result<Value, String> {
-    let caps = build_capabilities_overlay(tier_config, reranker, embedder_loaded, conn);
+    let caps = build_capabilities_overlay(
+        tier_config,
+        resolved_models,
+        reranker,
+        embedder_loaded,
+        conn,
+    );
     let summary = build_capabilities_summary(profile);
     let describe = build_capabilities_describe_to_user(profile);
     let tools = build_capabilities_tools(profile, mcp_config, agent_id);
@@ -322,11 +336,18 @@ pub fn handle_capabilities_with_conn_v3(
 /// logic stays single-sourced.
 fn build_capabilities_overlay(
     tier_config: &TierConfig,
+    resolved_models: &ResolvedModels,
     reranker: Option<&BatchedReranker>,
     embedder_loaded: bool,
     conn: Option<&rusqlite::Connection>,
 ) -> crate::config::Capabilities {
-    let mut caps = tier_config.capabilities();
+    // v0.7.x (#1168) — build the report from the operator-resolved
+    // models triple. The boot banner already routes the same triple
+    // through `app_config.resolve_models()`; the capabilities surface
+    // now matches it so `memory_capabilities.models.*` reflects what
+    // the live LLM / embedder / reranker were wired to, not the
+    // compiled tier preset.
+    let mut caps = tier_config.capabilities_with_resolved(resolved_models);
 
     // --- Reranker live state (P1) ---
     caps.features.reranker_active = match reranker {

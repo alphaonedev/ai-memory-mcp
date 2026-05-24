@@ -65,6 +65,11 @@ pub async fn get_capabilities(
     let result = match accept {
         crate::mcp::CapabilitiesAccept::V3 => crate::mcp::handle_capabilities_with_conn_v3(
             app.tier_config.as_ref(),
+            // v0.7.x (issue #1168) — the operator-resolved models
+            // triple drives the `models.*` block so it matches the
+            // boot banner + the live LLM client wiring, not the
+            // compiled tier preset.
+            app.resolved_models.as_ref(),
             None,
             embedder_loaded,
             Some(conn),
@@ -79,6 +84,7 @@ pub async fn get_capabilities(
         ),
         _ => crate::mcp::handle_capabilities_with_conn(
             app.tier_config.as_ref(),
+            app.resolved_models.as_ref(),
             None,
             embedder_loaded,
             Some(conn),

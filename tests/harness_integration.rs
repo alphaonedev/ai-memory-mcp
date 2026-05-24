@@ -39,7 +39,7 @@
 //! tool count changes; the surface stays at the v0.7.0 tool count
 //! (51 tools — pinned in `src/profile.rs::Profile::full`).
 
-use ai_memory::config::{FeatureTier, McpConfig, TierConfig};
+use ai_memory::config::{FeatureTier, McpConfig, ResolvedModels, TierConfig};
 use ai_memory::harness::Harness;
 use ai_memory::mcp::handle_capabilities_with_conn_v3;
 use ai_memory::profile::Profile;
@@ -116,6 +116,7 @@ fn round_trip(
     let harness = detect_from_initialize(client_name);
     let val = handle_capabilities_with_conn_v3(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false,
         Some(&conn),
@@ -403,6 +404,7 @@ fn d4_empty_client_info_name_falls_back_to_generic_and_omits_field() {
     let conn = fresh_conn();
     let val = handle_capabilities_with_conn_v3(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false,
         Some(&conn),

@@ -23,7 +23,7 @@
 //! …and re-run this test. Drift between the spec and the substrate is
 //! exactly what this file is designed to surface.
 
-use ai_memory::config::{FeatureTier, TierConfig};
+use ai_memory::config::{FeatureTier, ResolvedModels, TierConfig};
 use ai_memory::mcp::handle_capabilities_with_conn_v3;
 use ai_memory::profile::Profile;
 use serde_json::Value;
@@ -40,6 +40,7 @@ fn v3_response(profile: &Profile) -> Value {
     let conn = fresh_conn();
     handle_capabilities_with_conn_v3(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false,
         Some(&conn),
