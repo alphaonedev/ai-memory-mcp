@@ -429,17 +429,33 @@ cd ai-memory-mcp &amp;&amp; cargo build --release</code></pre>
         <a href="https://ollama.com">Ollama</a>, LMStudio, vLLM, llama.cpp server,
         <strong>xAI Grok</strong>, OpenAI, Anthropic, Google Gemini, DeepSeek, Kimi (Moonshot), Qwen
         (DashScope), Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks
-        &mdash; selected by the <code>AI_MEMORY_LLM_BACKEND</code> env var.
+        &mdash; configured via a <code>[llm]</code> section in <code>~/.config/ai-memory/config.toml</code>
+        (recommended, post-<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1146">#1146</a>)
+        or via <code>AI_MEMORY_LLM_BACKEND</code> env vars (override path).
       </p>
       <p>
-        <strong>Critical for MCP usage:</strong> shell exports do NOT reach the MCP-spawned subprocess.
-        The LLM env vars MUST live inside your AI client's MCP server-config <code>env:</code> block.
-        Copy-pasteable per-backend recipes (Claude Code <code>~/.claude.json</code>, Cursor
-        <code>~/.cursor/mcp.json</code>, Codex <code>~/.codex/config.toml</code>, etc.) live in the
-        canonical recipe page:
+        <strong>Single source of truth.</strong> <code>config.toml</code> is consumed by every surface —
+        the MCP server, the HTTP daemon, <code>ai-memory atomise</code>, <code>ai-memory curator</code>, the boot
+        banner, and the <code>ai-memory doctor</code> reachability probe — so they all report the same backend.
+        Example for xAI Grok 4.3:
+      </p>
+      <pre style="background:var(--code-bg, #0d1117); color:var(--code-fg, #c9d1d9); padding:1rem; border-radius:6px; overflow:auto; font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:0.9em">schema_version = 2
+
+[llm]
+backend     = "xai"
+model       = "grok-4.3"
+base_url    = "https://api.x.ai/v1"
+api_key_env = "XAI_API_KEY"            # env-var name (inline keys rejected at parse time)</pre>
+      <p>
+        Export <code>XAI_API_KEY</code> in your shell rc; the MCP config stays minimal (no <code>env:</code>
+        block needed). The <strong>override path</strong> — an <code>env:</code> block on the MCP server
+        config — still works and takes precedence; it's useful for CI / per-session tweaks but shell exports
+        do NOT reach the MCP-spawned subprocess.
       </p>
       <div style="margin-top:1rem">
-        <a class="cta primary" href="integrations/llm-backends.md">LLM-backend MCP recipes &rarr;</a>
+        <a class="cta primary" href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/CONFIG_SCHEMA.md">Canonical config schema &rarr;</a>
+        &nbsp;
+        <a class="cta primary" href="integrations/llm-backends.md">Per-vendor recipes &rarr;</a>
         &nbsp;
         <a class="cta ghost" href="ADMIN_GUIDE.md#llm-backend-setup-smart--autonomous-tiers">Standalone CLI / HTTP daemon setup</a>
       </div>

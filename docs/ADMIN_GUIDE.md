@@ -169,17 +169,79 @@ ai-memory serve --host 127.0.0.1 --port 9077
 
 ### LLM Backend Setup (Smart & Autonomous Tiers)
 
-The `smart` and `autonomous` tiers require an LLM backend. **Post-[#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067) (v0.7.0)** the backend is provider-agnostic — pick from local Ollama OR any OpenAI-compatible vendor (xAI Grok, OpenAI, Anthropic via OpenAI shim, Google Gemini, DeepSeek, Kimi/Moonshot, Qwen/Dashscope, Mistral, Groq, Together AI, Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, llama.cpp server).
+The `smart` and `autonomous` tiers require an LLM backend. **Post-[#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067) + [#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146) (v0.7.0)** the backend is provider-agnostic — pick from local Ollama OR any OpenAI-compatible vendor (xAI Grok, OpenAI, Anthropic via OpenAI shim, Google Gemini, DeepSeek, Kimi/Moonshot, Qwen/Dashscope, Mistral, Groq, Together AI, Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, llama.cpp server).
 
-> **Important — MCP clients do NOT inherit your interactive shell** ([#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144)). The shell-level `export AI_MEMORY_LLM_BACKEND=…` setup documented below is sufficient for:
+#### Recommended path — `[llm]` section in `config.toml` (#1146)
+
+`~/.config/ai-memory/config.toml` is the **single source of truth**. Every surface (MCP stdio, HTTP daemon, `ai-memory atomise`, `ai-memory curator`, the boot banner, the `ai-memory doctor` reachability probe) consumes the same `AppConfig::resolve_llm` resolver output, so the boot banner and the live MCP server are guaranteed to agree on the backend.
+
+```toml
+# ~/.config/ai-memory/config.toml
+schema_version = 2
+
+tier = "autonomous"
+db   = "/Users/<you>/.claude/ai-memory.db"
+
+[llm]
+backend     = "xai"                    # ollama | openai | xai | anthropic | gemini |
+                                       # deepseek | kimi | qwen | mistral | groq |
+                                       # together | cerebras | openrouter |
+                                       # fireworks | lmstudio | openai-compatible
+model       = "grok-4.3"               # vendor-specific identifier
+base_url    = "https://api.x.ai/v1"   # optional; vendor-default if unset
+api_key_env = "XAI_API_KEY"            # process-env-var name (NOT the literal key)
+# api_key_file = "/etc/ai-memory/keys/xai.key"   # mode 0400 enforced; alt to api_key_env
+
+[llm.auto_tag]                         # fast structured-output sibling
+backend = "ollama"
+model   = "gemma3:4b"
+
+[embeddings]
+backend = "ollama"
+url     = "http://localhost:11434"
+model   = "nomic-embed-text-v1.5"
+
+[reranker]
+enabled = true
+model   = "ms-marco-MiniLM-L-6-v2"
+```
+
+**API-key resolution chain.** For non-Ollama backends, the resolver consults (in order):
+
+1. `AI_MEMORY_LLM_API_KEY` (process env) — universal escape hatch.
+2. Per-vendor process env-var fallback: `OPENAI_API_KEY`, `XAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY` (or `GOOGLE_API_KEY`), `DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY` (or `KIMI_API_KEY`), `DASHSCOPE_API_KEY` (or `QWEN_API_KEY`), `MISTRAL_API_KEY`, `GROQ_API_KEY`, `TOGETHER_API_KEY`, `CEREBRAS_API_KEY`, `OPENROUTER_API_KEY`, `FIREWORKS_API_KEY`.
+3. `[llm].api_key_env = "<NAME>"` — config-pointed env var.
+4. `[llm].api_key_file = "/path/to/key"` — file (mode 0400 enforced via `AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS=1` escape hatch per [#1055](https://github.com/alphaonedev/ai-memory-mcp/issues/1055)).
+
+If all four return empty, the resolver returns `KeySource::None` (correct for `backend = "ollama"`; a misconfiguration for any OpenAI-compatible backend — `ai-memory doctor` surfaces this).
+
+**Secret-handling discipline.** `[llm].api_key = "<literal>"` is **rejected at parse time** with a clear stderr error — `config.toml` is typically world-readable, so literal keys would be a credential leak. `api_key_env` and `api_key_file` are mutually exclusive.
+
+**Precedence ladder (uniform across all four resolvers — LLM / embeddings / reranker / storage):**
+
+```
+CLI flag  >  AI_MEMORY_LLM_* env  >  [llm] section  >  legacy flat fields  >  compiled default
+```
+
+**Migration tool — `ai-memory config migrate`.** Rewrites a legacy v0.6.x flat-field `config.toml` in place (with a timestamped `.bak`) to the v2 sectioned shape. Idempotent. `--dry-run` prints the diff; `--also-clean-claude-json` additionally strips redundant `mcpServers.<*>.env` blocks whose `command` resolves to `ai-memory` from `~/.claude.json`.
+
+**Reachability probe — `ai-memory doctor`.** A `LLM Reachability (#1146)` section resolves the canonical config and probes the endpoint with the resolved Bearer key (`/api/tags` for Ollama, `/models` for OpenAI-compatible). Reports PASS / WARN (401/403/429/5xx) / CRIT (4xx other, network, DNS, TLS) plus the resolved provenance facts (`backend`, `model`, `base_url`, `config_source`, `key_source`).
+
+Canonical schema reference: [`CONFIG_SCHEMA.md`](CONFIG_SCHEMA.md).
+
+#### Override path — `AI_MEMORY_LLM_*` env vars
+
+Env vars take precedence over `[llm]` in `config.toml`. Useful for CI / per-session tweaks and the only path that doesn't require editing a file.
+
+> **MCP clients do NOT inherit your interactive shell** ([#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144)). The shell-level `export AI_MEMORY_LLM_BACKEND=…` setup documented below is sufficient for:
 >
 > - the standalone `ai-memory` CLI (`ai-memory store / recall / search / list / …`)
 > - the standalone HTTP daemon (`ai-memory serve …`)
 > - any process you launch yourself from an interactive shell that inherits the exports
 >
-> It is **NOT sufficient** for MCP usage — Claude Code, Claude Desktop, Cursor, Codex CLI, Cline, Continue, Zed, Windsurf, Goose, Roo Code, etc. spawn the MCP server as a **fresh subprocess** with only the `env:` keys explicitly declared in the MCP server config. Shell exports from your `.zshrc` / `.bashrc` / `.profile` are invisible to that subprocess.
+> It is **NOT sufficient** for MCP usage — Claude Code, Claude Desktop, Cursor, Codex CLI, Cline, Continue, Zed, Windsurf, Goose, Roo Code, etc. spawn the MCP server as a **fresh subprocess** with only the `env:` keys explicitly declared in the MCP server config. Shell exports from `.zshrc` / `.bashrc` / `.profile` are invisible to that subprocess. The recommended path above (a `[llm]` section in `config.toml` with `api_key_env`) avoids this paper-cut by letting every surface read the same file. Background: [#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144) → [#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146).
 >
-> For MCP usage, the same `AI_MEMORY_LLM_BACKEND` / `AI_MEMORY_LLM_API_KEY` / `AI_MEMORY_LLM_MODEL` variables MUST also live inside the MCP server config's `env:` block. Copy-pasteable per-backend recipes (Ollama, LMStudio, vLLM, llama.cpp server, xAI, OpenAI, Anthropic, Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks): see [`integrations/llm-backends.md`](integrations/llm-backends.md).
+> If you DO use the env-block override, the same `AI_MEMORY_LLM_BACKEND` / `AI_MEMORY_LLM_API_KEY` / `AI_MEMORY_LLM_MODEL` variables must live inside the MCP server config's `env:` block. Copy-pasteable per-backend recipes: [`integrations/llm-backends.md`](integrations/llm-backends.md).
 
 **Selection by env var.** Set `AI_MEMORY_LLM_BACKEND` to one of: `ollama` (default), `openai-compatible` (generic; requires `AI_MEMORY_LLM_BASE_URL`), or a pre-filled vendor alias (`openai`, `xai`, `anthropic`, `gemini`, `deepseek`, `kimi`/`moonshot`, `qwen`/`dashscope`, `mistral`, `groq`, `together`, `cerebras`, `openrouter`, `fireworks`, `lmstudio`).
 

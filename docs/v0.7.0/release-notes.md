@@ -159,6 +159,123 @@ inject the secret from a 0400-mode env file.
 [`src/llm.rs`](../../src/llm.rs); `LlmProvider` enum + `OllamaClient::from_env()`
 constructor are the canonical anchors.
 
+## v0.7.0 enterprise configuration standard ([#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146), 2026-05-23)
+
+The #1067 LLM substrate landed env-aware resolution into every
+production code path that builds an LLM client, but the operator
+configuration surface remained fragmented across five disjoint sources
+(`~/.config/ai-memory/config.toml` partial flat fields,
+`~/.claude.json` MCP env block, the SessionStart hook env, compiled
+tier presets in `src/config.rs`, and process env). The boot banner
+reported one backend; the live MCP server ran another; API keys lived
+inline in `~/.claude.json`. #1146 retires that fragmentation.
+
+**Single source of truth — sectioned config schema v2.**
+`~/.config/ai-memory/config.toml` now carries dedicated
+`[llm]`, `[llm.auto_tag]`, `[embeddings]`, `[reranker]`, and `[storage]`
+sections. The compile-time tier presets (`src/config.rs:165-178`)
+remain as the last-resort fallback under the precedence ladder, not
+as a parallel source of truth.
+
+```toml
+schema_version = 2
+
+[llm]
+backend     = "xai"
+model       = "grok-4.3"
+base_url    = "https://api.x.ai/v1"
+api_key_env = "XAI_API_KEY"            # process-env-var name (NOT the literal key)
+# api_key_file = "/etc/ai-memory/keys/xai.key"   # mode 0400 enforced; alt to api_key_env
+
+[llm.auto_tag]
+backend = "ollama"
+model   = "gemma3:4b"
+```
+
+**Canonical resolver — one shape, every surface.** Every LLM-init site
+(MCP stdio at `src/mcp/mod.rs`, HTTP daemon at `src/daemon_runtime.rs`,
+`ai-memory atomise` at `src/cli/commands/atomise.rs`, `ai-memory curator`
+at `src/cli/curator.rs`, the boot banner at `src/cli/boot.rs`, the
+doctor probe at `src/cli/doctor.rs`) now consumes
+`AppConfig::resolve_llm(cli_backend, cli_model, cli_base_url) -> ResolvedLlm`
+with a uniform precedence ladder:
+
+```
+CLI flag  >  AI_MEMORY_LLM_* env  >  [llm] section  >  legacy flat fields  >  compiled default
+```
+
+Sister resolvers `resolve_llm_auto_tag`, `resolve_embeddings`,
+`resolve_reranker`, and `resolve_storage` follow the same ladder. The
+`ResolvedLlm` struct's `Debug` impl redacts the resolved `api_key` to
+`<redacted>` so accidental `{:?}` prints never leak credentials.
+
+**Inline-key rejection.** `[llm].api_key = "<literal>"` is **rejected
+at parse time** with a clear stderr error and the daemon falls back to
+`AppConfig::default()` so it still boots. Operators MUST use either
+`[llm].api_key_env = "<ENV_VAR_NAME>"` (process-env reference) or
+`[llm].api_key_file = "/path"` (file path; mode 0400 enforced via the
+`AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS` escape hatch from
+[#1055](https://github.com/alphaonedev/ai-memory-mcp/issues/1055)).
+`api_key_env` and `api_key_file` are mutually exclusive.
+
+**Migration tool — `ai-memory config migrate`.** Rewrites a legacy
+v0.6.x flat-field `config.toml` in place (with a timestamped `.bak`)
+to the v2 sectioned shape. Idempotent. `--dry-run` prints the diff
+without writing; `--also-clean-claude-json` additionally removes
+`mcpServers.<*>.env` blocks whose `command` resolves to `ai-memory`
+from `~/.claude.json` after the operator has verified the new config
+works.
+
+```bash
+ai-memory config migrate
+ai-memory config migrate --dry-run
+ai-memory config migrate --also-clean-claude-json
+```
+
+**Reachability probe — `ai-memory doctor`.** A new `LLM Reachability
+(#1146)` section in the doctor report resolves the canonical config
+and probes the endpoint with the resolved Bearer key
+(`GET <base_url>/api/tags` for Ollama, `GET <base_url>/models` for
+OpenAI-compatible). Severity partition:
+
+| Severity | Outcome                                          |
+|----------|--------------------------------------------------|
+| INFO     | 200 (vendor reachable + auth OK)                 |
+| WARN     | 401 / 403 (auth issue; URL reachable)            |
+| WARN     | 429 (rate-limited; reachable)                    |
+| WARN     | 5xx (vendor outage; reachable)                   |
+| CRIT     | 4xx other (likely wrong base_url / endpoint)     |
+| CRIT     | network / DNS / connect-refused / TLS error      |
+
+The report surfaces the resolved provenance facts (`backend`, `model`,
+`base_url`, `config_source`, `key_source`) so operators see WHICH
+precedence layer won.
+
+**Legacy v0.6.x flat fields** (`llm_model`, `ollama_url`, `embed_url`,
+`embedding_model`, `cross_encoder`, `default_namespace`,
+`archive_on_gc`, `archive_max_days`, `max_memory_mb`,
+`auto_tag_model`) continue to parse and feed the resolver's `Legacy`
+arm. Loading a legacy config emits a `Once`-gated stderr WARN
+pointing at `ai-memory config migrate`. **Legacy fields will be
+removed in v0.8.0.**
+
+**HTTP / CLI surface additions.** The `Config` subcommand and the
+`/api/v1/config/*` HTTP routes are new at v0.7.x; the count change is
+captured in [`CLAUDE.md`](../../CLAUDE.md) §Architecture (87 HTTP
+routes, 58 CLI subcommands).
+
+**Test pins.** Resolver precedence + secret-handling discipline are
+pinned by 19 tests under `src/config::tests::*1146*` +
+`src/cli/commands/config::tests::migrate_*`. Adding a new resolver
+field requires updating the resolver function AND the precedence
+test for that resolver.
+
+**Operator references.**
+
+- [`docs/CONFIG_SCHEMA.md`](../CONFIG_SCHEMA.md) — canonical reference for every section + field.
+- [`docs/MIGRATION_v0.7.md` §"Provider-agnostic LLM backend"](../MIGRATION_v0.7.md#provider-agnostic-llm-backend-1067--1146) — recommended config-first path.
+- [`docs/ADMIN_GUIDE.md` §"LLM Backend Setup"](../ADMIN_GUIDE.md#llm-backend-setup-smart--autonomous-tiers) — operator runbook.
+
 ## v0.7.0 mobile target CI ([#1068](https://github.com/alphaonedev/ai-memory-mcp/issues/1068), Posture-1a 3-layer ship, 2026-05-21)
 
 Lands the three-layer CI coverage for the Posture-1a (Edge / Mobile)

@@ -39,7 +39,7 @@ Add to `~/.config/zed/settings.json`:
 }
 ```
 
-> **Using `--tier smart` or `--tier autonomous` with a non-default LLM backend?** Extend the inner `env` block above with `AI_MEMORY_LLM_BACKEND`, `AI_MEMORY_LLM_API_KEY`, and `AI_MEMORY_LLM_MODEL`. **Do not** rely on shell exports — Zed's MCP-spawned subprocesses don't see your interactive shell's environment ([#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144)). Copy-pasteable recipes for every supported provider (Ollama, LMStudio, vLLM, llama.cpp server, xAI Grok, OpenAI, Anthropic, Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks): [`llm-backends.md`](llm-backends.md).
+> **Using `--tier smart` or `--tier autonomous` with a non-default LLM backend?** Post-[#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146) (v0.7.0) the **recommended** path is a `[llm]` section in `~/.config/ai-memory/config.toml` — single source of truth across MCP / HTTP daemon / CLI / boot banner / doctor probe. Example: `backend = "xai"`, `model = "grok-4.3"`, `api_key_env = "XAI_API_KEY"` (the env-var name, not the literal key — inline keys are rejected at parse time). Export the named env var in your shell rc; the Zed config can stay minimal. **Override** path: extend the inner `env` block above with `AI_MEMORY_LLM_BACKEND`, `AI_MEMORY_LLM_API_KEY`, and `AI_MEMORY_LLM_MODEL` — shell exports don't reach Zed's MCP-spawned subprocesses ([#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144)). Full schema + per-vendor recipes: [`../CONFIG_SCHEMA.md`](../CONFIG_SCHEMA.md) + [`llm-backends.md`](llm-backends.md).
 
 Notes:
 
