@@ -763,13 +763,10 @@ pub fn build_capability_models(tier: &TierConfig, models: &ResolvedModels) -> Ca
     let embedding_dim = if tier.embedding_model.is_none() {
         0
     } else {
-        models
-            .embeddings
-            .embedding_dim
-            .map_or_else(
-                || tier.embedding_model.map_or(0, EmbeddingModel::dim),
-                |d| d as usize,
-            )
+        models.embeddings.embedding_dim.map_or_else(
+            || tier.embedding_model.map_or(0, EmbeddingModel::dim),
+            |d| d as usize,
+        )
     };
 
     let cross_encoder = if models.reranker.enabled || tier.cross_encoder {
