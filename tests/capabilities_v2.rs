@@ -24,7 +24,7 @@
 
 use ai_memory::config::{
     Capabilities, CapabilitiesV1, CapabilityFeatures, FeatureTier, RecallMode, RerankerMode,
-    TierConfig,
+    ResolvedModels, TierConfig,
 };
 use ai_memory::mcp::{CapabilitiesAccept, handle_capabilities_with_conn};
 use ai_memory::reranker::{BatchedReranker, CrossEncoder};
@@ -50,6 +50,7 @@ fn cap_v2_reports_recall_mode_keyword_only_when_no_embedder() {
     let conn = fresh_conn();
     let val = handle_capabilities_with_conn(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,  // no reranker
         false, // no embedder loaded
         Some(&conn),
@@ -75,6 +76,7 @@ fn cap_v2_reports_reranker_off_when_disabled_at_startup() {
     let conn = fresh_conn();
     let val = handle_capabilities_with_conn(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None, // no reranker handle = "off"
         false,
         Some(&conn),
@@ -107,6 +109,7 @@ fn cap_v2_reports_reranker_lexical_fallback_when_neural_init_failed() {
     let conn = fresh_conn();
     let val = handle_capabilities_with_conn(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         Some(&lexical),
         true,
         Some(&conn),
@@ -142,6 +145,7 @@ fn cap_v2_omits_dropped_fields_in_v2_response() {
     let conn = fresh_conn();
     let val = handle_capabilities_with_conn(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         true,
         Some(&conn),
@@ -205,6 +209,7 @@ fn cap_v1_compat_returns_legacy_shape_on_accept_header() {
     let conn = fresh_conn();
     let val = handle_capabilities_with_conn(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         true,
         Some(&conn),
@@ -265,6 +270,7 @@ fn cap_v2_recall_mode_hybrid_when_embedder_loaded_on_semantic_tier() {
     let conn = fresh_conn();
     let val = handle_capabilities_with_conn(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         true, // embedder loaded
         Some(&conn),
@@ -291,6 +297,7 @@ fn cap_v2_recall_mode_degraded_when_embedder_configured_but_not_loaded() {
     let conn = fresh_conn();
     let val = handle_capabilities_with_conn(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false, // configured but not loaded — HF download failed, etc.
         Some(&conn),

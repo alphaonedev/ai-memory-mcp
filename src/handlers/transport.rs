@@ -281,6 +281,17 @@ pub struct AppState {
     /// design rationale + the cross-instance isolation regression
     /// pinning.
     pub rule_cache: Arc<crate::governance::rule_cache::RuleCache>,
+
+    /// v0.7.x (issue #1168) — operator-resolved LLM / embeddings /
+    /// reranker triple. Threaded into the HTTP `/api/v1/capabilities`
+    /// handler so the wire-reported `models.*` block mirrors the
+    /// running daemon's actual model wiring (matching the boot banner)
+    /// instead of the compiled tier preset. Built once at
+    /// `bootstrap_serve` via [`crate::config::AppConfig::resolve_models`]
+    /// and reused for every request — the resolver folds CLI / env /
+    /// `[llm]` / legacy / compiled-default precedence, so the resulting
+    /// triple is process-stable.
+    pub resolved_models: Arc<crate::config::ResolvedModels>,
 }
 
 /// v0.7.0 B3 — canonical 1-2 sentence English descriptors for each
