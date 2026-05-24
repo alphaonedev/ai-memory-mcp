@@ -65,7 +65,7 @@ pub struct CapabilitiesTool;
 
 impl McpTool for CapabilitiesTool {
     fn name() -> &'static str {
-        "memory_capabilities"
+        crate::mcp::registry::tool_names::MEMORY_CAPABILITIES
     }
 
     fn description() -> &'static str {
@@ -677,6 +677,7 @@ pub fn build_capabilities_tools(
 #[must_use]
 pub fn tool_examples(name: &str) -> Vec<crate::config::ToolExample> {
     use crate::config::ToolExample;
+    use crate::mcp::registry::tool_names as tn;
     use crate::models::Tier;
     use serde_json::json;
     let ex = |call: serde_json::Value, desc: &str| ToolExample {
@@ -684,27 +685,27 @@ pub fn tool_examples(name: &str) -> Vec<crate::config::ToolExample> {
         description: desc.to_string(),
     };
     match name {
-        "memory_store" => vec![ex(
+        tn::MEMORY_STORE => vec![ex(
             json!({"title": "design", "content": "wt-1 atomisation", "tier": Tier::Long.as_str(), "namespace": "ai-memory"}),
             "Persists a long-tier memory; returns {id, status}.",
         )],
-        "memory_recall" => vec![ex(
+        tn::MEMORY_RECALL => vec![ex(
             json!({"query": "atomisation gates", "namespace": "ai-memory", "limit": 5}),
             "Hybrid FTS+semantic recall; returns top-K ranked memories.",
         )],
-        "memory_search" => vec![ex(
+        tn::MEMORY_SEARCH => vec![ex(
             json!({"query": "L1-6 governance", "limit": 10}),
             "FTS5 keyword search across namespaces.",
         )],
-        "memory_link" => vec![ex(
+        tn::MEMORY_LINK => vec![ex(
             json!({"from_id": "<uuid-a>", "to_id": "<uuid-b>", "relation": "derives_from"}),
             "Signed directional edge; returns {link_id, attest_level}.",
         )],
-        "memory_reflect" => vec![ex(
+        tn::MEMORY_REFLECT => vec![ex(
             json!({"memory_ids": ["<uuid-1>", "<uuid-2>"], "depth": 1}),
             "Curator synthesises a Reflection; returns {reflection_id}.",
         )],
-        "memory_persona_generate" => vec![
+        tn::MEMORY_PERSONA_GENERATE => vec![
             ex(
                 json!({"entity_id": "alice", "namespace": "team/alpha"}),
                 "Single-namespace scope.",
@@ -714,43 +715,43 @@ pub fn tool_examples(name: &str) -> Vec<crate::config::ToolExample> {
                 "#848 cross-namespace; persona lands in 'global'.",
             ),
         ],
-        "memory_consolidate" => vec![ex(
+        tn::MEMORY_CONSOLIDATE => vec![ex(
             json!({"namespace": "raw/notes", "into_namespace": "team/alpha", "limit": 20}),
             "Curator distils notes into one consolidated memory.",
         )],
-        "memory_atomise" => vec![ex(
+        tn::MEMORY_ATOMISE => vec![ex(
             json!({"memory_id": "<long-uuid>", "max_atom_tokens": 200}),
             "WT-1 decomposition; archives parent.",
         )],
-        "memory_find_paths" => vec![ex(
+        tn::MEMORY_FIND_PATHS => vec![ex(
             json!({"from_id": "<uuid-a>", "to_id": "<uuid-b>", "max_depth": 4}),
             "BFS over KG; returns path arrays of memory ids.",
         )],
-        "memory_kg_query" => vec![ex(
+        tn::MEMORY_KG_QUERY => vec![ex(
             json!({"start_id": "<uuid>", "relation": "derives_from", "direction": "out", "depth": 2}),
             "Typed KG walk; returns nodes+edges.",
         )],
-        "memory_export_reflection" => vec![ex(
+        tn::MEMORY_EXPORT_REFLECTION => vec![ex(
             json!({"memory_id": "<reflection-uuid>", "format": "md"}),
             "QW-1 export; returns {content, suggested_filename}.",
         )],
-        "memory_smart_load" => vec![ex(
+        tn::MEMORY_SMART_LOAD => vec![ex(
             json!({"intent": "inspect the knowledge graph", "include_schema": true}),
             "B2 intent routing.",
         )],
-        "memory_load_family" => vec![ex(
+        tn::MEMORY_LOAD_FAMILY => vec![ex(
             json!({"family": "graph", "include_schema": true}),
             "B1 explicit family load.",
         )],
-        "memory_session_start" => vec![ex(
+        tn::MEMORY_SESSION_START => vec![ex(
             json!({"topic": "v0.7.0 ship"}),
             "SessionStart bootstrap; returns memories+persona+rules.",
         )],
-        "memory_verify" => vec![ex(
+        tn::MEMORY_VERIFY => vec![ex(
             json!({"memory_id": "<uuid>"}),
             "H4 signature replay; returns {verified, attest_level}.",
         )],
-        "memory_notify" => vec![ex(
+        tn::MEMORY_NOTIFY => vec![ex(
             json!({"event_type": "deploy.completed", "payload": {"env": "prod"}, "ttl_seconds": crate::SECS_PER_HOUR}),
             "Fan-out to active subscribers.",
         )],

@@ -381,7 +381,7 @@ pub struct ReflectTool;
 
 impl McpTool for ReflectTool {
     fn name() -> &'static str {
-        "memory_reflect"
+        crate::mcp::registry::tool_names::MEMORY_REFLECT
     }
     fn description() -> &'static str {
         "Persist a reflection memory plus reflects_on provenance links to each source."

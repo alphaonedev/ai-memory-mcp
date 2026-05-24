@@ -78,7 +78,7 @@ pub struct ReflectionOriginTool;
 
 impl McpTool for ReflectionOriginTool {
     fn name() -> &'static str {
-        "memory_reflection_origin"
+        crate::mcp::registry::tool_names::MEMORY_REFLECTION_ORIGIN
     }
     fn description() -> &'static str {
         "Inspect the cross-peer provenance of a reflection memory."

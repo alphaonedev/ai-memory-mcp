@@ -910,10 +910,15 @@ impl Default for CapabilityHooks {
 /// here closes the v0.6.3.1 honest-disclosure that the
 /// `approval.subscribers` field was advertised but unwired.
 fn default_webhook_events() -> Vec<String> {
+    // v0.7.x (issue #1174 PR1 — pm-v3.1 MCP tool name sweep): the
+    // three entries that ARE MCP tool names route through the
+    // canonical `tool_names` consts; the remaining four are
+    // subscription-event types (different namespace) and stay raw.
+    use crate::mcp::registry::tool_names as tn;
     vec![
-        "memory_store".to_string(),
-        "memory_promote".to_string(),
-        "memory_delete".to_string(),
+        tn::MEMORY_STORE.to_string(),
+        tn::MEMORY_PROMOTE.to_string(),
+        tn::MEMORY_DELETE.to_string(),
         "memory_link_created".to_string(),
         "memory_link_invalidated".to_string(),
         "memory_consolidated".to_string(),
@@ -1158,14 +1163,20 @@ pub struct CapabilitySkills {
 /// the regression test
 /// `cap_v3_l3_5_skill_tools_match_registered_mcp_dispatch` ensures the
 /// two stay in sync.
+// v0.7.x (issue #1174 PR1 — pm-v3.1 MCP tool name sweep) — each
+// entry routes through the canonical `tool_names` const so this
+// capability surface cannot drift from the dispatch table in name
+// spelling. The `cap_v3_l3_5_skill_tools_match_registered_mcp_dispatch`
+// regression test continues to enforce membership equality between
+// this slice and the registered set.
 pub const SKILL_TOOL_NAMES: &[&str] = &[
-    "memory_skill_register",
-    "memory_skill_list",
-    "memory_skill_get",
-    "memory_skill_resource",
-    "memory_skill_export",
-    "memory_skill_promote_from_reflection",
-    "memory_skill_compositional_context",
+    crate::mcp::registry::tool_names::MEMORY_SKILL_REGISTER,
+    crate::mcp::registry::tool_names::MEMORY_SKILL_LIST,
+    crate::mcp::registry::tool_names::MEMORY_SKILL_GET,
+    crate::mcp::registry::tool_names::MEMORY_SKILL_RESOURCE,
+    crate::mcp::registry::tool_names::MEMORY_SKILL_EXPORT,
+    crate::mcp::registry::tool_names::MEMORY_SKILL_PROMOTE_FROM_REFLECTION,
+    crate::mcp::registry::tool_names::MEMORY_SKILL_COMPOSITIONAL_CONTEXT,
 ];
 
 impl CapabilitySkills {

@@ -26,7 +26,7 @@ pub struct DeleteTool;
 
 impl McpTool for DeleteTool {
     fn name() -> &'static str {
-        "memory_delete"
+        crate::mcp::registry::tool_names::MEMORY_DELETE
     }
     fn description() -> &'static str {
         "Delete a memory by ID."
@@ -89,7 +89,7 @@ pub(super) fn handle_delete(
     crate::governance::audit::record_decision(
         &caller_for_forensic,
         "allow",
-        "memory_delete",
+        crate::mcp::registry::tool_names::MEMORY_DELETE,
         "",
         json!({ "id": id }),
     );
@@ -224,7 +224,7 @@ pub(super) fn handle_delete(
         .ok();
         crate::subscriptions::dispatch_event_with_details(
             conn,
-            "memory_delete",
+            crate::mcp::registry::tool_names::MEMORY_DELETE,
             &target.id,
             &snapshot_namespace,
             snapshot_owner.as_deref(),

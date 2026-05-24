@@ -34,7 +34,7 @@ pub struct GetTaxonomyTool;
 
 impl McpTool for GetTaxonomyTool {
     fn name() -> &'static str {
-        "memory_get_taxonomy"
+        crate::mcp::registry::tool_names::MEMORY_GET_TAXONOMY
     }
     fn description() -> &'static str {
         "Return a hierarchical tree of namespaces with memory counts."

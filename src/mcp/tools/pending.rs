@@ -30,7 +30,7 @@ pub struct PendingListTool;
 
 impl McpTool for PendingListTool {
     fn name() -> &'static str {
-        "memory_pending_list"
+        crate::mcp::registry::tool_names::MEMORY_PENDING_LIST
     }
     fn description() -> &'static str {
         "List pending governance-queued actions."
@@ -65,7 +65,7 @@ pub struct PendingApproveTool;
 
 impl McpTool for PendingApproveTool {
     fn name() -> &'static str {
-        "memory_pending_approve"
+        crate::mcp::registry::tool_names::MEMORY_PENDING_APPROVE
     }
     fn description() -> &'static str {
         "Approve a pending action; `remember` auto-decides next time."
@@ -100,7 +100,7 @@ pub struct PendingRejectTool;
 
 impl McpTool for PendingRejectTool {
     fn name() -> &'static str {
-        "memory_pending_reject"
+        crate::mcp::registry::tool_names::MEMORY_PENDING_REJECT
     }
     fn description() -> &'static str {
         "Reject a pending action; `remember` auto-decides next time."
@@ -375,7 +375,7 @@ pub struct SubscriptionDlqListTool;
 
 impl McpTool for SubscriptionDlqListTool {
     fn name() -> &'static str {
-        "memory_subscription_dlq_list"
+        crate::mcp::registry::tool_names::MEMORY_SUBSCRIPTION_DLQ_LIST
     }
     fn description() -> &'static str {
         "List subscription_dlq rows (exhausted retry ladder)."

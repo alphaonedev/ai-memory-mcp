@@ -83,10 +83,18 @@ pub struct NewSubscription<'a> {
 /// `memory_kg_invalidate` fires this event after the link's
 /// `valid_until` is set, regardless of which KG backend handled the
 /// SET).
+// v0.7.x (issue #1174 PR1 — pm-v3.1 MCP tool name sweep): the three
+// entries that ARE MCP tool names (`memory_store`, `memory_promote`,
+// `memory_delete`) reference the canonical `tool_names` consts. The
+// remaining four entries (`memory_link_created`,
+// `memory_link_invalidated`, `memory_consolidated`,
+// `approval_requested`) are subscription-event types, NOT MCP tool
+// names — they stay as raw literals because they live in a different
+// namespace (webhook events vs. JSON-RPC method names).
 pub const WEBHOOK_EVENT_TYPES: &[&str] = &[
-    "memory_store",
-    "memory_promote",
-    "memory_delete",
+    crate::mcp::registry::tool_names::MEMORY_STORE,
+    crate::mcp::registry::tool_names::MEMORY_PROMOTE,
+    crate::mcp::registry::tool_names::MEMORY_DELETE,
     "memory_link_created",
     "memory_link_invalidated",
     "memory_consolidated",

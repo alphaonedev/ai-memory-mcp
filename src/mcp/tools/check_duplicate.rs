@@ -99,7 +99,7 @@ pub struct CheckDuplicateTool;
 
 impl McpTool for CheckDuplicateTool {
     fn name() -> &'static str {
-        "memory_check_duplicate"
+        crate::mcp::registry::tool_names::MEMORY_CHECK_DUPLICATE
     }
     fn description() -> &'static str {
         "Pre-write near-duplicate check via cosine over stored embeddings."

@@ -53,7 +53,7 @@ pub struct KgQueryTool;
 
 impl McpTool for KgQueryTool {
     fn name() -> &'static str {
-        "memory_kg_query"
+        crate::mcp::registry::tool_names::MEMORY_KG_QUERY
     }
     fn description() -> &'static str {
         "Outbound KG traversal from a source memory (<=5 hops)."

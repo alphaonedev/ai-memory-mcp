@@ -38,7 +38,7 @@ pub struct LoadFamilyTool;
 
 impl McpTool for LoadFamilyTool {
     fn name() -> &'static str {
-        "memory_load_family"
+        crate::mcp::registry::tool_names::MEMORY_LOAD_FAMILY
     }
     fn description() -> &'static str {
         "Load top-k recent + high-priority memories from a Family."
@@ -80,7 +80,7 @@ pub struct SmartLoadTool;
 
 impl McpTool for SmartLoadTool {
     fn name() -> &'static str {
-        "memory_smart_load"
+        crate::mcp::registry::tool_names::MEMORY_SMART_LOAD
     }
     fn description() -> &'static str {
         "Intent-routed loader: free-text intent picks the best Family."

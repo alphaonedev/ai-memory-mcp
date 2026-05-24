@@ -101,7 +101,7 @@ pub struct QuotaStatusTool;
 
 impl McpTool for QuotaStatusTool {
     fn name() -> &'static str {
-        "memory_quota_status"
+        crate::mcp::registry::tool_names::MEMORY_QUOTA_STATUS
     }
     fn description() -> &'static str {
         "Report per-agent + per-namespace quota usage. Operator-facing."

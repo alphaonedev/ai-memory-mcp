@@ -250,7 +250,7 @@ pub async fn update_memory(
                         let ns_for_dispatch = mem.namespace.clone();
                         super::dispatch_event_postgres(
                             &app,
-                            "memory_update",
+                            crate::mcp::registry::tool_names::MEMORY_UPDATE,
                             &id,
                             &ns_for_dispatch,
                             agent_for_dispatch.as_deref(),
@@ -504,7 +504,7 @@ pub async fn delete_memory(
     crate::governance::audit::record_decision(
         &caller_for_forensic,
         "allow",
-        "memory_delete",
+        crate::mcp::registry::tool_names::MEMORY_DELETE,
         "",
         json!({ "id": &id }),
     );
@@ -617,7 +617,7 @@ pub async fn delete_memory(
                         .map(str::to_string);
                     super::dispatch_event_postgres(
                         &app,
-                        "memory_delete",
+                        crate::mcp::registry::tool_names::MEMORY_DELETE,
                         &id,
                         &mem.namespace,
                         mem_owner.as_deref(),
@@ -791,7 +791,7 @@ pub async fn delete_memory(
             .map(str::to_string);
         crate::subscriptions::dispatch_event_with_details(
             &lock.0,
-            "memory_delete",
+            crate::mcp::registry::tool_names::MEMORY_DELETE,
             &target.id,
             &target.namespace,
             owner_aid.as_deref(),
@@ -1008,7 +1008,7 @@ pub async fn promote_memory(
                     .map(str::to_string);
                 super::dispatch_event_postgres(
                     &app,
-                    "memory_promote",
+                    crate::mcp::registry::tool_names::MEMORY_PROMOTE,
                     &target.id,
                     &target.namespace,
                     mem_owner.as_deref(),
@@ -1213,7 +1213,7 @@ pub async fn promote_memory(
             .ok();
             crate::subscriptions::dispatch_event_with_details(
                 &lock.0,
-                "memory_promote",
+                crate::mcp::registry::tool_names::MEMORY_PROMOTE,
                 &resolved_id,
                 &target.namespace,
                 owner_aid.as_deref(),

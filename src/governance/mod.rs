@@ -143,28 +143,39 @@ pub enum Op {
 impl Op {
     /// Wire name used in `[permissions.rules].op`. Stable across
     /// versions.
+    ///
+    /// v0.7.x (issue #1174 PR1 — pm-v3.1 MCP tool name sweep): the
+    /// five variants whose wire string ALSO appears as an MCP tool
+    /// name reference the canonical `tool_names` const so the
+    /// governance-op spelling cannot drift from the dispatch table.
+    /// `MemoryArchive` is the lone exception: its wire string
+    /// `"memory_archive"` is a governance op identifier covering the
+    /// 4-tool archive family (list/purge/restore/stats); it is NOT
+    /// itself an MCP tool name and therefore stays as a raw literal.
     #[must_use]
     pub fn as_str(self) -> &'static str {
+        use crate::mcp::registry::tool_names as tn;
         match self {
-            Op::MemoryStore => "memory_store",
-            Op::MemoryLink => "memory_link",
-            Op::MemoryDelete => "memory_delete",
+            Op::MemoryStore => tn::MEMORY_STORE,
+            Op::MemoryLink => tn::MEMORY_LINK,
+            Op::MemoryDelete => tn::MEMORY_DELETE,
             Op::MemoryArchive => "memory_archive",
-            Op::MemoryConsolidate => "memory_consolidate",
-            Op::MemoryReplay => "memory_replay",
+            Op::MemoryConsolidate => tn::MEMORY_CONSOLIDATE,
+            Op::MemoryReplay => tn::MEMORY_REPLAY,
         }
     }
 
     /// Parse from the wire name. Used by rule loaders.
     #[must_use]
     pub fn from_str(s: &str) -> Option<Op> {
+        use crate::mcp::registry::tool_names as tn;
         match s {
-            "memory_store" => Some(Op::MemoryStore),
-            "memory_link" => Some(Op::MemoryLink),
-            "memory_delete" => Some(Op::MemoryDelete),
+            tn::MEMORY_STORE => Some(Op::MemoryStore),
+            tn::MEMORY_LINK => Some(Op::MemoryLink),
+            tn::MEMORY_DELETE => Some(Op::MemoryDelete),
             "memory_archive" => Some(Op::MemoryArchive),
-            "memory_consolidate" => Some(Op::MemoryConsolidate),
-            "memory_replay" => Some(Op::MemoryReplay),
+            tn::MEMORY_CONSOLIDATE => Some(Op::MemoryConsolidate),
+            tn::MEMORY_REPLAY => Some(Op::MemoryReplay),
             _ => None,
         }
     }

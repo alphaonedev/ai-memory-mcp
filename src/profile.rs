@@ -112,7 +112,11 @@ pub enum Family {
 /// always-on bootstrap so the runtime-discovery dance works out of the
 /// box on `--profile core`. Per RFC S27 and the v0.6.4-002 acceptance
 /// criteria.
-pub const ALWAYS_ON_TOOLS: &[&str] = &["memory_capabilities"];
+///
+/// v0.7.x (issue #1174 PR1 — pm-v3.1 MCP tool name sweep): the
+/// literal references the canonical const so this slice cannot drift
+/// from the dispatch table.
+pub const ALWAYS_ON_TOOLS: &[&str] = &[crate::mcp::registry::tool_names::MEMORY_CAPABILITIES];
 
 impl Family {
     /// Lookup the family that owns a given tool name. Source-anchored
@@ -123,132 +127,139 @@ impl Family {
     /// reconciliation).
     #[must_use]
     pub fn for_tool(name: &str) -> Option<Self> {
+        // v0.7.x (issue #1174 PR1 — pm-v3.1 MCP tool name sweep) — every
+        // match arm references a const from
+        // [`crate::mcp::registry::tool_names`] so the family routing
+        // table and the dispatch table cannot drift in name spelling.
+        use crate::mcp::registry::tool_names as tn;
         match name {
             // core (7 — v0.7 B1 added memory_load_family as the always-on
             // alternative to memory_recall when the agent already knows
             // which family taxonomy it wants; v0.7 B2 added
             // memory_smart_load as the intent-routed front door that
             // picks the best family for the caller).
-            "memory_store" | "memory_recall" | "memory_list" | "memory_get" | "memory_search"
-            | "memory_load_family" | "memory_smart_load" => Some(Self::Core),
+            tn::MEMORY_STORE | tn::MEMORY_RECALL | tn::MEMORY_LIST | tn::MEMORY_GET
+            | tn::MEMORY_SEARCH | tn::MEMORY_LOAD_FAMILY | tn::MEMORY_SMART_LOAD => {
+                Some(Self::Core)
+            }
             // lifecycle (5)
-            "memory_update" | "memory_delete" | "memory_forget" | "memory_gc"
-            | "memory_promote" => Some(Self::Lifecycle),
+            tn::MEMORY_UPDATE | tn::MEMORY_DELETE | tn::MEMORY_FORGET | tn::MEMORY_GC
+            | tn::MEMORY_PROMOTE => Some(Self::Lifecycle),
             // graph (11 — v0.7.0 I4 added memory_replay; v0.7 H4 added memory_verify;
             // v0.7 J7 added memory_find_paths)
-            "memory_kg_query"
-            | "memory_kg_timeline"
-            | "memory_kg_invalidate"
-            | "memory_link"
-            | "memory_get_links"
-            | "memory_entity_register"
-            | "memory_entity_get_by_alias"
-            | "memory_get_taxonomy"
-            | "memory_replay"
-            | "memory_verify"
-            | "memory_find_paths" => Some(Self::Graph),
+            tn::MEMORY_KG_QUERY
+            | tn::MEMORY_KG_TIMELINE
+            | tn::MEMORY_KG_INVALIDATE
+            | tn::MEMORY_LINK
+            | tn::MEMORY_GET_LINKS
+            | tn::MEMORY_ENTITY_REGISTER
+            | tn::MEMORY_ENTITY_GET_BY_ALIAS
+            | tn::MEMORY_GET_TAXONOMY
+            | tn::MEMORY_REPLAY
+            | tn::MEMORY_VERIFY
+            | tn::MEMORY_FIND_PATHS => Some(Self::Graph),
             // governance (8)
-            "memory_pending_list"
-            | "memory_pending_approve"
-            | "memory_pending_reject"
-            | "memory_namespace_set_standard"
-            | "memory_namespace_get_standard"
-            | "memory_namespace_clear_standard"
-            | "memory_subscribe"
-            | "memory_unsubscribe" => Some(Self::Governance),
+            tn::MEMORY_PENDING_LIST
+            | tn::MEMORY_PENDING_APPROVE
+            | tn::MEMORY_PENDING_REJECT
+            | tn::MEMORY_NAMESPACE_SET_STANDARD
+            | tn::MEMORY_NAMESPACE_GET_STANDARD
+            | tn::MEMORY_NAMESPACE_CLEAR_STANDARD
+            | tn::MEMORY_SUBSCRIBE
+            | tn::MEMORY_UNSUBSCRIBE => Some(Self::Governance),
             // power (10 — v0.7 K7 added the subscription-reliability pair:
             // `memory_subscription_replay` + `memory_subscription_dlq_list`;
             // v0.7 K8 added `memory_quota_status` for the per-agent quota
             // substrate; v0.7.0 Task 4/8 added `memory_reflect` — the
             // substrate-native recursive-learning primitive. All
             // operator/governance, not data-plane.)
-            "memory_consolidate"
-            | "memory_detect_contradiction"
-            | "memory_check_duplicate"
-            | "memory_auto_tag"
-            | "memory_expand_query"
-            | "memory_inbox"
-            | "memory_subscription_replay"
-            | "memory_subscription_dlq_list"
-            | "memory_quota_status"
-            | "memory_reflect"
-            | "memory_reflection_origin"
+            tn::MEMORY_CONSOLIDATE
+            | tn::MEMORY_DETECT_CONTRADICTION
+            | tn::MEMORY_CHECK_DUPLICATE
+            | tn::MEMORY_AUTO_TAG
+            | tn::MEMORY_EXPAND_QUERY
+            | tn::MEMORY_INBOX
+            | tn::MEMORY_SUBSCRIPTION_REPLAY
+            | tn::MEMORY_SUBSCRIPTION_DLQ_LIST
+            | tn::MEMORY_QUOTA_STATUS
+            | tn::MEMORY_REFLECT
+            | tn::MEMORY_REFLECTION_ORIGIN
             // v0.7.0 QW-1 — file-backed reflection chain export.
             // Operator-facing; substrate returns rendered content,
             // agent harness owns the disk write.
-            | "memory_export_reflection"
+            | tn::MEMORY_EXPORT_REFLECTION
             // v0.7.0 QW-2 — Persona-as-artifact. The read-only
             // `memory_persona` lookup and the write-side
             // `memory_persona_generate` regeneration both sit under
             // Power. Tier-gating in the MCP dispatcher refuses the
             // write-side surface unless smart+autonomous is enabled.
-            | "memory_persona"
-            | "memory_persona_generate"
+            | tn::MEMORY_PERSONA
+            | tn::MEMORY_PERSONA_GENERATE
             // v0.7.0 Form 5 (issue #758) — calibration sweep over the
             // shadow-mode observation table. Operator-callable
             // equivalent of `ai-memory calibrate confidence
             // --from-shadow`. Lives in Power alongside the other
             // operator-facing observability tools.
-            | "memory_calibrate_confidence"
+            | tn::MEMORY_CALIBRATE_CONFIDENCE
             // v0.7.0 L2-3 (issue #668) — read-side surface for the
             // reflection invalidation propagation walker. Operator-
             // facing inspector for the per-reflection dependent set
             // that gets notified on Reflection→Reflection supersedes.
-            | "memory_dependents_of_invalidated"
+            | tn::MEMORY_DEPENDENTS_OF_INVALIDATED
             // v0.7.0 (issue #691) — substrate-level agent-action rules
             // engine. Both tools live in Family::Power (governance /
             // operator-facing, not data-plane). Mutation tools are
             // explicitly NOT registered over MCP per design revision
             // 2026-05-13 — operator uses CLI / HTTP with signed key.
-            | "memory_check_agent_action"
-            | "memory_rule_list"
+            | tn::MEMORY_CHECK_AGENT_ACTION
+            | tn::MEMORY_RULE_LIST
             // v0.7.0 QW-3 follow-up — context-offload substrate primitive.
             // The pair lives in Family::Power so the `power` (and `full`)
             // profile surfaces them while keeping the keyword-tier
             // `core` surface unchanged (semantic-tier+ exposure per the
             // QW-3 brief).
-            | "memory_offload"
-            | "memory_deref"
+            | tn::MEMORY_OFFLOAD
+            | tn::MEMORY_DEREF
             // v0.7.0 WT-1-C — curator-pass atomisation tool. Lives in
             // the same family/profile group as memory_consolidate and
             // memory_reflect (semantic+ tier; the keyword tier short-
             // circuits with a tier-locked advisory envelope).
-            | "memory_atomise"
+            | tn::MEMORY_ATOMISE
             // v0.7.0 Form 3 (issue #756) — multi-step ingest
             // orchestrator. Lives at Family::Power alongside the other
             // LLM-driven write-side tools; tier-gated to smart+ with
             // the standard tier-locked advisory on keyword.
-            | "memory_ingest_multistep"
+            | tn::MEMORY_INGEST_MULTISTEP
             // v0.7.0 (issues #224 + #311) — Phase 3 Memory Sharing &
             // Sync RFC pulled forward per operator directive
             // `28860423-d12c-4959-bc8b-8fa9a94a33d9`. Substrate-level
             // point-to-point copy into `_shared/<from>→<to>/`.
-            | "memory_share" => Some(Self::Power),
+            | tn::MEMORY_SHARE => Some(Self::Power),
             // meta (6 — 5 baseline + v0.7.0 Gap 3 (#886)
             // memory_recall_observations).
-            "memory_capabilities"
-            | "memory_agent_register"
-            | "memory_agent_list"
-            | "memory_session_start"
-            | "memory_stats"
-            | "memory_recall_observations" => Some(Self::Meta),
+            tn::MEMORY_CAPABILITIES
+            | tn::MEMORY_AGENT_REGISTER
+            | tn::MEMORY_AGENT_LIST
+            | tn::MEMORY_SESSION_START
+            | tn::MEMORY_STATS
+            | tn::MEMORY_RECALL_OBSERVATIONS => Some(Self::Meta),
             // archive (4)
-            "memory_archive_list"
-            | "memory_archive_purge"
-            | "memory_archive_restore"
-            | "memory_archive_stats" => Some(Self::Archive),
+            tn::MEMORY_ARCHIVE_LIST
+            | tn::MEMORY_ARCHIVE_PURGE
+            | tn::MEMORY_ARCHIVE_RESTORE
+            | tn::MEMORY_ARCHIVE_STATS => Some(Self::Archive),
             // other (9 — 2 baseline + v0.7.0 L1-5 5 skill tools +
             // v0.7.0 L2-6 memory_skill_promote_from_reflection (#671) +
             // v0.7.0 L2-7 memory_skill_compositional_context (#672))
-            "memory_list_subscriptions"
-            | "memory_notify"
-            | "memory_skill_register"
-            | "memory_skill_list"
-            | "memory_skill_get"
-            | "memory_skill_resource"
-            | "memory_skill_export"
-            | "memory_skill_promote_from_reflection"
-            | "memory_skill_compositional_context" => Some(Self::Other),
+            tn::MEMORY_LIST_SUBSCRIPTIONS
+            | tn::MEMORY_NOTIFY
+            | tn::MEMORY_SKILL_REGISTER
+            | tn::MEMORY_SKILL_LIST
+            | tn::MEMORY_SKILL_GET
+            | tn::MEMORY_SKILL_RESOURCE
+            | tn::MEMORY_SKILL_EXPORT
+            | tn::MEMORY_SKILL_PROMOTE_FROM_REFLECTION
+            | tn::MEMORY_SKILL_COMPOSITIONAL_CONTEXT => Some(Self::Other),
             _ => None,
         }
     }
@@ -348,158 +359,164 @@ impl Family {
     /// sync.
     #[must_use]
     pub const fn tool_names(self) -> &'static [&'static str] {
+        // v0.7.x (issue #1174 PR1 — pm-v3.1 MCP tool name sweep) — every
+        // entry references a `pub const` from
+        // [`crate::mcp::registry::tool_names`] so the per-family lists,
+        // the dispatch table, and the registry iterator cannot drift
+        // in name spelling.
+        use crate::mcp::registry::tool_names as tn;
         match self {
             Self::Core => &[
-                "memory_store",
-                "memory_recall",
-                "memory_list",
-                "memory_get",
-                "memory_search",
+                tn::MEMORY_STORE,
+                tn::MEMORY_RECALL,
+                tn::MEMORY_LIST,
+                tn::MEMORY_GET,
+                tn::MEMORY_SEARCH,
                 // v0.7 B1 — always-on alternative to memory_recall when
                 // the agent already knows the Family taxonomy it wants.
-                "memory_load_family",
+                tn::MEMORY_LOAD_FAMILY,
                 // v0.7 B2 — intent-routed front door. Caller passes a
                 // free-text intent; the handler picks the best family
                 // from the cached descriptors and forwards to
                 // `memory_load_family`.
-                "memory_smart_load",
+                tn::MEMORY_SMART_LOAD,
             ],
             Self::Lifecycle => &[
-                "memory_update",
-                "memory_delete",
-                "memory_forget",
-                "memory_gc",
-                "memory_promote",
+                tn::MEMORY_UPDATE,
+                tn::MEMORY_DELETE,
+                tn::MEMORY_FORGET,
+                tn::MEMORY_GC,
+                tn::MEMORY_PROMOTE,
             ],
             Self::Graph => &[
-                "memory_kg_query",
-                "memory_kg_timeline",
-                "memory_kg_invalidate",
-                "memory_link",
-                "memory_get_links",
-                "memory_entity_register",
-                "memory_entity_get_by_alias",
-                "memory_get_taxonomy",
+                tn::MEMORY_KG_QUERY,
+                tn::MEMORY_KG_TIMELINE,
+                tn::MEMORY_KG_INVALIDATE,
+                tn::MEMORY_LINK,
+                tn::MEMORY_GET_LINKS,
+                tn::MEMORY_ENTITY_REGISTER,
+                tn::MEMORY_ENTITY_GET_BY_ALIAS,
+                tn::MEMORY_GET_TAXONOMY,
                 // v0.7.0 I4 — traverses memory_transcript_links (I2) to
                 // reconstruct the source-transcript chain for a memory.
-                "memory_replay",
+                tn::MEMORY_REPLAY,
                 // v0.7 H4 — re-verifies a stored link's Ed25519
                 // signature on demand, returning attest_level.
-                "memory_verify",
+                tn::MEMORY_VERIFY,
                 // v0.7 J7 — enumerate up to N paths between two memories
                 // (BFS with cycle detection over memory_links).
-                "memory_find_paths",
+                tn::MEMORY_FIND_PATHS,
             ],
             Self::Governance => &[
-                "memory_pending_list",
-                "memory_pending_approve",
-                "memory_pending_reject",
-                "memory_namespace_set_standard",
-                "memory_namespace_get_standard",
-                "memory_namespace_clear_standard",
-                "memory_subscribe",
-                "memory_unsubscribe",
+                tn::MEMORY_PENDING_LIST,
+                tn::MEMORY_PENDING_APPROVE,
+                tn::MEMORY_PENDING_REJECT,
+                tn::MEMORY_NAMESPACE_SET_STANDARD,
+                tn::MEMORY_NAMESPACE_GET_STANDARD,
+                tn::MEMORY_NAMESPACE_CLEAR_STANDARD,
+                tn::MEMORY_SUBSCRIBE,
+                tn::MEMORY_UNSUBSCRIBE,
             ],
             Self::Power => &[
-                "memory_consolidate",
-                "memory_detect_contradiction",
-                "memory_check_duplicate",
-                "memory_auto_tag",
-                "memory_expand_query",
-                "memory_inbox",
+                tn::MEMORY_CONSOLIDATE,
+                tn::MEMORY_DETECT_CONTRADICTION,
+                tn::MEMORY_CHECK_DUPLICATE,
+                tn::MEMORY_AUTO_TAG,
+                tn::MEMORY_EXPAND_QUERY,
+                tn::MEMORY_INBOX,
                 // v0.7 K7 — operator/governance subscription-reliability
                 // tools. Replay reads back the audit row series for one
                 // subscription since an RFC3339 cursor; dlq_list inspects
                 // payloads that exhausted the [200ms, 1s, 5s] retry ladder.
-                "memory_subscription_replay",
-                "memory_subscription_dlq_list",
+                tn::MEMORY_SUBSCRIPTION_REPLAY,
+                tn::MEMORY_SUBSCRIPTION_DLQ_LIST,
                 // v0.7 K8 — per-agent quota status (memories/day, storage
                 // bytes, links/day). Operator-facing inspector for the K8
                 // rate-limit substrate.
-                "memory_quota_status",
+                tn::MEMORY_QUOTA_STATUS,
                 // v0.7.0 Task 4/8 (recursive learning, issue #655) —
                 // substrate-native reflection primitive. Inserts a
                 // reflection memory plus N `reflects_on` provenance
                 // links in a single atomic transaction.
-                "memory_reflect",
+                tn::MEMORY_REFLECT,
                 // v0.7.0 L2-2 (S6-M1) — cross-peer reflection origin
                 // inspector. Returns peer_origin / signing_agent /
                 // original_depth / local_depth_at_arrival for a row.
-                "memory_reflection_origin",
+                tn::MEMORY_REFLECTION_ORIGIN,
                 // v0.7.0 L2-3 (issue #668) — invalidation propagation
                 // read-side inspector. Lists dependents flagged by
                 // the walker on Reflection→Reflection supersedes.
-                "memory_dependents_of_invalidated",
+                tn::MEMORY_DEPENDENTS_OF_INVALIDATED,
                 // v0.7.0 (issue #691) — substrate-level agent-action
                 // rules engine. Read-side surface; mutation tools are
                 // NOT registered over MCP (operator uses CLI / HTTP).
-                "memory_check_agent_action",
-                "memory_rule_list",
+                tn::MEMORY_CHECK_AGENT_ACTION,
+                tn::MEMORY_RULE_LIST,
                 // v0.7.0 QW-1 — file-backed reflection chain export
                 // companion. Renders the markdown / JSON envelope;
                 // does NOT write to disk (agent harness owns disk I/O).
-                "memory_export_reflection",
+                tn::MEMORY_EXPORT_REFLECTION,
                 // v0.7.0 QW-3 follow-up — context-offload substrate
                 // primitive (offload + deref). Power-family registration
                 // gives semantic-tier+ exposure per the QW-3 brief; the
                 // handlers themselves live at src/mcp/tools/offload.rs.
-                "memory_offload",
-                "memory_deref",
+                tn::MEMORY_OFFLOAD,
+                tn::MEMORY_DEREF,
                 // v0.7.0 WT-1-C — curator-pass atomisation tool.
                 // Decomposes a coarse memory into 2-10 atomic
                 // propositions; archives the source. Lives in Power
                 // alongside memory_consolidate / memory_reflect.
-                "memory_atomise",
+                tn::MEMORY_ATOMISE,
                 // v0.7.0 QW-2 — Persona-as-artifact. Read-only lookup
                 // + smart+ regeneration. Substrate writes the SQL row
                 // (and optionally the filesystem export via namespace
                 // policy); the agent never holds the keypair.
-                "memory_persona",
-                "memory_persona_generate",
+                tn::MEMORY_PERSONA,
+                tn::MEMORY_PERSONA_GENERATE,
                 // v0.7.0 Form 3 (issue #756) — multi-step ingest
                 // orchestrator. Deterministic helpers + LLM stages
                 // with explicit-trust slots and prompt-cache reuse.
-                "memory_ingest_multistep",
+                tn::MEMORY_INGEST_MULTISTEP,
                 // v0.7.0 Form 5 (issue #758) — calibration sweep over
                 // the shadow-mode observation table. Operator surface
                 // for tuning per-(namespace, source) confidence
                 // baselines.
-                "memory_calibrate_confidence",
+                tn::MEMORY_CALIBRATE_CONFIDENCE,
                 // v0.7.0 (issues #224 + #311) — Phase 3 Memory Sharing &
                 // Sync RFC pulled forward per operator directive
                 // `28860423-d12c-4959-bc8b-8fa9a94a33d9`. Substrate-
                 // level point-to-point copy into `_shared/<from>→<to>/`.
-                "memory_share",
+                tn::MEMORY_SHARE,
             ],
             Self::Meta => &[
-                "memory_capabilities",
-                "memory_agent_register",
-                "memory_agent_list",
-                "memory_session_start",
-                "memory_stats",
+                tn::MEMORY_CAPABILITIES,
+                tn::MEMORY_AGENT_REGISTER,
+                tn::MEMORY_AGENT_LIST,
+                tn::MEMORY_SESSION_START,
+                tn::MEMORY_STATS,
                 // v0.7.0 Gap 3 (#886) — read-side surface for the
                 // `recall_observations` ledger.
-                "memory_recall_observations",
+                tn::MEMORY_RECALL_OBSERVATIONS,
             ],
             Self::Archive => &[
-                "memory_archive_list",
-                "memory_archive_purge",
-                "memory_archive_restore",
-                "memory_archive_stats",
+                tn::MEMORY_ARCHIVE_LIST,
+                tn::MEMORY_ARCHIVE_PURGE,
+                tn::MEMORY_ARCHIVE_RESTORE,
+                tn::MEMORY_ARCHIVE_STATS,
             ],
             Self::Other => &[
-                "memory_list_subscriptions",
-                "memory_notify",
+                tn::MEMORY_LIST_SUBSCRIPTIONS,
+                tn::MEMORY_NOTIFY,
                 // v0.7.0 L1-5 — Agent Skills ingestion substrate (Pillar 1.5).
-                "memory_skill_register",
-                "memory_skill_list",
-                "memory_skill_get",
-                "memory_skill_resource",
-                "memory_skill_export",
+                tn::MEMORY_SKILL_REGISTER,
+                tn::MEMORY_SKILL_LIST,
+                tn::MEMORY_SKILL_GET,
+                tn::MEMORY_SKILL_RESOURCE,
+                tn::MEMORY_SKILL_EXPORT,
                 // v0.7.0 L2-6 (issue #671) — closing the recursive-learning loop.
-                "memory_skill_promote_from_reflection",
+                tn::MEMORY_SKILL_PROMOTE_FROM_REFLECTION,
                 // v0.7.0 L2-7 (issue #672) — reflection-skill composition.
-                "memory_skill_compositional_context",
+                tn::MEMORY_SKILL_COMPOSITIONAL_CONTEXT,
             ],
         }
     }

@@ -217,7 +217,7 @@ pub struct IngestMultistepTool;
 
 impl McpTool for IngestMultistepTool {
     fn name() -> &'static str {
-        "memory_ingest_multistep"
+        crate::mcp::registry::tool_names::MEMORY_INGEST_MULTISTEP
     }
     fn description() -> &'static str {
         "Form 3 multi-step ingest: deterministic helpers + LLM stages."

@@ -160,7 +160,7 @@ pub struct ShareTool;
 
 impl McpTool for ShareTool {
     fn name() -> &'static str {
-        "memory_share"
+        crate::mcp::registry::tool_names::MEMORY_SHARE
     }
     fn description() -> &'static str {
         "Share a memory with another agent (copy into _shared/<from>→<to>/)."

@@ -302,7 +302,7 @@ pub struct SkillExportTool;
 
 impl McpTool for SkillExportTool {
     fn name() -> &'static str {
-        "memory_skill_export"
+        crate::mcp::registry::tool_names::MEMORY_SKILL_EXPORT
     }
     fn description() -> &'static str {
         "Export a skill to a folder; re-register produces identical digest."

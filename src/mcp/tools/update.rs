@@ -75,7 +75,7 @@ pub struct UpdateTool;
 
 impl McpTool for UpdateTool {
     fn name() -> &'static str {
-        "memory_update"
+        crate::mcp::registry::tool_names::MEMORY_UPDATE
     }
     fn description() -> &'static str {
         "Update an existing memory by ID (only provided fields change)."

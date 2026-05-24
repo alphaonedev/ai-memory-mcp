@@ -50,7 +50,7 @@ pub struct SearchTool;
 
 impl McpTool for SearchTool {
     fn name() -> &'static str {
-        "memory_search"
+        crate::mcp::registry::tool_names::MEMORY_SEARCH
     }
     fn description() -> &'static str {
         "Search memories by exact keyword match (AND semantics)."

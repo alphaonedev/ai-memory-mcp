@@ -33,7 +33,7 @@ pub struct LinkTool;
 
 impl McpTool for LinkTool {
     fn name() -> &'static str {
-        "memory_link"
+        crate::mcp::registry::tool_names::MEMORY_LINK
     }
     fn description() -> &'static str {
         "Create a typed link between two memories."
@@ -64,7 +64,7 @@ pub struct GetLinksTool;
 
 impl McpTool for GetLinksTool {
     fn name() -> &'static str {
-        "memory_get_links"
+        crate::mcp::registry::tool_names::MEMORY_GET_LINKS
     }
     fn description() -> &'static str {
         "Get all links for a memory (both directions)."

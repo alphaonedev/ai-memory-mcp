@@ -141,7 +141,7 @@ pub struct SkillListTool;
 
 impl McpTool for SkillListTool {
     fn name() -> &'static str {
-        "memory_skill_list"
+        crate::mcp::registry::tool_names::MEMORY_SKILL_LIST
     }
     fn description() -> &'static str {
         "List current (non-superseded) skills; body not returned."

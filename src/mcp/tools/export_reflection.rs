@@ -148,7 +148,7 @@ pub struct ExportReflectionTool;
 
 impl McpTool for ExportReflectionTool {
     fn name() -> &'static str {
-        "memory_export_reflection"
+        crate::mcp::registry::tool_names::MEMORY_EXPORT_REFLECTION
     }
     fn description() -> &'static str {
         "Render a single reflection memory as markdown or JSON (no filesystem write)."

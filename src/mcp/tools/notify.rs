@@ -182,7 +182,7 @@ pub struct NotifyTool;
 
 impl McpTool for NotifyTool {
     fn name() -> &'static str {
-        "memory_notify"
+        crate::mcp::registry::tool_names::MEMORY_NOTIFY
     }
     fn description() -> &'static str {
         "Send a message from the caller to another agent's inbox."
@@ -222,7 +222,7 @@ pub struct InboxTool;
 
 impl McpTool for InboxTool {
     fn name() -> &'static str {
-        "memory_inbox"
+        crate::mcp::registry::tool_names::MEMORY_INBOX
     }
     fn description() -> &'static str {
         "List messages sent to an agent via memory_notify."

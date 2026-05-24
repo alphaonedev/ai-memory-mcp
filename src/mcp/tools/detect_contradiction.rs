@@ -70,7 +70,7 @@ pub struct DetectContradictionTool;
 
 impl McpTool for DetectContradictionTool {
     fn name() -> &'static str {
-        "memory_detect_contradiction"
+        crate::mcp::registry::tool_names::MEMORY_DETECT_CONTRADICTION
     }
     fn description() -> &'static str {
         "LLM-check whether two memories contradict each other (smart/autonomous tier)."

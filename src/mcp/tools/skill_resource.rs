@@ -124,7 +124,7 @@ pub struct SkillResourceTool;
 
 impl McpTool for SkillResourceTool {
     fn name() -> &'static str {
-        "memory_skill_resource"
+        crate::mcp::registry::tool_names::MEMORY_SKILL_RESOURCE
     }
     fn description() -> &'static str {
         "Fetch + digest-verify a skill resource."

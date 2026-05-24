@@ -139,7 +139,7 @@ pub struct RuleListTool;
 
 impl McpTool for RuleListTool {
     fn name() -> &'static str {
-        "memory_rule_list"
+        crate::mcp::registry::tool_names::MEMORY_RULE_LIST
     }
     fn description() -> &'static str {
         "List substrate-level agent-action rules. Read-only (#691)."

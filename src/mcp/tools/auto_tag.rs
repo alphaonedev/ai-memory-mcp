@@ -79,7 +79,7 @@ pub struct AutoTagTool;
 
 impl McpTool for AutoTagTool {
     fn name() -> &'static str {
-        "memory_auto_tag"
+        crate::mcp::registry::tool_names::MEMORY_AUTO_TAG
     }
     fn description() -> &'static str {
         "LLM-generate tags for a memory (smart/autonomous tier)."
