@@ -114,7 +114,7 @@ pub fn handle_ingest_multistep(
     let namespace = params
         .get("namespace")
         .and_then(Value::as_str)
-        .unwrap_or("global");
+        .unwrap_or(crate::DEFAULT_NAMESPACE);
 
     // ── Tier gate ───────────────────────────────────────────────────
     if tier == FeatureTier::Keyword || handler.is_none() {

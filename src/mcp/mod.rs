@@ -166,7 +166,7 @@ fn audit_emit_for_mcp_dispatch(
     let namespace = arguments
         .get("namespace")
         .and_then(Value::as_str)
-        .unwrap_or("global")
+        .unwrap_or(crate::DEFAULT_NAMESPACE)
         .to_string();
     let memory_id = arguments
         .get("id")
@@ -10587,7 +10587,7 @@ mod tests {
     fn chunkc_archive_purge_denied_by_permission_rule() {
         let _gate = chunkc_lock_perms();
         crate::permissions::set_active_permission_rules(vec![crate::permissions::PermissionRule {
-            namespace_pattern: "global".to_string(),
+            namespace_pattern: crate::DEFAULT_NAMESPACE.to_string(),
             op: "memory_archive".to_string(),
             // Unique agent_pattern so other tests' implicit calls don't
             // match this rule.
@@ -10620,7 +10620,7 @@ mod tests {
             crate::config::PermissionsMode::Advisory,
         );
         crate::permissions::set_active_permission_rules(vec![crate::permissions::PermissionRule {
-            namespace_pattern: "global".to_string(),
+            namespace_pattern: crate::DEFAULT_NAMESPACE.to_string(),
             op: "memory_archive".to_string(),
             agent_pattern: "chunkc-archask-*".to_string(),
             decision: crate::permissions::RuleDecision::Ask,

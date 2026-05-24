@@ -350,7 +350,7 @@ pub fn fts_classifier_with(params: &HelperParams, ctx: &HelperContext<'_>) -> He
         .namespace
         .as_deref()
         .or(ctx.namespace)
-        .unwrap_or("global");
+        .unwrap_or(crate::DEFAULT_NAMESPACE);
 
     let body_lower = content.to_lowercase();
     let kind = if body_lower.contains("step ")

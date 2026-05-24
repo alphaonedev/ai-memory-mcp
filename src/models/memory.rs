@@ -765,7 +765,7 @@ impl Default for Memory {
         Self {
             id: String::new(),
             tier: Tier::Mid,
-            namespace: "global".to_string(),
+            namespace: crate::DEFAULT_NAMESPACE.to_string(),
             title: String::new(),
             content: String::new(),
             tags: Vec::new(),
@@ -871,7 +871,7 @@ fn default_tier() -> Tier {
     Tier::Mid
 }
 fn default_namespace() -> String {
-    "global".to_string()
+    crate::DEFAULT_NAMESPACE.to_string()
 }
 fn default_priority() -> i32 {
     5

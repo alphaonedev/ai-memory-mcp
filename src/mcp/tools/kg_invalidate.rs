@@ -91,7 +91,7 @@ pub fn handle_kg_invalidate(
         use crate::permissions::{Op, PermissionContext, Permissions};
         let link_ns = match db::get(conn, source_id) {
             Ok(Some(m)) => m.namespace,
-            _ => "global".to_string(),
+            _ => crate::DEFAULT_NAMESPACE.to_string(),
         };
         let agent_id = crate::identity::resolve_agent_id(params["agent_id"].as_str(), None)
             .map_err(|e| e.to_string())?;
@@ -150,7 +150,7 @@ pub fn handle_kg_invalidate(
                         .map(str::to_string);
                     (mem.namespace, owner)
                 }
-                _ => ("global".to_string(), None),
+                _ => (crate::DEFAULT_NAMESPACE.to_string(), None),
             };
             let details = serde_json::to_value(crate::subscriptions::LinkInvalidatedEventDetails {
                 target_id: target_id.to_string(),

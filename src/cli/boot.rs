@@ -596,7 +596,11 @@ pub fn run(
         return Ok(());
     }
 
-    let displayed_ns = if fell_back { "global" } else { &namespace };
+    let displayed_ns = if fell_back {
+        crate::DEFAULT_NAMESPACE
+    } else {
+        &namespace
+    };
     let status = if fell_back {
         BootStatus::InfoFallback
     } else {
