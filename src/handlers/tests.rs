@@ -409,7 +409,7 @@ async fn http_create_memory_uses_appstate_and_persists() {
         .with_state(test_app_state(state.clone()));
 
     let body = serde_json::json!({
-        "tier": "long",
+        "tier": Tier::Long.as_str(),
         "namespace": "http-embed-test",
         "title": "Semantic-ready via HTTP",
         "content": "HTTP-authored memories must now participate in semantic recall.",
@@ -471,7 +471,7 @@ async fn http_create_memory_succeeds_when_llm_is_absent_l5() {
         .with_state(test_app_state(state.clone()));
 
     let body = serde_json::json!({
-        "tier": "long",
+        "tier": Tier::Long.as_str(),
         "namespace": "l5-no-llm",
         "title": "L5 soft-hook absence",
         "content": "Auto-tag must remain a soft hook when no LLM is wired; \
@@ -649,7 +649,7 @@ async fn http_sync_push_applies_and_advances_clock() {
         "sender_clock": {"entries": {}},
         "memories": [{
             "id": Uuid::new_v4().to_string(),
-            "tier": "long",
+            "tier": Tier::Long.as_str(),
             "namespace": "sync-smoke",
             "title": "From peer",
             "content": "Pushed via HTTP sync endpoint.",
@@ -944,7 +944,7 @@ async fn http_bulk_create_uses_appstate_and_persists() {
     let bodies: Vec<serde_json::Value> = (0..5)
         .map(|i| {
             serde_json::json!({
-                "tier": "long",
+                "tier": Tier::Long.as_str(),
                 "namespace": "bulk-appstate",
                 "title": format!("bulk-{i}"),
                 "content": format!("body-{i}"),
@@ -1089,7 +1089,7 @@ async fn http_bulk_create_fans_out_with_federation() {
     let bodies: Vec<serde_json::Value> = (0..n)
         .map(|i| {
             serde_json::json!({
-                "tier": "long",
+                "tier": Tier::Long.as_str(),
                 "namespace": "bulk-fanout",
                 "title": format!("bulk-fanout-{i}"),
                 "content": "c",
@@ -1153,7 +1153,7 @@ async fn http_sync_push_rejects_oversized_batch_redteam_242() {
         .map(|i| {
             serde_json::json!({
                 "id": Uuid::new_v4().to_string(),
-                "tier": "long",
+                "tier": Tier::Long.as_str(),
                 "namespace": "oversize",
                 "title": format!("m{i}"),
                 "content": "x",
@@ -1204,7 +1204,7 @@ async fn http_sync_push_dry_run_applies_nothing() {
         "sender_clock": {"entries": {}},
         "memories": [{
             "id": Uuid::new_v4().to_string(),
-            "tier": "long",
+            "tier": Tier::Long.as_str(),
             "namespace": "sync-dryrun",
             "title": "Must not land",
             "content": "Preview only.",
@@ -2170,7 +2170,7 @@ async fn create_memory_rejects_missing_required_fields() {
 
     // Missing title
     let body = serde_json::json!({
-        "tier": "long",
+        "tier": Tier::Long.as_str(),
         "namespace": "test",
         "content": "body text",
         "tags": [],
@@ -2218,7 +2218,7 @@ async fn create_memory_rejects_empty_title() {
         .with_state(test_app_state(state));
 
     let body = serde_json::json!({
-        "tier": "long",
+        "tier": Tier::Long.as_str(),
         "namespace": "test",
         "title": "",
         "content": "body text",
@@ -2257,7 +2257,7 @@ async fn create_memory_rejects_oversized_content() {
     // 65KB + 1 — exceeds MAX_CONTENT_SIZE (65536)
     let oversized = "x".repeat(65537);
     let body = serde_json::json!({
-        "tier": "long",
+        "tier": Tier::Long.as_str(),
         "namespace": "test",
         "title": "Test",
         "content": oversized,
@@ -2322,7 +2322,7 @@ async fn create_memory_rejects_invalid_priority() {
         .with_state(test_app_state(state));
 
     let body = serde_json::json!({
-        "tier": "long",
+        "tier": Tier::Long.as_str(),
         "namespace": "test",
         "title": "Test",
         "content": "body",
@@ -2354,7 +2354,7 @@ async fn create_memory_rejects_invalid_confidence() {
         .with_state(test_app_state(state));
 
     let body = serde_json::json!({
-        "tier": "long",
+        "tier": Tier::Long.as_str(),
         "namespace": "test",
         "title": "Test",
         "content": "body",
@@ -2386,7 +2386,7 @@ async fn create_memory_rejects_invalid_source() {
         .with_state(test_app_state(state));
 
     let body = serde_json::json!({
-        "tier": "long",
+        "tier": Tier::Long.as_str(),
         "namespace": "test",
         "title": "Test",
         "content": "body",
@@ -2992,7 +2992,7 @@ async fn create_memory_handles_missing_content_type() {
         .with_state(test_app_state(state));
 
     let body = serde_json::json!({
-        "tier": "long",
+        "tier": Tier::Long.as_str(),
         "namespace": "test",
         "title": "Test",
         "content": "body",
@@ -3547,7 +3547,7 @@ async fn http_bulk_create_oversized_batch_rejected() {
     let bodies: Vec<serde_json::Value> = (0..=MAX_BULK_SIZE)
         .map(|i| {
             serde_json::json!({
-                "tier": "long",
+                "tier": Tier::Long.as_str(),
                 "namespace": "bulk-overflow",
                 "title": format!("t-{i}"),
                 "content": "c",
@@ -3584,7 +3584,7 @@ async fn http_bulk_create_partial_success_collects_errors() {
         .with_state(test_app_state(state.clone()));
     let bodies = serde_json::json!([
         {
-            "tier": "long",
+            "tier": Tier::Long.as_str(),
             "namespace": "bulk-mixed",
             "title": "good row",
             "content": "ok",
@@ -3595,7 +3595,7 @@ async fn http_bulk_create_partial_success_collects_errors() {
             "metadata": {}
         },
         {
-            "tier": "long",
+            "tier": Tier::Long.as_str(),
             "namespace": "bulk-mixed",
             "title": "",
             "content": "bad: empty title",
@@ -5549,7 +5549,7 @@ async fn http_import_memories_oversized_batch_rejected() {
         .map(|i| {
             serde_json::json!({
                 "id": format!("11111111-1111-4111-8111-{:012}", i),
-                "tier": "long",
+                "tier": Tier::Long.as_str(),
                 "namespace": "imp",
                 "title": format!("t-{i}"),
                 "content": "x",
@@ -5594,7 +5594,7 @@ async fn http_import_memories_skips_invalid_rows() {
         .with_state(test_app_state_with_admin(state, "ops:admin"));
     let valid = serde_json::json!({
         "id": Uuid::new_v4().to_string(),
-        "tier": "long",
+        "tier": Tier::Long.as_str(),
         "namespace": "imp",
         "title": "ok-row",
         "content": "valid content",
@@ -5612,7 +5612,7 @@ async fn http_import_memories_skips_invalid_rows() {
     // Empty title is rejected by validate_memory.
     let invalid = serde_json::json!({
         "id": Uuid::new_v4().to_string(),
-        "tier": "long",
+        "tier": Tier::Long.as_str(),
         "namespace": "imp",
         "title": "",
         "content": "x",
@@ -6623,7 +6623,7 @@ async fn http_forget_memories_by_tier_only_targets_tier() {
     let app = Router::new()
         .route("/api/v1/forget", axum_post(forget_memories))
         .with_state(test_app_state(state));
-    let body = serde_json::json!({"tier": "short"});
+    let body = serde_json::json!({"tier": Tier::Short.as_str()});
     let resp = app
         .oneshot(
             axum::http::Request::builder()
@@ -8553,7 +8553,7 @@ async fn http_approve_pending_happy_path_executes_store() {
             "alice",
             &serde_json::json!({
                 "id": Uuid::new_v4().to_string(),
-                "tier": "long",
+                "tier": Tier::Long.as_str(),
                 "namespace": "approve-ns",
                 "title": "approved-store",
                 "content": "executed via approval",
@@ -8658,7 +8658,7 @@ async fn http_approve_pending_already_approved_is_rejected() {
             None,
             "alice",
             &serde_json::json!({
-                "tier": "long",
+                "tier": Tier::Long.as_str(),
                 "namespace": "double-approve",
                 "title": "store",
                 "content": "x",
@@ -8724,7 +8724,7 @@ async fn http_approve_pending_executor_records_decided_by() {
             "requester-bob",
             &serde_json::json!({
                 "id": Uuid::new_v4().to_string(),
-                "tier": "long",
+                "tier": Tier::Long.as_str(),
                 "namespace": "executor-ns",
                 "title": "e",
                 "content": "y",
@@ -8781,7 +8781,7 @@ async fn http_approve_pending_returns_memory_id_for_store_payload() {
             "alice",
             &serde_json::json!({
                 "id": Uuid::new_v4().to_string(),
-                "tier": "long",
+                "tier": Tier::Long.as_str(),
                 "namespace": "executed-write",
                 "title": "executed-mem",
                 "content": "this exists after approval",
@@ -8853,7 +8853,7 @@ async fn http_reject_pending_happy_path_marks_rejected_no_execution() {
             None,
             "alice",
             &serde_json::json!({
-                "tier": "long",
+                "tier": Tier::Long.as_str(),
                 "namespace": "reject-ns",
                 "title": "blocked",
                 "content": "must not be created",
@@ -8932,7 +8932,7 @@ async fn http_reject_pending_already_rejected_returns_404() {
             None,
             "alice",
             &serde_json::json!({
-                "tier": "long",
+                "tier": Tier::Long.as_str(),
                 "namespace": "double-reject",
                 "title": "x",
                 "content": "x",
@@ -9046,7 +9046,7 @@ async fn http_consolidate_two_into_one_happy_path() {
         "title": "merged-result",
         "summary": "a merge of two drafts",
         "namespace": "merge-ns",
-        "tier": "long"
+        "tier": Tier::Long.as_str()
     });
     let resp = app
         .oneshot(
@@ -11573,7 +11573,7 @@ async fn http_import_memories_inserts_valid_rows() {
     let now = Utc::now().to_rfc3339();
     let mem = serde_json::json!({
         "id": Uuid::new_v4().to_string(),
-        "tier": "long",
+        "tier": Tier::Long.as_str(),
         "namespace": "imported",
         "title": "imported-row",
         "content": "imported content",
@@ -12797,7 +12797,7 @@ async fn http_create_memory_invalid_x_agent_id_header_returns_400() {
         .route("/api/v1/memories", axum_post(create_memory))
         .with_state(test_app_state(state));
     let body = serde_json::json!({
-        "tier": "long",
+        "tier": Tier::Long.as_str(),
         "namespace": "test",
         "title": "t",
         "content": "c",
@@ -12852,7 +12852,7 @@ async fn l11_create_memory_rejects_metadata_agent_id_mismatch_post_907() {
         .with_state(test_app_state(state.clone()));
 
     let body = serde_json::json!({
-        "tier": "long",
+        "tier": Tier::Long.as_str(),
         "namespace": "l11-agentid",
         "title": "L11 agent_id from metadata",
         "content": "Caller stamped agent_id only inside metadata.",
@@ -12892,7 +12892,7 @@ async fn http_create_memory_invalid_scope_returns_400() {
     // scope must be one of the recognised tokens; gibberish fails
     // validate_scope.
     let body = serde_json::json!({
-        "tier": "long",
+        "tier": Tier::Long.as_str(),
         "namespace": "test",
         "title": "t",
         "content": "c",
@@ -13081,7 +13081,7 @@ async fn http_create_memory_governance_pending_returns_202() {
         .route("/api/v1/memories", axum_post(create_memory))
         .with_state(test_app_state(state));
     let body = serde_json::json!({
-        "tier": "long",
+        "tier": Tier::Long.as_str(),
         "namespace": "gov-create",
         "title": "queued",
         "content": "should be queued, not stored",
@@ -13128,7 +13128,7 @@ async fn http_create_memory_governance_deny_returns_403() {
         .route("/api/v1/memories", axum_post(create_memory))
         .with_state(test_app_state(state));
     let body = serde_json::json!({
-        "tier": "long",
+        "tier": Tier::Long.as_str(),
         "namespace": "gov-deny",
         "title": "rejected",
         "content": "rejected content",
@@ -13286,7 +13286,7 @@ async fn http_create_memory_with_top_level_scope_succeeds() {
         .route("/api/v1/memories", axum_post(create_memory))
         .with_state(test_app_state(state));
     let body = serde_json::json!({
-        "tier": "long",
+        "tier": Tier::Long.as_str(),
         "namespace": "scoped",
         "title": "with scope",
         "content": "scoped content",
@@ -13322,7 +13322,7 @@ async fn http_create_memory_clamps_extreme_priority_to_range() {
     // priority=15 is an attempted overflow but validate_create
     // rejects out-of-range so we use 10 (max) which clamps to 10.
     let body = serde_json::json!({
-        "tier": "long",
+        "tier": Tier::Long.as_str(),
         "namespace": "clamp",
         "title": "clamp",
         "content": "c",

@@ -479,13 +479,19 @@ pub async fn get_stats(
                     }
                     *by_namespace.entry(m.namespace.clone()).or_insert(0) += 1;
                 }
+                // by_tier wire shape: { <tier-wire-string>: <count> }.
+                // Keys are routed through `Tier::<X>.as_str()` so the
+                // wire-string mapping stays single-sourced (pm-v3.1 PR6,
+                // #1174). `json!` requires literal keys, so we build
+                // the inner map with `serde_json::Map` to interpolate
+                // the enum-derived keys.
+                let mut by_tier_map = serde_json::Map::new();
+                by_tier_map.insert(Tier::Short.as_str().to_string(), json!(short));
+                by_tier_map.insert(Tier::Mid.as_str().to_string(), json!(mid));
+                by_tier_map.insert(Tier::Long.as_str().to_string(), json!(long));
                 Json(json!({
                     "total_memories": total,
-                    "by_tier": {
-                        "short": short,
-                        "mid": mid,
-                        "long": long,
-                    },
+                    "by_tier": by_tier_map,
                     "by_namespace": by_namespace,
                     "storage_backend": "postgres",
                 }))

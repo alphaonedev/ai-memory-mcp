@@ -10037,7 +10037,7 @@ mod tests {
         assert_eq!(got.title, "Restorable");
         assert_eq!(
             got.tier.as_str(),
-            "short",
+            Tier::Short.as_str(),
             "G5: restore must preserve the original tier"
         );
         assert_eq!(
@@ -13890,7 +13890,7 @@ mod tests {
             "title": "reflective synthesis",
             "content": "deep observation across sources",
             "namespace": "ns/reflect",
-            "tier": "mid",
+            "tier": Tier::Mid.as_str(),
             "tags": ["reflective"],
             "priority": 6,
             "confidence": 0.9,

@@ -195,6 +195,7 @@ fn escape_toon(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::Tier;
     use serde_json::json;
 
     #[test]
@@ -215,7 +216,7 @@ mod tests {
             "memories": [{
                 "id": "abc-123",
                 "title": "PostgreSQL config",
-                "tier": "long",
+                "tier": Tier::Long.as_str(),
                 "namespace": "infra",
                 "priority": 9,
                 "confidence": 1.0,
@@ -244,7 +245,7 @@ mod tests {
     #[test]
     fn compact_mode_fewer_fields() {
         let resp = json!({
-            "memories": [{"id": "x", "title": "Test", "tier": "mid", "namespace": "test", "priority": 5, "score": 0.5, "tags": []}],
+            "memories": [{"id": "x", "title": "Test", "tier": Tier::Mid.as_str(), "namespace": "test", "priority": 5, "score": 0.5, "tags": []}],
             "count": 1
         });
         let toon = memories_to_toon(&resp, true);
@@ -260,7 +261,7 @@ mod tests {
             "memories": [{
                 "id": "x",
                 "title": "Test",
-                "tier": "mid",
+                "tier": Tier::Mid.as_str(),
                 "namespace": "test",
                 "priority": 5,
                 "score": 0.5,
@@ -279,7 +280,7 @@ mod tests {
 
     #[test]
     fn pipe_in_title_escaped() {
-        let resp = json!({"memories": [{"id": "x", "title": "A|B", "tier": "mid"}], "count": 1});
+        let resp = json!({"memories": [{"id": "x", "title": "A|B", "tier": Tier::Mid.as_str()}], "count": 1});
         let toon = memories_to_toon(&resp, true);
         assert!(toon.contains("A\\|B"));
     }
@@ -289,9 +290,9 @@ mod tests {
         // Demonstrate: 3 memories, field names appear only once
         let resp = json!({
             "memories": [
-                {"id": "a", "title": "Memory 1", "tier": "long", "namespace": "test", "priority": 9, "score": 0.9, "tags": ["t1"]},
-                {"id": "b", "title": "Memory 2", "tier": "mid", "namespace": "test", "priority": 7, "score": 0.7, "tags": ["t2"]},
-                {"id": "c", "title": "Memory 3", "tier": "short", "namespace": "test", "priority": 5, "score": 0.5, "tags": ["t3"]}
+                {"id": "a", "title": "Memory 1", "tier": Tier::Long.as_str(), "namespace": "test", "priority": 9, "score": 0.9, "tags": ["t1"]},
+                {"id": "b", "title": "Memory 2", "tier": Tier::Mid.as_str(), "namespace": "test", "priority": 7, "score": 0.7, "tags": ["t2"]},
+                {"id": "c", "title": "Memory 3", "tier": Tier::Short.as_str(), "namespace": "test", "priority": 5, "score": 0.5, "tags": ["t3"]}
             ],
             "count": 3,
             "mode": "hybrid"
@@ -309,7 +310,7 @@ mod tests {
 
     #[test]
     fn search_results_key() {
-        let resp = json!({"results": [{"id": "x", "title": "Found", "tier": "mid"}], "count": 1});
+        let resp = json!({"results": [{"id": "x", "title": "Found", "tier": Tier::Mid.as_str()}], "count": 1});
         let toon = search_to_toon(&resp, true);
         assert!(toon.contains("memories["));
         assert!(toon.contains("Found"));
@@ -326,7 +327,7 @@ mod tests {
                 {
                     "id": "01",
                     "title": "PostgreSQL config",
-                    "tier": "long",
+                    "tier": Tier::Long.as_str(),
                     "namespace": "infra",
                     "priority": 9,
                     "confidence": 1.0,
@@ -341,7 +342,7 @@ mod tests {
                 {
                     "id": "02",
                     "title": "Redis cache strategy",
-                    "tier": "long",
+                    "tier": Tier::Long.as_str(),
                     "namespace": "infra",
                     "priority": 8,
                     "confidence": 0.95,
@@ -356,7 +357,7 @@ mod tests {
                 {
                     "id": "03",
                     "title": "BIND9 custom build",
-                    "tier": "mid",
+                    "tier": Tier::Mid.as_str(),
                     "namespace": "infra/dns",
                     "priority": 7,
                     "confidence": 0.9,
@@ -371,7 +372,7 @@ mod tests {
                 {
                     "id": "04",
                     "title": "Kubernetes pod recovery",
-                    "tier": "mid",
+                    "tier": Tier::Mid.as_str(),
                     "namespace": "platform/k8s",
                     "priority": 6,
                     "confidence": 0.85,
@@ -386,7 +387,7 @@ mod tests {
                 {
                     "id": "05",
                     "title": "Vault secrets rotation",
-                    "tier": "short",
+                    "tier": Tier::Short.as_str(),
                     "namespace": "security",
                     "priority": 5,
                     "confidence": 0.8,
@@ -518,7 +519,7 @@ mod tests {
         // Empty metadata object → empty string in TOON output.
         let resp = json!({
             "memories": [{
-                "id": "x", "title": "t", "tier": "long", "namespace": "n",
+                "id": "x", "title": "t", "tier": Tier::Long.as_str(), "namespace": "n",
                 "priority": 1, "confidence": 1.0, "score": 0.5, "access_count": 0,
                 "tags": [], "source": "", "created_at": "", "updated_at": "",
                 "metadata": {}
@@ -535,7 +536,7 @@ mod tests {
     fn format_value_object_non_empty_serialized_json() {
         let resp = json!({
             "memories": [{
-                "id": "x", "title": "t", "tier": "long", "namespace": "n",
+                "id": "x", "title": "t", "tier": Tier::Long.as_str(), "namespace": "n",
                 "priority": 1, "confidence": 1.0, "score": 0.5, "access_count": 0,
                 "tags": [], "source": "", "created_at": "", "updated_at": "",
                 "metadata": {"k": "v"}
@@ -613,7 +614,7 @@ mod tests {
             "memories": [{
                 "id": "abc-xyz",
                 "title": "Round-trip test",
-                "tier": "long",
+                "tier": Tier::Long.as_str(),
                 "namespace": "test",
                 "priority": 9,
                 "confidence": 1.0,

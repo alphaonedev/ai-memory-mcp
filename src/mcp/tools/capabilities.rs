@@ -677,6 +677,7 @@ pub fn build_capabilities_tools(
 #[must_use]
 pub fn tool_examples(name: &str) -> Vec<crate::config::ToolExample> {
     use crate::config::ToolExample;
+    use crate::models::Tier;
     use serde_json::json;
     let ex = |call: serde_json::Value, desc: &str| ToolExample {
         call,
@@ -684,7 +685,7 @@ pub fn tool_examples(name: &str) -> Vec<crate::config::ToolExample> {
     };
     match name {
         "memory_store" => vec![ex(
-            json!({"title": "design", "content": "wt-1 atomisation", "tier": "long", "namespace": "ai-memory"}),
+            json!({"title": "design", "content": "wt-1 atomisation", "tier": Tier::Long.as_str(), "namespace": "ai-memory"}),
             "Persists a long-tier memory; returns {id, status}.",
         )],
         "memory_recall" => vec![ex(

@@ -191,6 +191,14 @@ pub(super) fn handle_promote(
     // highest-reachable-tier behaviour (short→long / mid→long in a
     // single call), which the v0.7.0 CLAUDE.md docs pin under
     // "Data Model" + "Recall Pipeline → Touch operations".
+    //
+    // The string literals in the match arms below are the canonical
+    // wire deserializer for `target_tier`; they pair byte-for-byte with
+    // `Tier::as_str` outputs (see `src/models/memory.rs`). Per pm-v3.1
+    // PR6 (#1174), this site is intentionally kept as raw literals
+    // because it consumes caller-supplied wire input — anywhere else
+    // that *constructs* a tier wire value routes through
+    // `Tier::<X>.as_str()`.
     let target_tier = match params["target_tier"].as_str() {
         None => Tier::Long,
         Some("long") => Tier::Long,

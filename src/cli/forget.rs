@@ -189,7 +189,7 @@ mod tests {
             .unwrap();
         }
         let mut a = args();
-        a.tier = Some("long".to_string());
+        a.tier = Some(Tier::Long.as_str().to_string());
         // Round-2 F11 — `forget --tier` without `--namespace` requires
         // the global confirmation flag.
         a.confirm_global = true;
@@ -266,7 +266,7 @@ mod tests {
     #[test]
     fn requires_global_confirmation_tier_no_namespace() {
         let mut a = args();
-        a.tier = Some("long".into());
+        a.tier = Some(Tier::Long.as_str().into());
         assert!(requires_global_confirmation(&a));
     }
 

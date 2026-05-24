@@ -263,7 +263,7 @@ mod tests {
         let _ = insert_one(&conn, "tier-ns", "m", Tier::Mid);
         let resp = handle_forget(
             &conn,
-            &json!({"namespace": "tier-ns", "tier": "short"}),
+            &json!({"namespace": "tier-ns", "tier": Tier::Short.as_str()}),
             false,
         )
         .expect("ok");

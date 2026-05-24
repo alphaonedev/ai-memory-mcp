@@ -2639,7 +2639,7 @@ mod tests {
                     "arguments": {
                         "title": format!("issue-965-stress-{i}"),
                         "content": format!("audit stress probe iteration {i}"),
-                        "tier": "short",
+                        "tier": Tier::Short.as_str(),
                         "namespace": "issue-965-audit",
                     },
                 }),
@@ -4183,7 +4183,7 @@ mod tests {
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let req = make_tools_call(
             "memory_store",
-            json!({"title": "t", "content": "c", "namespace": "m9-store", "tier": "short"}),
+            json!({"title": "t", "content": "c", "namespace": "m9-store", "tier": Tier::Short.as_str()}),
         );
         let resp = invoke_handle_request(&conn, &req);
         assert!(resp.error.is_none());
@@ -4193,7 +4193,7 @@ mod tests {
             .to_string();
         let val: Value = serde_json::from_str(&text).unwrap();
         assert!(val["id"].is_string());
-        assert_eq!(val["tier"], "short");
+        assert_eq!(val["tier"], Tier::Short.as_str());
     }
 
     #[test]
@@ -5921,7 +5921,7 @@ mod tests {
                 "target_agent_id": "alice",
                 "title": "hello",
                 "payload": "world",
-                "tier": "mid",
+                "tier": Tier::Mid.as_str(),
                 "priority": 5,
             }),
         );
@@ -6256,7 +6256,7 @@ mod tests {
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let req = make_tools_call(
             "memory_forget",
-            json!({"namespace": "w12-forget", "tier": "short", "dry_run": true}),
+            json!({"namespace": "w12-forget", "tier": Tier::Short.as_str(), "dry_run": true}),
         );
         let resp = invoke_handle_request(&conn, &req);
         assert!(resp.error.is_none());
@@ -7130,7 +7130,7 @@ mod tests {
         let val: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(val["promoted"], true);
         assert_eq!(val["mode"], "tier");
-        assert_eq!(val["tier"], "long");
+        assert_eq!(val["tier"], Tier::Long.as_str());
     }
 
     #[test]
@@ -7144,7 +7144,7 @@ mod tests {
                 "title": "dup-title",
                 "content": "first",
                 "namespace": "w12-dedup",
-                "tier": "mid",
+                "tier": Tier::Mid.as_str(),
             }),
         );
         let resp1 = invoke_handle_request(&conn, &req1);
@@ -7162,7 +7162,7 @@ mod tests {
                 "title": "dup-title",
                 "content": "second-update",
                 "namespace": "w12-dedup",
-                "tier": "long",
+                "tier": Tier::Long.as_str(),
             }),
         );
         let resp2 = invoke_handle_request(&conn, &req2);
@@ -7806,7 +7806,7 @@ mod tests {
             json!({
                 "query": "test query",
                 "namespace": "w12-search",
-                "tier": "long",
+                "tier": Tier::Long.as_str(),
                 "limit": 10,
                 "agent_id": "ai:bot",
                 "format": "json",
@@ -7911,7 +7911,7 @@ mod tests {
             "memory_list",
             json!({
                 "namespace": "w12-list-tier",
-                "tier": "long",
+                "tier": Tier::Long.as_str(),
                 "agent_id": "ai:bot",
                 "limit": 25,
                 "format": "json",
@@ -8035,7 +8035,7 @@ mod tests {
                 "target_agent_id": "alice-w12",
                 "title": "ping",
                 "payload": "are you there?",
-                "tier": "short",
+                "tier": Tier::Short.as_str(),
             }),
         );
         let _ = invoke_handle_request(&conn, &notify);
@@ -8203,7 +8203,7 @@ mod tests {
                 "tags": ["a", "b"],
                 "title": "new-title",
                 "content": "new-content",
-                "tier": "long",
+                "tier": Tier::Long.as_str(),
                 "priority": 8_i64,
                 "confidence": 0.9_f64,
             }),
@@ -8719,7 +8719,7 @@ mod tests {
                 "title": "pattern: alpha",
                 "content": "synthesised reflection content",
                 "namespace": "team/reflect-a",
-                "tier": "mid",
+                "tier": Tier::Mid.as_str(),
                 "priority": 7,
                 "confidence": 0.9,
                 "tags": ["reflection", "alpha"],
@@ -10610,7 +10610,7 @@ mod tests {
             json!({
                 "namespace": "chunkc-mix",
                 "pattern": "a-",
-                "tier": "short",
+                "tier": Tier::Short.as_str(),
                 "dry_run": true,
             }),
         );
@@ -10635,7 +10635,7 @@ mod tests {
             json!({
                 "query": "needle",
                 "namespace": "chunkc-search-ns",
-                "tier": "long",
+                "tier": Tier::Long.as_str(),
                 "limit": 5,
                 "agent_id": "test-agent-chunkc",
                 "format": "json",

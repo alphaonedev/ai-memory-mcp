@@ -380,7 +380,7 @@ mod tests {
                 "id": id,
                 "title": "new title",
                 "content": "new body content here",
-                "tier": "long",
+                "tier": MTier::Long.as_str(),
                 "namespace": "ns2",
                 "tags": ["x", "y"],
                 "priority": 7,
