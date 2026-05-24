@@ -303,10 +303,14 @@ fn build_migrated_table(
     // were either redundant or operator drift; drop them.)
     if !migrated.contains_key("llm") && llm_model.is_some() {
         let mut llm = toml::map::Map::new();
-        // Legacy implied Ollama.
+        // Legacy v1 configs implied the Ollama-native backend
+        // (`llm_model` + `ollama_url` were the only LLM knobs).
+        // Reference the canonical backend-name const in `llm.rs`
+        // (issue #1174 PR4 — substrate-vendor cleanup) so the
+        // migrator never re-names the vendor.
         llm.insert(
             "backend".to_string(),
-            toml::Value::String("ollama".to_string()),
+            toml::Value::String(crate::llm::BACKEND_OLLAMA.to_string()),
         );
         if let Some(v) = llm_model {
             llm.insert("model".to_string(), v);
@@ -326,9 +330,11 @@ fn build_migrated_table(
     // [embeddings] section.
     if !migrated.contains_key("embeddings") && (embed_url.is_some() || embedding_model.is_some()) {
         let mut emb = toml::map::Map::new();
+        // Same legacy implication for embeddings — pre-v0.7.x configs
+        // only spoke to Ollama for embedding generation.
         emb.insert(
             "backend".to_string(),
-            toml::Value::String("ollama".to_string()),
+            toml::Value::String(crate::llm::BACKEND_OLLAMA.to_string()),
         );
         if let Some(v) = embed_url {
             emb.insert("url".to_string(), v);

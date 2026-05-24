@@ -412,12 +412,15 @@ impl BootManifest {
             resolved_emb.model.clone()
         };
 
-        // LLM: `backend:model` provenance. When backend == "ollama" we
-        // emit just the model (legacy banner shape) so existing
-        // grep'ing tools that match `llm=gemma3:4b` continue to work;
-        // when backend != "ollama" the full `xai:grok-4.3` shape is
-        // emitted so the operator-facing disambiguation is loud.
-        let llm = if resolved_llm.backend == "ollama" {
+        // LLM: `backend:model` provenance. On the Ollama-native wire
+        // shape we emit just the model (legacy banner shape) so
+        // existing grep'ing tools that match `llm=gemma3:4b` continue
+        // to work; on any OpenAI-compatible vendor the full
+        // `xai:grok-4.3` shape is emitted so the operator-facing
+        // disambiguation is loud. The vendor-literal check lives on
+        // `ResolvedLlm` (issue #1174 PR4 — substrate-vendor cleanup)
+        // so the banner code never re-names the backend.
+        let llm = if resolved_llm.is_ollama_native() {
             resolved_llm.model.clone()
         } else {
             resolved_llm.display_label()
