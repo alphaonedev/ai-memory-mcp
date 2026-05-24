@@ -87,7 +87,7 @@ pub(super) async fn post_once(
     };
     let mut req = client
         .post(url)
-        .header("content-type", "application/json")
+        .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
         .body(body_bytes.clone());
     if let Some(key) = idempotency_key {
         req = req.header("Idempotency-Key", key);
@@ -1467,7 +1467,7 @@ pub async fn bulk_catchup_push(
             };
             let mut req = client
                 .post(&url)
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(body_bytes.clone());
             // No Idempotency-Key on the batch — the batch is itself an
             // idempotent replay, and the peer's `insert_if_newer`

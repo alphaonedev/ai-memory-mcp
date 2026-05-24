@@ -1127,7 +1127,7 @@ fn send(
     };
     let mut req = client
         .post(url)
-        .header("content-type", "application/json")
+        .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
         .header("user-agent", "ai-memory/0.6.0.0")
         .header("x-ai-memory-timestamp", timestamp)
         .header("x-ai-memory-correlation-id", correlation_id);
@@ -3003,7 +3003,7 @@ mod tests {
             .and(header("x-ai-memory-signature", "sha256=abc123"))
             .and(header_exists("x-ai-memory-timestamp"))
             .and(header_exists("x-ai-memory-correlation-id"))
-            .and(header("content-type", "application/json"))
+            .and(header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON))
             .respond_with(AckEcho)
             .expect(1)
             .mount(&server)
