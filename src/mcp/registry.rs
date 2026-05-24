@@ -5,6 +5,384 @@
 
 use serde_json::{Value, json};
 
+// --- v0.7.x (issue #1174 PR1 — pm-v3.1 MCP tool name sweep) — tool_names module ---
+
+/// v0.7.x (issue #1174 PR1 — pm-v3.1 MCP tool name sweep) — canonical
+/// constants for every MCP tool name. Replaces ~150 inline string
+/// literals across the codebase. Adding a tool name in one place
+/// instead of N places makes renaming a one-line edit and prevents
+/// silent drift between dispatch-arm tables and audit/governance
+/// allowlists.
+///
+/// **Invariants pinned by the registry-level pin tests below
+/// (`tool_names::pin_tests`):**
+///
+/// - Every const's value is byte-equal to the historical wire string
+///   it replaces; the wire layer still emits `"memory_store"` as the
+///   JSON-RPC method name, exact byte-for-byte.
+/// - Every tool registered in [`registered_tools`] has a matching
+///   `pub const` here and the const value equals the tool's
+///   `McpTool::name()` return.
+/// - The count of consts equals
+///   [`crate::profile::Profile::full().expected_tool_count`].
+///
+/// **Adding a new tool**: append the const here AND the
+/// `RegisteredTool::of::<…>()` line in [`registered_tools`]. The pin
+/// tests will fail if either side is missed.
+///
+/// Naming convention: `MEMORY_<UPPER_SNAKE>` matches the wire string
+/// `memory_<lower_snake>` so the call site reads naturally
+/// (`tool_names::MEMORY_STORE => …` ⇒ `"memory_store" => …`).
+pub mod tool_names {
+    pub const MEMORY_AGENT_LIST: &str = "memory_agent_list";
+    pub const MEMORY_AGENT_REGISTER: &str = "memory_agent_register";
+    pub const MEMORY_ARCHIVE_LIST: &str = "memory_archive_list";
+    pub const MEMORY_ARCHIVE_PURGE: &str = "memory_archive_purge";
+    pub const MEMORY_ARCHIVE_RESTORE: &str = "memory_archive_restore";
+    pub const MEMORY_ARCHIVE_STATS: &str = "memory_archive_stats";
+    pub const MEMORY_ATOMISE: &str = "memory_atomise";
+    pub const MEMORY_AUTO_TAG: &str = "memory_auto_tag";
+    pub const MEMORY_CALIBRATE_CONFIDENCE: &str = "memory_calibrate_confidence";
+    pub const MEMORY_CAPABILITIES: &str = "memory_capabilities";
+    pub const MEMORY_CHECK_AGENT_ACTION: &str = "memory_check_agent_action";
+    pub const MEMORY_CHECK_DUPLICATE: &str = "memory_check_duplicate";
+    pub const MEMORY_CONSOLIDATE: &str = "memory_consolidate";
+    pub const MEMORY_DELETE: &str = "memory_delete";
+    pub const MEMORY_DEPENDENTS_OF_INVALIDATED: &str = "memory_dependents_of_invalidated";
+    pub const MEMORY_DEREF: &str = "memory_deref";
+    pub const MEMORY_DETECT_CONTRADICTION: &str = "memory_detect_contradiction";
+    pub const MEMORY_ENTITY_GET_BY_ALIAS: &str = "memory_entity_get_by_alias";
+    pub const MEMORY_ENTITY_REGISTER: &str = "memory_entity_register";
+    pub const MEMORY_EXPAND_QUERY: &str = "memory_expand_query";
+    pub const MEMORY_EXPORT_REFLECTION: &str = "memory_export_reflection";
+    pub const MEMORY_FIND_PATHS: &str = "memory_find_paths";
+    pub const MEMORY_FORGET: &str = "memory_forget";
+    pub const MEMORY_GC: &str = "memory_gc";
+    pub const MEMORY_GET: &str = "memory_get";
+    pub const MEMORY_GET_LINKS: &str = "memory_get_links";
+    pub const MEMORY_GET_TAXONOMY: &str = "memory_get_taxonomy";
+    pub const MEMORY_INBOX: &str = "memory_inbox";
+    pub const MEMORY_INGEST_MULTISTEP: &str = "memory_ingest_multistep";
+    pub const MEMORY_KG_INVALIDATE: &str = "memory_kg_invalidate";
+    pub const MEMORY_KG_QUERY: &str = "memory_kg_query";
+    pub const MEMORY_KG_TIMELINE: &str = "memory_kg_timeline";
+    pub const MEMORY_LINK: &str = "memory_link";
+    pub const MEMORY_LIST: &str = "memory_list";
+    pub const MEMORY_LIST_SUBSCRIPTIONS: &str = "memory_list_subscriptions";
+    pub const MEMORY_LOAD_FAMILY: &str = "memory_load_family";
+    pub const MEMORY_NAMESPACE_CLEAR_STANDARD: &str = "memory_namespace_clear_standard";
+    pub const MEMORY_NAMESPACE_GET_STANDARD: &str = "memory_namespace_get_standard";
+    pub const MEMORY_NAMESPACE_SET_STANDARD: &str = "memory_namespace_set_standard";
+    pub const MEMORY_NOTIFY: &str = "memory_notify";
+    pub const MEMORY_OFFLOAD: &str = "memory_offload";
+    pub const MEMORY_PENDING_APPROVE: &str = "memory_pending_approve";
+    pub const MEMORY_PENDING_LIST: &str = "memory_pending_list";
+    pub const MEMORY_PENDING_REJECT: &str = "memory_pending_reject";
+    pub const MEMORY_PERSONA: &str = "memory_persona";
+    pub const MEMORY_PERSONA_GENERATE: &str = "memory_persona_generate";
+    pub const MEMORY_PROMOTE: &str = "memory_promote";
+    pub const MEMORY_QUOTA_STATUS: &str = "memory_quota_status";
+    pub const MEMORY_RECALL: &str = "memory_recall";
+    pub const MEMORY_RECALL_OBSERVATIONS: &str = "memory_recall_observations";
+    pub const MEMORY_REFLECT: &str = "memory_reflect";
+    pub const MEMORY_REFLECTION_ORIGIN: &str = "memory_reflection_origin";
+    pub const MEMORY_REPLAY: &str = "memory_replay";
+    pub const MEMORY_RULE_LIST: &str = "memory_rule_list";
+    pub const MEMORY_SEARCH: &str = "memory_search";
+    pub const MEMORY_SESSION_START: &str = "memory_session_start";
+    pub const MEMORY_SHARE: &str = "memory_share";
+    pub const MEMORY_SKILL_COMPOSITIONAL_CONTEXT: &str = "memory_skill_compositional_context";
+    pub const MEMORY_SKILL_EXPORT: &str = "memory_skill_export";
+    pub const MEMORY_SKILL_GET: &str = "memory_skill_get";
+    pub const MEMORY_SKILL_LIST: &str = "memory_skill_list";
+    pub const MEMORY_SKILL_PROMOTE_FROM_REFLECTION: &str = "memory_skill_promote_from_reflection";
+    pub const MEMORY_SKILL_REGISTER: &str = "memory_skill_register";
+    pub const MEMORY_SKILL_RESOURCE: &str = "memory_skill_resource";
+    pub const MEMORY_SMART_LOAD: &str = "memory_smart_load";
+    pub const MEMORY_STATS: &str = "memory_stats";
+    pub const MEMORY_STORE: &str = "memory_store";
+    pub const MEMORY_SUBSCRIBE: &str = "memory_subscribe";
+    pub const MEMORY_SUBSCRIPTION_DLQ_LIST: &str = "memory_subscription_dlq_list";
+    pub const MEMORY_SUBSCRIPTION_REPLAY: &str = "memory_subscription_replay";
+    pub const MEMORY_UNSUBSCRIBE: &str = "memory_unsubscribe";
+    pub const MEMORY_UPDATE: &str = "memory_update";
+    pub const MEMORY_VERIFY: &str = "memory_verify";
+
+    /// The full canonical set of every MCP tool name. Useful for
+    /// iterating in tests + the audit-tool-call dispatcher's
+    /// "known names" guard. Order is alphabetical by const name so
+    /// adding a new entry has a stable diff position. The slice
+    /// length is pinned to `73` by [`pin_tests::const_count_is_73`].
+    ///
+    /// `dead_code` is allowed because the only consumer today is the
+    /// `pin_tests` module below; making it `pub` keeps the API
+    /// available to external test crates (e.g. integration tests
+    /// under `tests/`) that may want to iterate the canonical set
+    /// without re-typing it.
+    #[allow(dead_code)]
+    pub const ALL: &[&str] = &[
+        MEMORY_AGENT_LIST,
+        MEMORY_AGENT_REGISTER,
+        MEMORY_ARCHIVE_LIST,
+        MEMORY_ARCHIVE_PURGE,
+        MEMORY_ARCHIVE_RESTORE,
+        MEMORY_ARCHIVE_STATS,
+        MEMORY_ATOMISE,
+        MEMORY_AUTO_TAG,
+        MEMORY_CALIBRATE_CONFIDENCE,
+        MEMORY_CAPABILITIES,
+        MEMORY_CHECK_AGENT_ACTION,
+        MEMORY_CHECK_DUPLICATE,
+        MEMORY_CONSOLIDATE,
+        MEMORY_DELETE,
+        MEMORY_DEPENDENTS_OF_INVALIDATED,
+        MEMORY_DEREF,
+        MEMORY_DETECT_CONTRADICTION,
+        MEMORY_ENTITY_GET_BY_ALIAS,
+        MEMORY_ENTITY_REGISTER,
+        MEMORY_EXPAND_QUERY,
+        MEMORY_EXPORT_REFLECTION,
+        MEMORY_FIND_PATHS,
+        MEMORY_FORGET,
+        MEMORY_GC,
+        MEMORY_GET,
+        MEMORY_GET_LINKS,
+        MEMORY_GET_TAXONOMY,
+        MEMORY_INBOX,
+        MEMORY_INGEST_MULTISTEP,
+        MEMORY_KG_INVALIDATE,
+        MEMORY_KG_QUERY,
+        MEMORY_KG_TIMELINE,
+        MEMORY_LINK,
+        MEMORY_LIST,
+        MEMORY_LIST_SUBSCRIPTIONS,
+        MEMORY_LOAD_FAMILY,
+        MEMORY_NAMESPACE_CLEAR_STANDARD,
+        MEMORY_NAMESPACE_GET_STANDARD,
+        MEMORY_NAMESPACE_SET_STANDARD,
+        MEMORY_NOTIFY,
+        MEMORY_OFFLOAD,
+        MEMORY_PENDING_APPROVE,
+        MEMORY_PENDING_LIST,
+        MEMORY_PENDING_REJECT,
+        MEMORY_PERSONA,
+        MEMORY_PERSONA_GENERATE,
+        MEMORY_PROMOTE,
+        MEMORY_QUOTA_STATUS,
+        MEMORY_RECALL,
+        MEMORY_RECALL_OBSERVATIONS,
+        MEMORY_REFLECT,
+        MEMORY_REFLECTION_ORIGIN,
+        MEMORY_REPLAY,
+        MEMORY_RULE_LIST,
+        MEMORY_SEARCH,
+        MEMORY_SESSION_START,
+        MEMORY_SHARE,
+        MEMORY_SKILL_COMPOSITIONAL_CONTEXT,
+        MEMORY_SKILL_EXPORT,
+        MEMORY_SKILL_GET,
+        MEMORY_SKILL_LIST,
+        MEMORY_SKILL_PROMOTE_FROM_REFLECTION,
+        MEMORY_SKILL_REGISTER,
+        MEMORY_SKILL_RESOURCE,
+        MEMORY_SMART_LOAD,
+        MEMORY_STATS,
+        MEMORY_STORE,
+        MEMORY_SUBSCRIBE,
+        MEMORY_SUBSCRIPTION_DLQ_LIST,
+        MEMORY_SUBSCRIPTION_REPLAY,
+        MEMORY_UNSUBSCRIBE,
+        MEMORY_UPDATE,
+        MEMORY_VERIFY,
+    ];
+
+    #[cfg(test)]
+    mod pin_tests {
+        //! v0.7.x (issue #1174 PR1) — pin tests for every const VALUE
+        //! is byte-equal to the historical wire string it replaces.
+        //! If any of these fail, the refactor introduced wire drift —
+        //! revert the offending const or the dispatch site, NOT this
+        //! test.
+        use super::*;
+
+        #[test]
+        fn const_count_is_73() {
+            // The v0.7.0 surface advertises 73 MCP tools at
+            // `--profile full` (72 callable + the always-on
+            // `memory_capabilities` bootstrap; both are in `ALL`).
+            // If you added a new tool: bump this to N+1 AND add the
+            // const above AND the slice entry AND a per-name byte-
+            // equal test below AND a `RegisteredTool::of::<…>()`
+            // line in `registered_tools()`. The
+            // `consts_match_registered_tools` test below mechanically
+            // verifies the registry side.
+            assert_eq!(
+                ALL.len(),
+                73,
+                "tool_names::ALL must hold exactly the 73 v0.7.0 MCP tool names"
+            );
+        }
+
+        #[test]
+        fn const_set_is_deduplicated() {
+            // Defence-in-depth: forbids accidental copy-paste
+            // duplication when adding a new const. A duplicate entry
+            // in `ALL` would silently mask the missing tool.
+            use std::collections::BTreeSet;
+            let unique: BTreeSet<&&str> = ALL.iter().collect();
+            assert_eq!(
+                unique.len(),
+                ALL.len(),
+                "tool_names::ALL has duplicate entries"
+            );
+        }
+
+        #[test]
+        fn const_values_lowercase_memory_prefix() {
+            // Wire-shape invariant: every tool name starts with
+            // `"memory_"` and is otherwise `[a-z_]+`. Catches the
+            // failure mode where someone writes
+            // `pub const MEMORY_Foo: &str = "memory_Foo";` and the
+            // const compiles but the wire side rejects the casing.
+            for name in ALL {
+                assert!(
+                    name.starts_with("memory_"),
+                    "tool name {name:?} does not start with 'memory_'"
+                );
+                assert!(
+                    name.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                    "tool name {name:?} contains non-[a-z_] character"
+                );
+            }
+        }
+
+        /// Per-name byte-equal pin tests. Each `assert_eq!(CONST, "literal")`
+        /// is the load-bearing assertion: if anyone "tidies" the const
+        /// value (e.g. `"memory_Store"` for camel-case "consistency"
+        /// with a renamed module), the wire layer breaks and this
+        /// test surfaces the regression at `cargo test` time, not at
+        /// `Claude Desktop reload` time.
+        #[test]
+        fn const_values_byte_equal_to_historical_wire_strings() {
+            assert_eq!(MEMORY_AGENT_LIST, "memory_agent_list");
+            assert_eq!(MEMORY_AGENT_REGISTER, "memory_agent_register");
+            assert_eq!(MEMORY_ARCHIVE_LIST, "memory_archive_list");
+            assert_eq!(MEMORY_ARCHIVE_PURGE, "memory_archive_purge");
+            assert_eq!(MEMORY_ARCHIVE_RESTORE, "memory_archive_restore");
+            assert_eq!(MEMORY_ARCHIVE_STATS, "memory_archive_stats");
+            assert_eq!(MEMORY_ATOMISE, "memory_atomise");
+            assert_eq!(MEMORY_AUTO_TAG, "memory_auto_tag");
+            assert_eq!(MEMORY_CALIBRATE_CONFIDENCE, "memory_calibrate_confidence");
+            assert_eq!(MEMORY_CAPABILITIES, "memory_capabilities");
+            assert_eq!(MEMORY_CHECK_AGENT_ACTION, "memory_check_agent_action");
+            assert_eq!(MEMORY_CHECK_DUPLICATE, "memory_check_duplicate");
+            assert_eq!(MEMORY_CONSOLIDATE, "memory_consolidate");
+            assert_eq!(MEMORY_DELETE, "memory_delete");
+            assert_eq!(
+                MEMORY_DEPENDENTS_OF_INVALIDATED,
+                "memory_dependents_of_invalidated"
+            );
+            assert_eq!(MEMORY_DEREF, "memory_deref");
+            assert_eq!(MEMORY_DETECT_CONTRADICTION, "memory_detect_contradiction");
+            assert_eq!(MEMORY_ENTITY_GET_BY_ALIAS, "memory_entity_get_by_alias");
+            assert_eq!(MEMORY_ENTITY_REGISTER, "memory_entity_register");
+            assert_eq!(MEMORY_EXPAND_QUERY, "memory_expand_query");
+            assert_eq!(MEMORY_EXPORT_REFLECTION, "memory_export_reflection");
+            assert_eq!(MEMORY_FIND_PATHS, "memory_find_paths");
+            assert_eq!(MEMORY_FORGET, "memory_forget");
+            assert_eq!(MEMORY_GC, "memory_gc");
+            assert_eq!(MEMORY_GET, "memory_get");
+            assert_eq!(MEMORY_GET_LINKS, "memory_get_links");
+            assert_eq!(MEMORY_GET_TAXONOMY, "memory_get_taxonomy");
+            assert_eq!(MEMORY_INBOX, "memory_inbox");
+            assert_eq!(MEMORY_INGEST_MULTISTEP, "memory_ingest_multistep");
+            assert_eq!(MEMORY_KG_INVALIDATE, "memory_kg_invalidate");
+            assert_eq!(MEMORY_KG_QUERY, "memory_kg_query");
+            assert_eq!(MEMORY_KG_TIMELINE, "memory_kg_timeline");
+            assert_eq!(MEMORY_LINK, "memory_link");
+            assert_eq!(MEMORY_LIST, "memory_list");
+            assert_eq!(MEMORY_LIST_SUBSCRIPTIONS, "memory_list_subscriptions");
+            assert_eq!(MEMORY_LOAD_FAMILY, "memory_load_family");
+            assert_eq!(
+                MEMORY_NAMESPACE_CLEAR_STANDARD,
+                "memory_namespace_clear_standard"
+            );
+            assert_eq!(
+                MEMORY_NAMESPACE_GET_STANDARD,
+                "memory_namespace_get_standard"
+            );
+            assert_eq!(
+                MEMORY_NAMESPACE_SET_STANDARD,
+                "memory_namespace_set_standard"
+            );
+            assert_eq!(MEMORY_NOTIFY, "memory_notify");
+            assert_eq!(MEMORY_OFFLOAD, "memory_offload");
+            assert_eq!(MEMORY_PENDING_APPROVE, "memory_pending_approve");
+            assert_eq!(MEMORY_PENDING_LIST, "memory_pending_list");
+            assert_eq!(MEMORY_PENDING_REJECT, "memory_pending_reject");
+            assert_eq!(MEMORY_PERSONA, "memory_persona");
+            assert_eq!(MEMORY_PERSONA_GENERATE, "memory_persona_generate");
+            assert_eq!(MEMORY_PROMOTE, "memory_promote");
+            assert_eq!(MEMORY_QUOTA_STATUS, "memory_quota_status");
+            assert_eq!(MEMORY_RECALL, "memory_recall");
+            assert_eq!(MEMORY_RECALL_OBSERVATIONS, "memory_recall_observations");
+            assert_eq!(MEMORY_REFLECT, "memory_reflect");
+            assert_eq!(MEMORY_REFLECTION_ORIGIN, "memory_reflection_origin");
+            assert_eq!(MEMORY_REPLAY, "memory_replay");
+            assert_eq!(MEMORY_RULE_LIST, "memory_rule_list");
+            assert_eq!(MEMORY_SEARCH, "memory_search");
+            assert_eq!(MEMORY_SESSION_START, "memory_session_start");
+            assert_eq!(MEMORY_SHARE, "memory_share");
+            assert_eq!(
+                MEMORY_SKILL_COMPOSITIONAL_CONTEXT,
+                "memory_skill_compositional_context"
+            );
+            assert_eq!(MEMORY_SKILL_EXPORT, "memory_skill_export");
+            assert_eq!(MEMORY_SKILL_GET, "memory_skill_get");
+            assert_eq!(MEMORY_SKILL_LIST, "memory_skill_list");
+            assert_eq!(
+                MEMORY_SKILL_PROMOTE_FROM_REFLECTION,
+                "memory_skill_promote_from_reflection"
+            );
+            assert_eq!(MEMORY_SKILL_REGISTER, "memory_skill_register");
+            assert_eq!(MEMORY_SKILL_RESOURCE, "memory_skill_resource");
+            assert_eq!(MEMORY_SMART_LOAD, "memory_smart_load");
+            assert_eq!(MEMORY_STATS, "memory_stats");
+            assert_eq!(MEMORY_STORE, "memory_store");
+            assert_eq!(MEMORY_SUBSCRIBE, "memory_subscribe");
+            assert_eq!(MEMORY_SUBSCRIPTION_DLQ_LIST, "memory_subscription_dlq_list");
+            assert_eq!(MEMORY_SUBSCRIPTION_REPLAY, "memory_subscription_replay");
+            assert_eq!(MEMORY_UNSUBSCRIBE, "memory_unsubscribe");
+            assert_eq!(MEMORY_UPDATE, "memory_update");
+            assert_eq!(MEMORY_VERIFY, "memory_verify");
+        }
+
+        #[test]
+        fn consts_match_registered_tools() {
+            // The `tool_names::ALL` slice and the
+            // `registered_tools()` iterator are two halves of the
+            // same contract: they enumerate the same set of names.
+            // This test enforces that every const value also appears
+            // as some registered tool's `name()` return, and vice
+            // versa. Drift in either direction is a refactor bug.
+            use std::collections::BTreeSet;
+            let from_consts: BTreeSet<&str> = ALL.iter().copied().collect();
+            let from_registry: BTreeSet<&str> = crate::mcp::registry::registered_tools()
+                .iter()
+                .map(|r| r.name)
+                .collect();
+            let only_in_consts: Vec<&&str> = from_consts.difference(&from_registry).collect();
+            let only_in_registry: Vec<&&str> = from_registry.difference(&from_consts).collect();
+            assert!(
+                only_in_consts.is_empty() && only_in_registry.is_empty(),
+                "tool_names::ALL and registered_tools() drifted; \
+                 only_in_consts = {only_in_consts:?}, \
+                 only_in_registry = {only_in_registry:?}"
+            );
+        }
+    }
+}
+
 // --- McpTool trait (v0.7.0 #972 D1.1, issue #982) ---
 
 /// Per-tool descriptor surface introduced by v0.7.0 #972 split D1.1.

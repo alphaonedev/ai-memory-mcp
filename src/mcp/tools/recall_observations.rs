@@ -85,7 +85,7 @@ pub struct RecallObservationsTool;
 
 impl McpTool for RecallObservationsTool {
     fn name() -> &'static str {
-        "memory_recall_observations"
+        crate::mcp::registry::tool_names::MEMORY_RECALL_OBSERVATIONS
     }
     fn description() -> &'static str {
         "List recall_observations (#886)."

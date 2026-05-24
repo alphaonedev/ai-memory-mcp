@@ -77,7 +77,7 @@ pub struct CalibrateConfidenceTool;
 
 impl McpTool for CalibrateConfidenceTool {
     fn name() -> &'static str {
-        "memory_calibrate_confidence"
+        crate::mcp::registry::tool_names::MEMORY_CALIBRATE_CONFIDENCE
     }
     fn description() -> &'static str {
         "Scan confidence_shadow_observations and emit per-source baselines (Form 5)."

@@ -426,7 +426,7 @@ pub struct SkillRegisterTool;
 
 impl McpTool for SkillRegisterTool {
     fn name() -> &'static str {
-        "memory_skill_register"
+        crate::mcp::registry::tool_names::MEMORY_SKILL_REGISTER
     }
     fn description() -> &'static str {
         "Register an agentskills.io SKILL.md from a folder or inline text."

@@ -122,7 +122,7 @@ pub struct OffloadTool;
 
 impl McpTool for OffloadTool {
     fn name() -> &'static str {
-        "memory_offload"
+        crate::mcp::registry::tool_names::MEMORY_OFFLOAD
     }
     fn description() -> &'static str {
         "Offload verbatim content; returns ref_id (Family::Power)."
@@ -153,7 +153,7 @@ pub struct DerefTool;
 
 impl McpTool for DerefTool {
     fn name() -> &'static str {
-        "memory_deref"
+        crate::mcp::registry::tool_names::MEMORY_DEREF
     }
     fn description() -> &'static str {
         "Dereference a memory_offload ref_id (Family::Power)."

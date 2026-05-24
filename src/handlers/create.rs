@@ -629,7 +629,7 @@ async fn fanout_and_assemble_create_response(
         let lock = app.db.lock().await;
         crate::subscriptions::dispatch_event(
             &lock.0,
-            "memory_store",
+            crate::mcp::registry::tool_names::MEMORY_STORE,
             actual_id,
             &mem.namespace,
             resolved_agent_id.as_deref(),
@@ -812,7 +812,7 @@ async fn create_memory_postgres(
             let agent_for_dispatch = agent_id.to_string();
             super::dispatch_event_postgres(
                 app,
-                "memory_store",
+                crate::mcp::registry::tool_names::MEMORY_STORE,
                 &id_for_dispatch,
                 &ns_for_dispatch,
                 Some(&agent_for_dispatch),

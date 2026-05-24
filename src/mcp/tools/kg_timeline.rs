@@ -37,7 +37,7 @@ pub struct KgTimelineTool;
 
 impl McpTool for KgTimelineTool {
     fn name() -> &'static str {
-        "memory_kg_timeline"
+        crate::mcp::registry::tool_names::MEMORY_KG_TIMELINE
     }
     fn description() -> &'static str {
         "Ordered fact timeline for an entity (outbound KG links by valid_from)."

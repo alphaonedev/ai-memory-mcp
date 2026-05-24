@@ -135,21 +135,22 @@ fn audit_emit_for_mcp_dispatch(
     if !crate::audit::is_enabled() {
         return;
     }
+    use crate::mcp::registry::tool_names;
     let action = match tool_name {
         // Skipped — emitted from inside the handler with full target context.
-        "memory_store" | "memory_delete" => return,
-        "memory_recall"
-        | "memory_search"
-        | "memory_get"
-        | "memory_list"
-        | "memory_session_start" => crate::audit::AuditAction::Recall,
-        "memory_update" => crate::audit::AuditAction::Update,
-        "memory_promote" => crate::audit::AuditAction::Promote,
-        "memory_forget" => crate::audit::AuditAction::Forget,
-        "memory_link" => crate::audit::AuditAction::Link,
-        "memory_consolidate" => crate::audit::AuditAction::Consolidate,
-        "memory_pending_approve" => crate::audit::AuditAction::Approve,
-        "memory_pending_reject" => crate::audit::AuditAction::Reject,
+        tool_names::MEMORY_STORE | tool_names::MEMORY_DELETE => return,
+        tool_names::MEMORY_RECALL
+        | tool_names::MEMORY_SEARCH
+        | tool_names::MEMORY_GET
+        | tool_names::MEMORY_LIST
+        | tool_names::MEMORY_SESSION_START => crate::audit::AuditAction::Recall,
+        tool_names::MEMORY_UPDATE => crate::audit::AuditAction::Update,
+        tool_names::MEMORY_PROMOTE => crate::audit::AuditAction::Promote,
+        tool_names::MEMORY_FORGET => crate::audit::AuditAction::Forget,
+        tool_names::MEMORY_LINK => crate::audit::AuditAction::Link,
+        tool_names::MEMORY_CONSOLIDATE => crate::audit::AuditAction::Consolidate,
+        tool_names::MEMORY_PENDING_APPROVE => crate::audit::AuditAction::Approve,
+        tool_names::MEMORY_PENDING_REJECT => crate::audit::AuditAction::Reject,
         // Read-only / metadata tools — no audit event.
         _ => return,
     };
@@ -931,16 +932,23 @@ pub(crate) struct ToolDispatchCtx<'a> {
 pub(crate) type DispatchFn = fn(&ToolDispatchCtx<'_>) -> Result<Value, String>;
 
 /// Registry-registration macro. Today this expands to a plain
-/// `(literal, fn)` tuple suitable for the `TOOL_DISPATCH_TABLE` array
+/// `(name, fn)` tuple suitable for the `TOOL_DISPATCH_TABLE` array
 /// literal, but the indirection lets future refactors swap to
 /// `inventory::submit!` (cross-module collect) without touching every
 /// call site.
 ///
+/// `$name` accepts any `&'static str` expression: a string literal
+/// OR a `pub const NAME: &str` from
+/// [`crate::mcp::registry::tool_names`] (issue #1174 PR1 — pm-v3.1
+/// MCP tool name sweep). Per-tool registrations should reference the
+/// `tool_names` const so the dispatch table stays in sync with the
+/// canonical tool-name table.
+///
 /// ```text
-/// register_mcp_tool!("memory_search", dispatch_memory_search)
+/// register_mcp_tool!(tool_names::MEMORY_SEARCH, dispatch_memory_search)
 /// ```
 macro_rules! register_mcp_tool {
-    ($name:literal, $f:path) => {
+    ($name:expr, $f:path) => {
         ($name, $f as DispatchFn)
     };
 }
@@ -1454,129 +1462,200 @@ fn dispatch_memory_deref(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
 ///
 /// New tools land by adding a `dispatch_<tool>` wrapper above and an
 /// entry here via [`register_mcp_tool!`].
-pub(crate) static TOOL_DISPATCH_TABLE: &[(&str, DispatchFn)] = &[
-    register_mcp_tool!("memory_store", dispatch_memory_store),
-    register_mcp_tool!("memory_recall", dispatch_memory_recall),
-    register_mcp_tool!(
-        "memory_recall_observations",
-        dispatch_memory_recall_observations
-    ),
-    register_mcp_tool!("memory_search", dispatch_memory_search),
-    register_mcp_tool!("memory_list", dispatch_memory_list),
-    register_mcp_tool!("memory_load_family", dispatch_memory_load_family),
-    register_mcp_tool!("memory_smart_load", dispatch_memory_smart_load),
-    register_mcp_tool!("memory_get_taxonomy", dispatch_memory_get_taxonomy),
-    register_mcp_tool!("memory_check_duplicate", dispatch_memory_check_duplicate),
-    register_mcp_tool!("memory_entity_register", dispatch_memory_entity_register),
-    register_mcp_tool!(
-        "memory_entity_get_by_alias",
-        dispatch_memory_entity_get_by_alias
-    ),
-    register_mcp_tool!("memory_kg_timeline", dispatch_memory_kg_timeline),
-    register_mcp_tool!("memory_kg_invalidate", dispatch_memory_kg_invalidate),
-    register_mcp_tool!("memory_kg_query", dispatch_memory_kg_query),
-    register_mcp_tool!("memory_find_paths", dispatch_memory_find_paths),
-    register_mcp_tool!("memory_delete", dispatch_memory_delete),
-    register_mcp_tool!("memory_promote", dispatch_memory_promote),
-    register_mcp_tool!("memory_pending_list", dispatch_memory_pending_list),
-    register_mcp_tool!("memory_pending_approve", dispatch_memory_pending_approve),
-    register_mcp_tool!("memory_pending_reject", dispatch_memory_pending_reject),
-    register_mcp_tool!("memory_forget", dispatch_memory_forget),
-    register_mcp_tool!("memory_stats", dispatch_memory_stats),
-    register_mcp_tool!("memory_update", dispatch_memory_update),
-    register_mcp_tool!("memory_get", dispatch_memory_get),
-    register_mcp_tool!("memory_link", dispatch_memory_link),
-    register_mcp_tool!("memory_get_links", dispatch_memory_get_links),
-    register_mcp_tool!("memory_verify", dispatch_memory_verify),
-    register_mcp_tool!("memory_replay", dispatch_memory_replay),
-    register_mcp_tool!("memory_consolidate", dispatch_memory_consolidate),
-    register_mcp_tool!("memory_atomise", dispatch_memory_atomise),
-    register_mcp_tool!("memory_ingest_multistep", dispatch_memory_ingest_multistep),
-    register_mcp_tool!("memory_reflect", dispatch_memory_reflect),
-    register_mcp_tool!("memory_capabilities", dispatch_memory_capabilities),
-    register_mcp_tool!("memory_expand_query", dispatch_memory_expand_query),
-    register_mcp_tool!("memory_auto_tag", dispatch_memory_auto_tag),
-    register_mcp_tool!(
-        "memory_detect_contradiction",
-        dispatch_memory_detect_contradiction
-    ),
-    register_mcp_tool!("memory_archive_list", dispatch_memory_archive_list),
-    register_mcp_tool!("memory_archive_restore", dispatch_memory_archive_restore),
-    register_mcp_tool!("memory_archive_purge", dispatch_memory_archive_purge),
-    register_mcp_tool!("memory_archive_stats", dispatch_memory_archive_stats),
-    register_mcp_tool!("memory_gc", dispatch_memory_gc),
-    register_mcp_tool!("memory_session_start", dispatch_memory_session_start),
-    register_mcp_tool!(
-        "memory_namespace_set_standard",
-        dispatch_memory_namespace_set_standard
-    ),
-    register_mcp_tool!(
-        "memory_namespace_get_standard",
-        dispatch_memory_namespace_get_standard
-    ),
-    register_mcp_tool!(
-        "memory_namespace_clear_standard",
-        dispatch_memory_namespace_clear_standard
-    ),
-    register_mcp_tool!("memory_agent_register", dispatch_memory_agent_register),
-    register_mcp_tool!("memory_agent_list", dispatch_memory_agent_list),
-    register_mcp_tool!("memory_notify", dispatch_memory_notify),
-    register_mcp_tool!("memory_share", dispatch_memory_share),
-    register_mcp_tool!("memory_inbox", dispatch_memory_inbox),
-    register_mcp_tool!("memory_subscribe", dispatch_memory_subscribe),
-    register_mcp_tool!("memory_unsubscribe", dispatch_memory_unsubscribe),
-    register_mcp_tool!(
-        "memory_list_subscriptions",
-        dispatch_memory_list_subscriptions
-    ),
-    register_mcp_tool!(
-        "memory_subscription_replay",
-        dispatch_memory_subscription_replay
-    ),
-    register_mcp_tool!(
-        "memory_subscription_dlq_list",
-        dispatch_memory_subscription_dlq_list
-    ),
-    register_mcp_tool!("memory_quota_status", dispatch_memory_quota_status),
-    register_mcp_tool!(
-        "memory_check_agent_action",
-        dispatch_memory_check_agent_action
-    ),
-    register_mcp_tool!("memory_rule_list", dispatch_memory_rule_list),
-    register_mcp_tool!(
-        "memory_reflection_origin",
-        dispatch_memory_reflection_origin
-    ),
-    register_mcp_tool!(
-        "memory_export_reflection",
-        dispatch_memory_export_reflection
-    ),
-    register_mcp_tool!("memory_persona", dispatch_memory_persona),
-    register_mcp_tool!("memory_persona_generate", dispatch_memory_persona_generate),
-    register_mcp_tool!(
-        "memory_calibrate_confidence",
-        dispatch_memory_calibrate_confidence
-    ),
-    register_mcp_tool!(
-        "memory_dependents_of_invalidated",
-        dispatch_memory_dependents_of_invalidated
-    ),
-    register_mcp_tool!("memory_skill_register", dispatch_memory_skill_register),
-    register_mcp_tool!("memory_skill_list", dispatch_memory_skill_list),
-    register_mcp_tool!("memory_skill_get", dispatch_memory_skill_get),
-    register_mcp_tool!("memory_skill_resource", dispatch_memory_skill_resource),
-    register_mcp_tool!("memory_skill_export", dispatch_memory_skill_export),
-    register_mcp_tool!(
-        "memory_skill_promote_from_reflection",
-        dispatch_memory_skill_promote_from_reflection
-    ),
-    register_mcp_tool!(
-        "memory_skill_compositional_context",
-        dispatch_memory_skill_compositional_context
-    ),
-    register_mcp_tool!("memory_offload", dispatch_memory_offload),
-    register_mcp_tool!("memory_deref", dispatch_memory_deref),
-];
+///
+/// v0.7.x (issue #1174 PR1 — pm-v3.1 MCP tool name sweep): every
+/// dispatch arm references a const from
+/// [`crate::mcp::registry::tool_names`]. Renaming a tool is now a
+/// one-line edit (the const value) rather than a per-call-site sweep.
+pub(crate) static TOOL_DISPATCH_TABLE: &[(&str, DispatchFn)] = {
+    use crate::mcp::registry::tool_names;
+    &[
+        register_mcp_tool!(tool_names::MEMORY_STORE, dispatch_memory_store),
+        register_mcp_tool!(tool_names::MEMORY_RECALL, dispatch_memory_recall),
+        register_mcp_tool!(
+            tool_names::MEMORY_RECALL_OBSERVATIONS,
+            dispatch_memory_recall_observations
+        ),
+        register_mcp_tool!(tool_names::MEMORY_SEARCH, dispatch_memory_search),
+        register_mcp_tool!(tool_names::MEMORY_LIST, dispatch_memory_list),
+        register_mcp_tool!(tool_names::MEMORY_LOAD_FAMILY, dispatch_memory_load_family),
+        register_mcp_tool!(tool_names::MEMORY_SMART_LOAD, dispatch_memory_smart_load),
+        register_mcp_tool!(
+            tool_names::MEMORY_GET_TAXONOMY,
+            dispatch_memory_get_taxonomy
+        ),
+        register_mcp_tool!(
+            tool_names::MEMORY_CHECK_DUPLICATE,
+            dispatch_memory_check_duplicate
+        ),
+        register_mcp_tool!(
+            tool_names::MEMORY_ENTITY_REGISTER,
+            dispatch_memory_entity_register
+        ),
+        register_mcp_tool!(
+            tool_names::MEMORY_ENTITY_GET_BY_ALIAS,
+            dispatch_memory_entity_get_by_alias
+        ),
+        register_mcp_tool!(tool_names::MEMORY_KG_TIMELINE, dispatch_memory_kg_timeline),
+        register_mcp_tool!(
+            tool_names::MEMORY_KG_INVALIDATE,
+            dispatch_memory_kg_invalidate
+        ),
+        register_mcp_tool!(tool_names::MEMORY_KG_QUERY, dispatch_memory_kg_query),
+        register_mcp_tool!(tool_names::MEMORY_FIND_PATHS, dispatch_memory_find_paths),
+        register_mcp_tool!(tool_names::MEMORY_DELETE, dispatch_memory_delete),
+        register_mcp_tool!(tool_names::MEMORY_PROMOTE, dispatch_memory_promote),
+        register_mcp_tool!(
+            tool_names::MEMORY_PENDING_LIST,
+            dispatch_memory_pending_list
+        ),
+        register_mcp_tool!(
+            tool_names::MEMORY_PENDING_APPROVE,
+            dispatch_memory_pending_approve
+        ),
+        register_mcp_tool!(
+            tool_names::MEMORY_PENDING_REJECT,
+            dispatch_memory_pending_reject
+        ),
+        register_mcp_tool!(tool_names::MEMORY_FORGET, dispatch_memory_forget),
+        register_mcp_tool!(tool_names::MEMORY_STATS, dispatch_memory_stats),
+        register_mcp_tool!(tool_names::MEMORY_UPDATE, dispatch_memory_update),
+        register_mcp_tool!(tool_names::MEMORY_GET, dispatch_memory_get),
+        register_mcp_tool!(tool_names::MEMORY_LINK, dispatch_memory_link),
+        register_mcp_tool!(tool_names::MEMORY_GET_LINKS, dispatch_memory_get_links),
+        register_mcp_tool!(tool_names::MEMORY_VERIFY, dispatch_memory_verify),
+        register_mcp_tool!(tool_names::MEMORY_REPLAY, dispatch_memory_replay),
+        register_mcp_tool!(tool_names::MEMORY_CONSOLIDATE, dispatch_memory_consolidate),
+        register_mcp_tool!(tool_names::MEMORY_ATOMISE, dispatch_memory_atomise),
+        register_mcp_tool!(
+            tool_names::MEMORY_INGEST_MULTISTEP,
+            dispatch_memory_ingest_multistep
+        ),
+        register_mcp_tool!(tool_names::MEMORY_REFLECT, dispatch_memory_reflect),
+        register_mcp_tool!(
+            tool_names::MEMORY_CAPABILITIES,
+            dispatch_memory_capabilities
+        ),
+        register_mcp_tool!(
+            tool_names::MEMORY_EXPAND_QUERY,
+            dispatch_memory_expand_query
+        ),
+        register_mcp_tool!(tool_names::MEMORY_AUTO_TAG, dispatch_memory_auto_tag),
+        register_mcp_tool!(
+            tool_names::MEMORY_DETECT_CONTRADICTION,
+            dispatch_memory_detect_contradiction
+        ),
+        register_mcp_tool!(
+            tool_names::MEMORY_ARCHIVE_LIST,
+            dispatch_memory_archive_list
+        ),
+        register_mcp_tool!(
+            tool_names::MEMORY_ARCHIVE_RESTORE,
+            dispatch_memory_archive_restore
+        ),
+        register_mcp_tool!(
+            tool_names::MEMORY_ARCHIVE_PURGE,
+            dispatch_memory_archive_purge
+        ),
+        register_mcp_tool!(
+            tool_names::MEMORY_ARCHIVE_STATS,
+            dispatch_memory_archive_stats
+        ),
+        register_mcp_tool!(tool_names::MEMORY_GC, dispatch_memory_gc),
+        register_mcp_tool!(
+            tool_names::MEMORY_SESSION_START,
+            dispatch_memory_session_start
+        ),
+        register_mcp_tool!(
+            tool_names::MEMORY_NAMESPACE_SET_STANDARD,
+            dispatch_memory_namespace_set_standard
+        ),
+        register_mcp_tool!(
+            tool_names::MEMORY_NAMESPACE_GET_STANDARD,
+            dispatch_memory_namespace_get_standard
+        ),
+        register_mcp_tool!(
+            tool_names::MEMORY_NAMESPACE_CLEAR_STANDARD,
+            dispatch_memory_namespace_clear_standard
+        ),
+        register_mcp_tool!(
+            tool_names::MEMORY_AGENT_REGISTER,
+            dispatch_memory_agent_register
+        ),
+        register_mcp_tool!(tool_names::MEMORY_AGENT_LIST, dispatch_memory_agent_list),
+        register_mcp_tool!(tool_names::MEMORY_NOTIFY, dispatch_memory_notify),
+        register_mcp_tool!(tool_names::MEMORY_SHARE, dispatch_memory_share),
+        register_mcp_tool!(tool_names::MEMORY_INBOX, dispatch_memory_inbox),
+        register_mcp_tool!(tool_names::MEMORY_SUBSCRIBE, dispatch_memory_subscribe),
+        register_mcp_tool!(tool_names::MEMORY_UNSUBSCRIBE, dispatch_memory_unsubscribe),
+        register_mcp_tool!(
+            tool_names::MEMORY_LIST_SUBSCRIPTIONS,
+            dispatch_memory_list_subscriptions
+        ),
+        register_mcp_tool!(
+            tool_names::MEMORY_SUBSCRIPTION_REPLAY,
+            dispatch_memory_subscription_replay
+        ),
+        register_mcp_tool!(
+            tool_names::MEMORY_SUBSCRIPTION_DLQ_LIST,
+            dispatch_memory_subscription_dlq_list
+        ),
+        register_mcp_tool!(
+            tool_names::MEMORY_QUOTA_STATUS,
+            dispatch_memory_quota_status
+        ),
+        register_mcp_tool!(
+            tool_names::MEMORY_CHECK_AGENT_ACTION,
+            dispatch_memory_check_agent_action
+        ),
+        register_mcp_tool!(tool_names::MEMORY_RULE_LIST, dispatch_memory_rule_list),
+        register_mcp_tool!(
+            tool_names::MEMORY_REFLECTION_ORIGIN,
+            dispatch_memory_reflection_origin
+        ),
+        register_mcp_tool!(
+            tool_names::MEMORY_EXPORT_REFLECTION,
+            dispatch_memory_export_reflection
+        ),
+        register_mcp_tool!(tool_names::MEMORY_PERSONA, dispatch_memory_persona),
+        register_mcp_tool!(
+            tool_names::MEMORY_PERSONA_GENERATE,
+            dispatch_memory_persona_generate
+        ),
+        register_mcp_tool!(
+            tool_names::MEMORY_CALIBRATE_CONFIDENCE,
+            dispatch_memory_calibrate_confidence
+        ),
+        register_mcp_tool!(
+            tool_names::MEMORY_DEPENDENTS_OF_INVALIDATED,
+            dispatch_memory_dependents_of_invalidated
+        ),
+        register_mcp_tool!(
+            tool_names::MEMORY_SKILL_REGISTER,
+            dispatch_memory_skill_register
+        ),
+        register_mcp_tool!(tool_names::MEMORY_SKILL_LIST, dispatch_memory_skill_list),
+        register_mcp_tool!(tool_names::MEMORY_SKILL_GET, dispatch_memory_skill_get),
+        register_mcp_tool!(
+            tool_names::MEMORY_SKILL_RESOURCE,
+            dispatch_memory_skill_resource
+        ),
+        register_mcp_tool!(
+            tool_names::MEMORY_SKILL_EXPORT,
+            dispatch_memory_skill_export
+        ),
+        register_mcp_tool!(
+            tool_names::MEMORY_SKILL_PROMOTE_FROM_REFLECTION,
+            dispatch_memory_skill_promote_from_reflection
+        ),
+        register_mcp_tool!(
+            tool_names::MEMORY_SKILL_COMPOSITIONAL_CONTEXT,
+            dispatch_memory_skill_compositional_context
+        ),
+        register_mcp_tool!(tool_names::MEMORY_OFFLOAD, dispatch_memory_offload),
+        register_mcp_tool!(tool_names::MEMORY_DEREF, dispatch_memory_deref),
+    ]
+};
 
 /// v0.7.0 #1105 — O(1) HashMap-based lookup against
 /// [`TOOL_DISPATCH_TABLE`]. Pre-#1105 this was a linear scan over the
@@ -1833,11 +1912,12 @@ fn handle_request(
                         .get("format")
                         .and_then(|v| v.as_str())
                         .unwrap_or("toon_compact");
+                    use crate::mcp::registry::tool_names as tn;
                     let text = match format_str {
                         "toon"
                             if matches!(
                                 tool_name,
-                                "memory_recall" | "memory_list" | "memory_session_start"
+                                tn::MEMORY_RECALL | tn::MEMORY_LIST | tn::MEMORY_SESSION_START
                             ) =>
                         {
                             crate::toon::memories_to_toon(&val, false)
@@ -1845,15 +1925,15 @@ fn handle_request(
                         "toon_compact"
                             if matches!(
                                 tool_name,
-                                "memory_recall" | "memory_list" | "memory_session_start"
+                                tn::MEMORY_RECALL | tn::MEMORY_LIST | tn::MEMORY_SESSION_START
                             ) =>
                         {
                             crate::toon::memories_to_toon(&val, true)
                         }
-                        "toon" if tool_name == "memory_search" => {
+                        "toon" if tool_name == tn::MEMORY_SEARCH => {
                             crate::toon::search_to_toon(&val, false)
                         }
-                        "toon_compact" if tool_name == "memory_search" => {
+                        "toon_compact" if tool_name == tn::MEMORY_SEARCH => {
                             crate::toon::search_to_toon(&val, true)
                         }
                         _ => serde_json::to_string_pretty(&val).unwrap_or_default(),

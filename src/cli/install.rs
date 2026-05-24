@@ -905,10 +905,13 @@ fn remove_claude_code(obj: &mut Map<String, Value>) {
 //   intentionally scope the hook to a subset of tools; clobbering that
 //   would silently change their policy.
 
-/// Reference name for the MCP tool the PreToolUse hook invokes. Pinned
-/// here so changing the tool name in one place updates the installer +
-/// docs together. Matches the wire name registered in `src/mcp/mod.rs`.
-const PRETOOL_HOOK_TOOL_NAME: &str = "memory_check_agent_action";
+/// Reference name for the MCP tool the PreToolUse hook invokes.
+///
+/// v0.7.x (issue #1174 PR1 — pm-v3.1 MCP tool name sweep): routes
+/// through the canonical [`crate::mcp::registry::tool_names`] const,
+/// so renaming a tool is one edit (the const value) and the installer
+/// follows automatically.
+const PRETOOL_HOOK_TOOL_NAME: &str = crate::mcp::registry::tool_names::MEMORY_CHECK_AGENT_ACTION;
 
 /// Build the PreToolUse entry the installer writes. Uses the
 /// type=`mcp_tool` form (vs `type=command`) so Claude Code dispatches

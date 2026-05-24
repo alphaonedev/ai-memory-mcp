@@ -38,7 +38,7 @@ pub struct ReplayTool;
 
 impl McpTool for ReplayTool {
     fn name() -> &'static str {
-        "memory_replay"
+        crate::mcp::registry::tool_names::MEMORY_REPLAY
     }
     fn description() -> &'static str {
         "Reconstruct the conversation transcript chain that produced a memory."

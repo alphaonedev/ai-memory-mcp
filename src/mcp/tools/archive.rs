@@ -170,7 +170,7 @@ pub struct ArchiveListTool;
 
 impl McpTool for ArchiveListTool {
     fn name() -> &'static str {
-        "memory_archive_list"
+        crate::mcp::registry::tool_names::MEMORY_ARCHIVE_LIST
     }
     fn description() -> &'static str {
         "List archived (expired) memories."
@@ -202,7 +202,7 @@ pub struct ArchivePurgeTool;
 
 impl McpTool for ArchivePurgeTool {
     fn name() -> &'static str {
-        "memory_archive_purge"
+        crate::mcp::registry::tool_names::MEMORY_ARCHIVE_PURGE
     }
     fn description() -> &'static str {
         "Permanently delete archived memories."
@@ -233,7 +233,7 @@ pub struct ArchiveRestoreTool;
 
 impl McpTool for ArchiveRestoreTool {
     fn name() -> &'static str {
-        "memory_archive_restore"
+        crate::mcp::registry::tool_names::MEMORY_ARCHIVE_RESTORE
     }
     fn description() -> &'static str {
         "Restore an archived memory back to the active store."
@@ -271,7 +271,7 @@ pub struct GcTool;
 
 impl McpTool for GcTool {
     fn name() -> &'static str {
-        "memory_gc"
+        crate::mcp::registry::tool_names::MEMORY_GC
     }
     fn description() -> &'static str {
         "Trigger garbage collection on expired memories (archives first)."
@@ -294,7 +294,7 @@ pub struct ArchiveStatsTool;
 
 impl McpTool for ArchiveStatsTool {
     fn name() -> &'static str {
-        "memory_archive_stats"
+        crate::mcp::registry::tool_names::MEMORY_ARCHIVE_STATS
     }
     fn description() -> &'static str {
         "Show archive statistics (total count and per-namespace breakdown)."

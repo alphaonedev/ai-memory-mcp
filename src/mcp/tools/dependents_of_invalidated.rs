@@ -86,7 +86,7 @@ pub struct DependentsOfInvalidatedTool;
 
 impl McpTool for DependentsOfInvalidatedTool {
     fn name() -> &'static str {
-        "memory_dependents_of_invalidated"
+        crate::mcp::registry::tool_names::MEMORY_DEPENDENTS_OF_INVALIDATED
     }
     fn description() -> &'static str {
         "List dependents flagged by the L2-3 invalidation walker."

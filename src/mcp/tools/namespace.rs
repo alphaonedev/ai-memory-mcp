@@ -38,7 +38,7 @@ pub struct NamespaceSetStandardTool;
 
 impl McpTool for NamespaceSetStandardTool {
     fn name() -> &'static str {
-        "memory_namespace_set_standard"
+        crate::mcp::registry::tool_names::MEMORY_NAMESPACE_SET_STANDARD
     }
     fn description() -> &'static str {
         "Set a memory as the standard/policy for a namespace."
@@ -73,7 +73,7 @@ pub struct NamespaceGetStandardTool;
 
 impl McpTool for NamespaceGetStandardTool {
     fn name() -> &'static str {
-        "memory_namespace_get_standard"
+        crate::mcp::registry::tool_names::MEMORY_NAMESPACE_GET_STANDARD
     }
     fn description() -> &'static str {
         "Get the standard/policy memory for a namespace."
@@ -104,7 +104,7 @@ pub struct NamespaceClearStandardTool;
 
 impl McpTool for NamespaceClearStandardTool {
     fn name() -> &'static str {
-        "memory_namespace_clear_standard"
+        crate::mcp::registry::tool_names::MEMORY_NAMESPACE_CLEAR_STANDARD
     }
     fn description() -> &'static str {
         "Clear the standard/policy for a namespace."

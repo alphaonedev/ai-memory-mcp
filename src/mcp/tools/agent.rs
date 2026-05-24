@@ -103,7 +103,7 @@ pub struct AgentRegisterTool;
 
 impl McpTool for AgentRegisterTool {
     fn name() -> &'static str {
-        "memory_agent_register"
+        crate::mcp::registry::tool_names::MEMORY_AGENT_REGISTER
     }
     fn description() -> &'static str {
         "Register an agent in the reserved _agents namespace."
@@ -132,7 +132,7 @@ pub struct AgentListTool;
 
 impl McpTool for AgentListTool {
     fn name() -> &'static str {
-        "memory_agent_list"
+        crate::mcp::registry::tool_names::MEMORY_AGENT_LIST
     }
     fn description() -> &'static str {
         "List every registered agent."

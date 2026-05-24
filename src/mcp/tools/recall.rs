@@ -34,7 +34,7 @@ pub struct RecallTool;
 
 impl McpTool for RecallTool {
     fn name() -> &'static str {
-        "memory_recall"
+        crate::mcp::registry::tool_names::MEMORY_RECALL
     }
     fn description() -> &'static str {
         "Recall memories relevant to a context (ranked)."

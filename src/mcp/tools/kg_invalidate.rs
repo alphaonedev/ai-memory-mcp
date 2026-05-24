@@ -36,7 +36,7 @@ pub struct KgInvalidateTool;
 
 impl McpTool for KgInvalidateTool {
     fn name() -> &'static str {
-        "memory_kg_invalidate"
+        crate::mcp::registry::tool_names::MEMORY_KG_INVALIDATE
     }
     fn description() -> &'static str {
         "Mark a KG link as superseded by setting its valid_until column."

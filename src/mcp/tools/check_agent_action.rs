@@ -270,7 +270,7 @@ pub struct CheckAgentActionTool;
 
 impl McpTool for CheckAgentActionTool {
     fn name() -> &'static str {
-        "memory_check_agent_action"
+        crate::mcp::registry::tool_names::MEMORY_CHECK_AGENT_ACTION
     }
     fn description() -> &'static str {
         "Check action vs governance_rules (#691); Allow/Refuse/Warn."

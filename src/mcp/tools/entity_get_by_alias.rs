@@ -29,7 +29,7 @@ pub struct EntityGetByAliasTool;
 
 impl McpTool for EntityGetByAliasTool {
     fn name() -> &'static str {
-        "memory_entity_get_by_alias"
+        crate::mcp::registry::tool_names::MEMORY_ENTITY_GET_BY_ALIAS
     }
     fn description() -> &'static str {
         "Resolve an alias to its registered entity."

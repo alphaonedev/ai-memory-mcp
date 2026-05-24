@@ -40,7 +40,7 @@ pub struct FindPathsTool;
 
 impl McpTool for FindPathsTool {
     fn name() -> &'static str {
-        "memory_find_paths"
+        crate::mcp::registry::tool_names::MEMORY_FIND_PATHS
     }
     fn description() -> &'static str {
         "Enumerate up to N paths through the KG between two memories (BFS, max_depth<=7)."

@@ -172,7 +172,7 @@ pub struct SkillGetTool;
 
 impl McpTool for SkillGetTool {
     fn name() -> &'static str {
-        "memory_skill_get"
+        crate::mcp::registry::tool_names::MEMORY_SKILL_GET
     }
     fn description() -> &'static str {
         "Get full skill activation payload (metadata + body)."

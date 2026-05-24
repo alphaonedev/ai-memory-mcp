@@ -45,7 +45,7 @@ pub struct SubscribeTool;
 
 impl McpTool for SubscribeTool {
     fn name() -> &'static str {
-        "memory_subscribe"
+        crate::mcp::registry::tool_names::MEMORY_SUBSCRIBE
     }
     fn description() -> &'static str {
         "Register a webhook subscription for memory events."
@@ -75,7 +75,7 @@ pub struct UnsubscribeTool;
 
 impl McpTool for UnsubscribeTool {
     fn name() -> &'static str {
-        "memory_unsubscribe"
+        crate::mcp::registry::tool_names::MEMORY_UNSUBSCRIBE
     }
     fn description() -> &'static str {
         "Delete a subscription by id."
@@ -275,7 +275,7 @@ pub struct ListSubscriptionsTool;
 
 impl McpTool for ListSubscriptionsTool {
     fn name() -> &'static str {
-        "memory_list_subscriptions"
+        crate::mcp::registry::tool_names::MEMORY_LIST_SUBSCRIPTIONS
     }
     fn description() -> &'static str {
         "List active webhook subscriptions."
@@ -309,7 +309,7 @@ pub struct SubscriptionReplayTool;
 
 impl McpTool for SubscriptionReplayTool {
     fn name() -> &'static str {
-        "memory_subscription_replay"
+        crate::mcp::registry::tool_names::MEMORY_SUBSCRIPTION_REPLAY
     }
     fn description() -> &'static str {
         "Replay subscription_events since an RFC3339 timestamp."
