@@ -62,6 +62,14 @@ use ai_memory::signed_events::{SignedEvent, list_signed_events, payload_hash};
 use chrono::Utc;
 use rusqlite::Connection;
 
+/// Vendor-neutral fixture source for this test file's `ReflectInput`
+/// builders, per PR #1175 (`validate::DEFAULT_NHI_SOURCE = "nhi"`)
+/// + PR #1174 PR9 (vendor-deflake test fixtures). The substrate now
+/// stamps `source = "nhi"` by default for any AI NHI; pinning a
+/// vendor literal here would silently couple the audit-record test
+/// to a single vendor identity.
+const FIXTURE_SOURCE: &str = "nhi";
+
 // ─────────────────────────────────────────────────────────────────────
 // Fixture helpers — mirror tests/recursive_learning_task4_memory_reflect.rs.
 // ─────────────────────────────────────────────────────────────────────
@@ -114,7 +122,7 @@ fn reflect_input(
         tags: vec!["reflection".to_string()],
         priority: 5,
         confidence: 1.0,
-        source: "claude".to_string(),
+        source: FIXTURE_SOURCE.to_string(),
         agent_id: agent_id.to_string(),
         metadata: serde_json::json!({}),
     }

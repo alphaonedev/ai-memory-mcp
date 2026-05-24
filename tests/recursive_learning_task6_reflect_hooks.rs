@@ -74,6 +74,14 @@ use rusqlite::Connection;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// Vendor-neutral fixture source for this test file's `ReflectInput`
+/// builders, per PR #1175 (`validate::DEFAULT_NHI_SOURCE = "nhi"`)
+/// + PR #1174 PR9 (vendor-deflake test fixtures). The substrate now
+/// stamps `source = "nhi"` by default for any AI NHI; pinning a
+/// vendor literal here would silently couple the reflect-hooks test
+/// to a single vendor identity.
+const FIXTURE_SOURCE: &str = "nhi";
+
 // ─────────────────────────────────────────────────────────────────────
 // Fixture helpers — mirror tests/recursive_learning_task4*+task5*.rs.
 // ─────────────────────────────────────────────────────────────────────
@@ -121,7 +129,7 @@ fn reflect_input(source_ids: Vec<String>, namespace: Option<&str>, title: &str) 
         tags: vec!["reflection".to_string()],
         priority: 5,
         confidence: 1.0,
-        source: "claude".to_string(),
+        source: FIXTURE_SOURCE.to_string(),
         agent_id: "test-agent-task6".to_string(),
         metadata: serde_json::json!({}),
     }
@@ -713,7 +721,7 @@ fn reflect_each_validation_failure_surfaces_validation_error() {
         tags: vec!["t".to_string()],
         priority: 5,
         confidence: 0.5,
-        source: "claude".to_string(),
+        source: FIXTURE_SOURCE.to_string(),
         agent_id: "test-agent-validation".to_string(),
         metadata: serde_json::json!({}),
     };
@@ -791,7 +799,7 @@ fn reflect_refuses_when_title_namespace_collides_with_existing() {
         tags: vec!["reflection".to_string()],
         priority: 5,
         confidence: 1.0,
-        source: "claude".to_string(),
+        source: FIXTURE_SOURCE.to_string(),
         agent_id: "test-agent-task6c".to_string(),
         metadata: serde_json::json!({}),
     };

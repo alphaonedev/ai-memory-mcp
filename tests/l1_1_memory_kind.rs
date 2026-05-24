@@ -28,6 +28,14 @@ use ai_memory::models::{Memory, MemoryKind, Tier};
 use chrono::Utc;
 use rusqlite::Connection;
 
+/// Vendor-neutral fixture source for this test file's `ReflectInput`
+/// builders, per PR #1175 (`validate::DEFAULT_NHI_SOURCE = "nhi"`)
+/// + PR #1174 PR9 (vendor-deflake test fixtures). The substrate now
+/// stamps `source = "nhi"` by default for any AI NHI; pinning a
+/// vendor literal here would silently couple this test to a single
+/// vendor identity and weaken the heterogeneous-NHI invariant.
+const FIXTURE_SOURCE: &str = "nhi";
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Fixtures
 // ─────────────────────────────────────────────────────────────────────────────
@@ -79,7 +87,7 @@ fn reflect_input(source_ids: Vec<String>, namespace: &str, title: &str) -> Refle
         tags: vec!["l1-1-reflection".to_string()],
         priority: 5,
         confidence: 1.0,
-        source: "claude".to_string(),
+        source: FIXTURE_SOURCE.to_string(),
         agent_id: "test-l1-1".to_string(),
         metadata: serde_json::json!({}),
     }

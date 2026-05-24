@@ -47,6 +47,16 @@ use rusqlite::Connection;
 mod common;
 use common::fresh_db_tempfile_conn as fresh_db;
 
+/// Vendor-neutral non-"user" fixture source for this test file's
+/// per-source baseline aggregation tests, per PR #1175
+/// (`validate::DEFAULT_NHI_SOURCE = "nhi"`) + PR #1174 PR9
+/// (vendor-deflake test fixtures). The form-5 calibration tests just
+/// need a contrast source value (anything != `"user"`) to demonstrate
+/// per-source grouping — pre-deflake the literal `"claude"` was used,
+/// which silently coupled the calibration coverage to a single vendor
+/// identity.
+const FIXTURE_SOURCE: &str = "nhi";
+
 // ---------------------------------------------------------------------------
 // Fixture helpers
 // ---------------------------------------------------------------------------
@@ -230,7 +240,7 @@ fn calibration_produces_per_source_baselines_from_shadow() {
     let m1 = fixture_memory("ns", "u-1");
     let m2 = fixture_memory("ns", "u-2");
     let mut m3 = fixture_memory("ns", "c-1");
-    m3.source = "claude".to_string();
+    m3.source = FIXTURE_SOURCE.to_string();
     db::insert(&conn, &m1).expect("ins");
     db::insert(&conn, &m2).expect("ins");
     db::insert(&conn, &m3).expect("ins");
@@ -238,7 +248,7 @@ fn calibration_produces_per_source_baselines_from_shadow() {
     let s = ConfidenceSignals::default();
     observe(&conn, &m1.id, "ns", "user", 0.95, 0.55, &s, None).unwrap();
     observe(&conn, &m2.id, "ns", "user", 0.95, 0.65, &s, None).unwrap();
-    observe(&conn, &m3.id, "ns", "claude", 0.95, 0.30, &s, None).unwrap();
+    observe(&conn, &m3.id, "ns", FIXTURE_SOURCE, 0.95, 0.30, &s, None).unwrap();
 
     let report = calibrate_from_shadow(&conn, 30, Utc::now()).expect("calibrate");
     assert_eq!(report.total_observations, 3);
@@ -251,12 +261,12 @@ fn calibration_produces_per_source_baselines_from_shadow() {
     assert_eq!(user.namespace, "ns");
     assert_eq!(user.count, 2);
     assert!((user.median - 0.6).abs() < 1e-6);
-    let claude = report
+    let non_user = report
         .baselines
         .iter()
-        .find(|b| b.source == "claude")
-        .expect("claude baseline");
-    assert!((claude.median - 0.3).abs() < 1e-6);
+        .find(|b| b.source == FIXTURE_SOURCE)
+        .expect("non-user baseline");
+    assert!((non_user.median - 0.3).abs() < 1e-6);
 }
 
 // ---------------------------------------------------------------------------
@@ -467,7 +477,7 @@ fn mcp_handler_calibrate_confidence_returns_baselines_envelope() {
     let m1 = fixture_memory("ns_a", "u-1");
     let m2 = fixture_memory("ns_a", "u-2");
     let mut m3 = fixture_memory("ns_a", "c-1");
-    m3.source = "claude".to_string();
+    m3.source = FIXTURE_SOURCE.to_string();
     db::insert(&conn, &m1).expect("insert m1");
     db::insert(&conn, &m2).expect("insert m2");
     db::insert(&conn, &m3).expect("insert m3");
@@ -475,7 +485,7 @@ fn mcp_handler_calibrate_confidence_returns_baselines_envelope() {
     let s = ConfidenceSignals::default();
     observe(&conn, &m1.id, "ns_a", "user", 0.9, 0.55, &s, None).unwrap();
     observe(&conn, &m2.id, "ns_a", "user", 0.9, 0.65, &s, None).unwrap();
-    observe(&conn, &m3.id, "ns_a", "claude", 0.9, 0.30, &s, None).unwrap();
+    observe(&conn, &m3.id, "ns_a", FIXTURE_SOURCE, 0.9, 0.30, &s, None).unwrap();
 
     // The MCP handler lives at
     // `src/mcp/tools/calibrate_confidence.rs::handle_calibrate_confidence`.
@@ -509,13 +519,13 @@ fn mcp_handler_calibrate_confidence_returns_baselines_envelope() {
     assert_eq!(user.count, 2);
     assert!((user.median - 0.6).abs() < 1e-6);
 
-    let claude = report
+    let non_user = report
         .baselines
         .iter()
-        .find(|b| b.source == "claude")
-        .expect("claude");
-    assert_eq!(claude.count, 1);
-    assert!((claude.median - 0.3).abs() < 1e-6);
+        .find(|b| b.source == FIXTURE_SOURCE)
+        .expect("non-user baseline");
+    assert_eq!(non_user.count, 1);
+    assert!((non_user.median - 0.3).abs() < 1e-6);
 
     // The same call serialised to JSON matches the documented wire
     // envelope (the MCP handler wraps it in `{ "report": ... }`).

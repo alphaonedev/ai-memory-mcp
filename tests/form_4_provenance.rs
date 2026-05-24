@@ -144,13 +144,20 @@ fn source_uri_accepts_typed_schemes_rejects_bare_strings() {
             "expected accepted: {ok}"
         );
     }
-    // Rejected: empty, no scheme, unrecognised scheme, empty payload
+    // Rejected: empty, no scheme, unrecognised scheme, empty payload.
+    //
+    // Note (#1174 PR9): the bare-word reject sample was previously
+    // `"claude"` (a vendor name), which gave the wrong optical
+    // impression that the validator special-cases vendor identifiers.
+    // It does not — any bare word without a recognised URI scheme is
+    // rejected. Using `"bare-word"` here removes the vendor-name
+    // association while exercising the exact same rejection branch.
     for bad in [
         "",
         "   ",
         "https://example.test",
         "user",
-        "claude",
+        "bare-word",
         "ftp:foo",
         "uri:",
         "doc:",
