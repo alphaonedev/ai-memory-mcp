@@ -164,7 +164,7 @@ might want to set once and forget:
 |---|---|---|
 | Database path | `export AI_MEMORY_DB=/path/to/db` | Move the SQLite file anywhere on disk. |
 | Default agent ID | `export AI_MEMORY_AGENT_ID=alice` | Stamps every memory `alice` wrote with that ID (instead of the leaky `host:<hostname>:pid-<pid>-<uuid>` fallback). Recommended on shared machines. |
-| LLM backend | `export AI_MEMORY_LLM_BACKEND=ollama` | Picks which LLM the `smart` and `autonomous` tiers talk to. Aliases for `openai`, `xai`, `anthropic`, `gemini`, `deepseek`, `kimi`, `qwen`, `mistral`, `groq`, `together`, `cerebras`, `openrouter`, `fireworks`, `lmstudio` are recognized. Pair with `AI_MEMORY_LLM_API_KEY` for hosted providers; `ollama` and `lmstudio` need no key. **For MCP usage (Claude Code / Cursor / Codex / etc.) these shell exports are NOT visible to the MCP-spawned subprocess — the same vars MUST also live inside the MCP config's `env:` block.** See [`integrations/llm-backends.md`](integrations/llm-backends.md) for per-backend MCP env-block recipes, and [#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144) for the operator paper-cut history. |
+| LLM backend | **Recommended:** `[llm]` section in `~/.config/ai-memory/config.toml` (see below). **Override:** `export AI_MEMORY_LLM_BACKEND=xai` etc. | Picks which LLM the `smart` and `autonomous` tiers talk to. Aliases for `ollama`, `openai`, `xai`, `anthropic`, `gemini`, `deepseek`, `kimi`, `qwen`, `mistral`, `groq`, `together`, `cerebras`, `openrouter`, `fireworks`, `lmstudio` are recognized. Pair with `api_key_env = "<NAME>"` (config-file path) or `AI_MEMORY_LLM_API_KEY=…` / per-vendor env (override path) for hosted providers; `ollama` and `lmstudio` need no key. See [`CONFIG_SCHEMA.md`](CONFIG_SCHEMA.md) for the canonical `[llm]` schema, [`integrations/llm-backends.md`](integrations/llm-backends.md) for per-backend MCP env-block recipes, and [#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144) → [#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146) for the operator paper-cut history + retirement. |
 | Permissions mode | `export AI_MEMORY_PERMISSIONS_MODE=advisory` | Loosens v0.7.0's enforced governance gate to the v0.6.x permissive posture. Default is `enforce` and you should leave it on unless you're debugging. |
 | Encrypted DB | `export AI_MEMORY_ENCRYPT_AT_REST=1` | Requires a sqlcipher build + `--db-passphrase-file`. See [`docs/INSTALL.md`](INSTALL.md) § encrypted-at-rest. |
 
@@ -176,8 +176,39 @@ of the project [`CLAUDE.md`](../CLAUDE.md).
 You can also put settings in `~/.config/ai-memory/config.toml`
 instead of env vars — useful when you want one config for both
 interactive shells and the launchd / systemd unit that runs
-`ai-memory serve`. CLI flags beat env vars beat config-file
-entries beat compiled defaults.
+`ai-memory serve`. **This is the recommended path for the LLM
+backend post-[#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146)
+(v0.7.0)** — every surface (MCP, HTTP daemon, CLI, boot banner,
+`ai-memory doctor`) reads the same file, so the boot banner and the
+live MCP server agree on the backend. Example for xAI Grok 4.3:
+
+```toml
+# ~/.config/ai-memory/config.toml
+schema_version = 2
+
+[llm]
+backend     = "xai"
+model       = "grok-4.3"
+base_url    = "https://api.x.ai/v1"
+api_key_env = "XAI_API_KEY"                       # process-env-var name (NOT the key)
+# api_key_file = "/etc/ai-memory/keys/xai.key"    # alt — mode 0400 enforced
+```
+
+**Inline API keys in `config.toml` are rejected at parse time** —
+use `api_key_env` (env-var reference) or `api_key_file` (file path).
+
+Precedence ladder (uniform across all four resolvers — LLM /
+embeddings / reranker / storage):
+
+```
+CLI flag  >  AI_MEMORY_* env  >  config.toml section  >  legacy flat fields  >  compiled default
+```
+
+`ai-memory config migrate` rewrites a legacy v0.6.x flat-field
+`config.toml` in place; `--dry-run` prints the diff;
+`--also-clean-claude-json` additionally strips redundant
+`mcpServers.<*>.env` blocks. Canonical schema reference:
+[`CONFIG_SCHEMA.md`](CONFIG_SCHEMA.md).
 
 ## 8. Next: connect your AI
 
@@ -199,18 +230,20 @@ Claude Code and you're done.
 
 > **Using `smart` or `autonomous` tier with a non-Ollama LLM?** The
 > installer writes a default MCP block without LLM-backend env vars
-> (so the default Ollama path keeps working out of the box). To wire
-> xAI Grok / OpenAI / Anthropic / Gemini / DeepSeek / Kimi / Qwen /
-> Mistral / Groq / Together / Cerebras / OpenRouter / Fireworks /
-> LMStudio / vLLM / llama.cpp server, after `--apply`, hand-edit
+> (so the default Ollama path keeps working out of the box). The
+> **recommended** path is to write a `[llm]` section in
+> `~/.config/ai-memory/config.toml` (see §"You can also put settings
+> in config.toml" above) — one file, every surface, no MCP-config edits
+> per AI client. The **override** path is to hand-edit
 > `~/.claude.json`'s `memory` server block and add an `env` map with
 > `AI_MEMORY_LLM_BACKEND`, `AI_MEMORY_LLM_API_KEY`, and
-> `AI_MEMORY_LLM_MODEL`. **Do NOT** rely on shell exports — MCP-spawned
-> subprocesses don't see your interactive shell's env. Copy-pasteable
-> per-backend recipes: [`integrations/llm-backends.md`](integrations/llm-backends.md).
-> Issue [#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144)
-> tracks operator-side ergonomics so future installer revisions wire
-> this for you on first run.
+> `AI_MEMORY_LLM_MODEL` — useful for CI / per-session tweaks. Shell
+> exports work for the CLI / HTTP daemon but **not** for MCP-spawned
+> subprocesses. Copy-pasteable per-backend recipes:
+> [`integrations/llm-backends.md`](integrations/llm-backends.md).
+> Background: [#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144)
+> (env-block paper-cut) → [#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146)
+> (single source of truth, retires the env-block requirement).
 
 ## 9. Uninstall
 

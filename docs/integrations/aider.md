@@ -13,7 +13,7 @@ file to `aider --message-file`. The Rust-native cross-platform
 equivalent is `ai-memory wrap aider` (PR-6 of issue #487) — same
 semantics, no shell required.
 
-> **Note on ai-memory's own LLM backend.** This doc covers Aider AS the AI client (reading ai-memory boot output). If you also want ai-memory's smart/autonomous-tier features (query expansion, auto-tag, contradiction detection — which call out to an LLM internally), the `ai-memory boot` invocation is a CLI subprocess that inherits your shell's env, so `export AI_MEMORY_LLM_BACKEND=...` in your `.zshrc` works here. For the MCP-server posture (where shell exports do NOT reach the spawned subprocess), see [`llm-backends.md`](llm-backends.md).
+> **Note on ai-memory's own LLM backend.** This doc covers Aider AS the AI client (reading ai-memory boot output). If you also want ai-memory's smart/autonomous-tier features (query expansion, auto-tag, contradiction detection — which call out to an LLM internally), the recommended path post-[#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146) (v0.7.0) is a `[llm]` section in `~/.config/ai-memory/config.toml` — every surface (CLI, MCP, HTTP daemon, boot banner) reads the same file. See [`../CONFIG_SCHEMA.md`](../CONFIG_SCHEMA.md). Shell-export overrides (`export AI_MEMORY_LLM_BACKEND=...` in `.zshrc`) still work for the CLI subprocess Aider launches. For the MCP-server posture (where shell exports do NOT reach the spawned subprocess), see [`llm-backends.md`](llm-backends.md).
 
 ## Wrapper script
 

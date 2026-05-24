@@ -58,7 +58,22 @@ existing `SessionStart` array.
 That's it. Restart Claude Code. The next session will see your most-recent
 memory context as part of its system prompt.
 
-> **Running ai-memory's `--tier smart` or `--tier autonomous` with a non-default LLM backend?** The MCP server entry in `~/.claude.json` (separate from this SessionStart hook) needs an `env` block declaring `AI_MEMORY_LLM_BACKEND`, `AI_MEMORY_LLM_API_KEY`, and `AI_MEMORY_LLM_MODEL`. **Shell exports do not reach Claude Code's MCP-spawned subprocess** ([#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144)). See [`llm-backends.md`](llm-backends.md) for copy-pasteable recipes covering xAI Grok, OpenAI, Anthropic, Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, llama.cpp server, and Ollama.
+> **Running ai-memory's `--tier smart` or `--tier autonomous` with a non-default LLM backend?** Post-[#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146) (v0.7.0) the **recommended** path is a `[llm]` section in `~/.config/ai-memory/config.toml` — every surface (the MCP server, the boot banner this hook prints, the `ai-memory doctor` reachability probe) reads the same file, so the boot banner here and the live MCP server agree on the backend. Example for xAI Grok 4.3:
+>
+> ```toml
+> # ~/.config/ai-memory/config.toml
+> schema_version = 2
+>
+> [llm]
+> backend     = "xai"
+> model       = "grok-4.3"
+> base_url    = "https://api.x.ai/v1"
+> api_key_env = "XAI_API_KEY"            # process-env-var name (NOT the literal key)
+> ```
+>
+> Export `XAI_API_KEY` in your shell rc; restart Claude Code. The SessionStart hook's boot banner should now report `llm=xai:grok-4.3`.
+>
+> The **override** path is an `env:` block in the MCP server entry in `~/.claude.json` with `AI_MEMORY_LLM_BACKEND` / `_API_KEY` / `_MODEL` — still works and takes precedence over `config.toml`. Shell exports do not reach Claude Code's MCP-spawned subprocess ([#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144) → [#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146)). Full recipes: [`llm-backends.md`](llm-backends.md).
 
 ## Why these flags
 

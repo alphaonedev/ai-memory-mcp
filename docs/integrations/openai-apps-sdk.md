@@ -6,7 +6,7 @@ OpenAI's Assistants API, Responses API, and Apps SDK all expose system
 messages / instructions as the integration point. Prepend `ai-memory boot`
 output before creating the assistant or before the first request.
 
-> **Cross-reference — using OpenAI as ai-memory's own LLM backend.** This doc covers OpenAI-family endpoints as the AI client. For the inverse direction (ai-memory's smart / autonomous tier calling OpenAI internally for query expansion, auto-tag, contradiction detection), see [`llm-backends.md` § OpenAI](llm-backends.md#openai). The MCP env-block recipe shown there is the supported posture; shell exports don't reach MCP-spawned subprocesses ([#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144)).
+> **Cross-reference — using OpenAI as ai-memory's own LLM backend.** This doc covers OpenAI-family endpoints as the AI client. For the inverse direction (ai-memory's smart / autonomous tier calling OpenAI internally for query expansion, auto-tag, contradiction detection), the recommended path post-[#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146) (v0.7.0) is a `[llm]` section in `~/.config/ai-memory/config.toml` (`backend = "openai"`, `model = "gpt-5"`, `api_key_env = "OPENAI_API_KEY"`); see [`../CONFIG_SCHEMA.md`](../CONFIG_SCHEMA.md) for the canonical schema. The override path is the MCP env-block recipe in [`llm-backends.md` § OpenAI](llm-backends.md#openai) — shell exports don't reach MCP-spawned subprocesses ([#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144)).
 
 ## Or for the simple wrapper case — `ai-memory wrap`
 
