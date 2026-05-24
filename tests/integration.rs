@@ -3962,6 +3962,12 @@ fn test_mine_stamps_caller_agent_id() {
     });
     std::fs::write(&conv_path, format!("{conv}\n")).unwrap();
 
+    // NOTE (#1174 PR9): `--format claude` is the canonical CLI selector
+    // for the `Format::Claude` mine-conversation parser variant, which
+    // exists specifically to ingest Anthropic's Claude `conversations.json`
+    // export format. This is legitimately vendor-named integration code
+    // (not vendor-monoculture substrate) per the PR #1184 reasoning, so
+    // the literal is preserved here.
     let out = cmd(binary)
         .args([
             "--db",
