@@ -226,7 +226,39 @@ impl TierConfig {
     /// `reranker_active` start at conservative defaults (`disabled` /
     /// `off`); the wrapper updates them based on the *runtime* embedder
     /// + reranker handles, not the *configured* tier values.
+    ///
+    /// **#1168 back-compat shim.** Delegates to
+    /// [`Self::capabilities_with_resolved`] with a
+    /// [`ResolvedModels::from_tier_preset`] triple so the
+    /// pre-#1168 wire shape is byte-equal for callers (legacy tests,
+    /// migrate-tool diagnostics) that don't load an operator
+    /// [`AppConfig`]. Production wrappers MUST call
+    /// [`Self::capabilities_with_resolved`] directly with
+    /// [`AppConfig::resolve_models`] output — otherwise
+    /// `memory_capabilities.models.*` drifts from the live LLM /
+    /// embedder / reranker wiring.
     pub fn capabilities(&self) -> Capabilities {
+        self.capabilities_with_resolved(&ResolvedModels::from_tier_preset(self))
+    }
+
+    /// v0.7.x (issue #1168) — resolver-aware capabilities builder.
+    ///
+    /// Identical to [`Self::capabilities`] except `models.embedding` /
+    /// `models.llm` / `models.cross_encoder` come from the
+    /// operator-resolved `models` triple (built via
+    /// [`AppConfig::resolve_models`]) instead of the compiled tier
+    /// preset. This is the production entry point used by every
+    /// `handle_capabilities_with_conn[_v3]` wrapper post-#1168.
+    ///
+    /// The display logic mirrors the boot banner
+    /// (`src/cli/boot.rs` `BootManifest::build`): Ollama-backend LLM
+    /// emits the bare model id (legacy banner shape); other backends
+    /// emit `backend:model`. Embedder + reranker respect the
+    /// tier-preset disable flag so the keyword tier still reports
+    /// `embedding="none"` even if an operator left a stale
+    /// `[embeddings]` block in their config.
+    #[must_use]
+    pub fn capabilities_with_resolved(&self, models: &ResolvedModels) -> Capabilities {
         let has_embeddings = self.embedding_model.is_some();
         let has_llm = self.llm_model.is_some();
 
@@ -276,20 +308,7 @@ impl TierConfig {
                 // config when a `BatchedReranker` handle is available.
                 reflection_boost: ReflectionBoostReport::default(),
             },
-            models: CapabilityModels {
-                embedding: self
-                    .embedding_model
-                    .map_or_else(|| "none".to_string(), |m| m.hf_model_id().to_string()),
-                embedding_dim: self.embedding_model.map_or(0, EmbeddingModel::dim),
-                llm: self
-                    .llm_model
-                    .map_or_else(|| "none".to_string(), |m| m.ollama_model_id().to_string()),
-                cross_encoder: if self.cross_encoder {
-                    "cross-encoder/ms-marco-MiniLM-L-6-v2".to_string()
-                } else {
-                    "none".to_string()
-                },
-            },
+            models: build_capability_models(self, models),
             // v2 dynamic blocks — start at zero-state defaults. The MCP
             // and HTTP `handle_capabilities` wrappers overwrite these
             // with live counts when they have a `&Connection` handle.
@@ -688,6 +707,62 @@ pub struct CapabilityModels {
     pub embedding_dim: usize,
     pub llm: String,
     pub cross_encoder: String,
+}
+
+/// v0.7.x (issue #1168) — build the `models.*` block of the
+/// capabilities report from the resolver-aware
+/// [`ResolvedModels`] triple, NOT the compiled tier preset.
+///
+/// Display logic mirrors `src/cli/boot.rs` `BootManifest::build`
+/// (v0.7.x #1146) so the boot banner and `memory_capabilities`
+/// agree byte-for-byte on what backend / model the daemon is
+/// wired to:
+///
+/// - `llm` — `"none"` when no LLM is configured; bare `model` for
+///   Ollama backends (legacy banner shape); `backend:model` for
+///   every OpenAI-compatible vendor (xAI, OpenAI, Anthropic,
+///   Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together,
+///   Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, llama.cpp).
+/// - `embedding` — `"none"` when the tier preset disables the
+///   embedder (`keyword` tier); otherwise the resolver's canonical
+///   model string.
+/// - `embedding_dim` — sourced from the tier preset
+///   ([`EmbeddingModel::dim`]) because the resolver returns only the
+///   model id string; the dim is a compile-time property of the
+///   selected embedder family.
+/// - `cross_encoder` — `"none"` when neither the resolver nor the
+///   tier preset enables the cross-encoder; otherwise the
+///   resolver's model string.
+#[must_use]
+pub fn build_capability_models(tier: &TierConfig, models: &ResolvedModels) -> CapabilityModels {
+    let llm = if models.llm.model.is_empty() {
+        "none".to_string()
+    } else if models.llm.is_ollama_native() {
+        models.llm.model.clone()
+    } else {
+        models.llm.display_label()
+    };
+
+    let embedding = if tier.embedding_model.is_none() {
+        // Tier-preset disabled — keep the historical "none" sentinel
+        // even if a stale `[embeddings]` block remains in config.
+        "none".to_string()
+    } else {
+        models.embeddings.model.clone()
+    };
+
+    let cross_encoder = if models.reranker.enabled || tier.cross_encoder {
+        models.reranker.model.clone()
+    } else {
+        "none".to_string()
+    };
+
+    CapabilityModels {
+        embedding,
+        embedding_dim: tier.embedding_model.map_or(0, EmbeddingModel::dim),
+        llm,
+        cross_encoder,
+    }
 }
 
 /// Permissions block (capabilities schema v2). Pre-P4 reports a live
@@ -3170,6 +3245,113 @@ pub struct ResolvedStorage {
     pub source: ConfigSource,
 }
 
+/// v0.7.x (issue #1168) — bundle the three model-resolver outputs into
+/// a single triple consumed by the capabilities surface. Lets callers
+/// thread ONE struct through `handle_capabilities_with_conn` /
+/// `handle_capabilities_with_conn_v3` / `build_capabilities_overlay`
+/// instead of three independent borrows, and makes the contract loud:
+/// `memory_capabilities.models.*` reflects the operator-resolved
+/// configuration, NEVER the compiled tier preset.
+///
+/// **Production constructor:** [`AppConfig::resolve_models`].
+/// **Test / back-compat constructor:** [`ResolvedModels::from_tier_preset`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedModels {
+    /// Resolved LLM configuration (`AppConfig::resolve_llm`).
+    pub llm: ResolvedLlm,
+    /// Resolved embedder configuration (`AppConfig::resolve_embeddings`).
+    pub embeddings: ResolvedEmbeddings,
+    /// Resolved reranker configuration (`AppConfig::resolve_reranker`).
+    pub reranker: ResolvedReranker,
+}
+
+/// Compiled-default `ResolvedModels` triple. Equivalent to running
+/// the resolvers against an [`AppConfig::default`] — Ollama backend,
+/// no operator overrides, no API key, reranker disabled. Convenient
+/// for test scaffolds that need a `ResolvedModels` value but don't
+/// care about its contents.
+impl Default for ResolvedModels {
+    fn default() -> Self {
+        Self {
+            llm: ResolvedLlm {
+                backend: "ollama".to_string(),
+                model: String::new(),
+                base_url: "http://localhost:11434".to_string(),
+                api_key: None,
+                api_key_source: KeySource::None,
+                source: ConfigSource::CompiledDefault,
+            },
+            embeddings: ResolvedEmbeddings {
+                backend: "ollama".to_string(),
+                url: "http://localhost:11434".to_string(),
+                model: String::new(),
+                backfill_batch: 100,
+                source: ConfigSource::CompiledDefault,
+            },
+            reranker: ResolvedReranker {
+                enabled: false,
+                model: "ms-marco-MiniLM-L-6-v2".to_string(),
+                source: ConfigSource::CompiledDefault,
+            },
+        }
+    }
+}
+
+impl ResolvedModels {
+    /// Back-compat constructor: synthesise a `ResolvedModels` triple
+    /// from the compiled [`TierConfig`] preset alone.
+    ///
+    /// Yields the same [`CapabilityModels`] byte-for-byte that the
+    /// pre-#1168 `TierConfig::capabilities()` produced, so legacy
+    /// callers + tests that scaffold a `TierConfig` in isolation (no
+    /// `AppConfig` available) continue to assert their original
+    /// strings. The synthesised triple carries
+    /// [`ConfigSource::CompiledDefault`] on every leaf so observers can
+    /// distinguish a back-compat scaffold from an operator-resolved
+    /// production triple.
+    ///
+    /// **Production paths** that have access to the operator
+    /// [`AppConfig`] MUST use [`AppConfig::resolve_models`] instead.
+    /// Using this helper in a production wrapper re-introduces the
+    /// #1168 drift (the capabilities surface would report the tier
+    /// preset instead of the operator-configured backend / model).
+    #[must_use]
+    pub fn from_tier_preset(tier: &TierConfig) -> Self {
+        Self {
+            llm: ResolvedLlm {
+                backend: "ollama".to_string(),
+                model: tier
+                    .llm_model
+                    .map(|m| m.ollama_model_id().to_string())
+                    .unwrap_or_default(),
+                base_url: "http://localhost:11434".to_string(),
+                api_key: None,
+                api_key_source: KeySource::None,
+                source: ConfigSource::CompiledDefault,
+            },
+            embeddings: ResolvedEmbeddings {
+                backend: "ollama".to_string(),
+                url: "http://localhost:11434".to_string(),
+                model: tier
+                    .embedding_model
+                    .map(|m| m.hf_model_id().to_string())
+                    .unwrap_or_default(),
+                backfill_batch: 100,
+                source: ConfigSource::CompiledDefault,
+            },
+            reranker: ResolvedReranker {
+                enabled: tier.cross_encoder,
+                // Back-compat: the pre-#1168 capabilities surface emitted
+                // the full `cross-encoder/...` HF org-prefixed string when
+                // the tier-preset enabled the cross-encoder. Preserve
+                // that here so legacy assertions stay byte-equal.
+                model: "cross-encoder/ms-marco-MiniLM-L-6-v2".to_string(),
+                source: ConfigSource::CompiledDefault,
+            },
+        }
+    }
+}
+
 /// v0.7.0 (issue #518) — `[agents]` top-level block. Today only carries
 /// the `defaults` sub-block (`[agents.defaults.recall_scope]`); future
 /// agent-scoped knobs (per-agent quota overrides, per-agent autonomy
@@ -5185,6 +5367,28 @@ impl AppConfig {
             enabled,
             model,
             source,
+        }
+    }
+
+    /// v0.7.x (issue #1168) — bundle the three model-resolver outputs
+    /// into a single [`ResolvedModels`] triple for the capabilities
+    /// surface (MCP `memory_capabilities`, HTTP `GET /api/v1/capabilities`).
+    ///
+    /// Routes through the canonical [`Self::resolve_llm`],
+    /// [`Self::resolve_embeddings`], and [`Self::resolve_reranker`]
+    /// resolvers so the capabilities `models.*` block reflects the
+    /// same resolved configuration the live LLM client / embedder /
+    /// reranker were built from, NEVER the compiled tier preset.
+    ///
+    /// Pairs with [`ResolvedModels::from_tier_preset`] (back-compat
+    /// constructor for tests that scaffold a `TierConfig` without an
+    /// `AppConfig`).
+    #[must_use]
+    pub fn resolve_models(&self) -> ResolvedModels {
+        ResolvedModels {
+            llm: self.resolve_llm(None, None, None),
+            embeddings: self.resolve_embeddings(),
+            reranker: self.resolve_reranker(),
         }
     }
 

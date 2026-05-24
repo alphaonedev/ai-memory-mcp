@@ -102,6 +102,7 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
         deferred_audit_queue: std::sync::Arc::new(None),
         admin_agent_ids: std::sync::Arc::new(Vec::new()),
         rule_cache: std::sync::Arc::new(ai_memory::governance::rule_cache::RuleCache::new()),
+        resolved_models: std::sync::Arc::new(ai_memory::config::ResolvedModels::default()),
     };
     let api_key_state = ai_memory::handlers::ApiKeyState {
         key: None,

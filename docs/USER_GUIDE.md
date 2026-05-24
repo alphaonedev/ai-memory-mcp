@@ -728,16 +728,30 @@ Report the active feature tier, loaded models, and available capabilities of the
     "query_expansion": false,
     "auto_tagging": false,
     "contradiction_detection": false,
-    "cross_encoder_reranking": false,
     "cross_encoder_reranking": false
   },
   "models": {
-    "embedding": "all-MiniLM-L6-v2",
+    "embedding": "nomic-embed-text-v1.5",
+    "embedding_dim": 384,
     "llm": "none",
     "cross_encoder": "none"
   }
 }
 ```
+
+> **`models.*` reflects the operator-resolved configuration** (issue
+> [#1168](https://github.com/alphaonedev/ai-memory-mcp/issues/1168),
+> 2026-05-24). The values mirror the boot banner and the live LLM /
+> embedder / reranker the daemon was wired to. When you set
+> `[llm] backend = "xai", model = "grok-4.3"` in
+> `~/.config/ai-memory/config.toml`, `models.llm` reports
+> `"xai:grok-4.3"`; an Ollama backend reports the bare model id
+> (`"gemma3:4b"`); `models.embedding` reports the configured
+> `[embeddings].model` string verbatim. An unconfigured deployment
+> reports the resolver's defaults
+> (`"nomic-embed-text-v1.5"` + `"none"` for the LLM). See the
+> [v0.7.x #1146 enterprise-config rollout](../docs/v0.7.0/release-notes.md#v070-enterprise-configuration-standard-1146-2026-05-23)
+> for the full precedence ladder.
 
 ---
 

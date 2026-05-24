@@ -27,7 +27,7 @@
 
 #![allow(clippy::doc_markdown)]
 
-use ai_memory::config::{CapabilityMemoryKindVocab, FeatureTier, TierConfig};
+use ai_memory::config::{CapabilityMemoryKindVocab, FeatureTier, ResolvedModels, TierConfig};
 use ai_memory::hooks::pre_store::{classify_by_regex, maybe_auto_classify};
 use ai_memory::mcp::{handle_capabilities_with_conn_v3, handle_recall};
 use ai_memory::models::{Memory, MemoryKind, MemoryKindAutoClassify, Tier};
@@ -640,6 +640,7 @@ fn cap_v3_form6_carries_memory_kind_vocab_block() {
     let conn = open_db();
     let val = handle_capabilities_with_conn_v3(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false,
         Some(&conn),

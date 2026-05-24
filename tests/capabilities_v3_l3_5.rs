@@ -32,7 +32,7 @@
 use ai_memory::config::{
     Capabilities, CapabilitiesV3, CapabilityAtomisation, CapabilityForensic, CapabilityGovernance,
     CapabilityReflection, CapabilitySkills, ENFORCED_AGENT_ACTIONS, FeatureTier,
-    GOVERNANCE_BYPASS_IMPOSSIBILITY_TESTS, SKILL_TOOL_NAMES, TierConfig,
+    GOVERNANCE_BYPASS_IMPOSSIBILITY_TESTS, ResolvedModels, SKILL_TOOL_NAMES, TierConfig,
 };
 use ai_memory::mcp::{
     CapabilitiesAccept, handle_capabilities_with_conn, handle_capabilities_with_conn_v3,
@@ -57,6 +57,7 @@ fn cap_v3_l3_5_response_carries_reflection_block() {
     let conn = fresh_conn();
     let val = handle_capabilities_with_conn_v3(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false,
         Some(&conn),
@@ -86,6 +87,7 @@ fn cap_v3_l3_5_response_carries_skills_block() {
     let conn = fresh_conn();
     let val = handle_capabilities_with_conn_v3(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false,
         Some(&conn),
@@ -156,6 +158,7 @@ fn cap_v3_l3_5_response_carries_forensic_block() {
     let conn = fresh_conn();
     let val = handle_capabilities_with_conn_v3(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false,
         Some(&conn),
@@ -179,6 +182,7 @@ fn cap_v3_l3_5_response_carries_governance_block() {
     let conn = fresh_conn();
     let val = handle_capabilities_with_conn_v3(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false,
         Some(&conn),
@@ -285,6 +289,7 @@ fn cap_v3_l3_5_memory_kinds_reports_real_implemented_set_only() {
     let conn = fresh_conn();
     let val = handle_capabilities_with_conn_v3(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false,
         Some(&conn),
@@ -407,6 +412,7 @@ fn cap_v3_l3_5_v2_clients_see_no_new_top_level_fields() {
     let conn = fresh_conn();
     let val = handle_capabilities_with_conn(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false,
         Some(&conn),
@@ -453,6 +459,7 @@ fn cap_v3_l3_5_v1_clients_see_no_new_top_level_fields() {
     let conn = fresh_conn();
     let val = handle_capabilities_with_conn(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false,
         Some(&conn),
@@ -495,6 +502,7 @@ fn cap_v3_wt1g_response_carries_atomisation_block() {
     let conn = fresh_conn();
     let val = handle_capabilities_with_conn_v3(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false,
         Some(&conn),
@@ -630,6 +638,7 @@ fn cap_v3_wt1g_v2_clients_see_no_atomisation_field() {
     let conn = fresh_conn();
     let val = handle_capabilities_with_conn(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false,
         Some(&conn),
@@ -655,6 +664,7 @@ fn cap_v3_l3_5_schema_version_discriminator_is_3() {
     let conn = fresh_conn();
     let val = handle_capabilities_with_conn_v3(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false,
         Some(&conn),
