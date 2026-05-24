@@ -726,10 +726,15 @@ pub struct CapabilityModels {
 /// - `embedding` — `"none"` when the tier preset disables the
 ///   embedder (`keyword` tier); otherwise the resolver's canonical
 ///   model string.
-/// - `embedding_dim` — sourced from the tier preset
-///   ([`EmbeddingModel::dim`]) because the resolver returns only the
-///   model id string; the dim is a compile-time property of the
-///   selected embedder family.
+/// - `embedding_dim` — v0.7.x (issue #1169): sourced from
+///   [`ResolvedEmbeddings::embedding_dim`] when the resolver
+///   recognised the operator-picked model id (via the
+///   [`KNOWN_EMBEDDING_DIMS`] lookup); falls back to the tier preset
+///   ([`EmbeddingModel::dim`]) only when the operator's model is not
+///   in the table. Pre-#1169 this field was sourced ONLY from the
+///   tier preset, which silently drifted the moment an operator set
+///   `[embeddings].model` to anything outside the 2-family
+///   [`EmbeddingModel`] enum.
 /// - `cross_encoder` — `"none"` when neither the resolver nor the
 ///   tier preset enables the cross-encoder; otherwise the
 ///   resolver's model string.
@@ -751,6 +756,19 @@ pub fn build_capability_models(tier: &TierConfig, models: &ResolvedModels) -> Ca
         models.embeddings.model.clone()
     };
 
+    // v0.7.x (#1169) — resolver-side dim wins when known; tier preset
+    // is the back-compat fallback for unrecognised model ids and the
+    // tier-disabled-embedder posture (where the field stays 0 to match
+    // pre-#1169 semantics).
+    let embedding_dim = if tier.embedding_model.is_none() {
+        0
+    } else {
+        models.embeddings.embedding_dim.map_or_else(
+            || tier.embedding_model.map_or(0, EmbeddingModel::dim),
+            |d| d as usize,
+        )
+    };
+
     let cross_encoder = if models.reranker.enabled || tier.cross_encoder {
         models.reranker.model.clone()
     } else {
@@ -759,7 +777,7 @@ pub fn build_capability_models(tier: &TierConfig, models: &ResolvedModels) -> Ca
 
     CapabilityModels {
         embedding,
-        embedding_dim: tier.embedding_model.map_or(0, EmbeddingModel::dim),
+        embedding_dim,
         llm,
         cross_encoder,
     }
@@ -3213,6 +3231,14 @@ pub struct ResolvedEmbeddings {
     /// Backfill batch size. Bounded `1..=10000`; out-of-range values
     /// fall back to 100 with a WARN.
     pub backfill_batch: u32,
+    /// v0.7.x (issue #1169) — vector dim of the resolved model, when
+    /// known. Populated by [`canonical_embedding_dim`] against
+    /// [`KNOWN_EMBEDDING_DIMS`]. `None` when the operator chose a
+    /// model id that isn't in the table — in that case
+    /// [`build_capability_models`] falls back to the tier preset's
+    /// dim (preserving pre-#1169 behaviour for unrecognised ids and
+    /// avoiding the silent-wrong-dim trap for the recognised ones).
+    pub embedding_dim: Option<u32>,
     /// Provenance of the resolved configuration.
     pub source: ConfigSource,
 }
@@ -3286,6 +3312,7 @@ impl Default for ResolvedModels {
                 url: "http://localhost:11434".to_string(),
                 model: String::new(),
                 backfill_batch: 100,
+                embedding_dim: None,
                 source: ConfigSource::CompiledDefault,
             },
             reranker: ResolvedReranker {
@@ -3337,6 +3364,12 @@ impl ResolvedModels {
                     .map(|m| m.hf_model_id().to_string())
                     .unwrap_or_default(),
                 backfill_batch: 100,
+                // v0.7.x (#1169) — back-compat constructor: source the
+                // dim from the tier-preset enum directly so the
+                // ResolvedModels::from_tier_preset path matches the
+                // pre-#1169 capabilities byte-shape (the test invariant
+                // pinned by tests/issue_1168_*::from_tier_preset_*).
+                embedding_dim: tier.embedding_model.map(|m| m.dim() as u32),
                 source: ConfigSource::CompiledDefault,
             },
             reranker: ResolvedReranker {
@@ -4456,6 +4489,93 @@ fn canonicalise_embedding_model(raw: String) -> String {
     }
 }
 
+/// v0.7.x (issue #1169) — known canonical embedding-model id → vector
+/// dim mappings.
+///
+/// Used by [`canonical_embedding_dim`] (resolver-side) and
+/// [`build_capability_models`] (capabilities-surface side) so the
+/// reported `embedding_dim` reflects the live model the embedder
+/// produces vectors of, NOT the compiled tier preset's hardcoded dim.
+/// Pre-#1169 the dim was sourced only from the 2-family
+/// [`EmbeddingModel`] enum — picking any other model id (e.g. Ollama
+/// `bge-large-en`) silently fell back to the tier preset's wrong dim.
+///
+/// New entries land here when an operator adopts a model not yet
+/// covered. Unknown models resolve to `None`
+/// ([`canonical_embedding_dim`] return), which causes
+/// [`build_capability_models`] to fall back to the tier preset's dim
+/// — preserving the pre-#1169 behaviour for unrecognised ids and
+/// avoiding the silent-wrong-dim trap for recognised ones.
+///
+/// Match keys are case-insensitive (lookup uses
+/// `eq_ignore_ascii_case`) and span the canonical HF id, the
+/// unprefixed shortname, and the common Ollama tag where they
+/// diverge. Matches whatever the operator actually wrote in
+/// `[embeddings].model` post-`canonicalise_embedding_model`.
+pub const KNOWN_EMBEDDING_DIMS: &[(&str, u32)] = &[
+    // nomic-ai (default for the v0.7.0 autonomous tier)
+    ("nomic-embed-text-v1.5", 768),
+    ("nomic-embed-text", 768),
+    ("nomic-ai/nomic-embed-text-v1.5", 768),
+    // sentence-transformers / MiniLM family
+    ("sentence-transformers/all-MiniLM-L6-v2", 384),
+    ("all-MiniLM-L6-v2", 384),
+    ("all-minilm", 384),
+    ("all-minilm:l6-v2", 384),
+    // BAAI BGE family (common Ollama-side operator picks — the #1169
+    // repro example was bge-large-en)
+    ("bge-large-en", 1024),
+    ("bge-large-en-v1.5", 1024),
+    ("baai/bge-large-en-v1.5", 1024),
+    ("bge-base-en", 768),
+    ("bge-base-en-v1.5", 768),
+    ("baai/bge-base-en-v1.5", 768),
+    ("bge-small-en", 384),
+    ("bge-small-en-v1.5", 384),
+    ("baai/bge-small-en-v1.5", 384),
+    ("bge-m3", 1024),
+    ("baai/bge-m3", 1024),
+    // Mixed Bread AI
+    ("mxbai-embed-large", 1024),
+    ("mxbai-embed-large-v1", 1024),
+    ("mixedbread-ai/mxbai-embed-large-v1", 1024),
+    // OpenAI text-embedding family
+    ("text-embedding-3-small", 1536),
+    ("text-embedding-3-large", 3072),
+    ("text-embedding-ada-002", 1536),
+    // Google embedding
+    ("embedding-001", 768),
+    ("text-embedding-004", 768),
+    // Snowflake Arctic
+    ("snowflake-arctic-embed", 1024),
+    ("snowflake-arctic-embed:l", 1024),
+    ("snowflake-arctic-embed-l", 1024),
+    ("snowflake-arctic-embed:m", 768),
+    ("snowflake-arctic-embed:s", 384),
+];
+
+/// v0.7.x (issue #1169) — look up the vector dim for a canonical
+/// embedding model id. Returns `None` when the model is not in the
+/// [`KNOWN_EMBEDDING_DIMS`] table; callers fall back to the tier
+/// preset (preserving pre-#1169 behaviour for unrecognised ids).
+///
+/// The lookup is case-insensitive and ignores leading/trailing
+/// whitespace. Matches the canonicalised form
+/// ([`canonicalise_embedding_model`] runs first), so the table
+/// keys are the HF-id / Ollama tag forms operators actually set in
+/// `[embeddings].model` after legacy-alias canonicalisation.
+#[must_use]
+pub fn canonical_embedding_dim(model: &str) -> Option<u32> {
+    let needle = model.trim();
+    if needle.is_empty() {
+        return None;
+    }
+    KNOWN_EMBEDDING_DIMS
+        .iter()
+        .find(|(id, _)| id.eq_ignore_ascii_case(needle))
+        .map(|(_, dim)| *dim)
+}
+
 /// Resolve the API key + provenance tag for the configured backend.
 ///
 /// Precedence:
@@ -5326,11 +5446,18 @@ impl AppConfig {
             ConfigSource::CompiledDefault
         };
 
+        // v0.7.x (#1169) — derive the dim from the resolved model id
+        // via the canonical lookup table. None when the operator picked
+        // a model not in [`KNOWN_EMBEDDING_DIMS`]; callers (capabilities
+        // surface) fall back to the tier preset's compiled dim.
+        let embedding_dim = canonical_embedding_dim(&model);
+
         ResolvedEmbeddings {
             backend,
             url,
             model,
             backfill_batch,
+            embedding_dim,
             source,
         }
     }
