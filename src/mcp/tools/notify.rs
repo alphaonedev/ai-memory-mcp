@@ -25,7 +25,7 @@ pub(crate) fn handle_notify(
     let priority = i32::try_from(params["priority"].as_i64().unwrap_or(5))
         .unwrap_or(i32::MAX)
         .clamp(1, 10);
-    let tier_str = params["tier"].as_str().unwrap_or("mid");
+    let tier_str = params["tier"].as_str().unwrap_or(Tier::Mid.as_str());
     let tier = Tier::from_str(tier_str).ok_or(format!("invalid tier: {tier_str}"))?;
 
     validate::validate_agent_id(target).map_err(|e| e.to_string())?;

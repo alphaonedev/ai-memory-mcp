@@ -415,7 +415,7 @@ mod tests {
         }
         let cfg = config::AppConfig::default();
         let mut args = list_args();
-        args.tier = Some("long".to_string());
+        args.tier = Some(Tier::Long.as_str().to_string());
         {
             let mut out = env.output();
             cmd_list(&db, &args, true, &cfg, &mut out).unwrap();
@@ -423,7 +423,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
         let mems = v["memories"].as_array().unwrap();
         assert_eq!(mems.len(), 1);
-        assert_eq!(mems[0]["tier"].as_str().unwrap(), "long");
+        assert_eq!(mems[0]["tier"].as_str().unwrap(), Tier::Long.as_str());
     }
 
     #[test]

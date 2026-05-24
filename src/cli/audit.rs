@@ -481,6 +481,7 @@ mod tests {
         AuditAction as AAct, AuditOutcome, CHAIN_HEAD_PREV_HASH, EventBuilder, actor, target_memory,
     };
     use crate::config::AuditConfig;
+    use crate::models::Tier;
 
     fn write_chained_log(dir: &Path) -> std::path::PathBuf {
         // Build a 3-line chain by hand using the public API; we use
@@ -512,7 +513,7 @@ mod tests {
                 format!("mem-{seq}"),
                 "ns-x",
                 Some("title".to_string()),
-                Some("mid".to_string()),
+                Some(Tier::Mid.as_str().to_string()),
                 None,
             ),
             outcome: AuditOutcome::Allow,

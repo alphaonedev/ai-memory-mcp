@@ -31,6 +31,12 @@ pub struct MineArgs {
     #[arg(long, short)]
     pub namespace: Option<String>,
     /// Memory tier for imported memories
+    ///
+    /// `default_value` must be a literal at attribute-parse time, so
+    /// the wire string is kept here verbatim; it is byte-equal to
+    /// `crate::models::Tier::Mid.as_str()` (pm-v3.1 PR6 #1174 sweep —
+    /// raw tier literals are confined to the deserializer + clap
+    /// `default_value` attrs that cannot accept const expressions).
     #[arg(long, short, default_value = "mid")]
     pub tier: String,
     /// Minimum message count to import a conversation
@@ -533,7 +539,7 @@ mod tests {
             "memories": [
                 {
                     "id": "11111111-1111-1111-1111-111111111111",
-                    "tier": "mid",
+                    "tier": Tier::Mid.as_str(),
                     "namespace": "ns",
                     "title": "",  // invalid: empty title
                     "content": "c",
@@ -550,7 +556,7 @@ mod tests {
                 },
                 {
                     "id": "22222222-2222-2222-2222-222222222222",
-                    "tier": "mid",
+                    "tier": Tier::Mid.as_str(),
                     "namespace": "ns",
                     "title": "valid-row",
                     "content": "c",
@@ -674,7 +680,7 @@ mod tests {
             path: claude_path,
             format: "claude".to_string(),
             namespace: Some("mined-ns".to_string()),
-            tier: "mid".to_string(),
+            tier: Tier::Mid.as_str().to_string(),
             min_messages: 3,
             dry_run: true,
         };
@@ -705,7 +711,7 @@ mod tests {
             path: claude_path,
             format: "claude".to_string(),
             namespace: Some("mined-ns".to_string()),
-            tier: "mid".to_string(),
+            tier: Tier::Mid.as_str().to_string(),
             min_messages: 3,
             dry_run: true,
         };
@@ -732,7 +738,7 @@ mod tests {
             path: claude_path,
             format: "claude".to_string(),
             namespace: Some("mined-real".to_string()),
-            tier: "long".to_string(),
+            tier: Tier::Long.as_str().to_string(),
             min_messages: 3,
             dry_run: false,
         };
@@ -774,7 +780,7 @@ mod tests {
             path: claude_path,
             format: "claude".to_string(),
             namespace: Some("mined-json".to_string()),
-            tier: "mid".to_string(),
+            tier: Tier::Mid.as_str().to_string(),
             min_messages: 3,
             dry_run: false,
         };
@@ -784,7 +790,7 @@ mod tests {
         }
         let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
         assert_eq!(v["namespace"].as_str().unwrap(), "mined-json");
-        assert_eq!(v["tier"].as_str().unwrap(), "mid");
+        assert_eq!(v["tier"].as_str().unwrap(), Tier::Mid.as_str());
         assert!(v["imported"].as_u64().unwrap() >= 1);
     }
 
@@ -800,7 +806,7 @@ mod tests {
             path: claude_path,
             format: "claude".to_string(),
             namespace: None,
-            tier: "mid".to_string(),
+            tier: Tier::Mid.as_str().to_string(),
             min_messages: 3,
             dry_run: true,
         };
@@ -824,7 +830,7 @@ mod tests {
             path: p,
             format: "myspace".to_string(), // not claude/chatgpt/slack
             namespace: None,
-            tier: "mid".to_string(),
+            tier: Tier::Mid.as_str().to_string(),
             min_messages: 3,
             dry_run: true,
         };
@@ -871,7 +877,7 @@ mod tests {
             "memories": [
                 {
                     "id": "33333333-3333-3333-3333-333333333333",
-                    "tier": "mid",
+                    "tier": Tier::Mid.as_str(),
                     "namespace": "ns",
                     "title": "tt",
                     "content": "cc",
@@ -912,7 +918,7 @@ mod tests {
             "memories": [
                 {
                     "id": "44444444-4444-4444-4444-444444444444",
-                    "tier": "mid",
+                    "tier": Tier::Mid.as_str(),
                     "namespace": "ns",
                     "title": "",  // empty title fails validate
                     "content": "c",
@@ -988,7 +994,7 @@ mod tests {
             "memories": [
                 {
                     "id": "55555555-5555-5555-5555-555555555555",
-                    "tier": "mid",
+                    "tier": Tier::Mid.as_str(),
                     "namespace": "ns",
                     "title": "tt",
                     "content": "cc",
@@ -1031,7 +1037,7 @@ mod tests {
             "memories": [
                 {
                     "id": "66666666-6666-6666-6666-666666666666",
-                    "tier": "mid",
+                    "tier": Tier::Mid.as_str(),
                     "namespace": "ns",
                     "title": "tt",
                     "content": "cc",
@@ -1113,7 +1119,7 @@ mod tests {
             path,
             format: "chatgpt".to_string(),
             namespace: None,
-            tier: "short".to_string(),
+            tier: Tier::Short.as_str().to_string(),
             min_messages: 3,
             dry_run: false,
         };
@@ -1140,7 +1146,7 @@ mod tests {
             path: tmp.path().to_path_buf(),
             format: "slack".to_string(),
             namespace: None,
-            tier: "mid".to_string(),
+            tier: Tier::Mid.as_str().to_string(),
             min_messages: 3,
             dry_run: true,
         };
@@ -1166,7 +1172,7 @@ mod tests {
             path,
             format: "chatgpt".to_string(),
             namespace: None,
-            tier: "mid".to_string(),
+            tier: Tier::Mid.as_str().to_string(),
             min_messages: 1,
             dry_run: true,
         };
@@ -1190,7 +1196,7 @@ mod tests {
             path: claude_path,
             format: "claude".to_string(),
             namespace: Some("text-mine".to_string()),
-            tier: "long".to_string(),
+            tier: Tier::Long.as_str().to_string(),
             min_messages: 3,
             dry_run: false,
         };
@@ -1215,7 +1221,7 @@ mod tests {
             path: claude_path,
             format: "claude".to_string(),
             namespace: Some("dry-text".to_string()),
-            tier: "short".to_string(),
+            tier: Tier::Short.as_str().to_string(),
             min_messages: 3,
             dry_run: true,
         };

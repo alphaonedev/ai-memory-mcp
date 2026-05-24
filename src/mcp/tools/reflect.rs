@@ -63,7 +63,7 @@ pub fn handle_reflect(
         .as_str()
         .ok_or("content is required")?
         .to_string();
-    let tier_str = params["tier"].as_str().unwrap_or("mid");
+    let tier_str = params["tier"].as_str().unwrap_or(Tier::Mid.as_str());
     let tier = Tier::from_str(tier_str).ok_or(format!("invalid tier: {tier_str}"))?;
     let namespace = params["namespace"].as_str().map(str::to_string);
     let priority = i32::try_from(params["priority"].as_i64().unwrap_or(5)).unwrap_or(5);

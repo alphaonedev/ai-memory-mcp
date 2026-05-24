@@ -134,7 +134,7 @@ pub fn cmd_promote(
         writeln!(
             out.stdout,
             "{}",
-            serde_json::json!({"promoted": true, "id": resolved_id, "tier": "long"})
+            serde_json::json!({"promoted": true, "id": resolved_id, "tier": Tier::Long.as_str()})
         )?;
     } else {
         writeln!(out.stdout, "promoted to long-term: {resolved_id}")?;
@@ -242,7 +242,7 @@ mod tests {
         }
         let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
         assert_eq!(v["promoted"].as_bool().unwrap(), true);
-        assert_eq!(v["tier"].as_str().unwrap(), "long");
+        assert_eq!(v["tier"].as_str().unwrap(), Tier::Long.as_str());
         let conn = db::open(&db).unwrap();
         let mem = db::get(&conn, &id).unwrap().unwrap();
         assert_eq!(mem.tier, Tier::Long);

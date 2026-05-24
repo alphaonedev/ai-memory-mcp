@@ -976,6 +976,7 @@ fn mark_append_only(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::Tier;
 
     fn sample_event(seq: u64, prev: &str) -> AuditEvent {
         let mut ev = AuditEvent {
@@ -988,7 +989,7 @@ mod tests {
                 format!("mem-{seq}"),
                 "ns-x",
                 Some("title".to_string()),
-                Some("mid".to_string()),
+                Some(Tier::Mid.as_str().to_string()),
                 None,
             ),
             outcome: AuditOutcome::Allow,
@@ -1767,10 +1768,10 @@ mod tests {
             "mem-1",
             "ns-x",
             Some("title".to_string()),
-            Some("long".to_string()),
+            Some(Tier::Long.as_str().to_string()),
             Some("team".to_string()),
         );
-        assert_eq!(t.tier.as_deref(), Some("long"));
+        assert_eq!(t.tier.as_deref(), Some(Tier::Long.as_str()));
         assert_eq!(t.scope.as_deref(), Some("team"));
     }
 

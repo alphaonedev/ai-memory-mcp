@@ -167,7 +167,7 @@ mod tests {
         let conn = fresh_conn();
         db::insert(&conn, &make_mem("a", "ns", MTier::Short, "ai:a")).expect("ins");
         db::insert(&conn, &make_mem("b", "ns", MTier::Long, "ai:b")).expect("ins");
-        let out = handle_list(&conn, &json!({"tier": "long"})).expect("ok");
+        let out = handle_list(&conn, &json!({"tier": MTier::Long.as_str()})).expect("ok");
         assert_eq!(out["count"].as_u64(), Some(1));
         // invalid tier silently falls through (and_then None) — listed all.
         let out_bad = handle_list(&conn, &json!({"tier": "nonsense"})).expect("ok");

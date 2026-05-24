@@ -46,6 +46,17 @@ pub fn cyan(text: &str) -> String {
     wrap("96", text)
 }
 
+/// Colorize `text` according to the caller-supplied tier wire string.
+///
+/// The string literals in the match arms below are the **canonical
+/// deserializer** for the `Tier` enum's wire form — they pair with
+/// `crate::models::Tier::as_str` (Short → "short" / Mid → "mid" /
+/// Long → "long"). They MUST stay as raw literals here because this
+/// is the boundary where a caller-supplied `&str` (config, CLI flag,
+/// JSON value) gets dispatched; the enum has nothing to plug in at
+/// this point. Anywhere else that constructs a tier wire value should
+/// route through `Tier::<X>.as_str()`. See pm-v3.1 PR6 (#1174) for the
+/// sweep that pinned this invariant.
 pub fn tier_color(tier: &str, text: &str) -> String {
     match tier {
         "short" => short(text),
@@ -106,10 +117,11 @@ mod tests {
 
     #[test]
     fn tier_color_dispatch() {
+        use crate::models::Tier;
         with_color_off(|| {
-            assert_eq!(tier_color("short", "x"), "x");
-            assert_eq!(tier_color("mid", "x"), "x");
-            assert_eq!(tier_color("long", "x"), "x");
+            assert_eq!(tier_color(Tier::Short.as_str(), "x"), "x");
+            assert_eq!(tier_color(Tier::Mid.as_str(), "x"), "x");
+            assert_eq!(tier_color(Tier::Long.as_str(), "x"), "x");
             assert_eq!(tier_color("unknown", "x"), "x");
         });
     }

@@ -428,6 +428,7 @@ mod tests {
     //! distinct payloads; tests do not assert on cross-test ordering.
 
     use super::*;
+    use crate::models::Tier;
     use crate::storage as db;
     use serde_json::json;
 
@@ -460,7 +461,7 @@ mod tests {
             "pa-ns",
             Some("11111111-2222-3333-4444-555555555555"),
             requester,
-            &json!({"target_tier": "long"}),
+            &json!({"target_tier": Tier::Long.as_str()}),
         )
         .expect("queue")
     }

@@ -98,6 +98,12 @@ pub async fn notify(
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         let priority_i32 = body.priority.and_then(|p| i32::try_from(p).ok());
+        // Canonical wire deserializer for the HTTP `tier` field — the
+        // raw string literals here pair byte-for-byte with
+        // `Tier::as_str` outputs and are intentionally kept in this
+        // form per pm-v3.1 PR6 (#1174) because the input is a caller-
+        // supplied wire string. Construction sites elsewhere route
+        // through `Tier::<X>.as_str()`.
         let resolved_tier = match body.tier.as_deref() {
             Some("short") => Some(Tier::Short),
             Some("mid") => Some(Tier::Mid),

@@ -1018,7 +1018,7 @@ pub async fn promote_memory(
                 Json(json!({
                     "promoted": true,
                     "id": target.id,
-                    "tier": "long",
+                    "tier": Tier::Long.as_str(),
                     "storage_backend": "postgres",
                 }))
                 .into_response()
@@ -1206,7 +1206,7 @@ pub async fn promote_memory(
                 .map(str::to_string);
             let details = serde_json::to_value(crate::subscriptions::PromoteEventDetails {
                 mode: "tier".to_string(),
-                tier: Some("long".to_string()),
+                tier: Some(Tier::Long.as_str().to_string()),
                 to_namespace: None,
                 clone_id: None,
             })
@@ -1229,7 +1229,8 @@ pub async fn promote_memory(
                 let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
                 return super::quorum_not_met_response(&payload);
             }
-            Json(json!({"promoted": true, "id": resolved_id, "tier": "long"})).into_response()
+            Json(json!({"promoted": true, "id": resolved_id, "tier": Tier::Long.as_str()}))
+                .into_response()
         }
         Ok((false, _)) => {
             (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response()
