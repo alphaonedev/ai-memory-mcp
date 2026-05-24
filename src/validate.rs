@@ -564,7 +564,7 @@ pub fn validate_ttl_secs(ttl: Option<i64>) -> Result<()> {
         if secs <= 0 {
             bail!("ttl_secs must be positive (got {secs})");
         }
-        if secs > 365 * 24 * 3600 {
+        if secs > 365 * crate::SECS_PER_DAY {
             bail!("ttl_secs exceeds maximum of 1 year");
         }
     }
@@ -1700,10 +1700,10 @@ mod tests {
     #[test]
     fn test_valid_ttl() {
         assert!(validate_ttl_secs(None).is_ok());
-        assert!(validate_ttl_secs(Some(3600)).is_ok());
+        assert!(validate_ttl_secs(Some(crate::SECS_PER_HOUR)).is_ok());
         assert!(validate_ttl_secs(Some(0)).is_err());
         assert!(validate_ttl_secs(Some(-1)).is_err());
-        assert!(validate_ttl_secs(Some(366 * 24 * 3600)).is_err());
+        assert!(validate_ttl_secs(Some(366 * crate::SECS_PER_DAY)).is_err());
     }
 
     #[test]

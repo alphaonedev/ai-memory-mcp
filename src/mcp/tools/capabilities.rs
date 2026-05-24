@@ -750,7 +750,7 @@ pub fn tool_examples(name: &str) -> Vec<crate::config::ToolExample> {
             "H4 signature replay; returns {verified, attest_level}.",
         )],
         "memory_notify" => vec![ex(
-            json!({"event_type": "deploy.completed", "payload": {"env": "prod"}, "ttl_seconds": 3600}),
+            json!({"event_type": "deploy.completed", "payload": {"env": "prod"}, "ttl_seconds": crate::SECS_PER_HOUR}),
             "Fan-out to active subscribers.",
         )],
         _ => Vec::new(),

@@ -708,11 +708,11 @@ fn section_governance(conn: &rusqlite::Connection) -> ReportSection {
     match db::doctor_oldest_pending_age_secs(conn) {
         Ok(Some(age)) => {
             facts.push(("oldest_pending_age_secs".into(), age.to_string()));
-            if age > 86_400 {
+            if age > crate::SECS_PER_DAY {
                 severity = Severity::Critical;
                 note = Some(format!(
                     "oldest pending action is {age}s old (>{} threshold = 24h)",
-                    86_400
+                    crate::SECS_PER_DAY,
                 ));
             }
         }
@@ -1748,7 +1748,7 @@ mod tests {
             // last_seen_at = now, last_pulled_at = 1 hour ago → 3600s skew.
             let now = chrono::Utc::now();
             let now_s = now.to_rfc3339();
-            let earlier = (now - chrono::Duration::seconds(3600)).to_rfc3339();
+            let earlier = (now - chrono::Duration::seconds(crate::SECS_PER_HOUR)).to_rfc3339();
             conn.execute(
                 "INSERT INTO sync_state (agent_id, peer_id, last_seen_at, last_pulled_at) \
                  VALUES ('me', 'peer-1', ?1, ?2)",

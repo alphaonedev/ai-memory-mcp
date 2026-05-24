@@ -321,7 +321,7 @@ fn recency_score(created_at: &str, now_epoch: i64) -> f64 {
     };
     let then = parsed.timestamp();
     let age_secs = (now_epoch.saturating_sub(then)).max(0);
-    const YEAR_SECS: f64 = 365.25 * 24.0 * 3600.0;
+    const YEAR_SECS: f64 = 365.25 * crate::SECS_PER_DAY as f64;
     let normalised = 1.0 - (age_secs as f64 / YEAR_SECS).min(1.0);
     normalised.clamp(0.0, 1.0)
 }

@@ -12,6 +12,24 @@
 
 // Library interface for ai-memory. Exposes public modules for testing and external use.
 
+// ---------------------------------------------------------------------------
+// v0.7.x (issue #1174 PR3 — pm-v3.1 time-secs sweep) — common time-unit
+// conversions to seconds. Replaces ~50 inline literals (`3600`,
+// `86_400`, `604_800`) across the codebase. The substrate is large
+// enough that magic numeric literals are a debt accelerator; named
+// constants make time-unit math grep-able and refactor-safe.
+//
+// `i64` matches the column type the values feed into (TTL seconds,
+// `chrono::Duration::seconds`, lifecycle thresholds). `u64` callers
+// (`std::time::Duration::from_secs`, prometheus counters) cast at the
+// use site via `SECS_PER_HOUR as u64` etc. — the byte-equal value is
+// preserved either way.
+// ---------------------------------------------------------------------------
+
+pub const SECS_PER_HOUR: i64 = 3_600;
+pub const SECS_PER_DAY: i64 = 86_400;
+pub const SECS_PER_WEEK: i64 = 604_800;
+
 pub mod approvals;
 // v0.7.0 WT-1-B — substrate-level atomisation engine. Decomposes
 // long-form memories into atomic propositions with full provenance

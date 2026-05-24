@@ -278,7 +278,7 @@ mod tests {
         let conn = fresh_conn();
         let resp = handle_offload(
             &conn,
-            &json!({"content": "ttl-payload", "ttl_seconds": 3600}),
+            &json!({"content": "ttl-payload", "ttl_seconds": crate::SECS_PER_HOUR}),
             "ai:alice",
         )
         .expect("ok");
@@ -290,6 +290,6 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(ttl, Some(3600));
+        assert_eq!(ttl, Some(crate::SECS_PER_HOUR));
     }
 }

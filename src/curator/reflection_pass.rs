@@ -1048,8 +1048,9 @@ mod tests {
 
     #[test]
     fn temporal_window_is_7_days() {
-        // 7 * 24 * 3600 = 604_800 seconds.
-        assert_eq!(temporal_window_seconds(), 604_800);
+        // 7 * 24 * 3600 = 604_800 seconds (named as
+        // `crate::SECS_PER_WEEK` post PR #1174 PR3 — pm-v3.1).
+        assert_eq!(temporal_window_seconds(), crate::SECS_PER_WEEK);
     }
 
     #[test]

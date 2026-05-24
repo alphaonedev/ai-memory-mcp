@@ -2130,7 +2130,7 @@ pub const DEFAULT_TRANSCRIPT_TTL_SECS: i64 = 2_592_000;
 /// A transcript whose `archived_at` is older than this is hard-deleted
 /// by the prune phase; the I2 join table is cleaned up via
 /// `ON DELETE CASCADE`.
-pub const DEFAULT_TRANSCRIPT_ARCHIVE_GRACE_SECS: i64 = 604_800;
+pub const DEFAULT_TRANSCRIPT_ARCHIVE_GRACE_SECS: i64 = crate::SECS_PER_WEEK;
 
 /// Maximum transcript TTL / grace clamp: 10 years in seconds. Mirrors
 /// [`MAX_TTL_SECS`] above so the same overflow guard applies to the
@@ -6046,22 +6046,22 @@ mod tests {
     #[test]
     fn resolved_ttl_defaults_match_hardcoded() {
         let resolved = ResolvedTtl::default();
-        assert_eq!(resolved.short_ttl_secs, Some(6 * 3600));
-        assert_eq!(resolved.mid_ttl_secs, Some(7 * 24 * 3600));
+        assert_eq!(resolved.short_ttl_secs, Some(6 * crate::SECS_PER_HOUR));
+        assert_eq!(resolved.mid_ttl_secs, Some(crate::SECS_PER_WEEK));
         assert_eq!(resolved.long_ttl_secs, None);
-        assert_eq!(resolved.short_extend_secs, 3600);
-        assert_eq!(resolved.mid_extend_secs, 86400);
+        assert_eq!(resolved.short_extend_secs, crate::SECS_PER_HOUR);
+        assert_eq!(resolved.mid_extend_secs, crate::SECS_PER_DAY);
     }
 
     #[test]
     fn resolved_ttl_from_partial_config() {
         let cfg = TtlConfig {
-            mid_ttl_secs: Some(90 * 24 * 3600), // ~3 months
+            mid_ttl_secs: Some(90 * crate::SECS_PER_DAY), // ~3 months
             ..Default::default()
         };
         let resolved = ResolvedTtl::from_config(Some(&cfg));
-        assert_eq!(resolved.short_ttl_secs, Some(6 * 3600)); // unchanged
-        assert_eq!(resolved.mid_ttl_secs, Some(90 * 24 * 3600)); // overridden
+        assert_eq!(resolved.short_ttl_secs, Some(6 * crate::SECS_PER_HOUR)); // unchanged
+        assert_eq!(resolved.mid_ttl_secs, Some(90 * crate::SECS_PER_DAY)); // overridden
         assert_eq!(resolved.long_ttl_secs, None); // unchanged
     }
 
@@ -6081,7 +6081,7 @@ mod tests {
     fn resolved_ttl_clamps_overflow() {
         let cfg = TtlConfig {
             mid_ttl_secs: Some(i64::MAX),
-            short_extend_secs: Some(-3600),
+            short_extend_secs: Some(-crate::SECS_PER_HOUR),
             ..Default::default()
         };
         let resolved = ResolvedTtl::from_config(Some(&cfg));
@@ -6109,11 +6109,23 @@ mod tests {
     #[test]
     fn resolved_ttl_tier_methods() {
         let resolved = ResolvedTtl::default();
-        assert_eq!(resolved.ttl_for_tier(&Tier::Short), Some(6 * 3600));
-        assert_eq!(resolved.ttl_for_tier(&Tier::Mid), Some(7 * 24 * 3600));
+        assert_eq!(
+            resolved.ttl_for_tier(&Tier::Short),
+            Some(6 * crate::SECS_PER_HOUR)
+        );
+        assert_eq!(
+            resolved.ttl_for_tier(&Tier::Mid),
+            Some(crate::SECS_PER_WEEK)
+        );
         assert_eq!(resolved.ttl_for_tier(&Tier::Long), None);
-        assert_eq!(resolved.extend_for_tier(&Tier::Short), Some(3600));
-        assert_eq!(resolved.extend_for_tier(&Tier::Mid), Some(86400));
+        assert_eq!(
+            resolved.extend_for_tier(&Tier::Short),
+            Some(crate::SECS_PER_HOUR)
+        );
+        assert_eq!(
+            resolved.extend_for_tier(&Tier::Mid),
+            Some(crate::SECS_PER_DAY)
+        );
         assert_eq!(resolved.extend_for_tier(&Tier::Long), None);
     }
 
@@ -6732,7 +6744,7 @@ legacy_scoring = false
         nss.insert(
             "agent/claude".into(),
             TranscriptNamespaceConfig {
-                default_ttl_secs: Some(3600),
+                default_ttl_secs: Some(crate::SECS_PER_HOUR),
                 auto_extract: None,
                 ..Default::default()
             },

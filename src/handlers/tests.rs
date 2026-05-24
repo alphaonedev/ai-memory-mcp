@@ -11157,7 +11157,7 @@ async fn http_promote_memory_happy_path_clears_expires_at() {
             created_at: now.to_rfc3339(),
             updated_at: now.to_rfc3339(),
             last_accessed_at: None,
-            expires_at: Some((now + Duration::seconds(3600)).to_rfc3339()),
+            expires_at: Some((now + Duration::seconds(crate::SECS_PER_HOUR)).to_rfc3339()),
             metadata: serde_json::json!({}),
             reflection_depth: 0,
             memory_kind: crate::models::MemoryKind::Observation,
