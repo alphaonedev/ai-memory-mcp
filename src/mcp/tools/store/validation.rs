@@ -99,7 +99,16 @@ pub(super) fn parse_and_build_memory(
     let tier_str = params["tier"].as_str().unwrap_or("mid");
     let tier = Tier::from_str(tier_str).ok_or(format!("invalid tier: {tier_str}"))?;
     let namespace = params["namespace"].as_str().unwrap_or("global").to_string();
-    let source = params["source"].as_str().unwrap_or("claude").to_string();
+    // v0.7.x (issue #1175): vendor-neutral substrate default. The
+    // pre-#1175 hardcode of `"claude"` was a heterogeneous-NHI monoculture
+    // defect — `memory_store` from a non-Anthropic NHI silently stamped
+    // `source = "claude"` regardless of which model actually made the call.
+    // Caller-supplied `params["source"]` still wins; the default is now
+    // the role-categorical vendor-neutral value `"nhi"`.
+    let source = params["source"]
+        .as_str()
+        .unwrap_or(validate::DEFAULT_NHI_SOURCE)
+        .to_string();
     // v0.6.3.1 P2 (G6) — explicit `on_conflict` overrides the per-client default.
     let on_conflict = if let Some(s) = params["on_conflict"].as_str() {
         OnConflict::parse(s)?
@@ -271,6 +280,74 @@ mod tests {
         assert_eq!(
             default_on_conflict_for_client(Some("ai:unknown-client@host:pid-1")),
             OnConflict::Merge
+        );
+    }
+
+    /// v0.7.x (issue #1175) — `parse_and_build_memory` MUST default the
+    /// `source` field to the vendor-neutral [`crate::validate::DEFAULT_NHI_SOURCE`]
+    /// when the caller omits it. Pre-#1175 this site hardcoded `"claude"`
+    /// — a heterogeneous-NHI monoculture defect that silently broke
+    /// forensic queries keyed on `source = 'claude'` for every
+    /// non-Anthropic NHI's writes.
+    ///
+    /// Pinned at the unit-test layer (rather than as an integration
+    /// test) because [`crate::mcp::tools::store::handle_store`] is
+    /// `pub(crate)`; the substrate has not historically committed to a
+    /// public-API surface for the store entry point.
+    #[test]
+    fn issue_1175_source_default_is_vendor_neutral_nhi() {
+        use crate::config::ResolvedTtl;
+        use crate::storage as db;
+        use serde_json::json;
+
+        let conn = db::open(std::path::Path::new(":memory:")).expect("open in-memory db");
+        let ttl = ResolvedTtl::default();
+        let params = json!({
+            "title": "issue-1175-store-default",
+            "content": "memory body",
+            "namespace": "issue-1175-store-default",
+            // No source field — should default to DEFAULT_NHI_SOURCE.
+        });
+
+        let (mem, _on_conflict, _agent_id, _explicit_scope) =
+            parse_and_build_memory(&params, None, &ttl, &conn)
+                .expect("parse_and_build_memory must succeed for a minimal valid payload");
+
+        assert_eq!(
+            mem.source,
+            crate::validate::DEFAULT_NHI_SOURCE,
+            "memory_store must default to the vendor-neutral substrate \
+             source value (\"nhi\"); pre-#1175 this site stamped \"claude\""
+        );
+    }
+
+    /// v0.7.x (issue #1175) — caller-supplied `source` MUST still
+    /// override the default. The vendor-neutral default only fires
+    /// when the caller omits the field; pre-#1175 callers that
+    /// explicitly passed `source: "claude"` continue to land that
+    /// value verbatim.
+    #[test]
+    fn issue_1175_caller_source_overrides_vendor_neutral_default() {
+        use crate::config::ResolvedTtl;
+        use crate::storage as db;
+        use serde_json::json;
+
+        let conn = db::open(std::path::Path::new(":memory:")).expect("open in-memory db");
+        let ttl = ResolvedTtl::default();
+        let params = json!({
+            "title": "issue-1175-store-override",
+            "content": "memory body",
+            "namespace": "issue-1175-store-override",
+            "source": "system",
+        });
+
+        let (mem, _on_conflict, _agent_id, _explicit_scope) =
+            parse_and_build_memory(&params, None, &ttl, &conn)
+                .expect("parse_and_build_memory must succeed");
+
+        assert_eq!(
+            mem.source, "system",
+            "caller-supplied source wins over the default"
         );
     }
 }

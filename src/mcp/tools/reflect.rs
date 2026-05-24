@@ -100,7 +100,15 @@ pub fn handle_reflect(
         tags,
         priority,
         confidence,
-        source: "claude".to_string(),
+        // v0.7.x (issue #1175): vendor-neutral substrate default.
+        // The pre-#1175 hardcode of `"claude"` was a heterogeneous-NHI
+        // monoculture defect (forensic queries on `source = 'claude'`
+        // silently missed every reflection minted by a non-Anthropic
+        // NHI). Vendor identification continues to live in
+        // `metadata.agent_id` via the `ai:<client>@<host>:pid-<pid>`
+        // resolution ladder — `source` is now the role-categorical
+        // value `"nhi"` for every AI NHI write regardless of vendor.
+        source: crate::validate::DEFAULT_NHI_SOURCE.to_string(),
         agent_id,
         metadata,
     };
