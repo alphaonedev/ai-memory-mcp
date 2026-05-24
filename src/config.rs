@@ -3189,9 +3189,15 @@ impl ResolvedLlm {
     /// True when the resolved backend uses the Ollama-native wire
     /// shape (`/api/chat`, `/api/embed`, no auth). False for any
     /// OpenAI-compatible vendor.
+    ///
+    /// Compares `self.backend` against the canonical
+    /// [`crate::llm::BACKEND_OLLAMA`] selector (#1174 PR4 substrate
+    /// cleanup) so the literal lives in `llm.rs` alongside the rest
+    /// of the vendor-alias tables instead of being re-named at each
+    /// substrate site.
     #[must_use]
     pub fn is_ollama_native(&self) -> bool {
-        self.backend == "ollama"
+        self.backend == crate::llm::BACKEND_OLLAMA
     }
 
     /// Display string for the boot banner: `<backend>:<model>`.
