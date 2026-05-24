@@ -3898,25 +3898,44 @@ pub struct PermissionsConfig {
 //
 // The gate (`db::enforce_governance`) needs to consult the active mode
 // at decision time but lives in the `db` module, which has no handle on
-// `AppConfig`. We use a `OnceLock` set by `main` (and the daemon
-// runtime) so the gate can read the mode without an API churn through
-// every callsite. When the lock is unset — the case for unit and
-// integration tests that drive `db::enforce_governance` directly
-// without booting the daemon — the gate defaults to
-// [`PermissionsMode::Enforce`] so the strict semantics that the K1
-// ship-gate suite codifies remain the load-bearing default for
-// programmatic callers.
+// `AppConfig`. We hold the active mode in a single `RwLock<Option<…>>`
+// set by `main` (and the daemon runtime) so the gate can read the mode
+// without an API churn through every callsite. When the lock is unset
+// — the case for unit and integration tests that drive
+// `db::enforce_governance` directly without booting the daemon — the
+// gate defaults to [`PermissionsMode::Advisory`] (the v0.7.0 K3
+// secure-but-non-blocking posture). Tests opt into `Enforce` via the
+// `set_active_permissions_mode` setter or the
+// `override_active_permissions_mode_for_test` alias.
+//
+// **#1174 pm-v3.1 PR7 (this commit)**: collapsed the previous
+// dual-source-of-truth (a `OnceLock<PermissionsMode>` for production +
+// an `AtomicU8` test-only override that secretly took precedence over
+// it) into a single `RwLock<Option<PermissionsMode>>`. The previous
+// `OnceLock` shape blocked legitimate runtime reload paths — a SIGHUP
+// handler that wanted to re-resolve `[permissions].mode` from
+// `config.toml` and call `set_active_permissions_mode` again would
+// silently no-op, leaving the gate on the boot-time value while every
+// other resolver caught the new value. The new shape supports
+// last-writer-wins so a future SIGHUP / `ai-memory reload` surface
+// can refresh the mode without restart. The test-override semantics
+// are preserved: tests still hold the
+// [`lock_permissions_mode_for_test`] guard around their mutations and
+// the public setter / overrider signatures are unchanged.
 
-use std::sync::OnceLock;
+static ACTIVE_PERMISSIONS_MODE: std::sync::RwLock<Option<PermissionsMode>> =
+    std::sync::RwLock::new(None);
 
-static ACTIVE_PERMISSIONS_MODE: OnceLock<PermissionsMode> = OnceLock::new();
-
-/// Set the process-wide active [`PermissionsMode`]. Idempotent — the
-/// first caller wins; subsequent calls are no-ops. Called from
-/// `main` (CLI) and the daemon bootstrap path with the value resolved
-/// from `[permissions].mode` in `config.toml`.
+/// Set the process-wide active [`PermissionsMode`]. Called from `main`
+/// (CLI) and the daemon bootstrap path with the value resolved from
+/// `[permissions].mode` in `config.toml`. Last-writer-wins so a future
+/// SIGHUP / `ai-memory reload` surface can refresh the mode without
+/// restart (#1174 PR7); the previous `OnceLock` shape made repeat
+/// callers silently no-op.
 pub fn set_active_permissions_mode(mode: PermissionsMode) {
-    let _ = ACTIVE_PERMISSIONS_MODE.set(mode);
+    if let Ok(mut w) = ACTIVE_PERMISSIONS_MODE.write() {
+        *w = Some(mode);
+    }
 }
 
 /// Read the process-wide active [`PermissionsMode`]. Falls back to
@@ -3930,47 +3949,43 @@ pub fn set_active_permissions_mode(mode: PermissionsMode) {
 /// scenario.
 #[must_use]
 pub fn active_permissions_mode() -> PermissionsMode {
-    let override_tag = OVERRIDE_PERMISSIONS_MODE.load(std::sync::atomic::Ordering::SeqCst);
-    match override_tag {
-        1 => return PermissionsMode::Enforce,
-        2 => return PermissionsMode::Advisory,
-        3 => return PermissionsMode::Off,
-        _ => {}
-    }
     ACTIVE_PERMISSIONS_MODE
-        .get()
-        .copied()
+        .read()
+        .ok()
+        .and_then(|g| *g)
         .unwrap_or(PermissionsMode::Advisory)
 }
 
 /// Test-only override of the active mode. Production code MUST use
 /// [`set_active_permissions_mode`]; this helper exists so the K3 test
 /// matrix can flip mode mid-test without spinning up a fresh process.
+///
+/// **#1174 PR7**: with the dual-source-of-truth collapse the override
+/// is now a thin alias around [`set_active_permissions_mode`]. The
+/// two functions are wire-equivalent at every callsite. The alias is
+/// kept (rather than renaming all test callers in one pass) because
+/// the `_for_test` suffix at every callsite documents the intent —
+/// "this is a test poking the global gate" — better than an
+/// unsuffixed setter would.
 #[doc(hidden)]
 pub fn override_active_permissions_mode_for_test(mode: PermissionsMode) {
-    // SAFETY: OnceLock::set returns Err when already set; we want
-    // last-writer-wins for tests only. Use a static Mutex to serialize
-    // and an inner OnceCell-like reset via take + set is not possible
-    // (OnceLock has no take). Instead, store an atomic indirection.
-    OVERRIDE_PERMISSIONS_MODE.store(
-        match mode {
-            PermissionsMode::Enforce => 1,
-            PermissionsMode::Advisory => 2,
-            PermissionsMode::Off => 3,
-        },
-        std::sync::atomic::Ordering::SeqCst,
-    );
+    set_active_permissions_mode(mode);
 }
 
-/// Test-only override slot. `0` = no override, otherwise encodes the
-/// mode tag. Read by [`active_permissions_mode`] when set.
-static OVERRIDE_PERMISSIONS_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-
-/// Test-only: clear any override so subsequent tests see the
-/// `OnceLock` value (or the default).
+/// Test-only: clear any test-override so subsequent tests start from
+/// the unset state (the [`PermissionsMode::Advisory`] default).
+///
+/// **#1174 PR7**: previously this cleared the `OVERRIDE_PERMISSIONS_MODE`
+/// atomic without touching the production-side `OnceLock`, which let
+/// a test that called the production setter once leak its value into
+/// the next test. With the single-source-of-truth collapse, clearing
+/// resets the lone slot — subsequent reads see `Advisory` until the
+/// next setter call, which is the documented contract.
 #[doc(hidden)]
 pub fn clear_permissions_mode_override_for_test() {
-    OVERRIDE_PERMISSIONS_MODE.store(0, std::sync::atomic::Ordering::SeqCst);
+    if let Ok(mut w) = ACTIVE_PERMISSIONS_MODE.write() {
+        *w = None;
+    }
 }
 
 /// Test-only: acquire the global gate-mode serialization lock.
@@ -4000,9 +4015,47 @@ pub fn lock_permissions_mode_for_test() -> std::sync::MutexGuard<'static, ()> {
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-static DECISIONS_ENFORCE: AtomicU64 = AtomicU64::new(0);
-static DECISIONS_ADVISORY: AtomicU64 = AtomicU64::new(0);
-static DECISIONS_OFF: AtomicU64 = AtomicU64::new(0);
+/// Per-process per-mode decision counters (#1174 pm-v3.1 PR7).
+///
+/// Previously three sibling `static AtomicU64` items
+/// (`DECISIONS_ENFORCE`/`_ADVISORY`/`_OFF`). Folding them into a
+/// single struct keeps the in-memory layout identical (`#[repr(C)]`
+/// is unnecessary — Rust's default field order is fine for the
+/// atomic-counters-as-observability use case) while ensuring that
+/// adding a fourth mode in the future requires a single grep-friendly
+/// edit instead of N parallel static declarations.
+///
+/// `Relaxed` ordering is preserved everywhere the original three
+/// statics used it: the counters are observability, not load-bearing
+/// for correctness, and the inter-mode read consistency that an
+/// `SeqCst` snapshot would buy is not exercised by any current caller
+/// (`ai-memory doctor` + capabilities both render the snapshot as
+/// three independent integers).
+struct DecisionCounters {
+    enforce: AtomicU64,
+    advisory: AtomicU64,
+    off: AtomicU64,
+}
+
+impl DecisionCounters {
+    const fn new() -> Self {
+        Self {
+            enforce: AtomicU64::new(0),
+            advisory: AtomicU64::new(0),
+            off: AtomicU64::new(0),
+        }
+    }
+
+    fn counter_for(&self, mode: PermissionsMode) -> &AtomicU64 {
+        match mode {
+            PermissionsMode::Enforce => &self.enforce,
+            PermissionsMode::Advisory => &self.advisory,
+            PermissionsMode::Off => &self.off,
+        }
+    }
+}
+
+static DECISION_COUNTERS: DecisionCounters = DecisionCounters::new();
 
 /// Snapshot of decision counts per mode since process start. Surfaced
 /// by `ai-memory doctor` and the capabilities `permissions` block so
@@ -4019,21 +4072,18 @@ pub struct PermissionsDecisionCounts {
 /// every consult. `Relaxed` is fine: the counters are observability,
 /// not load-bearing for correctness.
 pub fn record_permissions_decision(mode: PermissionsMode) {
-    let c = match mode {
-        PermissionsMode::Enforce => &DECISIONS_ENFORCE,
-        PermissionsMode::Advisory => &DECISIONS_ADVISORY,
-        PermissionsMode::Off => &DECISIONS_OFF,
-    };
-    c.fetch_add(1, Ordering::Relaxed);
+    DECISION_COUNTERS
+        .counter_for(mode)
+        .fetch_add(1, Ordering::Relaxed);
 }
 
 /// Snapshot the current per-mode decision counts.
 #[must_use]
 pub fn permissions_decision_counts() -> PermissionsDecisionCounts {
     PermissionsDecisionCounts {
-        enforce: DECISIONS_ENFORCE.load(Ordering::Relaxed),
-        advisory: DECISIONS_ADVISORY.load(Ordering::Relaxed),
-        off: DECISIONS_OFF.load(Ordering::Relaxed),
+        enforce: DECISION_COUNTERS.enforce.load(Ordering::Relaxed),
+        advisory: DECISION_COUNTERS.advisory.load(Ordering::Relaxed),
+        off: DECISION_COUNTERS.off.load(Ordering::Relaxed),
     }
 }
 
@@ -4041,9 +4091,9 @@ pub fn permissions_decision_counts() -> PermissionsDecisionCounts {
 /// can assert exact deltas.
 #[doc(hidden)]
 pub fn reset_permissions_decision_counts_for_test() {
-    DECISIONS_ENFORCE.store(0, Ordering::SeqCst);
-    DECISIONS_ADVISORY.store(0, Ordering::SeqCst);
-    DECISIONS_OFF.store(0, Ordering::SeqCst);
+    DECISION_COUNTERS.enforce.store(0, Ordering::SeqCst);
+    DECISION_COUNTERS.advisory.store(0, Ordering::SeqCst);
+    DECISION_COUNTERS.off.store(0, Ordering::SeqCst);
 }
 
 // ---------------------------------------------------------------------------
@@ -7069,13 +7119,29 @@ legacy_scoring = false
     #[test]
     fn reset_permissions_decision_counts_zeros_all_atomics() {
         // Lines 2619-2623: test-only reset helper. Increment then reset.
-        DECISIONS_ENFORCE.fetch_add(5, Ordering::SeqCst);
-        DECISIONS_ADVISORY.fetch_add(3, Ordering::SeqCst);
-        DECISIONS_OFF.fetch_add(1, Ordering::SeqCst);
+        // Post-#1174 PR7: counters live behind the `DECISION_COUNTERS`
+        // struct; we exercise them via the public surface to keep the
+        // test resilient to internal reshape.
+        let _serialise = lock_permissions_mode_for_test();
         reset_permissions_decision_counts_for_test();
-        assert_eq!(DECISIONS_ENFORCE.load(Ordering::SeqCst), 0);
-        assert_eq!(DECISIONS_ADVISORY.load(Ordering::SeqCst), 0);
-        assert_eq!(DECISIONS_OFF.load(Ordering::SeqCst), 0);
+        record_permissions_decision(PermissionsMode::Enforce);
+        record_permissions_decision(PermissionsMode::Enforce);
+        record_permissions_decision(PermissionsMode::Enforce);
+        record_permissions_decision(PermissionsMode::Enforce);
+        record_permissions_decision(PermissionsMode::Enforce);
+        record_permissions_decision(PermissionsMode::Advisory);
+        record_permissions_decision(PermissionsMode::Advisory);
+        record_permissions_decision(PermissionsMode::Advisory);
+        record_permissions_decision(PermissionsMode::Off);
+        let pre = permissions_decision_counts();
+        assert_eq!(pre.enforce, 5);
+        assert_eq!(pre.advisory, 3);
+        assert_eq!(pre.off, 1);
+        reset_permissions_decision_counts_for_test();
+        let post = permissions_decision_counts();
+        assert_eq!(post.enforce, 0);
+        assert_eq!(post.advisory, 0);
+        assert_eq!(post.off, 0);
     }
 
     #[test]
