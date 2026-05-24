@@ -424,7 +424,7 @@ async fn http_create_memory_uses_appstate_and_persists() {
             axum::http::Request::builder()
                 .uri("/api/v1/memories")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .header("x-agent-id", "alice")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
@@ -488,7 +488,7 @@ async fn http_create_memory_succeeds_when_llm_is_absent_l5() {
             axum::http::Request::builder()
                 .uri("/api/v1/memories")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .header("x-agent-id", "alice")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
@@ -622,7 +622,7 @@ async fn http_update_memory_uses_appstate() {
             axum::http::Request::builder()
                 .uri(format!("/api/v1/memories/{id}"))
                 .method("PUT")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&patch).unwrap()))
                 .unwrap(),
         )
@@ -671,7 +671,7 @@ async fn http_sync_push_applies_and_advances_clock() {
             axum::http::Request::builder()
                 .uri("/api/v1/sync/push")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .header("x-agent-id", "local-receiver")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
@@ -764,7 +764,7 @@ async fn http_sync_push_applies_archives() {
             axum::http::Request::builder()
                 .uri("/api/v1/sync/push")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -841,7 +841,7 @@ async fn http_archive_by_ids_happy_path() {
             axum::http::Request::builder()
                 .uri("/api/v1/archive")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -914,7 +914,7 @@ async fn http_archive_by_ids_default_reason() {
             axum::http::Request::builder()
                 .uri("/api/v1/archive")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -961,7 +961,7 @@ async fn http_bulk_create_uses_appstate_and_persists() {
             axum::http::Request::builder()
                 .uri("/api/v1/memories/bulk")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&bodies).unwrap()))
                 .unwrap(),
         )
@@ -1106,7 +1106,7 @@ async fn http_bulk_create_fans_out_with_federation() {
             axum::http::Request::builder()
                 .uri("/api/v1/memories/bulk")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&bodies).unwrap()))
                 .unwrap(),
         )
@@ -1181,7 +1181,7 @@ async fn http_sync_push_rejects_oversized_batch_redteam_242() {
             axum::http::Request::builder()
                 .uri("/api/v1/sync/push")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -1226,7 +1226,7 @@ async fn http_sync_push_dry_run_applies_nothing() {
             axum::http::Request::builder()
                 .uri("/api/v1/sync/push")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -1413,7 +1413,7 @@ async fn http_sync_push_applies_deletions() {
             axum::http::Request::builder()
                 .uri("/api/v1/sync/push")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .header("x-agent-id", "local-receiver")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
@@ -1529,7 +1529,7 @@ async fn http_sync_push_applies_incoming_links() {
             axum::http::Request::builder()
                 .uri("/api/v1/sync/push")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .header("x-agent-id", "local-receiver")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
@@ -1654,7 +1654,7 @@ async fn http_sync_push_refuses_reflection_cycle_from_peer() {
             axum::http::Request::builder()
                 .uri("/api/v1/sync/push")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .header("x-agent-id", "local-receiver")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
@@ -1786,7 +1786,7 @@ async fn http_sync_push_governance_bypass_on_peer_attested() {
             axum::http::Request::builder()
                 .uri("/api/v1/sync/push")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .header("x-agent-id", "local-receiver")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
@@ -2147,7 +2147,7 @@ async fn create_memory_rejects_invalid_json() {
             axum::http::Request::builder()
                 .uri("/api/v1/memories")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(b"not valid json".to_vec()))
                 .unwrap(),
         )
@@ -2185,7 +2185,7 @@ async fn create_memory_rejects_missing_required_fields() {
             axum::http::Request::builder()
                 .uri("/api/v1/memories")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -2233,7 +2233,7 @@ async fn create_memory_rejects_empty_title() {
             axum::http::Request::builder()
                 .uri("/api/v1/memories")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -2272,7 +2272,7 @@ async fn create_memory_rejects_oversized_content() {
             axum::http::Request::builder()
                 .uri("/api/v1/memories")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -2300,7 +2300,7 @@ async fn create_memory_rejects_invalid_tier() {
             axum::http::Request::builder()
                 .uri("/api/v1/memories")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(body_str.as_bytes().to_vec()))
                 .unwrap(),
         )
@@ -2337,7 +2337,7 @@ async fn create_memory_rejects_invalid_priority() {
             axum::http::Request::builder()
                 .uri("/api/v1/memories")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -2369,7 +2369,7 @@ async fn create_memory_rejects_invalid_confidence() {
             axum::http::Request::builder()
                 .uri("/api/v1/memories")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -2401,7 +2401,7 @@ async fn create_memory_rejects_invalid_source() {
             axum::http::Request::builder()
                 .uri("/api/v1/memories")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -2428,7 +2428,7 @@ async fn update_memory_rejects_invalid_id() {
             axum::http::Request::builder()
                 .uri("/api/v1/memories/@@@@@@@@@@@@") // invalid characters
                 .method("PUT")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -2486,7 +2486,7 @@ async fn update_memory_rejects_oversized_content() {
             axum::http::Request::builder()
                 .uri(format!("/api/v1/memories/{id}"))
                 .method("PUT")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -2542,7 +2542,7 @@ async fn update_memory_rejects_invalid_confidence() {
             axum::http::Request::builder()
                 .uri(format!("/api/v1/memories/{id}"))
                 .method("PUT")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -2571,7 +2571,7 @@ async fn link_rejects_self_link() {
             axum::http::Request::builder()
                 .uri("/api/v1/links")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -2629,7 +2629,7 @@ async fn link_rejects_unknown_relation() {
             axum::http::Request::builder()
                 .uri("/api/v1/links")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -2676,7 +2676,7 @@ async fn link_rejects_malformed_relation() {
                 axum::http::Request::builder()
                     .uri("/api/v1/links")
                     .method("POST")
-                    .header("content-type", "application/json")
+                    .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                     .body(Body::from(serde_json::to_vec(&body).unwrap()))
                     .unwrap(),
             )
@@ -2716,7 +2716,7 @@ async fn recall_post_rejects_empty_context() {
             axum::http::Request::builder()
                 .uri("/api/v1/memories/recall")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -2746,7 +2746,7 @@ async fn recall_post_zero_budget_tokens_returns_empty() {
             axum::http::Request::builder()
                 .uri("/api/v1/memories/recall")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -2804,7 +2804,7 @@ async fn register_agent_rejects_invalid_agent_id() {
             axum::http::Request::builder()
                 .uri("/api/v1/agents")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -2830,7 +2830,7 @@ async fn register_agent_rejects_invalid_agent_type() {
             axum::http::Request::builder()
                 .uri("/api/v1/agents")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -2862,7 +2862,7 @@ async fn subscribe_rejects_private_ip() {
             axum::http::Request::builder()
                 .uri("/api/v1/subscriptions")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .header("x-agent-id", "alice")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
@@ -2901,7 +2901,7 @@ async fn subscribe_rejects_file_url() {
             axum::http::Request::builder()
                 .uri("/api/v1/subscriptions")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .header("x-agent-id", "alice")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
@@ -2929,7 +2929,7 @@ async fn subscribe_accepts_localhost_loopback() {
             axum::http::Request::builder()
                 .uri("/api/v1/subscriptions")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .header("x-agent-id", "alice")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
@@ -2959,7 +2959,7 @@ async fn notify_rejects_missing_payload() {
             axum::http::Request::builder()
                 .uri("/api/v1/notify")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .header("x-agent-id", "alice")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
@@ -3463,7 +3463,7 @@ async fn http_archive_by_ids_rejects_oversized_batch() {
             axum::http::Request::builder()
                 .uri("/api/v1/archive")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -3490,7 +3490,7 @@ async fn http_archive_by_ids_rejects_invalid_id_in_batch() {
             axum::http::Request::builder()
                 .uri("/api/v1/archive")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -3520,7 +3520,7 @@ async fn http_archive_by_ids_all_missing() {
             axum::http::Request::builder()
                 .uri("/api/v1/archive")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -3564,7 +3564,7 @@ async fn http_bulk_create_oversized_batch_rejected() {
             axum::http::Request::builder()
                 .uri("/api/v1/memories/bulk")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&bodies).unwrap()))
                 .unwrap(),
         )
@@ -3611,7 +3611,7 @@ async fn http_bulk_create_partial_success_collects_errors() {
             axum::http::Request::builder()
                 .uri("/api/v1/memories/bulk")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&bodies).unwrap()))
                 .unwrap(),
         )
@@ -3656,7 +3656,7 @@ async fn http_bulk_create_empty_body_succeeds_with_zero_created() {
             axum::http::Request::builder()
                 .uri("/api/v1/memories/bulk")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&bodies).unwrap()))
                 .unwrap(),
         )
@@ -4021,7 +4021,7 @@ async fn http_recall_post_rejects_blank_context() {
             axum::http::Request::builder()
                 .uri("/api/v1/memories/recall")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -4045,7 +4045,7 @@ async fn http_recall_post_keyword_mode_returns_mode_field() {
             axum::http::Request::builder()
                 .uri("/api/v1/memories/recall")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -4192,7 +4192,7 @@ async fn http_session_start_rejects_invalid_agent_id() {
             axum::http::Request::builder()
                 .uri("/api/v1/session/start")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -4213,7 +4213,7 @@ async fn http_session_start_stamps_session_id() {
             axum::http::Request::builder()
                 .uri("/api/v1/session/start")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -4365,7 +4365,7 @@ async fn http_check_duplicate_rejects_invalid_title() {
             axum::http::Request::builder()
                 .uri("/api/v1/check_duplicate")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -4387,7 +4387,7 @@ async fn http_check_duplicate_rejects_invalid_content() {
             axum::http::Request::builder()
                 .uri("/api/v1/check_duplicate")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -4413,7 +4413,7 @@ async fn http_check_duplicate_rejects_invalid_namespace() {
             axum::http::Request::builder()
                 .uri("/api/v1/check_duplicate")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -4435,7 +4435,7 @@ async fn http_check_duplicate_503_when_no_embedder() {
             axum::http::Request::builder()
                 .uri("/api/v1/check_duplicate")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -4465,7 +4465,7 @@ async fn http_entity_register_creates_then_idempotent_returns_200() {
             axum::http::Request::builder()
                 .uri("/api/v1/entities")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .header("x-agent-id", "alice")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
@@ -4480,7 +4480,7 @@ async fn http_entity_register_creates_then_idempotent_returns_200() {
             axum::http::Request::builder()
                 .uri("/api/v1/entities")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -4504,7 +4504,7 @@ async fn http_entity_register_rejects_invalid_canonical_name() {
             axum::http::Request::builder()
                 .uri("/api/v1/entities")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -4528,7 +4528,7 @@ async fn http_entity_register_rejects_invalid_namespace() {
             axum::http::Request::builder()
                 .uri("/api/v1/entities")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -4552,7 +4552,7 @@ async fn http_entity_register_rejects_invalid_agent_id_header() {
             axum::http::Request::builder()
                 .uri("/api/v1/entities")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .header("x-agent-id", "BAD AGENT!")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
@@ -4612,7 +4612,7 @@ async fn http_entity_register_collision_with_non_entity_returns_409() {
             axum::http::Request::builder()
                 .uri("/api/v1/entities")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -4868,7 +4868,7 @@ async fn http_kg_invalidate_rejects_invalid_link() {
             axum::http::Request::builder()
                 .uri("/api/v1/kg/invalidate")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -4894,7 +4894,7 @@ async fn http_kg_invalidate_rejects_invalid_valid_until() {
             axum::http::Request::builder()
                 .uri("/api/v1/kg/invalidate")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -4921,7 +4921,7 @@ async fn http_kg_invalidate_404_when_link_missing() {
             axum::http::Request::builder()
                 .uri("/api/v1/kg/invalidate")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -4983,7 +4983,7 @@ async fn http_kg_invalidate_marks_link_as_invalidated() {
             axum::http::Request::builder()
                 .uri("/api/v1/kg/invalidate")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -5012,7 +5012,7 @@ async fn http_kg_query_rejects_invalid_source_id() {
             axum::http::Request::builder()
                 .uri("/api/v1/kg/query")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -5036,7 +5036,7 @@ async fn http_kg_query_rejects_invalid_valid_at() {
             axum::http::Request::builder()
                 .uri("/api/v1/kg/query")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -5060,7 +5060,7 @@ async fn http_kg_query_rejects_invalid_allowed_agent() {
             axum::http::Request::builder()
                 .uri("/api/v1/kg/query")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -5086,7 +5086,7 @@ async fn http_kg_query_returns_422_for_oversized_max_depth() {
             axum::http::Request::builder()
                 .uri("/api/v1/kg/query")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -5112,7 +5112,7 @@ async fn http_kg_query_returns_422_for_zero_max_depth() {
             axum::http::Request::builder()
                 .uri("/api/v1/kg/query")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -5170,7 +5170,7 @@ async fn http_kg_query_returns_empty_for_unlinked_source() {
             axum::http::Request::builder()
                 .uri("/api/v1/kg/query")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -5201,7 +5201,7 @@ async fn http_kg_query_short_circuits_empty_allowed_agents() {
             axum::http::Request::builder()
                 .uri("/api/v1/kg/query")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -5234,7 +5234,7 @@ async fn http_delete_link_rejects_self_link() {
             axum::http::Request::builder()
                 .uri("/api/v1/links")
                 .method("DELETE")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -5259,7 +5259,7 @@ async fn http_delete_link_returns_deleted_false_when_missing() {
             axum::http::Request::builder()
                 .uri("/api/v1/links")
                 .method("DELETE")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -5428,7 +5428,7 @@ async fn http_forget_memories_with_namespace_filter_returns_count() {
             axum::http::Request::builder()
                 .uri("/api/v1/forget")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -5572,7 +5572,7 @@ async fn http_import_memories_oversized_batch_rejected() {
             axum::http::Request::builder()
                 .uri("/api/v1/import")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -5633,7 +5633,7 @@ async fn http_import_memories_skips_invalid_rows() {
             axum::http::Request::builder()
                 .uri("/api/v1/import")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .header("x-agent-id", "ops:admin")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
@@ -5688,7 +5688,7 @@ async fn http_sync_push_namespace_meta_clears_garbage_skipped() {
             axum::http::Request::builder()
                 .uri("/api/v1/sync/push")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -5716,7 +5716,7 @@ async fn http_sync_push_pending_decision_invalid_id_skipped() {
             axum::http::Request::builder()
                 .uri("/api/v1/sync/push")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -5745,7 +5745,7 @@ async fn http_sync_push_namespace_meta_invalid_skipped() {
             axum::http::Request::builder()
                 .uri("/api/v1/sync/push")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -5775,7 +5775,7 @@ async fn http_sync_push_dry_run_namespace_meta_no_apply() {
             axum::http::Request::builder()
                 .uri("/api/v1/sync/push")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -5964,7 +5964,7 @@ async fn http_archive_by_ids_single_id_success() {
             axum::http::Request::builder()
                 .uri("/api/v1/archive")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -5996,7 +5996,7 @@ async fn http_archive_by_ids_bulk_success() {
             axum::http::Request::builder()
                 .uri("/api/v1/archive")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -6025,7 +6025,7 @@ async fn http_archive_by_ids_empty_array_returns_ok_zero_count() {
             axum::http::Request::builder()
                 .uri("/api/v1/archive")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -6055,7 +6055,7 @@ async fn http_archive_by_ids_missing_ids_field_returns_400() {
             axum::http::Request::builder()
                 .uri("/api/v1/archive")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -6076,7 +6076,7 @@ async fn http_archive_by_ids_malformed_json_returns_400() {
             axum::http::Request::builder()
                 .uri("/api/v1/archive")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from("not-valid-json{{"))
                 .unwrap(),
         )
@@ -6505,7 +6505,7 @@ async fn http_forget_memories_no_filter_returns_400() {
             axum::http::Request::builder()
                 .uri("/api/v1/forget")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -6566,7 +6566,7 @@ async fn http_forget_memories_pattern_only_deletes_matches() {
             axum::http::Request::builder()
                 .uri("/api/v1/forget")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -6629,7 +6629,7 @@ async fn http_forget_memories_by_tier_only_targets_tier() {
             axum::http::Request::builder()
                 .uri("/api/v1/forget")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -6702,7 +6702,7 @@ async fn http_forget_memories_combined_filters_intersect() {
             axum::http::Request::builder()
                 .uri("/api/v1/forget")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -6729,7 +6729,7 @@ async fn http_forget_memories_malformed_json_returns_400() {
             axum::http::Request::builder()
                 .uri("/api/v1/forget")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from("{not-json"))
                 .unwrap(),
         )
@@ -6756,7 +6756,7 @@ async fn http_forget_memories_no_match_returns_zero_deleted() {
             axum::http::Request::builder()
                 .uri("/api/v1/forget")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -6820,7 +6820,7 @@ async fn h8b_subscribe_https_url_returns_created() {
             axum::http::Request::builder()
                 .uri("/api/v1/subscriptions")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .header("x-agent-id", "alice")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
@@ -6854,7 +6854,7 @@ async fn h8b_subscribe_missing_url_and_namespace_rejected() {
             axum::http::Request::builder()
                 .uri("/api/v1/subscriptions")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .header("x-agent-id", "alice")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
@@ -6888,7 +6888,7 @@ async fn h8b_subscribe_invalid_url_rejected() {
             axum::http::Request::builder()
                 .uri("/api/v1/subscriptions")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .header("x-agent-id", "alice")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
@@ -6919,7 +6919,7 @@ async fn h8b_subscribe_rejects_link_local_metadata_ip() {
             axum::http::Request::builder()
                 .uri("/api/v1/subscriptions")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .header("x-agent-id", "alice")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
@@ -6960,7 +6960,7 @@ async fn h8b_subscribe_namespace_shape_synthesizes_url() {
             axum::http::Request::builder()
                 .uri("/api/v1/subscriptions")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .header("x-agent-id", "alice")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
@@ -7004,7 +7004,7 @@ async fn h8b_subscribe_event_filter_round_trips() {
             axum::http::Request::builder()
                 .uri("/api/v1/subscriptions")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .header("x-agent-id", "alice")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
@@ -7041,7 +7041,7 @@ async fn h8b_subscribe_persists_hmac_secret() {
             axum::http::Request::builder()
                 .uri("/api/v1/subscriptions")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .header("x-agent-id", "alice")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
@@ -7383,7 +7383,7 @@ async fn h8b_notify_happy_path_creates_message() {
             axum::http::Request::builder()
                 .uri("/api/v1/notify")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .header("x-agent-id", "alice")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
@@ -7438,7 +7438,7 @@ async fn h8b_notify_missing_target_agent_id_rejected() {
             axum::http::Request::builder()
                 .uri("/api/v1/notify")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .header("x-agent-id", "alice")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
@@ -7473,7 +7473,7 @@ async fn h8b_notify_invalid_target_agent_id_rejected() {
             axum::http::Request::builder()
                 .uri("/api/v1/notify")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .header("x-agent-id", "alice")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
@@ -7504,7 +7504,7 @@ async fn h8b_notify_oversized_payload_rejected() {
             axum::http::Request::builder()
                 .uri("/api/v1/notify")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .header("x-agent-id", "alice")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
@@ -7549,7 +7549,7 @@ async fn h8b_notify_accepts_content_alias_for_payload() {
             axum::http::Request::builder()
                 .uri("/api/v1/notify")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .header("x-agent-id", "alice")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
@@ -7610,7 +7610,7 @@ async fn h8b_get_inbox_returns_pending_after_notify() {
             axum::http::Request::builder()
                 .uri("/api/v1/notify")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .header("x-agent-id", "alice")
                 .body(Body::from(serde_json::to_vec(&notify_body).unwrap()))
                 .unwrap(),
@@ -7852,7 +7852,7 @@ async fn h8b_session_start_with_valid_agent_id_echoes() {
             axum::http::Request::builder()
                 .uri("/api/v1/session/start")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -7917,7 +7917,7 @@ async fn h8b_session_start_namespace_filter() {
             axum::http::Request::builder()
                 .uri("/api/v1/session/start")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -7948,7 +7948,7 @@ async fn h8b_session_start_returns_session_id_without_agent() {
             axum::http::Request::builder()
                 .uri("/api/v1/session/start")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -8015,7 +8015,7 @@ async fn h8b_session_start_preloads_recent_context() {
             axum::http::Request::builder()
                 .uri("/api/v1/session/start")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -8172,7 +8172,7 @@ async fn http_register_agent_happy_path_returns_created() {
             axum::http::Request::builder()
                 .uri("/api/v1/agents")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -8210,7 +8210,7 @@ async fn http_register_agent_missing_agent_type_400() {
             axum::http::Request::builder()
                 .uri("/api/v1/agents")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -8240,7 +8240,7 @@ async fn http_register_agent_invalid_agent_id_with_space_400() {
             axum::http::Request::builder()
                 .uri("/api/v1/agents")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -8269,7 +8269,7 @@ async fn http_register_agent_duplicate_register_idempotent_preserves_registered_
             axum::http::Request::builder()
                 .uri("/api/v1/agents")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -8281,7 +8281,7 @@ async fn http_register_agent_duplicate_register_idempotent_preserves_registered_
             axum::http::Request::builder()
                 .uri("/api/v1/agents")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -8317,7 +8317,7 @@ async fn http_register_agent_capabilities_array_preserved() {
             axum::http::Request::builder()
                 .uri("/api/v1/agents")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -9053,7 +9053,7 @@ async fn http_consolidate_two_into_one_happy_path() {
             axum::http::Request::builder()
                 .uri("/api/v1/consolidate")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .header("x-agent-id", "consolidator")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
@@ -9095,7 +9095,7 @@ async fn http_consolidate_single_id_400() {
             axum::http::Request::builder()
                 .uri("/api/v1/consolidate")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -9122,7 +9122,7 @@ async fn http_consolidate_invalid_namespace_400() {
             axum::http::Request::builder()
                 .uri("/api/v1/consolidate")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -9151,7 +9151,7 @@ async fn http_consolidate_invalid_agent_id_400() {
             axum::http::Request::builder()
                 .uri("/api/v1/consolidate")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .header("x-agent-id", "bad agent id")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
@@ -9180,7 +9180,7 @@ async fn http_consolidate_max_id_count_cap_exceeded_400() {
             axum::http::Request::builder()
                 .uri("/api/v1/consolidate")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -9211,7 +9211,7 @@ async fn http_consolidate_missing_source_500() {
             axum::http::Request::builder()
                 .uri("/api/v1/consolidate")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -9688,7 +9688,7 @@ async fn http_get_namespace_standard_qs_returns_standard_for_existing_ns() {
             axum::http::Request::builder()
                 .uri("/api/v1/namespaces/qs-existing/standard")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&json!({})).unwrap()))
                 .unwrap(),
         )
@@ -9859,7 +9859,7 @@ async fn http_set_namespace_standard_qs_happy_path_creates_placeholder() {
             axum::http::Request::builder()
                 .uri("/api/v1/namespaces")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -9889,7 +9889,7 @@ async fn http_set_namespace_standard_qs_missing_namespace_returns_400() {
             axum::http::Request::builder()
                 .uri("/api/v1/namespaces")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -9963,7 +9963,7 @@ async fn http_set_namespace_standard_qs_invalid_governance_returns_400() {
             axum::http::Request::builder()
                 .uri("/api/v1/namespaces")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -9987,7 +9987,7 @@ async fn http_set_namespace_standard_qs_nested_standard_payload_works() {
             axum::http::Request::builder()
                 .uri("/api/v1/namespaces")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -10016,7 +10016,7 @@ async fn http_clear_namespace_standard_qs_happy_path_after_set() {
             axum::http::Request::builder()
                 .uri("/api/v1/namespaces")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(
                     serde_json::to_vec(&json!({"namespace": "qs-clear-happy"})).unwrap(),
                 ))
@@ -10123,7 +10123,7 @@ async fn http_set_qs_fanout_503_when_all_peers_down() {
             axum::http::Request::builder()
                 .uri("/api/v1/namespaces")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(
                     serde_json::to_vec(&json!({"namespace": "qs-fed-down"})).unwrap(),
                 ))
@@ -10151,7 +10151,7 @@ async fn http_set_qs_fanout_503_payload_shape_includes_quorum_fields() {
             axum::http::Request::builder()
                 .uri("/api/v1/namespaces")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(
                     serde_json::to_vec(&json!({"namespace": "qs-503-shape"})).unwrap(),
                 ))
@@ -10187,7 +10187,7 @@ async fn http_set_qs_fanout_503_includes_retry_after_header() {
             axum::http::Request::builder()
                 .uri("/api/v1/namespaces")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(
                     serde_json::to_vec(&json!({"namespace": "qs-503-retry-after"})).unwrap(),
                 ))
@@ -10221,7 +10221,7 @@ async fn http_set_qs_fanout_quorum_met_with_one_peer_down() {
             axum::http::Request::builder()
                 .uri("/api/v1/namespaces")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(
                     serde_json::to_vec(&json!({"namespace": "qs-quorum-met"})).unwrap(),
                 ))
@@ -10247,7 +10247,7 @@ async fn http_set_qs_fanout_quorum_not_met_strict_n_equals_w() {
             axum::http::Request::builder()
                 .uri("/api/v1/namespaces")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(
                     serde_json::to_vec(&json!({"namespace": "qs-strict-quorum"})).unwrap(),
                 ))
@@ -10280,7 +10280,7 @@ async fn http_set_qs_fanout_quorum_w_equals_one_any_success_writes_succeed() {
             axum::http::Request::builder()
                 .uri("/api/v1/namespaces")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(
                     serde_json::to_vec(&json!({"namespace": "qs-w1-any"})).unwrap(),
                 ))
@@ -10307,7 +10307,7 @@ async fn http_set_qs_fanout_503_when_peer_hangs_past_deadline() {
             axum::http::Request::builder()
                 .uri("/api/v1/namespaces")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(
                     serde_json::to_vec(&json!({"namespace": "qs-hang"})).unwrap(),
                 ))
@@ -10344,7 +10344,7 @@ async fn http_set_qs_fanout_503_when_peer_returns_503() {
             axum::http::Request::builder()
                 .uri("/api/v1/namespaces")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(
                     serde_json::to_vec(&json!({"namespace": "qs-peer-503"})).unwrap(),
                 ))
@@ -10376,7 +10376,7 @@ async fn http_set_qs_fanout_503_when_peer_returns_4xx() {
             axum::http::Request::builder()
                 .uri("/api/v1/namespaces")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(
                     serde_json::to_vec(&json!({"namespace": "qs-peer-400"})).unwrap(),
                 ))
@@ -10404,7 +10404,7 @@ async fn http_set_qs_fanout_503_partition_minority_fails() {
             axum::http::Request::builder()
                 .uri("/api/v1/namespaces")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(
                     serde_json::to_vec(&json!({"namespace": "qs-minority"})).unwrap(),
                 ))
@@ -10439,7 +10439,7 @@ async fn http_set_qs_fanout_majority_tolerates_minority_partition() {
             axum::http::Request::builder()
                 .uri("/api/v1/namespaces")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(
                     serde_json::to_vec(&json!({"namespace": "qs-majority"})).unwrap(),
                 ))
@@ -10468,7 +10468,7 @@ async fn http_clear_qs_fanout_503_when_peer_down() {
             axum::http::Request::builder()
                 .uri("/api/v1/namespaces")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(
                     serde_json::to_vec(&json!({"namespace": "qs-clear-fed"})).unwrap(),
                 ))
@@ -10523,7 +10523,7 @@ async fn http_set_qs_fanout_no_federation_returns_201_without_peers() {
             axum::http::Request::builder()
                 .uri("/api/v1/namespaces")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(
                     serde_json::to_vec(&json!({"namespace": "qs-no-fed"})).unwrap(),
                 ))
@@ -10552,7 +10552,7 @@ async fn http_set_qs_fanout_peer_called_at_least_once_on_quorum_failure() {
             axum::http::Request::builder()
                 .uri("/api/v1/namespaces")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(
                     serde_json::to_vec(&json!({"namespace": "qs-fanout-attempt"})).unwrap(),
                 ))
@@ -10592,7 +10592,7 @@ async fn http_set_qs_fanout_peer_receives_post_on_happy_path() {
             axum::http::Request::builder()
                 .uri("/api/v1/namespaces")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(
                     serde_json::to_vec(&json!({"namespace": "qs-fanout-happy"})).unwrap(),
                 ))
@@ -11209,7 +11209,7 @@ async fn http_update_memory_unknown_id_returns_404() {
             axum::http::Request::builder()
                 .uri(format!("/api/v1/memories/{id}"))
                 .method("PUT")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -11231,7 +11231,7 @@ async fn http_update_memory_happy_path_returns_updated_payload() {
             axum::http::Request::builder()
                 .uri(format!("/api/v1/memories/{id}"))
                 .method("PUT")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -11264,7 +11264,7 @@ async fn http_create_link_happy_path_returns_201() {
             axum::http::Request::builder()
                 .uri("/api/v1/links")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -11313,7 +11313,7 @@ async fn http_create_link_refuses_cycle() {
             axum::http::Request::builder()
                 .uri("/api/v1/links")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -11371,7 +11371,7 @@ async fn http_create_link_respects_governance() {
             axum::http::Request::builder()
                 .uri("/api/v1/links")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -11409,7 +11409,7 @@ async fn http_create_link_invalid_link_returns_400() {
             axum::http::Request::builder()
                 .uri("/api/v1/links")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -11489,7 +11489,7 @@ async fn http_delete_link_after_create_returns_deleted_true() {
             axum::http::Request::builder()
                 .uri("/api/v1/links")
                 .method("DELETE")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -11594,7 +11594,7 @@ async fn http_import_memories_inserts_valid_rows() {
             axum::http::Request::builder()
                 .uri("/api/v1/import")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .header("x-agent-id", "ops:admin")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
@@ -11642,7 +11642,7 @@ async fn http_recall_post_invalid_as_agent_returns_400() {
             axum::http::Request::builder()
                 .uri("/api/v1/recall")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -11666,7 +11666,7 @@ async fn http_recall_post_zero_budget_tokens_returns_200() {
             axum::http::Request::builder()
                 .uri("/api/v1/recall")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -11710,7 +11710,7 @@ async fn http_forget_memories_with_nothing_to_match_returns_zero() {
             axum::http::Request::builder()
                 .uri("/api/v1/forget")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -11910,7 +11910,7 @@ async fn http_session_start_with_namespace_returns_session_id() {
             axum::http::Request::builder()
                 .uri("/api/v1/session/start")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -11943,7 +11943,7 @@ async fn http_notify_missing_payload_and_content_returns_400() {
                 .uri("/api/v1/notify")
                 .method("POST")
                 .header("x-agent-id", "ai:alice")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -11975,7 +11975,7 @@ async fn http_notify_with_payload_field_returns_201() {
                 .uri("/api/v1/notify")
                 .method("POST")
                 .header("x-agent-id", "ai:alice")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -12000,7 +12000,7 @@ async fn http_subscribe_missing_url_and_namespace_returns_400() {
             axum::http::Request::builder()
                 .uri("/api/v1/subscribe")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .header("x-agent-id", "ai:alice")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
@@ -12025,7 +12025,7 @@ async fn http_subscribe_with_namespace_synthesizes_loopback_url_and_returns_201(
             axum::http::Request::builder()
                 .uri("/api/v1/subscribe")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .header("x-agent-id", "ai:alice")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
@@ -12078,7 +12078,7 @@ async fn http_unsubscribe_by_agent_namespace_after_subscribe_returns_removed() {
             axum::http::Request::builder()
                 .uri("/api/v1/subscribe")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .header("x-agent-id", "ai:alice")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
@@ -12128,7 +12128,7 @@ async fn http_list_subscriptions_returns_subscription_rows() {
             axum::http::Request::builder()
                 .uri("/api/v1/subscribe")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .header("x-agent-id", "ai:carol")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
@@ -12181,7 +12181,7 @@ async fn http_kg_query_after_create_link_returns_node() {
             axum::http::Request::builder()
                 .uri("/api/v1/kg/query")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -12220,7 +12220,7 @@ async fn http_kg_invalidate_round_trip_marks_link() {
             axum::http::Request::builder()
                 .uri("/api/v1/kg/invalidate")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -12279,7 +12279,7 @@ async fn http_archive_by_ids_with_explicit_reason_records_it() {
             axum::http::Request::builder()
                 .uri("/api/v1/archive")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -12316,7 +12316,7 @@ async fn http_sync_push_oversize_deletions_returns_400() {
             axum::http::Request::builder()
                 .uri("/api/v1/sync/push")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -12352,7 +12352,7 @@ async fn http_sync_push_oversize_archives_returns_400() {
             axum::http::Request::builder()
                 .uri("/api/v1/sync/push")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -12382,7 +12382,7 @@ async fn http_sync_push_oversize_restores_returns_400() {
             axum::http::Request::builder()
                 .uri("/api/v1/sync/push")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -12412,7 +12412,7 @@ async fn http_sync_push_oversize_namespace_meta_clears_returns_400() {
             axum::http::Request::builder()
                 .uri("/api/v1/sync/push")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -12447,7 +12447,7 @@ async fn http_sync_push_invalid_sender_agent_id_returns_400() {
             axum::http::Request::builder()
                 .uri("/api/v1/sync/push")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -12476,7 +12476,7 @@ async fn http_sync_push_invalid_x_agent_id_header_returns_400() {
             axum::http::Request::builder()
                 .uri("/api/v1/sync/push")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .header("x-agent-id", "bad agent id")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
@@ -12515,7 +12515,7 @@ async fn http_sync_push_pending_invalid_id_skipped() {
             axum::http::Request::builder()
                 .uri("/api/v1/sync/push")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -12552,7 +12552,7 @@ async fn http_sync_push_links_invalid_id_skipped() {
             axum::http::Request::builder()
                 .uri("/api/v1/sync/push")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -12591,7 +12591,7 @@ async fn http_sync_push_dry_run_links_no_apply() {
             axum::http::Request::builder()
                 .uri("/api/v1/sync/push")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -12627,7 +12627,7 @@ async fn http_consolidate_invalid_title_returns_400() {
             axum::http::Request::builder()
                 .uri("/api/v1/consolidate")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .header("x-agent-id", "ai:tester")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
@@ -12651,7 +12651,7 @@ async fn http_bulk_create_zero_body_returns_zero_created() {
             axum::http::Request::builder()
                 .uri("/api/v1/memories/bulk")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -12683,7 +12683,7 @@ async fn http_entity_register_with_x_agent_id_header_succeeds() {
             axum::http::Request::builder()
                 .uri("/api/v1/entities")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .header("x-agent-id", "ai:tester")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
@@ -12812,7 +12812,7 @@ async fn http_create_memory_invalid_x_agent_id_header_returns_400() {
             axum::http::Request::builder()
                 .uri("/api/v1/memories")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .header("x-agent-id", "bad agent id")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
@@ -12867,7 +12867,7 @@ async fn l11_create_memory_rejects_metadata_agent_id_mismatch_post_907() {
             axum::http::Request::builder()
                 .uri("/api/v1/memories")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .header("x-agent-id", "ai:bob@plan-c")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
@@ -12908,7 +12908,7 @@ async fn http_create_memory_invalid_scope_returns_400() {
             axum::http::Request::builder()
                 .uri("/api/v1/memories")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -12953,7 +12953,7 @@ async fn http_check_duplicate_blank_namespace_treated_as_none() {
             axum::http::Request::builder()
                 .uri("/api/v1/check_duplicate")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -12979,7 +12979,7 @@ async fn http_archive_by_ids_with_no_reason_defaults_to_archive() {
             axum::http::Request::builder()
                 .uri("/api/v1/archive")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -13096,7 +13096,7 @@ async fn http_create_memory_governance_pending_returns_202() {
             axum::http::Request::builder()
                 .uri("/api/v1/memories")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .header("x-agent-id", "ai:caller")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
@@ -13143,7 +13143,7 @@ async fn http_create_memory_governance_deny_returns_403() {
             axum::http::Request::builder()
                 .uri("/api/v1/memories")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .header("x-agent-id", "ai:unregistered")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
@@ -13302,7 +13302,7 @@ async fn http_create_memory_with_top_level_scope_succeeds() {
             axum::http::Request::builder()
                 .uri("/api/v1/memories")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -13337,7 +13337,7 @@ async fn http_create_memory_clamps_extreme_priority_to_range() {
             axum::http::Request::builder()
                 .uri("/api/v1/memories")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -13379,7 +13379,7 @@ async fn http_update_memory_with_oversized_title_returns_400() {
             axum::http::Request::builder()
                 .uri(format!("/api/v1/memories/{id}"))
                 .method("PUT")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -13452,7 +13452,7 @@ async fn http_entity_register_aliases_with_blanks_filtered() {
             axum::http::Request::builder()
                 .uri("/api/v1/entities")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -13482,7 +13482,7 @@ async fn http_subscribe_with_explicit_url_succeeds() {
             axum::http::Request::builder()
                 .uri("/api/v1/subscribe")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .header("x-agent-id", "ai:webhook-user")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
@@ -13619,7 +13619,7 @@ async fn http_auto_tag_route_returns_503_when_no_llm_l6() {
             axum::http::Request::builder()
                 .uri("/api/v1/auto_tag")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -13643,7 +13643,7 @@ async fn http_expand_query_route_returns_503_when_no_llm_l6() {
             axum::http::Request::builder()
                 .uri("/api/v1/expand_query")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -13719,7 +13719,7 @@ async fn http_consolidate_accepts_use_llm_without_summary_l7() {
             axum::http::Request::builder()
                 .uri("/api/v1/consolidate")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .header("x-agent-id", "ai:alice")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
@@ -13845,7 +13845,7 @@ async fn http_consolidate_response_carries_summary_on_every_key_s51_reads() {
             axum::http::Request::builder()
                 .uri("/api/v1/consolidate")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .header("x-agent-id", "ai:alice")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
@@ -13983,7 +13983,7 @@ async fn http_load_family_returns_200_on_known_family_l10() {
             axum::http::Request::builder()
                 .uri("/api/v1/memory_load_family")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -14011,7 +14011,7 @@ async fn http_load_family_rejects_unknown_family_l10() {
             axum::http::Request::builder()
                 .uri("/api/v1/memory_load_family")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -14075,7 +14075,7 @@ async fn h5_verify_link_strict_mode_rejects_missing_nonce_with_400() {
             axum::http::Request::builder()
                 .uri("/api/v1/links/verify")
                 .method("POST")
-                .header("content-type", "application/json")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
