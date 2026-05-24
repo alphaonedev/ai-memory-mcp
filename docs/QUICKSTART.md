@@ -91,31 +91,49 @@ Args: mcp --tier semantic
 **Smart / autonomous tier with a cloud LLM** (any of xAI Grok, OpenAI,
 Anthropic, Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together,
 Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, llama.cpp server) —
-add an `env` block to the MCP server entry. Example for xAI Grok:
+the recommended path is the `[llm]` section in
+`~/.config/ai-memory/config.toml` ([#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146)).
+Example for xAI Grok:
+
+```toml
+# ~/.config/ai-memory/config.toml
+schema_version = 2
+
+[llm]
+backend     = "xai"
+model       = "grok-4.3"
+base_url    = "https://api.x.ai/v1"
+api_key_env = "XAI_API_KEY"            # process-env-var name (NOT the literal key)
+```
+
+Export `XAI_API_KEY` in your shell rc (`.zshrc` / `.bashrc`) so the
+AI client's parent process inherits it. The MCP config stays minimal:
 
 ```json
 {
   "mcpServers": {
     "ai-memory": {
       "command": "ai-memory",
-      "args": ["mcp", "--tier", "autonomous"],
-      "env": {
-        "AI_MEMORY_LLM_BACKEND": "xai",
-        "AI_MEMORY_LLM_API_KEY": "xai-...",
-        "AI_MEMORY_LLM_MODEL": "grok-4.3"
-      }
+      "args": ["mcp", "--tier", "autonomous"]
     }
   }
 }
 ```
 
-> **MCP clients do not inherit your shell.** Setting `export
-> AI_MEMORY_LLM_BACKEND=xai` in `.zshrc` works for the standalone CLI
-> but **not** for MCP usage — Claude Code / Cursor / Codex spawn the
-> MCP server as a fresh subprocess. Put the LLM env vars inside the
-> MCP config's `env:` block. Full per-backend recipes:
-> [`integrations/llm-backends.md`](integrations/llm-backends.md)
-> (issue [#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144)).
+Verify: `ai-memory boot --quiet --limit 1` should report
+`llm=xai:grok-4.3`. Full canonical schema:
+[`CONFIG_SCHEMA.md`](CONFIG_SCHEMA.md).
+
+> **Override path — `env:` block.** Adding an `env:` block to the MCP
+> config (with `AI_MEMORY_LLM_BACKEND` / `_API_KEY` / `_MODEL`) still
+> works and takes precedence over `config.toml`. Useful for CI /
+> per-session tweaks. Background: [#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144)
+> (the env-block paper-cut, retired by #1146 above). Full per-backend
+> recipes: [`integrations/llm-backends.md`](integrations/llm-backends.md).
+>
+> **Inline API keys in `config.toml` are rejected at parse time** — use
+> `api_key_env` (process-env reference) or `api_key_file` (file path;
+> mode 0400 enforced).
 
 Restart the IDE. You'll now see 23 `memory_*` tools in the tool list.
 Ask the assistant "remember that my preferred deploy target is

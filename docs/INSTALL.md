@@ -133,6 +133,49 @@
 
    **`smart` / `autonomous` tier with a cloud LLM backend** (xAI Grok shown; same shape for OpenAI / Anthropic / Gemini / DeepSeek / Kimi / Qwen / Mistral / Groq / Together / Cerebras / OpenRouter / Fireworks / LMStudio / vLLM / llama.cpp server):
 
+   ### Recommended path — `[llm]` section in `~/.config/ai-memory/config.toml` ([#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146))
+
+   Write the backend, model, and an env-var name pointing at your API key into the canonical config file. Every surface — MCP server, HTTP daemon, `ai-memory atomise`, `ai-memory curator`, the boot banner, and the `ai-memory doctor` reachability probe — reads the same file, so the boot banner and the live MCP server agree on the backend.
+
+   ```toml
+   # ~/.config/ai-memory/config.toml
+   schema_version = 2
+
+   tier = "autonomous"
+   db   = "~/.claude/ai-memory.db"
+
+   [llm]
+   backend     = "xai"                    # ollama | openai | xai | anthropic | gemini |
+                                          # deepseek | kimi | qwen | mistral | groq |
+                                          # together | cerebras | openrouter |
+                                          # fireworks | lmstudio | openai-compatible
+   model       = "grok-4.3"               # vendor-specific identifier
+   base_url    = "https://api.x.ai/v1"   # optional; vendor-default if unset
+   api_key_env = "XAI_API_KEY"            # process-env-var name (NOT the literal key)
+   # api_key_file = "/etc/ai-memory/keys/xai.key"   # mode 0400 enforced; alt to api_key_env
+   ```
+
+   Then keep the MCP config minimal — no `env:` block needed:
+
+   ```json
+   {
+     "mcpServers": {
+       "memory": {
+         "command": "ai-memory",
+         "args": ["--db", "~/.claude/ai-memory.db", "mcp", "--tier", "autonomous"]
+       }
+     }
+   }
+   ```
+
+   Export `XAI_API_KEY` in your shell rc (`.zshrc` / `.bashrc` / `.profile`) so the parent process inherits it; the MCP-spawned subprocess inherits from the AI client which inherits from your login shell. **Inline keys in `config.toml` are rejected at parse time** — use `api_key_env` (process-env reference) or `api_key_file` (file path; mode 0400 enforced).
+
+   Full canonical schema reference: [`CONFIG_SCHEMA.md`](CONFIG_SCHEMA.md).
+
+   ### Override path — `env:` block in the MCP config
+
+   Pre-#1146 operators wired LLM config via the `env:` block of the AI client's MCP config. This still works and takes precedence over `config.toml`, but it's the override layer now — useful for CI / per-session tweaks, not the primary path.
+
    ```json
    {
      "mcpServers": {
@@ -149,7 +192,7 @@
    }
    ```
 
-   > **Important — MCP clients do NOT inherit your interactive shell.** Setting `export AI_MEMORY_LLM_BACKEND=xai` in `.zshrc` / `.bashrc` is sufficient for the standalone `ai-memory` CLI and the HTTP daemon, but is **NOT** sufficient for Claude Code / Cursor / Codex / Cline / Continue / Zed / Windsurf / etc. — they spawn the MCP server as a fresh subprocess with only the `env:` keys from the MCP config. For MCP usage, replicate the LLM env vars inside the `env` block as shown above. This was the operator paper-cut behind [#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144). Full per-backend recipes (every supported provider with copy-pasteable snippets): [`integrations/llm-backends.md`](integrations/llm-backends.md).
+   > **Important — MCP clients do NOT inherit your interactive shell.** Setting `export AI_MEMORY_LLM_BACKEND=xai` in `.zshrc` / `.bashrc` is sufficient for the standalone `ai-memory` CLI and the HTTP daemon, but is **NOT** sufficient for Claude Code / Cursor / Codex / Cline / Continue / Zed / Windsurf / etc. — they spawn the MCP server as a fresh subprocess with only the `env:` keys from the MCP config. The recommended path above (a `[llm]` section in `config.toml` with `api_key_env`) avoids this paper-cut by letting every surface read the same file. Background: [#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144) (env-block paper-cut) and [#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146) (single source of truth). Full per-backend recipes (every supported provider with copy-pasteable snippets): [`integrations/llm-backends.md`](integrations/llm-backends.md).
 
    > **Note:** `~/.claude.json` likely already exists with other settings. Merge the `mcpServers` key into the existing JSON — do not overwrite the file. See [Claude Code MCP Scopes](#claude-code-mcp-configuration-scopes) below for project-level and team-shared alternatives.
 
@@ -830,18 +873,47 @@ ai-memory completions fish > ~/.config/fish/completions/ai-memory.fish
 
 ## LLM Backend Setup (Smart & Autonomous Tiers)
 
-Smart and autonomous tiers require an LLM backend. **Post-[#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067) (v0.7.0)** the backend is provider-agnostic — pick from:
+Smart and autonomous tiers require an LLM backend. **Post-[#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067) + [#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146) (v0.7.0)** the backend is provider-agnostic — pick from:
 
 - **Local LLM:** [Ollama](https://ollama.com), [LMStudio](https://lmstudio.ai), [vLLM](https://docs.vllm.ai), or llama.cpp server (any OpenAI-compatible local endpoint).
 - **Cloud LLM:** xAI Grok, OpenAI, Anthropic (via OpenAI shim), Google Gemini, DeepSeek, Kimi (Moonshot), Qwen (Alibaba), Mistral, Groq, Together AI, Cerebras, OpenRouter, Fireworks.
 
-Selection is by `AI_MEMORY_LLM_BACKEND` env var. See [`ADMIN_GUIDE.md` § "LLM Backend Setup"](ADMIN_GUIDE.md#llm-backend-setup-smart--autonomous-tiers) for the full env-var matrix, vendor aliases, and per-vendor API-key fallback chain.
-
 The `keyword` and `semantic` tiers do **not** require any LLM backend.
+
+### Recommended path — `[llm]` section in `config.toml`
+
+Single source of truth — every surface (MCP, HTTP daemon, CLI, boot banner, doctor probe) reads the same file. Example for xAI Grok 4.3:
+
+```toml
+# ~/.config/ai-memory/config.toml
+schema_version = 2
+
+[llm]
+backend     = "xai"
+model       = "grok-4.3"
+base_url    = "https://api.x.ai/v1"
+api_key_env = "XAI_API_KEY"                       # process-env-var name
+# api_key_file = "/etc/ai-memory/keys/xai.key"    # alt — mode 0400 enforced
+```
+
+Export `XAI_API_KEY` in the parent shell (`.zshrc` / `.bashrc` / `.profile`) so the daemon and MCP-spawned subprocess inherit it. **Inline keys in `config.toml` are rejected at parse time.**
+
+Verify end-to-end:
+
+```bash
+ai-memory boot --quiet --limit 1   # banner should report llm=xai:grok-4.3
+ai-memory doctor                    # LLM Reachability (#1146) — DNS + TLS + auth round-trip
+```
+
+Canonical schema reference: [`CONFIG_SCHEMA.md`](CONFIG_SCHEMA.md). Full operator runbook (per-vendor recipes, precedence ladder, secret-handling discipline): [`ADMIN_GUIDE.md` § "LLM Backend Setup"](ADMIN_GUIDE.md#llm-backend-setup-smart--autonomous-tiers).
+
+### Override path — env vars
+
+`AI_MEMORY_LLM_BACKEND` / `_MODEL` / `_BASE_URL` / `_API_KEY` env vars take precedence over `[llm]` in `config.toml`. Useful for CI / per-session tweaks, and the only path that doesn't require editing a file. Per-vendor recipes: [`integrations/llm-backends.md`](integrations/llm-backends.md).
 
 ### Ollama (local LLM — v0.6.4 default, still supported)
 
-Below is the canonical local-Ollama install path. For other backends, set the env vars per ADMIN_GUIDE.md instead.
+Below is the canonical local-Ollama install path. For other backends, write the `[llm]` section per the recipe above (or set env vars as the override path).
 
 ### macOS
 

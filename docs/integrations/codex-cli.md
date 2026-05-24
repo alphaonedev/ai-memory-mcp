@@ -7,7 +7,7 @@ mechanism. The integration is at the application boundary: prepend
 `ai-memory boot` output to the system message before each new
 conversation.
 
-> **Codex DOES launch ai-memory as an MCP server when configured in `~/.codex/config.toml` (`mcp_servers.memory`).** If you're using that path AND running `--tier smart` or `--tier autonomous` with a non-default LLM backend, see [`llm-backends.md` § Codex CLI TOML shape](llm-backends.md#codex-cli-toml-shape) for the TOML env-block recipe. Shell exports do NOT reach the MCP-spawned subprocess ([#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144)).
+> **Codex DOES launch ai-memory as an MCP server when configured in `~/.codex/config.toml` (`mcp_servers.memory`).** If you're using that path AND running `--tier smart` or `--tier autonomous` with a non-default LLM backend, the **recommended** path post-[#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146) is a `[llm]` section in `~/.config/ai-memory/config.toml` (single source of truth — no `mcp_servers.memory.env` block needed; export the API-key env var named by `api_key_env` in your shell rc). The **override** path is a TOML env-block in `mcp_servers.memory.env`; see [`llm-backends.md` § Codex CLI TOML shape](llm-backends.md#codex-cli-toml-shape) for the recipe. Shell exports do NOT reach the MCP-spawned subprocess ([#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144) → [#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146)). Full schema: [`../CONFIG_SCHEMA.md`](../CONFIG_SCHEMA.md).
 
 ## Use `ai-memory wrap` (recommended — pure Rust, cross-platform)
 
