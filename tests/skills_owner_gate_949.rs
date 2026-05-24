@@ -110,6 +110,7 @@ fn build_router_with_admin(db_path: &std::path::Path, admin_ids: Vec<String>) ->
         deferred_audit_queue: Arc::new(None),
         admin_agent_ids: Arc::new(admin_ids),
         rule_cache: std::sync::Arc::new(ai_memory::governance::rule_cache::RuleCache::new()),
+        resolved_models: std::sync::Arc::new(ai_memory::config::ResolvedModels::default()),
     };
     let api_key_state = ApiKeyState {
         key: None,

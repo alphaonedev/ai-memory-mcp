@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] — v0.7.x doc follow-ups + Wave-2 refactor (post-tag)
 
+### fix(config, #1168) — `memory_capabilities.models.*` drift from the v0.7.x #1146 unified resolver (2026-05-24)
+
+Closes [#1168](https://github.com/alphaonedev/ai-memory-mcp/issues/1168). Pre-fix `handle_capabilities_with_conn` and `handle_capabilities_with_conn_v3` reported `models.embedding`, `models.llm`, and `models.cross_encoder` from the compiled [`TierConfig`] preset rather than from `AppConfig::resolve_llm` / `resolve_embeddings` / `resolve_reranker`. Every other LLM-init surface — boot banner (`src/cli/boot.rs:401`), MCP/HTTP daemon LLM client (`src/daemon_runtime.rs:1775`), curator LLM (`src/cli/curator.rs:98`), `ai-memory doctor` reachability probe — was migrated to the unified resolver in #1146; the capabilities surface was missed.
+
+**Symptom.** With `[llm] backend = "xai", model = "grok-4.3"` in `~/.config/ai-memory/config.toml`, the boot banner correctly reported `llm: xai:grok-4.3` and the daemon talked to xAI Grok, but `memory_capabilities` returned `"models": { "llm": "gemma4:e4b" }` (the compiled autonomous-tier preset). NHI agents and operator dashboards consulting the capabilities wire got a stale answer that disagreed with the actual LLM client wiring. Runtime correctness was unaffected; the defect was strictly observability.
+
+**Fix.**
+- **NEW** `pub struct ResolvedModels { llm, embeddings, reranker }` in `src/config.rs` bundling the three resolver outputs into a single triple consumed by the capabilities surface.
+- **NEW** `AppConfig::resolve_models()` wraps the three existing resolvers (`resolve_llm`/`resolve_embeddings`/`resolve_reranker`) so production wrappers thread one struct.
+- **NEW** `ResolvedModels::from_tier_preset(&TierConfig)` back-compat constructor synthesises a resolver triple from the compiled tier preset for tests + the legacy `TierConfig::capabilities()` shim — byte-equal output to the pre-#1168 wire shape on every tier.
+- **NEW** `TierConfig::capabilities_with_resolved(&self, &ResolvedModels)` is the production entry point. Display logic mirrors the boot banner (`src/cli/boot.rs:420-424`): Ollama backend → bare model id; other backends → `backend:model`; embedder/reranker still honour the tier-preset disable flag.
+- **CHANGED** `build_capabilities_overlay`, `handle_capabilities_with_conn`, `handle_capabilities_with_conn_v3` (`src/mcp/tools/capabilities.rs`) gain a required `&ResolvedModels` parameter — no `Option<>`, no silent fall-through. A fn-pointer signature assertion in the new regression test file pins this so a future refactor that drops the parameter fails to compile.
+- **CHANGED** `ToolDispatchCtx::resolved_models` (`src/mcp/mod.rs:911`) + `handle_request` slot 2 + the `dispatch_memory_capabilities` forward.
+- **CHANGED** `AppState::resolved_models: Arc<ResolvedModels>` (`src/handlers/transport.rs:294`) + `get_capabilities` forward (`src/handlers/system.rs:72,87`).
+- **CHANGED** `run_mcp_server` builds the triple once outside the stdio loop (`src/mcp/mod.rs:2438`); `bootstrap_serve` builds it once into `AppState` (`src/daemon_runtime.rs:3232`).
+
+**Live MCP probe verification.** Against the live operator config (`[llm] backend = "xai", model = "grok-4.3"`), `printf JSONRPC | ai-memory mcp --profile full | jq '.models'` returns `{"llm": "xai:grok-4.3", "embedding": "nomic-embed-text-v1.5", "embedding_dim": 384, "cross_encoder": "ms-marco-MiniLM-L-6-v2"}` — matches the boot banner + the actual LLM client wiring.
+
+**Test coverage.** 13 new regression tests in `tests/issue_1168_capabilities_resolver_drift.rs` pin: (1) resolver wins for the xAI/grok-4.3 defect on V2 + V3, (2) Ollama bare-model display, (3) `[embeddings]` operator override surfaces, (4-5) reranker enable/disable + model override, (6) keyword-tier embedder-disable wins over stale config, (7) `from_tier_preset` byte-equal to legacy `tier.capabilities()` across all four tier kinds, (8) V2/V3 envelope parity, (9) fn-pointer signature assertion blocks regressions, (10) no-LLM tiers report `models.llm == "none"`, (11) `ResolvedModels::default()` baseline, (12) `build_capability_models` display rules unit-tested across all four LLM-backend shapes (none/Ollama/xAI/OpenAI). All 4685 existing capabilities tests pass unchanged via the back-compat shim.
+
+**Known follow-up.** [#1169](https://github.com/alphaonedev/ai-memory-mcp/issues/1169) tracks `models.embedding_dim` — still sourced from the tier preset (`EmbeddingModel::dim`), drifts silently when an operator picks an embedder model not in the `EmbeddingModel` enum. Out of scope for #1168 (the resolver-drift core defect is fully closed); will land as a separate v0.7.x follow-up.
+
+**Cargo gates.** `cargo fmt --check` ✓ · `cargo clippy --lib --tests -- -D warnings -D clippy::all -D clippy::pedantic` ✓ · `AI_MEMORY_NO_CONFIG=1 cargo test` ✓ (4737/4738 — single unrelated DNS-flake in `subscriptions::tests::test_validate_url_dns_fails_closed_on_dns_failure_1053` passes in isolation and is documented as environment-dependent) · `cargo audit` ✓ (no vulnerabilities, 529 deps scanned).
+
 ### Added
 
 - feat(quotas, #1156): per-namespace K8 quota dimension extension (schema v50). Extends `agent_quotas` PRIMARY KEY from `(agent_id)` to `(agent_id, namespace)` so per-namespace quota allotments hold even when a single agent operates across many namespaces. Pre-v50 rows backfill to the `_global` sentinel namespace, preserving pre-v50 row accounting verbatim. NSA CSI MCP recommendation (c) — defense-in-depth blast-radius controls. Both adapters now at `CURRENT_SCHEMA_VERSION = 50` (`src/storage/migrations.rs` sqlite ladder + `src/store/postgres.rs::migrate_v50()` postgres mirror with `ALTER TABLE ... ADD COLUMN namespace TEXT NOT NULL DEFAULT '_global'` + PK swap + index). New migration file `migrations/sqlite/0042_v50_per_namespace_quota.sql`; 14 integration tests in `tests/per_namespace_quota.rs`.

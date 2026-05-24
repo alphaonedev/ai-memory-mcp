@@ -151,6 +151,7 @@ fn recall_mode_capabilities_consistent() {
     // true; the LLM is None (i.e. "down"). Result must be Hybrid.
     let caps_up = ai_memory::mcp::handle_capabilities_with_conn(
         &smart_tier,
+        &ai_memory::config::ResolvedModels::from_tier_preset(&smart_tier),
         /*reranker*/ None,
         /*embedder_loaded*/ true,
         /*conn*/ None,
@@ -170,6 +171,7 @@ fn recall_mode_capabilities_consistent() {
     // Embedder down → Degraded, never silently Hybrid.
     let caps_down = ai_memory::mcp::handle_capabilities_with_conn(
         &smart_tier,
+        &ai_memory::config::ResolvedModels::from_tier_preset(&smart_tier),
         None,
         /*embedder_loaded*/ false,
         None,
@@ -190,6 +192,7 @@ fn recall_mode_capabilities_consistent() {
     assert!(keyword_tier.embedding_model.is_none());
     let caps_keyword = ai_memory::mcp::handle_capabilities_with_conn(
         &keyword_tier,
+        &ai_memory::config::ResolvedModels::from_tier_preset(&keyword_tier),
         None,
         /*embedder_loaded*/ false,
         None,

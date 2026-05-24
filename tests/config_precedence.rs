@@ -43,7 +43,7 @@
 
 use std::path::PathBuf;
 
-use ai_memory::config::{AppConfig, FeatureTier, TierConfig};
+use ai_memory::config::{AppConfig, FeatureTier, ResolvedModels, TierConfig};
 use ai_memory::daemon_runtime::Cli;
 use ai_memory::mcp::{CapabilitiesAccept, handle_capabilities_with_conn};
 use clap::Parser;
@@ -159,9 +159,15 @@ fn test_secret_not_in_capabilities() {
     // capabilities document still serializes the runtime tier + features
     // + models surface, which is the exact surface a regression would
     // accidentally leak env state through.
-    let response =
-        handle_capabilities_with_conn(&tier_config, None, false, None, CapabilitiesAccept::V2)
-            .expect("v2 capabilities serialize");
+    let response = handle_capabilities_with_conn(
+        &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
+        None,
+        false,
+        None,
+        CapabilitiesAccept::V2,
+    )
+    .expect("v2 capabilities serialize");
 
     let response_str =
         serde_json::to_string(&response).expect("capabilities response JSON-serializes");

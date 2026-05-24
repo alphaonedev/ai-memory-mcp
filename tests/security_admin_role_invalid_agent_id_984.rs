@@ -90,6 +90,7 @@ mod common_admin {
             // are due to the agent_id resolution, not a missing admin.
             admin_agent_ids: Arc::new(vec!["ai:operator".to_string()]),
             rule_cache: std::sync::Arc::new(ai_memory::governance::rule_cache::RuleCache::new()),
+            resolved_models: std::sync::Arc::new(ai_memory::config::ResolvedModels::default()),
         };
         let api_key_state = ai_memory::handlers::ApiKeyState {
             key: None,

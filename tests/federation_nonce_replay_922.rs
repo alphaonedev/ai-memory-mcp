@@ -128,6 +128,7 @@ fn setup() -> TwoHosts {
         deferred_audit_queue: Arc::new(None),
         admin_agent_ids: Arc::new(Vec::new()),
         rule_cache: std::sync::Arc::new(ai_memory::governance::rule_cache::RuleCache::new()),
+        resolved_models: std::sync::Arc::new(ai_memory::config::ResolvedModels::default()),
     };
     let router = ai_memory::build_router(api_key_state, app_state);
 
