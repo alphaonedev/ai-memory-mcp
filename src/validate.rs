@@ -22,8 +22,35 @@ const MAX_AGENT_ID_LEN: usize = 128;
 const MAX_METADATA_SIZE: usize = 65_536;
 const MAX_METADATA_DEPTH: usize = 32;
 
-const VALID_SOURCES: &[&str] = &[
+/// Canonical role-categorical source values accepted by the substrate.
+///
+/// **v0.7.x (issue #1175) — heterogeneous-NHI design:** the substrate is
+/// LLM-vendor-agnostic by design. The role-categorical values describe
+/// **who in the system minted the row** (user / api caller / hook /
+/// cli / etc.), NOT which LLM-vendor backed the AI NHI behind the call.
+/// Vendor identity belongs in `metadata.agent_id` (via the
+/// `host:`/`ai:<client>@<host>:pid-<pid>` resolution ladder), where it
+/// composes with the agent-action substrate without leaking vendor
+/// names into the closed role-categorical enum.
+///
+/// **`"nhi"` (v0.7.x):** the canonical vendor-neutral source value for
+/// reflections / memories minted by an AI Non-Human Identity. Replaces
+/// the pre-#1175 default of `"claude"` (which singled out one vendor
+/// against the substrate's heterogeneous-NHI principle established by
+/// #1067). New substrate writes stamp `"nhi"`; pre-existing rows with
+/// `source = "claude"` continue to be accepted by the validator for
+/// back-compat (see entry below).
+///
+/// **`"claude"` (deprecated, back-compat only):** retained in this
+/// allowlist so legacy rows + tests written before #1175 continue to
+/// validate. Removal scheduled for v0.8.x once operators have had a
+/// migration window. New writes that hardcode this value should be
+/// caught by the per-issue lint added in #1174 PR #10.
+pub(crate) const VALID_SOURCES: &[&str] = &[
     "user",
+    // v0.7.x (#1175) — vendor-neutral substrate default for AI NHI writes.
+    "nhi",
+    // v0.7.x (#1175) — deprecated, back-compat only; remove in v0.8.x.
     "claude",
     "hook",
     "api",
@@ -38,6 +65,24 @@ const VALID_SOURCES: &[&str] = &[
     // never reaches the target's inbox on peer nodes.
     "notify",
 ];
+
+/// v0.7.x (issue #1175) — the canonical vendor-neutral substrate
+/// default for `source` on AI-NHI-minted rows. Use this constant at
+/// every substrate write site that previously hardcoded `"claude"`.
+///
+/// **Why:** the substrate is heterogeneous-NHI by design (per #1067 +
+/// the v0.7.0 reflection-boundary-is-LLM-agnostic property). Stamping
+/// a single vendor's name on every reflection — regardless of which
+/// AI NHI made the call — is a monoculture defect: forensic queries
+/// keyed on `source = 'claude'` silently miss every row minted by an
+/// OpenAI / xAI / Anthropic / Gemini / DeepSeek / Groq / etc. NHI.
+///
+/// **Migration:** pre-existing rows with `source = "claude"` are
+/// untouched. New substrate writes stamp `DEFAULT_NHI_SOURCE`. Tests
+/// that pass `source = "claude"` continue to validate (the validator
+/// accepts both for back-compat). Removal of the `"claude"` allowlist
+/// arm is scheduled for v0.8.x.
+pub const DEFAULT_NHI_SOURCE: &str = "nhi";
 // Canonical relation taxonomy. The validator (`validate_relation`) accepts
 // these names via the fast-path branch and also accepts any caller-supplied
 // `[a-z0-9_]+` identifier via the lenient branch (post-cb92998). Adding a
