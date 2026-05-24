@@ -37,6 +37,14 @@ use ai_memory::models::ConfidenceSource;
 use ai_memory::models::{GovernanceLevel, GovernancePolicy, GovernedAction, Memory, Tier};
 use chrono::Utc;
 
+/// Vendor-neutral fixture source for this test file's `ReflectInput`
+/// builders, per PR #1175 (`validate::DEFAULT_NHI_SOURCE = "nhi"`)
+/// + PR #1174 PR9 (vendor-deflake test fixtures). Pre-deflake the
+/// literal `"claude"` was used here, which silently coupled this test
+/// to a single vendor identity and weakened the heterogeneous-NHI
+/// invariant pinned by `tests/issue_809_*` + `tests/capabilities_v3_*`.
+const FIXTURE_SOURCE: &str = "nhi";
+
 // ─────────────────────────────────────────────────────────────────────
 // Fixture helpers
 // ─────────────────────────────────────────────────────────────────────
@@ -84,7 +92,7 @@ fn reflect_input(source_ids: Vec<String>, namespace: Option<&str>, title: &str) 
         tags: vec!["l1-8".to_string()],
         priority: 5,
         confidence: 1.0,
-        source: "claude".to_string(),
+        source: FIXTURE_SOURCE.to_string(),
         agent_id: "test-agent-l1-8".to_string(),
         metadata: serde_json::json!({}),
     }
