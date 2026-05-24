@@ -2313,6 +2313,7 @@ fn resolve_configured_embedding_dim(
         .or_else(|| preset.map(|m| u32::try_from(m.dim()).unwrap_or(384)))
 }
 
+#[cfg(feature = "sal")]
 async fn build_store_handle(
     store_url: Option<&str>,
     db_path: &Path,
