@@ -384,8 +384,8 @@ impl Tier {
 
     pub fn default_ttl_secs(&self) -> Option<i64> {
         match self {
-            Self::Short => Some(6 * 3600),
-            Self::Mid => Some(7 * 24 * 3600),
+            Self::Short => Some(6 * crate::SECS_PER_HOUR),
+            Self::Mid => Some(crate::SECS_PER_WEEK),
             Self::Long => None,
         }
     }
@@ -1342,12 +1342,15 @@ mod tests {
 
     #[test]
     fn tier_default_ttl_secs_short_is_six_hours() {
-        assert_eq!(Tier::Short.default_ttl_secs(), Some(6 * 3600));
+        assert_eq!(
+            Tier::Short.default_ttl_secs(),
+            Some(6 * crate::SECS_PER_HOUR)
+        );
     }
 
     #[test]
     fn tier_default_ttl_secs_mid_is_seven_days() {
-        assert_eq!(Tier::Mid.default_ttl_secs(), Some(7 * 24 * 3600));
+        assert_eq!(Tier::Mid.default_ttl_secs(), Some(crate::SECS_PER_WEEK));
     }
 
     #[test]

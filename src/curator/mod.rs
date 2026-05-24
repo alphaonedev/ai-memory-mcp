@@ -65,7 +65,7 @@ use candidates::{
 use persist::{persist_auto_tags, persist_contradiction};
 
 /// Default curator sweep interval (1 hour).
-pub const DEFAULT_INTERVAL_SECS: u64 = 3600;
+pub const DEFAULT_INTERVAL_SECS: u64 = crate::SECS_PER_HOUR as u64;
 
 /// Default per-cycle operation cap (stops runaway LLM calls).
 pub const DEFAULT_MAX_OPS_PER_CYCLE: usize = 100;
@@ -519,7 +519,7 @@ pub fn run_daemon(
     // from `DAEMON_KEYPAIR_LABEL` on disk, auto-generating when absent.
     active_keypair: Option<Arc<crate::identity::keypair::AgentKeypair>>,
 ) {
-    let interval = cfg.interval_secs.clamp(60, 86400);
+    let interval = cfg.interval_secs.clamp(60, crate::SECS_PER_DAY as u64);
     tracing::info!(
         "curator daemon started (interval={}s, max_ops={}, dry_run={}, auto_persona={})",
         interval,
@@ -2055,7 +2055,7 @@ fn priority_feedback_caps_at_priority_10() {
     // This is implicitly covered by the autonomy pass, but we verify
     // the config default allows max_ops_per_cycle without overflow.
     let cfg = CuratorConfig {
-        interval_secs: 3600,
+        interval_secs: crate::SECS_PER_HOUR as u64,
         max_ops_per_cycle: 100,
         dry_run: false,
         include_namespaces: vec![],

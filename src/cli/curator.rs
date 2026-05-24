@@ -24,7 +24,7 @@ pub struct CuratorArgs {
     #[arg(long)]
     pub daemon: bool,
     /// Seconds between daemon sweeps. Clamped to [60, 86400].
-    #[arg(long, default_value_t = 3600)]
+    #[arg(long, default_value_t = crate::SECS_PER_HOUR as u64)]
     pub interval_secs: u64,
     /// Hard cap on LLM-invoking operations per cycle.
     #[arg(long, default_value_t = 100)]
@@ -451,7 +451,7 @@ mod tests {
         CuratorArgs {
             once: false,
             daemon: false,
-            interval_secs: 3600,
+            interval_secs: crate::SECS_PER_HOUR as u64,
             max_ops: 100,
             dry_run: false,
             include_namespaces: Vec::new(),

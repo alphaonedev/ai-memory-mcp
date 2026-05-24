@@ -157,7 +157,7 @@ pub fn reset_eviction_counters_for_test() {
 /// the caller branches on the returned count to escalate from WARN
 /// (already emitted) to ERROR.
 fn record_eviction_and_count_recent(now_nanos: u64) -> usize {
-    const ONE_HOUR_NANOS: u64 = 3_600 * 1_000_000_000;
+    const ONE_HOUR_NANOS: u64 = crate::SECS_PER_HOUR as u64 * 1_000_000_000;
     let cutoff = now_nanos.saturating_sub(ONE_HOUR_NANOS);
     let Ok(mut ring) = EVICTION_RATE_RING.lock() else {
         // Poisoned lock — observability is best-effort, return 0 so

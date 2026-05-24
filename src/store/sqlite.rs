@@ -425,8 +425,8 @@ impl MemoryStore for SqliteStore {
                 since.as_deref(),
                 until.as_deref(),
                 None, // vector_index threaded by the caller from AppState
-                3600,
-                86_400,
+                crate::SECS_PER_HOUR,
+                crate::SECS_PER_DAY,
                 ctx.as_agent.as_deref(),
                 None,
                 &scoring,
@@ -449,8 +449,8 @@ impl MemoryStore for SqliteStore {
                 tags_first,
                 since.as_deref(),
                 until.as_deref(),
-                3600,
-                86_400,
+                crate::SECS_PER_HOUR,
+                crate::SECS_PER_DAY,
                 ctx.as_agent.as_deref(),
                 None,
                 false,
@@ -486,7 +486,7 @@ impl MemoryStore for SqliteStore {
         // 40 SQLite write-lock acquisitions; batched form pays 1
         // outer transaction with 3N cached UPDATE statements.
         let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
-        if let Err(e) = db::touch_many(&conn, &id_refs, 3600, 86_400) {
+        if let Err(e) = db::touch_many(&conn, &id_refs, crate::SECS_PER_HOUR, crate::SECS_PER_DAY) {
             tracing::warn!("touch_many failed for {} memories: {e}", ids.len());
         }
         // v0.7.0 Form 5 / Cluster G — opportunistic freshness-decay

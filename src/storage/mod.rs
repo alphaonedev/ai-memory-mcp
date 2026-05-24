@@ -7068,7 +7068,7 @@ fn blend_and_rank(
                     let secs = (now_utc - ts.with_timezone(&Utc)).num_seconds();
                     #[allow(clippy::cast_precision_loss)]
                     {
-                        secs as f64 / 86_400.0
+                        secs as f64 / crate::SECS_PER_DAY as f64
                     }
                 });
             let decay = scoring.decay_multiplier(&mem.tier, age_days);
@@ -10816,8 +10816,8 @@ mod tests {
             None,
             None,
             None,
-            3600,
-            86400,
+            crate::SECS_PER_HOUR,
+            crate::SECS_PER_DAY,
             None,
             None,
             false,
@@ -13553,7 +13553,7 @@ mod tests {
         // 2-hour-old pending row; global default is 1 hour → must expire.
         insert_stale_pending(&conn, "stale-1", "ns/a", 7_200, None);
 
-        let expired = sweep_pending_action_timeouts(&conn, 3_600).unwrap();
+        let expired = sweep_pending_action_timeouts(&conn, crate::SECS_PER_HOUR).unwrap();
         assert_eq!(expired.len(), 1, "expected exactly one expiry");
         assert_eq!(expired[0], ("stale-1".to_string(), "ns/a".to_string()));
 
@@ -13578,7 +13578,7 @@ mod tests {
         // 30-second-old pending row; global default is 1 hour → still pending.
         insert_stale_pending(&conn, "fresh-1", "ns/a", 30, None);
 
-        let expired = sweep_pending_action_timeouts(&conn, 3_600).unwrap();
+        let expired = sweep_pending_action_timeouts(&conn, crate::SECS_PER_HOUR).unwrap();
         assert!(expired.is_empty());
         let status: String = conn
             .query_row(
@@ -13600,7 +13600,7 @@ mod tests {
         // 1h global default.
         insert_stale_pending(&conn, "no-override", "ns/a", 300, None);
 
-        let expired = sweep_pending_action_timeouts(&conn, 3_600).unwrap();
+        let expired = sweep_pending_action_timeouts(&conn, crate::SECS_PER_HOUR).unwrap();
         let ids: Vec<&String> = expired.iter().map(|(id, _)| id).collect();
         assert_eq!(ids, vec![&"short-ttl".to_string()]);
     }
@@ -14045,7 +14045,7 @@ mod tests {
         insert_stale_pending(&conn, "stale-b", "ns/y", 7_200, None);
         insert_stale_pending(&conn, "fresh-c", "ns/z", 30, None);
 
-        let expired = sweep_pending_action_timeouts(&conn, 3_600).unwrap();
+        let expired = sweep_pending_action_timeouts(&conn, crate::SECS_PER_HOUR).unwrap();
         assert_eq!(expired.len(), 2, "two stale rows must expire");
         assert_eq!(
             count_signed_events(&conn, "pending_action.timed_out"),
