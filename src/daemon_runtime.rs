@@ -3047,15 +3047,34 @@ pub async fn bootstrap_serve(
     // would leave the schema mis-dimensioned silently. Falls back to
     // `None` only when no embedder model is configured at all
     // (keyword-only).
+    //
+    // v0.7.x (issue #1169): the resolution ladder now prefers the
+    // resolver-side canonical dim lookup
+    // ([`crate::config::canonical_embedding_dim`]) so an operator
+    // pick of `[embeddings].model = "bge-large-en"` (or any other
+    // model id outside the 2-family [`EmbeddingModel`] enum) bootstraps
+    // the postgres schema at the live 1024-dim instead of silently
+    // dropping to the tier-preset's 768-dim. The enum-parse arm
+    // remains as the back-compat path for legacy flat-field configs
+    // (`embedding_model = "nomic_embed_v15"`), and the tier preset is
+    // the last-resort fallback. The pre-#1169 path lost the resolver
+    // signal entirely — schema dim wrong on every non-enum operator
+    // pick, with no log signal because the parse arm silently fell
+    // through to the preset.
     #[cfg(feature = "sal")]
     let configured_embedding_dim: Option<u32> = {
         let preset = tier_config.embedding_model;
-        let resolved = app_config
-            .embedding_model
-            .as_deref()
-            .and_then(|raw| raw.parse::<crate::config::EmbeddingModel>().ok())
-            .or(preset);
-        resolved.map(|m| u32::try_from(m.dim()).unwrap_or(384))
+        let resolved = app_config.resolve_embeddings();
+        resolved
+            .embedding_dim
+            .or_else(|| {
+                app_config
+                    .embedding_model
+                    .as_deref()
+                    .and_then(|raw| raw.parse::<crate::config::EmbeddingModel>().ok())
+                    .map(|m| u32::try_from(m.dim()).unwrap_or(384))
+            })
+            .or_else(|| preset.map(|m| u32::try_from(m.dim()).unwrap_or(384)))
     };
     #[cfg(feature = "sal")]
     let (storage_backend, store_handle) = build_store_handle(

@@ -107,14 +107,16 @@ fn keyword_tier() -> TierConfig {
 
 #[test]
 fn resolver_wins_for_known_bge_large_en() {
-    let cfg = parse(r#"
+    let cfg = parse(
+        r#"
         schema_version = 2
         tier = "autonomous"
 
         [embeddings]
         backend = "ollama"
         model = "bge-large-en"
-    "#);
+    "#,
+    );
     let models = ResolvedModels {
         llm: cfg.resolve_llm(None, None, None),
         embeddings: cfg.resolve_embeddings(),
@@ -128,8 +130,7 @@ fn resolver_wins_for_known_bge_large_en() {
         "ResolvedEmbeddings.embedding_dim must come from the resolver table"
     );
     assert_eq!(
-        caps.embedding_dim,
-        BGE_LARGE_EN_DIM as usize,
+        caps.embedding_dim, BGE_LARGE_EN_DIM as usize,
         "capabilities.models.embedding_dim must reflect the live operator-picked model, \
          not the autonomous-tier preset's {AUTONOMOUS_PRESET_DIM}-dim hardcode"
     );
@@ -142,7 +143,8 @@ fn resolver_wins_for_known_bge_large_en() {
 
 #[test]
 fn resolver_wins_for_text_embedding_3_large() {
-    let cfg = parse(&format!(r#"
+    let cfg = parse(&format!(
+        r#"
         schema_version = 2
         tier = "autonomous"
 
@@ -150,7 +152,8 @@ fn resolver_wins_for_text_embedding_3_large() {
         backend = "openai-compatible"
         url = "https://api.openai.com/v1"
         model = "{OPENAI_3_LARGE}"
-    "#));
+    "#
+    ));
     let models = ResolvedModels {
         llm: cfg.resolve_llm(None, None, None),
         embeddings: cfg.resolve_embeddings(),
@@ -169,10 +172,12 @@ fn resolver_wins_for_text_embedding_3_large() {
 
 #[test]
 fn resolver_matches_tier_preset_for_canonical_default() {
-    let cfg = parse(r#"
+    let cfg = parse(
+        r#"
         schema_version = 2
         tier = "autonomous"
-    "#);
+    "#,
+    );
     let models = ResolvedModels {
         llm: cfg.resolve_llm(None, None, None),
         embeddings: cfg.resolve_embeddings(),
@@ -193,14 +198,16 @@ fn resolver_matches_tier_preset_for_canonical_default() {
 
 #[test]
 fn unknown_model_falls_back_to_tier_preset_for_back_compat() {
-    let cfg = parse(&format!(r#"
+    let cfg = parse(&format!(
+        r#"
         schema_version = 2
         tier = "autonomous"
 
         [embeddings]
         backend = "ollama"
         model = "{UNKNOWN_MODEL}"
-    "#));
+    "#
+    ));
     let models = ResolvedModels {
         llm: cfg.resolve_llm(None, None, None),
         embeddings: cfg.resolve_embeddings(),
@@ -213,8 +220,7 @@ fn unknown_model_falls_back_to_tier_preset_for_back_compat() {
         "unknown model resolves to None at the resolver layer"
     );
     assert_eq!(
-        caps.embedding_dim,
-        AUTONOMOUS_PRESET_DIM as usize,
+        caps.embedding_dim, AUTONOMOUS_PRESET_DIM as usize,
         "capabilities falls back to the tier preset's compiled dim — \
          preserves pre-#1169 behaviour for unrecognised ids"
     );
@@ -227,14 +233,16 @@ fn unknown_model_falls_back_to_tier_preset_for_back_compat() {
 
 #[test]
 fn keyword_tier_disables_embedding_dim_even_with_stale_config() {
-    let cfg = parse(r#"
+    let cfg = parse(
+        r#"
         schema_version = 2
         tier = "keyword"
 
         [embeddings]
         backend = "ollama"
         model = "bge-large-en"
-    "#);
+    "#,
+    );
     let models = ResolvedModels {
         llm: cfg.resolve_llm(None, None, None),
         embeddings: cfg.resolve_embeddings(),
@@ -258,9 +266,18 @@ fn keyword_tier_disables_embedding_dim_even_with_stale_config() {
 
 #[test]
 fn canonical_embedding_dim_is_case_insensitive() {
-    assert_eq!(canonical_embedding_dim("BGE-Large-EN"), Some(BGE_LARGE_EN_DIM));
-    assert_eq!(canonical_embedding_dim("bge-LARGE-en"), Some(BGE_LARGE_EN_DIM));
-    assert_eq!(canonical_embedding_dim(BGE_LARGE_EN), Some(BGE_LARGE_EN_DIM));
+    assert_eq!(
+        canonical_embedding_dim("BGE-Large-EN"),
+        Some(BGE_LARGE_EN_DIM)
+    );
+    assert_eq!(
+        canonical_embedding_dim("bge-LARGE-en"),
+        Some(BGE_LARGE_EN_DIM)
+    );
+    assert_eq!(
+        canonical_embedding_dim(BGE_LARGE_EN),
+        Some(BGE_LARGE_EN_DIM)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -287,11 +304,13 @@ fn canonical_embedding_dim_trims_whitespace() {
 
 #[test]
 fn legacy_alias_round_trips_to_canonical_dim() {
-    let cfg = parse(r#"
+    let cfg = parse(
+        r#"
         schema_version = 2
         tier = "autonomous"
         embedding_model = "nomic_embed_v15"
-    "#);
+    "#,
+    );
     let models = ResolvedModels {
         llm: cfg.resolve_llm(None, None, None),
         embeddings: cfg.resolve_embeddings(),
@@ -357,10 +376,12 @@ fn known_dims_table_carries_v0_7_0_default_pair() {
 
 #[test]
 fn semantic_tier_default_matches_minilm_preset_dim() {
-    let cfg = parse(r#"
+    let cfg = parse(
+        r#"
         schema_version = 2
         tier = "semantic"
-    "#);
+    "#,
+    );
     let models = ResolvedModels {
         llm: cfg.resolve_llm(None, None, None),
         embeddings: cfg.resolve_embeddings(),
@@ -383,5 +404,8 @@ fn semantic_tier_default_matches_minilm_preset_dim() {
     assert_eq!(models.embeddings.embedding_dim, Some(NOMIC_DIM));
     assert_eq!(caps.embedding_dim, NOMIC_DIM as usize);
     // Sanity check on the semantic-tier preset itself.
-    assert_eq!(semantic_tier().embedding_model.unwrap().dim(), SEMANTIC_PRESET_DIM as usize);
+    assert_eq!(
+        semantic_tier().embedding_model.unwrap().dim(),
+        SEMANTIC_PRESET_DIM as usize
+    );
 }
