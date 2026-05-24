@@ -40,6 +40,23 @@ use std::time::{Duration, Instant};
 
 const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
 
+/// v0.7.x (#1174 PR4-remainder) — canonical name of the Ollama-native
+/// backend selector.
+///
+/// Used in `AI_MEMORY_LLM_BACKEND`, the `[llm].backend` config field,
+/// and the `ResolvedLlm::backend` runtime view. Every substrate site
+/// that needs to ask "is this the native-Ollama wire shape?" must
+/// either reference this const (for string compares against the wire
+/// value) or call [`crate::config::ResolvedLlm::is_ollama_native`]
+/// (the typed accessor that wraps the comparison).
+///
+/// Centralising the literal here keeps the heterogeneous-NHI substrate
+/// (#1067) from re-naming a single vendor across `cli/`, `mcp/`,
+/// `handlers/`, etc. Per PR #1175 + this PR, vendor names belong in
+/// `llm.rs` aliases / `config.rs` alias tables, not scattered across
+/// the codebase.
+pub const BACKEND_OLLAMA: &str = "ollama";
+
 /// Per-vendor default base URLs for the OpenAI-compatible alias
 /// backends. Operator-provided `AI_MEMORY_LLM_BASE_URL` overrides
 /// these. Verified against vendor documentation as of 2026-Q2.
