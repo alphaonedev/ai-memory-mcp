@@ -1,0 +1,232 @@
+<!--
+  Copyright 2026 AlphaOne LLC
+  SPDX-License-Identifier: Apache-2.0
+  GitHub Pages render of the v0.7.0 heterogeneous AI NHI assessment.
+  Tracking issue: #1171. Lane 6 deliverable per #832 + #1198.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Heterogeneous AI NHI Assessment of ai-memory v0.7.0 &mdash; three-evaluator parallel evaluation</title>
+<meta name="description" content="A first-of-its-kind heterogeneous multi-evaluator assessment of ai-memory v0.7.0 by Claude Opus 4.7, GPT 5.5, and Grok 4.3 running the same prompt in isolation. Decorrelated-errors property of three model families produces bias-detection-by-architecture at the assessment layer.">
+<link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/v0.7.0/heterogeneous-ai-nhi-assessment/">
+<style>
+:root{--bg:#0a0a0a;--panel:#121212;--border:#262626;--border-hi:#3a3a3a;--text:#f5f5f5;--muted:#9a9a9a;--dim:#6b6b6b;--accent:#6ee7ff;--warn:#ffb86b;--good:#7cd992;--anth:#d97757;--openai:#10a37f;--xai:#cfcfcf;--code-bg:#161616;--font-sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;--font-mono:"SF Mono","JetBrains Mono","Cascadia Code",Consolas,monospace;--w-mid:840px;--w-wide:1080px}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{background:var(--bg);color:var(--text);font-family:var(--font-sans);line-height:1.65;-webkit-font-smoothing:antialiased}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+code,pre{font-family:var(--font-mono);font-size:.88rem}
+code{background:var(--code-bg);padding:.1em .35em;border-radius:3px;color:#d4d4d4}
+pre{background:var(--code-bg);border:1px solid var(--border);border-radius:6px;padding:1rem 1.15rem;overflow-x:auto;line-height:1.55;margin:1rem 0}
+pre code{background:none;padding:0;color:#d4d4d4}
+.wrap-mid{max-width:var(--w-mid);margin:0 auto;padding:0 1.5rem}
+.topnav{border-bottom:1px solid var(--border);position:sticky;top:0;background:rgba(10,10,10,.92);backdrop-filter:blur(8px);z-index:50}
+.topnav .row{display:flex;align-items:center;justify-content:space-between;padding:1rem 1.5rem;max-width:var(--w-wide);margin:0 auto;font-size:.9rem}
+.topnav .brand{color:var(--text);font-weight:600}
+.topnav .links{display:flex;gap:1.5rem}
+.topnav .links a{color:var(--muted)}
+.topnav .links a:hover{color:var(--text);text-decoration:none}
+.crumb{padding:1.25rem 1.5rem 0;max-width:var(--w-mid);margin:0 auto;color:var(--dim);font-size:.82rem;font-family:var(--font-mono)}
+.crumb a{color:var(--muted)}
+.hero{padding:3rem 0 2.5rem}
+.hero .eyebrow{font-family:var(--font-mono);font-size:.72rem;letter-spacing:.18em;color:var(--accent);text-transform:uppercase;margin-bottom:1rem}
+.hero h1{font-size:2.1rem;font-weight:700;letter-spacing:-.025em;line-height:1.15;margin-bottom:1.25rem}
+.hero .lede{font-size:1.1rem;color:var(--muted);max-width:720px;line-height:1.6}
+section{padding:3rem 0;border-top:1px solid var(--border)}
+.eyebrow-h2{font-family:var(--font-mono);font-size:.7rem;letter-spacing:.18em;color:var(--dim);text-transform:uppercase;margin-bottom:.5rem}
+h2{font-size:1.5rem;font-weight:700;letter-spacing:-.015em;margin-bottom:1rem}
+h3{font-size:1.05rem;font-weight:600;margin:1.75rem 0 .5rem;color:var(--text)}
+p{color:var(--muted);margin-bottom:1rem;max-width:720px}
+p.lede{color:var(--text);font-size:1rem}
+ul,ol{color:var(--muted);margin:0 0 1rem 1.5rem}
+li{margin-bottom:.35rem}
+li code{font-size:.85em}
+.eval-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:1rem;margin:1.5rem 0}
+.eval-card{padding:1.25rem;background:var(--panel);border:1px solid var(--border);border-radius:8px}
+.eval-card .vendor{font-family:var(--font-mono);font-size:.72rem;letter-spacing:.1em;text-transform:uppercase;margin-bottom:.5rem}
+.eval-card.anthropic .vendor{color:var(--anth)}
+.eval-card.openai .vendor{color:var(--openai)}
+.eval-card.xai .vendor{color:var(--xai)}
+.eval-card h3{margin-top:0}
+.eval-card .status{display:inline-block;padding:.15rem .55rem;border-radius:3px;font-family:var(--font-mono);font-size:.72rem;margin-top:.5rem}
+.eval-card .status.live{background:rgba(124,217,146,.12);color:var(--good);border:1px solid rgba(124,217,146,.3)}
+.eval-card .status.pending{background:rgba(255,184,107,.1);color:var(--warn);border:1px solid rgba(255,184,107,.3)}
+.eval-card a.report-link{display:inline-block;margin-top:.75rem;font-size:.85rem;color:var(--accent)}
+.callout{border-left:3px solid var(--accent);padding:1rem 1.25rem;background:rgba(110,231,255,.04);border-radius:0 6px 6px 0;margin:1.5rem 0;font-size:.92rem}
+.callout strong{color:var(--text)}
+.callout p{color:var(--muted);max-width:none;margin-bottom:.5rem}
+.next{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:.6rem;margin:1.5rem 0}
+.next a{display:block;padding:.85rem 1rem;background:var(--panel);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:.9rem;transition:border-color .15s}
+.next a:hover{border-color:var(--accent);text-decoration:none}
+.next a .desc{display:block;color:var(--muted);font-size:.78rem;margin-top:.2rem;font-weight:400}
+table{width:100%;border-collapse:collapse;margin:1rem 0;font-size:.88rem}
+th,td{padding:.55rem .65rem;border:1px solid var(--border);text-align:left;color:var(--text)}
+th{background:var(--panel);font-weight:600;color:var(--muted);font-size:.78rem;text-transform:uppercase;letter-spacing:.08em}
+td code{font-size:.82rem}
+footer{padding:3rem 0;border-top:1px solid var(--border);color:var(--dim);font-size:.82rem;text-align:center}
+footer a{color:var(--muted)}
+.meta-row{display:flex;flex-wrap:wrap;gap:.5rem;margin-top:1.5rem}
+.meta-row span{padding:.3rem .7rem;background:var(--panel);border:1px solid var(--border);border-radius:4px;font-family:var(--font-mono);font-size:.75rem;color:var(--muted)}
+</style>
+</head>
+<body>
+
+<nav class="topnav">
+  <div class="row">
+    <a class="brand" href="../../">ai-memory</a>
+    <div class="links">
+      <a href="../../#install">Install</a>
+      <a href="../../audience/developer.html">Developer</a>
+      <a href="../../audience/operator.html">Operator</a>
+      <a href="../../audience/decision-maker.html">Decision</a>
+      <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<div class="crumb"><a href="../../">ai-memory</a> &nbsp;/&nbsp; v0.7.0 &nbsp;/&nbsp; heterogeneous AI NHI assessment</div>
+
+<header class="hero wrap-mid">
+  <div class="eyebrow">Heterogeneous AI NHI Assessment &middot; v0.7.0 attested-cortex</div>
+  <h1>Three model families. One prompt. No cross-talk.</h1>
+  <p class="lede">A first-of-its-kind multi-evaluator, model-heterogeneous assessment of ai-memory v0.7.0 by three frontier AI NHI agents &mdash; Anthropic Claude Opus 4.7, OpenAI GPT 5.5, xAI Grok 4.3 &mdash; running the same prompt in isolation, then synthesised. The decorrelated-errors property across three model families with different training distributions, RLHF lineage, and architectural priors is the entire methodological point. Same-model reflection re-introduces the echo-chamber problem this assessment exists to surface.</p>
+  <div class="meta-row">
+    <span>Issue <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1171" style="color:var(--accent)">#1171</a></span>
+    <span>release/v0.7.0 @ <code>1cb95bbe7</code></span>
+    <span>2026-05-24 / 2026-05-25</span>
+    <span>3 evaluators &middot; 22-probe matrix</span>
+  </div>
+</header>
+
+<section class="wrap-mid">
+  <div class="eyebrow-h2">Why three evaluators</div>
+  <h2>Bias-detection by architecture, not by reviewer goodwill.</h2>
+  <p>ai-memory v0.7.0 makes the reflection boundary <strong>LLM-agnostic by design</strong> &mdash; same row shape, same signature primitives, same audit chain whether the curator is Opus, Gemma, GPT, or Grok. This assessment lifts that property up to the assessment layer itself: same prompt, three model families, no cross-talk during Phase 1, then orchestrator synthesis in Phase 2.</p>
+  <p>This is bias-detection-by-architecture, not redundant tooling, for four reasons:</p>
+  <ul>
+    <li><strong>Echo-chamber problem.</strong> A model asked to evaluate the substrate it itself uses runs the evaluation through the same RLHF surface that produced its own blind spots. The evaluator cannot be the auditor of its own priors.</li>
+    <li><strong>Bias amplification by accretion.</strong> &ldquo;Opus reflects on what Opus wrote, then Opus reflects on the synthesis&rdquo; amplifies whatever Opus systematically over-weights. Compounding is monotonic in the worst direction.</li>
+    <li><strong>Decorrelated errors as ML-theoretic justification.</strong> Three model families trained on overlapping-but-not-identical data, with different RLHF objectives and architecture priors. Their error distributions are decorrelated &mdash; agreement is high-confidence substrate property; disagreement is the bias signal.</li>
+    <li><strong>Anti-monoculture hedge.</strong> Frontier labs increasingly train on overlapping data + similar instruction-following objectives. A heterogeneous panel hedges against the convergent failure mode.</li>
+  </ul>
+  <div class="callout">
+    <p>&ldquo;Opus reflects on Opus&rdquo; is <strong>NOT</strong> substrate-equivalent to &ldquo;Grok reflects on Opus.&rdquo; The substrate is the same; the cognitive operation is fundamentally different. Any leakage between evaluators during Phase 1 collapses three decorrelated samples into one correlated sample.</p>
+  </div>
+</section>
+
+<section class="wrap-mid">
+  <div class="eyebrow-h2">Evaluator pool</div>
+  <h2>Three model families, three independent workspaces.</h2>
+  <p>Each evaluator runs the full 22-probe matrix against its own isolated workspace under <code>.local-runs/v070-nhi-assessment-&lt;ts&gt;-&lt;evaluator&gt;/</code> with no cross-talk to the other two reports during Phase 1.</p>
+  <div class="eval-grid">
+    <div class="eval-card anthropic">
+      <div class="vendor">Anthropic</div>
+      <h3>Claude Opus 4.7</h3>
+      <p style="color:var(--muted);font-size:.88rem;margin-bottom:.5rem">Model: <code>claude-opus-4-7[1m]</code> (1M-context variant). Probe execution: 2026-05-24, refined 2026-05-25.</p>
+      <span class="status live">Phase 1 complete</span><br>
+      <a class="report-link" href="report-claude-opus-4-7.md">Read full Opus 4.7 report &rarr;</a>
+    </div>
+    <div class="eval-card openai">
+      <div class="vendor">OpenAI</div>
+      <h3>GPT 5.5</h3>
+      <p style="color:var(--muted);font-size:.88rem;margin-bottom:.5rem">Model: <code>gpt-5</code> (canonical alias <code>openai</code> backend). Awaiting independent Phase-1 execution.</p>
+      <span class="status pending">Phase 1 awaiting</span><br>
+      <a class="report-link" href="report-gpt-5-5.md">Report file (placeholder) &rarr;</a>
+    </div>
+    <div class="eval-card xai">
+      <div class="vendor">xAI</div>
+      <h3>Grok 4.3</h3>
+      <p style="color:var(--muted);font-size:.88rem;margin-bottom:.5rem">Model: <code>grok-4.3</code> (canonical alias <code>xai</code> backend, <code>https://api.x.ai/v1</code>). Awaiting independent Phase-1 execution.</p>
+      <span class="status pending">Phase 1 awaiting</span><br>
+      <a class="report-link" href="report-grok-4-3.md">Report file (placeholder) &rarr;</a>
+    </div>
+  </div>
+  <p>After all three Phase-1 reports land, an orchestrator pass (Claude Opus 4.7 in synthesizer-role, against all three reports as input) produces the cross-evaluator synthesis at <a href="synthesis.md"><code>synthesis.md</code></a> with three load-bearing outputs:</p>
+  <ul>
+    <li><strong>Points of agreement</strong> &mdash; high-confidence claims about v0.7.0 the three evaluators converged on independently.</li>
+    <li><strong>Points of principled disagreement</strong> &mdash; organised by axis (latency tolerance, surface-size opinion, magic-vs-feature framing, reference-architecture grading, what counts as a step-change primitive).</li>
+    <li><strong>Cross-model bias-detection</strong> &mdash; claims one evaluator made that another flagged as model-specific bias rather than substrate property. This is the highest-information output of the multi-evaluator design.</li>
+  </ul>
+</section>
+
+<section class="wrap-mid">
+  <div class="eyebrow-h2">Three-phase protocol</div>
+  <h2>Isolation, synthesis, operator gate.</h2>
+  <table>
+    <thead><tr><th>Phase</th><th>Who</th><th>What</th><th>Cross-talk</th></tr></thead>
+    <tbody>
+      <tr><td><strong>1 &mdash; Isolated execution</strong></td><td>Each evaluator independently</td><td>Run the full 22-probe matrix against the evaluator&apos;s own <code>.local-runs/</code> workspace. Write <code>report-&lt;evaluator&gt;.md</code>. 90-120 min per evaluator.</td><td>NONE. Reading another evaluator&apos;s report during Phase 1 collapses the decorrelated-errors property.</td></tr>
+      <tr><td><strong>2 &mdash; Orchestrator synthesis</strong></td><td>Claude Opus 4.7 (synthesizer-role)</td><td>Read all three Phase-1 reports as input. Produce <code>synthesis.md</code> with agreement / disagreement / bias-detection sections.</td><td>Allowed &mdash; Phase 2 IS the cross-talk, but it&apos;s structured.</td></tr>
+      <tr><td><strong>3 &mdash; Operator review</strong></td><td>Justin Jessup, AlphaOne LLC</td><td>Review the synthesis. Resolve disagreements via (a) re-probing the contested primitive, (b) operator override with rationale, or (c) filing as known cross-model uncertainty in v0.7.0 release notes.</td><td>n/a &mdash; biologic operator gates.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="wrap-mid">
+  <div class="eyebrow-h2">The 22-probe matrix</div>
+  <h2>Five tiers, code-path anchored.</h2>
+  <p>The assessment prompt (<a href="prompt.md"><code>prompt.md</code></a>) defines a 22-probe matrix across five tiers. Each probe names a concrete file path in <code>release/v0.7.0 @ 1cb95bbe7</code> and a question the evaluator must answer from direct examination, not training-prior recall.</p>
+  <table>
+    <thead><tr><th>Tier</th><th>Probes</th><th>Focus</th></tr></thead>
+    <tbody>
+      <tr><td>T1 &mdash; Substrate primitives</td><td>P1&ndash;P5</td><td>Memory struct shape, link variants, schema migration ladder, recall pipeline, agent identity</td></tr>
+      <tr><td>T2 &mdash; Governance</td><td>P6&ndash;P10</td><td>L1-6 rule engine, Ed25519 attestation, signed-events V-4 chain, namespace inheritance, permissions enforce-mode</td></tr>
+      <tr><td>T3 &mdash; Substrate interfaces</td><td>P11&ndash;P15</td><td>MCP tool surface (73 advertised), HTTP route registry (87 routes / 73 unique paths), CLI subcommand table (58), config schema v2 sectioning, env-var precedence ladder</td></tr>
+      <tr><td>T4 &mdash; AI-NHI primitives</td><td>P16&ndash;P19</td><td>Recursive-learning depth gate, atomisation engine, persona-as-artifact, context-offload TTL sweep</td></tr>
+      <tr><td>T5 &mdash; Operational hardening</td><td>P20&ndash;P22</td><td>SSRF fail-CLOSED, governance fail-CLOSED, postgres + Apache AGE backend parity</td></tr>
+    </tbody>
+  </table>
+  <p>Each probe has a documented expected verdict and a documented bias-surface (the angle on which an evaluator&apos;s training distribution is most likely to inject a model-specific reading). The synthesis pass attends to whether evaluators converged on the same evidence-anchored verdict or diverged along the predicted bias-surface.</p>
+</section>
+
+<section class="wrap-mid">
+  <div class="eyebrow-h2">Phase-1 Opus 4.7 verdict (preview)</div>
+  <h2>SHIP-WITH-CAVEATS, refinement-pass shortened.</h2>
+  <p>The Phase-1 Opus 4.7 report (<a href="report-claude-opus-4-7.md">full text &rarr;</a>) returned <strong>SHIP-WITH-CAVEATS</strong> on 2026-05-24 morning, refined the same day with two of the caveats closed by filed PRs and three new follow-up issues opened. Surface findings:</p>
+  <ul>
+    <li><a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1172">#1172</a> &mdash; <code>memory_reflect</code> MCP tool strips caller-supplied <code>metadata.entity_id</code>. Closure PR <a href="https://github.com/alphaonedev/ai-memory-mcp/pull/1177">#1177</a> with 5-invariant regression suite.</li>
+    <li><a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1169">#1169</a> &mdash; <code>memory_capabilities.models.embedding_dim</code> sources from tier preset instead of canonical <code>KNOWN_EMBEDDING_DIMS</code> table. Closure PR <a href="https://github.com/alphaonedev/ai-memory-mcp/pull/1178">#1178</a> with 13-invariant regression suite covering known / unknown / tier-disabled / legacy-alias paths.</li>
+    <li><a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1174">#1174</a> &mdash; Codegraph-driven global refactor sweep for <code>local</code> / <code>global</code> / <code>const</code> discipline (pm-v3.1 prime-directive addendum). Phase-1 inventory subagent audited 266 Rust source files + 233 integration tests and produced a 98-finding (37 MUST + 54 SHOULD + 7 NICE) report.</li>
+    <li><a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1175">#1175</a> &mdash; <code>src/mcp/tools/reflect.rs:103</code> unconditionally stamped <code>source: "claude"</code> on every reflection regardless of which AI NHI made the call. The substrate is heterogeneous-NHI by design; that hardcode is a monoculture defect. <em>Fixed in commit <code>84ec159c1</code> per <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1181">#1181</a>.</em></li>
+    <li><a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1176">#1176</a> &mdash; MCP approval-gate <code>pending_action</code> payload drops <code>metadata</code> on the pending&rarr;execute round-trip. Sibling defect to #1172 via a different code path.</li>
+  </ul>
+  <p>The Phase-1 Opus 4.7 finding that the substrate is the <strong>cognitive-checks-and-balances primitive for AI NHI</strong> &mdash; specifically the load-bearing claim that ai-memory is the externalised site of NHI cognition-across-time, with frozen weights + ephemeral processes as the load-bearing constraints rather than pathologies &mdash; is consistent with the substrate&apos;s own marketing and design rationale. Cross-evaluator confirmation of this framing (or principled disagreement with it) is one of the highest-stakes outputs of the eventual synthesis pass.</p>
+</section>
+
+<section class="wrap-mid">
+  <div class="eyebrow-h2">Files in this directory</div>
+  <h2>Direct links.</h2>
+  <div class="next">
+    <a href="README.md"><strong>README.md</strong><span class="desc">Assessment context, evaluator pool, three-phase protocol</span></a>
+    <a href="prompt.md"><strong>prompt.md</strong><span class="desc">Verbatim assessment prompt &mdash; anchor for all three reports</span></a>
+    <a href="report-claude-opus-4-7.md"><strong>report-claude-opus-4-7.md</strong><span class="desc">Phase-1 Opus 4.7 evaluator report &mdash; SHIP-WITH-CAVEATS</span></a>
+    <a href="report-gpt-5-5.md"><strong>report-gpt-5-5.md</strong><span class="desc">Awaiting Phase-1 independent execution by GPT 5.5</span></a>
+    <a href="report-grok-4-3.md"><strong>report-grok-4-3.md</strong><span class="desc">Awaiting Phase-1 independent execution by Grok 4.3</span></a>
+    <a href="synthesis.md"><strong>synthesis.md</strong><span class="desc">Awaiting Phase-2 orchestrator pass after all three reports land</span></a>
+  </div>
+</section>
+
+<section class="wrap-mid">
+  <div class="eyebrow-h2">Next</div>
+  <h2>Related reading.</h2>
+  <div class="next">
+    <a href="../../essays/brass-tacks-1-what.html"><strong>Brass tacks 1 &mdash; What</strong><span class="desc">60-second essay on what ai-memory actually is</span></a>
+    <a href="../../essays/brass-tacks-2-how.html"><strong>Brass tacks 2 &mdash; How</strong><span class="desc">How an NHI uses the substrate</span></a>
+    <a href="../../essays/brass-tacks-3-why.html"><strong>Brass tacks 3 &mdash; Why</strong><span class="desc">Why a substrate beats vector-DB-only</span></a>
+    <a href="../release-notes.md"><strong>v0.7.0 release notes</strong><span class="desc">Full per-PR changelog for attested-cortex</span></a>
+    <a href="../test-campaign-2026-05-22-release-gate-final/"><strong>2026-05-22 release-gate-final campaign</strong><span class="desc">SHIP-RECOMMENDED &middot; 7,321 PASS / 0 FAIL across 269 binaries</span></a>
+    <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1171"><strong>Issue #1171</strong><span class="desc">Tracking issue &mdash; stays OPEN until all three reports + synthesis land</span></a>
+  </div>
+</section>
+
+<footer>
+  <p>ai-memory v0.7.0 &middot; heterogeneous AI NHI assessment &middot; tracking <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1171">#1171</a> under Lane 6 <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1198">#1198</a></p>
+  <p style="margin-top:.5rem">Copyright 2026 AlphaOne LLC &middot; Apache-2.0 licensed</p>
+</footer>
+
+</body>
+</html>
