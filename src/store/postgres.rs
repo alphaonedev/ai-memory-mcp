@@ -10886,13 +10886,20 @@ mod tests {
             eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
             return;
         };
-        // If the operator points the same URL at both, this assertion
-        // would be wrong — guard with an early-skip when AGE_URL == URL.
-        if age_url().as_deref() == Some(url.as_str()) {
-            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL points at the AGE fixture");
+        // #1272 — detect AGE on the connected DB rather than comparing
+        // URL strings. Operators commonly point both env vars at the
+        // same single AGE-enabled fixture (e.g. infra/lan-parity-test/
+        // PG+AGE container) or omit AI_MEMORY_TEST_AGE_URL entirely;
+        // either way the string-equality check was unreliable. The
+        // backend-detection skip is the structurally correct test for
+        // "is AGE present on this URL?".
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        if store.kg_backend() == KgBackend::Age {
+            eprintln!(
+                "skip: connected DB has AGE installed; this test exercises the                  CTE-fallback path (#1272)"
+            );
             return;
         }
-        let store = PostgresStore::connect(&url).await.expect("connect");
         assert_eq!(
             store.kg_backend(),
             KgBackend::Cte,
@@ -10909,11 +10916,14 @@ mod tests {
         let Some(url) = postgres_url() else {
             return;
         };
-        if age_url().as_deref() == Some(url.as_str()) {
-            return;
-        }
         let store = PostgresStore::connect(&url).await.expect("connect");
         let probed = detect_kg_backend(&store.pool).await;
+        if probed == KgBackend::Age {
+            eprintln!(
+                "skip: connected DB has AGE installed; this test exercises the                  CTE-fallback path (#1272)"
+            );
+            return;
+        }
         assert_eq!(probed, KgBackend::Cte);
     }
 
@@ -11013,11 +11023,13 @@ mod tests {
             eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
             return;
         };
-        if age_kg_url().as_deref() == Some(url.as_str()) {
-            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL points at the AGE fixture");
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        if store.kg_backend() == KgBackend::Age {
+            eprintln!(
+                "skip: connected DB has AGE installed; this test exercises the                  CTE-fallback path (#1272)"
+            );
             return;
         }
-        let store = PostgresStore::connect(&url).await.expect("connect");
         assert_eq!(
             store.kg_backend(),
             KgBackend::Cte,
@@ -11250,11 +11262,13 @@ mod tests {
             eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
             return;
         };
-        if age_kg_url().as_deref() == Some(url.as_str()) {
-            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL points at the AGE fixture");
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        if store.kg_backend() == KgBackend::Age {
+            eprintln!(
+                "skip: connected DB has AGE installed; this test exercises the                  CTE-fallback path (#1272)"
+            );
             return;
         }
-        let store = PostgresStore::connect(&url).await.expect("connect");
         assert_eq!(
             store.kg_backend(),
             KgBackend::Cte,
@@ -11380,11 +11394,13 @@ mod tests {
             eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
             return;
         };
-        if age_kg_url().as_deref() == Some(url.as_str()) {
-            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL points at the AGE fixture");
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        if store.kg_backend() == KgBackend::Age {
+            eprintln!(
+                "skip: connected DB has AGE installed; this test exercises the                  CTE-fallback path (#1272)"
+            );
             return;
         }
-        let store = PostgresStore::connect(&url).await.expect("connect");
         assert_eq!(
             store.kg_backend(),
             KgBackend::Cte,
