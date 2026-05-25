@@ -30,7 +30,7 @@ use rusqlite::Connection;
 
 /// Vendor-neutral fixture source for this test file's `ReflectInput`
 /// builders, per PR #1175 (`validate::DEFAULT_NHI_SOURCE = "nhi"`)
-/// + PR #1174 PR9 (vendor-deflake test fixtures). The substrate now
+/// Plus PR #1174 PR9 (vendor-deflake test fixtures). The substrate now
 /// stamps `source = "nhi"` by default for any AI NHI; pinning a
 /// vendor literal here would silently couple this test to a single
 /// vendor identity and weaken the heterogeneous-NHI invariant.

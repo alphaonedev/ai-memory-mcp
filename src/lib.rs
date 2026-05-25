@@ -161,6 +161,12 @@ pub mod kg;
 // so a future GPU/MTP backend (v0.8 Phase 1) drops in transparently.
 pub mod inference;
 pub mod llm;
+// v0.7.x (#1183, split out of #1174 PR4) — per-CLI-binary WrapStrategy
+// table for `ai-memory wrap <agent>`. Sibling to `llm.rs` so the
+// per-vendor substrate has one home per concern (HTTP wire shape in
+// `llm.rs`, CLI ABI in `llm_cli_wrap.rs`). The CLI-binary-name
+// detection logic that PICKS a WrapStrategy stays in `cli/wrap.rs`.
+pub mod llm_cli_wrap;
 pub mod log_paths;
 pub mod logging;
 pub mod mcp;

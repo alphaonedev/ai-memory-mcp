@@ -39,15 +39,26 @@
 //!
 //! ## Lookup table
 //!
-//! `default_strategy(agent)` resolves the unflagged form `ai-memory
-//! wrap <agent> -- <args>` to the right delivery mechanism for the
-//! agents we can identify by name today. Unknown agents fall through to
-//! `--system <msg>` because that's the most common contract across
-//! OpenAI-compatible CLIs. Future PRs (notably PR-7) can extend the
-//! table by adding match arms.
+//! [`crate::llm_cli_wrap::default_strategy`] resolves the unflagged
+//! form `ai-memory wrap <agent> -- <args>` to the right delivery
+//! mechanism for the agents we can identify by name today. Unknown
+//! agents fall through to `--system <msg>` because that's the most
+//! common contract across OpenAI-compatible CLIs. Future PRs (notably
+//! PR-7) can extend the table by adding match arms.
+//!
+//! ## Substrate split (#1183)
+//!
+//! The per-CLI-binary `WrapStrategy` enum + the per-vendor table live
+//! in [`crate::llm_cli_wrap`], adjacent to [`crate::llm`]'s alias
+//! tables, so the per-vendor substrate has one home per concern (HTTP
+//! wire shape in `llm.rs`, CLI ABI in `llm_cli_wrap.rs`). The
+//! CLI-binary-name detection logic that PICKS a `WrapStrategy` stays
+//! HERE because it's CLI-specific (clap `WrapArgs` overrides → table
+//! fallback).
 
 use crate::cli::CliOutput;
 use crate::cli::boot::{self, BootArgs};
+use crate::llm_cli_wrap::{WrapStrategy, default_strategy};
 use anyhow::{Context, Result};
 use clap::Args;
 use std::ffi::OsStr;
@@ -70,91 +81,14 @@ const DEFAULT_WRAP_LIMIT: usize = 10;
 const WRAP_PREAMBLE: &str = "You have access to ai-memory, a persistent memory system. \
 The recent context loaded for you appears below. Reference it when relevant to the user's request.";
 
-/// Strategy for delivering the assembled system message to the wrapped
-/// agent. Each variant maps to a distinct CLI ABI an agent might
-/// expose.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WrapStrategy {
-    /// Pass the system message as the value of a CLI flag, e.g.
-    /// `codex --system "<msg>" <args...>`.
-    SystemFlag {
-        /// The flag name including any leading dashes — e.g. `--system`,
-        /// `--system-prompt`, `-s`.
-        flag: String,
-    },
-    /// Set the system message as an environment variable for the child
-    /// process. e.g. `OLLAMA_SYSTEM=<msg> ollama run hermes3:8b`.
-    SystemEnv {
-        /// The env var name, e.g. `OLLAMA_SYSTEM`.
-        name: String,
-    },
-    /// Write the system message to a tempfile and pass the path via a
-    /// CLI flag. e.g. `aider --message-file <path> <args...>`. Used by
-    /// agents whose system-message length exceeds shell argv limits or
-    /// whose CLI explicitly takes a file path.
-    MessageFile {
-        /// The flag that takes the file path, e.g. `--message-file`.
-        flag: String,
-    },
-    /// Resolve the strategy at runtime from `default_strategy(agent)`.
-    /// This is the natural mode when the user hasn't passed any of the
-    /// strategy override flags.
-    Auto,
-}
-
-/// Built-in agent → strategy lookup. The list is small by design — we
-/// only encode strategies for agents we've actually verified. Anything
-/// not in the table falls through to `--system <msg>` because that's
-/// the most common contract across OpenAI-compatible CLIs.
-///
-/// PR-7 may extend this map; the matrix is intentionally tabular so
-/// adding a row is a one-line change.
-#[must_use]
-pub fn default_strategy(agent: &str) -> WrapStrategy {
-    match agent {
-        // OpenAI Codex CLI. The flag name varies between Codex variants
-        // (`--system`, `--system-prompt`, `OPENAI_CLI_SYSTEM`) but
-        // `--system` is the documented form on the upstream codex-cli
-        // crate (PR-1 recipe + Codex CLI README). Users running a
-        // variant that exposes a different flag can override with
-        // `--system-flag <flag>`.
-        "codex" | "codex-cli" => WrapStrategy::SystemFlag {
-            flag: "--system".into(),
-        },
-        // Aider takes its system / instructions input from a file via
-        // `--message-file`. Aider's CLI explicitly recommends this for
-        // anything longer than a one-liner because it doesn't shell-quote
-        // the arg-form for newlines reliably.
-        "aider" => WrapStrategy::MessageFile {
-            flag: "--message-file".into(),
-        },
-        // Google Gemini CLI. `--system` is the documented prepend form.
-        "gemini" => WrapStrategy::SystemFlag {
-            flag: "--system".into(),
-        },
-        // Ollama uses an env var because `ollama run <model>` doesn't
-        // expose a `--system` flag at the CLI level — it expects the
-        // system prompt either inside the prompt body or via the
-        // `OLLAMA_SYSTEM` env var (also the form `ollama serve` reads).
-        "ollama" => WrapStrategy::SystemEnv {
-            name: "OLLAMA_SYSTEM".into(),
-        },
-        // Default: most OpenAI-compatible CLIs accept `--system <msg>`.
-        // If that's wrong, users override with `--system-flag` /
-        // `--system-env` / `--message-file-flag`.
-        _ => WrapStrategy::SystemFlag {
-            flag: "--system".into(),
-        },
-    }
-}
-
 /// Args for `ai-memory wrap`. Designed so the simplest form
 /// (`ai-memory wrap codex -- "hello"`) just works — every flag has a
 /// defaulted value or the lookup table fills it in.
 #[derive(Args, Debug)]
 pub struct WrapArgs {
     /// Name of the agent CLI to wrap, e.g. `codex`, `aider`, `gemini`,
-    /// `ollama`. Resolved against `default_strategy` to pick the
+    /// `ollama`. Resolved against
+    /// [`crate::llm_cli_wrap::default_strategy`] to pick the
     /// system-message delivery mechanism unless the user overrides
     /// with one of the strategy flags below. The agent name is also
     /// the executable looked up on `$PATH`.
@@ -213,7 +147,9 @@ pub struct WrapArgs {
 /// 1. `--system-env <name>` → `SystemEnv`
 /// 2. `--message-file-flag <flag>` → `MessageFile`
 /// 3. `--system-flag <flag>` → `SystemFlag`
-/// 4. fall through to `default_strategy(agent)` (the lookup table)
+/// 4. fall through to
+///    [`crate::llm_cli_wrap::default_strategy`]`(agent)` (the
+///    per-CLI-binary lookup table)
 fn resolve_strategy(args: &WrapArgs) -> WrapStrategy {
     if let Some(name) = args.system_env.as_deref() {
         return WrapStrategy::SystemEnv { name: name.into() };
@@ -437,46 +373,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn wrap_resolves_default_strategy_per_known_agent() {
-        assert_eq!(
-            default_strategy("codex"),
-            WrapStrategy::SystemFlag {
-                flag: "--system".into()
-            }
-        );
-        assert_eq!(
-            default_strategy("codex-cli"),
-            WrapStrategy::SystemFlag {
-                flag: "--system".into()
-            }
-        );
-        assert_eq!(
-            default_strategy("aider"),
-            WrapStrategy::MessageFile {
-                flag: "--message-file".into()
-            }
-        );
-        assert_eq!(
-            default_strategy("gemini"),
-            WrapStrategy::SystemFlag {
-                flag: "--system".into()
-            }
-        );
-        assert_eq!(
-            default_strategy("ollama"),
-            WrapStrategy::SystemEnv {
-                name: "OLLAMA_SYSTEM".into()
-            }
-        );
-        // Unknown agent → fall through to --system.
-        assert_eq!(
-            default_strategy("some-future-cli"),
-            WrapStrategy::SystemFlag {
-                flag: "--system".into()
-            }
-        );
-    }
+    // NOTE: The canonical per-agent table pin moved to
+    // `crate::llm_cli_wrap::tests::default_strategy_per_known_agent_pins_1183`
+    // alongside the table itself in #1183. The tests below exercise the
+    // wrap-side dispatch (override precedence + command-build shape) and
+    // reach the moved table via the re-imported `default_strategy`
+    // symbol.
 
     #[test]
     fn resolve_strategy_explicit_overrides_lookup_table() {
