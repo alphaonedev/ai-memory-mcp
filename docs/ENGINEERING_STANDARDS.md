@@ -87,12 +87,17 @@ Every PR must pass these gates before merge:
 | `cargo clippy -- -D warnings -D clippy::all -D clippy::pedantic` | Zero warnings |
 | `AI_MEMORY_NO_CONFIG=1 cargo test` | All passing, 0 failures |
 | `cargo audit` | 0 vulnerabilities (warnings acceptable if transitive) |
+| `scripts/check-vendor-literals.sh` | Zero violations — vendor-monoculture + `SECS_PER_*` magic-number HARD-BLOCK ([#1200](https://github.com/alphaonedev/ai-memory-mcp/pull/1200)) |
+| `scripts/qc-codegraph-precheck.sh` | Zero violations — C8 caller-context allowlist + structural-drift HARD-BLOCK ([#923](https://github.com/alphaonedev/ai-memory-mcp/issues/923)) |
 | Functional test | All categories pass (maintainer performs during review) |
 | Security review | 0 ship-blocking findings (maintainer performs during review) |
 | Documentation sync | Test counts and tool counts updated in all docs |
 | CLA | Signed (see [CLA.md](../CLA.md)) |
 
-Contributors are responsible for the first four gates. Maintainers perform the functional test, security review, and documentation sync verification during PR review.
+Contributors are responsible for the first six gates (four cargo + two
+script gates wired into `.github/workflows/c8-precheck.yml` — see
+[CLAUDE.md §"Lint gates (issue #1174 PR10)"](../CLAUDE.md)). Maintainers perform the
+functional test, security review, and documentation sync verification during PR review.
 
 ---
 
@@ -110,13 +115,18 @@ AI_MEMORY_NO_CONFIG=1 cargo test
 
 ### 2.2 Full Pre-PR Verification
 
-Contributors must run all four before submitting:
+Contributors must run all six before submitting (four cargo gates plus
+the two script gates introduced by
+[#1200](https://github.com/alphaonedev/ai-memory-mcp/pull/1200) for the
+substrate-canonical-discipline campaign):
 
 ```bash
 cargo fmt --check
 cargo clippy -- -D warnings -D clippy::all -D clippy::pedantic
 AI_MEMORY_NO_CONFIG=1 cargo test
 cargo audit
+scripts/check-vendor-literals.sh        # vendor-monoculture + SECS_PER_* HARD-BLOCK (#1200)
+scripts/qc-codegraph-precheck.sh        # C8 caller-context allowlist + structural drift (#923)
 ```
 
 ### 2.3 Full Spectrum Functional Test

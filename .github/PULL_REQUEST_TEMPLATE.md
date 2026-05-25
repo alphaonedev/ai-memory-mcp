@@ -49,6 +49,8 @@ Closes #
 - [ ] `cargo clippy -- -D warnings -D clippy::all -D clippy::pedantic` clean
 - [ ] `AI_MEMORY_NO_CONFIG=1 cargo test` all passing
 - [ ] `cargo audit` clean (or warnings explained)
+- [ ] `scripts/check-vendor-literals.sh` clean (vendor-monoculture + SECS_PER_* HARD-BLOCK — #1200)
+- [ ] `scripts/qc-codegraph-precheck.sh` clean (C8 caller-context allowlist + structural drift — #923)
 - [ ] Manual security checklist reviewed (Engineering Standards §3.2) — applicable to source changes
 - [ ] Documentation sync where applicable (test counts, MCP tool counts — see Engineering Standards §2.6)
 - [ ] CLA on file for the accountable contributor
