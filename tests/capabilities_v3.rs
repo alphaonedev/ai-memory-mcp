@@ -61,6 +61,7 @@ fn allowlist(rows: &[(&str, &[&str])]) -> McpConfig {
     McpConfig {
         profile: None,
         allowlist: Some(map),
+        ..McpConfig::default()
     }
 }
 
@@ -675,6 +676,7 @@ fn cap_v3_a4_allowlist_disabled_omits_field() {
     let cfg = McpConfig {
         profile: None,
         allowlist: Some(HashMap::new()),
+        ..McpConfig::default()
     };
     assert_eq!(
         build_agent_permitted_families(Some(&cfg), Some("alice")),
