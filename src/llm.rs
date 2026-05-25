@@ -315,7 +315,7 @@ impl OllamaClient {
         let backend = std::env::var("AI_MEMORY_LLM_BACKEND")
             .ok()
             .map(|s| s.trim().to_ascii_lowercase())
-            .unwrap_or_else(|| "ollama".to_string());
+            .unwrap_or_else(|| BACKEND_OLLAMA.to_string());
 
         let model = std::env::var("AI_MEMORY_LLM_MODEL")
             .ok()
@@ -339,7 +339,7 @@ impl OllamaClient {
             });
 
         match backend.as_str() {
-            "ollama" => {
+            BACKEND_OLLAMA => {
                 let base_url = std::env::var("AI_MEMORY_LLM_BASE_URL")
                     .ok()
                     .or_else(|| std::env::var("OLLAMA_BASE_URL").ok())
@@ -476,7 +476,7 @@ impl OllamaClient {
             resolved.source.as_str(),
         );
 
-        if resolved.backend == "ollama" {
+        if resolved.backend == BACKEND_OLLAMA {
             return Self::new_with_url(&resolved.base_url, &resolved.model).map(Some);
         }
 
@@ -1337,7 +1337,7 @@ mod tests {
             ("cerebras", &["CEREBRAS_API_KEY"]),
             ("openrouter", &["OPENROUTER_API_KEY"]),
             ("fireworks", &["FIREWORKS_API_KEY"]),
-            ("ollama", &[]),
+            (BACKEND_OLLAMA, &[]),
             ("lmstudio", &[]),
             ("openai-compatible", &[]),
             ("totally-unknown-vendor", &[]),
