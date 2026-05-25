@@ -1630,7 +1630,13 @@ mod tests {
     }
 
     /// The helper returns the first `Ok(child)` without sleeping when
-    /// the closure succeeds on the first attempt.
+    /// the closure succeeds on the first attempt. Unix-only because
+    /// the test spawns `/bin/true` (or `/usr/bin/true`); Windows has
+    /// no equivalent always-present zero-exit binary in a stable path,
+    /// and the spawn-retry helper itself is a no-op on Windows
+    /// (`is_transient_spawn_errno` always returns `false` when
+    /// `cfg(unix)` is off).
+    #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn issue_1207_spawn_retry_first_attempt_succeeds() {
         let started = Instant::now();
