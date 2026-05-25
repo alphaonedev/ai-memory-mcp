@@ -200,6 +200,34 @@ async fn migrate_v36_restores_memory_kind_column_and_backfills_legacy_rows() {
         return;
     };
 
+    // #1321 — defensive pre-flight: previous tests in the same
+    // postgres-feature CI job (notably `issue_1213_atttypmod_age_schema_scope`)
+    // can leave the shared DB in a state where `public.memories` was
+    // dropped + recreated in a contrived shape AND `schema_version` is
+    // stamped at head. A fresh `PostgresStore::connect()` against that
+    // state hits `CREATE TABLE IF NOT EXISTS` as a no-op (so the v0.7
+    // inline columns never land) and migrate_locked() early-returns
+    // (so migrate_v36 never runs, the partial index
+    // `idx_personas_by_entity` is never created). Both modes were the
+    // CI failure on PR #1305 / release/v0.7.0 HEAD.
+    //
+    // The fix: force-drop the FK-bearing tables, the `memories` table,
+    // and the `schema_version` table so `PostgresStore::connect()`
+    // below is guaranteed to re-bootstrap to head + walk the full
+    // migrate ladder. The DROP IF EXISTS pattern is idempotent; on a
+    // truly-fresh CI DB these statements are no-ops.
+    let preflight = inspection_pool(&url).await;
+    for stmt in [
+        "DROP TABLE IF EXISTS memory_links CASCADE",
+        "DROP TABLE IF EXISTS memory_transcript_links CASCADE",
+        "DROP TABLE IF EXISTS archived_memories CASCADE",
+        "DROP TABLE IF EXISTS public.memories CASCADE",
+        "DROP TABLE IF EXISTS schema_version CASCADE",
+    ] {
+        let _ = sqlx::query(stmt).execute(&preflight).await;
+    }
+    drop(preflight);
+
     // Phase 1 — initial connect runs the full ladder. After this the
     // DB is at the head version with all v36+ columns present. We
     // bind the handle so its pool stays alive across the schema-shape
