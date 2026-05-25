@@ -328,7 +328,11 @@ impl RecallRequest {
             budget_tokens: args.budget_tokens.and_then(|v| i64::try_from(v).ok()),
             context_tokens: args.context_tokens.clone(),
             session_default: Some(args.session_default),
-            session_id: None,
+            // v0.7.0 #1257 — CLI parity for the session_id boost
+            // (#518). Pre-#1257 this was hard-coded to `None`, so
+            // a CLI caller could not reach the in-session ring
+            // rerank boost even though MCP / HTTP callers could.
+            session_id: args.session_id.clone(),
             include_archived: Some(args.include_archived),
             has_citations: Some(args.has_citations),
             source_uri_prefix: args.source_uri_prefix.clone(),
@@ -611,6 +615,8 @@ mod tests {
             confidence_tier: Some("high".to_string()),
             verbose_provenance: true,
             format: "toon".to_string(),
+            // v0.7.0 #1257 — CLI parity for session_id (DTO C2 #967).
+            session_id: Some("sess-1".to_string()),
         };
         let req = RecallRequest::from_cli_args(&cli_args);
         assert_eq!(req.context, "hello");
@@ -638,6 +644,12 @@ mod tests {
             req.format.as_deref(),
             Some("toon"),
             "#1098: --format marshals into DTO.format"
+        );
+        // #1257: pin --session-id round-trip into DTO.session_id.
+        assert_eq!(
+            req.session_id.as_deref(),
+            Some("sess-1"),
+            "#1257: --session-id marshals into DTO.session_id"
         );
         // CLI `tier` has no DTO field — it's a CLI-only knob that
         // drives embedder construction, not a wire-level filter.
