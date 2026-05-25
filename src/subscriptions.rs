@@ -395,41 +395,20 @@ pub const RETRY_BACKOFFS: &[std::time::Duration] = &[
 /// expectations.
 pub const ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// v0.7.0 #1073 — process-wide `reqwest::blocking::Client` accessor
-/// scaffolding for the subscription dispatch path.
-///
-/// **Currently retained but unused** — the v0.7.0 SR-2 #1082 SSRF
-/// hardening at `send()` requires per-call `builder.resolve(host,
-/// addr)` DNS pinning, which lives on the client itself, so a fully
-/// process-wide shared client cannot hold pins that vary per
-/// dispatched URL. A future refactor will route the per-call pin
-/// through a custom `reqwest::dns::Resolve` trait object so the
-/// pin becomes per-request and the client can be process-shared
-/// (matching the federation `peer.rs` pattern). See `send()` for
-/// the live builder path that retains the SSRF guard.
-///
-/// Kept as scaffolding (with the `#[allow(dead_code)]` gate) so the
-/// follow-up refactor lands on the canonical accessor name without
-/// renaming churn.
-#[allow(dead_code)]
-fn dispatch_http_client() -> Option<&'static reqwest::blocking::Client> {
-    static CLIENT: std::sync::OnceLock<Option<reqwest::blocking::Client>> =
-        std::sync::OnceLock::new();
-    CLIENT
-        .get_or_init(|| {
-            match reqwest::blocking::Client::builder()
-                .timeout(ACK_TIMEOUT)
-                .build()
-            {
-                Ok(c) => Some(c),
-                Err(e) => {
-                    tracing::warn!("dispatch_http_client: shared client build failed: {e}");
-                    None
-                }
-            }
-        })
-        .as_ref()
-}
+// v0.7.0 #1073 — `dispatch_http_client()` scaffolding REMOVED
+//
+// v0.7.x (issue #1174 follow-up #1196) — the dead-code shared-client
+// accessor + its `OnceLock<Option<reqwest::blocking::Client>>` static
+// were removed. Sub-agent code review (#1196 PR8) found zero
+// production callers — only the `tests/sr3_perf_regressions.rs`
+// scaffolding-pin test kept the symbol alive. The SR-2 #1082 SSRF
+// hardening (per-call `builder.resolve(host, addr)` DNS pinning)
+// keeps the per-call builder path live in `send()`; the future
+// custom `reqwest::dns::Resolve` refactor will re-introduce a shared
+// client at that point through `RuntimeContext`, not as a private
+// module-level OnceLock. Removed alongside the test pin in the same
+// commit so the scaffolding doesn't drift back via the existence
+// assertion.
 
 /// One row of the `subscription_events` per-delivery audit log. K6
 /// writes one row before each network send; K7's
@@ -1113,11 +1092,14 @@ fn send(
     // that vary per dispatched URL. We still amortize the bulk of
     // the work (TLS provider init, default connector) by sharing
     // the resolver+TLS state through this thread-local builder.
-    // The shared `dispatch_http_client()` accessor below is retained
-    // as scaffolding for a future custom-resolver refactor where the
-    // per-call pin becomes a trait-object dns::Resolve and the
-    // client can be process-shared. Correctness (SSRF closure) wins
-    // over the per-attempt client rebuild cost in the meantime.
+    // A future custom-resolver refactor will move the per-call pin
+    // onto a trait-object `dns::Resolve` so the client itself can be
+    // process-shared (matching the federation `peer.rs` pattern, and
+    // re-introduced through `RuntimeContext` at that point). For now
+    // correctness (SSRF closure) wins over the per-attempt client
+    // rebuild cost. The prior `dispatch_http_client()` scaffolding
+    // was removed in #1196 — it had zero production callers, only a
+    // test pin kept it alive.
     let client = match builder.build() {
         Ok(c) => c,
         Err(e) => {

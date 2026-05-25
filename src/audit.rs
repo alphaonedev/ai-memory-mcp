@@ -39,13 +39,15 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, RwLock};
+use std::sync::Mutex;
+use std::sync::atomic::Ordering;
 
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+use crate::runtime_context::RuntimeContext;
 
 /// Stable schema version stamped on every emitted line. Bump only when
 /// a field's semantics change in a way SIEM parsers care about
@@ -200,21 +202,29 @@ pub struct AuditAuth {
 // Sink — process-wide singleton holding the file handle + chain head.
 // ---------------------------------------------------------------------------
 
-/// Process-wide audit sink. `None` when audit is disabled. Wrapped in
-/// `RwLock` (rather than `OnceLock`) so tests can swap in an
-/// in-memory sink between cases without leaking state across runs.
-static SINK: RwLock<Option<std::sync::Arc<AuditSink>>> = RwLock::new(None);
-/// Per-process monotonic sequence counter. Starts at 1 on first emit.
-static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+// v0.7.x (issue #1174 follow-up #1192) — sink + sequence moved into
+// `RuntimeContext::audit`. The accessors below preserve byte-equivalent
+// semantics: every read goes through `RuntimeContext::global().audit.*`
+// so the V-4 hash chain invariant + the F2 sequence-restart invariant
+// are observed identically by `init`, `emit`, `verify_chain`, and the
+// `init_for_test` / `shutdown_for_test` helpers.
 
 /// Initialised audit sink — writer handle protected by a mutex so the
 /// chain head update + write are atomic across emission threads. The
 /// writer is `dyn Write + Send` so tests can substitute an in-memory
 /// `Vec<u8>` for the production `File`.
-pub(crate) struct AuditSink {
+pub struct AuditSink {
     inner: Mutex<SinkInner>,
     #[allow(dead_code)]
     redact_content: bool,
+}
+
+impl std::fmt::Debug for AuditSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuditSink")
+            .field("redact_content", &self.redact_content)
+            .finish_non_exhaustive()
+    }
 }
 
 struct SinkInner {
@@ -286,8 +296,9 @@ pub fn init(path: &Path, redact_content: bool, append_only_hint: bool) -> Result
         redact_content,
     };
 
-    SEQUENCE.store(last_sequence, Ordering::SeqCst);
-    if let Ok(mut guard) = SINK.write() {
+    let audit = &RuntimeContext::global().audit;
+    audit.sequence.store(last_sequence, Ordering::SeqCst);
+    if let Ok(mut guard) = audit.sink.write() {
         *guard = Some(std::sync::Arc::new(sink));
     }
     Ok(())
@@ -319,8 +330,9 @@ pub fn init_for_test(buf: std::sync::Arc<Mutex<Vec<u8>>>) {
         }),
         redact_content: true,
     };
-    SEQUENCE.store(0, Ordering::SeqCst);
-    if let Ok(mut guard) = SINK.write() {
+    let audit = &RuntimeContext::global().audit;
+    audit.sequence.store(0, Ordering::SeqCst);
+    if let Ok(mut guard) = audit.sink.write() {
         *guard = Some(std::sync::Arc::new(sink));
     }
 }
@@ -329,10 +341,11 @@ pub fn init_for_test(buf: std::sync::Arc<Mutex<Vec<u8>>>) {
 /// no-op.
 #[cfg(test)]
 pub fn shutdown_for_test() {
-    if let Ok(mut guard) = SINK.write() {
+    let audit = &RuntimeContext::global().audit;
+    if let Ok(mut guard) = audit.sink.write() {
         *guard = None;
     }
-    SEQUENCE.store(0, Ordering::SeqCst);
+    audit.sequence.store(0, Ordering::SeqCst);
 }
 
 /// Read the last `(self_hash, sequence)` pair from an existing audit
@@ -400,7 +413,12 @@ fn read_chain_tail(path: &Path) -> Result<Option<(String, u64)>> {
 /// Whether the audit subsystem is currently enabled. Cheap.
 #[must_use]
 pub fn is_enabled() -> bool {
-    SINK.read().map(|g| g.is_some()).unwrap_or(false)
+    RuntimeContext::global()
+        .audit
+        .sink
+        .read()
+        .map(|g| g.is_some())
+        .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -516,8 +534,10 @@ pub fn emit(builder: EventBuilder) {
 /// Inner emission with proper `Result` so tests can assert directly on
 /// the writer. `emit` swallows errors so production never blocks.
 fn try_emit(builder: EventBuilder) -> Result<()> {
+    let audit = &RuntimeContext::global().audit;
     let sink = {
-        let guard = SINK
+        let guard = audit
+            .sink
             .read()
             .map_err(|_| anyhow!("audit sink rwlock poisoned"))?;
         match guard.as_ref() {
@@ -531,7 +551,7 @@ fn try_emit(builder: EventBuilder) -> Result<()> {
         .lock()
         .map_err(|_| anyhow!("audit sink mutex poisoned"))?;
 
-    let sequence = SEQUENCE.fetch_add(1, Ordering::SeqCst) + 1;
+    let sequence = audit.sequence.fetch_add(1, Ordering::SeqCst) + 1;
 
     let mut ev = AuditEvent {
         schema_version: SCHEMA_VERSION,
@@ -808,7 +828,7 @@ pub fn verify_chain_from_reader<R: Read>(reader: R) -> Result<VerifyReport> {
 /// - The audit directory or file cannot be opened.
 pub fn init_from_config(cfg: &crate::config::AuditConfig) -> Result<()> {
     if !cfg.enabled.unwrap_or(false) {
-        if let Ok(mut guard) = SINK.write() {
+        if let Ok(mut guard) = RuntimeContext::global().audit.sink.write() {
             *guard = None;
         }
         return Ok(());

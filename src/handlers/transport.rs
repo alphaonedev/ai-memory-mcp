@@ -292,6 +292,22 @@ pub struct AppState {
     /// `[llm]` / legacy / compiled-default precedence, so the resulting
     /// triple is process-stable.
     pub resolved_models: Arc<crate::config::ResolvedModels>,
+
+    /// v0.7.x (issue #1174 follow-up #1192 / #1196) — cross-surface
+    /// [`crate::runtime_context::RuntimeContext`] handle. Holds the
+    /// process-wide K7 HMAC override, I1 decompression cap, V-4 audit
+    /// chain state, session-recall tracker, and X25519 keypair cache
+    /// — i.e. every substrate static that the HTTP daemon, MCP stdio
+    /// binary, and CLI need to observe identically.
+    ///
+    /// Always populated. Cloned by reference (`Arc::clone`) so storing
+    /// it on `AppState` is cheap and the wire / chain / cache
+    /// semantics across surfaces stay byte-equivalent: every accessor
+    /// (`crate::config::active_hooks_hmac_secret`, `crate::audit::emit`,
+    /// `crate::reranker::global_session_recall_tracker`,
+    /// `crate::encryption::get_or_create_keypair`) delegates to the
+    /// same `RuntimeContext::global()` singleton.
+    pub runtime: Arc<crate::runtime_context::RuntimeContext>,
 }
 
 /// v0.7.0 B3 — canonical 1-2 sentence English descriptors for each

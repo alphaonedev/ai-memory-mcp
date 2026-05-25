@@ -362,6 +362,7 @@ fn test_app_state(db: Db) -> AppState {
         admin_agent_ids: Arc::new(vec!["*".to_string()]),
         rule_cache: std::sync::Arc::new(crate::governance::rule_cache::RuleCache::new()),
         resolved_models: std::sync::Arc::new(crate::config::ResolvedModels::default()),
+        runtime: crate::runtime_context::RuntimeContext::global_arc(),
     }
 }
 
@@ -1079,6 +1080,7 @@ async fn http_bulk_create_fans_out_with_federation() {
         admin_agent_ids: Arc::new(Vec::new()),
         rule_cache: std::sync::Arc::new(crate::governance::rule_cache::RuleCache::new()),
         resolved_models: std::sync::Arc::new(crate::config::ResolvedModels::default()),
+        runtime: crate::runtime_context::RuntimeContext::global_arc(),
     };
     let router = Router::new()
         .route("/api/v1/memories/bulk", axum_post(bulk_create))
@@ -9665,6 +9667,7 @@ fn h8d_app_state_with_fed(db: Db, peer_urls: Vec<String>, w: usize, timeout_ms: 
         admin_agent_ids: Arc::new(Vec::new()),
         rule_cache: std::sync::Arc::new(crate::governance::rule_cache::RuleCache::new()),
         resolved_models: std::sync::Arc::new(crate::config::ResolvedModels::default()),
+        runtime: crate::runtime_context::RuntimeContext::global_arc(),
     }
 }
 

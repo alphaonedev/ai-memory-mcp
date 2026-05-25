@@ -14,7 +14,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{Sender, sync_channel};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -164,10 +164,16 @@ impl SessionRecallTracker {
 /// path. Lazily initialised on first access; never reset within a
 /// process lifetime (per-process state by design — operator restart
 /// clears every session's recent set).
+///
+/// v0.7.x (issue #1174 follow-up #1196) — the tracker lives on
+/// [`crate::runtime_context::RuntimeContext::recall_tracker`]. The
+/// returned `&'static` reference is stable because
+/// `RuntimeContext::global()` itself is a `OnceLock`-backed
+/// process-wide singleton; the `Arc<SessionRecallTracker>` inside it
+/// is allocated once and outlives every caller.
 #[must_use]
 pub fn global_session_recall_tracker() -> &'static SessionRecallTracker {
-    static TRACKER: OnceLock<SessionRecallTracker> = OnceLock::new();
-    TRACKER.get_or_init(SessionRecallTracker::new)
+    &crate::runtime_context::RuntimeContext::global().recall_tracker
 }
 
 /// v0.7.0 (issue #518) — apply the per-session recently-accessed boost

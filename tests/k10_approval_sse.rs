@@ -152,6 +152,7 @@ async fn http_sse_endpoint_emits_event_to_attached_client() {
         admin_agent_ids: std::sync::Arc::new(Vec::new()),
         rule_cache: std::sync::Arc::new(ai_memory::governance::rule_cache::RuleCache::new()),
         resolved_models: std::sync::Arc::new(ai_memory::config::ResolvedModels::default()),
+        runtime: ai_memory::runtime_context::RuntimeContext::global_arc(),
     };
     let api_key_state = ai_memory::handlers::ApiKeyState {
         key: None,

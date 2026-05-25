@@ -3692,22 +3692,30 @@ impl AppConfig {
 // Process-wide handle for the K7 server-wide HMAC override.
 // Mirrors the `ACTIVE_PERMISSIONS_MODE` pattern: set once at boot,
 // read by `subscriptions::dispatch_event_with_details` without an
-// API churn through every callsite. Stored behind a `RwLock<Option<…>>`
-// so the K7 integration tests can flip the value mid-process without
-// the `OnceLock`'s set-once contract getting in the way.
+// API churn through every callsite.
+//
+// v0.7.x (issue #1174 follow-up #1192) — storage moved to
+// `RuntimeContext::hooks_hmac_secret` so the HTTP daemon, the MCP
+// stdio binary, and the CLI all share one source of truth. The
+// accessors below delegate to the process-wide singleton; the wire
+// semantics + the K7 integration-test fixture (which flips the value
+// mid-process) are byte-equivalent.
 // ---------------------------------------------------------------------------
-
-use std::sync::RwLock;
-
-static ACTIVE_HOOKS_HMAC_SECRET: RwLock<Option<String>> = RwLock::new(None);
 
 /// v0.7.0 K7 — set the process-wide webhook HMAC override. Called from
 /// `main`/daemon bootstrap with the value from
 /// `[hooks.subscription] hmac_secret`. Last writer wins — this is
 /// production-safe because boot only invokes it once; tests use the
 /// same setter to flip mid-process.
+///
+/// v0.7.x (issue #1192) — delegates to
+/// [`crate::runtime_context::RuntimeContext::global`]; the storage
+/// lives on `RuntimeContext::hooks_hmac_secret`.
 pub fn set_active_hooks_hmac_secret(secret: Option<String>) {
-    if let Ok(mut w) = ACTIVE_HOOKS_HMAC_SECRET.write() {
+    if let Ok(mut w) = crate::runtime_context::RuntimeContext::global()
+        .hooks_hmac_secret
+        .write()
+    {
         *w = secret;
     }
 }
@@ -3715,9 +3723,17 @@ pub fn set_active_hooks_hmac_secret(secret: Option<String>) {
 /// v0.7.0 K7 — read the process-wide webhook HMAC override. Returns
 /// `None` when unset (the K6-and-earlier behaviour: only
 /// per-subscription secrets sign outgoing payloads).
+///
+/// v0.7.x (issue #1192) — delegates to
+/// [`crate::runtime_context::RuntimeContext::global`]; the storage
+/// lives on `RuntimeContext::hooks_hmac_secret`.
 #[must_use]
 pub fn active_hooks_hmac_secret() -> Option<String> {
-    ACTIVE_HOOKS_HMAC_SECRET.read().ok().and_then(|g| g.clone())
+    crate::runtime_context::RuntimeContext::global()
+        .hooks_hmac_secret
+        .read()
+        .ok()
+        .and_then(|g| g.clone())
 }
 
 // ---------------------------------------------------------------------------
@@ -3730,24 +3746,37 @@ pub fn active_hooks_hmac_secret() -> Option<String> {
 // via `[transcripts] max_decompressed_bytes = …`; default-on uses the
 // compiled `MAX_DECOMPRESSED_BYTES` constant. The cap is per-call;
 // concurrent fetches consume up to N × this value of transient memory.
-
-static ACTIVE_MAX_DECOMPRESSED_BYTES: std::sync::RwLock<Option<usize>> =
-    std::sync::RwLock::new(None);
+//
+// v0.7.x (issue #1174 follow-up #1192) — storage moved to
+// `RuntimeContext::max_decompressed_bytes`. The accessors below
+// delegate; the per-call cap semantics are byte-equivalent.
 
 /// Set the process-wide decompression cap. Boot reads
 /// `[transcripts] max_decompressed_bytes` and calls this; tests flip
 /// mid-process to exercise both branches.
+///
+/// v0.7.x (issue #1192) — delegates to
+/// [`crate::runtime_context::RuntimeContext::global`]; the storage
+/// lives on `RuntimeContext::max_decompressed_bytes`.
 pub fn set_active_max_decompressed_bytes(cap: Option<usize>) {
-    if let Ok(mut w) = ACTIVE_MAX_DECOMPRESSED_BYTES.write() {
+    if let Ok(mut w) = crate::runtime_context::RuntimeContext::global()
+        .max_decompressed_bytes
+        .write()
+    {
         *w = cap;
     }
 }
 
 /// Read the process-wide decompression cap, falling back to the
 /// compiled default when unset.
+///
+/// v0.7.x (issue #1192) — delegates to
+/// [`crate::runtime_context::RuntimeContext::global`]; the storage
+/// lives on `RuntimeContext::max_decompressed_bytes`.
 #[must_use]
 pub fn active_max_decompressed_bytes() -> usize {
-    ACTIVE_MAX_DECOMPRESSED_BYTES
+    crate::runtime_context::RuntimeContext::global()
+        .max_decompressed_bytes
         .read()
         .ok()
         .and_then(|g| *g)
