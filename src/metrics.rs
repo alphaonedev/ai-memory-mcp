@@ -194,6 +194,17 @@ pub struct Metrics {
     /// from this with a 60s rolling window. Surfaced as an `IntGauge`
     /// so the value is also readable via Prometheus scraping.
     pub hnsw_last_eviction_at_nanos: IntGauge,
+
+    /// #1253 (MED, 2026-05-25) — monotonic counter for subscription
+    /// DLQ insert attempts that were refused because the per-
+    /// subscription DLQ depth had already hit
+    /// [`crate::subscriptions::MAX_SUBSCRIPTION_DLQ_ROWS`]. Non-zero
+    /// means a hostile (or simply-broken) webhook target is failing
+    /// every delivery and would otherwise fill the operator's disk
+    /// with quarantined rows. Each refused insert pairs with a
+    /// `tracing::warn!` so operators see the subscription id + correlation
+    /// id of the dropped row.
+    pub subscription_dlq_overflow_total: IntCounter,
 }
 
 /// Lazily-built process-global metrics handle.
@@ -453,6 +464,19 @@ impl Metrics {
         )?;
         registry.register(Box::new(hnsw_last_eviction_at_nanos.clone()))?;
 
+        // #1253 (MED, 2026-05-25) — subscription DLQ overflow counter.
+        let subscription_dlq_overflow_total = IntCounter::new(
+            "ai_memory_subscription_dlq_overflow_total",
+            "Monotonic counter of subscription_dlq inserts refused \
+             because the per-subscription DLQ depth had already hit \
+             MAX_SUBSCRIPTION_DLQ_ROWS (10_000). Non-zero indicates a \
+             hostile or persistently-broken webhook target that would \
+             otherwise fill the operator's disk with quarantined rows. \
+             Operators drain the queue via `ai-memory subscription dlq \
+             drain <subscription_id>` before resetting.",
+        )?;
+        registry.register(Box::new(subscription_dlq_overflow_total.clone()))?;
+
         Ok(Self {
             registry,
             store_total,
@@ -477,8 +501,26 @@ impl Metrics {
             federation_push_dlq_quarantined,
             hnsw_evictions_total,
             hnsw_last_eviction_at_nanos,
+            subscription_dlq_overflow_total,
         })
     }
+}
+
+/// #1253 (MED, 2026-05-25) — record one subscription_dlq insert that
+/// was refused because the per-subscription DLQ already held
+/// [`crate::subscriptions::MAX_SUBSCRIPTION_DLQ_ROWS`] rows. Pairs
+/// with a `tracing::warn!` at the call site so operators see the
+/// subscription id + correlation id of the dropped row.
+pub fn record_subscription_dlq_overflow() {
+    registry().subscription_dlq_overflow_total.inc();
+}
+
+/// #1253 (MED, 2026-05-25) — read the current value of the
+/// subscription DLQ overflow counter. Test-only accessor for the
+/// regression that pins this cap.
+#[must_use]
+pub fn subscription_dlq_overflow_count() -> u64 {
+    registry().subscription_dlq_overflow_total.get()
 }
 
 /// Cluster-A COR-3 (v0.7.0) — record a single corrupt-provenance row

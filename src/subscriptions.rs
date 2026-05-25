@@ -1680,6 +1680,23 @@ pub fn record_dlq(
     )
 }
 
+/// #1253 (MED, 2026-05-25) — operator-disk-fill DoS guard. Hard cap
+/// on the per-subscription `subscription_dlq` depth. Pre-#1253 the
+/// DLQ grew unboundedly when a hostile (or simply broken) webhook
+/// target failed every delivery — a single bad subscriber could
+/// exhaust the operator's disk by sustaining a high failure rate.
+/// Past this cap [`record_dlq_with_conn`] refuses the insert with
+/// the typed `dlq_overflow` error, increments the
+/// `ai_memory_subscription_dlq_overflow_total` counter, and emits a
+/// `tracing::warn!`. Operators drain the queue via
+/// `memory_subscription_dlq_list` + the planned `... dlq drain`
+/// admin tool before resetting. 10_000 rows is well above realistic
+/// transient-failure depths (a healthy peer recovers in minutes, not
+/// thousands of events) while still bounded enough that a hostile
+/// peer can write at most ~10 MB before being capped (the payload
+/// column is itself bounded by the webhook JSON-body cap upstream).
+pub const MAX_SUBSCRIPTION_DLQ_ROWS: i64 = 10_000;
+
 /// v0.7.0 #1072 — `Connection`-reuse variant of [`record_dlq`].
 #[allow(clippy::too_many_arguments)]
 pub fn record_dlq_with_conn(
@@ -1693,6 +1710,32 @@ pub fn record_dlq_with_conn(
     first_failed_at: &str,
     last_failed_at: &str,
 ) -> Result<()> {
+    // #1253 — refuse the insert if the per-subscription DLQ is full.
+    // Counting before the INSERT keeps the cap honest under
+    // concurrent dispatch threads (the SQLite single-writer lock
+    // serialises this read+write pair against any sibling DLQ
+    // insert against the same subscription).
+    let depth: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM subscription_dlq WHERE subscription_id = ?1",
+            params![sub_id],
+            |row| row.get(0),
+        )
+        .context("subscription_dlq depth probe")?;
+    if depth >= MAX_SUBSCRIPTION_DLQ_ROWS {
+        crate::metrics::record_subscription_dlq_overflow();
+        tracing::warn!(
+            subscription_id = %sub_id,
+            correlation_id = %correlation_id,
+            event_type = %event_type,
+            depth = depth,
+            cap = MAX_SUBSCRIPTION_DLQ_ROWS,
+            "dlq_overflow: refusing subscription_dlq insert — per-subscription cap reached",
+        );
+        return Err(anyhow!(
+            "dlq_overflow: subscription {sub_id} dlq at cap ({MAX_SUBSCRIPTION_DLQ_ROWS}); drain before further inserts"
+        ));
+    }
     conn.execute(
         "INSERT INTO subscription_dlq \
          (subscription_id, correlation_id, event_type, payload, retry_count, last_error, first_failed_at, last_failed_at) \
@@ -3698,6 +3741,103 @@ mod tests {
         let envelope = memory_subscription_replay(&conn, &sub_id, "2026-03-01T00:00:00Z").unwrap();
         assert_eq!(envelope["count"], 1);
         assert_eq!(envelope["events"][0]["correlation_id"], "c-new");
+    }
+
+    /// #1253 (MED, 2026-05-25) — regression: per-subscription
+    /// `subscription_dlq` depth is capped at
+    /// [`MAX_SUBSCRIPTION_DLQ_ROWS`]; the (cap + 1)-th insert is
+    /// refused with a `dlq_overflow` error, leaves the table at
+    /// exactly cap rows, and bumps the
+    /// `ai_memory_subscription_dlq_overflow_total` counter.
+    #[test]
+    fn issue_1253_dlq_overflow_cap_refuses_past_max() {
+        let (_keep, db_path) = fresh_db();
+        let conn = Connection::open(&db_path).unwrap();
+        let sub_id = insert(
+            &conn,
+            &NewSubscription {
+                url: "https://example.com/hook",
+                events: "*",
+                secret: Some("s"),
+                namespace_filter: None,
+                agent_filter: None,
+                created_by: None,
+                event_types: None,
+            },
+        )
+        .unwrap();
+
+        // Drive the DLQ to the cap with the canonical writer so the
+        // test exercises the same insert path production uses.
+        for i in 0..MAX_SUBSCRIPTION_DLQ_ROWS {
+            let corr = format!("c-{i}");
+            record_dlq_with_conn(
+                &conn,
+                &sub_id,
+                &corr,
+                "memory_store",
+                "{}",
+                4,
+                "http-500",
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T00:00:00Z",
+            )
+            .expect("inserts below cap must succeed");
+        }
+        let depth: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM subscription_dlq WHERE subscription_id = ?1",
+                params![&sub_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(depth, MAX_SUBSCRIPTION_DLQ_ROWS, "DLQ should fill to cap");
+
+        // Snapshot the overflow counter so we can prove it advances.
+        let before = crate::metrics::subscription_dlq_overflow_count();
+
+        // (cap + 1)-th insert must be refused with the typed error
+        // shape — the err string starts with "dlq_overflow:" so
+        // operators / dashboards can pattern-match it.
+        let res = record_dlq_with_conn(
+            &conn,
+            &sub_id,
+            "c-overflow",
+            "memory_store",
+            "{}",
+            4,
+            "http-500",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+        );
+        let err = res.expect_err("over-cap insert must be refused");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("dlq_overflow"),
+            "error must carry the dlq_overflow tag for operators: {msg}"
+        );
+
+        // The table must remain at cap — refusal is total, not partial.
+        let depth_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM subscription_dlq WHERE subscription_id = ?1",
+                params![&sub_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            depth_after, MAX_SUBSCRIPTION_DLQ_ROWS,
+            "refused insert must not leak a row into subscription_dlq"
+        );
+
+        // Counter must have ticked. The metrics handle is a singleton
+        // so parallel tests can also bump it; what we own is the +1
+        // contributed by this call.
+        let after = crate::metrics::subscription_dlq_overflow_count();
+        assert!(
+            after >= before + 1,
+            "subscription_dlq_overflow_total did not advance (before={before}, after={after})"
+        );
     }
 }
 
