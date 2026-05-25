@@ -12915,7 +12915,10 @@ mod tests {
         // underlying stream (the drain path).
         let mut scratch = [0u8; 64];
         let m = src.read(&mut scratch).expect("further reads succeed");
-        assert!(m > 0, "underlying stream still has bytes for the drain path");
+        assert!(
+            m > 0,
+            "underlying stream still has bytes for the drain path"
+        );
     }
 
     /// Inputs at or below the cap that DO contain a newline must
