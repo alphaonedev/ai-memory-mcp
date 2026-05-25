@@ -107,7 +107,13 @@ fn alias_api_key_env_vars(alias: &str) -> &'static [&'static str] {
 /// historical name preserved post-#1066 for call-site backward
 /// compatibility — a future rename to `LlmClient` is non-breaking and
 /// tracked separately).
-#[derive(Debug, Clone)]
+///
+/// #1258 — `api_key` carries a vendor Bearer token; the manual `Drop`
+/// impl below zeroizes the in-memory bytes when an `LlmProvider` falls
+/// out of scope so the secret does not linger on the heap. #1262 —
+/// the manual `Debug` impl redacts the `api_key` to `<redacted>` so a
+/// stray `{:?}` print never leaks the secret.
+#[derive(Clone)]
 pub enum LlmProvider {
     /// Ollama native API: `POST /api/chat`, `POST /api/embed`. No
     /// auth header. This is the historical pre-#1066 behavior and
@@ -120,6 +126,34 @@ pub enum LlmProvider {
     /// Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, llama.cpp
     /// server, and any other vendor following the spec.
     OpenAiCompatible { api_key: String },
+}
+
+impl std::fmt::Debug for LlmProvider {
+    /// #1262 — redact `api_key` so accidental `{:?}` prints never leak
+    /// the vendor Bearer token. The variant name stays for operator
+    /// diagnostics.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LlmProvider::Ollama => f.debug_struct("Ollama").finish(),
+            LlmProvider::OpenAiCompatible { .. } => f
+                .debug_struct("OpenAiCompatible")
+                .field("api_key", &"<redacted>")
+                .finish(),
+        }
+    }
+}
+
+impl Drop for LlmProvider {
+    /// #1258 — zeroize the `api_key` buffer on scope exit so the vendor
+    /// Bearer token does not linger on the heap after the
+    /// `LlmProvider` is dropped. `Ollama` carries no secret and is a
+    /// no-op.
+    fn drop(&mut self) {
+        if let LlmProvider::OpenAiCompatible { api_key } = self {
+            use zeroize::Zeroize;
+            api_key.zeroize();
+        }
+    }
 }
 
 const GENERATE_TIMEOUT: Duration = Duration::from_secs(30);
