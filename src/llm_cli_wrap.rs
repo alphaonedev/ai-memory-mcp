@@ -94,6 +94,20 @@ pub fn default_strategy(agent: &str) -> WrapStrategy {
         "codex" | "codex-cli" => WrapStrategy::SystemFlag {
             flag: "--system".into(),
         },
+        // Anthropic Claude Code CLI (#1238). The canonical flag for
+        // appending a system prompt onto a `claude` invocation is
+        // `--append-system-prompt "<msg>"` per the upstream
+        // `@anthropic-ai/claude-code` CLI docs. The env-var equivalent
+        // is `CLAUDE_SYSTEM_PROMPT` but the flag form is preferred —
+        // it composes with `claude -p` (one-shot mode) without forcing
+        // operators to leak the prompt into the child's env block.
+        // Pre-#1238 this fell through to the generic `--system`
+        // fallback, which `claude` either rejects or silently
+        // ignores — the project's own primary use case sat in the
+        // unverified fallback.
+        "claude" | "claude-cli" => WrapStrategy::SystemFlag {
+            flag: "--append-system-prompt".into(),
+        },
         // Aider takes its system / instructions input from a file via
         // `--message-file`. Aider's CLI explicitly recommends this for
         // anything longer than a one-liner because it doesn't shell-quote
@@ -115,6 +129,30 @@ pub fn default_strategy(agent: &str) -> WrapStrategy {
         // Default: most OpenAI-compatible CLIs accept `--system <msg>`.
         // If that's wrong, users override with `--system-flag` /
         // `--system-env` / `--message-file-flag`.
+        //
+        // # Documented gaps (#1238)
+        //
+        // The following vendor CLI binaries are intentionally LEFT in
+        // the generic fallback rather than pinned to a flag, because
+        // upstream documentation does not surface a canonical
+        // `--system`-equivalent flag the way the entries above do:
+        //
+        // - `gpt` — no canonical first-party OpenAI CLI binary uses
+        //   that name; multiple community wrappers exist with
+        //   incompatible flag shapes. Falls through to `--system`.
+        // - `grok` — xAI ships no first-party CLI binary at v0.7.0
+        //   (the Grok surface is API-only); falls through to
+        //   `--system` for any community wrapper that defaults to it.
+        // - `anthropic-cli` — there is no first-party CLI binary
+        //   named `anthropic-cli` at v0.7.0 (Anthropic ships the
+        //   Python SDK + the `claude` Claude Code CLI handled above);
+        //   falls through to `--system` for any third-party tool.
+        //
+        // Operators running a vendor CLI in any of the three gaps
+        // above pass `--system-flag <flag>` (or `--system-env <name>`
+        // / `--message-file-flag <flag>`) explicitly. If a canonical
+        // upstream form lands for any of these later, add a row
+        // here + extend `default_strategy_per_known_agent_pins_1183`.
         _ => WrapStrategy::SystemFlag {
             flag: "--system".into(),
         },
@@ -163,6 +201,38 @@ mod tests {
                 name: "OLLAMA_SYSTEM".into()
             }
         );
+        // #1238 — Claude Code CLI uses --append-system-prompt; the
+        // pre-#1238 default fall-through to `--system` is wrong for
+        // `claude` and `claude-cli` (the project's own primary
+        // wrapped agent).
+        assert_eq!(
+            default_strategy("claude"),
+            WrapStrategy::SystemFlag {
+                flag: "--append-system-prompt".into()
+            }
+        );
+        assert_eq!(
+            default_strategy("claude-cli"),
+            WrapStrategy::SystemFlag {
+                flag: "--append-system-prompt".into()
+            }
+        );
+        // #1238 — documented gaps. `gpt`, `grok`, `anthropic-cli`
+        // have no canonical first-party CLI flag at v0.7.0 ship;
+        // they intentionally fall through to the generic --system
+        // default. If a canonical form lands for any of these
+        // later, add a row in `default_strategy` AND extend this
+        // assertion.
+        for gap in ["gpt", "grok", "anthropic-cli"] {
+            assert_eq!(
+                default_strategy(gap),
+                WrapStrategy::SystemFlag {
+                    flag: "--system".into()
+                },
+                "documented #1238 gap `{gap}` must fall through to the generic --system \
+                 default until a canonical upstream form is verifiable"
+            );
+        }
         // Unknown agent → fall through to --system.
         assert_eq!(
             default_strategy("some-future-cli"),
