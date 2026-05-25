@@ -139,7 +139,25 @@ echo "  tls_flags='$TLS_FLAGS'"
 echo "  quorum_flags='$QUORUM_FLAGS'"
 
 unset AI_MEMORY_DB
-export AI_MEMORY_AGENT_ID=daemon
+# #1231 (2026-05-25) — DO NOT override AI_MEMORY_AGENT_ID to the
+# reserved sentinel `daemon`. The wire-side validator
+# `validate::validate_agent_id` (src/validate.rs:366) was hardened by
+# #977 (commit d81df2d7c) to reject every member of
+# `RESERVED_AGENT_IDS` (which includes `daemon`) when supplied via env
+# var or wire callers. Setting AI_MEMORY_AGENT_ID=daemon here causes
+# `identity::resolve_agent_id` (src/identity/mod.rs:153) to bail with
+# `agent_id 'daemon' is reserved for internal use and cannot be
+# supplied by wire callers`, crashlooping the daemon container.
+#
+# The daemon's self-signing keypair is loaded by the LITERAL label
+# `DAEMON_KEYPAIR_LABEL = "daemon"` via
+# `crate::identity::keypair::load("daemon", &dir)`
+# (src/daemon_runtime.rs:1937, src/mcp/mod.rs:2038) — that path does
+# NOT read AI_MEMORY_AGENT_ID and stays correct regardless of the
+# daemon process's resolved agent_id. The operator-supplied
+# AI_MEMORY_AGENT_ID (e.g. `ai:ic-parity-alice@lan-parity` set by
+# docker-compose) flows through unchanged and is honoured by
+# `resolve_agent_id` step 2.
 export RUST_LOG="${RUST_LOG:-ai_memory=info}"
 
 exec /usr/local/bin/ai-memory serve \
