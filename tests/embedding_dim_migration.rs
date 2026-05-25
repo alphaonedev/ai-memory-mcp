@@ -103,10 +103,21 @@ async fn inspection_pool(url: &str) -> PgPool {
 }
 
 async fn current_dim(pool: &PgPool) -> Option<i32> {
+    // #1213 — scope to `public.memories`. When Apache AGE is installed
+    // on the same DB, `ag_catalog.memories` exists with its own
+    // `embedding vector(N)` column (landed at a different dim by some
+    // earlier IronClaw bootstrap that ran with
+    // `search_path=ic_<name>,ag_catalog,public`). The unscoped query
+    // surfaces whichever row postgres returns first (oid-ordered →
+    // ag_catalog wins on a fresh AGE-installed DB), masking the public-
+    // schema dim with the unrelated ag_catalog one.
     sqlx::query_scalar::<_, i32>(
-        "SELECT atttypmod FROM pg_attribute a
+        "SELECT a.atttypmod FROM pg_attribute a
          JOIN pg_class c ON c.oid = a.attrelid
-         WHERE c.relname = 'memories' AND a.attname = 'embedding'",
+         JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = 'public'
+           AND c.relname = 'memories'
+           AND a.attname = 'embedding'",
     )
     .fetch_optional(pool)
     .await
@@ -262,4 +273,71 @@ async fn http_write_path_accepts_768_after_auto_migrate() {
         row.is_some(),
         "issue-877 row must persist through the postgres write path post-auto-migrate"
     );
+}
+
+/// #1213 regression: `current_embedding_dim()` must scope to
+/// `public.memories` so an unrelated `ag_catalog.memories` left behind
+/// by Apache AGE / per-IronClaw search-path bootstraps cannot mask the
+/// real public-schema dim with its own.
+///
+/// Mechanic: simulate the LAN-parity bootstrap state by installing a
+/// fake `ag_catalog.memories` at `vector(768)` alongside the
+/// `public.memories` at `vector(384)` the test bootstraps via
+/// `connect_with_dim`. Assert `current_embedding_dim()` returns 384
+/// (the public dim), not 768 (the `ag_catalog` dim).
+#[tokio::test]
+async fn current_embedding_dim_scopes_to_public_schema_1213() {
+    let Some(url) = postgres_url() else {
+        eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+        return;
+    };
+    let _guard = SUITE_LOCK.lock().await;
+
+    let inspect = inspection_pool(&url).await;
+    reset_schema(&inspect).await;
+
+    // Drop any prior fake ag_catalog table from a previous run (the
+    // test reset_schema helper above doesn't touch ag_catalog by design
+    // — production code must not depend on ag_catalog state).
+    let _ = sqlx::query("DROP TABLE IF EXISTS ag_catalog.memories")
+        .execute(&inspect)
+        .await;
+
+    // Bootstrap public.memories at vector(384) (the bug-trigger dim).
+    let store = PostgresStore::connect_with_dim(&url, 384)
+        .await
+        .expect("public bootstrap at dim=384");
+
+    // Install a fake ag_catalog.memories at vector(768) to simulate the
+    // AGE/search-path bootstrap that put ai-memory tables in ag_catalog
+    // because the per-IC schema was empty at boot.
+    sqlx::query(
+        "CREATE TABLE ag_catalog.memories (
+            id TEXT PRIMARY KEY,
+            embedding vector(768)
+         )",
+    )
+    .execute(&inspect)
+    .await
+    .expect("install fake ag_catalog.memories at vector(768)");
+
+    // The probe must now return 384 (public), not 768 (ag_catalog).
+    // Pre-fix this returned Some(768); post-fix it returns Some(384).
+    let dim = store
+        .current_embedding_dim()
+        .await
+        .expect("current_embedding_dim probe must succeed");
+    assert_eq!(
+        dim,
+        Some(384),
+        "#1213: current_embedding_dim must scope to public.memories \
+         (read back {dim:?}; expected Some(384) — ag_catalog.memories at \
+         vector(768) must NOT mask the real column)"
+    );
+
+    // Cleanup so a subsequent test in the same suite doesn't trip on
+    // the leftover fake table.
+    let _ = sqlx::query("DROP TABLE IF EXISTS ag_catalog.memories")
+        .execute(&inspect)
+        .await;
 }

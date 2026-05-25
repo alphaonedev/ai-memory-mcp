@@ -755,10 +755,19 @@ impl PostgresStore {
         // log a WARN here so the operator notices before writes start
         // failing on a dim-mismatch insert. (#304 nit; v0.7.0 L3 made
         // the comparand parameterisable.)
+        // #1213 — scope to `public.memories` so an Apache AGE install
+        // that has landed its own `ag_catalog.memories` (e.g. via a
+        // per-IronClaw `search_path=ic_<name>,ag_catalog,public` that
+        // bootstrapped the ai-memory schema into `ag_catalog` because
+        // the IC schema was empty at boot) does not mask the real
+        // public-schema column dim with the unrelated ag_catalog one.
         let typmod: Option<(i32,)> = sqlx::query_as(
-            "SELECT atttypmod FROM pg_attribute a
+            "SELECT a.atttypmod FROM pg_attribute a
              JOIN pg_class c ON c.oid = a.attrelid
-             WHERE c.relname = 'memories' AND a.attname = 'embedding'",
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = 'public'
+               AND c.relname = 'memories'
+               AND a.attname = 'embedding'",
         )
         .fetch_optional(&pool)
         .await
@@ -2690,10 +2699,23 @@ impl PostgresStore {
     /// Returns `StoreError::BackendUnavailable` if the catalog probe
     /// fails (connection issue, etc.).
     pub async fn current_embedding_dim(&self) -> StoreResult<Option<i32>> {
+        // #1213 — scope to `public.memories` (see the bootstrap-WARN
+        // site at ~L759 for the full rationale). Apache AGE installs
+        // create an `ag_catalog.memories` table whose `embedding` column
+        // is unrelated to the ai-memory write surface; without the
+        // namespace filter `fetch_optional` returns whichever row
+        // postgres surfaces first (oid-ordered → ag_catalog wins on a
+        // fresh AGE-installed DB), and the issue-#877 auto-migrate
+        // gate at `connect_with_dim_and_timeout_auto_migrate` reads the
+        // wrong dim → silently no-ops (or runs destructively against
+        // the wrong column).
         let row: Option<(i32,)> = sqlx::query_as(
-            "SELECT atttypmod FROM pg_attribute a
+            "SELECT a.atttypmod FROM pg_attribute a
              JOIN pg_class c ON c.oid = a.attrelid
-             WHERE c.relname = 'memories' AND a.attname = 'embedding'",
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = 'public'
+               AND c.relname = 'memories'
+               AND a.attname = 'embedding'",
         )
         .fetch_optional(&self.pool)
         .await
@@ -3117,10 +3139,15 @@ impl PostgresStore {
         // exists with whatever dim the operator chose at connect time.
         // Falls back to DEFAULT_EMBEDDING_DIM if the probe comes back
         // empty (defensive — should never happen in practice).
+        // #1213 — scope to `public.memories` (see `current_embedding_dim`
+        // for the full rationale on the AGE / ag_catalog masking risk).
         let existing_dim: Option<(i32,)> = sqlx::query_as(
-            "SELECT atttypmod FROM pg_attribute a
+            "SELECT a.atttypmod FROM pg_attribute a
              JOIN pg_class c ON c.oid = a.attrelid
-             WHERE c.relname = 'memories' AND a.attname = 'embedding'",
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = 'public'
+               AND c.relname = 'memories'
+               AND a.attname = 'embedding'",
         )
         .fetch_optional(&mut *tx)
         .await
