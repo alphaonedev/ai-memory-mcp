@@ -667,12 +667,13 @@ disciplines the Wave 1+2 #1174 refactor train landed:
 - **Vendor identifiers** (`"claude" | "openai" | "xai" |
   "anthropic" | "gemini" | "deepseek" | "groq" | "ollama" |
   "grok" | "mistral" | "cohere" | "huggingface"`) are legitimate
-  ONLY in the 6 substrate carve-outs:
+  ONLY in the 7 substrate carve-outs:
   - `src/llm.rs` — canonical alias tables, default URLs
   - `src/config.rs` — per-vendor URL/key/model defaults
   - `src/mine.rs` — `Format::Claude` conversation-mining enum
   - `src/validate.rs` — `VALID_SOURCES` back-compat allowlist
-  - `src/cli/wrap.rs` — per-vendor CLI-binary `WrapStrategy` table
+  - `src/cli/wrap.rs` — CLI-binary-name → `WrapStrategy` picker
+  - `src/llm_cli_wrap.rs` — per-vendor CLI-binary `WrapStrategy` table (split from `src/cli/wrap.rs` per #1183)
   - `src/harness.rs` — harness vendor-variant enum
 
   Every other production-code site must read the vendor string
@@ -711,7 +712,7 @@ immediately. Per pm-v3.2 NO FAIL MISSION closure discipline
 load-bearing, not decorative.
 
 **Adding a legitimate exception.** If a new vendor-specific
-surface genuinely belongs outside the 6-file allowlist (e.g. a
+surface genuinely belongs outside the 7-file allowlist (e.g. a
 new dedicated subsystem the way `src/mine.rs` carries
 `Format::Claude`), edit `scripts/check-vendor-literals.sh` to
 extend the `ALLOWED_FILES` array AND document the carve-out in

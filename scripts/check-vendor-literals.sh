@@ -15,14 +15,15 @@
 #   (A) Vendor-monoculture gate. Every `"claude" | "openai" | "xai" |
 #       "anthropic" | "gemini" | "deepseek" | "groq" | "ollama" |
 #       "grok" | "mistral" | "cohere" | "huggingface"` literal outside
-#       the 6-file substrate allowlist is a HARD-BLOCK. Vendor strings
+#       the 7-file substrate allowlist is a HARD-BLOCK. Vendor strings
 #       are legitimate only in:
-#         - `src/llm.rs`        (canonical alias tables, default URLs)
-#         - `src/config.rs`     (per-vendor URL/key/model defaults)
-#         - `src/mine.rs`       (Format::Claude conversation-mining enum)
-#         - `src/validate.rs`   (VALID_SOURCES back-compat allowlist)
-#         - `src/cli/wrap.rs`   (per-vendor CLI-binary WrapStrategy)
-#         - `src/harness.rs`    (harness vendor-variant enum)
+#         - `src/llm.rs`           (canonical alias tables, default URLs)
+#         - `src/config.rs`        (per-vendor URL/key/model defaults)
+#         - `src/mine.rs`          (Format::Claude conversation-mining enum)
+#         - `src/validate.rs`      (VALID_SOURCES back-compat allowlist)
+#         - `src/cli/wrap.rs`      (CLI-binary-name → WrapStrategy picker)
+#         - `src/llm_cli_wrap.rs`  (per-vendor CLI-binary WrapStrategy table; #1183 split from src/cli/wrap.rs)
+#         - `src/harness.rs`       (harness vendor-variant enum)
 #
 #   (B) SECS_PER_* regression gate. PR3 (#1188 lineage) extracted
 #       named constants `SECS_PER_HOUR` / `SECS_PER_DAY` / `SECS_PER_WEEK`
@@ -59,13 +60,14 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
-# 6-file allowlist. Repo-root-relative paths.
+# 7-file allowlist. Repo-root-relative paths.
 ALLOWED_FILES=(
     "src/llm.rs"
     "src/config.rs"
     "src/mine.rs"
     "src/validate.rs"
     "src/cli/wrap.rs"
+    "src/llm_cli_wrap.rs"
     "src/harness.rs"
 )
 
@@ -212,12 +214,13 @@ if [[ -n "${vendor_violations//[[:space:]]/}" ]]; then
         printf '%s' "$vendor_violations" | sed -E 's/^/  /'
         echo ""
         echo "Vendor identifiers are only allowed in:"
-        echo "  - src/llm.rs       (canonical alias tables)"
-        echo "  - src/config.rs    (per-vendor URL/key/model defaults)"
-        echo "  - src/mine.rs      (Format::Claude conversation-mining enum)"
-        echo "  - src/validate.rs  (VALID_SOURCES back-compat allowlist)"
-        echo "  - src/cli/wrap.rs  (per-vendor CLI-binary WrapStrategy)"
-        echo "  - src/harness.rs   (harness vendor-variant enum)"
+        echo "  - src/llm.rs           (canonical alias tables)"
+        echo "  - src/config.rs        (per-vendor URL/key/model defaults)"
+        echo "  - src/mine.rs          (Format::Claude conversation-mining enum)"
+        echo "  - src/validate.rs      (VALID_SOURCES back-compat allowlist)"
+        echo "  - src/cli/wrap.rs      (CLI-binary-name → WrapStrategy picker)"
+        echo "  - src/llm_cli_wrap.rs  (per-vendor CLI-binary WrapStrategy table; #1183)"
+        echo "  - src/harness.rs       (harness vendor-variant enum)"
         echo ""
         echo "Per pm-v3.1 (ai-memory global/policies memory f5334545-c1f5-4f5c-9efb-a0ec3a0c1fcd):"
         echo "vendor identifiers in substrate/wire code violate the heterogeneous-NHI design."
