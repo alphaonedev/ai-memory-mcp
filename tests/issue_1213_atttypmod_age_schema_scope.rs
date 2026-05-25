@@ -57,8 +57,45 @@ async fn inspect_pool(url: &str) -> PgPool {
 
 /// Drop both `public.memories` AND any duplicate `<other_schema>.memories`
 /// to leave the DB in a clean state for the next test pass.
+///
+/// #1321 — also drop the ai-memory-owned tables that have FK references
+/// back to `public.memories` AND `schema_version`. Without this, the
+/// next `PostgresStore::connect()` call hits two failure modes:
+///   1. `CREATE TABLE IF NOT EXISTS memories (...)` is a no-op against
+///      a leftover `public.memories` (e.g. the contrived `(id, embedding)`
+///      shape created mid-test), so the production columns never land
+///      and bootstrap's index-create on `title`/`content` fails with
+///      `column "title" does not exist`.
+///   2. With `schema_version` populated at the head version from a
+///      prior test's connect, `migrate_locked()` early-returns —
+///      `migrate_v36()` does NOT run — and the partial index
+///      `idx_personas_by_entity` is never re-created.
+///
+/// Both modes broke `tests/postgres_memory_kind_backfill.rs` when this
+/// test ran first under `--test-threads=1` in CI. The cleanup-the-DB
+/// contract is: subsequent `PostgresStore::connect()` MUST re-bootstrap
+/// to head, so we drop every table the bootstrap re-creates.
 async fn cleanup(pool: &PgPool, other_schema: &str) {
+    // Drop the FK-bearing children before dropping `memories` itself so
+    // a leftover-FK can't block the parent drop on legacy DBs.
+    let _ = sqlx::query("DROP TABLE IF EXISTS memory_links CASCADE")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("DROP TABLE IF EXISTS memory_transcript_links CASCADE")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("DROP TABLE IF EXISTS archived_memories CASCADE")
+        .execute(pool)
+        .await;
     let _ = sqlx::query("DROP TABLE IF EXISTS public.memories CASCADE")
+        .execute(pool)
+        .await;
+    // Reset schema_version so the next connect walks the migrate ladder
+    // from v0 → CURRENT_SCHEMA_VERSION (the partial indexes that
+    // postgres_schema.sql does NOT carry inline — e.g.
+    // `idx_personas_by_entity` — live exclusively in the migrate arms;
+    // an early-return from migrate_locked() would skip them).
+    let _ = sqlx::query("DROP TABLE IF EXISTS schema_version CASCADE")
         .execute(pool)
         .await;
     let stmt = format!("DROP TABLE IF EXISTS {other_schema}.memories CASCADE");
