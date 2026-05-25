@@ -137,15 +137,22 @@ async fn k7_hmac_signature_header_present_when_global_secret_configured() {
     // carries a `x-ai-memory-signature: sha256=<hex>` header even
     // though the subscription itself was unsigned.
     // ----------------------------------------------------------------
-    let server = MockServer::start().await;
+    // #1201 — dedicated TcpListener + UUID-suffixed path keeps the
+    // mock server out of wiremock's MOCK_SERVER_POOL and ensures
+    // straggler dispatches from prior tests can't land on a
+    // recycled port + path collision.
+    let listener = fresh_mock_listener_1201();
+    let server = MockServer::builder().listener(listener).start().await;
+    let unique = uuid::Uuid::new_v4().simple().to_string();
+    let path_str = format!("/k7-hmac/{unique}");
     Mock::given(method("POST"))
-        .and(path("/k7-hmac"))
+        .and(path(path_str.clone()))
         .respond_with(AckEcho)
         .mount(&server)
         .await;
 
     let (_keep, db_path) = fresh_db();
-    let url = format!("{}/k7-hmac", server.uri());
+    let url = format!("{}{}", server.uri(), path_str);
     let _sub_id = {
         let conn = Connection::open(&db_path).unwrap();
         subscriptions::insert(
@@ -182,8 +189,9 @@ async fn k7_hmac_signature_header_present_when_global_secret_configured() {
         );
     }
 
-    // Poll the mock server for ~5s for the dispatch thread to land.
-    let req: Request = poll_for_first_request(&server).await;
+    // Poll the mock server for ~5s for the dispatch thread to land
+    // a request on OUR per-test path (#1201 — straggler-resilient).
+    let req: Request = poll_for_first_request(&server, &path_str).await;
 
     // The header must be present and shaped `sha256=<64-hex-chars>`.
     let sig_header = req
@@ -246,15 +254,20 @@ async fn k7_hmac_unset_refuses_dispatch_when_no_per_sub_secret() {
     let _guard = K7_HMAC_GLOBAL_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let server = MockServer::start().await;
+    // #1201 — dedicated TcpListener + UUID-suffixed path keeps the
+    // mock server out of wiremock's MOCK_SERVER_POOL.
+    let listener = fresh_mock_listener_1201();
+    let server = MockServer::builder().listener(listener).start().await;
+    let unique = uuid::Uuid::new_v4().simple().to_string();
+    let path_str = format!("/k7-unsigned/{unique}");
     Mock::given(method("POST"))
-        .and(path("/k7-unsigned"))
+        .and(path(path_str.clone()))
         .respond_with(AckEcho)
         .mount(&server)
         .await;
 
     let (_keep, db_path) = fresh_db();
-    let url = format!("{}/k7-unsigned", server.uri());
+    let url = format!("{}{}", server.uri(), path_str);
     let sub_id = {
         let conn = Connection::open(&db_path).unwrap();
         subscriptions::insert(
@@ -304,7 +317,17 @@ async fn k7_hmac_unset_refuses_dispatch_when_no_per_sub_secret() {
     .await
     .unwrap();
 
-    let received = server.received_requests().await.unwrap_or_default();
+    // #1201 — filter by per-test path to be robust against any
+    // straggler from a sibling test landing on this server even if
+    // port reuse aligned (with the dedicated listener, this is now
+    // essentially impossible — the filter is defense in depth).
+    let received: Vec<_> = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.url.path() == path_str)
+        .collect();
     assert!(
         received.is_empty(),
         "dispatcher must NOT post an unsigned body — got {} request(s)",
@@ -322,16 +345,37 @@ async fn k7_hmac_unset_refuses_dispatch_when_no_per_sub_secret() {
 }
 
 /// Poll the wiremock server for ~5s waiting for at least one request to
-/// land. Panics on timeout so the failure mode is loud.
-async fn poll_for_first_request(server: &MockServer) -> Request {
+/// land on `expected_path`. Panics on timeout so the failure mode is
+/// loud. The path filter (#1201) makes the poll resilient to
+/// stragglers from concurrent webhook tests in the same binary.
+async fn poll_for_first_request(server: &MockServer, expected_path: &str) -> Request {
     for _ in 0..50 {
         let received = server.received_requests().await.unwrap_or_default();
-        if let Some(req) = received.into_iter().next() {
+        if let Some(req) = received.into_iter().find(|r| r.url.path() == expected_path) {
             return req;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     panic!("K7 dispatch thread never reached wiremock");
+}
+
+/// #1201 — bind a fresh `127.0.0.1:0` `TcpListener` for use with
+/// `MockServer::builder().listener(...)`. Bypasses wiremock's internal
+/// `MOCK_SERVER_POOL` so the ephemeral port the kernel hands us
+/// cannot be reassigned for the duration of the test. Retries on
+/// transient EADDRINUSE.
+fn fresh_mock_listener_1201() -> std::net::TcpListener {
+    let mut last_err = None;
+    for _ in 0..5 {
+        match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(l) => return l,
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+    panic!("#1201: failed to bind ephemeral port for mock after 5 attempts: {last_err:?}");
 }
 
 /// Independent reference implementation of the K7 canonical signature
