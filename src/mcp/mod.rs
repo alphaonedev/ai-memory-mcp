@@ -14,7 +14,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -2599,7 +2599,6 @@ pub fn run_mcp_server(
                     eprintln!("ai-memory MCP server stopped (drain ceiling exceeded)");
                     return Ok(());
                 }
-                use std::io::Read;
                 let m = stdin_locked.read(&mut scratch)?;
                 if m == 0 {
                     break;
