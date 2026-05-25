@@ -2099,9 +2099,17 @@ pub const DEFAULT_EMBED_BACKFILL_BATCH_SIZE: usize = 64;
 ///
 /// 1. Scans all unembedded rows in a single `SELECT` (unchanged
 ///    behaviour — [`db::get_unembedded_ids`]).
-/// 2. Slices the result into chunks of `batch_size` (default
-///    [`DEFAULT_EMBED_BACKFILL_BATCH_SIZE`], overridable via the
-///    `AI_MEMORY_EMBED_BACKFILL_BATCH` env var).
+/// 2. Slices the result into chunks of `batch_size`. Callers
+///    typically resolve this via
+///    [`crate::config::AppConfig::resolve_embeddings`] which
+///    applies the #1146 universal precedence ladder
+///    (CLI > env > config > legacy > compiled default). The
+///    [`run_embedding_backfill`] entry-point preserves the legacy
+///    env-only resolution for back-compat callers; the
+///    [`run_embedding_backfill_with_batch_size`] sibling takes an
+///    explicit value so production daemons can honour
+///    `[embeddings].backfill_batch` from `config.toml` even when
+///    the env var is unset (issue #1260).
 /// 3. Per chunk: calls [`Embed::embed_batch`] (the default impl
 ///    loops internally; a vectorised backend implementation is the
 ///    follow-up sub-issue), then a single
@@ -2128,6 +2136,43 @@ pub fn run_embedding_backfill(
     conn: &mut rusqlite::Connection,
     emb: &dyn Embed,
 ) -> anyhow::Result<usize> {
+    // Back-compat entry-point — resolves the batch size from the
+    // env-var-only path so existing callers (the embedding-backfill
+    // integration test, ops scripts that drive this function
+    // directly) keep working when no `AppConfig` is in scope.
+    // Production daemons should call
+    // `run_embedding_backfill_with_batch_size` with the value from
+    // `AppConfig::resolve_embeddings().backfill_batch` so
+    // `[embeddings].backfill_batch` in `config.toml` is honoured
+    // even when the env var is unset (issue #1260).
+    let batch_size = std::env::var("AI_MEMORY_EMBED_BACKFILL_BATCH")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_EMBED_BACKFILL_BATCH_SIZE);
+    run_embedding_backfill_with_batch_size(conn, emb, batch_size)
+}
+
+/// v0.7.0 issue #1260 — explicit-batch-size variant of
+/// [`run_embedding_backfill`]. Honors the canonical #1146 precedence
+/// ladder by accepting a pre-resolved batch size from
+/// [`crate::config::AppConfig::resolve_embeddings`].
+///
+/// `batch_size` is the post-resolver value — pass
+/// `AppConfig::resolve_embeddings().backfill_batch as usize`. Zero or
+/// out-of-band values are coerced up to
+/// [`DEFAULT_EMBED_BACKFILL_BATCH_SIZE`] defensively (`chunks(0)`
+/// panics in the standard library).
+///
+/// # Errors
+///
+/// Same contract as [`run_embedding_backfill`] — only the initial
+/// `get_unembedded_ids` scan can propagate.
+pub fn run_embedding_backfill_with_batch_size(
+    conn: &mut rusqlite::Connection,
+    emb: &dyn Embed,
+    batch_size: usize,
+) -> anyhow::Result<usize> {
     let unembedded = db::get_unembedded_ids(conn)?;
     if unembedded.is_empty() {
         // Idempotence: zero rows scanned ⇒ zero work, no log line so
@@ -2135,11 +2180,16 @@ pub fn run_embedding_backfill(
         return Ok(0);
     }
 
-    let batch_size = std::env::var("AI_MEMORY_EMBED_BACKFILL_BATCH")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(DEFAULT_EMBED_BACKFILL_BATCH_SIZE);
+    // Defensive: `chunks(0)` would panic. The resolver clamps to
+    // 1..=10000 by construction (`AppConfig::resolve_embeddings` at
+    // src/config.rs:5524-5532), but if a future caller passes an
+    // unvalidated value we coerce up to the compiled default rather
+    // than blowing up.
+    let batch_size = if batch_size == 0 {
+        DEFAULT_EMBED_BACKFILL_BATCH_SIZE
+    } else {
+        batch_size
+    };
 
     eprintln!(
         "ai-memory: backfilling {} memories (batch_size={batch_size})...",
@@ -2430,7 +2480,18 @@ pub fn run_mcp_server(
                 // chunk. This collapses N per-row UPDATE round-trips into
                 // ceil(N/B) transaction commits and creates the surface
                 // for a vectorised embedder backend to land later.
-                if let Err(e) = run_embedding_backfill(&mut conn, &emb) {
+                //
+                // v0.7.0 issue #1260 — resolve batch size via
+                // `AppConfig::resolve_embeddings` (canonical #1146
+                // precedence ladder: CLI > AI_MEMORY_EMBED_BACKFILL_BATCH
+                // env > [embeddings].backfill_batch config > compiled
+                // default 100). Pre-fix the function read the env var
+                // directly, so the operator's config-file value was
+                // silently ignored when the env var was unset.
+                let embed_batch_size = app_config.resolve_embeddings().backfill_batch as usize;
+                if let Err(e) =
+                    run_embedding_backfill_with_batch_size(&mut conn, &emb, embed_batch_size)
+                {
                     eprintln!("ai-memory: backfill failed: {e}");
                 }
                 Some(emb)
