@@ -146,11 +146,25 @@ pub fn resolve_agent_id(explicit: Option<&str>, mcp_client: Option<&str>) -> Res
     }
 
     // 2. AI_MEMORY_AGENT_ID env var (for MCP path; CLI clap merges this already,
-    //    but MCP callers that don't pass it explicitly need this fallback)
+    //    but MCP callers that don't pass it explicitly need this fallback).
+    //
+    //    Uses [`validate::validate_agent_id_shape`] (shape-only) rather than
+    //    [`validate::validate_agent_id`] (wire-strict, also rejects
+    //    [`validate::RESERVED_AGENT_IDS`]) because the env-var path is an
+    //    internal-bootstrap surface: the daemon's own self-signing keypair
+    //    label (`DAEMON_KEYPAIR_LABEL` = "daemon" at
+    //    `src/daemon_runtime.rs`) legitimately resolves through this path
+    //    when the operator (or `entrypoint.plan-c.sh` pre-#1231) injects
+    //    `AI_MEMORY_AGENT_ID=daemon` for daemon-process startup. Wire-side
+    //    callers (HTTP body `agent_id`, MCP `agent_id` tool param) still
+    //    flow through the strict `validate_agent_id` at their own ingress
+    //    boundary — the env-var carve-out does not loosen the wire posture.
+    //    Closes #1234 (RCA: this site was missed when #977 introduced
+    //    RESERVED_AGENT_IDS + the shape/wire split).
     if let Ok(v) = std::env::var(ENV_AGENT_ID)
         && !v.is_empty()
     {
-        validate::validate_agent_id(&v)?;
+        validate::validate_agent_id_shape(&v)?;
         return Ok(v);
     }
 

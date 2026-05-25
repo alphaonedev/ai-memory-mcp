@@ -24,6 +24,7 @@ use ed25519_dalek::SigningKey;
 
 use crate::cli::CliOutput;
 use crate::identity::{self, keypair};
+use crate::validate;
 
 #[derive(Args)]
 pub struct IdentityArgs {
@@ -140,7 +141,26 @@ fn generate(
     json_out: bool,
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
-    let id = resolve_id(explicit_agent_id)?;
+    // `identity generate` is an internal-bootstrap surface that must
+    // legitimately accept [`validate::RESERVED_AGENT_IDS`] sentinels
+    // (the daemon's own self-signing keypair label
+    // `DAEMON_KEYPAIR_LABEL` = "daemon", the federation-catchup label,
+    // etc.). Use [`validate::validate_agent_id_shape`] (shape-only,
+    // doesn't reject reserved sentinels) for the explicit caller path,
+    // bypassing the strict [`validate::validate_agent_id`] that
+    // `resolve_id` → `identity::resolve_agent_id` applies. The
+    // wire-side ingress boundaries (HTTP body, MCP tool param) still
+    // strict-validate at their own boundary — this carve-out is
+    // CLI-key-generation-only. Closes #1234 (RCA: this site was
+    // missed when #977 introduced RESERVED_AGENT_IDS + the
+    // shape/wire split).
+    let id = match explicit_agent_id {
+        Some(explicit) if !explicit.is_empty() => {
+            validate::validate_agent_id_shape(explicit)?;
+            explicit.to_string()
+        }
+        _ => resolve_id(explicit_agent_id)?,
+    };
     let pub_path = dir.join(format!("{id}.pub"));
     // Round-4 — refuse-by-default. The pre-Round-4 default was OVERWRITE,
     // which let a typo silently rotate (and destroy) a daemon or peer
