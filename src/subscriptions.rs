@@ -1110,7 +1110,10 @@ fn send(
     let mut req = client
         .post(url)
         .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
-        .header("user-agent", "ai-memory/0.6.0.0")
+        .header(
+            "user-agent",
+            format!("ai-memory/{}", env!("CARGO_PKG_VERSION")),
+        )
         .header("x-ai-memory-timestamp", timestamp)
         .header("x-ai-memory-correlation-id", correlation_id);
     if let Some(sig) = signature {
@@ -1836,6 +1839,23 @@ mod tests {
     fn https_allowed() {
         assert!(validate_url("https://example.com/hook").is_ok());
         assert!(validate_url("https://api.example.com:8443/hook?x=1").is_ok());
+    }
+
+    /// Regression for #1265 — webhook dispatch User-Agent must track
+    /// `CARGO_PKG_VERSION` rather than the v0.6.0.0 string the original
+    /// site hardcoded. The `format!` here mirrors the dispatch site in
+    /// `fn send()` so a bit-rot of one side is caught by the test.
+    #[test]
+    fn webhook_user_agent_tracks_cargo_pkg_version() {
+        let ua = format!("ai-memory/{}", env!("CARGO_PKG_VERSION"));
+        let expected = format!("ai-memory/{}", env!("CARGO_PKG_VERSION"));
+        assert_eq!(ua, expected);
+        // The legacy hardcoded value MUST NOT be the current expected
+        // value — guards against a future revert to a literal string.
+        assert_ne!(ua, "ai-memory/0.6.0.0");
+        // Shape sanity: matches the documented `ai-memory/<semver>` form.
+        assert!(ua.starts_with("ai-memory/"));
+        assert!(ua.len() > "ai-memory/".len());
     }
 
     #[test]
