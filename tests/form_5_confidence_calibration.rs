@@ -434,6 +434,9 @@ fn confidence_source_serialises_to_canonical_strings() {
         (ConfidenceSource::AutoDerived, "auto_derived"),
         (ConfidenceSource::Calibrated, "calibrated"),
         (ConfidenceSource::Decayed, "decayed"),
+        // v0.7.0 issue #1242 — curator-engine output bucket
+        // (atom rows + persona rows).
+        (ConfidenceSource::CuratorDerived, "curator_derived"),
     ] {
         assert_eq!(variant.as_str(), wire);
         assert_eq!(ConfidenceSource::from_str(wire), Some(variant));
