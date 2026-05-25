@@ -96,11 +96,14 @@ ai-memory serve --port 19077
 
 **Symptom**: Integration test fails on MCP tool count.
 
-**Cause**: A new tool landed in `src/mcp.rs` without updating the
-count assertion. Harmless — it's a test that locks the tool count to
-prevent accidental removal. Update the assertion to match the new
-count and ensure the new tool is in the `assert!(tool_names.contains())`
-block.
+**Cause**: A new tool landed in `src/mcp/tools/<name>.rs` + `registered_tools()`
+in `src/mcp/registry.rs` (#987 D1.6 recipe; pre-#1066 the source was the
+monolithic `src/mcp.rs`) without updating the tool-count assertion. Harmless
+— it's a test that locks the tool count to prevent accidental removal.
+The canonical post-#1187 source is `crate::mcp::tool_names::*` consts +
+`Profile::full().expected_tool_count()` in `src/profile.rs`. Update the
+assertion to match the new count and add the tool's `tool_names::*` const
+reference where the test enumerates expected tools.
 
 ### MCP tool returns "no memories found" but `ai-memory list` shows them
 
