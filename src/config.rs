@@ -4331,6 +4331,26 @@ pub struct McpConfig {
     /// "*"     = ["core"]
     /// ```
     pub allowlist: Option<std::collections::HashMap<String, Vec<String>>>,
+
+    /// #1254 (MED, 2026-05-25) — error-oracle posture for
+    /// `tools/call` against a tool that exists but is not loaded
+    /// under the active profile.
+    ///
+    /// Default `false` (production-secure): the daemon returns a
+    /// minimal `"unknown tool: <name>"` regardless of whether the
+    /// tool exists in another family. This prevents a lower-profile
+    /// client from probing the surface of a higher-profile tool set
+    /// (e.g. `admin` or `power` family names) by walking error
+    /// messages.
+    ///
+    /// Set to `true` to restore the v0.6.4-002 helpful hint
+    /// ("tool 'X' is in family 'Y' which is not loaded under the
+    /// active profile. Restart with `--profile <name>` ..."). The
+    /// hint is convenient for single-tenant dev environments where
+    /// every operator sees the full surface anyway, but leaks
+    /// family membership in any multi-tenant deployment.
+    #[serde(default)]
+    pub profile_hint_in_errors: bool,
 }
 
 impl McpConfig {
@@ -6391,6 +6411,7 @@ legacy_scoring = false
             mcp: Some(McpConfig {
                 profile: Some("graph".to_string()),
                 allowlist: None,
+                ..McpConfig::default()
             }),
             ..AppConfig::default()
         };
@@ -6447,6 +6468,7 @@ legacy_scoring = false
         McpConfig {
             profile: None,
             allowlist: Some(map),
+            ..McpConfig::default()
         }
     }
 
@@ -6464,6 +6486,7 @@ legacy_scoring = false
         let cfg = McpConfig {
             profile: None,
             allowlist: Some(std::collections::HashMap::new()),
+            ..McpConfig::default()
         };
         assert_eq!(
             cfg.allowlist_decision(Some("alice"), "graph"),

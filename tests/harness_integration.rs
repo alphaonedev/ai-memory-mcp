@@ -72,6 +72,7 @@ fn allowlist(rows: &[(&str, &[&str])]) -> McpConfig {
     McpConfig {
         profile: None,
         allowlist: Some(map),
+        ..McpConfig::default()
     }
 }
 
