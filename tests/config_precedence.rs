@@ -45,7 +45,10 @@ use std::path::PathBuf;
 
 use ai_memory::config::{AppConfig, FeatureTier, ResolvedModels, TierConfig};
 use ai_memory::daemon_runtime::Cli;
-use ai_memory::mcp::{CapabilitiesAccept, handle_capabilities_with_conn};
+use ai_memory::mcp::{
+    CapabilitiesAccept, handle_capabilities_with_conn, handle_capabilities_with_conn_v3,
+};
+use ai_memory::profile::Profile;
 use clap::Parser;
 
 mod common;
@@ -186,5 +189,36 @@ fn test_secret_not_in_capabilities() {
         !response_str.contains("AI_MEMORY_DB_PASSPHRASE"),
         "memory_capabilities response MUST NOT mention the secret env-var \
          name either; got: {response_str}",
+    );
+
+    // #1259 — extend the no-secret invariant to the V3 capabilities
+    // envelope. V3 carries additional overlays (summary / describe /
+    // tools[] / agent_permitted_families / harness deferred-registration
+    // probe) any of which a future refactor might absent-mindedly pipe
+    // env state through; pin the same no-leak property here so the
+    // V3 wire surface is mechanically covered.
+    let response_v3 = handle_capabilities_with_conn_v3(
+        &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
+        None,
+        false,
+        None,
+        &Profile::full(),
+        None,
+        None,
+        None,
+    )
+    .expect("v3 capabilities serialize");
+    let response_v3_str =
+        serde_json::to_string(&response_v3).expect("v3 capabilities response JSON-serializes");
+    assert!(
+        !response_v3_str.contains(SECRET),
+        "v3 memory_capabilities response MUST NOT contain AI_MEMORY_DB_PASSPHRASE; \
+         secret leaked into JSON: {response_v3_str}",
+    );
+    assert!(
+        !response_v3_str.contains("AI_MEMORY_DB_PASSPHRASE"),
+        "v3 memory_capabilities response MUST NOT mention the secret env-var \
+         name either; got: {response_v3_str}",
     );
 }
