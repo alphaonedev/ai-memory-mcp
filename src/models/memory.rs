@@ -241,6 +241,19 @@ pub enum ConfidenceSource {
     /// `AI_MEMORY_CONFIDENCE_DECAY=1` or the namespace policy
     /// `confidence_decay_half_life_days` is set.
     Decayed,
+    /// v0.7.0 issue #1242 — the curator engine (atomisation
+    /// `LlmCurator`, persona generator) computed the value at row-
+    /// mint time without an explicit caller-supplied number. Atom
+    /// rows inherit `confidence` from their parent memory; persona
+    /// rows pin `confidence = 1.0` per the QW-2 brief. In both
+    /// cases the value is engine-derived, not caller-supplied, and
+    /// must be discoverable to the calibration sweep + the partial
+    /// index `idx_memories_confidence_source` (which excludes
+    /// `caller_provided`). Pre-#1242 these rows mis-labelled
+    /// `confidence_source = CallerProvided`, hiding them from the
+    /// derived-row enumeration and violating the audit-honesty
+    /// invariant.
+    CuratorDerived,
 }
 
 impl ConfidenceSource {
@@ -253,6 +266,7 @@ impl ConfidenceSource {
             Self::AutoDerived => "auto_derived",
             Self::Calibrated => "calibrated",
             Self::Decayed => "decayed",
+            Self::CuratorDerived => "curator_derived",
         }
     }
 
@@ -267,6 +281,7 @@ impl ConfidenceSource {
             "auto_derived" => Some(Self::AutoDerived),
             "calibrated" => Some(Self::Calibrated),
             "decayed" => Some(Self::Decayed),
+            "curator_derived" => Some(Self::CuratorDerived),
             _ => None,
         }
     }
@@ -1641,6 +1656,11 @@ mod tests {
             ("auto_derived", ConfidenceSource::AutoDerived),
             ("calibrated", ConfidenceSource::Calibrated),
             ("decayed", ConfidenceSource::Decayed),
+            // v0.7.0 issue #1242 — curator-engine output bucket
+            // (atom rows + persona rows). Distinct from
+            // `auto_derived` (which is the Form 5 engine's
+            // signal-based derivation).
+            ("curator_derived", ConfidenceSource::CuratorDerived),
         ] {
             assert_eq!(ConfidenceSource::from_str(s), Some(v));
             assert_eq!(v.as_str(), s);

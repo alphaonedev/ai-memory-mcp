@@ -394,7 +394,15 @@ impl<'a> PersonaGenerator<'a> {
             citations: Vec::new(),
             source_uri: None,
             source_span: None,
-            confidence_source: ConfidenceSource::CallerProvided,
+            // v0.7.0 issue #1242 — persona rows are curator-engine output,
+            // not caller-supplied. The QW-2 brief pins `confidence = 1.0`
+            // for every Persona; that value is engine-derived (the
+            // generator picked it), so the discriminator must reflect the
+            // provenance. Pre-#1242 these rows mis-labelled
+            // `CallerProvided`, hiding them from the partial
+            // `idx_memories_confidence_source` enumeration and violating
+            // the audit-honesty invariant.
+            confidence_source: ConfidenceSource::CuratorDerived,
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,

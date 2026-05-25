@@ -645,7 +645,18 @@ fn write_atom(
         citations: source.citations.clone(),
         source_uri: Some(format!("doc:{}", source.id)),
         source_span: span,
-        confidence_source: ConfidenceSource::CallerProvided,
+        // v0.7.0 issue #1242 — atom rows are curator-engine output, not
+        // caller-supplied. The curator inherits `confidence` from the
+        // parent memory (line 567 `confidence: source.confidence`) — that
+        // value is engine-propagated, not caller-supplied, so the
+        // discriminator must reflect the provenance. Pre-#1242 these
+        // rows mis-labelled `CallerProvided`, hiding them from the
+        // partial `idx_memories_confidence_source` enumeration the
+        // calibration sweep scans, and violating the audit-honesty
+        // invariant. Distinct from `AutoDerived`, which means the
+        // Form 5 derive engine computed the value from row signals;
+        // here the curator simply propagated the parent's number.
+        confidence_source: ConfidenceSource::CuratorDerived,
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
