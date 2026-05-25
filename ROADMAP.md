@@ -276,7 +276,7 @@ This is the floor every plan below builds on. Numbers are sourced from the publi
 | Region coverage | 93.11% (v0.6.3 baseline; trending up) | evidence.html |
 | Function coverage | 92.55% (v0.6.3 baseline; trending up) | evidence.html |
 | Platform CI matrix | ubuntu-latest, macos-latest, windows-latest, iOS sim, Android emulator | evidence.html, mobile-runtime.yml |
-| Schema version (v0.7.0 release HEAD) | **v50** (sqlite) / **v50** (postgres) — `CURRENT_SCHEMA_VERSION = 50` in `src/storage/migrations.rs` and `src/store/postgres.rs`. Ladder: v15→v19 (v0.6.3.1) → v20 (v0.6.4 audit log) → v22 (v0.7.0 RC) → v29 (recursive-learning Task 1/8) → v30 (L1-1) → v33 (L2 wave `memory_links.relation` CHECK) → v34 (V-4 closeout #698) → v35-v48 (provenance / DLQ / archive carry-forward) → v49 (archived_memories full column carry, #1025) → v50 (per-namespace K8 quota dimension extension, #1156). Lockstep enforced by `tests/postgres_schema_parity.rs::schema_versions_match_across_adapters`. | release/v0.7.0 HEAD |
+| Schema version (v0.7.0 release HEAD) | **v51** (sqlite) / **v51** (postgres) — `CURRENT_SCHEMA_VERSION = 51` in `src/storage/migrations.rs` and `src/store/postgres.rs`. Ladder: v15→v19 (v0.6.3.1) → v20 (v0.6.4 audit log) → v22 (v0.7.0 RC) → v29 (recursive-learning Task 1/8) → v30 (L1-1) → v33 (L2 wave `memory_links.relation` CHECK) → v34 (V-4 closeout #698) → v35-v48 (provenance / DLQ / archive carry-forward) → v49 (archived_memories full column carry, #1025) → v50 (per-namespace K8 quota dimension extension, #1156) → v51 (federation_nonces persistence, #1255 / PR #1296). Lockstep enforced by `tests/postgres_schema_parity.rs::schema_versions_match_across_adapters`; test-side SSOT via `ai_memory::storage::current_schema_version_for_tests()` per #1311. | release/v0.7.0 HEAD |
 
 > **Doc-vs-substrate qualifier.** Schema versions can advance ahead of this document during in-flight work; the doc is updated at every layer §22 gate.
 
@@ -617,9 +617,9 @@ v0.7.0 grand-slam ships 25 lifecycle events. v0.8.0 adds 10 events for coordinat
 | `post_checkpoint_resolve` | After checkpoint resolved | Notify only |
 | `pre_routine_run` | Before routine instantiation | Allow / Modify(parameters) / Deny |
 
-#### Schema migration — v50 → vN
+#### Schema migration — v51 → vN
 
-v0.7.0 grand-slam terminal schema is v50 (sqlite + postgres lockstep). v0.8.0 Pillar 1 expansion lands at vN with additive tables (actions, action_edges, leases, signals, checkpoints, routines, routine_runs, model_attestations per §11.4.D). All `CREATE TABLE` operations additive. No existing table modifications. Migration idempotent + reversible.
+v0.7.0 grand-slam terminal schema is v51 (sqlite + postgres lockstep; v51 added by #1296 federation_nonces persistence). v0.8.0 Pillar 1 expansion lands at vN with additive tables (actions, action_edges, leases, signals, checkpoints, routines, routine_runs, model_attestations per §11.4.D). All `CREATE TABLE` operations additive. No existing table modifications. Migration idempotent + reversible.
 
 #### Effort summary — v0.8.0 total scope (post §3 scope test)
 
@@ -637,7 +637,7 @@ v0.7.0 grand-slam terminal schema is v50 (sqlite + postgres lockstep). v0.8.0 Pi
 | §11.4.C vLLM first-class inference backend | 0 | +5 | 5 |
 | §11.4.D Model signature verification chain | 0 | +2 | 2 |
 | Hook pipeline integration (10 new events) | 0 | +1.5 | 1.5 |
-| Schema migration v50 → vN | 0 | +0.5 | 0.5 |
+| Schema migration v51 → vN | 0 | +0.5 | 0.5 |
 | Test suite (~540 new tests) | 0 | +3 | 3 |
 | Documentation + reproducibility scripts | 0 | +1 | 1 |
 | **TOTAL (substrate scope, post §3 cuts)** | **24.5** | **+22.5** | **~47 sessions** |
@@ -1021,7 +1021,7 @@ Quantization backends (RaBitQ-IVF, TurboQuant, residual VQ) — pluggable via tr
 
 **Strategic anchor.** This roadmap derives from [`docs/strategy/moonshot-synthesis.md`](docs/strategy/moonshot-synthesis.md), which named ai-memory as the **endpoint substrate that enforces cognitive governance and architectural separation-of-powers at every point where AI/AGI/ASI cognition meets the physical, biological, or other-AI realm**. Seven properties carry across the trajectory: endpoint-resident, coherent, stoppable, improvable, attested, bias-displaced, LLM-agnostic. The substrate scales by being deployed at more endpoints, more kinds of endpoints, with more sophisticated cognition operating through each endpoint. The substrate does not become smarter; the cognition operating through the substrate does. The substrate's job description is constant from present-NHI through ASI and beyond.
 
-**Ship state at v0.7.0 (release/v0.7.0 HEAD).** Schema **v50** sqlite + postgres lockstep (CURRENT_SCHEMA_VERSION = 50 in both `src/storage/migrations.rs` and `src/store/postgres.rs`; ladder v33 → v50 includes V-4 closeout #698 at v34, federation_push_dlq at v48, archive_memories +14 columns at v49, per-namespace K8 quota dimension extension at v50). **73 MCP tools at `--profile full` / 7 at `--profile core`** per `Profile::full().expected_tool_count()` and `Profile::core().expected_tool_count()` in `src/profile.rs`. **25 hook lifecycle events** per `src/hooks/events.rs::HookEvent`. **6,961+ tests at ≥93% coverage.** **87 production HTTP route registrations / 73 unique URL paths. 58 CLI subcommands** (56 in default build). **7 Agent Skills MCP tools** (L1-5 register/list/get/resource/export + L2-6 `promote_from_reflection` + L2-7 `compositional_context`). **Policy Engine Option B foundation** (L1-6 substrate rules + PE-1/PE-2/PE-3 merged). **Provenance Gap framework #884-#890 ALL SHIPPED.** **Batman Forms 1-7 IMPLEMENTED.** **Recursive learning #655 Tasks 1-8 + L1 substrate stack + L2 wave all shipped.** **Federation reliability: per-peer DLQ + replay worker + Prometheus `federation_push_dlq_depth` gauge.** **NSA CSI MCP Security 10/10 concerns structurally met.**
+**Ship state at v0.7.0 (release/v0.7.0 HEAD).** Schema **v51** sqlite + postgres lockstep (CURRENT_SCHEMA_VERSION = 51 in both `src/storage/migrations.rs` and `src/store/postgres.rs`; ladder v33 → v51 includes V-4 closeout #698 at v34, federation_push_dlq at v48, archive_memories +14 columns at v49, per-namespace K8 quota dimension extension at v50, federation_nonces persistence at v51 via #1255 / PR #1296). **73 MCP tools at `--profile full` / 7 at `--profile core`** per `Profile::full().expected_tool_count()` and `Profile::core().expected_tool_count()` in `src/profile.rs`. **25 hook lifecycle events** per `src/hooks/events.rs::HookEvent`. **6,961+ tests at ≥93% coverage.** **87 production HTTP route registrations / 73 unique URL paths. 58 CLI subcommands** (56 in default build). **7 Agent Skills MCP tools** (L1-5 register/list/get/resource/export + L2-6 `promote_from_reflection` + L2-7 `compositional_context`). **Policy Engine Option B foundation** (L1-6 substrate rules + PE-1/PE-2/PE-3 merged). **Provenance Gap framework #884-#890 ALL SHIPPED.** **Batman Forms 1-7 IMPLEMENTED.** **Recursive learning #655 Tasks 1-8 + L1 substrate stack + L2 wave all shipped.** **Federation reliability: per-peer DLQ + replay worker + Prometheus `federation_push_dlq_depth` gauge.** **NSA CSI MCP Security 10/10 concerns structurally met.**
 
 **Audit reconciliation.** v0.6.3 audit found 22 distinct gaps. None blocked the published v0.6.3 claims. Status at v0.7.0: 19 SHIPPED across v0.6.3.1 / v0.7.0; 2 scheduled at v0.9 (G3 cold-start, G7-step2 reranker pool — addressed by §23 vector index substrate); 1 watch-only (G15 stats live-counted). All recovered commitments from prior phased roadmap either shipped, scheduled, cut explicitly, or tracked as research direction.
 
