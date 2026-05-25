@@ -119,6 +119,15 @@ pub struct RecallArgs {
     /// preserves v0.6.x CLI semantics.
     #[arg(long = "format", value_name = "FORMAT", value_parser = ["human", "json", "toon"], default_value = "human")]
     pub format: String,
+    /// v0.7.0 #1257 — session-id parity flag (DTO C2 #967, +0.05
+    /// rerank boost under #518). Pre-#1257 this was hard-coded to
+    /// `None` in `RecallRequest::from_cli_args`, so a CLI caller
+    /// could not reach the in-session ring boost even though MCP
+    /// (`{"session_id": "…"}` param) and HTTP (`?session_id=…` or
+    /// JSON body) callers could. Optional; omit to preserve v0.6.x
+    /// recall semantics.
+    #[arg(long = "session-id", value_name = "SESSION_ID")]
+    pub session_id: Option<String>,
 }
 
 /// v0.7.0 Form 4 (issue #757) — post-filter a recall result set by
@@ -541,6 +550,10 @@ mod tests {
             confidence_tier: None,
             verbose_provenance: false,
             format: "human".to_string(),
+            // v0.7.0 #1257 — CLI parity for session_id (DTO C2 #967).
+            // Test fixtures default to None so existing tests keep
+            // their pre-#1257 semantics (no in-session boost).
+            session_id: None,
         }
     }
 
