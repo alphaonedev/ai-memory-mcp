@@ -16,10 +16,13 @@
 
 use rusqlite::{Connection, params};
 
-/// Maximum number of hops the cycle-check walk follows before giving up.
-/// Mirrors `GovernancePolicy::effective_max_reflection_depth()` compiled-in
-/// default (3) as an upper bound; the caller passes the resolved cap so both
-/// are always consistent.
+/// Safety ceiling applied when a caller passes `max_depth = 0` (i.e. no
+/// explicit cap). The policy default for reflection depth lives elsewhere —
+/// see `GovernancePolicy::effective_max_reflection_depth()` for the runtime
+/// value the orchestration layer hands the cycle-check walk. This constant
+/// is intentionally larger than that policy default so it never silently
+/// truncates legitimate walks; it exists solely so an unset/zero cap can
+/// still bound a pathological reflection graph.
 const DEFAULT_MAX_DEPTH: u32 = 16;
 
 /// Result of a cycle-check walk: whether a cycle would be created, and if so,
