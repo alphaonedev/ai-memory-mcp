@@ -143,16 +143,30 @@ impl std::fmt::Debug for LlmProvider {
     }
 }
 
-impl Drop for LlmProvider {
-    /// #1258 — zeroize the `api_key` buffer on scope exit so the vendor
-    /// Bearer token does not linger on the heap after the
-    /// `LlmProvider` is dropped. `Ollama` carries no secret and is a
-    /// no-op.
-    fn drop(&mut self) {
+impl LlmProvider {
+    /// #1258 — zeroize the `api_key` buffer in place. Idempotent. The
+    /// `Drop` impl below delegates here so the helper is the single
+    /// source of truth for the zero-on-secret-loss contract. Tests
+    /// probe the buffer via this entry point so they observe the
+    /// post-zeroize state of a still-live allocation (probing after
+    /// the owning value is dropped is UB — the allocator's free-list
+    /// bookkeeping stamps the first 8-16 bytes of the just-freed slot
+    /// and that's not a `zeroize` defect; see #1321).
+    pub fn zeroize_secrets(&mut self) {
         if let LlmProvider::OpenAiCompatible { api_key } = self {
             use zeroize::Zeroize;
             api_key.zeroize();
         }
+    }
+}
+
+impl Drop for LlmProvider {
+    /// #1258 — zeroize the `api_key` buffer on scope exit so the vendor
+    /// Bearer token does not linger on the heap after the
+    /// `LlmProvider` is dropped. `Ollama` carries no secret and is a
+    /// no-op. Delegates to [`LlmProvider::zeroize_secrets`].
+    fn drop(&mut self) {
+        self.zeroize_secrets();
     }
 }
 
