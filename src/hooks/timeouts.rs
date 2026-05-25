@@ -177,15 +177,56 @@ pub fn event_class(event: HookEvent) -> EventClass {
 /// The `match` mirrors [`event_class`] inverse-style; a single
 /// branch means the compiler inlines this to a constant load at
 /// every call site.
+///
+/// **Issue #1207 — macOS timing-budget multiplier.** When running on
+/// macOS under parallel `cargo test` load, `fork+exec` of even a tiny
+/// shell script regularly takes >1s on a stressed dev host (Apple
+/// Silicon m1/m2/m3 alike). The 1000ms `Index` class deadline races
+/// the spawn budget and the test surfaces as a timeout — independent
+/// of the EAGAIN/ENOMEM/EMFILE spawn-errno class the rest of #1207
+/// addresses. The `AI_MEMORY_TEST_TIMING_BUDGET_MULT` env var is a
+/// test-only multiplier (default `1`) that scales every class deadline
+/// at runtime so tests can opt into a wider budget without changing
+/// production behaviour. The factory test runner sets this to `3` on
+/// macOS via the `tests/hooks_executor_test.rs` setup; production
+/// daemons inherit the unset default.
+///
+/// Compiled out of release binaries entirely via `cfg(any(test,
+/// debug_assertions))`. Production runs see the hardcoded constants
+/// at zero overhead — the env-var read fires only for `cargo test`.
 #[must_use]
 pub fn class_deadline(class: EventClass) -> Duration {
-    Duration::from_millis(match class {
+    let base_ms = match class {
         EventClass::Write => WRITE_CLASS_DEADLINE_MS,
         EventClass::Read => READ_CLASS_DEADLINE_MS,
         EventClass::Index => INDEX_CLASS_DEADLINE_MS,
         EventClass::Transcript => TRANSCRIPT_CLASS_DEADLINE_MS,
         EventClass::HotPath => HOT_PATH_CLASS_DEADLINE_MS,
-    })
+    };
+    Duration::from_millis(base_ms.saturating_mul(test_timing_budget_mult()))
+}
+
+/// Test-only timing budget multiplier. Reads
+/// `AI_MEMORY_TEST_TIMING_BUDGET_MULT` from the environment on each
+/// call (no caching) so individual tests can set it just-in-time;
+/// defaults to `1` (production behaviour). Compiled out of release
+/// builds entirely. The env-var read is a few-microsecond syscall —
+/// negligible relative to even the tightest 50ms `HotPath` budget.
+#[cfg(any(test, debug_assertions))]
+fn test_timing_budget_mult() -> u64 {
+    std::env::var("AI_MEMORY_TEST_TIMING_BUDGET_MULT")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&n| (1..=100).contains(&n))
+        .unwrap_or(1)
+}
+
+/// Production builds: always 1. Optimizer constant-folds the
+/// `saturating_mul` call above into a no-op.
+#[cfg(not(any(test, debug_assertions)))]
+#[inline(always)]
+fn test_timing_budget_mult() -> u64 {
+    1
 }
 
 /// Convenience wrapper: `class_deadline(event_class(event))`. Used
