@@ -1503,8 +1503,30 @@ mod d1_968_tests {
         }
         let rebuild_h = handle.join().expect("outer rebuild spawner panicked");
         let _ = rebuild_h.join();
-        // Force any warmed result to land.
-        idx.try_swap_warming();
+        // v0.7.0 #1212 — deterministic post-rebuild observation barrier.
+        // Pre-#1212 a single `try_swap_warming()` followed immediately
+        // by the search loop raced the cross-thread publication of the
+        // swap under stressed CI runners (`SAL-only feature gate` /
+        // parallel-test load). The fix is two-fold:
+        //   (1) Drain ANY parked warming result in a tight loop — handles
+        //       the rare double-rebuild case (writer crossing
+        //       REBUILD_THRESHOLD during the concurrent-write phase).
+        //   (2) Yield briefly so any post-swap state (`valid_ids_cache`
+        //       lazy rebuild, HNSW search-side state init) settles
+        //       before the search loop reads it. 10 ms is generous
+        //       enough for any GHA runner under 4-way parallel-test
+        //       contention; the test still completes in <100 ms total.
+        let mut swaps = 0_usize;
+        while idx.try_swap_warming() {
+            swaps += 1;
+            // Defensive cap — at v0.7.0 there can be at most one
+            // parked warming result at a time, but loop bounded just
+            // in case a follow-on rebuild parks one while we drain.
+            if swaps > 4 {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
 
         // Verify all 30 ids survived the rebuild. The CONTRACT under
         // test is "post-rebuild state INCLUDES the concurrent writes"
@@ -1520,11 +1542,30 @@ mod d1_968_tests {
         // beyond the tie cluster, NOT to weaken the contract.
         assert_eq!(inserts_done.load(Ordering::SeqCst), 30);
         let final_len = idx.len();
+        // v0.7.0 #1212 — snapshot the post-swap private state ONCE so
+        // every downstream assertion's panic message can cite the same
+        // ground-truth set of values. Pre-#1212 a panic at line
+        // src/hnsw.rs:1555 reported only "found < 29" with NO
+        // observable state, making the CI flake un-diagnosable
+        // without local repro. Capturing overflow.len() + hnsw size
+        // here (under a single inner-lock guard) is the diagnostic
+        // hook the operator + future agent needs to identify which
+        // buffer the concurrent inserts landed in at panic time.
+        let (overflow_len_dbg, hnsw_size_dbg) = {
+            let state = idx.inner.lock().expect("inner mutex poisoned");
+            let hnsw_size = state.hnsw.as_ref().map_or(0, |h| h.iter().count());
+            (state.overflow.len(), hnsw_size)
+        };
         assert_eq!(
-            final_len, 530,
-            "post-rebuild len must equal baseline 500 + concurrent 30 = 530, got {final_len}"
+            final_len,
+            530,
+            "post-rebuild len must equal baseline 500 + concurrent 30 = 530, \
+             got {final_len} (overflow={overflow_len_dbg}, hnsw={hnsw_size_dbg}, \
+             swaps={swaps}, inserts_done={})",
+            inserts_done.load(Ordering::SeqCst)
         );
         let mut found = 0_usize;
+        let mut missing: Vec<String> = Vec::new();
         for i in 0..30 {
             let mut v = vec![0.0_f32; 16];
             #[allow(clippy::cast_precision_loss)]
@@ -1534,8 +1575,11 @@ mod d1_968_tests {
             // k = baseline + concurrent + headroom. Any tighter and
             // the tie-break boundary intermittently clips a single id.
             let hits = idx.search(&q, 600);
-            if hits.iter().any(|h| h.id == format!("concurrent-{i}")) {
+            let id = format!("concurrent-{i}");
+            if hits.iter().any(|h| h.id == id) {
                 found += 1;
+            } else {
+                missing.push(id);
             }
         }
         // v0.7.x (#1148) — allow a single id of tie-break jitter under
@@ -1552,9 +1596,21 @@ mod d1_968_tests {
         // concurrent-rebuild path (the original pre-#1148 strict
         // assertion was `found == 30` which intermittently failed on
         // CI runners under contention).
+        //
+        // v0.7.0 #1212 — diagnostic context: cite the missing ids,
+        // post-swap buffer sizes, and swap count. Pre-#1212 this
+        // panic surfaced as "panicked at src/hnsw.rs:1555:9" with NO
+        // value-context, so the issue-1212 flake reproducer could
+        // not narrow down whether the regression was in HNSW
+        // approximate-search recall, the overflow-iteration path, or
+        // a swap race. With the diagnostic context the next flake
+        // (if any) names the failure mode in one read.
         assert!(
             found >= 29,
-            "post-rebuild search must surface ≥29 of 30 concurrent IDs (got {found}); \
+            "post-rebuild search must surface >=29 of 30 concurrent IDs \
+             (got {found}, missing={missing:?}; \
+             post-swap state: overflow={overflow_len_dbg}, hnsw={hnsw_size_dbg}, \
+             swaps={swaps}, final_len={final_len}); \
              tie-break jitter under runner load can clip a single tied entry, but \
              losing 2+ would indicate the concurrent-rebuild path itself regressed"
         );
