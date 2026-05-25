@@ -758,7 +758,9 @@ impl PostgresStore {
         let typmod: Option<(i32,)> = sqlx::query_as(
             "SELECT atttypmod FROM pg_attribute a
              JOIN pg_class c ON c.oid = a.attrelid
-             WHERE c.relname = 'memories' AND a.attname = 'embedding'",
+             JOIN pg_namespace n ON c.relnamespace = n.oid
+             WHERE c.relname = 'memories' AND a.attname = 'embedding'
+             AND n.nspname = 'public'",
         )
         .fetch_optional(&pool)
         .await
@@ -2693,7 +2695,9 @@ impl PostgresStore {
         let row: Option<(i32,)> = sqlx::query_as(
             "SELECT atttypmod FROM pg_attribute a
              JOIN pg_class c ON c.oid = a.attrelid
-             WHERE c.relname = 'memories' AND a.attname = 'embedding'",
+             JOIN pg_namespace n ON c.relnamespace = n.oid
+             WHERE c.relname = 'memories' AND a.attname = 'embedding'
+             AND n.nspname = 'public'",
         )
         .fetch_optional(&self.pool)
         .await
@@ -3120,7 +3124,9 @@ impl PostgresStore {
         let existing_dim: Option<(i32,)> = sqlx::query_as(
             "SELECT atttypmod FROM pg_attribute a
              JOIN pg_class c ON c.oid = a.attrelid
-             WHERE c.relname = 'memories' AND a.attname = 'embedding'",
+             JOIN pg_namespace n ON c.relnamespace = n.oid
+             WHERE c.relname = 'memories' AND a.attname = 'embedding'
+             AND n.nspname = 'public'",
         )
         .fetch_optional(&mut *tx)
         .await
