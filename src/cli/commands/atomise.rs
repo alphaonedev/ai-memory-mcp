@@ -281,11 +281,17 @@ pub fn run_with_curator(
 
     // Build the curator. Tests inject; production constructs an
     // LlmCurator backed by the tier-resolved Ollama model.
-    let curator: Box<dyn Curator> = if let Some(c) = curator_override {
-        c
+    //
+    // v0.7.0 (#1244) — also resolve the curator model name so the
+    // signed-event payload's `curator_model` field reflects what
+    // actually ran on this deployment.
+    let (curator, curator_model): (Box<dyn Curator>, String) = if let Some(c) = curator_override {
+        // Test path: caller injected a mock curator; we don't have a
+        // model name handy. Atomiser's "unknown" fallback applies.
+        (c, "unknown".to_string())
     } else {
         match build_llm_curator(tier) {
-            Ok(c) => c,
+            Ok((c, model)) => (c, model),
             Err(e) => {
                 let err = AtomiseError::CuratorFailed(e);
                 return emit_error(&err, &args.memory_id, args.json, out);
@@ -297,7 +303,8 @@ pub fn run_with_curator(
     // disk, matching the curator-pass / reflection-pass discipline.
     let keypair = load_keypair_best_effort(&calling_agent_id);
 
-    let atomiser = Atomiser::new(curator, keypair, AtomiserConfig::default(), tier);
+    let atomiser = Atomiser::new(curator, keypair, AtomiserConfig::default(), tier)
+        .with_curator_model(curator_model);
 
     match atomiser.atomise_sync(
         &conn,
@@ -328,7 +335,7 @@ pub fn run_with_curator(
 /// `openai-compatible` backend), when the legacy tier has no curator
 /// LLM configured (only `Keyword`, which the caller has already
 /// gated), or when the underlying client construction fails.
-fn build_llm_curator(tier: FeatureTier) -> std::result::Result<Box<dyn Curator>, String> {
+fn build_llm_curator(tier: FeatureTier) -> std::result::Result<(Box<dyn Curator>, String), String> {
     // v0.7.x (#1146) — route through the canonical resolver. The
     // resolver folds CLI flags (none here), AI_MEMORY_LLM_* env vars,
     // the [llm] config section, the legacy `llm_model`/`ollama_url`
@@ -336,11 +343,17 @@ fn build_llm_curator(tier: FeatureTier) -> std::result::Result<Box<dyn Curator>,
     // precedence ladder. Atomise's tier gate already refused
     // `Keyword`; for the other three tiers the resolver always
     // produces a usable backend/model pair.
+    //
+    // v0.7.0 (#1244) — also return the resolved model id so the caller
+    // can thread it into the atomiser's `curator_model` provenance.
     let _ = tier;
     let app_config = AppConfig::load();
     let resolved = app_config.resolve_llm(None, None, None);
     match OllamaClient::build_from_resolved(&resolved) {
-        Ok(Some(client)) => Ok(Box::new(LlmCurator::new(client))),
+        Ok(Some(client)) => {
+            let model = client.model_name().to_string();
+            Ok((Box::new(LlmCurator::new(client)), model))
+        }
         Ok(None) => Err(format!(
             "atomise: LLM resolver returned no client \
              (backend={}, source={}); atomise requires a curator LLM",

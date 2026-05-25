@@ -219,6 +219,20 @@ pub struct Atomiser {
     /// before the source is even loaded. Matches the WT-1-B brief
     /// ("keyword → TierLocked"); other tiers proceed.
     tier: crate::config::FeatureTier,
+    /// v0.7.0 (issue #1244) — the resolved curator model name. Stamped
+    /// verbatim into the `atomisation_complete` signed-event payload's
+    /// `curator_model` field so a downstream auditor walking
+    /// `signed_events` can attribute the decomposition to the model
+    /// that ACTUALLY ran on this deployment. Defaults to `"unknown"`
+    /// (the "truly unresolvable" fallback per the issue) when the
+    /// caller doesn't thread the model name through; production sites
+    /// call [`Self::with_curator_model`] with the resolved LLM model
+    /// id (`OllamaClient::model_name()` etc.) at construction.
+    ///
+    /// Pre-#1244 the payload field was hardcoded to `"gemma4"`,
+    /// surfacing the wrong provenance on every non-gemma deployment
+    /// (grok-4.3, claude-opus-4.7, etc. via the post-#1067 path).
+    curator_model: String,
 }
 
 impl Atomiser {
@@ -239,7 +253,41 @@ impl Atomiser {
             keypair,
             config,
             tier,
+            // v0.7.0 (#1244) — "unknown" is the documented fallback
+            // for callers (and tests with mock curators) that don't
+            // resolve a model. Production sites chain
+            // `.with_curator_model(llm.model_name())` after `::new`.
+            curator_model: "unknown".to_string(),
         }
+    }
+
+    /// v0.7.0 (issue #1244) — builder method that stamps the resolved
+    /// curator model name into the atomiser. Threaded into the
+    /// `atomisation_complete` signed-event payload as the
+    /// `curator_model` field so downstream auditors see the model that
+    /// actually ran on this deployment (grok-4.3, claude-opus-4.7,
+    /// gemma3:4b, etc.), not the pre-#1244 hardcoded `"gemma4"`.
+    ///
+    /// Production wiring sites pass `llm_client.model_name()` (from
+    /// `crate::llm::OllamaClient`). The model id passes through
+    /// verbatim — no normalisation, no defaulting beyond the
+    /// `"unknown"` fallback applied by [`Self::new`].
+    #[must_use]
+    pub fn with_curator_model(mut self, curator_model: impl Into<String>) -> Self {
+        let resolved = curator_model.into();
+        if !resolved.trim().is_empty() {
+            self.curator_model = resolved;
+        }
+        self
+    }
+
+    /// v0.7.0 (issue #1244) — accessor for the resolved curator model.
+    /// Exposed for the regression test that pins the
+    /// `atomisation_complete` payload's `curator_model` field reflects
+    /// the model threaded in at construction.
+    #[must_use]
+    pub fn curator_model(&self) -> &str {
+        &self.curator_model
     }
 
     /// Cluster-F PERF-5 — accessor for the configured Synchronous-mode
@@ -449,6 +497,7 @@ impl Atomiser {
             calling_agent_id,
             &archived_at,
             self.keypair.as_deref(),
+            &self.curator_model,
         )
         .map_err(|e| AtomiseError::DbError(e.to_string()))?;
 
@@ -700,6 +749,10 @@ fn archive_source(
 /// Append the final `atomisation_complete` event to `signed_events`.
 /// The payload binds the source id, the atom-id list, and the curator
 /// model id so a downstream auditor can reproduce the decomposition.
+///
+/// v0.7.0 (issue #1244) — `curator_model` is threaded in from the
+/// caller's resolved LLM model name (via [`Atomiser::with_curator_model`])
+/// rather than hardcoded to `"gemma4"`. Default fallback is `"unknown"`.
 fn emit_atomisation_complete_event(
     conn: &Connection,
     source_id: &str,
@@ -708,6 +761,7 @@ fn emit_atomisation_complete_event(
     calling_agent_id: &str,
     archived_at: &str,
     keypair: Option<&AgentKeypair>,
+    curator_model: &str,
 ) -> anyhow::Result<()> {
     let payload = serde_json::json!({
         "event_type": "atomisation_complete",
@@ -716,7 +770,7 @@ fn emit_atomisation_complete_event(
         "atom_count": atom_count,
         "calling_agent_id": calling_agent_id,
         "atomisation_timestamp": archived_at,
-        "curator_model": "gemma4",
+        "curator_model": curator_model,
     });
     let bytes = serde_json::to_vec(&payload)?;
     let (signature, attest_level) = if let Some(kp) = keypair.filter(|k| k.can_sign()) {

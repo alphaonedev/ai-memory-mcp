@@ -32,7 +32,7 @@ use ai_memory::atomisation::{AtomiseError, Atomiser, AtomiserConfig};
 use ai_memory::config::FeatureTier;
 use ai_memory::db;
 use ai_memory::models::{Memory, MemoryKind, MemoryLinkRelation, Tier};
-use ai_memory::signed_events::list_signed_events;
+use ai_memory::signed_events::{list_signed_events, payload_hash};
 use ai_memory::storage;
 use ai_memory::storage::GovernanceRefusal;
 
@@ -638,6 +638,175 @@ fn test_atomiser_records_signed_events() {
     assert!(
         !summary.payload_hash.is_empty(),
         "summary event must carry a payload_hash"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 8b — #1244 regression: non-gemma curator model surfaces in the
+// signed event's `curator_model` payload field, NOT the pre-#1244
+// hardcoded "gemma4" literal.
+// ---------------------------------------------------------------------------
+//
+// Approach: the signed_events table stores `payload_hash` (SHA-256
+// over the canonical payload JSON), not the raw payload. We can't
+// read the curator_model literal back from the row directly. Instead
+// we (a) construct an Atomiser with a known, non-gemma curator_model
+// via `Atomiser::with_curator_model`, (b) run atomise, (c)
+// reconstruct the expected payload JSON byte-for-byte (the production
+// `emit_atomisation_complete_event` builds it with serde_json::json!),
+// hash it, and assert the stored `payload_hash` matches.
+//
+// Cross-check (negative): we ALSO reconstruct the payload with the
+// pre-#1244 hardcoded literal `"gemma4"` and assert the hash does
+// NOT match — proves the fix actually threads the new value through,
+// not just that a payload hash exists.
+#[test]
+fn test_atomiser_signed_event_curator_model_threads_through_1244() {
+    let _g = test_serial()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    ensure_hook_installed();
+    set_mode(HookMode::Allow);
+
+    let (_tmp, conn) = fresh_db();
+    let source_id = insert_long_source(&conn, "ns/1244/curator_model", 30);
+
+    // The non-gemma model id we thread through. Picked to be a string
+    // that NOBODY would generate by accident if the curator_model
+    // field were still hardcoded — so a failure here unambiguously
+    // points at the pre-#1244 hardcoded `"gemma4"` regression.
+    let custom_curator_model = "grok-4.3-test-1244";
+
+    let curator = Box::new(MockCurator::new(vec![Ok(atoms(&[
+        "Atom α.", "Atom β.", "Atom γ.",
+    ]))]));
+    let atomiser = Atomiser::new(curator, None, AtomiserConfig::default(), FeatureTier::Smart)
+        .with_curator_model(custom_curator_model);
+
+    // Accessor sanity check (cheap, doesn't depend on the atomise run).
+    assert_eq!(
+        atomiser.curator_model(),
+        custom_curator_model,
+        "with_curator_model must store the resolved id verbatim (#1244)"
+    );
+
+    let result = atomiser
+        .atomise_sync(&conn, &source_id, 200, false, "test-agent")
+        .expect("atomise");
+    let archived_at = result.archived_at.clone();
+
+    // Pull the atomisation_complete signed event.
+    let events = list_signed_events(&conn, None, 1000, 0).expect("list signed_events");
+    let complete = events
+        .iter()
+        .find(|e| e.event_type == "atomisation_complete")
+        .expect("atomisation_complete signed_event must exist");
+
+    // Re-build the payload byte-for-byte. Field order MUST match the
+    // production `emit_atomisation_complete_event` `serde_json::json!`
+    // invocation (it's stable, the macro preserves declaration order
+    // for the resulting Value's serialisation when keys are unique
+    // strings, AND `serde_json::to_vec` walks `Value::Object`'s
+    // BTreeMap-backed entries — so the canonical bytes are
+    // map-iteration order. We compute the expected bytes by going
+    // through `serde_json::json!` ourselves and `to_vec`-ing them.
+    let expected_payload = serde_json::json!({
+        "event_type": "atomisation_complete",
+        "source_id": source_id,
+        "atom_ids": result.atom_ids,
+        "atom_count": result.atom_count,
+        "calling_agent_id": "test-agent",
+        "atomisation_timestamp": archived_at,
+        "curator_model": custom_curator_model,
+    });
+    let expected_bytes = serde_json::to_vec(&expected_payload).expect("serialize expected payload");
+    let expected_hash = payload_hash(&expected_bytes);
+
+    assert_eq!(
+        complete.payload_hash, expected_hash,
+        "atomisation_complete payload_hash must match a payload that carries the \
+         threaded curator_model `{custom_curator_model}` (#1244)"
+    );
+
+    // Negative cross-check: the pre-#1244 hardcoded literal `"gemma4"`
+    // produces a DIFFERENT hash — proves the fix actually substitutes
+    // the resolved value, not merely that we got SOME hash.
+    let pre_1244_payload = serde_json::json!({
+        "event_type": "atomisation_complete",
+        "source_id": source_id,
+        "atom_ids": result.atom_ids,
+        "atom_count": result.atom_count,
+        "calling_agent_id": "test-agent",
+        "atomisation_timestamp": archived_at,
+        "curator_model": "gemma4",
+    });
+    let pre_1244_bytes =
+        serde_json::to_vec(&pre_1244_payload).expect("serialize pre-#1244 payload");
+    let pre_1244_hash = payload_hash(&pre_1244_bytes);
+
+    assert_ne!(
+        complete.payload_hash, pre_1244_hash,
+        "pre-#1244 hardcoded `gemma4` payload MUST NOT match — the fix has to \
+         actually thread the model name (#1244)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 8c — #1244 fallback contract: when no curator_model is threaded
+// through, the Atomiser defaults to `"unknown"` (not the pre-#1244
+// hardcoded `"gemma4"`).
+// ---------------------------------------------------------------------------
+#[test]
+fn test_atomiser_signed_event_curator_model_defaults_to_unknown_1244() {
+    let _g = test_serial()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    ensure_hook_installed();
+    set_mode(HookMode::Allow);
+
+    let (_tmp, conn) = fresh_db();
+    let source_id = insert_long_source(&conn, "ns/1244/default_unknown", 30);
+
+    let curator = Box::new(MockCurator::new(vec![Ok(atoms(&[
+        "Atom α.", "Atom β.", "Atom γ.",
+    ]))]));
+    // Construct WITHOUT `.with_curator_model(...)`; the default must
+    // be `"unknown"` per the #1244 issue body ("Default to
+    // \"unknown\" only when truly unresolvable").
+    let atomiser = Atomiser::new(curator, None, AtomiserConfig::default(), FeatureTier::Smart);
+
+    assert_eq!(
+        atomiser.curator_model(),
+        "unknown",
+        "Atomiser::new must default curator_model to `unknown` (#1244)"
+    );
+
+    let result = atomiser
+        .atomise_sync(&conn, &source_id, 200, false, "test-agent")
+        .expect("atomise");
+
+    let events = list_signed_events(&conn, None, 1000, 0).expect("list signed_events");
+    let complete = events
+        .iter()
+        .find(|e| e.event_type == "atomisation_complete")
+        .expect("atomisation_complete signed_event must exist");
+
+    let expected_payload = serde_json::json!({
+        "event_type": "atomisation_complete",
+        "source_id": source_id,
+        "atom_ids": result.atom_ids,
+        "atom_count": result.atom_count,
+        "calling_agent_id": "test-agent",
+        "atomisation_timestamp": result.archived_at,
+        "curator_model": "unknown",
+    });
+    let expected_bytes = serde_json::to_vec(&expected_payload).expect("serialize expected payload");
+    let expected_hash = payload_hash(&expected_bytes);
+
+    assert_eq!(
+        complete.payload_hash, expected_hash,
+        "atomisation_complete payload_hash must reflect the `unknown` default \
+         (#1244), NOT the pre-#1244 hardcoded `gemma4`"
     );
 }
 
