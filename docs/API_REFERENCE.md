@@ -538,7 +538,7 @@ of the single namespace's standard.
 
 Returns 200 with `count: 0` and an empty `standards` array when no
 standard is set. Equivalent MCP tool: `memory_namespace_get_standard`
-(`src/mcp.rs:576`).
+(`src/mcp/tools/namespace.rs`).
 
 ### `POST /api/v1/namespaces/{ns}/standard` — set namespace standard
 
@@ -546,13 +546,13 @@ Body: `{ "id": "<memory-id>", "parent": "<optional-parent-namespace>", "governan
 `governance` accepts `write` / `promote` / `delete` (each `any` |
 `registered` | `owner` | `approve`), `approver` (ApproverType), and
 `inherit` (boolean, default `true`). Equivalent MCP tool:
-`memory_namespace_set_standard` (`src/mcp.rs:552`).
+`memory_namespace_set_standard` (`src/mcp/tools/namespace.rs`).
 
 ### `DELETE /api/v1/namespaces/{ns}/standard` — clear namespace standard
 
 Removes the namespace's pinned standard (the standard memory itself is
 not deleted; only the `namespace_meta.standard_id` link). Equivalent
-MCP tool: `memory_namespace_clear_standard` (`src/mcp.rs:588`).
+MCP tool: `memory_namespace_clear_standard` (`src/mcp/tools/namespace.rs`).
 
 ## Archive
 
@@ -564,20 +564,20 @@ Query: `namespace`, `limit` (default 50, max 1000), `offset`.
 { "memories": [ … ], "count": 24 }
 ```
 
-Equivalent MCP tool: `memory_archive_list` (`src/mcp.rs:489`).
+Equivalent MCP tool: `memory_archive_list` (`src/mcp/tools/archive.rs`).
 
 ### `POST /api/v1/archive/{id}/restore` — restore archived memory
 
 Path param: `id` (archived memory id). On success the row is removed
 from `archived_memories` and re-inserted into `memories` with
 `original_tier` and `original_expires_at` re-applied where present.
-Equivalent MCP tool: `memory_archive_restore` (`src/mcp.rs:501`).
+Equivalent MCP tool: `memory_archive_restore` (`src/mcp/tools/archive.rs`).
 
 ### `DELETE /api/v1/archive?older_than_days=30` — purge archived memories
 
 Query: `older_than_days` (optional). Without the query param, all
 archived rows are eligible. Returns `{"purged": N}`. Equivalent MCP
-tool: `memory_archive_purge` (`src/mcp.rs:512`).
+tool: `memory_archive_purge` (`src/mcp/tools/archive.rs`).
 
 ### `GET /api/v1/archive/stats` — archive counters
 
@@ -585,7 +585,7 @@ tool: `memory_archive_purge` (`src/mcp.rs:512`).
 { "total": 24, "by_namespace": [{"namespace":"global","count":18}, … ] }
 ```
 
-Equivalent MCP tool: `memory_archive_stats` (`src/mcp.rs:522`).
+Equivalent MCP tool: `memory_archive_stats` (`src/mcp/tools/archive.rs`).
 
 ## Agents + governance
 
@@ -610,19 +610,19 @@ Query: `status=pending|approved|rejected`, `limit` (default 100, max 1000).
 { "pending": [ { "id": "…", "action_type": "store", "namespace": "…", "status": "pending", "approvals": [ … ] } ], "count": 3 }
 ```
 
-Equivalent MCP tool: `memory_pending_list` (`src/mcp.rs:599`).
+Equivalent MCP tool: `memory_pending_list` (`src/mcp/tools/pending.rs`).
 
 ### `POST /api/v1/pending/{id}/approve` — approve pending action
 
 Path param: `id`. Stamps `decided_by` with the caller's `X-Agent-Id`.
 200 if consensus reached (and the governed action is executed). 202 if
 still collecting approvers. Equivalent MCP tool: `memory_pending_approve`
-(`src/mcp.rs:610`).
+(`src/mcp/tools/pending.rs`).
 
 ### `POST /api/v1/pending/{id}/reject` — reject pending action
 
 Path param: `id`. Returns `{"rejected":true,"id":"…","decided_by":"alice"}`.
-Equivalent MCP tool: `memory_pending_reject` (`src/mcp.rs:621`).
+Equivalent MCP tool: `memory_pending_reject` (`src/mcp/tools/pending.rs`).
 
 ## Sync / federation
 
@@ -672,18 +672,18 @@ private-range IPs; requires `https://` unless loopback).
 Body: `{ "url": "https://…", "events": ["memory_store", …], "secret": "<shared-secret>", "namespace_filter": "…", "agent_filter": "…" }`.
 Stores `secret` as a SHA-256 hash for HMAC signing of dispatched
 events. Returns the new subscription `id`. Equivalent MCP tool:
-`memory_subscribe` (`src/mcp.rs:680`).
+`memory_subscribe` (`src/mcp/tools/subscribe.rs`).
 
 ### `DELETE /api/v1/subscriptions?id=<id>` — unregister webhook
 
 Returns `{"deleted": true}`. Equivalent MCP tool: `memory_unsubscribe`
-(`src/mcp.rs:695`).
+(`src/mcp/tools/subscribe.rs`).
 
 ### `GET /api/v1/subscriptions` — list subscriptions
 
 Returns `{"subscriptions":[…],"count":N}`. Each entry includes `url`,
 `events`, `created_at`, `dispatch_count`, `failure_count`. Equivalent
-MCP tool: `memory_list_subscriptions` (`src/mcp.rs:706`).
+MCP tool: `memory_list_subscriptions` (`src/mcp/tools/subscribe.rs`).
 
 ## Federation (v0.7, opt-in via `--quorum-writes`)
 
