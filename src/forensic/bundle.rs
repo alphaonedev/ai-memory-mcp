@@ -1462,17 +1462,49 @@ pub fn read_ustar(bytes: &[u8]) -> Result<BundleFiles> {
         }
         let name = read_cstr(&header[..100]);
         let size = read_octal_size(&header[124..136])?;
-        pos += USTAR_BLOCK_SIZE;
-        if pos + size > bytes.len() {
+        // #1250 — refuse implausibly large entry sizes BEFORE the
+        // arithmetic that could otherwise wrap `usize`. The pre-#1250
+        // code did `pos + size > bytes.len()`; with a crafted 12-digit
+        // octal size near `usize::MAX` the addition wrapped to a small
+        // value, the check passed, and the slice `bytes[pos..pos+size]`
+        // panicked out of bounds (or read past the buffer on 32-bit
+        // targets before bounds detection). We cap at
+        // [`MAX_TAR_ENTRY_BYTES`] (1 GiB) which is two orders of
+        // magnitude above any realistic forensic-bundle file and below
+        // any value that could overflow `pos.checked_add(size)`.
+        if size > MAX_TAR_ENTRY_BYTES {
+            bail!(
+                "tar entry '{name}' size {size} exceeds the {MAX_TAR_ENTRY_BYTES}-byte \
+                 hard cap (likely a malformed or crafted bundle)"
+            );
+        }
+        pos = pos
+            .checked_add(USTAR_BLOCK_SIZE)
+            .ok_or_else(|| anyhow!("tar parser: pos overflow advancing past header"))?;
+        let body_end = pos
+            .checked_add(size)
+            .ok_or_else(|| anyhow!("tar entry '{name}' size {size} overflows usize"))?;
+        if body_end > bytes.len() {
             bail!("tar entry '{name}' size {size} extends beyond archive bytes");
         }
-        let body = bytes[pos..pos + size].to_vec();
+        let body = bytes[pos..body_end].to_vec();
         files.insert(name, body);
         let pad = (USTAR_BLOCK_SIZE - (size % USTAR_BLOCK_SIZE)) % USTAR_BLOCK_SIZE;
-        pos += size + pad;
+        pos = body_end
+            .checked_add(pad)
+            .ok_or_else(|| anyhow!("tar parser: pos overflow advancing past padding"))?;
     }
     Ok(files)
 }
+
+/// #1250 — hard cap on the per-entry body size accepted by
+/// [`read_ustar`]. Set to 1 GiB: two orders of magnitude above the
+/// largest realistic forensic-bundle file (a fully-attested signed
+/// chain of a 7-day mid-tier namespace is ~10 MB) and small enough
+/// that `pos.checked_add(size)` cannot wrap on any supported platform.
+/// A crafted bundle declaring a larger entry is refused at parse time
+/// with `tar entry … exceeds the … hard cap`.
+pub const MAX_TAR_ENTRY_BYTES: usize = 1024 * 1024 * 1024;
 
 fn read_cstr(bytes: &[u8]) -> String {
     let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
@@ -1933,5 +1965,55 @@ mod tests {
     fn verify_returns_error_for_missing_bundle_path() {
         let p = std::path::Path::new("/this/does/not/exist/bundle.tar");
         assert!(verify(p).is_err());
+    }
+
+    /// #1250 — regression: a tar header that declares a body size
+    /// above the hard cap MUST be refused with a typed error rather
+    /// than wrapping `pos + size` and panicking on the subsequent
+    /// slice. The pre-#1250 implementation panicked with `index out
+    /// of bounds` on a crafted oversize entry; the new path rejects
+    /// via the `MAX_TAR_ENTRY_BYTES` ceiling.
+    #[test]
+    fn read_ustar_rejects_oversize_entry_1250() {
+        // Build a header by hand. The body size lives at offset
+        // 124..136. Fill it with the largest legal 12-byte octal value
+        // — 11 octal digits + a terminating space (ustar convention).
+        // That decodes to (8^11 - 1) ≈ 8.6 GB, well over
+        // `MAX_TAR_ENTRY_BYTES` and, critically, large enough that
+        // pre-fix `pos + size` arithmetic would have overflowed on
+        // 32-bit and saturated near `usize::MAX` on 64-bit, defeating
+        // the `> bytes.len()` guard.
+        let mut header = [0u8; USTAR_BLOCK_SIZE];
+        // Name "x" + NUL at offset 0..100.
+        header[0] = b'x';
+        // Size field at 124..136 — 11 '7's + space terminator.
+        for b in &mut header[124..135] {
+            *b = b'7';
+        }
+        header[135] = b' ';
+        // Mode bits + uid/gid zeros are fine as-is (the parser doesn't
+        // read them); the rest of the header stays NUL.
+        let err = read_ustar(&header).expect_err("oversize entry must be refused");
+        let s = format!("{err}");
+        assert!(
+            s.contains("exceeds the") || s.contains("hard cap"),
+            "expected MAX_TAR_ENTRY_BYTES rejection message, got: {s}"
+        );
+    }
+
+    /// #1250 — invariants on the hard cap: must be far enough below
+    /// `usize::MAX` that `pos.checked_add(size)` cannot overflow even
+    /// after several iterations, AND must accommodate the largest
+    /// realistic bundle.
+    #[test]
+    fn read_ustar_oversize_cap_invariants_1250() {
+        assert!(
+            MAX_TAR_ENTRY_BYTES < usize::MAX / 4,
+            "MAX_TAR_ENTRY_BYTES must be << usize::MAX so checked_add can never panic"
+        );
+        assert!(
+            MAX_TAR_ENTRY_BYTES >= 100 * 1024 * 1024,
+            "MAX_TAR_ENTRY_BYTES must accommodate the largest realistic forensic bundle"
+        );
     }
 }
