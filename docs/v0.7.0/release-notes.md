@@ -532,6 +532,111 @@ The contributor-facing recipe is documented in
 pre-D1.6 recipe ("add a JSON definition in `tool_definitions()` + add
 a match arm") is gone.
 
+## v0.7.0 substrate-canonical-discipline ([#1174](https://github.com/alphaonedev/ai-memory-mcp/issues/1174) PR-train, pm-v3.1, 2026-05-23/24)
+
+The pm-v3.1 substrate-canonical-discipline campaign closed [#1174](https://github.com/alphaonedev/ai-memory-mcp/issues/1174)
+end-to-end across 10 sequenced PRs ([#1184](https://github.com/alphaonedev/ai-memory-mcp/pull/1184) →
+[#1200](https://github.com/alphaonedev/ai-memory-mcp/pull/1200)) plus the [#1183](https://github.com/alphaonedev/ai-memory-mcp/issues/1183)
+WrapStrategy split ([#1199](https://github.com/alphaonedev/ai-memory-mcp/pull/1199))
+and the [#1192](https://github.com/alphaonedev/ai-memory-mcp/issues/1192) /
+[#1196](https://github.com/alphaonedev/ai-memory-mcp/issues/1196) /
+[#1205](https://github.com/alphaonedev/ai-memory-mcp/issues/1205) RuntimeContext
+follow-up ([#1204](https://github.com/alphaonedev/ai-memory-mcp/pull/1204)).
+Three independent decorrelated codegraph-driven QC audits confirmed
+ZERO-DEFECTS-CONFIRMED per pm-v3.2 NO FAIL MISSION closure discipline
+(ai-memory `global/policies` memory `2cb15d34-2399-4611-a020-df6ef91683fe`).
+
+The net change is structural — **the wire shape is byte-identical** —
+but the substrate-vendor literal scatter is gone, magic time-second
+literals are gone, the per-CLI-binary `WrapStrategy` table is split
+into a sibling module, and a process-wide `RuntimeContext` singleton
+replaces the dual `ACTIVE_*` / `OVERRIDE_*` static pairs.
+
+**Wave 1 — substrate const extraction (6 PRs).**
+
+- [`crate::mcp::registry::tool_names`](../../src/mcp/registry.rs) module
+  with 73 canonical MCP tool-name consts ([#1187](https://github.com/alphaonedev/ai-memory-mcp/pull/1187)).
+- [`crate::HEADER_CONTENT_TYPE`](../../src/lib.rs) / [`crate::MIME_JSON`](../../src/lib.rs)
+  HTTP wire consts ([#1188](https://github.com/alphaonedev/ai-memory-mcp/pull/1188)).
+- [`crate::SECS_PER_HOUR`](../../src/lib.rs) (3_600) /
+  [`crate::SECS_PER_DAY`](../../src/lib.rs) (86_400) /
+  [`crate::SECS_PER_WEEK`](../../src/lib.rs) (604_800) named time
+  constants ([#1185](https://github.com/alphaonedev/ai-memory-mcp/pull/1185)).
+- [`crate::llm::BACKEND_OLLAMA`](../../src/llm.rs) substrate-vendor literal
+  sweep ([#1184](https://github.com/alphaonedev/ai-memory-mcp/pull/1184)).
+- [`crate::DEFAULT_NAMESPACE`](../../src/lib.rs) (`"global"`) with explicit
+  disambiguation from [`crate::quotas::GLOBAL_NAMESPACE`](../../src/quotas.rs)
+  (`"_global"`) so the storage default and the quota sentinel can no
+  longer be conflated at call sites
+  ([#1190](https://github.com/alphaonedev/ai-memory-mcp/pull/1190)).
+- Typed [`Tier::Short.as_str()`](../../src/models.rs) /
+  `Mid.as_str()` / `Long.as_str()` raw-string sweep
+  ([#1186](https://github.com/alphaonedev/ai-memory-mcp/pull/1186)).
+
+**Wave 2 — static-state extraction + cross-surface containers (5 PRs).**
+
+- `ACTIVE/OVERRIDE_PERMISSIONS_MODE` dual-source-of-truth collapsed
+  into a single `RwLock` ([#1191](https://github.com/alphaonedev/ai-memory-mcp/pull/1191)).
+- Class A SHOULD statics extracted into `AppState` / metrics registry
+  ([#1195](https://github.com/alphaonedev/ai-memory-mcp/pull/1195)).
+- Test fixtures deflaked from vendor-specific `"claude"` literals via
+  fresh canonical `"nhi"` / `"api"` constants in `tests/common::FIXTURE_SOURCE`
+  ([#1189](https://github.com/alphaonedev/ai-memory-mcp/pull/1189)).
+- Per-vendor CLI-binary `WrapStrategy` table extracted from
+  `src/cli/wrap.rs` into a new sibling
+  [`src/llm_cli_wrap.rs`](../../src/llm_cli_wrap.rs) module
+  ([#1199](https://github.com/alphaonedev/ai-memory-mcp/pull/1199),
+  closes [#1183](https://github.com/alphaonedev/ai-memory-mcp/issues/1183)).
+- **NEW** [`src/runtime_context.rs`](../../src/runtime_context.rs) with
+  `pub struct RuntimeContext` + process-wide
+  `OnceLock<Arc<RuntimeContext>>` singleton (`RuntimeContext::global()`
+  / `global_arc()`) carrying MUST-class statics (`hooks_hmac_secret`,
+  `max_decompressed_bytes`, `audit: Arc<AuditState>`) + SHOULD-class
+  statics (`recall_tracker`, `keypair_cache`).
+  `AppState.runtime: Arc<RuntimeContext>` threads the singleton onto
+  the HTTP daemon (73 `AppState { ... }` literals updated across
+  production + test trees); MCP stdio + CLI reach the same singleton
+  via the `OnceLock`
+  ([#1204](https://github.com/alphaonedev/ai-memory-mcp/pull/1204),
+  closes [#1192](https://github.com/alphaonedev/ai-memory-mcp/issues/1192)
+  + [#1196](https://github.com/alphaonedev/ai-memory-mcp/issues/1196)
+  + [#1205](https://github.com/alphaonedev/ai-memory-mcp/issues/1205)).
+
+**Wave 3 — load-bearing lint-gate enforcement (1 PR).**
+
+[`scripts/check-vendor-literals.sh`](../../scripts/check-vendor-literals.sh)
+([#1200](https://github.com/alphaonedev/ai-memory-mcp/pull/1200))
+HARD-BLOCKs (a) vendor-monoculture literals (`"claude"`, `"openai"`,
+`"xai"`, `"anthropic"`, `"gemini"`, `"deepseek"`, `"groq"`, `"ollama"`,
+`"grok"`, `"mistral"`, `"cohere"`, `"huggingface"`) outside the 7-file
+substrate carve-out (`src/llm.rs`, `src/config.rs`, `src/mine.rs`,
+`src/validate.rs`, `src/cli/wrap.rs`, `src/llm_cli_wrap.rs`,
+`src/harness.rs`) and (b) `Duration::from_secs(3600 | 86400 | 604800 | 3_600
+| 86_400 | 604_800 | 7200 | 21600 | 172800)` magic numbers anywhere in
+production code. The gate's own `--self-test` mode injects a contrived
+`"anthropic"` literal at a production site, verifies the gate trips,
+then cleans up — providing a CI-side canary against future
+detection-logic decay. Wired into
+[`.github/workflows/c8-precheck.yml`](../../.github/workflows/c8-precheck.yml)
+alongside the existing four cargo gates (fmt + clippy + test + audit).
+Full contract documented in
+[`CLAUDE.md`](../../CLAUDE.md) §"Lint gates (issue #1174 PR10)".
+
+**Wire impact.** The PR9 ([#1189](https://github.com/alphaonedev/ai-memory-mcp/pull/1189))
+`source: "claude"` → `source: "nhi"` / `"api"` test-fixture flip changes
+the `source` field on memories stored by the test harness only —
+production daemons preserve caller-supplied `source` verbatim (no live
+wire change). The PR4 ([#1184](https://github.com/alphaonedev/ai-memory-mcp/pull/1184))
+`"ollama"` substrate sweep is internal-only — all wire surfaces continue
+to accept and emit the literal string `"ollama"` as a backend name. The
+PR [#1199](https://github.com/alphaonedev/ai-memory-mcp/pull/1199)
+WrapStrategy module move is purely internal — `src/cli/wrap.rs`'s
+public surface is unchanged (the move split detection logic from the
+per-vendor table).
+
+The CHANGELOG entry is the canonical record (commit
+[`0b7530c92`](https://github.com/alphaonedev/ai-memory-mcp/commit/0b7530c92)).
+
 ## What's new since v0.6.4
 
 ### HNSW async rebuild + double-buffering (Wave-2 Tier-C3, issue [#968](https://github.com/alphaonedev/ai-memory-mcp/issues/968))
