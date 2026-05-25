@@ -14,7 +14,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -2186,6 +2186,22 @@ pub fn run_embedding_backfill(
 /// v0.6.4-002 (#522). Until that lands, every profile shows the full
 /// 43-tool surface — the resolution step still runs so the parse error
 /// path is exercised (and asserted in the integration tests).
+/// #1249 — per-line byte cap on the MCP stdio JSON-RPC parser. 16 MiB
+/// is well above the largest realistic tool-input payload (the wire
+/// trimmer keeps `tools/list` under ~11k cl100k tokens, ~50 KB of JSON;
+/// the heaviest individual store/recall calls are under 1 MB) while
+/// still bounded enough that an OOM-vector peer cannot exhaust the
+/// daemon's address space. On overrun the loop emits a `-32700` parse
+/// error, drains the rest of the offending line, and continues serving.
+pub const MCP_MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
+
+/// #1249 — hard ceiling on the post-overrun drain so a peer that
+/// streams a never-ending sequence of non-newline bytes cannot keep
+/// the daemon's drain loop spinning forever. When this ceiling fires
+/// the daemon emits a final `-32700` and exits cleanly so an operator
+/// process supervisor can restart it.
+pub const MCP_MAX_DRAIN_BYTES: usize = 64 * 1024 * 1024;
+
 #[allow(clippy::too_many_lines)]
 pub fn run_mcp_server(
     db_path: &Path,
@@ -2531,13 +2547,103 @@ pub fn run_mcp_server(
     // itself meaningful — absence means "we don't know").
     let mut detected_harness: Option<crate::harness::Harness> = None;
 
-    for line in stdin.lock().lines() {
-        let line = line?;
+    // #1249 — DoS guard on the stdio JSON-RPC parser. The pre-#1249 loop
+    // (`for line in stdin.lock().lines()`) had no per-line cap; a peer
+    // that streamed an unbounded sequence of non-newline bytes drove
+    // `BufRead::Lines` to grow its internal `String` allocation without
+    // limit, OOM-killing the daemon. The replacement is a manual
+    // `read_until('\n', &mut buf)` loop that enforces
+    // [`MCP_MAX_LINE_BYTES`]: on overrun we emit a `-32700` parse error,
+    // drain the rest of the offending line so the next request lines up
+    // on a fresh boundary, and continue the loop.
+    let mut stdin_locked = stdin.lock();
+    let mut line_buf: Vec<u8> = Vec::with_capacity(8192);
+    loop {
+        line_buf.clear();
+        // Take a per-line slice of stdin sized to MCP_MAX_LINE_BYTES + 1
+        // so we can detect overrun (read_until returns the byte count
+        // including the delimiter; when the cap is hit BEFORE we see a
+        // newline `read_until` returns the cap bytes and we know to
+        // drain the rest).
+        let n = (&mut stdin_locked)
+            .take((MCP_MAX_LINE_BYTES as u64) + 1)
+            .read_until(b'\n', &mut line_buf)?;
+        if n == 0 {
+            // Clean EOF.
+            break;
+        }
+        let overrun = line_buf.last() != Some(&b'\n') && n > MCP_MAX_LINE_BYTES;
+        if overrun {
+            // Drain the rest of this line so the next iteration starts
+            // on a clean boundary. We discard the bytes; this also caps
+            // the drain so a never-ending stream of non-newline bytes
+            // doesn't spin forever in the drain loop.
+            let mut scratch = [0u8; 8192];
+            let mut drained: usize = 0;
+            loop {
+                if drained >= MCP_MAX_DRAIN_BYTES {
+                    // Hard ceiling on drain — close the loop rather than
+                    // serve an infinitely-streaming peer.
+                    let resp = err_response(
+                        Value::Null,
+                        -32700,
+                        format!(
+                            "parse error: line exceeded {MCP_MAX_LINE_BYTES} bytes \
+                             and drain ceiling {MCP_MAX_DRAIN_BYTES} hit; closing stream"
+                        ),
+                    );
+                    let out = serde_json::to_string(&resp)?;
+                    writeln!(stdout, "{out}")?;
+                    stdout.flush()?;
+                    let _ = db::checkpoint(&conn);
+                    eprintln!("ai-memory MCP server stopped (drain ceiling exceeded)");
+                    return Ok(());
+                }
+                let m = stdin_locked.read(&mut scratch)?;
+                if m == 0 {
+                    break;
+                }
+                drained = drained.saturating_add(m);
+                if scratch[..m].contains(&b'\n') {
+                    break;
+                }
+            }
+            let resp = err_response(
+                Value::Null,
+                -32700,
+                format!("parse error: line exceeded {MCP_MAX_LINE_BYTES} bytes"),
+            );
+            let out = serde_json::to_string(&resp)?;
+            writeln!(stdout, "{out}")?;
+            stdout.flush()?;
+            continue;
+        }
+        // Trim trailing newline (and optional \r) before decoding.
+        if line_buf.last() == Some(&b'\n') {
+            line_buf.pop();
+        }
+        if line_buf.last() == Some(&b'\r') {
+            line_buf.pop();
+        }
+        let line = match std::str::from_utf8(&line_buf) {
+            Ok(s) => s,
+            Err(e) => {
+                let resp = err_response(
+                    Value::Null,
+                    -32700,
+                    format!("parse error: invalid UTF-8: {e}"),
+                );
+                let out = serde_json::to_string(&resp)?;
+                writeln!(stdout, "{out}")?;
+                stdout.flush()?;
+                continue;
+            }
+        };
         if line.trim().is_empty() {
             continue;
         }
 
-        let req: RpcRequest = match serde_json::from_str(&line) {
+        let req: RpcRequest = match serde_json::from_str(line) {
             Ok(r) => r,
             Err(e) => {
                 let resp = err_response(Value::Null, -32700, format!("parse error: {e}"));
@@ -2619,9 +2725,10 @@ mod tests {
     //
     //   1. `run_mcp_server` opens a plain `rusqlite::Connection` via
     //      `db::open` (no Arc, no Mutex) — `src/mcp/mod.rs:2013`.
-    //   2. The stdio loop is `for line in stdin.lock().lines()` —
-    //      synchronous and single-threaded by JSON-RPC stdio protocol
-    //      design — `src/mcp/mod.rs:2263`.
+    //   2. The stdio loop is a manual `read_until('\n')` loop (post-#1249
+    //      DoS hardening; pre-#1249 it was `for line in stdin.lock().lines()`)
+    //      — synchronous and single-threaded by JSON-RPC stdio protocol
+    //      design.
     //   3. `handle_request` and `ToolDispatchCtx` carry a plain
     //      `&rusqlite::Connection` reference — no shared-state wrapper —
     //      `src/mcp/mod.rs:1519,846`.
@@ -12748,5 +12855,94 @@ mod tests {
                  registered in registered_tools() — orphan dispatch wrapper (#1050)"
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // #1249 — MCP stdio JSON-RPC line-length cap regression tests
+    //
+    // The full daemon loop exercises the cap by feeding an oversized
+    // payload over stdin; that requires a child process. The unit tests
+    // here pin the underlying primitive (`Read::take` + `BufRead::read_until`)
+    // so a future refactor that drops the `.take()` wrap is caught
+    // without spawning a process.
+    // -----------------------------------------------------------------
+
+    /// The `MCP_MAX_LINE_BYTES` const must be > the largest known good
+    /// MCP request payload (~50 KB for `tools/list` plus the heaviest
+    /// individual store/recall calls under 1 MB), AND must be < the
+    /// drain ceiling so the overrun-then-drain sequence stays bounded.
+    #[test]
+    fn mcp_line_length_cap_1249_const_invariants() {
+        assert!(
+            super::MCP_MAX_LINE_BYTES > 1_000_000,
+            "16 MiB cap must comfortably exceed largest realistic MCP request"
+        );
+        assert!(
+            super::MCP_MAX_DRAIN_BYTES > super::MCP_MAX_LINE_BYTES,
+            "drain ceiling must exceed line cap so overrun handling can drain to next \\n"
+        );
+        assert!(
+            super::MCP_MAX_LINE_BYTES <= 64 * 1024 * 1024,
+            "16 MiB upper bound — bigger caps make OOM-vector peers viable again"
+        );
+    }
+
+    /// The `Read::take(N+1)` + `BufRead::read_until('\n', &mut buf)`
+    /// primitive that #1249 swapped in must (1) stop at the cap even
+    /// when the byte stream has no newline, (2) leave `buf.last() !=
+    /// Some(&b'\n')` so the overrun detection branch fires.
+    #[test]
+    fn mcp_line_length_cap_1249_read_until_take_overrun() {
+        use std::io::{BufRead, Read};
+        // 1 MiB of 'A' with no newline.
+        let cap: usize = 1024 * 1024;
+        let payload = vec![b'A'; cap + 8192]; // strictly larger than cap
+        let mut src = std::io::Cursor::new(payload);
+        let mut buf: Vec<u8> = Vec::new();
+        let n = (&mut src)
+            .take((cap as u64) + 1)
+            .read_until(b'\n', &mut buf)
+            .expect("read_until succeeds against in-memory cursor");
+        // Stopped at cap+1 because the underlying stream has no \n.
+        assert_eq!(n, cap + 1, "should stop at the take() cap");
+        assert_ne!(
+            buf.last(),
+            Some(&b'\n'),
+            "buf must NOT end in \\n when the cap was hit — that's the overrun signal"
+        );
+        // After overrun we must be able to keep reading from the
+        // underlying stream (the drain path).
+        let mut scratch = [0u8; 64];
+        let m = src.read(&mut scratch).expect("further reads succeed");
+        assert!(
+            m > 0,
+            "underlying stream still has bytes for the drain path"
+        );
+    }
+
+    /// Inputs at or below the cap that DO contain a newline must
+    /// terminate cleanly with `buf.last() == Some(&b'\n')`.
+    #[test]
+    fn mcp_line_length_cap_1249_clean_newline_termination() {
+        use std::io::BufRead;
+        let mut payload: Vec<u8> = vec![b'X'; 4096];
+        payload.push(b'\n');
+        payload.extend_from_slice(b"second line\n");
+        let mut src = std::io::Cursor::new(payload);
+        let mut buf: Vec<u8> = Vec::new();
+        let n = (&mut src)
+            .take((super::MCP_MAX_LINE_BYTES as u64) + 1)
+            .read_until(b'\n', &mut buf)
+            .expect("read_until OK");
+        assert_eq!(n, 4097);
+        assert_eq!(buf.last(), Some(&b'\n'));
+        // Second line still drains.
+        buf.clear();
+        let m = (&mut src)
+            .take((super::MCP_MAX_LINE_BYTES as u64) + 1)
+            .read_until(b'\n', &mut buf)
+            .expect("read_until OK");
+        assert_eq!(m, "second line\n".len());
+        assert_eq!(buf.last(), Some(&b'\n'));
     }
 }
