@@ -370,10 +370,18 @@ fn matrix_update(n: usize) {
         Some(true),
         "update: dedup flag"
     );
+    // Issue #1239 — synthesis Update verdict now also persists a
+    // lightweight provenance row per update (suffix-titled
+    // ` (sup ⟶ <target_id>)`) so the new memory's `supersedes`
+    // edge to each target lands with both FK endpoints alive. The
+    // canonical merged survivors remain the N original candidates
+    // (each in-place merged); total row count is therefore 2*N (N
+    // survivors + N provenance rows). The wire-response id still
+    // echoes the PRIMARY (first) update's candidate id.
     assert_eq!(
         ns_count(&conn, &ns),
-        i64::try_from(n).unwrap(),
-        "update matrix n={n}: SKIPs new-row insert; total stays at N",
+        i64::try_from(n * 2).unwrap(),
+        "update matrix n={n} (#1239): N merged survivors + N provenance rows",
     );
     // Every candidate's body must reflect its merged_content.
     for (i, id) in ids.iter().enumerate() {
