@@ -31,6 +31,7 @@ use ai_memory::quotas::{
     self, DEFAULT_MAX_MEMORIES_PER_DAY, DEFAULT_MAX_STORAGE_BYTES, GLOBAL_NAMESPACE,
     QuotaCheckError, QuotaLimit, QuotaOp,
 };
+use ai_memory::storage::current_schema_version_for_tests;
 use rusqlite::{Connection, params};
 
 mod common;
@@ -358,7 +359,7 @@ fn schema_v50_migration_is_idempotent() {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(version, 50);
+        assert_eq!(version, current_schema_version_for_tests());
 
         // Insert a row in a non-_global namespace.
         quotas::record_op(
@@ -460,7 +461,7 @@ fn schema_v50_migration_backfills_global_sentinel() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(version, 50);
+    assert_eq!(version, current_schema_version_for_tests());
 }
 
 // ─────────────────────────────────────────────────────────────────────
