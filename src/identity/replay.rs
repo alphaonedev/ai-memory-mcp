@@ -49,6 +49,7 @@
 //!    distributed deployment; we punt that to v0.8.
 
 use std::collections::{HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -481,13 +482,187 @@ pub struct FederationNonceCache {
     /// since boot. Non-zero values mean the outer LRU dropped a
     /// peer to make room — operator-visible via `peer_evictions_since_boot()`.
     peer_evictions: std::sync::atomic::AtomicU64,
+    /// #1255 (MED, 2026-05-25) — when `Some`, every Fresh
+    /// fingerprint is persisted to the `federation_nonce_cache`
+    /// table in the ai-memory sqlite DB on this path AND the
+    /// cache hydrates from the same table on construction. When
+    /// `None` the cache is in-memory only and a daemon restart
+    /// opens a fresh replay window (pre-#1255 behaviour, preserved
+    /// for test harnesses and for any caller that opts out).
+    db_path: Option<PathBuf>,
 }
 
 impl FederationNonceCache {
-    /// Fresh empty cache.
+    /// Fresh empty cache. In-memory only — the cache resets on every
+    /// daemon restart. Prefer [`Self::new_with_db_persistence`] in
+    /// production: pre-#1255 the in-memory-only cache opened a
+    /// replay window on every restart.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// #1255 (MED, 2026-05-25) — persistence-enabled constructor.
+    ///
+    /// Opens the ai-memory sqlite DB at `db_path` (runs migrations
+    /// to ensure the `federation_nonce_cache` table is present),
+    /// rehydrates the in-memory cache from the persisted rows
+    /// (oldest `last_touch` first so the in-process LRU ordering
+    /// matches the on-disk order), and arms the cache so every
+    /// subsequent `Fresh` fingerprint is persisted to disk.
+    ///
+    /// Construction errors out if the DB cannot be opened or
+    /// migrated — operators want loud failure here, not a silent
+    /// fallback to in-memory mode that re-opens the replay window.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the DB cannot be opened or the load
+    /// query fails.
+    pub fn new_with_db_persistence(db_path: impl Into<PathBuf>) -> anyhow::Result<Self> {
+        let db_path = db_path.into();
+        let cache = Self {
+            inner: Mutex::new(HashMap::new()),
+            touch_counter: AtomicU64::new(0),
+            peer_evictions: AtomicU64::new(0),
+            db_path: Some(db_path.clone()),
+        };
+        cache.hydrate_from_disk(&db_path)?;
+        Ok(cache)
+    }
+
+    /// #1255 — read every persisted `(peer_id, fingerprint,
+    /// last_touch)` triple from disk and seed the in-memory cache.
+    /// Iterates oldest-touch first so the on-disk LRU ordering
+    /// becomes the in-process FIFO ordering for the per-peer
+    /// `VecDeque`s. The post-load `touch_counter` is bumped past
+    /// the largest observed `last_touch` so subsequent inserts
+    /// stay monotonic against the rehydrated state.
+    fn hydrate_from_disk(&self, db_path: &Path) -> anyhow::Result<()> {
+        // Use `crate::db::open` which runs migrations on first open.
+        // This guarantees the `federation_nonce_cache` table exists
+        // even on a pre-v51 DB (the v51 migration is replay-safe).
+        let conn = crate::db::open(db_path)
+            .map_err(|e| anyhow::anyhow!("FederationNonceCache: open ai-memory db: {e}"))?;
+        let mut stmt = conn.prepare(
+            "SELECT peer_id, fingerprint, last_touch
+             FROM federation_nonce_cache
+             ORDER BY last_touch ASC",
+        )?;
+        let mut max_touch: u64 = 0;
+        let rows = stmt.query_map([], |row| {
+            let peer_id: String = row.get(0)?;
+            let fp_bytes: Vec<u8> = row.get(1)?;
+            let last_touch: i64 = row.get(2)?;
+            Ok((peer_id, fp_bytes, last_touch))
+        })?;
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("FederationNonceCache: hydration mutex poisoned"))?;
+        for row in rows {
+            let (peer_id, fp_bytes, last_touch) = row?;
+            // Coerce the 32-byte fingerprint back from the blob.
+            // Rows with non-32-byte blobs are skipped + warn-logged —
+            // they cannot have been produced by any v0.7.x writer,
+            // so they are forensic noise we don't want to crash on.
+            let fp: [u8; 32] = match fp_bytes.as_slice().try_into() {
+                Ok(fp) => fp,
+                Err(_) => {
+                    tracing::warn!(
+                        target: "ai_memory::identity::replay",
+                        peer_id = %peer_id,
+                        len = fp_bytes.len(),
+                        "FederationNonceCache: skipping persisted row with non-32-byte \
+                         fingerprint blob (forensic noise; not produced by any v0.7.x writer)",
+                    );
+                    continue;
+                }
+            };
+            #[allow(clippy::cast_sign_loss)]
+            let touch_u64 = last_touch.max(0) as u64;
+            if touch_u64 > max_touch {
+                max_touch = touch_u64;
+            }
+            let slot = guard.entry(peer_id).or_default();
+            // Honour the per-peer cap on hydration: oldest rows are
+            // dropped silently when the on-disk persistence holds
+            // more rows than `FEDERATION_NONCE_CAPACITY_PER_PEER`.
+            // (Shouldn't happen in practice — the persistence layer
+            // mirrors the in-memory cap — but defensive on operator
+            // hand-rolled DBs.)
+            if slot.order.len() >= FEDERATION_NONCE_CAPACITY_PER_PEER {
+                if let Some(evicted) = slot.order.pop_front() {
+                    slot.seen.remove(&evicted);
+                }
+            }
+            slot.order.push_back(fp);
+            slot.seen.insert(fp);
+            slot.last_touch = touch_u64;
+        }
+        drop(guard);
+        // Advance the in-process touch counter past every observed
+        // last_touch so the next insert is monotonic.
+        self.touch_counter
+            .store(max_touch.saturating_add(1), Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// #1255 — persist one `(peer_id, fingerprint, last_touch)`
+    /// triple to disk. Called from the Fresh arm of
+    /// `record_and_check` when `db_path.is_some()`. The INSERT OR
+    /// REPLACE shape keeps the row's `last_touch` in lockstep with
+    /// the in-memory cache on every re-touch path (currently the
+    /// `record_and_check` Fresh path only inserts; re-touch on
+    /// existing fingerprints surfaces as `Replay` and skips the
+    /// persistence call, which is fine — the original row remains).
+    /// Persistence errors are warn-logged and swallowed: an
+    /// operator-disk-full or transient db lock failure should not
+    /// be a 500 on every federated push. The in-memory cap still
+    /// holds, so a persistence outage degrades gracefully to
+    /// pre-#1255 behaviour (replay window opens on next restart).
+    fn persist_fingerprint(&self, peer_id: &str, fp: &[u8; 32], last_touch: u64) {
+        let Some(path) = self.db_path.as_deref() else {
+            return;
+        };
+        // `crate::db::open` runs migrations + is cheap on a warm
+        // SQLite WAL connection; the persistence rate is bounded by
+        // federated-POST throughput (sub-Hz on any realistic mesh).
+        let conn = match crate::db::open(path) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    target: "ai_memory::identity::replay",
+                    peer_id = %peer_id,
+                    path = %path.display(),
+                    err = %e,
+                    "FederationNonceCache: persist open failed; in-memory cache still holds \
+                     (#1255 graceful degradation)",
+                );
+                return;
+            }
+        };
+        // `i64::try_from` is safe because `touch_counter` advances
+        // at most once per record_and_check; a daemon would need to
+        // sustain >2^63 federated pushes/sec to overflow, which is
+        // not a real shape.
+        #[allow(clippy::cast_possible_wrap)]
+        let last_touch_i64 = last_touch as i64;
+        let now = chrono::Utc::now().to_rfc3339();
+        if let Err(e) = conn.execute(
+            "INSERT OR REPLACE INTO federation_nonce_cache
+             (peer_id, fingerprint, last_touch, inserted_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![peer_id, fp.as_slice(), last_touch_i64, now],
+        ) {
+            tracing::warn!(
+                target: "ai_memory::identity::replay",
+                peer_id = %peer_id,
+                err = %e,
+                "FederationNonceCache: persist insert failed; in-memory cache still holds \
+                 (#1255 graceful degradation)",
+            );
+        }
     }
 
     /// Check + record `(peer_id, nonce)`.
@@ -537,6 +712,16 @@ impl FederationNonceCache {
         }
         slot.order.push_back(fp);
         slot.seen.insert(fp);
+        // Release the inner mutex before doing disk I/O so a slow
+        // SQLite WAL fsync doesn't block sibling
+        // `record_and_check` calls. The persistence call itself
+        // opens its own connection (no shared state).
+        drop(guard);
+        // #1255 — persist the new fingerprint to disk so a daemon
+        // restart doesn't re-open the replay window. Persistence
+        // failures are warn-logged and swallowed (graceful
+        // degradation to the in-memory-only pre-#1255 posture).
+        self.persist_fingerprint(peer_id, &fp, touch);
         ReplayDecision::Fresh
     }
 
@@ -695,5 +880,84 @@ mod federation_nonce_cache_tests {
             "#1038: re-touching existing peers MUST NOT trigger LRU eviction"
         );
         assert_eq!(cache.peer_count(), FEDERATION_NONCE_MAX_PEERS);
+    }
+
+    /// #1255 (MED, 2026-05-25) — regression: a nonce that landed in
+    /// the cache before a daemon restart must STILL be rejected as
+    /// a replay after the restart. Pre-#1255 every restart opened a
+    /// fresh in-memory window, so any captured `(body, sig, nonce)`
+    /// tuple could be replayed once the daemon bounced.
+    ///
+    /// Simulates the restart by dropping the first
+    /// `FederationNonceCache` and constructing a second one against
+    /// the SAME `db_path`. The hydration step on the second cache
+    /// reloads every persisted fingerprint, so the same `(peer_id,
+    /// nonce)` MUST surface as `Replay` on the second cache.
+    #[test]
+    fn issue_1255_nonce_persists_across_recreated_cache() {
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let db_path = tmp.path().to_path_buf();
+
+        // First cache — accept the nonce as Fresh, persisting it.
+        let cache_a = FederationNonceCache::new_with_db_persistence(&db_path)
+            .expect("first cache must open the DB and run v51 migration");
+        assert_eq!(
+            cache_a.record_and_check("peer-1255", "n-1255"),
+            ReplayDecision::Fresh,
+            "#1255: first observation of (peer, nonce) is Fresh"
+        );
+        // A second observation in the SAME process is Replay
+        // (in-memory cache holds independent of disk persistence).
+        assert_eq!(
+            cache_a.record_and_check("peer-1255", "n-1255"),
+            ReplayDecision::Replay,
+            "#1255: in-process re-observation is Replay (sanity)"
+        );
+        drop(cache_a);
+
+        // Second cache — simulate daemon restart against the same
+        // DB. Hydration must replay the persisted fingerprint into
+        // the in-memory set so the SAME (peer, nonce) is REJECTED.
+        let cache_b = FederationNonceCache::new_with_db_persistence(&db_path)
+            .expect("second cache must hydrate from the same DB");
+        assert_eq!(
+            cache_b.record_and_check("peer-1255", "n-1255"),
+            ReplayDecision::Replay,
+            "#1255: persistence is load-bearing — a daemon restart must NOT \
+             reopen the replay window for a previously-seen nonce"
+        );
+        // A NEW (peer, nonce) under the second cache is Fresh — the
+        // hydration didn't accidentally over-block.
+        assert_eq!(
+            cache_b.record_and_check("peer-1255", "n-different"),
+            ReplayDecision::Fresh,
+            "#1255: hydration must NOT over-block on unrelated nonces"
+        );
+        // The hydrated cache still tracks at least the one peer
+        // from before (sanity on `len_for_peer`).
+        assert!(
+            cache_b.len_for_peer("peer-1255") >= 1,
+            "#1255: hydrated cache must retain the persisted fingerprint count"
+        );
+    }
+
+    /// #1255 — graceful degradation: persistence open errors do NOT
+    /// crash the cache. A broken DB path surfaces as a
+    /// constructor-time `Err`; callers (today: only the production
+    /// daemon bootstrap) get a clear error and fall back to either
+    /// retrying with the right path OR booting with the in-memory
+    /// constructor [`Self::new`].
+    #[test]
+    fn issue_1255_persistence_constructor_surfaces_open_errors() {
+        // Point at a path that cannot exist as a sqlite DB (a directory).
+        let dir = tempfile::TempDir::new().unwrap();
+        // Passing the directory itself as a path. SQLite's `open_with_flags`
+        // refuses to open a directory as a database file.
+        let res = FederationNonceCache::new_with_db_persistence(dir.path().to_path_buf());
+        assert!(
+            res.is_err(),
+            "#1255: a non-DB path must surface as a constructor Err so operators \
+             see the persistence failure rather than silently falling back"
+        );
     }
 }

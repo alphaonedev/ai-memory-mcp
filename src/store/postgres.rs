@@ -414,7 +414,14 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       so archive→restore round-trips preserve Form-4 / Form-5 /
 //       QW-2 / Gap-1 fields. Pure additive ALTER TABLE ADD COLUMN
 //       IF NOT EXISTS — fully idempotent + replay-safe.
-const CURRENT_SCHEMA_VERSION: i32 = 50;
+// v51 = #1255 (MED, 2026-05-25) — federation_nonce_cache persistence.
+//       Postgres-backed daemons keep their nonce cache in the
+//       sqlite ai-memory.db (the FederationNonceCache is a daemon-
+//       process primitive distinct from the memory store). The
+//       postgres ladder version-bumps to keep the SQLite/postgres
+//       CURRENT_SCHEMA_VERSION pinned in lockstep — this migration
+//       is a no-op DDL stub recording the version reach.
+const CURRENT_SCHEMA_VERSION: i32 = 51;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -1142,6 +1149,9 @@ impl PostgresStore {
         }
         if current_version < 50 {
             self.migrate_v50().await?;
+        }
+        if current_version < 51 {
+            self.migrate_v51().await?;
         }
 
         Ok(())
@@ -2028,6 +2038,40 @@ impl PostgresStore {
         tracing::info!(
             target = "store::postgres",
             "schema migration v50 applied (#1156: agent_quotas per-namespace dimension)"
+        );
+        Ok(())
+    }
+
+    /// v51 (#1255, MED, 2026-05-25) — federation_nonce_cache parity.
+    ///
+    /// The `FederationNonceCache` is a daemon-process primitive that
+    /// persists to the sqlite ai-memory.db regardless of which
+    /// backend powers the memory store. Postgres-backed daemons keep
+    /// their nonce cache in the sqlite file alongside other
+    /// daemon-local state (`audit/`, keys, etc.), so this migration
+    /// is intentionally a no-op DDL stub — it only records the
+    /// version reach so the postgres ladder stays in lockstep with
+    /// the sqlite ladder.
+    ///
+    /// If a future revision elects to back the nonce cache by
+    /// postgres for fully-distributed deployments, the DDL would
+    /// land here in this same arm.
+    async fn migrate_v51(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v51 tx", e))?;
+
+        record_schema_version(&mut tx, 51).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v51 migration", e))?;
+
+        tracing::info!(
+            target = "store::postgres",
+            "schema migration v51 applied (#1255: federation_nonce_cache lives in sqlite; no-op postgres DDL)"
         );
         Ok(())
     }
