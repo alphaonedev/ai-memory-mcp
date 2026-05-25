@@ -161,7 +161,7 @@ fn is_transient_spawn_errno(_err: &io::Error) -> bool {
 /// path and the env-var read itself is gated on `cfg(test)`. Even if
 /// the env var is set in a release binary, the helper short-circuits
 /// at compile time.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn test_force_eagain_remaining() -> u32 {
     use std::sync::atomic::{AtomicU32, Ordering};
     static REMAINING: AtomicU32 = AtomicU32::new(u32::MAX);
@@ -208,8 +208,12 @@ where
         }
 
         // Test-only fault injection — synthesize EAGAIN N times then
-        // pass through. Compiled out of release builds entirely.
-        #[cfg(test)]
+        // pass through. Compiled out of release builds entirely. Gated
+        // on `unix` because `libc::EAGAIN` lives in the cfg(unix)-only
+        // `libc` dep; on Windows the fault injection is a no-op (the
+        // transient-spawn-errno classifier is unix-only too, so there
+        // is nothing to fault-inject for).
+        #[cfg(all(test, unix))]
         {
             if test_force_eagain_remaining() > 0 {
                 last_err = Some(io::Error::from_raw_os_error(libc::EAGAIN));

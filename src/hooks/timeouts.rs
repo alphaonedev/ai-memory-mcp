@@ -481,4 +481,85 @@ mod tests {
         reset_timeout_violations_for_test();
         assert_eq!(timeout_violations_total(), 0);
     }
+
+    // ---------- Issue #1207 — timing-budget multiplier --------------------
+
+    // The multiplier env var is process-global; serialize these tests
+    // behind a Mutex so they don't race each other under parallel
+    // cargo-test load.
+    fn timing_mult_lock() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn with_mult<R>(value: Option<&str>, body: impl FnOnce() -> R) -> R {
+        let _guard = timing_mult_lock();
+        let prior = std::env::var("AI_MEMORY_TEST_TIMING_BUDGET_MULT").ok();
+        match value {
+            Some(v) => unsafe { std::env::set_var("AI_MEMORY_TEST_TIMING_BUDGET_MULT", v) },
+            None => unsafe { std::env::remove_var("AI_MEMORY_TEST_TIMING_BUDGET_MULT") },
+        }
+        let result = body();
+        match prior {
+            Some(v) => unsafe { std::env::set_var("AI_MEMORY_TEST_TIMING_BUDGET_MULT", v) },
+            None => unsafe { std::env::remove_var("AI_MEMORY_TEST_TIMING_BUDGET_MULT") },
+        }
+        result
+    }
+
+    #[test]
+    fn issue_1207_timing_mult_unset_defaults_to_one() {
+        with_mult(None, || {
+            assert_eq!(test_timing_budget_mult(), 1);
+            assert_eq!(
+                class_deadline(EventClass::Index),
+                Duration::from_millis(INDEX_CLASS_DEADLINE_MS),
+            );
+        });
+    }
+
+    #[test]
+    fn issue_1207_timing_mult_valid_scales_class_deadline() {
+        with_mult(Some("5"), || {
+            assert_eq!(test_timing_budget_mult(), 5);
+            assert_eq!(
+                class_deadline(EventClass::Index),
+                Duration::from_millis(INDEX_CLASS_DEADLINE_MS * 5),
+            );
+            assert_eq!(
+                class_deadline(EventClass::Write),
+                Duration::from_millis(WRITE_CLASS_DEADLINE_MS * 5),
+            );
+        });
+    }
+
+    #[test]
+    fn issue_1207_timing_mult_unparseable_falls_back_to_one() {
+        with_mult(Some("bogus-not-a-number"), || {
+            assert_eq!(test_timing_budget_mult(), 1);
+        });
+    }
+
+    #[test]
+    fn issue_1207_timing_mult_below_range_falls_back_to_one() {
+        with_mult(Some("0"), || {
+            assert_eq!(test_timing_budget_mult(), 1);
+        });
+    }
+
+    #[test]
+    fn issue_1207_timing_mult_above_range_falls_back_to_one() {
+        with_mult(Some("9999"), || {
+            assert_eq!(test_timing_budget_mult(), 1);
+        });
+    }
+
+    #[test]
+    fn issue_1207_timing_mult_boundary_at_one_and_hundred() {
+        with_mult(Some("1"), || assert_eq!(test_timing_budget_mult(), 1));
+        with_mult(Some("100"), || assert_eq!(test_timing_budget_mult(), 100));
+    }
 }
