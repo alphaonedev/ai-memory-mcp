@@ -530,6 +530,90 @@ impl SynthesisCounts {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Issue #1240 — synthesis-pass cycle-depth guard.
+//
+// Pathological curator output that chain-fires (e.g. a Form-1 verdict whose
+// post-store hooks trigger a fresh `memory_store` whose synthesis pass then
+// chain-fires again, ad infinitum) is bounded by a thread-local depth counter
+// analogous to `reflection_depth`. The counter increments when the store
+// handler enters a synthesis-eligible write, gets checked against the cap,
+// and decrements when the write completes. Any nested `memory_store` call
+// on the same thread observes the higher depth and refuses past
+// `MAX_SYNTHESIS_DEPTH` with `SYNTHESIS_DEPTH_EXCEEDED`.
+//
+// Thread-local (not process-wide) so parallel HTTP / MCP requests don't
+// share state — each request walks its own call stack and either stays
+// shallow or hits the cap independently.
+// ---------------------------------------------------------------------------
+
+/// Compiled-in cap for the recursive synthesis-pass depth. A
+/// `memory_store` call site running at depth `N` may invoke another
+/// `memory_store` (via post-store hooks, curator chain-fire, etc.); each
+/// such nesting bumps the counter by 1. Once the counter exceeds this
+/// cap the substrate refuses the synthesis pass with
+/// `SYNTHESIS_DEPTH_EXCEEDED`. Mirrors
+/// [`crate::models::GovernancePolicy::effective_max_reflection_depth`]
+/// at 3 — bounds recursion without strangling legitimate two-step
+/// curator hand-offs.
+pub const MAX_SYNTHESIS_DEPTH: u32 = 3;
+
+thread_local! {
+    /// Per-thread counter tracking how deep into the synthesis-pass
+    /// call stack the current `memory_store` invocation is. Reset to
+    /// 0 between independent requests by the RAII guard returned from
+    /// [`enter_synthesis_pass`]. Cheap, no allocation per call.
+    static SYNTHESIS_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Read the current thread's synthesis-pass recursion depth. Returns
+/// `0` outside any active store handler (production callers); returns
+/// `N` while the `N`-th nested store handler is in flight on this
+/// thread.
+#[must_use]
+pub fn current_synthesis_depth() -> u32 {
+    SYNTHESIS_DEPTH.with(std::cell::Cell::get)
+}
+
+/// RAII guard returned by [`enter_synthesis_pass`]. While the guard is
+/// alive, the thread's synthesis depth is incremented by 1; on drop
+/// the depth decrements. The store handler holds the guard across the
+/// `run_synthesis_pass` call so any post-store hooks that re-enter
+/// `memory_store` observe the incremented depth.
+pub struct SynthesisDepthGuard {
+    /// Depth this guard was responsible for incrementing TO. On drop
+    /// we restore to `prior = depth - 1`. Stored explicitly so a
+    /// panicked guard doesn't leak the higher depth into the next
+    /// request reusing this thread.
+    prior: u32,
+}
+
+impl Drop for SynthesisDepthGuard {
+    fn drop(&mut self) {
+        SYNTHESIS_DEPTH.with(|cell| cell.set(self.prior));
+    }
+}
+
+/// Enter a synthesis-pass scope. Returns the new depth (post-increment)
+/// plus an RAII guard that restores the depth on drop. Callers MUST
+/// retain the guard across the full synthesis-pass body — dropping it
+/// mid-call would underflow the depth and let nested calls escape the
+/// cap.
+///
+/// The caller is expected to compare the returned depth against
+/// [`MAX_SYNTHESIS_DEPTH`] and refuse with `SYNTHESIS_DEPTH_EXCEEDED`
+/// when over-cap.
+#[must_use]
+pub fn enter_synthesis_pass() -> (u32, SynthesisDepthGuard) {
+    let (prior, new) = SYNTHESIS_DEPTH.with(|cell| {
+        let prior = cell.get();
+        let new = prior.saturating_add(1);
+        cell.set(new);
+        (prior, new)
+    });
+    (new, SynthesisDepthGuard { prior })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -751,5 +835,51 @@ mod tests {
         assert_eq!(SynthesisVerb::Update.as_str(), "update");
         assert_eq!(SynthesisVerb::Delete.as_str(), "delete");
         assert_eq!(SynthesisVerb::NoOp.as_str(), "no_op");
+    }
+
+    // ---------------------------------------------------------------
+    // Issue #1240 — synthesis-pass cycle-depth guard.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn issue_1240_max_synthesis_depth_constant_is_three() {
+        // Mirrors `effective_max_reflection_depth`'s compiled default
+        // so the two recursive-write primitives have symmetric caps.
+        assert_eq!(MAX_SYNTHESIS_DEPTH, 3);
+    }
+
+    #[test]
+    fn issue_1240_enter_synthesis_pass_increments_and_guard_restores() {
+        // Per-thread counter — run on a dedicated worker thread so the
+        // assertion isn't contaminated by parallel-test depth state.
+        let t = std::thread::spawn(|| {
+            assert_eq!(current_synthesis_depth(), 0, "fresh thread starts at 0");
+            {
+                let (d1, _g1) = enter_synthesis_pass();
+                assert_eq!(d1, 1, "first entry returns 1");
+                assert_eq!(current_synthesis_depth(), 1);
+                {
+                    let (d2, _g2) = enter_synthesis_pass();
+                    assert_eq!(d2, 2, "second entry returns 2");
+                    assert_eq!(current_synthesis_depth(), 2);
+                    {
+                        let (d3, _g3) = enter_synthesis_pass();
+                        assert_eq!(d3, 3, "third entry returns 3");
+                        assert_eq!(current_synthesis_depth(), 3);
+                        {
+                            let (d4, _g4) = enter_synthesis_pass();
+                            assert_eq!(d4, 4, "fourth entry returns 4 — over cap");
+                            assert!(d4 > MAX_SYNTHESIS_DEPTH, "depth=4 exceeds cap=3");
+                        }
+                        // After g4 drops, depth restored to 3.
+                        assert_eq!(current_synthesis_depth(), 3, "g4 drop -> depth=3");
+                    }
+                    assert_eq!(current_synthesis_depth(), 2, "g3 drop -> depth=2");
+                }
+                assert_eq!(current_synthesis_depth(), 1, "g2 drop -> depth=1");
+            }
+            assert_eq!(current_synthesis_depth(), 0, "g1 drop -> depth=0");
+        });
+        t.join().expect("worker thread joins clean");
     }
 }
