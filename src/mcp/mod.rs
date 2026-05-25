@@ -1806,22 +1806,50 @@ fn handle_request(
             // can self-correct via `--profile <hint>` or use
             // `memory_capabilities --include-schema family=<f>` to opt in
             // at runtime (Track C, v0.6.4-006).
+            //
+            // #1254 (MED, 2026-05-25) — the helpful "tool exists in
+            // family X, use --profile Y to load it" hint leaks the
+            // higher-profile tool name + family membership to a
+            // lower-profile client. Multi-tenant operators MUST be able
+            // to opt out so a probing client sees a uniform
+            // "unknown tool" response regardless of whether the name
+            // exists in another family. The escape hatch is the
+            // `profile_hint_in_errors` McpConfig field (default
+            // `false`); operators flip it on for single-tenant dev
+            // posture where every caller sees the full surface anyway.
             if !profile.loads(tool_name) {
-                let owning_family = crate::profile::Family::for_tool(tool_name);
-                let hint = match owning_family {
-                    Some(f) => format!(
-                        "tool '{tool_name}' is in family '{}' which is not loaded under \
-                         the active profile. Restart with `--profile <name>` or \
-                         `--profile core,{}` to load it, or call `memory_capabilities \
-                         --include-schema family={}` to expand at runtime.",
-                        f.name(),
-                        f.name(),
-                        f.name()
-                    ),
-                    None => format!(
-                        "tool '{tool_name}' is not registered in this build. Call \
-                         `memory_capabilities` to see available tools."
-                    ),
+                let hint_enabled = mcp_config.is_some_and(|c| c.profile_hint_in_errors);
+                let hint = if hint_enabled {
+                    let owning_family = crate::profile::Family::for_tool(tool_name);
+                    match owning_family {
+                        Some(f) => format!(
+                            "tool '{tool_name}' is in family '{}' which is not loaded under \
+                             the active profile. Restart with `--profile <name>` or \
+                             `--profile core,{}` to load it, or call `memory_capabilities \
+                             --include-schema family={}` to expand at runtime.",
+                            f.name(),
+                            f.name(),
+                            f.name()
+                        ),
+                        None => format!(
+                            "tool '{tool_name}' is not registered in this build. Call \
+                             `memory_capabilities` to see available tools."
+                        ),
+                    }
+                } else {
+                    // Default (production-secure): uniform error
+                    // regardless of whether the tool exists in another
+                    // family. Pairs with a debug-level tracing line so
+                    // operators with `RUST_LOG=ai_memory::mcp=debug`
+                    // can still see the precise refusal cause.
+                    tracing::debug!(
+                        target: "ai_memory::mcp",
+                        tool = tool_name,
+                        owning_family = ?crate::profile::Family::for_tool(tool_name).map(crate::profile::Family::name),
+                        "tools/call refused: tool not loaded under active profile (\
+                         #1254 — set mcp.profile_hint_in_errors=true to surface family hint)",
+                    );
+                    format!("unknown tool: {tool_name}")
                 };
                 return err_response(id, -32601, hint);
             }
@@ -5271,6 +5299,149 @@ mod tests {
         let err = resp.error.unwrap();
         assert_eq!(err.code, -32601);
         assert!(err.message.contains("memory_does_not_exist"));
+    }
+
+    /// #1254 (MED, 2026-05-25) — regression: by default a `tools/call`
+    /// against a tool that exists in a higher-profile family returns a
+    /// uniform `"unknown tool: <name>"` error from a lower-profile
+    /// client. Pre-#1254 the daemon leaked the family name + a
+    /// "Restart with --profile <name>" hint, which an untrusted
+    /// lower-profile client could walk to enumerate the higher-profile
+    /// surface (e.g. probe for admin tool names from a core profile).
+    ///
+    /// Operators opt back into the helpful hint via the new
+    /// `McpConfig.profile_hint_in_errors = true` knob for single-tenant
+    /// dev posture where every caller sees the full surface anyway.
+    #[test]
+    fn issue_1254_tool_name_leak_gated_behind_profile_hint_in_errors() {
+        use crate::config::McpConfig;
+        let tier_config = FeatureTier::Keyword.config();
+        let resolved_ttl = crate::config::ResolvedTtl::default();
+        let resolved_scoring = crate::config::ResolvedScoring::default();
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+
+        // `memory_atomise` lives in `Family::Power` — it is registered
+        // under `--profile full` and `--profile power`, NOT under the
+        // default `--profile core`. The pre-#1254 leak was: a
+        // `--profile core` client could call `memory_atomise` and the
+        // refusal text named the family + advised `--profile power`
+        // / `--profile core,power` to load it. That string leaks the
+        // higher-profile tool name + family membership to a probing
+        // client.
+        let core_profile = crate::profile::Profile::core();
+        assert!(
+            !core_profile.loads("memory_atomise"),
+            "test sentinel: memory_atomise must not be loaded under --profile core; \
+             pick a different higher-profile tool if this changes"
+        );
+        let req = make_tools_call("memory_atomise", json!({}));
+
+        // ---- Default posture (profile_hint_in_errors absent) ----
+        // No McpConfig at all — same as a daemon booted without a
+        // `[mcp]` block.
+        let resp_default = handle_request(
+            &conn,
+            std::path::Path::new(":memory:"),
+            &req,
+            None,
+            None,
+            None,
+            &tier_config,
+            &crate::config::ResolvedModels::from_tier_preset(&tier_config),
+            None,
+            &resolved_ttl,
+            &resolved_scoring,
+            true,
+            false,
+            None,
+            &core_profile,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let err_default = resp_default
+            .error
+            .expect("tools/call against a non-loaded tool must error");
+        assert_eq!(
+            err_default.code, -32601,
+            "method-not-found code unchanged across the hint posture"
+        );
+        // The default-secure message must be the uniform shape.
+        assert!(
+            err_default.message.starts_with("unknown tool: "),
+            "#1254: default posture must return a uniform 'unknown tool: <name>' \
+             error regardless of family membership; got: {}",
+            err_default.message
+        );
+        assert!(
+            err_default.message.contains("memory_atomise"),
+            "the refused tool name is fine — the leak was the FAMILY name, not the \
+             tool name (the client supplied that); got: {}",
+            err_default.message
+        );
+        // The pre-#1254 leak fingerprint MUST be absent.
+        assert!(
+            !err_default.message.contains("family"),
+            "#1254: default posture must NOT leak family membership; got: {}",
+            err_default.message
+        );
+        assert!(
+            !err_default.message.contains("--profile"),
+            "#1254: default posture must NOT advise which profile would load the tool; got: {}",
+            err_default.message
+        );
+
+        // ---- Opt-in dev posture (profile_hint_in_errors = true) ----
+        let cfg_with_hint = McpConfig {
+            profile_hint_in_errors: true,
+            ..McpConfig::default()
+        };
+        let resp_hint = handle_request(
+            &conn,
+            std::path::Path::new(":memory:"),
+            &req,
+            None,
+            None,
+            None,
+            &tier_config,
+            &crate::config::ResolvedModels::from_tier_preset(&tier_config),
+            None,
+            &resolved_ttl,
+            &resolved_scoring,
+            true,
+            false,
+            None,
+            &core_profile,
+            Some(&cfg_with_hint),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let err_hint = resp_hint
+            .error
+            .expect("hint-enabled tools/call must still error on non-loaded tool");
+        assert_eq!(err_hint.code, -32601);
+        // Hint-enabled message restores the family-membership advisory
+        // so the operator-debug posture still works.
+        assert!(
+            err_hint.message.contains("family"),
+            "#1254: profile_hint_in_errors=true must surface the family hint; \
+             got: {}",
+            err_hint.message
+        );
+        assert!(
+            err_hint.message.contains("--profile"),
+            "#1254: profile_hint_in_errors=true must advise the operator on \
+             how to load the tool; got: {}",
+            err_hint.message
+        );
     }
 
     #[test]
