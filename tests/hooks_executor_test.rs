@@ -27,29 +27,6 @@ use ai_memory::hooks::{
 use serde_json::json;
 use tempfile::TempDir;
 
-// ---------------------------------------------------------------------------
-// macOS CI timing budget multiplier (issue #1193).
-//
-// `Check (macos-latest)` on the GHA runner pool exhibits substantially
-// higher cold-start latency and I/O scheduling variance than
-// `ubuntu-latest`. The first `fork(2)+execve(2)+/bin/sh-startup`
-// cycle on a cold macOS dev box or GHA runner has been observed to
-// exceed 2.5s on its own under load, which makes the wall-clock-
-// sensitive assertions in this file flake across PRs in the #1174
-// refactor campaign. Per issue #1193's "Proposed fix" option 1
-// (preferred): apply a centralized macOS-only budget multiplier so
-// every `Duration::from_secs/from_millis(N)` site here can be
-// re-tuned with a single edit. The multiplier is 10 — matched to the
-// same value used in `tests/g3_hooks_stderr_drain.rs` for consistency
-// across the two hooks test binaries (see that file for the
-// reproduction evidence that drove the choice of 10 over the
-// initially-tried 3 and 5). Linux/Windows runs are unaffected
-// (multiplier = 1).
-#[cfg(target_os = "macos")]
-const MACOS_TIMING_BUDGET_MULT: u32 = 10;
-#[cfg(not(target_os = "macos"))]
-const MACOS_TIMING_BUDGET_MULT: u32 = 1;
-
 /// Write `body` to `dir/name`, mark it executable, return the path.
 /// Tests rely on /bin/sh being available — true on every supported
 /// deployment target (Linux containers, macOS dev hosts).
@@ -112,13 +89,7 @@ printf '%s\n' '{"action":"allow"}'
 "#,
     );
 
-    // macOS CI gets 10x headroom on both the per-fire timeout and
-    // aggregate wall-clock ceiling (#1193).
-    let executor = Arc::new(ExecExecutor::new(cfg_for(
-        script,
-        HookMode::Exec,
-        5_000 * MACOS_TIMING_BUDGET_MULT,
-    )));
+    let executor = Arc::new(ExecExecutor::new(cfg_for(script, HookMode::Exec, 5_000)));
 
     let started = Instant::now();
     let mut handles = Vec::with_capacity(100);
@@ -141,8 +112,8 @@ printf '%s\n' '{"action":"allow"}'
 
     let elapsed = started.elapsed();
     assert!(
-        elapsed < Duration::from_secs(30) * MACOS_TIMING_BUDGET_MULT,
-        "100 fires took {elapsed:?}; expected <30s wall-clock (300s on macOS)"
+        elapsed < Duration::from_secs(30),
+        "100 fires took {elapsed:?}; expected <30s wall-clock"
     );
 
     let metrics = executor.metrics();
@@ -164,17 +135,7 @@ async fn exec_mode_timeout_drops_request() {
 sleep 5
 ",
     );
-    // macOS CI gets 10x headroom on the timeout itself (#1193). The
-    // 200ms budget is small enough that a single scheduling tail on
-    // the macos-latest GHA pool can blow past it before the timer
-    // fires, causing spurious Timeout failures (or misclassifying the
-    // long fire as a normal slow run). The 5s script sleep below is
-    // unchanged — it just needs to outlast the timeout multiplied.
-    let executor = ExecExecutor::new(cfg_for(
-        script,
-        HookMode::Exec,
-        200 * MACOS_TIMING_BUDGET_MULT,
-    ));
+    let executor = ExecExecutor::new(cfg_for(script, HookMode::Exec, 200));
     let r = executor.fire(HookEvent::PostStore, json!({})).await;
     assert!(matches!(
         r,
@@ -206,13 +167,7 @@ while IFS= read -r _line; do
 done
 "#,
     );
-    // macOS CI gets 10x headroom on both the per-fire timeout and
-    // aggregate wall-clock ceiling (#1193).
-    let executor = DaemonExecutor::new(cfg_for(
-        script,
-        HookMode::Daemon,
-        5_000 * MACOS_TIMING_BUDGET_MULT,
-    ));
+    let executor = DaemonExecutor::new(cfg_for(script, HookMode::Daemon, 5_000));
 
     let started = Instant::now();
     for i in 0..1000u32 {
@@ -224,8 +179,8 @@ done
     }
     let elapsed = started.elapsed();
     assert!(
-        elapsed < Duration::from_secs(60) * MACOS_TIMING_BUDGET_MULT,
-        "1000 daemon fires took {elapsed:?}; expected <60s (600s on macOS)"
+        elapsed < Duration::from_secs(60),
+        "1000 daemon fires took {elapsed:?}; expected <60s"
     );
 
     let m = executor.metrics();
@@ -255,12 +210,7 @@ while IFS= read -r _line; do
 done
 "#,
     );
-    // macOS CI gets 10x headroom on per-fire timeout (#1193).
-    let executor = DaemonExecutor::new(cfg_for(
-        script,
-        HookMode::Daemon,
-        5_000 * MACOS_TIMING_BUDGET_MULT,
-    ));
+    let executor = DaemonExecutor::new(cfg_for(script, HookMode::Daemon, 5_000));
 
     // First 5 must Allow.
     for i in 0..5u32 {
@@ -315,20 +265,8 @@ while IFS= read -r _line; do printf '%s\n' '{"action":"allow"}'; done
 "#,
     );
 
-    // 2s per-fire is the tightest budget in this file. macOS CI gets
-    // 10x headroom (#1193) because the fork+exec path for the exec
-    // mode can push past 2s under load on the macos-latest GHA pool.
-    // 2s × 10 = 20s on macOS — plenty of headroom for cold-start spawn.
-    let exec_cfg = cfg_for(
-        exec_script,
-        HookMode::Exec,
-        2_000 * MACOS_TIMING_BUDGET_MULT,
-    );
-    let daemon_cfg = cfg_for(
-        daemon_script,
-        HookMode::Daemon,
-        2_000 * MACOS_TIMING_BUDGET_MULT,
-    );
+    let exec_cfg = cfg_for(exec_script, HookMode::Exec, 2_000);
+    let daemon_cfg = cfg_for(daemon_script, HookMode::Daemon, 2_000);
 
     let mut reg = ExecutorRegistry::new();
     let ex = reg.get(&exec_cfg);
@@ -367,11 +305,7 @@ cat >/dev/null
 printf '%s\n' '{"action":"deny","reason":"redact required","code":451}'
 "#,
     );
-    let exec = ExecExecutor::new(cfg_for(
-        script,
-        HookMode::Exec,
-        2_000 * MACOS_TIMING_BUDGET_MULT,
-    ));
+    let exec = ExecExecutor::new(cfg_for(script, HookMode::Exec, 2_000));
     let r = exec
         .fire(HookEvent::PostStore, json!({}))
         .await
@@ -414,6 +348,24 @@ printf '%s\n' '{"action":"deny","reason":"redact required","code":451}'
 async fn on_index_eviction_fires_with_full_payload() {
     use ai_memory::hooks::{ChainResult, EvictionEvent, HookChain, fire_on_index_eviction};
 
+    // Issue #1207 — widen the per-class timing budget on macOS under
+    // parallel `cargo test` load. The default 1000ms `Index` class
+    // deadline races the `fork+exec` of a shell script on a stressed
+    // dev host (typical Apple Silicon takes 600-900ms for the
+    // fork+exec under load). The multiplier scales every class
+    // deadline at runtime via `AI_MEMORY_TEST_TIMING_BUDGET_MULT`;
+    // 5× on macOS, 1× elsewhere. Compiled out of release builds.
+    #[cfg(target_os = "macos")]
+    // Safety: env vars are process-global. This test setter races
+    // with concurrent tests in the same binary that also read the
+    // env var, but the only readers are `class_deadline` (in test
+    // builds) and the read is idempotent — every reader sees `5`
+    // once any test sets it. The env var is never unset for the
+    // process lifetime so there's no read-after-unset race.
+    unsafe {
+        std::env::set_var("AI_MEMORY_TEST_TIMING_BUDGET_MULT", "5");
+    }
+
     let dir = tempfile::tempdir().expect("tempdir");
     let sidecar = dir.path().join("payload.json");
 
@@ -435,16 +387,26 @@ printf '%s\n' '{{"action":"allow"}}'
     );
 
     // Build a one-hook chain subscribed to OnIndexEviction.
-    // macOS CI gets 10x headroom on per-fire timeout (#1193).
+    //
+    // Issue #1207 — `FailMode::Closed` so spawn failures surface as
+    // `ChainResult::Deny` rather than masquerading as `Allow`. The
+    // previous `FailMode::Open` posture allowed a transient EAGAIN
+    // / ENOMEM / EMFILE on the parallel-test macOS path to silently
+    // produce `Allow` even though the capture script never actually
+    // ran — making the sidecar `read_to_string` panic and the test
+    // "fail" for the wrong reason. With #1207 part 1 lifting the
+    // transient errnos via spawn-retry-with-backoff in the executor,
+    // the only remaining surface for a `Deny` here is a structural
+    // regression worth surfacing hard.
     let cfg = HookConfig {
         event: HookEvent::OnIndexEviction,
         command: script,
         priority: 0,
-        timeout_ms: 5_000 * MACOS_TIMING_BUDGET_MULT,
+        timeout_ms: 5_000,
         mode: HookMode::Exec,
         enabled: true,
         namespace: "*".into(),
-        fail_mode: FailMode::Open,
+        fail_mode: FailMode::Closed,
     };
     let chain = HookChain::new(vec![cfg.clone()]);
     let mut registry = ExecutorRegistry::from_hooks(&[cfg]);
@@ -465,43 +427,6 @@ printf '%s\n' '{{"action":"allow"}}'
 
     // Read the sidecar — the child should have captured the full
     // wire envelope. Parse it back and assert each G8 field landed.
-    //
-    // **macOS race-class flake (issue #1193 follow-up #TODO).** Under
-    // parallel test load on macOS, fork+exec of the script sometimes
-    // surfaces a transient ENOMEM/EAGAIN that the executor maps via
-    // `FailMode::Open` to `ChainResult::Allow` — the assertion above
-    // still passes, but the script never ran, so the sidecar never
-    // exists. The race is independent of [`MACOS_TIMING_BUDGET_MULT`]
-    // (no amount of polling will surface a file the child never
-    // wrote). We poll for a generous budget so a slow-but-successful
-    // spawn isn't misclassified as the race, then bail with a soft
-    // skip on macOS so the test stops blocking the
-    // Check (macos-latest) matrix while the spawn-resilience
-    // follow-up is implemented (proper fix: switch this test's
-    // `fail_mode` to `FailMode::Closed` so spawn failures surface
-    // hard, and add retry-with-backoff to the executor's spawn path).
-    let max_polls = 100 * MACOS_TIMING_BUDGET_MULT;
-    for _ in 0..max_polls {
-        if sidecar.exists() {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    #[cfg(target_os = "macos")]
-    if !sidecar.exists() {
-        eprintln!(
-            "SOFT-SKIP (issue #1193 follow-up): sidecar absent after \
-             fire_on_index_eviction returned Allow — likely a transient \
-             fork+exec failure masked by FailMode::Open. Linux/Windows \
-             arms still pin the contract."
-        );
-        return;
-    }
-    #[cfg(not(target_os = "macos"))]
-    assert!(
-        sidecar.exists(),
-        "sidecar absent after fire — executor payload-delivery contract regression"
-    );
     let captured = std::fs::read_to_string(&sidecar).expect("sidecar exists after fire");
     let envelope: serde_json::Value =
         serde_json::from_str(&captured).expect("captured envelope parses as JSON");
@@ -564,11 +489,7 @@ printf 'failure diagnostic\n' >&2
 exit 42
 ",
     );
-    let exec = ExecExecutor::new(cfg_for(
-        script,
-        HookMode::Exec,
-        2_000 * MACOS_TIMING_BUDGET_MULT,
-    ));
+    let exec = ExecExecutor::new(cfg_for(script, HookMode::Exec, 2_000));
     let r = exec.fire(HookEvent::PostStore, json!({})).await;
     match r {
         Err(ai_memory::hooks::ExecutorError::ChildExit { code, stderr }) => {
@@ -595,11 +516,7 @@ cat >/dev/null
 printf '%s\n' '{"action":"unknown_action_zzz"}'
 "#,
     );
-    let exec = ExecExecutor::new(cfg_for(
-        script,
-        HookMode::Exec,
-        2_000 * MACOS_TIMING_BUDGET_MULT,
-    ));
+    let exec = ExecExecutor::new(cfg_for(script, HookMode::Exec, 2_000));
     let r = exec.fire(HookEvent::PostStore, json!({})).await;
     match r {
         Err(ai_memory::hooks::ExecutorError::Decode { reason }) => {
@@ -628,11 +545,7 @@ printf 'debug info\n' >&2
 printf '%s\n' '{"action":"allow"}'
 "#,
     );
-    let exec = ExecExecutor::new(cfg_for(
-        script,
-        HookMode::Exec,
-        2_000 * MACOS_TIMING_BUDGET_MULT,
-    ));
+    let exec = ExecExecutor::new(cfg_for(script, HookMode::Exec, 2_000));
     let r = exec
         .fire(HookEvent::PostStore, json!({}))
         .await
@@ -656,11 +569,13 @@ read -r _line
 exit 0
 ",
     );
-    let exec = DaemonExecutor::new(cfg_for(
-        script,
-        HookMode::Daemon,
-        1_000 * MACOS_TIMING_BUDGET_MULT,
-    ));
+    // Issue #1208 — widen from 1s to 5s. The 1s hook timeout races
+    // the daemon spawn + read + EOF cycle on macOS under cargo's
+    // parallel-test scheduler (same class as #1207 — the underlying
+    // OS pressure that motivated the spawn-retry + class-deadline
+    // multiplier). 5s matches the Write-class chain deadline and
+    // gives the OS room to schedule the spawn under load.
+    let exec = DaemonExecutor::new(cfg_for(script, HookMode::Daemon, 5_000));
     let r = exec.fire(HookEvent::PostStore, json!({})).await;
     match r {
         Err(ai_memory::hooks::ExecutorError::ChildExit { code, .. }) => {
@@ -713,11 +628,7 @@ done
             counter = counter.display(),
         ),
     );
-    let exec = DaemonExecutor::new(cfg_for(
-        script,
-        HookMode::Daemon,
-        5_000 * MACOS_TIMING_BUDGET_MULT,
-    ));
+    let exec = DaemonExecutor::new(cfg_for(script, HookMode::Daemon, 5_000));
     // First fire should error out.
     let r1 = exec.fire(HookEvent::PostStore, json!({})).await;
     assert!(
@@ -860,18 +771,10 @@ sleep 5
 printf '%s\n' '{"action":"allow"}'
 "#,
     );
-    // macOS CI gets 10x headroom on the 200ms timeout (#1193); the
-    // script sleeps 5s so the multiplied 2s still fires before
-    // the script's own sleep completes.
-    let exec = DaemonExecutor::new(cfg_for(
-        script,
-        HookMode::Daemon,
-        200 * MACOS_TIMING_BUDGET_MULT,
-    ));
+    let exec = DaemonExecutor::new(cfg_for(script, HookMode::Daemon, 200));
     let r = exec.fire(HookEvent::PostStore, json!({})).await;
-    // Timeout fires after 200ms (2s on macOS); stderr-tail is
-    // logged as WARN (we don't capture the log here, but the code
-    // path is hit).
+    // Timeout fires after 200ms; stderr-tail is logged as WARN
+    // (we don't capture the log here, but the code path is hit).
     assert!(matches!(
         r,
         Err(ai_memory::hooks::ExecutorError::Timeout { .. })
@@ -900,12 +803,11 @@ printf '%s\n' '{{"action":"allow"}}'
             seen = sidecar.display(),
         ),
     );
-    // macOS CI gets 10x headroom on per-fire timeout (#1193).
     let cfg = HookConfig {
         event: HookEvent::OnIndexEviction,
         command: script,
         priority: 0,
-        timeout_ms: 5_000 * MACOS_TIMING_BUDGET_MULT,
+        timeout_ms: 5_000,
         mode: HookMode::Exec,
         enabled: true,
         namespace: "*".into(),

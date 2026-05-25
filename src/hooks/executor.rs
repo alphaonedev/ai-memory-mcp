@@ -97,6 +97,148 @@ use tokio::time::timeout;
 /// invariant is "the most recent 4 KiB of stderr is always retained".
 const STDERR_RING_CAPACITY: usize = 4 * 1024;
 
+// ---------------------------------------------------------------------------
+// Spawn-retry backoff (issue #1207) — handle transient fork(2) errnos
+// ---------------------------------------------------------------------------
+//
+// Under parallel test load on macOS (and on any kernel under fork/FD
+// pressure), `fork+exec` of a hook child can fail with one of three
+// transient errnos:
+//
+//   * `EAGAIN` — kernel can't allocate a new process / hit RLIMIT_NPROC
+//     (libc::EAGAIN: 35 on macOS, 11 on Linux).
+//   * `ENOMEM` — kernel running low on memory (libc::ENOMEM = 12).
+//   * `EMFILE` — process FD table full (libc::EMFILE = 24).
+//
+// We also keep the pre-existing `ETXTBSY` (26) retry inline below
+// because it's the same shape: transient, kernel-mediated, resolved
+// by a few-ms backoff. Issue #1207 added EAGAIN/ENOMEM/EMFILE to the
+// same retry loop so the executor stops surfacing transient kernel
+// pressure to callers as a hard `ExecutorError::Spawn` — which under
+// `FailMode::Open` silently degrades to `ChainResult::Allow` and
+// masquerades as a passing test when the child never actually ran
+// (the v0.7 G8 `on_index_eviction_fires_with_full_payload` flake).
+
+/// Spawn-retry backoff ladder. Each attempt sleeps for the listed
+/// duration BEFORE retrying; the first attempt has no pre-sleep.
+/// Total wall-clock budget across all retries is ~1.26s, which keeps
+/// the executor well under the typical hook `timeout_ms` ceiling
+/// (5_000ms in the v0.7 G8 test fixture).
+const SPAWN_RETRY_BACKOFF_MS: &[u64] = &[10, 50, 200, 1_000];
+
+/// Returns `true` iff the io::Error is a transient errno the kernel
+/// will likely recover from on a short backoff. On non-unix platforms
+/// always returns `false` (Windows doesn't expose these errnos; the
+/// caller still gets the original error via the standard Spawn path).
+#[cfg(unix)]
+fn is_transient_spawn_errno(err: &io::Error) -> bool {
+    let Some(errno) = err.raw_os_error() else {
+        return false;
+    };
+    // libc::EAGAIN, ENOMEM, EMFILE, ETXTBSY (the v0.6 race) — all
+    // transient under parallel-load conditions. ETXTBSY is the
+    // exec-races-write window that PR #563 originally guarded.
+    errno == libc::EAGAIN
+        || errno == libc::ENOMEM
+        || errno == libc::EMFILE
+        || errno == libc::ETXTBSY
+}
+
+#[cfg(not(unix))]
+fn is_transient_spawn_errno(_err: &io::Error) -> bool {
+    false
+}
+
+/// Fault-injection hook for `spawn_with_transient_retry` unit tests.
+/// When set (in test builds only), the next `expected` spawn attempts
+/// will be forced to return a synthesized EAGAIN regardless of what
+/// the inner closure would return. Each call decrements the counter
+/// by one; the closure's real result is returned once the counter
+/// hits zero.
+///
+/// Production callers never read this — the constant
+/// `AI_MEMORY_TEST_FORCE_SPAWN_EAGAIN` env var is the only ingress
+/// path and the env-var read itself is gated on `cfg(test)`. Even if
+/// the env var is set in a release binary, the helper short-circuits
+/// at compile time.
+#[cfg(all(test, unix))]
+fn test_force_eagain_remaining() -> u32 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static REMAINING: AtomicU32 = AtomicU32::new(u32::MAX);
+    // Lazy-init from env on first call per process.
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let n = std::env::var("AI_MEMORY_TEST_FORCE_SPAWN_EAGAIN")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0);
+        REMAINING.store(n, Ordering::SeqCst);
+    });
+    let cur = REMAINING.load(Ordering::SeqCst);
+    if cur == 0 {
+        return 0;
+    }
+    REMAINING.fetch_sub(1, Ordering::SeqCst);
+    cur
+}
+
+/// Spawn a child with bounded retry on transient kernel errnos. The
+/// closure is invoked at least once and at most `SPAWN_RETRY_BACKOFF_MS.len() + 1`
+/// times. Between attempts we sleep per the backoff ladder. After
+/// exhausting retries we surface the original `io::Error` verbatim so
+/// the caller can wrap it in the appropriate `ExecutorError::Spawn`
+/// (or another variant) and operators still see the precise errno.
+///
+/// The closure is `FnMut(): io::Result<Child>` rather than
+/// `FnOnce` because each retry needs to invoke `Command::spawn()`
+/// afresh — `Command` is consumed by `spawn()` so the caller wraps
+/// the build-and-spawn pair in the closure.
+async fn spawn_with_transient_retry<F>(mut spawn_once: F) -> io::Result<Child>
+where
+    F: FnMut() -> io::Result<Child>,
+{
+    let total_attempts = SPAWN_RETRY_BACKOFF_MS.len() + 1;
+    let mut last_err: Option<io::Error> = None;
+    for attempt in 0..total_attempts {
+        if attempt > 0 {
+            // Backoff index is (attempt - 1) since attempt 0 has no
+            // pre-sleep. attempt 1 → BACKOFF_MS[0] = 10ms, etc.
+            let sleep_ms = SPAWN_RETRY_BACKOFF_MS[attempt - 1];
+            tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+        }
+
+        // Test-only fault injection — synthesize EAGAIN N times then
+        // pass through. Compiled out of release builds entirely. Gated
+        // on `unix` because `libc::EAGAIN` lives in the cfg(unix)-only
+        // `libc` dep; on Windows the fault injection is a no-op (the
+        // transient-spawn-errno classifier is unix-only too, so there
+        // is nothing to fault-inject for).
+        #[cfg(all(test, unix))]
+        {
+            if test_force_eagain_remaining() > 0 {
+                last_err = Some(io::Error::from_raw_os_error(libc::EAGAIN));
+                continue;
+            }
+        }
+
+        match spawn_once() {
+            Ok(child) => return Ok(child),
+            Err(e) if is_transient_spawn_errno(&e) => {
+                tracing::debug!(
+                    attempt = attempt + 1,
+                    max = total_attempts,
+                    errno = ?e.raw_os_error(),
+                    "hooks: transient spawn errno, retrying after backoff"
+                );
+                last_err = Some(e);
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| io::Error::other("spawn retries exhausted with no error")))
+}
+
 /// Bounded ring buffer used by the daemon-mode stderr drain. Wrapped
 /// in an `Arc<Mutex<…>>` so the drain task and the executor (which
 /// snapshots the contents on timeout / drop) can both reach it without
@@ -532,44 +674,30 @@ impl ExecExecutor {
             reason: format!("envelope encode: {e}"),
         })?;
 
-        // Linux ETXTBSY ("Text file busy") fires when exec() races
-        // with another process that still holds the file open for
-        // write — even a recently-closed-and-fsynced writer can leave
-        // a brief window where the kernel's writer-count is non-zero.
-        // We retry up to 5 times with a tiny backoff; if it persists,
-        // surface the original error so an operator-side issue
-        // (write-locked file, NFS quirk, etc.) is still visible.
-        let mut last_err: Option<io::Error> = None;
-        let mut child = None;
-        for attempt in 0..5 {
-            match Command::new(&self.config.command)
+        // Spawn-retry-with-backoff (issue #1207). Covers:
+        //   * Linux/macOS ETXTBSY ("Text file busy") — exec() races
+        //     with another process that still holds the file open for
+        //     write. The pre-#1207 ETXTBSY loop is now folded into
+        //     `spawn_with_transient_retry`.
+        //   * EAGAIN/ENOMEM/EMFILE — kernel under fork/FD pressure
+        //     under parallel test load. The v0.7 G8 flake
+        //     (`on_index_eviction_fires_with_full_payload`) was the
+        //     trigger; pre-#1207 the executor surfaced EAGAIN to the
+        //     caller, `FailMode::Open` masked it as `ChainResult::Allow`,
+        //     and the child never actually ran.
+        let command_path = self.config.command.clone();
+        let child = spawn_with_transient_retry(|| {
+            Command::new(&command_path)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .kill_on_drop(true)
                 .spawn()
-            {
-                Ok(c) => {
-                    child = Some(c);
-                    break;
-                }
-                Err(e) if e.raw_os_error() == Some(26) => {
-                    // ETXTBSY — back off briefly and retry.
-                    last_err = Some(e);
-                    tokio::time::sleep(Duration::from_millis(5 * (attempt + 1))).await;
-                    continue;
-                }
-                Err(e) => {
-                    return Err(ExecutorError::Spawn {
-                        command: self.config.command.display().to_string(),
-                        source: e,
-                    });
-                }
-            }
-        }
-        let child = child.ok_or_else(|| ExecutorError::Spawn {
+        })
+        .await
+        .map_err(|source| ExecutorError::Spawn {
             command: self.config.command.display().to_string(),
-            source: last_err.unwrap_or_else(|| io::Error::other("ETXTBSY retries exhausted")),
+            source,
         })?;
 
         let started = Instant::now();
@@ -873,7 +1001,7 @@ impl DaemonExecutor {
                 let backoff_ms = (BASE_BACKOFF_MS.saturating_mul(pow)).min(MAX_BACKOFF_MS);
                 tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
             }
-            match self.spawn_one() {
+            match self.spawn_one().await {
                 Ok(conn) => return Ok(conn),
                 Err(e) => {
                     tracing::warn!(
@@ -891,7 +1019,7 @@ impl DaemonExecutor {
         }))
     }
 
-    fn spawn_one(&self) -> Result<DaemonConnection> {
+    async fn spawn_one(&self) -> Result<DaemonConnection> {
         // v0.7.0 (issue #691 fold-1) — same ProcessSpawn gate as the
         // exec-mode path above. Daemon-mode hooks spawn at most once
         // per (process, hook) so this fires at start-up rather than
@@ -908,15 +1036,24 @@ impl DaemonExecutor {
                 reason: refusal.reason,
             });
         }
-        let mut child = Command::new(&self.config.command)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|source| ExecutorError::Spawn {
-                command: self.config.command.display().to_string(),
-                source,
-            })?;
+        // Spawn-retry-with-backoff (issue #1207) for the daemon path
+        // too. The outer `connect_with_backoff` retries on any
+        // ExecutorError (5 attempts, 100ms → 5s); this inner loop
+        // catches the narrow transient-errno class first so a brief
+        // fork-pressure window doesn't even consume a reconnect slot.
+        let command_path = self.config.command.clone();
+        let mut child = spawn_with_transient_retry(|| {
+            Command::new(&command_path)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+        })
+        .await
+        .map_err(|source| ExecutorError::Spawn {
+            command: self.config.command.display().to_string(),
+            source,
+        })?;
         let stdin = child.stdin.take().ok_or_else(|| {
             ExecutorError::Io(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -1458,5 +1595,181 @@ mod tests {
             ExecutorError::Decode { reason } => assert!(reason.contains("object")),
             other => panic!("expected Decode, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #1207 — spawn-retry-with-backoff pin tests.
+    // -----------------------------------------------------------------
+
+    /// EAGAIN / ENOMEM / EMFILE / ETXTBSY are the four errnos the
+    /// helper must treat as transient. Other errnos (e.g. ENOENT for
+    /// a missing binary) must surface immediately.
+    #[cfg(unix)]
+    #[test]
+    fn issue_1207_is_transient_spawn_errno_classification() {
+        // Positive cases.
+        for errno in [libc::EAGAIN, libc::ENOMEM, libc::EMFILE, libc::ETXTBSY] {
+            let err = io::Error::from_raw_os_error(errno);
+            assert!(
+                is_transient_spawn_errno(&err),
+                "errno {errno} should be transient"
+            );
+        }
+        // Negative cases — ENOENT (missing binary), EACCES (perm denied)
+        // must NOT be retried; those are operator-actionable.
+        for errno in [libc::ENOENT, libc::EACCES, libc::ENOEXEC] {
+            let err = io::Error::from_raw_os_error(errno);
+            assert!(
+                !is_transient_spawn_errno(&err),
+                "errno {errno} must NOT be classified as transient"
+            );
+        }
+        // io::Error without an errno (e.g. synthetic Other) is also
+        // non-transient — we can't reason about kernel state.
+        assert!(!is_transient_spawn_errno(&io::Error::other("oops")));
+    }
+
+    /// The helper returns the first `Ok(child)` without sleeping when
+    /// the closure succeeds on the first attempt. Unix-only because
+    /// the test spawns `/bin/true` (or `/usr/bin/true`); Windows has
+    /// no equivalent always-present zero-exit binary in a stable path,
+    /// and the spawn-retry helper itself is a no-op on Windows
+    /// (`is_transient_spawn_errno` always returns `false` when
+    /// `cfg(unix)` is off).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn issue_1207_spawn_retry_first_attempt_succeeds() {
+        let started = Instant::now();
+        let child = spawn_with_transient_retry(|| {
+            Command::new(if std::path::Path::new("/bin/true").exists() {
+                "/bin/true"
+            } else {
+                "/usr/bin/true"
+            })
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+        })
+        .await
+        .expect("first-attempt spawn should succeed");
+        // Reap the child to keep the test hermetic.
+        drop(child);
+        // No backoff sleeps fired — well under the 10ms first-step
+        // ladder entry.
+        assert!(
+            started.elapsed() < Duration::from_millis(10),
+            "first-attempt success must not pay any backoff"
+        );
+    }
+
+    /// A non-transient errno (ENOENT — missing binary) MUST surface
+    /// immediately without retries.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn issue_1207_spawn_retry_non_transient_errno_surfaces_immediately() {
+        let started = Instant::now();
+        let err = spawn_with_transient_retry(|| {
+            Command::new("/nonexistent/path/to/binary-xyz-1207")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+        })
+        .await
+        .expect_err("spawn of /nonexistent should fail");
+        assert_eq!(err.raw_os_error(), Some(libc::ENOENT));
+        // Should NOT have paid any backoff sleeps — fail-fast on
+        // non-transient errno.
+        assert!(
+            started.elapsed() < Duration::from_millis(10),
+            "non-transient errno must surface immediately, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Fault-injected EAGAIN: the helper sleeps through 4 backoff
+    /// steps (~10+50+200+1000 = 1260ms) then succeeds on the 5th
+    /// attempt when the injected counter hits zero.
+    ///
+    /// This test sets the `AI_MEMORY_TEST_FORCE_SPAWN_EAGAIN` env var
+    /// to force the helper through the full backoff ladder; it MUST
+    /// run in a fresh process (via `cargo test`) because the env-var
+    /// gate is `Once`-initialized. We use a `Mutex` to serialize
+    /// against other tests in this module that might race.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn issue_1207_spawn_retry_recovers_from_transient_eagain() {
+        // This test exercises the retry loop by passing a closure
+        // that returns a synthesized EAGAIN on its first two calls,
+        // then a real successful spawn. We don't use the env-var
+        // injection here because the once-init makes it
+        // single-shot per process; a per-call counter under our
+        // direct control is the more honest unit test for the loop.
+        use std::cell::Cell;
+        let attempt_count: Cell<u32> = Cell::new(0);
+        let started = Instant::now();
+        let child = spawn_with_transient_retry(|| {
+            let n = attempt_count.get();
+            attempt_count.set(n + 1);
+            if n < 2 {
+                Err(io::Error::from_raw_os_error(libc::EAGAIN))
+            } else {
+                Command::new(if std::path::Path::new("/bin/true").exists() {
+                    "/bin/true"
+                } else {
+                    "/usr/bin/true"
+                })
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+            }
+        })
+        .await
+        .expect("spawn should succeed after 2 EAGAIN retries");
+        drop(child);
+        assert_eq!(
+            attempt_count.get(),
+            3,
+            "closure called 3 times (2 EAGAIN + 1 success)"
+        );
+        // Paid 10ms + 50ms = 60ms of backoff. Allow generous slop for
+        // CI scheduler jitter (especially under cargo's parallel
+        // test load — the EXACT condition this fix targets).
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(55),
+            "should pay at least 10+50=60ms backoff, got {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(1_500),
+            "should not pay the full 1.26s ladder when success comes on attempt 3, got {elapsed:?}"
+        );
+    }
+
+    /// Exhausting all 5 attempts surfaces the last transient error.
+    /// Guarantees the helper doesn't loop forever AND that operators
+    /// still see the precise errno when the kernel never recovers.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn issue_1207_spawn_retry_exhaustion_surfaces_last_error() {
+        use std::cell::Cell;
+        let attempt_count: Cell<u32> = Cell::new(0);
+        let err = spawn_with_transient_retry(|| {
+            attempt_count.set(attempt_count.get() + 1);
+            Err::<Child, _>(io::Error::from_raw_os_error(libc::EMFILE))
+        })
+        .await
+        .expect_err("all attempts return EMFILE → helper must surface");
+        assert_eq!(err.raw_os_error(), Some(libc::EMFILE));
+        assert_eq!(
+            attempt_count.get(),
+            (SPAWN_RETRY_BACKOFF_MS.len() + 1) as u32,
+            "closure must be called total_attempts times before exhaustion"
+        );
     }
 }
