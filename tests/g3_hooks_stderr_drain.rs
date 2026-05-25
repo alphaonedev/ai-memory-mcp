@@ -34,6 +34,7 @@
 #![cfg(unix)]
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ai_memory::hooks::{
@@ -42,41 +43,6 @@ use ai_memory::hooks::{
 };
 use serde_json::json;
 use tempfile::TempDir;
-
-// ---------------------------------------------------------------------------
-// macOS CI timing budget multiplier (issue #1193).
-//
-// `Check (macos-latest)` on the GHA runner pool exhibits substantially
-// higher cold-start latency and I/O scheduling variance than
-// `ubuntu-latest`. The first `fork(2)+execve(2)+/bin/sh-startup`
-// cycle on a cold macOS dev box or GHA runner has been observed to
-// exceed 1.5s on its own, which makes the wall-clock-sensitive
-// assertions in this file flake across PRs in the #1174 refactor
-// campaign. Per issue #1193's "Proposed fix" option 1 (preferred):
-// apply a centralized macOS-only budget multiplier so every
-// `Duration::from_secs/from_millis(N)` site here can be re-tuned with
-// a single edit.
-//
-// The multiplier is 10 — sized so the smallest budget in this file
-// (500ms for `daemon_mode_timeout_still_trips_with_drain_task_running`)
-// grows to 5s, which is comfortably past the observed cold-start
-// spawn ceiling on an active macOS dev host with parallel cargo+rustc
-// load. Reproduction on 2026-05-24 showed the first-fire (warm-the-
-// connection) path failing at `Timeout { ms: 2500 }` under 5x; the
-// bump to 10x clears that observation by another 2x. Larger budgets
-// in this file scale identically (the 60s aggregate slack becomes
-// 600s on macOS — still bounded, and the underlying defect this test
-// guards against deadlocks the executor forever, so 600s is plenty
-// of room to surface a real regression). Linux/Windows runs are
-// unaffected (multiplier = 1).
-//
-// Apply this in two places per budget: the per-fire `timeout_ms` we
-// hand to `DaemonExecutor::new(cfg_for(..., N))` AND the
-// `Duration::from_*` ceiling we assert against `elapsed`.
-#[cfg(target_os = "macos")]
-const MACOS_TIMING_BUDGET_MULT: u32 = 10;
-#[cfg(not(target_os = "macos"))]
-const MACOS_TIMING_BUDGET_MULT: u32 = 1;
 
 /// Write `body` to `dir/name`, mark it executable, return the path.
 /// Same shape as the helper in `tests/hooks_executor_test.rs` — kept
@@ -155,12 +121,8 @@ done
 
     // 30s per-fire timeout — generous. A regressed executor hangs
     // forever; a working one returns in milliseconds even with the
-    // 1 MiB stderr volume. macOS CI runners get 10x headroom (#1193).
-    let executor = DaemonExecutor::new(cfg_for(
-        script,
-        HookMode::Daemon,
-        30_000 * MACOS_TIMING_BUDGET_MULT,
-    ));
+    // 1 MiB stderr volume.
+    let executor = DaemonExecutor::new(cfg_for(script, HookMode::Daemon, 30_000));
 
     let started = Instant::now();
     for i in 0..5u32 {
@@ -178,9 +140,8 @@ done
     // 60s slack — even a slow CI runner should clear 5 MiB of
     // stderr piping in well under a minute. Anything close to this
     // bound suggests the drain task is missing or under-buffering.
-    // macOS CI runners get 10x headroom (#1193).
     assert!(
-        elapsed < Duration::from_secs(60) * MACOS_TIMING_BUDGET_MULT,
+        elapsed < Duration::from_secs(60),
         "5 fires of 1 MiB stderr each took {elapsed:?}; suggests drain task is missing",
     );
 
@@ -196,35 +157,52 @@ done
 /// cleanly when the child genuinely stops responding. A regressed
 /// drain task that buffered unboundedly could mask a hung child by
 /// keeping the pipe forever drainable; we want the executor to
-/// surface `Timeout` in bounded wall-clock regardless.
+/// surface `Timeout` deterministically regardless.
 ///
 /// The script writes one Allow then sleeps forever — the second fire
 /// must trip the configured 500ms timeout.
 ///
-/// **macOS quarantine (issue #1193 + follow-up #TODO).** Per issue
-/// #1193's "Proposed fix" option 2: this test is structurally
-/// wall-clock-coupled in two places — (a) the first-fire connection
-/// warm-up must succeed inside the per-fire `timeout_ms`, and (b)
-/// the second fire's Timeout-surfacing must happen inside the assert
-/// ceiling. On macOS GHA runners (and stressed macOS dev hosts) the
-/// fork+exec+sh-startup cold-start has been observed to exceed the
-/// option-1 [`MACOS_TIMING_BUDGET_MULT`] = 10× budget when this
-/// test runs concurrently with `daemon_mode_high_stderr_volume_no_deadlock`
-/// in the same binary (each test spawns its own /bin/sh tree, and
-/// the macOS scheduler tail under that contention is unbounded).
-/// The proper fix is option 3: rewrite the test to use a fake clock
-/// (e.g. `tokio::time::pause`) so the deadline-trip path is
-/// deterministic rather than wall-clock-coupled — tracked under
-/// the follow-up issue. Until then, we ignore on macOS so the
-/// Check (macos-latest) CI matrix stops blocking the #1174 refactor
-/// campaign PRs. The Linux + Windows arms still exercise the same
-/// code path so the H9 regression remains pinned everywhere except
-/// macOS.
-#[cfg_attr(
-    target_os = "macos",
-    ignore = "issue #1193 — wall-clock-coupled test; rewrite to fake clock in follow-up"
-)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+/// Issue #1206 — rewritten from wall-clock-coupled to **fake clock**
+/// for the timeout-trip half of the test.
+///
+/// The pre-#1206 shape used a real `Instant::now()` budget + 5s
+/// assertion ceiling and a 10× macOS multiplier (PR #1203), which
+/// still flaked on stressed macOS hosts because the `fork+exec+sh`
+/// cold-start cycle plus the executor's 500ms timeout left no
+/// safety margin under contention (issue #1193).
+///
+/// The rewrite splits the test into two phases with different
+/// time-source disciplines:
+///
+///   * **Phase 1 — first fire (real clock).** The first fire spawns
+///     the child via `tokio::process::Command`, writes the envelope,
+///     and reads the child's response. The H9 contract under test
+///     here is that the executor doesn't deadlock on a verbose child
+///     — that's a real-I/O contract, not a timer contract, so this
+///     phase runs against the real tokio clock. The child responds
+///     in real milliseconds; the 500ms timeout is a backstop that
+///     never trips.
+///   * **Phase 2 — second fire (paused clock).** After the first
+///     fire completes, `tokio::time::pause()` freezes the clock.
+///     The second fire is spawned (the child is sleeping for 60s
+///     wall-clock and will never respond) and the test future
+///     explicitly `tokio::time::advance`s past the 500ms deadline.
+///     The executor's `tokio::time::timeout(deadline, exchange)`
+///     trips deterministically against the advanced fake clock,
+///     surfacing `Timeout`. No wall-clock dependence; no flake band.
+///
+/// Runtime flavor is `current_thread` because `tokio::time::pause()`
+/// is `current_thread`-only (it operates on the runtime-local clock).
+/// `tokio::process` works fine on `current_thread` — the child's
+/// stdin/stdout/stderr pipes are async-readable via the runtime's
+/// I/O driver and the stderr-drain task runs as a `tokio::spawn`
+/// cooperative task on the same thread. We do **not** use
+/// `start_paused = true` because auto-advance would leap over the
+/// child's real `fork+exec+sh` cold-start before its first response;
+/// `tokio::time::pause()` is called explicitly between phase 1 and
+/// phase 2 so the first fire keeps wall-clock semantics and only
+/// the second fire's deadline-trip becomes deterministic.
+#[tokio::test(flavor = "current_thread")]
 async fn daemon_mode_timeout_still_trips_with_drain_task_running() {
     let dir = tempfile::tempdir().expect("tempdir");
     let script = write_script(
@@ -242,40 +220,49 @@ sleep 60
 "#,
     );
 
-    // macOS CI runners get 10x headroom (#1193) — the 500ms budget is
-    // the tightest in this file and was the most frequent #1193 flake
-    // source on the macos-latest GHA pool. 500ms × 10 = 5s on macOS,
-    // which clears the observed fork+exec+sh-startup ceiling (2.5s
-    // reproduced locally on 2026-05-24) by 2x.
-    let executor = DaemonExecutor::new(cfg_for(
-        script,
-        HookMode::Daemon,
-        500 * MACOS_TIMING_BUDGET_MULT,
-    ));
+    // Arc-wrap so we can share the executor with the spawned second
+    // fire below. `DaemonExecutor: Send + Sync` (its only interior
+    // mutability is the async `tokio::sync::Mutex<Option<…>>`).
+    let executor = Arc::new(DaemonExecutor::new(cfg_for(script, HookMode::Daemon, 500)));
 
-    // First fire warms the connection — must succeed.
+    // Phase 1 — first fire (real clock). Warms the daemon connection
+    // via real fork/exec/read/write; the child responds in real ms
+    // and the 500ms timeout never trips.
     let r1 = executor
         .fire(HookEvent::PostStore, json!({"first": true}))
         .await
         .expect("first fire warms the daemon connection");
     assert_eq!(r1, HookDecision::Allow);
 
-    // Second fire must trip Timeout (script is sleeping). The window
-    // is generous — the configured budget is 500ms (5s on macOS);
-    // if we don't see an answer inside 5s (50s on macOS) the drain
-    // task itself is hung.
-    let started = Instant::now();
-    let r2 = executor
-        .fire(HookEvent::PostStore, json!({"second": true}))
-        .await;
-    let elapsed = started.elapsed();
+    // Phase 2 — pause the tokio clock so the second fire's timeout
+    // is driven by `tokio::time::advance` instead of wall-clock.
+    // This is the #1206 fix: deterministic timeout-trip regardless
+    // of host contention / `fork+exec+sh` cold-start variance.
+    tokio::time::pause();
+
+    let executor2 = Arc::clone(&executor);
+    let fire2 = tokio::spawn(async move {
+        executor2
+            .fire(HookEvent::PostStore, json!({"second": true}))
+            .await
+    });
+
+    // Let the spawned task start, hit its envelope-write, and park
+    // awaiting the child's stdout response (which will never come —
+    // the script is in `sleep 60`).
+    tokio::task::yield_now().await;
+
+    // Advance the paused clock past the 500ms executor deadline.
+    // The tokio timer wired inside `fire_inner` now trips and the
+    // executor records `Timeout` with no wall-clock dependence.
+    tokio::time::advance(Duration::from_millis(600)).await;
+
+    // The spawned fire should be resolved — Timeout surfaced
+    // deterministically.
+    let r2 = fire2.await.expect("spawned fire must not panic");
     assert!(
         matches!(r2, Err(ExecutorError::Timeout { .. })),
         "second fire should have surfaced Timeout, got {r2:?}",
-    );
-    assert!(
-        elapsed < Duration::from_secs(5) * MACOS_TIMING_BUDGET_MULT,
-        "Timeout took {elapsed:?}; bounded budget should be ~500ms (5s on macOS)",
     );
 }
 
@@ -306,14 +293,10 @@ printf '%s\n' '{"action":"allow"}'
     // runners have grown slower since 0536e96 bumped 5→30s; runs in
     // 2026-05-17 timed out at the 30s mark. Local runs finish in ~130ms.
     // Budget is for CI-flake resilience, not real workload. Real-deployment
-    // hook timeouts are operator-configured. Per issue #1193 the macOS
-    // multiplier is applied uniformly here too (600s on macOS) so a
-    // single runner-load spike can't flake the success path either.
-    let executor = ExecExecutor::new(cfg_for(
-        script,
-        HookMode::Exec,
-        60_000 * MACOS_TIMING_BUDGET_MULT,
-    ));
+    // hook timeouts are operator-configured. If this bump is also
+    // insufficient, switch to #[cfg_attr(target_os = "macos", ignore)]
+    // and file a runner-investigation follow-up.
+    let executor = ExecExecutor::new(cfg_for(script, HookMode::Exec, 60_000));
     let r = executor
         .fire(HookEvent::PostStore, json!({}))
         .await
