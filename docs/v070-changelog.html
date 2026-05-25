@@ -1,0 +1,310 @@
+<!--
+  Copyright 2026 AlphaOne LLC
+  SPDX-License-Identifier: Apache-2.0
+  v0.7.0 CHANGELOG synthesis — public-facing, organised by user-facing impact (not PR sequence).
+  Lane 6 deliverable per #832 §5 + #1198.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>v0.7.0 CHANGELOG synthesis &mdash; user-facing impact</title>
+<meta name="description" content="What ai-memory v0.7.0 attested-cortex actually changes for you. Organised by user-facing impact, not PR sequence. New primitives, security defaults, breaking changes, upgrade path.">
+<link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/v070-changelog.html">
+<style>
+:root{--bg:#0a0a0a;--panel:#121212;--border:#262626;--border-hi:#3a3a3a;--text:#f5f5f5;--muted:#9a9a9a;--dim:#6b6b6b;--accent:#6ee7ff;--warn:#ffb86b;--good:#7cd992;--breaking:#f87171;--new:#a78bfa;--code-bg:#161616;--font-sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;--font-mono:"SF Mono","JetBrains Mono","Cascadia Code",Consolas,monospace;--w-mid:840px;--w-wide:1080px}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{background:var(--bg);color:var(--text);font-family:var(--font-sans);line-height:1.65;-webkit-font-smoothing:antialiased}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+code,pre{font-family:var(--font-mono);font-size:.88rem}
+code{background:var(--code-bg);padding:.1em .35em;border-radius:3px;color:#d4d4d4}
+pre{background:var(--code-bg);border:1px solid var(--border);border-radius:6px;padding:1rem 1.15rem;overflow-x:auto;line-height:1.55;margin:1rem 0}
+pre code{background:none;padding:0;color:#d4d4d4}
+.wrap-mid{max-width:var(--w-mid);margin:0 auto;padding:0 1.5rem}
+.topnav{border-bottom:1px solid var(--border);position:sticky;top:0;background:rgba(10,10,10,.92);backdrop-filter:blur(8px);z-index:50}
+.topnav .row{display:flex;align-items:center;justify-content:space-between;padding:1rem 1.5rem;max-width:var(--w-wide);margin:0 auto;font-size:.9rem}
+.topnav .brand{color:var(--text);font-weight:600}
+.topnav .links{display:flex;gap:1.5rem}
+.topnav .links a{color:var(--muted)}
+.topnav .links a:hover{color:var(--text);text-decoration:none}
+.crumb{padding:1.25rem 1.5rem 0;max-width:var(--w-mid);margin:0 auto;color:var(--dim);font-size:.82rem;font-family:var(--font-mono)}
+.crumb a{color:var(--muted)}
+.hero{padding:3rem 0 2.5rem}
+.hero .eyebrow{font-family:var(--font-mono);font-size:.72rem;letter-spacing:.18em;color:var(--accent);text-transform:uppercase;margin-bottom:1rem}
+.hero h1{font-size:2.2rem;font-weight:700;letter-spacing:-.025em;line-height:1.15;margin-bottom:1.25rem}
+.hero .lede{font-size:1.1rem;color:var(--muted);max-width:720px;line-height:1.6}
+section{padding:3rem 0;border-top:1px solid var(--border)}
+.eyebrow-h2{font-family:var(--font-mono);font-size:.7rem;letter-spacing:.18em;color:var(--dim);text-transform:uppercase;margin-bottom:.5rem}
+h2{font-size:1.5rem;font-weight:700;letter-spacing:-.015em;margin-bottom:1rem}
+h3{font-size:1.05rem;font-weight:600;margin:1.75rem 0 .5rem;color:var(--text)}
+p{color:var(--muted);margin-bottom:1rem;max-width:720px}
+p.lede{color:var(--text);font-size:1rem}
+ul,ol{color:var(--muted);margin:0 0 1rem 1.5rem}
+li{margin-bottom:.5rem}
+li code{font-size:.85em}
+li strong{color:var(--text)}
+.entry{padding:1rem 1.25rem;background:var(--panel);border:1px solid var(--border);border-radius:6px;margin:1rem 0}
+.entry .tag{display:inline-block;padding:.15rem .55rem;border-radius:3px;font-family:var(--font-mono);font-size:.7rem;text-transform:uppercase;letter-spacing:.08em;margin-bottom:.5rem}
+.entry .tag.new{color:var(--new);border:1px solid rgba(167,139,250,.4);background:rgba(167,139,250,.06)}
+.entry .tag.changed{color:var(--warn);border:1px solid rgba(255,184,107,.4);background:rgba(255,184,107,.06)}
+.entry .tag.breaking{color:var(--breaking);border:1px solid rgba(248,113,113,.4);background:rgba(248,113,113,.06)}
+.entry .tag.security{color:var(--good);border:1px solid rgba(124,217,146,.4);background:rgba(124,217,146,.06)}
+.entry h3{margin-top:0}
+.entry p{max-width:none;margin-bottom:.5rem}
+.entry p:last-child{margin-bottom:0}
+.entry .anchor{font-family:var(--font-mono);font-size:.78rem;color:var(--dim);margin-left:.5rem}
+.next{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:.6rem;margin:1.5rem 0}
+.next a{display:block;padding:.85rem 1rem;background:var(--panel);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:.9rem;transition:border-color .15s}
+.next a:hover{border-color:var(--accent);text-decoration:none}
+.next a .desc{display:block;color:var(--muted);font-size:.78rem;margin-top:.2rem;font-weight:400}
+.meta-row{display:flex;flex-wrap:wrap;gap:.5rem;margin-top:1.5rem}
+.meta-row span{padding:.3rem .7rem;background:var(--panel);border:1px solid var(--border);border-radius:4px;font-family:var(--font-mono);font-size:.75rem;color:var(--muted)}
+footer{padding:3rem 0;border-top:1px solid var(--border);color:var(--dim);font-size:.82rem;text-align:center}
+footer a{color:var(--muted)}
+</style>
+</head>
+<body>
+
+<nav class="topnav">
+  <div class="row">
+    <a class="brand" href="./">ai-memory</a>
+    <div class="links">
+      <a href="#install">Install</a>
+      <a href="audience/developer.html">Developer</a>
+      <a href="audience/operator.html">Operator</a>
+      <a href="audience/decision-maker.html">Decision</a>
+      <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<div class="crumb"><a href="./">ai-memory</a> &nbsp;/&nbsp; v0.7.0 CHANGELOG synthesis</div>
+
+<header class="hero wrap-mid">
+  <div class="eyebrow">v0.7.0 attested-cortex &middot; user-facing impact</div>
+  <h1>What v0.7.0 changes for you.</h1>
+  <p class="lede">This page is the public-facing CHANGELOG synthesis &mdash; organised by user-facing impact, not PR sequence. For the full per-PR release notes (every issue closed, every commit cited), read <a href="v0.7.0/release-notes.md">v0.7.0/release-notes.md</a>. For the architecture-level surface diff, read <a href="v070-architecture.html">v070-architecture.html</a>.</p>
+  <div class="meta-row">
+    <span>release/v0.7.0 @ <code>1cb95bbe7</code></span>
+    <span>SHIP-RECOMMENDED 2026-05-22</span>
+    <span>schema v33 &rarr; v50</span>
+    <span>capabilities v2 &rarr; v3</span>
+  </div>
+</header>
+
+<section class="wrap-mid">
+  <div class="eyebrow-h2">Headline</div>
+  <h2>The attested-cortex release.</h2>
+  <p>ai-memory v0.7.0 closes two long-standing gaps in one release. The substrate <strong>says what it can do</strong> &mdash; capabilities v3 pre-computes the calibration strings LLMs would otherwise improvise &mdash; and <strong>signs what it remembers</strong> &mdash; per-agent Ed25519 keypairs sign every memory link, with an append-only <code>signed_events</code> audit chain. Plus the K1/G1 namespace-inheritance cutline, a programmable 25-event hook pipeline, sidechain transcripts, an opt-in Apache AGE acceleration path, and a vendor-agnostic LLM substrate covering 15 frontier providers.</p>
+</section>
+
+<section class="wrap-mid">
+  <div class="eyebrow-h2">New primitives</div>
+  <h2>What you can do that you couldn&apos;t before.</h2>
+
+  <div class="entry">
+    <span class="tag new">NEW</span>
+    <h3>Provider-agnostic LLM substrate <span class="anchor">#1067</span></h3>
+    <p>Pre-#1067 the LLM client was Ollama-only and gated by feature tier. v0.7.0 ships a 15-vendor substrate (ollama, openai, xai, anthropic, gemini, deepseek, kimi, qwen, mistral, groq, together, cerebras, openrouter, fireworks, lmstudio, plus the generic <code>openai-compatible</code> escape hatch). Tier no longer dictates LLM vendor &mdash; every tier can speak to any provider via <code>AI_MEMORY_LLM_BACKEND</code>. Per-vendor env-var fallback (<code>XAI_API_KEY</code>, <code>OPENAI_API_KEY</code>, ...) honored automatically.</p>
+  </div>
+
+  <div class="entry">
+    <span class="tag new">NEW</span>
+    <h3>Ed25519 attestation + signed-events V-4 chain</h3>
+    <p>Per-agent Ed25519 keypairs (<code>ai-memory identity generate</code>) sign every memory link write. Inbound verification against <code>observed_by</code>. Append-only <code>signed_events</code> audit table with V-4 cross-row hash chain (<code>prev_hash</code> + <code>sequence</code>) shipped at schema v34, part of the v33 &rarr; v50 migration ladder. The audit chain compliance teams have been asking for.</p>
+  </div>
+
+  <div class="entry">
+    <span class="tag new">NEW</span>
+    <h3>25-event programmable hook pipeline</h3>
+    <p>Substrate-native hook surface fires on store, update, link, reflect, consolidate, promote, archive, restore, and 17 other lifecycle events. Hooks can be HTTP webhooks (HMAC-signed, mandatory at v0.7.0 post R3-S1.HMAC) or built-in (auto-tag, contradiction detection). DLQ + replay primitives for missed events.</p>
+  </div>
+
+  <div class="entry">
+    <span class="tag new">NEW</span>
+    <h3>Sidechain transcripts + <code>memory_replay</code></h3>
+    <p>Compressed conversation replay: zstd-3 BLOBs preserve full conversation context out-of-band from the memory row. <code>memory_replay</code> reconstructs the original interaction without bloating the recall pipeline. Optional; off by default.</p>
+  </div>
+
+  <div class="entry">
+    <span class="tag new">NEW</span>
+    <h3>Apache AGE graph backend (postgres path)</h3>
+    <p><code>ai-memory serve --store-url postgres://...</code> selects the Postgres SAL adapter with optional Apache AGE for depth-N knowledge-graph queries. pgvector 0.8.2 pin handles the semantic surface. Lan-parity test topology under <code>infra/lan-parity-test/</code> covers PG16 + AGE 1.6.0 + pgvector 0.8.2 against the same 7,321-test suite the sqlite path runs.</p>
+  </div>
+
+  <div class="entry">
+    <span class="tag new">NEW</span>
+    <h3>Recursive-learning primitive (<code>memory_reflect</code> depth gate)</h3>
+    <p>Substrate-native recursive refinement: <code>memory_reflect</code> writes a reflection row with <code>reflection_depth</code> tracked through the new <code>reflects_on</code> link variant. Depth cap (default 3) refuses with <code>REFLECTION_DEPTH_EXCEEDED</code>. The conceptual primer + reproduction script under <code>scripts/reproduce-recursive-learning.sh</code>.</p>
+  </div>
+
+  <div class="entry">
+    <span class="tag new">NEW</span>
+    <h3>Persona-as-artifact (<code>memory_persona</code>)</h3>
+    <p>QW-2 persona generator: produces a versioned persona artefact bound to an <code>entity_id</code>, threaded through the typed <code>memory_kind = "Persona"</code> row. Persona handoffs across NHI sessions become first-class rows rather than free-form summaries.</p>
+  </div>
+
+  <div class="entry">
+    <span class="tag new">NEW</span>
+    <h3>Context-offload primitive (<code>memory_offload</code>)</h3>
+    <p>QW-3: surfaces under-utilised context as a TTL-swept short-tier row for re-recall later. Reduces in-conversation context pressure for long sessions without losing the offloaded payload.</p>
+  </div>
+
+  <div class="entry">
+    <span class="tag new">NEW</span>
+    <h3>Form-4 fact provenance + Form-5 confidence calibration</h3>
+    <p>The Memory struct gains <code>citations</code> + <code>source_uri</code> + <code>source_span</code> (Form-4), and <code>confidence_source</code> + <code>confidence_signals</code> + <code>confidence_decayed_at</code> (Form-5). Auto-confidence calibration and confidence-decay opt-in via env (<code>AI_MEMORY_AUTO_CONFIDENCE=1</code>, <code>AI_MEMORY_CONFIDENCE_DECAY=1</code>).</p>
+  </div>
+</section>
+
+<section class="wrap-mid">
+  <div class="eyebrow-h2">Security defaults</div>
+  <h2>Secure-by-default at v0.7.0.</h2>
+
+  <div class="entry">
+    <span class="tag security">SECURITY</span>
+    <h3>Permissions enforce-mode by default</h3>
+    <p><code>permissions.mode = "enforce"</code> from v0.7.0 onward (was <code>advisory</code> at v0.6.x). Advisory / off requires explicit opt-out. K3/K9 governance gate now blocks writes that fail the L1-6 rule consultation.</p>
+  </div>
+
+  <div class="entry">
+    <span class="tag security">SECURITY</span>
+    <h3>Governance fail-CLOSED on rule-consultation errors <span class="anchor">#1054</span></h3>
+    <p>Pre-v0.7.0 a transient rule-provider timeout would silently fall through to permissive behaviour. v0.7.0 fails CLOSED &mdash; the write blocks until the rule consultation succeeds. Escape hatch: <code>AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1</code> (operator-advisory, only set if you accept the risk).</p>
+  </div>
+
+  <div class="entry">
+    <span class="tag security">SECURITY</span>
+    <h3>SSRF guard fail-CLOSED on DNS failure <span class="anchor">#1053</span></h3>
+    <p>Webhook + federation dispatches whose target URL fails DNS resolution now refuse the dispatch. Pre-v0.7.0 they would proceed and rely on TCP-connect failure as the defence; a sketchy resolver could trick the daemon into bypassing the loopback / private-range guard. Escape hatch: <code>AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL=1</code>.</p>
+  </div>
+
+  <div class="entry">
+    <span class="tag security">SECURITY</span>
+    <h3>Strict passphrase-file permissions on sqlcipher <span class="anchor">#1055</span></h3>
+    <p>The daemon rejects <code>--db-passphrase-file</code> with bits set in <code>mode &amp; 0o077</code> (group / world readable). Operators upgrading from v0.6.x must <code>chmod 0400 ./passphrase.txt</code> before first start. Escape hatch: <code>AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS=1</code>.</p>
+  </div>
+
+  <div class="entry">
+    <span class="tag security">SECURITY</span>
+    <h3>HMAC-signed webhook dispatch mandatory</h3>
+    <p>Post R3-S1.HMAC: unsigned webhook dispatch is DISABLED. Every outbound webhook carries an HMAC-SHA256 signature bound to the subscription secret. Subscribers without HMAC verification will reject the dispatch.</p>
+  </div>
+
+  <div class="entry">
+    <span class="tag security">SECURITY</span>
+    <h3>Federation peer signing + nonce enforcement <span class="anchor">#791, #922</span></h3>
+    <p><code>/sync/push</code> rejects missing / invalid <code>X-Memory-Sig</code> headers (#791) and enforces per-message nonce freshness via <code>X-Memory-Nonce</code> against a per-peer bounded LRU (#922). Signature bound to the nonce so a captured <code>(body, sig)</code> pair cannot be replayed under a fresh nonce without the private key.</p>
+  </div>
+</section>
+
+<section class="wrap-mid">
+  <div class="eyebrow-h2">Changed</div>
+  <h2>Things that look different.</h2>
+
+  <div class="entry">
+    <span class="tag changed">CHANGED</span>
+    <h3>Capabilities envelope schema_version 2 &rarr; 3</h3>
+    <p>The substrate&apos;s self-describing capabilities envelope now reports <code>schema_version: "3"</code>. v2 still served via <code>Accept-Capabilities: 2</code> HTTP header / <code>accept: 2</code> on the <code>memory_capabilities</code> MCP tool &mdash; pinned SDKs keep working. v3 is additive over v2 (no fields removed). v0.6.4 SDKs that ignore unknown top-level keys need no changes.</p>
+  </div>
+
+  <div class="entry">
+    <span class="tag changed">CHANGED</span>
+    <h3>K1/G1 namespace-inheritance cutline</h3>
+    <p>Parent namespace policies now enforce on child writes &mdash; enables N-level governance hierarchies. Pre-v0.7.0 G1 inheritance was silently broken in some configurations. Mitigation for callers who want the pre-v0.7.0 behaviour: set <code>inherit = false</code> on child policies.</p>
+  </div>
+
+  <div class="entry">
+    <span class="tag changed">CHANGED</span>
+    <h3>Sectioned config schema (#1146)</h3>
+    <p>v0.7.x adopts a sectioned <code>[llm]</code> / <code>[embeddings]</code> / <code>[reranker]</code> / <code>[storage]</code> shape with <code>schema_version = 2</code>. Legacy v0.6.x flat fields (<code>llm_model</code>, <code>ollama_url</code>, <code>embed_url</code>, <code>embedding_model</code>, <code>cross_encoder</code>, <code>default_namespace</code>, <code>archive_on_gc</code>, <code>archive_max_days</code>, <code>max_memory_mb</code>, <code>auto_tag_model</code>) continue to parse. Migrate with <code>ai-memory config migrate</code>. Legacy fields removed in v0.8.0.</p>
+  </div>
+
+  <div class="entry">
+    <span class="tag changed">CHANGED</span>
+    <h3>Per-namespace K8 quota dimension (#1156)</h3>
+    <p>Schema v50 extends <code>agent_quotas</code> PRIMARY KEY from <code>(agent_id)</code> to <code>(agent_id, namespace)</code>. Per-namespace K8 quota allotments hold even when a single agent operates across many namespaces. Pre-v50 rows backfill to the <code>_global</code> sentinel namespace.</p>
+  </div>
+
+  <div class="entry">
+    <span class="tag changed">CHANGED</span>
+    <h3>Vendor-neutrality lint-gated (#1174 PR10)</h3>
+    <p>Vendor identifiers (<code>"claude"</code>, <code>"openai"</code>, <code>"xai"</code>, ...) are legitimate ONLY in 7 substrate carve-outs (llm.rs, config.rs, mine.rs, validate.rs, cli/wrap.rs, llm_cli_wrap.rs, harness.rs). Every other production-code site MUST read from <code>crate::llm::BACKEND_*</code> constants. CI enforces. Self-test in <code>scripts/check-vendor-literals.sh</code>.</p>
+  </div>
+</section>
+
+<section class="wrap-mid">
+  <div class="eyebrow-h2">Breaking changes</div>
+  <h2>You need to know.</h2>
+
+  <div class="entry">
+    <span class="tag breaking">BREAKING</span>
+    <h3>HMAC-only webhook dispatch</h3>
+    <p>Subscribers that don&apos;t verify HMAC-SHA256 signatures will reject dispatches. Most existing subscribers will Just Work because they already verified; the rest need to add the verifier per <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/MIGRATION_v0.7.md">MIGRATION_v0.7.md</a>.</p>
+  </div>
+
+  <div class="entry">
+    <span class="tag breaking">BREAKING</span>
+    <h3>Permissions <code>enforce</code> is the new default</h3>
+    <p>v0.6.x operators with policies they hadn&apos;t fully exercised will see writes that were previously advisory-mode-permitted now blocked. Recommended pre-upgrade: run <code>ai-memory governance migrate-to-permissions</code> + dry-run-test the policy under the new default.</p>
+  </div>
+
+  <div class="entry">
+    <span class="tag breaking">BREAKING</span>
+    <h3>SQLCipher passphrase-file permissions strict</h3>
+    <p>If you use <code>--db-passphrase-file</code> with a non-0400 passphrase file, the daemon refuses to start. <code>chmod 0400 ./passphrase.txt</code> before first start.</p>
+  </div>
+</section>
+
+<section class="wrap-mid">
+  <div class="eyebrow-h2">Upgrade path</div>
+  <h2>How to get to v0.7.0 safely.</h2>
+  <ol>
+    <li><strong>Back up the DB.</strong> <code>cp ai-memory.db ai-memory.db.bak</code>.</li>
+    <li><strong>Stop the daemon, install the new binary.</strong> Migrations run automatically on first open of the new binary. The migration ladder is dry-run-tested against the operator&apos;s own DB by <code>scripts/dogfood-rebuild.sh</code>.</li>
+    <li><strong>Migrate the config.</strong> <code>ai-memory config migrate</code> rewrites <code>~/.config/ai-memory/config.toml</code> in the new sectioned shape. Idempotent &mdash; running against a v2 file is a no-op INFO log.</li>
+    <li><strong>If you use SQLCipher,</strong> <code>chmod 0400</code> on your passphrase file before starting.</li>
+    <li><strong>If you have subscribers,</strong> verify they handle HMAC-signed dispatches.</li>
+    <li><strong>Restart the daemon.</strong></li>
+    <li><strong>Validate post-upgrade:</strong> <code>ai-memory stats &amp;&amp; ai-memory verify --since 24h</code>.</li>
+  </ol>
+  <p>Full migration recipe with field-by-field schema-shape table: <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/MIGRATION_v0.7.md">MIGRATION_v0.7.md</a>.</p>
+</section>
+
+<section class="wrap-mid">
+  <div class="eyebrow-h2">Test evidence</div>
+  <h2>The verdict, in numbers.</h2>
+  <p>The 2026-05-22 release-gate-final campaign returned <strong>SHIP-RECOMMENDED on 7,321 PASS / 0 FAIL across 269 test binaries</strong> at tip <code>fd172f2cf</code>. 22 release-gate defects (#1120-#1141) filed, fixed, retested + re-checked, and CLOSED in-campaign &mdash; no deferrals to v0.8.0. Two QC passes (<code>a92308816df776eb7</code> + <code>a561ae68f0605cb1e</code>) verified the batch against the C1-C8 orchestrator-safeguard set.</p>
+  <p>Read the full campaign dossier: <a href="v0.7.0/test-campaign-2026-05-22-release-gate-final/">2026-05-22 release-gate-final campaign</a>. The audience-specific summaries:</p>
+  <div class="next">
+    <a href="v0.7.0/test-campaign-2026-05-22-release-gate-final/audience-non-technical.md"><strong>For non-technical readers</strong><span class="desc">600-800 words, plain English</span></a>
+    <a href="v0.7.0/test-campaign-2026-05-22-release-gate-final/audience-c-level.md"><strong>For decision-makers</strong><span class="desc">800-1,000 words, verdict + risk + cost</span></a>
+    <a href="v0.7.0/test-campaign-2026-05-22-release-gate-final/audience-sme-engineer.md"><strong>For SME engineers</strong><span class="desc">1,500-2,000 words, reproducibility + per-issue root-cause</span></a>
+  </div>
+</section>
+
+<section class="wrap-mid">
+  <div class="eyebrow-h2">Next</div>
+  <h2>Where to go from here.</h2>
+  <div class="next">
+    <a href="v0.7.0/release-notes.md"><strong>Full release notes</strong><span class="desc">Per-PR changelog, every issue cited</span></a>
+    <a href="v070-architecture.html"><strong>v0.7.0 architecture</strong><span class="desc">Post-#1174 substrate surface</span></a>
+    <a href="audience/developer.html"><strong>For developers</strong><span class="desc">Build, embed, extend</span></a>
+    <a href="audience/operator.html"><strong>For operators</strong><span class="desc">Install, configure, deploy, harden</span></a>
+    <a href="audience/decision-maker.html"><strong>For decision-makers</strong><span class="desc">Verdict, risk, cost, roadmap</span></a>
+    <a href="v0.7.0/heterogeneous-ai-nhi-assessment/"><strong>Heterogeneous AI NHI assessment</strong><span class="desc">Three-evaluator parallel evaluation</span></a>
+    <a href="essays/brass-tacks-1-what.html"><strong>Brass tacks essays</strong><span class="desc">60-second framing for AI NHI</span></a>
+    <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/MIGRATION_v0.7.md"><strong>MIGRATION_v0.7.md</strong><span class="desc">Field-by-field upgrade recipe</span></a>
+  </div>
+</section>
+
+<footer>
+  <p>ai-memory v0.7.0 attested-cortex &middot; CHANGELOG synthesis at <code>release/v0.7.0 @ 1cb95bbe7</code></p>
+  <p style="margin-top:.5rem">Copyright 2026 AlphaOne LLC &middot; Apache-2.0 licensed</p>
+</footer>
+
+</body>
+</html>
