@@ -219,6 +219,20 @@ pub struct OllamaClient {
 }
 
 impl OllamaClient {
+    /// v0.7.0 (issue #1244) — accessor for the resolved model name.
+    ///
+    /// Returns the model identifier the client was constructed with
+    /// (e.g. `gemma3:4b` on Ollama, `grok-4.3` on xAI, `claude-opus-4.7`
+    /// on Anthropic). Substrate sites that bind LLM provenance into
+    /// signed audit events (e.g. the atomisation_complete
+    /// `curator_model` payload field) read this verbatim — never a
+    /// hardcoded string — so the signed event reflects the model that
+    /// actually ran on a given deployment, not a v0.6.x-era default.
+    #[must_use]
+    pub fn model_name(&self) -> &str {
+        &self.model
+    }
+
     /// Creates a new `OllamaClient` with the default Ollama URL (<http://localhost:11434>).
     /// Checks that Ollama is reachable before returning.
     #[allow(dead_code)]

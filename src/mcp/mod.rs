@@ -2491,12 +2491,21 @@ pub fn run_mcp_server(
             let keypair_arc = active_keypair
                 .as_ref()
                 .map(|kp| std::sync::Arc::new(kp.clone()));
-            let atomiser = std::sync::Arc::new(crate::atomisation::Atomiser::new(
-                curator,
-                keypair_arc,
-                crate::atomisation::AtomiserConfig::default(),
-                tier_config.tier,
-            ));
+            // v0.7.0 (#1244) — thread the resolved LLM model name into
+            // the atomiser so the `atomisation_complete` signed-event
+            // payload's `curator_model` field reflects what actually
+            // ran on this deployment, not the pre-#1244 hardcoded
+            // `"gemma4"`.
+            let curator_model = llm_client.model_name().to_string();
+            let atomiser = std::sync::Arc::new(
+                crate::atomisation::Atomiser::new(
+                    curator,
+                    keypair_arc,
+                    crate::atomisation::AtomiserConfig::default(),
+                    tier_config.tier,
+                )
+                .with_curator_model(curator_model),
+            );
             eprintln!("ai-memory: atomisation engine ready (curator=LlmCurator)");
             Some(std::sync::Arc::new(atomise::AtomiseToolHandler::new(
                 atomiser,
