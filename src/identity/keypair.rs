@@ -313,17 +313,32 @@ pub fn load(agent_id: &str, dir: &Path) -> Result<AgentKeypair> {
     }
 
     let private = match fs::read(&priv_path) {
-        Ok(priv_bytes) => {
+        Ok(mut priv_bytes) => {
             if priv_bytes.len() != SECRET_KEY_LEN {
+                let actual_len = priv_bytes.len();
+                // #1258 — zeroize the (wrong-length) buffer before the
+                // bail; even a partial private key is a secret.
+                use zeroize::Zeroize;
+                priv_bytes.zeroize();
                 bail!(
                     "private key {} has {} bytes, expected {SECRET_KEY_LEN}",
                     priv_path.display(),
-                    priv_bytes.len()
+                    actual_len
                 );
             }
             let mut priv_arr = [0u8; SECRET_KEY_LEN];
             priv_arr.copy_from_slice(&priv_bytes);
             let signing = SigningKey::from_bytes(&priv_arr);
+            // #1258 — zeroize both copies of the raw private-key bytes
+            // before they fall out of scope. `SigningKey` owns its own
+            // internal `secret` field which `ed25519-dalek` zeroizes on
+            // Drop; the two intermediate buffers here are ours to
+            // wipe.
+            {
+                use zeroize::Zeroize;
+                priv_bytes.zeroize();
+                priv_arr.zeroize();
+            }
             // Cross-check: the private key must derive the same public
             // key we just loaded. Mismatch means file tampering or a
             // stale .pub — refuse loudly rather than sign with the

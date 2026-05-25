@@ -102,6 +102,7 @@ dependencies = [
  "uuid",
  "wiremock",
  "x25519-dalek",
+ "zeroize",
  "zstd",
 ]
 

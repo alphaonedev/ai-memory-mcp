@@ -132,6 +132,13 @@ ciborium = "0.2"
 # off so single-node deployments see zero behaviour change.
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 chacha20poly1305 = "0.10"
+# v0.7.0 #1258 — explicit zeroize on secret-bearing types (DB passphrase,
+# ed25519 private-key buffers, LLM `api_key`, hooks HMAC secret, AppConfig
+# `api_key`). `zeroize` 1.x is already in the transitive graph via
+# ed25519-dalek / chacha20poly1305; promoted to a direct dep so the
+# `ZeroizeOnDrop` derive + `zeroize()` accessor can be used at production
+# call sites. Pure Rust, no C deps.
+zeroize = { version = "1", features = ["derive"] }
 # v0.7.0 L1-5 — SKILL.md YAML frontmatter parsing for the Agent Skills
 # substrate. `serde_yaml` is the de-facto `serde`-native YAML backend;
 # version 0.9 compiles to pure Rust (no C libyaml), making it compatible
