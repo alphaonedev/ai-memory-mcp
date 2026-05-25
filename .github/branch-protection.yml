@@ -53,6 +53,8 @@ branches:
       - "Batman Mode acceptance gate / Rust integration (issue_800_batman_mode)"
       - "Batman Mode acceptance gate / Bash integration (test-batman-mode-suite.sh)"
       - "Batman Mode acceptance gate / Surface stability (load-bearing symbols)"
+      - "C8 caller-context allowlist check"
+      - "Vendor-monoculture + SECS_PER_* lint-gate (#1174 PR10)"
     require_up_to_date: true
     enforce_admins: true
     allow_force_push: false
@@ -67,6 +69,8 @@ branches:
       - "Batman Mode acceptance gate / Rust integration (issue_800_batman_mode)"
       - "Batman Mode acceptance gate / Bash integration (test-batman-mode-suite.sh)"
       - "Batman Mode acceptance gate / Surface stability (load-bearing symbols)"
+      - "C8 caller-context allowlist check"
+      - "Vendor-monoculture + SECS_PER_* lint-gate (#1174 PR10)"
     require_up_to_date: true
     enforce_admins: true
     allow_force_push: false
@@ -81,6 +85,8 @@ branches:
       - "Batman Mode acceptance gate / Rust integration (issue_800_batman_mode)"
       - "Batman Mode acceptance gate / Bash integration (test-batman-mode-suite.sh)"
       - "Batman Mode acceptance gate / Surface stability (load-bearing symbols)"
+      - "C8 caller-context allowlist check"
+      - "Vendor-monoculture + SECS_PER_* lint-gate (#1174 PR10)"
     require_up_to_date: true
     enforce_admins: false
     allow_force_push: false
