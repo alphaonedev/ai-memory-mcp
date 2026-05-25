@@ -3617,13 +3617,28 @@ impl std::fmt::Debug for HooksSubscriptionConfig {
     }
 }
 
-impl Drop for HooksSubscriptionConfig {
-    /// #1258 — zeroize `hmac_secret` on scope exit.
-    fn drop(&mut self) {
+impl HooksSubscriptionConfig {
+    /// #1258 — zeroize the `hmac_secret` buffer in place. Idempotent.
+    /// The `Drop` impl below delegates here so the helper is the
+    /// single source of truth for the zero-on-secret-loss contract.
+    /// Tests probe the buffer via this entry point so they observe
+    /// the post-zeroize state of a still-live allocation (probing
+    /// after the owning value is dropped is UB — the allocator's
+    /// free-list bookkeeping stamps the first 8-16 bytes of the
+    /// just-freed slot and that's not a `zeroize` defect; see #1321).
+    pub fn zeroize_secrets(&mut self) {
         if let Some(secret) = self.hmac_secret.as_mut() {
             use zeroize::Zeroize;
             secret.zeroize();
         }
+    }
+}
+
+impl Drop for HooksSubscriptionConfig {
+    /// #1258 — zeroize `hmac_secret` on scope exit. Delegates to
+    /// [`HooksSubscriptionConfig::zeroize_secrets`].
+    fn drop(&mut self) {
+        self.zeroize_secrets();
     }
 }
 
