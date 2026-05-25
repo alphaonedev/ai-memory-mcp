@@ -81,11 +81,11 @@ When running at the `semantic` tier or higher, ai-memory loads a HuggingFace emb
 - `ResolvedTtl` struct -- resolved TTL values after merging config defaults with per-tier overrides
 - Constants: `MAX_CONTENT_SIZE` (65536), `PROMOTION_THRESHOLD` (5), `SHORT_TTL_EXTEND_SECS` (3600), `MID_TTL_EXTEND_SECS` (86400)
 
-### `src/mcp.rs`
+### `src/mcp/`
 
 The MCP (Model Context Protocol) server implementation. MCP is an open standard -- this server works with any MCP-compatible AI client. Runs over stdio, processing one JSON-RPC message per line. **At v0.7.0 the registry exposes 73 advertised entries at `--profile full`** (72 callable "memory tools" + the always-on `memory_capabilities` bootstrap; both numbers are intentional, see issue [#862](https://github.com/alphaonedev/ai-memory-mcp/issues/862)). Default `--profile core` ships 7 tools (the original 5 + `memory_load_family` + `memory_smart_load`) plus the always-on bootstrap.
 
-The module is now split: `src/mcp/registry.rs` owns the new `registered_tools()` iterator + `tool_definitions()` view; `src/mcp/tools/*.rs` host per-tool handlers AND each tool's `<ToolName>Request` schemars struct + `McpTool` impl; `src/mcp/mod.rs` wires the JSON-RPC dispatch loop.
+The pre-#1066 monolithic `src/mcp.rs` is GONE — the module is split: `src/mcp/registry.rs` owns the canonical `registered_tools()` iterator + `tool_definitions()` view + the `tool_names` const module (73 canonical tool-name consts extracted per #1187 / Wave-1 PR1); `src/mcp/tools/*.rs` host per-tool handlers AND each tool's `<ToolName>Request` schemars struct + `McpTool` impl; `src/mcp/mod.rs` wires the JSON-RPC dispatch loop.
 
 Post-v0.7.0 #987 (D1.6) the source-of-truth lives in `registered_tools()` — a single `Vec<RegisteredTool>` with one entry per `McpTool` impl. `tool_definitions()` is now a thin four-line view that iterates the vec and projects each row to the wire shape (`name`/`description`/`docs`/`inputSchema`). The hand-coded `json!({...})` macro that previously held every tool's schema verbatim is GONE.
 
@@ -160,9 +160,9 @@ Structured error types for the HTTP API:
 - Implements `From<anyhow::Error>` and `From<rusqlite::Error>`
 - **Error sanitization**: `DatabaseError` responses return a generic `"Internal server error"` message to clients, never leaking internal database error details. Detailed errors are logged server-side.
 
-### `src/handlers.rs`
+### `src/handlers/`
 
-All HTTP handlers for the 24-endpoint REST API. State is `Arc<Mutex<(Connection, PathBuf)>>`. Each handler acquires the lock, validates input, performs DB operations, returns JSON.
+All HTTP handlers for the **87 production `.route(...)` registrations / 73 unique URL paths** at v0.7.0 (canonical count from CLAUDE.md §Architecture; counted via `codegraph_search kind=route limit=100`). The pre-Wave-1 monolithic `src/handlers.rs` (~17.8k LOC) is GONE — split into `src/handlers/{mod,http,transport,federation_receive,hook_subscribers}.rs`. State is the `Db = Arc<Mutex<(Connection, PathBuf, ResolvedTtl, bool)>>` extractor defined in `src/handlers/transport.rs`. Each handler acquires the lock, validates input via `crate::validate::RequestValidator` (#966 Wave-2 Tier-C1), performs DB operations through the SAL `MemoryStore` trait (`src/store/`), and returns JSON.
 
 Key handlers:
 - `create_memory` / `bulk_create` -- memory creation with deduplication (bulk limited to 1,000 items)
@@ -176,9 +176,9 @@ Key handlers:
 
 > **Note:** HTTP handlers are tested via integration tests (`tests/integration.rs`), not unit tests.
 
-### `src/db.rs`
+### `src/storage/` (alias `db` via `pub use storage as db` in `src/lib.rs:52`)
 
-The database layer. Key functions:
+The sqlite storage layer. The pre-#961 monolithic `src/db.rs` is GONE — split into the per-domain modules under `src/storage/` (CRUD, FTS5, recall scoring, GC, schema migrations at `src/storage/migrations.rs`, `reflect` at `src/storage/reflect.rs`). The legacy free-function names are preserved as the `db::*` alias for call-site backward compat. Post-#961 SAL boundary cleanup: new DB operations land on the `MemoryStore` trait in `src/store/mod.rs` FIRST; `storage/*` hosts primitives the sqlite adapter delegates to. Key functions:
 
 | Function | Description |
 |----------|-------------|
@@ -232,7 +232,7 @@ Embedding pipeline for `semantic+` tiers. Loads HuggingFace sentence-transformer
 
 ### `src/llm.rs`
 
-LLM integration via Ollama for query expansion, auto-tagging, and contradiction detection. Implements `OllamaClient` (HTTP via `reqwest`) and supplies the production implementation of the `AutonomyLlm` trait (see `src/autonomy.rs`). Prompts are kept short and structured to minimize token cost; failures are non-fatal — the curator and autonomy passes log and continue.
+Provider-agnostic LLM client (#1067) for query expansion, auto-tagging, and contradiction detection. Two wire shapes — Ollama-native (`/api/chat` + `/api/embed`, no auth) and OpenAI-compatible (`/v1/chat/completions` + `/v1/embeddings`, Bearer auth). Backend selected by `AI_MEMORY_LLM_BACKEND` env var with 15 vendor aliases (xai, openai, anthropic, gemini, deepseek, kimi, qwen, mistral, groq, together, cerebras, openrouter, fireworks, lmstudio, plus the generic `openai-compatible` escape hatch). The struct name `OllamaClient` is preserved post-#1066 for call-site backward compat (rename to `LlmClient` is non-breaking and tracked separately). Vendor identifiers in this module are legitimate per the substrate-canonical-discipline carve-out enforced by `scripts/check-vendor-literals.sh` (#1200). Supplies the production implementation of the `AutonomyLlm` trait (see `src/autonomy.rs`). Prompts are kept short and structured to minimize token cost; failures are non-fatal — the curator and autonomy passes log and continue.
 
 ### `src/mine.rs`
 
