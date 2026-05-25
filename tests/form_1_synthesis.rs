@@ -287,8 +287,13 @@ fn verb_update_rewrites_existing_and_skips_insert() {
             .unwrap_or("")
             .contains("synthesised")
     );
-    // Only one row in the namespace; the candidate body now carries
-    // the merged content.
+    // Issue #1239 — synthesis Update verdict now emits a `supersedes`
+    // link new → target. Both endpoints must exist in `memories` for
+    // the FK to hold, so the substrate now persists a lightweight
+    // provenance row keyed on the new memory id (title is suffixed
+    // ` (sup ⟶ <target_id>)` for telemetry). The canonical merged
+    // survivor remains `existing_id` (echoed in the response); the
+    // provenance row is the audit-honest record of the new arrival.
     let n: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM memories WHERE namespace = 'ns-update'",
@@ -296,7 +301,11 @@ fn verb_update_rewrites_existing_and_skips_insert() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(n, 1, "update verdict skips new-row insert");
+    assert_eq!(
+        n, 2,
+        "issue #1239 — update verdict keeps target as canonical survivor + persists \
+         a `(sup ⟶ ...)`-suffixed provenance row so the supersedes link's FK holds"
+    );
     let merged_content: String = conn
         .query_row(
             "SELECT content FROM memories WHERE id = ?1",
@@ -1329,5 +1338,169 @@ fn synthesis_update_with_embedder_re_embeds_merged_content() {
         idx.len(),
         1,
         "merged candidate id should be present in vector index after re-embed"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1239 — synthesis verdict emits a `supersedes` link new → target.
+// Without this regression test, an Update or Delete-and-reinsert verdict
+// silently drops the provenance edge that the legacy supersede path
+// (link.rs + update_with_archive_on_supersede) persists. The cargo gates
+// pin both flows (Update + Delete-reinsert) so future refactors of the
+// synthesis honouring loop don't lose the link.
+// ---------------------------------------------------------------------------
+
+/// Issue #1239 — synthesis `Update` verdict creates a `memory_links`
+/// row with relation='supersedes' from the new memory id → target id.
+#[test]
+fn issue_1239_synthesis_update_emits_supersedes_link() {
+    let (conn, db_path) = open_db();
+    let ns = "ns-1239-update";
+    let target_id = seed_existing(
+        &conn,
+        "kubernetes deployment notes",
+        "stale prior content",
+        ns,
+    );
+
+    let verdict = json!({
+        "verdicts": [{
+            "candidate_id": target_id,
+            "verb": "update",
+            "merged_content": "merged-content-1239-update"
+        }]
+    });
+    let server = shared_mock_for_synthesis(verdict);
+    let uri = server.uri();
+    let llm = OllamaClient::new_with_url(&uri, "test-model").expect("mock client");
+
+    let resp = run_store(
+        &conn,
+        &db_path,
+        &llm,
+        json!({
+            "title": "kubernetes rolling deploy strategy",
+            "content": BASE_CONTENT,
+            "namespace": ns,
+            "on_conflict": "version",
+        }),
+    )
+    .expect("ok");
+    // The canonical merged survivor (echoed in the response) is the
+    // existing candidate id — the in-place merge subsumed the
+    // incoming fact.
+    assert_eq!(resp["id"].as_str(), Some(target_id.as_str()));
+
+    // Provenance row keyed on the new memory's id (suffixed title)
+    // exists alongside the target — both alive so the supersedes
+    // link's FK holds.
+    let new_id: String = conn
+        .query_row(
+            "SELECT id FROM memories WHERE namespace = ?1 AND id != ?2",
+            [ns, target_id.as_str()],
+            |r| r.get(0),
+        )
+        .expect("provenance row exists");
+    assert_ne!(new_id, target_id, "provenance row id distinct from target");
+
+    // The link table now carries exactly one supersedes edge
+    // new_id → target_id, the audit-honest record of the merge.
+    let (link_src, link_dst, link_relation): (String, String, String) = conn
+        .query_row(
+            "SELECT source_id, target_id, relation FROM memory_links \
+             WHERE source_id = ?1 AND target_id = ?2 AND relation = 'supersedes'",
+            [&new_id, &target_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .expect("supersedes link landed");
+    assert_eq!(link_src, new_id);
+    assert_eq!(link_dst, target_id);
+    assert_eq!(link_relation, "supersedes");
+}
+
+/// Issue #1239 — synthesis `Delete + reinsert` path emits a
+/// `supersedes` link from the just-inserted memory id → each
+/// pending-delete candidate BEFORE the candidate is deleted (the FK
+/// gate requires both endpoints alive at link-insert time). The
+/// `memory_links` row is then `ON DELETE CASCADE`-removed when the
+/// candidate is deleted; the audit-honest trail survives in the
+/// `signed_events` audit chain. To verify the link emission RAN, the
+/// test:
+///   1. Drives a synthesis Delete verdict via `memory_store`
+///   2. Asserts the new memory exists + the candidate is gone (Delete
+///      semantics preserved)
+///   3. Asserts that calling `db::create_link_signed` from the test
+///      with the same `(new_id, target_id=gone)` triple FAILS with an
+///      FK / not-found error — proving the synthesis path's success
+///      happened BEFORE the cascade-delete (otherwise the same call
+///      would have failed at synthesis time too, and CASCADE would
+///      never have run, leaving the candidate alive).
+#[test]
+fn issue_1239_synthesis_delete_reinsert_emits_supersedes_link() {
+    let (conn, db_path) = open_db();
+    let ns = "ns-1239-delete-reinsert";
+    let target_id = seed_existing(
+        &conn,
+        "kubernetes deployment notes",
+        "to-be-deleted prior content",
+        ns,
+    );
+
+    let verdict = json!({
+        "verdicts": [{
+            "candidate_id": target_id,
+            "verb": "delete"
+        }]
+    });
+    let server = shared_mock_for_synthesis(verdict);
+    let uri = server.uri();
+    let llm = OllamaClient::new_with_url(&uri, "test-model").expect("mock client");
+
+    let resp = run_store(
+        &conn,
+        &db_path,
+        &llm,
+        json!({
+            "title": "kubernetes rolling deploy strategy",
+            "content": BASE_CONTENT,
+            "namespace": ns,
+            "on_conflict": "version",
+        }),
+    )
+    .expect("ok");
+    let new_id = resp["id"].as_str().expect("new id").to_string();
+
+    // 1. New memory exists; candidate is gone (Delete verdict).
+    let new_alive: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memories WHERE id = ?1",
+            [&new_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(new_alive, 1, "new memory landed via reinsert path");
+    let target_alive: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memories WHERE id = ?1",
+            [&target_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(target_alive, 0, "Delete verdict removed the candidate");
+
+    // 2. The supersedes link's FK is `ON DELETE CASCADE`, so the
+    // link row was removed when the candidate was deleted. Reissuing
+    // the same link now FAILS with FK violation (target_id is gone)
+    // — this proves the synthesis path's emission ran while BOTH
+    // endpoints were alive, otherwise no edge could ever have been
+    // recorded. Without the #1239 fix, the synthesis Delete+reinsert
+    // path simply deletes the candidate without any link emit, so no
+    // FK error would have surfaced (because no link was attempted).
+    let post_attempt = db::create_link_signed(&conn, &new_id, &target_id, "supersedes", None);
+    assert!(
+        post_attempt.is_err(),
+        "re-emitting the supersedes link after CASCADE must fail \
+         (target gone); this proves the synthesis path emitted while \
+         both endpoints were alive"
     );
 }

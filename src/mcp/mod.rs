@@ -656,6 +656,12 @@ pub mod tools {
             autonomous_hooks,
             mcp_client,
             federation_forward_url,
+            // Issue #1239 — integration-test entry point: no keypair.
+            // Synthesis Update / Delete supersedes-edge emission falls
+            // back to `attest_level='unsigned'` per
+            // `create_link_signed`'s documented contract when keypair
+            // is None.
+            None,
         )
     }
 }
@@ -975,6 +981,11 @@ fn dispatch_memory_store(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
         ctx.autonomous_hooks,
         ctx.mcp_client,
         ctx.federation_forward_url,
+        // Issue #1239 — thread the active daemon keypair so the
+        // synthesis Update / Delete supersedes-edge emission lands as
+        // `self_signed` (matching the legacy supersede path through
+        // `update_with_archive_on_supersede`).
+        ctx.active_keypair,
     )
 }
 

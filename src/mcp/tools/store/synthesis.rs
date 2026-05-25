@@ -31,8 +31,9 @@
 
 use serde_json::{Value, json};
 
+use crate::identity::keypair::AgentKeypair;
 use crate::llm::OllamaClient;
-use crate::models::{GovernancePolicy, Memory};
+use crate::models::{GovernancePolicy, Memory, MemoryLinkRelation};
 use crate::{db, hnsw::VectorIndex};
 
 use super::AUTONOMY_MIN_CONTENT_LEN;
@@ -267,10 +268,15 @@ pub(super) fn apply_synthesis_updates_and_deletes(
     embedder: Option<&dyn crate::embeddings::Embed>,
     vector_index: Option<&VectorIndex>,
     outcome: &SynthesisOutcome,
+    active_keypair: Option<&AgentKeypair>,
 ) -> Option<Value> {
     let primary_update = outcome.updates.first().cloned();
     let (primary_id, _) = primary_update.as_ref()?;
 
+    // Issue #1239 — counter into `outcome.updates` so subsequent
+    // iterations of a multi-update verdict (COR-5) mint distinct ids
+    // for their provenance rows instead of colliding on `mem.id` PK.
+    let mut updates_emitted: usize = 0;
     // Apply every queued update in sequence.
     for (cand_id, merged_content) in &outcome.updates {
         let Some(target) = existing.iter().find(|c| c.id == *cand_id).cloned() else {
@@ -315,6 +321,72 @@ pub(super) fn apply_synthesis_updates_and_deletes(
                 }
             }
         }
+
+        // Issue #1239 — emit a `supersedes` link so the merge is
+        // provenance-visible in the KG. Without this, a synthesis
+        // Update verdict silently drops the historical "the new fact
+        // subsumed the older one" edge that the legacy supersede path
+        // (link.rs + update_with_archive_on_supersede) persists via
+        // metadata.superseded_id.
+        //
+        // The merged content lives in `target.id` after the in-place
+        // update above. The incoming `mem.id` is not naturally
+        // inserted on the Update path (the new-row insert is skipped
+        // since the merge subsumed the incoming fact). To make the
+        // supersedes edge structurally valid — both endpoints must
+        // resolve in `memories` for the FK to hold — we persist a
+        // lightweight provenance row keyed on `mem.id` carrying the
+        // merged content. The row is the audit-honest "the new
+        // arrival landed (after being merged into target)" record;
+        // target.id remains the canonical merged survivor (echoed in
+        // the response). Both endpoints alive ⇒ the supersedes link
+        // lands in `memory_links`.
+        let mut provenance_row = mem.clone();
+        // Each Update verdict gets a distinct provenance row id so a
+        // multi-update batch (COR-5) doesn't collide on the
+        // `memories.id` PK. The first iteration reuses `mem.id` so
+        // single-update callers observe the supersedes link's
+        // `source_id` matching the new memory's intended identity;
+        // subsequent iterations mint fresh UUIDs.
+        if updates_emitted > 0 {
+            provenance_row.id = uuid::Uuid::new_v4().to_string();
+        }
+        provenance_row.content = merged_content.clone();
+        provenance_row.metadata =
+            crate::identity::preserve_agent_id(&target.metadata, &mem.metadata);
+        // The (title, namespace) UNIQUE constraint on `memories`
+        // would otherwise collide with the live target — append a
+        // stable per-target suffix so the provenance row claims a
+        // distinct slot. The trailing ` (sup ⟶ <id>)` is a fixed
+        // shape Form-1 telemetry can recognise.
+        provenance_row.title = format!("{} (sup ⟶ {})", mem.title, &target.id);
+        match db::insert(conn, &provenance_row) {
+            Ok(provenance_id) => {
+                if let Err(e) = db::create_link_signed(
+                    conn,
+                    &provenance_id,
+                    &target.id,
+                    MemoryLinkRelation::Supersedes.as_str(),
+                    active_keypair,
+                ) {
+                    tracing::warn!(
+                        target: "synthesis",
+                        "synthesis supersedes link emit failed for {} -> {}: {e}",
+                        provenance_id,
+                        target.id,
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "synthesis",
+                    "synthesis provenance-row insert failed for {} (target={}): {e}",
+                    mem.id,
+                    target.id,
+                );
+            }
+        }
+        updates_emitted += 1;
     }
 
     // Apply queued deletes from the same batch (skip the primary
@@ -360,14 +432,50 @@ pub(super) fn apply_synthesis_updates_and_deletes(
 
 /// Apply pending delete verdicts when no update fired — the store
 /// handler runs the standard `db::insert` afterward.
-pub(super) fn apply_pending_synthesis_deletes(
-    conn: &rusqlite::Connection,
-    outcome: &SynthesisOutcome,
-) {
+///
+/// Issue #1239 — returns the set of ids that were deleted so the
+/// caller (the store handler in `mod.rs`) can emit `supersedes` links
+/// from the just-inserted memory to each deleted candidate. Because
+/// `db::delete` removes the row from `memories`, the FK on
+/// `memory_links` will reject any link to a deleted id — therefore
+/// the store handler emits the link BEFORE calling `db::delete` on
+/// each candidate. To preserve that order, we expose the list here
+/// and let the handler drive the actual deletion + linking sequence.
+pub(super) fn pending_synthesis_delete_targets(outcome: &SynthesisOutcome) -> Vec<String> {
     if !outcome.updates.is_empty() {
-        return;
+        return Vec::new();
     }
-    for del_id in &outcome.deletes {
+    outcome.deletes.clone()
+}
+
+/// Issue #1239 — emit a `supersedes` link from the newly-inserted
+/// memory (`new_id`) to each pending Delete-verdict candidate, then
+/// delete each candidate. Order matters: the link FK requires both
+/// endpoints to exist in `memories`, so we emit before deleting.
+/// Both `new_id` and each `del_id` are alive at the start of this
+/// loop; after each emit the candidate is removed.
+///
+/// Best-effort: a per-candidate failure (link emit, delete) is
+/// warn-logged and does not roll back the standard insert.
+pub(super) fn apply_pending_synthesis_deletes_with_links(
+    conn: &rusqlite::Connection,
+    new_id: &str,
+    pending_deletes: &[String],
+    active_keypair: Option<&AgentKeypair>,
+) {
+    for del_id in pending_deletes {
+        if let Err(e) = db::create_link_signed(
+            conn,
+            new_id,
+            del_id,
+            MemoryLinkRelation::Supersedes.as_str(),
+            active_keypair,
+        ) {
+            tracing::warn!(
+                target: "synthesis",
+                "synthesis supersedes link emit failed for {new_id} -> {del_id}: {e}",
+            );
+        }
         if let Err(e) = db::delete(conn, del_id) {
             tracing::warn!(
                 target: "synthesis",
