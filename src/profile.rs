@@ -167,12 +167,23 @@ impl Family {
             | tn::MEMORY_NAMESPACE_CLEAR_STANDARD
             | tn::MEMORY_SUBSCRIBE
             | tn::MEMORY_UNSUBSCRIBE => Some(Self::Governance),
-            // power (10 — v0.7 K7 added the subscription-reliability pair:
-            // `memory_subscription_replay` + `memory_subscription_dlq_list`;
-            // v0.7 K8 added `memory_quota_status` for the per-agent quota
-            // substrate; v0.7.0 Task 4/8 added `memory_reflect` — the
-            // substrate-native recursive-learning primitive. All
-            // operator/governance, not data-plane.)
+            // power (23 — the actual count; v0.7 K7 added the
+            // subscription-reliability pair (`memory_subscription_replay`
+            // + `memory_subscription_dlq_list`); v0.7 K8 added
+            // `memory_quota_status`; v0.7.0 Task 4/8 added
+            // `memory_reflect`; v0.7.0 L2-2/L2-3 added
+            // `memory_reflection_origin` + `memory_dependents_of_invalidated`;
+            // v0.7.0 QW-1 added `memory_export_reflection`; v0.7.0 QW-2
+            // added `memory_persona` + `memory_persona_generate`; v0.7.0
+            // QW-3 follow-up added `memory_offload` + `memory_deref`;
+            // v0.7.0 WT-1-C added `memory_atomise`; v0.7.0 Form 3 added
+            // `memory_ingest_multistep`; v0.7.0 Form 5 added
+            // `memory_calibrate_confidence`; v0.7.0 #691 added
+            // `memory_check_agent_action` + `memory_rule_list`; v0.7.0
+            // #224/#311 added `memory_share`. All operator/governance,
+            // not data-plane. Pinned by `Family::expected_tool_count`
+            // (sibling impl) and the family-counts-sum-to-73 test.
+            // #1274 — corrected from stale `(10 — …)` comment.
             tn::MEMORY_CONSOLIDATE
             | tn::MEMORY_DETECT_CONTRADICTION
             | tn::MEMORY_CHECK_DUPLICATE
