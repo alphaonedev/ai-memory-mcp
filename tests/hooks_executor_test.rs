@@ -487,20 +487,21 @@ printf '%s\n' '{{"action":"allow"}}'
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
+    #[cfg(target_os = "macos")]
     if !sidecar.exists() {
-        #[cfg(target_os = "macos")]
-        {
-            eprintln!(
-                "SOFT-SKIP (issue #1193 follow-up): sidecar absent after \
-                 fire_on_index_eviction returned Allow — likely a transient \
-                 fork+exec failure masked by FailMode::Open. Linux/Windows \
-                 arms still pin the contract."
-            );
-            return;
-        }
-        #[cfg(not(target_os = "macos"))]
-        panic!("sidecar absent after fire — executor payload-delivery contract regression");
+        eprintln!(
+            "SOFT-SKIP (issue #1193 follow-up): sidecar absent after \
+             fire_on_index_eviction returned Allow — likely a transient \
+             fork+exec failure masked by FailMode::Open. Linux/Windows \
+             arms still pin the contract."
+        );
+        return;
     }
+    #[cfg(not(target_os = "macos"))]
+    assert!(
+        sidecar.exists(),
+        "sidecar absent after fire — executor payload-delivery contract regression"
+    );
     let captured = std::fs::read_to_string(&sidecar).expect("sidecar exists after fire");
     let envelope: serde_json::Value =
         serde_json::from_str(&captured).expect("captured envelope parses as JSON");
