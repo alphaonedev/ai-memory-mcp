@@ -27,11 +27,7 @@
 
 use ai_memory::{identity, validate};
 
-const RESERVED_SENTINELS: &[&str] = &[
-    "daemon",
-    "system",
-    "federation-catchup",
-];
+const RESERVED_SENTINELS: &[&str] = &["daemon", "system", "federation-catchup"];
 
 /// Probe 1 — `identity::resolve_agent_id` MUST accept reserved
 /// sentinels via the env-var path (internal-bootstrap surface).
@@ -57,9 +53,8 @@ fn issue_1234_resolve_agent_id_env_accepts_daemon_sentinel() {
 #[test]
 fn issue_1234_validate_agent_id_shape_accepts_reserved_sentinels() {
     for sentinel in RESERVED_SENTINELS {
-        validate::validate_agent_id_shape(sentinel).unwrap_or_else(|e| {
-            panic!("validate_agent_id_shape({sentinel:?}) must accept: {e}")
-        });
+        validate::validate_agent_id_shape(sentinel)
+            .unwrap_or_else(|e| panic!("validate_agent_id_shape({sentinel:?}) must accept: {e}"));
     }
 }
 
@@ -90,11 +85,11 @@ fn issue_1234_env_var_path_still_rejects_invalid_shape() {
     // The shape rules in validate.rs forbid them at the validator
     // level too, but the env-var path is short-circuited by libc.
     let bad_shapes: &[&str] = &[
-        " ",              // whitespace
-        "with space",     // internal whitespace
-        "with\nnewline",  // control char
-        "with`backtick",  // shell metachar
-        "with$dollar",    // shell metachar
+        " ",             // whitespace
+        "with space",    // internal whitespace
+        "with\nnewline", // control char
+        "with`backtick", // shell metachar
+        "with$dollar",   // shell metachar
     ];
     for bad in bad_shapes {
         unsafe { std::env::set_var("AI_MEMORY_AGENT_ID", bad) };
