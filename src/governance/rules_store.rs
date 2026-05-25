@@ -700,6 +700,13 @@ mod tests {
 
     #[test]
     fn list_enabled_by_kind_filters_correctly() {
+        // #1263 — on dev hosts where the operator already has an
+        // `operator.key.pub` configured, the substrate's enrichment
+        // hook reads + applies signed-rule semantics that this test
+        // doesn't seed; the result is a spurious failure isolated to
+        // dev hosts. Pin the no-pubkey posture via the RAII guard
+        // pattern documented in `governance/agent_action.rs::no_operator_pubkey`.
+        let _no_pubkey = force_no_operator_pubkey_for_test();
         let conn = fresh_conn();
         insert(&conn, &make_rule("R1", "bash", true)).unwrap();
         insert(&conn, &make_rule("R2", "bash", false)).unwrap();
