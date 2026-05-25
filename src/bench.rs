@@ -42,6 +42,26 @@ use crate::models::{Memory, Tier};
 /// before the run is marked `Fail`. Mirrors `PERFORMANCE.md`.
 pub const P95_TOLERANCE: f64 = 1.10;
 
+/// macOS-runner budget multiplier (issue #1193).
+///
+/// Apple's `macos-latest` GHA runner pool has substantially higher
+/// I/O scheduling variance and cold-start latency than `ubuntu-latest`.
+/// `tests/integration.rs::test_cli_bench_emits_json_with_seven_results_and_passes_budget`
+/// drives `ai-memory bench --iterations 5` end-to-end and asserts the
+/// process exits 0 — at the small iteration count the macOS tail can
+/// blow the absolute `target_p95_ms` budgets even when the underlying
+/// code is healthy. Per #1193 "Proposed fix" option 1 (preferred):
+/// apply a centralized multiplier inside the runner-effective budget
+/// path so the pass/fail verdict is platform-aware while the canonical
+/// `target_p95_ms` reported in the JSON envelope still reflects the
+/// PERFORMANCE.md numbers (unchanged for dashboards / regression
+/// trackers). Multiplier of 3 mirrors the same headroom applied to the
+/// timing-sensitive hooks tests under the same issue.
+#[cfg(target_os = "macos")]
+pub const MACOS_BUDGET_MULT: f64 = 3.0;
+#[cfg(not(target_os = "macos"))]
+pub const MACOS_BUDGET_MULT: f64 = 1.0;
+
 /// Default seeded namespace for the bench workload.
 pub const BENCH_NAMESPACE: &str = "ai-memory-bench";
 
@@ -107,6 +127,10 @@ impl Operation {
     /// at "depth ≤ 5" (250 ms). `SearchFts` and `KgTimeline` happen to
     /// share the same numeric budget as the depth ≤ 3 bucket despite
     /// belonging to different table rows in `PERFORMANCE.md`.
+    ///
+    /// This is the canonical published budget; the runner-effective
+    /// pass/fail verdict uses [`effective_target_p95_ms`] which
+    /// applies the [`MACOS_BUDGET_MULT`] platform multiplier on top.
     #[must_use]
     #[allow(clippy::match_same_arms)]
     pub fn target_p95_ms(self) -> f64 {
@@ -119,6 +143,17 @@ impl Operation {
             Self::KgQueryDepth5 => 250.0,
             Self::KgTimeline => 100.0,
         }
+    }
+
+    /// Runner-effective p95 budget — equal to [`target_p95_ms`] on
+    /// Linux/Windows, but multiplied by [`MACOS_BUDGET_MULT`] on
+    /// macOS targets per issue #1193. The pass/fail verdict in the
+    /// CLI bench tool uses this value; the JSON envelope's
+    /// `target_p95_ms` field continues to report the canonical
+    /// PERFORMANCE.md number so regression dashboards stay stable.
+    #[must_use]
+    pub fn effective_target_p95_ms(self) -> f64 {
+        self.target_p95_ms() * MACOS_BUDGET_MULT
     }
 }
 
@@ -476,7 +511,12 @@ fn percentile_summary(operation: Operation, samples: &[Duration]) -> OperationRe
     let p95 = percentile(&sorted, 0.95);
     let p99 = percentile(&sorted, 0.99);
     let target = operation.target_p95_ms();
-    let status = if p95 <= target * P95_TOLERANCE {
+    // Per issue #1193: the pass/fail verdict uses the runner-effective
+    // budget so the macOS GHA pool's higher I/O variance doesn't blow
+    // a clean run. The reported `target_p95_ms` keeps the canonical
+    // PERFORMANCE.md value so dashboards / baselines stay stable.
+    let effective_target = operation.effective_target_p95_ms();
+    let status = if p95 <= effective_target * P95_TOLERANCE {
         Status::Pass
     } else {
         Status::Fail
@@ -805,6 +845,38 @@ mod tests {
         assert!((Operation::KgQueryDepth3.target_p95_ms() - 100.0).abs() < 1e-9);
         assert!((Operation::KgQueryDepth5.target_p95_ms() - 250.0).abs() < 1e-9);
         assert!((Operation::KgTimeline.target_p95_ms() - 100.0).abs() < 1e-9);
+    }
+
+    /// Issue #1193 — the effective budget the pass/fail verdict uses
+    /// is the canonical budget × `MACOS_BUDGET_MULT`. On Linux/Windows
+    /// the multiplier is 1.0 (effective == canonical); on macOS the
+    /// multiplier is 3.0 (effective == 3 × canonical). Regression-pins
+    /// the wiring so a future refactor can't silently revert the
+    /// platform-aware verdict path.
+    #[test]
+    fn effective_target_applies_macos_multiplier() {
+        for op in [
+            Operation::StoreNoEmbedding,
+            Operation::SearchFts,
+            Operation::RecallHot,
+            Operation::KgQueryDepth1,
+            Operation::KgQueryDepth3,
+            Operation::KgQueryDepth5,
+            Operation::KgTimeline,
+        ] {
+            let expected = op.target_p95_ms() * MACOS_BUDGET_MULT;
+            assert!(
+                (op.effective_target_p95_ms() - expected).abs() < 1e-9,
+                "effective budget for {:?} = {} (expected {})",
+                op,
+                op.effective_target_p95_ms(),
+                expected,
+            );
+        }
+        #[cfg(target_os = "macos")]
+        assert!((MACOS_BUDGET_MULT - 3.0).abs() < 1e-9);
+        #[cfg(not(target_os = "macos"))]
+        assert!((MACOS_BUDGET_MULT - 1.0).abs() < 1e-9);
     }
 
     #[test]

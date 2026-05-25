@@ -58,6 +58,24 @@ jobs:
             echo "::notice::cannot resolve base commit ($base) — running full pipeline"
             exit 0
           fi
+          # Per issue #1193 PR #1203 — `fetch-depth: 2` is too shallow
+          # when the PR base SHA is more than 1 commit behind the
+          # PR-merge ref; `git rev-parse $base` returns the SHA from
+          # GitHub's pull/N/merge representation but the tree itself
+          # isn't downloaded, so `git diff $base HEAD` fails with
+          # `fatal: bad object`. Fetch the base commit on demand
+          # before the diff. This is a no-op when fetch-depth was
+          # already deep enough.
+          if ! git cat-file -e "$base^{tree}" 2>/dev/null; then
+            git fetch --depth=50 origin "$base" 2>/dev/null || \
+              git fetch --depth=200 origin "$base" 2>/dev/null || \
+              git fetch --unshallow origin 2>/dev/null || true
+          fi
+          if ! git cat-file -e "$base^{tree}" 2>/dev/null; then
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::cannot fetch base tree ($base) after retry — running full pipeline"
+            exit 0
+          fi
           changed=$(git diff --name-only "$base" HEAD)
           if [ -z "$changed" ]; then
             echo "docs_only=true" >> "$GITHUB_OUTPUT"
