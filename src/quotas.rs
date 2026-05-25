@@ -306,7 +306,17 @@ pub fn check_quota(
 
     match op {
         QuotaOp::Memory { bytes } => {
-            if memories_today + 1 > row.max_memories_per_day {
+            // #1256 (LOW, 2026-05-25) — `saturating_add` keeps the cap
+            // check honest even when a synthetic `i64::MAX` bytes (or
+            // any other adversarial input that crossed the
+            // saturating-cast boundary upstream) would otherwise wrap
+            // the unchecked `+` to a negative and bypass the
+            // `> max_storage_bytes` comparison. The clamp at
+            // `i64::MAX` is fine for the comparison because the
+            // ceiling fields themselves are bounded by
+            // `DEFAULT_MAX_STORAGE_BYTES` (100 MB) — `i64::MAX` is
+            // unambiguously over cap.
+            if memories_today.saturating_add(1) > row.max_memories_per_day {
                 return Err(QuotaCheckError::Quota(QuotaError {
                     agent_id: agent_id.to_string(),
                     namespace: namespace.to_string(),
@@ -315,7 +325,7 @@ pub fn check_quota(
                     max: row.max_memories_per_day,
                 }));
             }
-            if row.current_storage_bytes + bytes > row.max_storage_bytes {
+            if row.current_storage_bytes.saturating_add(bytes) > row.max_storage_bytes {
                 return Err(QuotaCheckError::Quota(QuotaError {
                     agent_id: agent_id.to_string(),
                     namespace: namespace.to_string(),
@@ -326,7 +336,9 @@ pub fn check_quota(
             }
         }
         QuotaOp::Link => {
-            if links_today + 1 > row.max_links_per_day {
+            // #1256 — same saturating-add safety net for the daily
+            // links counter.
+            if links_today.saturating_add(1) > row.max_links_per_day {
                 return Err(QuotaCheckError::Quota(QuotaError {
                     agent_id: agent_id.to_string(),
                     namespace: namespace.to_string(),
@@ -433,7 +445,11 @@ pub fn check_and_record(
 
         match op {
             QuotaOp::Memory { bytes } => {
-                if memories_today + 1 > row.max_memories_per_day {
+                // #1256 (LOW, 2026-05-25) — saturating-add safety net
+                // on the in-transaction cap check too, matching the
+                // pre-transaction `check_quota` arm. See the comment
+                // there for the full threat-model rationale.
+                if memories_today.saturating_add(1) > row.max_memories_per_day {
                     return Err(QuotaCheckError::Quota(QuotaError {
                         agent_id: agent_id.to_string(),
                         namespace: namespace.to_string(),
@@ -442,7 +458,7 @@ pub fn check_and_record(
                         max: row.max_memories_per_day,
                     }));
                 }
-                if row.current_storage_bytes + bytes > row.max_storage_bytes {
+                if row.current_storage_bytes.saturating_add(bytes) > row.max_storage_bytes {
                     return Err(QuotaCheckError::Quota(QuotaError {
                         agent_id: agent_id.to_string(),
                         namespace: namespace.to_string(),
@@ -476,7 +492,9 @@ pub fn check_and_record(
                 }
             }
             QuotaOp::Link => {
-                if links_today + 1 > row.max_links_per_day {
+                // #1256 (LOW, 2026-05-25) — saturating-add safety net
+                // on the daily-link counter check.
+                if links_today.saturating_add(1) > row.max_links_per_day {
                     return Err(QuotaCheckError::Quota(QuotaError {
                         agent_id: agent_id.to_string(),
                         namespace: namespace.to_string(),
@@ -1594,5 +1612,83 @@ mod tests {
         assert_eq!(s.namespace, GLOBAL_NAMESPACE);
         assert_eq!(s.current_memories_today, 1);
         assert_eq!(s.current_storage_bytes, 42);
+    }
+
+    /// #1256 (LOW, 2026-05-25) — regression: a synthetic `i64::MAX`
+    /// storage-bytes input must NOT wrap to a negative under
+    /// unchecked `+` and bypass the `> max_storage_bytes` cap check.
+    /// Pre-#1256 `row.current_storage_bytes + bytes` was a plain `+`;
+    /// with `current_storage_bytes = 1` and `bytes = i64::MAX`,
+    /// the sum overflows to `i64::MIN` (a large negative number),
+    /// which is `< max_storage_bytes` (any positive integer), so the
+    /// cap check incorrectly passed and the quota system silently
+    /// accepted the over-cap write.
+    ///
+    /// With `saturating_add` the sum clamps at `i64::MAX`, which is
+    /// unambiguously `>` the bounded `max_storage_bytes` ceiling
+    /// (defaults to 100 MB) so the cap check refuses the write.
+    #[test]
+    fn issue_1256_i64_max_input_does_not_wrap_under_saturating_add() {
+        let conn = fresh_db();
+        // Bootstrap: store a small memory under one agent so the row
+        // exists with sane defaults. The default
+        // `max_storage_bytes` = 100 MB is fine — `i64::MAX` is way
+        // above that.
+        check_quota(
+            &conn,
+            "agent-1256",
+            GLOBAL_NAMESPACE,
+            QuotaOp::Memory { bytes: 1 },
+        )
+        .expect("seed call must pass");
+        record_op(
+            &conn,
+            "agent-1256",
+            GLOBAL_NAMESPACE,
+            QuotaOp::Memory { bytes: 1 },
+        )
+        .unwrap();
+
+        // Adversarial input: `bytes = i64::MAX`. Pre-#1256 the
+        // unchecked `+` overflows the i64 cap to a negative,
+        // bypassing the comparison. Post-#1256 `saturating_add`
+        // clamps at i64::MAX > max_storage_bytes so the check refuses.
+        let err = check_quota(
+            &conn,
+            "agent-1256",
+            GLOBAL_NAMESPACE,
+            QuotaOp::Memory { bytes: i64::MAX },
+        )
+        .expect_err("i64::MAX bytes input MUST be refused (post-#1256 saturating_add)");
+        match err {
+            QuotaCheckError::Quota(q) => {
+                assert_eq!(
+                    q.limit,
+                    QuotaLimit::StorageBytes,
+                    "#1256: the storage-bytes cap must fire on the saturated sum, \
+                     not any other limit"
+                );
+                assert_eq!(q.agent_id, "agent-1256");
+            }
+            QuotaCheckError::Sql(e) => {
+                panic!("#1256: expected QuotaError::StorageBytes, got SQL: {e}")
+            }
+        }
+
+        // Repeat for the atomic `check_and_record` arm — same i64::MAX
+        // input, same saturating-add safety net.
+        let err = check_and_record(
+            &conn,
+            "agent-1256-atomic",
+            GLOBAL_NAMESPACE,
+            QuotaOp::Memory { bytes: i64::MAX },
+        )
+        .expect_err("check_and_record must also refuse i64::MAX bytes (post-#1256)");
+        match err {
+            QuotaCheckError::Quota(q) => {
+                assert_eq!(q.limit, QuotaLimit::StorageBytes);
+            }
+            QuotaCheckError::Sql(e) => panic!("#1256: expected QuotaError, got SQL: {e}"),
+        }
     }
 }
