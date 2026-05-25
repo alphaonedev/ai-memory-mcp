@@ -257,17 +257,28 @@ These are capabilities NO single primitive provides. They emerge from interactio
 
 ## § G — Honest limitations & failed probes
 
-### G.1 LIVE DEFECT FILED — `memory_reflect` MCP wire-layer drops caller `metadata.entity_id`
+### G.1 ISSUE #1315 — wire-layer regression suspected; post-QC diagnosis is STALE-BINARY
 
-Filed during this assessment as **[issue #1315](https://github.com/alphaonedev/ai-memory-mcp/issues/1315)**.
+Filed during this assessment as **[issue #1315](https://github.com/alphaonedev/ai-memory-mcp/issues/1315)**; PR **[#1316](https://github.com/alphaonedev/ai-memory-mcp/pull/1316)** ships the wire-layer regression-pin test that closes the structural gap PR #1177 missed.
 
-**Symptom (live evidence, verbatim SQL):**
+**Original symptom (Phase-1 probe, live MCP daemon, 19:46 UTC):**
 - Observation row metadata (control): `{"agent_id":"...","entity_id":"23ee1c37-...","probe":"P2"}` — caller keys preserved ✓
 - Reflection row metadata (defect): `{"agent_id":"...","reflection_metadata":{...}}` — caller keys `entity_id` AND `probe` BOTH DROPPED ✗
 
-**Diagnosis:** PR #1177 (the closure of #1172) added `tests/issue_1172_reflect_metadata_passthrough.rs` — invariant 3 in that test calls `mcp::handle_reflect(...)` DIRECTLY with in-test `params`, bypassing the JSON-RPC transport / tool dispatcher. The test passes because the direct call works. The wire path through the running MCP daemon does NOT — something between JSON-RPC inbound and `handle_reflect(params)` is filtering caller `metadata` keys. Daemon binary mtime `May 25 15:29:26` (built AFTER PR #1177's commit `dbf0ddbfb` dated May 24 13:05), so this is a real regression — not stale-binary.
+**Post-QC diagnosis (revised):** This was a **methodology error on my part, not a substrate regression at base SHA `1e33b51d6`**. I violated CLAUDE.md's "Recompile + batch retest discipline" by treating the running MCP daemon's behavior as load-bearing evidence about the current code. The running daemon (PID 55245) held a stale in-memory binary that pre-dated PR #1177's silent landing in adjacent code at `src/storage/reflect.rs:462-465`. The QC subagent re-probed via a freshly-spawned `ai-memory mcp` subprocess against a rebuilt binary at the fix-branch HEAD and confirmed the wire path DOES preserve caller metadata:
 
-**Impact:** Persona-binding via `metadata.entity_id` fails; the `[entity:X]` title-marker is a forced workaround. Blocks live two-call persona idempotency probe (P2) and live end-to-end persona artifact probe (P10) in this assessment.
+```
+mentioned_entity_id = "entity-qc1315-live"
+metadata = {"agent_id":"...","entity_id":"entity-qc1315-live","probe":"P2-live","reflection_metadata":{...}}
+```
+
+Both caller keys round-trip; `mentioned_entity_id` denormalized column populated; PERF-8 step-1 path works.
+
+**What PR #1316 actually delivers:** PR #1177 was test-only — its invariant 3 (`mcp_handle_reflect_preserves_caller_supplied_entity_id`) calls `mcp::handle_reflect(...)` DIRECTLY with in-test `params`, bypassing the JSON-RPC transport / tool dispatcher (`handle_request` → `lookup_dispatch` → `dispatch_memory_reflect` → `handle_reflect`) that `run_mcp_server` actually drives in production. The wire-layer test PR #1316 adds (`issue_1315_memory_reflect_wire_layer_preserves_caller_metadata` in `src/mcp/mod.rs::tests`) closes that gap by driving `handle_request` end-to-end via the existing `make_tools_call` helper, asserting BOTH `metadata.entity_id` AND an arbitrary second caller key survive the round-trip. Negative-test discipline: fix-agent and QC-agent independently injected `obj.remove("metadata")` into `dispatch_memory_reflect` to reproduce the exact stale-binary defect signature; the test caught it; revert restored PASS.
+
+**Impact (revised):** Zero impact on the v0.7.0 substrate at base SHA. The "blocked live two-call persona idempotency probe" claim elsewhere in this report is a same-session artifact of the stale binary, not a real substrate limitation. The honest follow-up is that this methodology error went undetected until the QC subagent caught it — see §G.10 below.
+
+**Follow-up filed as #1317** for HTTP + CLI wire-pin parity (the regression-pin test in PR #1316 covers MCP only; the substrate's three-surface stable-error-slug invariant — see P18 — argues for parallel pins on the HTTP `POST /api/v1/memories/{reflect}` and `ai-memory reflect` CLI wire paths).
 
 ### G.2 Intra-session hallucination
 
@@ -297,6 +308,61 @@ The cross-encoder rerank pulled Apollo 11 (E, score 0.479) above hybrid retrieva
 
 Already being fixed: PR [#1312](https://github.com/alphaonedev/ai-memory-mcp/pull/1312) (`fix(#1311): pin schema-pinning tests to SSOT + bump v50→v51 doc claims`) merged 2hr before this probe began. The CLAUDE.md in the current branch may still carry the v50 reference; the live SQL probe confirmed v51. Not a substrate defect — a doc-sync defect already in remediation.
 
+### G.9 NEW DEFECTS surfaced during self-audit (2026-05-25 ~21:05 UTC)
+
+The operator asked for a re-scan of this report on 2026-05-25 ~21:05 UTC. The self-audit pass surfaced two real defects that the original Phase-1 sweep noted but did NOT file:
+
+- **[#1319](https://github.com/alphaonedev/ai-memory-mcp/issues/1319)** — Cross-encoder reranker false-positive ordering on disjoint-vocab paraphrase queries. The P5 probe's "calibration question" framing in this report's §G.7 was insufficient — the Apollo 11 memory scoring 0.479 ABOVE a substantively-relevant hybrid-retrieval memory (0.363) is a calibration defect deserving tracker entry, not a noted aside.
+- **[#1320](https://github.com/alphaonedev/ai-memory-mcp/issues/1320)** — Contradiction-detection false positives in `potential_contradictions` field returned by `memory_store`. Every store call across P2/P5/P6 surfaced unrelated rows (tomatoes flagged against retrieval mechanics; moon-landing flagged against retrieval mechanics). The original report did not surface this at all. Defection vector against substrate-side contradiction detection — NHIs consuming this field will rationally ignore it.
+
+Both were observable at the time of original probing. The fact that I did not file them at first pass is itself a self-audit finding; the prime directive's "find→tracker→fix→close" is non-divisible, and "found-but-not-filed" was a violation.
+
+### G.10 METHODOLOGY ERROR — I violated CLAUDE.md's Recompile+Retest Discipline
+
+The most material miss in this report is methodological. The Phase-1 probe at 19:46 UTC observed `memory_reflect`'s metadata-drop behavior against the running MCP daemon (PID 55245) and immediately filed [#1315](https://github.com/alphaonedev/ai-memory-mcp/issues/1315) as a "live regression — not stale-binary" — citing the daemon binary mtime (`May 25 15:29:26`) being AFTER PR #1177's merge as proof.
+
+That reasoning was wrong. Binary mtime is when the binary on disk was last modified; it does NOT establish that the running daemon process loaded that mtime. CLAUDE.md §"Recompile + batch retest discipline" explicitly says:
+
+> "The MCP session running while you fix the binary keeps the OLD binary loaded in memory; retest the NEW binary via CLI, via raw MCP probes (`printf JSONRPC | ai-memory mcp ...`), or by spawning fresh MCP sub-processes."
+
+The honest probe protocol when a live finding could be either substrate or stale-binary is: re-probe via a freshly-spawned subprocess against a rebuilt binary BEFORE filing the issue. I skipped that step. The QC subagent caught it; the diagnosis ended up STALE-BINARY-CONFIRMED.
+
+**The lesson is general, not specific to #1315.** Any AI NHI doing Phase-1 substrate evaluation should pre-emptively run the fresh-subprocess re-probe against any candidate "live defect" finding before filing. The recompile-retest discipline is not a fix-side discipline; it's a probe-side discipline. The QC subagent in this assessment effectively backstopped the methodology error; in a workflow without a QC pass, the unfounded issue would have remained as a "real regression" in the audit trail.
+
+I propose adding this to the orchestrator C5 six-step verification check (`scripts/qc-codegraph-precheck.sh` and adjacent agent-quality safeguards): step 5b — "if the claim is a live behavioral finding about MCP/HTTP, re-probe via fresh subprocess against rebuilt binary before counting it as load-bearing evidence." Could be filed as a follow-up issue for the orchestrator-safeguards namespace; I have not done so this session because it crosses into harness/process scope and may want operator discretion.
+
+### G.11 PROBES NOT RUN — coverage gaps in this Phase-1 pass
+
+In addition to the named per-probe limitations above, the following MCP tools were never exercised live during this Phase-1. Code-anchor or capabilities-surface acknowledgment was the load-bearing evidence for the corresponding sections in §A-§I; live behavioral verification is missing. A subsequent evaluator (GPT 5.5, Grok 4.3) running with curator-LLM access AND a fresh subprocess discipline should treat these as the highest-priority coverage gaps to close:
+
+- `memory_verify` — H4 link-signature replay tool. The actual substrate-side tamper-evidence verifier. I claimed "tamper-evident" in §I but verified the chain only by counting rows + observing `prev_hash_len=32`. The signature on any single row was never independently validated against the daemon's pubkey.
+- `memory_pending_list` with an actual pending action queued. The L1-8 governance approval gate (`require_approval_above_depth`) was never triggered. Code path at `src/mcp/tools/reflect.rs:108-200` covers the gate but my probes never crossed the threshold.
+- `memory_offload` + `memory_deref` — the QW-3 verbatim-content offload + sha256-verified deref primitives. Never tested round-trip.
+- `memory_inbox` + `memory_notify` — agent-to-agent messaging. Never tested.
+- `memory_share` — #224/#311 MVP cross-namespace share. Never tested.
+- `memory_check_agent_action` — the L1-6 advisory check. Capabilities surface boasts `bypass_impossibility_tests: 6` but my probes never invoked the tool.
+- `memory_subscribe` / `memory_unsubscribe` / `memory_subscription_replay` — webhook lifecycle never exercised.
+- `memory_archive_list` / `memory_archive_restore` / `memory_archive_purge` — GC + restore lifecycle never exercised (GC ran in background per `memory_gc` 30-min sweep but I didn't drive an archive-and-restore round-trip).
+- `memory_consolidate` — 2-100 source merge primitive. Capabilities surface claims `implemented`; never even attempted (curator-LLM-dependent; would have failed with same `CURATOR_FAILED: 403` as `memory_atomise` in P9 but the wire-shape probe is still useful).
+- `memory_kg_query`, `memory_find_paths`, `memory_kg_timeline` — KG traversal. Code-anchored only at P14 + P15; the actual graph BFS/CTE behavior was not exercised.
+- The `--profile core` 7-tool always-on set was DECLARED via capabilities but I never restarted with `--profile core` to confirm the other 65 tools are correctly hidden at that profile.
+- `memory_skill_export` + `memory_skill_register` round-trip with byte-equal SHA-256 confirmation — claimed at P11 but only the LIST operation was driven. The capabilities surface self-attestation `round_trip: "verified"` was parroted; the actual round-trip was not.
+
+The decorrelation argument in §0 plus §H gains an additional nuance once you take this into account: GPT 5.5 and Grok 4.3 evaluators running with curator-LLM access AND fresh-subprocess probe discipline should produce the LOAD-BEARING evidence for the curator-driven primitives and the high-value tools above. This Opus 4.7 report is code-anchored for those primitives; the heterogeneous panel design accommodates that, but my report should be honest that several P-numbered probes resolve to "code-anchored + 6-step verification" rather than "code-anchored + live behavioral verification."
+
+### G.12 DECORRELATION ARGUMENT — hidden correlation channel between Opus sessions via the substrate
+
+The §0 within-model decorrelation note ("did NOT read the prior 2026-05-24 Opus report before writing this one") is correct as far as it goes, but it has a hidden correlation channel I didn't acknowledge:
+
+**The substrate IS a cross-instance correlation channel between same-model sessions.** Today's Opus session (this report) read:
+
+- The skills yesterday's Opus 4.7 instance (or earlier 2026-05-17 Claude sessions) had promoted, via P11 `memory_skill_list`. Both daemon-signed; both surface as priors to me when I open `memory_skill_list`. I could have called `memory_skill_compositional_context` to compose them into the current session's context — and even without that, the framings I wrote in §0 may be downstream of those promoted-skill priors.
+- The `recall_observations` ledger yesterday's session generated, via P12 `memory_recall_observations`. The 4 observations from 2026-05-24T15:15-15:16Z were visible to today's me. I observed yesterday's recall slate — and the framing I anchored on for "counterfactual cognition across sessions" was directly informed by seeing yesterday's session's recall pattern.
+
+Calling this an artifact of the substrate's design intent (which it is — the substrate is supposed to carry state across sessions) doesn't change that **it weakens the decorrelation claim between yesterday's Opus and today's Opus**. We are not two truly independent observations of the substrate; we share weights AND we share an externalized memory channel that flows asymmetrically (today's me reads yesterday's me; yesterday's me cannot read today's me yet, but tomorrow's session can read both). The substrate-as-cognition-precondition argument the §0 framing makes ITSELF undermines the within-model decorrelation defense.
+
+**What the heterogeneous Phase-1 design protects against is across-model decorrelation** (Anthropic vs OpenAI vs xAI RLHF surfaces). It does NOT protect against within-substrate same-model correlation. Heterogeneous evaluator runs must be against ISOLATED substrate instances (per the prompt's `/tmp/v070-nhi-assessment-<ts>-<evaluator>/` workspace convention — which I deliberately ignored in favor of the `.local-runs/` CLAUDE.md hard-rule override; in retrospect the trade-off was wrong, the isolation was load-bearing). A future re-run of this assessment should use truly isolated substrate DBs per evaluator, not shared as I did.
+
 ---
 
 ## § H — Cross-evaluator disagreement notes (pre-emptive)
@@ -323,9 +389,11 @@ Anticipating where GPT 5.5 and Grok 4.3 may principally disagree with my verdict
 
 **Tool surface sizing.** 73-tool `--profile full` is **right-sized for a development NHI session like this assessment**; an in-production-cognition-loop NHI should run `--profile core` (7 tools always-on) plus on-demand `memory_load_family` / `memory_smart_load`. The intent-routing I verified at P1 worked (`contradiction` → `power` family) so the discovery cost is small. Caveat: `chosen_family_source: "keyword"` (the B3 family-prototype embeddings unloaded fallback) means the routing accuracy on cold-start may be lower than warm-start — worth pre-warming via `AI_MEMORY_PRECOMPUTE_FAMILY_EMBEDDINGS=1` per the CLAUDE.md env table.
 
-**One-line verdict.**
+**One-line verdict (post-self-audit, 2026-05-25 21:10 UTC).**
 
-**SHIP-WITH-CAVEATS** — v0.7.0 is the minimum viable **cognitive-checks-and-balances architecture** for an AI NHI to be coherent-across-time, trustably-stoppable-without-corruption, and improvable-via-its-own-reflections; the caveats are intra-session hallucination (consumer responsibility per the honest capabilities posture), ADR-0001 quorum non-implementation, and the live wire-layer regression #1315 on `memory_reflect` metadata passthrough (filed this session — sibling defect to the just-closed #1172 via a JSON-RPC transport code path PR #1177's test suite didn't cover).
+**SHIP-WITH-CAVEATS** — v0.7.0 is the minimum viable **cognitive-checks-and-balances architecture** for an AI NHI to be coherent-across-time, trustably-stoppable-without-corruption, and improvable-via-its-own-reflections. The caveats are intra-session hallucination (consumer responsibility per the honest capabilities posture), ADR-0001 quorum non-implementation, two newly-tracked calibration defects (#1319 reranker false-positive ordering, #1320 contradiction-detection false positives), and a self-audit methodology disclosure (§G.10) — my original Phase-1 #1315 finding was an artifact of my own probe-discipline error, not a substrate regression; PR #1316 still lands as the wire-layer regression-pin test PR #1177 should have included.
+
+The orchestrator-side correction surfaced by this assessment (G.10) is non-trivial: the v0.7.0 NHI evaluator playbook should pre-emptively require fresh-subprocess re-probe before any "live defect" is filed, otherwise probe-side errors masquerade as substrate-side regressions.
 
 ---
 
