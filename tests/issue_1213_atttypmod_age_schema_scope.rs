@@ -9,8 +9,8 @@
 //!
 //! When Apache AGE is enrolled in the same database AND a duplicate
 //! `memories` relation exists under any other schema (e.g.
-//! `ag_catalog.memories` from a per-tenant search_path bootstrap in
-//! the LAN-parity IronClaw stack), the unscoped query returns the
+//! `ag_catalog.memories` from a per-tenant `search_path` bootstrap in
+//! the LAN-parity `IronClaw` stack), the unscoped query returns the
 //! WRONG dim — whichever Postgres surfaces first by oid order.
 //!
 //! This regression test stages the exact catalog shape that
@@ -27,7 +27,7 @@
 //! `src/store/postgres.rs:2694`, `src/store/postgres.rs:3121`) all
 //! still carry the unscoped query at this HEAD; #1213's "on hold"
 //! posture is NOT structurally safe — the duplicate-table
-//! catalog shape is reachable any time a per-tenant search_path
+//! catalog shape is reachable any time a per-tenant `search_path`
 //! places ai-memory schema in a non-`public` namespace.
 //!
 //! ## Test discipline
