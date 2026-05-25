@@ -95,12 +95,74 @@ fn subscribe_event_types(
     .expect("insert subscription")
 }
 
+/// Build a fresh `MockServer` bound to a dedicated, unique-path-anchored
+/// listener. Returns the server, the unique path component, and the
+/// full mock URL the test should hand to `subscribe_*`.
+///
+/// #1201 — under full-suite parallel-binary load, wiremock pools
+/// `BareMockServer` instances and the OS may reassign the same port
+/// across pool churn. `subscriptions::dispatch_event_with_details`
+/// spawns the HTTP POST on a detached `std::thread::spawn` (see
+/// `src/subscriptions.rs:738`), so a straggler POST from a prior test
+/// in the same binary can land on a recycled mock after port-reuse
+/// aligns. Two layers of isolation here:
+///   1. Bind a fresh `127.0.0.1:0` `TcpListener` per test and hand it
+///      to `MockServer::builder().listener(...)`. This bypasses the
+///      `MOCK_SERVER_POOL` (`wiremock-0.6.5/src/mock_server/pool.rs`)
+///      and pins the listener for the test's lifetime — the
+///      ephemeral port the kernel hands us cannot be reassigned until
+///      the listener is dropped.
+///   2. Anchor every dispatch URL on a per-test UUID path
+///      (`/hook/<uuid>`). The `wait_for_event` / `collect_event_bodies`
+///      filters check the request URL against that UUID so even if
+///      port reuse did somehow align, a foreign POST cannot be
+///      mis-counted as a "real" event for this test.
+fn fresh_mock_listener() -> std::net::TcpListener {
+    // bind retries on EADDRINUSE (5 attempts, 50 ms backoff) — under
+    // parallel binary load the ephemeral pool can briefly exhaust;
+    // the loop converts a rare transient into a deterministic bind.
+    let mut last_err = None;
+    for _ in 0..5 {
+        match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(l) => return l,
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+    panic!("#1201: failed to bind ephemeral port for mock after 5 attempts: {last_err:?}");
+}
+
+async fn fresh_mock_with_unique_path() -> (MockServer, String, String) {
+    let listener = fresh_mock_listener();
+    let server = MockServer::builder().listener(listener).start().await;
+    let unique = uuid::Uuid::new_v4().simple().to_string();
+    let path_str = format!("/hook/{unique}");
+    Mock::given(method("POST"))
+        .and(path(path_str.clone()))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let url = format!("{}{}", server.uri(), path_str);
+    (server, path_str, url)
+}
+
 /// Wait up to ~5 s for the wiremock server to receive at least one
-/// request matching `event_name` in its JSON body.
-async fn wait_for_event(server: &MockServer, event_name: &str) -> Option<Request> {
+/// request matching `event_name` in its JSON body AND `expected_path`
+/// as its URL path. The path filter rejects straggler POSTs from
+/// concurrent tests that may have landed on a recycled port (#1201).
+async fn wait_for_event(
+    server: &MockServer,
+    event_name: &str,
+    expected_path: &str,
+) -> Option<Request> {
     for _ in 0..50 {
         let received = server.received_requests().await.unwrap_or_default();
         for req in received {
+            if req.url.path() != expected_path {
+                continue;
+            }
             if let Ok(body_str) = std::str::from_utf8(&req.body)
                 && let Ok(val) = serde_json::from_str::<serde_json::Value>(body_str)
                 && val["event"].as_str() == Some(event_name)
@@ -113,13 +175,23 @@ async fn wait_for_event(server: &MockServer, event_name: &str) -> Option<Request
     None
 }
 
-/// Wait until at least `n` requests have landed at the mock, then
-/// return the parsed JSON bodies.
-async fn collect_event_bodies(server: &MockServer, n: usize) -> Vec<serde_json::Value> {
+/// Wait until at least `n` requests matching `expected_path` have
+/// landed at the mock, then return the parsed JSON bodies.
+async fn collect_event_bodies(
+    server: &MockServer,
+    expected_path: &str,
+    n: usize,
+) -> Vec<serde_json::Value> {
     for _ in 0..50 {
-        let received = server.received_requests().await.unwrap_or_default();
-        if received.len() >= n {
-            return received
+        let matching: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.url.path() == expected_path)
+            .collect();
+        if matching.len() >= n {
+            return matching
                 .into_iter()
                 .filter_map(|r| {
                     std::str::from_utf8(&r.body)
@@ -130,9 +202,12 @@ async fn collect_event_bodies(server: &MockServer, n: usize) -> Vec<serde_json::
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let received = server.received_requests().await.unwrap_or_default();
-    received
+    server
+        .received_requests()
+        .await
+        .unwrap_or_default()
         .into_iter()
+        .filter(|r| r.url.path() == expected_path)
         .filter_map(|r| {
             std::str::from_utf8(&r.body)
                 .ok()
@@ -147,15 +222,9 @@ async fn collect_event_bodies(server: &MockServer, n: usize) -> Vec<serde_json::
 
 #[tokio::test(flavor = "multi_thread")]
 async fn webhook_fires_on_promote() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/hook"))
-        .respond_with(ResponseTemplate::new(200))
-        .mount(&server)
-        .await;
+    let (server, mock_path, url) = fresh_mock_with_unique_path().await;
 
     let (_keep, db_path) = fresh_db();
-    let url = format!("{}/hook", server.uri());
     let _sub_id = subscribe_all(&db_path, &url);
 
     // Mirror the handle_promote (tier mode) call shape.
@@ -179,7 +248,7 @@ async fn webhook_fires_on_promote() {
         );
     }
 
-    let req = wait_for_event(&server, "memory_promote")
+    let req = wait_for_event(&server, "memory_promote", &mock_path)
         .await
         .expect("memory_promote webhook should reach mock");
 
@@ -203,15 +272,9 @@ async fn webhook_fires_on_promote() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn webhook_fires_on_delete() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/hook"))
-        .respond_with(ResponseTemplate::new(200))
-        .mount(&server)
-        .await;
+    let (server, mock_path, url) = fresh_mock_with_unique_path().await;
 
     let (_keep, db_path) = fresh_db();
-    let url = format!("{}/hook", server.uri());
     let _sub_id = subscribe_all(&db_path, &url);
 
     let details = serde_json::to_value(DeleteEventDetails {
@@ -232,7 +295,7 @@ async fn webhook_fires_on_delete() {
         );
     }
 
-    let req = wait_for_event(&server, "memory_delete")
+    let req = wait_for_event(&server, "memory_delete", &mock_path)
         .await
         .expect("memory_delete webhook should reach mock");
     let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
@@ -249,15 +312,9 @@ async fn webhook_fires_on_delete() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn webhook_fires_on_link_created() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/hook"))
-        .respond_with(ResponseTemplate::new(200))
-        .mount(&server)
-        .await;
+    let (server, mock_path, url) = fresh_mock_with_unique_path().await;
 
     let (_keep, db_path) = fresh_db();
-    let url = format!("{}/hook", server.uri());
     let _sub_id = subscribe_all(&db_path, &url);
 
     let details = serde_json::to_value(LinkCreatedEventDetails {
@@ -278,7 +335,7 @@ async fn webhook_fires_on_link_created() {
         );
     }
 
-    let req = wait_for_event(&server, "memory_link_created")
+    let req = wait_for_event(&server, "memory_link_created", &mock_path)
         .await
         .expect("memory_link_created webhook should reach mock");
     let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
@@ -294,15 +351,9 @@ async fn webhook_fires_on_link_created() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn webhook_fires_on_consolidate() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/hook"))
-        .respond_with(ResponseTemplate::new(200))
-        .mount(&server)
-        .await;
+    let (server, mock_path, url) = fresh_mock_with_unique_path().await;
 
     let (_keep, db_path) = fresh_db();
-    let url = format!("{}/hook", server.uri());
     let _sub_id = subscribe_all(&db_path, &url);
 
     let source_ids = vec![
@@ -328,7 +379,7 @@ async fn webhook_fires_on_consolidate() {
         );
     }
 
-    let req = wait_for_event(&server, "memory_consolidated")
+    let req = wait_for_event(&server, "memory_consolidated", &mock_path)
         .await
         .expect("memory_consolidated webhook should reach mock");
     let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
@@ -352,15 +403,9 @@ async fn webhook_fires_on_consolidate() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn subscriber_filtered_to_store_does_not_get_delete() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/hook"))
-        .respond_with(ResponseTemplate::new(200))
-        .mount(&server)
-        .await;
+    let (server, mock_path, url) = fresh_mock_with_unique_path().await;
 
     let (_keep, db_path) = fresh_db();
-    let url = format!("{}/hook", server.uri());
 
     // Opt-in to memory_store ONLY.
     let _sub_id = subscribe_event_types(&db_path, &url, &["memory_store".to_string()]);
@@ -395,14 +440,14 @@ async fn subscriber_filtered_to_store_does_not_get_delete() {
     }
 
     // Wait for the store event to land. The delete must NOT show up.
-    let _ = wait_for_event(&server, "memory_store")
+    let _ = wait_for_event(&server, "memory_store", &mock_path)
         .await
         .expect("store event must reach narrow subscriber");
 
     // Give any delete dispatch a chance to fire (it shouldn't), then
     // check that no delete event landed.
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let bodies = collect_event_bodies(&server, 1).await;
+    let bodies = collect_event_bodies(&server, &mock_path, 1).await;
     let delete_count = bodies
         .iter()
         .filter(|b| b["event"].as_str() == Some("memory_delete"))

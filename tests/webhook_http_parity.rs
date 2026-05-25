@@ -180,20 +180,28 @@ fn subscribe_all(db_path: &Path, mock_url: &str) -> String {
 }
 
 /// Wait for the mock server to receive a request whose JSON body has
-/// `event == expected_event`. Tolerates cross-test bleed: dispatch
-/// from prior `#[tokio::test]` runs `std::thread::spawn`-detached, so
-/// a slow dispatch from a prior test can land on this test's mock if
-/// port reuse aligns. Filtering by `event` makes each test resilient
-/// to straggler events from siblings.
+/// `event == expected_event` AND whose URL path matches `expected_path`.
+/// Tolerates cross-test bleed: dispatch from prior `#[tokio::test]`
+/// runs `std::thread::spawn`-detached
+/// (`src/subscriptions.rs:738`), so a slow dispatch from a prior test
+/// can land on this test's mock if port reuse aligns under wiremock's
+/// internal `MOCK_SERVER_POOL`
+/// (`wiremock-0.6.5/src/mock_server/pool.rs`). #1201 — the per-test
+/// UUID path + the dedicated listener pin in `fresh_mock` together
+/// ensure stragglers cannot pollute the count.
 async fn wait_for_event(
     mock: &MockServer,
     expected_event: &str,
+    expected_path: &str,
     total: Duration,
 ) -> Option<wiremock::Request> {
     let deadline = std::time::Instant::now() + total;
     loop {
         let received = mock.received_requests().await.unwrap_or_default();
         for req in &received {
+            if req.url.path() != expected_path {
+                continue;
+            }
             if let Ok(body) = serde_json::from_slice::<Value>(&req.body)
                 && body["event"].as_str() == Some(expected_event)
             {
@@ -207,16 +215,39 @@ async fn wait_for_event(
     }
 }
 
-/// Stand up a wiremock that always returns 200 OK on POST `/hook`.
-async fn fresh_mock() -> (MockServer, String) {
-    let mock = MockServer::start().await;
+/// Stand up a wiremock that always returns 200 OK on POST `/hook/<uuid>`.
+///
+/// #1201 — every test gets a dedicated `TcpListener` (bypassing the
+/// `MOCK_SERVER_POOL`) AND a unique per-test path. Both layers
+/// independently prevent the cross-test bleed surfaced under
+/// full-suite parallel-binary load.
+fn fresh_mock_listener() -> std::net::TcpListener {
+    // bind retries on EADDRINUSE (5 attempts, 50 ms backoff).
+    let mut last_err = None;
+    for _ in 0..5 {
+        match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(l) => return l,
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+    panic!("#1201: failed to bind ephemeral port for mock after 5 attempts: {last_err:?}");
+}
+
+async fn fresh_mock() -> (MockServer, String, String) {
+    let listener = fresh_mock_listener();
+    let mock = MockServer::builder().listener(listener).start().await;
+    let unique = uuid::Uuid::new_v4().simple().to_string();
+    let path_str = format!("/hook/{unique}");
     Mock::given(method("POST"))
-        .and(path("/hook"))
+        .and(path(path_str.clone()))
         .respond_with(ResponseTemplate::new(200))
         .mount(&mock)
         .await;
-    let url = format!("{}/hook", mock.uri());
-    (mock, url)
+    let url = format!("{}{}", mock.uri(), path_str);
+    (mock, path_str, url)
 }
 
 /// Insert a memory directly via the DB layer (skipping the HTTP create
@@ -243,7 +274,7 @@ fn seed_memory(db_path: &Path, title: &str, namespace: &str) -> String {
 #[tokio::test]
 async fn webhook_fires_on_http_delete() {
     let harness = HttpHarness::new();
-    let (mock, hook_url) = fresh_mock().await;
+    let (mock, mock_path, hook_url) = fresh_mock().await;
     let _sub_id = subscribe_all(&harness.db_path, &hook_url);
 
     let mem_id = seed_memory(&harness.db_path, "delete-target", "v064-017");
@@ -255,7 +286,7 @@ async fn webhook_fires_on_http_delete() {
     // Windows CI is consistently slower than Linux/macOS on the
     // std::thread::spawn dispatch + Connection::open cycle. 5s gives
     // enough headroom on every supported platform.
-    let req = wait_for_event(&mock, "memory_delete", Duration::from_secs(5))
+    let req = wait_for_event(&mock, "memory_delete", &mock_path, Duration::from_secs(5))
         .await
         .expect("memory_delete webhook must fire on HTTP DELETE within 2s");
 
@@ -276,7 +307,7 @@ async fn webhook_fires_on_http_delete() {
 #[tokio::test]
 async fn webhook_fires_on_http_promote() {
     let harness = HttpHarness::new();
-    let (mock, hook_url) = fresh_mock().await;
+    let (mock, mock_path, hook_url) = fresh_mock().await;
     subscribe_all(&harness.db_path, &hook_url);
 
     let mem_id = seed_memory(&harness.db_path, "promote-target", "v064-017");
@@ -285,7 +316,7 @@ async fn webhook_fires_on_http_promote() {
         .await;
     assert_eq!(status, StatusCode::OK, "promote should succeed");
 
-    let req = wait_for_event(&mock, "memory_promote", Duration::from_secs(5))
+    let req = wait_for_event(&mock, "memory_promote", &mock_path, Duration::from_secs(5))
         .await
         .expect("memory_promote webhook must fire on HTTP promote within 2s");
 
@@ -301,7 +332,7 @@ async fn webhook_fires_on_http_promote() {
 #[tokio::test]
 async fn webhook_fires_on_http_link_created() {
     let harness = HttpHarness::new();
-    let (mock, hook_url) = fresh_mock().await;
+    let (mock, mock_path, hook_url) = fresh_mock().await;
     subscribe_all(&harness.db_path, &hook_url);
 
     let src_id = seed_memory(&harness.db_path, "link-source", "v064-017");
@@ -318,9 +349,14 @@ async fn webhook_fires_on_http_link_created() {
         .await;
     assert_eq!(status, StatusCode::CREATED, "link should be created");
 
-    let req = wait_for_event(&mock, "memory_link_created", Duration::from_secs(5))
-        .await
-        .expect("memory_link_created webhook must fire on HTTP link within 2s");
+    let req = wait_for_event(
+        &mock,
+        "memory_link_created",
+        &mock_path,
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("memory_link_created webhook must fire on HTTP link within 2s");
 
     let body: Value = serde_json::from_slice(&req.body).unwrap();
     assert_eq!(body["event"], "memory_link_created");
@@ -334,7 +370,7 @@ async fn webhook_fires_on_http_link_created() {
 #[tokio::test]
 async fn webhook_fires_on_http_consolidate() {
     let harness = HttpHarness::new();
-    let (mock, hook_url) = fresh_mock().await;
+    let (mock, mock_path, hook_url) = fresh_mock().await;
     subscribe_all(&harness.db_path, &hook_url);
 
     let src_a = seed_memory(&harness.db_path, "consolidate-a", "v064-017");
@@ -360,9 +396,14 @@ async fn webhook_fires_on_http_consolidate() {
         .expect("response carries new id")
         .to_string();
 
-    let req = wait_for_event(&mock, "memory_consolidated", Duration::from_secs(5))
-        .await
-        .expect("memory_consolidated webhook must fire on HTTP consolidate within 2s");
+    let req = wait_for_event(
+        &mock,
+        "memory_consolidated",
+        &mock_path,
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("memory_consolidated webhook must fire on HTTP consolidate within 2s");
 
     let body: Value = serde_json::from_slice(&req.body).unwrap();
     assert_eq!(body["event"], "memory_consolidated");
