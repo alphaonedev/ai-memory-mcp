@@ -34,6 +34,19 @@ pub enum MemoryError {
         cap: u32,
         namespace: String,
     },
+    /// Issue #1240 (HIGH) — emitted by the `memory_store` write path when
+    /// the synthesis-pass recursion depth (post-store hooks that fire
+    /// further `memory_store` calls, e.g. via curator chain-fire) exceeds
+    /// the compiled-in cap of 3. Mirrors the
+    /// [`Self::ReflectionDepthExceeded`] variant so audit + wire shape
+    /// stay symmetric across the two recursive-write primitives.
+    ///
+    /// Wire shape (HTTP): `409 CONFLICT` with code `SYNTHESIS_DEPTH_EXCEEDED`.
+    SynthesisDepthExceeded {
+        attempted: u32,
+        cap: u32,
+        namespace: String,
+    },
     /// v0.7.0 L1-2 (issue #659) — emitted by the `memory_link` write path
     /// when adding a `reflects_on` edge would close a cycle in the
     /// reflection graph. Carries `source`, `target`, and the reconstructed
@@ -91,6 +104,7 @@ impl MemoryError {
             Self::DatabaseError(_) => "DATABASE_ERROR",
             Self::Conflict(_) => "CONFLICT",
             Self::ReflectionDepthExceeded { .. } => "REFLECTION_DEPTH_EXCEEDED",
+            Self::SynthesisDepthExceeded { .. } => "SYNTHESIS_DEPTH_EXCEEDED",
             Self::ReflectionCycleDetected { .. } => "REFLECTION_CYCLE_DETECTED",
             Self::RefusedByGovernance(_) | Self::RefusedByGovernanceGate(_) => "GOVERNANCE_REFUSED",
         }
@@ -106,6 +120,7 @@ impl MemoryError {
             // the rest of governance-style refusals.
             Self::Conflict(_)
             | Self::ReflectionDepthExceeded { .. }
+            | Self::SynthesisDepthExceeded { .. }
             | Self::ReflectionCycleDetected { .. } => StatusCode::CONFLICT,
             // L1-6 Deliverable E — a pre-write hook refusal is a typed
             // authorization-style denial: the caller's request was
@@ -132,6 +147,14 @@ impl MemoryError {
             } => format!(
                 "reflection depth {attempted} would exceed namespace \
                  max_reflection_depth {cap} (namespace='{namespace}')"
+            ),
+            Self::SynthesisDepthExceeded {
+                attempted,
+                cap,
+                namespace,
+            } => format!(
+                "synthesis depth {attempted} would exceed compiled \
+                 max_synthesis_depth {cap} (namespace='{namespace}')"
             ),
             Self::ReflectionCycleDetected {
                 source,
@@ -516,6 +539,58 @@ mod tests {
         };
         let resp = err.into_response();
         assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #1240 — SynthesisDepthExceeded variant coverage. Mirrors
+    // the ReflectionDepthExceeded contract above so the two recursive-
+    // write primitives stay symmetric across audit + wire surfaces.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn synthesis_depth_exceeded_code() {
+        let err = MemoryError::SynthesisDepthExceeded {
+            attempted: 4,
+            cap: 3,
+            namespace: "ns/x".into(),
+        };
+        assert_eq!(err.code(), "SYNTHESIS_DEPTH_EXCEEDED");
+    }
+
+    #[test]
+    fn synthesis_depth_exceeded_status_is_conflict() {
+        let err = MemoryError::SynthesisDepthExceeded {
+            attempted: 5,
+            cap: 3,
+            namespace: "ns/y".into(),
+        };
+        assert_eq!(err.status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn synthesis_depth_exceeded_message_contains_triple() {
+        let err = MemoryError::SynthesisDepthExceeded {
+            attempted: 7,
+            cap: 3,
+            namespace: "ai-memory/research".into(),
+        };
+        let msg = err.message();
+        assert!(msg.contains("7"));
+        assert!(msg.contains("3"));
+        assert!(msg.contains("ai-memory/research"));
+        assert!(msg.contains("max_synthesis_depth"));
+    }
+
+    #[test]
+    fn synthesis_depth_exceeded_display() {
+        let err = MemoryError::SynthesisDepthExceeded {
+            attempted: 4,
+            cap: 3,
+            namespace: "ns".into(),
+        };
+        let s = format!("{err}");
+        assert!(s.contains("SYNTHESIS_DEPTH_EXCEEDED"));
+        assert!(s.contains("max_synthesis_depth"));
     }
 
     // -----------------------------------------------------------------

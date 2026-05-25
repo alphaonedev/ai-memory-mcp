@@ -409,6 +409,21 @@ pub(crate) fn handle_store(
     // Returns the per-candidate update/delete queue + the counts the
     // response envelope echoes back. SEC-1 / COR-5 / COR-6 contracts
     // are encapsulated inside the helper.
+    // Issue #1240 — synthesis-pass cycle-depth guard. Acquire the
+    // per-thread depth guard BEFORE invoking `run_synthesis_pass`; if
+    // the post-increment depth exceeds `MAX_SYNTHESIS_DEPTH` we refuse
+    // with `SYNTHESIS_DEPTH_EXCEEDED`. The guard is held across the
+    // synthesis-pass body so any post-store hooks that chain-fire a
+    // nested `memory_store` observe the higher depth and either stay
+    // within budget or refuse on entry.
+    //
+    // The guard is bound to `_synthesis_depth_guard` even when the
+    // pass is skipped so an `_` binding doesn't accidentally drop the
+    // guard early on the eligible branch (Rust drops `let _ = ...`
+    // bindings at the end of the statement, but
+    // `let _name = ...` retains the binding for the rest of the
+    // function — we want the latter).
+    let (_synthesis_depth, _synthesis_depth_guard) = crate::synthesis::enter_synthesis_pass();
     let synthesis_outcome = if synthesis::synthesis_eligible(
         autonomous_hooks,
         llm.is_some(),
@@ -416,6 +431,22 @@ pub(crate) fn handle_store(
         &mem.namespace,
         &ns_policy,
     ) {
+        if _synthesis_depth > crate::synthesis::MAX_SYNTHESIS_DEPTH {
+            tracing::warn!(
+                target: "synthesis",
+                namespace = %mem.namespace,
+                attempted = _synthesis_depth,
+                cap = crate::synthesis::MAX_SYNTHESIS_DEPTH,
+                "synthesis.depth_exceeded",
+            );
+            return Err(format!(
+                "SYNTHESIS_DEPTH_EXCEEDED: synthesis depth {} would exceed compiled \
+                 max_synthesis_depth {} (namespace='{}')",
+                _synthesis_depth,
+                crate::synthesis::MAX_SYNTHESIS_DEPTH,
+                mem.namespace,
+            ));
+        }
         let llm_client = llm.expect("synthesis_eligible guarantees llm.is_some()");
         synthesis::run_synthesis_pass(llm_client, &mem, &agent_id, &existing, &ns_policy)?
     } else {
