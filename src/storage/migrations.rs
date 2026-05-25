@@ -7,12 +7,16 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 50).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 51).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
 //! broadcast fanout failures can be replayed by the new
 //! `replay_federation_push_dlq` worker.
+//! v51 (#1255) adds the `federation_nonce_cache` table so the
+//! `FederationNonceCache` LRU persists across daemon restarts —
+//! pre-#1255 every restart opened a fresh replay window for any
+//! `(body, sig, nonce)` tuple captured before the restart.
 
 use anyhow::Result;
 use rusqlite::{Connection, params};
@@ -525,7 +529,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_federation_push_dlq_pending_uniq
 //       column in the migration arm. NSA CSI mapping: recommendation
 //       (c) — defense-in-depth blast-radius controls on a compromised
 //       or misbehaving agent.
-const CURRENT_SCHEMA_VERSION: i64 = 50;
+const CURRENT_SCHEMA_VERSION: i64 = 51;
 
 /// v0.7.0 refactor PR-1 (#793) — schema-pins SSOT.
 ///
@@ -873,6 +877,17 @@ const MIGRATION_V48_SQLITE: &str =
 // blast-radius controls.
 const MIGRATION_V50_SQLITE: &str =
     include_str!("../../migrations/sqlite/0042_v50_per_namespace_quota.sql");
+// v0.7.0 #1255 — `federation_nonce_cache` persistence table backing
+// the `FederationNonceCache` LRU across daemon restarts. Pre-#1255
+// every restart opened a fresh replay window for any captured
+// `(body, sig, nonce)` tuple — the in-memory cache started empty,
+// so a previously-rejected fingerprint was treated as never-seen
+// on the new process. The new table persists every `(peer_id,
+// fingerprint, last_touch)` triple so the daemon can rehydrate
+// the cache on boot. Pure additive — `CREATE TABLE IF NOT EXISTS`
+// + two indexes — fully idempotent.
+const MIGRATION_V51_SQLITE: &str =
+    include_str!("../../migrations/sqlite/0043_v51_federation_nonce_cache.sql");
 
 // COVERAGE: per-version ALTER/CREATE branches inside this function
 // are guarded by `has_X` column-existence probes and `IF NOT EXISTS`
@@ -2108,6 +2123,14 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             } else if !cols.contains("namespace") {
                 conn.execute_batch(MIGRATION_V50_SQLITE)?;
             }
+        }
+        if version < 51 {
+            // v0.7.0 #1255 — `federation_nonce_cache` table for
+            // persisting the `FederationNonceCache` LRU across
+            // daemon restarts. `CREATE TABLE IF NOT EXISTS` so the
+            // migration is replay-safe even if the operator
+            // hand-rolled the table earlier.
+            conn.execute_batch(MIGRATION_V51_SQLITE)?;
         }
 
         conn.execute("DELETE FROM schema_version", [])?;

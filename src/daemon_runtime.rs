@@ -3237,7 +3237,30 @@ pub async fn bootstrap_serve(
         // operators opt into strict mode via `config.toml`.
         replay_cache: Arc::new(crate::identity::replay::ReplayCache::new()),
         verify_require_nonce: app_config.verify.as_ref().is_some_and(|v| v.require_nonce),
-        federation_nonce_cache: Arc::new(crate::identity::replay::FederationNonceCache::new()),
+        // #1255 (MED, 2026-05-25) — persistence-enabled federation
+        // nonce cache. Rehydrates from disk on boot so a daemon
+        // restart does NOT re-open the replay window for any
+        // captured `(body, sig, nonce)` tuple. Falls back to the
+        // in-memory-only constructor with a WARN log if persistence
+        // open fails (e.g. disk pressure, locked file) — the daemon
+        // continues to boot at the pre-#1255 posture rather than
+        // crash-looping on a transient sqlite issue.
+        federation_nonce_cache: Arc::new(
+            match crate::identity::replay::FederationNonceCache::new_with_db_persistence(db_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "ai_memory::identity::replay",
+                        db_path = %db_path.display(),
+                        err = %e,
+                        "#1255: FederationNonceCache persistence open failed; falling back to \
+                         in-memory cache. Daemon restarts will reopen the replay window until \
+                         operators resolve the underlying sqlite issue."
+                    );
+                    crate::identity::replay::FederationNonceCache::new()
+                }
+            },
+        ),
         // v0.7.0 (issue #519) — resolved autonomous_hooks flag for the
         // HTTP create_memory path's proactive conflict-detection
         // helper. Falls back to false when unset (preserves v0.6.x
