@@ -525,7 +525,7 @@ pub async fn create_link(
     // the MCP contract.
     if create_result.is_ok() {
         let (link_namespace, link_owner) = db::get(&lock.0, &source_id).ok().flatten().map_or_else(
-            || ("global".to_string(), None),
+            || (crate::DEFAULT_NAMESPACE.to_string(), None),
             |m| {
                 let owner = m
                     .metadata

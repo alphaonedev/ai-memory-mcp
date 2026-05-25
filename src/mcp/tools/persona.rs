@@ -59,7 +59,9 @@ pub(super) fn handle_persona(conn: &rusqlite::Connection, params: &Value) -> Res
     if entity_id.is_empty() {
         return Err("entity_id cannot be empty".to_string());
     }
-    let namespace = params["namespace"].as_str().unwrap_or("global");
+    let namespace = params["namespace"]
+        .as_str()
+        .unwrap_or(crate::DEFAULT_NAMESPACE);
 
     let persona = get_latest_persona(conn, entity_id, namespace)
         .map_err(|e| format!("memory_persona substrate error: {e}"))?;
@@ -151,7 +153,7 @@ pub fn handle_persona_generate(
         ),
         None => (
             generator
-                .generate_cross_namespace(entity_id, "global")
+                .generate_cross_namespace(entity_id, crate::DEFAULT_NAMESPACE)
                 .map_err(persona_error_to_string)?,
             "cross_namespace".to_string(),
         ),

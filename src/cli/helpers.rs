@@ -59,7 +59,7 @@ pub fn auto_namespace() -> String {
     std::env::current_dir()
         .ok()
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
-        .unwrap_or_else(|| "global".to_string())
+        .unwrap_or_else(|| crate::DEFAULT_NAMESPACE.to_string())
 }
 
 /// Format an RFC3339 timestamp as a short relative age ("just now", "5m ago",

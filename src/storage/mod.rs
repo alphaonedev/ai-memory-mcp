@@ -2897,7 +2897,7 @@ pub fn validate_link_pre_create(
         // the missing-memory error after this returns.
         let link_ns = match get(conn, source_id) {
             Ok(Some(m)) => m.namespace,
-            _ => "global".to_string(),
+            _ => crate::DEFAULT_NAMESPACE.to_string(),
         };
         let ctx = PermissionContext {
             op: Op::MemoryLink,

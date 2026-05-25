@@ -69,7 +69,7 @@ pub struct ConsolidateBody {
 }
 
 fn default_ns() -> String {
-    "global".to_string()
+    crate::DEFAULT_NAMESPACE.to_string()
 }
 
 /// v0.7.0 L7 — resolve the consolidation `summary` field when the
