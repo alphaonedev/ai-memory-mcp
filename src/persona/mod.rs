@@ -607,19 +607,39 @@ pub fn get_latest_persona(
 
 /// Resolve the next `persona_version` for `(entity_id, namespace)`.
 /// Returns `1` when no prior persona exists for the pair.
+///
+/// # Cluster-A COR-2 fix (issue #1241)
+///
+/// Pre-fix the body folded every rusqlite error into `Ok(1)` via the
+/// local `optional_default(0_i32)` shim. That collapsed three
+/// semantically distinct cases — `Ok(n)`, `Err(QueryReturnedNoRows)`,
+/// and `Err(other)` (lock-timeout, IO, schema drift, …) — into a
+/// single happy-path branch. A transient DB lock at the very
+/// moment a new persona row was being minted would silently mint
+/// `persona_version = 1` even when a prior row existed, breaking
+/// the monotonic-version contract that downstream consumers rely
+/// on (forensic audit, federation push, `persona_title()` lookup).
+///
+/// Post-fix mirrors the [`crate::atomisation::read_atomised_into`]
+/// COR-2 pattern: `Ok(_)` returns the value, `Err(QueryReturnedNoRows)`
+/// is the documented "no prior persona" path that maps to `Ok(1)`,
+/// every other rusqlite error propagates via `?` and surfaces as
+/// the caller's `anyhow::Error`. Pinned by
+/// [`tests::next_version_propagates_db_errors`].
 fn next_version(conn: &Connection, entity_id: &str, namespace: &str) -> Result<i32> {
-    let v: Option<i32> = conn
-        .query_row(
-            "SELECT COALESCE(MAX(persona_version), 0)
-             FROM memories
-             WHERE memory_kind = 'persona'
-               AND entity_id = ?1
-               AND namespace = ?2",
-            rusqlite::params![entity_id, namespace],
-            |r| r.get(0),
-        )
-        .optional_default(0_i32);
-    Ok(v.map(|n| n + 1).unwrap_or(1))
+    match conn.query_row(
+        "SELECT COALESCE(MAX(persona_version), 0)
+         FROM memories
+         WHERE memory_kind = 'persona'
+           AND entity_id = ?1
+           AND namespace = ?2",
+        rusqlite::params![entity_id, namespace],
+        |r| r.get::<_, i32>(0),
+    ) {
+        Ok(n) => Ok(n + 1),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(1),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Load up to `limit` reflection-kind memories from `namespace` whose
@@ -833,25 +853,16 @@ pub fn render_persona_json(persona: &Persona) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Local helper: optional_default style ergonomic shim
+// Local helper trait removed
 // ---------------------------------------------------------------------------
-
-trait OptionalDefault<T> {
-    fn optional_default(self, default: T) -> Option<T>;
-}
-
-impl<T> OptionalDefault<T> for std::result::Result<T, rusqlite::Error>
-where
-    T: Default,
-{
-    fn optional_default(self, default: T) -> Option<T> {
-        match self {
-            Ok(v) => Some(v),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Some(default),
-            Err(_) => None,
-        }
-    }
-}
+//
+// The `OptionalDefault` shim is gone as of #1241. Its only caller
+// (`next_version`) was the source of the COR-2 error-masking bug —
+// rusqlite errors other than `QueryReturnedNoRows` were folded into
+// the default value and silently swallowed. The replacement explicit
+// `match` block at the call-site distinguishes the three result
+// arms (`Ok` / `QueryReturnedNoRows` / `Err(other)`) so transient DB
+// faults propagate via `?` instead of collapsing to `Ok(1)`.
 
 #[cfg(test)]
 mod tests {
@@ -1012,6 +1023,55 @@ mod tests {
         };
         db::insert(&conn, &mem).unwrap();
         assert_eq!(next_version(&conn, "alice", "team/alpha").unwrap(), 2);
+    }
+
+    /// Regression for issue #1241 — COR-2 error propagation in
+    /// `persona::next_version`.
+    ///
+    /// Pre-fix the body folded every rusqlite error into `Ok(1)` via
+    /// the local `optional_default(0_i32)` shim. A transient DB
+    /// fault (lock-timeout, schema drift, IO, …) was indistinguishable
+    /// from "no prior persona exists" — the function would silently
+    /// return `1` and the caller would mint a duplicate
+    /// `persona_version`, breaking the monotonic-version contract.
+    ///
+    /// This test forces a non-`QueryReturnedNoRows` error by dropping
+    /// the `memories` table out from under the query. Post-fix the
+    /// rusqlite "no such table" `SqliteFailure` propagates via `?`
+    /// instead of collapsing to `Ok(1)`. Mirrors the atomisation
+    /// `read_atomised_into` COR-2 pattern pinned by
+    /// `src/atomisation/mod.rs:484-494`.
+    #[test]
+    fn next_version_propagates_db_errors() {
+        let (conn, _dir) = fresh_db();
+
+        // Sanity: the happy path still returns 1 on a fresh empty DB
+        // (no prior persona row, the `QueryReturnedNoRows` /
+        // `MAX()`-of-empty-set arm is exercised).
+        assert_eq!(next_version(&conn, "alice", "team/alpha").unwrap(), 1);
+
+        // Drop the table to synthesise a non-`QueryReturnedNoRows`
+        // rusqlite error on the next query. A real-world transient
+        // lock-timeout or schema-drift fault surfaces through the
+        // same `Err(other)` arm, so this is the cleanest in-process
+        // proxy for the production failure mode the original bug
+        // masked.
+        conn.execute("DROP TABLE memories", []).unwrap();
+
+        let err = next_version(&conn, "alice", "team/alpha")
+            .expect_err("next_version must propagate non-NoRows DB errors, not collapse to Ok(1)");
+
+        // The error chain must carry the underlying rusqlite cause —
+        // a regression to the old `optional_default` path would
+        // return `Ok(1)` (no error at all). We also assert the
+        // surface message references the missing-table sqlite
+        // failure to lock the propagation contract.
+        let msg = format!("{err:#}");
+        assert!(
+            msg.to_lowercase().contains("no such table") || msg.to_lowercase().contains("memories"),
+            "expected propagated rusqlite error to mention the missing \
+             memories table, got: {msg}"
+        );
     }
 
     #[test]
