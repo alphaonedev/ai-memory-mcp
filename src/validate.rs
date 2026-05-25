@@ -344,6 +344,31 @@ pub fn validate_agent_id_shape(agent_id: &str) -> Result<()> {
             bail!("agent_id contains invalid character '{c}' (allowed: alphanumeric, _-:@./)");
         }
     }
+    // #1251 (security-medium, 2026-05-25) — block path-traversal
+    // sequences in identity strings that downstream callers consume as
+    // filename fragments (e.g. `<keydir>/<agent_id>.pub` in
+    // `crate::identity::keypair::load`). The pre-#1251 shape check
+    // permitted `.` and `/` separately, so an `observed_by` (or any
+    // wire-supplied agent_id) of `../../../etc/secret` resolved to a
+    // path OUTSIDE the keydir; a federated peer that could place a
+    // 32-byte valid Ed25519 pubkey anywhere on the receiver host could
+    // forge a `signed` attest-level. The reject mirrors the same
+    // discipline `validate_id` already enforces for memory IDs
+    // (`src/validate.rs::validate_id`, #1051).
+    //
+    // SPIFFE URIs (`spiffe://example.org/ns/prod`) are explicitly
+    // preserved: they contain a `//` (empty segment) after the scheme,
+    // but no `..`. The `..` ban is the load-bearing protection — empty
+    // segments are tolerated because `Path::join("<keydir>", "spiffe:")`
+    // and `Path::join(..., "")` both stay inside the keydir. The
+    // leading-`/` ban prevents `agent_id = "/etc/passwd"` from making
+    // `PathBuf::join` abandon the keydir entirely.
+    if agent_id.contains("..") {
+        bail!("agent_id may not contain '..' (path-traversal guard)");
+    }
+    if agent_id.starts_with('/') {
+        bail!("agent_id may not start with '/' (path-traversal guard)");
+    }
     Ok(())
 }
 
@@ -1471,6 +1496,55 @@ mod tests {
                 "legitimate NHI shape '{legitimate}' MUST still pass after #977",
             );
         }
+    }
+
+    /// #1251 — agent_id strings consumed as on-disk filename fragments
+    /// (`<keydir>/<agent_id>.pub`) must reject path-traversal sequences
+    /// at the shape validator. A federated peer that could supply
+    /// `observed_by = "../../etc/some-pubkey"` would otherwise drive
+    /// `keypair::load` to read 32 bytes from outside the keydir and
+    /// accept that data as a valid signing key.
+    #[test]
+    fn test_agent_id_rejects_path_traversal_1251() {
+        // Direct `..` substring.
+        for traversal in [
+            "..",
+            "../foo",
+            "foo/..",
+            "foo/../bar",
+            "ai:claude/../etc",
+            "host:..",
+            "....", // doubled `..` still contains `..`
+        ] {
+            let r = validate_agent_id_shape(traversal);
+            assert!(
+                r.is_err(),
+                "path-traversal shape '{traversal}' must be rejected by validate_agent_id_shape",
+            );
+            let msg = r.unwrap_err().to_string();
+            assert!(
+                msg.contains("path-traversal") || msg.contains(".."),
+                "reject message for '{traversal}' should cite path-traversal; got: {msg}",
+            );
+        }
+
+        // Leading `/` (absolute path escape).
+        let r = validate_agent_id_shape("/etc/keys");
+        assert!(r.is_err(), "leading '/' agent_id must be rejected");
+        assert!(
+            r.unwrap_err().to_string().contains("path-traversal"),
+            "leading '/' must cite path-traversal in the error",
+        );
+    }
+
+    /// #1251 — confirm SPIFFE URIs (which contain a `//`) still pass.
+    /// Empty path segments are tolerated because the `..` ban is the
+    /// load-bearing guarantee — empty segments cannot escape the keydir
+    /// on their own.
+    #[test]
+    fn test_agent_id_spiffe_still_ok_after_1251() {
+        assert!(validate_agent_id_shape("spiffe://example.org/ns/prod").is_ok());
+        assert!(validate_agent_id_shape("spiffe://a/b").is_ok());
     }
 
     #[test]
