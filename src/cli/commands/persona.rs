@@ -35,7 +35,7 @@ pub struct PersonaArgs {
     pub entity_id: String,
 
     /// Namespace the persona lives under. Defaults to `global`.
-    #[arg(long, value_name = "NS", default_value = "global")]
+    #[arg(long, value_name = "NS", default_value = crate::DEFAULT_NAMESPACE)]
     pub namespace: String,
 
     /// When set, force a fresh curator synthesis and persist a new

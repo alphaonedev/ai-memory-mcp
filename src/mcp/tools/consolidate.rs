@@ -33,7 +33,9 @@ pub(super) fn handle_consolidate(
         }
     }
     let title = params["title"].as_str().ok_or("title is required")?;
-    let namespace = params["namespace"].as_str().unwrap_or("global");
+    let namespace = params["namespace"]
+        .as_str()
+        .unwrap_or(crate::DEFAULT_NAMESPACE);
 
     // Auto-generate summary via LLM if not provided
     let summary: String = if let Some(s) = params["summary"].as_str() {

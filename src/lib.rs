@@ -53,6 +53,42 @@ pub const SECS_PER_WEEK: i64 = 604_800;
 pub const HEADER_CONTENT_TYPE: &str = "content-type";
 pub const MIME_JSON: &str = "application/json";
 
+// ---------------------------------------------------------------------------
+// v0.7.x (issue #1174 PR5 — pm-v3.1 namespace-sentinel sweep) — the
+// default namespace for AI-NHI memory writes when the caller omits
+// the `namespace` parameter. Bare value: `"global"`.
+//
+// Distinguished from [`GLOBAL_NAMESPACE`] (underscored `"_global"`),
+// which is the system-reserved namespace for substrate-internal
+// rows (governance, quotas, audit). NEVER conflate these — they
+// are different namespaces with different semantics. The
+// underscore prefix is the reserved-namespace convention.
+//
+// Replaces ~25 inline literal `"global"` sites across config,
+// storage, handlers, MCP tools, and models. The wire value is
+// preserved byte-for-byte (`"global"` stays `"global"` on every
+// JSON-RPC and HTTP response); only the literal's source location
+// changes.
+// ---------------------------------------------------------------------------
+
+/// v0.7.x (issue #1174 PR5 — pm-v3.1 namespace-sentinel sweep) — the
+/// default namespace for AI-NHI memory writes when the caller omits
+/// the `namespace` parameter. Bare value: `"global"`.
+///
+/// Distinguished from [`GLOBAL_NAMESPACE`] (underscored `"_global"`),
+/// which is the system-reserved namespace for substrate-internal
+/// rows (governance, quotas, audit). NEVER conflate these — they
+/// are different namespaces with different semantics. The
+/// underscore prefix is the reserved-namespace convention.
+pub const DEFAULT_NAMESPACE: &str = "global";
+
+/// v0.7.x (issue #1174 PR5) — re-export of the system-reserved
+/// namespace constant defined originally at `src/quotas.rs:70`.
+/// Centralised here so other modules don't independently re-define
+/// the literal. SEPARATE from [`DEFAULT_NAMESPACE`] — see that
+/// doc-comment for the disambiguation.
+pub use crate::quotas::GLOBAL_NAMESPACE;
+
 pub mod approvals;
 // v0.7.0 WT-1-B — substrate-level atomisation engine. Decomposes
 // long-form memories into atomic propositions with full provenance

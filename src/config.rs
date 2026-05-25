@@ -5599,7 +5599,7 @@ impl AppConfig {
                     .clone()
                     .filter(|s| !s.trim().is_empty())
             })
-            .unwrap_or_else(|| "global".to_string());
+            .unwrap_or_else(|| crate::DEFAULT_NAMESPACE.to_string());
 
         let archive_on_gc = cfg
             .and_then(|s| s.archive_on_gc)

@@ -78,7 +78,7 @@ pub(super) fn handle_archive_purge(
             .map_err(|e| e.to_string())?;
         let ctx = PermissionContext {
             op: Op::MemoryArchive,
-            namespace: "global".to_string(),
+            namespace: crate::DEFAULT_NAMESPACE.to_string(),
             agent_id,
             payload: json!({
                 "older_than_days": older_than_days,
