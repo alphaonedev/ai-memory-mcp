@@ -26,7 +26,17 @@ jobs:
       - name: Yank version
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          # Route untrusted workflow_dispatch inputs through env vars
+          # instead of inlining `${{ inputs.X }}` directly in `run:`.
+          # The template interpolation form expands BEFORE the shell
+          # parses the line, so an input like `1.0.0"; rm -rf /; #`
+          # would land in the script verbatim and run. Reading the
+          # values via `"$VERSION"` / `"$REASON"` shell variables
+          # forces the shell to treat them as data, not code.
+          # See: https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions#using-an-intermediate-environment-variable
+          VERSION: ${{ github.event.inputs.version }}
+          REASON: ${{ github.event.inputs.reason }}
         run: |
-          echo "Yanking ai-memory@${{ github.event.inputs.version }}"
-          echo "Reason: ${{ github.event.inputs.reason }}"
-          cargo yank --version "${{ github.event.inputs.version }}" ai-memory
+          echo "Yanking ai-memory@$VERSION"
+          echo "Reason: $REASON"
+          cargo yank --version "$VERSION" ai-memory
