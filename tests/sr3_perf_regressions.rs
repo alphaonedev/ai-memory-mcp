@@ -186,33 +186,20 @@ fn sr3_1072_subscription_dispatch_reuses_worker_conn() {
 }
 
 // -----------------------------------------------------------------
-// #1073 — shared reqwest client
+// #1073 — shared reqwest client scaffolding REMOVED
 // -----------------------------------------------------------------
-
-#[test]
-fn sr3_1073_dispatch_http_client_scaffolding_exists() {
-    // v0.7.0 #1073 + #1082 interaction. The SSRF hardening at
-    // #1082 added per-call `builder.resolve(host, addr)` DNS
-    // pinning on the `send()` path; that pin lives on the client
-    // itself, so a fully process-wide shared client cannot hold
-    // per-host pins that vary per dispatched URL. The shared
-    // accessor is therefore retained as scaffolding (gated by
-    // `#[allow(dead_code)]`) for a follow-up refactor where the
-    // per-call pin becomes a `reqwest::dns::Resolve` trait object
-    // and the client itself becomes process-shared. For now the
-    // SSRF correctness gate wins over the per-attempt builder cost;
-    // this pin documents that the accessor exists and the OnceLock
-    // shape is correct for the future swap-in.
-    let source = lf(include_str!("../src/subscriptions.rs"));
-    assert!(
-        source.contains("fn dispatch_http_client() -> Option<&'static reqwest::blocking::Client>"),
-        "dispatch_http_client() scaffolding must exist post-#1073"
-    );
-    assert!(
-        source.contains("static CLIENT: std::sync::OnceLock<Option<reqwest::blocking::Client>>"),
-        "shared dispatch client must live in a OnceLock post-#1073"
-    );
-}
+//
+// v0.7.x (issue #1174 follow-up #1196) — the
+// `sr3_1073_dispatch_http_client_scaffolding_exists` test was removed
+// alongside the `dispatch_http_client()` accessor it pinned. Sub-agent
+// code review (#1196 PR8) confirmed zero production callers; the
+// scaffolding was dead code held alive only by this test pin. The SR-2
+// #1082 SSRF hardening still mandates per-call `builder.resolve(host,
+// addr)` DNS pinning; the future custom `reqwest::dns::Resolve`
+// refactor will re-introduce a process-shared client through
+// `RuntimeContext` at that point, not as a private module-level
+// `OnceLock`. New regression coverage for the live `send()` SSRF guard
+// lives in `tests/h11_ssrf_*.rs` and is not affected by this removal.
 
 // -----------------------------------------------------------------
 // #1097 — list_by_event prefilter

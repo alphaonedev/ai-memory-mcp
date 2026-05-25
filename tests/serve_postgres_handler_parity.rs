@@ -120,6 +120,7 @@ async fn build_postgres_app_state(url: &str) -> AppState {
         admin_agent_ids: Arc::new(vec!["ai:parity-test".to_string()]),
         rule_cache: std::sync::Arc::new(ai_memory::governance::rule_cache::RuleCache::new()),
         resolved_models: std::sync::Arc::new(ai_memory::config::ResolvedModels::default()),
+        runtime: ai_memory::runtime_context::RuntimeContext::global_arc(),
     }
 }
 

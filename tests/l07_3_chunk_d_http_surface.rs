@@ -142,6 +142,7 @@ fn build_router_fixture() -> (axum::Router, NamedTempFile) {
         admin_agent_ids: Arc::new(vec![TEST_ADMIN_ID.to_string()]),
         rule_cache: std::sync::Arc::new(ai_memory::governance::rule_cache::RuleCache::new()),
         resolved_models: std::sync::Arc::new(ai_memory::config::ResolvedModels::default()),
+        runtime: ai_memory::runtime_context::RuntimeContext::global_arc(),
     };
     let api_key_state = ApiKeyState {
         key: None,
@@ -204,6 +205,7 @@ fn build_router_fixture_no_admin() -> (axum::Router, NamedTempFile) {
         admin_agent_ids: Arc::new(Vec::new()),
         rule_cache: std::sync::Arc::new(ai_memory::governance::rule_cache::RuleCache::new()),
         resolved_models: std::sync::Arc::new(ai_memory::config::ResolvedModels::default()),
+        runtime: ai_memory::runtime_context::RuntimeContext::global_arc(),
     };
     let api_key_state = ApiKeyState {
         key: None,

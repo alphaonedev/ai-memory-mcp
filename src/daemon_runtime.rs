@@ -3279,6 +3279,7 @@ pub async fn bootstrap_serve(
         // The resolver folds CLI / env / `[llm]` / legacy / compiled-
         // default precedence and the resulting triple is process-stable.
         resolved_models: Arc::new(app_config.resolve_models()),
+        runtime: crate::runtime_context::RuntimeContext::global_arc(),
     };
 
     // v0.7.0 Policy-Engine Item 3 — register the deferred-audit
@@ -4176,6 +4177,7 @@ mod tests {
             // `fresh_conn()`).
             rule_cache: Arc::new(crate::governance::rule_cache::RuleCache::new()),
             resolved_models: Arc::new(crate::config::ResolvedModels::default()),
+            runtime: crate::runtime_context::RuntimeContext::global_arc(),
         }
     }
 

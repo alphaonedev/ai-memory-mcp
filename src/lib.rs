@@ -229,6 +229,15 @@ pub mod profile;
 pub mod quotas;
 pub mod replication;
 pub mod reranker;
+// v0.7.x (issue #1174 follow-up #1192 / #1196) — cross-surface
+// substrate state (HMAC override, decompression cap, audit chain,
+// session-recall tracker, keypair cache). Held as `Arc<RuntimeContext>`
+// by every long-lived runtime so the HTTP daemon, MCP stdio binary,
+// and CLI all share one source of truth. The legacy free-fn surface
+// (`config::active_hooks_hmac_secret`, `audit::emit`,
+// `reranker::global_session_recall_tracker`, …) delegates here so the
+// wire / chain / cache semantics stay byte-equivalent.
+pub mod runtime_context;
 pub mod signed_events;
 pub mod sizes;
 pub mod subscriptions;

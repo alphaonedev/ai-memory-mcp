@@ -1,6 +1,13 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+// v0.7.x (#1192/#1196 follow-up) — toolchain bump baseline: rustc 1.95
+// surfaced `clippy::doc_lazy_continuation` against the pre-existing
+// `///` doc paragraphs in this test file (the lint was added between
+// the file's last edit and the rustc bump). Suppression is local to
+// this file so the substrate-wide clippy gate keeps catching new
+// occurrences in future code.
+#![allow(clippy::doc_lazy_continuation)]
 #![allow(clippy::needless_update)]
 // clippy allows (test scaffolding): pedantic lints with no behavioural impact.
 #![allow(
