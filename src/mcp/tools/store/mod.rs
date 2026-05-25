@@ -241,6 +241,12 @@ pub(crate) fn handle_store(
     autonomous_hooks: bool,
     mcp_client: Option<&str>,
     federation_forward_url: Option<&str>,
+    // Issue #1239 — synthesis Update / Delete verdicts now emit a
+    // `supersedes` link new → target via `db::create_link_signed`. The
+    // active daemon keypair (when configured) signs the link so the
+    // edge lands with `attest_level='self_signed'` — matching the
+    // legacy supersede path through `update_with_archive_on_supersede`.
+    active_keypair: Option<&crate::identity::keypair::AgentKeypair>,
 ) -> Result<Value, String> {
     // v0.7.0 (issue #318) — when operators have configured a federation
     // forward URL, every MCP write routes through the local HTTP daemon
@@ -438,12 +444,18 @@ pub(crate) fn handle_store(
         embedder,
         vector_index,
         &synthesis_outcome,
+        active_keypair,
     ) {
         return Ok(resp);
     }
-    // When no update fired, apply any queued deletes before the
-    // standard insert path proceeds.
-    synthesis::apply_pending_synthesis_deletes(conn, &synthesis_outcome);
+    // When no update fired, capture the list of to-be-deleted
+    // candidate ids. Per issue #1239, we delete them AFTER the
+    // standard insert below + link emit so the supersedes link from
+    // the new memory → each deleted candidate has both endpoints
+    // alive at FK-check time. When the synthesis verdict carried no
+    // deletes, this is a zero-cost empty list.
+    let pending_synthesis_delete_targets =
+        synthesis::pending_synthesis_delete_targets(&synthesis_outcome);
 
     let exact_dup = if matches!(on_conflict, OnConflict::Merge) {
         existing
@@ -602,6 +614,19 @@ pub(crate) fn handle_store(
             return Err(e.to_string());
         }
     };
+
+    // Issue #1239 — synthesis Delete + reinsert path: now that the
+    // new memory has been inserted, emit a `supersedes` link from it
+    // to each Delete-verdict candidate BEFORE deleting the candidate
+    // (the FK gate requires both endpoints alive at link-insert
+    // time). Best-effort: per-candidate failures warn-log and the
+    // standard insert is not rolled back.
+    synthesis::apply_pending_synthesis_deletes_with_links(
+        conn,
+        &actual_id,
+        &pending_synthesis_delete_targets,
+        active_keypair,
+    );
 
     // PR-5 (issue #487): security audit trail. No-op when disabled.
     crate::audit::emit(crate::audit::EventBuilder::new(

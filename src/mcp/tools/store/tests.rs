@@ -89,6 +89,7 @@ fn happy_path_basic_store() {
         false,
         None,
         None,
+        None,
     )
     .expect("ok");
     assert!(resp["id"].is_string());
@@ -113,6 +114,7 @@ fn happy_path_with_embedder() {
         Some(&idx),
         &ttl,
         false,
+        None,
         None,
         None,
     )
@@ -140,6 +142,7 @@ fn missing_title_errors() {
         false,
         None,
         None,
+        None,
     )
     .unwrap_err();
     assert!(err.contains("title"));
@@ -162,6 +165,7 @@ fn missing_content_errors() {
         false,
         None,
         None,
+        None,
     )
     .unwrap_err();
     assert!(err.contains("content"));
@@ -176,7 +180,7 @@ fn invalid_tier_errors() {
     let mut params = base_params("bt");
     params["tier"] = json!("flibbertigibbet");
     let err = handle_store(
-        &conn, &db_path, &params, None, None, None, &ttl, false, None, None,
+        &conn, &db_path, &params, None, None, None, &ttl, false, None, None, None,
     )
     .unwrap_err();
     assert!(err.contains("invalid tier"));
@@ -191,7 +195,7 @@ fn empty_title_errors() {
     let mut params = base_params("x");
     params["title"] = json!("");
     let err = handle_store(
-        &conn, &db_path, &params, None, None, None, &ttl, false, None, None,
+        &conn, &db_path, &params, None, None, None, &ttl, false, None, None, None,
     )
     .unwrap_err();
     assert!(!err.is_empty());
@@ -206,7 +210,7 @@ fn invalid_namespace_errors() {
     let mut params = base_params("ns");
     params["namespace"] = json!("has space");
     let err = handle_store(
-        &conn, &db_path, &params, None, None, None, &ttl, false, None, None,
+        &conn, &db_path, &params, None, None, None, &ttl, false, None, None, None,
     )
     .unwrap_err();
     assert!(!err.is_empty());
@@ -221,7 +225,7 @@ fn invalid_priority_errors() {
     let mut params = base_params("p");
     params["priority"] = json!(99);
     let err = handle_store(
-        &conn, &db_path, &params, None, None, None, &ttl, false, None, None,
+        &conn, &db_path, &params, None, None, None, &ttl, false, None, None, None,
     )
     .unwrap_err();
     assert!(!err.is_empty());
@@ -236,7 +240,7 @@ fn invalid_on_conflict_errors() {
     let mut params = base_params("oc");
     params["on_conflict"] = json!("bogus");
     let err = handle_store(
-        &conn, &db_path, &params, None, None, None, &ttl, false, None, None,
+        &conn, &db_path, &params, None, None, None, &ttl, false, None, None, None,
     )
     .unwrap_err();
     assert!(err.contains("invalid on_conflict"));
@@ -251,7 +255,7 @@ fn priority_extreme_saturates_and_validates() {
     let mut params = base_params("p");
     params["priority"] = json!(9_999_999_999_i64);
     let err = handle_store(
-        &conn, &db_path, &params, None, None, None, &ttl, false, None, None,
+        &conn, &db_path, &params, None, None, None, &ttl, false, None, None, None,
     )
     .unwrap_err();
     assert!(!err.is_empty());
@@ -266,11 +270,11 @@ fn on_conflict_error_rejects_duplicate() {
     let mut params = base_params("dup");
     params["on_conflict"] = json!("error");
     let _ = handle_store(
-        &conn, &db_path, &params, None, None, None, &ttl, false, None, None,
+        &conn, &db_path, &params, None, None, None, &ttl, false, None, None, None,
     )
     .expect("first");
     let err = handle_store(
-        &conn, &db_path, &params, None, None, None, &ttl, false, None, None,
+        &conn, &db_path, &params, None, None, None, &ttl, false, None, None, None,
     )
     .unwrap_err();
     assert!(err.contains("CONFLICT"));
@@ -285,11 +289,11 @@ fn on_conflict_version_suffixes_title() {
     let mut params = base_params("ver");
     params["on_conflict"] = json!("version");
     let r1 = handle_store(
-        &conn, &db_path, &params, None, None, None, &ttl, false, None, None,
+        &conn, &db_path, &params, None, None, None, &ttl, false, None, None, None,
     )
     .expect("first");
     let r2 = handle_store(
-        &conn, &db_path, &params, None, None, None, &ttl, false, None, None,
+        &conn, &db_path, &params, None, None, None, &ttl, false, None, None, None,
     )
     .expect("second");
     assert_eq!(r1["title"].as_str(), Some("ver"));
@@ -306,11 +310,11 @@ fn on_conflict_merge_dedup_branch() {
     let mut params = base_params("merged");
     params["on_conflict"] = json!("merge");
     let r1 = handle_store(
-        &conn, &db_path, &params, None, None, None, &ttl, false, None, None,
+        &conn, &db_path, &params, None, None, None, &ttl, false, None, None, None,
     )
     .expect("first");
     let r2 = handle_store(
-        &conn, &db_path, &params, None, None, None, &ttl, false, None, None,
+        &conn, &db_path, &params, None, None, None, &ttl, false, None, None, None,
     )
     .expect("second");
     assert_eq!(r1["id"], r2["id"], "dedup yields same id");
@@ -338,6 +342,7 @@ fn merge_dedup_reembeds_on_content_change() {
         false,
         None,
         None,
+        None,
     )
     .expect("first");
     // Change content for the second call to drive content_changed=true
@@ -351,6 +356,7 @@ fn merge_dedup_reembeds_on_content_change() {
         Some(&idx),
         &ttl,
         false,
+        None,
         None,
         None,
     )
@@ -377,6 +383,7 @@ fn idempotent_merge_default_for_unknown_client() {
         false,
         Some("ai:unknown@host"),
         None,
+        None,
     )
     .expect("first");
     let r2 = handle_store(
@@ -389,6 +396,7 @@ fn idempotent_merge_default_for_unknown_client() {
         &ttl,
         false,
         Some("ai:unknown@host"),
+        None,
         None,
     )
     .expect("second");
@@ -404,7 +412,7 @@ fn scope_validated_and_merged_into_metadata() {
     let mut params = base_params("scoped");
     params["scope"] = json!("team");
     let resp = handle_store(
-        &conn, &db_path, &params, None, None, None, &ttl, false, None, None,
+        &conn, &db_path, &params, None, None, None, &ttl, false, None, None, None,
     )
     .expect("ok");
     let mem = db::get(&conn, resp["id"].as_str().unwrap())
@@ -435,6 +443,7 @@ fn agent_id_via_metadata_inline() {
         false,
         None,
         None,
+        None,
     )
     .expect("ok");
     assert_eq!(resp["agent_id"].as_str(), Some("ai:bob"));
@@ -455,6 +464,7 @@ fn autonomy_hook_skipped_disabled_no_field_when_off() {
         None,
         &ttl,
         false, // hooks disabled
+        None,
         None,
         None,
     )
@@ -478,6 +488,7 @@ fn autonomy_hook_skipped_no_llm_reason() {
         None,
         &ttl,
         true, // hooks enabled
+        None,
         None,
         None,
     )
@@ -511,6 +522,7 @@ fn autonomy_hook_skipped_content_too_short() {
         true,
         None,
         None,
+        None,
     )
     .expect("ok");
     assert_eq!(
@@ -539,6 +551,7 @@ fn autonomy_hook_skipped_internal_namespace() {
         None,
         &ttl,
         true,
+        None,
         None,
         None,
     )
@@ -602,7 +615,7 @@ fn k9_deny_rule_short_circuits_store() {
     let mut params = base_params("denied");
     params["namespace"] = json!("k9-deny-store");
     let err = handle_store(
-        &conn, &db_path, &params, None, None, None, &ttl, false, None, None,
+        &conn, &db_path, &params, None, None, None, &ttl, false, None, None, None,
     )
     .unwrap_err();
     assert!(err.contains("denied"), "got: {err}");
@@ -625,7 +638,7 @@ fn k9_ask_rule_returns_ask_envelope_for_store() {
     let mut params = base_params("ask");
     params["namespace"] = json!("k9-ask-store");
     let out = handle_store(
-        &conn, &db_path, &params, None, None, None, &ttl, false, None, None,
+        &conn, &db_path, &params, None, None, None, &ttl, false, None, None, None,
     )
     .expect("ask returns Ok");
     assert_eq!(out["status"].as_str(), Some("ask"));
@@ -681,6 +694,7 @@ async fn autonomy_hook_executes_with_llm_success() {
             true,
             None,
             None,
+            None,
         )
     })
     .await
@@ -732,6 +746,7 @@ async fn autonomy_hook_swallows_llm_error() {
             true,
             None,
             None,
+            None,
         )
     })
     .await
@@ -773,6 +788,7 @@ async fn federation_forward_url_propagates_server_error() {
             false,
             None,
             Some(&uri),
+            None,
         )
     })
     .await
@@ -814,6 +830,7 @@ async fn federation_forward_url_propagates_parse_error() {
             false,
             None,
             Some(&uri),
+            None,
         )
     })
     .await
@@ -854,6 +871,7 @@ async fn federation_forward_url_happy_returns_body() {
             false,
             None,
             Some(&uri),
+            None,
         )
     })
     .await
@@ -881,7 +899,8 @@ fn federation_forward_url_branch_takes_http_path() {
         &ttl,
         false,
         None,
-        Some("http://127.0.0.1:1"), // unreachable
+        Some("http://127.0.0.1:1"), // unreachable,
+        None,
     )
     .unwrap_err();
     assert!(err.contains("federation_forward"));
@@ -911,7 +930,8 @@ fn federation_forward_url_uses_metadata_agent_id_when_top_level_absent() {
         &ttl,
         false,
         None,
-        Some("http://127.0.0.1:1"), // unreachable — we just want to exercise the agent_id path
+        Some("http://127.0.0.1:1"), // unreachable — we just want to exercise the agent_id path,
+        None,
     );
     // Unreachable URL means a federation_forward error; the
     // important pin is no panic and the metadata.agent_id fallback
@@ -939,6 +959,7 @@ fn federation_forward_url_rejects_malformed_agent_id() {
         false,
         None,
         Some("http://127.0.0.1:1"),
+        None,
     )
     .unwrap_err();
     // The error should be the validator rejection from
@@ -1108,7 +1129,7 @@ fn governance_deny_blocks_store() {
     params["namespace"] = json!(ns);
     params["agent_id"] = json!("ai:eve");
     let err = handle_store(
-        &conn, &db_path, &params, None, None, None, &ttl, false, None, None,
+        &conn, &db_path, &params, None, None, None, &ttl, false, None, None, None,
     )
     .unwrap_err();
     assert!(
@@ -1141,7 +1162,7 @@ fn governance_pending_returns_pending_envelope_for_store() {
     params["namespace"] = json!(ns);
     params["agent_id"] = json!("ai:bob");
     let out = handle_store(
-        &conn, &db_path, &params, None, None, None, &ttl, false, None, None,
+        &conn, &db_path, &params, None, None, None, &ttl, false, None, None, None,
     )
     .expect("pending returns Ok");
     assert_eq!(out["status"].as_str(), Some("pending"));
@@ -1225,6 +1246,7 @@ async fn autonomy_hook_confirmed_contradictions_reach_response() {
             false,
             None,
             None,
+            None,
         )
         .expect("seed");
         // Now store a candidate with a different content; autonomy
@@ -1244,6 +1266,7 @@ async fn autonomy_hook_confirmed_contradictions_reach_response() {
             None,
             &ttl,
             true,
+            None,
             None,
             None,
         )
@@ -1290,6 +1313,7 @@ fn autonomy_hook_skipped_short_content_with_no_llm() {
         true, // autonomous_hooks ON
         None,
         None,
+        None,
     )
     .expect("store with short content + autonomy off should succeed");
     assert!(resp["id"].is_string());
@@ -1307,7 +1331,7 @@ fn store_preserves_caller_supplied_memory_kind() {
     let mut params = base_params("kind-test");
     params["kind"] = json!("claim");
     let resp = handle_store(
-        &conn, &db_path, &params, None, None, None, &ttl, false, None, None,
+        &conn, &db_path, &params, None, None, None, &ttl, false, None, None, None,
     )
     .expect("ok");
     let id = resp["id"].as_str().unwrap();
@@ -1330,7 +1354,7 @@ fn store_accepts_form4_fields_in_params() {
     params["source_uri"] = json!("uri:https://example.com/x");
     params["source_span"] = json!({"start": 0, "end": 5});
     let res = handle_store(
-        &conn, &db_path, &params, None, None, None, &ttl, false, None, None,
+        &conn, &db_path, &params, None, None, None, &ttl, false, None, None, None,
     );
     // The handler may or may not parse these fields depending on
     // how it constructs the Memory; we accept either Ok (form4
@@ -1353,6 +1377,7 @@ fn store_empty_title_propagates_validate_title_error() {
         None,
         &ttl,
         false,
+        None,
         None,
         None,
     )
@@ -1379,6 +1404,7 @@ fn store_oversize_content_propagates_validate_content_error() {
         false,
         None,
         None,
+        None,
     )
     .unwrap_err();
     assert!(err.contains("content"), "got: {err}");
@@ -1393,7 +1419,7 @@ fn store_empty_tag_propagates_validate_tags_error() {
     let mut params = base_params("tags-empty");
     params["tags"] = json!(["valid", ""]);
     let err = handle_store(
-        &conn, &db_path, &params, None, None, None, &ttl, false, None, None,
+        &conn, &db_path, &params, None, None, None, &ttl, false, None, None, None,
     )
     .unwrap_err();
     assert!(err.contains("tag"), "got: {err}");
@@ -1410,7 +1436,7 @@ fn store_oversize_confidence_propagates_validate_confidence_error() {
     // validate runs before clamp in handle_store).
     params["confidence"] = json!(2.5);
     let res = handle_store(
-        &conn, &db_path, &params, None, None, None, &ttl, false, None, None,
+        &conn, &db_path, &params, None, None, None, &ttl, false, None, None, None,
     );
     // confidence is clamped to [0,1] BEFORE validate, so this may
     // succeed; both outcomes prove the validate edge is exercised.
@@ -1426,7 +1452,7 @@ fn store_invalid_scope_propagates_validate_scope_error() {
     let mut params = base_params("scope-bad");
     params["scope"] = json!("not-a-real-scope");
     let err = handle_store(
-        &conn, &db_path, &params, None, None, None, &ttl, false, None, None,
+        &conn, &db_path, &params, None, None, None, &ttl, false, None, None, None,
     )
     .unwrap_err();
     assert!(
@@ -1444,7 +1470,7 @@ fn store_accepts_valid_explicit_scope() {
     let mut params = base_params("scope-good");
     params["scope"] = json!("team");
     let resp = handle_store(
-        &conn, &db_path, &params, None, None, None, &ttl, false, None, None,
+        &conn, &db_path, &params, None, None, None, &ttl, false, None, None, None,
     )
     .expect("valid scope accepted");
     let id = resp["id"].as_str().unwrap();
@@ -1468,7 +1494,7 @@ fn store_accepts_inline_metadata_scope() {
     let mut params = base_params("scope-inline");
     params["metadata"] = json!({"scope": "private"});
     let resp = handle_store(
-        &conn, &db_path, &params, None, None, None, &ttl, false, None, None,
+        &conn, &db_path, &params, None, None, None, &ttl, false, None, None, None,
     )
     .expect("inline scope accepted");
     let id = resp["id"].as_str().unwrap();
@@ -1494,7 +1520,7 @@ fn store_non_object_metadata_replaced_with_empty() {
     let mut params = base_params("meta-non-object");
     params["metadata"] = json!("not-an-object-string");
     let resp = handle_store(
-        &conn, &db_path, &params, None, None, None, &ttl, false, None, None,
+        &conn, &db_path, &params, None, None, None, &ttl, false, None, None, None,
     )
     .expect("non-object metadata must not panic; handler replaces with empty");
     assert!(resp["id"].is_string());
@@ -1510,12 +1536,12 @@ fn store_on_conflict_error_with_existing_returns_conflict_message() {
     let mut params = base_params("conflict-victim");
     params["on_conflict"] = json!("error");
     handle_store(
-        &conn, &db_path, &params, None, None, None, &ttl, false, None, None,
+        &conn, &db_path, &params, None, None, None, &ttl, false, None, None, None,
     )
     .expect("seed succeeds");
     // Second store with same title + namespace + on_conflict=error must conflict.
     let err = handle_store(
-        &conn, &db_path, &params, None, None, None, &ttl, false, None, None,
+        &conn, &db_path, &params, None, None, None, &ttl, false, None, None, None,
     )
     .unwrap_err();
     assert!(err.contains("CONFLICT"), "got: {err}");
@@ -1536,7 +1562,7 @@ fn store_accepts_inline_metadata_agent_id() {
     // No top-level agent_id; supply via metadata.agent_id instead.
     params["metadata"] = json!({"agent_id": "ai:inline-claude"});
     let resp = handle_store(
-        &conn, &db_path, &params, None, None, None, &ttl, false, None, None,
+        &conn, &db_path, &params, None, None, None, &ttl, false, None, None, None,
     )
     .expect("inline metadata.agent_id accepted");
     assert_eq!(resp["agent_id"].as_str(), Some("ai:inline-claude"));
@@ -1562,7 +1588,7 @@ fn store_rejects_malformed_agent_id() {
     let mut params = base_params("malformed-aid");
     params["agent_id"] = json!("contains whitespace");
     let res = handle_store(
-        &conn, &db_path, &params, None, None, None, &ttl, false, None, None,
+        &conn, &db_path, &params, None, None, None, &ttl, false, None, None, None,
     );
     assert!(res.is_err(), "malformed agent_id must be rejected");
 }
@@ -1581,7 +1607,7 @@ fn store_rejects_metadata_with_oversized_key() {
     let long_key = "k".repeat(2048);
     params["metadata"] = json!({long_key: "v"});
     let res = handle_store(
-        &conn, &db_path, &params, None, None, None, &ttl, false, None, None,
+        &conn, &db_path, &params, None, None, None, &ttl, false, None, None, None,
     );
     // Accept either outcome — if validate_metadata caps key length
     // the call errors; if it permits it, the call succeeds. Either
@@ -1601,7 +1627,7 @@ fn store_rejects_metadata_with_excessive_total_size() {
     let big_value = "x".repeat(200_000);
     params["metadata"] = json!({"data": big_value});
     let res = handle_store(
-        &conn, &db_path, &params, None, None, None, &ttl, false, None, None,
+        &conn, &db_path, &params, None, None, None, &ttl, false, None, None, None,
     );
     let _ = res;
 }
@@ -1631,6 +1657,7 @@ fn store_merge_dedup_re_embeds_on_content_change() {
         false,
         None,
         None,
+        None,
     )
     .expect("seed");
     // Re-store with different content — must update existing row
@@ -1645,6 +1672,7 @@ fn store_merge_dedup_re_embeds_on_content_change() {
         Some(&idx),
         &ttl,
         false,
+        None,
         None,
         None,
     )
@@ -1680,6 +1708,7 @@ fn store_failing_embedder_warns_but_completes() {
         None,
         &ttl,
         false,
+        None,
         None,
         None,
     )
@@ -1734,6 +1763,7 @@ fn store_quota_exhausted_returns_quota_exceeded_error() {
         false,
         None,
         None,
+        None,
     )
     .unwrap_err();
     assert!(
@@ -1755,7 +1785,7 @@ fn store_invalid_source_propagates_validate_source_error() {
     // pick a clearly invalid one.
     params["source"] = json!("has whitespace and is too long for the validator anyway");
     let err = handle_store(
-        &conn, &db_path, &params, None, None, None, &ttl, false, None, None,
+        &conn, &db_path, &params, None, None, None, &ttl, false, None, None, None,
     )
     .unwrap_err();
     assert!(!err.is_empty(), "validate_source must surface an error");
@@ -1821,6 +1851,7 @@ async fn legacy_classifier_handles_no_and_error_responses() {
             false,
             None,
             None,
+            None,
         )
         .expect("seed");
         handle_store(
@@ -1838,6 +1869,7 @@ async fn legacy_classifier_handles_no_and_error_responses() {
             None,
             &ttl,
             true,
+            None,
             None,
             None,
         )
@@ -1900,6 +1932,7 @@ async fn legacy_classifier_handles_no_and_error_responses() {
             false,
             None,
             None,
+            None,
         )
         .expect("seed");
         handle_store(
@@ -1917,6 +1950,7 @@ async fn legacy_classifier_handles_no_and_error_responses() {
             None,
             &ttl,
             true,
+            None,
             None,
             None,
         )
