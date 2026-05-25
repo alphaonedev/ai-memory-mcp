@@ -855,6 +855,7 @@ Plus per-release:
 - Public-surface landing pages (ship-gate, A2A-gate) auto-update from result JSON.
 - **NEW: §2 property contribution declared per release.** Each release's CHANGELOG.md must name which of the seven properties (§2.1–§2.7) the release strengthens, with code anchors. If a release strengthens none, the release proposal must be re-evaluated against the §3 scope test before merge.
 - **NEW for major versions: heterogeneous AI NHI panel review** ([#1171](https://github.com/alphaonedev/ai-memory-mcp/issues/1171) methodology) on strategic-layer claims before tag. Single-evaluator strategic claims are not procurement-defensible; heterogeneous-evaluator strategic claims are.
+- **CLI design rationale.** For why the CLI exposes some MCP tools as flat verbs and others through actor-named higher-level verbs, see [`docs/cli-design-rationale.md`](docs/cli-design-rationale.md). The asymmetry between `ai-memory store` / `ai-memory recall` (flat) and `ai-memory curator --reflect` / `ai-memory consolidate` (actor-named) preserves the §2.6 bias-displacement architectural distinction at the operator interface.
 
 ---
 
