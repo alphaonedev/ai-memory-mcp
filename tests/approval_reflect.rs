@@ -39,7 +39,7 @@ use chrono::Utc;
 
 /// Vendor-neutral fixture source for this test file's `ReflectInput`
 /// builders, per PR #1175 (`validate::DEFAULT_NHI_SOURCE = "nhi"`)
-/// + PR #1174 PR9 (vendor-deflake test fixtures). Pre-deflake the
+/// Plus PR #1174 PR9 (vendor-deflake test fixtures). Pre-deflake the
 /// literal `"claude"` was used here, which silently coupled this test
 /// to a single vendor identity and weakened the heterogeneous-NHI
 /// invariant pinned by `tests/issue_809_*` + `tests/capabilities_v3_*`.
