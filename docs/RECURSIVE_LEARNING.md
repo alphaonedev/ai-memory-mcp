@@ -164,12 +164,12 @@ the entire primitive.
 
 | Surface | Where | Notes |
 |---|---|---|
-| `memories.reflection_depth INTEGER NOT NULL DEFAULT 0` | SQLite schema v29 (`src/db.rs`); Postgres schema v31 ([`src/store/postgres_schema.sql`](../src/store/postgres_schema.sql), [`migrations/postgres/0013_v0700_reflection_depth.sql`](../migrations/postgres/0013_v0700_reflection_depth.sql)) | Caller-minted rows are 0; reflections are `max(source_depths) + 1`. UPSERT clauses take `MAX(old, new)` so federation merges preserve the higher-depth signal. |
+| `memories.reflection_depth INTEGER NOT NULL DEFAULT 0` | SQLite schema v29 (`src/storage/migrations.rs`; pre-#961 was `src/db.rs`); Postgres schema v31 ([`src/store/postgres_schema.sql`](../src/store/postgres_schema.sql), [`migrations/postgres/0013_v0700_reflection_depth.sql`](../migrations/postgres/0013_v0700_reflection_depth.sql)) | Caller-minted rows are 0; reflections are `max(source_depths) + 1`. UPSERT clauses take `MAX(old, new)` so federation merges preserve the higher-depth signal. |
 | `Memory::reflection_depth: i32` | [`src/models.rs`](../src/models.rs) | `#[serde(default)]` keeps wire-compat with pre-v0.7.0 federation peers. `impl Default for Memory` ships in the same commit so future struct-field adds stop fanning out to ~50 test fixtures. |
 | `GovernancePolicy::max_reflection_depth: Option<u32>` | [`src/models.rs`](../src/models.rs) | Per-namespace cap. `None` → compiled default 3. `Some(0)` → kill-switch. |
 | `GovernancePolicy::effective_max_reflection_depth(&self) -> u32` | [`src/models.rs`](../src/models.rs) | Flat accessor. Does NOT walk ancestors — call `resolve_governance_policy` first, then this accessor on the result. |
-| `reflects_on` relation | [`src/validate.rs`](../src/validate.rs) (`VALID_RELATIONS`); MCP enums in [`src/mcp.rs`](../src/mcp.rs) for `memory_link` / `memory_unlink`; `claude_help` prompt pipe-list | No schema migration required. `memory_links.relation` has no `CHECK (relation IN ...)` clause on either adapter — adding a label is a pure validator + documentation change. |
-| `memory_reflect` MCP tool | [`src/mcp.rs`](../src/mcp.rs); substrate impl `db::reflect` in [`src/db.rs`](../src/db.rs); postgres parity `PostgresStore::reflect` in [`src/store/postgres.rs`](../src/store/postgres.rs) | `Family::Power`. Tool count 51 → 52. Atomic insert + N `reflects_on` link writes inside a single `BEGIN IMMEDIATE` / `COMMIT` block (SQLite) or `sqlx::Transaction` (Postgres). |
+| `reflects_on` relation | [`src/validate.rs`](../src/validate.rs) (`VALID_RELATIONS`); MCP enums in [`src/mcp/tools/link.rs`](../src/mcp/tools/link.rs) + [`src/mcp/tools/unlink.rs`](../src/mcp/tools/unlink.rs) (post-#1066 split; was `src/mcp.rs` pre-split); `claude_help` prompt pipe-list | No schema migration required. `memory_links.relation` has no `CHECK (relation IN ...)` clause on either adapter — adding a label is a pure validator + documentation change. |
+| `memory_reflect` MCP tool | [`src/mcp/tools/reflect.rs`](../src/mcp/tools/reflect.rs) (post-#1066 + #987 D1.6 split); substrate impl `reflect` in [`src/storage/reflect.rs`](../src/storage/reflect.rs) (post-#961 SAL boundary cleanup; `db::reflect` is the back-compat alias); postgres parity `PostgresStore::reflect` in [`src/store/postgres.rs`](../src/store/postgres.rs) | `Family::Power`. Tool count 51 → 52. Atomic insert + N `reflects_on` link writes inside a single `BEGIN IMMEDIATE` / `COMMIT` block (SQLite) or `sqlx::Transaction` (Postgres). |
 | `MemoryError::ReflectionDepthExceeded { attempted: u32, cap: u32, namespace: String }` | [`src/errors.rs`](../src/errors.rs) | HTTP `409 CONFLICT`, code `REFLECTION_DEPTH_EXCEEDED`. The structured triple is what downstream auditors and hook emitters need without parsing error strings. |
 
 ## Directionality contract for `reflects_on`
@@ -291,7 +291,10 @@ The Track-G hook pipeline grows from 21 to 23 events with two new
   connection.
 
 The hook decision surface is the narrow
-[`ReflectHookDecision`](../src/db.rs) enum:
+[`ReflectHookDecision`](../src/storage/reflect.rs) enum (post-#961
+SAL boundary cleanup relocated the type from `src/db.rs` to
+`src/storage/reflect.rs`; `db::ReflectHookDecision` remains a
+back-compat alias):
 
 ```rust
 pub enum ReflectHookDecision {
