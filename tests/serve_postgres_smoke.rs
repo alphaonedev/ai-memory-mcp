@@ -49,7 +49,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, Notify, RwLock};
 
 mod common;
-use common::{free_port, pg_test_client, postgres_url};
+use common::{DAEMON_READY_TIMEOUT, free_port, pg_test_client, postgres_url, wait_for_http_ready};
 
 /// Build the `AppState` for a postgres-backed in-process daemon.
 ///
@@ -130,22 +130,16 @@ async fn serve_postgres_smoke_round_trip() {
         .await
     });
 
-    // Wait for the listener to come up. ~5s budget with 100ms backoff.
-    let mut ready = false;
-    for _ in 0..50 {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        if let Ok(resp) = reqwest::get(&format!("http://{addr}/api/v1/health")).await {
-            if resp.status() == reqwest::StatusCode::OK {
-                ready = true;
-                break;
-            }
-        }
-    }
-    assert!(
-        ready,
-        "postgres-backed serve health probe never returned 200 — \
-         in-process HTTP daemon failed to bind"
-    );
+    // #1194: progress-detecting health-check loop with 5 min generous
+    // overall timeout — replaces the prior fixed 50 × 100 ms = 5 s
+    // budget that flaked under GHA runner load. See
+    // `tests/common::wait_for_http_ready` for the rationale + shape.
+    wait_for_http_ready(&addr, DAEMON_READY_TIMEOUT)
+        .await
+        .expect(
+            "postgres-backed serve health probe never returned 200 — \
+         in-process HTTP daemon failed to bind",
+        );
 
     let client = pg_test_client("ai:smoke-test");
     let base = format!("http://{addr}");

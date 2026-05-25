@@ -38,7 +38,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, Notify, RwLock};
 
 mod common;
-use common::{free_port, pg_test_client, postgres_url};
+use common::{DAEMON_READY_TIMEOUT, free_port, pg_test_client, postgres_url, wait_for_http_ready};
 
 async fn build_postgres_app_state(url: &str) -> AppState {
     let conn = ai_memory::db::open(std::path::Path::new(":memory:")).expect("scratch sqlite");
@@ -112,17 +112,15 @@ async fn spawn_daemon(
         )
         .await
     });
-    let mut ready = false;
-    for _ in 0..50 {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        if let Ok(resp) = reqwest::get(format!("http://{addr}/api/v1/health")).await
-            && resp.status() == reqwest::StatusCode::OK
-        {
-            ready = true;
-            break;
-        }
-    }
-    assert!(ready, "postgres-backed serve never became ready");
+    // #1194: progress-detecting health-check loop with 5 min generous
+    // overall timeout — replaces the prior fixed 50 × 100 ms = 5 s
+    // budget that flaked under GHA runner load (PRs #1178/#1179/
+    // #1189/#1190). The helper polls `/api/v1/health` (which drives a
+    // SELECT 1 round-trip on the postgres pool) with exponential
+    // backoff and returns ASAP when the daemon binds.
+    wait_for_http_ready(&addr, DAEMON_READY_TIMEOUT)
+        .await
+        .expect("postgres-backed serve never became ready");
     (format!("http://{addr}"), shutdown, handle)
 }
 
