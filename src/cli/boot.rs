@@ -86,7 +86,16 @@ pub const MIN_SUPPORTED_SCHEMA: u32 = 16;
 /// allotments hold even when a single agent operates across many
 /// namespaces. Pre-v50 rows backfill to the `_global` sentinel
 /// namespace so the historical accounting is preserved verbatim.
-pub const MAX_SUPPORTED_SCHEMA: u32 = 50;
+///
+/// **#1255 (2026-05-25):** bumped 50 → 51 for the
+/// `federation_nonce_cache` persistence table. Pre-#1255 the
+/// `FederationNonceCache` LRU lived purely in-process, so a daemon
+/// restart opened a fresh replay window for any captured
+/// `(body, sig, nonce)` tuple. The new table persists every
+/// `(peer_id, fingerprint, last_touch)` triple so the cache can
+/// rehydrate on the next boot. Pure additive `CREATE TABLE IF NOT
+/// EXISTS` + two indexes — fully idempotent.
+pub const MAX_SUPPORTED_SCHEMA: u32 = 51;
 
 /// Pure boundary check: `true` when `v` lies within
 /// `[MIN_SUPPORTED_SCHEMA, MAX_SUPPORTED_SCHEMA]`. Extracted so the
