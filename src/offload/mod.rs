@@ -624,12 +624,21 @@ pub fn sweep_expired(
 
     let mut deleted = 0usize;
     for ref_id in candidates {
-        conn.execute(
-            "DELETE FROM offloaded_blobs WHERE ref_id = ?1",
-            params![ref_id],
-        )
-        .with_context(|| format!("DELETE offloaded_blob {ref_id}"))?;
-        deleted += 1;
+        // Re-evaluate the TTL predicate in the DELETE itself so a concurrent
+        // `offload()` that refreshed `stored_at` between the SELECT above and
+        // this row's DELETE does not cause the fresh blob to be dropped (#1264).
+        let rows = conn
+            .execute(
+                "DELETE FROM offloaded_blobs
+                 WHERE ref_id = ?1
+                   AND ttl_seconds IS NOT NULL
+                   AND (stored_at + ttl_seconds) < ?2",
+                params![ref_id, now_unix],
+            )
+            .with_context(|| format!("DELETE offloaded_blob {ref_id}"))?;
+        if rows > 0 {
+            deleted += 1;
+        }
         if !sleep_between_deletes.is_zero() {
             std::thread::sleep(sleep_between_deletes);
         }
@@ -792,6 +801,46 @@ mod tests {
         assert!(off.deref(&a.ref_id, None).is_err());
         assert!(off.deref(&b.ref_id, None).is_err());
         assert!(off.deref(&c.ref_id, None).is_ok());
+    }
+
+    /// Regression for #1264 — TOCTOU race between `sweep_expired` SELECT
+    /// and DELETE. If a concurrent `offload()` refreshes `stored_at` after
+    /// the row is selected but before its DELETE runs, the per-row DELETE
+    /// must re-evaluate the TTL predicate and SKIP the now-fresh row.
+    #[test]
+    fn sweep_does_not_drop_blob_refreshed_after_select() {
+        let conn = fresh_db();
+        let off = ContextOffloader::new(&conn, None, OffloadConfig::default());
+        let r = off
+            .offload("racy", "ns", Some(60), "ai:alice")
+            .expect("offload");
+        let original_stored_at = r.stored_at;
+        let sweep_now = original_stored_at + 60 * 60;
+
+        // Simulate the race: between sweep's SELECT and DELETE the row gets
+        // its `stored_at` bumped to `sweep_now` (e.g. a concurrent
+        // `offload()` calling `ON CONFLICT DO UPDATE SET stored_at =
+        // excluded.stored_at`). Bumping stored_at to `sweep_now` makes the
+        // row's expiry `sweep_now + 60` — i.e. NOT expired against
+        // `sweep_now`.
+        conn.execute(
+            "UPDATE offloaded_blobs SET stored_at = ?1 WHERE ref_id = ?2",
+            params![sweep_now, r.ref_id],
+        )
+        .expect("simulate concurrent refresh");
+
+        // Sweep with the same `now` the SELECT phase used. Pre-fix, the
+        // DELETE drops the row because the predicate is only `ref_id = ?`.
+        // Post-fix, the DELETE re-checks `(stored_at + ttl_seconds) < now`
+        // and the refreshed row survives.
+        let deleted =
+            sweep_expired(&conn, sweep_now, 1000, std::time::Duration::ZERO).expect("sweep");
+        assert_eq!(
+            deleted, 0,
+            "sweep must not drop a row whose stored_at was refreshed past expiry"
+        );
+        let back = off.deref(&r.ref_id, None).expect("blob must still exist");
+        assert_eq!(back.content, "racy");
     }
 
     #[test]
