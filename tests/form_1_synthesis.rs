@@ -1504,3 +1504,129 @@ fn issue_1239_synthesis_delete_reinsert_emits_supersedes_link() {
          both endpoints were alive"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #1240 — synthesis-pass cycle-depth guard.
+//
+// A pathological curator (or post-store hook chain) could fire a fresh
+// `memory_store` from inside the synthesis pass; without a depth guard
+// each nested call would also synthesise, creating a recursive blow-up
+// that consumes the LLM budget and may stack-overflow.
+//
+// The substrate exposes a per-thread `enter_synthesis_pass()` RAII
+// helper that increments a depth counter on entry and decrements on
+// drop. `handle_store` checks the post-increment depth against the
+// compiled cap `MAX_SYNTHESIS_DEPTH = 3` BEFORE invoking
+// `run_synthesis_pass`; a depth of 4 refuses the write with
+// `SYNTHESIS_DEPTH_EXCEEDED`.
+// ---------------------------------------------------------------------------
+
+/// Issue #1240 — at depth=4 (after three nested synthesis-pass entries),
+/// the 4th `memory_store` synthesis-eligible call refuses with
+/// `SYNTHESIS_DEPTH_EXCEEDED`. Simulates the pathological chain-fire by
+/// holding three `enter_synthesis_pass()` guards across the test call.
+#[test]
+fn issue_1240_synthesis_depth_guard_refuses_at_depth_4() {
+    let (conn, db_path) = open_db();
+    let ns = "ns-1240-depth";
+    let _seed = seed_existing(&conn, "kubernetes deployment notes", "prior body", ns);
+
+    let verdict = json!({
+        "verdicts": [{"candidate_id": "any", "verb": "no_op"}]
+    });
+    let server = shared_mock_for_synthesis(verdict);
+    let uri = server.uri();
+    let llm = OllamaClient::new_with_url(&uri, "test-model").expect("mock client");
+
+    // Push the per-thread depth counter to 3 by acquiring three
+    // synthesis-pass guards. The 4th entry (inside `run_store` ->
+    // `handle_store`) will post-increment to 4 and trip the cap.
+    let (d1, _g1) = ai_memory::synthesis::enter_synthesis_pass();
+    let (d2, _g2) = ai_memory::synthesis::enter_synthesis_pass();
+    let (d3, _g3) = ai_memory::synthesis::enter_synthesis_pass();
+    assert_eq!(d1, 1, "first entry sets depth=1");
+    assert_eq!(d2, 2, "second entry sets depth=2");
+    assert_eq!(d3, 3, "third entry sets depth=3");
+    assert_eq!(
+        ai_memory::synthesis::current_synthesis_depth(),
+        3,
+        "depth counter reads back the active depth"
+    );
+
+    let err = run_store(
+        &conn,
+        &db_path,
+        &llm,
+        json!({
+            "title": "kubernetes rolling deploy strategy",
+            "content": BASE_CONTENT,
+            "namespace": ns,
+            "on_conflict": "version",
+        }),
+    )
+    .expect_err("must refuse at depth=4");
+    assert!(
+        err.starts_with("SYNTHESIS_DEPTH_EXCEEDED:"),
+        "expected SYNTHESIS_DEPTH_EXCEEDED refusal, got: {err}"
+    );
+    assert!(
+        err.contains('4'),
+        "error message names the attempted depth (4): {err}"
+    );
+    assert!(
+        err.contains('3'),
+        "error message names the compiled cap (3): {err}"
+    );
+    assert!(
+        err.contains(ns),
+        "error message names the target namespace: {err}"
+    );
+}
+
+/// Issue #1240 — at depth <= cap (3 or below), the synthesis pass runs
+/// to completion (sanity guard so the depth-cap check doesn't refuse
+/// the happy-path single-store). Drops all guards before the call to
+/// confirm the counter starts at 0 in the absence of a parent scope.
+#[test]
+fn issue_1240_synthesis_depth_guard_admits_depth_under_cap() {
+    let (conn, db_path) = open_db();
+    let ns = "ns-1240-under-cap";
+    let _seed = seed_existing(&conn, "kubernetes deployment notes", "prior body", ns);
+
+    let verdict = json!({
+        "verdicts": [{"candidate_id": "any", "verb": "no_op"}]
+    });
+    let server = shared_mock_for_synthesis(verdict);
+    let uri = server.uri();
+    let llm = OllamaClient::new_with_url(&uri, "test-model").expect("mock client");
+
+    // Sanity: depth starts at 0 in a fresh test thread (the guards
+    // from the prior failing test were dropped at end-of-fn).
+    assert_eq!(
+        ai_memory::synthesis::current_synthesis_depth(),
+        0,
+        "depth counter is per-thread and resets between independent tests"
+    );
+
+    // Depth=1 (the store handler's own entry) — under the cap of 3.
+    let resp = run_store(
+        &conn,
+        &db_path,
+        &llm,
+        json!({
+            "title": "kubernetes rolling deploy strategy",
+            "content": BASE_CONTENT,
+            "namespace": ns,
+            "on_conflict": "version",
+        }),
+    )
+    .expect("store ok at depth=1");
+    assert!(resp["id"].is_string(), "store proceeded at depth=1");
+
+    // After the call returns, the depth counter is back at 0.
+    assert_eq!(
+        ai_memory::synthesis::current_synthesis_depth(),
+        0,
+        "RAII guard restored the depth on drop"
+    );
+}
