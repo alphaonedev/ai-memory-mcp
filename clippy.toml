@@ -10,3 +10,24 @@
 # allowance keeps CI green while the split lands; removing the
 # allowance is the gate that says "this file is now under-budget".
 too-many-lines-threshold = 250
+
+# #1174 PR10 — pm-v3.1 lint-gate. Vendor-monoculture detection lives
+# in the script gate `scripts/check-vendor-literals.sh` (file-level
+# allowlist: `src/llm.rs` / `src/config.rs` / `src/mine.rs` /
+# `src/validate.rs` / `src/cli/wrap.rs` / `src/harness.rs`); the script
+# is wired into `.github/workflows/c8-precheck.yml` for CI enforcement.
+#
+# Why no `disallowed_methods = ["std::time::Duration::from_secs"]` entry
+# (PR3 SECS_PER_* discipline): `Duration::from_secs` is called 90+ times
+# in the codebase with legitimate small-int timeouts (5, 10, 30 seconds
+# for HTTP / health probes / circuit-breaker cooldowns); clippy's
+# `disallowed_methods` lint cannot distinguish "literal magic number"
+# from "named const argument", so a blanket disallow would block all
+# 90+ sites including the legitimate ones. The SECS_PER_* discipline
+# (use `crate::SECS_PER_HOUR` / `SECS_PER_DAY` / `SECS_PER_WEEK` instead
+# of raw `3600` / `86400` / `604_800` literals) is enforced at the
+# code-review layer + grep-as-gate (the script also greps for the
+# specific literal forms `Duration::from_secs(3600|86400|604800|3_600|
+# 86_400|604_800|7200|21600)` to catch the documented regression
+# patterns). See `scripts/check-vendor-literals.sh` for the full
+# discipline.
