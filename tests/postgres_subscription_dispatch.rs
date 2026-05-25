@@ -41,6 +41,25 @@ use tokio::sync::{Mutex, RwLock};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+/// #1201 — bind a fresh `127.0.0.1:0` `TcpListener` for use with
+/// `MockServer::builder().listener(...)`. Bypasses wiremock's internal
+/// `MOCK_SERVER_POOL` so the ephemeral port the kernel hands us
+/// cannot be reassigned for the duration of the test. Retries on
+/// transient EADDRINUSE.
+fn fresh_mock_listener_1201() -> std::net::TcpListener {
+    let mut last_err = None;
+    for _ in 0..5 {
+        match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(l) => return l,
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+    panic!("#1201: failed to bind ephemeral port for mock after 5 attempts: {last_err:?}");
+}
+
 /// Local SHA-256 helper — the `ai_memory::subscriptions::sha256_hex`
 /// helper is `pub(crate)` so it isn't reachable from the integration
 /// test crate. Re-implement the byte-for-byte equivalent here using
@@ -201,9 +220,15 @@ async fn dispatch_event_postgres_fires_hmac_signed_post() {
     // sink URL outright.
     ai_memory::config::set_allow_loopback_webhooks(true);
 
-    let server = MockServer::start().await;
+    // #1201 — dedicated listener + UUID path keeps this mock out of
+    // wiremock's pool and shields it from straggler POSTs from
+    // sibling tests in the same binary.
+    let listener = fresh_mock_listener_1201();
+    let server = MockServer::builder().listener(listener).start().await;
+    let unique = uuid::Uuid::new_v4().simple().to_string();
+    let path_str = format!("/sink/{unique}");
     Mock::given(method("POST"))
-        .and(path("/sink"))
+        .and(path(path_str.clone()))
         .respond_with(AckEcho)
         .mount(&server)
         .await;
@@ -215,7 +240,7 @@ async fn dispatch_event_postgres_fires_hmac_signed_post() {
     // postgres branch persists at subscribe time — SHA-256 of the
     // plaintext, mirroring the sqlite path's `secret_hash` column.
     let sub_secret_hash = sha256_hex_local("track-d-test-secret");
-    let url = format!("{}/sink", server.uri());
+    let url = format!("{}{}", server.uri(), path_str);
     let sub_mem = make_subscription_memory(
         "track-d-sub-1",
         "probe",
@@ -242,11 +267,11 @@ async fn dispatch_event_postgres_fires_hmac_signed_post() {
     )
     .await;
 
-    // Poll until the wiremock observes the dispatched POST.
+    // Poll until the wiremock observes the dispatched POST on OUR
+    // per-test path (#1201).
     for _ in 0..50 {
         let received = server.received_requests().await.unwrap_or_default();
-        if !received.is_empty() {
-            let req = &received[0];
+        if let Some(req) = received.iter().find(|r| r.url.path() == path_str) {
             let sig = req
                 .headers
                 .get("x-ai-memory-signature")
@@ -272,9 +297,13 @@ async fn dispatch_event_postgres_fires_hmac_signed_post() {
 /// sqlite and postgres paths.
 #[tokio::test(flavor = "multi_thread")]
 async fn dispatch_event_postgres_respects_namespace_filter() {
-    let server = MockServer::start().await;
+    // #1201 — dedicated listener + UUID path.
+    let listener = fresh_mock_listener_1201();
+    let server = MockServer::builder().listener(listener).start().await;
+    let unique = uuid::Uuid::new_v4().simple().to_string();
+    let path_str = format!("/sink/{unique}");
     Mock::given(method("POST"))
-        .and(path("/sink"))
+        .and(path(path_str.clone()))
         .respond_with(ResponseTemplate::new(200))
         .expect(0)
         .mount(&server)
@@ -282,7 +311,7 @@ async fn dispatch_event_postgres_respects_namespace_filter() {
 
     let (state, _audit_path) = make_test_state();
 
-    let url = format!("{}/sink", server.uri());
+    let url = format!("{}{}", server.uri(), path_str);
     let sub_mem = make_subscription_memory(
         "ns-mismatch-sub",
         "probe",
@@ -307,7 +336,14 @@ async fn dispatch_event_postgres_respects_namespace_filter() {
 
     // Wait briefly to confirm no dispatch fires.
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let received = server.received_requests().await.unwrap_or_default();
+    // #1201 — filter to OUR per-test path to be straggler-resilient.
+    let received: Vec<_> = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.url.path() == path_str)
+        .collect();
     assert!(
         received.is_empty(),
         "namespace-filtered subscription must NOT receive an event \
