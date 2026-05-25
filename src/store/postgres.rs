@@ -11487,9 +11487,13 @@ mod tests {
         };
         let store = PostgresStore::connect(&url).await.expect("connect");
         let ctx = CallerContext::for_agent("ai:sal-test");
+        // #1278 — uuid-randomize namespace so the (title, namespace)
+        // upsert-by-title path can't collide with a prior test run's
+        // row when the postgres DB is shared across runs.
+        let ns = format!("sal-test-{}", uuid::Uuid::new_v4());
         let mem = sample_memory(
             &format!("test-{}", uuid::Uuid::new_v4()),
-            "sal-test",
+            &ns,
             "hello",
             "quick brown fox jumps over the lazy dog",
         );
@@ -11497,7 +11501,7 @@ mod tests {
         assert_eq!(returned, mem.id);
         let fetched = store.get(&ctx, &mem.id).await.expect("get");
         assert_eq!(fetched.title, "hello");
-        assert_eq!(fetched.namespace, "sal-test");
+        assert_eq!(fetched.namespace, ns);
     }
 
     #[tokio::test]
@@ -11507,16 +11511,19 @@ mod tests {
         };
         let store = PostgresStore::connect(&url).await.unwrap();
         let ctx = CallerContext::for_agent("ai:sal-test");
+        // #1278 — uuid-randomize namespace so the (title, namespace)
+        // upsert path can't return a stale prior-run row id.
+        let ns = format!("sal-search-{}", uuid::Uuid::new_v4());
         let id = format!("search-test-{}", uuid::Uuid::new_v4());
         let mem = sample_memory(
             &id,
-            "sal-search",
+            &ns,
             "uniquephrase xyzzy42",
             "body containing uniquephrase xyzzy42 as a distinctive token",
         );
         store.store(&ctx, &mem).await.unwrap();
         let filter = Filter {
-            namespace: Some("sal-search".to_string()),
+            namespace: Some(ns.clone()),
             limit: 5,
             ..Filter::default()
         };
@@ -11534,8 +11541,10 @@ mod tests {
         };
         let store = PostgresStore::connect(&url).await.unwrap();
         let ctx = CallerContext::for_agent("ai:sal-test");
+        // #1278 — uuid-randomize namespace.
+        let ns = format!("sal-del-{}", uuid::Uuid::new_v4());
         let id = format!("del-test-{}", uuid::Uuid::new_v4());
-        let mem = sample_memory(&id, "sal-del", "to be deleted", "soon gone");
+        let mem = sample_memory(&id, &ns, "to be deleted", "soon gone");
         store.store(&ctx, &mem).await.unwrap();
         store.delete(&ctx, &id).await.expect("delete");
         let err = store.get(&ctx, &id).await.unwrap_err();
@@ -11562,8 +11571,12 @@ mod tests {
         let store = PostgresStore::connect(&url).await.unwrap();
         let ctx = CallerContext::for_agent("ai:sal-test");
         let ns = format!("sal-upsert-{}", uuid::Uuid::new_v4());
-        let first = sample_memory("upsert-a", &ns, "shared title", "first body");
-        let second = sample_memory("upsert-b", &ns, "shared title", "second body");
+        // #1278 — uuid-randomize id to avoid pkey collision on test re-run
+        // against a non-truncated postgres DB.
+        let id_a = format!("upsert-a-{}", uuid::Uuid::new_v4());
+        let id_b = format!("upsert-b-{}", uuid::Uuid::new_v4());
+        let first = sample_memory(&id_a, &ns, "shared title", "first body");
+        let second = sample_memory(&id_b, &ns, "shared title", "second body");
         let id_first = store.store(&ctx, &first).await.unwrap();
         let id_second = store.store(&ctx, &second).await.unwrap();
         assert_eq!(id_first, id_second, "upsert should return the same id");
@@ -11593,12 +11606,16 @@ mod tests {
         let ctx = CallerContext::for_admin("ai:sal-test");
         let ns = format!("sal-agent-{}", uuid::Uuid::new_v4());
 
-        let mut first = sample_memory("agent-1", &ns, "owned-by-alice", "original");
+        // #1278 — uuid-randomize id to avoid pkey collision on test re-run
+        // against a non-truncated postgres DB.
+        let id_a = format!("agent-1-{}", uuid::Uuid::new_v4());
+        let id_b = format!("agent-2-{}", uuid::Uuid::new_v4());
+        let mut first = sample_memory(&id_a, &ns, "owned-by-alice", "original");
         first.metadata = serde_json::json!({"agent_id": "ai:alice"});
         store.store(&ctx, &first).await.unwrap();
 
         // Second store with the same (title, ns) but claims a different agent_id.
-        let mut second = sample_memory("agent-2", &ns, "owned-by-alice", "replayed");
+        let mut second = sample_memory(&id_b, &ns, "owned-by-alice", "replayed");
         second.metadata = serde_json::json!({"agent_id": "ai:attacker"});
         store.store(&ctx, &second).await.unwrap();
 
@@ -11622,8 +11639,11 @@ mod tests {
         let store = PostgresStore::connect(&url).await.unwrap();
         let ctx = CallerContext::for_agent("ai:sal-test");
 
+        // #1278 — uuid-randomize namespace so the (title, namespace)
+        // upsert path can't return a stale prior-run row id.
+        let ns = format!("sal-tier-{}", uuid::Uuid::new_v4());
         let id = format!("tier-test-{}", uuid::Uuid::new_v4());
-        let mut mem = sample_memory(&id, "sal-tier", "long-pinned", "must not downgrade");
+        let mut mem = sample_memory(&id, &ns, "long-pinned", "must not downgrade");
         mem.tier = Tier::Long;
         store.store(&ctx, &mem).await.unwrap();
 
