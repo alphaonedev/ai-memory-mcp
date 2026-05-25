@@ -64,7 +64,7 @@ use sqlx::Row;
 use tokio::sync::{Mutex, Notify, RwLock};
 
 mod common;
-use common::free_port;
+use common::{DAEMON_READY_TIMEOUT, free_port, wait_for_http_ready};
 
 /// AGE-or-Postgres URL fallback — sibling of g2/g4/g5; differs from
 /// `common::age_url` because this test exercises unsigned link
@@ -345,17 +345,11 @@ async fn g4_unsigned_http_link_projects_into_age() {
         .await
     });
 
-    let mut ready = false;
-    for _ in 0..50 {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        if let Ok(resp) = reqwest::get(format!("http://{addr}/api/v1/health")).await
-            && resp.status() == reqwest::StatusCode::OK
-        {
-            ready = true;
-            break;
-        }
-    }
-    assert!(ready, "in-process HTTP daemon never bound");
+    // #1194: progress-detecting health-check loop with 5 min generous
+    // overall timeout. See `tests/common::wait_for_http_ready`.
+    wait_for_http_ready(&addr, DAEMON_READY_TIMEOUT)
+        .await
+        .expect("in-process HTTP daemon never bound");
 
     let client = reqwest::Client::new();
     let base = format!("http://{addr}");

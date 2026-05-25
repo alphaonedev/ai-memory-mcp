@@ -410,3 +410,173 @@ mod hmac_fixture_tests {
         assert!(digest.chars().all(|c| c.is_ascii_hexdigit()));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Issue #1194 — health-check wait-for-ready for in-process postgres daemons.
+//
+// Pre-#1194 every postgres-feature integration test that spawned the
+// in-process HTTP daemon used a fixed 50 × 100 ms = 5 s polling budget
+// before asserting `postgres-backed serve never became ready`. Under
+// ubuntu-latest runner load (#1178/#1179/#1189/#1190 evidence) the
+// postgres-container startup + first `PostgresStore::connect()` round-trip
+// can exceed that budget intermittently, producing CI flakes that
+// "pass on re-run" — i.e. the classic too-tight-timeout false-negative.
+//
+// Per #1194's preferred fix (option 2): replace the polling-with-fixed-budget
+// with a **progress-detecting health-check loop** bounded by a generous
+// overall timeout. The loop:
+//
+//   1. Probes the actual daemon `/api/v1/health` endpoint (which itself
+//      drives a `SELECT 1` round-trip on the postgres pool — see
+//      `src/handlers/http.rs::health`), returning ASAP when the
+//      response is 200.
+//   2. Uses exponential backoff (50 ms → 100 ms → 200 ms → 500 ms),
+//      capped at 1 s, so the first ~5 s of polling is dense (matches
+//      the pre-#1194 budget for the common case) while later seconds
+//      back off to avoid hammering a slow postgres container.
+//   3. Is bounded by an overall timeout (default 5 min — `DAEMON_READY_TIMEOUT`)
+//      so a genuinely-broken daemon still fails fast enough that CI
+//      doesn't burn the whole 6 h job budget. The 5 min default is
+//      generous vs. the 5 s pre-#1194 budget (60× headroom) while still
+//      well under the GHA runner-load 99th-percentile cold-start of
+//      postgres-container + sqlx connect + AGE extension install
+//      (observed: ~30-60 s under load, ~5-15 s warm).
+//
+// Acceptance per #1194: "Postgres feature gate passes deterministically
+// on 5+ consecutive PRs without flake." This helper is the load-bearing
+// mechanism for that acceptance bar.
+// ---------------------------------------------------------------------------
+
+/// Default overall timeout for [`wait_for_http_ready`] — 5 minutes.
+///
+/// Sized generously vs. the pre-#1194 5 s fixed budget so GHA
+/// runner-load variance on postgres-container startup doesn't surface
+/// as a "never became ready" assertion. A daemon that's genuinely
+/// broken will still fail well inside the CI job's 6 h budget.
+pub const DAEMON_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Probe the in-process HTTP daemon's `/api/v1/health` endpoint until
+/// it returns 200 OK or the overall `timeout` elapses.
+///
+/// `addr` is the `host:port` form returned by [`free_port`] — i.e.
+/// without the `http://` scheme prefix. The helper appends the scheme
+/// + path internally.
+///
+/// Returns `Ok(elapsed)` with the actual time-to-ready on success and
+/// `Err(WaitForReadyError)` on overall-timeout. The elapsed measurement
+/// supports diagnostic logging in callers that want to surface slow
+/// starts without failing.
+///
+/// Per #1194 — this is the progress-detecting health-check replacement
+/// for the pre-#1194 `for _ in 0..50 { sleep(100ms); ... }` polling
+/// pattern. The polling loop is the same shape but with:
+///
+/// - Exponential backoff (50 ms → 1 s cap) rather than fixed 100 ms.
+/// - Overall timeout in the 5-minute generous range rather than the
+///   5-second flake-prone range.
+/// - Structured error type so callers can route on timeout vs. success
+///   without parsing assert messages.
+///
+/// Example:
+///
+/// ```ignore
+/// let addr = format!("127.0.0.1:{}", free_port());
+/// // ... spawn the daemon against `addr` ...
+/// wait_for_http_ready(&addr, DAEMON_READY_TIMEOUT)
+///     .await
+///     .expect("postgres-backed serve never became ready");
+/// ```
+pub async fn wait_for_http_ready(
+    addr: &str,
+    timeout: std::time::Duration,
+) -> Result<std::time::Duration, WaitForReadyError> {
+    let start = std::time::Instant::now();
+    let url = format!("http://{addr}/api/v1/health");
+    // Exponential backoff: 50ms, 100ms, 200ms, 500ms, then 1s cap.
+    // Hits the common-case 5s window with ~10 probes while keeping
+    // late-poll cost low for slow-container starts.
+    let backoffs_ms = [50u64, 100, 200, 500, 1000];
+    let mut probe_idx = 0usize;
+    let mut last_err: Option<String> = None;
+    loop {
+        let elapsed = start.elapsed();
+        if elapsed >= timeout {
+            return Err(WaitForReadyError {
+                addr: addr.to_string(),
+                elapsed,
+                last_error: last_err
+                    .unwrap_or_else(|| "no successful health probe before timeout".to_string()),
+            });
+        }
+        match reqwest::get(&url).await {
+            Ok(resp) if resp.status() == reqwest::StatusCode::OK => {
+                return Ok(elapsed);
+            }
+            Ok(resp) => {
+                last_err = Some(format!("health returned {}", resp.status()));
+            }
+            Err(e) => {
+                last_err = Some(format!("connect error: {e}"));
+            }
+        }
+        let sleep_ms = backoffs_ms[probe_idx.min(backoffs_ms.len() - 1)];
+        probe_idx = probe_idx.saturating_add(1);
+        tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+    }
+}
+
+/// Structured error returned by [`wait_for_http_ready`] when the daemon
+/// fails to bind / accept-connections / report healthy within the
+/// caller-supplied overall timeout.
+///
+/// Callers typically `.expect("postgres-backed serve never became ready")`
+/// on the `Result` so the assert message preserves continuity with the
+/// pre-#1194 panic shape that operators searching for the failure
+/// string in CI logs already know.
+#[derive(Debug)]
+pub struct WaitForReadyError {
+    pub addr: String,
+    pub elapsed: std::time::Duration,
+    pub last_error: String,
+}
+
+impl std::fmt::Display for WaitForReadyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "wait_for_http_ready({addr}) timed out after {elapsed:?}: {reason}",
+            addr = self.addr,
+            elapsed = self.elapsed,
+            reason = self.last_error,
+        )
+    }
+}
+
+impl std::error::Error for WaitForReadyError {}
+
+#[cfg(test)]
+mod wait_for_ready_tests {
+    use super::{DAEMON_READY_TIMEOUT, WaitForReadyError, wait_for_http_ready};
+
+    /// The 5-minute default matches the #1194 acceptance criterion
+    /// ("bounded by a generous overall timeout, 5+ min"). Pin the
+    /// constant so a future tightening triggers explicit review.
+    #[test]
+    fn default_timeout_is_five_minutes() {
+        assert_eq!(DAEMON_READY_TIMEOUT.as_secs(), 300);
+    }
+
+    /// A short timeout against an unbound port surfaces the structured
+    /// error rather than hanging or panicking — the failure-fast bound
+    /// from #1194 must hold.
+    #[tokio::test(flavor = "current_thread")]
+    async fn errors_on_overall_timeout() {
+        // 127.0.0.1:1 is the standard "nobody is listening" probe port.
+        let res = wait_for_http_ready("127.0.0.1:1", std::time::Duration::from_millis(200)).await;
+        let err = res.expect_err("must time out against unbound port");
+        assert!(
+            matches!(err, WaitForReadyError { .. }),
+            "structured timeout error expected"
+        );
+    }
+}
