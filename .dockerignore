@@ -1,9 +1,11 @@
 target/
 .cargo-*-target/
 .cargo-shared-target/
+.cargo-target/
 .local-runs/
 .codegraph/
 .git/
+.claude/
 docs/
 benchmarks/
 *.md
