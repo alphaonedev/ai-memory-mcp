@@ -21,7 +21,6 @@ include = [
     "benches/**/*",
     "examples/**/*",
     "migrations/**/*",
-    "build.rs",
     "Cargo.toml",
     "Cargo.lock",
     "README.md",
