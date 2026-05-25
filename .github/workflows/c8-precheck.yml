@@ -1,18 +1,32 @@
 # C8 orchestrator safeguard CI gate (issue #953, CLAUDE.md §"Enforceable
-# Orchestrator Safeguards").
+# Orchestrator Safeguards") + #1174 PR10 vendor-monoculture lint-gate.
 #
-# HARD-BLOCKs PRs that introduce a new `CallerContext::for_agent("<literal>")`
-# site or a new `for_admin` privacy-bypass site outside the allowlists at
-# `scripts/qc-codegraph-allowlists/`. These literals bypass the
-# request-scoped caller identity that the SAL #910 visibility filter
-# depends on; an un-reviewed addition would silently re-introduce
-# cross-tenant leak surfaces of the kind QC sweep #947/#955/#959
-# remediated.
+# Two HARD-BLOCK jobs:
 #
-# Mirrors the local-developer flow: `scripts/qc-codegraph-precheck.sh`
-# is the same script. Run `scripts/qc-codegraph-precheck.sh --update`
-# locally to regenerate the allowlist when you deliberately add a new
-# exception, then review the diff before committing.
+#   1. c8-precheck — `CallerContext::for_agent("<literal>")` /
+#      `for_admin("<literal>")` allowlist enforcement (issue #953).
+#      These literals bypass the request-scoped caller identity that
+#      the SAL #910 visibility filter depends on; an un-reviewed
+#      addition would silently re-introduce cross-tenant leak surfaces
+#      of the kind QC sweep #947/#955/#959 remediated.
+#
+#   2. vendor-literal-gate — vendor-identifier + SECS_PER_* magic-number
+#      regression detection (issue #1174 PR10, pm-v3.1 lint-gate). Without
+#      this gate, the Wave 1+2 refactor's vendor-monoculture cleanup
+#      (PRs 1-9) decays as new code lands with hardcoded `"claude"` /
+#      `"openai"` / `"anthropic"` strings outside the 6-file substrate
+#      allowlist, AND the SECS_PER_* named-constant discipline (PR3)
+#      regresses as new `Duration::from_secs(3600)` etc. land. Both
+#      gates are load-bearing per the pm-v3.2 NO FAIL MISSION closure
+#      audit (ai-memory global/policies memory
+#      2cb15d34-2399-4611-a020-df6ef91683fe).
+#
+# Mirrors the local-developer flow: both `scripts/qc-codegraph-precheck.sh`
+# and `scripts/check-vendor-literals.sh` are the same scripts CI uses.
+# Run `scripts/qc-codegraph-precheck.sh --update` locally to regenerate
+# the C8 allowlist when you deliberately add a new exception; run
+# `scripts/check-vendor-literals.sh --self-test` locally to confirm the
+# vendor gate still catches a contrived violation.
 
 name: c8-precheck
 
@@ -31,3 +45,21 @@ jobs:
       - uses: actions/checkout@v4
       - name: Run C8 precheck
         run: bash scripts/qc-codegraph-precheck.sh
+
+  vendor-literal-gate:
+    name: Vendor-monoculture + SECS_PER_* lint-gate (#1174 PR10)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run vendor-literal gate
+        run: bash scripts/check-vendor-literals.sh
+      - name: Self-test the gate (regression evidence)
+        # Pm-v3.2 NO FAIL MISSION closure-audit discipline: the gate
+        # itself must be load-bearing. The --self-test mode injects a
+        # contrived `"anthropic"` literal at a production site outside
+        # the allowlist, runs the gate, verifies the gate exits non-zero
+        # + emits the expected violation message, then cleans up. Any
+        # regression in the gate's detection logic (e.g. an over-broad
+        # allowlist, a broken test-boundary heuristic) trips here.
+        run: bash scripts/check-vendor-literals.sh --self-test

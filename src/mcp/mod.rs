@@ -2299,8 +2299,10 @@ pub fn run_mcp_server(
                 );
                 // For ollama backends, exercise the legacy ensure_model
                 // pull step so first-run UX (model not on disk) still
-                // emits the pull-progress hint.
-                if resolved_llm.backend == "ollama" {
+                // emits the pull-progress hint. Backend identifier comes
+                // from `crate::llm::BACKEND_OLLAMA` per the PR10 vendor-
+                // monoculture lint gate (issue #1174).
+                if resolved_llm.backend == crate::llm::BACKEND_OLLAMA {
                     if let Err(e) = client.ensure_model() {
                         eprintln!("ai-memory: model pull failed: {e} (LLM features disabled)");
                         None

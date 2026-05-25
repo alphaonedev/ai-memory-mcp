@@ -647,6 +647,86 @@ but new public operations live on the trait.
   `coverage` for `coverage/thresholds.toml` and floor adjustments, `qc` for
   QC-review artefacts + remediation. Scope is encouraged but optional.
 
+### Lint gates (issue #1174 PR10 — pm-v3.1 vendor-monoculture + SECS_PER_*)
+
+Two script-based lint gates run in CI alongside the four cargo gates
+(fmt / clippy / test / audit). Both are HARD-BLOCK and are wired into
+`.github/workflows/c8-precheck.yml`.
+
+**1. C8 caller-context allowlist** —
+`scripts/qc-codegraph-precheck.sh`. Blocks any new
+`CallerContext::for_agent("<literal>")` or
+`CallerContext::for_admin("<literal>")` site outside
+`scripts/qc-codegraph-allowlists/*.txt`. See the §"Enforceable
+Orchestrator Safeguards" section above for the full contract.
+
+**2. Vendor-monoculture + SECS_PER_* gate** —
+`scripts/check-vendor-literals.sh`. Blocks regressions in two
+disciplines the Wave 1+2 #1174 refactor train landed:
+
+- **Vendor identifiers** (`"claude" | "openai" | "xai" |
+  "anthropic" | "gemini" | "deepseek" | "groq" | "ollama" |
+  "grok" | "mistral" | "cohere" | "huggingface"`) are legitimate
+  ONLY in the 6 substrate carve-outs:
+  - `src/llm.rs` — canonical alias tables, default URLs
+  - `src/config.rs` — per-vendor URL/key/model defaults
+  - `src/mine.rs` — `Format::Claude` conversation-mining enum
+  - `src/validate.rs` — `VALID_SOURCES` back-compat allowlist
+  - `src/cli/wrap.rs` — per-vendor CLI-binary `WrapStrategy` table
+  - `src/harness.rs` — harness vendor-variant enum
+
+  Every other production-code site must read the vendor string
+  from `crate::llm::*` / `crate::config::*` (e.g.
+  `crate::llm::BACKEND_OLLAMA` instead of the literal `"ollama"`).
+  Per pm-v3.1 (ai-memory `global/policies` memory
+  `f5334545-c1f5-4f5c-9efb-a0ec3a0c1fcd`): vendor identifiers
+  scattered across substrate/wire code violate the heterogeneous-NHI
+  design.
+
+- **SECS_PER_* magic numbers** —
+  `Duration::from_secs(3600 | 86400 | 604800 | 3_600 | 86_400 |
+  604_800 | 7200 | 21600 | 172800)` and the underscore variants are
+  HARD-BLOCKed. Use the named constants from `src/lib.rs`:
+  `SECS_PER_HOUR` (3_600), `SECS_PER_DAY` (86_400),
+  `SECS_PER_WEEK` (604_800).
+
+  Why script-based instead of clippy `disallowed_methods`:
+  `Duration::from_secs` is called 90+ times in the codebase with
+  legitimate small-int timeouts (5, 10, 30 seconds for HTTP /
+  health probes / circuit-breaker cooldowns); clippy can't
+  distinguish "literal magic number" from "named const argument",
+  so a blanket disallow would block all 90+ sites including the
+  legitimate ones.
+
+**Self-test (load-bearing evidence).**
+`scripts/check-vendor-literals.sh --self-test` injects a contrived
+`"anthropic"` literal at a production site, runs the gate, verifies
+the gate exits non-zero with the expected violation message, then
+cleans up. The CI workflow runs the self-test step after the main
+check so a regression in the gate's detection logic (e.g. an
+over-broad allowlist, a broken test-boundary heuristic) trips
+immediately. Per pm-v3.2 NO FAIL MISSION closure discipline
+(ai-memory `global/policies` memory
+`2cb15d34-2399-4611-a020-df6ef91683fe`): the gate itself must be
+load-bearing, not decorative.
+
+**Adding a legitimate exception.** If a new vendor-specific
+surface genuinely belongs outside the 6-file allowlist (e.g. a
+new dedicated subsystem the way `src/mine.rs` carries
+`Format::Claude`), edit `scripts/check-vendor-literals.sh` to
+extend the `ALLOWED_FILES` array AND document the carve-out in
+this section. Operator-approved review before merge.
+
+**Production-vs-test heuristic.** The script skips:
+- Files whose basename matches `*test*.rs` or `tests.rs`
+- Lines at or below the first `mod tests {` / `pub mod tests {`
+  occurrence in each file
+- Comment lines (`//`, `///`) and block-comment continuations (`*`)
+
+The heuristic mirrors `scripts/qc-codegraph-precheck.sh` so the
+two gates have the same production-vs-test boundary across the
+codebase.
+
 ## Prime directive (operator-set, 2026-05-17)
 
 > This is a **prime directive** — it overrides any general-purpose
