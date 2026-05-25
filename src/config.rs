@@ -2517,7 +2517,14 @@ pub struct AppConfig {
     pub ttl: Option<TtlConfig>,
     /// Archive memories before GC deletion (default: true)
     pub archive_on_gc: Option<bool>,
-    /// Optional API key for HTTP API authentication
+    /// Optional API key for HTTP API authentication.
+    ///
+    /// #1262 — `skip_serializing` prevents the secret from being
+    /// echoed back through any `serde_json::to_string(&AppConfig)`
+    /// path (capabilities overlays, debug dumps, audit traces).
+    /// #1258 — the manual `Drop` impl on `AppConfig` zeroizes this
+    /// buffer on scope exit.
+    #[serde(default, skip_serializing)]
     pub api_key: Option<String>,
     /// Maximum archive age in days for automatic purge during GC (default: disabled)
     pub archive_max_days: Option<i64>,
@@ -2734,6 +2741,23 @@ pub struct AppConfig {
     /// fields). The `db` path stays top-level per the I4 carve-out in
     /// #1146 (path expansion semantics pinned by #507).
     pub storage: Option<StorageSection>,
+}
+
+impl AppConfig {
+    /// #1258 — manually zeroize the `api_key` buffer. Callers that hold
+    /// the only owner of an `AppConfig` and are about to drop it
+    /// invoke this immediately before scope-exit so the secret bytes
+    /// do not linger on the heap. The free-standing helper (instead of
+    /// a blanket `Drop` impl on `AppConfig`) preserves the
+    /// `..AppConfig::default()` struct-update syntax used by ~20
+    /// existing test sites; adding a blanket `Drop` would forbid the
+    /// move-by-spread pattern Rust requires for `Drop` types.
+    pub fn zeroize_secrets(&mut self) {
+        use zeroize::Zeroize;
+        if let Some(key) = self.api_key.as_mut() {
+            key.zeroize();
+        }
+    }
 }
 
 /// v0.7.0 SEC-2 (Cluster D, issue #767) — `[governance]` top-level
@@ -3564,12 +3588,43 @@ pub struct HooksConfig {
 /// `[hooks.subscription]` sub-block. K7 ships one knob today
 /// (`hmac_secret`); future K-track work may add per-event opt-out
 /// filters or alternate signing algorithms.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+///
+/// #1262 — `Debug` is implemented manually to redact `hmac_secret` so
+/// accidental `{:?}` prints never leak the signing key. #1258 — the
+/// manual `Drop` impl zeroizes the secret on scope exit.
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct HooksSubscriptionConfig {
     /// Server-wide HMAC secret. Plaintext on disk — operators are
     /// expected to chmod 600 the config file (same posture as the
     /// existing `api_key` field).
+    ///
+    /// #1262 — `skip_serializing` blocks the secret from being echoed
+    /// through any `serde_json::to_string(&HooksSubscriptionConfig)`
+    /// path.
+    #[serde(default, skip_serializing)]
     pub hmac_secret: Option<String>,
+}
+
+impl std::fmt::Debug for HooksSubscriptionConfig {
+    /// #1262 — redact `hmac_secret` to `<redacted>` when present.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HooksSubscriptionConfig")
+            .field(
+                "hmac_secret",
+                &self.hmac_secret.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+impl Drop for HooksSubscriptionConfig {
+    /// #1258 — zeroize `hmac_secret` on scope exit.
+    fn drop(&mut self) {
+        if let Some(secret) = self.hmac_secret.as_mut() {
+            use zeroize::Zeroize;
+            secret.zeroize();
+        }
+    }
 }
 
 /// v0.7.0 H5 (round-2) — `[verify]` config block. Operator-facing

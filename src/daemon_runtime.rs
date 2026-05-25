@@ -1551,9 +1551,18 @@ pub fn passphrase_from_file(path: &Path) -> Result<String> {
             }
         }
     }
-    let raw = std::fs::read_to_string(path)
+    let mut raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading passphrase file {}", path.display()))?;
     let passphrase = raw.trim_end_matches(['\n', '\r']).to_string();
+    // #1258 — zeroize the intermediate `raw` buffer so the secret bytes
+    // do not linger on the heap after we hand the trimmed copy to the
+    // caller. The caller is responsible for zeroizing the returned
+    // `passphrase` when it falls out of scope (typically passed
+    // straight into `AI_MEMORY_DB_PASSPHRASE`).
+    {
+        use zeroize::Zeroize;
+        raw.zeroize();
+    }
     if passphrase.is_empty() {
         anyhow::bail!("passphrase file {} is empty", path.display());
     }

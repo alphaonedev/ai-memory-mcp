@@ -53,7 +53,12 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 /// reload path, and the audit chain uses interior `Mutex` to keep emit
 /// ordering atomic across producers (matching the pre-#1192
 /// `audit::SINK` lock posture).
-#[derive(Debug, Default)]
+///
+/// #1262 — `Debug` is implemented manually below to redact the
+/// `hooks_hmac_secret` field; the derived impl would have leaked the
+/// raw HMAC bytes through any `{:?}` print. #1258 — the manual `Drop`
+/// impl zeroizes the secret on scope exit.
+#[derive(Default)]
 pub struct RuntimeContext {
     /// v0.7.0 K7 — resolved webhook HMAC override. `None` when the
     /// operator has not configured `[hooks.subscription] hmac_secret`,
@@ -61,6 +66,10 @@ pub struct RuntimeContext {
     /// Mutable so the K7 integration tests can flip mid-process; in
     /// production this is set once at boot from
     /// `AppConfig::effective_hooks_hmac_secret`.
+    ///
+    /// #1262 — manual `Debug` impl redacts this to `<redacted>` when
+    /// present; #1258 — manual `Drop` impl zeroizes the secret on
+    /// scope exit.
     pub hooks_hmac_secret: RwLock<Option<String>>,
 
     /// I1 cap (#628 agent-3 follow-up) — per-call transcript
@@ -89,6 +98,47 @@ pub struct RuntimeContext {
     /// the in-memory shape lets the encryption substrate land without
     /// forcing a key-rotation tool design decision in the same patch.
     pub keypair_cache: Arc<Mutex<HashMap<String, crate::encryption::Keypair>>>,
+}
+
+impl std::fmt::Debug for RuntimeContext {
+    /// #1262 — redact `hooks_hmac_secret` so accidental `{:?}` prints
+    /// of the runtime context never leak the HMAC signing key. The
+    /// remaining fields are non-secret and use their derived Debug.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let secret_present = self
+            .hooks_hmac_secret
+            .read()
+            .map(|g| g.is_some())
+            .unwrap_or(false);
+        f.debug_struct("RuntimeContext")
+            .field(
+                "hooks_hmac_secret",
+                &if secret_present {
+                    "<redacted>"
+                } else {
+                    "<unset>"
+                },
+            )
+            .field("max_decompressed_bytes", &self.max_decompressed_bytes)
+            .field("audit", &self.audit)
+            .field("recall_tracker", &"<recall_tracker>")
+            .field("keypair_cache", &"<keypair_cache>")
+            .finish()
+    }
+}
+
+impl Drop for RuntimeContext {
+    /// #1258 — zeroize the resolved `hooks_hmac_secret` (if any) on
+    /// scope exit so the HMAC signing key does not linger on the heap
+    /// past the runtime context's lifetime.
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.hooks_hmac_secret.write() {
+            if let Some(secret) = guard.as_mut() {
+                use zeroize::Zeroize;
+                secret.zeroize();
+            }
+        }
+    }
 }
 
 /// V-4 audit chain state. Owns the same `(sink, sequence)` pair the
