@@ -108,7 +108,22 @@ pub async fn skill_list_route(
     let lock = app.db.lock().await;
     match crate::mcp::handle_skill_list(&lock.0, &params) {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
+        Err(e) => {
+            // #1261 — never forward the raw substrate error (often a
+            // `rusqlite::Error` string carrying SQL fragments) on the
+            // HTTP wire. Log the raw text for operators, surface a
+            // generic "internal server error" to the caller.
+            tracing::error!(
+                target: "ai_memory::handlers::skills",
+                error = %e,
+                "skill_list_route: substrate error (sanitized for wire response, #1261)"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "internal server error"})),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -133,7 +148,20 @@ pub async fn skill_get_route(
             if e.starts_with("skill not found") {
                 (StatusCode::NOT_FOUND, Json(json!({"error": e}))).into_response()
             } else {
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response()
+                // #1261 — never forward the raw substrate error (often
+                // a `rusqlite::Error` string carrying SQL fragments) on
+                // the HTTP wire. Log the raw text; emit a generic
+                // "internal server error" to the caller.
+                tracing::error!(
+                    target: "ai_memory::handlers::skills",
+                    error = %e,
+                    "skill_get_route: substrate error (sanitized for wire response, #1261)"
+                );
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "internal server error"})),
+                )
+                    .into_response()
             }
         }
     }
@@ -300,7 +328,19 @@ pub async fn skill_compose_route(
             if e.starts_with("skill not found") {
                 (StatusCode::NOT_FOUND, Json(json!({"error": e}))).into_response()
             } else {
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response()
+                // #1261 — never forward the raw substrate error on
+                // the HTTP wire. Log the raw text; emit a generic
+                // "internal server error" to the caller.
+                tracing::error!(
+                    target: "ai_memory::handlers::skills",
+                    error = %e,
+                    "skill_compose_route: substrate error (sanitized for wire response, #1261)"
+                );
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "internal server error"})),
+                )
+                    .into_response()
             }
         }
     }
