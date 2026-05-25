@@ -149,6 +149,74 @@ fn llm_invokes_wire_check_before_ollama_request() {
     );
 }
 
+/// v0.7.0 (issue #1237) — extend the wire-point pin to cover the
+/// post-#1067 production chat surfaces. Both `OllamaClient::generate`
+/// and `OllamaClient::generate_with_model_override` MUST invoke
+/// `self.check_outbound()` immediately after the `breaker_is_open()`
+/// short-circuit and BEFORE the outbound `reqwest::post`. The
+/// pre-#1237 code shipped both fns without the gate, so an operator
+/// `refuse` rule against the LLM host was silently ignored on every
+/// vendor (Ollama + OpenAI-compatible) — a governance bypass.
+#[test]
+fn llm_generate_invokes_wire_check_before_post_1237() {
+    let body = src("src/llm.rs");
+
+    // Locate the body of `pub fn generate(`. The function spans from
+    // its signature through the next `fn ` that starts a SIBLING fn
+    // at the impl-block indentation. Approximating with a bounded
+    // window (up to the next `fn generate_with_model_override`).
+    let fn_start = body
+        .find("pub fn generate(&self, prompt: &str, system: Option<&str>)")
+        .expect("OllamaClient::generate signature must exist in src/llm.rs");
+    // Bound the search to the start of the next chat fn so we don't
+    // bleed into generate_with_model_override.
+    let fn_end = body[fn_start..]
+        .find("fn generate_with_model_override")
+        .map(|i| fn_start + i)
+        .expect("generate_with_model_override must follow generate");
+    let generate_body = &body[fn_start..fn_end];
+
+    let check_idx = generate_body.find("self.check_outbound()").expect(
+        "OllamaClient::generate must call self.check_outbound() before the outbound HTTP \
+         (#1237 fix)",
+    );
+    let post_idx = generate_body
+        .find(".post(")
+        .expect(".client.post(...) must exist in OllamaClient::generate");
+    assert!(
+        check_idx < post_idx,
+        "check_outbound must precede .client.post(...) in OllamaClient::generate \
+         (#1237)"
+    );
+}
+
+#[test]
+fn llm_generate_with_model_override_invokes_wire_check_before_post_1237() {
+    let body = src("src/llm.rs");
+    let fn_start = body
+        .find("fn generate_with_model_override(")
+        .expect("OllamaClient::generate_with_model_override signature must exist");
+    // Bound by the next fn in the impl (check_outbound is the next one).
+    let fn_end = body[fn_start..]
+        .find("fn check_outbound")
+        .map(|i| fn_start + i)
+        .expect("check_outbound must follow generate_with_model_override in source order");
+    let fn_body = &body[fn_start..fn_end];
+
+    let check_idx = fn_body.find("self.check_outbound()").expect(
+        "OllamaClient::generate_with_model_override must call self.check_outbound() before \
+         the outbound HTTP (#1237 fix)",
+    );
+    let post_idx = fn_body
+        .find(".post(")
+        .expect(".client.post(...) must exist in generate_with_model_override");
+    assert!(
+        check_idx < post_idx,
+        "check_outbound must precede .client.post(...) in \
+         OllamaClient::generate_with_model_override (#1237)"
+    );
+}
+
 #[test]
 fn skill_export_invokes_wire_check_before_each_filesystem_write() {
     let body = src("src/mcp/tools/skill_export.rs");

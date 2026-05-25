@@ -674,6 +674,13 @@ impl OllamaClient {
                 self.base_url,
             ));
         }
+        // v0.7.0 (issue #1237, #691 fold-1) — consult the governance
+        // NetworkRequest wire-point hook BEFORE issuing the outbound
+        // HTTP. Mirrors the gate in generate_with_body (line ~1005).
+        // The post-#1067 chat surface forgot this call; an operator
+        // `refuse` rule against the LLM host was being silently
+        // ignored on the production chat path.
+        self.check_outbound()?;
 
         // #1066 — branch on provider for endpoint path, auth header,
         // payload shape, and response parsing.
@@ -862,6 +869,10 @@ impl OllamaClient {
                 self.base_url,
             ));
         }
+        // v0.7.0 (issue #1237, #691 fold-1) — consult the governance
+        // NetworkRequest wire-point hook BEFORE issuing the outbound
+        // HTTP. Mirrors the gate in generate_with_body (line ~1005).
+        self.check_outbound()?;
         let model = model_override.unwrap_or(&self.model);
 
         let (url, payload, bearer): (String, Value, Option<&str>) = match &self.provider {
