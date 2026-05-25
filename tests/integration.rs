@@ -9016,6 +9016,7 @@ impl OneshotDaemon {
             admin_agent_ids: std::sync::Arc::new(vec![INTEGRATION_TEST_ADMIN.to_string()]),
             rule_cache: std::sync::Arc::new(ai_memory::governance::rule_cache::RuleCache::new()),
             resolved_models: std::sync::Arc::new(ai_memory::config::ResolvedModels::default()),
+            runtime: ai_memory::runtime_context::RuntimeContext::global_arc(),
         };
         let api_key_state = ai_memory::handlers::ApiKeyState {
             key: None,
@@ -12856,6 +12857,7 @@ fn build_serve_state(
         admin_agent_ids: std::sync::Arc::new(Vec::new()),
         rule_cache: std::sync::Arc::new(ai_memory::governance::rule_cache::RuleCache::new()),
         resolved_models: std::sync::Arc::new(ai_memory::config::ResolvedModels::default()),
+        runtime: ai_memory::runtime_context::RuntimeContext::global_arc(),
     };
     let api_key_state = ai_memory::handlers::ApiKeyState {
         key: None,

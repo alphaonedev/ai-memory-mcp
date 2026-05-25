@@ -52,7 +52,7 @@ use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use rand_core::{OsRng, RngCore};
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 /// Envelope wire-version. Bumped only when the byte layout changes;
@@ -161,9 +161,15 @@ impl Envelope {
 /// issue will swap this for an on-disk store; the in-memory shape lets
 /// the encryption substrate land without forcing a key-rotation tool
 /// design decision in the same patch.
+///
+/// v0.7.x (issue #1174 follow-up #1196) — the cache lives on
+/// [`crate::runtime_context::RuntimeContext::keypair_cache`]. The
+/// returned `&'static` reference is stable because
+/// `RuntimeContext::global()` itself is a `OnceLock`-backed
+/// process-wide singleton; the `Arc<Mutex<HashMap<...>>>` inside it
+/// is allocated once and outlives every caller.
 fn keypair_cache() -> &'static Mutex<HashMap<String, Keypair>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, Keypair>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+    &crate::runtime_context::RuntimeContext::global().keypair_cache
 }
 
 /// Look up the per-agent X25519 [`Keypair`], generating + caching it on
