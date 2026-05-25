@@ -67,12 +67,20 @@
 // `Decode` variant — failure modes the operator sees (warning
 // log + degrade-to-Allow on the dispatcher path) are unchanged.
 //
-// # Out of scope (per the G3 prompt; still pending)
+// # Cross-references (G5/G6 shipped post-G3)
 //
-// * G5 chain ordering / first-deny-wins — separate task.
-// * G6 per-event-class deadlines — G3 honours `HookConfig.timeout_ms`
-//   only.
-// * G7-G11 firing at the actual memory operation points.
+// * G5 chain ordering / first-deny-wins lives in `hooks/chain.rs`.
+//   The executor here is the per-config fire primitive; `chain.rs`
+//   composes a sequence of executors into the per-event chain.
+// * G6 per-event-class deadlines + multiplier path live in
+//   `hooks/timeouts.rs`. This executor still honours
+//   `HookConfig.timeout_ms` as the per-fire ceiling; the class
+//   deadlines in `timeouts.rs` resolve the budget the chain hands
+//   each fire (via the class-multiplier table).
+// * G7-G11 firing at the actual memory operation points is wired
+//   through the per-event hook sites under `hooks/recall.rs`,
+//   `hooks/pre_store/`, and `hooks/post_reflect/`, composed via the
+//   chain entry points in `hooks/chain.rs`.
 
 use std::collections::VecDeque;
 use std::io;
