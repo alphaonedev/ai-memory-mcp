@@ -21,6 +21,71 @@ use crate::profile::Family;
 
 pub type Db = Arc<Mutex<(rusqlite::Connection, std::path::PathBuf, ResolvedTtl, bool)>>;
 
+/// v0.7.0 PERF-1 (FX-3) — `spawn_blocking` helper for HTTP handler DB I/O.
+///
+/// Wraps a synchronous `rusqlite` operation in `tokio::task::spawn_blocking`
+/// so it runs on the blocking pool instead of pinning a tokio worker thread.
+/// Pre-fix every HTTP handler held the `tokio::sync::Mutex` AND executed
+/// synchronous `rusqlite` calls (FTS5 scans, multi-row UPDATEs on touch,
+/// trigger fires) on the tokio worker that picked up the request. With
+/// the default multi-threaded runtime (`#tokio = ncpu`), N concurrent
+/// recalls serialised completely on the single-connection mutex AND stole
+/// worker slots from non-DB tasks (federation receive, webhook dispatch,
+/// metrics scrape). p99 floor under N concurrent recalls was
+/// `N × wall_time(FTS+touch)` rather than `max(wall_time)`.
+///
+/// Helper contract:
+///
+/// - Takes a `Db` clone (the `Arc<Mutex<...>>` extractor handle) and an
+///   `FnOnce(&mut (Connection, PathBuf, ResolvedTtl, bool)) -> T` closure
+///   so callers can access every field the existing pattern reads
+///   (`lock.0` = Connection, `lock.1` = DB path, `lock.2` = `ResolvedTtl`,
+///   `lock.3` = SAL-enabled flag).
+/// - Uses `Mutex::blocking_lock` inside `spawn_blocking` — the
+///   `tokio::sync::Mutex` API explicitly supports this from a
+///   spawn_blocking worker; the worker is OFF the tokio runtime threads
+///   so no await-deadlock risk.
+/// - Returns `T` directly. Join errors from `spawn_blocking` (panic
+///   propagation, runtime shutdown) surface via `expect`; a panic
+///   inside the closure unwinds the blocking worker and the join error
+///   is logged before the handler aborts with a 500 — the caller's
+///   `Result<T, _>` is the right shape to surface domain errors. Join
+///   failures are runtime bugs, not request-shape failures.
+///
+/// The helper deliberately does NOT take `headers: HeaderMap` /
+/// `caller: &str` etc. — every closure already captures whatever extra
+/// context it needs by move. The helper is the narrow waist: lock +
+/// run + drop, no business logic.
+///
+/// Limit-of-applicability: closures that hold `await` points inside
+/// CANNOT use this helper (the `spawn_blocking` worker is a sync
+/// context). Handlers that interleave SQL with vector-index
+/// `Mutex::lock().await` or federation `broadcast_*().await` must
+/// either restructure to drop the DB lock first (the common case),
+/// or keep the legacy `.lock().await` pattern when the interleave is
+/// load-bearing (e.g. `recall` keeps the lock across `decorate_memory`
+/// re-queries). The recall + create hot paths carry follow-up
+/// trackers (the in-tree `#982` docstring at `src/handlers/recall.rs:485`
+/// already calls out the deeper restructure).
+///
+/// Type parameter `T` requires `Send + 'static` because the closure's
+/// return value crosses the spawn_blocking boundary back to the tokio
+/// runtime.
+pub async fn db_op<T, F>(db: Db, op: F) -> T
+where
+    T: Send + 'static,
+    F: FnOnce(&mut (rusqlite::Connection, std::path::PathBuf, ResolvedTtl, bool)) -> T
+        + Send
+        + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let mut guard = db.blocking_lock();
+        op(&mut guard)
+    })
+    .await
+    .expect("PERF-1: db_op spawn_blocking worker panicked or runtime shut down")
+}
+
 /// v0.7.0 Wave-3 — declared storage backend for the daemon.
 ///
 /// Surfaced through the `/capabilities` payload so operators and clients
@@ -766,9 +831,15 @@ pub async fn api_key_auth(
 }
 
 pub async fn health(State(app): State<AppState>) -> impl IntoResponse {
-    let lock = app.db.lock().await;
-    let ok = db::health_check(&lock.0).unwrap_or(false);
-    drop(lock);
+    // PERF-1 (FX-3): route the rusqlite health_check through `db_op`
+    // so it runs on the blocking pool. /health is the most-frequently
+    // scraped endpoint (every Prometheus / k8s liveness probe hits it
+    // every few seconds); pinning a tokio worker on a sync sqlite
+    // PRAGMA query starves the runtime under concurrent load.
+    let ok = db_op(app.db.clone(), |guard| {
+        db::health_check(&guard.0).unwrap_or(false)
+    })
+    .await;
     let embedder_ready = app.embedder.as_ref().is_some();
     let federation_enabled = app.federation.as_ref().is_some();
     let code = if ok {
@@ -796,14 +867,19 @@ pub async fn health(State(app): State<AppState>) -> impl IntoResponse {
 /// scrapers see up-to-date counts without needing a background refresh
 /// task.
 pub async fn prometheus_metrics(State(state): State<Db>) -> impl IntoResponse {
-    {
-        let lock = state.lock().await;
-        if let Ok(stats) = db::stats(&lock.0, &lock.1) {
+    // PERF-1 (FX-3): route the rusqlite stats query through `db_op`.
+    // The stats query touches `memories` + `archived_memories` for COUNTs
+    // and can take 10-50ms on a populated DB; scrape cadence is every
+    // 10-30s, so without spawn_blocking this would periodically pin a
+    // tokio worker mid-scrape.
+    db_op(state, |guard| {
+        if let Ok(stats) = db::stats(&guard.0, &guard.1) {
             crate::metrics::registry()
                 .memories_gauge
                 .set(stats.total.try_into().unwrap_or(i64::MAX));
         }
-    }
+    })
+    .await;
     let body = crate::metrics::render();
     (
         StatusCode::OK,
