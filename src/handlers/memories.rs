@@ -95,9 +95,33 @@ pub async fn get_memory(
     let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
         .unwrap_or_else(|_| format!("anonymous:req-{}", uuid::Uuid::new_v4()));
 
-    let lock = app.db.lock().await;
-    match db::resolve_id(&lock.0, &id) {
-        Ok(Some(mem)) => {
+    // PERF-1 (FX-3): wrap the rusqlite read sequence in `db_op` so the
+    // FTS5 + memory_links lookups run on the blocking pool, not on the
+    // tokio worker. `get_memory` is on the per-id retrieval hot path.
+    // The visibility check is pure CPU on the owned Memory so it stays
+    // outside the helper; only the SQL touches the DB lock.
+    let id_clone = id.clone();
+    let lookup: Result<
+        Option<(crate::models::Memory, Vec<crate::models::MemoryLink>)>,
+        anyhow::Error,
+    > = super::db_op(app.db.clone(), move |guard| {
+        match db::resolve_id(&guard.0, &id_clone) {
+            Ok(Some(mem)) => {
+                // #869 audit (Category B — safe default): a substrate
+                // failure on `get_links` is non-fatal — the memory
+                // body itself was retrieved cleanly. Empty `links`
+                // array degrades graph navigation rather than
+                // failing the GET.
+                let links = db::get_links(&guard.0, &mem.id).unwrap_or_default();
+                Ok(Some((mem, links)))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(e),
+        }
+    })
+    .await;
+    match lookup {
+        Ok(Some((mem, links))) => {
             // #927 — 404 (not 403) on a private-row read by a non-owner
             // matches the existing visibility convention: returning
             // 403 would leak the existence of a row the caller is not
@@ -116,11 +140,6 @@ pub async fn get_memory(
                 return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"})))
                     .into_response();
             }
-            // #869 audit (Category B — safe default): a substrate
-            // failure on `get_links` is non-fatal — the memory body
-            // itself was retrieved cleanly. Empty `links` array
-            // degrades graph navigation rather than failing the GET.
-            let links = db::get_links(&lock.0, &mem.id).unwrap_or_default();
             Json(json!({"memory": mem, "links": links})).into_response()
         }
         Ok(None) => (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response(),
