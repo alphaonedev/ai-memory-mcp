@@ -422,6 +422,27 @@ pub enum Command {
     /// route (`POST /api/v1/share`) consume — guaranteeing byte-equal
     /// envelopes across the three surfaces.
     Share(crate::cli::share::ShareArgs),
+    /// v0.7.0 ARCH-3 / FX-12 — `ai-memory kg-query` subcommand.
+    /// Outbound KG traversal from a source memory (<=5 hops). CLI
+    /// parity for the MCP `memory_kg_query` tool.
+    KgQuery(crate::cli::commands::kg_query::KgQueryArgs),
+    /// v0.7.0 ARCH-3 / FX-12 — `ai-memory find-paths` subcommand.
+    /// Enumerate up to N paths through the KG between two memories
+    /// (BFS, `max_depth<=7`). CLI parity for `memory_find_paths`.
+    FindPaths(crate::cli::commands::find_paths::FindPathsArgs),
+    /// v0.7.0 ARCH-3 / FX-12 — `ai-memory recall-observations`
+    /// subcommand. List rows from the recall-consumption ledger
+    /// (#886). CLI parity for `memory_recall_observations`.
+    RecallObservations(crate::cli::commands::recall_observations::RecallObservationsArgs),
+    /// v0.7.0 ARCH-3 / FX-12 — `ai-memory check-duplicate`
+    /// subcommand. Pre-write near-duplicate check via cosine over
+    /// stored embeddings. CLI parity for `memory_check_duplicate`.
+    /// Requires the embedder (semantic tier or above).
+    CheckDuplicate(crate::cli::commands::check_duplicate::CheckDuplicateArgs),
+    /// v0.7.0 ARCH-3 / FX-12 — `ai-memory replay` subcommand.
+    /// Reconstruct the conversation transcript chain that produced a
+    /// memory. CLI parity for `memory_replay`.
+    Replay(crate::cli::commands::replay::ReplayArgs),
 }
 
 /// `ai-memory governance` parent argument struct.
@@ -1423,6 +1444,51 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
             // HTTP surfaces consume; wire envelope is byte-equal across
             // the three.
             cli::share::cmd_share(&db_path, &a, &mut out)
+        }
+        // v0.7.0 ARCH-3 / FX-12 — MCP/CLI parity build-out. Each
+        // dispatch arm wraps the same substrate primitive the MCP tool
+        // consumes; wire envelope is byte-equal across MCP / HTTP /
+        // CLI. See `docs/v0.7.0/arch-3-mcp-cli-parity-audit.md`.
+        Command::KgQuery(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::commands::kg_query::cmd_kg_query(&db_path, &a, &mut out)
+        }
+        Command::FindPaths(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::commands::find_paths::cmd_find_paths(&db_path, &a, &mut out)
+        }
+        Command::RecallObservations(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::commands::recall_observations::cmd_recall_observations(&db_path, &a, &mut out)
+        }
+        Command::CheckDuplicate(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::commands::check_duplicate::cmd_check_duplicate(&db_path, &a, app_config, &mut out)
+                .await
+        }
+        Command::Replay(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::commands::replay::cmd_replay(&db_path, &a, &mut out)
         }
     };
 

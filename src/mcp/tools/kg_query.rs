@@ -70,10 +70,12 @@ impl McpTool for KgQueryTool {
     }
 }
 
-pub(super) fn handle_kg_query(
-    conn: &rusqlite::Connection,
-    params: &Value,
-) -> Result<Value, String> {
+// v0.7.0 ARCH-3 / FX-12 — promoted from `pub(super)` to `pub` so the
+// `ai-memory kg query` CLI subcommand can dispatch into the same
+// substrate primitive the MCP `memory_kg_query` tool consumes, without
+// duplicating business logic. Wire envelope is byte-equal across MCP /
+// HTTP / CLI.
+pub fn handle_kg_query(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
     // v0.7.0 Provenance Gap 6 (#889) — reciprocal "subgraph rooted at
     // every memory sharing source_uri" entrypoint. When
     // `by_source_uri` is supplied, every memory carrying that URI is
