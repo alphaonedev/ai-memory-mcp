@@ -395,6 +395,161 @@ const fn attest_rank(level: AttestLevel) -> u8 {
     }
 }
 
+/// FX-4 / PERF-2 (2026-05-26) — batched lookup of the strongest
+/// attestation level across every link incident on each `memory_id`
+/// in `ids`. Replaces the per-row [`latest_link_attest_level`] call
+/// that the HTTP recall handler used to issue under the DB mutex
+/// (one round-trip per row × N rows = N round-trips under the lock).
+/// One `IN(...)` SQL emit covers the batch; the map is keyed by
+/// `memory_id` and only entries with a non-`None` level land in it.
+/// Best-effort: a SQL error returns an empty map so the recall
+/// response keeps its remaining decoration.
+pub(crate) fn latest_link_attest_level_many(
+    conn: &rusqlite::Connection,
+    ids: &[&str],
+) -> std::collections::HashMap<String, String> {
+    let mut out: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    if ids.is_empty() {
+        return out;
+    }
+    // Chunk to keep the SQL parameter count well below sqlite's
+    // default `SQLITE_LIMIT_VARIABLE_NUMBER` (999 on the standard
+    // build); each row contributes 2 placeholders (source_id +
+    // target_id) so 250 ids per chunk = 500 params, comfortable
+    // headroom. The recall handler caps `limit` at 50 today so the
+    // typical batch is one chunk; the cap is defensive only.
+    const CHUNK: usize = 250;
+    // Track best attestation per id across both the `source_id` and
+    // `target_id` columns. A link with `target_id = id` still
+    // contributes to `id`'s attestation rank because `get_links`
+    // surfaces incident edges in either direction.
+    let mut best_by_id: std::collections::HashMap<String, AttestLevel> =
+        std::collections::HashMap::new();
+    for chunk in ids.chunks(CHUNK) {
+        let placeholders = std::iter::repeat("?")
+            .take(chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT source_id, target_id, attest_level \
+             FROM memory_links \
+             WHERE source_id IN ({placeholders}) OR target_id IN ({placeholders})"
+        );
+        // Bind ids twice — once for the `source_id IN (...)` clause
+        // and once for the `target_id IN (...)` clause. Allocation
+        // is a single `Vec<&str>` of length 2 × chunk.len().
+        let mut params: Vec<&str> = Vec::with_capacity(chunk.len() * 2);
+        params.extend_from_slice(chunk);
+        params.extend_from_slice(chunk);
+        let Ok(mut stmt) = conn.prepare(&sql) else {
+            // Prepare error — return what we have. The decorator
+            // already treats `None` as a degraded-best-effort signal.
+            return out;
+        };
+        let Ok(rows) = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            let source_id: String = row.get(0)?;
+            let target_id: String = row.get(1)?;
+            let level: Option<String> = row.get(2)?;
+            Ok((source_id, target_id, level))
+        }) else {
+            return out;
+        };
+        // `chunk` is &[&str] — convert to a HashSet<&str> for O(1)
+        // membership tests across both columns.
+        let in_batch: std::collections::HashSet<&str> = chunk.iter().copied().collect();
+        for r in rows {
+            let Ok((source_id, target_id, level_opt)) = r else {
+                continue;
+            };
+            let Some(level_str) = level_opt else { continue };
+            let Some(level) = AttestLevel::from_str(&level_str) else {
+                continue;
+            };
+            let rank = attest_rank(level);
+            // Apply to whichever endpoint(s) of the link are in our
+            // batch — both directions count as "incident" per the
+            // per-row implementation above.
+            for endpoint in [&source_id, &target_id] {
+                if !in_batch.contains(endpoint.as_str()) {
+                    continue;
+                }
+                match best_by_id.get(endpoint) {
+                    None => {
+                        best_by_id.insert(endpoint.clone(), level);
+                    }
+                    Some(curr) if rank > attest_rank(*curr) => {
+                        best_by_id.insert(endpoint.clone(), level);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    for (id, level) in best_by_id {
+        out.insert(id, level.as_str().to_string());
+    }
+    out
+}
+
+/// FX-4 / PERF-2 (2026-05-26) — batched front-end for
+/// [`decorate_memory`] used by the HTTP recall handler. Resolves
+/// the verbose-decoration link-attestation lookup for every memory
+/// in one SQL round-trip via [`latest_link_attest_level_many`]
+/// instead of N round-trips. Returns one `Value` per `(mem, score)`
+/// in input order so the caller can splice it straight into the
+/// response payload.
+///
+/// Per-row pure fields (`confidence_tier`, `freshness_state`, the
+/// serialised `Memory` body, and the rounded `score`) match the
+/// shape that [`decorate_memory`] produces — the only structural
+/// difference is that the attestation lookup is amortised across
+/// the batch. The verbose-OFF path is identical to the legacy
+/// per-row shape (no DB queries) and is short-circuited here.
+pub fn decorate_memory_many(
+    rows: &[(Memory, f64)],
+    verbose_provenance: bool,
+    conn: &rusqlite::Connection,
+) -> Vec<Value> {
+    if !verbose_provenance {
+        return rows
+            .iter()
+            .map(|(mem, score)| {
+                let mut val = serde_json::to_value(mem).unwrap_or_default();
+                if let Some(obj) = val.as_object_mut() {
+                    obj.insert(
+                        "score".to_string(),
+                        json!((score * 1000.0).round() / 1000.0),
+                    );
+                }
+                val
+            })
+            .collect();
+    }
+    let ids: Vec<&str> = rows.iter().map(|(m, _)| m.id.as_str()).collect();
+    let attest_map = latest_link_attest_level_many(conn, &ids);
+    rows.iter()
+        .map(|(mem, score)| {
+            let mut val = serde_json::to_value(mem).unwrap_or_default();
+            let Some(obj) = val.as_object_mut() else {
+                return val;
+            };
+            obj.insert(
+                "score".to_string(),
+                json!((score * 1000.0).round() / 1000.0),
+            );
+            obj.insert(
+                "confidence_tier".to_string(),
+                json!(mem.confidence_tier().as_str()),
+            );
+            obj.insert("freshness_state".to_string(), json!(freshness_state(mem)));
+            if let Some(level) = attest_map.get(&mem.id) {
+                obj.insert("latest_link_attest_level".to_string(), json!(level));
+            }
+            val
+        })
+        .collect()
+}
+
 /// v0.7.0 Gap 3 (#886) — record one `recall_observations` row per
 /// returned candidate under `recall_id`. The `retriever` label is
 /// stamped uniformly across the batch ("hybrid+rerank", "hybrid",
