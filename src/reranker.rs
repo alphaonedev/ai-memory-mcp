@@ -1044,6 +1044,108 @@ pub struct BatchedReranker {
     /// [`Self::with_reflection_boost`] before the worker starts taking
     /// jobs.
     reflection_boost: ReflectionBoostConfig,
+    /// v0.7.0 #1319 — opt-in noise floor applied AFTER the blend
+    /// (`0.6 * original + 0.4 * ce_score`) and AFTER the reflection
+    /// boost. Default is [`RerankerScoreFloor::Off`] so existing
+    /// callers see byte-identical output to pre-#1319. Operators that
+    /// observed the cross-encoder false-positive ordering on
+    /// disjoint-vocab paraphrase queries (the v1 P5 probe — an Apollo
+    /// 11 row at 0.479 surfacing above a substantively-relevant hit at
+    /// 0.363) opt in via [`Self::with_score_floor`] to drop the
+    /// low-confidence tail entirely.
+    score_floor: RerankerScoreFloor,
+}
+
+/// v0.7.0 #1319 — post-blend score floor applied by [`BatchedReranker`].
+///
+/// **Default is [`Self::Off`]** — every existing caller observes
+/// byte-identical pre-#1319 output. Operators who hit the
+/// paraphrase / disjoint-vocab noise band turn it on via
+/// [`BatchedReranker::with_score_floor`] (constructor knob) or
+/// through the resolver-side `[reranker].score_floor*` config fields
+/// once they land.
+///
+/// **Why two shapes.** [`Self::Absolute`] is the literal "drop
+/// anything below 0.5" handle the recall caller's documentation
+/// suggests. [`Self::RelativeToTop`] keeps the top-of-list always
+/// available — useful when the corpus is small (a 3-row recall
+/// shouldn't return zero results just because every row scored
+/// `0.42`) and the operator just wants a "tail cleaner".
+///
+/// Both variants compare the **final blended score** (after the L2-8
+/// reflection boost), not the raw cross-encoder logit, so the floor
+/// is comparable to the values an operator reads off `recall.memories[].score`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RerankerScoreFloor {
+    /// No floor — pre-#1319 behavior. Every blended candidate is kept,
+    /// regardless of score. Default.
+    Off,
+    /// Drop every candidate whose final blended score falls strictly
+    /// below the supplied absolute value. Clamped at runtime to
+    /// `[0.0, 1.0]`.
+    Absolute(f64),
+    /// Drop every candidate whose final blended score falls strictly
+    /// below `top_score * ratio` (where `top_score` is the first row
+    /// after sorting). Clamped at runtime to `[0.0, 1.0]`. The top
+    /// row itself is never dropped — operators get at least one
+    /// result even when the entire ranked set is in the noise band.
+    RelativeToTop(f64),
+}
+
+impl Default for RerankerScoreFloor {
+    fn default() -> Self {
+        Self::Off
+    }
+}
+
+impl RerankerScoreFloor {
+    /// Apply the floor in-place to a pre-sorted (descending) vector
+    /// of `(Memory, blended_score)` candidates. The implementation is
+    /// extracted as a free helper so unit tests can pin the cutoff
+    /// arithmetic without spinning up a [`BatchedReranker`].
+    ///
+    /// The top row is always preserved (so a tiny corpus never
+    /// returns zero results) — see [`RerankerScoreFloor::RelativeToTop`]
+    /// documentation for the rationale.
+    fn apply(&self, scored: &mut Vec<(Memory, f64)>) {
+        if scored.is_empty() {
+            return;
+        }
+        let cutoff: f64 = match *self {
+            Self::Off => return,
+            Self::Absolute(v) => v.clamp(0.0, 1.0),
+            Self::RelativeToTop(ratio) => {
+                let top = scored.first().map(|(_, s)| *s).unwrap_or(0.0);
+                top * ratio.clamp(0.0, 1.0)
+            }
+        };
+        // Walk index-first so we can preserve the top row even when
+        // its score sits below `cutoff` (small-corpus invariant: the
+        // floor is a tail cleaner, not a "return nothing" knob).
+        let mut keep = Vec::with_capacity(scored.len());
+        for (idx, (_, score)) in scored.iter().enumerate() {
+            if idx == 0 || *score >= cutoff {
+                keep.push(idx);
+            }
+        }
+        // `keep` is monotonically increasing; iterate in reverse and
+        // remove dropped indices so the Vec retains the descending
+        // sort order from the upstream rerank.
+        let mut next_keep = keep.iter().rev().copied();
+        let mut want = next_keep.next();
+        let mut idx = scored.len();
+        while idx > 0 {
+            idx -= 1;
+            match want {
+                Some(k) if k == idx => {
+                    want = next_keep.next();
+                }
+                _ => {
+                    scored.remove(idx);
+                }
+            }
+        }
+    }
 }
 
 impl BatchedReranker {
@@ -1060,6 +1162,7 @@ impl BatchedReranker {
             max_batch,
             max_wait_ms,
             ReflectionBoostConfig::default(),
+            RerankerScoreFloor::Off,
         )
     }
 
@@ -1068,7 +1171,29 @@ impl BatchedReranker {
     /// Used by the recall integration tests to pin specific boost shapes
     /// (e.g. `disabled()` for the regression test).
     pub fn with_reflection_boost(encoder: CrossEncoder, boost: ReflectionBoostConfig) -> Self {
-        Self::with_full_params(encoder, DEFAULT_MAX_BATCH, DEFAULT_MAX_WAIT_MS, boost)
+        Self::with_full_params(
+            encoder,
+            DEFAULT_MAX_BATCH,
+            DEFAULT_MAX_WAIT_MS,
+            boost,
+            RerankerScoreFloor::Off,
+        )
+    }
+
+    /// v0.7.0 #1319 — wrap a `CrossEncoder` with a post-blend score
+    /// floor. The reflection-boost knob is left at the daemon default
+    /// (`1.2`); use [`Self::with_full_params`] to set both at once.
+    /// **Default constructors leave the floor `Off`** — flipping it on
+    /// here is an explicit operator-opt-in.
+    #[must_use]
+    pub fn with_score_floor(encoder: CrossEncoder, floor: RerankerScoreFloor) -> Self {
+        Self::with_full_params(
+            encoder,
+            DEFAULT_MAX_BATCH,
+            DEFAULT_MAX_WAIT_MS,
+            ReflectionBoostConfig::default(),
+            floor,
+        )
     }
 
     /// Internal constructor — all knobs visible.
@@ -1077,6 +1202,7 @@ impl BatchedReranker {
         max_batch: usize,
         max_wait_ms: u64,
         reflection_boost: ReflectionBoostConfig,
+        score_floor: RerankerScoreFloor,
     ) -> Self {
         let encoder = Arc::new(encoder);
         let (tx, rx) = std::sync::mpsc::channel::<RerankJob>();
@@ -1158,6 +1284,7 @@ impl BatchedReranker {
             worker: Some(worker),
             encoder,
             reflection_boost,
+            score_floor,
         }
     }
 
@@ -1169,6 +1296,20 @@ impl BatchedReranker {
     /// falls back to a direct `rerank` call on the underlying encoder
     /// (with the wrapper's configured reflection boost applied).
     pub fn rerank(&self, query: &str, candidates: Vec<(Memory, f64)>) -> Vec<(Memory, f64)> {
+        let mut scored = self.rerank_unfloored(query, candidates);
+        // v0.7.0 #1319 — post-blend score floor (default Off; opt-in
+        // via `with_score_floor`). Applies to the already-sorted
+        // descending vector returned by the encoder/worker.
+        self.score_floor.apply(&mut scored);
+        scored
+    }
+
+    /// Internal — same shape as [`Self::rerank`] but skips the
+    /// post-blend score floor. Pre-#1319 callsites that explicitly
+    /// want the raw blended output (regression tests, the byte-equal
+    /// pin in `g9_batched_reranker_serial_calls_match_rerank`) call
+    /// this directly.
+    fn rerank_unfloored(&self, query: &str, candidates: Vec<(Memory, f64)>) -> Vec<(Memory, f64)> {
         let Some(sender) = self.sender.as_ref() else {
             return self.encoder.rerank_with_reflection_boost(
                 query,
@@ -1193,6 +1334,14 @@ impl BatchedReranker {
             self.encoder
                 .rerank_with_reflection_boost(query, Vec::new(), &self.reflection_boost)
         })
+    }
+
+    /// v0.7.0 #1319 — expose the configured score floor for the
+    /// `memory_capabilities` reporter and for operator-facing
+    /// diagnostics.
+    #[must_use]
+    pub fn score_floor(&self) -> RerankerScoreFloor {
+        self.score_floor
     }
 
     /// v0.7.0 L2-8 — expose the configured boost for the
@@ -1921,6 +2070,193 @@ mod tests {
         }
         // First entry's blended score >= second by sort contract.
         assert!(out[0].1 >= out[1].1);
+    }
+
+    // ---------- Issue #1319 — reranker score floor (calibration) -----------
+
+    /// Issue #1319 — `RerankerScoreFloor::Off` is the default and a
+    /// no-op. Pre-#1319 callers see byte-identical output through the
+    /// new `apply` helper.
+    #[test]
+    fn reranker_score_floor_default_is_off_1319() {
+        let floor = RerankerScoreFloor::default();
+        assert_eq!(floor, RerankerScoreFloor::Off);
+        let mut scored = vec![
+            (make_memory("a", "x"), 0.9_f64),
+            (make_memory("b", "y"), 0.4_f64),
+            (make_memory("c", "z"), 0.1_f64),
+        ];
+        let before = scored.clone();
+        floor.apply(&mut scored);
+        assert_eq!(scored.len(), before.len());
+        for (i, (mem, s)) in scored.iter().enumerate() {
+            assert_eq!(mem.title, before[i].0.title);
+            assert!((s - before[i].1).abs() < f64::EPSILON);
+        }
+    }
+
+    /// Issue #1319 — absolute floor drops the tail. Top row is
+    /// preserved even when its score happens to fall below the floor
+    /// (small-corpus safety so a 1-row recall never returns nothing).
+    #[test]
+    fn reranker_score_floor_absolute_drops_tail_1319() {
+        let floor = RerankerScoreFloor::Absolute(0.5);
+        let mut scored = vec![
+            (make_memory("top", "x"), 0.90_f64),
+            (make_memory("mid", "y"), 0.60_f64),
+            (make_memory("low", "z"), 0.30_f64),
+            (make_memory("noise", "n"), 0.10_f64),
+        ];
+        floor.apply(&mut scored);
+        // top + mid kept; low + noise dropped.
+        let titles: Vec<&str> = scored.iter().map(|(m, _)| m.title.as_str()).collect();
+        assert_eq!(titles, vec!["top", "mid"]);
+    }
+
+    /// Issue #1319 — relative floor preserves the head and drops
+    /// candidates below `top_score * ratio`.
+    #[test]
+    fn reranker_score_floor_relative_drops_tail_1319() {
+        let floor = RerankerScoreFloor::RelativeToTop(0.5);
+        // top_score = 0.80, cutoff = 0.40.
+        let mut scored = vec![
+            (make_memory("top", "x"), 0.80_f64),
+            (make_memory("kept", "y"), 0.50_f64),
+            (make_memory("dropped_1", "z"), 0.35_f64),
+            (make_memory("dropped_2", "z"), 0.20_f64),
+        ];
+        floor.apply(&mut scored);
+        let titles: Vec<&str> = scored.iter().map(|(m, _)| m.title.as_str()).collect();
+        assert_eq!(titles, vec!["top", "kept"]);
+    }
+
+    /// Issue #1319 — top row is preserved even when the absolute
+    /// floor sits above every blended score. A tiny corpus that all
+    /// scored at 0.20 must still surface its top hit, not return
+    /// empty.
+    #[test]
+    fn reranker_score_floor_preserves_top_row_when_everything_below_1319() {
+        let floor = RerankerScoreFloor::Absolute(0.5);
+        let mut scored = vec![
+            (make_memory("apollo", "moon landing"), 0.20_f64),
+            (make_memory("recall", "blends fts and semantic"), 0.10_f64),
+        ];
+        floor.apply(&mut scored);
+        assert_eq!(scored.len(), 1);
+        assert_eq!(scored[0].0.title, "apollo");
+    }
+
+    /// Issue #1319 — empty input is a no-op (no panic on `.first()`).
+    #[test]
+    fn reranker_score_floor_handles_empty_1319() {
+        let floor = RerankerScoreFloor::Absolute(0.5);
+        let mut scored: Vec<(Memory, f64)> = vec![];
+        floor.apply(&mut scored);
+        assert!(scored.is_empty());
+    }
+
+    /// Issue #1319 — v1 P5 probe surfaced a paraphrase-aware corpus
+    /// where an Apollo-11 row scored 0.479 above a
+    /// substantively-relevant recall-mechanics row at 0.363 with
+    /// nothing visible to the operator that would have explained the
+    /// ordering. This regression test reconstructs the empirical
+    /// situation (disjoint-vocab paraphrase query — query terms appear
+    /// in neither candidate's title or content) and asserts that, with
+    /// an operator-opt-in `RerankerScoreFloor::Absolute(0.40)`, the
+    /// Apollo-11 false positive is dropped while the head ranking is
+    /// preserved.
+    ///
+    /// **Why the floor matters here.** With the lexical CE, both
+    /// candidates score 0.0 on the paraphrase query (disjoint vocab).
+    /// The blend `0.6 * original + 0.4 * 0.0` reduces to `0.6 * original`,
+    /// so the empirical ordering is set entirely by the upstream
+    /// `original` score. The substrate cannot reorder them away from
+    /// the noise — but it CAN expose an operator handle that drops
+    /// the entire tail below a threshold the operator chose. That's
+    /// what `RerankerScoreFloor` provides.
+    #[test]
+    fn reranker_v1_p5_paraphrase_noise_dropped_by_floor_1319() {
+        let ce = CrossEncoder::new(); // lexical, deterministic.
+        let apollo = make_memory(
+            "Apollo 11 moon landing",
+            "Neil Armstrong walked on the moon in 1969.",
+        );
+        let recall_b = make_memory(
+            "Recall blends FTS and semantic scores",
+            "The hybrid pipeline weighs cosine vs BM25 then reranks the top-k.",
+        );
+
+        // Empirical pre-#1319 shape: upstream hybrid retrieval scored
+        // Apollo above recall_b. The exact numbers mirror the v1 P5
+        // probe (Apollo 0.479, recall_b 0.363) so the test reads as
+        // the operator-observed evidence on the issue.
+        let candidates = vec![(apollo.clone(), 0.479_f64), (recall_b.clone(), 0.363_f64)];
+
+        // Operator query: a paraphrase that lexically misses both
+        // candidates ("what makes a recall implementation good?").
+        // Lexical CE produces 0 for both, so the blend reduces to
+        // `0.6 * original`.
+        let query = "what makes a recall implementation good?";
+
+        // Sanity: pre-floor, Apollo still sits on top — the
+        // substrate has no way to reorder paraphrase-disjoint
+        // candidates without semantic input from upstream.
+        let pre = ce.rerank(query, candidates.clone());
+        assert_eq!(pre[0].0.title, "Apollo 11 moon landing");
+        // Blended top score = 0.6 * 0.479 = 0.2874 (paraphrase noise band).
+        assert!(pre[0].1 < 0.30, "top score in noise band: {}", pre[0].1);
+
+        // Post-#1319 with absolute floor at 0.40: the entire tail is
+        // dropped EXCEPT the top row (preserved per the small-corpus
+        // safety rule). The operator now sees a single result and can
+        // judge "noise" vs "this is genuinely the best the substrate
+        // has" without an Apollo-11 false positive sitting beneath it
+        // at 0.218.
+        let mut post = pre.clone();
+        RerankerScoreFloor::Absolute(0.40).apply(&mut post);
+        assert_eq!(
+            post.len(),
+            1,
+            "floor at 0.40 must drop tail when blended scores in noise band: {post:?}"
+        );
+        // Top preserved.
+        assert_eq!(post[0].0.title, "Apollo 11 moon landing");
+    }
+
+    /// Issue #1319 — `BatchedReranker::with_score_floor` plumbs the
+    /// operator-opt-in floor end-to-end through the batched worker.
+    /// Pinned via the wrapper so future refactors of the worker
+    /// pipeline can't silently bypass the floor.
+    #[test]
+    fn batched_reranker_score_floor_plumbed_end_to_end_1319() {
+        use super::BatchedReranker;
+        let batched = BatchedReranker::with_score_floor(
+            CrossEncoder::new(),
+            RerankerScoreFloor::Absolute(0.40),
+        );
+        assert_eq!(batched.score_floor(), RerankerScoreFloor::Absolute(0.40));
+
+        let apollo = make_memory("Apollo 11 moon landing", "Armstrong, 1969");
+        let recall_b = make_memory(
+            "Recall blends FTS and semantic scores",
+            "hybrid pipeline weighs cosine vs BM25",
+        );
+        let candidates = vec![(apollo, 0.479_f64), (recall_b, 0.363_f64)];
+        let out = batched.rerank("paraphrase miss query", candidates);
+        // Default daemon path uses `BatchedReranker::new` (floor Off),
+        // so existing behavior is preserved — only the opt-in
+        // constructor plumbs the floor.
+        assert_eq!(out.len(), 1, "score floor must drop tail: {out:?}");
+    }
+
+    /// Issue #1319 — the existing `BatchedReranker::new` path leaves
+    /// the floor at `Off`, preserving pre-#1319 byte-equality for
+    /// every daemon that has not opted in.
+    #[test]
+    fn batched_reranker_default_constructor_leaves_floor_off_1319() {
+        use super::BatchedReranker;
+        let batched = BatchedReranker::new(CrossEncoder::new());
+        assert_eq!(batched.score_floor(), RerankerScoreFloor::Off);
     }
 }
 
