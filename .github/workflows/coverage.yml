@@ -47,9 +47,70 @@ env:
   AI_MEMORY_TEST_AGE_URL: "postgres://ai_memory:ai_memory_test@127.0.0.1:5432/ai_memory_test"
 
 jobs:
+  # Issue #1343 — docs-only PRs should skip the heavy llvm-cov sweep.
+  # Mirrors the same classify pattern used by `.github/workflows/ci.yml`
+  # (see the classify job there for the canonical implementation).
+  # When `docs_only == 'true'`, the `per-module-thresholds` job below
+  # is skipped, which GitHub reports as `status: skipping` on the PR
+  # check page — branch-protection treats a skipped required check as
+  # passing (same handling that ci.yml's downstream jobs already rely
+  # on for docs-only PRs).
+  classify:
+    name: Coverage classify (docs-only short-circuit)
+    runs-on: ubuntu-latest
+    outputs:
+      docs_only: ${{ steps.cls.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 2 }
+      - id: cls
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            base="${{ github.event.before }}"
+          else
+            base=""
+          fi
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ] || ! git rev-parse "$base" >/dev/null 2>&1; then
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::cannot resolve base commit ($base) — running full pipeline"
+            exit 0
+          fi
+          # Per issue #1193 / PR #1203 — fetch-depth=2 is too shallow
+          # when the PR base SHA is more than one commit behind the
+          # merge ref. Fetch on demand if the base tree isn't local.
+          if ! git cat-file -e "$base^{tree}" 2>/dev/null; then
+            git fetch --depth=50 origin "$base" 2>/dev/null || \
+              git fetch --depth=200 origin "$base" 2>/dev/null || \
+              git fetch --unshallow origin 2>/dev/null || true
+          fi
+          if ! git cat-file -e "$base^{tree}" 2>/dev/null; then
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::cannot fetch base tree ($base) after retry — running full pipeline"
+            exit 0
+          fi
+          changed=$(git diff --name-only "$base" HEAD)
+          if [ -z "$changed" ]; then
+            echo "docs_only=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::no diff vs base — treating as docs-only no-op"
+            exit 0
+          fi
+          # docs-only iff every changed file matches docs/** OR *.md anywhere
+          if echo "$changed" | grep -qvE '^(docs/|.*\.md$)'; then
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::changed files include non-docs paths — running full pipeline"
+          else
+            echo "docs_only=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::all changed files are docs-only — skipping heavy llvm-cov sweep"
+          fi
+
   per-module-thresholds:
     name: Per-Module Coverage Thresholds
     runs-on: ubuntu-latest
+    needs: classify
+    if: needs.classify.outputs.docs_only != 'true'
     permissions:
       contents: read
       pull-requests: write
