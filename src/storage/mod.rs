@@ -6736,6 +6736,52 @@ pub fn recall_hybrid(
     Ok((results, outcome))
 }
 
+/// FX-4 / PERF-2 (2026-05-26) — convenience wrapper for the HTTP
+/// recall handler. Same return shape as [`recall_hybrid`] but accepts
+/// a pre-computed HNSW hit slice (caller ran `idx.search()` outside
+/// the DB lock) so the DB-mutex hold window does not cover the
+/// CPU-bound ANN walk. Telemetry is dropped on this path; the HTTP
+/// surface does not consume it today.
+#[allow(clippy::too_many_arguments)]
+pub fn recall_hybrid_precomputed_hnsw(
+    conn: &Connection,
+    context: &str,
+    query_embedding: &[f32],
+    namespace: Option<&str>,
+    limit: usize,
+    tags_filter: Option<&str>,
+    since: Option<&str>,
+    until: Option<&str>,
+    precomputed_hnsw_hits: &[crate::hnsw::VectorHit],
+    short_extend: i64,
+    mid_extend: i64,
+    as_agent: Option<&str>,
+    budget_tokens: Option<usize>,
+    scoring: &crate::config::ResolvedScoring,
+    include_archived: bool,
+    source_uri_prefix: Option<&str>,
+) -> Result<(Vec<(Memory, f64)>, BudgetOutcome)> {
+    let (results, outcome, _telemetry) = recall_hybrid_with_telemetry_precomputed_hnsw(
+        conn,
+        context,
+        query_embedding,
+        namespace,
+        limit,
+        tags_filter,
+        since,
+        until,
+        precomputed_hnsw_hits,
+        short_extend,
+        mid_extend,
+        as_agent,
+        budget_tokens,
+        scoring,
+        include_archived,
+        source_uri_prefix,
+    )?;
+    Ok((results, outcome))
+}
+
 /// v0.6.3.1 (P3 + P6): hybrid recall reporting per-stage candidate counts,
 /// the average semantic blend weight, and the full budget outcome. MCP
 /// `handle_recall` uses the telemetry to populate the `meta` block (closes
@@ -6979,6 +7025,19 @@ fn semantic_phase(
     prep: &HybridPrep<'_>,
     query_embedding: &[f32],
     vector_index: Option<&crate::hnsw::VectorIndex>,
+    // FX-4 / PERF-2 (2026-05-26) — when supplied, the HNSW search
+    // has already been executed OUTSIDE the DB lock by the caller
+    // (HTTP recall handler) and the hits are passed in here. The
+    // function uses these directly instead of re-running
+    // `idx.search()`, which keeps the CPU-bound ANN walk off the
+    // DB-mutex hold window so concurrent recalls do not serialise
+    // behind one another. When both `vector_index` and
+    // `precomputed_hnsw_hits` are supplied, the precomputed slice
+    // wins — callers that already paid the search cost outside the
+    // lock must not pay it again inside. Existing callers (MCP /
+    // CLI / SAL) pass `None` and keep the legacy single-call
+    // behaviour where `semantic_phase` runs the search itself.
+    precomputed_hnsw_hits: Option<&[crate::hnsw::VectorHit]>,
     namespace: Option<&str>,
     tags_filter: Option<&str>,
     since: Option<&str>,
@@ -6990,9 +7049,22 @@ fn semantic_phase(
 ) -> Result<usize> {
     let mut hnsw_candidates_count: usize = 0;
     let now = prep.now.as_str();
-    if let Some(idx) = vector_index {
-        let ann_limit = (limit * 5).max(50);
-        let hits = idx.search(query_embedding, ann_limit);
+    // FX-4 / PERF-2 — when `precomputed_hnsw_hits` is supplied OR a
+    // `vector_index` is supplied, run the HNSW-hit ingestion path.
+    // The precomputed path skips the `idx.search()` call (already
+    // paid outside the lock); the legacy path runs the search
+    // inline.
+    if precomputed_hnsw_hits.is_some() || vector_index.is_some() {
+        let owned_hits;
+        let hits: &[crate::hnsw::VectorHit] = if let Some(pre) = precomputed_hnsw_hits {
+            pre
+        } else {
+            let ann_limit = (limit * 5).max(50);
+            owned_hits = vector_index
+                .expect("vector_index set in legacy branch")
+                .search(query_embedding, ann_limit);
+            owned_hits.as_slice()
+        };
         // v0.7.0 #981 — pre-#981 this branch called `get(conn, &hit.id)`
         // per hit, producing 50-250 round-trips per recall on a warm
         // index. The fix collects the ids that pass the
@@ -7013,7 +7085,7 @@ fn semantic_phase(
             // see the matching comment in the linear-scan branch below.
             if cosine > 0.2 {
                 needed_ids.push(hit.id.clone());
-                hit_meta.push((hit.id, cosine));
+                hit_meta.push((hit.id.clone(), cosine));
             }
         }
         let fetched = get_many(conn, &needed_ids)?;
@@ -7309,6 +7381,118 @@ pub fn recall_hybrid_with_telemetry(
     BudgetOutcome,
     crate::models::RecallTelemetry,
 )> {
+    recall_hybrid_with_telemetry_inner(
+        conn,
+        context,
+        query_embedding,
+        namespace,
+        limit,
+        tags_filter,
+        since,
+        until,
+        vector_index,
+        None,
+        short_extend,
+        mid_extend,
+        as_agent,
+        budget_tokens,
+        scoring,
+        include_archived,
+        source_uri_prefix,
+    )
+}
+
+/// FX-4 / PERF-2 (2026-05-26) — variant of
+/// [`recall_hybrid_with_telemetry`] that accepts a pre-computed slice
+/// of HNSW hits in place of the in-pipeline `idx.search()` call. The
+/// HTTP recall handler runs the ANN walk OUTSIDE the DB mutex (the
+/// HNSW index lives behind its own `vector_index` mutex; the DB lock
+/// is not required for the search) and passes the result here so the
+/// DB-mutex hold window covers only the FTS5 query + the batched
+/// `get_many` fetch + the touch ops. Concurrent recalls overlap
+/// their CPU-bound ANN walks instead of serialising behind the
+/// single shared connection.
+///
+/// Semantics-preserving by construction: the precomputed hits feed
+/// the same per-hit `cosine > 0.2` gate + `get_many` round-trip
+/// inside [`semantic_phase`] that the legacy single-call path uses.
+/// Existing callers (MCP / CLI / SAL) continue to call
+/// [`recall_hybrid_with_telemetry`] and pay the search cost inside
+/// the lock; only the HTTP handler swaps in the new path.
+#[allow(clippy::too_many_arguments)]
+pub fn recall_hybrid_with_telemetry_precomputed_hnsw(
+    conn: &Connection,
+    context: &str,
+    query_embedding: &[f32],
+    namespace: Option<&str>,
+    limit: usize,
+    tags_filter: Option<&str>,
+    since: Option<&str>,
+    until: Option<&str>,
+    precomputed_hnsw_hits: &[crate::hnsw::VectorHit],
+    short_extend: i64,
+    mid_extend: i64,
+    as_agent: Option<&str>,
+    budget_tokens: Option<usize>,
+    scoring: &crate::config::ResolvedScoring,
+    include_archived: bool,
+    source_uri_prefix: Option<&str>,
+) -> Result<(
+    Vec<(Memory, f64)>,
+    BudgetOutcome,
+    crate::models::RecallTelemetry,
+)> {
+    recall_hybrid_with_telemetry_inner(
+        conn,
+        context,
+        query_embedding,
+        namespace,
+        limit,
+        tags_filter,
+        since,
+        until,
+        None,
+        Some(precomputed_hnsw_hits),
+        short_extend,
+        mid_extend,
+        as_agent,
+        budget_tokens,
+        scoring,
+        include_archived,
+        source_uri_prefix,
+    )
+}
+
+/// Inner dispatch shared by [`recall_hybrid_with_telemetry`] (legacy,
+/// runs `idx.search()` inside the DB-lock window) and
+/// [`recall_hybrid_with_telemetry_precomputed_hnsw`] (FX-4 / PERF-2,
+/// caller pre-ran the ANN walk outside the DB lock). Exactly one of
+/// `vector_index` / `precomputed_hnsw_hits` is `Some` on any given
+/// call; the inner is private so the variant choice cannot drift.
+#[allow(clippy::too_many_arguments)]
+fn recall_hybrid_with_telemetry_inner(
+    conn: &Connection,
+    context: &str,
+    query_embedding: &[f32],
+    namespace: Option<&str>,
+    limit: usize,
+    tags_filter: Option<&str>,
+    since: Option<&str>,
+    until: Option<&str>,
+    vector_index: Option<&crate::hnsw::VectorIndex>,
+    precomputed_hnsw_hits: Option<&[crate::hnsw::VectorHit]>,
+    short_extend: i64,
+    mid_extend: i64,
+    as_agent: Option<&str>,
+    budget_tokens: Option<usize>,
+    scoring: &crate::config::ResolvedScoring,
+    include_archived: bool,
+    source_uri_prefix: Option<&str>,
+) -> Result<(
+    Vec<(Memory, f64)>,
+    BudgetOutcome,
+    crate::models::RecallTelemetry,
+)> {
     // Stage 1 — query preparation (FTS sanitisation, namespace
     // hierarchy expansion, visibility prefixes, SQL fragments).
     let prep = prepare_hybrid_query(
@@ -7357,12 +7541,16 @@ pub fn recall_hybrid_with_telemetry(
         fts_candidates_count += 1;
     }
 
-    // Stage 3 — semantic phase (HNSW when available, linear-scan fallback).
+    // Stage 3 — semantic phase (HNSW when available, linear-scan
+    // fallback). When `precomputed_hnsw_hits` is supplied the search
+    // step is skipped (already paid outside the DB lock); otherwise
+    // the in-pipeline `idx.search()` runs as before.
     let hnsw_candidates_count = semantic_phase(
         conn,
         &prep,
         query_embedding,
         vector_index,
+        precomputed_hnsw_hits,
         namespace,
         tags_filter,
         since,

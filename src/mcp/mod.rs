@@ -462,10 +462,22 @@ pub use quota_status::handle_quota_status;
 pub use check_agent_action::handle_check_agent_action;
 pub use recall::handle_recall;
 pub use recall::handle_recall_with_pre_recall_hook;
-// v0.7.x #1155 — exposed for the HTTP recall handler at
-// `src/handlers/recall.rs` so the Gap 7 verbose decoration is shared
-// between the MCP and HTTP wire paths.
-pub(crate) use recall::decorate_memory;
+// v0.7.x #1155 / FX-4 PERF-2 (2026-05-26) — batched front-end
+// consumed by the HTTP recall handler when releasing the DB mutex
+// around the per-row `latest_link_attest_level` lookup. One IN(...)
+// SQL emit replaces N round-trips, so the re-acquired lock window
+// on the verbose-provenance branch shrinks from O(N) to O(1) DB
+// round-trips. The legacy per-row `decorate_memory` is still
+// consumed inside the MCP module by `handle_recall_dto`; the HTTP
+// surface routes through `decorate_memory_many` instead.
+//
+// Exposed as `pub` (not `pub(crate)`) so the FX-4 regression suite
+// at `tests/recall_no_lock_across_hnsw.rs` can pin the wire-shape
+// parity between this batched front-end and the legacy per-row
+// `decorate_memory`. The internal `latest_link_attest_level_many`
+// helper stays `pub(crate)` because the test only needs to verify
+// the composed behaviour, not the raw lookup map.
+pub use recall::decorate_memory_many;
 // v0.7.0 Provenance Gap 3 (#886) — recall-consumption observation tier.
 // `handle_recall_observations` lives in `src/mcp/tools/recall_observations.rs`
 // (sibling-agent landing); the function is dispatched via

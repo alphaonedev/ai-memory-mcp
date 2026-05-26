@@ -482,99 +482,139 @@ async fn recall_response(
         None
     };
 
-    // v0.7.0 #982 — invert lock acquisition order so the
-    // vector_index mutex is taken BEFORE the (singleton) DB mutex.
-    // Pre-#982 the handler took DB then VI, which serialized every
-    // recall through both locks in DB-first order; HNSW eviction
-    // and embedder writes that grab the VI lock alone (e.g.
-    // `src/handlers/create.rs:541`) had a different lock-order
-    // semantic that risked deadlock if any future code path took DB
-    // INSIDE a VI guard. The invert puts the read-path order in
-    // line with the rest of the codebase. The deeper perf win
-    // (HNSW search OUTSIDE the DB lock so concurrent recalls overlap
-    // their CPU-bound ANN walks) is tracked as a follow-up; it
-    // requires changing `recall_hybrid` / `recall_hybrid_with_telemetry`
-    // / `semantic_phase` to accept precomputed `Option<Vec<VectorHit>>`
-    // and threading the change through 4 callers (handler + MCP tool
-    // + CLI + SAL adapter). Post-#981 the DB lock hold during
-    // semantic_phase is much shorter (1 batched SELECT vs N), so the
-    // marginal value of the deep refactor is reduced; this commit
-    // ships the order-invert win + caches the TTL config out of the
-    // mutex tuple so it doesn't need a re-read on every recall.
-    let vi_guard_outer = if query_emb.is_some() {
-        Some(app.vector_index.lock().await)
+    // FX-4 / PERF-2 (2026-05-26) — release the DB mutex across the
+    // HNSW search + post-recall decoration. Pre-fix the handler held
+    // `db.lock().await` across:
+    //   1. the HNSW `idx.search()` (CPU-bound vector walk)
+    //   2. `db::recall_hybrid` itself (FTS5 + get_many + touch)
+    //   3. the per-row `decorate_memory` loop (N extra round-trips
+    //      for `latest_link_attest_level` under verbose provenance)
+    // serialising every concurrent recall behind one another at the
+    // single-connection mutex. Lock-release boundary (this commit):
+    //
+    //   a) Take VI lock briefly → run `idx.search()` → drop VI lock.
+    //      HNSW search runs OUTSIDE the DB lock so concurrent recalls
+    //      overlap their CPU-bound ANN walks.
+    //   b) Acquire DB lock briefly → call recall (FTS5 + the batched
+    //      `get_many` round-trip for the HNSW hits + touch ops) →
+    //      drop DB lock.
+    //   c) Post-filters (form4 / kinds / session-recency) run on
+    //      owned `Memory` rows OUTSIDE the lock — they're pure CPU.
+    //   d) Re-acquire DB lock briefly for `decorate_memory_many`
+    //      (one IN(...) SQL emit covers the verbose-provenance
+    //      attestation lookup for the full batch) → drop DB lock.
+    //
+    // Net effect: the DB-mutex hold window covers only the FTS5
+    // query and the batched get_many fetch + touch (and a brief
+    // re-acquire for verbose decoration), not the HNSW search and
+    // not N per-row attestation queries. Regression pin lives at
+    // `tests/recall_no_lock_across_hnsw.rs`.
+
+    // Stage (a) — HNSW search OUTSIDE the DB lock. The vector_index
+    // mutex is its own lock and does not touch the DB connection,
+    // so taking + releasing it here costs nothing in DB-mutex
+    // contention. `idx.search()` reads the immutable active graph
+    // and returns owned `Vec<VectorHit>`; the guard drops at the
+    // end of this scope so the next recall's search can overlap.
+    let precomputed_hits: Option<Vec<crate::hnsw::VectorHit>> = if let Some(ref qe) = query_emb {
+        let vi_guard = app.vector_index.lock().await;
+        let hits = if let Some(idx) = vi_guard.as_ref() {
+            let ann_limit = (limit * 5).max(50);
+            idx.search(qe, ann_limit)
+        } else {
+            // No HNSW index → empty hit slice. `semantic_phase`
+            // skips the per-hit loop on an empty slice and falls
+            // through to the linear-scan branch under the lock
+            // (preserving pre-fix behaviour for the no-HNSW path).
+            Vec::new()
+        };
+        Some(hits)
     } else {
         None
     };
-    let lock = app.db.lock().await;
-    let short_extend = lock.2.short_extend_secs;
-    let mid_extend = lock.2.mid_extend_secs;
 
-    let (result, mode) = if let Some(ref qe) = query_emb {
-        // The VI guard is held since the outer if-let above; cannot
-        // move it into the inner scope without re-acquiring the lock.
-        let vi_guard = vi_guard_outer
-            .as_ref()
-            .expect("vi_guard_outer set when query_emb is Some");
-        let vi_ref = vi_guard.as_ref();
-        let r = db::recall_hybrid(
-            &lock.0,
-            context,
-            qe,
-            namespace,
-            limit,
-            tags,
-            since,
-            until,
-            vi_ref,
-            short_extend,
-            mid_extend,
-            // #928 SECURITY-medium (Track A P5, 2026-05-20):
-            // thread the header-resolved caller_principal as the
-            // visibility-filter principal so scope=private rows owned
-            // by other agents are NOT leaked when the caller doesn't
-            // set body.as_agent. Pre-fix the sqlite path passed only
-            // `as_agent` (typically None from real callers) and the
-            // visibility_clause short-circuited to "all rows visible".
-            // Mirror of the postgres SAL branch's
-            // `as_agent.or(caller_principal).unwrap_or("daemon")`.
-            as_agent.or(caller_principal),
-            budget_tokens,
-            app.scoring.as_ref(),
-            false,
-            // v0.7.0 Cluster-A PERF-3 — push the prefix into SQL on
-            // both FTS and semantic branches so the partial
-            // idx_memories_source_uri index covers the lookup; the
-            // post-fetch apply_form4_recall_filters below remains for
-            // the `has_citations` axis.
-            source_uri_prefix,
-        );
-        (r, "hybrid")
-    } else {
-        let r = db::recall(
-            &lock.0,
-            context,
-            namespace,
-            limit,
-            tags,
-            since,
-            until,
-            short_extend,
-            mid_extend,
-            // #928 — same caller_principal fallback as the hybrid
-            // branch above; see the longer note there.
-            as_agent.or(caller_principal),
-            budget_tokens,
-            false,
-            // v0.7.0 Cluster-A PERF-3 — see hybrid branch above.
-            source_uri_prefix,
-        );
-        (r, "keyword")
+    // Stage (b) — DB lock for the FTS5 query + get_many for the
+    // pre-computed HNSW hits + touch ops. Scoped tightly so the
+    // guard drops as soon as `recall_hybrid_precomputed_hnsw` /
+    // `recall` returns.
+    let (result, mode) = {
+        let lock = app.db.lock().await;
+        let short_extend = lock.2.short_extend_secs;
+        let mid_extend = lock.2.mid_extend_secs;
+        let (result, mode) = if let Some(ref qe) = query_emb {
+            // SAFETY: `precomputed_hits` is Some when `query_emb` is
+            // Some, by construction of the if-let above. The empty
+            // slice case (no HNSW index) still threads through the
+            // precomputed-hits path; `semantic_phase` short-circuits
+            // on `hits.is_empty()` and the linear-scan fallback at
+            // the bottom of the function runs (same behaviour as the
+            // pre-fix `idx = None` branch).
+            let hits = precomputed_hits
+                .as_deref()
+                .expect("precomputed_hits set when query_emb is Some");
+            let r = db::recall_hybrid_precomputed_hnsw(
+                &lock.0,
+                context,
+                qe,
+                namespace,
+                limit,
+                tags,
+                since,
+                until,
+                hits,
+                short_extend,
+                mid_extend,
+                // #928 SECURITY-medium (Track A P5, 2026-05-20):
+                // thread the header-resolved caller_principal as the
+                // visibility-filter principal so scope=private rows
+                // owned by other agents are NOT leaked when the
+                // caller doesn't set body.as_agent. See the matching
+                // longer note on the pre-FX-4 code for the rationale.
+                as_agent.or(caller_principal),
+                budget_tokens,
+                app.scoring.as_ref(),
+                false,
+                // v0.7.0 Cluster-A PERF-3 — push the prefix into SQL
+                // on both FTS and semantic branches so the partial
+                // idx_memories_source_uri index covers the lookup;
+                // the post-fetch apply_form4_recall_filters below
+                // remains for the `has_citations` axis.
+                source_uri_prefix,
+            );
+            (r, "hybrid")
+        } else {
+            let r = db::recall(
+                &lock.0,
+                context,
+                namespace,
+                limit,
+                tags,
+                since,
+                until,
+                short_extend,
+                mid_extend,
+                // #928 — same caller_principal fallback as the hybrid
+                // branch above; see the longer note there.
+                as_agent.or(caller_principal),
+                budget_tokens,
+                false,
+                // v0.7.0 Cluster-A PERF-3 — see hybrid branch above.
+                source_uri_prefix,
+            );
+            (r, "keyword")
+        };
+        (result, mode)
+        // `lock` drops here — every line below this block runs
+        // WITHOUT the DB mutex held. short_extend / mid_extend are
+        // consumed by the recall call above and are not needed after
+        // the lock releases.
     };
 
     match result {
         Ok((r, outcome)) => {
             // v0.7.0 Form 4 (issue #757) — fact-provenance post-filter.
+            // Stage (c) — these post-filters run on OWNED Memory rows;
+            // no DB connection needed. The lock is already dropped.
             let r =
                 crate::cli::recall::apply_form4_recall_filters(r, has_citations, source_uri_prefix);
             // v0.7.x Form 6 — apply post-fetch kinds filter on the
@@ -590,50 +630,64 @@ async fn recall_response(
             // v0.7.0 (issue #518) — per-session recency boost +
             // post-recall record on the sqlite branch.
             let r = crate::reranker::apply_session_recency_boost(r, session_id, session_tracker);
-            // #869 — same `Value::Null` masking fix as the postgres
-            // branch above; sqlite branch needs the identical
-            // filter_map + log so an encoder regression cannot silently
-            // drop fields from a recall row to look like a real null.
+            // Stage (d) — verbose-provenance decoration. The
+            // per-row `latest_link_attest_level` lookup used to fire
+            // N round-trips under the DB lock; FX-4 / PERF-2 routes
+            // through `decorate_memory_many` which issues ONE
+            // IN(...) SQL emit for the whole batch under a briefly
+            // re-acquired lock. The verbose-OFF path stays pure-CPU
+            // and runs without the lock.
             //
-            // v0.7.x #1155 — when `Accept-Provenance: verbose` was
-            // sent, route through `crate::mcp::tools::recall::decorate_memory`
-            // so the HTTP envelope carries the Gap 7 derived
-            // decoration (confidence_tier, freshness_state,
-            // latest_link_attest_level) — same shape MCP defaults to.
-            // Pre-#1155 the bare serde-roundtripped Memory shape
-            // (still carrying Form 4/5/6 columns) was the HTTP
-            // default; that legacy shape remains the default for
-            // backwards compat with v0.6.x HTTP clients that have not
-            // yet adopted the verbose envelope. Procurement-grade
-            // closure of the consumer-default friction documented in
-            // `docs/compliance/honest-limitations.md` §3.2.
-            let scored: Vec<serde_json::Value> = r
-                .iter()
-                .filter_map(|(m, s)| {
-                    if provenance_shape.is_verbose() {
-                        Some(crate::mcp::decorate_memory(m, *s, true, &lock.0))
-                    } else {
-                        match serde_json::to_value(m) {
-                            Ok(mut v) => {
-                                if let Some(obj) = v.as_object_mut() {
-                                    obj.insert(
-                                        "score".to_string(),
-                                        json!((*s * 1000.0).round() / 1000.0),
-                                    );
-                                }
-                                Some(v)
-                            }
-                            Err(e) => {
-                                tracing::error!(
-                                    memory_id = %m.id,
-                                    "recall (sqlite): serialise Memory failed, skipping row: {e}"
+            // #869 — `Value::Null` masking discipline kept: the
+            // serialise step inside `decorate_memory_many` mirrors
+            // the per-row `serde_json::to_value(mem).unwrap_or_default()`
+            // shape, so a Memory-serialise failure surfaces as the
+            // `Value::Null` row that the postgres branch also
+            // produces; the sqlite parity here matches the upstream
+            // contract (#869) and the pre-#1155 verbose shape.
+            //
+            // v0.7.x #1155 — Accept-Provenance: verbose shape
+            // remains the gate (confidence_tier, freshness_state,
+            // latest_link_attest_level). Default HTTP shape stays
+            // bare for v0.6.x backwards compat per the existing
+            // contract on this surface.
+            let scored: Vec<serde_json::Value> = if provenance_shape.is_verbose() {
+                // Re-acquire DB lock briefly for the batched
+                // attestation lookup; the lock guard drops at the
+                // end of this block. One IN(...) SQL emit covers the
+                // whole batch instead of N per-row round-trips.
+                let lock = app.db.lock().await;
+                let out = crate::mcp::decorate_memory_many(&r, true, &lock.0);
+                drop(lock);
+                out
+            } else {
+                // Verbose-OFF path: pure-CPU serde shape. No DB
+                // access required; the lock is NOT re-acquired here.
+                // Mirrors the pre-FX-4 bare-shape branch byte-for-
+                // byte, including the #869 `Value::Null` masking
+                // discipline (a Memory-serialise failure surfaces as
+                // a `Value::Null` row + tracing::error).
+                r.iter()
+                    .filter_map(|(m, s)| match serde_json::to_value(m) {
+                        Ok(mut v) => {
+                            if let Some(obj) = v.as_object_mut() {
+                                obj.insert(
+                                    "score".to_string(),
+                                    json!((*s * 1000.0).round() / 1000.0),
                                 );
-                                None
                             }
+                            Some(v)
                         }
-                    }
-                })
-                .collect();
+                        Err(e) => {
+                            tracing::error!(
+                                memory_id = %m.id,
+                                "recall (sqlite): serialise Memory failed, skipping row: {e}"
+                            );
+                            None
+                        }
+                    })
+                    .collect()
+            };
             let mut resp = json!({
                 "memories": scored,
                 "count": scored.len(),
