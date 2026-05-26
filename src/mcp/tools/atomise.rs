@@ -231,6 +231,15 @@ pub fn handle_atomise(
         }
         Err(AtomiseError::SignerError(detail)) => Err(format!("SIGNER_ERROR: {detail}")),
         Err(AtomiseError::DbError(detail)) => Err(format!("DB_ERROR: {detail}")),
+        // ARCH-5 (FX-6) — recursive-primitive refusal mirroring the
+        // `REFLECTION_DEPTH_EXCEEDED` / `SYNTHESIS_DEPTH_EXCEEDED` wire
+        // shape on the MCP surface (Err string prefixed with the stable
+        // slug). Downstream MCP clients can switch on the slug without
+        // parsing the prose.
+        Err(AtomiseError::DepthExceeded { attempted, cap }) => Err(format!(
+            "ATOMISATION_DEPTH_EXCEEDED: atomisation depth {attempted} would exceed \
+             compiled max_atomisation_depth {cap}"
+        )),
     }
 }
 
