@@ -22,11 +22,13 @@
 
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::str::FromStr;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result, anyhow};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::sync::Semaphore;
 
 /// Public-facing subscription record (no secret plaintext).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -395,6 +397,91 @@ pub const RETRY_BACKOFFS: &[std::time::Duration] = &[
 /// expectations.
 pub const ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// PERF-3 (fix campaign 2026-05-26, FX-10) — default upper bound on the
+/// number of webhook deliveries that may be in flight concurrently.
+///
+/// Pre-fix posture: every matching subscriber span on every store event
+/// spawned a fresh `std::thread::spawn` worker that opened its own
+/// SQLite connection. At 1000 subscribers this minted 1000 OS threads
+/// (~1 MB stack each = 1 GB virtual) and 1000 SQLite handles per
+/// store event, bypassing the existing Tokio runtime entirely.
+///
+/// Post-fix posture: each delivery is enqueued on a bounded
+/// [`tokio::sync::Semaphore`] (default permits = this constant) and
+/// the blocking-HTTP + audit-write step runs inside
+/// [`tokio::task::spawn_blocking`] so the dispatcher uses the
+/// existing runtime's blocking-thread pool instead of unbounded
+/// OS-thread spawn.
+///
+/// Operators tune the bound via `AI_MEMORY_WEBHOOK_DISPATCH_CONCURRENCY`.
+/// Values outside `1..=4096` fall back to the default with a warn-log.
+pub const DEFAULT_WEBHOOK_DISPATCH_CONCURRENCY: usize = 32;
+
+/// PERF-3 (FX-10) — module-level shared semaphore that bounds the
+/// in-flight webhook delivery count across every concurrent
+/// `dispatch_event_to_subs` call. Built lazily on first dispatch from
+/// `AI_MEMORY_WEBHOOK_DISPATCH_CONCURRENCY` (default
+/// [`DEFAULT_WEBHOOK_DISPATCH_CONCURRENCY`]). Held in `Arc` so worker
+/// tasks can clone-and-move it into their async body.
+static DISPATCH_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+/// Resolve the bound from env (test seam: tests call
+/// [`override_dispatch_concurrency_for_tests`] before any dispatch
+/// runs to pin the bound to a known value).
+fn dispatch_concurrency_bound() -> usize {
+    if let Some(forced) = TEST_DISPATCH_CONCURRENCY_OVERRIDE.get() {
+        return *forced;
+    }
+    match std::env::var("AI_MEMORY_WEBHOOK_DISPATCH_CONCURRENCY") {
+        Ok(raw) => match raw.parse::<usize>() {
+            Ok(n) if (1..=4096).contains(&n) => n,
+            _ => {
+                tracing::warn!(
+                    "AI_MEMORY_WEBHOOK_DISPATCH_CONCURRENCY={raw:?} not in 1..=4096; \
+                     falling back to default {DEFAULT_WEBHOOK_DISPATCH_CONCURRENCY}"
+                );
+                DEFAULT_WEBHOOK_DISPATCH_CONCURRENCY
+            }
+        },
+        Err(_) => DEFAULT_WEBHOOK_DISPATCH_CONCURRENCY,
+    }
+}
+
+/// Return a clone of the shared dispatch semaphore, building it on
+/// first call from the resolved concurrency bound.
+fn dispatch_semaphore() -> Arc<Semaphore> {
+    DISPATCH_SEMAPHORE
+        .get_or_init(|| Arc::new(Semaphore::new(dispatch_concurrency_bound())))
+        .clone()
+}
+
+/// Test-only override for the dispatch concurrency bound. Tests set
+/// this BEFORE the first dispatch runs in the process so the
+/// semaphore is sized to the assertion's expectations. Subsequent
+/// changes after the semaphore is built are ignored (the bound is
+/// per-process).
+static TEST_DISPATCH_CONCURRENCY_OVERRIDE: OnceLock<usize> = OnceLock::new();
+
+/// Test-only seam: pin the dispatch concurrency bound to `n`. Must be
+/// called before any `dispatch_event*` runs in the current process.
+/// Returns `Err(_)` if the bound has already been set (in which case
+/// the prior value remains authoritative).
+#[doc(hidden)]
+pub fn override_dispatch_concurrency_for_tests(n: usize) -> Result<(), usize> {
+    TEST_DISPATCH_CONCURRENCY_OVERRIDE.set(n)
+}
+
+/// PERF-3 (FX-10) — diagnostic accessor returning the number of
+/// permits currently AVAILABLE on the shared dispatch semaphore. Used
+/// by the regression test in
+/// `tests/subscriptions_no_thread_spawn_per_subscriber.rs` to assert
+/// the in-flight ceiling holds even when 50 subscribers fan out
+/// concurrently.
+#[doc(hidden)]
+pub fn dispatch_semaphore_available_permits() -> usize {
+    dispatch_semaphore().available_permits()
+}
+
 // v0.7.0 #1073 — `dispatch_http_client()` scaffolding REMOVED
 //
 // v0.7.x (issue #1174 follow-up #1196) — the dead-code shared-client
@@ -560,13 +647,24 @@ pub struct LinkInvalidatedEventDetails {
     pub previous_valid_until: Option<String>,
 }
 
-/// Fire an event to all matching subscribers. Each dispatch runs in
-/// its own OS thread and does NOT block the caller. Errors are logged
-/// and counted in the DB via `failure_count`.
+/// Fire an event to all matching subscribers. Each dispatch is
+/// fire-and-forget — the caller is NOT blocked on delivery. Errors are
+/// logged and counted in the DB via `failure_count`.
 ///
-/// Caller owns the connection. Dispatch threads re-open the connection
-/// as needed to update counters (cheap — `SQLite` connections are
-/// process-shared via WAL).
+/// PERF-3 (FX-10, 2026-05-26): pre-fix posture was
+/// `std::thread::spawn` + per-worker `Connection::open(...)` per
+/// matching subscriber — 1000 subscribers minted 1000 OS threads + 1000
+/// SQLite handles per store event. Post-fix posture uses a bounded
+/// [`tokio::sync::Semaphore`] (default 32 permits, tunable via
+/// `AI_MEMORY_WEBHOOK_DISPATCH_CONCURRENCY`) + `tokio::task::spawn_blocking`
+/// against the existing daemon Tokio runtime so the in-flight delivery
+/// count is capped. The pre-fix `std::thread::spawn` path is preserved
+/// as a fallback for legacy unit tests that run outside any runtime.
+///
+/// Caller owns the connection. Dispatch workers still re-open the
+/// connection per delivery to update counters (cheap — `SQLite`
+/// connections are process-shared via WAL — and the new concurrency
+/// bound keeps the simultaneous handle count bounded too).
 ///
 /// P5 (G9): convenience wrapper for the historical no-details case
 /// (used by `memory_store`). New event types should call
@@ -684,6 +782,25 @@ pub fn dispatch_event_to_subs(
     // differs from their clock by more than 5 minutes (replay window).
     // (#301 item 1 — prior implementation had no replay protection.)
     let timestamp = chrono::Utc::now().timestamp().to_string();
+
+    // PERF-3 (FX-10, 2026-05-26) — bridge the dispatch fan-out onto
+    // the existing Tokio runtime. We grab the current Handle once per
+    // batch; the per-subscriber worker is enqueued as
+    // `handle.spawn(async { semaphore.acquire().await;
+    // spawn_blocking(|| { … reqwest::blocking::send + audit
+    // writes … }).await })`. The semaphore caps in-flight deliveries
+    // at [`DEFAULT_WEBHOOK_DISPATCH_CONCURRENCY`] (operator-tunable
+    // via `AI_MEMORY_WEBHOOK_DISPATCH_CONCURRENCY`) so 1000 matching
+    // subscribers no longer mint 1000 OS threads + 1000 SQLite
+    // handles.
+    //
+    // Fallback: when no Tokio runtime is attached to the calling
+    // thread (e.g. legacy CLI tests that call `dispatch_event`
+    // outside a runtime), fall back to the pre-fix
+    // `std::thread::spawn` path. Production daemons (CLI/MCP/HTTP)
+    // ALL run under `#[tokio::main]`, so this fallback is the cold
+    // path.
+    let handle = tokio::runtime::Handle::try_current().ok();
     for (sub, sub_secret_hash) in matching {
         // v0.7.0 K6 — UUIDv7 correlation id is generated per
         // (subscription, event) pair so receivers can correlate ACKs
@@ -714,7 +831,13 @@ pub fn dispatch_event_to_subs(
         let ts = timestamp.clone();
         let db_path = db_path.to_path_buf();
         let secret_hash_owned = sub_secret_hash.clone();
-        std::thread::spawn(move || {
+
+        // PERF-3 (FX-10) — the entire per-subscriber delivery body
+        // is captured by a `FnOnce()` closure so it can run either
+        // on the Tokio blocking pool (production path) or on a
+        // freshly-spawned `std::thread` (no-runtime fallback). The
+        // body is otherwise unchanged from the pre-fix code.
+        let work = move || {
             // v0.7.0 #1072 — open ONE sqlite connection for the
             // whole delivery instead of 4-5 across the
             // event-audit / status-update / dispatch-counter / DLQ
@@ -874,7 +997,52 @@ pub fn dispatch_event_to_subs(
                     tracing::warn!("subscription DLQ write failed: {e}");
                 }
             }
-        });
+        };
+
+        // PERF-3 (FX-10) — production path: bounded semaphore + Tokio
+        // blocking pool. The semaphore caps concurrent in-flight
+        // deliveries at the operator-tunable bound; permits are
+        // released when the `_permit` guard drops at the end of the
+        // worker. Cold path (no runtime attached): legacy
+        // `std::thread::spawn`. Tests use the production path because
+        // `#[tokio::test]` attaches a runtime to the calling thread.
+        if let Some(rt) = handle.as_ref() {
+            let permit_sem = dispatch_semaphore();
+            rt.spawn(async move {
+                // Acquire-then-blocking-step. `acquire_owned` returns
+                // an `OwnedSemaphorePermit` that gets moved into the
+                // blocking task and is dropped when the worker
+                // returns — releasing the slot for the next pending
+                // dispatch.
+                let permit = match permit_sem.acquire_owned().await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(
+                            "subscription dispatch: semaphore acquire failed: {e}; \
+                             dropping delivery (semaphore closed)"
+                        );
+                        return;
+                    }
+                };
+                // The reqwest::blocking + rusqlite work is sync; run
+                // it on the Tokio blocking pool so we don't pin a
+                // runtime worker thread on the LLM-slow HTTP send.
+                if let Err(e) = tokio::task::spawn_blocking(move || {
+                    work();
+                    drop(permit);
+                })
+                .await
+                {
+                    tracing::warn!("subscription dispatch: spawn_blocking join failed: {e}");
+                }
+            });
+        } else {
+            // Fallback: no runtime in scope. This path is exercised
+            // only by legacy unit tests that call `dispatch_event`
+            // outside `#[tokio::test]`; production daemons always
+            // run under `#[tokio::main]`.
+            std::thread::spawn(work);
+        }
     }
 }
 
