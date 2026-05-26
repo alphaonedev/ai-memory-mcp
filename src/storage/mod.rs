@@ -2789,6 +2789,44 @@ fn contradiction_title_jaccard(
     if union > 0.0 { inter / union } else { 0.0 }
 }
 
+/// Stage-1 FTS5 recall for similar-title candidates. Returns up to
+/// `limit` rows from `memories_fts` matching the sanitised seed
+/// title, ordered by FTS5 rank.
+///
+/// This is the broader recall pool that feeds both
+/// [`find_contradictions`] (wire-side `potential_contradictions`,
+/// post Stage-2 Jaccard floor) and [`find_synthesis_candidates`]
+/// (Form 1 synthesis curator, NO Jaccard floor). Two consumers,
+/// two different relevance budgets; see #1320 + #1337 for why the
+/// pool can't be filtered universally.
+fn find_similar_title_candidates(
+    conn: &Connection,
+    title: &str,
+    namespace: &str,
+    limit: usize,
+) -> Result<Vec<Memory>> {
+    let fts_query = sanitize_fts_query(title, true);
+    let mut stmt = conn.prepare(
+        "SELECT m.id, m.tier, m.namespace, m.title, m.content, m.tags, m.priority,
+                m.confidence, m.source, m.access_count, m.created_at, m.updated_at,
+                m.last_accessed_at, m.expires_at, m.metadata, m.reflection_depth,
+                m.memory_kind, m.entity_id, m.persona_version,
+                m.citations, m.source_uri, m.source_span,
+                m.confidence_source, m.confidence_signals, m.confidence_decayed_at
+         FROM memories_fts fts
+         JOIN memories m ON m.rowid = fts.rowid
+         WHERE memories_fts MATCH ?1 AND m.namespace = ?2
+         ORDER BY fts.rank
+         LIMIT ?3",
+    )?;
+    let rows = stmt.query_map(
+        params![fts_query, namespace, i64::try_from(limit).unwrap_or(20)],
+        row_to_memory,
+    )?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
 /// Detect potential contradictions: memories in same namespace with similar titles.
 ///
 /// Two-stage filter (#1320 calibration):
@@ -2804,26 +2842,21 @@ fn contradiction_title_jaccard(
 /// the wire-side `potential_contradictions` field documents while
 /// removing the stopword-OR noise floor that crossed unrelated topics
 /// at v0.6.x / pre-fix v0.7.0.
+///
+/// **Scope** (#1337): this function is the WIRE-output filter. The
+/// Form 1 synthesis curator path uses [`find_synthesis_candidates`]
+/// instead, which omits the Stage-2 Jaccard floor — the curator needs
+/// the broader Stage-1 pool to see legitimately-similar memories
+/// whose titles share only one strong content token (e.g.
+/// `"kubernetes deployment notes"` vs
+/// `"kubernetes rolling deploy strategy"`, Jaccard 1/6 ≈ 0.167)
+/// without depending on whether 0.30 happens to be the right
+/// stopword-noise floor for the wire surface.
 pub fn find_contradictions(conn: &Connection, title: &str, namespace: &str) -> Result<Vec<Memory>> {
-    let fts_query = sanitize_fts_query(title, true);
     // Stage 1 — FTS5 recall. Pull a wider candidate pool (20) so the
     // stage-2 Jaccard filter has headroom; the final cap of 5 is
     // applied after the filter so the wire shape is preserved.
-    let mut stmt = conn.prepare(
-        "SELECT m.id, m.tier, m.namespace, m.title, m.content, m.tags, m.priority,
-                m.confidence, m.source, m.access_count, m.created_at, m.updated_at,
-                m.last_accessed_at, m.expires_at, m.metadata, m.reflection_depth,
-                m.memory_kind, m.entity_id, m.persona_version,
-                m.citations, m.source_uri, m.source_span,
-                m.confidence_source, m.confidence_signals, m.confidence_decayed_at
-         FROM memories_fts fts
-         JOIN memories m ON m.rowid = fts.rowid
-         WHERE memories_fts MATCH ?1 AND m.namespace = ?2
-         ORDER BY fts.rank
-         LIMIT 20",
-    )?;
-    let rows = stmt.query_map(params![fts_query, namespace], row_to_memory)?;
-    let candidates: Vec<Memory> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    let candidates = find_similar_title_candidates(conn, title, namespace, 20)?;
 
     // Stage 2 — Jaccard floor on stopword-stripped title tokens.
     let seed_tokens = contradiction_title_tokens(title);
@@ -2837,6 +2870,36 @@ pub fn find_contradictions(conn: &Connection, title: &str, namespace: &str) -> R
         .collect();
     filtered.truncate(5);
     Ok(filtered)
+}
+
+/// Stage-1-only FTS5 candidate recall for the Form 1 synthesis
+/// curator path.
+///
+/// The synthesis curator (`mcp/tools/store/synthesis.rs`) needs the
+/// broader similar-title pool — every namespace row whose title
+/// matches the seed under FTS5 — so the LLM can decide which
+/// candidates legitimately overlap with the incoming write.
+///
+/// This intentionally OMITS the Stage-2 Jaccard floor that
+/// [`find_contradictions`] applies to its wire output: the floor was
+/// calibrated for "stopword-only overlap" wire-noise rejection
+/// (#1320), but the synthesis tests exercise legitimate single-strong-
+/// token overlaps (e.g. `"kubernetes deployment notes"` vs
+/// `"kubernetes rolling deploy strategy"` share `{kubernetes}` =
+/// Jaccard 1/6 ≈ 0.167 < 0.30). Applying the wire-floor here would
+/// hide those candidates from the curator and short-circuit every
+/// add/update/delete verb in the synthesis verdict matrix (#1337).
+///
+/// Returns up to 5 candidates (matches the wire ceiling for
+/// `potential_contradictions`, the historical synthesis prompt cap).
+pub fn find_synthesis_candidates(
+    conn: &Connection,
+    title: &str,
+    namespace: &str,
+) -> Result<Vec<Memory>> {
+    let mut candidates = find_similar_title_candidates(conn, title, namespace, 20)?;
+    candidates.truncate(5);
+    Ok(candidates)
 }
 
 // --- Links ---
