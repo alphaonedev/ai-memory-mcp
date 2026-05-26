@@ -192,3 +192,42 @@ fn issue_1325_negative_depth_rejected_at_parse() {
         "negative-depth refusal must use the stable slug; got: {err}"
     );
 }
+
+/// Case 4 — caller asserts a negative depth (`d < 0`). The handler
+/// refuses BEFORE the substrate is touched with the stable
+/// `CALLER_DEPTH_MISMATCH` slug AND the explanatory phrase
+/// `non-negative integer`. This pins both halves of the input-validation
+/// gate the handler enforces at the negative-domain branch
+/// (`src/mcp/tools/reflect.rs:99-105`) and closes the Per-Module
+/// Coverage gap flagged on PR #1338 (mcp/tools/reflect.rs measured
+/// 92.47% < threshold 95%).
+#[test]
+fn issue_1325_negative_depth_refused() {
+    let tmp = NamedTempFile::new().expect("tempfile");
+    let conn = db::open(tmp.path()).expect("db::open");
+    let src_a = insert_depth0_observation(&conn, "ns-1325-neg-refused", "src-a");
+
+    let err = handle_reflect(
+        &conn,
+        tmp.path(),
+        &json!({
+            "source_ids": [src_a],
+            "title": "reflection asserts negative depth",
+            "content": "depth=-1 must be refused at the input-validation gate",
+            "depth": -1,
+        }),
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect_err("negative depth must refuse");
+    assert!(
+        err.contains("CALLER_DEPTH_MISMATCH"),
+        "negative-depth refusal must carry the stable slug; got: {err}"
+    );
+    assert!(
+        err.contains("non-negative"),
+        "negative-depth refusal must explain the constraint (\"non-negative\"); got: {err}"
+    );
+}
