@@ -986,6 +986,13 @@ mod tests {
     fn build_curator_llm_with_keyword_tier_returns_none() {
         // Keyword tier has no llm_model — the function returns None
         // BEFORE entering the body. Sanity check.
+        //
+        // TEST-5 — pin `AI_MEMORY_NO_CONFIG=1` so `AppConfig::load()`
+        // returns `Default::default()` instead of reading the
+        // developer's `~/.config/ai-memory/config.toml` (which would
+        // resolve a non-default `[llm]` stanza and cause this
+        // assertion to fail).
+        crate::cli::test_utils::ensure_no_config_env();
         let result = build_curator_llm(config::FeatureTier::Keyword);
         assert!(result.is_none());
     }
@@ -996,6 +1003,11 @@ mod tests {
         // `let model = ...` + `OllamaClient::new(&model).ok()` lines.
         // In hermetic tests Ollama is unreachable, so the result is
         // None — but the body lines are now covered.
+        //
+        // TEST-5 — pin `AI_MEMORY_NO_CONFIG=1` so the resolver always
+        // returns the Ollama compiled default rather than reading the
+        // host's user-config-resolved backend.
+        crate::cli::test_utils::ensure_no_config_env();
         let _ = build_curator_llm(config::FeatureTier::Smart);
         // No assertion on the value; the test exercises lines 55-56.
     }
@@ -1228,6 +1240,11 @@ mod tests {
         // Autonomous tier — exercises the autonomous arm of the
         // configured llm_model match. Will likely return None when
         // Ollama isn't running.
+        //
+        // TEST-5 — pin `AI_MEMORY_NO_CONFIG=1` so the resolver always
+        // returns the Ollama compiled default rather than the host's
+        // configured backend.
+        crate::cli::test_utils::ensure_no_config_env();
         let _ = build_curator_llm(config::FeatureTier::Autonomous);
     }
 

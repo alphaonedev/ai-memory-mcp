@@ -62,6 +62,36 @@ use crate::{db, models};
 use chrono::Utc;
 use std::path::{Path, PathBuf};
 
+/// TEST-5 — Pin `AI_MEMORY_NO_CONFIG=1` for the lifetime of the test
+/// process before any test calls `AppConfig::load()`. Without this,
+/// CLI tests that build a curator / atomiser / reflect pipeline read
+/// the developer host's `~/.config/ai-memory/config.toml` (which often
+/// points at xAI / Ollama / Anthropic). On hosts where that config
+/// exists AND its `[llm]` stanza resolves to a non-Ollama backend,
+/// `build_from_resolved` builds a `reqwest::blocking::Client` —
+/// which spins up an inner tokio current-thread runtime that, when
+/// dropped at the end of a `#[tokio::test]` body, panics with
+/// "Cannot drop a runtime in a context where blocking is not
+/// allowed" (TEST-6). Setting the env var once before any test body
+/// short-circuits `AppConfig::load()` to `Default::default()` and
+/// closes both TEST-5 (assertion drift) and TEST-6 (runtime drop
+/// panic) in a single place. Idempotent and `Once`-gated so the
+/// `unsafe` env-var write happens exactly once per test binary.
+pub fn ensure_no_config_env() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        // SAFETY: `std::env::set_var` is `unsafe` on the 2024 edition
+        // because env mutation is process-global. We gate it through
+        // `Once` so it runs at most once per test binary, before any
+        // test thread can read `AI_MEMORY_NO_CONFIG`, which removes
+        // the data-race window the unsafety contract is guarding
+        // against.
+        unsafe {
+            std::env::set_var("AI_MEMORY_NO_CONFIG", "1");
+        }
+    });
+}
+
 /// Per-test fixture: scratch DB path + captured output buffers.
 pub struct TestEnv {
     pub db_path: PathBuf,
@@ -75,6 +105,11 @@ impl TestEnv {
     /// Allocate a fresh tempdir + DB path. The DB file is *not* created;
     /// `db::open` will materialize it on first use.
     pub fn fresh() -> Self {
+        // TEST-5 + TEST-6 — pin `AI_MEMORY_NO_CONFIG=1` for the test
+        // process so `AppConfig::load()` never reads the developer's
+        // real config. See `ensure_no_config_env` for the full
+        // rationale.
+        ensure_no_config_env();
         let _tmp = tempfile::tempdir().expect("tempdir");
         let db_path = _tmp.path().join("ai-memory.db");
         Self {
