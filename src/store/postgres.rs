@@ -6034,6 +6034,46 @@ fn to_store_err(what: &str, e: sqlx::Error) -> StoreError {
     }
 }
 
+/// ARCH-1 — Postgres-side adapter for the substrate
+/// [`crate::storage::GOVERNANCE_PRE_WRITE`] hook.
+///
+/// Consults the process-wide pre-write hook installed by the daemon
+/// `serve` bootstrap. On refusal, returns
+/// [`StoreError::PermissionDenied`] with the operator-authored
+/// `reason` so the SAL-trait-routed write surfaces as `403 FORBIDDEN`
+/// via [`crate::handlers::postgres_gate::store_err_to_response`] — the
+/// nearest typed variant that maps to the canonical
+/// `GOVERNANCE_REFUSED` HTTP status. The `action` /
+/// `target` fields carry enough context for operators reading the
+/// scrubbed wire response to recognise the substrate gate.
+///
+/// The SQLite path uses the same hook from inside
+/// `crate::storage::insert*`; this helper mirrors that contract for
+/// the sqlx-native postgres write paths so multi-tenant
+/// postgres-backed deployments cannot bypass operator-signed
+/// governance.
+fn consult_governance_pre_write_pg(memory: &Memory) -> StoreResult<()> {
+    match crate::storage::consult_governance_pre_write(memory) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // The substrate helper wraps the refusal in
+            // `anyhow::Error::new(GovernanceRefusal { reason })`.
+            // Downcast to recover the operator-authored reason; if
+            // the downcast somehow fails (cannot happen in practice
+            // given the helper's contract), fall back to the
+            // anyhow display string so the refusal still flows.
+            let reason = e
+                .downcast_ref::<crate::storage::GovernanceRefusal>()
+                .map_or_else(|| e.to_string(), |r| r.reason.clone());
+            Err(StoreError::PermissionDenied {
+                action: "memory_write".to_string(),
+                target: memory.namespace.clone(),
+                reason,
+            })
+        }
+    }
+}
+
 /// v0.7.0 fold-A2A1.3 (#700) — AGE-side runtime failure classifier.
 ///
 /// Decides whether a `StoreError` returned from one of the
@@ -6952,6 +6992,14 @@ impl MemoryStore for PostgresStore {
     }
 
     async fn store(&self, ctx: &CallerContext, memory: &Memory) -> StoreResult<String> {
+        // ARCH-1 (CRITICAL) — substrate governance pre-write parity with
+        // the SQLite path. The `GOVERNANCE_PRE_WRITE` hook is consulted
+        // on EVERY substrate write path on EVERY backend; multi-tenant
+        // postgres-backed deployments would otherwise silently bypass
+        // operator-signed governance. See module-level comment in
+        // `src/storage/mod.rs` for the full layering rationale.
+        consult_governance_pre_write_pg(memory)?;
+
         let created_at = parse_rfc3339_required(&memory.created_at)?;
         let updated_at = parse_rfc3339_required(&memory.updated_at)?;
         let last_accessed_at = parse_rfc3339_opt(memory.last_accessed_at.as_deref());
@@ -7110,6 +7158,13 @@ impl MemoryStore for PostgresStore {
         memory: &Memory,
         embedding: Option<&[f32]>,
     ) -> StoreResult<String> {
+        // ARCH-1 (CRITICAL) — substrate governance pre-write parity.
+        // The semantic-recall write path MUST consult the hook just
+        // like the plain `store` path; otherwise an operator-signed
+        // refuse rule could be bypassed by routing through the
+        // embedded-vector path. See `src/storage/mod.rs` for context.
+        consult_governance_pre_write_pg(memory)?;
+
         // Same upsert contract as `store` but additionally writes the
         // pgvector `embedding` column when a vector is supplied. This
         // is the load-bearing path for semantic recall on postgres —
@@ -7700,6 +7755,15 @@ impl MemoryStore for PostgresStore {
         _ctx: &CallerContext,
         memory: &Memory,
     ) -> StoreResult<String> {
+        // ARCH-1 (CRITICAL) — substrate governance pre-write parity.
+        // Federation-pushed memories must clear the same pre-write
+        // hook as locally-authored writes; otherwise a peer could push
+        // a row that the local operator's signed governance rules
+        // would refuse to accept on the local write path. The SQLite
+        // mirror is `crate::storage::insert_if_newer`
+        // (src/storage/mod.rs:6218).
+        consult_governance_pre_write_pg(memory)?;
+
         // Mirrors sqlite db::insert_if_newer:
         //   1. INSERT verbatim if no row matches.
         //   2. On (title, namespace) collision: UPDATE only if the
