@@ -168,6 +168,21 @@ pub enum AtomiseError {
     /// Database error (SQL, transaction commit, etc.). Carries the
     /// underlying diagnostic.
     DbError(String),
+    /// ARCH-5 (FX-6) — emitted when the recursive atomisation depth
+    /// exceeds [`MAX_ATOMISATION_DEPTH`]. A curator that chain-fires
+    /// an atomise on each derived atom (e.g. via an aggressive
+    /// `pre_store` auto-atomise hook that itself triggers another
+    /// atomise) is bounded by the thread-local depth guard installed
+    /// by [`enter_atomisation_pass`]. Past the cap the substrate
+    /// refuses with this typed variant, surfacing the stable
+    /// `ATOMISATION_DEPTH_EXCEEDED` slug to MCP / HTTP / CLI callers.
+    ///
+    /// Mirrors the
+    /// [`crate::errors::MemoryError::ReflectionDepthExceeded`] +
+    /// [`crate::errors::MemoryError::SynthesisDepthExceeded`] contract
+    /// so the recursive-primitive discipline is uniform across the
+    /// substrate's recursive write paths.
+    DepthExceeded { attempted: u32, cap: u32 },
 }
 
 impl std::fmt::Display for AtomiseError {
@@ -192,11 +207,116 @@ impl std::fmt::Display for AtomiseError {
             Self::GovernanceRefused(d) => write!(f, "atomise: governance refused: {d}"),
             Self::SignerError(d) => write!(f, "atomise: signer error: {d}"),
             Self::DbError(d) => write!(f, "atomise: db error: {d}"),
+            Self::DepthExceeded { attempted, cap } => write!(
+                f,
+                "ATOMISATION_DEPTH_EXCEEDED: atomisation depth {attempted} would exceed \
+                 compiled max_atomisation_depth {cap}"
+            ),
         }
     }
 }
 
 impl std::error::Error for AtomiseError {}
+
+// ---------------------------------------------------------------------------
+// ARCH-5 (FX-6) — atomisation-pass cycle-depth guard.
+//
+// Atomisation can re-enter itself indirectly via the `pre_store` /
+// `post_store` substrate hook chain (a freshly-minted atom is itself a
+// `memory_store` write, which fires the auto-atomise hook against
+// namespaces that opted in; if that hook fires a fresh `atomise_sync`
+// then we have a recursive primitive). Every other recursive primitive
+// in the substrate (reflect, synthesis, kg-query, find-paths,
+// cycle-check) has an explicit named cap with a typed refusal slug;
+// pre-FX-6 the atomiser was the lone outlier, relying solely on the
+// `AlreadyAtomised` idempotency check to break a chain. A misbehaving
+// curator that returns slightly different atom content on each pass
+// (LLM nondeterminism — different atom titles never trip the
+// idempotency check because that check keys on `atomised_into > 0` on
+// the source, not on atom content) could therefore drive an unbounded
+// recursion + OOM.
+//
+// The guard pattern mirrors
+// [`crate::synthesis::enter_synthesis_pass`] verbatim — a thread-local
+// counter (cheap, no allocation per call), an RAII guard that
+// increments on entry + decrements on drop, and a `pub const` cap that
+// the substrate compares against on every entry. Thread-local because
+// parallel HTTP / MCP requests must not share state; each request
+// walks its own call stack and either stays shallow or hits the cap
+// independently.
+// ---------------------------------------------------------------------------
+
+/// Compiled-in cap for the recursive atomisation-pass depth. An
+/// `atomise_sync_with_retries` call site running at depth `N` may
+/// indirectly invoke another atomise (via the `pre_store`
+/// auto-atomise hook firing on a freshly-minted atom in a namespace
+/// that opted in, etc.); each such nesting bumps the counter by 1.
+/// Once the counter exceeds this cap the substrate refuses the
+/// atomisation pass with [`AtomiseError::DepthExceeded`] and the
+/// stable slug `ATOMISATION_DEPTH_EXCEEDED`.
+///
+/// Mirrors [`crate::synthesis::MAX_SYNTHESIS_DEPTH`] and the
+/// `effective_max_reflection_depth` ceiling at 3 — bounds recursion
+/// without strangling legitimate two-step curator hand-offs.
+pub const MAX_ATOMISATION_DEPTH: u32 = 3;
+
+thread_local! {
+    /// Per-thread counter tracking how deep into the
+    /// atomisation-pass call stack the current `atomise_sync*`
+    /// invocation is. Reset to 0 between independent requests by
+    /// the RAII guard returned from [`enter_atomisation_pass`].
+    /// Cheap, no allocation per call.
+    static ATOMISATION_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Read the current thread's atomisation-pass recursion depth.
+/// Returns `0` outside any active atomiser call (production callers);
+/// returns `N` while the `N`-th nested atomise is in flight on this
+/// thread.
+#[must_use]
+pub fn current_atomisation_depth() -> u32 {
+    ATOMISATION_DEPTH.with(std::cell::Cell::get)
+}
+
+/// RAII guard returned by [`enter_atomisation_pass`]. While the guard
+/// is alive, the thread's atomisation depth is incremented by 1; on
+/// drop the depth decrements back to the prior value. The atomiser
+/// holds the guard across the full `atomise_sync_with_retries` body
+/// so any `pre_store` / `post_store` hooks that re-enter atomise
+/// observe the incremented depth and refuse past the cap on entry.
+pub struct AtomisationDepthGuard {
+    /// Depth this guard was responsible for incrementing TO. On drop
+    /// we restore to `prior = depth - 1`. Stored explicitly so a
+    /// panicked guard doesn't leak the higher depth into the next
+    /// request reusing this thread.
+    prior: u32,
+}
+
+impl Drop for AtomisationDepthGuard {
+    fn drop(&mut self) {
+        ATOMISATION_DEPTH.with(|cell| cell.set(self.prior));
+    }
+}
+
+/// Enter an atomisation-pass scope. Returns the new depth
+/// (post-increment) plus an RAII guard that restores the depth on
+/// drop. Callers MUST retain the guard across the full atomise body —
+/// dropping it mid-call would underflow the depth and let nested
+/// calls escape the cap.
+///
+/// The caller is expected to compare the returned depth against
+/// [`MAX_ATOMISATION_DEPTH`] and refuse with
+/// [`AtomiseError::DepthExceeded`] when over-cap.
+#[must_use]
+pub fn enter_atomisation_pass() -> (u32, AtomisationDepthGuard) {
+    let (prior, new) = ATOMISATION_DEPTH.with(|cell| {
+        let prior = cell.get();
+        let new = prior.saturating_add(1);
+        cell.set(new);
+        (prior, new)
+    });
+    (new, AtomisationDepthGuard { prior })
+}
 
 /// The atomisation engine.
 ///
@@ -374,6 +494,31 @@ impl Atomiser {
         calling_agent_id: &str,
         max_retries: u32,
     ) -> Result<AtomiseResult, AtomiseError> {
+        // ARCH-5 (FX-6) — atomisation-pass cycle-depth guard. Acquire
+        // the per-thread depth guard BEFORE any substrate work so a
+        // nested atomise triggered by a `pre_store` / `post_store` hook
+        // on a freshly-minted atom observes the higher depth and
+        // refuses on entry. The guard is bound to `_depth_guard` (a
+        // named binding) so Rust retains the RAII drop until the full
+        // atomise body completes; a bare `let _ = ...` would drop the
+        // guard at the end of the statement and let nested calls
+        // escape the cap. Mirrors the discipline in
+        // `crate::synthesis::enter_synthesis_pass` (issue #1240).
+        let (_depth, _depth_guard) = enter_atomisation_pass();
+        if _depth > MAX_ATOMISATION_DEPTH {
+            tracing::warn!(
+                target: "atomisation",
+                source_id = %source_id,
+                attempted = _depth,
+                cap = MAX_ATOMISATION_DEPTH,
+                "atomisation.depth_exceeded",
+            );
+            return Err(AtomiseError::DepthExceeded {
+                attempted: _depth,
+                cap: MAX_ATOMISATION_DEPTH,
+            });
+        }
+
         // Step 3 — tier check (pulled forward of step 1 so we don't burn
         // a DB read when the daemon is on keyword tier).
         if self.tier == crate::config::FeatureTier::Keyword {
@@ -920,10 +1065,62 @@ mod tests {
             AtomiseError::GovernanceRefused("policy".into()),
             AtomiseError::SignerError("no key".into()),
             AtomiseError::DbError("io".into()),
+            AtomiseError::DepthExceeded {
+                attempted: 4,
+                cap: MAX_ATOMISATION_DEPTH,
+            },
         ] {
             let s = format!("{e}");
             assert!(!s.is_empty());
         }
+    }
+
+    // ---- ARCH-5 (FX-6) — atomisation depth-cap invariants.
+
+    #[test]
+    fn max_atomisation_depth_matches_substrate_recursive_primitive_cap() {
+        // The cap must match the rest of the recursive-primitive
+        // discipline (reflection / synthesis ship at 3). A drift here
+        // would mean the atomiser tolerates deeper recursion than its
+        // sibling primitives — surfaced explicitly so a refactor that
+        // bumps any of the four caps trips this pin.
+        assert_eq!(MAX_ATOMISATION_DEPTH, 3);
+        assert_eq!(
+            MAX_ATOMISATION_DEPTH,
+            crate::synthesis::MAX_SYNTHESIS_DEPTH,
+            "atomisation cap must match synthesis cap"
+        );
+    }
+
+    #[test]
+    fn atomisation_depth_guard_increments_and_decrements() {
+        // Pre-entry depth is 0 on a fresh thread.
+        assert_eq!(current_atomisation_depth(), 0);
+        {
+            let (d1, _g1) = enter_atomisation_pass();
+            assert_eq!(d1, 1);
+            assert_eq!(current_atomisation_depth(), 1);
+            {
+                let (d2, _g2) = enter_atomisation_pass();
+                assert_eq!(d2, 2);
+                assert_eq!(current_atomisation_depth(), 2);
+                {
+                    let (d3, _g3) = enter_atomisation_pass();
+                    assert_eq!(d3, 3);
+                    {
+                        // 4-th nesting trips the cap.
+                        let (d4, _g4) = enter_atomisation_pass();
+                        assert_eq!(d4, 4);
+                        assert!(d4 > MAX_ATOMISATION_DEPTH, "depth=4 exceeds cap=3");
+                    }
+                    // Drop restores depth back to 3.
+                    assert_eq!(current_atomisation_depth(), 3);
+                }
+                assert_eq!(current_atomisation_depth(), 2);
+            }
+            assert_eq!(current_atomisation_depth(), 1);
+        }
+        assert_eq!(current_atomisation_depth(), 0);
     }
 
     // ---- Cluster-A COR-1 / COR-7 / COV-3 — compute_atom_span tests.
