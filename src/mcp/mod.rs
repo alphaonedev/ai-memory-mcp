@@ -441,6 +441,13 @@ pub use capabilities::{
     overlay_tool_payloads,
 };
 pub use find_paths::handle_find_paths;
+// v0.7.0 ARCH-3 / FX-12 — CLI parity exports for handlers previously
+// private to the MCP module (`pub(super)`). The CLI subcommands under
+// `src/cli/commands/kg_query.rs` / `src/cli/commands/check_duplicate.rs`
+// dispatch into the same substrate primitives the MCP tools consume,
+// guaranteeing wire envelope parity across the three surfaces.
+pub use check_duplicate::handle_check_duplicate;
+pub use kg_query::handle_kg_query;
 pub use load_family::{handle_load_family, handle_smart_load};
 pub(crate) use namespace::handle_namespace_clear_standard;
 // v0.7.0 G-PHASE-E-2 (#707) — promoted to `pub` so the integration
@@ -711,7 +718,8 @@ use archive::{
     handle_gc,
 };
 use auto_tag::handle_auto_tag;
-use check_duplicate::handle_check_duplicate;
+// v0.7.0 ARCH-3 / FX-12 — `handle_check_duplicate` is `pub use`-exported
+// above; dispatch resolves via the crate path.
 use consolidate::handle_consolidate;
 // v0.7.0 WT-1-C — `memory_atomise` MCP tool wiring.
 use atomise::handle_atomise;
@@ -733,7 +741,8 @@ use get::handle_get;
 use get_taxonomy::handle_get_taxonomy;
 use ingest_multistep::handle_ingest_multistep;
 use kg_invalidate::handle_kg_invalidate;
-use kg_query::handle_kg_query;
+// v0.7.0 ARCH-3 / FX-12 — `handle_kg_query` is `pub use`-exported above;
+// dispatch resolves via the crate path.
 use kg_timeline::handle_kg_timeline;
 use link::{handle_get_links, handle_link};
 use list::handle_list;
