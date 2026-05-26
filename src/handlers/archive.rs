@@ -95,10 +95,18 @@ pub async fn list_archive(
         };
     }
 
-    let lock = app.db.lock().await;
     let limit = q.limit.unwrap_or(50).clamp(1, 1000);
     let offset = q.offset.unwrap_or(0);
-    match db::list_archived(&lock.0, q.namespace.as_deref(), limit, offset) {
+    // PERF-1 (FX-3): wrap rusqlite scan in `db_op`. archived_memories
+    // can carry hundreds of thousands of rows on long-running daemons;
+    // the LIMIT/OFFSET scan can take 50ms+ at the tail and would
+    // otherwise pin a tokio worker.
+    let namespace = q.namespace.clone();
+    let result = super::db_op(app.db.clone(), move |guard| {
+        db::list_archived(&guard.0, namespace.as_deref(), limit, offset)
+    })
+    .await;
+    match result {
         Ok(items) => Json(json!({"archived": items, "count": items.len()})).into_response(),
         Err(e) => {
             tracing::error!("handler error: {e}");
@@ -196,18 +204,25 @@ pub async fn restore_archive(
     // non-owner attempt returns 404 (not 403) so the surface cannot
     // be used to enumerate other owners' archived ids — mirrors the
     // #927 `get_memory` posture.
-    let restored = {
-        let lock = app.db.lock().await;
-        match db::restore_archived_for_caller(&lock.0, &id, &caller) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::error!("handler error: {e}");
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": "internal server error"})),
-                )
-                    .into_response();
-            }
+    // PERF-1 (FX-3): wrap the rusqlite restore in `db_op`. The restore
+    // path does INSERT...SELECT + DELETE on archived_memories, then
+    // re-inserts the row into memories triggering FTS rebuild — all
+    // on the calling thread pre-fix.
+    let id_for_restore = id.clone();
+    let caller_for_restore = caller.clone();
+    let restored = match super::db_op(app.db.clone(), move |guard| {
+        db::restore_archived_for_caller(&guard.0, &id_for_restore, &caller_for_restore)
+    })
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!("handler error: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "internal server error"})),
+            )
+                .into_response();
         }
     };
     if !restored {
@@ -317,12 +332,19 @@ pub async fn purge_archive(
         };
     }
 
-    let lock = app.db.lock().await;
-    let purge_result = if is_admin {
-        db::purge_archive(&lock.0, q.older_than_days)
-    } else {
-        db::purge_archive_for_caller(&lock.0, &caller, q.older_than_days)
-    };
+    // PERF-1 (FX-3): wrap the rusqlite DELETE in `db_op`. The purge
+    // can touch tens of thousands of archived rows; running it on the
+    // tokio worker pinned the runtime for the whole DELETE.
+    let caller_for_purge = caller.clone();
+    let older_than_days = q.older_than_days;
+    let purge_result = super::db_op(app.db.clone(), move |guard| {
+        if is_admin {
+            db::purge_archive(&guard.0, older_than_days)
+        } else {
+            db::purge_archive_for_caller(&guard.0, &caller_for_purge, older_than_days)
+        }
+    })
+    .await;
     match purge_result {
         Ok(n) => Json(json!({
             "purged": n,
@@ -361,8 +383,12 @@ pub async fn archive_stats(
         };
     }
 
-    let lock = app.db.lock().await;
-    match db::archive_stats(&lock.0) {
+    // PERF-1 (FX-3): wrap the rusqlite aggregate scan in `db_op`.
+    // archive_stats reads multiple GROUP BY queries off
+    // archived_memories and is admin-only — low rate but high tail
+    // latency on a saturated archive table.
+    let result = super::db_op(app.db.clone(), move |guard| db::archive_stats(&guard.0)).await;
+    match result {
         Ok(archive_stats) => Json(archive_stats).into_response(),
         Err(e) => {
             tracing::error!("handler error: {e}");
