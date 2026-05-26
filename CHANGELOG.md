@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] — v0.7.x doc follow-ups + Wave-2 refactor (post-tag)
 
+### Documentation
+
+- **Add `docs/cli-design-rationale.md`** — documents why the CLI surface omits a flat `ai-memory reflect` verb despite providing `ai-memory store` and `ai-memory recall`. Reflection composes with the §2.6 bias-displacement architecture (cross-model reflection boundary); the CLI surfaces reflection through actor-named higher-level verbs (`curator --reflect`, `consolidate`) rather than as a flat primitive verb. The substrate primitive remains accessible via `ai-memory mcp` JSON-RPC for debugging and bridge tooling. `ROADMAP.md` §17 cross-references this rationale alongside the existing quality-gate enumeration.
+
 ### refactor(#1174) — pm-v3.1 Variables + Constants + Vendor-Neutrality 10-PR train (2026-05-24/25)
 
 Closes [#1174](https://github.com/alphaonedev/ai-memory-mcp/issues/1174) (parent) with unanimous ZERO-DEFECTS-CONFIRMED across three independent decorrelated codegraph-driven QC audits per pm-v3.2 NO FAIL MISSION closure discipline (ai-memory `global/policies` memory `2cb15d34-2399-4611-a020-df6ef91683fe`): Audit A literal enumeration (0 substrate violations across all 6 gated categories), Audit B structural call-graph (25 callers of `DEFAULT_NAMESPACE`, 46 of `SECS_PER_HOUR`, 185 of `tool_names::MEMORY_*`, 132 of `Tier::*.as_str()`, 36 cross-surface refs of `RuntimeContext::global()` — every abstraction exceeds expected minimums), Audit C regression-invariance fault injection (6 contrived violations × 6 categories all caught by `scripts/check-vendor-literals.sh` with cleanup-clean + final-clean exit 0 = GATE-LOAD-BEARING-CONFIRMED).
