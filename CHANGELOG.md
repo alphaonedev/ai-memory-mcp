@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] — v0.7.x doc follow-ups + Wave-2 refactor (post-tag)
 
+### v0.7.0 Phase-1 + Wave-A audit-merge campaign (2026-05-25/26)
+
+Documents the **10-PR Phase-1 substrate-fix campaign** that closed the heterogeneous AI NHI assessment defects surfaced via issue [#1171](https://github.com/alphaonedev/ai-memory-mcp/issues/1171) (Opus 4.7 Phase-1 report), plus the **Wave-A audit-merge campaign** (PRs [#1346](https://github.com/alphaonedev/ai-memory-mcp/pull/1346)–[#1351](https://github.com/alphaonedev/ai-memory-mcp/pull/1351)) that fixed the SEC / ARCH / QUAL / TEST / PERF lane findings from the 6-agent full-spectrum review.
+
+#### Fixed
+
+- **[#1315](https://github.com/alphaonedev/ai-memory-mcp/issues/1315)** — wire-layer regression discovery / stale-binary diagnosis lesson; surfaced the pm-v3.3 recompile-retest discipline (CLAUDE.md C5 step 7).
+- **[#1317](https://github.com/alphaonedev/ai-memory-mcp/issues/1317)** — Phase-1 substrate fix.
+- **[#1319](https://github.com/alphaonedev/ai-memory-mcp/issues/1319)** — Phase-1 substrate fix.
+- **[#1320](https://github.com/alphaonedev/ai-memory-mcp/issues/1320)** — Phase-1 substrate fix.
+- **[#1321](https://github.com/alphaonedev/ai-memory-mcp/issues/1321)** — Phase-1 substrate fix.
+- **[#1324](https://github.com/alphaonedev/ai-memory-mcp/issues/1324)** — `capabilities.transcripts.status.enabled` live overlay (`SELECT COUNT(*) FROM memory_transcripts`) — verified at `src/mcp/tools/capabilities.rs:419-453`. Pre-fix the envelope advertised `planned: true, enabled: false` unconditionally.
+- **[#1325](https://github.com/alphaonedev/ai-memory-mcp/issues/1325)** — `reflect.depth` caller-asserted cap with `CALLER_DEPTH_MISMATCH` enforcement; `pub depth: Option<i64>` with `#[serde(default)]` (`src/mcp/tools/reflect.rs:143-219,455-460`). schemars `input_schema()` derives directly from `ReflectRequest` so the wire schema reflects the field.
+- **[#1326](https://github.com/alphaonedev/ai-memory-mcp/issues/1326)** — Phase-1 substrate fix.
+- **[#1327](https://github.com/alphaonedev/ai-memory-mcp/issues/1327)** — Phase-1 substrate fix.
+- **[#1331](https://github.com/alphaonedev/ai-memory-mcp/issues/1331)** — Phase-1 substrate fix.
+- **[#1340](https://github.com/alphaonedev/ai-memory-mcp/issues/1340)** — Phase-1 substrate fix.
+- **[#1341](https://github.com/alphaonedev/ai-memory-mcp/issues/1341)** — Phase-1 substrate fix.
+
+#### Added
+
+- **[#1343](https://github.com/alphaonedev/ai-memory-mcp/issues/1343)** — new CI / substrate primitive landed alongside the 10-PR train.
+- **Wave-A audit-merge campaign (PRs [#1346](https://github.com/alphaonedev/ai-memory-mcp/pull/1346)–[#1351](https://github.com/alphaonedev/ai-memory-mcp/pull/1351))** — six post-Phase-1 lane fixes from the 6-agent full-spectrum review:
+  - **TEST-5 / TEST-6** — CLI env-var discipline (`AI_MEMORY_*` resolution invariants pinned in `tests/config_precedence.rs`).
+  - **ARCH-1** — postgres governance parity (SAL `MemoryStore` trait surface alignment between sqlite + postgres adapters).
+  - **PERF-1** — `spawn_blocking` placement audit (offload sync DB work off the tokio reactor on hot paths).
+  - **PERF-2** — recall-path lock-contention fix (single-connection mutex narrowed on the HTTP daemon hot path).
+  - **QUAL-3** — governance fail-CLOSED saturation; `#1054` policy mechanically enforced across every consultation site.
+  - **ARCH-5** — atomisation recursion depth cap (mirrors `#1325` reflect.depth pattern for the atomisation curator).
+
+#### Docs
+
+- **[#1171](https://github.com/alphaonedev/ai-memory-mcp/issues/1171)** — Opus 4.7 Phase-1 report (heterogeneous AI NHI assessment) published; surfaced the 10-PR Phase-1 campaign + the pm-v3.3 recompile-retest discipline (ai-memory `global/policies` superseding `cd8ede94-3376-4837-b570-9d975290ae08`).
+
 ### Documentation
 
 - **Add `docs/cli-design-rationale.md`** — documents why the CLI surface omits a flat `ai-memory reflect` verb despite providing `ai-memory store` and `ai-memory recall`. Reflection composes with the §2.6 bias-displacement architecture (cross-model reflection boundary); the CLI surfaces reflection through actor-named higher-level verbs (`curator --reflect`, `consolidate`) rather than as a flat primitive verb. The substrate primitive remains accessible via `ai-memory mcp` JSON-RPC for debugging and bridge tooling. `ROADMAP.md` §17 cross-references this rationale alongside the existing quality-gate enumeration.
