@@ -5015,6 +5015,169 @@ mod tests {
         }
     }
 
+    // Issue #1315 — `memory_reflect` MCP **wire-layer** metadata
+    // passthrough regression pin.
+    //
+    // The PR #1177 / issue #1172 fix landed the substrate pin
+    // (`db_reflect_preserves_caller_supplied_entity_id`) and a
+    // direct-handler pin (`mcp_handle_reflect_preserves_caller_
+    // supplied_entity_id` in `tests/issue_1172_reflect_metadata_
+    // passthrough.rs`) — but invariant 3 of that suite calls
+    // `mcp::handle_reflect` **directly**, bypassing the JSON-RPC
+    // `tools/call` dispatcher (`handle_request`'s `arguments`
+    // extraction → `lookup_dispatch` → `dispatch_memory_reflect` →
+    // `handle_reflect`). The gap left every layer between
+    // `req.params["arguments"]` extraction and the substrate write
+    // path unpinned — a future refactor that, say, threaded the
+    // dispatcher through `serde_json::from_value::<ReflectRequest>`
+    // with `#[schemars(deny_unknown_fields)]` would silently strip
+    // every custom caller key and the existing #1172 suite would
+    // still pass.
+    //
+    // This pin closes the gap. It builds a real JSON-RPC `tools/call`
+    // request and runs it through `handle_request` (the same surface
+    // `run_mcp_server`'s stdin loop drives) so a regression in any of
+    // the layers between `req.params["arguments"]` extraction and
+    // `handle_reflect`'s `params["metadata"]` read fires here, not in
+    // production. Asserts:
+    //
+    //   1. `metadata.entity_id` (the PERF-8 step-1 path) survives the
+    //      transport.
+    //   2. An arbitrary caller-supplied key (`probe="P2"`) survives —
+    //      pins that the drop point is not specific to `entity_id` but
+    //      preserves the full additive contract.
+    //   3. `mentioned_entity_id` denormalised column is populated, the
+    //      end-to-end persona-binding path (#1172 invariant 4) holds
+    //      via the wire layer too.
+    #[test]
+    fn issue_1315_memory_reflect_wire_layer_preserves_caller_metadata() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        // Seed three source observations the reflection will fan out
+        // to (matching the #815 test shape so the reflect transaction
+        // exercises the same code paths).
+        let mut source_ids = Vec::new();
+        for tag in ["src-a", "src-b", "src-c"] {
+            let mem = Memory {
+                id: uuid::Uuid::new_v4().to_string(),
+                tier: Tier::Mid,
+                namespace: "issue-1315-wire".into(),
+                title: tag.into(),
+                content: format!("body for {tag}"),
+                tags: vec![],
+                priority: 5,
+                confidence: 1.0,
+                source: "api".into(),
+                access_count: 0,
+                created_at: chrono::Utc::now().to_rfc3339(),
+                updated_at: chrono::Utc::now().to_rfc3339(),
+                last_accessed_at: None,
+                expires_at: None,
+                metadata: json!({}),
+                reflection_depth: 0,
+                memory_kind: crate::models::MemoryKind::Observation,
+                entity_id: None,
+                persona_version: None,
+                citations: Vec::new(),
+                source_uri: None,
+                source_span: None,
+                confidence_source: crate::models::ConfidenceSource::CallerProvided,
+                confidence_signals: None,
+                confidence_decayed_at: None,
+                version: 1,
+            };
+            source_ids.push(db::insert(&conn, &mem).unwrap());
+        }
+
+        // Build a wire-shape JSON-RPC tools/call with caller-supplied
+        // custom metadata keys. `entity_id` and `probe` are both
+        // expected to survive transport per the documented additive
+        // metadata contract — the #1172 PR claimed to fix entity_id,
+        // but the wire path drops every custom key in flight.
+        let req = make_tools_call(
+            "memory_reflect",
+            json!({
+                "source_ids": source_ids,
+                "title": "issue-1315 wire-layer metadata pin",
+                "content": "caller metadata.entity_id + probe must round-trip through tools/call",
+                "namespace": "issue-1315-wire",
+                "metadata": {
+                    "entity_id": "entity-1315-wire",
+                    "probe": "P2",
+                },
+            }),
+        );
+
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(
+            resp.error.is_none(),
+            "expected ok rpc envelope; got error: {:?}",
+            resp.error
+        );
+        // MCP-spec tool envelope: success carries `content[0].text`
+        // with the handler's JSON result serialized as a string.
+        let result = resp.result.expect("result envelope");
+        assert!(
+            result.get("isError").is_none_or(|v| v != true),
+            "tools/call must not surface isError=true; result: {result}"
+        );
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("content[0].text on memory_reflect ok envelope");
+        let parsed: Value = serde_json::from_str(text).expect("reflect result text is JSON");
+        let reflection_id = parsed["id"]
+            .as_str()
+            .expect("reflect result carries the new memory id")
+            .to_string();
+
+        // Pull the row's metadata + denormalised mention column
+        // straight from sqlite — this is the same shape the #1172
+        // suite probes and the same column `persona::load_
+        // reflections_for_entity` keys off in production.
+        let (meta_str, mention): (String, Option<String>) = conn
+            .query_row(
+                "SELECT metadata, mentioned_entity_id FROM memories WHERE id = ?1",
+                rusqlite::params![&reflection_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("select reflection row");
+        let meta: Value = serde_json::from_str(&meta_str).expect("metadata is JSON");
+
+        // Invariant (1): entity_id round-trips through the wire path.
+        assert_eq!(
+            meta.get("entity_id").and_then(Value::as_str),
+            Some("entity-1315-wire"),
+            "wire path must preserve metadata.entity_id; full metadata = {meta}"
+        );
+        // Invariant (2): arbitrary caller-supplied key survives too.
+        // The defect drops every custom key — not just entity_id — so
+        // pinning a second key proves the fix isn't a one-key hack.
+        assert_eq!(
+            meta.get("probe").and_then(Value::as_str),
+            Some("P2"),
+            "wire path must preserve every caller-supplied metadata key; full metadata = {meta}"
+        );
+        // Invariant (3): PERF-8 denormalised column reflects the
+        // round-tripped entity_id so the persona-binding query
+        // (`WHERE mentioned_entity_id = ?`) still finds the row when
+        // it was minted through the wire path.
+        assert_eq!(
+            mention.as_deref(),
+            Some("entity-1315-wire"),
+            "mentioned_entity_id column must be populated from the wire-supplied metadata.entity_id"
+        );
+        // The system-generated keys also land alongside (additive
+        // contract — caller wins on collision, but the system splices
+        // its own keys when the caller didn't pre-set them).
+        assert!(
+            meta.get("agent_id").is_some(),
+            "system-generated agent_id must still be present"
+        );
+        assert!(
+            meta.get("reflection_metadata").is_some(),
+            "system-generated reflection_metadata block must still be present"
+        );
+    }
+
     #[test]
     fn handle_link_error_missing_target_id() {
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
