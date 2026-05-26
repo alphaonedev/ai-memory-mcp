@@ -2730,9 +2730,85 @@ pub fn next_versioned_title(
     }))
 }
 
+/// Stopwords stripped before computing the title-similarity Jaccard floor
+/// in [`find_contradictions`]. The list is intentionally tiny — a small
+/// closed-class English set — because a maximalist stopword list would
+/// over-filter agglutinative or short titles and re-introduce noise on
+/// the other side. The substrate's contradiction surface is supposed to
+/// be a near-duplicate-titles signal, not a generic content search.
+const CONTRADICTION_TITLE_STOPWORDS: &[&str] = &[
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "has", "have", "in", "is",
+    "it", "its", "of", "on", "or", "that", "the", "this", "to", "was", "were", "will", "with",
+];
+
+/// Minimum Jaccard-of-content-tokens between the seed title and a
+/// candidate title for the candidate to qualify as a contradiction
+/// hit. Computed after lowercasing + stopword removal.
+///
+/// **Why this exists** (issue #1320). Pre-fix, [`find_contradictions`]
+/// returned the top 5 FTS5 matches on an OR-joined sanitised query
+/// against the title. With seed title "Tomatoes are red" the OR list
+/// becomes `"tomatoes" OR "are" OR "red"`, and FTS5 happily ranked
+/// every row containing the common stopword "are" near the top.
+/// Operators observed unrelated memories ("Moon landing happened in
+/// 1969", "Retrieval-augmented generation works by...") flagged as
+/// `potential_contradictions` against tomato facts — pure stopword
+/// noise. The Jaccard floor below preserves the documented "similar
+/// titles" semantics (e.g. "Database is PostgreSQL" vs "Database is
+/// MySQL" share `{database}` after stopword removal — Jaccard
+/// `1/3 ≈ 0.33`, passes the 0.3 floor) while rejecting the
+/// disjoint-topic false positives (Jaccard 0).
+const CONTRADICTION_TITLE_JACCARD_FLOOR: f32 = 0.30;
+
+/// Lowercase + stopword-strip a title for the contradiction Jaccard
+/// comparison. Splits on non-alphanumeric so titles like
+/// `"Database is PostgreSQL"` and `"Database/is/PostgreSQL"` produce
+/// the same token set.
+fn contradiction_title_tokens(title: &str) -> std::collections::HashSet<String> {
+    title
+        .split(|c: char| !c.is_alphanumeric())
+        .map(str::to_ascii_lowercase)
+        .filter(|t| !t.is_empty())
+        .filter(|t| !CONTRADICTION_TITLE_STOPWORDS.contains(&t.as_str()))
+        .collect()
+}
+
+/// Jaccard token overlap between two pre-tokenised title sets. Returns
+/// `0.0` when either side is empty so a seed title that's pure
+/// stopwords (e.g. `"the"`) cannot produce phantom hits.
+#[allow(clippy::cast_precision_loss)]
+fn contradiction_title_jaccard(
+    a: &std::collections::HashSet<String>,
+    b: &std::collections::HashSet<String>,
+) -> f32 {
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let inter = a.intersection(b).count() as f32;
+    let union = a.union(b).count() as f32;
+    if union > 0.0 { inter / union } else { 0.0 }
+}
+
 /// Detect potential contradictions: memories in same namespace with similar titles.
+///
+/// Two-stage filter (#1320 calibration):
+/// 1. FTS5 OR-match on stopword-tolerant query — fast recall over
+///    `memories_fts`, capped at a candidate ceiling so a pathological
+///    common-word title can't pull the entire namespace.
+/// 2. Jaccard-token-overlap floor on the stopword-stripped title sets,
+///    keeping only candidates whose title shares at least
+///    [`CONTRADICTION_TITLE_JACCARD_FLOOR`] of the seed's content
+///    tokens. Final result is capped at 5 (the pre-fix wire ceiling).
+///
+/// The two-stage design preserves the "similar title" semantics that
+/// the wire-side `potential_contradictions` field documents while
+/// removing the stopword-OR noise floor that crossed unrelated topics
+/// at v0.6.x / pre-fix v0.7.0.
 pub fn find_contradictions(conn: &Connection, title: &str, namespace: &str) -> Result<Vec<Memory>> {
     let fts_query = sanitize_fts_query(title, true);
+    // Stage 1 — FTS5 recall. Pull a wider candidate pool (20) so the
+    // stage-2 Jaccard filter has headroom; the final cap of 5 is
+    // applied after the filter so the wire shape is preserved.
     let mut stmt = conn.prepare(
         "SELECT m.id, m.tier, m.namespace, m.title, m.content, m.tags, m.priority,
                 m.confidence, m.source, m.access_count, m.created_at, m.updated_at,
@@ -2744,11 +2820,23 @@ pub fn find_contradictions(conn: &Connection, title: &str, namespace: &str) -> R
          JOIN memories m ON m.rowid = fts.rowid
          WHERE memories_fts MATCH ?1 AND m.namespace = ?2
          ORDER BY fts.rank
-         LIMIT 5",
+         LIMIT 20",
     )?;
     let rows = stmt.query_map(params![fts_query, namespace], row_to_memory)?;
-    rows.collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(Into::into)
+    let candidates: Vec<Memory> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+
+    // Stage 2 — Jaccard floor on stopword-stripped title tokens.
+    let seed_tokens = contradiction_title_tokens(title);
+    let mut filtered: Vec<Memory> = candidates
+        .into_iter()
+        .filter(|cand| {
+            let cand_tokens = contradiction_title_tokens(&cand.title);
+            contradiction_title_jaccard(&seed_tokens, &cand_tokens)
+                >= CONTRADICTION_TITLE_JACCARD_FLOOR
+        })
+        .collect();
+    filtered.truncate(5);
+    Ok(filtered)
 }
 
 // --- Links ---
@@ -9924,6 +10012,151 @@ mod tests {
 
         let contradictions = find_contradictions(&conn, "Database is PostgreSQL", "infra").unwrap();
         assert!(!contradictions.is_empty());
+    }
+
+    /// Issue #1320 regression — disjoint-topic titles that share only
+    /// English stopwords ("are", "is", "the") MUST NOT surface as
+    /// potential contradictions of each other. Pre-fix the FTS5
+    /// OR-joined query matched any row containing the stopword, so a
+    /// tomato-fact stored alongside a moon-landing fact and a
+    /// retrieval-mechanics fact returned every cross-topic pair as
+    /// `potential_contradictions`. Post-fix the Jaccard floor on
+    /// stopword-stripped title tokens drops the false positives;
+    /// `Vec::is_empty()` is the post-condition.
+    #[test]
+    fn find_contradictions_disjoint_topics_no_false_positives_1320() {
+        let conn = test_db();
+        insert(
+            &conn,
+            &make_memory("Tomatoes are red fruit", "v1-p5-disjoint", Tier::Long, 5),
+        )
+        .unwrap();
+        insert(
+            &conn,
+            &make_memory(
+                "Moon landing happened in 1969",
+                "v1-p5-disjoint",
+                Tier::Long,
+                5,
+            ),
+        )
+        .unwrap();
+        insert(
+            &conn,
+            &make_memory(
+                "Retrieval-augmented generation works by combining recall with synthesis",
+                "v1-p5-disjoint",
+                Tier::Long,
+                5,
+            ),
+        )
+        .unwrap();
+
+        // Tomato seed must not flag moon-landing or retrieval rows.
+        let hits = find_contradictions(&conn, "Tomatoes are red fruit", "v1-p5-disjoint").unwrap();
+        assert!(
+            hits.iter().all(|m| m.title == "Tomatoes are red fruit"),
+            "tomato seed leaked false positives: {:?}",
+            hits.iter().map(|m| m.title.as_str()).collect::<Vec<_>>(),
+        );
+
+        // Moon-landing seed must not flag tomato or retrieval rows.
+        let hits =
+            find_contradictions(&conn, "Moon landing happened in 1969", "v1-p5-disjoint").unwrap();
+        assert!(
+            hits.iter()
+                .all(|m| m.title == "Moon landing happened in 1969"),
+            "moon-landing seed leaked false positives: {:?}",
+            hits.iter().map(|m| m.title.as_str()).collect::<Vec<_>>(),
+        );
+
+        // Retrieval seed must not flag tomato or moon-landing rows.
+        let hits = find_contradictions(
+            &conn,
+            "Retrieval-augmented generation works by combining recall with synthesis",
+            "v1-p5-disjoint",
+        )
+        .unwrap();
+        assert!(
+            hits.iter().all(|m| m.title.starts_with("Retrieval")),
+            "retrieval seed leaked false positives: {:?}",
+            hits.iter().map(|m| m.title.as_str()).collect::<Vec<_>>(),
+        );
+    }
+
+    /// Issue #1320 regression — pure-stopword seed title must not pull
+    /// any rows. Pre-fix the FTS5 OR-query expanded to a no-op against
+    /// the stopword set; post-fix the seed tokenises to empty after
+    /// stopword removal so the Jaccard floor returns 0 for every
+    /// candidate.
+    #[test]
+    fn find_contradictions_pure_stopword_seed_returns_empty_1320() {
+        let conn = test_db();
+        insert(
+            &conn,
+            &make_memory(
+                "The thing is the other thing",
+                "v1-p5-stopword",
+                Tier::Long,
+                5,
+            ),
+        )
+        .unwrap();
+        let hits = find_contradictions(&conn, "the is a", "v1-p5-stopword").unwrap();
+        assert!(
+            hits.is_empty(),
+            "pure-stopword seed pulled candidates: {:?}",
+            hits.iter().map(|m| m.title.as_str()).collect::<Vec<_>>(),
+        );
+    }
+
+    /// Issue #1320 — stage-2 filter must not over-prune the legitimate
+    /// near-duplicate case. "Database is PostgreSQL" and "Database is
+    /// MySQL" share `{database}` after stopword removal — Jaccard 1/3,
+    /// passes the 0.30 floor. Pinned alongside the false-positive test
+    /// so a future tightening of the floor can't silently regress the
+    /// supported "similar-title" detection.
+    #[test]
+    fn find_contradictions_similar_titles_still_caught_1320() {
+        let conn = test_db();
+        insert(
+            &conn,
+            &make_memory("Database is PostgreSQL", "v1-p5-positive", Tier::Long, 8),
+        )
+        .unwrap();
+        insert(
+            &conn,
+            &make_memory("Database is MySQL", "v1-p5-positive", Tier::Long, 5),
+        )
+        .unwrap();
+        let hits = find_contradictions(&conn, "Database is PostgreSQL", "v1-p5-positive").unwrap();
+        let titles: Vec<&str> = hits.iter().map(|m| m.title.as_str()).collect();
+        assert!(
+            titles.contains(&"Database is MySQL"),
+            "similar-title detection regressed: {titles:?}",
+        );
+    }
+
+    #[test]
+    fn contradiction_title_jaccard_floor_pinned_1320() {
+        // Pin the compiled floor at 0.30 (the v0.7.0 #1320 calibration
+        // landing). Lowering it re-introduces stopword noise; raising
+        // it breaks the "Database is PostgreSQL / MySQL" near-duplicate
+        // case (Jaccard 1/3 ≈ 0.333). Either direction needs an issue
+        // ticket and a fresh calibration sweep.
+        assert!(
+            (CONTRADICTION_TITLE_JACCARD_FLOOR - 0.30).abs() < f32::EPSILON,
+            "floor drifted: {CONTRADICTION_TITLE_JACCARD_FLOOR}",
+        );
+    }
+
+    #[test]
+    fn contradiction_title_tokens_strips_stopwords_and_lowercases_1320() {
+        let toks = contradiction_title_tokens("The Database Is PostgreSQL");
+        assert!(toks.contains("database"));
+        assert!(toks.contains("postgresql"));
+        assert!(!toks.contains("the"));
+        assert!(!toks.contains("is"));
     }
 
     #[test]
