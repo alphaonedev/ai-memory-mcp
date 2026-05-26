@@ -465,6 +465,13 @@
           "content": {
             "type": "string"
           },
+          "depth": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "metadata": {},
           "namespace": {
             "type": [

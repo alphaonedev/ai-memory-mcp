@@ -738,8 +738,19 @@ pub fn tool_examples(name: &str) -> Vec<crate::config::ToolExample> {
             "Signed directional edge; returns {link_id, attest_level}.",
         )],
         tn::MEMORY_REFLECT => vec![ex(
-            json!({"memory_ids": ["<uuid-1>", "<uuid-2>"], "depth": 1}),
-            "Curator synthesises a Reflection; returns {reflection_id}.",
+            // v0.7.0 #1325 — example payload is byte-equal to a valid call.
+            // Canonical parser field is `source_ids` (NOT `memory_ids`);
+            // `depth` is an optional caller-asserted cap that MUST equal
+            // max(source_depths)+1 or the call refuses with
+            // CALLER_DEPTH_MISMATCH. For depth-0 sources, the substrate
+            // computes reflection_depth=1, which the example asserts.
+            json!({
+                "source_ids": ["<uuid-1>", "<uuid-2>"],
+                "title": "Reflection over alpha + beta",
+                "content": "Synthesis of the two source memories.",
+                "depth": 1,
+            }),
+            "Curator synthesises a Reflection; returns {id, reflection_depth, reflects_on, namespace}.",
         )],
         tn::MEMORY_PERSONA_GENERATE => vec![
             ex(
@@ -791,6 +802,22 @@ pub fn tool_examples(name: &str) -> Vec<crate::config::ToolExample> {
             json!({"event_type": "deploy.completed", "payload": {"env": "prod"}, "ttl_seconds": crate::SECS_PER_HOUR}),
             "Fan-out to active subscribers.",
         )],
+        // v0.7.0 #1327 — canonical example for `memory_skill_register`.
+        // Parameter name is `folder_path` (NOT `skill_folder`); the
+        // example payload is BYTE-EQUAL to what `handle_skill_register`
+        // parses (see `src/mcp/tools/skill_register.rs:254-279`).
+        // `inline_skill` is the alternative form for callers without a
+        // filesystem path. Either field is required (not both).
+        tn::MEMORY_SKILL_REGISTER => vec![
+            ex(
+                json!({"folder_path": "/path/to/skill-dir"}),
+                "Register a SKILL.md folder (optional resources/ sub-dir); returns {id, digest, signed}.",
+            ),
+            ex(
+                json!({"inline_skill": "---\nnamespace: example\nname: demo\ndescription: A demo skill.\n---\n\nBody.\n"}),
+                "Register a SKILL.md from inline text (no filesystem dependency).",
+            ),
+        ],
         _ => Vec::new(),
     }
 }

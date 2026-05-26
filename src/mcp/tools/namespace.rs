@@ -311,7 +311,7 @@ pub fn handle_namespace_set_standard(
     Ok(resp)
 }
 
-pub(crate) fn handle_namespace_get_standard(
+pub fn handle_namespace_get_standard(
     conn: &rusqlite::Connection,
     params: &Value,
 ) -> Result<Value, String> {
@@ -353,10 +353,20 @@ pub(crate) fn handle_namespace_get_standard(
             let mem = db::get(conn, &id).map_err(|e| e.to_string())?;
             match mem {
                 Some(m) => {
-                    // Task 1.8: surface metadata.governance (or default policy).
-                    let gov = GovernancePolicy::from_metadata(&m.metadata)
-                        .map(Result::unwrap_or_default)
-                        .unwrap_or_default();
+                    // v0.7.0 #1326 — surface the FULL `metadata.governance`
+                    // blob, not just the typed `GovernancePolicy` whitelist.
+                    // The typed struct omits caller-supplied free fields
+                    // like `require_approval_above_depth` (read by
+                    // `storage::resolve_require_approval_above_depth`)
+                    // which means set_standard would silently round-trip
+                    // them into the DB while get_standard returned a
+                    // policy blob that didn't surface them. The fix:
+                    // start from the typed policy as the base (so default
+                    // fields like `write`/`promote`/`delete`/`approver`/
+                    // `inherit` populate), then layer the raw blob keys
+                    // back on top — preserving every field the operator
+                    // sent on set, including off-struct fields.
+                    let gov = merge_governance_for_response(&m.metadata);
                     Ok(json!({
                         "namespace": namespace,
                         "standard_id": id,
@@ -375,18 +385,64 @@ pub(crate) fn handle_namespace_get_standard(
     }
 }
 
+/// v0.7.0 #1326 — build the governance blob returned by the
+/// `memory_namespace_get_standard` MCP response.
+///
+/// Composes the typed [`GovernancePolicy`] default-or-resolved
+/// serialisation as the base (so well-known fields like `write`,
+/// `promote`, `delete`, `approver`, `inherit` always populate even
+/// when omitted by the operator), then overlays the raw
+/// `metadata.governance` JSON keys on top so caller-supplied
+/// off-struct fields (`require_approval_above_depth`,
+/// `skill_promotion_min_depth`, future extension keys) survive the
+/// round-trip.
+///
+/// The pre-#1326 path returned only the typed-struct serialisation,
+/// dropping every off-struct field on the floor. The L1-8 approval
+/// gate (`storage::resolve_require_approval_above_depth`) read the
+/// field directly from `metadata.governance`, so the gate kept firing
+/// correctly — but operators inspecting the get-standard surface saw
+/// an incomplete policy blob and could not confirm their gate was
+/// stored.
+fn merge_governance_for_response(metadata: &Value) -> Value {
+    // Step 1: typed-struct base. Resolves to defaults when no
+    // governance metadata is present (matches pre-#1326 behaviour
+    // for the well-known-fields surface).
+    let base = GovernancePolicy::from_metadata(metadata)
+        .map(Result::unwrap_or_default)
+        .unwrap_or_default();
+    let mut merged = serde_json::to_value(&base)
+        .ok()
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+
+    // Step 2: overlay raw `metadata.governance` keys so off-struct
+    // fields survive. Iterate over the raw JSON object and insert
+    // every key that wasn't already produced by the typed serialisation
+    // (keys present in both are byte-equal because the typed struct
+    // was deserialised from the same JSON).
+    if let Some(raw) = metadata.get("governance").and_then(Value::as_object) {
+        for (k, v) in raw {
+            merged.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+    }
+    Value::Object(merged)
+}
+
 /// Task 1.8 — extract metadata.governance from a serialized memory value,
 /// resolving to the default policy when missing or invalid. Used by the
 /// `--inherit` get-standard path and tool responses.
+///
+/// v0.7.0 #1326 — surfaces the FULL `metadata.governance` JSON blob
+/// (typed default fields + caller-supplied off-struct fields like
+/// `require_approval_above_depth`). The pre-#1326 path returned only
+/// the typed [`GovernancePolicy`] whitelist, dropping every off-struct
+/// field. See [`merge_governance_for_response`] for the merge contract.
 pub(super) fn extract_governance(mem_val: &Value) -> Value {
-    let default = serde_json::to_value(GovernancePolicy::default()).unwrap_or(Value::Null);
     let Some(meta) = mem_val.get("metadata") else {
-        return default;
+        return serde_json::to_value(GovernancePolicy::default()).unwrap_or(Value::Null);
     };
-    match GovernancePolicy::from_metadata(meta) {
-        Some(Ok(p)) => serde_json::to_value(&p).unwrap_or(default),
-        _ => default,
-    }
+    merge_governance_for_response(meta)
 }
 
 pub(crate) fn handle_namespace_clear_standard(
