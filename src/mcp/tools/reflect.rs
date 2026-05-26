@@ -82,6 +82,28 @@ pub fn handle_reflect(
         serde_json::json!({})
     };
 
+    // v0.7.0 #1325 — caller-asserted depth cap. When the caller passes
+    // `depth: N`, the substrate-computed depth (max(source depths) + 1)
+    // MUST equal `N` or the call is refused with the stable error slug
+    // `CALLER_DEPTH_MISMATCH`. This honors the docstring example
+    // (`{"source_ids": […], "depth": 1}`) without silently accepting
+    // the field. Omission preserves backward-compat: the substrate
+    // computes depth as before.
+    //
+    // The pre-#1325 path silently dropped the field, leaving operators
+    // who set it convinced the substrate honored their cap when it
+    // didn't. The fix surfaces a typed refusal slug that fits the
+    // existing `REFLECTION_DEPTH_EXCEEDED` / `REFLECTION_HOOK_VETO`
+    // family of stable string-prefix errors.
+    let caller_depth: Option<i64> = params.get("depth").and_then(serde_json::Value::as_i64);
+    if let Some(d) = caller_depth {
+        if d < 0 {
+            return Err(format!(
+                "CALLER_DEPTH_MISMATCH: depth must be a non-negative integer (got depth={d})"
+            ));
+        }
+    }
+
     // NHI: resolve agent_id via the same precedence chain memory_store
     // uses, so the reflection memory's `metadata.agent_id` is consistent
     // with regular stores.
@@ -112,6 +134,32 @@ pub fn handle_reflect(
         agent_id,
         metadata,
     };
+
+    // ─── #1325: caller-asserted depth mismatch refusal ──────────────
+    // When the caller passed `depth: N`, verify it matches the
+    // substrate-computed value `max(src depths) + 1` BEFORE the write.
+    // Mirrors the same source-load pattern the L1-8 gate (below) uses.
+    // Mismatch returns `CALLER_DEPTH_MISMATCH` so callers can detect
+    // wire/intent drift without combing through the post-write
+    // `reflection_depth` field.
+    if let Some(caller_d) = caller_depth {
+        let max_src_depth = input
+            .source_ids
+            .iter()
+            .filter_map(|id| db::get(conn, id).ok().flatten())
+            .map(|m| m.reflection_depth)
+            .max()
+            .unwrap_or(0);
+        let computed = i64::from(max_src_depth.saturating_add(1));
+        if caller_d != computed {
+            return Err(format!(
+                "CALLER_DEPTH_MISMATCH: caller asserted depth={caller_d} but \
+                 substrate computed reflection_depth={computed} from sources \
+                 (max(source_depths)+1). Omit the `depth` field to defer to the \
+                 substrate, or pass the matching value."
+            ));
+        }
+    }
 
     // ─── L1-8: require_approval_above_depth gate ────────────────────
     // Evaluated BEFORE the substrate write so we can intercept deep
@@ -373,6 +421,13 @@ pub struct ReflectRequest {
     /// Merged with system reflection_metadata; caller keys win.
     #[serde(default)]
     pub metadata: Option<serde_json::Value>,
+
+    /// v0.7.0 #1325 — caller-asserted reflection depth (cap-style).
+    /// When set, MUST equal max(source_depths)+1 or the call is
+    /// refused with `CALLER_DEPTH_MISMATCH`. Omit to defer to the
+    /// substrate-computed value (backward-compatible).
+    #[serde(default)]
+    pub depth: Option<i64>,
 }
 
 /// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_reflect`.

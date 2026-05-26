@@ -442,14 +442,19 @@ pub use capabilities::{
 };
 pub use find_paths::handle_find_paths;
 pub use load_family::{handle_load_family, handle_smart_load};
-pub(crate) use namespace::{handle_namespace_clear_standard, handle_namespace_get_standard};
+pub(crate) use namespace::handle_namespace_clear_standard;
 // v0.7.0 G-PHASE-E-2 (#707) — promoted to `pub` so the integration
 // regression at `tests/g_phase_e_2_namespace_set_standard_governance_passthrough.rs`
 // can exercise the merge path directly. The handler is still routed
 // through the MCP dispatch above; the `pub` re-export is purely so
 // external test harnesses can pin the substrate behaviour without
 // going through stdio JSON-RPC.
-pub use namespace::handle_namespace_set_standard;
+//
+// v0.7.0 #1326 — `handle_namespace_get_standard` promoted to `pub`
+// on the same rationale so the get-side governance pass-through
+// regression at `tests/issue_1326_*.rs` can pin the surface without
+// stdio JSON-RPC scaffolding.
+pub use namespace::{handle_namespace_get_standard, handle_namespace_set_standard};
 pub(crate) use notify::{handle_inbox, handle_notify};
 pub use pending::{handle_pending_approve, handle_pending_reject};
 pub use quota_status::handle_quota_status;
@@ -582,6 +587,24 @@ pub mod schema_handler_parity_test_exports {
 /// `handle_request`.
 pub mod tools {
     pub use super::atomise::{AtomiseToolHandler, handle_atomise};
+
+    // v0.7.0 #1325 — re-export the canonical `tool_examples`
+    // catalog so the regression test at
+    // `tests/issue_1325_reflect_caller_depth.rs` and
+    // `tests/issue_1327_skill_register_docstring_example.rs` can
+    // pin the docstring-example invariants without going through
+    // the full `memory_capabilities` envelope.
+    pub mod capabilities {
+        pub use super::super::capabilities::tool_examples;
+    }
+
+    // v0.7.0 #1327 — re-export the canonical SkillRegisterRequest
+    // struct + handler so the regression test at
+    // `tests/issue_1327_skill_register_docstring_example.rs` can
+    // parse the docstring example through the actual parser shape.
+    pub mod skill_register {
+        pub use super::super::skill_register::{SkillRegisterRequest, handle_skill_register};
+    }
 
     // v0.7.0 Form 3 (issue #756) — multi-step ingest orchestrator
     // handler + bundle. Integration test at
