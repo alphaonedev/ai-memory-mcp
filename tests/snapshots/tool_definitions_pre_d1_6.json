@@ -1030,6 +1030,10 @@
             "description": "Reflection content.",
             "type": "string"
           },
+          "depth": {
+            "description": "v0.7.0 #1325 — caller-asserted reflection depth (cap-style). When set, MUST equal max(source_depths)+1 or the call is refused with `CALLER_DEPTH_MISMATCH`. Omit to defer to the substrate-computed value (backward-compatible).",
+            "type": "integer"
+          },
           "metadata": {
             "description": "Merged with system reflection_metadata; caller keys win.",
             "type": "object"
