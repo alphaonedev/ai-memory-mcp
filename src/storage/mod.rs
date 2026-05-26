@@ -120,16 +120,24 @@ impl std::fmt::Display for GovernanceRefusal {
 
 impl std::error::Error for GovernanceRefusal {}
 
-/// Internal helper consulted by every `storage::insert*` path BEFORE
+/// Internal helper consulted by every substrate write path BEFORE
 /// the SQL write. When the [`GOVERNANCE_PRE_WRITE`] hook is unset
 /// (CLI mode or pre-hook-install daemon path), this is a zero-cost
 /// no-op `Ok(())`. When the hook is set, the closure runs and an
 /// `Err(reason)` wraps into a [`GovernanceRefusal`] propagated up the
 /// `anyhow` chain.
 ///
+/// Visibility: `pub(crate)` so the `PostgresStore` SAL adapter
+/// (`src/store/postgres.rs`) can consult the same hook on its write
+/// paths — fixing ARCH-1 (substrate governance pre-write parity
+/// between the SQLite and Postgres backends). The hook itself is
+/// process-wide and installed once by the daemon `serve` bootstrap;
+/// every substrate write path on EVERY backend MUST consult it before
+/// touching SQL.
+///
 /// The function is hot-path; avoid heap allocation on the Allow leg.
 #[inline]
-fn consult_governance_pre_write(mem: &Memory) -> Result<()> {
+pub(crate) fn consult_governance_pre_write(mem: &Memory) -> Result<()> {
     if let Some(hook) = GOVERNANCE_PRE_WRITE.get() {
         if let Err(reason) = hook(mem) {
             return Err(anyhow::Error::new(GovernanceRefusal { reason }));
