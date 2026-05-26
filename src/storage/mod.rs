@@ -7862,7 +7862,20 @@ pub fn resolve_require_approval_above_depth(conn: &Connection, namespace: &str) 
         // the field governs if the leaf does not override it).
         if let Some(threshold) = gov.get("require_approval_above_depth") {
             if let Some(n) = threshold.as_u64() {
-                return Some(n as u32);
+                // QUAL-3 (FX-5): operator-controlled metadata. Reject the
+                // silent `n as u32` truncation that would let an operator
+                // who sets `require_approval_above_depth = 2^32` (which
+                // would silently land as 0) DISABLE the approval gate
+                // entirely (depth > 0 was the original intent, but
+                // `low_32(2^32) == 0` makes `depth > 0` the actual gate;
+                // any value ≥ 2^32 whose low-32 bits are also high turns
+                // off the gate). Fail-CLOSED on overflow: saturate to 0
+                // so EVERY depth triggers approval — this is the
+                // conservative posture per CLAUDE.md K3/K9 governance
+                // discipline. The companion regression test at
+                // `tests/governance_metadata_no_silent_truncation.rs`
+                // pins this behaviour.
+                return Some(u32::try_from(n).unwrap_or(0));
             }
             // Key present but null → no gate at this level; keep walking.
         }
@@ -7914,7 +7927,20 @@ pub fn resolve_skill_promotion_min_depth(conn: &Connection, namespace: &str) -> 
         };
         if let Some(threshold) = gov.get("skill_promotion_min_depth") {
             if let Some(n) = threshold.as_u64() {
-                return Some(n as u32);
+                // QUAL-3 (FX-5): operator-controlled metadata. Reject the
+                // silent `n as u32` truncation that would let an operator
+                // who sets `skill_promotion_min_depth = 2^32 + k` silently
+                // land as `k` after truncation — including the
+                // catastrophic `k == 0` case which would mean "every
+                // reflection can be promoted to a skill regardless of
+                // depth". Fail-CLOSED on overflow: saturate to `u32::MAX`
+                // so NO reflection can be promoted (the
+                // `actual_depth_u32 < min_depth` check at
+                // `src/mcp/tools/skill_promote.rs:174` becomes
+                // permanently true). The companion regression test at
+                // `tests/governance_metadata_no_silent_truncation.rs`
+                // pins this behaviour.
+                return Some(u32::try_from(n).unwrap_or(u32::MAX));
             }
             // Key present but null → no override at this level; keep walking.
         }
