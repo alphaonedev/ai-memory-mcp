@@ -127,6 +127,10 @@ pub fn exit_code(err: &AtomiseError) -> i32 {
         AtomiseError::CuratorFailed(_) => 4,
         AtomiseError::GovernanceRefused(_) => 5,
         AtomiseError::DbError(_) | AtomiseError::SignerError(_) => 6,
+        // ARCH-5 (FX-6) — recursive-primitive refusal. Distinct exit
+        // code (7) so operators wrapping the CLI can distinguish a
+        // depth-cap refusal from a curator / governance / DB failure.
+        AtomiseError::DepthExceeded { .. } => 7,
     }
 }
 
@@ -150,6 +154,11 @@ pub fn error_slug(err: &AtomiseError) -> &'static str {
         AtomiseError::GovernanceRefused(_) => "GOVERNANCE_REFUSED",
         AtomiseError::DbError(_) => "db_error",
         AtomiseError::SignerError(_) => "signer_error",
+        // ARCH-5 (FX-6) — stable slug matches the
+        // `REFLECTION_DEPTH_EXCEEDED` / `SYNTHESIS_DEPTH_EXCEEDED`
+        // family casing (SCREAMING_SNAKE) used by the rest of the
+        // recursive-primitive refusal taxonomy.
+        AtomiseError::DepthExceeded { .. } => "ATOMISATION_DEPTH_EXCEEDED",
     }
 }
 
@@ -189,6 +198,12 @@ pub fn human_error_message(err: &AtomiseError, source_id: &str) -> String {
         }
         AtomiseError::SignerError(detail) => format!("Signer error: {detail}"),
         AtomiseError::DbError(detail) => format!("Database error: {detail}"),
+        AtomiseError::DepthExceeded { attempted, cap } => format!(
+            "Atomisation refused: depth {attempted} would exceed compiled \
+             max_atomisation_depth {cap}. A recursive atomisation chain hit \
+             the cycle-depth cap — inspect the curator / pre_store hook stack \
+             that re-entered atomise."
+        ),
     }
 }
 
@@ -454,6 +469,16 @@ mod tests {
             }),
             1
         );
+        // ARCH-5 (FX-6) — distinct exit code so operators wrapping the
+        // CLI can disambiguate the recursive-primitive refusal from
+        // curator / governance / DB failures.
+        assert_eq!(
+            exit_code(&AtomiseError::DepthExceeded {
+                attempted: 4,
+                cap: crate::atomisation::MAX_ATOMISATION_DEPTH,
+            }),
+            7
+        );
     }
 
     #[test]
@@ -489,6 +514,16 @@ mod tests {
                 existing_atom_ids: vec!["a".into()]
             }),
             "already_atomised"
+        );
+        // ARCH-5 (FX-6) — SCREAMING_SNAKE_CASE slug to match the
+        // existing `REFLECTION_DEPTH_EXCEEDED` / `SYNTHESIS_DEPTH_EXCEEDED`
+        // family. Stable wire shape pinned across MCP / HTTP / CLI.
+        assert_eq!(
+            error_slug(&AtomiseError::DepthExceeded {
+                attempted: 4,
+                cap: crate::atomisation::MAX_ATOMISATION_DEPTH,
+            }),
+            "ATOMISATION_DEPTH_EXCEEDED"
         );
     }
 
