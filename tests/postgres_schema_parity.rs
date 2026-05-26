@@ -70,7 +70,26 @@ use common::postgres_url;
 // dimension extending `agent_quotas` PK from `(agent_id)` to
 // `(agent_id, namespace)`). The constant is kept in lock-step with
 // `src/store/postgres.rs::CURRENT_SCHEMA_VERSION`.
-const POSTGRES_CURRENT_VERSION: i64 = 50;
+//
+// #1340 (fix): the previous `const POSTGRES_CURRENT_VERSION: i64 = 50;`
+// drifted past the v51 `federation_nonces` bump (#1296 / PR #1296) — the
+// SQLite-side schema-pin tests had been updated to read through the
+// SSOT accessor `ai_memory::storage::current_schema_version_for_tests()`
+// (#1311) but this Postgres parity literal was missed and CI tripped on
+// the now-real drift. Deriving the floor from the SSOT accessor makes
+// the constant impossible to drift again: any future bump in
+// `src/storage/migrations.rs::CURRENT_SCHEMA_VERSION` will be picked up
+// here automatically. The accessor returns `i64` already, so no cast is
+// needed.
+//
+// The two ladders SHARE one logical schema number at v0.7.0+ (see
+// CLAUDE.md §Database) — sqlite and postgres both report v51 at the
+// release/v0.7.0 HEAD that this test pins against. Should the two
+// ladders ever diverge in the future, this wrapper becomes the single
+// point at which to introduce a per-adapter override.
+fn postgres_current_version() -> i64 {
+    ai_memory::storage::current_schema_version_for_tests()
+}
 
 /// Open an out-of-band `sqlx` pool against the same URL the adapter
 /// uses. We deliberately bypass `PostgresStore` for the inspection
@@ -145,18 +164,22 @@ async fn schema_versions_match_across_adapters() {
 
     let pg_version_i64 = i64::from(pg_version.expect("schema_version row must exist"));
     // The two ladders are independent integer namespaces (see the
-    // POSTGRES_CURRENT_VERSION docstring); a direct `>=` cross-ladder
+    // postgres_current_version() docstring); a direct `>=` cross-ladder
     // comparison is no longer meaningful now that SQLite trails Postgres
     // numerically while still leading functionally. The equality
     // assertion below is the load-bearing parity check — if Postgres'
     // `migrate()` did not reach its own CURRENT_SCHEMA_VERSION constant
     // (because a `migrate_vN` arm panicked, was skipped, or the
     // constant was bumped without the corresponding function), this
-    // test fails.
+    // test fails. The expected version is derived from the SSOT
+    // accessor `ai_memory::storage::current_schema_version_for_tests()`
+    // (#1340) so a future bump cannot drift this constant out of step
+    // again.
+    let expected = postgres_current_version();
     assert_eq!(
-        pg_version_i64, POSTGRES_CURRENT_VERSION,
+        pg_version_i64, expected,
         "Postgres schema_version ({pg_version_i64}) must match the \
-         Postgres CURRENT_SCHEMA_VERSION ({POSTGRES_CURRENT_VERSION}). \
+         Postgres CURRENT_SCHEMA_VERSION ({expected}). \
          A drift here means a Postgres ladder step didn't run, or the \
          constant was bumped without the corresponding migrate_vN \
          function in src/store/postgres.rs."
