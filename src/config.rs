@@ -349,7 +349,12 @@ impl TierConfig {
                 pending_requests: 0,
                 deferred_audit_dlq_size: 0,
             },
-            transcripts: CapabilityTranscripts::planned(),
+            // v0.7.0 #1324 — substrate ships at v0.7.0; flag reads
+            // `planned: false, enabled: false` until an operator wires
+            // the R5 extraction hook and rows land in `memory_transcripts`.
+            // The MCP / HTTP overlay flips `enabled: true` when the live
+            // count is non-zero.
+            transcripts: CapabilityTranscripts::shipped(),
             hnsw: CapabilityHnsw::default(),
             // v0.7 J1 — populated by the SAL wrapper at runtime when a
             // Postgres adapter is active. None at config-construction
@@ -1007,11 +1012,44 @@ pub struct CapabilityTranscripts {
 }
 
 impl CapabilityTranscripts {
-    /// Pre-v0.7 zero-state: planned, not enabled.
+    /// Pre-v0.7 zero-state: planned, not enabled. Retained for the
+    /// pre-build capability surface used by the bootstrap config; the
+    /// MCP / HTTP overlay flips this to [`Self::shipped`] before the
+    /// report goes on the wire at v0.7.0+.
     #[must_use]
     pub fn planned() -> Self {
         Self {
             status: PlannedFeature::planned("v0.7+"),
+            total_count: 0,
+            total_size_mb: 0,
+        }
+    }
+
+    /// v0.7.0 #1324 — the substrate ships at v0.7.0: zstd-3 BLOB
+    /// store, `memory_transcripts` table, `memory_transcript_links`
+    /// join, `replay_transcript_union` walk, the `memory_replay` MCP
+    /// tool, and the per-namespace lifecycle sweep are all on disk.
+    /// Operators flip `enabled: true` by wiring the R5 reference
+    /// `pre_store` hook (`tools/transcript-extractor/`) — the
+    /// substrate cannot link transcripts without an operator-driven
+    /// extraction path, so this constructor reflects "shipped but
+    /// awaiting per-namespace opt-in." The live MCP / HTTP overlay
+    /// can additionally flip `enabled` when it observes a non-zero
+    /// transcript count (operator opt-in is observed indirectly via
+    /// presence of rows).
+    ///
+    /// Returning `planned: false` here closes the v0.7.0 honesty drift
+    /// — the pre-#1324 surface advertised `planned: true` even after
+    /// the substrate landed, which confused operators reading the
+    /// capabilities surface as a feature-availability oracle.
+    #[must_use]
+    pub fn shipped() -> Self {
+        Self {
+            status: PlannedFeature {
+                planned: false,
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                enabled: false,
+            },
             total_count: 0,
             total_size_mb: 0,
         }
@@ -6106,10 +6144,14 @@ mod tests {
             "v2 honesty patch drops `approval.default_timeout_seconds` (no sweeper)"
         );
 
-        // transcripts zero-state: planned, not enabled, zero counts skipped
-        assert_eq!(val["transcripts"]["planned"], true);
+        // v0.7.0 #1324 — substrate ships at v0.7.0; capability flag
+        // reads `planned: false, enabled: false` at zero-state (no rows
+        // in `memory_transcripts`, no operator-wired R5 hook yet). The
+        // live MCP / HTTP overlay flips `enabled: true` when the
+        // transcripts row count is non-zero.
+        assert_eq!(val["transcripts"]["planned"], false);
         assert_eq!(val["transcripts"]["enabled"], false);
-        assert_eq!(val["transcripts"]["version"], "v0.7+");
+        assert_eq!(val["transcripts"]["version"], env!("CARGO_PKG_VERSION"));
 
         // memory_reflection: planned-feature object (was bool).
         // v0.7.0 recursive-learning (issue #655) Tasks 1-6 shipped the
@@ -6140,7 +6182,11 @@ mod tests {
         assert_eq!(restored.schema_version, "2");
         assert_eq!(restored.permissions.mode, "advisory");
         assert!(restored.compaction.status.planned);
-        assert!(restored.transcripts.status.planned);
+        // v0.7.0 #1324 — transcripts substrate ships at v0.7.0; the
+        // capability flag was `planned: true` pre-#1324 (mis-advertised
+        // the substrate as roadmap-only). Round-trip now pins
+        // `planned: false`.
+        assert!(!restored.transcripts.status.planned);
         assert_eq!(restored.features.recall_mode_active, RecallMode::Disabled);
         assert_eq!(restored.features.reranker_active, RerankerMode::Off);
         assert!(restored.kg_backend.is_none());

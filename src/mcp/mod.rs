@@ -5299,11 +5299,17 @@ mod tests {
             "v2 drops approval.default_timeout_seconds (no sweeper)"
         );
 
-        // transcripts block — planned-feature shape (P1 honesty patch).
+        // v0.7.0 #1324 — transcripts substrate shipped at v0.7.0
+        // (zstd-3 BLOB store, memory_transcripts table,
+        // memory_transcript_links join, replay_transcript_union,
+        // memory_replay MCP tool, lifecycle sweep). Capability flag
+        // reads `planned: false, enabled: false` at zero-state — no
+        // rows in `memory_transcripts` yet. The MCP / HTTP overlay
+        // flips `enabled: true` when a non-zero count is observed.
         assert!(val["transcripts"].is_object(), "transcripts block present");
-        assert_eq!(val["transcripts"]["planned"], true);
+        assert_eq!(val["transcripts"]["planned"], false);
         assert_eq!(val["transcripts"]["enabled"], false);
-        assert_eq!(val["transcripts"]["version"], "v0.7+");
+        assert_eq!(val["transcripts"]["version"], env!("CARGO_PKG_VERSION"));
 
         // memory_reflection: planned-feature object (was bool in v1).
         // v0.7.0 recursive-learning (issue #655) Tasks 1-6 shipped the

@@ -977,8 +977,8 @@
       "name": "memory_verify"
     },
     {
-      "description": "Reconstruct the conversation transcript chain that produced a memory.",
-      "docs": "I4: transcript chain (text + span metadata). verbose=false (default) truncates >100KB entries. L2-4 (#669): for reflections, walks reflects_on edges for transcript UNION; cap via depth (null=full, 0=self only).",
+      "description": "Reconstruct the conversation transcript chain that produced a memory. Returns 0 transcripts until an operator wires the R5 `pre_store` extraction hook.",
+      "docs": "I4: transcript chain (text + span metadata). verbose=false (default) truncates >100KB entries. L2-4 (#669): for reflections, walks reflects_on edges for transcript UNION; cap via depth (null=full, 0=self only). OPERATOR CONFIG REQUIRED (#1324): the v0.7.0 substrate ships the storage + replay primitives, but no production write path auto-links transcripts. `memory_replay` returns `count: 0` for any memory until the operator wires the R5 reference `pre_store` hook (`tools/transcript-extractor/`) or calls `transcripts::store` + `transcripts::link_transcript` directly. The `memory_capabilities.transcripts.enabled` flag flips to `true` once at least one row lands in `memory_transcripts` \u2014 use it as the operator-facing indicator that the extraction pipeline is wired. See `docs/sidechain-transcripts.md` \u00a7'Operator workflow' for the setup steps.",
       "inputSchema": {
         "properties": {
           "agent_id": {

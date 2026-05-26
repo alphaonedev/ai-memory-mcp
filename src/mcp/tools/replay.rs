@@ -41,10 +41,23 @@ impl McpTool for ReplayTool {
         crate::mcp::registry::tool_names::MEMORY_REPLAY
     }
     fn description() -> &'static str {
-        "Reconstruct the conversation transcript chain that produced a memory."
+        "Reconstruct the conversation transcript chain that produced a memory. \
+         Returns 0 transcripts until an operator wires the R5 `pre_store` extraction hook."
     }
     fn docs() -> &'static str {
-        "I4: transcript chain (text + span metadata). verbose=false (default) truncates >100KB entries. L2-4 (#669): for reflections, walks reflects_on edges for transcript UNION; cap via depth (null=full, 0=self only)."
+        "I4: transcript chain (text + span metadata). verbose=false (default) \
+         truncates >100KB entries. L2-4 (#669): for reflections, walks reflects_on \
+         edges for transcript UNION; cap via depth (null=full, 0=self only). \
+         \
+         OPERATOR CONFIG REQUIRED (#1324): the v0.7.0 substrate ships the storage + \
+         replay primitives, but no production write path auto-links transcripts. \
+         `memory_replay` returns `count: 0` for any memory until the operator wires \
+         the R5 reference `pre_store` hook (`tools/transcript-extractor/`) or calls \
+         `transcripts::store` + `transcripts::link_transcript` directly. The \
+         `memory_capabilities.transcripts.enabled` flag flips to `true` once at \
+         least one row lands in `memory_transcripts` — use it as the operator-facing \
+         indicator that the extraction pipeline is wired. See \
+         `docs/sidechain-transcripts.md` §'Operator workflow' for the setup steps."
     }
     fn input_schema() -> Value {
         let schema = schemars::schema_for!(ReplayRequest);
@@ -495,6 +508,92 @@ mod tests {
         let entries = resp["transcripts"].as_array().unwrap();
         assert!(entries[0]["content"].is_string());
         assert!(entries[0].get("truncated").is_none());
+    }
+
+    /// Issue #1324 regression — pin the capabilities-vs-actual-behavior
+    /// contract. The v0.7.0 substrate ships the storage + replay
+    /// primitives but does NOT auto-link transcripts during
+    /// `memory_reflect`; a chain that's persisted (`reflection_depth`
+    /// column populated) returns `count: 0` from `memory_replay`
+    /// because no production write path created `memory_transcripts`
+    /// rows or `memory_transcript_links` edges. This test pins:
+    ///
+    /// 1. Zero-state — a reflection memory with no linked transcripts
+    ///    returns `count: 0` from the union walk. The capabilities
+    ///    surface (separately) reports `transcripts.enabled: false` so
+    ///    the operator can correlate.
+    /// 2. Post-link state — once the operator-driven extraction wired
+    ///    a transcript via `transcripts::store + link_transcript`, the
+    ///    union walk returns the linked transcript AND the capabilities
+    ///    overlay flips `transcripts.enabled: true` on the next call.
+    ///
+    /// The contract is "capabilities matches actual behavior", not
+    /// "memory_replay always returns transcripts" — operators who hit
+    /// the empty surface need a reliable signal to distinguish "no
+    /// transcripts wired" from "broken substrate."
+    #[test]
+    fn memory_replay_capabilities_matches_actual_behavior_1324() {
+        use crate::config::ResolvedModels;
+        use crate::mcp::handle_capabilities_with_conn;
+
+        let conn = fresh_conn();
+        let mid = seed_observation(&conn, "rp-1324", "reflection-anchor");
+
+        // Zero-state — no transcripts wired. memory_replay returns 0,
+        // capabilities reports `enabled: false`.
+        let resp = handle_replay(
+            &conn,
+            &json!({"memory_id": mid, "agent_id": "ai:test"}),
+            None,
+        )
+        .expect("ok");
+        assert_eq!(resp["count"].as_u64(), Some(0));
+
+        let tier = crate::config::FeatureTier::Keyword.config();
+        let models = ResolvedModels::from_tier_preset(&tier);
+        let caps = handle_capabilities_with_conn(
+            &tier,
+            &models,
+            None, // no reranker
+            false,
+            Some(&conn),
+            crate::mcp::CapabilitiesAccept::V2,
+        )
+        .expect("caps");
+        assert_eq!(caps["transcripts"]["enabled"], false);
+        assert_eq!(caps["transcripts"]["planned"], false);
+
+        // Post-link state — operator wires a transcript via the
+        // documented R5 path (transcripts::store + link_transcript).
+        // memory_replay surfaces it AND capabilities flips enabled=true.
+        let t = transcripts::store(&conn, "rp-1324", "the linked transcript body", None)
+            .expect("store");
+        transcripts::link_transcript(&conn, &mid, &t.id, None, None).expect("link");
+
+        let resp = handle_replay(
+            &conn,
+            &json!({"memory_id": mid, "agent_id": "ai:test"}),
+            None,
+        )
+        .expect("ok");
+        assert_eq!(resp["count"].as_u64(), Some(1));
+
+        let caps = handle_capabilities_with_conn(
+            &tier,
+            &models,
+            None,
+            false,
+            Some(&conn),
+            crate::mcp::CapabilitiesAccept::V2,
+        )
+        .expect("caps");
+        assert_eq!(
+            caps["transcripts"]["enabled"], true,
+            "capabilities must flip to enabled=true after a row lands in memory_transcripts: \
+             got {:?}",
+            caps["transcripts"]
+        );
+        assert_eq!(caps["transcripts"]["total_count"], 1);
     }
 }
 

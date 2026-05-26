@@ -415,6 +415,42 @@ fn build_capabilities_overlay(
         if let Ok(n) = crate::governance::deferred_audit::dlq_size(c) {
             caps.approval.deferred_audit_dlq_size = n;
         }
+
+        // v0.7.0 #1324 — transcripts substrate live overlay.
+        //
+        // Pre-#1324 the capabilities surface advertised
+        // `planned: true, enabled: false` for transcripts even though
+        // the v0.7.0 substrate ships the full zstd-3 BLOB store + the
+        // `memory_replay` MCP tool + the lifecycle sweep. Operators
+        // hitting `memory_replay` against a reflection chain reasonably
+        // expected non-empty output and instead received an empty
+        // array, because the substrate does not auto-link transcripts
+        // — that requires the operator to wire the R5 reference
+        // `pre_store` hook (`tools/transcript-extractor/`).
+        //
+        // The overlay below flips `enabled: true` when at least one
+        // row exists in `memory_transcripts` (the operator wired the
+        // hook + rows are flowing) and surfaces a non-zero
+        // `total_count` / `total_size_mb` so the operator can audit
+        // capacity without scraping the DB directly. A missing table
+        // (pre-v21 DB) or transient lock falls through to the
+        // pre-overlay defaults (count = 0, enabled = false) so the
+        // capabilities response always succeeds.
+        if let Ok((count, bytes)) = c.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(compressed_size), 0) FROM memory_transcripts",
+            [],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+        ) {
+            #[allow(clippy::cast_sign_loss)]
+            let count_usize = count.max(0) as usize;
+            #[allow(clippy::cast_sign_loss)]
+            let bytes_u64 = bytes.max(0) as u64;
+            caps.transcripts.total_count = count_usize;
+            caps.transcripts.total_size_mb = bytes_u64 / (1024 * 1024);
+            if count_usize > 0 {
+                caps.transcripts.status.enabled = true;
+            }
+        }
     }
 
     caps

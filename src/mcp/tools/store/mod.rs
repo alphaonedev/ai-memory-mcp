@@ -365,9 +365,17 @@ pub(crate) fn handle_store(
     // v0.6.3.1 P2 (G6) — only the Merge policy enters the dedup-then-update
     // branch. `Error` mode already short-circuited above; `Version` mode
     // already rewrote the title to a free suffix so an exact dup cannot
-    // exist. Both still call `find_contradictions` so the response can
-    // surface `potential_contradictions` (similar-title fuzzy matches).
-    let existing = db::find_contradictions(conn, &mem.title, &mem.namespace).unwrap_or_default();
+    // exist. The candidate pool feeds both the Form 1 synthesis curator
+    // (`run_synthesis_pass`) and the wire-side `potential_contradictions`
+    // echo. #1337 — the synthesis curator path uses
+    // `find_synthesis_candidates` (Stage-1 FTS5 recall only) so the LLM
+    // sees legitimately-similar memories whose titles share only one
+    // strong content token (e.g. `"kubernetes deployment notes"` vs
+    // `"kubernetes rolling deploy strategy"`, Jaccard 1/6 ≈ 0.167). The
+    // wire-output `contradiction_ids` then applies the #1320 Jaccard
+    // floor below to keep stopword-only overlaps off the wire.
+    let existing =
+        db::find_synthesis_candidates(conn, &mem.title, &mem.namespace).unwrap_or_default();
 
     // v0.7.x Form 1 (#754) — Resolve namespace policy ONCE up-front so
     // both the synthesis path (Form 1) and the synchronous-atomise mode
@@ -677,7 +685,19 @@ pub(crate) fn handle_store(
     ));
 
     // Exclude self-ID from contradictions (both proposed and actual, since upsert may reuse existing ID)
-    let contradiction_ids: Vec<String> = existing
+    //
+    // #1320 wire-output discipline: re-fetch the Stage-1+Stage-2
+    // filtered pool via `find_contradictions` so the wire
+    // `potential_contradictions` echo applies the Jaccard floor on
+    // stopword-stripped title tokens (rejects pure-stopword overlaps
+    // that would otherwise leak through the broader synthesis pool
+    // used above for the curator). On storage error the wire field is
+    // omitted rather than silently echoing the un-filtered pool — the
+    // synthesis path's verdicts still applied; only the wire-side
+    // contradictions hint is suppressed.
+    let filtered_contradictions =
+        db::find_contradictions(conn, &mem.title, &mem.namespace).unwrap_or_default();
+    let contradiction_ids: Vec<String> = filtered_contradictions
         .iter()
         .filter(|c| c.id != mem.id && c.id != actual_id)
         .map(|c| c.id.clone())

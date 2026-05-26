@@ -192,9 +192,12 @@ fn cap_v2_omits_dropped_fields_in_v2_response() {
     assert_eq!(val["compaction"]["planned"], true);
     assert_eq!(val["compaction"]["enabled"], false);
     assert_eq!(val["compaction"]["version"], "v0.8+");
-    assert_eq!(val["transcripts"]["planned"], true);
+    // v0.7.0 #1324 — transcripts substrate shipped at v0.7.0
+    // (zstd-3 BLOB store + memory_replay tool). Capability flag now
+    // reads `planned: false, enabled: false` at zero-state.
+    assert_eq!(val["transcripts"]["planned"], false);
     assert_eq!(val["transcripts"]["enabled"], false);
-    assert_eq!(val["transcripts"]["version"], "v0.7+");
+    assert_eq!(val["transcripts"]["version"], env!("CARGO_PKG_VERSION"));
 }
 
 // ---------------------------------------------------------------------------

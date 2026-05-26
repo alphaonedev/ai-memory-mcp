@@ -9491,9 +9491,11 @@ async fn http_capabilities_v2_schema_includes_all_blocks() {
     assert!(v["approval"].get("subscribers").is_none());
     assert!(v["approval"].get("default_timeout_seconds").is_none());
 
-    // transcripts: planned-feature shape
+    // v0.7.0 #1324 — transcripts substrate shipped at v0.7.0.
+    // Capability flag reads `planned: false, enabled: false` at
+    // zero-state (no rows in memory_transcripts yet).
     assert!(v["transcripts"].is_object());
-    assert_eq!(v["transcripts"]["planned"], true);
+    assert_eq!(v["transcripts"]["planned"], false);
     assert_eq!(v["transcripts"]["enabled"], false);
 
     // P1: live recall/reranker mode tags present (default tier
