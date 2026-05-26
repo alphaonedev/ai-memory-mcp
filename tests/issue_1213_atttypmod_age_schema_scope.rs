@@ -41,9 +41,38 @@
 
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 fn postgres_url() -> Option<String> {
     std::env::var("AI_MEMORY_TEST_POSTGRES_URL").ok()
+}
+
+/// Serialize the two `#[tokio::test]` functions in this file against
+/// each other under the canonical Per-Module Coverage Thresholds CI
+/// invocation (`--test-threads=2`).
+///
+/// Issue #1341 — both tests create a non-`public` `<schema>.memories`
+/// table to stage the duplicate-table catalog shape. When they run in
+/// parallel, the `pg_class WHERE relname = 'memories'` probe in the
+/// first test observes THREE rows (its own duplicate + `public` + the
+/// sibling test's duplicate that has not yet cleaned up), tripping the
+/// `assert_eq!(dims.len(), 2, ...)` staging-sanity check. `cleanup()`
+/// only drops the schema name it's handed, so the cross-test residue
+/// is invisible to the per-test cleanup.
+///
+/// Smallest fix: a shared module-scoped `Mutex<()>` both tests lock at
+/// entry. No new dependencies (`std::sync` only), no async lock needed
+/// (the critical section spans the whole test body which is already
+/// `await`-blocking — `std::sync::Mutex` is fine because each test
+/// runs in its own `tokio::test` runtime and the guard is dropped at
+/// scope end, not held across an await *between* tests). Poison
+/// recovery via `unwrap_or_else(PoisonError::into_inner)` so a panic
+/// in one test doesn't permanently lock out the next.
+fn issue_1213_serial_lock() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 async fn inspect_pool(url: &str) -> PgPool {
@@ -57,8 +86,45 @@ async fn inspect_pool(url: &str) -> PgPool {
 
 /// Drop both `public.memories` AND any duplicate `<other_schema>.memories`
 /// to leave the DB in a clean state for the next test pass.
+///
+/// #1321 — also drop the ai-memory-owned tables that have FK references
+/// back to `public.memories` AND `schema_version`. Without this, the
+/// next `PostgresStore::connect()` call hits two failure modes:
+///   1. `CREATE TABLE IF NOT EXISTS memories (...)` is a no-op against
+///      a leftover `public.memories` (e.g. the contrived `(id, embedding)`
+///      shape created mid-test), so the production columns never land
+///      and bootstrap's index-create on `title`/`content` fails with
+///      `column "title" does not exist`.
+///   2. With `schema_version` populated at the head version from a
+///      prior test's connect, `migrate_locked()` early-returns —
+///      `migrate_v36()` does NOT run — and the partial index
+///      `idx_personas_by_entity` is never re-created.
+///
+/// Both modes broke `tests/postgres_memory_kind_backfill.rs` when this
+/// test ran first under `--test-threads=1` in CI. The cleanup-the-DB
+/// contract is: subsequent `PostgresStore::connect()` MUST re-bootstrap
+/// to head, so we drop every table the bootstrap re-creates.
 async fn cleanup(pool: &PgPool, other_schema: &str) {
+    // Drop the FK-bearing children before dropping `memories` itself so
+    // a leftover-FK can't block the parent drop on legacy DBs.
+    let _ = sqlx::query("DROP TABLE IF EXISTS memory_links CASCADE")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("DROP TABLE IF EXISTS memory_transcript_links CASCADE")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("DROP TABLE IF EXISTS archived_memories CASCADE")
+        .execute(pool)
+        .await;
     let _ = sqlx::query("DROP TABLE IF EXISTS public.memories CASCADE")
+        .execute(pool)
+        .await;
+    // Reset schema_version so the next connect walks the migrate ladder
+    // from v0 → CURRENT_SCHEMA_VERSION (the partial indexes that
+    // postgres_schema.sql does NOT carry inline — e.g.
+    // `idx_personas_by_entity` — live exclusively in the migrate arms;
+    // an early-return from migrate_locked() would skip them).
+    let _ = sqlx::query("DROP TABLE IF EXISTS schema_version CASCADE")
         .execute(pool)
         .await;
     let stmt = format!("DROP TABLE IF EXISTS {other_schema}.memories CASCADE");
@@ -81,8 +147,26 @@ async fn cleanup(pool: &PgPool, other_schema: &str) {
 /// `public` schema. If the test fails on a binary built against the
 /// pre-fix code, the failure mode is precisely the #1213 bug
 /// (returns 768 instead of 384).
+// #1341: holding `std::sync::MutexGuard` across `await` is the
+// INTENDED behaviour — the whole point of `issue_1213_serial_lock`
+// is to serialize the two `#[tokio::test]` bodies, so the guard MUST
+// stay live for the duration of every `await` in the test body.
+// An async `tokio::sync::Mutex` would relax the lock between await
+// points (which is exactly what we don't want — that would let the
+// sibling test interleave staging steps with this one). Each
+// `#[tokio::test]` spawns its own current-thread runtime, so there
+// is no within-runtime deadlock risk: only ONE async task is alive
+// per runtime per test invocation, so the synchronous lock is held
+// only for "this test's exclusive turn" semantics.
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn issue_1213_atttypmod_probe_scopes_to_public_schema() {
+    // #1341: serialize against `issue_1213_unscoped_probe_demonstrates_root_cause`
+    // so the unscoped `pg_class WHERE relname='memories'` probe (and
+    // the parallel scoped staging check) sees exactly two rows, not
+    // three.
+    let _serial = issue_1213_serial_lock();
+
     let Some(url) = postgres_url() else {
         eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
         return;
@@ -191,8 +275,19 @@ async fn issue_1213_atttypmod_probe_scopes_to_public_schema() {
 /// fixed returns 384) by checking that the unscoped query returns
 /// AT LEAST one row and the scoped query returns exactly the
 /// public-schema row.
+// #1341: see allow rationale on
+// `issue_1213_atttypmod_probe_scopes_to_public_schema` above. Same
+// intent: the sync lock holds across awaits BY DESIGN to serialize
+// against the sibling test.
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn issue_1213_unscoped_probe_demonstrates_root_cause() {
+    // #1341: serialize against `issue_1213_atttypmod_probe_scopes_to_public_schema`
+    // so the `assert_eq!(unscoped.len(), 2, ...)` staging-sanity check
+    // observes exactly the two rows this test stages (public + its
+    // own `ai_memory_issue_1213_demo` duplicate), not three.
+    let _serial = issue_1213_serial_lock();
+
     let Some(url) = postgres_url() else {
         eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
         return;
