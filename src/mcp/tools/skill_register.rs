@@ -408,10 +408,18 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 /// v0.7.0 #972 D1.5 (#986) — request body for `memory_skill_register`.
+///
+/// v0.7.0 #1327 — canonical parameter names are `folder_path` and
+/// `inline_skill`. Earlier draft docs used `skill_folder` informally;
+/// the parser at `handle_skill_register` (`src/mcp/tools/skill_register.rs:254`)
+/// only accepts `folder_path`. The `tool_examples()` catalog in
+/// `src/mcp/tools/capabilities.rs` carries a byte-equal worked example
+/// for each form.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[allow(dead_code)]
 pub struct SkillRegisterRequest {
-    /// Dir containing SKILL.md + optional resources/.
+    /// Dir containing SKILL.md + optional resources/. Canonical field
+    /// name is `folder_path` (NOT `skill_folder`).
     #[serde(default)]
     pub folder_path: Option<String>,
 
