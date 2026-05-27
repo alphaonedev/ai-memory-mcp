@@ -2458,31 +2458,43 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        target_os = "windows",
-        ignore = "v0.7.x (#1148): RFC 6761 reserves the .invalid TLD for \
-                  NXDOMAIN guarantees, but Windows' built-in DNS resolver \
-                  does not fully honor it — NetBIOS / WINS / DNS search \
-                  suffixes can synthesize a 'success' that bypasses the \
-                  fail-closed expectation. This test exercises a security \
-                  invariant on the production HTTP daemon, which only ships \
-                  on Linux + macOS (see docs/integrations/platforms.md); the \
-                  Windows runner exists for the lib-build contract, not the \
-                  daemon. Ignoring on target_os = windows keeps the \
-                  Linux/macOS guarantee enforced without false-failing the \
-                  Windows lib-build."
-    )]
     fn test_validate_url_dns_fails_closed_on_dns_failure_1053() {
         // v0.7.0 #1053 (Agent-2 #3) — DNS resolution failure now
         // returns Err so an attacker cannot smuggle a private-range
         // IP through a DNS-rebind path where the daemon's resolver
         // hiccups and reqwest's later resolution lands on an
-        // internal target. Use a definitely-non-existent TLD so the
-        // resolver returns NXDOMAIN deterministically.
-        let res = validate_url_dns("https://nonexistent-host.invalid./");
+        // internal target.
+        //
+        // FX-F1 (2026-05-27) — hermetic hostname construction.
+        // The pre-FX-F1 test used `"https://nonexistent-host.invalid./"`
+        // and relied on RFC 6761 guaranteeing NXDOMAIN for the `.invalid`
+        // TLD. In practice three platforms violate that guarantee:
+        //   - Windows' built-in resolver consults NetBIOS / WINS /
+        //     DNS search-suffix lists and synthesizes a "hit" for
+        //     bare `.invalid` labels.
+        //   - macOS' mDNSResponder + captive-portal DNS in some
+        //     CI runner network configs (observed on
+        //     `release/v0.7.0` SHA 5bfbb109c → job 78098087774)
+        //     also synthesizes a "hit" so the test panicked with
+        //     `got Ok(())` instead of the expected `Err`.
+        //   - Some corporate DNS resolvers wildcard-redirect any
+        //     unresolvable name to a "did-you-mean" landing page.
+        //
+        // To make the test hermetic across every platform we
+        // construct a hostname that the `getaddrinfo(3)` libc call
+        // rejects at the SHAPE level rather than at the DNS-lookup
+        // level: each DNS label has a hard 63-octet ceiling per RFC
+        // 1035 §2.3.4, so a single 70-character label MUST return
+        // `EAI_NONAME` / `EAI_FAIL` regardless of which resolver
+        // is configured. No DNS query is even attempted, so captive
+        // portals / search suffixes / NetBIOS cannot interfere.
+        let oversized_label = "a".repeat(70);
+        let url = format!("https://{oversized_label}.fxf1-test./");
+        let res = validate_url_dns(&url);
         assert!(
             res.is_err(),
-            "#1053: SSRF guard MUST fail-closed on DNS resolution failure (NXDOMAIN); got {res:?}"
+            "#1053: SSRF guard MUST fail-closed on DNS resolution failure \
+             (oversized label rejected at getaddrinfo shape check); got {res:?}"
         );
         let err_msg = format!("{}", res.unwrap_err());
         assert!(
@@ -2512,7 +2524,13 @@ mod tests {
         unsafe {
             std::env::set_var("AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL", "1");
         }
-        let res = validate_url_dns("https://nonexistent-host.invalid./");
+        // FX-F1: use the same shape-rejected hostname construction
+        // as `test_validate_url_dns_fails_closed_on_dns_failure_1053`
+        // for hermetic platform-independence (see that test's
+        // docstring for rationale).
+        let oversized_label = "a".repeat(70);
+        let url = format!("https://{oversized_label}.fxf1-test./");
+        let res = validate_url_dns(&url);
         unsafe {
             std::env::remove_var("AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL");
         }
