@@ -37,6 +37,15 @@ use tower::ServiceExt as _;
 // helper so this file's call-sites do not churn.
 mod common;
 
+// TEST-2 (med/low review batch) — module-scoped mutex rationale.
+// The K10 approval-flow HTTP tests in this file exercise process-global
+// state (the synthetic-rule registry under `ai_memory::approvals`, plus
+// the pending-action / approvals HMAC fixture that mutates env-derived
+// configuration via `tests/common/mod.rs::ENV_LOCK`). Serial execution
+// keeps the registry deterministic across the multi-step
+// `seed → POST /approvals/* → assert` flows below. Same idiom as
+// `tests/dispatch_integration.rs` (audit-chain singleton) and
+// `tests/security_admin_wildcard_980.rs` (env-mutation).
 static K10_HTTP_LOCK: Mutex<()> = Mutex::new(());
 
 /// Build the router from a shared `Db` so the test body can both

@@ -439,7 +439,13 @@ fn run_rollback(db_path: &Path, args: &CuratorArgs, out: &mut CliOutput<'_>) -> 
         return Ok(());
     }
 
-    unreachable!("run_rollback entered without --rollback or --rollback-last");
+    // QUAL-2 (med/low review batch) — typed error instead of `unreachable!()`.
+    // The caller-side guard at `cmd_curator` (line ~147) already short-circuits
+    // when neither `--rollback` nor `--rollback-last` is set; this branch is
+    // reachable only if that guard ever regresses. Returning an `anyhow::Error`
+    // preserves the audit message but keeps the failure recoverable (typed
+    // CLI exit code) instead of crashing the process with a panic.
+    anyhow::bail!("run_rollback entered without --rollback or --rollback-last");
 }
 
 #[cfg(test)]
@@ -1267,5 +1273,31 @@ mod tests {
             run(&db, &args, &cfg, &mut out).await.unwrap();
         }
         assert!(env.stdout_str().contains("reflection pass report"));
+    }
+
+    /// QUAL-2 regression — `run_rollback` must `bail!()` (typed error)
+    /// instead of `unreachable!()` (process panic) when neither
+    /// `--rollback` nor `--rollback-last` is set. The caller-side guard
+    /// at `run()` short-circuits this case, but the function-level
+    /// recovery path must remain typed so a future guard regression
+    /// surfaces as a CLI exit, not a crash.
+    #[test]
+    fn qual_2_run_rollback_returns_error_when_no_mode_set() {
+        let env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let args = default_args();
+        let mut stdout: Vec<u8> = Vec::new();
+        let mut stderr: Vec<u8> = Vec::new();
+        let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+        let res = run_rollback(&db, &args, &mut out);
+        assert!(
+            res.is_err(),
+            "run_rollback must return Err when both --rollback and --rollback-last are None"
+        );
+        let msg = res.unwrap_err().to_string();
+        assert!(
+            msg.contains("run_rollback entered without --rollback or --rollback-last"),
+            "unexpected error message: {msg}"
+        );
     }
 }

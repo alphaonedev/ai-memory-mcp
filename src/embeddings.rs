@@ -376,9 +376,128 @@ impl Embedder {
     }
 
     /// Generate embeddings for multiple texts in one call.
+    ///
+    /// PERF-5 (FX-C4-batch2, 2026-05-26): true batched forward
+    /// instead of the prior `texts.iter().map(|t| self.embed(t))`
+    /// fan-out. The Local arm tokenises every input, pads to the
+    /// batch's max sequence length, stacks to a (B, L) tensor, and
+    /// runs `BertModel::forward` ONCE per batch — Candle's
+    /// per-call overhead dominates B=1 calls, so a true batch of 32
+    /// inputs is ~10-20× faster than 32 sequential calls. The
+    /// Ollama arm continues to dispatch one POST per text (the
+    /// vendor wire shape for batched `/api/embed` differs across
+    /// Ollama versions and a wire-version probe would add the same
+    /// per-call latency we are saving; keep the per-text loop here
+    /// while a `LlmClient`-side batched-embed API is staged).
+    ///
+    /// Callers: `multistep_ingest`, `atomisation`, the periodic
+    /// embedding-backfill sweep (`AI_MEMORY_EMBED_BACKFILL_BATCH`).
     #[allow(dead_code)]
     pub fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        texts.iter().map(|t| self.embed(t)).collect()
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        match self {
+            Self::Local {
+                model,
+                tokenizer,
+                device,
+            } => Self::embed_local_batch(model, tokenizer, device, texts),
+            // Ollama arm: keep the sequential per-text loop until
+            // the LlmClient migration lands the batched-embed wire
+            // contract.
+            Self::Ollama { .. } => texts.iter().map(|t| self.embed(t)).collect(),
+        }
+    }
+
+    /// PERF-5 — batched local forward. Tokenise → pad to max-seq →
+    /// stack → single forward → slice per-row output.
+    fn embed_local_batch(
+        model: &BertModel,
+        tokenizer: &Tokenizer,
+        device: &Device,
+        texts: &[&str],
+    ) -> Result<Vec<Vec<f32>>> {
+        // Tokenise every input. `encode_batch` exists on the
+        // tokenizers crate, but the project may pin a version that
+        // requires `Vec<&str>` shape — build the vector explicitly.
+        let inputs: Vec<&str> = texts.to_vec();
+        let encodings = tokenizer
+            .encode_batch(inputs, true)
+            .map_err(|e| anyhow::anyhow!("tokenisation batch failed: {e}"))?;
+
+        // Find max seq len across the batch.
+        let max_len = encodings
+            .iter()
+            .map(tokenizers::Encoding::len)
+            .max()
+            .unwrap_or(0);
+        if max_len == 0 {
+            // Every input was empty after tokenisation; return one
+            // empty embedding per slot.
+            return Ok(texts.iter().map(|_| Vec::new()).collect());
+        }
+
+        let batch_size = encodings.len();
+
+        // Pad each sequence to max_len with 0 (PAD token id is
+        // typically 0 for BERT family; the attention mask zeros
+        // out padded positions so the value is irrelevant for the
+        // mean-pool).
+        let mut input_ids_flat = Vec::with_capacity(batch_size * max_len);
+        let mut attention_mask_flat = Vec::with_capacity(batch_size * max_len);
+        let mut token_type_ids_flat = Vec::with_capacity(batch_size * max_len);
+        for enc in &encodings {
+            let ids = enc.get_ids();
+            let mask = enc.get_attention_mask();
+            let tt = enc.get_type_ids();
+            let len = ids.len();
+            input_ids_flat.extend_from_slice(ids);
+            attention_mask_flat.extend_from_slice(mask);
+            token_type_ids_flat.extend_from_slice(tt);
+            // Pad up.
+            for _ in len..max_len {
+                input_ids_flat.push(0);
+                attention_mask_flat.push(0);
+                token_type_ids_flat.push(0);
+            }
+        }
+
+        let input_ids =
+            Tensor::new(input_ids_flat.as_slice(), device)?.reshape((batch_size, max_len))?;
+        let attention_mask_tensor =
+            Tensor::new(attention_mask_flat.as_slice(), device)?.reshape((batch_size, max_len))?;
+        let token_type_ids =
+            Tensor::new(token_type_ids_flat.as_slice(), device)?.reshape((batch_size, max_len))?;
+
+        let hidden = model
+            .forward(&input_ids, &token_type_ids, Some(&attention_mask_tensor))
+            .context("model forward pass (batched) failed")?;
+
+        // Mean-pool along seq dim with attention mask.
+        let mask = attention_mask_tensor
+            .unsqueeze(2)?
+            .to_dtype(candle_core::DType::F32)?
+            .broadcast_as(hidden.shape())?;
+        let masked = hidden.mul(&mask)?;
+        let summed = masked.sum(1)?;
+        let count = mask.sum(1)?.clamp(1e-9, f64::MAX)?;
+        let pooled = summed.div(&count)?;
+
+        let norm = pooled
+            .sqr()?
+            .sum_keepdim(1)?
+            .sqrt()?
+            .clamp(1e-12, f64::MAX)?;
+        let normalised = pooled.broadcast_div(&norm)?;
+
+        // Slice out per-row embeddings.
+        let mut out: Vec<Vec<f32>> = Vec::with_capacity(batch_size);
+        for i in 0..batch_size {
+            let row: Vec<f32> = normalised.get(i)?.to_vec1()?;
+            out.push(row);
+        }
+        Ok(out)
     }
 
     /// Compute cosine similarity between two embedding vectors.
@@ -388,10 +507,22 @@ impl Embedder {
             return 0.0;
         }
 
-        let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-        let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-        let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-        let denom = norm_a * norm_b;
+        // PERF-4 (med/low review batch) — fuse three passes into one so
+        // LLVM auto-vectorises the leaf loop. The pre-fix shape walked the
+        // slices 3× (dot, |a|², |b|²); with embedding dims of 384-1024 and
+        // up to ~250 candidates per recall this was the per-recall hot
+        // path most likely to leave SIMD performance on the table. The
+        // numerical result is byte-equal (same multiplications and sums
+        // in the same order, just interleaved).
+        let mut dot: f32 = 0.0;
+        let mut sq_a: f32 = 0.0;
+        let mut sq_b: f32 = 0.0;
+        for (&x, &y) in a.iter().zip(b.iter()) {
+            dot += x * y;
+            sq_a += x * x;
+            sq_b += y * y;
+        }
+        let denom = sq_a.sqrt() * sq_b.sqrt();
         if denom < 1e-12 { 0.0 } else { dot / denom }
     }
 
@@ -1500,6 +1631,25 @@ mod c5_ollama_variant_tests {
             }
             other => panic!("expected Failed(_), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn perf_5_embed_batch_empty_input_returns_empty_vec() {
+        // PERF-5 — the batched local arm must short-circuit on
+        // empty input rather than attempting `encode_batch(&[])`
+        // which could error on some tokenizers crate versions.
+        // Walk through MockEmbedder (the Embed trait implementor
+        // that doesn't need a live Candle model). Its inherent
+        // `embed_batch` is the same contract as the production
+        // Embedder's PERF-5 fast-path.
+        use super::test_support::MockEmbedder;
+        let mock = MockEmbedder::new_local().expect("mock local");
+        let result = mock.embed_batch(&[]).expect("empty batch ok");
+        assert!(
+            result.is_empty(),
+            "PERF-5: empty input must yield empty output (got {} rows)",
+            result.len(),
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

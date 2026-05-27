@@ -54,6 +54,66 @@ pub const HEADER_CONTENT_TYPE: &str = "content-type";
 pub const MIME_JSON: &str = "application/json";
 
 // ---------------------------------------------------------------------------
+// ARCH-14 (FX-C4-batch2, 2026-05-26) — canonical route-count constant.
+//
+// The daemon's `build_router_with_timeout` registers exactly this
+// many production `.route(...)` calls at `/api/v1/`. The constant is
+// load-bearing for the docs (CLAUDE.md §"Architecture") and is
+// mechanically pinned by `tests/route_count_invariant.rs` so any
+// addition / removal of a route surface requires bumping this
+// constant in lockstep with the test failing.
+//
+// The 88th `.route(` at the bottom of `build_router_with_timeout` is
+// the `/slow` slowloris-test route gated by `#[cfg(test)]` — that is
+// counted by `EXPECTED_TEST_ROUTES_COUNT` below.
+// ---------------------------------------------------------------------------
+
+pub const EXPECTED_PRODUCTION_ROUTES_COUNT: usize = 87;
+pub const EXPECTED_TEST_ROUTES_COUNT: usize = 1;
+
+// ---------------------------------------------------------------------------
+// ARCH-10 (FX-C4-batch2, 2026-05-26) — minimal FFI self-identification
+// symbol.
+//
+// `cbindgen.toml` at v0.7.0 advertises a `staticlib`/`cdylib` build
+// surface for the iOS / Android cross-compile lanes (`mobile-cross-
+// compile` CI workflow + `mobile-ios` / `mobile-android` release
+// jobs) that previously produced artifacts with ZERO callable
+// `extern "C"` symbols. Operators linking the artifact via Xcode /
+// AGP would find nothing to call and have no way to confirm the
+// linker actually pulled in the substrate.
+//
+// This symbol gives the artifact a self-identification entry point
+// so consumers can at minimum link-and-validate the symbol table
+// before the full C ABI surface lands in a v0.7.x follow-up
+// (issue #1068 Layer 2 / #1069 wrapper SDK). The function returns
+// the substrate's Cargo.toml `version` field as a NUL-terminated
+// C string pointer with `'static` lifetime.
+//
+// Naming convention: `ai_memory_<verb>` matches the
+// `cbindgen.toml` namespace contract; the function name will be the
+// stable ABI handle for downstream consumers.
+// ---------------------------------------------------------------------------
+
+/// FFI: returns the substrate's Cargo.toml `version` field as a
+/// NUL-terminated UTF-8 C string with `'static` lifetime.
+///
+/// # Safety
+///
+/// The returned pointer is valid for the lifetime of the program;
+/// callers MUST NOT free it. The pointed-to bytes are immutable.
+///
+/// Stable since v0.7.0 (ARCH-10).
+#[unsafe(no_mangle)]
+pub extern "C" fn ai_memory_version() -> *const std::os::raw::c_char {
+    // `concat!` with a trailing nul byte gives a `&'static [u8]` of
+    // exactly the right shape; CStr::from_bytes_with_nul produces
+    // the pointer without an allocation.
+    const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "\0");
+    VERSION.as_ptr().cast::<std::os::raw::c_char>()
+}
+
+// ---------------------------------------------------------------------------
 // v0.7.x (issue #1174 PR5 — pm-v3.1 namespace-sentinel sweep) — the
 // default namespace for AI-NHI memory writes when the caller omits
 // the `namespace` parameter. Bare value: `"global"`.
@@ -123,9 +183,27 @@ pub mod storage;
 
 // Backward-compat shim from L0.5-3 rename — preserves
 // `crate::db::*` paths used elsewhere in the codebase. To be
-// removed in a future cleanup once all callsites migrate to
-// `crate::storage::*`.
+// removed in v0.8.0 once all callsites migrate to
+// `crate::storage::*` AND external consumers migrate to the
+// `crate::store::MemoryStore` SAL trait surface.
+//
+// ARCH-13 (FX-C4-batch2, 2026-05-26): marked `#[deprecated]` on the
+// public re-export so any out-of-tree consumer pinning
+// `ai_memory::db::*` gets a compile-time deprecation warning. The
+// integration-test crate under `tests/` uses `ai_memory::db::*`
+// extensively (open / insert / set_namespace_standard / etc.) so a
+// hard downgrade to `pub(crate) use` would break those tests; the
+// deprecation attribute is the load-bearing signal for the v0.8.0
+// migration. External consumers should reach for the
+// `crate::store::MemoryStore` SAL trait instead (the canonical
+// public surface), and the in-tree handlers continue to use the
+// short `db::*` path until the ARCH-2 SAL boundary cleanup migrates
+// the remaining 40+ handler sites.
 #[allow(dead_code)]
+#[deprecated(
+    since = "0.7.0",
+    note = "use `ai_memory::store::MemoryStore` (the SAL trait surface) instead; the sqlite-only legacy `db` alias is slated for removal in v0.8.0"
+)]
 pub use storage as db;
 pub mod embeddings;
 // v0.7.0 (issue #228) — E2E memory content encryption at rest.
@@ -261,21 +339,32 @@ pub mod store;
 // ---------------------------------------------------------------------------
 // Router construction
 // ---------------------------------------------------------------------------
-//
-// `build_router` is the single source of truth for the daemon's HTTP route
-// table. It is exposed through the lib crate so the integration test suite
-// can construct an in-process `axum::Router` and exercise endpoints via
-// `Router::oneshot()` instead of spawning a subprocess + curl, which:
-//   1. eliminates the OS-level daemon-spawn overhead per test (~200-500ms),
-//   2. exposes the routes' line coverage to `cargo llvm-cov` (subprocess
-//      coverage attribution requires extra `LLVM_PROFILE_FILE` plumbing
-//      that the test harness doesn't provide), and
-//   3. lets test failures surface assertion-level diagnostics instead of
-//      "curl returned 000" black holes.
-//
-// The function takes the same two state values that `serve()` constructs
-// inline (the API key middleware state and the composite app state) so
-// the production binary and the test harness share a single route map.
+
+/// Build the daemon's HTTP `axum::Router` from the API-key middleware
+/// state and the composite app state.
+///
+/// This is the single source of truth for the daemon's HTTP route
+/// table (87 production routes / 73 unique URL paths at v0.7.0). It is
+/// exposed through the lib crate so the integration test suite can
+/// construct an in-process `axum::Router` and exercise endpoints via
+/// `Router::oneshot()` instead of spawning a subprocess + curl, which:
+///
+/// 1. eliminates the OS-level daemon-spawn overhead per test
+///    (~200-500ms),
+/// 2. exposes the routes' line coverage to `cargo llvm-cov` (subprocess
+///    coverage attribution requires extra `LLVM_PROFILE_FILE` plumbing
+///    that the test harness doesn't provide), and
+/// 3. lets test failures surface assertion-level diagnostics instead
+///    of "curl returned 000" black holes.
+///
+/// The function takes the same two state values that `serve()`
+/// constructs inline so the production binary and the test harness
+/// share a single route map.
+///
+/// DOC-5 (med/low review batch) — promoted from the pre-existing `//`
+/// banner so the doc-comment attaches to the symbol (cargo-doc + IDE
+/// surfaces) and is symmetric with the sibling
+/// [`build_router_with_timeout`].
 pub fn build_router(
     api_key_state: handlers::ApiKeyState,
     app_state: handlers::AppState,

@@ -6,6 +6,196 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 
+// ---------------------------------------------------------------------------
+// ARCH-9 (FX-C4-batch2, 2026-05-26) — canonical stable error slugs.
+//
+// Single source of truth for the `&'static str` error slugs returned
+// by `MemoryError::code()`, `StorageError::code()`, and
+// `StoreError::code()`. Hoisting the literal slugs into shared
+// `const`s lets cross-surface parity tests (HTTP / MCP / CLI) assert
+// byte-equal slug strings without re-spelling them at each call
+// site. Any future slug rename touches one constant rather than
+// scattered string literals across three enum bodies and N handler
+// branches.
+//
+// Slug convention: SCREAMING_SNAKE_CASE matching the legacy
+// `MemoryError::code()` output so downstream consumers' string-match
+// expectations carry through.
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
+pub mod error_codes {
+    // ---- MemoryError-side (handler-facing) ----------------------------------
+    pub const NOT_FOUND: &str = "NOT_FOUND";
+    pub const VALIDATION_FAILED: &str = "VALIDATION_FAILED";
+    pub const DATABASE_ERROR: &str = "DATABASE_ERROR";
+    pub const CONFLICT: &str = "CONFLICT";
+    pub const REFLECTION_DEPTH_EXCEEDED: &str = "REFLECTION_DEPTH_EXCEEDED";
+    pub const SYNTHESIS_DEPTH_EXCEEDED: &str = "SYNTHESIS_DEPTH_EXCEEDED";
+    pub const REFLECTION_CYCLE_DETECTED: &str = "REFLECTION_CYCLE_DETECTED";
+    pub const GOVERNANCE_REFUSED: &str = "GOVERNANCE_REFUSED";
+
+    // ---- StorageError-side (substrate-facing) -------------------------------
+    pub const PENDING_ACTION_NOT_FOUND: &str = "PENDING_ACTION_NOT_FOUND";
+    pub const AMBIGUOUS_ID_PREFIX: &str = "AMBIGUOUS_ID_PREFIX";
+    pub const INVALID_ARGUMENT: &str = "INVALID_ARGUMENT";
+    pub const PENDING_ACTION_STATE_INVALID: &str = "PENDING_ACTION_STATE_INVALID";
+    pub const LINK_PERMISSION_DENIED: &str = "LINK_PERMISSION_DENIED";
+    pub const LINK_REFLECTION_CYCLE: &str = "LINK_REFLECTION_CYCLE";
+    pub const APPROVER_LAUNDERING: &str = "APPROVER_LAUNDERING";
+    pub const UNIQUE_CONFLICT: &str = "UNIQUE_CONFLICT";
+    pub const ARCHIVE_RESTORE_COLLISION: &str = "ARCHIVE_RESTORE_COLLISION";
+    pub const ARCHIVE_SUPERSEDE_FAILED: &str = "ARCHIVE_SUPERSEDE_FAILED";
+    pub const SQLCIPHER_MISSING_PASSPHRASE: &str = "SQLCIPHER_MISSING_PASSPHRASE";
+
+    // ---- StoreError-side (SAL trait-facing) ---------------------------------
+    pub const STORE_BACKEND_UNAVAILABLE: &str = "BACKEND_UNAVAILABLE";
+    pub const STORE_UNSUPPORTED_CAPABILITY: &str = "UNSUPPORTED_CAPABILITY";
+    pub const STORE_OPERATION_FAILED: &str = "STORE_OPERATION_FAILED";
+    pub const STORE_DATABASE_ERROR: &str = "DATABASE_ERROR";
+    pub const STORE_NOT_FOUND: &str = "NOT_FOUND";
+    pub const STORE_VALIDATION_FAILED: &str = "VALIDATION_FAILED";
+    pub const STORE_GOVERNANCE_REFUSED: &str = "GOVERNANCE_REFUSED";
+    pub const STORE_VERSION_CONFLICT: &str = "VERSION_CONFLICT";
+}
+
+#[cfg(test)]
+mod arch_9_slug_tests {
+    use super::error_codes::*;
+
+    #[test]
+    fn arch_9_canonical_slugs_have_stable_string_values() {
+        // ARCH-9 — pin the wire string values for the canonical
+        // shared slugs (NOT_FOUND, VALIDATION_FAILED, etc.) so a
+        // future rename in `error_codes` fails this test loudly.
+        // The `STORE_*` prefixed constants have wire values
+        // distinct from their constant names (e.g.
+        // `STORE_BACKEND_UNAVAILABLE` resolves to the wire slug
+        // `"BACKEND_UNAVAILABLE"`); their stability is pinned by
+        // the round-trip tests below.
+        assert_eq!(NOT_FOUND, "NOT_FOUND");
+        assert_eq!(VALIDATION_FAILED, "VALIDATION_FAILED");
+        assert_eq!(DATABASE_ERROR, "DATABASE_ERROR");
+        assert_eq!(CONFLICT, "CONFLICT");
+        assert_eq!(GOVERNANCE_REFUSED, "GOVERNANCE_REFUSED");
+        assert_eq!(REFLECTION_DEPTH_EXCEEDED, "REFLECTION_DEPTH_EXCEEDED");
+        assert_eq!(SYNTHESIS_DEPTH_EXCEEDED, "SYNTHESIS_DEPTH_EXCEEDED");
+        assert_eq!(REFLECTION_CYCLE_DETECTED, "REFLECTION_CYCLE_DETECTED");
+        assert_eq!(AMBIGUOUS_ID_PREFIX, "AMBIGUOUS_ID_PREFIX");
+        assert_eq!(INVALID_ARGUMENT, "INVALID_ARGUMENT");
+        assert_eq!(LINK_PERMISSION_DENIED, "LINK_PERMISSION_DENIED");
+        assert_eq!(LINK_REFLECTION_CYCLE, "LINK_REFLECTION_CYCLE");
+        assert_eq!(UNIQUE_CONFLICT, "UNIQUE_CONFLICT");
+        // STORE_-prefixed constants — wire values intentionally
+        // strip the `STORE_` prefix because the wire is
+        // backend-agnostic.
+        assert_eq!(STORE_BACKEND_UNAVAILABLE, "BACKEND_UNAVAILABLE");
+        assert_eq!(STORE_UNSUPPORTED_CAPABILITY, "UNSUPPORTED_CAPABILITY");
+        assert_eq!(STORE_OPERATION_FAILED, "STORE_OPERATION_FAILED");
+        assert_eq!(STORE_VERSION_CONFLICT, "VERSION_CONFLICT");
+    }
+
+    #[test]
+    fn arch_9_store_error_slug_round_trip() {
+        use crate::store::{BoxBackendError, StoreError};
+        let variants = [
+            StoreError::NotFound { id: "x".into() },
+            StoreError::Conflict { id: "x".into() },
+            StoreError::PermissionDenied {
+                action: "a".into(),
+                target: "t".into(),
+                reason: "r".into(),
+            },
+            StoreError::BackendUnavailable {
+                backend: "b".into(),
+                detail: "d".into(),
+            },
+            StoreError::InvalidInput { detail: "d".into() },
+            StoreError::UnsupportedCapability {
+                capability: "c".into(),
+            },
+            StoreError::IntegrityFailed { detail: "d".into() },
+            StoreError::Backend(BoxBackendError::new("boom")),
+        ];
+        let expected = [
+            NOT_FOUND,
+            CONFLICT,
+            GOVERNANCE_REFUSED,
+            STORE_BACKEND_UNAVAILABLE,
+            VALIDATION_FAILED,
+            STORE_UNSUPPORTED_CAPABILITY,
+            STORE_OPERATION_FAILED,
+            DATABASE_ERROR,
+        ];
+        for (got, want) in variants.iter().zip(expected.iter()) {
+            assert_eq!(got.code(), *want, "ARCH-9 StoreError code drift");
+        }
+    }
+
+    #[test]
+    fn arch_9_storage_error_slug_round_trip() {
+        // Walk every StorageError variant and confirm `code()` returns
+        // one of the canonical slugs from the const set.
+        use crate::storage::{LinkEnd, StorageError};
+        let variants = [
+            StorageError::MemoryNotFound {
+                id: "x".into(),
+                role: None,
+            },
+            StorageError::MemoryNotFound {
+                id: "x".into(),
+                role: Some(LinkEnd::Source),
+            },
+            StorageError::PendingActionNotFound {
+                pending_id: "p".into(),
+            },
+            StorageError::AmbiguousIdPrefix {
+                prefix: "x".into(),
+                candidates: vec!["a".into(), "b".into()],
+            },
+            StorageError::InvalidArgument { reason: "r".into() },
+            StorageError::PendingActionStateInvalid {
+                pending_id: "p".into(),
+                status: "s".into(),
+            },
+            StorageError::LinkPermissionDenied { reason: "r".into() },
+            StorageError::LinkReflectionCycle {
+                source_id: "s".into(),
+                target_id: "t".into(),
+            },
+            StorageError::ApproverLaundering {
+                pending_id: "p".into(),
+                claimed: "a".into(),
+                requester: "b".into(),
+            },
+            StorageError::UniqueConflict { reason: "r".into() },
+            StorageError::ArchiveRestoreCollision { id: "x".into() },
+            StorageError::ArchiveSupersedeFailed {
+                archived_id: "x".into(),
+            },
+            StorageError::SqlcipherMissingPassphrase,
+        ];
+        let expected = [
+            NOT_FOUND,
+            NOT_FOUND,
+            PENDING_ACTION_NOT_FOUND,
+            AMBIGUOUS_ID_PREFIX,
+            INVALID_ARGUMENT,
+            PENDING_ACTION_STATE_INVALID,
+            LINK_PERMISSION_DENIED,
+            LINK_REFLECTION_CYCLE,
+            APPROVER_LAUNDERING,
+            UNIQUE_CONFLICT,
+            ARCHIVE_RESTORE_COLLISION,
+            ARCHIVE_SUPERSEDE_FAILED,
+            SQLCIPHER_MISSING_PASSPHRASE,
+        ];
+        for (got, want) in variants.iter().zip(expected.iter()) {
+            assert_eq!(got.code(), *want, "ARCH-9 StorageError code drift");
+        }
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Serialize)]
 pub struct ApiError {
@@ -98,15 +288,21 @@ pub enum MemoryError {
 
 impl MemoryError {
     pub fn code(&self) -> &'static str {
+        // ARCH-9 (FX-C4-batch2, 2026-05-26): each arm returns a slug
+        // from the shared `error_codes` const set so cross-surface
+        // (HTTP / MCP / CLI) parity tests can assert byte-equal slug
+        // strings against the same source of truth.
         match self {
-            Self::NotFound(_) => "NOT_FOUND",
-            Self::ValidationFailed(_) => "VALIDATION_FAILED",
-            Self::DatabaseError(_) => "DATABASE_ERROR",
-            Self::Conflict(_) => "CONFLICT",
-            Self::ReflectionDepthExceeded { .. } => "REFLECTION_DEPTH_EXCEEDED",
-            Self::SynthesisDepthExceeded { .. } => "SYNTHESIS_DEPTH_EXCEEDED",
-            Self::ReflectionCycleDetected { .. } => "REFLECTION_CYCLE_DETECTED",
-            Self::RefusedByGovernance(_) | Self::RefusedByGovernanceGate(_) => "GOVERNANCE_REFUSED",
+            Self::NotFound(_) => error_codes::NOT_FOUND,
+            Self::ValidationFailed(_) => error_codes::VALIDATION_FAILED,
+            Self::DatabaseError(_) => error_codes::DATABASE_ERROR,
+            Self::Conflict(_) => error_codes::CONFLICT,
+            Self::ReflectionDepthExceeded { .. } => error_codes::REFLECTION_DEPTH_EXCEEDED,
+            Self::SynthesisDepthExceeded { .. } => error_codes::SYNTHESIS_DEPTH_EXCEEDED,
+            Self::ReflectionCycleDetected { .. } => error_codes::REFLECTION_CYCLE_DETECTED,
+            Self::RefusedByGovernance(_) | Self::RefusedByGovernanceGate(_) => {
+                error_codes::GOVERNANCE_REFUSED
+            }
         }
     }
 
