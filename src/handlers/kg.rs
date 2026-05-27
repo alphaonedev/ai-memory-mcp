@@ -931,18 +931,22 @@ pub async fn kg_invalidate(
             .into_response();
     }
 
-    // v0.7.0 Wave-3 Continuation — postgres dispatches via the
-    // PostgresStore::kg_invalidate helper.
+    // v0.7.0 SAL-routing batch-4 (FX-C2) — postgres dispatches via the
+    // canonical `MemoryStore::invalidate_link` trait method. The
+    // pre-fix `kg_invalidate_via_store` helper (an `as_any_for_postgres`
+    // downcast hatch) stays in place for back-compat callers but new
+    // routes ride the trait surface — no SAL-boundary bypass.
     #[cfg(feature = "sal-postgres")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        return match crate::store::postgres::kg_invalidate_via_store(
-            &app.store,
-            &body.source_id,
-            &body.target_id,
-            &body.relation,
-            valid_until,
-        )
-        .await
+        return match app
+            .store
+            .invalidate_link(
+                &body.source_id,
+                &body.target_id,
+                &body.relation,
+                valid_until,
+            )
+            .await
         {
             Ok(res) if res.found => (
                 StatusCode::OK,
