@@ -43,6 +43,29 @@ const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
 /// PERF-9 (v0.7.0 FX-C1, 2026-05-26) — bridge sync API to the new async
 /// `reqwest::Client` without double-blocking or panicking.
 ///
+/// **FX-D1 (v0.7.0, 2026-05-27) — regression fix.** The original
+/// FX-C1 design panicked on the current-thread arm because every
+/// in-repo `#[tokio::test]` used `flavor = "multi_thread"`. Production
+/// hit the panic via `daemon_runtime::build_llm_client` →
+/// `spawn_blocking(|| OllamaClient::build_from_resolved(...))`:
+/// `tokio::task::spawn_blocking` inherits the runtime handle on its
+/// blocking pool thread, so `Handle::try_current()` resolves and
+/// `runtime_flavor()` is `CurrentThread` whenever the outer runtime
+/// is current-thread (the default for `#[tokio::test]`). The panic
+/// surfaced as a `task panicked with message "OllamaClient sync
+/// wrapper called from inside a current-thread tokio runtime."`
+/// warning in the daemon log.
+///
+/// The fix is to never panic — instead, on the current-thread arm,
+/// spawn a fresh OS thread (which has no inherited tokio context),
+/// build a one-shot current-thread runtime on it, drive the future
+/// there, and join the thread back. This costs one thread spawn +
+/// one join per current-thread bridge call, but it keeps every
+/// existing sync wrapper signature intact and removes the
+/// recurrence-risk panic surface entirely. Multi-thread runtimes
+/// still use the productive `block_in_place` path; no runtime at
+/// all still uses the in-line ephemeral runtime path.
+///
 /// Three cases the helper handles:
 ///
 /// 1. **Inside a multi-thread tokio runtime** (the `#[tokio::main]`
@@ -51,11 +74,15 @@ const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
 ///    `tokio::task::block_in_place` + `Handle::current().block_on` so
 ///    the runtime keeps the worker thread productive for other tasks
 ///    while the LLM HTTP call is in flight.
-/// 2. **Inside a current-thread tokio runtime** (some `#[tokio::test]`
-///    defaults to current-thread) — `block_in_place` panics there, so
-///    we fall back to constructing an ephemeral current-thread
-///    runtime in a fresh OS thread (via `std::thread::spawn`) so the
-///    outer runtime is not re-entered.
+/// 2. **Inside a current-thread tokio runtime** (the default
+///    `#[tokio::test]` flavor; production hit through
+///    `daemon_runtime::build_llm_client` → `spawn_blocking` when the
+///    outer runtime was current-thread) — `block_in_place` panics
+///    there, and re-entering the existing runtime via a fresh
+///    `block_on` deadlocks. We construct an ephemeral current-thread
+///    runtime on a freshly-spawned OS thread (via
+///    `std::thread::spawn`) so the outer runtime is not re-entered
+///    and the future drives to completion on an isolated thread.
 /// 3. **No tokio runtime at all** (a `#[test]` regression in a
 ///    non-async test file, the legacy synchronous CLI path that
 ///    bypasses `#[tokio::main]`) — build a fresh current-thread
@@ -65,11 +92,14 @@ const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
 /// shapes keeps the every-callsite-stays-sync contract intact while
 /// allowing the underlying HTTP I/O to migrate to async. Production
 /// hot paths (HTTP handlers, daemon dispatch) should prefer the
-/// `*_async` variants and skip the bridge entirely.
+/// `*_async` variants and skip the bridge entirely — the FX-D1
+/// surgical fix at `daemon_runtime::build_llm_client` does exactly
+/// this for the known callsite that surfaced the regression.
 fn block_on_local<F, Fut, T>(make_fut: F) -> T
 where
-    F: FnOnce() -> Fut,
+    F: FnOnce() -> Fut + Send,
     Fut: std::future::Future<Output = T>,
+    T: Send,
 {
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         match handle.runtime_flavor() {
@@ -85,19 +115,49 @@ where
             _ => {
                 // Current-thread runtime — `block_in_place` panics
                 // there, and re-entering the runtime via a fresh
-                // `block_on` deadlocks. Production never hits this
-                // branch (the daemon's `#[tokio::main]` is
-                // multi-thread); tests that want to drive the sync
-                // wrapper from inside a current-thread test must
-                // mark the test as `#[tokio::test(flavor =
-                // "multi_thread")]` — every existing llm.rs test
-                // already does. We surface a clear panic so a
-                // regression is loud, not silent.
-                panic!(
-                    "OllamaClient sync wrapper called from inside a current-thread \
-                     tokio runtime. Use the `*_async` variant or annotate the test \
-                     `#[tokio::test(flavor = \"multi_thread\")]`."
-                )
+                // `block_on` deadlocks. FX-D1 (2026-05-27): the
+                // previous design panicked here, but production hit
+                // this branch via `daemon_runtime::build_llm_client`'s
+                // `spawn_blocking` (the blocking pool thread inherits
+                // the outer current-thread runtime handle). We now
+                // move the `FnOnce` future-builder onto a freshly-
+                // scoped OS thread that owns its own one-shot
+                // current-thread runtime. That thread has no
+                // inherited tokio context, so the inner `block_on`
+                // does not re-enter the outer runtime and does not
+                // deadlock.
+                //
+                // We use `std::thread::scope` instead of
+                // `std::thread::spawn` so the closure can borrow
+                // non-`'static` data from the caller (e.g. the
+                // `&self` capture every `block_on_local(|| self.foo_async(...))`
+                // wrapper carries). Scoped threads guarantee the
+                // borrow outlives the spawn-and-join pair.
+                //
+                // Cost: one thread spawn + one join per call. The sync
+                // wrapper is a bridge-of-last-resort surface — every
+                // production hot path either runs on a multi-thread
+                // runtime (which uses the productive arm above) or
+                // calls the `*_async` variant directly. The
+                // current-thread arm is exercised only by tests that
+                // defaulted to current-thread and by the legacy
+                // `spawn_blocking → sync wrapper` chain that FX-D1
+                // surgically migrated to the async path at known
+                // callsites.
+                std::thread::scope(|s| {
+                    s.spawn(move || {
+                        tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .expect("ephemeral runtime builds")
+                            .block_on(make_fut())
+                    })
+                    .join()
+                    .expect(
+                        "block_on_local current-thread bridge thread panicked; \
+                         underlying future panicked",
+                    )
+                })
             }
         }
     } else {
@@ -592,6 +652,63 @@ impl OllamaClient {
         // Non-Ollama backends require an API key. If the resolver
         // could not produce one, surface the error via a returned
         // `Err` (consistent with the pre-#1143 `from_env` posture).
+        let Some(api_key) = resolved.api_key() else {
+            return Err(anyhow!(
+                "LLM backend `{}` requires an API key but the resolver \
+                 produced none. KeySource = {}. Configure either \
+                 AI_MEMORY_LLM_API_KEY, a per-vendor env var (e.g. \
+                 XAI_API_KEY), [llm].api_key_env, or [llm].api_key_file \
+                 in config.toml. See \
+                 https://github.com/alphaonedev/ai-memory-mcp/issues/1146",
+                resolved.backend,
+                resolved.api_key_source.as_str(),
+            ));
+        };
+
+        Self::new_openai_compatible(&resolved.base_url, &resolved.model, api_key).map(Some)
+    }
+
+    /// FX-D1 (v0.7.0, 2026-05-27) — async sibling of
+    /// [`Self::build_from_resolved`]. Surgical fix for the
+    /// `daemon_runtime::build_llm_client` callsite that hit the
+    /// FX-C1 `block_on_local` current-thread panic: the daemon
+    /// wrapped this sync constructor in `tokio::task::spawn_blocking`,
+    /// and the blocking pool thread inherited the outer (current-
+    /// thread, in `#[tokio::test]`) runtime handle, which drove
+    /// `block_on_local` into its panic arm.
+    ///
+    /// Callers already on a tokio runtime — the daemon's
+    /// `build_llm_client`, `mcp/mod.rs::run_mcp_server` once it
+    /// migrates, and CLI atomise/curator builders — should call this
+    /// directly to bypass the sync→async bridge entirely. The Ollama
+    /// arm now goes through [`Self::new_with_url_async`] (no
+    /// `block_on_local`); the non-Ollama arm uses
+    /// [`Self::new_openai_compatible`] which is already pure-sync
+    /// (no I/O — just a `reqwest::Client::builder`).
+    ///
+    /// # Errors
+    ///
+    /// Same conditions as [`Self::build_from_resolved`]: Ollama
+    /// reachability failure, missing API key for a non-Ollama
+    /// backend, or HTTP client build failure.
+    pub async fn build_from_resolved_async(
+        resolved: &crate::config::ResolvedLlm,
+    ) -> Result<Option<Self>> {
+        tracing::debug!(
+            "LLM client construction via #1146 resolver (async, FX-D1) — backend={}, model={}, base_url={}, key_source={}, source={}",
+            resolved.backend,
+            resolved.model,
+            resolved.base_url,
+            resolved.api_key_source.as_str(),
+            resolved.source.as_str(),
+        );
+
+        if resolved.backend == BACKEND_OLLAMA {
+            return Self::new_with_url_async(&resolved.base_url, &resolved.model)
+                .await
+                .map(Some);
+        }
+
         let Some(api_key) = resolved.api_key() else {
             return Err(anyhow!(
                 "LLM backend `{}` requires an API key but the resolver \
