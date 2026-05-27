@@ -6901,4 +6901,154 @@ decision = "allow"
             "env-source backend against unreachable URL MUST map to None"
         );
     }
+
+    // ===========================================================================
+    // FX-F1 — additional helper-function coverage uplift.
+    // The build_llm_client tests above close the FX-D1 gap; these tests
+    // pin the smaller helper surfaces (`apply_anonymize_default`,
+    // `resolve_admin_agent_ids`) that previously had narrow branches
+    // uncovered. Each closes one or two uncovered lines so the file
+    // floor (85%) clears comfortably.
+    // ===========================================================================
+
+    /// FX-F1 — `apply_anonymize_default` writes the env var when both
+    /// (a) the effective default is true AND (b) the env var is
+    /// unset. Pre-FX-F1 this `unsafe { set_var }` arm was uncovered.
+    #[test]
+    fn test_apply_anonymize_default_sets_env_when_unset() {
+        let _guard = fx_f1_lock_env();
+        // SAFETY: serialised through fx_f1_lock_env.
+        let prev = std::env::var("AI_MEMORY_ANONYMIZE").ok();
+        unsafe { std::env::remove_var("AI_MEMORY_ANONYMIZE") };
+        let mut cfg = AppConfig::default();
+        cfg.identity = Some(crate::config::IdentityConfig {
+            anonymize_default: true,
+            ..crate::config::IdentityConfig::default()
+        });
+        apply_anonymize_default(&cfg);
+        let got = std::env::var("AI_MEMORY_ANONYMIZE").ok();
+        // Restore env before asserting so a failure doesn't leak.
+        match prev {
+            Some(v) => unsafe { std::env::set_var("AI_MEMORY_ANONYMIZE", v) },
+            None => unsafe { std::env::remove_var("AI_MEMORY_ANONYMIZE") },
+        }
+        assert_eq!(
+            got.as_deref(),
+            Some("1"),
+            "anonymize_default=true with env unset MUST set AI_MEMORY_ANONYMIZE=1"
+        );
+    }
+
+    /// FX-F1 — `apply_anonymize_default` is a no-op when the env var
+    /// is already set. Mirrors the existing test gap on the "env wins
+    /// over config" precedence rule.
+    #[test]
+    fn test_apply_anonymize_default_preserves_existing_env() {
+        let _guard = fx_f1_lock_env();
+        let prev = std::env::var("AI_MEMORY_ANONYMIZE").ok();
+        unsafe { std::env::set_var("AI_MEMORY_ANONYMIZE", "0") };
+        let mut cfg = AppConfig::default();
+        cfg.identity = Some(crate::config::IdentityConfig {
+            anonymize_default: true,
+            ..crate::config::IdentityConfig::default()
+        });
+        apply_anonymize_default(&cfg);
+        let got = std::env::var("AI_MEMORY_ANONYMIZE").ok();
+        match prev {
+            Some(v) => unsafe { std::env::set_var("AI_MEMORY_ANONYMIZE", v) },
+            None => unsafe { std::env::remove_var("AI_MEMORY_ANONYMIZE") },
+        }
+        assert_eq!(
+            got.as_deref(),
+            Some("0"),
+            "env-var precedence: pre-set AI_MEMORY_ANONYMIZE MUST survive apply_anonymize_default"
+        );
+    }
+
+    /// FX-F1 — `resolve_admin_agent_ids` empty-entry handling.
+    /// `AI_MEMORY_ADMIN_AGENT_IDS="alice,,bob"` should drop the empty
+    /// entry without erroring. Pins the `continue` branch on line
+    /// 1882 of the env-csv walker.
+    #[test]
+    fn test_resolve_admin_agent_ids_skips_empty_entries() {
+        let _guard = fx_f1_lock_env();
+        let prev = std::env::var("AI_MEMORY_ADMIN_AGENT_IDS").ok();
+        unsafe { std::env::set_var("AI_MEMORY_ADMIN_AGENT_IDS", "alice,,bob,,") };
+        let ids = resolve_admin_agent_ids(None);
+        match prev {
+            Some(v) => unsafe { std::env::set_var("AI_MEMORY_ADMIN_AGENT_IDS", v) },
+            None => unsafe { std::env::remove_var("AI_MEMORY_ADMIN_AGENT_IDS") },
+        }
+        assert_eq!(
+            ids,
+            vec!["alice".to_string(), "bob".to_string()],
+            "empty entries between commas MUST be skipped, not surface as agent_ids"
+        );
+    }
+
+    /// FX-F1 — `resolve_admin_agent_ids` rejects malformed entries
+    /// with a warn-log, preserving the valid ones. Pins the Err arm
+    /// of `validate_agent_id` on line 1901-1905.
+    #[test]
+    fn test_resolve_admin_agent_ids_drops_malformed_entries() {
+        let _guard = fx_f1_lock_env();
+        let prev = std::env::var("AI_MEMORY_ADMIN_AGENT_IDS").ok();
+        // `bad id with spaces` fails `validate_agent_id`'s shape
+        // check; `alice` passes; `*` is the post-#980 reject.
+        unsafe { std::env::set_var("AI_MEMORY_ADMIN_AGENT_IDS", "alice,bad id,*,bob") };
+        let ids = resolve_admin_agent_ids(None);
+        match prev {
+            Some(v) => unsafe { std::env::set_var("AI_MEMORY_ADMIN_AGENT_IDS", v) },
+            None => unsafe { std::env::remove_var("AI_MEMORY_ADMIN_AGENT_IDS") },
+        }
+        assert!(ids.contains(&"alice".to_string()));
+        assert!(ids.contains(&"bob".to_string()));
+        assert!(
+            !ids.iter().any(|s| s.contains(' ')),
+            "malformed entries MUST be dropped"
+        );
+        assert!(
+            !ids.contains(&"*".to_string()),
+            "wildcard `*` MUST be dropped (post-#980)"
+        );
+    }
+
+    /// FX-F1 — `resolve_admin_agent_ids` falls through to the config
+    /// when the env var is unset/empty. Pins the
+    /// `admin_cfg.map(...).unwrap_or_default()` tail.
+    #[test]
+    fn test_resolve_admin_agent_ids_falls_back_to_config() {
+        let _guard = fx_f1_lock_env();
+        let prev = std::env::var("AI_MEMORY_ADMIN_AGENT_IDS").ok();
+        unsafe { std::env::remove_var("AI_MEMORY_ADMIN_AGENT_IDS") };
+        // Empty env → fall through to config.
+        let ids = resolve_admin_agent_ids(None);
+        // Restore env before asserting.
+        if let Some(v) = prev {
+            unsafe { std::env::set_var("AI_MEMORY_ADMIN_AGENT_IDS", v) };
+        }
+        assert!(
+            ids.is_empty(),
+            "no env + no config MUST resolve to empty allowlist (secure default)"
+        );
+    }
+
+    /// FX-F1 — `resolve_admin_agent_ids` honours a whitespace-only
+    /// `AI_MEMORY_ADMIN_AGENT_IDS` value as "unset" (the
+    /// `!raw.trim().is_empty()` guard). Pins the guard arm.
+    #[test]
+    fn test_resolve_admin_agent_ids_whitespace_env_falls_to_config() {
+        let _guard = fx_f1_lock_env();
+        let prev = std::env::var("AI_MEMORY_ADMIN_AGENT_IDS").ok();
+        unsafe { std::env::set_var("AI_MEMORY_ADMIN_AGENT_IDS", "   ") };
+        let ids = resolve_admin_agent_ids(None);
+        match prev {
+            Some(v) => unsafe { std::env::set_var("AI_MEMORY_ADMIN_AGENT_IDS", v) },
+            None => unsafe { std::env::remove_var("AI_MEMORY_ADMIN_AGENT_IDS") },
+        }
+        assert!(
+            ids.is_empty(),
+            "whitespace-only env MUST be treated as unset"
+        );
+    }
 }
