@@ -6410,7 +6410,7 @@ decision = "allow"
         // path fires without spawning any blocking work.
         // FX-F1: hold the env-guard so concurrent tests can't flip
         // AI_MEMORY_LLM_BACKEND under us mid-resolve.
-        let _guard = fx_f1_lock_env();
+        let _guard = env_var_lock();
         fx_f1_clear_llm_env();
         let cfg = AppConfig::default();
         let res = build_llm_client(FeatureTier::Keyword, &cfg).await;
@@ -6421,7 +6421,7 @@ decision = "allow"
     async fn test_build_llm_client_returns_none_when_ollama_unreachable() {
         // Smart tier requires LLM, but pointing at an unreachable URL
         // exercises the constructor-error path (final Err arm).
-        let _guard = fx_f1_lock_env();
+        let _guard = env_var_lock();
         fx_f1_clear_llm_env();
         let mut cfg = AppConfig::default();
         cfg.ollama_url = Some("http://127.0.0.1:1".to_string());
@@ -6624,21 +6624,17 @@ decision = "allow"
     // 85% (was 83.83% pre-FX-F1 per FX-F1 dispatch — the +1.17pp gap
     // closes by exercising the async ladder end-to-end).
     //
-    // The env-mutating tests below serialise on a module-local mutex
-    // (mirrors `src/llm.rs::tests::ENV_GUARD_1143`) so parallel test
-    // workers can't race each other on `AI_MEMORY_LLM_*` reads —
-    // pre-mutex the wiremock happy-path collided with the env-source
-    // negative test's `AI_MEMORY_LLM_BASE_URL=http://127.0.0.1:1` write.
-    static FX_F1_ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn fx_f1_lock_env() -> std::sync::MutexGuard<'static, ()> {
-        FX_F1_ENV_GUARD
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
+    // The env-mutating tests below serialise on the module-canonical
+    // `env_var_lock()` defined above (line 4505) — the same mutex the
+    // pre-existing env-touching tests (`test_anonymize_unchanged_when_env_already_set`,
+    // `test_anonymize_unchanged_when_config_false`, etc.) already hold.
+    // FX-F1 first added a parallel `FX_F1_ENV_GUARD` mutex for these
+    // tests; that turned out to race the pre-existing tests because
+    // independent mutexes don't serialise against each other (issue
+    // surfaced by the QC pass on the FX-F1 patch, 2026-05-27).
 
     /// SAFETY: env-var mutation is unsynchronised across threads at
-    /// the OS level. `fx_f1_lock_env` serialises mutation across this
+    /// the OS level. `env_var_lock` serialises mutation across this
     /// test region so the unsafe is sound for the duration of each
     /// test that holds the guard. The cleared keys match every
     /// resolver ingress that `build_llm_client` and
@@ -6667,7 +6663,7 @@ decision = "allow"
             "OPENROUTER_API_KEY",
             "FIREWORKS_API_KEY",
         ] {
-            // SAFETY: guarded by fx_f1_lock_env at call sites.
+            // SAFETY: guarded by env_var_lock at call sites.
             unsafe { std::env::remove_var(k) };
         }
     }
@@ -6679,7 +6675,7 @@ decision = "allow"
     /// intent" arms; the Keyword variant is pinned above.
     #[tokio::test]
     async fn test_build_llm_client_semantic_tier_compiled_default_returns_none() {
-        let _guard = fx_f1_lock_env();
+        let _guard = env_var_lock();
         fx_f1_clear_llm_env();
         let cfg = AppConfig::default();
         let res = build_llm_client(FeatureTier::Semantic, &cfg).await;
@@ -6696,7 +6692,7 @@ decision = "allow"
     /// None). Exercises the `Err(_)` match arm of `build_llm_client`.
     #[tokio::test]
     async fn test_build_llm_client_autonomous_tier_unreachable_ollama_returns_none() {
-        let _guard = fx_f1_lock_env();
+        let _guard = env_var_lock();
         fx_f1_clear_llm_env();
         let mut cfg = AppConfig::default();
         cfg.ollama_url = Some("http://127.0.0.1:1".to_string());
@@ -6715,7 +6711,7 @@ decision = "allow"
     /// non-Ollama-no-key path in build_llm_client.
     #[tokio::test]
     async fn test_build_llm_client_xai_backend_without_api_key_returns_none() {
-        let _guard = fx_f1_lock_env();
+        let _guard = env_var_lock();
         fx_f1_clear_llm_env();
         use crate::config::LlmSection;
         let mut cfg = AppConfig::default();
@@ -6741,7 +6737,7 @@ decision = "allow"
     /// `Ok(Some(_))` arm of build_llm_client is exercised.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_build_llm_client_ollama_happy_path_against_wiremock() {
-        let _guard = fx_f1_lock_env();
+        let _guard = env_var_lock();
         fx_f1_clear_llm_env();
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -6766,7 +6762,7 @@ decision = "allow"
     /// sibling against a wiremock-backed endpoint. Pins the happy path.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_build_from_resolved_async_ollama_happy_path() {
-        let _guard = fx_f1_lock_env();
+        let _guard = env_var_lock();
         fx_f1_clear_llm_env();
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -6793,7 +6789,7 @@ decision = "allow"
     /// without a panic.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_build_from_resolved_async_ollama_unreachable_errs() {
-        let _guard = fx_f1_lock_env();
+        let _guard = env_var_lock();
         fx_f1_clear_llm_env();
         use std::net::TcpListener;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -6815,7 +6811,7 @@ decision = "allow"
     /// arm with the canonical error-message pattern.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_build_from_resolved_async_non_ollama_missing_key_errs() {
-        let _guard = fx_f1_lock_env();
+        let _guard = env_var_lock();
         fx_f1_clear_llm_env();
         use crate::config::LlmSection;
         let mut cfg = AppConfig::default();
@@ -6844,13 +6840,13 @@ decision = "allow"
     /// the happy path on the OpenAI-compatible arm.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_build_from_resolved_async_non_ollama_with_key_returns_some() {
-        let _guard = fx_f1_lock_env();
+        let _guard = env_var_lock();
         fx_f1_clear_llm_env();
         use crate::config::LlmSection;
         // Use a private env var that no other test touches; set it just
         // long enough for the resolver to pick it up, then unset.
         let env_name = "AI_MEMORY_FX_F1_OPENAI_KEY";
-        // SAFETY: env mutation guarded by fx_f1_lock_env; restored below.
+        // SAFETY: env mutation guarded by env_var_lock; restored below.
         unsafe { std::env::set_var(env_name, "sk-test-fx-f1-fake-key") };
         let mut cfg = AppConfig::default();
         cfg.llm = Some(LlmSection {
@@ -6881,9 +6877,9 @@ decision = "allow"
     /// (Err→None arm in build_llm_client).
     #[tokio::test]
     async fn test_build_llm_client_env_backend_unreachable_returns_none() {
-        let _guard = fx_f1_lock_env();
+        let _guard = env_var_lock();
         fx_f1_clear_llm_env();
-        // SAFETY: env mutation guarded by fx_f1_lock_env; cleared below.
+        // SAFETY: env mutation guarded by env_var_lock; cleared below.
         unsafe {
             std::env::set_var("AI_MEMORY_LLM_BACKEND", "ollama");
             std::env::set_var("AI_MEMORY_LLM_BASE_URL", "http://127.0.0.1:1");
@@ -6916,8 +6912,8 @@ decision = "allow"
     /// unset. Pre-FX-F1 this `unsafe { set_var }` arm was uncovered.
     #[test]
     fn test_apply_anonymize_default_sets_env_when_unset() {
-        let _guard = fx_f1_lock_env();
-        // SAFETY: serialised through fx_f1_lock_env.
+        let _guard = env_var_lock();
+        // SAFETY: serialised through env_var_lock.
         let prev = std::env::var("AI_MEMORY_ANONYMIZE").ok();
         unsafe { std::env::remove_var("AI_MEMORY_ANONYMIZE") };
         let mut cfg = AppConfig::default();
@@ -6944,7 +6940,7 @@ decision = "allow"
     /// over config" precedence rule.
     #[test]
     fn test_apply_anonymize_default_preserves_existing_env() {
-        let _guard = fx_f1_lock_env();
+        let _guard = env_var_lock();
         let prev = std::env::var("AI_MEMORY_ANONYMIZE").ok();
         unsafe { std::env::set_var("AI_MEMORY_ANONYMIZE", "0") };
         let mut cfg = AppConfig::default();
@@ -6971,7 +6967,7 @@ decision = "allow"
     /// 1882 of the env-csv walker.
     #[test]
     fn test_resolve_admin_agent_ids_skips_empty_entries() {
-        let _guard = fx_f1_lock_env();
+        let _guard = env_var_lock();
         let prev = std::env::var("AI_MEMORY_ADMIN_AGENT_IDS").ok();
         unsafe { std::env::set_var("AI_MEMORY_ADMIN_AGENT_IDS", "alice,,bob,,") };
         let ids = resolve_admin_agent_ids(None);
@@ -6991,7 +6987,7 @@ decision = "allow"
     /// of `validate_agent_id` on line 1901-1905.
     #[test]
     fn test_resolve_admin_agent_ids_drops_malformed_entries() {
-        let _guard = fx_f1_lock_env();
+        let _guard = env_var_lock();
         let prev = std::env::var("AI_MEMORY_ADMIN_AGENT_IDS").ok();
         // `bad id with spaces` fails `validate_agent_id`'s shape
         // check; `alice` passes; `*` is the post-#980 reject.
@@ -7018,7 +7014,7 @@ decision = "allow"
     /// `admin_cfg.map(...).unwrap_or_default()` tail.
     #[test]
     fn test_resolve_admin_agent_ids_falls_back_to_config() {
-        let _guard = fx_f1_lock_env();
+        let _guard = env_var_lock();
         let prev = std::env::var("AI_MEMORY_ADMIN_AGENT_IDS").ok();
         unsafe { std::env::remove_var("AI_MEMORY_ADMIN_AGENT_IDS") };
         // Empty env → fall through to config.
@@ -7038,7 +7034,7 @@ decision = "allow"
     /// `!raw.trim().is_empty()` guard). Pins the guard arm.
     #[test]
     fn test_resolve_admin_agent_ids_whitespace_env_falls_to_config() {
-        let _guard = fx_f1_lock_env();
+        let _guard = env_var_lock();
         let prev = std::env::var("AI_MEMORY_ADMIN_AGENT_IDS").ok();
         unsafe { std::env::set_var("AI_MEMORY_ADMIN_AGENT_IDS", "   ") };
         let ids = resolve_admin_agent_ids(None);
