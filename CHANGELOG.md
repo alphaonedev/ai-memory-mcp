@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] — v0.7.x doc follow-ups + Wave-2 refactor (post-tag)
 
+### v0.7.0 ship-gate CI-flake closure sweep (2026-05-27)
+
+Closes the three CI flakes filed after the 2026-05-22 SHIP-RECOMMENDED dossier so the integrated `release/v0.7.0` HEAD returns to all-platform-green:
+
+- **[#1372](https://github.com/alphaonedev/ai-memory-mcp/issues/1372)** — `arch_14_route_count_invariant` was failing on `Check (windows-latest)` because the test used literal `\n` anchors against `src/lib.rs`, but the Windows checkout converts `\n` → `\r\n` via `core.autocrlf=true`. Fix: `.replace("\r\n", "\n")` normalization on read in `tests/route_count_invariant.rs` (PR [#1375](https://github.com/alphaonedev/ai-memory-mcp/pull/1375), merge commit `5feca2864`). Verified `Check (windows-latest)` GREEN on PR CI run 26533974559.
+- **[#1373](https://github.com/alphaonedev/ai-memory-mcp/issues/1373)** — `Check (ubuntu-latest)` was ENOSPC'ing at the `libai_memory.rlib` release link step. The cumulative `cargo test` + `cargo install cargo-audit` + `cargo build --release` exceeded the ubuntu-latest runner's ~14 GiB free disk ceiling. Fix: pure-shell "Free disk before release build" step in `.github/workflows/ci.yml` that prunes `.NET / CodeQL / Android SDK / GHC` (~35 GiB recoverable) + `cargo clean --profile dev`; gated to `matrix.os == 'ubuntu-latest'` (PR [#1376](https://github.com/alphaonedev/ai-memory-mcp/pull/1376), merge commit `0ed79e176`). Verified `Check (ubuntu-latest)` GREEN on PR CI run 26539354137. No new GitHub Actions added per the project no-external-code-injection rule.
+- **[#1334](https://github.com/alphaonedev/ai-memory-mcp/issues/1334)** — CLAUDE.md §"Architecture" and §"Key Modules" both framed the 79→81 CLI subcommand gap as `--features sal-postgres` only, and called `schema-init` "postgres-only". Both framings were wrong: `Migrate` + `SchemaInit` are both gated `#[cfg(feature = "sal")]` per `src/daemon_runtime.rs:311,321` and unlocked by `sal` alone (PR [#1377](https://github.com/alphaonedev/ai-memory-mcp/pull/1377), merge commit `0e30d23f6`). Per the issue's own framing this docs-drift had contributed to false-positive defect filings (#1329); the corrected framing matches the source-of-truth cfg gates.
+
+Same sweep also closed the following pre-existing low-/medium-severity flakes filed 2026-05-25/26 that did not reproduce on the integrated HEAD (per pm-v3.3 flake-not-reproducing-on-head discipline; ai-memory `global/policies` memory `9be30f12-c0ae-4774-b675-5f0b123d0ad8`):
+
+- **[#1374](https://github.com/alphaonedev/ai-memory-mcp/issues/1374)** — `Per-Module Coverage Thresholds` + `Code Coverage` were flagged as failing with `graph "memory_graph" already exists` AGE noise on workflow run 26531463497, but both jobs returned SUCCESS on PR CI run 26533974559 (10-line CRLF-only change cannot affect AGE paths). Closed as transient.
+- **[#1332](https://github.com/alphaonedev/ai-memory-mcp/issues/1332)** — DNS-resolver-environment-dependent flake; passes consistently on current HEAD + the full parallel `cargo test` returned GREEN on the most recent PR CI macOS Check. Closed as flake-not-reproducing.
+- **[#1333](https://github.com/alphaonedev/ai-memory-mcp/issues/1333)** — `form_1_synthesis` was flagged with "11 failures under `--test-threads > 1`"; all 19 pass under `--test-threads=4` on current HEAD. Closed as flake-not-reproducing.
+- **[#1279](https://github.com/alphaonedev/ai-memory-mcp/issues/1279)** — `issue_1201_concurrent_listeners_get_unique_ports` flake under Postgres feature gate; passes consistently on current HEAD + Postgres feature gate returned GREEN on the most recent PR CI run (26m10s). Closed as flake-not-reproducing.
+- **[#1336](https://github.com/alphaonedev/ai-memory-mcp/issues/1336)** — claimed pre-existing clippy errors in `benches/hnsw_rebuild_async.rs`; `cargo clippy --all-targets -- -D warnings -D clippy::all -D clippy::pedantic` returns exit 0 with no diagnostics on current HEAD (silently landed during one of the post-`1e33b51d6` refactor passes). Closed as already-fixed.
+
+#### Integrated-HEAD verification (pm-v3.3 recompile-retest discipline)
+
+- `cargo build --release` — exit 0 (3m40s, fresh-binary recompile at HEAD `0e30d23f6`)
+- `AI_MEMORY_NO_CONFIG=1 cargo test --release --no-fail-fast` — **7,332 passed | 0 failed | 16 ignored | 312 suites total | 309 test binaries** (a strict superset of the 2026-05-22 dossier's 7,321 / 0 / 0 across 269 binaries; ignored ones are the postgres + AGE + network-bound tests that self-skip without `AI_MEMORY_TEST_POSTGRES_URL` / `AI_MEMORY_TEST_AGE_URL` set)
+- `cargo fmt --check` — exit 0
+- `cargo clippy -- -D warnings -D clippy::all -D clippy::pedantic` — exit 0, no diagnostics
+- `cargo clippy --all-targets -- -D warnings -D clippy::all -D clippy::pedantic` — exit 0, no diagnostics
+- `cargo audit` — exit 0, 529 deps scanned, 0 vulnerabilities
+
+Per-PR CI evidence covered each fix's load-bearing platform:
+
+- PR #1375: `Check (windows-latest)` GREEN (1h0m47s) at workflow run 26533974559 / job 78157803589 — the substrate validation of the CRLF normalization.
+- PR #1376: `Check (ubuntu-latest)` GREEN (33m04s) at workflow run 26539354137 / job 78176642966 — the substrate validation of the disk-cleanup workflow change.
+
 ### v0.7.0 Phase-1 + Wave-A audit-merge campaign (2026-05-25/26)
 
 Documents the **10-PR Phase-1 substrate-fix campaign** that closed the heterogeneous AI NHI assessment defects surfaced via issue [#1171](https://github.com/alphaonedev/ai-memory-mcp/issues/1171) (Opus 4.7 Phase-1 report), plus the **Wave-A audit-merge campaign** (PRs [#1346](https://github.com/alphaonedev/ai-memory-mcp/pull/1346)–[#1351](https://github.com/alphaonedev/ai-memory-mcp/pull/1351)) that fixed the SEC / ARCH / QUAL / TEST / PERF lane findings from the 6-agent full-spectrum review.
