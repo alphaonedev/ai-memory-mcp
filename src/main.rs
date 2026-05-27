@@ -1,7 +1,13 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
-#![recursion_limit = "256"]
+// v0.7.0 ARCH-12 (med/low review batch) — match the lib crate's
+// `recursion_limit = "512"` so macro-heavy code (clap derive, schemars
+// derive, etc.) that lands in `main.rs` does not surprise-hit a tighter
+// cap than the same code compiled through the lib target. The 256 default
+// historically sufficed when `main.rs` was a near-empty shim; keeping the
+// two compile units in lockstep prevents drift surprises.
+#![recursion_limit = "512"]
 
 // W6 reduced `main.rs` to a thin shim: every CLI subcommand and the HTTP
 // daemon body now live in `ai_memory::daemon_runtime`. The bin keeps its
