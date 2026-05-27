@@ -2533,27 +2533,85 @@ pub struct AppConfig {
     /// Path to the `SQLite` database file
     pub db: Option<String>,
     /// Ollama base URL for LLM generation (default: <http://localhost:11434>)
+    ///
+    /// DOC-6 (FX-C4-batch2, 2026-05-26): legacy flat field, slated
+    /// for removal in v0.8.0. Use the sectioned `[llm].base_url` /
+    /// `[embeddings].url` shape from #1146 instead. Run
+    /// `ai-memory config migrate` to rewrite legacy configs.
+    #[deprecated(
+        since = "0.7.0",
+        note = "use the sectioned `[llm].base_url` / `[embeddings].url` (#1146); slated for removal in v0.8.0"
+    )]
     pub ollama_url: Option<String>,
     /// Separate URL for embedding model (defaults to `ollama_url` if unset)
+    ///
+    /// DOC-6: legacy; use `[embeddings].url`.
+    #[deprecated(
+        since = "0.7.0",
+        note = "use `[embeddings].url` (#1146); slated for removal in v0.8.0"
+    )]
     pub embed_url: Option<String>,
     /// Embedding model override: `mini_lm_l6_v2` or `nomic_embed_v15`
+    ///
+    /// DOC-6: legacy; use `[embeddings].model`.
+    #[deprecated(
+        since = "0.7.0",
+        note = "use `[embeddings].model` (#1146); slated for removal in v0.8.0"
+    )]
     pub embedding_model: Option<String>,
     /// LLM model override (Ollama tag, e.g. "gemma4:e2b")
+    ///
+    /// DOC-6: legacy; use `[llm].model`.
+    #[deprecated(
+        since = "0.7.0",
+        note = "use `[llm].model` (#1146); slated for removal in v0.8.0"
+    )]
     pub llm_model: Option<String>,
     /// Dedicated model for auto_tag (and other short-structured LLM calls).
     /// Defaults to `gemma3:4b` (fast, deterministic, ~0.7s p50 vs 15s for
     /// thinking-mode Gemma 4). Falls back to `llm_model` if unset.
     /// See L15 patch (2026-05-11) for rationale.
+    ///
+    /// DOC-6: legacy; use `[llm.auto_tag].model`.
+    #[deprecated(
+        since = "0.7.0",
+        note = "use `[llm.auto_tag].model` (#1146); slated for removal in v0.8.0"
+    )]
     pub auto_tag_model: Option<String>,
     /// Enable cross-encoder reranking (true/false)
+    ///
+    /// DOC-6: legacy; use `[reranker].enabled`.
+    #[deprecated(
+        since = "0.7.0",
+        note = "use `[reranker].enabled` (#1146); slated for removal in v0.8.0"
+    )]
     pub cross_encoder: Option<bool>,
     /// Default namespace for new memories
+    ///
+    /// DOC-6: legacy; use `[storage].default_namespace`.
+    #[deprecated(
+        since = "0.7.0",
+        note = "use `[storage].default_namespace` (#1146); slated for removal in v0.8.0"
+    )]
     pub default_namespace: Option<String>,
     /// Maximum memory budget in MB (used for auto tier selection)
+    ///
+    /// DOC-6: legacy; the auto-tier path now resolves via the
+    /// sectioned `[storage]` block.
+    #[deprecated(
+        since = "0.7.0",
+        note = "auto-tier resolution now resolves via the sectioned [storage] block (#1146); slated for removal in v0.8.0"
+    )]
     pub max_memory_mb: Option<usize>,
     /// Per-tier TTL overrides
     pub ttl: Option<TtlConfig>,
     /// Archive memories before GC deletion (default: true)
+    ///
+    /// DOC-6: legacy; use `[storage].archive_on_gc`.
+    #[deprecated(
+        since = "0.7.0",
+        note = "use `[storage].archive_on_gc` (#1146); slated for removal in v0.8.0"
+    )]
     pub archive_on_gc: Option<bool>,
     /// Optional API key for HTTP API authentication.
     ///
@@ -2565,6 +2623,13 @@ pub struct AppConfig {
     #[serde(default, skip_serializing)]
     pub api_key: Option<String>,
     /// Maximum archive age in days for automatic purge during GC (default: disabled)
+    ///
+    /// DOC-6: legacy; the archive purge knob resolves via the
+    /// sectioned `[storage]` block at v0.7.x.
+    #[deprecated(
+        since = "0.7.0",
+        note = "archive purge resolution moves under the sectioned [storage] block (#1146); slated for removal in v0.8.0"
+    )]
     pub archive_max_days: Option<i64>,
     /// Identity-resolution overrides (Task 1.2 follow-up #198).
     pub identity: Option<IdentityConfig>,
@@ -5046,6 +5111,16 @@ impl AppConfig {
     /// The WARN is gated by [`std::sync::Once`] so re-loading the
     /// config in the same process (e.g. tests that call
     /// [`AppConfig::load_from`] in a loop) does not spam stderr.
+    ///
+    /// DOC-6 (FX-C4-batch2, 2026-05-26): the v2 sectioned schema
+    /// resolution path intentionally reads the legacy fields to
+    /// emit the warn — the `#[allow(deprecated)]` is scoped here
+    /// so the WARN site (the only thing that legitimately TOUCHES
+    /// the legacy fields post-#1146) doesn't cascade pedantic
+    /// errors. External consumers writing `let cfg: AppConfig =
+    /// ...; cfg.llm_model` still get the compile-time deprecation
+    /// warning.
+    #[allow(deprecated)]
     fn warn_legacy_schema_drift(&self, path: &Path) {
         use std::sync::Once;
         static WARN_ONCE: Once = Once::new();
@@ -5313,6 +5388,10 @@ impl AppConfig {
     }
 
     /// Resolve Ollama URL for LLM generation (config or default).
+    ///
+    /// DOC-6: legacy resolver — kept for v0.7.x backward compat.
+    /// New callers should use the sectioned `[llm]` resolver.
+    #[allow(deprecated)]
     pub fn effective_ollama_url(&self) -> &str {
         self.ollama_url
             .as_deref()
@@ -5331,6 +5410,9 @@ impl AppConfig {
     }
 
     /// Whether to archive memories before GC deletion (default: true).
+    ///
+    /// DOC-6: legacy resolver — kept for v0.7.x backward compat.
+    #[allow(deprecated)]
     pub fn effective_archive_on_gc(&self) -> bool {
         self.archive_on_gc.unwrap_or(true)
     }
@@ -5435,6 +5517,9 @@ impl AppConfig {
     }
 
     /// Resolve URL for embedding model (falls back to `ollama_url`).
+    ///
+    /// DOC-6: legacy resolver — kept for v0.7.x backward compat.
+    #[allow(deprecated)]
     pub fn effective_embed_url(&self) -> &str {
         self.embed_url
             .as_deref()
@@ -5464,7 +5549,15 @@ impl AppConfig {
     /// overrides (pass `None` for `ai-memory mcp` / `ai-memory serve`
     /// which currently expose no CLI override; the CLI plumbing lands
     /// in a follow-up commit).
+    ///
+    /// DOC-6: this resolver intentionally reads the legacy flat
+    /// fields as the lowest-precedence fallback layer (per the
+    /// sectioned/v2 contract), so the `#[allow(deprecated)]`
+    /// attribute is necessary here. External callers should pass
+    /// CLI / env / `[llm]` section values and let this resolver
+    /// reach for the legacy fields only when those are unset.
     #[must_use]
+    #[allow(deprecated)]
     pub fn resolve_llm(
         &self,
         cli_backend: Option<&str>,
@@ -5556,7 +5649,11 @@ impl AppConfig {
     /// output sibling. Fields fall back to [`Self::resolve_llm`] field-
     /// by-field; commonly only `model` is overridden (defaults to
     /// `gemma3:4b` per the L15 fast-structured-output policy).
+    ///
+    /// DOC-6: reads the legacy `auto_tag_model` field as the
+    /// lowest-precedence fallback layer (`#[allow(deprecated)]`).
     #[must_use]
+    #[allow(deprecated)]
     pub fn resolve_llm_auto_tag(&self) -> ResolvedLlm {
         let parent = self.resolve_llm(None, None, None);
         let sub = self.llm.as_ref().and_then(|l| l.auto_tag.as_ref());
@@ -5622,7 +5719,11 @@ impl AppConfig {
     }
 
     /// v0.7.x (#1146) — resolve the canonical embedder configuration.
+    ///
+    /// DOC-6: reads the legacy `embed_url`/`embedding_model`/
+    /// `ollama_url` fields as the lowest-precedence fallback layer.
     #[must_use]
+    #[allow(deprecated)]
     pub fn resolve_embeddings(&self) -> ResolvedEmbeddings {
         let cfg = self.embeddings.as_ref();
 
@@ -5689,7 +5790,11 @@ impl AppConfig {
     /// v0.7.x (#1146) — resolve the canonical reranker configuration.
     /// Folds the legacy `cross_encoder: Option<bool>` flag into the
     /// `enabled` field; `model` defaults to `ms-marco-MiniLM-L-6-v2`.
+    ///
+    /// DOC-6: reads the legacy `cross_encoder` field as the
+    /// lowest-precedence fallback layer.
     #[must_use]
+    #[allow(deprecated)]
     pub fn resolve_reranker(&self) -> ResolvedReranker {
         let cfg = self.reranker.as_ref();
 
@@ -5744,7 +5849,12 @@ impl AppConfig {
     }
 
     /// v0.7.x (#1146) — resolve the canonical storage configuration.
+    ///
+    /// DOC-6: reads the legacy `default_namespace`/`archive_on_gc`/
+    /// `archive_max_days`/`max_memory_mb` fields as the
+    /// lowest-precedence fallback layer.
     #[must_use]
+    #[allow(deprecated)]
     pub fn resolve_storage(&self) -> ResolvedStorage {
         let cfg = self.storage.as_ref();
 
@@ -5926,6 +6036,7 @@ impl AppConfig {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(deprecated)] // DOC-6: tests intentionally exercise legacy AppConfig flat fields
 mod tests {
     use super::*;
 
