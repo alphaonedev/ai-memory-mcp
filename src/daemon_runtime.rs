@@ -6408,6 +6408,10 @@ decision = "allow"
     async fn test_build_llm_client_returns_none_for_keyword_tier() {
         // FeatureTier::Keyword has no llm_model, so the early-return
         // path fires without spawning any blocking work.
+        // FX-F1: hold the env-guard so concurrent tests can't flip
+        // AI_MEMORY_LLM_BACKEND under us mid-resolve.
+        let _guard = fx_f1_lock_env();
+        fx_f1_clear_llm_env();
         let cfg = AppConfig::default();
         let res = build_llm_client(FeatureTier::Keyword, &cfg).await;
         assert!(res.is_none(), "keyword tier must not build an LLM client");
@@ -6417,6 +6421,8 @@ decision = "allow"
     async fn test_build_llm_client_returns_none_when_ollama_unreachable() {
         // Smart tier requires LLM, but pointing at an unreachable URL
         // exercises the constructor-error path (final Err arm).
+        let _guard = fx_f1_lock_env();
+        fx_f1_clear_llm_env();
         let mut cfg = AppConfig::default();
         cfg.ollama_url = Some("http://127.0.0.1:1".to_string());
         let res = build_llm_client(FeatureTier::Smart, &cfg).await;
@@ -6604,5 +6610,295 @@ decision = "allow"
         let dim = resolve_configured_embedding_dim(&cfg, &tier_config);
         // Autonomous tier preset (NomicEmbedV15) → 768.
         assert_eq!(dim, Some(768));
+    }
+
+    // ===========================================================================
+    // FX-F1 (2026-05-27) — coverage uplift for the FX-D1 `build_llm_client`
+    // overhaul. The pre-FX-F1 surface had two thin async tests
+    // (Keyword early-return + Smart unreachable URL). FX-F1 adds the
+    // missing branches: explicit operator-intent (Legacy / Config /
+    // Env source via `ollama_url` or `llm.backend`), the Semantic
+    // early-return path, every LLM backend's no-key Err arm, and an
+    // Ollama happy-path through `build_from_resolved_async` against a
+    // wiremock-backed `/api/tags` endpoint. Target floor for the file:
+    // 85% (was 83.83% pre-FX-F1 per FX-F1 dispatch — the +1.17pp gap
+    // closes by exercising the async ladder end-to-end).
+    //
+    // The env-mutating tests below serialise on a module-local mutex
+    // (mirrors `src/llm.rs::tests::ENV_GUARD_1143`) so parallel test
+    // workers can't race each other on `AI_MEMORY_LLM_*` reads —
+    // pre-mutex the wiremock happy-path collided with the env-source
+    // negative test's `AI_MEMORY_LLM_BASE_URL=http://127.0.0.1:1` write.
+    static FX_F1_ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn fx_f1_lock_env() -> std::sync::MutexGuard<'static, ()> {
+        FX_F1_ENV_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// SAFETY: env-var mutation is unsynchronised across threads at
+    /// the OS level. `fx_f1_lock_env` serialises mutation across this
+    /// test region so the unsafe is sound for the duration of each
+    /// test that holds the guard. The cleared keys match every
+    /// resolver ingress that `build_llm_client` and
+    /// `build_from_resolved_async` consult.
+    fn fx_f1_clear_llm_env() {
+        for k in [
+            "AI_MEMORY_LLM_BACKEND",
+            "AI_MEMORY_LLM_MODEL",
+            "AI_MEMORY_LLM_BASE_URL",
+            "AI_MEMORY_LLM_API_KEY",
+            "OLLAMA_BASE_URL",
+            "XAI_API_KEY",
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "MOONSHOT_API_KEY",
+            "KIMI_API_KEY",
+            "DASHSCOPE_API_KEY",
+            "QWEN_API_KEY",
+            "MISTRAL_API_KEY",
+            "GROQ_API_KEY",
+            "TOGETHER_API_KEY",
+            "CEREBRAS_API_KEY",
+            "OPENROUTER_API_KEY",
+            "FIREWORKS_API_KEY",
+        ] {
+            // SAFETY: guarded by fx_f1_lock_env at call sites.
+            unsafe { std::env::remove_var(k) };
+        }
+    }
+    // ===========================================================================
+
+    /// FX-F1 — Semantic tier has `llm_model = None` (per tier preset),
+    /// so when `source = CompiledDefault` the early-return arm fires.
+    /// Pins the second of the two "tier has no llm_model + no operator
+    /// intent" arms; the Keyword variant is pinned above.
+    #[tokio::test]
+    async fn test_build_llm_client_semantic_tier_compiled_default_returns_none() {
+        let _guard = fx_f1_lock_env();
+        fx_f1_clear_llm_env();
+        let cfg = AppConfig::default();
+        let res = build_llm_client(FeatureTier::Semantic, &cfg).await;
+        assert!(
+            res.is_none(),
+            "semantic tier with no operator config must short-circuit to None"
+        );
+    }
+
+    /// FX-F1 — Autonomous tier with no operator config and unreachable
+    /// Ollama URL → resolver winds up with `Legacy` source (because
+    /// `ollama_url` is set), bypasses the early-return arm, and falls
+    /// through to the async constructor which returns Err (treated as
+    /// None). Exercises the `Err(_)` match arm of `build_llm_client`.
+    #[tokio::test]
+    async fn test_build_llm_client_autonomous_tier_unreachable_ollama_returns_none() {
+        let _guard = fx_f1_lock_env();
+        fx_f1_clear_llm_env();
+        let mut cfg = AppConfig::default();
+        cfg.ollama_url = Some("http://127.0.0.1:1".to_string());
+        let res = build_llm_client(FeatureTier::Autonomous, &cfg).await;
+        // Unreachable endpoint → Err from new_with_url_async → None.
+        assert!(
+            res.is_none(),
+            "autonomous tier against unreachable ollama must surface as None"
+        );
+    }
+
+    /// FX-F1 — Smart tier with an `llm.backend = "xai"` config section
+    /// (no API key available) drives the resolver to `Config` source
+    /// → bypasses the early-return → `build_from_resolved_async`
+    /// returns the missing-API-key Err → mapped to None. Pins the
+    /// non-Ollama-no-key path in build_llm_client.
+    #[tokio::test]
+    async fn test_build_llm_client_xai_backend_without_api_key_returns_none() {
+        let _guard = fx_f1_lock_env();
+        fx_f1_clear_llm_env();
+        use crate::config::LlmSection;
+        let mut cfg = AppConfig::default();
+        cfg.llm = Some(LlmSection {
+            backend: Some("xai".to_string()),
+            model: Some("grok-4.3".to_string()),
+            api_key_env: Some("AI_MEMORY_FX_F1_NEVER_SET_XAI_KEY".to_string()),
+            ..LlmSection::default()
+        });
+        let res = build_llm_client(FeatureTier::Smart, &cfg).await;
+        assert!(
+            res.is_none(),
+            "xai backend without API key MUST map to None (Err path)"
+        );
+    }
+
+    /// FX-F1 — Happy-path: Smart tier with `ollama_url` pointed at a
+    /// wiremock-backed `/api/tags` endpoint. Resolver lands on the
+    /// `Legacy` source (operator set `ollama_url`), bypasses the
+    /// early-return, calls `build_from_resolved_async` which calls
+    /// `new_with_url_async` against the mock — the health probe
+    /// returns 200, so the constructor returns Ok(Some). The
+    /// `Ok(Some(_))` arm of build_llm_client is exercised.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_build_llm_client_ollama_happy_path_against_wiremock() {
+        let _guard = fx_f1_lock_env();
+        fx_f1_clear_llm_env();
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"models":[]}"#))
+            .mount(&server)
+            .await;
+        let mut cfg = AppConfig::default();
+        cfg.ollama_url = Some(server.uri());
+        cfg.llm_model = Some("test-model".to_string());
+        let res = build_llm_client(FeatureTier::Smart, &cfg).await;
+        assert!(
+            res.is_some(),
+            "wiremock-backed /api/tags must drive build_llm_client to Some"
+        );
+    }
+
+    /// FX-F1 — `build_from_resolved_async` Ollama arm directly. Mirrors
+    /// the sync test in `llm::tests::*` but exercises the FX-D1 async
+    /// sibling against a wiremock-backed endpoint. Pins the happy path.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_build_from_resolved_async_ollama_happy_path() {
+        let _guard = fx_f1_lock_env();
+        fx_f1_clear_llm_env();
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"models":[]}"#))
+            .mount(&server)
+            .await;
+        let mut cfg = AppConfig::default();
+        cfg.ollama_url = Some(server.uri());
+        cfg.llm_model = Some("test-model".to_string());
+        let resolved = cfg.resolve_llm(None, None, None);
+        let client = crate::llm::OllamaClient::build_from_resolved_async(&resolved)
+            .await
+            .expect("build_from_resolved_async must succeed against healthy /api/tags");
+        assert!(client.is_some());
+        assert!(client.unwrap().is_ollama_native());
+    }
+
+    /// FX-F1 — `build_from_resolved_async` Ollama arm against an
+    /// unreachable URL (TCP RST). Pins the Err return path so the
+    /// caller's `Ok(Some)/Ok(None)/Err` match still routes the failure
+    /// without a panic.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_build_from_resolved_async_ollama_unreachable_errs() {
+        let _guard = fx_f1_lock_env();
+        fx_f1_clear_llm_env();
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let mut cfg = AppConfig::default();
+        cfg.ollama_url = Some(format!("http://127.0.0.1:{port}"));
+        cfg.llm_model = Some("test-model".to_string());
+        let resolved = cfg.resolve_llm(None, None, None);
+        let res = crate::llm::OllamaClient::build_from_resolved_async(&resolved).await;
+        assert!(
+            res.is_err(),
+            "unreachable Ollama endpoint MUST surface as Err"
+        );
+    }
+
+    /// FX-F1 — `build_from_resolved_async` non-Ollama branch where the
+    /// resolver could not produce an API key. Pins the missing-key Err
+    /// arm with the canonical error-message pattern.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_build_from_resolved_async_non_ollama_missing_key_errs() {
+        let _guard = fx_f1_lock_env();
+        fx_f1_clear_llm_env();
+        use crate::config::LlmSection;
+        let mut cfg = AppConfig::default();
+        cfg.llm = Some(LlmSection {
+            backend: Some("anthropic".to_string()),
+            model: Some("claude-opus-4.7".to_string()),
+            api_key_env: Some("AI_MEMORY_FX_F1_NEVER_SET_ANTHROPIC_KEY".to_string()),
+            ..LlmSection::default()
+        });
+        let resolved = cfg.resolve_llm(None, None, None);
+        let res = crate::llm::OllamaClient::build_from_resolved_async(&resolved).await;
+        let err = match res {
+            Err(e) => e,
+            Ok(_) => panic!("anthropic backend without API key MUST Err"),
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("requires an API key"),
+            "missing-key error must cite the API key requirement; got: {msg}"
+        );
+    }
+
+    /// FX-F1 — `build_from_resolved_async` non-Ollama branch with an
+    /// API key resolves to `Ok(Some)` because
+    /// `new_openai_compatible` does no I/O at construct time. Pins
+    /// the happy path on the OpenAI-compatible arm.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_build_from_resolved_async_non_ollama_with_key_returns_some() {
+        let _guard = fx_f1_lock_env();
+        fx_f1_clear_llm_env();
+        use crate::config::LlmSection;
+        // Use a private env var that no other test touches; set it just
+        // long enough for the resolver to pick it up, then unset.
+        let env_name = "AI_MEMORY_FX_F1_OPENAI_KEY";
+        // SAFETY: env mutation guarded by fx_f1_lock_env; restored below.
+        unsafe { std::env::set_var(env_name, "sk-test-fx-f1-fake-key") };
+        let mut cfg = AppConfig::default();
+        cfg.llm = Some(LlmSection {
+            backend: Some("openai".to_string()),
+            model: Some("gpt-5".to_string()),
+            api_key_env: Some(env_name.to_string()),
+            ..LlmSection::default()
+        });
+        let resolved = cfg.resolve_llm(None, None, None);
+        let res = crate::llm::OllamaClient::build_from_resolved_async(&resolved).await;
+        unsafe { std::env::remove_var(env_name) };
+        let client = res.expect("openai backend with key MUST return Ok");
+        assert!(
+            client.is_some(),
+            "build_from_resolved_async with key MUST produce Some(client)"
+        );
+        assert!(
+            !client.unwrap().is_ollama_native(),
+            "openai backend must NOT report ollama-native"
+        );
+    }
+
+    /// FX-F1 — exercises the `Env` source bypass of the
+    /// `build_llm_client` early-return arm: operator sets
+    /// `AI_MEMORY_LLM_BACKEND=ollama` + `AI_MEMORY_LLM_BASE_URL`
+    /// pointing at an unreachable endpoint. Resolver source = Env →
+    /// no early-return → constructor errors → mapped to None
+    /// (Err→None arm in build_llm_client).
+    #[tokio::test]
+    async fn test_build_llm_client_env_backend_unreachable_returns_none() {
+        let _guard = fx_f1_lock_env();
+        fx_f1_clear_llm_env();
+        // SAFETY: env mutation guarded by fx_f1_lock_env; cleared below.
+        unsafe {
+            std::env::set_var("AI_MEMORY_LLM_BACKEND", "ollama");
+            std::env::set_var("AI_MEMORY_LLM_BASE_URL", "http://127.0.0.1:1");
+        }
+        let cfg = AppConfig::default();
+        let res = build_llm_client(FeatureTier::Keyword, &cfg).await;
+        unsafe {
+            std::env::remove_var("AI_MEMORY_LLM_BACKEND");
+            std::env::remove_var("AI_MEMORY_LLM_BASE_URL");
+        }
+        // Env source bypasses the early return → constructor errors on
+        // unreachable endpoint → mapped to None.
+        assert!(
+            res.is_none(),
+            "env-source backend against unreachable URL MUST map to None"
+        );
     }
 }
