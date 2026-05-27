@@ -11,7 +11,7 @@
 //! the same workload should keep search p95 under 35 ms. The bench
 //! seeds a fixed-size index (5k vectors by default — large enough to
 //! make the rebuild non-trivial in release mode, small enough to keep
-//! the run cycle under a minute), spawns a rebuild_async, then drives
+//! the run cycle under a minute), spawns a `rebuild_async`, then drives
 //! N=200 searches and reports the p50/p95/p99 distribution.
 //!
 //! `harness = false` in Cargo.toml — this is a hand-rolled bench (no
@@ -140,8 +140,7 @@ fn main() {
 
     if p95 > P95_BUDGET {
         eprintln!(
-            "FAIL: search p95 {:?} exceeds #968 budget {:?} — rebuild is blocking readers",
-            p95, P95_BUDGET,
+            "FAIL: search p95 {p95:?} exceeds #968 budget {P95_BUDGET:?} — rebuild is blocking readers",
         );
         std::process::exit(1);
     }
