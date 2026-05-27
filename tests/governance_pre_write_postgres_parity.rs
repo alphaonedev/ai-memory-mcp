@@ -301,6 +301,256 @@ async fn postgres_store_with_embedding_fires_hook_and_refuses() {
     set_verdict(HookVerdict::Allow);
 }
 
+/// FX-C5 pin: `PostgresStore::update_with_archive_on_supersede`
+/// consults the hook BEFORE the archive step destroys the OLD live
+/// row. Pre-FX-C5 the raw INSERT at the tail of the supersede tx
+/// bypassed the hook entirely; multi-tenant supersession workflow
+/// could silently bypass governance.
+#[tokio::test]
+#[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — Track C blocker per issue #79"]
+async fn postgres_supersede_fires_hook_and_refuses() {
+    use ai_memory::models::EditSource;
+    use ai_memory::store::UpdatePatch;
+
+    let _g = test_serial().lock().await;
+    let Some(pg) = live_pg().await else {
+        return;
+    };
+    ensure_hook_installed();
+    set_verdict(HookVerdict::Allow);
+    let _ = reset_fire_count();
+
+    let ctx = CallerContext::for_admin("fxc5-pg-supersede");
+    let seed = sample_memory("fxc5-pg-supersede-seed", "fxc5/pg-supersede");
+    pg.store(&ctx, &seed).await.expect("seed store");
+    let _ = reset_fire_count();
+
+    // Now flip to refuse and probe supersede.
+    set_verdict(HookVerdict::Refuse("FX-C5 pg supersede deny".to_string()));
+    let patch = UpdatePatch {
+        title: Some("fxc5-pg-supersede-new".to_string()),
+        content: Some("patched body".to_string()),
+        ..Default::default()
+    };
+    let err = pg
+        .update_with_archive_on_supersede(&seed.id, patch, None, EditSource::Llm)
+        .await
+        .expect_err("Refuse verdict MUST short-circuit supersede");
+
+    match &err {
+        StoreError::PermissionDenied { reason, .. } => {
+            assert!(
+                reason.contains("FX-C5 pg supersede deny"),
+                "operator-authored reason must propagate; got {reason:?}"
+            );
+        }
+        other => panic!("expected PermissionDenied; got {other:?}"),
+    }
+
+    let fires = fire_count().load(Ordering::SeqCst);
+    assert!(fires >= 1, "hook MUST fire on supersede; observed {fires}");
+
+    // FX-C5 atomicity: the OLD row MUST still be live (the hook fires
+    // BEFORE the archive step, so the supersede tx never commits on
+    // refusal — sqlx implicitly rolls back on early-return).
+    let still_live = MemoryStore::get(&pg, &ctx, &seed.id)
+        .await
+        .expect("OLD row must still be live");
+    assert_eq!(still_live.title, seed.title);
+
+    // Cleanup.
+    set_verdict(HookVerdict::Allow);
+    let _ = MemoryStore::delete(&pg, &ctx, &seed.id).await;
+}
+
+/// FX-C5 pin: `PostgresStore::consolidate` consults the hook before
+/// the raw INSERT lands.
+#[tokio::test]
+#[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — Track C blocker per issue #79"]
+async fn postgres_consolidate_fires_hook_and_refuses() {
+    let _g = test_serial().lock().await;
+    let Some(pg) = live_pg().await else {
+        return;
+    };
+    ensure_hook_installed();
+    set_verdict(HookVerdict::Allow);
+    let _ = reset_fire_count();
+
+    let ctx = CallerContext::for_admin("fxc5-pg-consolidate");
+    let a = sample_memory("fxc5-pg-cons-a", "fxc5/pg-cons-refuse");
+    let b = sample_memory("fxc5-pg-cons-b", "fxc5/pg-cons-refuse");
+    pg.store(&ctx, &a).await.expect("seed a");
+    pg.store(&ctx, &b).await.expect("seed b");
+
+    set_verdict(HookVerdict::Refuse("FX-C5 pg consolidate deny".to_string()));
+    let _ = reset_fire_count();
+
+    let err = MemoryStore::consolidate(
+        &pg,
+        &ctx,
+        &[a.id.clone(), b.id.clone()],
+        "fxc5-pg-cons-new",
+        "merged summary",
+        "fxc5/pg-cons-refuse",
+        &ai_memory::models::Tier::Long,
+        "test",
+        "ai:fxc5-pg-consolidator",
+    )
+    .await
+    .expect_err("Refuse verdict MUST short-circuit consolidate");
+
+    match &err {
+        StoreError::PermissionDenied { reason, .. } => {
+            assert!(
+                reason.contains("FX-C5 pg consolidate deny"),
+                "operator-authored reason must propagate; got {reason:?}"
+            );
+        }
+        other => panic!("expected PermissionDenied; got {other:?}"),
+    }
+
+    let fires = fire_count().load(Ordering::SeqCst);
+    assert!(
+        fires >= 1,
+        "hook MUST fire on consolidate; observed {fires}"
+    );
+
+    // Source rows preserved on refusal.
+    let still_a = MemoryStore::get(&pg, &ctx, &a.id)
+        .await
+        .expect("a preserved");
+    let still_b = MemoryStore::get(&pg, &ctx, &b.id)
+        .await
+        .expect("b preserved");
+    assert_eq!(still_a.title, a.title);
+    assert_eq!(still_b.title, b.title);
+
+    set_verdict(HookVerdict::Allow);
+    let _ = MemoryStore::delete(&pg, &ctx, &a.id).await;
+    let _ = MemoryStore::delete(&pg, &ctx, &b.id).await;
+}
+
+/// FX-C5 pin: `PostgresStore::archive_restore` consults the hook on
+/// the restore path. Without this, a restored row could re-enter a
+/// namespace that the operator's signed rules refuse on direct write.
+#[tokio::test]
+#[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — Track C blocker per issue #79"]
+async fn postgres_archive_restore_fires_hook_and_refuses() {
+    let _g = test_serial().lock().await;
+    let Some(pg) = live_pg().await else {
+        return;
+    };
+    ensure_hook_installed();
+    set_verdict(HookVerdict::Allow);
+    let _ = reset_fire_count();
+
+    let ctx = CallerContext::for_admin("fxc5-pg-archive-restore");
+    let seed = sample_memory("fxc5-pg-archive-restore", "fxc5/pg-restore-refuse");
+    pg.store(&ctx, &seed).await.expect("seed");
+
+    // Archive it explicitly.
+    let archived =
+        MemoryStore::archive_by_ids(&pg, &ctx, std::slice::from_ref(&seed.id), Some("test"))
+            .await
+            .expect("archive");
+    assert_eq!(archived, 1);
+
+    set_verdict(HookVerdict::Refuse("FX-C5 pg restore deny".to_string()));
+    let _ = reset_fire_count();
+
+    let err = MemoryStore::archive_restore(&pg, &ctx, &seed.id)
+        .await
+        .expect_err("Refuse verdict MUST short-circuit restore");
+
+    match &err {
+        StoreError::PermissionDenied { reason, .. } => {
+            assert!(
+                reason.contains("FX-C5 pg restore deny"),
+                "operator-authored reason must propagate; got {reason:?}"
+            );
+        }
+        other => panic!("expected PermissionDenied; got {other:?}"),
+    }
+
+    let fires = fire_count().load(Ordering::SeqCst);
+    assert!(
+        fires >= 1,
+        "hook MUST fire on archive_restore; observed {fires}"
+    );
+
+    // FX-C5 atomicity: archived row remains, no live row.
+    match MemoryStore::get(&pg, &ctx, &seed.id).await {
+        Err(StoreError::NotFound { .. }) => {}
+        Ok(_) => panic!("FX-C5 BYPASS: archive_restore wrote a row despite refusal"),
+        Err(other) => panic!("unexpected error: {other:?}"),
+    }
+
+    // Reset + drain the archive so the test process leaves PG clean.
+    set_verdict(HookVerdict::Allow);
+    let _ = MemoryStore::archive_restore(&pg, &ctx, &seed.id).await;
+    let _ = MemoryStore::delete(&pg, &ctx, &seed.id).await;
+}
+
+/// FX-C5 pin: `PostgresStore::reflect_with_hooks` consults the hook
+/// before the reflect INSERT lands. Refusal surfaces as
+/// `ReflectError::HookVeto` carrying the operator-authored reason.
+#[tokio::test]
+#[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — Track C blocker per issue #79"]
+async fn postgres_reflect_fires_hook_and_refuses() {
+    use ai_memory::db::{ReflectError, ReflectHooks, ReflectInput};
+
+    let _g = test_serial().lock().await;
+    let Some(pg) = live_pg().await else {
+        return;
+    };
+    ensure_hook_installed();
+    set_verdict(HookVerdict::Allow);
+    let _ = reset_fire_count();
+
+    let ctx = CallerContext::for_admin("fxc5-pg-reflect");
+    let src = sample_memory("fxc5-pg-reflect-src", "fxc5/pg-reflect-refuse");
+    pg.store(&ctx, &src).await.expect("seed src");
+
+    set_verdict(HookVerdict::Refuse("FX-C5 pg reflect deny".to_string()));
+    let _ = reset_fire_count();
+
+    let input = ReflectInput {
+        source_ids: vec![src.id.clone()],
+        title: "fxc5-pg-reflection".to_string(),
+        content: "reflection body".to_string(),
+        tier: ai_memory::models::Tier::Long,
+        namespace: Some("fxc5/pg-reflect-refuse".to_string()),
+        tags: vec![],
+        priority: 5,
+        confidence: 1.0,
+        source: "test".to_string(),
+        agent_id: "ai:fxc5-pg-reflect".to_string(),
+        metadata: serde_json::json!({}),
+    };
+
+    let err = pg
+        .reflect_with_hooks(&ctx, &input, &ReflectHooks::empty())
+        .await
+        .expect_err("Refuse verdict MUST short-circuit reflect");
+
+    match &err {
+        ReflectError::HookVeto { reason, code } => {
+            assert!(
+                reason.contains("FX-C5 pg reflect deny"),
+                "operator-authored reason must propagate; got {reason:?}"
+            );
+            assert_eq!(*code, 403, "HookVeto code MUST be 403 (GOVERNANCE_REFUSED)");
+        }
+        other => panic!("expected ReflectError::HookVeto; got {other:?}"),
+    }
+
+    let fires = fire_count().load(Ordering::SeqCst);
+    assert!(fires >= 1, "hook MUST fire on reflect; observed {fires}");
+
+    set_verdict(HookVerdict::Allow);
+    let _ = MemoryStore::delete(&pg, &ctx, &src.id).await;
+}
+
 /// ARCH-1 pin: `PostgresStore::apply_remote_memory` (federation
 /// receive path) consults the hook. Federation-pushed memories must
 /// clear the same pre-write hook as locally-authored writes;
