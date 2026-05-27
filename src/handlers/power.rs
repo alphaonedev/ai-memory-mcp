@@ -722,91 +722,53 @@ pub async fn check_duplicate(
     }
     let threshold = body.threshold.unwrap_or(db::DUPLICATE_THRESHOLD_DEFAULT);
 
-    // v0.7.0 Wave-3 Continuation 4 (Bucket E / S48) — postgres-backed
-    // daemons now perform an exact-content sweep through the SAL
-    // `list` projection. When an embedder is loaded the call also
-    // computes the query embedding and hands it to
-    // `recall_hybrid`; the highest-cosine match becomes the nearest
-    // candidate. Without an embedder the fallback walks the
-    // namespace via `list` and surfaces any row whose
-    // `(title, content)` tuple matches exactly (the same content-hash
-    // short-circuit `db::check_duplicate_with_text` uses on sqlite,
-    // before the embedding pass).
+    // v0.7.0 SAL-routing batch-4 (FX-C2) — postgres-backed daemons
+    // route through the canonical `MemoryStore::check_duplicate_with_text`
+    // trait method. Mirrors the SQLite `db::check_duplicate_with_text`
+    // shape byte-for-byte: SHA-256 exact-content short-circuit (returns
+    // `similarity=1.0` on byte-equal `format!("{title} {content}")`),
+    // then pgvector cosine distance for nearest-neighbor on near hits.
+    // Pre-fix branch was hand-rolled (`list` + client-side exact-match
+    // walk + `recall_hybrid` fallback); the trait method consolidates
+    // both phases into single SQL round-trips so the byte-shape stays
+    // identical across backends.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        // QC P1 fix (2026-05-20): use header-resolved caller so the
-        // SAL #910 visibility filter applies — duplicate-detection
-        // only sees memories the caller owns (or scope=shared/public).
-        // Pre-fix `for_agent("daemon")` mismatched every memory's
-        // metadata.agent_id and the candidate pool was zero.
-        let ctx = crate::handlers::parity::http_caller_ctx(&headers, None);
-        let filter = crate::store::Filter {
-            namespace: namespace.map(str::to_string),
-            limit: 1000,
-            ..Default::default()
+        let embedding_text = format!("{} {}", body.title, body.content);
+        // Best-effort: when the embedder is loaded, compute the query
+        // vector so phase 2 (cosine nearest) is available. Without it
+        // the trait method falls through to phase-1 hash-only.
+        let query_embedding: Vec<f32> = match app.embedder.as_ref().as_ref() {
+            Some(emb) => emb.embed(&embedding_text).unwrap_or_default(),
+            None => Vec::new(),
         };
-        let mut nearest: Option<(crate::models::Memory, f64)> = None;
-        let mut scanned = 0_u64;
-        // Exact-content sweep first — cheap, deterministic, no embed.
-        match app.store.list(&ctx, &filter).await {
-            Ok(rows) => {
-                for m in rows {
-                    scanned += 1;
-                    if m.content == body.content && m.title == body.title {
-                        nearest = Some((m, 1.0));
-                        break;
-                    }
-                }
-            }
-            Err(e) => return store_err_to_response(e),
-        }
-        // If exact match didn't surface, optionally try embedding-based
-        // hybrid recall with the title+content as the query.
-        if nearest.is_none()
-            && let Some(emb) = app.embedder.as_ref().as_ref()
+        return match app
+            .store
+            .check_duplicate_with_text(&query_embedding, &embedding_text, namespace, threshold)
+            .await
         {
-            let embedding_text = format!("{} {}", body.title, body.content);
-            if let Ok(qe) = emb.embed(&embedding_text) {
-                let recall_filter = crate::store::Filter {
-                    namespace: namespace.map(str::to_string),
-                    limit: 5,
-                    ..Default::default()
+            Ok(check) => {
+                let near_json = match check.nearest {
+                    Some(n) => json!({
+                        "id": n.id,
+                        "title": n.title,
+                        "namespace": n.namespace,
+                        "score": n.similarity,
+                    }),
+                    None => serde_json::Value::Null,
                 };
-                if let Ok(scored_pairs) = app
-                    .store
-                    .recall_hybrid(&ctx, &embedding_text, Some(&qe), &recall_filter)
-                    .await
-                {
-                    if let Some((m, s)) = scored_pairs.into_iter().next() {
-                        nearest = Some((m, s));
-                    }
-                }
-                drop(qe);
+                Json(json!({
+                    "is_duplicate": check.is_duplicate,
+                    "threshold": check.threshold,
+                    "nearest": near_json,
+                    "suggested_merge": check.is_duplicate,
+                    "candidates_scanned": check.candidates_scanned,
+                    "storage_backend": "postgres",
+                }))
+                .into_response()
             }
-        }
-        let (is_duplicate, near_json) = if let Some((m, score)) = nearest {
-            let is_dup = score >= f64::from(threshold);
-            (
-                is_dup,
-                json!({
-                    "id": m.id,
-                    "title": m.title,
-                    "namespace": m.namespace,
-                    "score": score,
-                }),
-            )
-        } else {
-            (false, serde_json::Value::Null)
+            Err(e) => store_err_to_response(e),
         };
-        return Json(json!({
-            "is_duplicate": is_duplicate,
-            "threshold": threshold,
-            "nearest": near_json,
-            "suggested_merge": is_duplicate,
-            "candidates_scanned": scanned,
-            "storage_backend": "postgres",
-        }))
-        .into_response();
     }
 
     // Embed before taking the DB lock — same rationale as create_memory
