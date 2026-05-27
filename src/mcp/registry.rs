@@ -541,6 +541,17 @@ impl RegisteredTool {
 /// Order matches the pre-D1.6 `tool_definitions()` macro order so
 /// callers that iterate the wire array see the same sequence they
 /// saw before the migration.
+///
+/// DOC-8 (med/low review batch) — counting discipline. A naive
+/// `grep -c 'RegisteredTool::of' src/mcp/registry.rs` over-counts
+/// because some tools (`offload::DerefTool`,
+/// `offload::OffloadTool`, sibling re-exports) appear in multiple
+/// register-call sites. The authoritative tool-count is the count
+/// of **unique `<crate::mcp::*>` paths** under the `RegisteredTool::of`
+/// invocations (73 at v0.7.0), pinned by
+/// [`crate::profile::Profile::full().expected_tool_count()`]. The raw
+/// `grep -c` count is structurally cosmetic; reach for the
+/// `Profile::*().expected_tool_count()` assertion when counting.
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn registered_tools() -> Vec<RegisteredTool> {

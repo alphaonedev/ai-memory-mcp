@@ -572,20 +572,19 @@ impl OllamaClient {
     /// `connect_timeout` so a dead endpoint fails in [`CONNECT_TIMEOUT`]
     /// instead of hanging on the kernel SYN retry budget. The per-request
     /// `timeout` is preserved at [`GENERATE_TIMEOUT`].
+    ///
+    /// PERF-12 (FX-C4-batch2, 2026-05-26): the synchronous
+    /// `/api/tags` health check this constructor previously performed
+    /// at construction adds 50-200 ms of boot lag for daemon `serve`
+    /// against a remote endpoint, and per-dispatch lag for tooling
+    /// that spawns `ai-memory mcp` fresh per request. The probe is
+    /// now performed via [`Self::new_with_url_no_health_check`]
+    /// PLUS the explicit `ensure_model`/`is_available` callable from
+    /// the daemon's [`ai-memory doctor`] reachability sweep. The
+    /// legacy `new_with_url` shape kept the health-check posture for
+    /// callers that depend on construction-time validation.
     pub fn new_with_url(base_url: &str, model: &str) -> Result<Self> {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(GENERATE_TIMEOUT)
-            .connect_timeout(CONNECT_TIMEOUT)
-            .build()
-            .context("Failed to build HTTP client")?;
-
-        let instance = Self {
-            provider: LlmProvider::Ollama,
-            base_url: base_url.trim_end_matches('/').to_string(),
-            model: model.to_string(),
-            client,
-            breaker: Mutex::new(BreakerState::new()),
-        };
+        let instance = Self::new_with_url_no_health_check(base_url, model)?;
 
         if !instance.is_available() {
             return Err(anyhow!(
@@ -596,6 +595,38 @@ impl OllamaClient {
         }
 
         Ok(instance)
+    }
+
+    /// PERF-12 (FX-C4-batch2, 2026-05-26) — construct an
+    /// `OllamaClient` WITHOUT the synchronous `/api/tags` health
+    /// check.
+    ///
+    /// Boot-fast variant for daemon paths that want to defer
+    /// reachability verification to first-use (or to the
+    /// `ai-memory doctor` reachability sweep). Saves the 50-200 ms
+    /// round-trip to a remote LLM endpoint on every `serve` boot
+    /// and on every `ai-memory mcp` dispatch. The circuit-breaker
+    /// at [`Self::generate`] still handles transient failures the
+    /// usual way, so a degraded LLM endpoint is contained at first
+    /// use rather than at construction.
+    ///
+    /// Use [`Self::new_with_url`] when caller-side construction-
+    /// time validation is required (e.g. CLI commands that fail
+    /// fast on bring-up).
+    pub fn new_with_url_no_health_check(base_url: &str, model: &str) -> Result<Self> {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(GENERATE_TIMEOUT)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .build()
+            .context("Failed to build HTTP client")?;
+
+        Ok(Self {
+            provider: LlmProvider::Ollama,
+            base_url: base_url.trim_end_matches('/').to_string(),
+            model: model.to_string(),
+            client,
+            breaker: Mutex::new(BreakerState::new()),
+        })
     }
 
     /// v0.7.0 F6 — observe the breaker's state without acquiring it for
@@ -2166,6 +2197,50 @@ mod wiremock_tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(models))
             .mount(server)
             .await;
+    }
+
+    // ---------------- PERF-12 lazy-health-check ----------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn perf_12_new_with_url_no_health_check_skips_probe() {
+        // PERF-12 (FX-C4-batch2, 2026-05-26): the boot-fast
+        // constructor must NOT call `/api/tags`. Point it at a
+        // reserved-but-closed port so any health probe at
+        // construction would fail; the constructor must succeed
+        // anyway. The circuit-breaker / `is_available` at first
+        // use still surfaces the unreachable endpoint.
+        //
+        // `reqwest::blocking::Client` cannot be created inside a
+        // tokio async context — the per-blocking-client runtime
+        // would shadow the outer one — so the whole construction
+        // path runs under `spawn_blocking`.
+        let url = tokio::task::spawn_blocking(|| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            format!("http://127.0.0.1:{port}")
+        })
+        .await
+        .unwrap();
+
+        let (constructed_ok, is_available_after) = tokio::task::spawn_blocking(move || {
+            // Boot-fast path: succeeds despite the unreachable
+            // endpoint because no probe is made at construction.
+            let client = OllamaClient::new_with_url_no_health_check(&url, "test-model")
+                .expect("PERF-12: new_with_url_no_health_check must not probe");
+            // The lazy health check still reports false against
+            // the unreachable port; first-use surfaces the gap.
+            let avail = client.is_available();
+            (true, avail)
+        })
+        .await
+        .unwrap();
+
+        assert!(constructed_ok);
+        assert!(
+            !is_available_after,
+            "PERF-12: lazy is_available() must return false for an unreachable endpoint",
+        );
     }
 
     // ---------------- is_available ----------------

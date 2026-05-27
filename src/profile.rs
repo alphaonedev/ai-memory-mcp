@@ -116,6 +116,17 @@ pub enum Family {
 /// v0.7.x (issue #1174 PR1 — pm-v3.1 MCP tool name sweep): the
 /// literal references the canonical const so this slice cannot drift
 /// from the dispatch table.
+///
+/// DOC-7 (med/low review batch) — semantic note: this is a sentinel
+/// list with `len == 1` at v0.7.0 (only `memory_capabilities`). The
+/// `&[…]` slice shape is intentionally extensible: future profile
+/// work may promote additional bootstrap-class tools (e.g.
+/// `memory_load_family`, `memory_smart_load`) into the always-on set,
+/// at which point [`Profile::core`] would need to subtract them from
+/// the per-family count to avoid double-counting. Today the family
+/// counts treat `memory_load_family` and `memory_smart_load` as core
+/// family members, NOT as always-on; promotion would require updating
+/// `Profile::expected_tool_count` arithmetic accordingly.
 pub const ALWAYS_ON_TOOLS: &[&str] = &[crate::mcp::registry::tool_names::MEMORY_CAPABILITIES];
 
 impl Family {
