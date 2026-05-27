@@ -111,7 +111,7 @@ as ARCH-2-followup with a proposed trait addition).
 
 | Line | Call | Class | Status |
 |---|---|---|---|
-| 130 | `db::list_pending_actions(&lock.0, …)` | Missing-trait | Deferred-to-followup (no SAL equivalent) |
+| 130 | `db::list_pending_actions(&lock.0, …)` | Missing-trait (closed) / Test-blocked drift | **Trait method `MemoryStore::list_pending_actions` landed in FX-C2-batch-3** (SQLite + Postgres impls + 1 SQLite test + 1 live-Postgres parity test). Postgres branch already routes through `list_pending_actions_via_store` (which accepts an extra namespace filter); the new trait method closes the missing-trait gap for the namespace-omitted shape. SQLite branch stays on `db::list_pending_actions` because tests seed via `db::queue_pending_action(&lock.0, …)`. |
 | 306-307 | `db::approve_with_approver_type` + `db::execute_pending_action` | Missing-trait | Deferred-to-followup |
 | 315 | `db::get(&lock.0, mid)` post-execute capture | Keeper | Pre-existing keeper (write-then-read in same lock window) |
 | 480 | `db::decide_pending_action(&lock.0, …)` | Missing-trait | Deferred-to-followup |
@@ -127,7 +127,7 @@ as ARCH-2-followup with a proposed trait addition).
 | Line | Call | Class | Status |
 |---|---|---|---|
 | 311 | `db::entity_register(…)` | Drift | Deferred-to-followup (SAL has no `entity_register`; trait extension required) |
-| 468 | `db::entity_get_by_alias(&lock.0, alias, namespace)` | Missing-trait | Deferred-to-followup |
+| 468 | `db::entity_get_by_alias(&lock.0, alias, namespace)` | Missing-trait (closed) / Test-blocked drift | **Trait method `MemoryStore::entity_get_by_alias` landed in FX-C2-batch-3** (SQLite + Postgres impls + 3 SQLite tests + 1 live-Postgres parity test). Postgres branch **Routed-in-this-PR** for the exact-alias match; the title-eq-alias fallback walk preserved on the SAL `list` path so the case-insensitive title match shape stays intact. |
 | 479 | `db::get(&lock.0, &rec.entity_id)` post-resolve | Test-blocked drift | Deferred-to-followup |
 | 631, 647 | `db::get(&lock.0, &p.source_id)` for find_paths owner gate | Test-blocked drift | Deferred-to-followup |
 | 735 | `db::kg_timeline(&lock.0, …)` | Missing-trait | Deferred-to-followup |
@@ -144,16 +144,16 @@ All 12 reaches (`db::resolve_governance_policy`, `db::insert_if_newer`, `db::del
 
 | Line | Call | Class | Status |
 |---|---|---|---|
-| 840 | `db::health_check(&guard.0)` | Missing-trait | Deferred-to-followup (no `MemoryStore::health_check`) |
-| 876 | `db::stats(&guard.0, &guard.1)` | Missing-trait | Deferred-to-followup |
+| 840 | `db::health_check(&guard.0)` | Missing-trait (closed) | **Trait method `MemoryStore::health_check` landed in FX-C2-batch-3** + Postgres branch **Routed-in-this-PR** (natively-async sqlx round-trip, no blocking-pool dispatch). SQLite branch stays on `db_op + db::health_check` per PERF-1 (FX-3). |
+| 876 | `db::stats(&guard.0, &guard.1)` | Missing-trait (closed) / Test-blocked drift | Trait method landed in FX-C2-batch-3; prometheus_metrics fold takes `State<Db>` not `State<AppState>` so the routing closure can't reach `app.store` today. Deferred to FX-C2-a (state-shape convergence). |
 
 ### `src/handlers/admin.rs`
 
 | Line | Call | Class | Status |
 |---|---|---|---|
 | 175 | `db::get(&lock.0, id)` admin lookup | Test-blocked drift | Deferred-to-followup |
-| 280 | `db::list_agents(&lock.0)` | Missing-trait | Deferred-to-followup |
-| 505 | `db::stats(&lock.0, &lock.1)` | Missing-trait | Deferred-to-followup |
+| 280 | `db::list_agents(&lock.0)` | Missing-trait (closed) / Test-blocked drift | **Trait method `MemoryStore::list_agents` landed in FX-C2-batch-3** (SQLite + Postgres impls + 2 SQLite parity tests + 1 live-Postgres parity test). Postgres branch is **Routed-in-this-PR** through the trait method (drops the prior `list()` + client-side metadata fold). SQLite branch stays on `db::list_agents` because tests seed `app.db` via `db::queue/insert_*` paths that don't reach `app.store`. Reclassified Test-blocked drift; tracked for FX-C2-a follow-up. |
+| 505 | `db::stats(&lock.0, &lock.1)` | Missing-trait (closed) / Test-blocked drift | **Trait method `MemoryStore::stats` landed in FX-C2-batch-3** (SQLite + Postgres impls + 1 SQLite parity test + 1 live-Postgres parity test). Postgres branch **Routed-in-this-PR** (replaces the 1M-limit `list()` scan + per-tier client fold with SQL aggregates). SQLite branch stays on `db::stats`; reclassified Test-blocked drift. |
 
 ### `src/handlers/memories_query.rs`
 
@@ -171,8 +171,8 @@ All 12 reaches (`db::resolve_governance_policy`, `db::insert_if_newer`, `db::del
 |---|---|---|---|
 | 231 | `db::list(&lock.0, …)` candidate-set scan | Test-blocked drift | Deferred-to-followup |
 | 280 | `db::get_links(&lock.0, id)` per-anchor probe | Missing-trait (closed) / Test-blocked drift | Trait method `MemoryStore::get_links_for_anchor` landed in PR #FX-C2-batch-2; this SQLite branch stays on `db::get_links` because the contradiction-link assembly holds `app.db.lock()` for the upstream `db::list` + this `db::get_links` in the same window. Reclassified Test-blocked drift; tracked for FX-C2-a follow-up. |
-| 411 | `db::list_namespaces(&lock.0)` | Missing-trait | Deferred-to-followup |
-| 620 | `db::get_taxonomy(&lock.0, …)` | Missing-trait | Deferred-to-followup |
+| 411 | `db::list_namespaces(&lock.0)` | Missing-trait (closed) / Test-blocked drift | **Trait method `MemoryStore::list_namespaces` landed in FX-C2-batch-3** (SQLite + Postgres impls + 2 SQLite tests + 1 live-Postgres parity test). Postgres branch **Routed-in-this-PR** (replaces 1M-limit `list()` + BTreeSet fold with SQL `GROUP BY namespace`). |
+| 620 | `db::get_taxonomy(&lock.0, …)` | Missing-trait (closed) / Test-blocked drift | **Trait method `MemoryStore::get_taxonomy` landed in FX-C2-batch-3** (SQLite + Postgres impls + 2 SQLite tests + 1 live-Postgres parity test); shared tree-fold helper `crate::storage::fold_taxonomy_groups` pins byte-equal output across backends. Postgres branch **Routed-in-this-PR**; the pre-fix in-handler tree assembly is preserved as opt-in legacy fallback gated on `AI_MEMORY_TAXONOMY_LEGACY_PG=1`. |
 | 825 | `db::check_duplicate_with_text(…)` | Missing-trait | Deferred-to-followup |
 | 849 | `db::get(&lock.0, &near.id)` post-dedup decoration | Keeper | Pre-existing keeper (read inside same lock window) |
 
@@ -203,17 +203,30 @@ FX-C2 batch-2 follow-up (this PR — `fix/arch2-sal-routing-batch2`):
 | Routed-in-this-PR (Postgres) | 1 | `links.rs:850-887` — postgres branch of `get_links` now rides the trait method instead of `list_links(None) + client-side filter` |
 | Reclassified Missing-trait → Test-blocked drift | 2 | `links.rs:894`, `power.rs:280` — trait method now exists; SQLite-branch routing blocked on test-fixture convergence (option b) per ARCH-2-followup §"Test-fixture convergence" |
 
+FX-C2 **batch-3** follow-up (this PR — `fix/arch2-sal-routing-batch2`):
+
+| Action | Sites | Notes |
+|---|---|---|
+| New trait methods landed | 7 | `MemoryStore::list_namespaces` (#10), `MemoryStore::get_taxonomy` (#11), `MemoryStore::list_agents` (#18), `MemoryStore::list_pending_actions` (#6), `MemoryStore::entity_get_by_alias` (#16), `MemoryStore::health_check` (#20), `MemoryStore::stats` (#21) — SQLite + Postgres adapter impls + 18 unit tests (11 SQLite + 7 live-Postgres parity, gated on `AI_MEMORY_TEST_POSTGRES_URL`) |
+| Backend-blind helper extracted | 1 | `crate::storage::fold_taxonomy_groups` — hoisted from `db::get_taxonomy` so both adapters share the exact same tree-folding logic; pins cross-backend wire shape byte-for-byte |
+| Routed-in-this-PR (Postgres) | 5 | `power.rs:411` → `list_namespaces` (replaces 1M-limit `list()` scan + client-side BTreeSet fold); `power.rs:620` → `get_taxonomy` (replaces the `taxonomy_namespaces_via_store` + in-handler tree assembly path, which is now an opt-in legacy fallback gated on `AI_MEMORY_TAXONOMY_LEGACY_PG=1`); `kg.rs:468` → `entity_get_by_alias` exact-match path with legacy SAL `list` fallback for the title-eq-alias branch; `admin.rs:280` → `list_agents` (replaces the `list()` + per-row metadata fold); `admin.rs:505` → `stats` (replaces the 1M-limit `list()` + per-tier client fold) |
+| Routed-in-this-PR (HTTP daemon, async-safe) | 1 | `transport.rs:840` — `/health` endpoint now routes Postgres-backed daemons through `MemoryStore::health_check` natively-async (no blocking-pool dispatch); SQLite path stays on `db_op` per PERF-1 (FX-3) |
+| Reclassified Missing-trait → Test-blocked drift | 7 | `power.rs:411` (SQLite), `power.rs:620` (SQLite), `kg.rs:468` (SQLite), `subscriptions.rs:454` (SQLite), `admin.rs:280` (SQLite), `admin.rs:505` (SQLite), `transport.rs:876` (SQLite stats via `prometheus_metrics`) — trait methods now exist; SQLite-branch routing blocked on test-fixture convergence per ARCH-2-followup §"Test-fixture convergence" |
+
 Note: the original ARCH-2 finding cited "40+ sites". The full audit
 surfaces 76 sites once `crate::storage::*` typed-error downcasts and
 federation-receive write paths are counted; the gap is the
 typed-downcast carve-out (already documented in-place since #961)
 plus the federation-receive intentional sqlite path.
 
-FX-C2 cumulative progress: 3 sites routed (2 from PR #1356, 1 from
-this batch); 1 of 21 proposed missing-trait additions landed (#1
-`get_links_for_anchor`). The remaining 20 missing-trait additions
-+ 27 deferred-drift handler routings + 19 test-blocked drift sites
-are tracked under the FX-C2-a … FX-C2-f sub-batch sequencing in
+FX-C2 cumulative progress (after batch-3): 9 sites routed (2 from
+PR #1356, 1 from batch-2, 6 from batch-3); 8 of 21 proposed
+missing-trait additions landed (#1 `get_links_for_anchor`, #6
+`list_pending_actions`, #10 `list_namespaces`, #11 `get_taxonomy`,
+#16 `entity_get_by_alias`, #18 `list_agents`, #20 `health_check`,
+#21 `stats`). The remaining 13 missing-trait additions + 21
+deferred-drift handler routings + 19 test-blocked drift sites are
+tracked under the FX-C2-c … FX-C2-f sub-batch sequencing in
 sub-section §"FX-C2 sub-batch dispatch plan" below.
 
 ### FX-C2 sub-batch dispatch plan
