@@ -17,7 +17,8 @@
 //! ceiling here, which surfaces the size growth in code review.
 //!
 //! The ceiling table below is calibrated to the v0.7.0 substrate
-//! (FX-C4-batch2 SHA). When a file's LOC genuinely needs to grow
+//! (FX-C4-batch2 SHA, with subsequent FX-C2 ARCH-2 + PERF-9 bumps
+//! per FX-D2). When a file's LOC genuinely needs to grow
 //! (a new SAL method implementation, a new tool handler, a new
 //! migration), the contributor bumps the ceiling in the same PR.
 //! When a file's LOC SHRINKS (a refactor split), the ceiling
@@ -36,13 +37,30 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // The five 3000+ LOC offenders from QUAL-10.
     ("src/storage/mod.rs", 16_000),
     ("src/mcp/mod.rs", 14_000),
-    ("src/store/postgres.rs", 13_000),
+    // postgres.rs bumped 13_000 → 15_200 by FX-D2 to accommodate
+    // FX-C2-batch{1..5} ARCH-2 SAL trait method implementations
+    // (fdfa69dd9 / 1d2b9553f / 6c8283cdf / dca98bd6b / 5d7f083e4 —
+    // ~30 new sqlx-native methods spanning kg / governance / storage /
+    // observations / federation). Growth is justified: each method
+    // is a new entry on the canonical SAL trait surface needed for
+    // postgres-backed daemons. Refactor-split into
+    // `src/store/postgres/{mod,kg,governance,storage,...}.rs` is
+    // tracked as a separate v0.7.x post-ship ARCH cleanup.
+    ("src/store/postgres.rs", 15_200),
     ("src/config.rs", 9_000),
     ("src/daemon_runtime.rs", 7_000),
     ("src/subscriptions.rs", 4_500),
     ("src/cli/install.rs", 3_500),
     ("src/storage/migrations.rs", 3_500),
-    ("src/llm.rs", 3_500),
+    // llm.rs bumped 3_500 → 5_200 by FX-D2 to accommodate PERF-9
+    // (36e2573a3 — `OllamaClient` blocking → async `reqwest::Client`
+    // conversion) and the #1361 med/low findings batch fold-in.
+    // Async client wiring is wider per call site (await + Result
+    // propagation + #[allow] surface for clippy::pedantic on the
+    // backend dispatch arms across ~15 vendor aliases). Refactor-split
+    // into `src/llm/{client,backends,auto_tag,expansion}.rs` is
+    // tracked as a separate v0.7.x post-ship ARCH cleanup.
+    ("src/llm.rs", 5_200),
 ];
 
 #[test]
