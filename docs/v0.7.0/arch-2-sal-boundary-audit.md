@@ -53,14 +53,14 @@ as ARCH-2-followup with a proposed trait addition).
 
 | Line | Call | Class | Status |
 |---|---|---|---|
-| 187 | `db::find_by_title_namespace(conn, …)` | Drift | Deferred-to-followup |
-| 210 | `db::next_versioned_title(conn, …)` | Missing-trait | Deferred-to-followup |
+| 187 | `db::find_by_title_namespace(conn, …)` | Missing-trait (closed) / Test-blocked drift | **Trait method `MemoryStore::find_by_title_namespace` landed in FX-C2-batch-4** (SQLite + Postgres impls + 2 SQLite tests + 1 live-Postgres test). SQLite branch stays on `db::find_by_title_namespace` because the lookup runs under `app.db.lock()` immediately before the upstream `db::insert` write; routing through `app.store` would break the same-lock-window write coherence (and the test harness's disjoint `app.db` vs `app.store` backings). The `create_memory_postgres` path doesn't need the trait method (its `store_with_embedding` upsert handles the conflict natively). |
+| 210 | `db::next_versioned_title(conn, …)` | Missing-trait (closed) / Test-blocked drift | **Trait method `MemoryStore::next_versioned_title` landed in FX-C2-batch-4** (SQLite + Postgres impls + 2 SQLite tests + 1 live-Postgres test). SQLite branch stays on `db::next_versioned_title` for the same same-lock-window reason as line 187. |
 | 285 | `db::enforce_governance(…)` | Missing-trait | Deferred-to-followup (SAL has `enforce_governance_action` but signature differs; trait alignment work required) |
 | 308 | `db::get_pending_action(&lock.0, &pending_id)` | Drift | Deferred-to-followup (SAL `get_pending` exists) |
 | 466 | `db::insert(&lock.0, mem)` | Test-blocked drift | Deferred-to-followup (SAL `store` exists) |
-| 475 | `db::set_embedding(&lock.0, &actual_id, vec)` | Missing-trait | Deferred-to-followup (no `MemoryStore::set_embedding`; covered by `store_with_embedding` but split-write surface differs) |
+| 475 | `db::set_embedding(&lock.0, &actual_id, vec)` | Missing-trait (closed) / Test-blocked drift | **`SqliteStore::update_embedding` override landed in FX-C2-batch-4** — the trait method was already defined but the default impl was a no-op for SQLite; the override now delegates to `db::set_embedding` so `app.store.update_embedding` is the canonical embedding-update surface across backends (postgres already overrode this method via the `vector(N)` UPDATE). 1 SQLite parity test + 1 live-Postgres parity test landed. SQLite branch at line 475 stays on `db::set_embedding` because it runs under the same `app.db.lock()` window as the upstream `db::insert`. |
 | 516, 1337, 1341 | `crate::storage::GovernanceRefusal` typed downcast | Keeper | Pre-existing keeper |
-| 1025 | `db::find_contradictions(&lock.0, …)` | Missing-trait | Deferred-to-followup |
+| 1025 | `db::find_contradictions(&lock.0, …)` | Missing-trait (closed) / Test-blocked drift | **Trait method `MemoryStore::find_contradictions` landed in FX-C2-batch-4** (SQLite + Postgres impls + 1 SQLite parity test + 1 live-Postgres parity test). SQLite branch stays on `db::find_contradictions` because it runs under `app.db.lock()` between governance and the proactive conflict check; routing through `app.store` would break the same-lock-window scan coherence. |
 | 1041 | `db::proactive_conflict_check(&lock.0, …)` | Missing-trait | Deferred-to-followup |
 
 ### `src/handlers/recall.rs`
@@ -132,7 +132,7 @@ as ARCH-2-followup with a proposed trait addition).
 | 631, 647 | `db::get(&lock.0, &p.source_id)` for find_paths owner gate | Test-blocked drift | Deferred-to-followup |
 | 735 | `db::kg_timeline(&lock.0, …)` | Missing-trait | Deferred-to-followup |
 | 833 | `db::get(&lock.0, &body.source_id)` for kg_invalidate owner gate | Test-blocked drift | Deferred-to-followup |
-| 932 | `db::invalidate_link(…)` | Missing-trait | Deferred-to-followup |
+| 932 | `db::invalidate_link(…)` | Missing-trait (closed) | **Trait method `MemoryStore::invalidate_link` landed in FX-C2-batch-4** (SQLite + Postgres impls + 2 SQLite parity tests + 2 live-Postgres parity tests). Postgres branch **Routed-in-this-PR** (replaces the `kg_invalidate_via_store` downcast hatch with a trait-native call). SQLite branch stays on `db::invalidate_link` because the audit-event append + `signed_events` row write happen inside the same locked transaction. Reclassified Test-blocked drift; tracked for FX-C2-a follow-up. |
 | 1359 | `db::kg_query(&lock.0, …)` | Missing-trait | Deferred-to-followup |
 | 1373 | `db::get(&lock.0, &n.target_id)` in kg_query result decoration | Test-blocked drift | Deferred-to-followup |
 
@@ -173,7 +173,7 @@ All 12 reaches (`db::resolve_governance_policy`, `db::insert_if_newer`, `db::del
 | 280 | `db::get_links(&lock.0, id)` per-anchor probe | Missing-trait (closed) / Test-blocked drift | Trait method `MemoryStore::get_links_for_anchor` landed in PR #FX-C2-batch-2; this SQLite branch stays on `db::get_links` because the contradiction-link assembly holds `app.db.lock()` for the upstream `db::list` + this `db::get_links` in the same window. Reclassified Test-blocked drift; tracked for FX-C2-a follow-up. |
 | 411 | `db::list_namespaces(&lock.0)` | Missing-trait (closed) / Test-blocked drift | **Trait method `MemoryStore::list_namespaces` landed in FX-C2-batch-3** (SQLite + Postgres impls + 2 SQLite tests + 1 live-Postgres parity test). Postgres branch **Routed-in-this-PR** (replaces 1M-limit `list()` + BTreeSet fold with SQL `GROUP BY namespace`). |
 | 620 | `db::get_taxonomy(&lock.0, …)` | Missing-trait (closed) / Test-blocked drift | **Trait method `MemoryStore::get_taxonomy` landed in FX-C2-batch-3** (SQLite + Postgres impls + 2 SQLite tests + 1 live-Postgres parity test); shared tree-fold helper `crate::storage::fold_taxonomy_groups` pins byte-equal output across backends. Postgres branch **Routed-in-this-PR**; the pre-fix in-handler tree assembly is preserved as opt-in legacy fallback gated on `AI_MEMORY_TAXONOMY_LEGACY_PG=1`. |
-| 825 | `db::check_duplicate_with_text(…)` | Missing-trait | Deferred-to-followup |
+| 825 | `db::check_duplicate_with_text(…)` | Missing-trait (closed) / Test-blocked drift | **Trait method `MemoryStore::check_duplicate_with_text` landed in FX-C2-batch-4** (SQLite + Postgres impls + 2 SQLite tests + 1 live-Postgres test). Postgres branch (lines 736-810) is **Routed-in-this-PR** (replaces 75 LOC of hand-rolled `list` + exact-match + `recall_hybrid` fallback with a trait-native call). SQLite branch at line 856 stays on `db::check_duplicate_with_text` because the same-lock-window contract holds across the embedding write + scan + post-dedup decoration. |
 | 849 | `db::get(&lock.0, &near.id)` post-dedup decoration | Keeper | Pre-existing keeper (read inside same lock window) |
 
 ### `src/handlers/federation_sync_since.rs`
@@ -228,6 +228,24 @@ missing-trait additions landed (#1 `get_links_for_anchor`, #6
 deferred-drift handler routings + 19 test-blocked drift sites are
 tracked under the FX-C2-c … FX-C2-f sub-batch sequencing in
 sub-section §"FX-C2 sub-batch dispatch plan" below.
+
+FX-C2 **batch-4** follow-up (this PR — `fix/arch2-sal-routing-batch2`):
+
+| Action | Sites | Notes |
+|---|---|---|
+| New trait methods landed | 6 | `MemoryStore::find_by_title_namespace` (#3), `MemoryStore::next_versioned_title` (#4), `MemoryStore::find_contradictions` (#5), `MemoryStore::invalidate_link` (#17), `MemoryStore::check_duplicate_with_text` (#12), plus `SqliteStore::update_embedding` override (closes #2 `set_embedding` via the existing trait surface — the postgres adapter already overrode `update_embedding`; sqlite's default no-op is now replaced with a `db::set_embedding` delegate so the trait method is the canonical embedding-update surface across backends). SQLite + Postgres adapter impls + 17 unit tests (9 SQLite + 8 live-Postgres parity, gated on `AI_MEMORY_TEST_POSTGRES_URL`). |
+| Routed-in-this-PR (Postgres) | 2 | `kg.rs:932` → `MemoryStore::invalidate_link` (replaces the `kg_invalidate_via_store` `as_any_for_postgres` downcast hatch; the legacy helper stays in place for back-compat callers but new routes ride the trait surface); `power.rs:825` postgres branch (lines 736-810) → `MemoryStore::check_duplicate_with_text` (replaces the 75-LOC hand-rolled `list` + exact-match walk + `recall_hybrid` fallback with a single trait call whose phase-1 SHA-256 short-circuit + phase-2 pgvector cosine path mirror SQLite's `db::check_duplicate_with_text` byte-for-byte). |
+| Reclassified Missing-trait → Test-blocked drift | 5 | `create.rs:187` (find_by_title_namespace SQLite), `create.rs:210` (next_versioned_title SQLite), `create.rs:475` (set_embedding SQLite — held under `app.db.lock()` in same window as `db::insert`), `create.rs:1025` (find_contradictions SQLite — held under same lock), `federation_receive.rs:1052` (set_embedding SQLite — held under same lock window as the upstream `apply_remote_memory` write). Trait methods now exist; SQLite-branch routing blocked on test-fixture convergence per ARCH-2-followup §"Test-fixture convergence". |
+| Reclassified Missing-trait → Test-blocked drift (power.rs) | 1 | `power.rs:856` (check_duplicate_with_text SQLite) — trait method landed; SQLite-branch routing blocked on the same same-lock-window constraint as `create.rs` (the handler holds `app.db.lock()` for the upstream embedding write + check_duplicate scan + post-dedup decoration). |
+
+FX-C2 cumulative progress (after batch-4): 11 sites routed (2 from
+PR #1356, 1 from batch-2, 6 from batch-3, 2 from batch-4); 14 of 21
+proposed missing-trait additions landed (batch-2 #1; batch-3 #6, #10,
+#11, #16, #18, #20, #21; batch-4 #2 — via `update_embedding` override —
+plus #3, #4, #5, #12, #17). The remaining 7 missing-trait additions +
+remaining deferred-drift handler routings + 25 test-blocked drift
+sites (19 original + 6 newly reclassified in batch-4) are tracked
+under the FX-C2-d … FX-C2-f sub-batch sequencing.
 
 ### FX-C2 sub-batch dispatch plan
 
