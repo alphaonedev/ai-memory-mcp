@@ -153,6 +153,45 @@ jobs:
           cargo install cargo-audit --locked
           cargo audit
 
+      # Issue #1372 — ubuntu-latest Check ran out of disk during the
+      # release link step (`libai_memory.rlib`: No space left on
+      # device (os error 28)). The runner image ships with ~14 GiB
+      # free; after `cargo test` (target/debug ~6-9 GiB) plus
+      # `cargo install cargo-audit --locked` (~1-2 GiB), the
+      # subsequent `cargo build --release` (~6-9 GiB more) hits the
+      # ceiling at link time. Pure-shell fix per project no-external-
+      # code-injection rule (CLAUDE.md §"Sole-authority operator"):
+      # we prune known-large unused tooling from the runner image
+      # (~35 GiB recoverable across .NET / CodeQL / Android SDK)
+      # AND drop the now-redundant dev-profile target tree before
+      # release link begins. Diagnostic `df -h` + `du -sh` bracket
+      # the cleanup so a future ceiling regression is visible in
+      # the workflow log.
+      - name: Free disk before release build (ubuntu-latest)
+        if: needs.classify.outputs.docs_only != 'true' && matrix.os == 'ubuntu-latest'
+        run: |
+          set -eu
+          echo "::group::Disk usage before cleanup"
+          df -h /
+          du -sh target 2>/dev/null || true
+          echo "::endgroup::"
+          # Prune large unused tooling from the ubuntu-latest runner
+          # image. Each `rm -rf` is best-effort — runner image
+          # contents may shift between versions, and a missing path
+          # is benign (the disk we wanted to free wasn't there).
+          sudo rm -rf /usr/share/dotnet              || true  # ~17 GiB
+          sudo rm -rf /opt/hostedtoolcache/CodeQL    || true  # ~5 GiB
+          sudo rm -rf /usr/local/lib/android         || true  # ~13 GiB
+          sudo rm -rf /opt/ghc                       || true  # ~5 GiB
+          # Drop dev-profile artefacts now that the test step is
+          # complete. Keeps the dep cache (proc-macros, build-scripts)
+          # so the release build doesn't recompile from scratch.
+          cargo clean --profile dev || true
+          echo "::group::Disk usage after cleanup"
+          df -h /
+          du -sh target 2>/dev/null || true
+          echo "::endgroup::"
+
       - name: Build release
         if: needs.classify.outputs.docs_only != 'true'
         run: cargo build --release
