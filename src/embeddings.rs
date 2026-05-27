@@ -388,10 +388,22 @@ impl Embedder {
             return 0.0;
         }
 
-        let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-        let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-        let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-        let denom = norm_a * norm_b;
+        // PERF-4 (med/low review batch) — fuse three passes into one so
+        // LLVM auto-vectorises the leaf loop. The pre-fix shape walked the
+        // slices 3× (dot, |a|², |b|²); with embedding dims of 384-1024 and
+        // up to ~250 candidates per recall this was the per-recall hot
+        // path most likely to leave SIMD performance on the table. The
+        // numerical result is byte-equal (same multiplications and sums
+        // in the same order, just interleaved).
+        let mut dot: f32 = 0.0;
+        let mut sq_a: f32 = 0.0;
+        let mut sq_b: f32 = 0.0;
+        for (&x, &y) in a.iter().zip(b.iter()) {
+            dot += x * y;
+            sq_a += x * x;
+            sq_b += y * y;
+        }
+        let denom = sq_a.sqrt() * sq_b.sqrt();
         if denom < 1e-12 { 0.0 } else { dot / denom }
     }
 

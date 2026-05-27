@@ -7517,7 +7517,18 @@ fn recall_hybrid_with_telemetry_inner(
     // Fusion pool (id → (memory, fts_score, cosine_score)). FTS rows
     // land first so their inline-fetched embedding-cosine wins; the
     // semantic phase only inserts ids it hasn't seen.
-    let mut scored: HashMap<String, (Memory, f64, f64)> = HashMap::new();
+    //
+    // PERF-6 (med/low review batch) — pre-size the map so we avoid the
+    // 4-realloc growth path (4 → 8 → 16 → 32) on every recall. Upper
+    // bound is fts_results.len() (already in scope) + the upcoming
+    // semantic phase's `ann_limit = max(limit*5, 50)`; the slight
+    // over-allocation is dwarfed by the saved zeroing + rehashing cost
+    // at default `limit=10` where the natural growth path would have
+    // run through ~3 reallocations.
+    let scored_cap = fts_results
+        .len()
+        .saturating_add(limit.saturating_mul(5).max(50));
+    let mut scored: HashMap<String, (Memory, f64, f64)> = HashMap::with_capacity(scored_cap);
     let mut max_fts_score: f64 = 1.0;
     let mut fts_candidates_count: usize = 0;
     for (mem, fts_score, embedding_bytes) in fts_results {
