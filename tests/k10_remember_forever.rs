@@ -31,6 +31,15 @@ use ai_memory::models::ConfidenceSource;
 use serde_json::json;
 use std::sync::Mutex;
 
+// TEST-2 (med/low review batch) — module-scoped mutex rationale.
+// The tests in this file mutate the process-global synthetic-rule
+// registry (`record_synthetic_rule` / `clear_synthetic_rules_for_test`
+// in `ai_memory::approvals`). Without serialisation two tests can
+// interleave their `clear` + `record` calls and observe each other's
+// state, producing spurious assertion failures under `cargo test`'s
+// default thread-pool parallelism. See `tests/dispatch_integration.rs`
+// and `tests/security_admin_wildcard_980.rs` for the established
+// idiom this lock follows.
 static REMEMBER_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
