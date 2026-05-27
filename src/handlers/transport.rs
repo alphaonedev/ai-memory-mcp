@@ -831,11 +831,24 @@ pub async fn api_key_auth(
 }
 
 pub async fn health(State(app): State<AppState>) -> impl IntoResponse {
-    // PERF-1 (FX-3): route the rusqlite health_check through `db_op`
-    // so it runs on the blocking pool. /health is the most-frequently
-    // scraped endpoint (every Prometheus / k8s liveness probe hits it
-    // every few seconds); pinning a tokio worker on a sync sqlite
-    // PRAGMA query starves the runtime under concurrent load.
+    // v0.7.0 ARCH-2 followup (FX-C2-batch3) — Postgres-backed daemons
+    // ride the new `MemoryStore::health_check` trait method which is
+    // natively async (sqlx round-trip), so we can skip the blocking
+    // pool for that path entirely. SQLite-backed daemons stay on the
+    // `db_op` blocking-pool route per PERF-1 (FX-3); /health is the
+    // most-frequently scraped endpoint and pinning a tokio worker on
+    // a sync sqlite PRAGMA query would starve the runtime under
+    // concurrent scrape load.
+    #[cfg(feature = "sal-postgres")]
+    let ok = if matches!(app.storage_backend, StorageBackend::Postgres) {
+        app.store.health_check().await.unwrap_or(false)
+    } else {
+        db_op(app.db.clone(), |guard| {
+            db::health_check(&guard.0).unwrap_or(false)
+        })
+        .await
+    };
+    #[cfg(not(feature = "sal-postgres"))]
     let ok = db_op(app.db.clone(), |guard| {
         db::health_check(&guard.0).unwrap_or(false)
     })

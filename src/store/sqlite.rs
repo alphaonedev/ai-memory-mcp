@@ -1037,6 +1037,61 @@ impl MemoryStore for SqliteStore {
         Ok(filtered)
     }
 
+    // ----- v0.7.0 ARCH-2 followup (FX-C2-batch3) read-only impls --------
+    //
+    // Thin delegates over the legacy `db::*` free-functions; the SAL
+    // adapter's job here is only to expose the routing surface, not to
+    // re-implement the query. Postgres parity tests pin byte-equal
+    // wire shapes across backends.
+
+    async fn list_namespaces(&self) -> StoreResult<Vec<crate::models::NamespaceCount>> {
+        let conn = self.state.lock().await;
+        db::list_namespaces(&conn).map_err(box_err)
+    }
+
+    async fn get_taxonomy(
+        &self,
+        namespace_prefix: Option<&str>,
+        max_depth: usize,
+        limit: usize,
+    ) -> StoreResult<crate::models::Taxonomy> {
+        let conn = self.state.lock().await;
+        db::get_taxonomy(&conn, namespace_prefix, max_depth, limit).map_err(box_err)
+    }
+
+    async fn list_agents(&self) -> StoreResult<Vec<AgentRegistration>> {
+        let conn = self.state.lock().await;
+        db::list_agents(&conn).map_err(box_err)
+    }
+
+    async fn list_pending_actions(
+        &self,
+        status: Option<&str>,
+        limit: usize,
+    ) -> StoreResult<Vec<crate::models::PendingAction>> {
+        let conn = self.state.lock().await;
+        db::list_pending_actions(&conn, status, limit).map_err(box_err)
+    }
+
+    async fn entity_get_by_alias(
+        &self,
+        alias: &str,
+        namespace: Option<&str>,
+    ) -> StoreResult<Option<crate::models::EntityRecord>> {
+        let conn = self.state.lock().await;
+        db::entity_get_by_alias(&conn, alias, namespace).map_err(box_err)
+    }
+
+    async fn health_check(&self) -> StoreResult<bool> {
+        let conn = self.state.lock().await;
+        db::health_check(&conn).map_err(box_err)
+    }
+
+    async fn stats(&self) -> StoreResult<crate::models::Stats> {
+        let conn = self.state.lock().await;
+        db::stats(&conn, &self.path).map_err(box_err)
+    }
+
     async fn notify(
         &self,
         ctx: &CallerContext,
@@ -2100,5 +2155,269 @@ mod tests {
             .await
             .expect("get_pending miss");
         assert!(row.is_none());
+    }
+
+    // ===== v0.7.0 ARCH-2 followup (FX-C2-batch3) — trait unit tests ======
+    //
+    // Each new trait method gets a happy-path test + an empty/edge-case
+    // test. Postgres-side parity tests live under the
+    // `sqlite_postgres_parity` module gated on
+    // `AI_MEMORY_TEST_POSTGRES_URL`.
+
+    #[tokio::test]
+    async fn list_namespaces_groups_and_orders_by_count() {
+        // FX-C2-batch3 — `list_namespaces` returns `(namespace, count)`
+        // rows sorted by count desc with deterministic alphabetic
+        // tie-break, mirroring `db::list_namespaces`.
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice");
+        for (ns, n) in &[("alpha", 3usize), ("beta", 1usize), ("gamma", 2usize)] {
+            for i in 0..*n {
+                let mut m =
+                    test_memory(&format!("{ns}-{i}"), "content body for the namespace probe");
+                m.namespace = (*ns).to_string();
+                store.store(&ctx, &m).await.expect("store");
+            }
+        }
+        let rows = store.list_namespaces().await.expect("list_namespaces");
+        let alpha = rows.iter().find(|r| r.namespace == "alpha").expect("alpha");
+        let beta = rows.iter().find(|r| r.namespace == "beta").expect("beta");
+        let gamma = rows.iter().find(|r| r.namespace == "gamma").expect("gamma");
+        assert_eq!(alpha.count, 3);
+        assert_eq!(beta.count, 1);
+        assert_eq!(gamma.count, 2);
+        // Densest namespace surfaces first.
+        let alpha_pos = rows
+            .iter()
+            .position(|r| r.namespace == "alpha")
+            .expect("alpha pos");
+        let beta_pos = rows
+            .iter()
+            .position(|r| r.namespace == "beta")
+            .expect("beta pos");
+        assert!(
+            alpha_pos < beta_pos,
+            "expected alpha (count=3) before beta (count=1)"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_namespaces_empty_store_returns_empty_vec() {
+        let store = fresh_store();
+        let rows = store
+            .list_namespaces()
+            .await
+            .expect("list_namespaces on empty store");
+        assert!(rows.is_empty(), "empty store must yield empty vec");
+    }
+
+    #[tokio::test]
+    async fn get_taxonomy_assembles_hierarchical_tree() {
+        // FX-C2-batch3 — `get_taxonomy` projects a hierarchical tree
+        // whose ancestor `subtree_count`s sum every descendant's count.
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice");
+        for (ns, n) in &[
+            ("alphaone", 1usize),
+            ("alphaone/team", 2usize),
+            ("alphaone/team/secrets", 1usize),
+        ] {
+            for i in 0..*n {
+                let mut m = test_memory(&format!("{ns}-{i}"), "taxonomy fixture body content");
+                m.namespace = (*ns).to_string();
+                store.store(&ctx, &m).await.expect("store");
+            }
+        }
+        let tax = store
+            .get_taxonomy(Some("alphaone"), 8, 100)
+            .await
+            .expect("get_taxonomy");
+        // 1 (alphaone) + 2 (alphaone/team) + 1 (alphaone/team/secrets) = 4
+        assert_eq!(tax.total_count, 4, "total prefix count");
+        assert_eq!(tax.tree.namespace, "alphaone");
+        assert_eq!(tax.tree.subtree_count, 4);
+        assert!(!tax.truncated);
+    }
+
+    #[tokio::test]
+    async fn get_taxonomy_empty_prefix_yields_empty_total() {
+        let store = fresh_store();
+        let tax = store
+            .get_taxonomy(Some("nonexistent"), 8, 100)
+            .await
+            .expect("get_taxonomy");
+        assert_eq!(tax.total_count, 0);
+        assert!(tax.tree.children.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_agents_roundtrip_through_register() {
+        // FX-C2-batch3 — `list_agents` enumerates the `_agents`
+        // namespace and parses the metadata blob into the
+        // `AgentRegistration` shape.
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("daemon");
+        let agent = AgentRegistration {
+            agent_id: "ai:tester@host".to_string(),
+            agent_type: "test".to_string(),
+            capabilities: vec!["recall".to_string(), "store".to_string()],
+            registered_at: String::new(),
+            last_seen_at: String::new(),
+        };
+        store
+            .register_agent(&ctx, &agent)
+            .await
+            .expect("register_agent");
+        let listed = store.list_agents().await.expect("list_agents");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].agent_id, "ai:tester@host");
+        assert_eq!(listed[0].agent_type, "test");
+        assert!(listed[0].capabilities.contains(&"recall".to_string()));
+        assert!(!listed[0].registered_at.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_agents_empty_store_returns_empty_vec() {
+        let store = fresh_store();
+        let listed = store.list_agents().await.expect("list_agents");
+        assert!(listed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_pending_actions_filters_by_status() {
+        // FX-C2-batch3 — status filter passes through verbatim.
+        use crate::models::GovernedAction;
+        let store = fresh_store();
+        {
+            let conn = store.state.lock().await;
+            db::queue_pending_action(
+                &conn,
+                GovernedAction::Store,
+                "ns",
+                None,
+                "alice",
+                &serde_json::json!({"title":"t","content":"c"}),
+            )
+            .expect("queue 1");
+            db::queue_pending_action(
+                &conn,
+                GovernedAction::Store,
+                "ns",
+                None,
+                "bob",
+                &serde_json::json!({"title":"t2","content":"c2"}),
+            )
+            .expect("queue 2");
+        }
+        let all = store
+            .list_pending_actions(None, 100)
+            .await
+            .expect("list all");
+        assert_eq!(all.len(), 2);
+        let pending = store
+            .list_pending_actions(Some("pending"), 100)
+            .await
+            .expect("list pending");
+        assert_eq!(pending.len(), 2, "both rows start pending");
+        let approved = store
+            .list_pending_actions(Some("approved"), 100)
+            .await
+            .expect("list approved");
+        assert!(approved.is_empty(), "no approved rows yet");
+    }
+
+    #[tokio::test]
+    async fn entity_get_by_alias_resolves_canonical_record() {
+        // FX-C2-batch3 — `entity_get_by_alias` returns the canonical
+        // entity record (entity_id + canonical_name + namespace +
+        // alias set).
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice");
+        // Stamp the metadata so the entity passes the kind=entity
+        // CHECK in `db::entity_get_by_alias`.
+        let mut m = test_memory("alphaone-co", "company entity row body fixture");
+        m.namespace = "alphaone".to_string();
+        m.metadata = serde_json::json!({
+            "kind": "entity",
+            "agent_id": "alice",
+        });
+        let id = store.store(&ctx, &m).await.expect("store");
+        {
+            let conn = store.state.lock().await;
+            // SQLite `entity_aliases` table shape is
+            // (entity_id, alias, created_at); namespace comes from the
+            // JOIN with memories.
+            conn.execute(
+                "INSERT INTO entity_aliases (entity_id, alias, created_at) VALUES (?1, ?2, ?3)",
+                rusqlite::params![&id, "AlphaOne", chrono::Utc::now().to_rfc3339()],
+            )
+            .expect("insert alias");
+        }
+        let rec = store
+            .entity_get_by_alias("AlphaOne", Some("alphaone"))
+            .await
+            .expect("entity_get_by_alias");
+        let rec = rec.expect("entity must resolve");
+        assert_eq!(rec.entity_id, id);
+        assert_eq!(rec.canonical_name, "alphaone-co");
+        assert_eq!(rec.namespace, "alphaone");
+        assert!(rec.aliases.iter().any(|a| a == "AlphaOne"));
+    }
+
+    #[tokio::test]
+    async fn entity_get_by_alias_returns_none_for_unknown() {
+        let store = fresh_store();
+        let rec = store
+            .entity_get_by_alias("never-registered", None)
+            .await
+            .expect("entity_get_by_alias miss");
+        assert!(rec.is_none());
+    }
+
+    #[tokio::test]
+    async fn entity_get_by_alias_empty_alias_returns_none() {
+        // Empty / whitespace-only alias is rejected at the storage
+        // layer — verify the SAL preserves the contract.
+        let store = fresh_store();
+        let rec = store
+            .entity_get_by_alias("   ", None)
+            .await
+            .expect("entity_get_by_alias whitespace");
+        assert!(rec.is_none());
+    }
+
+    #[tokio::test]
+    async fn health_check_returns_true_on_open_store() {
+        let store = fresh_store();
+        let ok = store.health_check().await.expect("health_check");
+        assert!(ok);
+    }
+
+    #[tokio::test]
+    async fn stats_projects_full_shape() {
+        // FX-C2-batch3 — `stats` projects total, per-tier, per-namespace,
+        // expiring_soon, links_count, db_size_bytes for the open store.
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice");
+        for i in 0..3 {
+            let mut m = test_memory(
+                &format!("title-{i}"),
+                "stats fixture body content adequate length",
+            );
+            m.namespace = "alphaone".to_string();
+            store.store(&ctx, &m).await.expect("store");
+        }
+        let s = store.stats().await.expect("stats");
+        assert_eq!(s.total, 3);
+        // by_namespace must include alphaone with count=3
+        let alpha = s
+            .by_namespace
+            .iter()
+            .find(|r| r.namespace == "alphaone")
+            .expect("alphaone in stats.by_namespace");
+        assert_eq!(alpha.count, 3);
+        // db_size_bytes is best-effort — fresh DB is non-zero
+        // (rusqlite at least writes the page header).
+        assert!(s.db_size_bytes > 0, "expected non-zero db file size");
     }
 }

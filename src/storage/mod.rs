@@ -4218,6 +4218,102 @@ fn sort_taxonomy(node: &mut TaxonomyNode) {
     }
 }
 
+/// v0.7.0 ARCH-2 followup (FX-C2-batch3) — backend-blind taxonomy
+/// tree-folding helper. Lifted out of `get_taxonomy` so the Postgres
+/// SAL adapter can share the exact same fold logic with the SQLite
+/// adapter, holding the cross-backend wire shape byte-for-byte.
+///
+/// Inputs:
+/// - `prefix`: the namespace prefix the caller queried (`""` = global root).
+/// - `effective_depth`: clamped depth, already `min(MAX_NAMESPACE_DEPTH)`.
+/// - `total_count`: full prefix total (NOT truncated by the row walk).
+/// - `truncated`: caller-computed truncation flag.
+/// - `groups`: walked `(namespace, count)` rows.
+///
+/// Returns the assembled [`Taxonomy`] tree with sorted children.
+#[doc(hidden)]
+pub fn fold_taxonomy_groups(
+    prefix: &str,
+    effective_depth: usize,
+    total_count: usize,
+    truncated: bool,
+    groups: Vec<(String, usize)>,
+) -> Taxonomy {
+    let root_name = prefix.rsplit('/').next().unwrap_or("").to_string();
+    let mut root = TaxonomyNode {
+        namespace: prefix.to_string(),
+        name: root_name,
+        count: 0,
+        subtree_count: 0,
+        children: Vec::new(),
+    };
+
+    for (ns, c) in groups {
+        let suffix: &str = if prefix.is_empty() {
+            ns.as_str()
+        } else if ns == prefix {
+            ""
+        } else if ns.len() > prefix.len() + 1
+            && ns.starts_with(prefix)
+            && ns.as_bytes()[prefix.len()] == b'/'
+        {
+            &ns[prefix.len() + 1..]
+        } else {
+            continue;
+        };
+        let all_segments: Vec<&str> = if suffix.is_empty() {
+            Vec::new()
+        } else {
+            suffix.split('/').collect()
+        };
+        let take = all_segments.len().min(effective_depth);
+        let used = &all_segments[..take];
+        let exact_match_in_view = take == all_segments.len();
+
+        root.subtree_count += c;
+        if used.is_empty() {
+            root.count += c;
+            continue;
+        }
+
+        let mut path_so_far = prefix.to_string();
+        let mut node = &mut root;
+        for (i, seg) in used.iter().enumerate() {
+            if !path_so_far.is_empty() {
+                path_so_far.push('/');
+            }
+            path_so_far.push_str(seg);
+            let pos = node.children.iter().position(|ch| ch.name == *seg);
+            let idx = if let Some(p) = pos {
+                p
+            } else {
+                node.children.push(TaxonomyNode {
+                    namespace: path_so_far.clone(),
+                    name: (*seg).to_string(),
+                    count: 0,
+                    subtree_count: 0,
+                    children: Vec::new(),
+                });
+                node.children.len() - 1
+            };
+            node = &mut node.children[idx];
+            node.subtree_count += c;
+            let is_leaf = i + 1 == used.len();
+            if is_leaf && exact_match_in_view {
+                node.count += c;
+            }
+        }
+    }
+
+    sort_taxonomy(&mut root);
+
+    Taxonomy {
+        tree: root,
+        total_count,
+        truncated,
+    }
+}
+
 /// Hard floor for duplicate-check threshold. Below this, anything can match
 /// random unrelated content — refuse to honor the lookup so callers don't
 /// silently get garbage merge suggestions.
