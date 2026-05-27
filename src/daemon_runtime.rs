@@ -1722,6 +1722,7 @@ pub fn resolve_admin_agent_ids(admin_cfg: Option<&crate::config::AdminConfig>) -
 /// (HTTP daemon) and `cli::recall::run` (offline recall). Prior to W6
 /// each call site had its own copy, with subtly different fallback
 /// shapes — the bug at issue #322 was a direct consequence.
+#[allow(deprecated)]
 pub async fn build_embedder(feature_tier: FeatureTier, app_config: &AppConfig) -> Option<Embedder> {
     let tier_config = feature_tier.config();
     // L2 fix: honor the documented top-level `embedding_model` override
@@ -2370,6 +2371,7 @@ pub struct ServeBootstrap {
 /// `configured_embedding_dim` doc comment.
 #[cfg(feature = "sal")]
 #[must_use]
+#[allow(deprecated)]
 fn resolve_configured_embedding_dim(
     app_config: &crate::config::AppConfig,
     tier_config: &crate::config::TierConfig,
@@ -2482,6 +2484,13 @@ async fn build_store_handle(
 
 /// Build all daemon state and spawn background tasks. Returns the
 /// aggregated state without binding any sockets — testable in isolation.
+///
+/// DOC-6: this function reads several legacy `AppConfig` fields
+/// (`auto_tag_model`, `llm_model`, `ollama_url`) directly for v0.7.x
+/// backward compat; the `#[allow(deprecated)]` carves out the legacy
+/// reads while keeping the deprecation warning live for external
+/// consumers.
+#[allow(deprecated)]
 pub async fn bootstrap_serve(
     db_path: &Path,
     args: &ServeArgs,
@@ -3210,17 +3219,18 @@ pub async fn bootstrap_serve(
         let sink: std::sync::Arc<dyn federation::FederationDlqSink> = match storage_backend {
             #[cfg(feature = "sal-postgres")]
             crate::handlers::StorageBackend::Postgres => {
-                // Recover the typed PostgresStore via the
-                // `as_any_for_postgres` downcast hatch so the sink
-                // can issue raw SQL through `PostgresStore::pool()`.
-                // Falls back to the sqlite sink (which would error
-                // on every INSERT because the postgres DB has no
-                // sqlite connection) when the downcast fails — that
-                // is unreachable in practice because the only
-                // backend returning `StorageBackend::Postgres` IS
+                // Recover the typed PostgresStore via the generic
+                // `as_any` downcast hatch (renamed from
+                // `as_any_for_postgres` per ARCH-15, FX-C4-batch2) so
+                // the sink can issue raw SQL through
+                // `PostgresStore::pool()`. Falls back to the sqlite
+                // sink (which would error on every INSERT because the
+                // postgres DB has no sqlite connection) when the
+                // downcast fails — unreachable in practice because the
+                // only backend returning `StorageBackend::Postgres` IS
                 // PostgresStore.
                 if let Some(pg) = store_handle
-                    .as_any_for_postgres()
+                    .as_any()
                     .downcast_ref::<crate::store::postgres::PostgresStore>()
                 {
                     std::sync::Arc::new(federation::push_dlq::PostgresDlqSink::new(
@@ -4203,6 +4213,7 @@ fn _imports_in_use(_: Instant, _: Duration) {}
 // ===========================================================================
 
 #[cfg(test)]
+#[allow(deprecated)] // DOC-6: tests intentionally exercise legacy AppConfig flat fields
 mod tests {
     use super::*;
     use crate::cli::test_utils::TestEnv;

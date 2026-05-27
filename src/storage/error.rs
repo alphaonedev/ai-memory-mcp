@@ -184,6 +184,48 @@ impl std::fmt::Display for StorageError {
 
 impl std::error::Error for StorageError {}
 
+impl StorageError {
+    /// ARCH-9 (FX-C4-batch2, 2026-05-26) — canonical stable error
+    /// slug for each variant.
+    ///
+    /// Returns a `&'static str` that mirrors the
+    /// [`crate::errors::MemoryError::code`] discipline. The slug is
+    /// the load-bearing key for cross-surface (HTTP/MCP/CLI) parity
+    /// tests and for structured-trace fields. Adding a variant
+    /// requires extending this match — the
+    /// `#[deny(unreachable_patterns)]` attribute on the outer match
+    /// catches dead arms; the test `arch_9_storage_error_slug_*`
+    /// in [`crate::errors::error_codes::tests`] pins the slug-set against a
+    /// regression.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::MemoryNotFound { .. } => crate::errors::error_codes::NOT_FOUND,
+            Self::PendingActionNotFound { .. } => {
+                crate::errors::error_codes::PENDING_ACTION_NOT_FOUND
+            }
+            Self::AmbiguousIdPrefix { .. } => crate::errors::error_codes::AMBIGUOUS_ID_PREFIX,
+            Self::InvalidArgument { .. } => crate::errors::error_codes::INVALID_ARGUMENT,
+            Self::PendingActionStateInvalid { .. } => {
+                crate::errors::error_codes::PENDING_ACTION_STATE_INVALID
+            }
+            Self::LinkPermissionDenied { .. } => crate::errors::error_codes::LINK_PERMISSION_DENIED,
+            Self::LinkReflectionCycle { .. } => crate::errors::error_codes::LINK_REFLECTION_CYCLE,
+            Self::ApproverLaundering { .. } => crate::errors::error_codes::APPROVER_LAUNDERING,
+            Self::UniqueConflict { .. } => crate::errors::error_codes::UNIQUE_CONFLICT,
+            Self::ArchiveRestoreCollision { .. } => {
+                crate::errors::error_codes::ARCHIVE_RESTORE_COLLISION
+            }
+            Self::ArchiveSupersedeFailed { .. } => {
+                crate::errors::error_codes::ARCHIVE_SUPERSEDE_FAILED
+            }
+            Self::SqlcipherMissingPassphrase => {
+                crate::errors::error_codes::SQLCIPHER_MISSING_PASSPHRASE
+            }
+        }
+    }
+}
+
 // Note: `anyhow::Error::from<E: StdError>` already covers `StorageError`
 // via the blanket impl, so an explicit `From<StorageError> for
 // anyhow::Error` would conflict. Substrate code wraps via the explicit
