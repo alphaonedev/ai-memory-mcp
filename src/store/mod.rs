@@ -1521,6 +1521,132 @@ pub trait MemoryStore: Send + Sync {
             capability: "STATS".to_string(),
         })
     }
+
+    /// Resolve a memory id by `(title, namespace)` — used by the
+    /// `on_conflict=error` path during `memory_store` to surface a
+    /// `409 CONFLICT` envelope citing the colliding row's id. Closes
+    /// `db::find_by_title_namespace` (handler reach at
+    /// `create.rs:187`).
+    ///
+    /// Returns `Ok(None)` when no live row matches the tuple.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` when the underlying store reports an error.
+    async fn find_by_title_namespace(
+        &self,
+        _title: &str,
+        _namespace: &str,
+    ) -> StoreResult<Option<String>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "FIND_BY_TITLE_NAMESPACE".to_string(),
+        })
+    }
+
+    /// Pick a title that does not collide with an existing
+    /// `(title, namespace)` row by appending `(2)`, `(3)`, ... up to
+    /// the substrate's hard cap. Used by `on_conflict='version'`.
+    /// Closes `db::next_versioned_title` (handler reach at
+    /// `create.rs:210`).
+    ///
+    /// Returns the original title when no row claims it; otherwise
+    /// the first available `"<base> (N)"` suffix. Errors with the
+    /// substrate's `UniqueConflict` envelope when the cap is exhausted.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` on store errors; `UniqueConflict` when the
+    /// substrate cap is exhausted.
+    async fn next_versioned_title(
+        &self,
+        _base_title: &str,
+        _namespace: &str,
+    ) -> StoreResult<String> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "NEXT_VERSIONED_TITLE".to_string(),
+        })
+    }
+
+    /// Detect potential contradictions: memories in the same
+    /// namespace with FTS-similar titles. Closes
+    /// `db::find_contradictions` (handler reach at `create.rs:1025`).
+    ///
+    /// Returns up to 5 candidates ranked by FTS score (no embedding
+    /// pass). Used by the autonomous-hooks fan-out to seed the
+    /// contradiction-detection LLM with deterministic candidates
+    /// before pricing the cosine pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` when the underlying store reports an error.
+    async fn find_contradictions(
+        &self,
+        _title: &str,
+        _namespace: &str,
+    ) -> StoreResult<Vec<Memory>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "FIND_CONTRADICTIONS".to_string(),
+        })
+    }
+
+    /// Mark a KG link as superseded by setting its `valid_until`
+    /// column. Closes `db::invalidate_link` (handler reach at
+    /// `kg.rs:932`); the Postgres branch routes through the inherent
+    /// `PostgresStore::kg_invalidate` method which preserves the
+    /// AGE↔CTE dual-path discipline.
+    ///
+    /// Returns a [`KgInvalidateRow`] carrying `found = false` when the
+    /// `(source_id, target_id, relation)` triple does not match an
+    /// existing link, matching the SQLite-side `Ok(None)` contract
+    /// projected into the SAL row shape.
+    ///
+    /// Idempotent: calling repeatedly overwrites the prior
+    /// `valid_until` (the prior value is returned in
+    /// `previous_valid_until` so callers can detect the overwrite).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` when the underlying store reports an error.
+    async fn invalidate_link(
+        &self,
+        _source_id: &str,
+        _target_id: &str,
+        _relation: &str,
+        _valid_until: Option<&str>,
+    ) -> StoreResult<KgInvalidateRow> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "INVALIDATE_LINK".to_string(),
+        })
+    }
+
+    /// Content-hash + embedding-cosine duplicate detector. Closes
+    /// `db::check_duplicate_with_text` (handler reach at
+    /// `power.rs:825`).
+    ///
+    /// Phase 1 SHA-256-matches the canonical `title content` text
+    /// against every live, namespace-matching candidate; an exact
+    /// match short-circuits at `similarity=1.0`. Phase 2 falls
+    /// through to the embedding-based nearest-neighbor scan so
+    /// near-but-not-exact hits still surface a closest-existing
+    /// signal.
+    ///
+    /// `query_text` MUST be the exact string used to produce
+    /// `query_embedding` (typically `format!("{title} {content}")`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` when the underlying store reports an error.
+    async fn check_duplicate_with_text(
+        &self,
+        _query_embedding: &[f32],
+        _query_text: &str,
+        _namespace: Option<&str>,
+        _threshold: f32,
+    ) -> StoreResult<crate::models::DuplicateCheck> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "CHECK_DUPLICATE_WITH_TEXT".to_string(),
+        })
+    }
 }
 
 /// v0.7.0 Wave-3 Continuation 3 (Phase 20) — action class threaded
