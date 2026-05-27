@@ -225,6 +225,34 @@ pub enum StoreError {
     Backend(#[from] BoxBackendError),
 }
 
+impl StoreError {
+    /// ARCH-9 (FX-C4-batch2, 2026-05-26) — canonical stable error
+    /// slug for each variant.
+    ///
+    /// Mirrors [`crate::errors::MemoryError::code`] and
+    /// [`crate::storage::error::StorageError::code`]. The three
+    /// `code()` methods together let cross-surface (HTTP / MCP /
+    /// CLI) parity tests assert byte-equal slug values from a
+    /// single source of truth at [`crate::errors::error_codes`].
+    /// Adding a variant requires extending the match below and the
+    /// test `arch_9_store_error_slug_round_trip` in the
+    /// `error_codes` test module.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        use crate::errors::error_codes;
+        match self {
+            Self::NotFound { .. } => error_codes::NOT_FOUND,
+            Self::Conflict { .. } => error_codes::CONFLICT,
+            Self::PermissionDenied { .. } => error_codes::GOVERNANCE_REFUSED,
+            Self::BackendUnavailable { .. } => error_codes::STORE_BACKEND_UNAVAILABLE,
+            Self::InvalidInput { .. } => error_codes::VALIDATION_FAILED,
+            Self::UnsupportedCapability { .. } => error_codes::STORE_UNSUPPORTED_CAPABILITY,
+            Self::IntegrityFailed { .. } => error_codes::STORE_OPERATION_FAILED,
+            Self::Backend(_) => error_codes::DATABASE_ERROR,
+        }
+    }
+}
+
 /// Escape hatch for adapter-specific errors that don't map cleanly to
 /// a `StoreError` variant. Adapters wrap their native error types in
 /// this to retain the underlying cause without leaking the concrete
@@ -638,8 +666,31 @@ pub trait MemoryStore: Send + Sync {
     ///
     /// Default returns a unit reference; adapters override to return
     /// `self`.
-    fn as_any_for_postgres(&self) -> &dyn std::any::Any {
+    ///
+    /// ARCH-15 (FX-C4-batch2, 2026-05-26): renamed from
+    /// `as_any_for_postgres` to the generic `as_any`. The legacy name
+    /// would have locked the hatch to today's two adapters; a future
+    /// third adapter (in-memory test adapter, AGE-only path) can now
+    /// override the same hook without a trait-surface rename. The
+    /// `as_any_for_postgres` shim below is kept as a compat alias so
+    /// any out-of-tree consumers that depended on the original name
+    /// don't break at v0.7.0 — the alias is `#[deprecated]` and slated
+    /// for removal in v0.8.0.
+    fn as_any(&self) -> &dyn std::any::Any {
         &()
+    }
+
+    /// Compat alias for the pre-ARCH-15 method name.
+    ///
+    /// This shim simply delegates to [`MemoryStore::as_any`]. Out-of-tree
+    /// callers that pin the old name should migrate to `as_any` before
+    /// v0.8.0 when this alias is removed.
+    #[deprecated(
+        since = "0.7.0",
+        note = "use `MemoryStore::as_any` directly; will be removed in v0.8.0"
+    )]
+    fn as_any_for_postgres(&self) -> &dyn std::any::Any {
+        self.as_any()
     }
 
     // ==================================================================
@@ -1964,11 +2015,25 @@ mod tests {
     }
 
     #[test]
-    fn default_as_any_for_postgres_is_unit() {
+    fn default_as_any_is_unit() {
         let s: Box<dyn MemoryStore> = Box::new(MinimalStore);
-        let any = s.as_any_for_postgres();
+        let any = s.as_any();
         // Default returns a unit reference; downcast must fail.
         assert!(any.downcast_ref::<()>().is_some());
+    }
+
+    #[test]
+    fn arch_15_as_any_for_postgres_alias_delegates_to_as_any() {
+        // FX-C4-batch2 ARCH-15: the legacy `as_any_for_postgres` shim
+        // must delegate to `as_any` so existing callers keep working
+        // until v0.8.0 removes the alias.
+        let s: Box<dyn MemoryStore> = Box::new(MinimalStore);
+        #[allow(deprecated)]
+        let any_legacy = s.as_any_for_postgres();
+        let any_new = s.as_any();
+        // Both surfaces return the same default unit reference.
+        assert!(any_legacy.downcast_ref::<()>().is_some());
+        assert!(any_new.downcast_ref::<()>().is_some());
     }
 
     #[test]

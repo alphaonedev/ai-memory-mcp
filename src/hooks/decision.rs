@@ -328,31 +328,57 @@ impl HookDecision {
 /// because the runtime guard is the only consumer today; G5's
 /// chain runner will reach for it the same way when wiring
 /// `Modify` accumulation through the pipeline.
+///
+/// ARCH-7 (FX-C4-batch2, 2026-05-26): the body uses an EXHAUSTIVE
+/// `match` over `HookEvent` (rather than the prior `matches!` macro)
+/// so adding a 26th hook variant fails compilation at THIS function
+/// rather than silently defaulting the new variant to the
+/// "post-event" treatment. The `#[deny(unreachable_patterns)]` outer
+/// gate catches the inverse failure mode (a duplicate / dead arm
+/// signalling a stale match table). The test
+/// `arch_7_is_pre_event_exhaustive_on_all_known_variants` in the
+/// inline tests below + `tests/hook_pipeline_exhaustiveness.rs`
+/// pin the coverage.
 #[must_use]
+#[deny(unreachable_patterns)]
 pub fn is_pre_event(event: HookEvent) -> bool {
-    matches!(
-        event,
+    match event {
+        // ---- pre-events: `Modify` decisions ARE honoured -----------------
         HookEvent::PreStore
-            | HookEvent::PreRecall
-            | HookEvent::PreSearch
-            | HookEvent::PreDelete
-            | HookEvent::PrePromote
-            | HookEvent::PreLink
-            | HookEvent::PreConsolidate
-            | HookEvent::PreGovernanceDecision
-            | HookEvent::PreArchive
-            | HookEvent::PreTranscriptStore
-            // G10: hot-path query expansion fires before the recall
-            // call — Modify decisions rewrite the in-flight query.
-            | HookEvent::PreRecallExpand
-            // v0.7.0 Task 6/8: pre_reflect fires before the depth-cap
-            // check so a Deny veto refuses the reflection BEFORE the
-            // substrate evaluates `effective_max_reflection_depth()`.
-            | HookEvent::PreReflect
-            // v0.7.0 L1-7: pre_compaction fires before the cluster is
-            // processed by a CompactionPass — Deny aborts the cluster.
-            | HookEvent::PreCompaction
-    )
+        | HookEvent::PreRecall
+        | HookEvent::PreSearch
+        | HookEvent::PreDelete
+        | HookEvent::PrePromote
+        | HookEvent::PreLink
+        | HookEvent::PreConsolidate
+        | HookEvent::PreGovernanceDecision
+        | HookEvent::PreArchive
+        | HookEvent::PreTranscriptStore
+        // G10: hot-path query expansion fires before the recall
+        // call — Modify decisions rewrite the in-flight query.
+        | HookEvent::PreRecallExpand
+        // v0.7.0 Task 6/8: pre_reflect fires before the depth-cap
+        // check so a Deny veto refuses the reflection BEFORE the
+        // substrate evaluates `effective_max_reflection_depth()`.
+        | HookEvent::PreReflect
+        // v0.7.0 L1-7: pre_compaction fires before the cluster is
+        // processed by a CompactionPass — Deny aborts the cluster.
+        | HookEvent::PreCompaction => true,
+
+        // ---- post-/on- events: `Modify` decisions are degraded to Allow --
+        HookEvent::PostStore
+        | HookEvent::PostRecall
+        | HookEvent::PostSearch
+        | HookEvent::PostDelete
+        | HookEvent::PostPromote
+        | HookEvent::PostLink
+        | HookEvent::PostConsolidate
+        | HookEvent::PostGovernanceDecision
+        | HookEvent::OnIndexEviction
+        | HookEvent::PostTranscriptStore
+        | HookEvent::PostReflect
+        | HookEvent::OnCompactionRollback => false,
+    }
 }
 
 // ---------------------------------------------------------------------------

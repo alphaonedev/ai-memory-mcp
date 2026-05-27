@@ -7705,7 +7705,7 @@ impl MemoryStore for PostgresStore {
             .collect()
     }
 
-    fn as_any_for_postgres(&self) -> &dyn std::any::Any {
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 
@@ -10322,7 +10322,7 @@ fn downcast_postgres(store: &std::sync::Arc<dyn MemoryStore>) -> StoreResult<&Po
     // operator passes `--store-url postgres://...` so the storage_backend
     // flag is the load-bearing discriminator. Use `Any` projection via
     // a private hatch.
-    let any = store.as_any_for_postgres();
+    let any = store.as_any();
     any.downcast_ref::<PostgresStore>()
         .ok_or_else(|| StoreError::BackendUnavailable {
             backend: "postgres".to_string(),

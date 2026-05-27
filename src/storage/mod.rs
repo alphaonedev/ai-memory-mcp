@@ -349,6 +349,7 @@ pub(crate) mod connection;
 // invoke `migrate_v34_backfill_chain` directly to exercise the
 // idempotent-replay property without going through a full daemon
 // boot cycle.
+pub mod migration_meta;
 pub mod migrations;
 pub(crate) mod reflect;
 
@@ -2161,6 +2162,15 @@ pub fn proximity_boost(agent_ns: &str, memory_ns: &str) -> f64 {
 /// variable-length positional list is awkward, and the inputs come
 /// from `namespace_ancestors()` → `validate_namespace`-approved
 /// strings. Single-quote doubling is applied defensively.
+///
+/// PERF-8 (FX-C4-batch2, 2026-05-26): the hierarchy fragment is a
+/// pure function of `namespace`, so a bounded LRU cache amortises
+/// the `format!` + `Vec<String>::join` cost across the recall
+/// hot path. Cache hits return a clone of the cached `String`
+/// (still allocates, but skips the per-call SQL string build); the
+/// cache itself is keyed by namespace string and capped at
+/// `HIERARCHY_CACHE_MAX` entries to bound memory in the face of
+/// per-tenant namespace explosions.
 fn hierarchy_in_clause(namespace: Option<&str>) -> (Option<String>, bool) {
     let Some(ns) = namespace else {
         return (None, false);
@@ -2168,6 +2178,16 @@ fn hierarchy_in_clause(namespace: Option<&str>) -> (Option<String>, bool) {
     if !ns.contains('/') {
         return (None, false);
     }
+
+    // PERF-8 cache lookup. The cache stores the rendered SQL
+    // fragment Option<String>; the `bool` shadow flag is always
+    // `true` for cached entries (we only cache hierarchical
+    // namespaces — the `!ns.contains('/')` short-circuit above
+    // never reaches the cache).
+    if let Some(cached) = hierarchy_cache_get(ns) {
+        return (Some(cached), true);
+    }
+
     let ancestors = crate::models::namespace_ancestors(ns);
     if ancestors.is_empty() {
         return (None, false);
@@ -2176,10 +2196,51 @@ fn hierarchy_in_clause(namespace: Option<&str>) -> (Option<String>, bool) {
         .iter()
         .map(|a| format!("'{}'", a.replace('\'', "''")))
         .collect();
-    (
-        Some(format!("AND m.namespace IN ({})", quoted.join(","))),
-        true,
-    )
+    let fragment = format!("AND m.namespace IN ({})", quoted.join(","));
+    hierarchy_cache_put(ns, &fragment);
+    (Some(fragment), true)
+}
+
+// PERF-8 (FX-C4-batch2, 2026-05-26) — bounded LRU cache for the
+// rendered `hierarchy_in_clause` SQL fragment. Cap chosen to be
+// large enough for the typical few-hundred-namespace deployment
+// while keeping memory bounded on multi-tenant hosts.
+const HIERARCHY_CACHE_MAX: usize = 256;
+
+fn hierarchy_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn hierarchy_cache_get(ns: &str) -> Option<String> {
+    let cache = hierarchy_cache().lock().ok()?;
+    cache.get(ns).cloned()
+}
+
+fn hierarchy_cache_put(ns: &str, fragment: &str) {
+    let Ok(mut cache) = hierarchy_cache().lock() else {
+        return;
+    };
+    if cache.len() >= HIERARCHY_CACHE_MAX {
+        // Bounded eviction: drop one arbitrary entry. The cache is
+        // not a true LRU because the recall hot path runs in
+        // microseconds and a full LRU's bookkeeping cost would
+        // dominate the cache-hit savings. Random eviction is fine
+        // because the hot working set typically stays well under
+        // the cap; the eviction only fires on the long tail.
+        if let Some(k) = cache.keys().next().cloned() {
+            cache.remove(&k);
+        }
+    }
+    cache.insert(ns.to_string(), fragment.to_string());
+}
+
+#[cfg(test)]
+fn hierarchy_cache_clear_for_tests() {
+    if let Ok(mut cache) = hierarchy_cache().lock() {
+        cache.clear();
+    }
 }
 
 /// Task 1.12 — apply proximity boost to scored memories ranked against
@@ -9779,6 +9840,56 @@ mod tests {
 
     fn test_db() -> Connection {
         open(std::path::Path::new(":memory:")).unwrap()
+    }
+
+    #[test]
+    fn perf_8_hierarchy_in_clause_cache_hits_on_repeat() {
+        // PERF-8 — verify cached fragment matches the freshly-
+        // computed value byte-equal. Cache invalidation isn't part
+        // of the public contract (ancestors are deterministic on
+        // the namespace input), so a cache hit must be wire-equal
+        // to a cold compute.
+        hierarchy_cache_clear_for_tests();
+        let ns = Some("alphaone/team/alice");
+        let (a, active_a) = hierarchy_in_clause(ns);
+        let (b, active_b) = hierarchy_in_clause(ns);
+        assert!(active_a && active_b);
+        assert_eq!(
+            a, b,
+            "PERF-8: cached hierarchy_in_clause result drift on second lookup",
+        );
+        assert!(
+            a.expect("non-None fragment")
+                .contains("AND m.namespace IN ("),
+            "PERF-8: fragment shape regressed",
+        );
+    }
+
+    #[test]
+    fn perf_8_hierarchy_cache_handles_non_hierarchical_ns() {
+        // Non-hierarchical namespaces (no `/`) MUST short-circuit
+        // before touching the cache so the cache only stores the
+        // legitimate entries.
+        hierarchy_cache_clear_for_tests();
+        let (frag, active) = hierarchy_in_clause(Some("global"));
+        assert_eq!(frag, None);
+        assert!(!active);
+    }
+
+    #[test]
+    fn perf_8_hierarchy_cache_bounded_under_pressure() {
+        // Filling the cache past HIERARCHY_CACHE_MAX must not
+        // unbounded-grow it; eviction kicks in beyond the cap.
+        hierarchy_cache_clear_for_tests();
+        for i in 0..(HIERARCHY_CACHE_MAX * 2) {
+            let ns = format!("tenant{i}/sub");
+            let _ = hierarchy_in_clause(Some(&ns));
+        }
+        let cache_len = hierarchy_cache().lock().unwrap().len();
+        assert!(
+            cache_len <= HIERARCHY_CACHE_MAX,
+            "PERF-8: hierarchy cache grew unbounded: {cache_len} > {HIERARCHY_CACHE_MAX}",
+        );
     }
 
     /// v0.7.0 #981 — `get_many` batches the SELECTs the semantic-phase
