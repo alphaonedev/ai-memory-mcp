@@ -7846,6 +7846,76 @@ impl MemoryStore for PostgresStore {
             .collect()
     }
 
+    /// v0.7.0 ARCH-2 followup (FX-C2) — per-anchor edge probe over
+    /// Postgres. Mirrors the SQLite `db::get_links` shape: returns every
+    /// row where `anchor_id` is either source or target, projects the
+    /// `attest_level` + temporal-validity columns the
+    /// `memory_get_links` MCP tool's docstring promises, leaves
+    /// `signature` as `None` (the verifier owns that surface).
+    ///
+    /// Ordering: descending by `created_at`. The SQLite path naturally
+    /// returns rows in this order via the legacy projection; the
+    /// Postgres path makes it explicit so cross-backend wire shape is
+    /// stable.
+    async fn get_links_for_anchor(&self, anchor_id: &str) -> StoreResult<Vec<MemoryLink>> {
+        let rows = sqlx::query(
+            "SELECT source_id, target_id, relation, created_at,
+                    valid_from, valid_until, observed_by, attest_level
+             FROM memory_links
+             WHERE source_id = $1 OR target_id = $1
+             ORDER BY created_at DESC",
+        )
+        .bind(anchor_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| to_store_err("get_links_for_anchor", e))?;
+
+        rows.iter()
+            .map(|r| {
+                let created_at: DateTime<Utc> = r
+                    .try_get::<DateTime<Utc>, _>("created_at")
+                    .map_err(|e| to_store_err("read created_at", e))?;
+                let valid_from: Option<DateTime<Utc>> = r
+                    .try_get::<Option<DateTime<Utc>>, _>("valid_from")
+                    .map_err(|e| to_store_err("read valid_from", e))?;
+                let valid_until: Option<DateTime<Utc>> = r
+                    .try_get::<Option<DateTime<Utc>>, _>("valid_until")
+                    .map_err(|e| to_store_err("read valid_until", e))?;
+                let observed_by: Option<String> = r
+                    .try_get::<Option<String>, _>("observed_by")
+                    .map_err(|e| to_store_err("read observed_by", e))?;
+                let relation_str: String = r
+                    .try_get::<String, _>("relation")
+                    .map_err(|e| to_store_err("read relation", e))?;
+                let attest_level: Option<String> =
+                    r.try_get::<Option<String>, _>("attest_level")
+                        .map_err(|e| to_store_err("read attest_level", e))?;
+                Ok(MemoryLink {
+                    source_id: r
+                        .try_get::<String, _>("source_id")
+                        .map_err(|e| to_store_err("read source_id", e))?,
+                    target_id: r
+                        .try_get::<String, _>("target_id")
+                        .map_err(|e| to_store_err("read target_id", e))?,
+                    // Closed-set relation parse — unknown values fall
+                    // back to the canonical default. Mirrors the SQLite
+                    // path's `from_str(...).unwrap_or_default()` posture.
+                    relation: crate::models::MemoryLinkRelation::from_str(&relation_str)
+                        .unwrap_or_default(),
+                    created_at: created_at.to_rfc3339(),
+                    // Signature is intentionally not surfaced on this
+                    // read path — owned by the verifier (mirrors the
+                    // SQLite `db::get_links` decision).
+                    signature: None,
+                    observed_by,
+                    valid_from: valid_from.map(|t| t.to_rfc3339()),
+                    valid_until: valid_until.map(|t| t.to_rfc3339()),
+                    attest_level,
+                })
+            })
+            .collect()
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -12797,5 +12867,174 @@ mod tests {
         }
 
         cleanup_governance_ns(&pool, &format!("fa2a12-cap-{suffix}")).await;
+    }
+
+    // ---------------------------------------------------------------------
+    // FX-C2 (ARCH-2 followup) — `get_links_for_anchor` parity coverage.
+    //
+    // Mirror of the SQLite-side tests in `src/store/sqlite.rs`. Pins
+    // the per-anchor probe's wire shape across both backends: inbound +
+    // outbound edges in one call, empty vec for unlinked anchors,
+    // attest_level + temporal-validity columns round-trip via the
+    // sqlx projection. Skips cleanly when AI_MEMORY_TEST_POSTGRES_URL
+    // is unset so the default `cargo test` flow stays offline.
+    // ---------------------------------------------------------------------
+
+    async fn fxc2_seed_two_memories(store: &PostgresStore, ns: &str) -> (String, String) {
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let a_id = format!("fxc2-a-{}", uuid::Uuid::new_v4());
+        let b_id = format!("fxc2-b-{}", uuid::Uuid::new_v4());
+        let a = sample_memory(&a_id, ns, "fxc2-anchor", "anchor content here");
+        let b = sample_memory(&b_id, ns, "fxc2-target", "target content here");
+        store.store(&ctx, &a).await.expect("store anchor");
+        store.store(&ctx, &b).await.expect("store target");
+        (a_id, b_id)
+    }
+
+    #[tokio::test]
+    async fn live_get_links_for_anchor_returns_inbound_and_outbound() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let ns = format!("fxc2-getlinks-{}", uuid::Uuid::new_v4());
+        let (a_id, b_id) = fxc2_seed_two_memories(&store, &ns).await;
+        // upstream memory C used as inbound-anchor probe source
+        let c_id = format!("fxc2-c-{}", uuid::Uuid::new_v4());
+        let c = sample_memory(&c_id, &ns, "fxc2-upstream", "upstream content");
+        store.store(&ctx, &c).await.expect("store upstream");
+
+        let now = chrono::Utc::now().to_rfc3339();
+        // anchor -> target (outbound)
+        store
+            .link(
+                &ctx,
+                &MemoryLink {
+                    source_id: a_id.clone(),
+                    target_id: b_id.clone(),
+                    relation: crate::models::MemoryLinkRelation::RelatedTo,
+                    created_at: now.clone(),
+                    valid_from: None,
+                    valid_until: None,
+                    observed_by: None,
+                    signature: None,
+                    attest_level: None,
+                },
+            )
+            .await
+            .expect("link a->b");
+        // upstream -> anchor (inbound)
+        store
+            .link(
+                &ctx,
+                &MemoryLink {
+                    source_id: c_id.clone(),
+                    target_id: a_id.clone(),
+                    relation: crate::models::MemoryLinkRelation::Contradicts,
+                    created_at: now,
+                    valid_from: None,
+                    valid_until: None,
+                    observed_by: None,
+                    signature: None,
+                    attest_level: None,
+                },
+            )
+            .await
+            .expect("link c->a");
+
+        let edges = store
+            .get_links_for_anchor(&a_id)
+            .await
+            .expect("get_links_for_anchor");
+        assert!(
+            edges
+                .iter()
+                .any(|l| l.source_id == a_id && l.target_id == b_id),
+            "missing outbound edge in postgres parity"
+        );
+        assert!(
+            edges
+                .iter()
+                .any(|l| l.source_id == c_id && l.target_id == a_id),
+            "missing inbound edge in postgres parity"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_get_links_for_anchor_empty_for_unlinked_id() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let ns = format!("fxc2-empty-{}", uuid::Uuid::new_v4());
+        let alone_id = format!("fxc2-alone-{}", uuid::Uuid::new_v4());
+        let alone = sample_memory(&alone_id, &ns, "fxc2-alone", "no edges here");
+        store.store(&ctx, &alone).await.expect("store alone");
+        let edges = store
+            .get_links_for_anchor(&alone_id)
+            .await
+            .expect("get_links_for_anchor on unlinked id");
+        assert!(
+            edges.is_empty(),
+            "unlinked id must yield empty vec across both backends"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_get_links_for_anchor_projects_attest_level_and_temporal() {
+        // FX-C2 wire-shape parity: the Postgres branch MUST project the
+        // same `attest_level` + temporal-validity columns the SQLite
+        // branch does. This test inserts a row with explicit
+        // valid_from/valid_until/observed_by/attest_level via raw sqlx
+        // and verifies the trait-routed read round-trips them.
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ns = format!("fxc2-temporal-{}", uuid::Uuid::new_v4());
+        let (a_id, b_id) = fxc2_seed_two_memories(&store, &ns).await;
+        let vf = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .expect("parse vf")
+            .with_timezone(&chrono::Utc);
+        let vu = chrono::DateTime::parse_from_rfc3339("2026-12-31T23:59:59Z")
+            .expect("parse vu")
+            .with_timezone(&chrono::Utc);
+        sqlx::query(
+            "INSERT INTO memory_links
+                (source_id, target_id, relation, created_at,
+                 valid_from, valid_until, observed_by, attest_level)
+             VALUES ($1, $2, $3, NOW(), $4, $5, $6, $7)",
+        )
+        .bind(&a_id)
+        .bind(&b_id)
+        .bind("related_to")
+        .bind(vf)
+        .bind(vu)
+        .bind("ai:tester@host")
+        .bind("unsigned")
+        .execute(&store.pool)
+        .await
+        .expect("raw insert for temporal probe");
+
+        let edges = store
+            .get_links_for_anchor(&a_id)
+            .await
+            .expect("get_links_for_anchor");
+        let row = edges
+            .iter()
+            .find(|l| l.source_id == a_id && l.target_id == b_id)
+            .expect("just-inserted edge");
+        assert_eq!(row.valid_from.as_deref(), Some("2026-01-01T00:00:00+00:00"));
+        assert_eq!(
+            row.valid_until.as_deref(),
+            Some("2026-12-31T23:59:59+00:00")
+        );
+        assert_eq!(row.observed_by.as_deref(), Some("ai:tester@host"));
+        assert_eq!(row.attest_level.as_deref(), Some("unsigned"));
     }
 }

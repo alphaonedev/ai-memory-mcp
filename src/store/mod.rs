@@ -648,6 +648,41 @@ pub trait MemoryStore: Send + Sync {
     /// resume mid-stream without losing rows.
     async fn list_links(&self, namespace: Option<&str>) -> StoreResult<Vec<MemoryLink>>;
 
+    /// v0.7.0 ARCH-2 followup (FX-C2) — per-anchor edge probe. Returns
+    /// every link where `anchor_id` is either the source or the target
+    /// (the inbound + outbound union — same shape `db::get_links` has
+    /// returned since v0.6 for the `memory_get_links` MCP tool).
+    ///
+    /// Replaces the audit's missing-trait reach at `links.rs:894` and
+    /// `power.rs:280` so the per-anchor scan can ride the SAL trait
+    /// instead of falling through to the legacy free-function path.
+    /// [`MemoryStore::list_links`] is namespace-scoped, not
+    /// anchor-scoped, so the two methods are complementary — list_links
+    /// powers migrate/export; get_links_for_anchor powers the graph
+    /// view at a specific node.
+    ///
+    /// Wire-shape contract (matches `db::get_links`):
+    /// - `source_id`, `target_id`, `relation` populated from the row.
+    /// - `created_at`, `valid_from`, `valid_until`, `observed_by`,
+    ///   `attest_level` projected so the `memory_get_links` MCP tool's
+    ///   docstring promise holds on both backends.
+    /// - `signature` stays `None` (the verifier surface owns the bytes
+    ///   blob; exposing it here would force every existing caller to
+    ///   ignore a base64 blob in the response).
+    ///
+    /// Ordering: descending by `created_at` (most-recent edges first)
+    /// to match the SQLite `db::get_links` natural ordering after the
+    /// v0.7.0 issue #860 row-projection widening.
+    ///
+    /// Default returns `UnsupportedCapability` so adapters that don't
+    /// yet wire the per-anchor probe fail loudly rather than silently
+    /// degrade to an empty list (which would mask graph data loss).
+    async fn get_links_for_anchor(&self, _anchor_id: &str) -> StoreResult<Vec<MemoryLink>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "GET_LINKS_FOR_ANCHOR".to_string(),
+        })
+    }
+
     /// Register an agent in the adapter's `_agents` namespace (Task
     /// 1.3).
     async fn register_agent(
