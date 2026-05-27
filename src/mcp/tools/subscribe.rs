@@ -92,7 +92,7 @@ impl McpTool for UnsubscribeTool {
     }
 }
 
-pub(super) fn handle_subscribe(
+pub fn handle_subscribe(
     conn: &rusqlite::Connection,
     params: &Value,
     mcp_client: Option<&str>,
@@ -179,7 +179,7 @@ pub(super) fn handle_subscribe(
     Ok(response)
 }
 
-pub(crate) fn handle_unsubscribe(
+pub fn handle_unsubscribe(
     conn: &rusqlite::Connection,
     params: &Value,
     mcp_client: Option<&str>,
@@ -196,7 +196,7 @@ pub(crate) fn handle_unsubscribe(
     Ok(json!({"id": id, "removed": removed}))
 }
 
-pub(super) fn handle_list_subscriptions(
+pub fn handle_list_subscriptions(
     conn: &rusqlite::Connection,
     mcp_client: Option<&str>,
 ) -> Result<Value, String> {
