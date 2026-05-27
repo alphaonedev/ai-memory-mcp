@@ -95,6 +95,17 @@ mod arch_9_slug_tests {
         assert_eq!(STORE_VERSION_CONFLICT, "VERSION_CONFLICT");
     }
 
+    // FX-E1 (2026-05-27) — `crate::store` is gated behind
+    // `#[cfg(feature = "sal")]` in `src/lib.rs:336`. Without this
+    // matching gate the test fails to compile under the default
+    // feature set (the `cargo build --tests` invocation used by
+    // `token-budget.yml`, `mobile-cross-compile`, etc.), which
+    // cascaded into the Per-Module Coverage / CI Check x3 / Postgres
+    // gate failures observed on `release/v0.7.0`. The SAL-feature
+    // gating is intentional — the round-trip test exercises
+    // `StoreError::code()` which only exists when the SAL trait
+    // surface is compiled in.
+    #[cfg(feature = "sal")]
     #[test]
     fn arch_9_store_error_slug_round_trip() {
         use crate::store::{BoxBackendError, StoreError};
