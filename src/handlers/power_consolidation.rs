@@ -121,20 +121,18 @@ async fn resolve_consolidate_summary(
     // configured per-LLM-call timeout (default 30s). On timeout we
     // degrade to the deterministic concat fallback below (already the
     // L7 LLM-absent path).
-    let join = tokio::time::timeout(
-        llm_timeout,
-        tokio::task::spawn_blocking(move || {
-            let llm = match llm_arc.as_ref() {
-                Some(c) => c,
-                None => return Ok(String::new()),
-            };
-            llm.summarize_memories(&pairs)
-        }),
-    )
+    // PERF-9 (v0.7.0 FX-C1) — direct async summarize. No spawn_blocking
+    // hop now that OllamaClient is async-`reqwest::Client`.
+    let join = tokio::time::timeout(llm_timeout, async move {
+        let Some(llm) = llm_arc.as_ref() else {
+            return Ok::<String, anyhow::Error>(String::new());
+        };
+        llm.summarize_memories_async(&pairs).await
+    })
     .await;
 
     match join {
-        Ok(Ok(Ok(s))) if !s.trim().is_empty() => Ok(s),
+        Ok(Ok(s)) if !s.trim().is_empty() => Ok(s),
         Err(_) => {
             tracing::warn!(
                 "H8: LLM call (summarize_memories) exceeded {}s timeout — falling back to \
@@ -144,10 +142,8 @@ async fn resolve_consolidate_summary(
             Ok("Consolidated summary (LLM timeout; deterministic fallback)".to_string())
         }
         Ok(_) => {
-            // LLM returned an empty body or errored (or the join task
-            // panicked) — fall back to a deterministic concat-of-titles
-            // fallback. Logging on the error branch only so a successful
-            // empty response doesn't spam the daemon log.
+            // LLM returned an empty body or errored — fall back to a
+            // deterministic concat-of-titles fallback.
             Ok("Consolidated summary (LLM unavailable; deterministic fallback)".to_string())
         }
     }
@@ -555,33 +551,23 @@ pub async fn auto_tag_handler(
     // never withheld when the operator asked for tags but Ollama was
     // slow (matches the "LLM-absent fallback" branch the keyword/
     // semantic tiers already exercise).
-    let join = tokio::time::timeout(
-        llm_timeout,
-        tokio::task::spawn_blocking(move || {
-            let llm = match llm_arc.as_ref() {
-                Some(c) => c,
-                None => return Ok(Vec::new()),
-            };
-            llm.auto_tag(&title_owned, &content_owned, auto_tag_model.as_deref())
-        }),
-    )
+    // PERF-9 (v0.7.0 FX-C1) — direct async auto_tag.
+    let join = tokio::time::timeout(llm_timeout, async move {
+        let Some(llm) = llm_arc.as_ref() else {
+            return Ok::<Vec<String>, anyhow::Error>(Vec::new());
+        };
+        llm.auto_tag_async(&title_owned, &content_owned, auto_tag_model.as_deref())
+            .await
+    })
     .await;
 
     let tags = match join {
-        Ok(Ok(Ok(tags))) => tags.into_iter().take(AUTO_TAG_MAX_TAGS).collect::<Vec<_>>(),
-        Ok(Ok(Err(e))) => {
+        Ok(Ok(tags)) => tags.into_iter().take(AUTO_TAG_MAX_TAGS).collect::<Vec<_>>(),
+        Ok(Err(e)) => {
             tracing::warn!("L6: auto_tag LLM call failed: {e}");
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(json!({"error": format!("LLM auto_tag failed: {e}")})),
-            )
-                .into_response();
-        }
-        Ok(Err(e)) => {
-            tracing::warn!("L6: auto_tag spawn_blocking join failed: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
             )
                 .into_response();
         }
@@ -646,33 +632,22 @@ pub async fn expand_query_handler(
     // H8 (v0.7.0 round-2) — bound the Ollama call by the configured
     // per-LLM-call timeout (default 30s). On timeout return an empty
     // expansion list — matches the LLM-absent fallback shape.
-    let join = tokio::time::timeout(
-        llm_timeout,
-        tokio::task::spawn_blocking(move || {
-            let llm = match llm_arc.as_ref() {
-                Some(c) => c,
-                None => return Ok(Vec::new()),
-            };
-            llm.expand_query(&query_owned)
-        }),
-    )
+    // PERF-9 (v0.7.0 FX-C1) — direct async expand_query.
+    let join = tokio::time::timeout(llm_timeout, async move {
+        let Some(llm) = llm_arc.as_ref() else {
+            return Ok::<Vec<String>, anyhow::Error>(Vec::new());
+        };
+        llm.expand_query_async(&query_owned).await
+    })
     .await;
 
     let expansions = match join {
-        Ok(Ok(Ok(terms))) => terms,
-        Ok(Ok(Err(e))) => {
+        Ok(Ok(terms)) => terms,
+        Ok(Err(e)) => {
             tracing::warn!("L6: expand_query LLM call failed: {e}");
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(json!({"error": format!("LLM expand_query failed: {e}")})),
-            )
-                .into_response();
-        }
-        Ok(Err(e)) => {
-            tracing::warn!("L6: expand_query spawn_blocking join failed: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
             )
                 .into_response();
         }
