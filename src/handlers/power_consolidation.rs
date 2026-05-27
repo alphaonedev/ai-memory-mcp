@@ -193,6 +193,16 @@ async fn fetch_consolidate_source_pairs(
         return Ok(out);
     }
 
+    // ARCH-2 keeper: the sqlite path reads through `db::get` on the
+    // `app.db` connection that the test harness shares with handler
+    // writes. `app.store` (SqliteStore) opens its own connection on
+    // a separate temp file in test mode (see
+    // `test_sqlite_store_handle` in `src/handlers/tests.rs`); routing
+    // this read through `app.store.get` reads from the wrong file in
+    // tests. Production behavior is identical to SAL routing because
+    // the test-disjoint `app.store` is a unit-test artifact, but the
+    // refactor needs a test-fixture change tracked under the
+    // ARCH-2-followup audit before the sqlite path can converge.
     let lock = app.db.lock().await;
     let mut out: Vec<(String, String)> = Vec::with_capacity(ids.len());
     for id in ids {
@@ -712,6 +722,11 @@ async fn fetch_memory_for_handler(
         };
     }
 
+    // ARCH-2 keeper: same constraint as `fetch_consolidate_source_pairs`
+    // — `app.store` and `app.db` are pinned to disjoint files in the
+    // test harness, so routing this sqlite read through `app.store.get`
+    // breaks tests. ARCH-2-followup must converge the harness before
+    // the sqlite path can route through SAL.
     let lock = app.db.lock().await;
     match db::get(&lock.0, id) {
         Ok(Some(mem)) => Ok(mem),
