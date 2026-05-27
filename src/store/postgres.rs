@@ -2355,6 +2355,50 @@ impl PostgresStore {
             );
         }
 
+        // FX-C5 — substrate governance pre-write hook parity. The
+        // supersede path mints a NEW live row via a raw INSERT inside
+        // this transaction that bypasses `PostgresStore::store(..)`
+        // (which is where ARCH-1 wired in the
+        // `consult_governance_pre_write_pg` adapter at line 7001).
+        // Without this call the substrate hook is unaware that a
+        // supersede was about to land — multi-tenant + supersession
+        // workflow could bypass operator-signed governance. Compose
+        // the candidate memory the way the INSERT below will persist
+        // it and fire the hook BEFORE the archive step destroys the
+        // OLD live row. A refusal returns `PermissionDenied` and the
+        // tx ROLLBACK in the caller leaves the substrate clean.
+        let now_dt = Utc::now();
+        let now_rfc = now_dt.to_rfc3339();
+        let candidate = Memory {
+            id: new_id.clone(),
+            tier: new_tier.clone(),
+            namespace: new_namespace.clone(),
+            title: new_title.clone(),
+            content: new_content.clone(),
+            tags: new_tags.clone(),
+            priority: new_priority,
+            confidence: new_confidence,
+            source: existing.source.clone(),
+            access_count: 0,
+            created_at: now_rfc.clone(),
+            updated_at: now_rfc,
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: new_metadata.clone(),
+            reflection_depth: existing.reflection_depth,
+            memory_kind: existing.memory_kind.clone(),
+            entity_id: existing.entity_id.clone(),
+            persona_version: existing.persona_version,
+            citations: existing.citations.clone(),
+            source_uri: new_source_uri.clone(),
+            source_span: existing.source_span,
+            confidence_source: existing.confidence_source.clone(),
+            confidence_signals: existing.confidence_signals.clone(),
+            confidence_decayed_at: existing.confidence_decayed_at.clone(),
+            version: crate::models::default_memory_version(),
+        };
+        consult_governance_pre_write_pg(&candidate)?;
+
         // Step 1: archive the OLD row with archive_reason='superseded'.
         // #1025 (CRITICAL, 2026-05-21) — full v0.7.0 column carry.
         let archive_rows = sqlx::query(
@@ -5734,6 +5778,60 @@ impl PostgresStore {
         let tags_json = serde_json::to_value(&input.tags)
             .map_err(|e| ReflectError::Database(format!("serialize tags: {e}")))?;
 
+        // FX-C5 — substrate governance pre-write hook parity. The
+        // postgres reflect path mints a fresh memory via a raw INSERT
+        // that bypasses `PostgresStore::store(..)` (which is where
+        // ARCH-1 wired in the `consult_governance_pre_write_pg`
+        // adapter at line 7001). Without this call, an operator's
+        // signed governance rule could be bypassed by routing through
+        // the reflect surface. Compose the candidate memory the way
+        // the INSERT below will persist it and fire the hook BEFORE
+        // the tx opens. A refusal returns
+        // `ReflectError::HookVeto`-style via map of
+        // `StoreError::PermissionDenied` so the surface stays typed.
+        let candidate = Memory {
+            id: new_id.clone(),
+            tier: input.tier.clone(),
+            namespace: target_namespace.clone(),
+            title: input.title.clone(),
+            content: input.content.clone(),
+            tags: input.tags.clone(),
+            priority: input.priority.clamp(1, 10),
+            confidence: input.confidence.clamp(0.0, 1.0),
+            source: input.source.clone(),
+            access_count: 0,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: metadata_value.clone(),
+            reflection_depth: new_depth_i32,
+            memory_kind: crate::models::MemoryKind::Reflection,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: crate::models::ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: crate::models::default_memory_version(),
+        };
+        if let Err(e) = consult_governance_pre_write_pg(&candidate) {
+            // Map `StoreError::PermissionDenied` (the canonical refusal
+            // shape on the postgres adapter) into `ReflectError`. The
+            // operator-authored reason rides on the payload so callers
+            // can surface it in the wire response. Use HTTP-style code
+            // 403 to mirror the wire-level mapping the
+            // `consult_governance_pre_write_pg` adapter produces on the
+            // other postgres write paths (`GOVERNANCE_REFUSED`).
+            let reason = match &e {
+                StoreError::PermissionDenied { reason, .. } => reason.clone(),
+                other => other.to_string(),
+            };
+            return Err(ReflectError::HookVeto { reason, code: 403 });
+        }
+
         let mut tx = self
             .pool
             .begin()
@@ -6071,6 +6169,49 @@ fn consult_governance_pre_write_pg(memory: &Memory) -> StoreResult<()> {
                 reason,
             })
         }
+    }
+}
+
+impl PostgresStore {
+    /// FX-C5 — load a row from `archived_memories` shaped as a
+    /// [`Memory`] so the substrate
+    /// [`crate::storage::GOVERNANCE_PRE_WRITE`] hook can inspect the
+    /// restore candidate BEFORE the live INSERT lands. The archived
+    /// table shares the v0.7.0 column shape with `memories` (#1025)
+    /// so the same [`PostgresStore::row_to_memory`] mapper applies;
+    /// columns absent on legacy pre-#1025 archived rows fall through
+    /// to the same defaults the mapper already applies. The
+    /// `original_tier` column wins over the archive-time `tier` so
+    /// the candidate hook sees the row at the tier it will land at
+    /// post-restore (matches the SQL the caller is about to execute).
+    async fn load_archived_as_memory_pg(
+        executor: &mut sqlx::PgConnection,
+        id: &str,
+    ) -> StoreResult<Memory> {
+        let row = sqlx::query(
+            "SELECT id, COALESCE(original_tier, tier) AS tier, namespace, title, content,
+                    tags, priority, confidence, source, access_count, created_at,
+                    updated_at, last_accessed_at,
+                    COALESCE(original_expires_at, expires_at) AS expires_at, metadata,
+                    embedding, embedding_dim,
+                    COALESCE(reflection_depth, 0) AS reflection_depth,
+                    atomised_into, atom_of,
+                    COALESCE(memory_kind, 'observation') AS memory_kind,
+                    entity_id, persona_version,
+                    COALESCE(citations, '[]') AS citations,
+                    source_uri, source_span,
+                    COALESCE(confidence_source, 'caller_provided') AS confidence_source,
+                    confidence_signals, confidence_decayed_at,
+                    mentioned_entity_id,
+                    COALESCE(version, 1) AS version
+             FROM archived_memories WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(executor)
+        .await
+        .map_err(|e| to_store_err("load archived as memory", e))?;
+        let row = row.ok_or_else(|| StoreError::NotFound { id: id.to_string() })?;
+        Self::row_to_memory(&row)
     }
 }
 
@@ -8743,6 +8884,46 @@ impl MemoryStore for PostgresStore {
                 detail: format!("serialize consolidated tags: {e}"),
             })?;
 
+        // FX-C5 — substrate governance pre-write hook parity. Consolidate
+        // mints a fresh memory via a raw INSERT inside this transaction
+        // that bypasses `PostgresStore::store(..)` (which is where
+        // ARCH-1 wired in the `consult_governance_pre_write_pg` adapter
+        // at line 7001). Compose the candidate memory shape the way the
+        // INSERT below will persist it and fire the hook BEFORE the
+        // INSERT. A refusal short-circuits the transaction (the tx is
+        // implicitly dropped on the early-return without commit, leaving
+        // the substrate clean — source rows untouched).
+        let now_rfc = now.to_rfc3339();
+        let candidate = Memory {
+            id: new_id.clone(),
+            tier: tier.clone(),
+            namespace: namespace.to_string(),
+            title: title.to_string(),
+            content: summary.to_string(),
+            tags: all_tags.clone(),
+            priority: max_priority,
+            confidence: 1.0,
+            source: source.to_string(),
+            access_count: total_access,
+            created_at: now_rfc.clone(),
+            updated_at: now_rfc,
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: merged_metadata_value.clone(),
+            reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: crate::models::ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: crate::models::default_memory_version(),
+        };
+        consult_governance_pre_write_pg(&candidate)?;
+
         // Plan C R4 / R5 cert finding: the prior implementation was a plain
         // INSERT that exploded with `duplicate key value violates unique
         // constraint "memories_title_ns_uidx"` when an operator re-ran a
@@ -8929,6 +9110,18 @@ impl MemoryStore for PostgresStore {
         if active.is_some() {
             return Err(StoreError::Conflict { id: id.to_string() });
         }
+
+        // FX-C5 — substrate governance pre-write hook parity. Restoring
+        // an archived row mints a fresh live row via a raw INSERT...SELECT
+        // that bypasses `PostgresStore::store(..)` (which is where ARCH-1
+        // wired in the `consult_governance_pre_write_pg` adapter at
+        // line 7001). Without this call, an operator's signed governance
+        // rule could be bypassed by restoring a row whose `(title,
+        // namespace)` would otherwise be refused on a direct write.
+        // Load the archived row shaped as a `Memory` and fire the hook
+        // BEFORE the INSERT lands.
+        let candidate = Self::load_archived_as_memory_pg(&mut *tx, id).await?;
+        consult_governance_pre_write_pg(&candidate)?;
 
         let now = chrono::Utc::now();
         // #1025 (CRITICAL, 2026-05-21) — full v0.7.0 column carry on

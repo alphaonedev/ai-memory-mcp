@@ -1483,17 +1483,16 @@ pub fn update_with_archive_on_supersede(
     // for this (title, namespace) slot rather than dual-populated.
     let archived_id = existing.id.clone();
 
-    // Step 1: archive the OLD row with reason='superseded'.
-    let moved = archive_memory(conn, &archived_id, Some("superseded"))?;
-    if !moved {
-        // #962 typed envelope — substrate-internal fault (DB row vanished
-        // between read and write or row count drifted). Maps to 500.
-        return Err(anyhow::Error::new(StorageError::ArchiveSupersedeFailed {
-            archived_id: archived_id.clone(),
-        }));
-    }
-
-    // Step 2: insert the NEW row carrying the patched content.
+    // FX-C5 — compose the NEW row up front so the substrate
+    // pre-write governance hook (`GOVERNANCE_PRE_WRITE`) gets a
+    // chance to refuse BEFORE the archive step destroys the live
+    // OLD row. Pre-FX-C5 the hook was consulted transitively via
+    // `insert(..)` at the tail of this function; archive ran first
+    // so a refusal left the live table without the OLD row AND
+    // without the patched NEW row. Now the hook fires on a fully-
+    // composed candidate before any state mutation, mirroring the
+    // FX-2 pattern on the postgres adapter (see
+    // `consult_governance_pre_write_pg` in `src/store/postgres.rs`).
     let mut new_mem = existing.clone();
     new_mem.id = new_id.clone();
     new_mem.title = new_title;
@@ -1514,6 +1513,23 @@ pub fn update_with_archive_on_supersede(
     // continuation of the OLD row's version chain (the chain is
     // preserved via the supersede link stamped in metadata).
     new_mem.version = crate::models::default_memory_version();
+
+    // FX-C5 — consult the substrate governance pre-write hook on
+    // the composed NEW row BEFORE archiving the OLD row. A refusal
+    // returns cleanly with no state change.
+    consult_governance_pre_write(&new_mem)?;
+
+    // Step 1: archive the OLD row with reason='superseded'.
+    let moved = archive_memory(conn, &archived_id, Some("superseded"))?;
+    if !moved {
+        // #962 typed envelope — substrate-internal fault (DB row vanished
+        // between read and write or row count drifted). Maps to 500.
+        return Err(anyhow::Error::new(StorageError::ArchiveSupersedeFailed {
+            archived_id: archived_id.clone(),
+        }));
+    }
+
+    // Step 2: insert the NEW row carrying the patched content.
     insert(conn, &new_mem)?;
 
     // Step 3: the supersede edge from new→archived id is preserved
@@ -3782,6 +3798,46 @@ pub fn consolidate(
             .context("merged metadata exceeds size limit")?;
         let metadata_json = serde_json::to_string(&merged_metadata_value)?;
 
+        // FX-C5 — substrate governance pre-write hook parity. Consolidate
+        // mints a fresh memory via a raw INSERT that bypasses the
+        // `db::insert(..)` tail (which is where the SQLite path normally
+        // consults `GOVERNANCE_PRE_WRITE`). Without this call the
+        // operator's signed governance rules could be bypassed by
+        // routing through the consolidate surface. Compose the candidate
+        // memory shape the way the INSERT below would persist it and
+        // fire the hook; a refusal short-circuits the transaction body
+        // and the outer ROLLBACK undoes any work already done in this
+        // closure.
+        let candidate = Memory {
+            id: new_id.clone(),
+            tier: tier.clone(),
+            namespace: namespace.to_string(),
+            title: title.to_string(),
+            content: summary.to_string(),
+            tags: all_tags.clone(),
+            priority: max_priority,
+            confidence: 1.0,
+            source: source.to_string(),
+            access_count: total_access,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: merged_metadata_value.clone(),
+            reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: crate::models::ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: crate::models::default_memory_version(),
+        };
+        consult_governance_pre_write(&candidate)?;
+
         conn.execute(
             "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, metadata)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1.0, ?8, ?9, ?10, ?10, ?11)",
@@ -5880,6 +5936,17 @@ pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
                 params![id],
             )?;
         }
+        // FX-C5 — substrate governance pre-write hook parity. Restoring
+        // an archived row mints a fresh live row via a raw INSERT...SELECT
+        // that bypasses the `db::insert(..)` tail (which is where the
+        // SQLite path normally consults `GOVERNANCE_PRE_WRITE`). Without
+        // this call, an operator's signed governance rule could be
+        // bypassed by restoring a row whose `(title, namespace)` would
+        // otherwise be refused on a direct write. Load the archived row
+        // shaped as a `Memory` and fire the hook BEFORE the INSERT;
+        // a refusal short-circuits the transaction (outer ROLLBACK).
+        let candidate = load_archived_as_memory(conn, id)?;
+        consult_governance_pre_write(&candidate)?;
 
         // v0.6.3.1 P2 (G5) — preserve original tier + expires_at + embedding
         // on restore. Pre-v17 rows lost this metadata permanently; the
@@ -6007,6 +6074,14 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
                 params![id],
             )?;
         }
+        // FX-C5 — substrate governance pre-write hook parity. See the
+        // matching block in `restore_archived` above for rationale.
+        // Caller-scoped variant uses the same hook contract — the
+        // hook is owner-agnostic (it sees the Memory payload, not the
+        // caller context); ownership gating already happened on the
+        // SELECT above.
+        let candidate = load_archived_as_memory(conn, id)?;
+        consult_governance_pre_write(&candidate)?;
         // #1025 (CRITICAL, 2026-05-21) — full v0.7.0 column carry on
         // archive→restore. Pre-#1025 the SELECT pulled only 17 columns;
         // restored row landed with reflection_depth=0 (DEFAULT),
@@ -6054,6 +6129,36 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
             Err(e)
         }
     }
+}
+
+/// FX-C5 — load a row from `archived_memories` shaped as a [`Memory`]
+/// so the substrate `GOVERNANCE_PRE_WRITE` hook can inspect the
+/// restore candidate BEFORE the live INSERT lands. The archived
+/// table shares the v0.7.0 column shape with `memories` (#1025) so
+/// the same `row_to_memory` helper applies; columns absent on legacy
+/// pre-#1025 archived rows fall through to the same defaults
+/// `row_to_memory` already applies. The `original_tier` column wins
+/// over the archive-time `tier` so the candidate hook sees the row
+/// at the tier it will land at post-restore (matches the SQL the
+/// caller is about to execute).
+fn load_archived_as_memory(conn: &Connection, id: &str) -> Result<Memory> {
+    let mut stmt = conn.prepare(
+        "SELECT id, COALESCE(original_tier, tier) AS tier, namespace, title, content,
+                tags, priority, confidence, source, access_count, created_at,
+                updated_at, last_accessed_at,
+                COALESCE(original_expires_at, expires_at) AS expires_at, metadata,
+                COALESCE(reflection_depth, 0) AS reflection_depth,
+                COALESCE(memory_kind, 'observation') AS memory_kind,
+                entity_id, persona_version,
+                COALESCE(citations, '[]') AS citations,
+                source_uri, source_span,
+                COALESCE(confidence_source, 'caller_provided') AS confidence_source,
+                confidence_signals, confidence_decayed_at,
+                COALESCE(version, 1) AS version
+         FROM archived_memories WHERE id = ?1",
+    )?;
+    let mem = stmt.query_row(params![id], row_to_memory)?;
+    Ok(mem)
 }
 
 pub fn purge_archive(conn: &Connection, older_than_days: Option<i64>) -> Result<usize> {
