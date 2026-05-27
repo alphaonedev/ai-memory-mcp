@@ -6365,8 +6365,7 @@ decision = "allow"
         // CI passes on clean-HOME runners; local fails. The guard
         // below forces `resolve_operator_pubkey()` to return None
         // for the test scope, matching the CI posture deterministically.
-        let _no_pubkey_guard =
-            crate::governance::rules_store::force_no_operator_pubkey_for_test();
+        let _no_pubkey_guard = crate::governance::rules_store::force_no_operator_pubkey_for_test();
         let _gate = env_var_lock();
         let env = TestEnv::fresh();
         let conn = db::open(&env.db_path).unwrap();
