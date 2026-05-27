@@ -125,25 +125,23 @@ pub(crate) async fn maybe_auto_tag(
     // per-LLM-call timeout (default 30s). On timeout we degrade to the
     // LLM-absent fallback (empty tags) — same shape the keyword /
     // semantic tiers already return when no LLM is wired (L5/L7).
-    let join = tokio::time::timeout(
-        llm_timeout,
-        tokio::task::spawn_blocking(move || {
-            let llm = match llm_arc.as_ref() {
-                Some(c) => c,
-                None => return Ok(Vec::new()),
-            };
-            llm.auto_tag(&title_owned, &content_owned, auto_tag_model.as_deref())
-        }),
-    )
+    // PERF-9 (v0.7.0 FX-C1, 2026-05-26) — direct async call. Pre-PERF-9
+    // this hopped through `spawn_blocking` because `OllamaClient::auto_tag`
+    // was synchronous-`reqwest::blocking` underneath; now it's
+    // `reqwest::Client` async, so we drive `auto_tag_async` inline and
+    // let `tokio::time::timeout` bound it without an extra thread hop.
+    let join = tokio::time::timeout(llm_timeout, async move {
+        let Some(llm) = llm_arc.as_ref() else {
+            return Ok::<Vec<String>, anyhow::Error>(Vec::new());
+        };
+        llm.auto_tag_async(&title_owned, &content_owned, auto_tag_model.as_deref())
+            .await
+    })
     .await;
     match join {
-        Ok(Ok(Ok(tags))) => tags.into_iter().take(AUTO_TAG_MAX_TAGS).collect(),
-        Ok(Ok(Err(e))) => {
-            tracing::warn!("L5: auto_tag hook failed: {e}");
-            Vec::new()
-        }
+        Ok(Ok(tags)) => tags.into_iter().take(AUTO_TAG_MAX_TAGS).collect(),
         Ok(Err(e)) => {
-            tracing::warn!("L5: auto_tag spawn_blocking join failed: {e}");
+            tracing::warn!("L5: auto_tag hook failed: {e}");
             Vec::new()
         }
         Err(_) => {
@@ -224,26 +222,23 @@ async fn maybe_detect_conflicts(
         let llm_arc_cl = llm_arc.clone();
         let cand_content_cl = cand_content.clone();
         let new_content_cl = new_content.clone();
-        let join = tokio::time::timeout(
-            llm_timeout,
-            tokio::task::spawn_blocking(move || {
-                let llm = match llm_arc_cl.as_ref() {
-                    Some(c) => c,
-                    None => return Ok(false),
-                };
-                llm.detect_contradiction(&new_content_cl, &cand_content_cl)
-            }),
-        )
+        // PERF-9 (v0.7.0 FX-C1) — direct async detect_contradiction.
+        let join = tokio::time::timeout(llm_timeout, async move {
+            let Some(llm) = llm_arc_cl.as_ref() else {
+                return Ok::<bool, anyhow::Error>(false);
+            };
+            llm.detect_contradiction_async(&new_content_cl, &cand_content_cl)
+                .await
+        })
         .await;
         match join {
-            Ok(Ok(Ok(true))) => out.push(ConflictReport {
+            Ok(Ok(true)) => out.push(ConflictReport {
                 id: cand_id,
                 title: cand_title,
                 suggested_merge: None,
             }),
-            Ok(Ok(Ok(false))) => {}
-            Ok(Ok(Err(e))) => tracing::warn!("detect_contradiction LLM error for {cand_id}: {e}"),
-            Ok(Err(e)) => tracing::warn!("detect_contradiction join error for {cand_id}: {e}"),
+            Ok(Ok(false)) => {}
+            Ok(Err(e)) => tracing::warn!("detect_contradiction LLM error for {cand_id}: {e}"),
             Err(_) => tracing::warn!(
                 "H8: LLM call (detect_contradiction) exceeded {}s timeout for {cand_id} — skipping",
                 llm_timeout.as_secs()
