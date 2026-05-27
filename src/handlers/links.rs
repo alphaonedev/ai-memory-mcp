@@ -891,35 +891,72 @@ pub async fn get_links(
     }
 
     let lock = app.db.lock().await;
-    match db::get_links(&lock.0, &id) {
+    // ARCH-2 keeper: `db::get_links` is a sqlite-only per-anchor edge
+    // probe with no SAL trait equivalent (`list_links(namespace)` is
+    // namespace-scoped, not anchor-scoped). Filed as a missing-trait
+    // follow-up under docs/v0.7.0/arch-2-sal-boundary-audit.md.
+    let links_for_anchor = db::get_links(&lock.0, &id);
+    drop(lock);
+    match links_for_anchor {
         Ok(links) => {
             let visible = if caller_is_admin {
                 links
             } else {
-                // sqlite-legacy: post-filter via in-process db::get +
-                // is_visible_to_caller on each endpoint. The unconditional
-                // `is_some_and(|m| visible)` returns false when the row is
-                // missing entirely — same posture as the postgres branch
-                // above. Note an attacker who can correctly guess a memory
-                // id AND see that the row exists at all is already past
-                // a more sensitive surface; this filter is a defence-in-
-                // depth on the graph-edge surface.
-                links
-                    .into_iter()
-                    .filter(|link| {
-                        let src_ok = db::get(&lock.0, &link.source_id)
-                            .ok()
-                            .flatten()
-                            .as_ref()
-                            .is_some_and(|m| crate::visibility::is_visible_to_caller(m, &caller));
-                        let tgt_ok = db::get(&lock.0, &link.target_id)
-                            .ok()
-                            .flatten()
-                            .as_ref()
-                            .is_some_and(|m| crate::visibility::is_visible_to_caller(m, &caller));
-                        src_ok && tgt_ok
-                    })
-                    .collect()
+                // ARCH-2 (post-#961 SAL boundary cleanup): route the
+                // per-endpoint visibility post-filter through the SAL
+                // `MemoryStore::get` trait method so the sqlite
+                // visibility check mirrors the postgres branch above
+                // (#910 scope=private folding into NotFound is honored
+                // verbatim in both backends). Under `--no-default-
+                // features` (no `sal`) the legacy `db::get`-based filter
+                // remains as the only available path.
+                #[cfg(feature = "sal")]
+                {
+                    let ctx = crate::store::CallerContext::for_agent(&caller);
+                    let mut keep: Vec<_> = Vec::with_capacity(links.len());
+                    for link in links {
+                        let src_ok = app
+                            .store
+                            .get(&ctx, &link.source_id)
+                            .await
+                            .map(|m| crate::visibility::is_visible_to_caller(&m, &caller))
+                            .unwrap_or(false);
+                        let tgt_ok = app
+                            .store
+                            .get(&ctx, &link.target_id)
+                            .await
+                            .map(|m| crate::visibility::is_visible_to_caller(&m, &caller))
+                            .unwrap_or(false);
+                        if src_ok && tgt_ok {
+                            keep.push(link);
+                        }
+                    }
+                    keep
+                }
+                #[cfg(not(feature = "sal"))]
+                {
+                    let lock = app.db.lock().await;
+                    links
+                        .into_iter()
+                        .filter(|link| {
+                            let src_ok = db::get(&lock.0, &link.source_id)
+                                .ok()
+                                .flatten()
+                                .as_ref()
+                                .is_some_and(|m| {
+                                    crate::visibility::is_visible_to_caller(m, &caller)
+                                });
+                            let tgt_ok = db::get(&lock.0, &link.target_id)
+                                .ok()
+                                .flatten()
+                                .as_ref()
+                                .is_some_and(|m| {
+                                    crate::visibility::is_visible_to_caller(m, &caller)
+                                });
+                            src_ok && tgt_ok
+                        })
+                        .collect()
+                }
             };
             Json(json!({"links": visible})).into_response()
         }
