@@ -313,9 +313,20 @@ fn sr3_1084_crossencoder_neural_no_mutex() {
 #[test]
 fn sr3_1087_hnsw_search_caches_valid_ids() {
     let source = lf(include_str!("../src/hnsw.rs"));
+    // FX-E1 (2026-05-27) — PERF-7 (commit c9579686e, FX-C4-batch2)
+    // narrowed the cache element type from `String` to
+    // `Arc<str>` for ~halved per-rebuild allocator pressure on the
+    // 100k-entry warmup (UUIDs are 36 bytes; `Arc<str>` is a
+    // 16-byte fat pointer with the bytes heap-shared and no spare
+    // capacity, vs. `String`'s 24-byte ptr/len/cap struct PLUS the
+    // heap-side bytes). Membership against `&str` still works
+    // through the `Borrow<str>` impl. The original sr3 pin still
+    // asserted the pre-PERF-7 `String` shape; this update tracks
+    // the canonical post-PERF-7 invariant (also pinned by
+    // `src/hnsw.rs::tests::perf_7_valid_ids_cache_is_arc_str_typed`).
     assert!(
-        source.contains("valid_ids_cache: Option<std::collections::HashSet<String>>"),
-        "IndexState must carry a cached valid_ids set post-#1087"
+        source.contains("valid_ids_cache: Option<std::collections::HashSet<std::sync::Arc<str>>>"),
+        "IndexState must carry a cached valid_ids set typed as Arc<str> post-#1087/PERF-7"
     );
     // The mutation paths must invalidate the cache.
     let invalidations = source.matches("state.valid_ids_cache = None;").count();
