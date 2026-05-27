@@ -6,7 +6,12 @@
 use crate::embeddings::Embed;
 use crate::{db, validate};
 use serde_json::{Value, json};
-pub(super) fn handle_check_duplicate(
+// v0.7.0 ARCH-3 / FX-12 — promoted from `pub(super)` to `pub` so the
+// `ai-memory check-duplicate` CLI subcommand can dispatch into the
+// same substrate primitive the MCP `memory_check_duplicate` tool
+// consumes, without duplicating business logic. Wire envelope is
+// byte-equal across MCP / HTTP / CLI.
+pub fn handle_check_duplicate(
     conn: &rusqlite::Connection,
     params: &Value,
     embedder: Option<&dyn Embed>,
