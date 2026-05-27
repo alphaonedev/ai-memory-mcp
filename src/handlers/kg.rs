@@ -24,8 +24,6 @@
 
 #![allow(clippy::too_many_lines)]
 
-#[cfg(feature = "sal")]
-use crate::models::ConfidenceSource;
 use crate::models::Memory;
 use axum::{
     Json,
@@ -33,16 +31,10 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
-#[cfg(feature = "sal")]
-use chrono::Utc;
 use serde::Deserialize;
 use serde_json::json;
-#[cfg(feature = "sal")]
-use uuid::Uuid;
 
 use crate::db;
-#[cfg(feature = "sal")]
-use crate::models::Tier;
 use crate::validate;
 
 use super::AppState;
@@ -136,6 +128,15 @@ pub async fn entity_register(
     // canonical SQLite contract (`db::entity_register` unions aliases
     // across registrations), we first list any matching entity row and
     // union its prior aliases into the incoming set before the upsert.
+    // v0.7.0 ARCH-2 FX-C2-batch5 (2026-05-27): the postgres branch now
+    // rides the SAL trait `entity_register` (the alias-union walk +
+    // upsert is encapsulated inside the adapter, byte-for-byte aligned
+    // with the sqlite `db::entity_register` contract). Pre-batch5 the
+    // handler open-coded the alias union + `app.store.store` upsert in
+    // ~150 LOC; the trait method collapses that to a single call. The
+    // governance enforcement gate (F-A2A1.5 / #705) is preserved
+    // verbatim — entity rows remain governance-relevant writes and
+    // must consult the namespace policy before the underlying upsert.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         let aid = agent_id
@@ -143,110 +144,26 @@ pub async fn entity_register(
             .unwrap_or_else(|| "anonymous:entity-register".to_string());
         let ctx = crate::store::CallerContext::for_agent(aid.clone());
 
-        // Pull the prior entity row, if any, so we can union aliases
-        // across registrations. This is a single namespace-scoped
-        // `list` plus an in-memory match by canonical_name; the data
-        // volume per namespace is small (entities rather than memories
-        // proper) so the linear scan is acceptable.
-        let prior_aliases: Vec<String> = {
-            let filter = crate::store::Filter {
-                namespace: Some(body.namespace.clone()),
-                limit: 10_000,
-                ..Default::default()
-            };
-            match app.store.list(&ctx, &filter).await {
-                // #869 audit (Category B — safe default): a missing
-                // `aliases` field or a non-entity row collapses to
-                // empty `Vec<String>`, which is the documented
-                // "first-time registration" path (no prior aliases to
-                // union against the new ones).
-                Ok(rows) => rows
-                    .into_iter()
-                    .find(|m| {
-                        m.title == body.canonical_name
-                            && m.metadata.get("kind").and_then(|v| v.as_str()) == Some("entity")
-                    })
-                    .and_then(|m| {
-                        m.metadata
-                            .get("aliases")
-                            .and_then(|v| v.as_array())
-                            .map(|a| {
-                                a.iter()
-                                    .filter_map(|x| x.as_str().map(str::to_string))
-                                    .collect()
-                            })
-                    })
-                    .unwrap_or_default(),
-                Err(_) => Vec::new(),
-            }
-        };
-
-        // Union: preserve insertion order (prior first, then new),
-        // de-dup case-sensitively to match `db::entity_register`.
-        let mut union: Vec<String> = Vec::new();
-        for a in prior_aliases.iter().chain(body.aliases.iter()) {
-            if !union.iter().any(|x| x == a) {
-                union.push(a.clone());
-            }
-        }
-
-        let now = Utc::now().to_rfc3339();
-        let mut metadata = extra_metadata.clone();
-        let meta = metadata.as_object_mut().expect("verified above");
-        meta.insert("kind".to_string(), json!("entity"));
-        meta.insert("aliases".to_string(), json!(union.clone()));
-        meta.insert("agent_id".to_string(), json!(aid));
-        let mem = Memory {
-            id: Uuid::new_v4().to_string(),
-            tier: Tier::Long,
-            namespace: body.namespace.clone(),
-            title: body.canonical_name.clone(),
-            content: format!(
-                "Entity registration: {} (aliases: {})",
-                body.canonical_name,
-                union.join(", ")
-            ),
-            tags: vec!["entity".to_string()],
-            priority: 5,
-            confidence: 1.0,
-            source: "entity-register".to_string(),
-            access_count: 0,
-            created_at: now.clone(),
-            updated_at: now,
-            last_accessed_at: None,
-            expires_at: None,
-            metadata,
-            reflection_depth: 0,
-            memory_kind: crate::models::MemoryKind::Observation,
-            entity_id: None,
-            persona_version: None,
-            citations: Vec::new(),
-            source_uri: None,
-            source_span: None,
-            confidence_source: ConfidenceSource::CallerProvided,
-            confidence_signals: None,
-            confidence_decayed_at: None,
-            version: 1,
-        };
-        // F-A2A1.5 (#705) — governance enforcement on the postgres
-        // entity-register path. Mirrors the F-A2A1.2 delete/promote gates
-        // and the Wave-3 Continuation 3 create_memory gate: entity rows
-        // are governance-relevant writes (they upsert a `Memory` row in
-        // the requested namespace), so the postgres branch must consult
-        // `enforce_governance_action(Store, ...)` before the upsert. Deny
-        // returns 403; Pending returns 202 + pending_id. Without this
-        // gate, postgres-backed daemons silently allowed any caller to
-        // register entities into namespaces governed by `write=owner` or
-        // `write=approve` standards, defeating the same A2A surface
-        // F-A2A1.2 closed for delete/promote and create_memory.
+        // F-A2A1.5 (#705) — governance enforcement runs BEFORE the
+        // entity_register trait call so deny / pending / 403 / 202
+        // semantics match the sqlite path. The payload shape is the
+        // canonical entity-create body so a downstream approver replay
+        // can reconstruct the registration on `execute_pending_action`.
         {
             use crate::models::GovernanceDecision;
-            let payload_for_pending = serde_json::to_value(&mem).unwrap_or_else(|_| json!({}));
+            let payload_for_pending = serde_json::json!({
+                "title": body.canonical_name,
+                "namespace": body.namespace,
+                "tier": "long",
+                "tags": ["entity"],
+                "metadata": &extra_metadata,
+                "aliases": &body.aliases,
+            });
             match app
                 .store
                 .enforce_governance_action(
                     crate::store::GovernedAction::Store,
-                    &mem.namespace,
+                    &body.namespace,
                     &aid,
                     None,
                     None,
@@ -276,7 +193,7 @@ pub async fn entity_register(
                             "pending_id": pending_id,
                             "reason": "governance requires approval",
                             "action": "store",
-                            "namespace": mem.namespace,
+                            "namespace": body.namespace,
                             "storage_backend": "postgres",
                         })),
                     )
@@ -286,20 +203,30 @@ pub async fn entity_register(
             }
         }
 
-        let created = prior_aliases.is_empty();
-        return match app.store.store(&ctx, &mem).await {
-            Ok(id) => (
-                if created {
+        return match app
+            .store
+            .entity_register(
+                &ctx,
+                &body.canonical_name,
+                &body.namespace,
+                &body.aliases,
+                &extra_metadata,
+                Some(&aid),
+            )
+            .await
+        {
+            Ok(reg) => (
+                if reg.created {
                     StatusCode::CREATED
                 } else {
                     StatusCode::OK
                 },
                 Json(json!({
-                    "entity_id": id,
-                    "canonical_name": body.canonical_name,
-                    "namespace": body.namespace,
-                    "aliases": union,
-                    "created": created,
+                    "entity_id": reg.entity_id,
+                    "canonical_name": reg.canonical_name,
+                    "namespace": reg.namespace,
+                    "aliases": reg.aliases,
+                    "created": reg.created,
                 })),
             )
                 .into_response(),
@@ -730,22 +657,21 @@ pub async fn kg_timeline(
             .into_response();
     }
 
-    // v0.7.0 Wave-3 Continuation — postgres dispatches via the
-    // PostgresStore::kg_timeline helper. The adapter resolves AGE vs
-    // CTE backend at connect time and projects rows in the shared
-    // `KgTimelineRow` shape so the wire envelope stays parity-equal
-    // to the SQLite path.
+    // v0.7.0 ARCH-2 FX-C2-batch5 (2026-05-27): postgres dispatches via
+    // the new `MemoryStore::kg_timeline` trait method (the SAL is the
+    // canonical kg_timeline surface). The legacy
+    // `kg_timeline_via_store` helper stays in place for out-of-tree
+    // back-compat but new routes ride the trait. The adapter still
+    // resolves AGE vs CTE backend at connect time and projects rows in
+    // the shared `KgTimelineRow` shape so the wire envelope stays
+    // parity-equal to the SQLite path.
     #[cfg(feature = "sal-postgres")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         let limit = p.limit;
-        return match crate::store::postgres::kg_timeline_via_store(
-            &app.store,
-            &p.source_id,
-            since,
-            until,
-            limit,
-        )
-        .await
+        return match app
+            .store
+            .kg_timeline(&p.source_id, since, until, limit)
+            .await
         {
             Ok(events) => {
                 let events_json: Vec<serde_json::Value> = events
@@ -1308,21 +1234,21 @@ pub async fn kg_query(
         }
     }
 
-    // v0.7.0 Wave-3 Continuation — postgres dispatches via the
-    // PostgresStore::kg_query helper. Backend (AGE vs CTE) is
-    // resolved at adapter connect time. Temporal/agent filters are
-    // applied client-side post-traversal because the AGE Cypher
-    // path returns the unfiltered topology — match the SQLite
-    // recursive-CTE wire shape.
+    // v0.7.0 ARCH-2 FX-C2-batch5 (2026-05-27): postgres dispatches via
+    // the new `MemoryStore::kg_query` trait method (the SAL is the
+    // canonical kg_query surface). The legacy `kg_query_via_store`
+    // helper stays in place for out-of-tree back-compat but new routes
+    // ride the trait. Backend (AGE vs CTE) is still resolved at
+    // adapter connect time inside `kg_query_with_history`.
+    // Temporal/agent filters are applied client-side post-traversal
+    // because the AGE Cypher path returns the unfiltered topology —
+    // match the SQLite recursive-CTE wire shape.
     #[cfg(feature = "sal-postgres")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        return match crate::store::postgres::kg_query_via_store(
-            &app.store,
-            &source_id,
-            max_depth,
-            body.include_invalidated,
-        )
-        .await
+        return match app
+            .store
+            .kg_query(&source_id, max_depth, body.include_invalidated)
+            .await
         {
             Ok(nodes) => {
                 // #910 — fetch each target's metadata, filter by the

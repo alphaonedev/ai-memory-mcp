@@ -73,22 +73,22 @@ pub async fn list_archive(
             .into_response();
     }
 
-    // v0.7.0 Wave-3 Continuation — postgres-backed daemons project from
-    // the `archived_memories` table via the SAL adapter. The trait does
-    // not yet expose archive operations, so we dispatch via the typed
-    // `PostgresStore::list_archived` helper added under feature
-    // `sal-postgres`. Returns the same wire envelope as sqlite.
+    // v0.7.0 ARCH-2 FX-C2-batch5 (2026-05-27): route the postgres branch
+    // through the new `MemoryStore::list_archived` trait method (the
+    // SAL is now the canonical archive-list surface). The legacy
+    // `list_archived_via_store` downcast hatch still exists for
+    // out-of-tree callers but new routes ride the trait surface.
+    // Pre-batch5 the postgres branch dispatched through
+    // `list_archived_via_store`, which downcasted to `PostgresStore`
+    // via the `as_any_for_postgres` hatch.
     #[cfg(feature = "sal-postgres")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         let limit = q.limit.unwrap_or(50).clamp(1, 1000);
         let offset = q.offset.unwrap_or(0);
-        return match crate::store::postgres::list_archived_via_store(
-            &app.store,
-            q.namespace.as_deref(),
-            limit,
-            offset,
-        )
-        .await
+        return match app
+            .store
+            .list_archived(q.namespace.as_deref(), limit, offset)
+            .await
         {
             Ok(items) => Json(json!({"archived": items, "count": items.len()})).into_response(),
             Err(e) => store_err_to_response(e),
