@@ -1215,6 +1215,153 @@ impl MemoryStore for SqliteStore {
         let conn = self.state.lock().await;
         db::insert(&conn, &mem).map_err(box_err)
     }
+
+    // ------------------------------------------------------------------
+    // v0.7.0 ARCH-2 FX-C2-batch5 — final 6 trait additions
+    // ------------------------------------------------------------------
+
+    /// FX-C2-batch5 — SqliteStore override of the default
+    /// `execute_pending_action` (which returned `UnsupportedCapability`).
+    /// Delegates to the canonical sqlite primitive `db::execute_pending_action`
+    /// so the SAL trait is the canonical execute surface across backends.
+    async fn execute_pending_action(
+        &self,
+        _ctx: &CallerContext,
+        pending_id: &str,
+    ) -> StoreResult<Option<String>> {
+        let conn = self.state.lock().await;
+        db::execute_pending_action(&conn, pending_id).map_err(box_err)
+    }
+
+    /// FX-C2-batch5 — Sqlite override matching the nominal SQLite
+    /// primitive name. Delegates to `db::approve_with_approver_type`
+    /// directly (bypassing the trait's default forward to
+    /// `governance_approve_with_consensus` for one less indirection).
+    async fn approve_with_approver_type(
+        &self,
+        _ctx: &CallerContext,
+        pending_id: &str,
+        approver_agent_id: &str,
+    ) -> StoreResult<super::ApproveOutcome> {
+        let conn = self.state.lock().await;
+        let outcome = db::approve_with_approver_type(&conn, pending_id, approver_agent_id)
+            .map_err(box_err)?;
+        let sal = match outcome {
+            db::ApproveOutcome::Approved => super::ApproveOutcome::Approved,
+            db::ApproveOutcome::Pending { votes, quorum } => {
+                super::ApproveOutcome::Pending { votes, quorum }
+            }
+            db::ApproveOutcome::Rejected(reason) => super::ApproveOutcome::Rejected(reason),
+        };
+        Ok(sal)
+    }
+
+    /// FX-C2-batch5 — Sqlite override matching the nominal SQLite
+    /// primitive name. Delegates to `db::decide_pending_action`.
+    async fn decide_pending_action(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+        approve: bool,
+        decided_by: &str,
+    ) -> StoreResult<bool> {
+        let conn = self.state.lock().await;
+        db::decide_pending_action(&conn, id, approve, decided_by).map_err(box_err)
+    }
+
+    /// FX-C2-batch5 — outbound knowledge-graph traversal. Thin
+    /// delegate to `db::kg_query`; projects the per-hop SQLite
+    /// `KgQueryNode` rows into the SAL `KgQueryRow` shape.
+    async fn kg_query(
+        &self,
+        source_id: &str,
+        max_depth: usize,
+        include_invalidated: bool,
+    ) -> StoreResult<Vec<super::KgQueryRow>> {
+        let conn = self.state.lock().await;
+        let nodes = db::kg_query(
+            &conn,
+            source_id,
+            max_depth,
+            None,
+            None,
+            None,
+            include_invalidated,
+        )
+        .map_err(box_err)?;
+        Ok(nodes
+            .into_iter()
+            .map(|n| super::KgQueryRow {
+                target_id: n.target_id,
+                relation: n.relation,
+                depth: n.depth,
+                path: n.path,
+            })
+            .collect())
+    }
+
+    /// FX-C2-batch5 — knowledge-graph timeline scan. Thin delegate to
+    /// `db::kg_timeline`; projects the per-event SQLite
+    /// `KgTimelineEvent` rows into the SAL `KgTimelineRow` shape.
+    async fn kg_timeline(
+        &self,
+        source_id: &str,
+        since: Option<&str>,
+        until: Option<&str>,
+        limit: Option<usize>,
+    ) -> StoreResult<Vec<super::KgTimelineRow>> {
+        let conn = self.state.lock().await;
+        let events = db::kg_timeline(&conn, source_id, since, until, limit).map_err(box_err)?;
+        Ok(events
+            .into_iter()
+            .map(|e| super::KgTimelineRow {
+                target_id: e.target_id,
+                relation: e.relation,
+                valid_from: e.valid_from,
+                valid_until: e.valid_until,
+                observed_by: e.observed_by,
+                title: e.title,
+                target_namespace: e.target_namespace,
+            })
+            .collect())
+    }
+
+    /// FX-C2-batch5 — register a knowledge-graph entity. Thin delegate
+    /// to `db::entity_register`; idempotent on
+    /// `(canonical_name, namespace)`.
+    async fn entity_register(
+        &self,
+        _ctx: &CallerContext,
+        canonical_name: &str,
+        namespace: &str,
+        aliases: &[String],
+        extra_metadata: &serde_json::Value,
+        agent_id: Option<&str>,
+    ) -> StoreResult<crate::models::EntityRegistration> {
+        let conn = self.state.lock().await;
+        db::entity_register(
+            &conn,
+            canonical_name,
+            namespace,
+            aliases,
+            extra_metadata,
+            agent_id,
+        )
+        .map_err(box_err)
+    }
+
+    /// FX-C2-batch5 — list archived memories. Thin delegate to
+    /// `db::list_archived`; returns the same JSON row shape across
+    /// backends.
+    async fn list_archived(
+        &self,
+        namespace: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> StoreResult<Vec<serde_json::Value>> {
+        let conn = self.state.lock().await;
+        db::list_archived(&conn, namespace, limit, offset).map_err(box_err)
+    }
 }
 
 /// Transaction handle that no-ops commit (`SQLite` txn support is
@@ -2687,5 +2834,305 @@ mod tests {
             .expect("check_duplicate_with_text empty");
         assert!(!check.is_duplicate);
         assert_eq!(check.candidates_scanned, 0);
+    }
+
+    // ------------------------------------------------------------------
+    // FX-C2-batch5 — parity tests for the final 6 trait methods.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn fx_c2_batch5_decide_pending_action_alias_matches_pending_decide() {
+        // The `decide_pending_action` trait method is a nominal alias
+        // for `pending_decide`; the two surfaces must produce
+        // identical results.
+        use crate::models::GovernedAction;
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice");
+        let pid = {
+            let conn = store.state.lock().await;
+            db::queue_pending_action(
+                &conn,
+                GovernedAction::Store,
+                "ns-decide-alias",
+                None,
+                "alice",
+                &serde_json::json!({"title":"t","content":"c"}),
+            )
+            .expect("queue")
+        };
+        let result = store
+            .decide_pending_action(&ctx, &pid, true, "alice")
+            .await
+            .expect("decide_pending_action");
+        assert!(result, "first decide must transition the row");
+        let second = store
+            .decide_pending_action(&ctx, &pid, true, "alice")
+            .await
+            .expect("decide_pending_action second");
+        assert!(!second, "already-decided rows must be no-op");
+    }
+
+    #[tokio::test]
+    async fn fx_c2_batch5_approve_with_approver_type_matches_governance_path() {
+        // The `approve_with_approver_type` trait method is a nominal
+        // alias for `governance_approve_with_consensus`; under Human
+        // approver_type the result is identical.
+        use crate::models::GovernedAction;
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice");
+        let pid = {
+            let conn = store.state.lock().await;
+            db::queue_pending_action(
+                &conn,
+                GovernedAction::Store,
+                "ns-approve-alias",
+                None,
+                "alice",
+                &serde_json::json!({"title":"t","content":"c"}),
+            )
+            .expect("queue")
+        };
+        let outcome = store
+            .approve_with_approver_type(&ctx, &pid, "approver")
+            .await
+            .expect("approve_with_approver_type");
+        assert!(matches!(outcome, crate::store::ApproveOutcome::Approved));
+    }
+
+    #[tokio::test]
+    async fn fx_c2_batch5_execute_pending_action_sqlite_override() {
+        // Before FX-C2-batch5 the SqliteStore relied on the trait
+        // default (UnsupportedCapability); this test pins the new
+        // override.
+        use crate::models::GovernedAction;
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice");
+        let memory_payload = serde_json::to_value(test_memory("fx-c2-b5-exec", "executed payload"))
+            .expect("serialize memory");
+        let pid = {
+            let conn = store.state.lock().await;
+            let pid = db::queue_pending_action(
+                &conn,
+                GovernedAction::Store,
+                "alphaone",
+                None,
+                "alice",
+                &memory_payload,
+            )
+            .expect("queue");
+            db::approve_with_approver_type(&conn, &pid, "alice").expect("approve");
+            pid
+        };
+        let executed = store
+            .execute_pending_action(&ctx, &pid)
+            .await
+            .expect("execute_pending_action");
+        // Store action returns the resulting memory id.
+        assert!(executed.is_some(), "store action must return a memory id");
+    }
+
+    #[tokio::test]
+    async fn fx_c2_batch5_kg_query_returns_outbound_neighbors() {
+        // Insert a source memory + a target + a related_to link; the
+        // trait method must surface the neighbor through the CTE
+        // traversal.
+        use crate::models::{MemoryLink, MemoryLinkRelation};
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice");
+        let src = store
+            .store(&ctx, &test_memory("kg-src", "source body"))
+            .await
+            .expect("src");
+        let dst = store
+            .store(&ctx, &test_memory("kg-dst", "target body"))
+            .await
+            .expect("dst");
+        let now = chrono::Utc::now().to_rfc3339();
+        let link = MemoryLink {
+            source_id: src.clone(),
+            target_id: dst.clone(),
+            relation: MemoryLinkRelation::RelatedTo,
+            created_at: now.clone(),
+            valid_from: Some(now.clone()),
+            valid_until: None,
+            observed_by: Some("alice".to_string()),
+            attest_level: Some("unsigned".to_string()),
+            signature: None,
+        };
+        store.link(&ctx, &link).await.expect("link");
+        let rows = store.kg_query(&src, 2, false).await.expect("kg_query");
+        assert_eq!(rows.len(), 1, "exactly one neighbor expected");
+        assert_eq!(rows[0].target_id, dst);
+        assert_eq!(rows[0].depth, 1);
+    }
+
+    #[tokio::test]
+    async fn fx_c2_batch5_kg_timeline_orders_by_valid_from() {
+        // Two outbound assertions with explicit valid_from; the
+        // timeline must surface them in ASC order. We write the
+        // memory_links rows directly so we can pin valid_from
+        // explicitly (the `link` trait method does not surface a
+        // valid_from override).
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice");
+        let src = store
+            .store(&ctx, &test_memory("tl-src", "tl source body"))
+            .await
+            .expect("src");
+        let dst_old = store
+            .store(&ctx, &test_memory("tl-dst-old", "tl old body"))
+            .await
+            .expect("dst-old");
+        let dst_new = store
+            .store(&ctx, &test_memory("tl-dst-new", "tl new body"))
+            .await
+            .expect("dst-new");
+        {
+            let conn = store.state.lock().await;
+            conn.execute(
+                "INSERT INTO memory_links \
+                 (source_id, target_id, relation, created_at, valid_from, attest_level) \
+                 VALUES (?1, ?2, 'related_to', ?3, ?4, 'unsigned')",
+                rusqlite::params![
+                    &src,
+                    &dst_new,
+                    "2030-01-02T00:00:01Z",
+                    "2030-01-02T00:00:00Z"
+                ],
+            )
+            .expect("insert new link");
+            conn.execute(
+                "INSERT INTO memory_links \
+                 (source_id, target_id, relation, created_at, valid_from, attest_level) \
+                 VALUES (?1, ?2, 'related_to', ?3, ?4, 'unsigned')",
+                rusqlite::params![
+                    &src,
+                    &dst_old,
+                    "2030-01-01T00:00:01Z",
+                    "2030-01-01T00:00:00Z"
+                ],
+            )
+            .expect("insert old link");
+        }
+        let events = store
+            .kg_timeline(&src, None, None, None)
+            .await
+            .expect("kg_timeline");
+        assert_eq!(events.len(), 2, "two timeline events expected");
+        assert_eq!(events[0].target_id, dst_old, "older event first");
+        assert_eq!(events[1].target_id, dst_new, "newer event second");
+    }
+
+    #[tokio::test]
+    async fn fx_c2_batch5_entity_register_creates_new_entity() {
+        // Idempotent registration creates a new row on first call.
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice");
+        let reg = store
+            .entity_register(
+                &ctx,
+                "Acme Corp",
+                "alphaone-test",
+                &["ACME".to_string(), "acme-corp".to_string()],
+                &serde_json::json!({"website":"https://acme.example"}),
+                Some("alice"),
+            )
+            .await
+            .expect("entity_register");
+        assert!(reg.created, "first registration must create the entity row");
+        assert_eq!(reg.canonical_name, "Acme Corp");
+        assert_eq!(reg.namespace, "alphaone-test");
+        assert!(reg.aliases.iter().any(|a| a == "ACME"));
+    }
+
+    #[tokio::test]
+    async fn fx_c2_batch5_entity_register_unions_aliases_on_reregister() {
+        // Second call with new aliases merges into the existing row.
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice");
+        store
+            .entity_register(
+                &ctx,
+                "BetaCo",
+                "alphaone-test",
+                &["beta".to_string()],
+                &serde_json::json!({}),
+                Some("alice"),
+            )
+            .await
+            .expect("first");
+        let reg = store
+            .entity_register(
+                &ctx,
+                "BetaCo",
+                "alphaone-test",
+                &["BETA-CORP".to_string()],
+                &serde_json::json!({}),
+                Some("alice"),
+            )
+            .await
+            .expect("reregister");
+        assert!(!reg.created, "re-registration must NOT create a new row");
+        assert!(reg.aliases.iter().any(|a| a == "beta"));
+        assert!(reg.aliases.iter().any(|a| a == "BETA-CORP"));
+    }
+
+    #[tokio::test]
+    async fn fx_c2_batch5_list_archived_returns_archived_rows() {
+        // Insert + archive a memory; list_archived must surface it.
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice");
+        let id = store
+            .store(&ctx, &test_memory("archived-row", "to be archived"))
+            .await
+            .expect("store");
+        // Forget with archive=true so the row lands on archived_memories.
+        let archived = store
+            .forget(&ctx, Some("sal-test"), None, None, true)
+            .await
+            .expect("forget");
+        assert!(archived > 0, "forget must archive at least one row");
+        let listed = store
+            .list_archived(Some("sal-test"), 100, 0)
+            .await
+            .expect("list_archived");
+        assert_eq!(listed.len(), 1, "one archived row expected");
+        let row = &listed[0];
+        assert_eq!(
+            row.get("id").and_then(|v| v.as_str()),
+            Some(id.as_str()),
+            "archived row id must match"
+        );
+    }
+
+    #[tokio::test]
+    async fn fx_c2_batch5_list_archived_namespace_filter_excludes_other_tenants() {
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice");
+        let mut m = test_memory("ns-a-row", "body");
+        m.namespace = "tenant-a".to_string();
+        store.store(&ctx, &m).await.expect("store-a");
+        let mut m2 = test_memory("ns-b-row", "body");
+        m2.namespace = "tenant-b".to_string();
+        store.store(&ctx, &m2).await.expect("store-b");
+        store
+            .forget(&ctx, Some("tenant-a"), None, None, true)
+            .await
+            .expect("forget-a");
+        store
+            .forget(&ctx, Some("tenant-b"), None, None, true)
+            .await
+            .expect("forget-b");
+        let tenant_a = store
+            .list_archived(Some("tenant-a"), 100, 0)
+            .await
+            .expect("list a");
+        assert_eq!(tenant_a.len(), 1);
+        assert_eq!(
+            tenant_a[0].get("namespace").and_then(|v| v.as_str()),
+            Some("tenant-a")
+        );
+        let global = store.list_archived(None, 100, 0).await.expect("list all");
+        assert_eq!(global.len(), 2, "global list must surface both tenants");
     }
 }
