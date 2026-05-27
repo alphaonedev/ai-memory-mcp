@@ -2,17 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! ARCH-1 (CRITICAL) regression — `GOVERNANCE_PRE_WRITE` pre-write
-//! hook parity between the SQLite and Postgres SAL adapters.
+//! hook parity between the `SQLite` and Postgres SAL adapters.
 //!
 //! Pre-fix: the substrate pre-write hook
 //! ([`ai_memory::storage::GOVERNANCE_PRE_WRITE`]) was consulted ONLY
-//! by the legacy `crate::storage::insert*` free-functions (the SQLite
+//! by the legacy `crate::storage::insert*` free-functions (the `SQLite`
 //! path). The sqlx-native [`PostgresStore::store`],
 //! [`PostgresStore::store_with_embedding`], and
 //! [`PostgresStore::apply_remote_memory`] paths bypassed the hook
 //! entirely — multi-tenant cloud + postgres-backed daemons would
 //! silently accept memories that the operator's signed governance
-//! rules refuse on the SQLite path. A substrate-level bypass.
+//! rules refuse on the `SQLite` path. A substrate-level bypass.
 //!
 //! Post-fix: each of the three postgres write paths consults the same
 //! hook via the `consult_governance_pre_write_pg` adapter helper that
@@ -26,7 +26,7 @@
 //! test binary so it gets its own process, its own `OnceLock` slot
 //! for `GOVERNANCE_PRE_WRITE`, and can install a fresh hook without
 //! coordinating with `governance_storage_insert_hook.rs` (which holds
-//! the SQLite-path mirror tests). The hook closure records every
+//! the `SQLite`-path mirror tests). The hook closure records every
 //! dispatch in a process-wide `AtomicU64` so the test can assert
 //! the hook fired exactly once per write path.
 //!
