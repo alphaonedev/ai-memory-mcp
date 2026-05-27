@@ -13307,6 +13307,21 @@ async fn test_daemon_curator_with_primitives_runs_with_dry_run_config() {
     // and was fully dark prior to this test. Production
     // main.rs::cmd_curator uses this variant to sidestep a bin/lib
     // CuratorConfig type-mismatch.
+    //
+    // FX-C6 env-discipline (mirrors FX-1 / TEST-5+TEST-6 closure for
+    // lib tests). `run_curator_daemon_with_primitives` calls
+    // `AppConfig::load()` at `src/daemon_runtime.rs:4119`. Without
+    // pinning `AI_MEMORY_NO_CONFIG=1` for this test process the load
+    // reads the developer host's `~/.config/ai-memory/config.toml`;
+    // when that config resolves to a non-Ollama `[llm]` backend,
+    // `build_from_resolved` builds a `reqwest::blocking::Client`
+    // whose inner tokio current-thread runtime panics on drop inside
+    // this `#[tokio::test]` body with "Cannot drop a runtime in a
+    // context where blocking is not allowed". Calling
+    // `common::ensure_no_config_env()` at test entry pins the env
+    // var once per binary so the resolver lands on `CompiledDefault`
+    // and the no-construct short-circuit (lines 4121-4127) fires.
+    common::ensure_no_config_env();
     let dir = std::env::temp_dir();
     let db = dir.join(format!(
         "ai-memory-curator-prim-test-{}.db",
