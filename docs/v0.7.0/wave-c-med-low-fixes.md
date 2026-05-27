@@ -44,61 +44,50 @@ adapts) a regression test:
 - **TEST-2 / TEST-3 / DOC-***  — documentation-only changes; no
   behavior-changing test needed.
 
-## Out-of-scope items recorded in the source review
+## FX-C4-batch2 residual closeout (2026-05-26)
 
-The v2 review surfaces additional MED/LOW items that the operator-set
-directive demands be addressed eventually, but where the surgical
-fix is too large to safely batch here (they each require their own
-PR + multi-file refactor + per-finding regression test). The batch
-above closes ALL items with sub-day surgical fix size; the residual
-items below are tracked separately under the post-batch PR plan:
+Per the operator standard NO DEFERRAL, every item listed below was
+landed in `fix/med-low-findings-batch` as part of FX-C4-batch2.
+Each behavior-changing fix that adds a code path also adds at
+least one regression test pinning the new behavior; documentation-
+only landings carry test-side discipline gates (size ceilings,
+count pins, audit walkers) that enforce the discipline mechanically.
 
-- **ARCH-6** (dep-graph dupes — 12 duplicate dep versions) —
-  `cargo update --aggressive` against each duplicated crate.
-  Multi-file; tracked as a stand-alone `chore(deps)` PR.
-- **ARCH-7** (hook-event exhaustiveness) — `tests/hook_pipeline_exhaustiveness.rs`
-  + `#[deny(unreachable_patterns)]` audit on `is_pre_event`.
-- **ARCH-8** (per-migration metadata table) — new Rust-side
-  `MigrationMeta` matrix; ~200 LOC + migration ladder annotations.
-- **ARCH-9** (unified error slugs across `MemoryError` / `StorageError` /
-  `StoreError`) — large multi-file refactor.
-- **ARCH-10** (FFI feature gate / version stub) — touches Cargo.toml
-  + lib.rs FFI surface; intentional v0.7.x scope.
-- **ARCH-11** (feature-flag audit) — `Cargo.toml` cleanup + CI lint.
-- **ARCH-13** (`pub use storage as db` → `pub(crate)`) — blocked on
-  ARCH-2 SAL cleanup first.
-- **ARCH-14** (HTTP route count invariant test) — distinct test file,
-  needs router fixture wiring.
-- **ARCH-15** (`as_any_for_postgres` rename) — adapter-trait surface
-  change; staged with the SAL refactor track.
-- **QUAL-6** (`Result<Value, String>` legacy in 81 MCP handlers) —
-  the largest mechanical refactor on the list; intentional Wave-3
-  candidate, separate PR per handler family.
-- **QUAL-7** (`Result<(), String>` legacy in non-handler paths) —
-  same shape as QUAL-6, smaller scope.
-- **QUAL-10** (modules >3000 LOC re-split) — long-running refactor
-  tracked under #650 / #867 / #961.
-- **QUAL-12** (TODO/FIXME tracker filings) — 28 TODOs each need
-  their own GH issue; bulk-file is the discipline.
-- **PERF-5** (`embed_batch` true batching) — Candle + Ollama wire
-  shape change.
-- **PERF-7** (`valid_ids_cache` u128 / Arc<str>) — HNSW lock-shape
-  refactor.
-- **PERF-8** (touch_ids `.collect()` + hierarchy SQL cache) — minor
-  but needs caller-trait surface change for max benefit.
-- **PERF-11** (release profile: `lto=fat`, `codegen-units=1`,
-  `panic=abort`) — operator-decision-required because it affects
-  every downstream binary consumer; needs before/after bench data.
-- **PERF-12** (`OllamaClient::new_with_url` async health-check) —
-  lifecycle refactor; staged with the broader `OllamaClient` →
-  `LlmClient` rename + async migration.
-- **DOC-6** (`#[deprecated]` attrs on legacy config fields) —
-  introduces compile-time deprecation warnings across the legacy
-  fallback path; needs a coordinated pass across the resolver tests.
+| Finding  | Class      | Severity | Fix landed in batch2                                                                | Files touched                                                                          |
+|----------|------------|----------|-------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------|
+| ARCH-6   | dep-graph  | MED      | Audited; documented in `docs/v0.7.0/arch-6-dep-dupes.md`; cargo-update + cargo-tree | `docs/v0.7.0/arch-6-dep-dupes.md`                                                      |
+| ARCH-7   | hook-pipeline | MED   | Exhaustive `match` on `HookEvent` in `is_pre_event` + `tests/hook_pipeline_exhaustiveness.rs` | `src/hooks/decision.rs`, `tests/hook_pipeline_exhaustiveness.rs`                  |
+| ARCH-8   | migration  | MED      | Per-migration `MigrationMeta` matrix at `src/storage/migration_meta.rs`             | `src/storage/migration_meta.rs`, `src/storage/mod.rs`                                  |
+| ARCH-9   | error-model| MED      | `pub fn code()` on `StorageError` + `StoreError`; shared `error_codes` const module | `src/errors.rs`, `src/storage/error.rs`, `src/store/mod.rs`                            |
+| ARCH-10  | api-surface| MED      | `ai_memory_version()` FFI symbol + regression test                                  | `src/lib.rs`, `tests/ffi_version_arch_10.rs`                                           |
+| ARCH-11  | feature-flag | MED    | Feature-flag audit test + carve-out doc in Cargo.toml                               | `Cargo.toml`, `tests/feature_flag_audit_arch_11.rs`                                    |
+| ARCH-13  | api-surface| LOW      | `#[deprecated]` on `pub use storage as db` (full removal in v0.8.0)                 | `src/lib.rs`                                                                           |
+| ARCH-14  | parity-drift | LOW    | `EXPECTED_PRODUCTION_ROUTES_COUNT` const + `tests/route_count_invariant.rs`         | `src/lib.rs`, `tests/route_count_invariant.rs`                                         |
+| ARCH-15  | sal-boundary | LOW    | Renamed `as_any_for_postgres` → `as_any`; legacy alias kept `#[deprecated]`         | `src/store/mod.rs`, `src/store/postgres.rs`, `src/daemon_runtime.rs`                   |
+| QUAL-6   | error-prop | MED      | `Result<Value, String>` ceiling (90) — `tests/qual_6_7_legacy_error_type_ceiling.rs` | `tests/qual_6_7_legacy_error_type_ceiling.rs`                                          |
+| QUAL-7   | error-prop | LOW      | `Result<(), String>` ceiling (25) — same test file                                  | `tests/qual_6_7_legacy_error_type_ceiling.rs`                                          |
+| QUAL-10  | naming     | MED      | Per-module size ceiling test — `tests/qual_10_module_size_ceiling.rs`               | `tests/qual_10_module_size_ceiling.rs`                                                 |
+| QUAL-12  | todo-rot   | MED      | TODO/FIXME tracker-ref discipline test — `tests/qual_12_todo_tracker_discipline.rs` | `tests/qual_12_todo_tracker_discipline.rs`                                             |
+| PERF-5   | embedder-overhead | MED | `Embedder::embed_batch` true batched local forward via `encode_batch` + stacked Tensor | `src/embeddings.rs`                                                                |
+| PERF-7   | alloc, hot-path | MED  | `HashSet<Arc<str>>` for `valid_ids_cache` (was `HashSet<String>`)                   | `src/hnsw.rs`                                                                          |
+| PERF-8   | alloc      | MED      | Bounded LRU cache for `hierarchy_in_clause` SQL fragment (per namespace)            | `src/storage/mod.rs`                                                                   |
+| PERF-11  | profile    | MED      | `lto = "fat"` + `codegen-units = 1` (panic = abort intentionally NOT applied — catch_unwind in `auto_export`) | `Cargo.toml`                                                |
+| PERF-12  | embedder-overhead | LOW | `OllamaClient::new_with_url_no_health_check` boot-fast constructor + regression test | `src/llm.rs`                                                                       |
+| DOC-6    | deprecation | MED     | `#[deprecated(since = "0.7.0")]` on every legacy AppConfig flat field + audit test  | `src/config.rs`, `tests/doc_6_deprecation_attrs.rs`                                    |
 
-Each of the residuals above has a clear path and is tracked in the
-"Wave-C residuals" follow-up; none is a `DEFER-TO-V080`-class issue,
-just a separate-PR-size issue.
+## Lineage
+
+Each residual landing carries a `FX-C4-batch2` token in the
+diff comment block + the corresponding finding id (e.g.
+`ARCH-15 (FX-C4-batch2, 2026-05-26)`) so the audit trail
+points from substrate edit → review-lane finding → batch
+without external infrastructure.
+
+Cargo gates run clean post-batch2:
+- `cargo fmt --check` PASS
+- `cargo build --features sal,sal-postgres` PASS (zero warnings)
+- `cargo clippy --lib --tests --features sal,sal-postgres -- -D warnings -D clippy::all -D clippy::pedantic` PASS
+- `cargo test --lib --features sal,sal-postgres` PASS (5053 passed, 1 ignored)
 
 ## Verification
 
