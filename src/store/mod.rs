@@ -2643,4 +2643,244 @@ mod tests {
         assert_eq!(r.findings.len(), 1);
         assert!(!r.signature_verified);
     }
+
+    // ===========================================================================
+    // FX-F1 (2026-05-27) — coverage uplift for the FX-C2 batch3+batch5
+    // trait additions. The pre-FX-F1 tests covered ~70% of the default
+    // impls; FX-F1 walks every remaining default body so the
+    // store/mod.rs floor (92%) holds against the 21-method trait
+    // expansion. Each default returns `UnsupportedCapability` or
+    // forwards to another method that does — both arms are pinned
+    // below.
+    // ===========================================================================
+
+    /// FX-F1 — covers `health_check`, `stats`, `find_by_title_namespace`,
+    /// `next_versioned_title`, `find_contradictions`,
+    /// `check_duplicate_with_text` defaults. Each returns the
+    /// `UnsupportedCapability` envelope so handlers can surface
+    /// `BACKEND_UNAVAILABLE` to the wire rather than silently degrading
+    /// to "everything's fine" / "no candidates".
+    #[tokio::test]
+    async fn default_probe_methods_unsupported() {
+        let s = MinimalStore;
+        assert!(matches!(
+            s.health_check().await.unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+        assert!(matches!(
+            s.stats().await.unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+        assert!(matches!(
+            s.find_by_title_namespace("t", "ns").await.unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+        assert!(matches!(
+            s.next_versioned_title("t", "ns").await.unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+        assert!(matches!(
+            s.find_contradictions("t", "ns").await.unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+        assert!(matches!(
+            s.check_duplicate_with_text(&[0.1_f32, 0.2], "title content", Some("ns"), 0.9)
+                .await
+                .unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+    }
+
+    /// FX-F1 — covers the FX-C2-batch5 KG / archive default surface:
+    /// `kg_query`, `kg_timeline`, `entity_register`, `list_archived`,
+    /// `invalidate_link`. Each MUST surface `UnsupportedCapability`
+    /// rather than silently returning empty rows.
+    #[tokio::test]
+    async fn default_kg_archive_methods_unsupported() {
+        let s = MinimalStore;
+        let ctx = CallerContext::for_agent("alice");
+        assert!(matches!(
+            s.kg_query("src", 2, false).await.unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+        assert!(matches!(
+            s.kg_timeline("src", None, None, Some(10))
+                .await
+                .unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+        assert!(matches!(
+            s.entity_register(
+                &ctx,
+                "Acme",
+                "ns",
+                &["acme".to_string()],
+                &serde_json::json!({}),
+                Some("alice")
+            )
+            .await
+            .unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+        assert!(matches!(
+            s.list_archived(Some("ns"), 10, 0).await.unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+        assert!(matches!(
+            s.invalidate_link("src", "tgt", "related_to", Some("2026-01-01T00:00:00Z"))
+                .await
+                .unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+    }
+
+    /// FX-F1 — covers the FX-C2-batch3 read-only probe defaults:
+    /// `list_namespaces`, `get_taxonomy`, `list_agents`,
+    /// `list_pending_actions`, `entity_get_by_alias`.
+    #[tokio::test]
+    async fn default_listing_methods_unsupported() {
+        let s = MinimalStore;
+        assert!(matches!(
+            s.list_namespaces().await.unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+        assert!(matches!(
+            s.get_taxonomy(Some("ns"), 5, 100).await.unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+        assert!(matches!(
+            s.list_agents().await.unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+        assert!(matches!(
+            s.list_pending_actions(Some("pending"), 50)
+                .await
+                .unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+        assert!(matches!(
+            s.entity_get_by_alias("acme", Some("ns")).await.unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+    }
+
+    /// FX-F1 — covers the v0.7.0 #1156 namespace-scoped quota defaults
+    /// (`quota_status_ns`, `quota_status_list_ns`). The non-NS forms
+    /// are pinned in `default_quota_and_verify_methods_unsupported`
+    /// above; this test pins the per-namespace siblings.
+    #[tokio::test]
+    async fn default_quota_namespace_scoped_unsupported() {
+        let s = MinimalStore;
+        assert!(matches!(
+            s.quota_status_ns("alice", "ns").await.unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+        assert!(matches!(
+            s.quota_status_list_ns("ns").await.unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+    }
+
+    /// FX-F1 — `approve_with_approver_type` forwards to
+    /// `governance_approve_with_consensus` (the alias preserves
+    /// nominal parity with the SQLite primitive name). Pins the
+    /// forwarding-default arm.
+    #[tokio::test]
+    async fn default_approve_with_approver_type_forwards_to_consensus() {
+        let s = MinimalStore;
+        let ctx = CallerContext::for_agent("alice");
+        // MinimalStore doesn't override governance_approve_with_consensus,
+        // so the trait default fires and returns UnsupportedCapability.
+        let err = s
+            .approve_with_approver_type(&ctx, "pid", "alice")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::UnsupportedCapability { .. }));
+    }
+
+    /// FX-F1 — `decide_pending_action` forwards to `pending_decide`.
+    /// MinimalStore takes the default `pending_decide` path which
+    /// returns `UnsupportedCapability`; the forwarding default
+    /// surfaces the same envelope. Pins the alias contract.
+    #[tokio::test]
+    async fn default_decide_pending_action_forwards_to_pending_decide() {
+        let s = MinimalStore;
+        let ctx = CallerContext::for_agent("alice");
+        let err = s
+            .decide_pending_action(&ctx, "any", true, "alice")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::UnsupportedCapability { .. }));
+    }
+
+    /// FX-F1 — pin the `link_signed` forwarding contract: when no
+    /// signature is supplied the default reports `"unsigned"` while
+    /// still calling through to `link()`. The existing
+    /// `default_link_signed_forwards_and_reports_unsigned` test pins
+    /// the no-signature arm; this test pins the supplied-signature
+    /// arm, which still routes through the same default body
+    /// (signature is forwarded onto the link insertion via
+    /// `MemoryLink::signature`).
+    #[tokio::test]
+    async fn default_link_signed_with_signature_still_forwards() {
+        let s = MinimalStore;
+        let ctx = CallerContext::for_agent("alice");
+        let link = MemoryLink {
+            source_id: "a".to_string(),
+            target_id: "b".to_string(),
+            relation: crate::models::MemoryLinkRelation::RelatedTo,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            valid_from: None,
+            valid_until: None,
+            observed_by: None,
+            signature: Some(b"sig-bytes".to_vec()),
+            attest_level: Some("ed25519".to_string()),
+        };
+        // The default body forwards to link() and reports the
+        // (caller-supplied) attest_level when no signature override
+        // was passed to link_signed. MinimalStore::link returns Ok,
+        // so this is the success path.
+        let level = s
+            .link_signed(&ctx, &link, None)
+            .await
+            .expect("default link_signed forwards");
+        // The default body returns "unsigned" because no signing key
+        // is supplied to link_signed; the link row's pre-baked
+        // signature is preserved through the forward but the
+        // attestation level reported is "unsigned" (the trait default
+        // does not introspect the link's own signature column —
+        // adapters that do override).
+        assert_eq!(level, "unsigned");
+    }
+
+    /// FX-F1 — pin the `verify_link` default behaviour with
+    /// non-default filters so the default body exercises every
+    /// non-`None` filter field. Covers the same default as
+    /// `default_quota_and_verify_methods_unsupported` but with a
+    /// populated `VerifyFilter`, hitting a code path llvm-cov may
+    /// have flagged unreachable when only the default filter was
+    /// passed.
+    #[tokio::test]
+    async fn default_verify_link_with_populated_filter_unsupported() {
+        let s = MinimalStore;
+        let filter = VerifyFilter {
+            source_id: Some("src".to_string()),
+            target_id: Some("tgt".to_string()),
+            link_id: Some("lid".to_string()),
+        };
+        let err = s.verify_link(filter).await.unwrap_err();
+        assert!(matches!(err, StoreError::UnsupportedCapability { .. }));
+    }
+
+    /// FX-F1 — pin the `schema_version` default behaviour: returns
+    /// zero. The existing `default_schema_version_returns_zero` test
+    /// covers the same body; this re-pin adds a second-shot guarantee
+    /// that the default body lands at zero so a future drift to (say)
+    /// returning `i64::MIN` is caught immediately.
+    #[tokio::test]
+    async fn default_schema_version_zero_invariant() {
+        let s = MinimalStore;
+        let v = s.schema_version().await.expect("default schema_version");
+        assert_eq!(v, 0, "default body MUST return 0");
+    }
 }
