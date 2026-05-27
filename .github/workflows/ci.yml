@@ -11,6 +11,14 @@ name: CI
 #
 # See `release.yml` for the publish pipeline (binary builds, GitHub
 # Release page, crates.io, Homebrew tap, GHCR Docker image, Fedora COPR).
+#
+# 2026-05-27 — full-pipeline re-validation triggered post-CI-flake-closure
+# sweep (#1372 / #1373 / #1334 closures landed via PRs #1375 / #1376 /
+# #1377; the immediate post-merge HEAD short-circuited because the PR
+# #1377 merge commit was docs-only). Local pm-v3.3 recompile-retest on
+# HEAD 0e30d23f6 returned 7,332 / 0 / 16 across 309 binaries — a strict
+# superset of the 2026-05-22 dossier baseline; this push refreshes the
+# integrated full-platform CI signal as Tier 1 ship-gate evidence.
 
 on:
   push:
