@@ -37,3 +37,26 @@ pub mod find_paths;
 pub mod kg_query;
 pub mod recall_observations;
 pub mod replay;
+// v0.7.0 ARCH-3 / FX-C3 (batch2) — closing the 16 remaining
+// applicable deferrals from the FX-12 audit. Each module wires a
+// thin clap arg-parser + output formatter that dispatches into the
+// same substrate primitive the MCP tool consumes. Wire envelope is
+// byte-equal across MCP / HTTP / CLI. See
+// `docs/v0.7.0/arch-3-mcp-cli-parity-audit.md` for the marked-off
+// audit rows.
+pub mod dependents_of_invalidated;
+pub mod entity_get_by_alias;
+pub mod entity_register;
+pub mod inbox;
+pub mod ingest_multistep;
+pub mod kg_invalidate;
+pub mod kg_timeline;
+pub mod list_subscriptions;
+pub mod notify;
+pub mod quota_status;
+pub mod reflect;
+pub mod reflection_origin;
+pub mod subscribe;
+pub mod subscription_dlq_list;
+pub mod subscription_replay;
+pub mod unsubscribe;

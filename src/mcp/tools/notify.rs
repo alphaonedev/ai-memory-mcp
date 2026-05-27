@@ -7,7 +7,7 @@ use crate::models::ConfidenceSource;
 use crate::models::{Memory, Tier};
 use crate::{db, validate};
 use serde_json::{Value, json};
-pub(crate) fn handle_notify(
+pub fn handle_notify(
     conn: &rusqlite::Connection,
     params: &Value,
     resolved_ttl: &crate::config::ResolvedTtl,
@@ -86,7 +86,7 @@ pub(crate) fn handle_notify(
     }))
 }
 
-pub(crate) fn handle_inbox(
+pub fn handle_inbox(
     conn: &rusqlite::Connection,
     params: &Value,
     mcp_client: Option<&str>,

@@ -46,7 +46,7 @@ impl McpTool for EntityGetByAliasTool {
     }
 }
 
-pub(super) fn handle_entity_get_by_alias(
+pub fn handle_entity_get_by_alias(
     conn: &rusqlite::Connection,
     params: &Value,
 ) -> Result<Value, String> {

@@ -462,7 +462,7 @@ pub(crate) use namespace::handle_namespace_clear_standard;
 // regression at `tests/issue_1326_*.rs` can pin the surface without
 // stdio JSON-RPC scaffolding.
 pub use namespace::{handle_namespace_get_standard, handle_namespace_set_standard};
-pub(crate) use notify::{handle_inbox, handle_notify};
+pub use notify::{handle_inbox, handle_notify};
 pub use pending::{handle_pending_approve, handle_pending_reject};
 pub use quota_status::handle_quota_status;
 // v0.7.0 (issue #691) — substrate-level agent-action rules engine.
@@ -493,7 +493,19 @@ pub use recall_observations::handle_recall_observations;
 pub use replay::handle_replay;
 pub use rule_list::handle_rule_list;
 pub(crate) use session_start::handle_session_start;
-pub(crate) use subscribe::handle_unsubscribe;
+pub use subscribe::handle_unsubscribe;
+// v0.7.0 ARCH-3 / FX-C3 (#batch2) — CLI parity exports for the
+// subscribe family + entity family + kg admin family + multistep
+// ingest + reflect/dependents/origin/quota observers. Promoted from
+// pub(super)/pub(crate) so the new CLI subcommands under
+// `src/cli/commands/*.rs` can dispatch into the same substrate
+// primitives the MCP tools consume.
+pub use entity_get_by_alias::handle_entity_get_by_alias;
+pub use entity_register::handle_entity_register;
+pub use ingest_multistep::{IngestMultistepHandler, handle_ingest_multistep};
+pub use kg_invalidate::handle_kg_invalidate;
+pub use kg_timeline::handle_kg_timeline;
+pub use subscribe::{handle_list_subscriptions, handle_subscribe};
 pub use verify::handle_verify;
 // v0.7.0 L1-5 / L2-6 — test-and-integration access to the skill
 // substrate handlers. These are public so the L2-6 regression suite
@@ -732,18 +744,20 @@ use delete::handle_delete;
 // v0.7.0 #1111 — `handle_dependents_of_invalidated` is `pub use`-
 // exported above; dispatch resolves via the crate path.
 use detect_contradiction::handle_detect_contradiction;
-use entity_get_by_alias::handle_entity_get_by_alias;
-use entity_register::handle_entity_register;
+// v0.7.0 ARCH-3 / FX-C3 (#batch2) — `handle_entity_get_by_alias`
+// and `handle_entity_register` are `pub use`-exported above so the
+// CLI subcommands can dispatch into them; dispatch in this module
+// resolves them via the crate path.
 use expand_query::handle_expand_query;
 // v0.7.0 #1111 — `handle_export_reflection` is `pub use`-exported above.
 use forget::{handle_forget, handle_stats};
 use get::handle_get;
 use get_taxonomy::handle_get_taxonomy;
-use ingest_multistep::handle_ingest_multistep;
-use kg_invalidate::handle_kg_invalidate;
+// v0.7.0 ARCH-3 / FX-C3 (#batch2) — `handle_ingest_multistep`,
+// `handle_kg_invalidate`, `handle_kg_timeline` are `pub use`-exported
+// above. Dispatch resolves via the crate path.
 // v0.7.0 ARCH-3 / FX-12 — `handle_kg_query` is `pub use`-exported above;
 // dispatch resolves via the crate path.
-use kg_timeline::handle_kg_timeline;
 use link::{handle_get_links, handle_link};
 use list::handle_list;
 use pending::handle_pending_list;
@@ -800,7 +814,9 @@ pub fn skill_compositional_context_for_tests(
 // them directly without going through the stdio JSON-RPC layer.
 use store::handle_store;
 // v0.7.0 #1111 — `handle_subscription_replay` is `pub use`-exported above.
-use subscribe::{handle_list_subscriptions, handle_subscribe};
+// v0.7.0 ARCH-3 / FX-C3 (#batch2) — `handle_subscribe` and
+// `handle_list_subscriptions` are also `pub use`-exported above; the
+// dispatch arms below resolve them via the crate path.
 use update::handle_update;
 
 // ---------------------------------------------------------------------------
