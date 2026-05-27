@@ -291,6 +291,18 @@ impl MemoryStore for SqliteStore {
         .map_err(box_err)
     }
 
+    /// v0.7.0 ARCH-2 followup (FX-C2) — per-anchor edge probe. Thin
+    /// delegate to the legacy `db::get_links` free-function so the
+    /// behaviour is byte-identical to the pre-trait sqlite path
+    /// (`src/handlers/links.rs:894`, `src/handlers/power.rs:280`).
+    /// Mirrors the Postgres adapter's sqlx-native impl over the same
+    /// `memory_links` table; cross-backend parity is pinned by
+    /// `sqlite_postgres_parity` tests in this file.
+    async fn get_links_for_anchor(&self, anchor_id: &str) -> StoreResult<Vec<MemoryLink>> {
+        let conn = self.state.lock().await;
+        db::get_links(&conn, anchor_id).map_err(box_err)
+    }
+
     async fn list_links(&self, namespace: Option<&str>) -> StoreResult<Vec<MemoryLink>> {
         // F6 Gap 2 (v0.7.0) — surface `memory_links` to the migrate
         // runner. The namespace filter, when set, matches the source
@@ -1025,6 +1037,133 @@ impl MemoryStore for SqliteStore {
         Ok(filtered)
     }
 
+    // ----- v0.7.0 ARCH-2 followup (FX-C2-batch3) read-only impls --------
+    //
+    // Thin delegates over the legacy `db::*` free-functions; the SAL
+    // adapter's job here is only to expose the routing surface, not to
+    // re-implement the query. Postgres parity tests pin byte-equal
+    // wire shapes across backends.
+
+    async fn list_namespaces(&self) -> StoreResult<Vec<crate::models::NamespaceCount>> {
+        let conn = self.state.lock().await;
+        db::list_namespaces(&conn).map_err(box_err)
+    }
+
+    async fn get_taxonomy(
+        &self,
+        namespace_prefix: Option<&str>,
+        max_depth: usize,
+        limit: usize,
+    ) -> StoreResult<crate::models::Taxonomy> {
+        let conn = self.state.lock().await;
+        db::get_taxonomy(&conn, namespace_prefix, max_depth, limit).map_err(box_err)
+    }
+
+    async fn list_agents(&self) -> StoreResult<Vec<AgentRegistration>> {
+        let conn = self.state.lock().await;
+        db::list_agents(&conn).map_err(box_err)
+    }
+
+    async fn list_pending_actions(
+        &self,
+        status: Option<&str>,
+        limit: usize,
+    ) -> StoreResult<Vec<crate::models::PendingAction>> {
+        let conn = self.state.lock().await;
+        db::list_pending_actions(&conn, status, limit).map_err(box_err)
+    }
+
+    async fn entity_get_by_alias(
+        &self,
+        alias: &str,
+        namespace: Option<&str>,
+    ) -> StoreResult<Option<crate::models::EntityRecord>> {
+        let conn = self.state.lock().await;
+        db::entity_get_by_alias(&conn, alias, namespace).map_err(box_err)
+    }
+
+    async fn health_check(&self) -> StoreResult<bool> {
+        let conn = self.state.lock().await;
+        db::health_check(&conn).map_err(box_err)
+    }
+
+    async fn stats(&self) -> StoreResult<crate::models::Stats> {
+        let conn = self.state.lock().await;
+        db::stats(&conn, &self.path).map_err(box_err)
+    }
+
+    /// v0.7.0 SAL-routing batch-4 (FX-C2) — close `db::set_embedding`
+    /// gap by overriding `update_embedding` (default impl is no-op).
+    /// Mirrors the Postgres adapter's path so `app.store.update_embedding`
+    /// is the canonical embedding-update surface across backends.
+    async fn update_embedding(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+        embedding: Option<&[f32]>,
+    ) -> StoreResult<()> {
+        let conn = self.state.lock().await;
+        match embedding {
+            Some(vec) => db::set_embedding(&conn, id, vec).map_err(box_err),
+            None => db::set_embedding(&conn, id, &[]).map_err(box_err),
+        }
+    }
+
+    async fn find_by_title_namespace(
+        &self,
+        title: &str,
+        namespace: &str,
+    ) -> StoreResult<Option<String>> {
+        let conn = self.state.lock().await;
+        db::find_by_title_namespace(&conn, title, namespace).map_err(box_err)
+    }
+
+    async fn next_versioned_title(&self, base_title: &str, namespace: &str) -> StoreResult<String> {
+        let conn = self.state.lock().await;
+        db::next_versioned_title(&conn, base_title, namespace).map_err(box_err)
+    }
+
+    async fn find_contradictions(&self, title: &str, namespace: &str) -> StoreResult<Vec<Memory>> {
+        let conn = self.state.lock().await;
+        db::find_contradictions(&conn, title, namespace).map_err(box_err)
+    }
+
+    async fn invalidate_link(
+        &self,
+        source_id: &str,
+        target_id: &str,
+        relation: &str,
+        valid_until: Option<&str>,
+    ) -> StoreResult<crate::store::KgInvalidateRow> {
+        let conn = self.state.lock().await;
+        match db::invalidate_link(&conn, source_id, target_id, relation, valid_until)
+            .map_err(box_err)?
+        {
+            Some(res) => Ok(crate::store::KgInvalidateRow {
+                found: true,
+                valid_until: res.valid_until,
+                previous_valid_until: res.previous_valid_until,
+            }),
+            None => Ok(crate::store::KgInvalidateRow {
+                found: false,
+                valid_until: String::new(),
+                previous_valid_until: None,
+            }),
+        }
+    }
+
+    async fn check_duplicate_with_text(
+        &self,
+        query_embedding: &[f32],
+        query_text: &str,
+        namespace: Option<&str>,
+        threshold: f32,
+    ) -> StoreResult<crate::models::DuplicateCheck> {
+        let conn = self.state.lock().await;
+        db::check_duplicate_with_text(&conn, query_embedding, query_text, namespace, threshold)
+            .map_err(box_err)
+    }
+
     async fn notify(
         &self,
         ctx: &CallerContext,
@@ -1075,6 +1214,153 @@ impl MemoryStore for SqliteStore {
         };
         let conn = self.state.lock().await;
         db::insert(&conn, &mem).map_err(box_err)
+    }
+
+    // ------------------------------------------------------------------
+    // v0.7.0 ARCH-2 FX-C2-batch5 — final 6 trait additions
+    // ------------------------------------------------------------------
+
+    /// FX-C2-batch5 — SqliteStore override of the default
+    /// `execute_pending_action` (which returned `UnsupportedCapability`).
+    /// Delegates to the canonical sqlite primitive `db::execute_pending_action`
+    /// so the SAL trait is the canonical execute surface across backends.
+    async fn execute_pending_action(
+        &self,
+        _ctx: &CallerContext,
+        pending_id: &str,
+    ) -> StoreResult<Option<String>> {
+        let conn = self.state.lock().await;
+        db::execute_pending_action(&conn, pending_id).map_err(box_err)
+    }
+
+    /// FX-C2-batch5 — Sqlite override matching the nominal SQLite
+    /// primitive name. Delegates to `db::approve_with_approver_type`
+    /// directly (bypassing the trait's default forward to
+    /// `governance_approve_with_consensus` for one less indirection).
+    async fn approve_with_approver_type(
+        &self,
+        _ctx: &CallerContext,
+        pending_id: &str,
+        approver_agent_id: &str,
+    ) -> StoreResult<super::ApproveOutcome> {
+        let conn = self.state.lock().await;
+        let outcome = db::approve_with_approver_type(&conn, pending_id, approver_agent_id)
+            .map_err(box_err)?;
+        let sal = match outcome {
+            db::ApproveOutcome::Approved => super::ApproveOutcome::Approved,
+            db::ApproveOutcome::Pending { votes, quorum } => {
+                super::ApproveOutcome::Pending { votes, quorum }
+            }
+            db::ApproveOutcome::Rejected(reason) => super::ApproveOutcome::Rejected(reason),
+        };
+        Ok(sal)
+    }
+
+    /// FX-C2-batch5 — Sqlite override matching the nominal SQLite
+    /// primitive name. Delegates to `db::decide_pending_action`.
+    async fn decide_pending_action(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+        approve: bool,
+        decided_by: &str,
+    ) -> StoreResult<bool> {
+        let conn = self.state.lock().await;
+        db::decide_pending_action(&conn, id, approve, decided_by).map_err(box_err)
+    }
+
+    /// FX-C2-batch5 — outbound knowledge-graph traversal. Thin
+    /// delegate to `db::kg_query`; projects the per-hop SQLite
+    /// `KgQueryNode` rows into the SAL `KgQueryRow` shape.
+    async fn kg_query(
+        &self,
+        source_id: &str,
+        max_depth: usize,
+        include_invalidated: bool,
+    ) -> StoreResult<Vec<super::KgQueryRow>> {
+        let conn = self.state.lock().await;
+        let nodes = db::kg_query(
+            &conn,
+            source_id,
+            max_depth,
+            None,
+            None,
+            None,
+            include_invalidated,
+        )
+        .map_err(box_err)?;
+        Ok(nodes
+            .into_iter()
+            .map(|n| super::KgQueryRow {
+                target_id: n.target_id,
+                relation: n.relation,
+                depth: n.depth,
+                path: n.path,
+            })
+            .collect())
+    }
+
+    /// FX-C2-batch5 — knowledge-graph timeline scan. Thin delegate to
+    /// `db::kg_timeline`; projects the per-event SQLite
+    /// `KgTimelineEvent` rows into the SAL `KgTimelineRow` shape.
+    async fn kg_timeline(
+        &self,
+        source_id: &str,
+        since: Option<&str>,
+        until: Option<&str>,
+        limit: Option<usize>,
+    ) -> StoreResult<Vec<super::KgTimelineRow>> {
+        let conn = self.state.lock().await;
+        let events = db::kg_timeline(&conn, source_id, since, until, limit).map_err(box_err)?;
+        Ok(events
+            .into_iter()
+            .map(|e| super::KgTimelineRow {
+                target_id: e.target_id,
+                relation: e.relation,
+                valid_from: e.valid_from,
+                valid_until: e.valid_until,
+                observed_by: e.observed_by,
+                title: e.title,
+                target_namespace: e.target_namespace,
+            })
+            .collect())
+    }
+
+    /// FX-C2-batch5 — register a knowledge-graph entity. Thin delegate
+    /// to `db::entity_register`; idempotent on
+    /// `(canonical_name, namespace)`.
+    async fn entity_register(
+        &self,
+        _ctx: &CallerContext,
+        canonical_name: &str,
+        namespace: &str,
+        aliases: &[String],
+        extra_metadata: &serde_json::Value,
+        agent_id: Option<&str>,
+    ) -> StoreResult<crate::models::EntityRegistration> {
+        let conn = self.state.lock().await;
+        db::entity_register(
+            &conn,
+            canonical_name,
+            namespace,
+            aliases,
+            extra_metadata,
+            agent_id,
+        )
+        .map_err(box_err)
+    }
+
+    /// FX-C2-batch5 — list archived memories. Thin delegate to
+    /// `db::list_archived`; returns the same JSON row shape across
+    /// backends.
+    async fn list_archived(
+        &self,
+        namespace: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> StoreResult<Vec<serde_json::Value>> {
+        let conn = self.state.lock().await;
+        db::list_archived(&conn, namespace, limit, offset).map_err(box_err)
     }
 }
 
@@ -1389,6 +1675,145 @@ mod tests {
                 .any(|l| l.source_id == a_id && l.target_id == b_id),
             "namespace filter must exclude links whose source lives elsewhere"
         );
+    }
+
+    #[tokio::test]
+    async fn get_links_for_anchor_returns_inbound_and_outbound() {
+        // v0.7.0 ARCH-2 followup (FX-C2) — per-anchor probe must
+        // return BOTH the outbound (source==anchor) and inbound
+        // (target==anchor) edges, mirroring `db::get_links`. Pins the
+        // SQLite half of the cross-backend parity contract.
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice");
+        let a = test_memory("anchor", "central memory for the probe");
+        let b = test_memory("downstream", "memory that anchor points to");
+        let c = test_memory("upstream", "memory that points to anchor");
+        let a_id = store.store(&ctx, &a).await.expect("store anchor");
+        let b_id = store.store(&ctx, &b).await.expect("store downstream");
+        let c_id = store.store(&ctx, &c).await.expect("store upstream");
+        // anchor -> downstream
+        store
+            .link(
+                &ctx,
+                &MemoryLink {
+                    source_id: a_id.clone(),
+                    target_id: b_id.clone(),
+                    relation: crate::models::MemoryLinkRelation::RelatedTo,
+                    created_at: chrono::Utc::now().to_rfc3339(),
+                    valid_from: None,
+                    valid_until: None,
+                    observed_by: None,
+                    signature: None,
+                    attest_level: None,
+                },
+            )
+            .await
+            .expect("link a->b");
+        // upstream -> anchor
+        store
+            .link(
+                &ctx,
+                &MemoryLink {
+                    source_id: c_id.clone(),
+                    target_id: a_id.clone(),
+                    relation: crate::models::MemoryLinkRelation::Contradicts,
+                    created_at: chrono::Utc::now().to_rfc3339(),
+                    valid_from: None,
+                    valid_until: None,
+                    observed_by: None,
+                    signature: None,
+                    attest_level: None,
+                },
+            )
+            .await
+            .expect("link c->a");
+        let edges = store
+            .get_links_for_anchor(&a_id)
+            .await
+            .expect("get_links_for_anchor");
+        assert_eq!(edges.len(), 2, "expected exactly 2 edges for the anchor");
+        assert!(
+            edges
+                .iter()
+                .any(|l| l.source_id == a_id && l.target_id == b_id),
+            "missing outbound edge anchor->downstream"
+        );
+        assert!(
+            edges
+                .iter()
+                .any(|l| l.source_id == c_id && l.target_id == a_id),
+            "missing inbound edge upstream->anchor"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_links_for_anchor_empty_for_unlinked_id() {
+        // Unlinked id must yield Ok(empty). Pins the "no rows" branch of
+        // the FX-C2 trait addition so downstream consumers can rely on
+        // empty-vec semantics rather than `NotFound`.
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice");
+        let m = test_memory("alone", "no edges from or to this memory");
+        let id = store.store(&ctx, &m).await.expect("store");
+        let edges = store
+            .get_links_for_anchor(&id)
+            .await
+            .expect("get_links_for_anchor on unlinked id");
+        assert!(edges.is_empty(), "unlinked id must yield empty vec");
+    }
+
+    #[tokio::test]
+    async fn get_links_for_anchor_projects_attest_level_and_temporal() {
+        // FX-C2 wire-shape contract: the per-anchor probe MUST project
+        // the temporal-validity columns (`valid_from`, `valid_until`,
+        // `observed_by`) + `attest_level` because the
+        // `memory_get_links` MCP tool docstring promises them. This
+        // test inserts a signed-ish link with explicit temporal anchors
+        // and verifies all three round-trip.
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice");
+        let a = test_memory("anchor-temp", "anchor for temporal-fields probe");
+        let b = test_memory("target-temp", "target for temporal-fields probe");
+        let a_id = store.store(&ctx, &a).await.expect("store a");
+        let b_id = store.store(&ctx, &b).await.expect("store b");
+        // Use the raw SQLite path to set valid_from/valid_until/observed_by
+        // since the simple `link` trait method doesn't expose them. The
+        // schema CHECK requires `attest_level=self_signed/peer_attested`
+        // to carry a 64-byte signature; `unsigned` lets us round-trip
+        // the temporal-validity fields without composing a real
+        // signature blob (the verifier surface — exercised in dedicated
+        // tests).
+        {
+            let conn = store.state.lock().await;
+            conn.execute(
+                "INSERT INTO memory_links (source_id, target_id, relation, created_at,
+                                           valid_from, valid_until, observed_by, attest_level)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                rusqlite::params![
+                    &a_id,
+                    &b_id,
+                    "related_to",
+                    chrono::Utc::now().to_rfc3339(),
+                    "2026-01-01T00:00:00Z",
+                    "2026-12-31T23:59:59Z",
+                    "ai:tester@host",
+                    "unsigned",
+                ],
+            )
+            .expect("temporal insert");
+        }
+        let edges = store
+            .get_links_for_anchor(&a_id)
+            .await
+            .expect("get_links_for_anchor");
+        let row = edges
+            .iter()
+            .find(|l| l.source_id == a_id && l.target_id == b_id)
+            .expect("just-inserted edge");
+        assert_eq!(row.valid_from.as_deref(), Some("2026-01-01T00:00:00Z"));
+        assert_eq!(row.valid_until.as_deref(), Some("2026-12-31T23:59:59Z"));
+        assert_eq!(row.observed_by.as_deref(), Some("ai:tester@host"));
+        assert_eq!(row.attest_level.as_deref(), Some("unsigned"));
     }
 
     #[tokio::test]
@@ -1949,5 +2374,765 @@ mod tests {
             .await
             .expect("get_pending miss");
         assert!(row.is_none());
+    }
+
+    // ===== v0.7.0 ARCH-2 followup (FX-C2-batch3) — trait unit tests ======
+    //
+    // Each new trait method gets a happy-path test + an empty/edge-case
+    // test. Postgres-side parity tests live under the
+    // `sqlite_postgres_parity` module gated on
+    // `AI_MEMORY_TEST_POSTGRES_URL`.
+
+    #[tokio::test]
+    async fn list_namespaces_groups_and_orders_by_count() {
+        // FX-C2-batch3 — `list_namespaces` returns `(namespace, count)`
+        // rows sorted by count desc with deterministic alphabetic
+        // tie-break, mirroring `db::list_namespaces`.
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice");
+        for (ns, n) in &[("alpha", 3usize), ("beta", 1usize), ("gamma", 2usize)] {
+            for i in 0..*n {
+                let mut m =
+                    test_memory(&format!("{ns}-{i}"), "content body for the namespace probe");
+                m.namespace = (*ns).to_string();
+                store.store(&ctx, &m).await.expect("store");
+            }
+        }
+        let rows = store.list_namespaces().await.expect("list_namespaces");
+        let alpha = rows.iter().find(|r| r.namespace == "alpha").expect("alpha");
+        let beta = rows.iter().find(|r| r.namespace == "beta").expect("beta");
+        let gamma = rows.iter().find(|r| r.namespace == "gamma").expect("gamma");
+        assert_eq!(alpha.count, 3);
+        assert_eq!(beta.count, 1);
+        assert_eq!(gamma.count, 2);
+        // Densest namespace surfaces first.
+        let alpha_pos = rows
+            .iter()
+            .position(|r| r.namespace == "alpha")
+            .expect("alpha pos");
+        let beta_pos = rows
+            .iter()
+            .position(|r| r.namespace == "beta")
+            .expect("beta pos");
+        assert!(
+            alpha_pos < beta_pos,
+            "expected alpha (count=3) before beta (count=1)"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_namespaces_empty_store_returns_empty_vec() {
+        let store = fresh_store();
+        let rows = store
+            .list_namespaces()
+            .await
+            .expect("list_namespaces on empty store");
+        assert!(rows.is_empty(), "empty store must yield empty vec");
+    }
+
+    #[tokio::test]
+    async fn get_taxonomy_assembles_hierarchical_tree() {
+        // FX-C2-batch3 — `get_taxonomy` projects a hierarchical tree
+        // whose ancestor `subtree_count`s sum every descendant's count.
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice");
+        for (ns, n) in &[
+            ("alphaone", 1usize),
+            ("alphaone/team", 2usize),
+            ("alphaone/team/secrets", 1usize),
+        ] {
+            for i in 0..*n {
+                let mut m = test_memory(&format!("{ns}-{i}"), "taxonomy fixture body content");
+                m.namespace = (*ns).to_string();
+                store.store(&ctx, &m).await.expect("store");
+            }
+        }
+        let tax = store
+            .get_taxonomy(Some("alphaone"), 8, 100)
+            .await
+            .expect("get_taxonomy");
+        // 1 (alphaone) + 2 (alphaone/team) + 1 (alphaone/team/secrets) = 4
+        assert_eq!(tax.total_count, 4, "total prefix count");
+        assert_eq!(tax.tree.namespace, "alphaone");
+        assert_eq!(tax.tree.subtree_count, 4);
+        assert!(!tax.truncated);
+    }
+
+    #[tokio::test]
+    async fn get_taxonomy_empty_prefix_yields_empty_total() {
+        let store = fresh_store();
+        let tax = store
+            .get_taxonomy(Some("nonexistent"), 8, 100)
+            .await
+            .expect("get_taxonomy");
+        assert_eq!(tax.total_count, 0);
+        assert!(tax.tree.children.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_agents_roundtrip_through_register() {
+        // FX-C2-batch3 — `list_agents` enumerates the `_agents`
+        // namespace and parses the metadata blob into the
+        // `AgentRegistration` shape.
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("daemon");
+        let agent = AgentRegistration {
+            agent_id: "ai:tester@host".to_string(),
+            agent_type: "test".to_string(),
+            capabilities: vec!["recall".to_string(), "store".to_string()],
+            registered_at: String::new(),
+            last_seen_at: String::new(),
+        };
+        store
+            .register_agent(&ctx, &agent)
+            .await
+            .expect("register_agent");
+        let listed = store.list_agents().await.expect("list_agents");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].agent_id, "ai:tester@host");
+        assert_eq!(listed[0].agent_type, "test");
+        assert!(listed[0].capabilities.contains(&"recall".to_string()));
+        assert!(!listed[0].registered_at.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_agents_empty_store_returns_empty_vec() {
+        let store = fresh_store();
+        let listed = store.list_agents().await.expect("list_agents");
+        assert!(listed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_pending_actions_filters_by_status() {
+        // FX-C2-batch3 — status filter passes through verbatim.
+        use crate::models::GovernedAction;
+        let store = fresh_store();
+        {
+            let conn = store.state.lock().await;
+            db::queue_pending_action(
+                &conn,
+                GovernedAction::Store,
+                "ns",
+                None,
+                "alice",
+                &serde_json::json!({"title":"t","content":"c"}),
+            )
+            .expect("queue 1");
+            db::queue_pending_action(
+                &conn,
+                GovernedAction::Store,
+                "ns",
+                None,
+                "bob",
+                &serde_json::json!({"title":"t2","content":"c2"}),
+            )
+            .expect("queue 2");
+        }
+        let all = store
+            .list_pending_actions(None, 100)
+            .await
+            .expect("list all");
+        assert_eq!(all.len(), 2);
+        let pending = store
+            .list_pending_actions(Some("pending"), 100)
+            .await
+            .expect("list pending");
+        assert_eq!(pending.len(), 2, "both rows start pending");
+        let approved = store
+            .list_pending_actions(Some("approved"), 100)
+            .await
+            .expect("list approved");
+        assert!(approved.is_empty(), "no approved rows yet");
+    }
+
+    #[tokio::test]
+    async fn entity_get_by_alias_resolves_canonical_record() {
+        // FX-C2-batch3 — `entity_get_by_alias` returns the canonical
+        // entity record (entity_id + canonical_name + namespace +
+        // alias set).
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice");
+        // Stamp the metadata so the entity passes the kind=entity
+        // CHECK in `db::entity_get_by_alias`.
+        let mut m = test_memory("alphaone-co", "company entity row body fixture");
+        m.namespace = "alphaone".to_string();
+        m.metadata = serde_json::json!({
+            "kind": "entity",
+            "agent_id": "alice",
+        });
+        let id = store.store(&ctx, &m).await.expect("store");
+        {
+            let conn = store.state.lock().await;
+            // SQLite `entity_aliases` table shape is
+            // (entity_id, alias, created_at); namespace comes from the
+            // JOIN with memories.
+            conn.execute(
+                "INSERT INTO entity_aliases (entity_id, alias, created_at) VALUES (?1, ?2, ?3)",
+                rusqlite::params![&id, "AlphaOne", chrono::Utc::now().to_rfc3339()],
+            )
+            .expect("insert alias");
+        }
+        let rec = store
+            .entity_get_by_alias("AlphaOne", Some("alphaone"))
+            .await
+            .expect("entity_get_by_alias");
+        let rec = rec.expect("entity must resolve");
+        assert_eq!(rec.entity_id, id);
+        assert_eq!(rec.canonical_name, "alphaone-co");
+        assert_eq!(rec.namespace, "alphaone");
+        assert!(rec.aliases.iter().any(|a| a == "AlphaOne"));
+    }
+
+    #[tokio::test]
+    async fn entity_get_by_alias_returns_none_for_unknown() {
+        let store = fresh_store();
+        let rec = store
+            .entity_get_by_alias("never-registered", None)
+            .await
+            .expect("entity_get_by_alias miss");
+        assert!(rec.is_none());
+    }
+
+    #[tokio::test]
+    async fn entity_get_by_alias_empty_alias_returns_none() {
+        // Empty / whitespace-only alias is rejected at the storage
+        // layer — verify the SAL preserves the contract.
+        let store = fresh_store();
+        let rec = store
+            .entity_get_by_alias("   ", None)
+            .await
+            .expect("entity_get_by_alias whitespace");
+        assert!(rec.is_none());
+    }
+
+    #[tokio::test]
+    async fn health_check_returns_true_on_open_store() {
+        let store = fresh_store();
+        let ok = store.health_check().await.expect("health_check");
+        assert!(ok);
+    }
+
+    #[tokio::test]
+    async fn stats_projects_full_shape() {
+        // FX-C2-batch3 — `stats` projects total, per-tier, per-namespace,
+        // expiring_soon, links_count, db_size_bytes for the open store.
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice");
+        for i in 0..3 {
+            let mut m = test_memory(
+                &format!("title-{i}"),
+                "stats fixture body content adequate length",
+            );
+            m.namespace = "alphaone".to_string();
+            store.store(&ctx, &m).await.expect("store");
+        }
+        let s = store.stats().await.expect("stats");
+        assert_eq!(s.total, 3);
+        // by_namespace must include alphaone with count=3
+        let alpha = s
+            .by_namespace
+            .iter()
+            .find(|r| r.namespace == "alphaone")
+            .expect("alphaone in stats.by_namespace");
+        assert_eq!(alpha.count, 3);
+        // db_size_bytes is best-effort — fresh DB is non-zero
+        // (rusqlite at least writes the page header).
+        assert!(s.db_size_bytes > 0, "expected non-zero db file size");
+    }
+
+    // ------------------------------------------------------------------
+    // FX-C2 batch-4 — parity tests for the new trait methods.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn update_embedding_persists_via_set_embedding() {
+        // FX-C2-batch4 — `SqliteStore::update_embedding` overrides the
+        // default no-op and delegates to `db::set_embedding` so the
+        // create.rs:475 embedding write is now SAL-routable.
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice");
+        let mem = test_memory("with-embed", "embedding-fixture body content");
+        let id = store.store(&ctx, &mem).await.expect("store");
+        // Use a 4-d vector to keep the test cheap. The dim-mismatch
+        // check inside `db::set_embedding` is keyed off the namespace's
+        // first established dim, so a fresh store accepts any dim.
+        let vec = vec![0.1_f32, 0.2, 0.3, 0.4];
+        store
+            .update_embedding(&ctx, &id, Some(&vec))
+            .await
+            .expect("update_embedding");
+        // Verify by re-reading the column. We deliberately read via
+        // the lock since the SAL doesn't expose a `get_embedding`
+        // surface yet (recall_hybrid is the consumer).
+        let conn = store.state.lock().await;
+        let blob: Vec<u8> = conn
+            .query_row(
+                "SELECT embedding FROM memories WHERE id = ?1",
+                rusqlite::params![&id],
+                |r| r.get(0),
+            )
+            .expect("read embedding");
+        assert!(!blob.is_empty(), "embedding blob should be populated");
+    }
+
+    #[tokio::test]
+    async fn find_by_title_namespace_resolves_id() {
+        // FX-C2-batch4 — `find_by_title_namespace` returns the live
+        // row's id when `(title, namespace)` matches.
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice");
+        let mem = test_memory("conflict-target", "find_by_title body");
+        let id = store.store(&ctx, &mem).await.expect("store");
+        let found = store
+            .find_by_title_namespace(&mem.title, &mem.namespace)
+            .await
+            .expect("find_by_title_namespace");
+        assert_eq!(found.as_deref(), Some(id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn find_by_title_namespace_returns_none_for_unknown() {
+        let store = fresh_store();
+        let found = store
+            .find_by_title_namespace("never-stored", "alphaone")
+            .await
+            .expect("find_by_title_namespace miss");
+        assert!(found.is_none());
+    }
+
+    #[tokio::test]
+    async fn next_versioned_title_first_use_returns_base() {
+        // FX-C2-batch4 — on a fresh store the base title is free.
+        let store = fresh_store();
+        let picked = store
+            .next_versioned_title("My Title", "alphaone")
+            .await
+            .expect("next_versioned_title");
+        assert_eq!(picked, "My Title");
+    }
+
+    #[tokio::test]
+    async fn next_versioned_title_appends_suffix_on_collision() {
+        // FX-C2-batch4 — when the base title is taken, append `(2)`.
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice");
+        let mut mem = test_memory("dup-title", "versioned body content");
+        mem.namespace = "alphaone".to_string();
+        store.store(&ctx, &mem).await.expect("store");
+        let picked = store
+            .next_versioned_title("dup-title", "alphaone")
+            .await
+            .expect("next_versioned_title");
+        assert_eq!(picked, "dup-title (2)");
+    }
+
+    #[tokio::test]
+    async fn find_contradictions_returns_fts_matches() {
+        // FX-C2-batch4 — `find_contradictions` returns FTS-similar
+        // candidates in the same namespace.
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice");
+        let mut a = test_memory("rust language semantics", "rust language safety guarantees");
+        a.namespace = "alphaone".to_string();
+        let mut b = test_memory(
+            "completely unrelated cookbook",
+            "fish stew recipe and instructions",
+        );
+        b.namespace = "alphaone".to_string();
+        store.store(&ctx, &a).await.expect("store a");
+        store.store(&ctx, &b).await.expect("store b");
+        let hits = store
+            .find_contradictions("rust language", "alphaone")
+            .await
+            .expect("find_contradictions");
+        // The FTS5 match query must surface the "rust language" memory;
+        // the recipe row should NOT trigger an FTS hit.
+        assert!(
+            hits.iter().any(|m| m.title.contains("rust language")),
+            "FTS match should surface the rust-language row"
+        );
+        assert!(
+            !hits.iter().any(|m| m.title.contains("cookbook")),
+            "unrelated row must not appear"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalidate_link_marks_found_with_previous_value() {
+        // FX-C2-batch4 — `invalidate_link` sets `valid_until` on the
+        // matching `(source, target, relation)` triple and surfaces
+        // `previous_valid_until` (None on first invalidation).
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice");
+        let src = test_memory("src-row", "source memory body content");
+        let dst = test_memory("dst-row", "destination memory body content");
+        let src_id = store.store(&ctx, &src).await.expect("store src");
+        let dst_id = store.store(&ctx, &dst).await.expect("store dst");
+        let link = crate::models::MemoryLink {
+            source_id: src_id.clone(),
+            target_id: dst_id.clone(),
+            relation: crate::models::MemoryLinkRelation::RelatedTo,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            signature: None,
+            observed_by: None,
+            valid_from: None,
+            valid_until: None,
+            attest_level: None,
+        };
+        store.link(&ctx, &link).await.expect("create link");
+        let row = store
+            .invalidate_link(&src_id, &dst_id, "related_to", Some("2030-01-01T00:00:00Z"))
+            .await
+            .expect("invalidate_link");
+        assert!(row.found, "link must be marked found");
+        assert_eq!(row.valid_until, "2030-01-01T00:00:00Z");
+        assert!(row.previous_valid_until.is_none(), "no prior invalidation");
+    }
+
+    #[tokio::test]
+    async fn invalidate_link_returns_not_found_for_unknown_triple() {
+        // FX-C2-batch4 — non-existent triple surfaces `found = false`,
+        // not an error.
+        let store = fresh_store();
+        let row = store
+            .invalidate_link("nope-src", "nope-dst", "related_to", None)
+            .await
+            .expect("invalidate_link miss");
+        assert!(!row.found);
+        assert!(row.valid_until.is_empty());
+    }
+
+    #[tokio::test]
+    async fn check_duplicate_with_text_exact_content_hash_short_circuits() {
+        // FX-C2-batch4 — phase 1 SHA-256 short-circuit returns
+        // `similarity=1.0` when `format!("{title} {content}")` is
+        // byte-equal to an existing row's text.
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice");
+        let mut mem = test_memory("dup-test-title", "dup-test body content");
+        mem.namespace = "alphaone".to_string();
+        store.store(&ctx, &mem).await.expect("store");
+        let query_text = format!("{} {}", mem.title, mem.content);
+        // Empty embedding is fine — phase 1 (hash) doesn't need it.
+        let check = store
+            .check_duplicate_with_text(&[], &query_text, Some("alphaone"), 0.8)
+            .await
+            .expect("check_duplicate_with_text");
+        assert!(check.is_duplicate);
+        let n = check.nearest.expect("nearest must be populated on dup");
+        assert!((n.similarity - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn check_duplicate_with_text_no_match_returns_false() {
+        // FX-C2-batch4 — empty candidate pool surfaces non-dup with
+        // candidates_scanned=0.
+        let store = fresh_store();
+        let check = store
+            .check_duplicate_with_text(&[], "no-match text", Some("alphaone"), 0.8)
+            .await
+            .expect("check_duplicate_with_text empty");
+        assert!(!check.is_duplicate);
+        assert_eq!(check.candidates_scanned, 0);
+    }
+
+    // ------------------------------------------------------------------
+    // FX-C2-batch5 — parity tests for the final 6 trait methods.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn fx_c2_batch5_decide_pending_action_alias_matches_pending_decide() {
+        // The `decide_pending_action` trait method is a nominal alias
+        // for `pending_decide`; the two surfaces must produce
+        // identical results.
+        use crate::models::GovernedAction;
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice");
+        let pid = {
+            let conn = store.state.lock().await;
+            db::queue_pending_action(
+                &conn,
+                GovernedAction::Store,
+                "ns-decide-alias",
+                None,
+                "alice",
+                &serde_json::json!({"title":"t","content":"c"}),
+            )
+            .expect("queue")
+        };
+        let result = store
+            .decide_pending_action(&ctx, &pid, true, "alice")
+            .await
+            .expect("decide_pending_action");
+        assert!(result, "first decide must transition the row");
+        let second = store
+            .decide_pending_action(&ctx, &pid, true, "alice")
+            .await
+            .expect("decide_pending_action second");
+        assert!(!second, "already-decided rows must be no-op");
+    }
+
+    #[tokio::test]
+    async fn fx_c2_batch5_approve_with_approver_type_matches_governance_path() {
+        // The `approve_with_approver_type` trait method is a nominal
+        // alias for `governance_approve_with_consensus`; under Human
+        // approver_type the result is identical.
+        use crate::models::GovernedAction;
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice");
+        let pid = {
+            let conn = store.state.lock().await;
+            db::queue_pending_action(
+                &conn,
+                GovernedAction::Store,
+                "ns-approve-alias",
+                None,
+                "alice",
+                &serde_json::json!({"title":"t","content":"c"}),
+            )
+            .expect("queue")
+        };
+        let outcome = store
+            .approve_with_approver_type(&ctx, &pid, "approver")
+            .await
+            .expect("approve_with_approver_type");
+        assert!(matches!(outcome, crate::store::ApproveOutcome::Approved));
+    }
+
+    #[tokio::test]
+    async fn fx_c2_batch5_execute_pending_action_sqlite_override() {
+        // Before FX-C2-batch5 the SqliteStore relied on the trait
+        // default (UnsupportedCapability); this test pins the new
+        // override.
+        use crate::models::GovernedAction;
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice");
+        let memory_payload = serde_json::to_value(test_memory("fx-c2-b5-exec", "executed payload"))
+            .expect("serialize memory");
+        let pid = {
+            let conn = store.state.lock().await;
+            let pid = db::queue_pending_action(
+                &conn,
+                GovernedAction::Store,
+                "alphaone",
+                None,
+                "alice",
+                &memory_payload,
+            )
+            .expect("queue");
+            db::approve_with_approver_type(&conn, &pid, "alice").expect("approve");
+            pid
+        };
+        let executed = store
+            .execute_pending_action(&ctx, &pid)
+            .await
+            .expect("execute_pending_action");
+        // Store action returns the resulting memory id.
+        assert!(executed.is_some(), "store action must return a memory id");
+    }
+
+    #[tokio::test]
+    async fn fx_c2_batch5_kg_query_returns_outbound_neighbors() {
+        // Insert a source memory + a target + a related_to link; the
+        // trait method must surface the neighbor through the CTE
+        // traversal.
+        use crate::models::{MemoryLink, MemoryLinkRelation};
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice");
+        let src = store
+            .store(&ctx, &test_memory("kg-src", "source body"))
+            .await
+            .expect("src");
+        let dst = store
+            .store(&ctx, &test_memory("kg-dst", "target body"))
+            .await
+            .expect("dst");
+        let now = chrono::Utc::now().to_rfc3339();
+        let link = MemoryLink {
+            source_id: src.clone(),
+            target_id: dst.clone(),
+            relation: MemoryLinkRelation::RelatedTo,
+            created_at: now.clone(),
+            valid_from: Some(now.clone()),
+            valid_until: None,
+            observed_by: Some("alice".to_string()),
+            attest_level: Some("unsigned".to_string()),
+            signature: None,
+        };
+        store.link(&ctx, &link).await.expect("link");
+        let rows = store.kg_query(&src, 2, false).await.expect("kg_query");
+        assert_eq!(rows.len(), 1, "exactly one neighbor expected");
+        assert_eq!(rows[0].target_id, dst);
+        assert_eq!(rows[0].depth, 1);
+    }
+
+    #[tokio::test]
+    async fn fx_c2_batch5_kg_timeline_orders_by_valid_from() {
+        // Two outbound assertions with explicit valid_from; the
+        // timeline must surface them in ASC order. We write the
+        // memory_links rows directly so we can pin valid_from
+        // explicitly (the `link` trait method does not surface a
+        // valid_from override).
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice");
+        let src = store
+            .store(&ctx, &test_memory("tl-src", "tl source body"))
+            .await
+            .expect("src");
+        let dst_old = store
+            .store(&ctx, &test_memory("tl-dst-old", "tl old body"))
+            .await
+            .expect("dst-old");
+        let dst_new = store
+            .store(&ctx, &test_memory("tl-dst-new", "tl new body"))
+            .await
+            .expect("dst-new");
+        {
+            let conn = store.state.lock().await;
+            conn.execute(
+                "INSERT INTO memory_links \
+                 (source_id, target_id, relation, created_at, valid_from, attest_level) \
+                 VALUES (?1, ?2, 'related_to', ?3, ?4, 'unsigned')",
+                rusqlite::params![
+                    &src,
+                    &dst_new,
+                    "2030-01-02T00:00:01Z",
+                    "2030-01-02T00:00:00Z"
+                ],
+            )
+            .expect("insert new link");
+            conn.execute(
+                "INSERT INTO memory_links \
+                 (source_id, target_id, relation, created_at, valid_from, attest_level) \
+                 VALUES (?1, ?2, 'related_to', ?3, ?4, 'unsigned')",
+                rusqlite::params![
+                    &src,
+                    &dst_old,
+                    "2030-01-01T00:00:01Z",
+                    "2030-01-01T00:00:00Z"
+                ],
+            )
+            .expect("insert old link");
+        }
+        let events = store
+            .kg_timeline(&src, None, None, None)
+            .await
+            .expect("kg_timeline");
+        assert_eq!(events.len(), 2, "two timeline events expected");
+        assert_eq!(events[0].target_id, dst_old, "older event first");
+        assert_eq!(events[1].target_id, dst_new, "newer event second");
+    }
+
+    #[tokio::test]
+    async fn fx_c2_batch5_entity_register_creates_new_entity() {
+        // Idempotent registration creates a new row on first call.
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice");
+        let reg = store
+            .entity_register(
+                &ctx,
+                "Acme Corp",
+                "alphaone-test",
+                &["ACME".to_string(), "acme-corp".to_string()],
+                &serde_json::json!({"website":"https://acme.example"}),
+                Some("alice"),
+            )
+            .await
+            .expect("entity_register");
+        assert!(reg.created, "first registration must create the entity row");
+        assert_eq!(reg.canonical_name, "Acme Corp");
+        assert_eq!(reg.namespace, "alphaone-test");
+        assert!(reg.aliases.iter().any(|a| a == "ACME"));
+    }
+
+    #[tokio::test]
+    async fn fx_c2_batch5_entity_register_unions_aliases_on_reregister() {
+        // Second call with new aliases merges into the existing row.
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice");
+        store
+            .entity_register(
+                &ctx,
+                "BetaCo",
+                "alphaone-test",
+                &["beta".to_string()],
+                &serde_json::json!({}),
+                Some("alice"),
+            )
+            .await
+            .expect("first");
+        let reg = store
+            .entity_register(
+                &ctx,
+                "BetaCo",
+                "alphaone-test",
+                &["BETA-CORP".to_string()],
+                &serde_json::json!({}),
+                Some("alice"),
+            )
+            .await
+            .expect("reregister");
+        assert!(!reg.created, "re-registration must NOT create a new row");
+        assert!(reg.aliases.iter().any(|a| a == "beta"));
+        assert!(reg.aliases.iter().any(|a| a == "BETA-CORP"));
+    }
+
+    #[tokio::test]
+    async fn fx_c2_batch5_list_archived_returns_archived_rows() {
+        // Insert + archive a memory; list_archived must surface it.
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice");
+        let id = store
+            .store(&ctx, &test_memory("archived-row", "to be archived"))
+            .await
+            .expect("store");
+        // Forget with archive=true so the row lands on archived_memories.
+        let archived = store
+            .forget(&ctx, Some("sal-test"), None, None, true)
+            .await
+            .expect("forget");
+        assert!(archived > 0, "forget must archive at least one row");
+        let listed = store
+            .list_archived(Some("sal-test"), 100, 0)
+            .await
+            .expect("list_archived");
+        assert_eq!(listed.len(), 1, "one archived row expected");
+        let row = &listed[0];
+        assert_eq!(
+            row.get("id").and_then(|v| v.as_str()),
+            Some(id.as_str()),
+            "archived row id must match"
+        );
+    }
+
+    #[tokio::test]
+    async fn fx_c2_batch5_list_archived_namespace_filter_excludes_other_tenants() {
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice");
+        let mut m = test_memory("ns-a-row", "body");
+        m.namespace = "tenant-a".to_string();
+        store.store(&ctx, &m).await.expect("store-a");
+        let mut m2 = test_memory("ns-b-row", "body");
+        m2.namespace = "tenant-b".to_string();
+        store.store(&ctx, &m2).await.expect("store-b");
+        store
+            .forget(&ctx, Some("tenant-a"), None, None, true)
+            .await
+            .expect("forget-a");
+        store
+            .forget(&ctx, Some("tenant-b"), None, None, true)
+            .await
+            .expect("forget-b");
+        let tenant_a = store
+            .list_archived(Some("tenant-a"), 100, 0)
+            .await
+            .expect("list a");
+        assert_eq!(tenant_a.len(), 1);
+        assert_eq!(
+            tenant_a[0].get("namespace").and_then(|v| v.as_str()),
+            Some("tenant-a")
+        );
+        let global = store.list_archived(None, 100, 0).await.expect("list all");
+        assert_eq!(global.len(), 2, "global list must surface both tenants");
     }
 }

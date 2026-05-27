@@ -648,6 +648,41 @@ pub trait MemoryStore: Send + Sync {
     /// resume mid-stream without losing rows.
     async fn list_links(&self, namespace: Option<&str>) -> StoreResult<Vec<MemoryLink>>;
 
+    /// v0.7.0 ARCH-2 followup (FX-C2) — per-anchor edge probe. Returns
+    /// every link where `anchor_id` is either the source or the target
+    /// (the inbound + outbound union — same shape `db::get_links` has
+    /// returned since v0.6 for the `memory_get_links` MCP tool).
+    ///
+    /// Replaces the audit's missing-trait reach at `links.rs:894` and
+    /// `power.rs:280` so the per-anchor scan can ride the SAL trait
+    /// instead of falling through to the legacy free-function path.
+    /// [`MemoryStore::list_links`] is namespace-scoped, not
+    /// anchor-scoped, so the two methods are complementary — list_links
+    /// powers migrate/export; get_links_for_anchor powers the graph
+    /// view at a specific node.
+    ///
+    /// Wire-shape contract (matches `db::get_links`):
+    /// - `source_id`, `target_id`, `relation` populated from the row.
+    /// - `created_at`, `valid_from`, `valid_until`, `observed_by`,
+    ///   `attest_level` projected so the `memory_get_links` MCP tool's
+    ///   docstring promise holds on both backends.
+    /// - `signature` stays `None` (the verifier surface owns the bytes
+    ///   blob; exposing it here would force every existing caller to
+    ///   ignore a base64 blob in the response).
+    ///
+    /// Ordering: descending by `created_at` (most-recent edges first)
+    /// to match the SQLite `db::get_links` natural ordering after the
+    /// v0.7.0 issue #860 row-projection widening.
+    ///
+    /// Default returns `UnsupportedCapability` so adapters that don't
+    /// yet wire the per-anchor probe fail loudly rather than silently
+    /// degrade to an empty list (which would mask graph data loss).
+    async fn get_links_for_anchor(&self, _anchor_id: &str) -> StoreResult<Vec<MemoryLink>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "GET_LINKS_FOR_ANCHOR".to_string(),
+        })
+    }
+
     /// Register an agent in the adapter's `_agents` namespace (Task
     /// 1.3).
     async fn register_agent(
@@ -1321,6 +1356,473 @@ pub trait MemoryStore: Send + Sync {
     ) -> StoreResult<Vec<Vec<String>>> {
         Err(StoreError::UnsupportedCapability {
             capability: "FIND_PATHS".to_string(),
+        })
+    }
+
+    // ==================================================================
+    // v0.7.0 ARCH-2 followup (FX-C2-batch3) — read-only trait
+    // completions. Each closes a "Missing-trait" handler reach so the
+    // SAL becomes the canonical read surface for these probes.
+    // Defaults return `UnsupportedCapability` so adapters that don't
+    // implement the probe fail loudly rather than silently returning
+    // empty results.
+    // ==================================================================
+
+    /// Enumerate live (non-expired) namespaces with their memory counts.
+    /// Closes `db::list_namespaces` (handler reach at `power.rs:411`).
+    ///
+    /// Ordering: descending by count, then ascending by name for stable
+    /// tie-breaking. The result excludes namespaces whose entire content
+    /// has expired but does NOT cascade through TTL semantics for
+    /// individual rows (callers requesting that should use `list` with a
+    /// namespace filter).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` when the underlying store reports an error.
+    async fn list_namespaces(&self) -> StoreResult<Vec<crate::models::NamespaceCount>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "LIST_NAMESPACES".to_string(),
+        })
+    }
+
+    /// Hierarchical namespace taxonomy. Closes `db::get_taxonomy`
+    /// (handler reach at `power.rs:620`).
+    ///
+    /// `namespace_prefix` filters the tree root; `max_depth` caps how
+    /// many `/`-separated segments are surfaced below the prefix;
+    /// `limit` caps the number of `(namespace, count)` rows walked.
+    /// Adapters MUST clamp `max_depth` and `limit` to safe bounds so
+    /// pathological callers cannot exhaust memory.
+    ///
+    /// Returned [`Taxonomy::total_count`] reflects the FULL prefix
+    /// total (not the truncated walk) and [`Taxonomy::truncated`] is
+    /// set when `limit` dropped rows so callers can warn the user.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` when the underlying store reports an error.
+    async fn get_taxonomy(
+        &self,
+        _namespace_prefix: Option<&str>,
+        _max_depth: usize,
+        _limit: usize,
+    ) -> StoreResult<crate::models::Taxonomy> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "GET_TAXONOMY".to_string(),
+        })
+    }
+
+    /// Enumerate registered agents in the `_agents` namespace. Closes
+    /// `db::list_agents` (handler reaches at `subscriptions.rs:454`,
+    /// `admin.rs:280`).
+    ///
+    /// Ordering: ascending by `registered_at` so audit consumers can
+    /// observe stable enrollment chronology. Each [`AgentRegistration`]
+    /// projects `agent_id`, `agent_type`, `capabilities`,
+    /// `registered_at`, `last_seen_at` parsed out of the underlying
+    /// memory row's metadata blob.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` when the underlying store reports an error or
+    /// when metadata fails to parse as JSON.
+    async fn list_agents(&self) -> StoreResult<Vec<AgentRegistration>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "LIST_AGENTS".to_string(),
+        })
+    }
+
+    /// Enumerate pending governance actions with optional status
+    /// filter. Closes `db::list_pending_actions` (handler reaches at
+    /// `governance.rs:130`, `approvals.rs:277` indirectly).
+    ///
+    /// `status` filters by the exact status string (`"pending"`,
+    /// `"approved"`, `"rejected"`, `"expired"`). `None` returns every
+    /// row regardless of status. `limit` caps row count; callers MUST
+    /// pass a positive value (zero behaves as "no rows" by SQL
+    /// convention).
+    ///
+    /// Ordering: descending by `requested_at` so the freshest entries
+    /// surface first, matching the legacy `db::list_pending_actions`
+    /// shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` when the underlying store reports an error.
+    async fn list_pending_actions(
+        &self,
+        _status: Option<&str>,
+        _limit: usize,
+    ) -> StoreResult<Vec<crate::models::PendingAction>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "LIST_PENDING_ACTIONS".to_string(),
+        })
+    }
+
+    /// Resolve a knowledge-graph entity by alias (case-sensitive
+    /// match). Closes `db::entity_get_by_alias` (handler reach at
+    /// `kg.rs:468`).
+    ///
+    /// `namespace`, when set, restricts the alias resolution to a
+    /// specific tenant. When `None`, the most-recently-created
+    /// matching entity wins (deterministic disambiguation if the same
+    /// alias was registered in multiple namespaces).
+    ///
+    /// Returns `Ok(None)` if no entity claims this alias; returns the
+    /// full alias set for the resolved entity otherwise.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` when the underlying store reports an error.
+    async fn entity_get_by_alias(
+        &self,
+        _alias: &str,
+        _namespace: Option<&str>,
+    ) -> StoreResult<Option<crate::models::EntityRecord>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ENTITY_GET_BY_ALIAS".to_string(),
+        })
+    }
+
+    /// Deep health check — verifies the underlying store is reachable
+    /// AND the full-text index (or postgres equivalent) is functional.
+    /// Closes `db::health_check` (handler reach at `transport.rs:840`).
+    ///
+    /// Returns `Ok(true)` on success. Implementations SHOULD perform a
+    /// cheap write-side probe (e.g. SQLite FTS integrity-check) so
+    /// degradation surfaces before the next user-facing recall fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` when the underlying store is unreachable or
+    /// the FTS / index probe fails.
+    async fn health_check(&self) -> StoreResult<bool> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "HEALTH_CHECK".to_string(),
+        })
+    }
+
+    /// Aggregate database statistics — total rows, per-tier counts,
+    /// per-namespace counts, expiring-soon count, link count, on-disk
+    /// size, dim violations, HNSW evictions. Closes `db::stats`
+    /// (handler reaches at `transport.rs:876`, `admin.rs:505`).
+    ///
+    /// Adapters SHOULD populate every field they can; missing fields
+    /// (e.g. `db_size_bytes` on Postgres where path-based sizing isn't
+    /// meaningful) default to zero so the response shape stays
+    /// constant across backends.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` when the underlying store reports an error.
+    async fn stats(&self) -> StoreResult<crate::models::Stats> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "STATS".to_string(),
+        })
+    }
+
+    /// Resolve a memory id by `(title, namespace)` — used by the
+    /// `on_conflict=error` path during `memory_store` to surface a
+    /// `409 CONFLICT` envelope citing the colliding row's id. Closes
+    /// `db::find_by_title_namespace` (handler reach at
+    /// `create.rs:187`).
+    ///
+    /// Returns `Ok(None)` when no live row matches the tuple.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` when the underlying store reports an error.
+    async fn find_by_title_namespace(
+        &self,
+        _title: &str,
+        _namespace: &str,
+    ) -> StoreResult<Option<String>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "FIND_BY_TITLE_NAMESPACE".to_string(),
+        })
+    }
+
+    /// Pick a title that does not collide with an existing
+    /// `(title, namespace)` row by appending `(2)`, `(3)`, ... up to
+    /// the substrate's hard cap. Used by `on_conflict='version'`.
+    /// Closes `db::next_versioned_title` (handler reach at
+    /// `create.rs:210`).
+    ///
+    /// Returns the original title when no row claims it; otherwise
+    /// the first available `"<base> (N)"` suffix. Errors with the
+    /// substrate's `UniqueConflict` envelope when the cap is exhausted.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` on store errors; `UniqueConflict` when the
+    /// substrate cap is exhausted.
+    async fn next_versioned_title(
+        &self,
+        _base_title: &str,
+        _namespace: &str,
+    ) -> StoreResult<String> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "NEXT_VERSIONED_TITLE".to_string(),
+        })
+    }
+
+    /// Detect potential contradictions: memories in the same
+    /// namespace with FTS-similar titles. Closes
+    /// `db::find_contradictions` (handler reach at `create.rs:1025`).
+    ///
+    /// Returns up to 5 candidates ranked by FTS score (no embedding
+    /// pass). Used by the autonomous-hooks fan-out to seed the
+    /// contradiction-detection LLM with deterministic candidates
+    /// before pricing the cosine pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` when the underlying store reports an error.
+    async fn find_contradictions(
+        &self,
+        _title: &str,
+        _namespace: &str,
+    ) -> StoreResult<Vec<Memory>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "FIND_CONTRADICTIONS".to_string(),
+        })
+    }
+
+    /// Mark a KG link as superseded by setting its `valid_until`
+    /// column. Closes `db::invalidate_link` (handler reach at
+    /// `kg.rs:932`); the Postgres branch routes through the inherent
+    /// `PostgresStore::kg_invalidate` method which preserves the
+    /// AGE↔CTE dual-path discipline.
+    ///
+    /// Returns a [`KgInvalidateRow`] carrying `found = false` when the
+    /// `(source_id, target_id, relation)` triple does not match an
+    /// existing link, matching the SQLite-side `Ok(None)` contract
+    /// projected into the SAL row shape.
+    ///
+    /// Idempotent: calling repeatedly overwrites the prior
+    /// `valid_until` (the prior value is returned in
+    /// `previous_valid_until` so callers can detect the overwrite).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` when the underlying store reports an error.
+    async fn invalidate_link(
+        &self,
+        _source_id: &str,
+        _target_id: &str,
+        _relation: &str,
+        _valid_until: Option<&str>,
+    ) -> StoreResult<KgInvalidateRow> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "INVALIDATE_LINK".to_string(),
+        })
+    }
+
+    /// Content-hash + embedding-cosine duplicate detector. Closes
+    /// `db::check_duplicate_with_text` (handler reach at
+    /// `power.rs:825`).
+    ///
+    /// Phase 1 SHA-256-matches the canonical `title content` text
+    /// against every live, namespace-matching candidate; an exact
+    /// match short-circuits at `similarity=1.0`. Phase 2 falls
+    /// through to the embedding-based nearest-neighbor scan so
+    /// near-but-not-exact hits still surface a closest-existing
+    /// signal.
+    ///
+    /// `query_text` MUST be the exact string used to produce
+    /// `query_embedding` (typically `format!("{title} {content}")`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` when the underlying store reports an error.
+    async fn check_duplicate_with_text(
+        &self,
+        _query_embedding: &[f32],
+        _query_text: &str,
+        _namespace: Option<&str>,
+        _threshold: f32,
+    ) -> StoreResult<crate::models::DuplicateCheck> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "CHECK_DUPLICATE_WITH_TEXT".to_string(),
+        })
+    }
+
+    // ==================================================================
+    // v0.7.0 ARCH-2 followup (FX-C2-batch5) — final 6 trait additions
+    // that close the last "Missing-trait" handler reaches on the
+    // governance + KG + archive surfaces. Each default returns
+    // `UnsupportedCapability` so backends that don't wire the operation
+    // fail loudly rather than silently returning empty / stale results.
+    // ==================================================================
+
+    /// v0.7.0 ARCH-2 FX-C2-batch5 — approver_type-aware approve. Mirrors
+    /// the canonical sqlite primitive `db::approve_with_approver_type`
+    /// (see `src/storage/mod.rs::approve_with_approver_type`); closes
+    /// the missing-trait reach at `governance.rs:306` / `approvals.rs:280`.
+    ///
+    /// Wire-shape contract: identical to
+    /// [`MemoryStore::governance_approve_with_consensus`] — both fan in
+    /// to the same `ApproveOutcome` enum, both enforce the same
+    /// Human / Agent(required) / Consensus(quorum) state machine. The
+    /// two names are the same operation; this alias exists so the
+    /// handler-side routing stays nominally aligned with the SQLite
+    /// primitive name (`db::approve_with_approver_type`) the audit doc
+    /// cites and so future backends can override either method.
+    ///
+    /// Default forwards to
+    /// [`MemoryStore::governance_approve_with_consensus`] so adapters
+    /// only have to wire one entry point. Override either if the
+    /// adapter wants nominally-distinct implementations.
+    async fn approve_with_approver_type(
+        &self,
+        ctx: &CallerContext,
+        pending_id: &str,
+        approver_agent_id: &str,
+    ) -> StoreResult<ApproveOutcome> {
+        self.governance_approve_with_consensus(ctx, pending_id, approver_agent_id)
+            .await
+    }
+
+    /// v0.7.0 ARCH-2 FX-C2-batch5 — decide a pending action (approve /
+    /// reject). Closes the missing-trait reach at `governance.rs:480` /
+    /// `approvals.rs:328` / `federation_receive.rs:941`.
+    ///
+    /// Wire-shape contract: identical to
+    /// [`MemoryStore::pending_decide`] (same `(id, approve, decided_by)`
+    /// signature, same `bool` return semantics — `true` when the row
+    /// transitioned from `pending`, `false` otherwise). The two names
+    /// are the same operation; this alias preserves nominal parity with
+    /// the SQLite primitive name (`db::decide_pending_action`) the
+    /// audit doc cites.
+    ///
+    /// Default forwards to [`MemoryStore::pending_decide`].
+    async fn decide_pending_action(
+        &self,
+        ctx: &CallerContext,
+        id: &str,
+        approve: bool,
+        decided_by: &str,
+    ) -> StoreResult<bool> {
+        self.pending_decide(ctx, id, approve, decided_by).await
+    }
+
+    /// v0.7.0 ARCH-2 FX-C2-batch5 — outbound knowledge-graph traversal.
+    /// Closes the missing-trait reach at `kg.rs:1359`.
+    ///
+    /// Returns up to `limit` reachable nodes from `source_id`, walking
+    /// the link graph up to `max_depth` hops. `include_invalidated`
+    /// lifts the default `valid_until` filter so callers can see the
+    /// full historical edge graph (S45's `as_of=past` semantics). The
+    /// Postgres adapter resolves AGE vs the CTE fallback at adapter
+    /// connect time; SQLite uses the recursive CTE in
+    /// `db::kg_query`.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidInput` when `max_depth` is zero or exceeds the
+    /// adapter's supported ceiling. Returns `Backend` for storage errors.
+    async fn kg_query(
+        &self,
+        _source_id: &str,
+        _max_depth: usize,
+        _include_invalidated: bool,
+    ) -> StoreResult<Vec<KgQueryRow>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "KG_QUERY".to_string(),
+        })
+    }
+
+    /// v0.7.0 ARCH-2 FX-C2-batch5 — knowledge-graph timeline scan.
+    /// Closes the missing-trait reach at `kg.rs:735`.
+    ///
+    /// Returns outbound link assertions from `source_id` ordered by
+    /// `valid_from` ASC (most recent → oldest scan via tie-broken
+    /// `created_at`). `since` / `until` constrain the window;
+    /// `limit` caps row count. Adapters MUST drop rows whose
+    /// `valid_from` is NULL — the timeline is anchored on the
+    /// authoritative validity timestamp.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` for storage errors.
+    async fn kg_timeline(
+        &self,
+        _source_id: &str,
+        _since: Option<&str>,
+        _until: Option<&str>,
+        _limit: Option<usize>,
+    ) -> StoreResult<Vec<KgTimelineRow>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "KG_TIMELINE".to_string(),
+        })
+    }
+
+    /// v0.7.0 ARCH-2 FX-C2-batch5 — register a knowledge-graph entity.
+    /// Closes the missing-trait reach at `kg.rs:311` (drift — postgres
+    /// adapter previously bypassed the trait via a bespoke handler-side
+    /// store + alias-union walk).
+    ///
+    /// Idempotent on `(canonical_name, namespace)`: on first call
+    /// inserts an entity-tagged Memory row; on subsequent calls unions
+    /// the new aliases into the existing row's
+    /// `metadata.aliases` array. Returns the resolved
+    /// [`crate::models::EntityRegistration`] so callers can surface
+    /// `entity_id` + the post-union alias set + the `created` flag.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Conflict` (mapped to 409) when a non-entity memory
+    /// already claims the `(canonical_name, namespace)` tuple.
+    /// Returns `Backend` for storage errors.
+    async fn entity_register(
+        &self,
+        _ctx: &CallerContext,
+        _canonical_name: &str,
+        _namespace: &str,
+        _aliases: &[String],
+        _extra_metadata: &serde_json::Value,
+        _agent_id: Option<&str>,
+    ) -> StoreResult<crate::models::EntityRegistration> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ENTITY_REGISTER".to_string(),
+        })
+    }
+
+    /// v0.7.0 ARCH-2 FX-C2-batch5 — list archived memories. Closes the
+    /// archive-list reach currently going through the
+    /// `list_archived_via_store` downcast hatch (`archive.rs:85`); the
+    /// SAL trait method makes the read backend-blind.
+    ///
+    /// Returns up to `limit` archived rows skipping `offset`, ordered
+    /// descending by `archived_at` (newest first). `namespace`, when
+    /// set, restricts the projection to a single tenant. The wire
+    /// shape mirrors `db::list_archived` on the SQLite path and
+    /// `PostgresStore::list_archived` on the Postgres path — a
+    /// JSON-shaped row per archived memory carrying every column on the
+    /// `archived_memories` table, including the v49 14-column expansion
+    /// for round-trip restore parity.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` for storage errors. Returns `InvalidInput`
+    /// when the adapter's `limit` clamp rejects the supplied value.
+    async fn list_archived(
+        &self,
+        _namespace: Option<&str>,
+        _limit: usize,
+        _offset: usize,
+    ) -> StoreResult<Vec<serde_json::Value>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "LIST_ARCHIVED".to_string(),
         })
     }
 }

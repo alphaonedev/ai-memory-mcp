@@ -229,49 +229,21 @@ pub async fn list_agents(
     if let Err(resp) = crate::handlers::admin_role::require_admin(&app, &headers, "list_agents") {
         return resp;
     }
-    // v0.7.0 Wave-3 Continuation — postgres-backed daemons project from
-    // the `_agents` namespace via the SAL `list` trait method, mirroring
-    // how sqlite's `db::list_agents` reads from the same namespace.
-    #[cfg(feature = "sal")]
+    // v0.7.0 ARCH-2 followup (FX-C2-batch3) — postgres-backed daemons
+    // route through `MemoryStore::list_agents`, which parses the
+    // `_agents`-namespace metadata blob into the canonical
+    // `AgentRegistration` shape exactly like SQLite's `db::list_agents`.
+    // Replaces the previous `list()` + client-side metadata-walk
+    // fold, which was a Drift cleanup target (audit doc, FX-C2 sub-
+    // batch dispatch plan §FX-C2-b).
+    #[cfg(feature = "sal-postgres")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        // #910 — admin surface (registration / list_agents / stats);
-        // bypass the SAL visibility filter so admin endpoints see the
-        // full row set regardless of metadata.scope.
-        let ctx = crate::store::CallerContext::for_admin("daemon");
-        let filter = crate::store::Filter {
-            namespace: Some("_agents".to_string()),
-            limit: 1000,
-            ..Default::default()
-        };
-        return match app.store.list(&ctx, &filter).await {
-            Ok(memories) => {
-                let agents: Vec<serde_json::Value> = memories
-                    .iter()
-                    .filter_map(|m| {
-                        let meta = m.metadata.as_object()?;
-                        let agent_id = meta.get("agent_id")?.as_str()?;
-                        let agent_type = meta
-                            .get("agent_type")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown");
-                        let capabilities = meta
-                            .get("capabilities")
-                            .cloned()
-                            .unwrap_or_else(|| serde_json::json!([]));
-                        Some(json!({
-                            "agent_id": agent_id,
-                            "agent_type": agent_type,
-                            "capabilities": capabilities,
-                            "registered_at": m.created_at,
-                        }))
-                    })
-                    .collect();
-                (
-                    StatusCode::OK,
-                    Json(json!({"count": agents.len(), "agents": agents})),
-                )
-                    .into_response()
-            }
+        return match app.store.list_agents().await {
+            Ok(agents) => (
+                StatusCode::OK,
+                Json(json!({"count": agents.len(), "agents": agents})),
+            )
+                .into_response(),
             Err(e) => store_err_to_response(e),
         };
     }
@@ -448,51 +420,36 @@ pub async fn get_stats(
     if let Err(resp) = crate::handlers::admin_role::require_admin(&app, &headers, "get_stats") {
         return resp;
     }
-    // v0.7.0 Wave-3 Continuation — postgres-backed daemons project a
-    // basic count from the SAL `list` method. Detailed per-tier
-    // breakdown + DB file size + WAL counters are sqlite-only fields
-    // and surface as `null` on postgres so clients see a consistent
-    // top-level shape.
-    #[cfg(feature = "sal")]
+    // v0.7.0 ARCH-2 followup (FX-C2-batch3) — postgres-backed daemons
+    // now route stats through `MemoryStore::stats`, which projects the
+    // full `Stats` shape via SQL aggregates (total + per-tier + per-
+    // namespace + expiring_soon + links_count + table-size). This
+    // replaces the previous client-side fold over a 1M-limit
+    // `list()` scan which was a Drift cleanup target and would not
+    // scale to large deployments.
+    #[cfg(feature = "sal-postgres")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        // #910 — admin surface (registration / list_agents / stats);
-        // bypass the SAL visibility filter so admin endpoints see the
-        // full row set regardless of metadata.scope.
-        let ctx = crate::store::CallerContext::for_admin("daemon");
-        let filter = crate::store::Filter {
-            limit: 1_000_000,
-            ..Default::default()
-        };
-        return match app.store.list(&ctx, &filter).await {
-            Ok(memories) => {
-                let total = memories.len();
-                let mut short = 0usize;
-                let mut mid = 0usize;
-                let mut long = 0usize;
-                let mut by_namespace: std::collections::BTreeMap<String, usize> =
-                    std::collections::BTreeMap::new();
-                for m in &memories {
-                    match m.tier {
-                        Tier::Short => short += 1,
-                        Tier::Mid => mid += 1,
-                        Tier::Long => long += 1,
-                    }
-                    *by_namespace.entry(m.namespace.clone()).or_insert(0) += 1;
-                }
-                // by_tier wire shape: { <tier-wire-string>: <count> }.
-                // Keys are routed through `Tier::<X>.as_str()` so the
-                // wire-string mapping stays single-sourced (pm-v3.1 PR6,
-                // #1174). `json!` requires literal keys, so we build
-                // the inner map with `serde_json::Map` to interpolate
-                // the enum-derived keys.
+        return match app.store.stats().await {
+            Ok(s) => {
+                // Project the SAL Stats shape into the postgres wire
+                // shape: by_tier as a wire-string-keyed map (mirrors
+                // the previous postgres envelope), per-namespace as
+                // a `{namespace: count}` map.
                 let mut by_tier_map = serde_json::Map::new();
-                by_tier_map.insert(Tier::Short.as_str().to_string(), json!(short));
-                by_tier_map.insert(Tier::Mid.as_str().to_string(), json!(mid));
-                by_tier_map.insert(Tier::Long.as_str().to_string(), json!(long));
+                for tc in &s.by_tier {
+                    by_tier_map.insert(tc.tier.clone(), json!(tc.count));
+                }
+                let mut by_namespace_map = serde_json::Map::new();
+                for nc in &s.by_namespace {
+                    by_namespace_map.insert(nc.namespace.clone(), json!(nc.count));
+                }
                 Json(json!({
-                    "total_memories": total,
+                    "total_memories": s.total,
                     "by_tier": by_tier_map,
-                    "by_namespace": by_namespace,
+                    "by_namespace": by_namespace_map,
+                    "expiring_soon": s.expiring_soon,
+                    "links_count": s.links_count,
+                    "db_size_bytes": s.db_size_bytes,
                     "storage_backend": "postgres",
                 }))
                 .into_response()
