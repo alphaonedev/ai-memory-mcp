@@ -45,7 +45,7 @@ as ARCH-2-followup with a proposed trait addition).
 | 745 | `db::delete_link(&lock.0, …)` — sqlite delete path (no source memory) | Drift | Deferred-to-followup |
 | 760 | `db::get(&lock.0, &target_id)` — fetch target memory owner for delete_link gate | Test-blocked drift | Deferred-to-followup |
 | 803 | `db::delete_link(&lock.0, &source_id, &target_id)` — sqlite delete write | Drift | Deferred-to-followup |
-| 894 | `db::get_links(&lock.0, &id)` — per-anchor edge probe in `get_links` sqlite branch | Missing-trait | Keeper-comment-added (no `MemoryStore::get_links_for_anchor`; SAL `list_links(namespace)` is namespace-scoped, not anchor-scoped) |
+| 894 | `db::get_links(&lock.0, &id)` — per-anchor edge probe in `get_links` sqlite branch | Missing-trait (closed) / Test-blocked drift | **Trait method `MemoryStore::get_links_for_anchor` landed in PR #FX-C2-batch-2** (SQLite + Postgres impls + 6 parity tests, see `src/store/{mod,sqlite,postgres}.rs`); the Postgres branch above at `links.rs:850-887` is **Routed-in-this-PR** through the new trait method (drops the pre-fix `list_links(None)` + client-side filter). The SQLite branch at this line stays on `db::get_links` because `app.store` and `app.db` point at disjoint backing files in unit tests (`test_app_state` opens a fresh tempfile-backed `SqliteStore`; `test_state()` uses `:memory:` sqlite); routing here breaks ~30 tests that seed via `db::create_link(&lock.0, …)`. Reclassified Test-blocked drift; tracked for FX-C2-a follow-up. |
 | 910-919 | `db::get(&lock.0, &link.{source,target}_id)` x2 inside per-edge visibility filter loop | Drift | **Routed-in-this-PR** — sqlite branch now routes through `app.store.get(&ctx, …)` to mirror the postgres branch's `#910` scope=private fold |
 | 619-625 | `e.downcast_ref::<db::StorageError>()` for `LinkReflectionCycle`/`LinkPermissionDenied` | Keeper | Pre-existing keeper (typed-error downcast; SAL `StoreError` doesn't carry these variants) |
 
@@ -170,7 +170,7 @@ All 12 reaches (`db::resolve_governance_policy`, `db::insert_if_newer`, `db::del
 | Line | Call | Class | Status |
 |---|---|---|---|
 | 231 | `db::list(&lock.0, …)` candidate-set scan | Test-blocked drift | Deferred-to-followup |
-| 280 | `db::get_links(&lock.0, id)` per-anchor probe | Missing-trait | Deferred-to-followup |
+| 280 | `db::get_links(&lock.0, id)` per-anchor probe | Missing-trait (closed) / Test-blocked drift | Trait method `MemoryStore::get_links_for_anchor` landed in PR #FX-C2-batch-2; this SQLite branch stays on `db::get_links` because the contradiction-link assembly holds `app.db.lock()` for the upstream `db::list` + this `db::get_links` in the same window. Reclassified Test-blocked drift; tracked for FX-C2-a follow-up. |
 | 411 | `db::list_namespaces(&lock.0)` | Missing-trait | Deferred-to-followup |
 | 620 | `db::get_taxonomy(&lock.0, …)` | Missing-trait | Deferred-to-followup |
 | 825 | `db::check_duplicate_with_text(…)` | Missing-trait | Deferred-to-followup |
@@ -185,7 +185,9 @@ All 12 reaches (`db::resolve_governance_policy`, `db::insert_if_newer`, `db::del
 
 ## Summary counts
 
-| Class | Total sites | Routed in this PR | Keeper-comment added | Pre-existing keeper | Deferred to followup |
+Original FX-11 ARCH-2 PR (#1356):
+
+| Class | Total sites | Routed in PR #1356 | Keeper-comment added | Pre-existing keeper | Deferred to followup |
 |---|---|---|---|---|---|
 | Drift | 11 | 2 (links.rs:910/915) | 0 | 0 | 9 |
 | Test-blocked drift | 19 | 0 | 2 (power_consolidation.rs:199/716) | 0 | 17 |
@@ -193,11 +195,46 @@ All 12 reaches (`db::resolve_governance_policy`, `db::insert_if_newer`, `db::del
 | Missing-trait | 27 | 0 | 1 (links.rs:894) | 0 | 26 |
 | **Total** | **76** | **2** | **3** | **19** | **52** |
 
+FX-C2 batch-2 follow-up (this PR — `fix/arch2-sal-routing-batch2`):
+
+| Action | Sites | Notes |
+|---|---|---|
+| New trait method landed | 1 | `MemoryStore::get_links_for_anchor` (proposed addition #1) — SQLite + Postgres adapter impls + 6 parity tests (3 SQLite + 3 live-Postgres) |
+| Routed-in-this-PR (Postgres) | 1 | `links.rs:850-887` — postgres branch of `get_links` now rides the trait method instead of `list_links(None) + client-side filter` |
+| Reclassified Missing-trait → Test-blocked drift | 2 | `links.rs:894`, `power.rs:280` — trait method now exists; SQLite-branch routing blocked on test-fixture convergence (option b) per ARCH-2-followup §"Test-fixture convergence" |
+
 Note: the original ARCH-2 finding cited "40+ sites". The full audit
 surfaces 76 sites once `crate::storage::*` typed-error downcasts and
 federation-receive write paths are counted; the gap is the
 typed-downcast carve-out (already documented in-place since #961)
 plus the federation-receive intentional sqlite path.
+
+FX-C2 cumulative progress: 3 sites routed (2 from PR #1356, 1 from
+this batch); 1 of 21 proposed missing-trait additions landed (#1
+`get_links_for_anchor`). The remaining 20 missing-trait additions
++ 27 deferred-drift handler routings + 19 test-blocked drift sites
+are tracked under the FX-C2-a … FX-C2-f sub-batch sequencing in
+sub-section §"FX-C2 sub-batch dispatch plan" below.
+
+### FX-C2 sub-batch dispatch plan
+
+Sized for single-agent landing with green gates on every batch:
+
+| Sub-batch | Scope | Notes |
+|---|---|---|
+| FX-C2-a | Test-fixture convergence — unify `test_state()` + `test_app_state` so `app.db` and `app.store` share the same backing | Unblocks all 19 Test-blocked drift sites + the 2 reclassified sites above |
+| FX-C2-b | 7 read-only trait additions (`list_agents`, `list_namespaces`, `list_pending_actions`, `entity_get_by_alias`, `get_taxonomy`, `health_check`, `stats`) | Read-only ⇒ no transaction-window concerns |
+| FX-C2-c | 7 write-path trait additions (`set_embedding`, `find_by_title_namespace`, `next_versioned_title`, `entity_register`, `invalidate_link`, `check_duplicate_with_text`, `find_contradictions`) | Single-row writes |
+| FX-C2-d | 6 governance/KG trait additions (`approve_with_approver_type`, `execute_pending_action`, `decide_pending_action`, `kg_query`, `kg_timeline`, `proactive_conflict_check`) | Multi-row state-machine writes |
+| FX-C2-e | Remaining handler routings (27 deferred-drift sites) | Depends on FX-C2-b/c/d |
+| FX-C2-f | Final pass: 19 test-blocked sites unblocked by FX-C2-a + `list_archived` / `get_namespace_meta_entry` trait additions | Closes the residual |
+
+Every sub-batch carries the same gating contract: `cargo fmt --check`,
+`cargo clippy --features sal,sal-postgres -- -D warnings -D
+clippy::pedantic`, `AI_MEMORY_NO_CONFIG=1 cargo test --features
+sal,sal-postgres`, plus SQLite + Postgres parity tests on every new
+trait method, plus this audit document updated with the
+"Routed-in-PR-#X" status for each site touched.
 
 ## ARCH-2-followup proposed trait additions
 
