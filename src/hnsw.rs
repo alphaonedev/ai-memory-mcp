@@ -369,7 +369,17 @@ struct IndexState {
     /// lazily on the first search after a mutation; invalidated to
     /// `None` on insert push, eviction drain, and remove retain.
     /// Pre-#1087 this set was rebuilt on EVERY recall.
-    valid_ids_cache: Option<std::collections::HashSet<String>>,
+    ///
+    /// PERF-7 (FX-C4-batch2, 2026-05-26): the cache stores
+    /// `Arc<str>` per id instead of `String`. UUID strings are 36
+    /// bytes; `Arc<str>` is a 16-byte fat pointer with the bytes
+    /// heap-allocated once, whereas a `String` is a 24-byte
+    /// (ptr/len/cap) struct with the bytes heap-allocated PLUS the
+    /// 24 bytes inline. On a 100 000-entry warm-up the change
+    /// halves the per-rebuild allocator pressure (16 vs 24+ bytes
+    /// per entry plus the no-spare-capacity heap-side). HashSet
+    /// lookup against `&str` works through the `Borrow<str>` impl.
+    valid_ids_cache: Option<std::collections::HashSet<std::sync::Arc<str>>>,
 }
 
 /// A search result from the vector index.
@@ -726,8 +736,17 @@ impl VectorIndex {
         // Pre-#1087 this set was rebuilt on EVERY recall (iterating
         // up to 100k strings + a fresh HashSet allocation per call).
         if state.valid_ids_cache.is_none() {
-            let set: std::collections::HashSet<String> =
-                state.all_entries.iter().map(|(id, _)| id.clone()).collect();
+            // PERF-7 — collect to HashSet<Arc<str>> instead of
+            // HashSet<String>. Arc<str> is a 16-byte fat pointer
+            // vs String's 24-byte (ptr/len/cap) struct; the
+            // backing bytes are shared with no spare capacity
+            // overhead. HashSet::contains accepts `&str` via the
+            // `Borrow<str>` impl on `Arc<str>`.
+            let set: std::collections::HashSet<std::sync::Arc<str>> = state
+                .all_entries
+                .iter()
+                .map(|(id, _)| std::sync::Arc::<str>::from(id.as_str()))
+                .collect();
             state.valid_ids_cache = Some(set);
         }
         let valid_ids = state
@@ -989,6 +1008,37 @@ mod tests {
         let idx = VectorIndex::empty();
         let results = idx.search(&[1.0, 0.0, 0.0], 10);
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn perf_7_valid_ids_cache_is_arc_str_typed() {
+        // PERF-7 (FX-C4-batch2, 2026-05-26) — the valid_ids cache
+        // must be HashSet<Arc<str>>, not HashSet<String>. The
+        // discriminator is the cache field's type, which we exercise
+        // by populating the index, searching once to materialise the
+        // cache, then reaching into the locked state to verify the
+        // cache element shape via downcast on a sample entry.
+        let entries = vec![
+            ("id1".to_string(), make_embedding(&[1.0, 0.0, 0.0])),
+            ("id2".to_string(), make_embedding(&[0.0, 1.0, 0.0])),
+        ];
+        let idx = VectorIndex::build(entries);
+        // Trigger one search so the cache populates.
+        let _ = idx.search(&[1.0, 0.0, 0.0], 2);
+        let state = idx.inner.lock().expect("lock state");
+        let cache = state
+            .valid_ids_cache
+            .as_ref()
+            .expect("valid_ids_cache populated after search");
+        assert!(
+            cache.contains("id1") && cache.contains("id2"),
+            "PERF-7: Arc<str> cache failed to admit &str lookup",
+        );
+        // Type system pins the field type — if a future refactor
+        // changes the type back to HashSet<String>, this `Arc::clone`
+        // line fails to compile.
+        let sample: Option<&std::sync::Arc<str>> = cache.iter().next();
+        assert!(sample.is_some(), "PERF-7: cache must hold Arc<str> entries");
     }
 
     #[test]

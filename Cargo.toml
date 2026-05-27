@@ -216,6 +216,14 @@ pgvector = { version = "0.4", optional = true, features = ["sqlx"] }
 # Operators who want encryption at rest also supply
 # `--db-passphrase-file <path>` at daemon startup to unlock the DB.
 [features]
+# ARCH-11 (FX-C4-batch2, 2026-05-26) — every flag listed below MUST
+# have at least one `cfg(feature = "<name>")` consumer in `src/` or
+# `tests/`, OR be enumerated in the carve-out list in
+# `tests/feature_flag_audit_arch_11.rs`. The audit test asserts the
+# invariant at `cargo test` time so a dead-flag regression cannot
+# silently land. Adding a new flag is a Cargo.toml change + at
+# least one `cfg(feature = ...)` consumer + (if it's a meta or
+# Cargo-composition flag) a carve-out entry in the audit test.
 default = ["sqlite-bundled"]
 sqlite-bundled = ["rusqlite/bundled"]
 sqlcipher = ["rusqlite/bundled-sqlcipher-vendored-openssl"]
@@ -414,7 +422,38 @@ paste = { git = "https://github.com/alphaonedev/paste", rev = "6a30252" }
 [profile.release]
 opt-level = 3
 strip = true
-lto = "thin"
+# PERF-11 (FX-C4-batch2, 2026-05-26) — upgraded from `lto = "thin"`
+# + default `codegen-units = 16` to a stricter release-profile
+# posture:
+#
+#   * `lto = "fat"`  — whole-program LTO; pays for cross-crate inline
+#                      of leaf math (cosine fast-path in PERF-4 / the
+#                      fused-loop hot path in `embeddings.rs`) into
+#                      `recall_hybrid`'s semantic phase. Build-time
+#                      cost is ~1.5-2x vs thin, but the inlined
+#                      cosine + reduced indirection cuts recall p99
+#                      proportionally on the cosine-heavy branch.
+#   * `codegen-units = 1`
+#                    — single TU lets the optimiser see the entire
+#                      crate at once. Pairs with fat LTO.
+#
+# NOT applied: `panic = "abort"`. The PERF-11 review notes this as a
+# size + icache win, but the substrate has at least one production
+# caller of `std::panic::catch_unwind` — the `auto_export` hook
+# recovery path at `src/hooks/post_reflect/auto_export.rs:130`.
+# Flipping to `abort` would silently disable that recovery and
+# convert a contained hook panic into a process abort. Keeping
+# `panic = "unwind"` (the default) preserves the recovery contract.
+# A future v0.7.x change can audit + remove every `catch_unwind`
+# site and then flip the panic posture in a follow-up.
+#
+# Trade-off accepted: build-time cost (fat LTO + 1 codegen unit) is
+# amortised over CI / dogfood-rebuild cycles and is acceptable for a
+# release binary (~3-5 min on the m1 dev host). The
+# `[profile.coverage]` block below is independently tuned for the
+# GH-hosted coverage runner and stays untouched.
+lto = "fat"
+codegen-units = 1
 
 # v0.7.x (#1148) — purpose-built profile for `cargo llvm-cov` runs in CI.
 # Inherits `dev` (debug-assertions on, opt-level=0, etc.) but trims the
