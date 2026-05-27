@@ -2336,6 +2336,7 @@ pub const MCP_MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
 pub const MCP_MAX_DRAIN_BYTES: usize = 64 * 1024 * 1024;
 
 #[allow(clippy::too_many_lines)]
+#[allow(deprecated)] // DOC-6: legacy AppConfig.llm_model / embedding_model fallback
 pub fn run_mcp_server(
     db_path: &Path,
     tier: FeatureTier,
