@@ -11087,6 +11087,207 @@ impl MemoryStore for PostgresStore {
             candidates_scanned,
         })
     }
+
+    // ------------------------------------------------------------------
+    // v0.7.0 ARCH-2 FX-C2-batch5 — final 6 trait additions
+    // ------------------------------------------------------------------
+
+    /// FX-C2-batch5 — outbound knowledge-graph traversal via the SAL
+    /// trait. Delegates to the inherent `kg_query_with_history` (the
+    /// 3-arg variant) which itself resolves AGE vs the CTE fallback at
+    /// adapter connect time.
+    async fn kg_query(
+        &self,
+        source_id: &str,
+        max_depth: usize,
+        include_invalidated: bool,
+    ) -> StoreResult<Vec<super::KgQueryRow>> {
+        self.kg_query_with_history(source_id, max_depth, include_invalidated)
+            .await
+    }
+
+    /// FX-C2-batch5 — knowledge-graph timeline scan via the SAL trait.
+    /// Inlines the AGE↔CTE dispatch from the inherent
+    /// `kg_timeline` so the trait method can land in this impl block
+    /// without a name-collision against the inherent helper (the
+    /// inherent stays in `impl PostgresStore` for external test
+    /// callers that bind to the concrete type).
+    async fn kg_timeline(
+        &self,
+        source_id: &str,
+        since: Option<&str>,
+        until: Option<&str>,
+        limit: Option<usize>,
+    ) -> StoreResult<Vec<super::KgTimelineRow>> {
+        match self.kg_backend {
+            KgBackend::Age => {
+                match self
+                    .kg_timeline_cypher(source_id, since, until, limit)
+                    .await
+                {
+                    Ok(rows) => Ok(rows),
+                    Err(err) if is_age_runtime_failure(&err) => {
+                        warn_age_fallback("kg_timeline", source_id, &err);
+                        self.kg_timeline_cte(source_id, since, until, limit).await
+                    }
+                    Err(err) => Err(err),
+                }
+            }
+            KgBackend::Cte => self.kg_timeline_cte(source_id, since, until, limit).await,
+        }
+    }
+
+    /// FX-C2-batch5 — register a knowledge-graph entity via the SAL
+    /// trait. Idempotent on `(canonical_name, namespace)`. Mirrors the
+    /// pre-trait handler-side path in `kg.rs::entity_register` for the
+    /// postgres branch: lists prior entity row by title-eq, unions
+    /// aliases, then upserts via `store_with_embedding` (preserving
+    /// the SAL-canonical embedding-on-write contract). Returns the
+    /// resolved [`crate::models::EntityRegistration`] so callers can
+    /// drop the bespoke handler-side alias-union walk.
+    async fn entity_register(
+        &self,
+        ctx: &CallerContext,
+        canonical_name: &str,
+        namespace: &str,
+        aliases: &[String],
+        extra_metadata: &serde_json::Value,
+        agent_id: Option<&str>,
+    ) -> StoreResult<crate::models::EntityRegistration> {
+        use crate::models::{ConfidenceSource, ENTITY_KIND, EntityRegistration, MemoryKind, Tier};
+
+        // Resolve effective agent_id: explicit arg wins; otherwise
+        // fall back to the caller context's agent_id.
+        let resolved_agent = agent_id
+            .map(str::to_string)
+            .unwrap_or_else(|| ctx.agent_id.clone());
+
+        // Look up any prior entity row in this namespace via the
+        // SAL `list` surface (namespace-scoped). We match by
+        // (title == canonical_name) AND (metadata.kind == "entity").
+        let filter = super::Filter {
+            namespace: Some(namespace.to_string()),
+            limit: 10_000,
+            ..Default::default()
+        };
+        let candidates = self.list(ctx, &filter).await?;
+        let prior = candidates.into_iter().find(|m| {
+            m.title == canonical_name
+                && m.metadata.get("kind").and_then(serde_json::Value::as_str) == Some(ENTITY_KIND)
+        });
+
+        // Detect a colliding non-entity row at (title, namespace).
+        // The list-then-filter above only finds entity rows; a
+        // non-entity collision lives in `find_by_title_namespace`.
+        if prior.is_none() {
+            if let Some(existing_id) = self
+                .find_by_title_namespace(canonical_name, namespace)
+                .await?
+            {
+                return Err(StoreError::Conflict { id: existing_id });
+            }
+        }
+
+        // Union the alias sets: prior aliases first, then new
+        // aliases, de-duped case-sensitively to match
+        // `db::entity_register`.
+        let prior_aliases: Vec<String> = prior
+            .as_ref()
+            .and_then(|m| {
+                m.metadata
+                    .get("aliases")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(str::to_string))
+                            .collect()
+                    })
+            })
+            .unwrap_or_default();
+        let mut union: Vec<String> = Vec::new();
+        for a in prior_aliases.iter().chain(aliases.iter()) {
+            if !a.trim().is_empty() && !union.iter().any(|x| x == a) {
+                union.push(a.clone());
+            }
+        }
+
+        // Build the entity memory's metadata: caller-supplied object
+        // merged, kind forced to "entity", aliases set to the union,
+        // agent_id preserved from the resolved caller.
+        let mut metadata = match extra_metadata {
+            serde_json::Value::Object(m) => serde_json::Value::Object(m.clone()),
+            _ => serde_json::json!({}),
+        };
+        let meta_map = metadata.as_object_mut().expect("metadata is an object");
+        meta_map.insert(
+            "kind".to_string(),
+            serde_json::Value::String(ENTITY_KIND.to_string()),
+        );
+        meta_map.insert("aliases".to_string(), serde_json::json!(union.clone()));
+        meta_map
+            .entry("agent_id".to_string())
+            .or_insert(serde_json::Value::String(resolved_agent.clone()));
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let resolved_id = prior
+            .as_ref()
+            .map(|m| m.id.clone())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let mem = Memory {
+            id: resolved_id.clone(),
+            tier: Tier::Long,
+            namespace: namespace.to_string(),
+            title: canonical_name.to_string(),
+            content: canonical_name.to_string(),
+            tags: vec!["entity".to_string()],
+            priority: 7,
+            confidence: 1.0,
+            source: "api".to_string(),
+            access_count: 0,
+            created_at: now.clone(),
+            updated_at: now,
+            last_accessed_at: None,
+            expires_at: None,
+            metadata,
+            reflection_depth: 0,
+            memory_kind: MemoryKind::Observation,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
+        };
+        let written_id = self.store(ctx, &mem).await?;
+        let created = prior.is_none();
+
+        Ok(EntityRegistration {
+            entity_id: written_id,
+            canonical_name: canonical_name.to_string(),
+            namespace: namespace.to_string(),
+            aliases: union,
+            created,
+        })
+    }
+
+    /// FX-C2-batch5 — list archived memories via the SAL trait.
+    /// Delegates to the inherent `list_archived_pg` (renamed from
+    /// `list_archived` so the trait method can land in the
+    /// `impl MemoryStore for PostgresStore` block without a name
+    /// collision). External callers that previously reached for the
+    /// inherent through `list_archived_via_store` continue to work
+    /// because the helper now calls `list_archived_pg` under the hood.
+    async fn list_archived(
+        &self,
+        namespace: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> StoreResult<Vec<serde_json::Value>> {
+        self.list_archived_pg(namespace, limit, offset).await
+    }
 }
 
 /// v0.7.0 Continuation 6 — adapter row-to-`QuotaStatus` projection.
@@ -11168,7 +11369,7 @@ pub async fn list_archived_via_store(
     offset: usize,
 ) -> StoreResult<Vec<serde_json::Value>> {
     let pg = downcast_postgres(store)?;
-    pg.list_archived(namespace, limit, offset).await
+    pg.list_archived_pg(namespace, limit, offset).await
 }
 
 /// Outbound multi-hop knowledge-graph traversal for postgres-backed
@@ -11301,7 +11502,13 @@ impl PostgresStore {
     /// `db::list_archived` produces for SQLite. Tags are stored as a
     /// JSONB array; we serialize back to a string-formatted JSON to
     /// match SQLite's `tags` text-encoded shape.
-    async fn list_archived(
+    ///
+    /// ARCH-2 FX-C2-batch5 (2026-05-27): renamed from `list_archived`
+    /// to `list_archived_pg` so the SAL trait method
+    /// `MemoryStore::list_archived` can land on the trait impl block
+    /// without a name collision. The trait impl delegates to this
+    /// inherent helper.
+    pub(super) async fn list_archived_pg(
         &self,
         namespace: Option<&str>,
         limit: usize,
@@ -14221,5 +14428,212 @@ mod tests {
         .await
         .expect("verify embedding");
         assert!(written.is_some(), "embedding column must be non-NULL");
+    }
+
+    // ------------------------------------------------------------------
+    // FX-C2-batch5 — parity tests for the final 6 trait methods.
+    // Gated on AI_MEMORY_TEST_POSTGRES_URL; otherwise skipped cleanly.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn fx_c2_batch5_live_kg_query_trait_method_works() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("fxc2b5-kgq-{unique}");
+        let src = sample_memory(&format!("src-{unique}"), &ns, "kg-query-src", "source body");
+        let dst = sample_memory(&format!("dst-{unique}"), &ns, "kg-query-dst", "target body");
+        let src_id = store.store(&ctx, &src).await.expect("store src");
+        let dst_id = store.store(&ctx, &dst).await.expect("store dst");
+        let link = crate::models::MemoryLink {
+            source_id: src_id.clone(),
+            target_id: dst_id.clone(),
+            relation: crate::models::MemoryLinkRelation::RelatedTo,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            signature: None,
+            observed_by: None,
+            valid_from: None,
+            valid_until: None,
+            attest_level: None,
+        };
+        store.link(&ctx, &link).await.expect("create link");
+        // Call the SAL trait method (3-arg form) — verifies the trait
+        // entry point reaches PostgresStore::kg_query_with_history.
+        let rows = <PostgresStore as MemoryStore>::kg_query(&store, &src_id, 2, false)
+            .await
+            .expect("kg_query trait");
+        assert!(
+            rows.iter().any(|r| r.target_id == dst_id),
+            "kg_query trait method must surface the linked neighbor"
+        );
+    }
+
+    #[tokio::test]
+    async fn fx_c2_batch5_live_kg_timeline_trait_method_works() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("fxc2b5-tl-{unique}");
+        let src = sample_memory(&format!("tl-src-{unique}"), &ns, "tl-src", "src body");
+        let dst = sample_memory(&format!("tl-dst-{unique}"), &ns, "tl-dst", "dst body");
+        let src_id = store.store(&ctx, &src).await.expect("store src");
+        let dst_id = store.store(&ctx, &dst).await.expect("store dst");
+        // Insert a link with valid_from set so kg_timeline picks it up
+        // (the SAL `link` trait method does not surface valid_from).
+        sqlx::query(
+            "INSERT INTO memory_links \
+             (source_id, target_id, relation, created_at, valid_from, attest_level) \
+             VALUES ($1, $2, 'related_to', NOW(), '2030-01-01 00:00:00+00', 'unsigned')",
+        )
+        .bind(&src_id)
+        .bind(&dst_id)
+        .execute(&store.pool)
+        .await
+        .expect("insert timeline link");
+        let events = <PostgresStore as MemoryStore>::kg_timeline(&store, &src_id, None, None, None)
+            .await
+            .expect("kg_timeline trait");
+        assert!(
+            events.iter().any(|e| e.target_id == dst_id),
+            "kg_timeline trait method must surface the assertion"
+        );
+    }
+
+    #[tokio::test]
+    async fn fx_c2_batch5_live_entity_register_creates_then_idempotent() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("fxc2b5-ent-{unique}");
+        let first = store
+            .entity_register(
+                &ctx,
+                "AlphaOne LLC",
+                &ns,
+                &["AlphaOne".to_string(), "AO".to_string()],
+                &serde_json::json!({"website": "https://alphaone.example"}),
+                Some("ai:sal-test"),
+            )
+            .await
+            .expect("entity_register first");
+        assert!(first.created, "first registration must create the row");
+        assert_eq!(first.canonical_name, "AlphaOne LLC");
+        assert!(first.aliases.iter().any(|a| a == "AlphaOne"));
+        // Second call merges aliases without creating a new row.
+        let second = store
+            .entity_register(
+                &ctx,
+                "AlphaOne LLC",
+                &ns,
+                &["AO Inc".to_string()],
+                &serde_json::json!({}),
+                Some("ai:sal-test"),
+            )
+            .await
+            .expect("entity_register second");
+        assert!(!second.created, "re-register must not create");
+        assert!(second.aliases.iter().any(|a| a == "AlphaOne"));
+        assert!(second.aliases.iter().any(|a| a == "AO"));
+        assert!(second.aliases.iter().any(|a| a == "AO Inc"));
+    }
+
+    #[tokio::test]
+    async fn fx_c2_batch5_live_list_archived_trait_method_works() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        // Use a unique namespace and ensure list returns an empty
+        // result (no rows to archive in this scratch ns) plus that
+        // the trait method dispatches to the inherent without an
+        // ambiguity error.
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("fxc2b5-arch-{unique}");
+        let listed = <PostgresStore as MemoryStore>::list_archived(&store, Some(&ns), 100, 0)
+            .await
+            .expect("list_archived trait");
+        assert!(
+            listed.is_empty(),
+            "fresh namespace must have zero archived rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn fx_c2_batch5_live_decide_pending_action_alias_works() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        // Insert a pending row directly so we can drive the
+        // decide_pending_action trait alias.
+        let unique = uuid::Uuid::new_v4();
+        let pid = format!("pending-{unique}");
+        let ns = format!("fxc2b5-decide-{unique}");
+        sqlx::query(
+            "INSERT INTO pending_actions \
+             (id, action_type, namespace, memory_id, requested_by, payload, status, requested_at, approvals) \
+             VALUES ($1, 'store', $2, NULL, 'ai:sal-test', '{}'::jsonb, 'pending', NOW(), '[]'::jsonb)",
+        )
+        .bind(&pid)
+        .bind(&ns)
+        .execute(&store.pool)
+        .await
+        .expect("insert pending");
+        let result = store
+            .decide_pending_action(&ctx, &pid, false, "ai:sal-test")
+            .await
+            .expect("decide_pending_action");
+        assert!(result, "first decide must return true");
+        let second = store
+            .decide_pending_action(&ctx, &pid, false, "ai:sal-test")
+            .await
+            .expect("decide_pending_action second");
+        assert!(!second, "already-decided rows must return false");
+    }
+
+    #[tokio::test]
+    async fn fx_c2_batch5_live_approve_with_approver_type_alias_works() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let pid = format!("pending-{unique}");
+        let ns = format!("fxc2b5-approve-{unique}");
+        sqlx::query(
+            "INSERT INTO pending_actions \
+             (id, action_type, namespace, memory_id, requested_by, payload, status, requested_at, approvals) \
+             VALUES ($1, 'store', $2, NULL, 'ai:sal-test', '{}'::jsonb, 'pending', NOW(), '[]'::jsonb)",
+        )
+        .bind(&pid)
+        .bind(&ns)
+        .execute(&store.pool)
+        .await
+        .expect("insert pending");
+        // approve_with_approver_type alias must produce the same outcome
+        // as governance_approve_with_consensus for the Human approver
+        // (no namespace policy ⇒ Human default).
+        let outcome = store
+            .approve_with_approver_type(&ctx, &pid, "ai:sal-test")
+            .await
+            .expect("approve_with_approver_type");
+        assert!(matches!(outcome, crate::store::ApproveOutcome::Approved));
     }
 }
