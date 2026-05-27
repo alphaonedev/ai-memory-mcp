@@ -112,28 +112,28 @@ as ARCH-2-followup with a proposed trait addition).
 | Line | Call | Class | Status |
 |---|---|---|---|
 | 130 | `db::list_pending_actions(&lock.0, …)` | Missing-trait (closed) / Test-blocked drift | **Trait method `MemoryStore::list_pending_actions` landed in FX-C2-batch-3** (SQLite + Postgres impls + 1 SQLite test + 1 live-Postgres parity test). Postgres branch already routes through `list_pending_actions_via_store` (which accepts an extra namespace filter); the new trait method closes the missing-trait gap for the namespace-omitted shape. SQLite branch stays on `db::list_pending_actions` because tests seed via `db::queue_pending_action(&lock.0, …)`. |
-| 306-307 | `db::approve_with_approver_type` + `db::execute_pending_action` | Missing-trait | Deferred-to-followup |
+| 306-307 | `db::approve_with_approver_type` + `db::execute_pending_action` | Missing-trait (closed) / Test-blocked drift | **Trait methods `MemoryStore::approve_with_approver_type` and `MemoryStore::execute_pending_action` landed in FX-C2-batch-5** (both adapters override; SQLite `execute_pending_action` replaces the trait's default `UnsupportedCapability`). SQLite branch stays on `db::approve_with_approver_type` because the handler holds `app.db.lock()` for the upstream pending-row write + post-execute `db::get` capture in the same window. Reclassified Test-blocked drift; tracked for FX-C2-a follow-up. |
 | 315 | `db::get(&lock.0, mid)` post-execute capture | Keeper | Pre-existing keeper (write-then-read in same lock window) |
-| 480 | `db::decide_pending_action(&lock.0, …)` | Missing-trait | Deferred-to-followup |
+| 480 | `db::decide_pending_action(&lock.0, …)` | Missing-trait (closed) / Test-blocked drift | **Trait method `MemoryStore::decide_pending_action` landed in FX-C2-batch-5** (alias of `pending_decide`; both adapters override directly). SQLite branch stays on `db::decide_pending_action` because the handler holds `app.db.lock()` for the upstream pending-row read + decide in the same window. Reclassified Test-blocked drift. |
 
 ### `src/handlers/approvals.rs`
 
 | Line | Call | Class | Status |
 |---|---|---|---|
-| 277-328 | `db::get_pending_action` / `db::approve_with_approver_type` / `db::execute_pending_action` / `db::decide_pending_action` | Missing-trait | Deferred-to-followup |
+| 277-328 | `db::get_pending_action` / `db::approve_with_approver_type` / `db::execute_pending_action` / `db::decide_pending_action` | Missing-trait (closed) / Test-blocked drift | **Trait methods `MemoryStore::approve_with_approver_type`, `MemoryStore::execute_pending_action`, `MemoryStore::decide_pending_action` landed in FX-C2-batch-5** (both adapters override). SQLite branch stays on the legacy `db::*` free functions because the handler holds `app.db.lock()` across the full approve → execute → audit-emit window; the trait routes are exercised via the postgres branch (which inherits the same path via the trait dispatch on `app.store`). Reclassified Test-blocked drift. |
 
 ### `src/handlers/kg.rs`
 
 | Line | Call | Class | Status |
 |---|---|---|---|
-| 311 | `db::entity_register(…)` | Drift | Deferred-to-followup (SAL has no `entity_register`; trait extension required) |
+| 311 | `db::entity_register(…)` | Drift (closed) | **Trait method `MemoryStore::entity_register` landed in FX-C2-batch-5** (both adapters override; Postgres re-implements the alias-union + upsert on top of the SAL `list` + `find_by_title_namespace` + `store` so the 150-LOC handler-side path collapses to a single trait call). Postgres branch **Routed-in-this-PR** (replaces ~150 LOC of hand-rolled alias union + upsert with a single trait call; governance enforcement gate preserved verbatim). SQLite branch stays on `db::entity_register` because tests seed via the legacy `db::*` path. Reclassified Test-blocked drift; tracked for FX-C2-a follow-up. |
 | 468 | `db::entity_get_by_alias(&lock.0, alias, namespace)` | Missing-trait (closed) / Test-blocked drift | **Trait method `MemoryStore::entity_get_by_alias` landed in FX-C2-batch-3** (SQLite + Postgres impls + 3 SQLite tests + 1 live-Postgres parity test). Postgres branch **Routed-in-this-PR** for the exact-alias match; the title-eq-alias fallback walk preserved on the SAL `list` path so the case-insensitive title match shape stays intact. |
 | 479 | `db::get(&lock.0, &rec.entity_id)` post-resolve | Test-blocked drift | Deferred-to-followup |
 | 631, 647 | `db::get(&lock.0, &p.source_id)` for find_paths owner gate | Test-blocked drift | Deferred-to-followup |
-| 735 | `db::kg_timeline(&lock.0, …)` | Missing-trait | Deferred-to-followup |
+| 735 | `db::kg_timeline(&lock.0, …)` | Missing-trait (closed) | **Trait method `MemoryStore::kg_timeline` landed in FX-C2-batch-5** (both adapters override; Postgres inlines the AGE↔CTE dispatch from the inherent so the trait method works without name-collision against the inherent helper). Postgres branch **Routed-in-this-PR** (replaces the `kg_timeline_via_store` downcast hatch). SQLite branch stays on `db::kg_timeline` because the handler holds `app.db.lock()` for the source-owner gate + timeline scan in the same window. Reclassified Test-blocked drift. |
 | 833 | `db::get(&lock.0, &body.source_id)` for kg_invalidate owner gate | Test-blocked drift | Deferred-to-followup |
 | 932 | `db::invalidate_link(…)` | Missing-trait (closed) | **Trait method `MemoryStore::invalidate_link` landed in FX-C2-batch-4** (SQLite + Postgres impls + 2 SQLite parity tests + 2 live-Postgres parity tests). Postgres branch **Routed-in-this-PR** (replaces the `kg_invalidate_via_store` downcast hatch with a trait-native call). SQLite branch stays on `db::invalidate_link` because the audit-event append + `signed_events` row write happen inside the same locked transaction. Reclassified Test-blocked drift; tracked for FX-C2-a follow-up. |
-| 1359 | `db::kg_query(&lock.0, …)` | Missing-trait | Deferred-to-followup |
+| 1359 | `db::kg_query(&lock.0, …)` | Missing-trait (closed) | **Trait method `MemoryStore::kg_query` landed in FX-C2-batch-5** (3-arg `(source_id, max_depth, include_invalidated)` shape; both adapters override; Postgres delegates to the inherent `kg_query_with_history` which resolves AGE vs CTE at adapter connect time). Postgres branch **Routed-in-this-PR** (replaces the `kg_query_via_store` downcast hatch). SQLite branch stays on `db::kg_query` because the handler holds `app.db.lock()` for the kg_query + per-target visibility filter `db::get` in the same window. Reclassified Test-blocked drift. |
 | 1373 | `db::get(&lock.0, &n.target_id)` in kg_query result decoration | Test-blocked drift | Deferred-to-followup |
 
 ### `src/handlers/federation_receive.rs`
@@ -246,6 +246,25 @@ plus #3, #4, #5, #12, #17). The remaining 7 missing-trait additions +
 remaining deferred-drift handler routings + 25 test-blocked drift
 sites (19 original + 6 newly reclassified in batch-4) are tracked
 under the FX-C2-d … FX-C2-f sub-batch sequencing.
+
+FX-C2 **batch-5** follow-up (this PR — `fix/arch2-sal-routing-batch2`):
+
+| Action | Sites | Notes |
+|---|---|---|
+| New trait methods landed | 6 | `MemoryStore::approve_with_approver_type` (#7) — convenience alias whose default forwards to `governance_approve_with_consensus`; both adapters override directly. `MemoryStore::decide_pending_action` (#9) — convenience alias whose default forwards to `pending_decide`; both adapters override directly. `MemoryStore::kg_query` (#13) — 3-arg `(source_id, max_depth, include_invalidated)` shape that closes `kg.rs:1359`; the SQLite impl delegates to `db::kg_query`, the Postgres impl forwards to the inherent `kg_query_with_history` (which resolves AGE vs CTE at adapter connect time). `MemoryStore::kg_timeline` (#14) — closes `kg.rs:735`; SQLite delegates to `db::kg_timeline`, Postgres inlines the AGE↔CTE dispatch verbatim from the inherent (the inherent remains in `impl PostgresStore` for external test callers that bind to the concrete type). `MemoryStore::entity_register` (#15) — closes `kg.rs:311` (formerly a drift entry because no trait method existed); SQLite delegates to `db::entity_register`, Postgres re-implements the alias-union + upsert on top of `MemoryStore::list` + `find_by_title_namespace` + `store` so the 150-LOC handler-side path collapses to a single trait call. `MemoryStore::list_archived` (#19) — closes `archive.rs:85` (formerly going through the `list_archived_via_store` `as_any_for_postgres` downcast hatch); SQLite delegates to `db::list_archived`, Postgres delegates to the inherent helper (renamed `list_archived_pg` to avoid name collision with the trait method). Plus a SqliteStore `execute_pending_action` override (closes #8 by replacing the trait's default `UnsupportedCapability`). SQLite + Postgres adapter impls + 15 unit tests (9 SQLite + 6 live-Postgres parity, gated on `AI_MEMORY_TEST_POSTGRES_URL`). |
+| Routed-in-this-PR (Postgres) | 4 | `archive.rs:85` → `MemoryStore::list_archived` (replaces the `list_archived_via_store` downcast hatch; the helper stays in place for back-compat but new routes ride the trait surface). `kg.rs:311` postgres branch → `MemoryStore::entity_register` (replaces ~150 LOC of hand-rolled alias-union + upsert with a single trait call; governance enforcement gate preserved verbatim). `kg.rs:735` postgres branch → `MemoryStore::kg_timeline` (replaces the `kg_timeline_via_store` downcast hatch). `kg.rs:1359` postgres branch → `MemoryStore::kg_query` (replaces the `kg_query_via_store` downcast hatch). |
+| Reclassified Missing-trait → Test-blocked drift | 5 | `governance.rs:306` (approve_with_approver_type SQLite — held under `app.db.lock()`), `governance.rs:480` (decide_pending_action SQLite — same lock window), `approvals.rs:280` (approve_with_approver_type SQLite), `approvals.rs:328` (decide_pending_action SQLite), `federation_receive.rs:941` (decide_pending_action SQLite — held under same lock window as the upstream `apply_remote_*` write per the #961 federation-receive keeper carve-out). Trait methods now exist; SQLite-branch routing blocked on test-fixture convergence + the #961 federation-receive carve-out, per ARCH-2-followup §"Test-fixture convergence". |
+
+FX-C2 cumulative progress (after batch-5): 15 sites routed (2 from
+PR #1356, 1 from batch-2, 6 from batch-3, 2 from batch-4, 4 from
+batch-5); **21 of 21 proposed missing-trait additions landed** (batch-2
+#1; batch-3 #6, #10, #11, #16, #18, #20, #21; batch-4 #2, #3, #4, #5,
+#12, #17; batch-5 #7, #8, #9, #13, #14, #15, #19). Every "Missing-trait"
+entry in the FX-C2 audit is now closed at the trait surface; the
+remaining deferred-drift handler routings + 30 test-blocked drift
+sites (25 from prior batches + 5 newly reclassified in batch-5) are
+tracked under FX-C2-a (test-fixture convergence) + FX-C2-e
+(handler-routing residual).
 
 ### FX-C2 sub-batch dispatch plan
 
