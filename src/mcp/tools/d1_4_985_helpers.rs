@@ -1,6 +1,13 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+// QUAL-15 (med/low review batch) — file-level `#![cfg(test)]` so the
+// `pub fn` items below carrying `panic!` bodies are self-evidently
+// test-only when read in isolation. Previously the gate lived at the
+// mount point in `src/mcp/mod.rs::mod d1_4_985_helpers;`, requiring a
+// grep-up-the-tree to confirm the file was not shipped in production.
+#![cfg(test)]
+
 //! v0.7.0 #972 D1.4 (#985) — shared test helpers for the per-tool
 //! schema-parity tests added under D1.4.
 //!

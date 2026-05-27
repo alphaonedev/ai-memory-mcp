@@ -574,7 +574,16 @@ fn record_recall_observations(
             #[allow(clippy::cast_possible_wrap)]
             let rank = (idx + 1) as i64;
             candidates.push(observations::Candidate {
-                memory_id: id_holders.last().copied().unwrap(),
+                // QUAL-4 (med/low review batch) — load-bearing `.expect()`
+                // with a reason string. The push at line 572 above is the
+                // immediate predecessor; `id_holders.last()` cannot be
+                // `None` here. The annotation pins the local invariant so
+                // a future refactor that breaks the push-then-read pairing
+                // surfaces a named panic instead of a bare unwrap.
+                memory_id: id_holders
+                    .last()
+                    .copied()
+                    .expect("just pushed id_holders above"),
                 retriever,
                 rank,
                 score,
