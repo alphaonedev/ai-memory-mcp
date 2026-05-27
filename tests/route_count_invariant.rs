@@ -22,7 +22,16 @@ use std::fs;
 
 #[test]
 fn arch_14_route_count_invariant() {
-    let src = fs::read_to_string("src/lib.rs").expect("read src/lib.rs");
+    // Normalize CRLF → LF at read time. The static-text scan below
+    // uses literal `\n` anchors (e.g. `"\n#[cfg(test)]\nmod "`); on
+    // Windows the runner checkout converts `\n` → `\r\n` via
+    // `core.autocrlf=true`, so the literal `\n` patterns never match
+    // and `.find(...)` returns None. Issue #1374 documents the
+    // failure on the windows-latest Check job. Stripping `\r` makes
+    // the test hermetic across every checkout configuration.
+    let src = fs::read_to_string("src/lib.rs")
+        .expect("read src/lib.rs")
+        .replace("\r\n", "\n");
 
     // Locate the build_router_with_timeout fn — its body contains
     // every production route. Then locate the `#[cfg(test)]\nmod
