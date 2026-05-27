@@ -291,6 +291,18 @@ impl MemoryStore for SqliteStore {
         .map_err(box_err)
     }
 
+    /// v0.7.0 ARCH-2 followup (FX-C2) — per-anchor edge probe. Thin
+    /// delegate to the legacy `db::get_links` free-function so the
+    /// behaviour is byte-identical to the pre-trait sqlite path
+    /// (`src/handlers/links.rs:894`, `src/handlers/power.rs:280`).
+    /// Mirrors the Postgres adapter's sqlx-native impl over the same
+    /// `memory_links` table; cross-backend parity is pinned by
+    /// `sqlite_postgres_parity` tests in this file.
+    async fn get_links_for_anchor(&self, anchor_id: &str) -> StoreResult<Vec<MemoryLink>> {
+        let conn = self.state.lock().await;
+        db::get_links(&conn, anchor_id).map_err(box_err)
+    }
+
     async fn list_links(&self, namespace: Option<&str>) -> StoreResult<Vec<MemoryLink>> {
         // F6 Gap 2 (v0.7.0) — surface `memory_links` to the migrate
         // runner. The namespace filter, when set, matches the source
@@ -1389,6 +1401,145 @@ mod tests {
                 .any(|l| l.source_id == a_id && l.target_id == b_id),
             "namespace filter must exclude links whose source lives elsewhere"
         );
+    }
+
+    #[tokio::test]
+    async fn get_links_for_anchor_returns_inbound_and_outbound() {
+        // v0.7.0 ARCH-2 followup (FX-C2) — per-anchor probe must
+        // return BOTH the outbound (source==anchor) and inbound
+        // (target==anchor) edges, mirroring `db::get_links`. Pins the
+        // SQLite half of the cross-backend parity contract.
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice");
+        let a = test_memory("anchor", "central memory for the probe");
+        let b = test_memory("downstream", "memory that anchor points to");
+        let c = test_memory("upstream", "memory that points to anchor");
+        let a_id = store.store(&ctx, &a).await.expect("store anchor");
+        let b_id = store.store(&ctx, &b).await.expect("store downstream");
+        let c_id = store.store(&ctx, &c).await.expect("store upstream");
+        // anchor -> downstream
+        store
+            .link(
+                &ctx,
+                &MemoryLink {
+                    source_id: a_id.clone(),
+                    target_id: b_id.clone(),
+                    relation: crate::models::MemoryLinkRelation::RelatedTo,
+                    created_at: chrono::Utc::now().to_rfc3339(),
+                    valid_from: None,
+                    valid_until: None,
+                    observed_by: None,
+                    signature: None,
+                    attest_level: None,
+                },
+            )
+            .await
+            .expect("link a->b");
+        // upstream -> anchor
+        store
+            .link(
+                &ctx,
+                &MemoryLink {
+                    source_id: c_id.clone(),
+                    target_id: a_id.clone(),
+                    relation: crate::models::MemoryLinkRelation::Contradicts,
+                    created_at: chrono::Utc::now().to_rfc3339(),
+                    valid_from: None,
+                    valid_until: None,
+                    observed_by: None,
+                    signature: None,
+                    attest_level: None,
+                },
+            )
+            .await
+            .expect("link c->a");
+        let edges = store
+            .get_links_for_anchor(&a_id)
+            .await
+            .expect("get_links_for_anchor");
+        assert_eq!(edges.len(), 2, "expected exactly 2 edges for the anchor");
+        assert!(
+            edges
+                .iter()
+                .any(|l| l.source_id == a_id && l.target_id == b_id),
+            "missing outbound edge anchor->downstream"
+        );
+        assert!(
+            edges
+                .iter()
+                .any(|l| l.source_id == c_id && l.target_id == a_id),
+            "missing inbound edge upstream->anchor"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_links_for_anchor_empty_for_unlinked_id() {
+        // Unlinked id must yield Ok(empty). Pins the "no rows" branch of
+        // the FX-C2 trait addition so downstream consumers can rely on
+        // empty-vec semantics rather than `NotFound`.
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice");
+        let m = test_memory("alone", "no edges from or to this memory");
+        let id = store.store(&ctx, &m).await.expect("store");
+        let edges = store
+            .get_links_for_anchor(&id)
+            .await
+            .expect("get_links_for_anchor on unlinked id");
+        assert!(edges.is_empty(), "unlinked id must yield empty vec");
+    }
+
+    #[tokio::test]
+    async fn get_links_for_anchor_projects_attest_level_and_temporal() {
+        // FX-C2 wire-shape contract: the per-anchor probe MUST project
+        // the temporal-validity columns (`valid_from`, `valid_until`,
+        // `observed_by`) + `attest_level` because the
+        // `memory_get_links` MCP tool docstring promises them. This
+        // test inserts a signed-ish link with explicit temporal anchors
+        // and verifies all three round-trip.
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice");
+        let a = test_memory("anchor-temp", "anchor for temporal-fields probe");
+        let b = test_memory("target-temp", "target for temporal-fields probe");
+        let a_id = store.store(&ctx, &a).await.expect("store a");
+        let b_id = store.store(&ctx, &b).await.expect("store b");
+        // Use the raw SQLite path to set valid_from/valid_until/observed_by
+        // since the simple `link` trait method doesn't expose them. The
+        // schema CHECK requires `attest_level=self_signed/peer_attested`
+        // to carry a 64-byte signature; `unsigned` lets us round-trip
+        // the temporal-validity fields without composing a real
+        // signature blob (the verifier surface — exercised in dedicated
+        // tests).
+        {
+            let conn = store.state.lock().await;
+            conn.execute(
+                "INSERT INTO memory_links (source_id, target_id, relation, created_at,
+                                           valid_from, valid_until, observed_by, attest_level)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                rusqlite::params![
+                    &a_id,
+                    &b_id,
+                    "related_to",
+                    chrono::Utc::now().to_rfc3339(),
+                    "2026-01-01T00:00:00Z",
+                    "2026-12-31T23:59:59Z",
+                    "ai:tester@host",
+                    "unsigned",
+                ],
+            )
+            .expect("temporal insert");
+        }
+        let edges = store
+            .get_links_for_anchor(&a_id)
+            .await
+            .expect("get_links_for_anchor");
+        let row = edges
+            .iter()
+            .find(|l| l.source_id == a_id && l.target_id == b_id)
+            .expect("just-inserted edge");
+        assert_eq!(row.valid_from.as_deref(), Some("2026-01-01T00:00:00Z"));
+        assert_eq!(row.valid_until.as_deref(), Some("2026-12-31T23:59:59Z"));
+        assert_eq!(row.observed_by.as_deref(), Some("ai:tester@host"));
+        assert_eq!(row.attest_level.as_deref(), Some("unsigned"));
     }
 
     #[tokio::test]

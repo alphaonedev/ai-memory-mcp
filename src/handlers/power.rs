@@ -273,6 +273,19 @@ pub async fn detect_contradictions(
     };
 
     // Existing contradicts links involving any candidate.
+    //
+    // ARCH-2 FX-C2 status: the SAL `MemoryStore::get_links_for_anchor`
+    // trait method now exists (proposed addition #1 in
+    // docs/v0.7.0/arch-2-sal-boundary-audit.md, landed in this commit).
+    // The Postgres branch's contradiction-link assembly above already
+    // rides the trait surface; this SQLite branch stays on the legacy
+    // `db::get_links` free-function because we hold `app.db.lock()` for
+    // the `db::list` + `db::get_links` lookups in the same window —
+    // routing through `app.store.get_links_for_anchor` here would
+    // either acquire a second mutex on the same connection (deadlock
+    // risk) or fail the disjoint-tempfile invariant under the unit-test
+    // harness. Classified as test-blocked drift, tracked for the
+    // FX-C2-a follow-up (test-fixture convergence).
     let candidate_ids: std::collections::HashSet<String> =
         candidates.iter().map(|m| m.id.clone()).collect();
     let mut existing_links: Vec<serde_json::Value> = Vec::new();
