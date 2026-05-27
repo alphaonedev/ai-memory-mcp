@@ -87,6 +87,58 @@ pub fn pg_test_client(agent_id: &str) -> reqwest::Client {
 /// env state on unwind.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+/// FX-C6 — Pin `AI_MEMORY_NO_CONFIG=1` for the lifetime of the test
+/// process before any in-process integration test transitively calls
+/// `AppConfig::load()`.
+///
+/// This is the integration-test sibling of
+/// `crate::cli::test_utils::ensure_no_config_env` (FX-1, commit
+/// `b2692ba9a`) — that helper is `#![cfg(test)]` and thus invisible
+/// to integration test binaries, which are external crates from the
+/// lib's perspective. Same root cause, same fix shape, separate
+/// surface.
+///
+/// **The failure mode this closes.** In-process integration tests
+/// that drive `ai_memory::daemon_runtime::run_curator_daemon_with_primitives`
+/// (and any future helper that calls `AppConfig::load()` on the
+/// test thread) read the developer host's
+/// `~/.config/ai-memory/config.toml`. On hosts where that config
+/// resolves to a non-Ollama `[llm]` backend, `build_from_resolved`
+/// constructs a `reqwest::blocking::Client` whose inner tokio
+/// current-thread runtime panics with
+/// `"Cannot drop a runtime in a context where blocking is not
+/// allowed"` when dropped inside a `#[tokio::test]` body
+/// (TEST-6 / FX-C6).
+///
+/// Setting `AI_MEMORY_NO_CONFIG=1` once per test binary
+/// short-circuits `AppConfig::load()` to `Default::default()` so
+/// the resolver lands on `CompiledDefault`, the no-construct
+/// short-circuit at `src/daemon_runtime.rs:4121-4127` fires, and
+/// no `reqwest::blocking::Client` is ever built. Idempotent and
+/// `Once`-gated so the `unsafe` env-var write happens exactly once
+/// per test binary, before any test thread reads the variable.
+///
+/// **Call site discipline.** Call this at the entry of every
+/// in-process integration test that transitively invokes
+/// `AppConfig::load()`. The subprocess-spawning helpers in this
+/// suite (`cmd(...)` in `tests/integration.rs`) already set the env
+/// on the child process; they don't need this helper because
+/// subprocesses don't share the parent's `#[tokio::test]` runtime.
+pub fn ensure_no_config_env() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        // SAFETY: `std::env::set_var` is `unsafe` on the 2024 edition
+        // because env mutation is process-global. We gate it through
+        // `Once` so it runs at most once per test binary, before any
+        // test thread can read `AI_MEMORY_NO_CONFIG`, which removes
+        // the data-race window the unsafety contract is guarding
+        // against.
+        unsafe {
+            std::env::set_var("AI_MEMORY_NO_CONFIG", "1");
+        }
+    });
+}
+
 /// RAII guard that sets an env var on construction and restores the
 /// prior value (or unsets if previously unset) on drop. Holds the
 /// process-wide `ENV_LOCK` for its lifetime so concurrent tests don't
