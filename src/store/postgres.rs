@@ -7846,6 +7846,76 @@ impl MemoryStore for PostgresStore {
             .collect()
     }
 
+    /// v0.7.0 ARCH-2 followup (FX-C2) — per-anchor edge probe over
+    /// Postgres. Mirrors the SQLite `db::get_links` shape: returns every
+    /// row where `anchor_id` is either source or target, projects the
+    /// `attest_level` + temporal-validity columns the
+    /// `memory_get_links` MCP tool's docstring promises, leaves
+    /// `signature` as `None` (the verifier owns that surface).
+    ///
+    /// Ordering: descending by `created_at`. The SQLite path naturally
+    /// returns rows in this order via the legacy projection; the
+    /// Postgres path makes it explicit so cross-backend wire shape is
+    /// stable.
+    async fn get_links_for_anchor(&self, anchor_id: &str) -> StoreResult<Vec<MemoryLink>> {
+        let rows = sqlx::query(
+            "SELECT source_id, target_id, relation, created_at,
+                    valid_from, valid_until, observed_by, attest_level
+             FROM memory_links
+             WHERE source_id = $1 OR target_id = $1
+             ORDER BY created_at DESC",
+        )
+        .bind(anchor_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| to_store_err("get_links_for_anchor", e))?;
+
+        rows.iter()
+            .map(|r| {
+                let created_at: DateTime<Utc> = r
+                    .try_get::<DateTime<Utc>, _>("created_at")
+                    .map_err(|e| to_store_err("read created_at", e))?;
+                let valid_from: Option<DateTime<Utc>> = r
+                    .try_get::<Option<DateTime<Utc>>, _>("valid_from")
+                    .map_err(|e| to_store_err("read valid_from", e))?;
+                let valid_until: Option<DateTime<Utc>> = r
+                    .try_get::<Option<DateTime<Utc>>, _>("valid_until")
+                    .map_err(|e| to_store_err("read valid_until", e))?;
+                let observed_by: Option<String> = r
+                    .try_get::<Option<String>, _>("observed_by")
+                    .map_err(|e| to_store_err("read observed_by", e))?;
+                let relation_str: String = r
+                    .try_get::<String, _>("relation")
+                    .map_err(|e| to_store_err("read relation", e))?;
+                let attest_level: Option<String> =
+                    r.try_get::<Option<String>, _>("attest_level")
+                        .map_err(|e| to_store_err("read attest_level", e))?;
+                Ok(MemoryLink {
+                    source_id: r
+                        .try_get::<String, _>("source_id")
+                        .map_err(|e| to_store_err("read source_id", e))?,
+                    target_id: r
+                        .try_get::<String, _>("target_id")
+                        .map_err(|e| to_store_err("read target_id", e))?,
+                    // Closed-set relation parse — unknown values fall
+                    // back to the canonical default. Mirrors the SQLite
+                    // path's `from_str(...).unwrap_or_default()` posture.
+                    relation: crate::models::MemoryLinkRelation::from_str(&relation_str)
+                        .unwrap_or_default(),
+                    created_at: created_at.to_rfc3339(),
+                    // Signature is intentionally not surfaced on this
+                    // read path — owned by the verifier (mirrors the
+                    // SQLite `db::get_links` decision).
+                    signature: None,
+                    observed_by,
+                    valid_from: valid_from.map(|t| t.to_rfc3339()),
+                    valid_until: valid_until.map(|t| t.to_rfc3339()),
+                    attest_level,
+                })
+            })
+            .collect()
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -10314,6 +10384,910 @@ impl MemoryStore for PostgresStore {
         }
         Ok(filtered)
     }
+
+    // ----- v0.7.0 ARCH-2 followup (FX-C2-batch3) read-only impls --------
+    //
+    // sqlx-native equivalents of the legacy `db::*` free-functions.
+    // Wire shape pinned byte-for-byte against the SQLite adapter by the
+    // `sqlite_postgres_parity_*` tests in this file (gated on
+    // `AI_MEMORY_TEST_POSTGRES_URL`).
+
+    async fn list_namespaces(&self) -> StoreResult<Vec<crate::models::NamespaceCount>> {
+        let now_dt = Utc::now();
+        let rows = sqlx::query(
+            "SELECT namespace, COUNT(*)::BIGINT AS c FROM memories
+             WHERE expires_at IS NULL OR expires_at > $1
+             GROUP BY namespace
+             ORDER BY c DESC, namespace ASC",
+        )
+        .bind(now_dt)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| to_store_err("list_namespaces", e))?;
+
+        rows.iter()
+            .map(|r| {
+                let namespace: String = r
+                    .try_get::<String, _>("namespace")
+                    .map_err(|e| to_store_err("read namespace", e))?;
+                let c: i64 = r
+                    .try_get::<i64, _>("c")
+                    .map_err(|e| to_store_err("read count", e))?;
+                Ok(crate::models::NamespaceCount {
+                    namespace,
+                    count: usize::try_from(c).unwrap_or(0),
+                })
+            })
+            .collect()
+    }
+
+    async fn get_taxonomy(
+        &self,
+        namespace_prefix: Option<&str>,
+        max_depth: usize,
+        limit: usize,
+    ) -> StoreResult<crate::models::Taxonomy> {
+        // Mirror the SQLite adapter's clamp semantics so callers see the
+        // same `truncated` behavior across backends.
+        const TAXONOMY_MAX_LIMIT: usize = 10_000;
+        let effective_limit = limit.min(TAXONOMY_MAX_LIMIT);
+        let effective_depth = max_depth.min(crate::models::MAX_NAMESPACE_DEPTH);
+        let prefix = namespace_prefix.unwrap_or("");
+        let now_dt = Utc::now();
+
+        // Total count is computed independently of the row-walk so the
+        // caller-observable `total_count` stays honest under truncation.
+        let total_count: i64 = if prefix.is_empty() {
+            sqlx::query_scalar(
+                "SELECT COUNT(*)::BIGINT FROM memories
+                 WHERE expires_at IS NULL OR expires_at > $1",
+            )
+            .bind(now_dt)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| to_store_err("get_taxonomy total", e))?
+        } else {
+            sqlx::query_scalar(
+                "SELECT COUNT(*)::BIGINT FROM memories
+                 WHERE (expires_at IS NULL OR expires_at > $1)
+                   AND (namespace = $2 OR namespace LIKE $2 || '/%')",
+            )
+            .bind(now_dt)
+            .bind(prefix)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| to_store_err("get_taxonomy prefix total", e))?
+        };
+
+        let limit_i64: i64 = i64::try_from(effective_limit).unwrap_or(i64::MAX);
+        let groups: Vec<(String, i64)> = if prefix.is_empty() {
+            sqlx::query_as(
+                "SELECT namespace, COUNT(*)::BIGINT FROM memories
+                 WHERE expires_at IS NULL OR expires_at > $1
+                 GROUP BY namespace
+                 ORDER BY COUNT(*) DESC, namespace ASC
+                 LIMIT $2",
+            )
+            .bind(now_dt)
+            .bind(limit_i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| to_store_err("get_taxonomy groups", e))?
+        } else {
+            sqlx::query_as(
+                "SELECT namespace, COUNT(*)::BIGINT FROM memories
+                 WHERE (expires_at IS NULL OR expires_at > $1)
+                   AND (namespace = $2 OR namespace LIKE $2 || '/%')
+                 GROUP BY namespace
+                 ORDER BY COUNT(*) DESC, namespace ASC
+                 LIMIT $3",
+            )
+            .bind(now_dt)
+            .bind(prefix)
+            .bind(limit_i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| to_store_err("get_taxonomy prefix groups", e))?
+        };
+
+        // Re-use the SQLite adapter's tree-folding logic; it operates
+        // purely on the `(namespace, count)` rows so it's backend-blind.
+        // Truncation flag mirrors SQLite: walked sum < total iff the
+        // LIMIT chopped some rows out.
+        let total_usize = usize::try_from(total_count).unwrap_or(0);
+        let group_rows: Vec<(String, usize)> = groups
+            .into_iter()
+            .map(|(ns, c)| (ns, usize::try_from(c).unwrap_or(0)))
+            .collect();
+        let walked_count: usize = group_rows.iter().map(|(_, c)| *c).sum();
+        let truncated = walked_count < total_usize;
+        // `effective_limit` is referenced here for symmetry with the
+        // SQLite path's clamp; the actual SQL `LIMIT` already enforces
+        // it. Bind to `_` to keep clippy from flagging the unused
+        // local while preserving the doc-binding for future debugging.
+        let _ = effective_limit;
+        Ok(crate::storage::fold_taxonomy_groups(
+            prefix,
+            effective_depth,
+            total_usize,
+            truncated,
+            group_rows,
+        ))
+    }
+
+    async fn list_agents(&self) -> StoreResult<Vec<AgentRegistration>> {
+        use crate::models::AGENTS_NAMESPACE;
+        let now_dt = Utc::now();
+        let rows = sqlx::query(
+            "SELECT metadata FROM memories
+             WHERE namespace = $1
+               AND (expires_at IS NULL OR expires_at > $2)
+             ORDER BY (metadata->>'registered_at') ASC NULLS LAST",
+        )
+        .bind(AGENTS_NAMESPACE)
+        .bind(now_dt)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| to_store_err("list_agents", e))?;
+
+        let mut agents = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let meta: serde_json::Value = r
+                .try_get::<serde_json::Value, _>("metadata")
+                .map_err(|e| to_store_err("read agent metadata", e))?;
+            let agent_id = meta
+                .get("agent_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let agent_type = meta
+                .get("agent_type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let capabilities: Vec<String> = meta
+                .get("capabilities")
+                .and_then(serde_json::Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let registered_at = meta
+                .get("registered_at")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let last_seen_at = meta
+                .get("last_seen_at")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            agents.push(AgentRegistration {
+                agent_id,
+                agent_type,
+                capabilities,
+                registered_at,
+                last_seen_at,
+            });
+        }
+        Ok(agents)
+    }
+
+    async fn list_pending_actions(
+        &self,
+        status: Option<&str>,
+        limit: usize,
+    ) -> StoreResult<Vec<crate::models::PendingAction>> {
+        let limit_i64: i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = sqlx::query(
+            "SELECT id, action_type, memory_id, namespace, payload, requested_by,
+                    requested_at, status, decided_by, decided_at, approvals
+             FROM pending_actions
+             WHERE ($1::TEXT IS NULL OR status = $1)
+             ORDER BY requested_at DESC
+             LIMIT $2",
+        )
+        .bind(status)
+        .bind(limit_i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| to_store_err("list_pending_actions", e))?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let requested_at: DateTime<Utc> = r
+                .try_get("requested_at")
+                .map_err(|e| to_store_err("read requested_at", e))?;
+            let decided_at: Option<DateTime<Utc>> = r
+                .try_get("decided_at")
+                .map_err(|e| to_store_err("read decided_at", e))?;
+            let approvals_v: serde_json::Value = r
+                .try_get("approvals")
+                .unwrap_or(serde_json::Value::Array(vec![]));
+            let approvals: Vec<crate::models::Approval> =
+                serde_json::from_value(approvals_v).unwrap_or_default();
+            out.push(crate::models::PendingAction {
+                id: r
+                    .try_get::<String, _>("id")
+                    .map_err(|e| to_store_err("read id", e))?,
+                action_type: r
+                    .try_get::<String, _>("action_type")
+                    .map_err(|e| to_store_err("read action_type", e))?,
+                memory_id: r.try_get::<Option<String>, _>("memory_id").unwrap_or(None),
+                namespace: r
+                    .try_get::<String, _>("namespace")
+                    .map_err(|e| to_store_err("read namespace", e))?,
+                payload: r
+                    .try_get::<serde_json::Value, _>("payload")
+                    .unwrap_or(serde_json::Value::Null),
+                requested_by: r
+                    .try_get::<String, _>("requested_by")
+                    .map_err(|e| to_store_err("read requested_by", e))?,
+                requested_at: requested_at.to_rfc3339(),
+                status: r
+                    .try_get::<String, _>("status")
+                    .map_err(|e| to_store_err("read status", e))?,
+                decided_by: r.try_get::<Option<String>, _>("decided_by").unwrap_or(None),
+                decided_at: decided_at.map(|d| d.to_rfc3339()),
+                approvals,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn entity_get_by_alias(
+        &self,
+        alias: &str,
+        namespace: Option<&str>,
+    ) -> StoreResult<Option<crate::models::EntityRecord>> {
+        use crate::models::{ENTITY_KIND, EntityRecord};
+        let trimmed = alias.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+
+        let row = if let Some(ns) = namespace {
+            sqlx::query(
+                "SELECT m.id, m.title, m.namespace
+                 FROM entity_aliases ea
+                 JOIN memories m ON m.id = ea.entity_id
+                 WHERE ea.alias = $1
+                   AND m.namespace = $2
+                   AND COALESCE(m.metadata->>'kind', '') = $3
+                 ORDER BY m.created_at DESC
+                 LIMIT 1",
+            )
+            .bind(trimmed)
+            .bind(ns)
+            .bind(ENTITY_KIND)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| to_store_err("entity_get_by_alias ns", e))?
+        } else {
+            sqlx::query(
+                "SELECT m.id, m.title, m.namespace
+                 FROM entity_aliases ea
+                 JOIN memories m ON m.id = ea.entity_id
+                 WHERE ea.alias = $1
+                   AND COALESCE(m.metadata->>'kind', '') = $2
+                 ORDER BY m.created_at DESC
+                 LIMIT 1",
+            )
+            .bind(trimmed)
+            .bind(ENTITY_KIND)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| to_store_err("entity_get_by_alias", e))?
+        };
+
+        let Some(r) = row else {
+            return Ok(None);
+        };
+        let entity_id: String = r
+            .try_get::<String, _>("id")
+            .map_err(|e| to_store_err("read entity id", e))?;
+        let canonical_name: String = r
+            .try_get::<String, _>("title")
+            .map_err(|e| to_store_err("read entity title", e))?;
+        let ns_resolved: String = r
+            .try_get::<String, _>("namespace")
+            .map_err(|e| to_store_err("read entity namespace", e))?;
+
+        let alias_rows =
+            sqlx::query("SELECT alias FROM entity_aliases WHERE entity_id = $1 ORDER BY alias")
+                .bind(&entity_id)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| to_store_err("list aliases for entity", e))?;
+        let aliases: Vec<String> = alias_rows
+            .iter()
+            .filter_map(|r| r.try_get::<String, _>("alias").ok())
+            .collect();
+
+        Ok(Some(EntityRecord {
+            entity_id,
+            canonical_name,
+            namespace: ns_resolved,
+            aliases,
+        }))
+    }
+
+    async fn health_check(&self) -> StoreResult<bool> {
+        // Postgres equivalent of SQLite's FTS integrity probe: a cheap
+        // SELECT against the memories table plus a SELECT 1 round-trip
+        // so connection-pool / network-layer failures surface.
+        let _: i64 = sqlx::query_scalar("SELECT COUNT(*)::BIGINT FROM memories")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| to_store_err("health_check count", e))?;
+        let one: i32 = sqlx::query_scalar("SELECT 1")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| to_store_err("health_check ping", e))?;
+        Ok(one == 1)
+    }
+
+    async fn stats(&self) -> StoreResult<crate::models::Stats> {
+        // Mirrors the SQLite adapter's `db::stats` shape; postgres has
+        // no on-disk file path so `db_size_bytes` reports the size of
+        // the `memories` table via pg_total_relation_size — best-effort
+        // (returns 0 if the function call errors so stats stays callable
+        // for least-privileged Postgres users).
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*)::BIGINT FROM memories")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| to_store_err("stats total", e))?;
+        let total_usize = usize::try_from(total).unwrap_or(0);
+
+        let tier_rows = sqlx::query(
+            "SELECT tier, COUNT(*)::BIGINT AS c FROM memories
+             GROUP BY tier ORDER BY c DESC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| to_store_err("stats by_tier", e))?;
+        let by_tier: Vec<crate::models::TierCount> = tier_rows
+            .iter()
+            .map(|r| {
+                let tier: String = r
+                    .try_get::<String, _>("tier")
+                    .map_err(|e| to_store_err("read tier", e))?;
+                let c: i64 = r
+                    .try_get::<i64, _>("c")
+                    .map_err(|e| to_store_err("read tier count", e))?;
+                Ok(crate::models::TierCount {
+                    tier,
+                    count: usize::try_from(c).unwrap_or(0),
+                })
+            })
+            .collect::<StoreResult<Vec<_>>>()?;
+
+        let ns_rows = sqlx::query(
+            "SELECT namespace, COUNT(*)::BIGINT AS c FROM memories
+             GROUP BY namespace ORDER BY c DESC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| to_store_err("stats by_namespace", e))?;
+        let by_namespace: Vec<crate::models::NamespaceCount> = ns_rows
+            .iter()
+            .map(|r| {
+                let namespace: String = r
+                    .try_get::<String, _>("namespace")
+                    .map_err(|e| to_store_err("read namespace", e))?;
+                let c: i64 = r
+                    .try_get::<i64, _>("c")
+                    .map_err(|e| to_store_err("read namespace count", e))?;
+                Ok(crate::models::NamespaceCount {
+                    namespace,
+                    count: usize::try_from(c).unwrap_or(0),
+                })
+            })
+            .collect::<StoreResult<Vec<_>>>()?;
+
+        let now_dt = Utc::now();
+        let one_hour = now_dt + chrono::Duration::hours(1);
+        let expiring_soon: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::BIGINT FROM memories
+             WHERE expires_at IS NOT NULL AND expires_at > $1 AND expires_at <= $2",
+        )
+        .bind(now_dt)
+        .bind(one_hour)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| to_store_err("stats expiring_soon", e))?;
+
+        let links_count: i64 = sqlx::query_scalar("SELECT COUNT(*)::BIGINT FROM memory_links")
+            .fetch_one(&self.pool)
+            .await
+            .unwrap_or(0);
+
+        // Best-effort table size — least-privileged Postgres users may
+        // lack EXECUTE on pg_total_relation_size; tolerate failure so
+        // the stats endpoint stays callable.
+        let db_size_bytes: i64 =
+            sqlx::query_scalar("SELECT COALESCE(pg_total_relation_size('memories'), 0)::BIGINT")
+                .fetch_one(&self.pool)
+                .await
+                .unwrap_or(0);
+
+        Ok(crate::models::Stats {
+            total: total_usize,
+            by_tier,
+            by_namespace,
+            expiring_soon: usize::try_from(expiring_soon).unwrap_or(0),
+            links_count: usize::try_from(links_count).unwrap_or(0),
+            db_size_bytes: u64::try_from(db_size_bytes).unwrap_or(0),
+            // Dim violations + HNSW evictions are sqlite-only concepts;
+            // postgres uses pgvector indexes which don't expose either.
+            dim_violations: 0,
+            index_evictions_total: 0,
+        })
+    }
+
+    async fn find_by_title_namespace(
+        &self,
+        title: &str,
+        namespace: &str,
+    ) -> StoreResult<Option<String>> {
+        // Mirror SQLite's `db::find_by_title_namespace`: project the id
+        // for the first live row matching `(title, namespace)`. The
+        // SAL contract is "no live row matches" → `Ok(None)`, not an
+        // error — `fetch_optional` is the right primitive.
+        let id: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM memories WHERE title = $1 AND namespace = $2 LIMIT 1",
+        )
+        .bind(title)
+        .bind(namespace)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| to_store_err("find_by_title_namespace", e))?;
+        Ok(id)
+    }
+
+    async fn next_versioned_title(&self, base_title: &str, namespace: &str) -> StoreResult<String> {
+        // Byte-for-byte mirror of `db::next_versioned_title` — try the
+        // base title first, then `(2)`, `(3)`, ... up to the substrate's
+        // hard cap. The cap (1024) prevents pathological infinite loops
+        // and matches SQLite's `MAX_VERSION_SUFFIX` exactly so the wire
+        // shape stays identical across backends.
+        const MAX_VERSION_SUFFIX: u32 = 1024;
+        if self
+            .find_by_title_namespace(base_title, namespace)
+            .await?
+            .is_none()
+        {
+            return Ok(base_title.to_string());
+        }
+        for n in 2..=MAX_VERSION_SUFFIX {
+            let candidate = format!("{base_title} ({n})");
+            if self
+                .find_by_title_namespace(&candidate, namespace)
+                .await?
+                .is_none()
+            {
+                return Ok(candidate);
+            }
+        }
+        // Match SQLite's UniqueConflict envelope; the substrate
+        // exposes it as `StorageError::UniqueConflict` on that side.
+        // At the SAL layer we surface it as `IntegrityFailed` because
+        // `StoreError` doesn't yet carry a `UniqueConflict` variant
+        // (#962 tracks the trait-side typed envelope).
+        Err(StoreError::IntegrityFailed {
+            detail: format!(
+                "could not find a free versioned title for '{base_title}' in namespace '{namespace}' within {MAX_VERSION_SUFFIX} attempts"
+            ),
+        })
+    }
+
+    async fn find_contradictions(&self, title: &str, namespace: &str) -> StoreResult<Vec<Memory>> {
+        // Postgres FTS via `to_tsvector` + `plainto_tsquery` mirroring
+        // the SQLite `memories_fts MATCH` semantics — top 5 candidates
+        // in the same namespace, ranked by relevance.
+        let rows = sqlx::query(
+            "SELECT m.* FROM memories m
+             WHERE m.namespace = $2
+               AND to_tsvector('english', m.title || ' ' || m.content)
+                   @@ plainto_tsquery('english', $1)
+             ORDER BY ts_rank(
+                 to_tsvector('english', m.title || ' ' || m.content),
+                 plainto_tsquery('english', $1)
+             ) DESC
+             LIMIT 5",
+        )
+        .bind(title)
+        .bind(namespace)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| to_store_err("find_contradictions", e))?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            out.push(Self::row_to_memory(r)?);
+        }
+        Ok(out)
+    }
+
+    async fn invalidate_link(
+        &self,
+        source_id: &str,
+        target_id: &str,
+        relation: &str,
+        valid_until: Option<&str>,
+    ) -> StoreResult<KgInvalidateRow> {
+        // Delegate to the inherent `kg_invalidate` method which carries
+        // the AGE↔CTE dual-path fallback discipline. The trait method
+        // is the canonical surface; `kg_invalidate_via_store` (the
+        // pre-trait `as_any_for_postgres` downcast hatch) is preserved
+        // for back-compat but new callers should reach via the trait.
+        self.kg_invalidate(source_id, target_id, relation, valid_until)
+            .await
+    }
+
+    async fn check_duplicate_with_text(
+        &self,
+        query_embedding: &[f32],
+        query_text: &str,
+        namespace: Option<&str>,
+        threshold: f32,
+    ) -> StoreResult<crate::models::DuplicateCheck> {
+        use sha2::{Digest, Sha256};
+        // Phase 1 — SHA-256 exact-match short-circuit (parity with
+        // `db::check_duplicate_with_text`). Hash `format!("{title}
+        // {content}")` for every live, namespace-scoped row and
+        // return similarity=1.0 on byte-equal hits. This sidesteps
+        // the embedding-prefix asymmetry that caps cosine at ~0.92
+        // for legitimately-identical inputs.
+        let effective_threshold = threshold.max(0.5_f32); // mirrors DUPLICATE_THRESHOLD_MIN
+        let now_dt = Utc::now();
+        let rows = if let Some(ns) = namespace {
+            sqlx::query(
+                "SELECT id, title, namespace, content FROM memories
+                 WHERE (expires_at IS NULL OR expires_at > $1)
+                   AND namespace = $2",
+            )
+            .bind(now_dt)
+            .bind(ns)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| to_store_err("check_duplicate_with_text scan", e))?
+        } else {
+            sqlx::query(
+                "SELECT id, title, namespace, content FROM memories
+                 WHERE (expires_at IS NULL OR expires_at > $1)",
+            )
+            .bind(now_dt)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| to_store_err("check_duplicate_with_text scan", e))?
+        };
+
+        let mut query_hasher = Sha256::new();
+        query_hasher.update(query_text.as_bytes());
+        let query_hash = query_hasher.finalize();
+
+        let candidates_scanned = rows.len();
+        for r in &rows {
+            let id: String = r.try_get("id").map_err(|e| to_store_err("read id", e))?;
+            let title: String = r
+                .try_get("title")
+                .map_err(|e| to_store_err("read title", e))?;
+            let ns_v: String = r
+                .try_get("namespace")
+                .map_err(|e| to_store_err("read namespace", e))?;
+            let content: String = r
+                .try_get("content")
+                .map_err(|e| to_store_err("read content", e))?;
+            let row_text = format!("{title} {content}");
+            let mut row_hasher = Sha256::new();
+            row_hasher.update(row_text.as_bytes());
+            let row_hash = row_hasher.finalize();
+            if row_hash == query_hash {
+                return Ok(crate::models::DuplicateCheck {
+                    is_duplicate: true,
+                    threshold: effective_threshold,
+                    nearest: Some(crate::models::DuplicateMatch {
+                        id,
+                        title,
+                        namespace: ns_v,
+                        similarity: 1.0,
+                    }),
+                    candidates_scanned,
+                });
+            }
+        }
+
+        // Phase 2 — fall through to the embedding-based nearest-
+        // neighbor scan via the SAL `recall_hybrid` shape so callers
+        // still get a "closest existing memory" signal on near hits.
+        // Empty-embedding shortcut: if no vector was supplied (caller
+        // is keyword-only), report "no duplicate found".
+        if query_embedding.is_empty() {
+            return Ok(crate::models::DuplicateCheck {
+                is_duplicate: false,
+                threshold: effective_threshold,
+                nearest: None,
+                candidates_scanned,
+            });
+        }
+
+        // Use pgvector cosine distance directly — `1 - distance` gives
+        // similarity in `[0, 1]`. We mirror SQLite's `check_duplicate`
+        // scan shape: live rows in `namespace` (or all live rows when
+        // `namespace=None`) with a non-null embedding, ordered by
+        // cosine ascending (= most similar first), limit 1.
+        let emb_pgvec = pgvector::Vector::from(query_embedding.to_vec());
+        let nearest_row = if let Some(ns) = namespace {
+            sqlx::query(
+                "SELECT id, title, namespace,
+                        1 - (embedding <=> $1) AS sim
+                 FROM memories
+                 WHERE embedding IS NOT NULL
+                   AND namespace = $2
+                   AND (expires_at IS NULL OR expires_at > $3)
+                 ORDER BY embedding <=> $1
+                 LIMIT 1",
+            )
+            .bind(&emb_pgvec)
+            .bind(ns)
+            .bind(now_dt)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| to_store_err("check_duplicate_with_text cosine", e))?
+        } else {
+            sqlx::query(
+                "SELECT id, title, namespace,
+                        1 - (embedding <=> $1) AS sim
+                 FROM memories
+                 WHERE embedding IS NOT NULL
+                   AND (expires_at IS NULL OR expires_at > $2)
+                 ORDER BY embedding <=> $1
+                 LIMIT 1",
+            )
+            .bind(&emb_pgvec)
+            .bind(now_dt)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| to_store_err("check_duplicate_with_text cosine", e))?
+        };
+
+        let nearest = match nearest_row {
+            Some(r) => {
+                let id: String = r.try_get("id").map_err(|e| to_store_err("read id", e))?;
+                let title: String = r
+                    .try_get("title")
+                    .map_err(|e| to_store_err("read title", e))?;
+                let ns_v: String = r
+                    .try_get("namespace")
+                    .map_err(|e| to_store_err("read namespace", e))?;
+                let sim: f64 = r.try_get("sim").map_err(|e| to_store_err("read sim", e))?;
+                #[allow(clippy::cast_possible_truncation)]
+                let sim_f32 = sim as f32;
+                Some(crate::models::DuplicateMatch {
+                    id,
+                    title,
+                    namespace: ns_v,
+                    similarity: sim_f32,
+                })
+            }
+            None => None,
+        };
+
+        let is_duplicate = nearest
+            .as_ref()
+            .is_some_and(|n| n.similarity >= effective_threshold);
+
+        Ok(crate::models::DuplicateCheck {
+            is_duplicate,
+            threshold: effective_threshold,
+            nearest,
+            candidates_scanned,
+        })
+    }
+
+    // ------------------------------------------------------------------
+    // v0.7.0 ARCH-2 FX-C2-batch5 — final 6 trait additions
+    // ------------------------------------------------------------------
+
+    /// FX-C2-batch5 — outbound knowledge-graph traversal via the SAL
+    /// trait. Delegates to the inherent `kg_query_with_history` (the
+    /// 3-arg variant) which itself resolves AGE vs the CTE fallback at
+    /// adapter connect time.
+    async fn kg_query(
+        &self,
+        source_id: &str,
+        max_depth: usize,
+        include_invalidated: bool,
+    ) -> StoreResult<Vec<super::KgQueryRow>> {
+        self.kg_query_with_history(source_id, max_depth, include_invalidated)
+            .await
+    }
+
+    /// FX-C2-batch5 — knowledge-graph timeline scan via the SAL trait.
+    /// Inlines the AGE↔CTE dispatch from the inherent
+    /// `kg_timeline` so the trait method can land in this impl block
+    /// without a name-collision against the inherent helper (the
+    /// inherent stays in `impl PostgresStore` for external test
+    /// callers that bind to the concrete type).
+    async fn kg_timeline(
+        &self,
+        source_id: &str,
+        since: Option<&str>,
+        until: Option<&str>,
+        limit: Option<usize>,
+    ) -> StoreResult<Vec<super::KgTimelineRow>> {
+        match self.kg_backend {
+            KgBackend::Age => {
+                match self
+                    .kg_timeline_cypher(source_id, since, until, limit)
+                    .await
+                {
+                    Ok(rows) => Ok(rows),
+                    Err(err) if is_age_runtime_failure(&err) => {
+                        warn_age_fallback("kg_timeline", source_id, &err);
+                        self.kg_timeline_cte(source_id, since, until, limit).await
+                    }
+                    Err(err) => Err(err),
+                }
+            }
+            KgBackend::Cte => self.kg_timeline_cte(source_id, since, until, limit).await,
+        }
+    }
+
+    /// FX-C2-batch5 — register a knowledge-graph entity via the SAL
+    /// trait. Idempotent on `(canonical_name, namespace)`. Mirrors the
+    /// pre-trait handler-side path in `kg.rs::entity_register` for the
+    /// postgres branch: lists prior entity row by title-eq, unions
+    /// aliases, then upserts via `store_with_embedding` (preserving
+    /// the SAL-canonical embedding-on-write contract). Returns the
+    /// resolved [`crate::models::EntityRegistration`] so callers can
+    /// drop the bespoke handler-side alias-union walk.
+    async fn entity_register(
+        &self,
+        ctx: &CallerContext,
+        canonical_name: &str,
+        namespace: &str,
+        aliases: &[String],
+        extra_metadata: &serde_json::Value,
+        agent_id: Option<&str>,
+    ) -> StoreResult<crate::models::EntityRegistration> {
+        use crate::models::{ConfidenceSource, ENTITY_KIND, EntityRegistration, MemoryKind, Tier};
+
+        // Resolve effective agent_id: explicit arg wins; otherwise
+        // fall back to the caller context's agent_id.
+        let resolved_agent = agent_id
+            .map(str::to_string)
+            .unwrap_or_else(|| ctx.agent_id.clone());
+
+        // Look up any prior entity row in this namespace via the
+        // SAL `list` surface (namespace-scoped). We match by
+        // (title == canonical_name) AND (metadata.kind == "entity").
+        let filter = super::Filter {
+            namespace: Some(namespace.to_string()),
+            limit: 10_000,
+            ..Default::default()
+        };
+        let candidates = self.list(ctx, &filter).await?;
+        let prior = candidates.into_iter().find(|m| {
+            m.title == canonical_name
+                && m.metadata.get("kind").and_then(serde_json::Value::as_str) == Some(ENTITY_KIND)
+        });
+
+        // Detect a colliding non-entity row at (title, namespace).
+        // The list-then-filter above only finds entity rows; a
+        // non-entity collision lives in `find_by_title_namespace`.
+        if prior.is_none() {
+            if let Some(existing_id) = self
+                .find_by_title_namespace(canonical_name, namespace)
+                .await?
+            {
+                return Err(StoreError::Conflict { id: existing_id });
+            }
+        }
+
+        // Union the alias sets: prior aliases first, then new
+        // aliases, de-duped case-sensitively to match
+        // `db::entity_register`.
+        let prior_aliases: Vec<String> = prior
+            .as_ref()
+            .and_then(|m| {
+                m.metadata
+                    .get("aliases")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(str::to_string))
+                            .collect()
+                    })
+            })
+            .unwrap_or_default();
+        let mut union: Vec<String> = Vec::new();
+        for a in prior_aliases.iter().chain(aliases.iter()) {
+            if !a.trim().is_empty() && !union.iter().any(|x| x == a) {
+                union.push(a.clone());
+            }
+        }
+
+        // Build the entity memory's metadata: caller-supplied object
+        // merged, kind forced to "entity", aliases set to the union,
+        // agent_id preserved from the resolved caller.
+        let mut metadata = match extra_metadata {
+            serde_json::Value::Object(m) => serde_json::Value::Object(m.clone()),
+            _ => serde_json::json!({}),
+        };
+        let meta_map = metadata.as_object_mut().expect("metadata is an object");
+        meta_map.insert(
+            "kind".to_string(),
+            serde_json::Value::String(ENTITY_KIND.to_string()),
+        );
+        meta_map.insert("aliases".to_string(), serde_json::json!(union.clone()));
+        meta_map
+            .entry("agent_id".to_string())
+            .or_insert(serde_json::Value::String(resolved_agent.clone()));
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let resolved_id = prior
+            .as_ref()
+            .map(|m| m.id.clone())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let mem = Memory {
+            id: resolved_id.clone(),
+            tier: Tier::Long,
+            namespace: namespace.to_string(),
+            title: canonical_name.to_string(),
+            content: canonical_name.to_string(),
+            tags: vec!["entity".to_string()],
+            priority: 7,
+            confidence: 1.0,
+            source: "api".to_string(),
+            access_count: 0,
+            created_at: now.clone(),
+            updated_at: now,
+            last_accessed_at: None,
+            expires_at: None,
+            metadata,
+            reflection_depth: 0,
+            memory_kind: MemoryKind::Observation,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
+        };
+        let written_id = self.store(ctx, &mem).await?;
+        let created = prior.is_none();
+
+        Ok(EntityRegistration {
+            entity_id: written_id,
+            canonical_name: canonical_name.to_string(),
+            namespace: namespace.to_string(),
+            aliases: union,
+            created,
+        })
+    }
+
+    /// FX-C2-batch5 — list archived memories via the SAL trait.
+    /// Delegates to the inherent `list_archived_pg` (renamed from
+    /// `list_archived` so the trait method can land in the
+    /// `impl MemoryStore for PostgresStore` block without a name
+    /// collision). External callers that previously reached for the
+    /// inherent through `list_archived_via_store` continue to work
+    /// because the helper now calls `list_archived_pg` under the hood.
+    async fn list_archived(
+        &self,
+        namespace: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> StoreResult<Vec<serde_json::Value>> {
+        self.list_archived_pg(namespace, limit, offset).await
+    }
 }
 
 /// v0.7.0 Continuation 6 — adapter row-to-`QuotaStatus` projection.
@@ -10395,7 +11369,7 @@ pub async fn list_archived_via_store(
     offset: usize,
 ) -> StoreResult<Vec<serde_json::Value>> {
     let pg = downcast_postgres(store)?;
-    pg.list_archived(namespace, limit, offset).await
+    pg.list_archived_pg(namespace, limit, offset).await
 }
 
 /// Outbound multi-hop knowledge-graph traversal for postgres-backed
@@ -10528,7 +11502,13 @@ impl PostgresStore {
     /// `db::list_archived` produces for SQLite. Tags are stored as a
     /// JSONB array; we serialize back to a string-formatted JSON to
     /// match SQLite's `tags` text-encoded shape.
-    async fn list_archived(
+    ///
+    /// ARCH-2 FX-C2-batch5 (2026-05-27): renamed from `list_archived`
+    /// to `list_archived_pg` so the SAL trait method
+    /// `MemoryStore::list_archived` can land on the trait impl block
+    /// without a name collision. The trait impl delegates to this
+    /// inherent helper.
+    pub(super) async fn list_archived_pg(
         &self,
         namespace: Option<&str>,
         limit: usize,
@@ -12797,5 +13777,863 @@ mod tests {
         }
 
         cleanup_governance_ns(&pool, &format!("fa2a12-cap-{suffix}")).await;
+    }
+
+    // ---------------------------------------------------------------------
+    // FX-C2 (ARCH-2 followup) — `get_links_for_anchor` parity coverage.
+    //
+    // Mirror of the SQLite-side tests in `src/store/sqlite.rs`. Pins
+    // the per-anchor probe's wire shape across both backends: inbound +
+    // outbound edges in one call, empty vec for unlinked anchors,
+    // attest_level + temporal-validity columns round-trip via the
+    // sqlx projection. Skips cleanly when AI_MEMORY_TEST_POSTGRES_URL
+    // is unset so the default `cargo test` flow stays offline.
+    // ---------------------------------------------------------------------
+
+    async fn fxc2_seed_two_memories(store: &PostgresStore, ns: &str) -> (String, String) {
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let a_id = format!("fxc2-a-{}", uuid::Uuid::new_v4());
+        let b_id = format!("fxc2-b-{}", uuid::Uuid::new_v4());
+        let a = sample_memory(&a_id, ns, "fxc2-anchor", "anchor content here");
+        let b = sample_memory(&b_id, ns, "fxc2-target", "target content here");
+        store.store(&ctx, &a).await.expect("store anchor");
+        store.store(&ctx, &b).await.expect("store target");
+        (a_id, b_id)
+    }
+
+    #[tokio::test]
+    async fn live_get_links_for_anchor_returns_inbound_and_outbound() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let ns = format!("fxc2-getlinks-{}", uuid::Uuid::new_v4());
+        let (a_id, b_id) = fxc2_seed_two_memories(&store, &ns).await;
+        // upstream memory C used as inbound-anchor probe source
+        let c_id = format!("fxc2-c-{}", uuid::Uuid::new_v4());
+        let c = sample_memory(&c_id, &ns, "fxc2-upstream", "upstream content");
+        store.store(&ctx, &c).await.expect("store upstream");
+
+        let now = chrono::Utc::now().to_rfc3339();
+        // anchor -> target (outbound)
+        store
+            .link(
+                &ctx,
+                &MemoryLink {
+                    source_id: a_id.clone(),
+                    target_id: b_id.clone(),
+                    relation: crate::models::MemoryLinkRelation::RelatedTo,
+                    created_at: now.clone(),
+                    valid_from: None,
+                    valid_until: None,
+                    observed_by: None,
+                    signature: None,
+                    attest_level: None,
+                },
+            )
+            .await
+            .expect("link a->b");
+        // upstream -> anchor (inbound)
+        store
+            .link(
+                &ctx,
+                &MemoryLink {
+                    source_id: c_id.clone(),
+                    target_id: a_id.clone(),
+                    relation: crate::models::MemoryLinkRelation::Contradicts,
+                    created_at: now,
+                    valid_from: None,
+                    valid_until: None,
+                    observed_by: None,
+                    signature: None,
+                    attest_level: None,
+                },
+            )
+            .await
+            .expect("link c->a");
+
+        let edges = store
+            .get_links_for_anchor(&a_id)
+            .await
+            .expect("get_links_for_anchor");
+        assert!(
+            edges
+                .iter()
+                .any(|l| l.source_id == a_id && l.target_id == b_id),
+            "missing outbound edge in postgres parity"
+        );
+        assert!(
+            edges
+                .iter()
+                .any(|l| l.source_id == c_id && l.target_id == a_id),
+            "missing inbound edge in postgres parity"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_get_links_for_anchor_empty_for_unlinked_id() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let ns = format!("fxc2-empty-{}", uuid::Uuid::new_v4());
+        let alone_id = format!("fxc2-alone-{}", uuid::Uuid::new_v4());
+        let alone = sample_memory(&alone_id, &ns, "fxc2-alone", "no edges here");
+        store.store(&ctx, &alone).await.expect("store alone");
+        let edges = store
+            .get_links_for_anchor(&alone_id)
+            .await
+            .expect("get_links_for_anchor on unlinked id");
+        assert!(
+            edges.is_empty(),
+            "unlinked id must yield empty vec across both backends"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_get_links_for_anchor_projects_attest_level_and_temporal() {
+        // FX-C2 wire-shape parity: the Postgres branch MUST project the
+        // same `attest_level` + temporal-validity columns the SQLite
+        // branch does. This test inserts a row with explicit
+        // valid_from/valid_until/observed_by/attest_level via raw sqlx
+        // and verifies the trait-routed read round-trips them.
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ns = format!("fxc2-temporal-{}", uuid::Uuid::new_v4());
+        let (a_id, b_id) = fxc2_seed_two_memories(&store, &ns).await;
+        let vf = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .expect("parse vf")
+            .with_timezone(&chrono::Utc);
+        let vu = chrono::DateTime::parse_from_rfc3339("2026-12-31T23:59:59Z")
+            .expect("parse vu")
+            .with_timezone(&chrono::Utc);
+        sqlx::query(
+            "INSERT INTO memory_links
+                (source_id, target_id, relation, created_at,
+                 valid_from, valid_until, observed_by, attest_level)
+             VALUES ($1, $2, $3, NOW(), $4, $5, $6, $7)",
+        )
+        .bind(&a_id)
+        .bind(&b_id)
+        .bind("related_to")
+        .bind(vf)
+        .bind(vu)
+        .bind("ai:tester@host")
+        .bind("unsigned")
+        .execute(&store.pool)
+        .await
+        .expect("raw insert for temporal probe");
+
+        let edges = store
+            .get_links_for_anchor(&a_id)
+            .await
+            .expect("get_links_for_anchor");
+        let row = edges
+            .iter()
+            .find(|l| l.source_id == a_id && l.target_id == b_id)
+            .expect("just-inserted edge");
+        assert_eq!(row.valid_from.as_deref(), Some("2026-01-01T00:00:00+00:00"));
+        assert_eq!(
+            row.valid_until.as_deref(),
+            Some("2026-12-31T23:59:59+00:00")
+        );
+        assert_eq!(row.observed_by.as_deref(), Some("ai:tester@host"));
+        assert_eq!(row.attest_level.as_deref(), Some("unsigned"));
+    }
+
+    // ============================================================
+    // FX-C2-batch3 — Postgres live parity for read-only trait
+    // additions (list_namespaces, get_taxonomy, list_agents,
+    // list_pending_actions, entity_get_by_alias, health_check,
+    // stats). Gated on AI_MEMORY_TEST_POSTGRES_URL.
+    // ============================================================
+
+    #[tokio::test]
+    async fn live_list_namespaces_groups_by_count() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns_alpha = format!("fxc2-ns-alpha-{unique}");
+        let ns_beta = format!("fxc2-ns-beta-{unique}");
+        for i in 0..3 {
+            let id = format!("a-{i}-{unique}");
+            let mem = sample_memory(&id, &ns_alpha, &format!("t-{i}"), "body content");
+            store.store(&ctx, &mem).await.expect("store alpha");
+        }
+        let mem = sample_memory(&format!("b-{unique}"), &ns_beta, "tb", "beta body content");
+        store.store(&ctx, &mem).await.expect("store beta");
+        let rows = store.list_namespaces().await.expect("list_namespaces");
+        let alpha = rows
+            .iter()
+            .find(|r| r.namespace == ns_alpha)
+            .expect("alpha namespace");
+        let beta = rows
+            .iter()
+            .find(|r| r.namespace == ns_beta)
+            .expect("beta namespace");
+        assert_eq!(alpha.count, 3);
+        assert_eq!(beta.count, 1);
+    }
+
+    #[tokio::test]
+    async fn live_get_taxonomy_assembles_hierarchical_tree() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let root = format!("fxc2-tax-{unique}");
+        let team = format!("{root}/team");
+        let secrets = format!("{root}/team/secrets");
+        let mem_root = sample_memory(&format!("root-{unique}"), &root, "rt", "root body content");
+        store.store(&ctx, &mem_root).await.expect("store root");
+        for i in 0..2 {
+            let mem = sample_memory(
+                &format!("team-{i}-{unique}"),
+                &team,
+                &format!("t-{i}"),
+                "team body content",
+            );
+            store.store(&ctx, &mem).await.expect("store team");
+        }
+        let mem_sec = sample_memory(
+            &format!("sec-{unique}"),
+            &secrets,
+            "ss",
+            "secrets body content",
+        );
+        store.store(&ctx, &mem_sec).await.expect("store secrets");
+
+        let tax = store
+            .get_taxonomy(Some(&root), 8, 100)
+            .await
+            .expect("get_taxonomy");
+        assert_eq!(tax.total_count, 4, "1 root + 2 team + 1 secrets = 4");
+        assert_eq!(tax.tree.namespace, root);
+        assert_eq!(tax.tree.subtree_count, 4);
+        assert!(!tax.truncated);
+    }
+
+    #[tokio::test]
+    async fn live_list_agents_roundtrip() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("daemon");
+        let unique = uuid::Uuid::new_v4();
+        let agent_id = format!("ai:fxc2-tester-{unique}");
+        let agent = AgentRegistration {
+            agent_id: agent_id.clone(),
+            agent_type: "test".to_string(),
+            capabilities: vec!["recall".to_string()],
+            registered_at: String::new(),
+            last_seen_at: String::new(),
+        };
+        store
+            .register_agent(&ctx, &agent)
+            .await
+            .expect("register_agent");
+        let listed = store.list_agents().await.expect("list_agents");
+        assert!(
+            listed.iter().any(|r| r.agent_id == agent_id),
+            "registered agent must surface in list_agents"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_list_pending_actions_returns_seeded_row() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("fxc2-pa-{unique}");
+        let pid = format!("pa-{unique}");
+        // Seed a single pending row directly into the table.
+        sqlx::query(
+            "INSERT INTO pending_actions
+                 (id, action_type, memory_id, namespace, payload, requested_by,
+                  requested_at, status, approvals)
+             VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7, $8)",
+        )
+        .bind(&pid)
+        .bind("Store")
+        .bind(None::<String>)
+        .bind(&ns)
+        .bind(serde_json::json!({"title":"t","content":"c"}))
+        .bind("alice")
+        .bind("pending")
+        .bind(serde_json::json!([]))
+        .execute(&store.pool)
+        .await
+        .expect("seed pending_actions row");
+
+        let rows =
+            <PostgresStore as MemoryStore>::list_pending_actions(&store, Some("pending"), 100)
+                .await
+                .expect("list_pending_actions");
+        let row = rows
+            .iter()
+            .find(|r| r.id == pid)
+            .expect("seeded pending row must surface");
+        assert_eq!(row.namespace, ns);
+        assert_eq!(row.status, "pending");
+        assert_eq!(row.requested_by, "alice");
+    }
+
+    #[tokio::test]
+    async fn live_entity_get_by_alias_resolves_canonical_record() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("fxc2-ent-{unique}");
+        let entity_id = format!("ent-{unique}");
+        let mut mem = sample_memory(
+            &entity_id,
+            &ns,
+            &format!("alphaone-co-{unique}"),
+            "entity row body",
+        );
+        mem.metadata = serde_json::json!({
+            "kind": "entity",
+            "agent_id": "ai:sal-test",
+        });
+        store.store(&ctx, &mem).await.expect("store entity");
+        let alias = format!("AlphaOne-{unique}");
+        // Postgres `entity_aliases` is (entity_id, alias, created_at);
+        // namespace is resolved via JOIN with `memories`.
+        sqlx::query("INSERT INTO entity_aliases (entity_id, alias) VALUES ($1, $2)")
+            .bind(&entity_id)
+            .bind(&alias)
+            .execute(&store.pool)
+            .await
+            .expect("insert alias");
+
+        let rec = store
+            .entity_get_by_alias(&alias, Some(&ns))
+            .await
+            .expect("entity_get_by_alias");
+        let rec = rec.expect("entity must resolve");
+        assert_eq!(rec.entity_id, entity_id);
+        assert_eq!(rec.namespace, ns);
+        assert!(rec.aliases.iter().any(|a| a == &alias));
+    }
+
+    #[tokio::test]
+    async fn live_health_check_returns_true() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ok = store.health_check().await.expect("health_check");
+        assert!(ok);
+    }
+
+    #[tokio::test]
+    async fn live_stats_projects_full_shape() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("fxc2-stats-{unique}");
+        for i in 0..2 {
+            let mem = sample_memory(
+                &format!("stats-{i}-{unique}"),
+                &ns,
+                &format!("t-{i}"),
+                "stats body content",
+            );
+            store.store(&ctx, &mem).await.expect("store");
+        }
+        let s = store.stats().await.expect("stats");
+        let ns_row = s
+            .by_namespace
+            .iter()
+            .find(|r| r.namespace == ns)
+            .expect("ns must surface in stats");
+        assert_eq!(ns_row.count, 2);
+        assert!(s.total >= 2, "stats.total must include seeded rows");
+        // db_size_bytes is best-effort on postgres; assert non-negative
+        // shape — we already enforce non-negative via u64::try_from.
+        let _ = s.db_size_bytes;
+    }
+
+    // ------------------------------------------------------------------
+    // FX-C2 batch-4 — live-Postgres parity tests for the six new trait
+    // methods (find_by_title_namespace, next_versioned_title,
+    // find_contradictions, invalidate_link, check_duplicate_with_text,
+    // update_embedding). Each test skips cleanly when
+    // AI_MEMORY_TEST_POSTGRES_URL is unset.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn live_find_by_title_namespace_resolves_id() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("fxc2b4-find-{unique}");
+        let mem = sample_memory(
+            &format!("find-{unique}"),
+            &ns,
+            "find-target-title",
+            "find_by_title body",
+        );
+        let id = store.store(&ctx, &mem).await.expect("store");
+        let found = store
+            .find_by_title_namespace("find-target-title", &ns)
+            .await
+            .expect("find_by_title_namespace");
+        assert_eq!(found.as_deref(), Some(id.as_str()));
+        let missing = store
+            .find_by_title_namespace("nonexistent-title", &ns)
+            .await
+            .expect("find_by_title_namespace miss");
+        assert!(missing.is_none());
+    }
+
+    #[tokio::test]
+    async fn live_next_versioned_title_picks_suffix_on_collision() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("fxc2b4-version-{unique}");
+        // First store claims the base title.
+        let mem = sample_memory(
+            &format!("ver-{unique}"),
+            &ns,
+            "version-base",
+            "v1 body content",
+        );
+        store.store(&ctx, &mem).await.expect("store");
+        let picked = store
+            .next_versioned_title("version-base", &ns)
+            .await
+            .expect("next_versioned_title");
+        assert_eq!(picked, "version-base (2)");
+        // Fresh title is returned unchanged.
+        let fresh = store
+            .next_versioned_title("never-used-title", &ns)
+            .await
+            .expect("next_versioned_title fresh");
+        assert_eq!(fresh, "never-used-title");
+    }
+
+    #[tokio::test]
+    async fn live_find_contradictions_surfaces_fts_hits() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("fxc2b4-contradictions-{unique}");
+        let m1 = sample_memory(
+            &format!("c1-{unique}"),
+            &ns,
+            "rust borrow checker semantics",
+            "rust language safety guarantees",
+        );
+        let m2 = sample_memory(
+            &format!("c2-{unique}"),
+            &ns,
+            "completely separate cookbook",
+            "fish stew recipe and instructions",
+        );
+        store.store(&ctx, &m1).await.expect("store m1");
+        store.store(&ctx, &m2).await.expect("store m2");
+        let hits = store
+            .find_contradictions("rust borrow checker", &ns)
+            .await
+            .expect("find_contradictions");
+        assert!(
+            hits.iter().any(|m| m.title.contains("rust borrow")),
+            "must surface rust row"
+        );
+        assert!(
+            !hits.iter().any(|m| m.title.contains("cookbook")),
+            "must not surface unrelated row"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_invalidate_link_marks_found() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("fxc2b4-invalidate-{unique}");
+        let src = sample_memory(
+            &format!("src-{unique}"),
+            &ns,
+            "src-title",
+            "src body content",
+        );
+        let dst = sample_memory(
+            &format!("dst-{unique}"),
+            &ns,
+            "dst-title",
+            "dst body content",
+        );
+        let src_id = store.store(&ctx, &src).await.expect("store src");
+        let dst_id = store.store(&ctx, &dst).await.expect("store dst");
+        let link = crate::models::MemoryLink {
+            source_id: src_id.clone(),
+            target_id: dst_id.clone(),
+            relation: crate::models::MemoryLinkRelation::RelatedTo,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            signature: None,
+            observed_by: None,
+            valid_from: None,
+            valid_until: None,
+            attest_level: None,
+        };
+        store.link(&ctx, &link).await.expect("create link");
+        let row = store
+            .invalidate_link(&src_id, &dst_id, "related_to", Some("2030-01-01T00:00:00Z"))
+            .await
+            .expect("invalidate_link");
+        assert!(row.found, "link must be marked found");
+        // valid_until is normalised on the postgres side; just assert
+        // non-empty + timezone present.
+        assert!(!row.valid_until.is_empty());
+        // Calling again should surface the prior value.
+        let row2 = store
+            .invalidate_link(&src_id, &dst_id, "related_to", Some("2031-02-02T00:00:00Z"))
+            .await
+            .expect("re-invalidate");
+        assert!(row2.found);
+        assert!(row2.previous_valid_until.is_some());
+    }
+
+    #[tokio::test]
+    async fn live_invalidate_link_returns_not_found_for_unknown_triple() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let row = store
+            .invalidate_link("nope-src", "nope-dst", "related_to", None)
+            .await
+            .expect("invalidate_link miss");
+        assert!(!row.found);
+        assert!(row.valid_until.is_empty());
+    }
+
+    #[tokio::test]
+    async fn live_check_duplicate_with_text_hash_short_circuit() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("fxc2b4-dup-{unique}");
+        let mem = sample_memory(
+            &format!("dup-{unique}"),
+            &ns,
+            "dup-test-title",
+            "dup-test body content",
+        );
+        store.store(&ctx, &mem).await.expect("store");
+        let query_text = format!("{} {}", mem.title, mem.content);
+        // Empty embedding — phase 1 hash short-circuit doesn't need
+        // pgvector and must surface similarity=1.0 byte-equal.
+        let check = store
+            .check_duplicate_with_text(&[], &query_text, Some(&ns), 0.8)
+            .await
+            .expect("check_duplicate_with_text");
+        assert!(
+            check.is_duplicate,
+            "byte-equal text must short-circuit as duplicate"
+        );
+        let n = check.nearest.expect("nearest must be populated");
+        assert!((n.similarity - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn live_update_embedding_persists_vector() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("fxc2b4-update-emb-{unique}");
+        let mem = sample_memory(
+            &format!("emb-{unique}"),
+            &ns,
+            "emb-test",
+            "embedding update body",
+        );
+        let id = store.store(&ctx, &mem).await.expect("store");
+        // PostgresStore declares the embedding column as `vector(N)`
+        // where N matches `EMBEDDING_DIM` (the connect-time selection).
+        // To stay backend-agnostic in this test we read the current
+        // column dim and craft a zero vector of that length.
+        let dim = store
+            .current_embedding_dim()
+            .await
+            .expect("current_embedding_dim");
+        let dim_usize = usize::try_from(dim.unwrap_or(384)).unwrap_or(384);
+        let vec = vec![0.0_f32; dim_usize];
+        store
+            .update_embedding(&ctx, &id, Some(&vec))
+            .await
+            .expect("update_embedding");
+        // Re-fetch to verify the vector landed (column is non-NULL).
+        let written: Option<i64> = sqlx::query_scalar(
+            "SELECT 1::BIGINT FROM memories WHERE id = $1 AND embedding IS NOT NULL",
+        )
+        .bind(&id)
+        .fetch_optional(&store.pool)
+        .await
+        .expect("verify embedding");
+        assert!(written.is_some(), "embedding column must be non-NULL");
+    }
+
+    // ------------------------------------------------------------------
+    // FX-C2-batch5 — parity tests for the final 6 trait methods.
+    // Gated on AI_MEMORY_TEST_POSTGRES_URL; otherwise skipped cleanly.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn fx_c2_batch5_live_kg_query_trait_method_works() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("fxc2b5-kgq-{unique}");
+        let src = sample_memory(&format!("src-{unique}"), &ns, "kg-query-src", "source body");
+        let dst = sample_memory(&format!("dst-{unique}"), &ns, "kg-query-dst", "target body");
+        let src_id = store.store(&ctx, &src).await.expect("store src");
+        let dst_id = store.store(&ctx, &dst).await.expect("store dst");
+        let link = crate::models::MemoryLink {
+            source_id: src_id.clone(),
+            target_id: dst_id.clone(),
+            relation: crate::models::MemoryLinkRelation::RelatedTo,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            signature: None,
+            observed_by: None,
+            valid_from: None,
+            valid_until: None,
+            attest_level: None,
+        };
+        store.link(&ctx, &link).await.expect("create link");
+        // Call the SAL trait method (3-arg form) — verifies the trait
+        // entry point reaches PostgresStore::kg_query_with_history.
+        let rows = <PostgresStore as MemoryStore>::kg_query(&store, &src_id, 2, false)
+            .await
+            .expect("kg_query trait");
+        assert!(
+            rows.iter().any(|r| r.target_id == dst_id),
+            "kg_query trait method must surface the linked neighbor"
+        );
+    }
+
+    #[tokio::test]
+    async fn fx_c2_batch5_live_kg_timeline_trait_method_works() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("fxc2b5-tl-{unique}");
+        let src = sample_memory(&format!("tl-src-{unique}"), &ns, "tl-src", "src body");
+        let dst = sample_memory(&format!("tl-dst-{unique}"), &ns, "tl-dst", "dst body");
+        let src_id = store.store(&ctx, &src).await.expect("store src");
+        let dst_id = store.store(&ctx, &dst).await.expect("store dst");
+        // Insert a link with valid_from set so kg_timeline picks it up
+        // (the SAL `link` trait method does not surface valid_from).
+        sqlx::query(
+            "INSERT INTO memory_links \
+             (source_id, target_id, relation, created_at, valid_from, attest_level) \
+             VALUES ($1, $2, 'related_to', NOW(), '2030-01-01 00:00:00+00', 'unsigned')",
+        )
+        .bind(&src_id)
+        .bind(&dst_id)
+        .execute(&store.pool)
+        .await
+        .expect("insert timeline link");
+        let events = <PostgresStore as MemoryStore>::kg_timeline(&store, &src_id, None, None, None)
+            .await
+            .expect("kg_timeline trait");
+        assert!(
+            events.iter().any(|e| e.target_id == dst_id),
+            "kg_timeline trait method must surface the assertion"
+        );
+    }
+
+    #[tokio::test]
+    async fn fx_c2_batch5_live_entity_register_creates_then_idempotent() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("fxc2b5-ent-{unique}");
+        let first = store
+            .entity_register(
+                &ctx,
+                "AlphaOne LLC",
+                &ns,
+                &["AlphaOne".to_string(), "AO".to_string()],
+                &serde_json::json!({"website": "https://alphaone.example"}),
+                Some("ai:sal-test"),
+            )
+            .await
+            .expect("entity_register first");
+        assert!(first.created, "first registration must create the row");
+        assert_eq!(first.canonical_name, "AlphaOne LLC");
+        assert!(first.aliases.iter().any(|a| a == "AlphaOne"));
+        // Second call merges aliases without creating a new row.
+        let second = store
+            .entity_register(
+                &ctx,
+                "AlphaOne LLC",
+                &ns,
+                &["AO Inc".to_string()],
+                &serde_json::json!({}),
+                Some("ai:sal-test"),
+            )
+            .await
+            .expect("entity_register second");
+        assert!(!second.created, "re-register must not create");
+        assert!(second.aliases.iter().any(|a| a == "AlphaOne"));
+        assert!(second.aliases.iter().any(|a| a == "AO"));
+        assert!(second.aliases.iter().any(|a| a == "AO Inc"));
+    }
+
+    #[tokio::test]
+    async fn fx_c2_batch5_live_list_archived_trait_method_works() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        // Use a unique namespace and ensure list returns an empty
+        // result (no rows to archive in this scratch ns) plus that
+        // the trait method dispatches to the inherent without an
+        // ambiguity error.
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("fxc2b5-arch-{unique}");
+        let listed = <PostgresStore as MemoryStore>::list_archived(&store, Some(&ns), 100, 0)
+            .await
+            .expect("list_archived trait");
+        assert!(
+            listed.is_empty(),
+            "fresh namespace must have zero archived rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn fx_c2_batch5_live_decide_pending_action_alias_works() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        // Insert a pending row directly so we can drive the
+        // decide_pending_action trait alias.
+        let unique = uuid::Uuid::new_v4();
+        let pid = format!("pending-{unique}");
+        let ns = format!("fxc2b5-decide-{unique}");
+        sqlx::query(
+            "INSERT INTO pending_actions \
+             (id, action_type, namespace, memory_id, requested_by, payload, status, requested_at, approvals) \
+             VALUES ($1, 'store', $2, NULL, 'ai:sal-test', '{}'::jsonb, 'pending', NOW(), '[]'::jsonb)",
+        )
+        .bind(&pid)
+        .bind(&ns)
+        .execute(&store.pool)
+        .await
+        .expect("insert pending");
+        let result = store
+            .decide_pending_action(&ctx, &pid, false, "ai:sal-test")
+            .await
+            .expect("decide_pending_action");
+        assert!(result, "first decide must return true");
+        let second = store
+            .decide_pending_action(&ctx, &pid, false, "ai:sal-test")
+            .await
+            .expect("decide_pending_action second");
+        assert!(!second, "already-decided rows must return false");
+    }
+
+    #[tokio::test]
+    async fn fx_c2_batch5_live_approve_with_approver_type_alias_works() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let pid = format!("pending-{unique}");
+        let ns = format!("fxc2b5-approve-{unique}");
+        sqlx::query(
+            "INSERT INTO pending_actions \
+             (id, action_type, namespace, memory_id, requested_by, payload, status, requested_at, approvals) \
+             VALUES ($1, 'store', $2, NULL, 'ai:sal-test', '{}'::jsonb, 'pending', NOW(), '[]'::jsonb)",
+        )
+        .bind(&pid)
+        .bind(&ns)
+        .execute(&store.pool)
+        .await
+        .expect("insert pending");
+        // approve_with_approver_type alias must produce the same outcome
+        // as governance_approve_with_consensus for the Human approver
+        // (no namespace policy ⇒ Human default).
+        let outcome = store
+            .approve_with_approver_type(&ctx, &pid, "ai:sal-test")
+            .await
+            .expect("approve_with_approver_type");
+        assert!(matches!(outcome, crate::store::ApproveOutcome::Approved));
     }
 }

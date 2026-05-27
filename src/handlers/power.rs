@@ -273,6 +273,19 @@ pub async fn detect_contradictions(
     };
 
     // Existing contradicts links involving any candidate.
+    //
+    // ARCH-2 FX-C2 status: the SAL `MemoryStore::get_links_for_anchor`
+    // trait method now exists (proposed addition #1 in
+    // docs/v0.7.0/arch-2-sal-boundary-audit.md, landed in this commit).
+    // The Postgres branch's contradiction-link assembly above already
+    // rides the trait surface; this SQLite branch stays on the legacy
+    // `db::get_links` free-function because we hold `app.db.lock()` for
+    // the `db::list` + `db::get_links` lookups in the same window —
+    // routing through `app.store.get_links_for_anchor` here would
+    // either acquire a second mutex on the same connection (deadlock
+    // risk) or fail the disjoint-tempfile invariant under the unit-test
+    // harness. Classified as test-blocked drift, tracked for the
+    // FX-C2-a follow-up (test-fixture convergence).
     let candidate_ids: std::collections::HashSet<String> =
         candidates.iter().map(|m| m.id.clone()).collect();
     let mut existing_links: Vec<serde_json::Value> = Vec::new();
@@ -376,31 +389,18 @@ pub async fn list_namespaces(
     {
         return resp;
     }
-    // v0.7.0 Wave-3 Continuation — postgres-backed daemons aggregate the
-    // distinct namespaces from `memories` via the SAL `list` method.
+    // v0.7.0 ARCH-2 followup (FX-C2-batch3) — postgres-backed daemons
+    // now route through the dedicated `MemoryStore::list_namespaces`
+    // trait method (sqlx-native `GROUP BY namespace`) instead of
+    // fan-folding through a 1M-limit `list()` scan. The aggregate
+    // shape mirrors the SQLite `db::list_namespaces` result: namespace
+    // identifiers are structural metadata, not user data, so no #910
+    // visibility filter applies — same posture as the SQLite branch.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        // QC P1 follow-up (2026-05-20): namespace identifiers are
-        // structural metadata, not user data — same posture as
-        // `get_namespace_standard_qs` (which is also `for_admin`).
-        // Without bypass the SAL #910 visibility filter would gate
-        // every namespace name behind owner==caller and the list
-        // would only ever return the caller's own namespaces, which
-        // breaks the cert harness `namespaces_round_trip_via_sal`
-        // test and surfaces in production as a fragmented namespace
-        // catalog per-tenant.
-        let ctx = crate::store::CallerContext::for_admin("ai:http-internal");
-        let filter = crate::store::Filter {
-            limit: 1_000_000,
-            ..Default::default()
-        };
-        return match app.store.list(&ctx, &filter).await {
-            Ok(memories) => {
-                let mut ns: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-                for m in memories {
-                    ns.insert(m.namespace);
-                }
-                let v: Vec<String> = ns.into_iter().collect();
+        return match app.store.list_namespaces().await {
+            Ok(rows) => {
+                let v: Vec<String> = rows.into_iter().map(|r| r.namespace).collect();
                 Json(json!({"namespaces": v})).into_response()
             }
             Err(e) => store_err_to_response(e),
@@ -478,15 +478,46 @@ pub async fn get_taxonomy(
         .min(crate::models::MAX_NAMESPACE_DEPTH);
     let limit = p.limit.unwrap_or(1000).clamp(1, 10_000);
 
-    // v0.7.0 Wave-3 Continuation 4 (Bucket E / S44) — full hierarchical
-    // taxonomy walk for postgres-backed daemons. Uses
-    // `taxonomy_namespaces_via_store` to project a single `GROUP BY
-    // namespace` aggregate (so we don't pull every memory row into
-    // memory), then assembles the hierarchical tree with honest
-    // `subtree_count` so the cert oracle can detect dishonest
-    // truncation.
+    // v0.7.0 ARCH-2 followup (FX-C2-batch3) — postgres-backed daemons
+    // now route taxonomy reads through `MemoryStore::get_taxonomy`.
+    // The new trait method shares its tree-folding logic with the
+    // SQLite path via `crate::storage::fold_taxonomy_groups`, so the
+    // wire shape is byte-equal across backends. We keep a
+    // `storage_backend: "postgres"` field on the response so the cert
+    // oracle can still distinguish backend provenance from a single
+    // capture.
     #[cfg(feature = "sal-postgres")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
+        return match app
+            .store
+            .get_taxonomy(prefix_owned.as_deref(), depth, limit)
+            .await
+        {
+            Ok(tax) => Json(json!({
+                "tree": tax.tree,
+                "total_count": tax.total_count,
+                "truncated": tax.truncated,
+                "storage_backend": "postgres",
+            }))
+            .into_response(),
+            Err(e) => store_err_to_response(e),
+        };
+    }
+
+    // Legacy postgres branch (pre-FX-C2-batch3): assembled the tree
+    // in-handler from a `(namespace, count)` pair list returned by
+    // `taxonomy_namespaces_via_store`. Now superseded by the SAL trait
+    // route above; the body is preserved as a debug-only fallback path
+    // (`AI_MEMORY_TAXONOMY_LEGACY_PG=1`) so operators can A/B the two
+    // assemblers if they suspect divergence. Without the env var set
+    // the branch never fires.
+    #[cfg(feature = "sal-postgres")]
+    if matches!(app.storage_backend, StorageBackend::Postgres)
+        && std::env::var("AI_MEMORY_TAXONOMY_LEGACY_PG")
+            .ok()
+            .as_deref()
+            == Some("1")
+    {
         let pairs = match crate::store::postgres::taxonomy_namespaces_via_store(
             &app.store,
             prefix_owned.as_deref(),
@@ -691,91 +722,53 @@ pub async fn check_duplicate(
     }
     let threshold = body.threshold.unwrap_or(db::DUPLICATE_THRESHOLD_DEFAULT);
 
-    // v0.7.0 Wave-3 Continuation 4 (Bucket E / S48) — postgres-backed
-    // daemons now perform an exact-content sweep through the SAL
-    // `list` projection. When an embedder is loaded the call also
-    // computes the query embedding and hands it to
-    // `recall_hybrid`; the highest-cosine match becomes the nearest
-    // candidate. Without an embedder the fallback walks the
-    // namespace via `list` and surfaces any row whose
-    // `(title, content)` tuple matches exactly (the same content-hash
-    // short-circuit `db::check_duplicate_with_text` uses on sqlite,
-    // before the embedding pass).
+    // v0.7.0 SAL-routing batch-4 (FX-C2) — postgres-backed daemons
+    // route through the canonical `MemoryStore::check_duplicate_with_text`
+    // trait method. Mirrors the SQLite `db::check_duplicate_with_text`
+    // shape byte-for-byte: SHA-256 exact-content short-circuit (returns
+    // `similarity=1.0` on byte-equal `format!("{title} {content}")`),
+    // then pgvector cosine distance for nearest-neighbor on near hits.
+    // Pre-fix branch was hand-rolled (`list` + client-side exact-match
+    // walk + `recall_hybrid` fallback); the trait method consolidates
+    // both phases into single SQL round-trips so the byte-shape stays
+    // identical across backends.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        // QC P1 fix (2026-05-20): use header-resolved caller so the
-        // SAL #910 visibility filter applies — duplicate-detection
-        // only sees memories the caller owns (or scope=shared/public).
-        // Pre-fix `for_agent("daemon")` mismatched every memory's
-        // metadata.agent_id and the candidate pool was zero.
-        let ctx = crate::handlers::parity::http_caller_ctx(&headers, None);
-        let filter = crate::store::Filter {
-            namespace: namespace.map(str::to_string),
-            limit: 1000,
-            ..Default::default()
+        let embedding_text = format!("{} {}", body.title, body.content);
+        // Best-effort: when the embedder is loaded, compute the query
+        // vector so phase 2 (cosine nearest) is available. Without it
+        // the trait method falls through to phase-1 hash-only.
+        let query_embedding: Vec<f32> = match app.embedder.as_ref().as_ref() {
+            Some(emb) => emb.embed(&embedding_text).unwrap_or_default(),
+            None => Vec::new(),
         };
-        let mut nearest: Option<(crate::models::Memory, f64)> = None;
-        let mut scanned = 0_u64;
-        // Exact-content sweep first — cheap, deterministic, no embed.
-        match app.store.list(&ctx, &filter).await {
-            Ok(rows) => {
-                for m in rows {
-                    scanned += 1;
-                    if m.content == body.content && m.title == body.title {
-                        nearest = Some((m, 1.0));
-                        break;
-                    }
-                }
-            }
-            Err(e) => return store_err_to_response(e),
-        }
-        // If exact match didn't surface, optionally try embedding-based
-        // hybrid recall with the title+content as the query.
-        if nearest.is_none()
-            && let Some(emb) = app.embedder.as_ref().as_ref()
+        return match app
+            .store
+            .check_duplicate_with_text(&query_embedding, &embedding_text, namespace, threshold)
+            .await
         {
-            let embedding_text = format!("{} {}", body.title, body.content);
-            if let Ok(qe) = emb.embed(&embedding_text) {
-                let recall_filter = crate::store::Filter {
-                    namespace: namespace.map(str::to_string),
-                    limit: 5,
-                    ..Default::default()
+            Ok(check) => {
+                let near_json = match check.nearest {
+                    Some(n) => json!({
+                        "id": n.id,
+                        "title": n.title,
+                        "namespace": n.namespace,
+                        "score": n.similarity,
+                    }),
+                    None => serde_json::Value::Null,
                 };
-                if let Ok(scored_pairs) = app
-                    .store
-                    .recall_hybrid(&ctx, &embedding_text, Some(&qe), &recall_filter)
-                    .await
-                {
-                    if let Some((m, s)) = scored_pairs.into_iter().next() {
-                        nearest = Some((m, s));
-                    }
-                }
-                drop(qe);
+                Json(json!({
+                    "is_duplicate": check.is_duplicate,
+                    "threshold": check.threshold,
+                    "nearest": near_json,
+                    "suggested_merge": check.is_duplicate,
+                    "candidates_scanned": check.candidates_scanned,
+                    "storage_backend": "postgres",
+                }))
+                .into_response()
             }
-        }
-        let (is_duplicate, near_json) = if let Some((m, score)) = nearest {
-            let is_dup = score >= f64::from(threshold);
-            (
-                is_dup,
-                json!({
-                    "id": m.id,
-                    "title": m.title,
-                    "namespace": m.namespace,
-                    "score": score,
-                }),
-            )
-        } else {
-            (false, serde_json::Value::Null)
+            Err(e) => store_err_to_response(e),
         };
-        return Json(json!({
-            "is_duplicate": is_duplicate,
-            "threshold": threshold,
-            "nearest": near_json,
-            "suggested_merge": is_duplicate,
-            "candidates_scanned": scanned,
-            "storage_backend": "postgres",
-        }))
-        .into_response();
     }
 
     // Embed before taking the DB lock — same rationale as create_memory

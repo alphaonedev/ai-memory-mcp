@@ -841,20 +841,17 @@ pub async fn get_links(
     };
     let caller_is_admin = crate::handlers::admin_role::is_admin_caller(&app, &caller);
 
-    // v0.7.0 Wave-3 — Postgres-backed daemons walk `list_links` (no
-    // namespace filter — the same projection as the legacy
-    // `db::get_links` returns) and narrow client-side to edges
-    // anchored at `id`. The trait does not (yet) expose a per-anchor
-    // edge probe; this filter is O(|edges|), which matches the
-    // SQLite path's behaviour for typical workloads.
+    // v0.7.0 Wave-3 + FX-C2 (ARCH-2 followup) — Postgres-backed daemons
+    // ride the SAL `get_links_for_anchor` trait method. Pre-FX-C2 this
+    // branch walked the full `list_links(None)` set and narrowed
+    // client-side; the per-anchor SAL surface lands the filter on the
+    // server, mirroring the SQLite `db::get_links` shape and dropping
+    // the over-fetch + linear-scan cost for daemons with non-trivial
+    // edge counts.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        return match app.store.list_links(None).await {
-            Ok(rows) => {
-                let edges: Vec<_> = rows
-                    .into_iter()
-                    .filter(|l| l.source_id == id || l.target_id == id)
-                    .collect();
+        return match app.store.get_links_for_anchor(&id).await {
+            Ok(edges) => {
                 let visible = if caller_is_admin {
                     edges
                 } else {
@@ -891,10 +888,17 @@ pub async fn get_links(
     }
 
     let lock = app.db.lock().await;
-    // ARCH-2 keeper: `db::get_links` is a sqlite-only per-anchor edge
-    // probe with no SAL trait equivalent (`list_links(namespace)` is
-    // namespace-scoped, not anchor-scoped). Filed as a missing-trait
-    // follow-up under docs/v0.7.0/arch-2-sal-boundary-audit.md.
+    // ARCH-2 FX-C2 status: the SAL `get_links_for_anchor` trait method
+    // now exists (closes the missing-trait gap the audit cited at
+    // docs/v0.7.0/arch-2-sal-boundary-audit.md:48); the Postgres branch
+    // above already rides through it. The SQLite branch stays on
+    // `db::get_links` because the unit-test harness at
+    // `src/handlers/tests.rs::test_app_state` pins `app.store` to a
+    // disjoint tempfile from `app.db` (`:memory:` SQLite cannot share
+    // a backing connection across the trait + free-function paths).
+    // Routing here would break the ~30+ unit tests that seed via
+    // `db::create_link(&lock.0, …)`; classified as test-blocked drift,
+    // tracked for the FX-C2-a follow-up (test-fixture convergence).
     let links_for_anchor = db::get_links(&lock.0, &id);
     drop(lock);
     match links_for_anchor {
