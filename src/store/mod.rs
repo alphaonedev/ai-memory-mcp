@@ -1307,6 +1307,169 @@ pub trait MemoryStore: Send + Sync {
             capability: "FIND_PATHS".to_string(),
         })
     }
+
+    // ==================================================================
+    // v0.7.0 ARCH-2 followup (FX-C2-batch3) — read-only trait
+    // completions. Each closes a "Missing-trait" handler reach so the
+    // SAL becomes the canonical read surface for these probes.
+    // Defaults return `UnsupportedCapability` so adapters that don't
+    // implement the probe fail loudly rather than silently returning
+    // empty results.
+    // ==================================================================
+
+    /// Enumerate live (non-expired) namespaces with their memory counts.
+    /// Closes `db::list_namespaces` (handler reach at `power.rs:411`).
+    ///
+    /// Ordering: descending by count, then ascending by name for stable
+    /// tie-breaking. The result excludes namespaces whose entire content
+    /// has expired but does NOT cascade through TTL semantics for
+    /// individual rows (callers requesting that should use `list` with a
+    /// namespace filter).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` when the underlying store reports an error.
+    async fn list_namespaces(&self) -> StoreResult<Vec<crate::models::NamespaceCount>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "LIST_NAMESPACES".to_string(),
+        })
+    }
+
+    /// Hierarchical namespace taxonomy. Closes `db::get_taxonomy`
+    /// (handler reach at `power.rs:620`).
+    ///
+    /// `namespace_prefix` filters the tree root; `max_depth` caps how
+    /// many `/`-separated segments are surfaced below the prefix;
+    /// `limit` caps the number of `(namespace, count)` rows walked.
+    /// Adapters MUST clamp `max_depth` and `limit` to safe bounds so
+    /// pathological callers cannot exhaust memory.
+    ///
+    /// Returned [`Taxonomy::total_count`] reflects the FULL prefix
+    /// total (not the truncated walk) and [`Taxonomy::truncated`] is
+    /// set when `limit` dropped rows so callers can warn the user.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` when the underlying store reports an error.
+    async fn get_taxonomy(
+        &self,
+        _namespace_prefix: Option<&str>,
+        _max_depth: usize,
+        _limit: usize,
+    ) -> StoreResult<crate::models::Taxonomy> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "GET_TAXONOMY".to_string(),
+        })
+    }
+
+    /// Enumerate registered agents in the `_agents` namespace. Closes
+    /// `db::list_agents` (handler reaches at `subscriptions.rs:454`,
+    /// `admin.rs:280`).
+    ///
+    /// Ordering: ascending by `registered_at` so audit consumers can
+    /// observe stable enrollment chronology. Each [`AgentRegistration`]
+    /// projects `agent_id`, `agent_type`, `capabilities`,
+    /// `registered_at`, `last_seen_at` parsed out of the underlying
+    /// memory row's metadata blob.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` when the underlying store reports an error or
+    /// when metadata fails to parse as JSON.
+    async fn list_agents(&self) -> StoreResult<Vec<AgentRegistration>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "LIST_AGENTS".to_string(),
+        })
+    }
+
+    /// Enumerate pending governance actions with optional status
+    /// filter. Closes `db::list_pending_actions` (handler reaches at
+    /// `governance.rs:130`, `approvals.rs:277` indirectly).
+    ///
+    /// `status` filters by the exact status string (`"pending"`,
+    /// `"approved"`, `"rejected"`, `"expired"`). `None` returns every
+    /// row regardless of status. `limit` caps row count; callers MUST
+    /// pass a positive value (zero behaves as "no rows" by SQL
+    /// convention).
+    ///
+    /// Ordering: descending by `requested_at` so the freshest entries
+    /// surface first, matching the legacy `db::list_pending_actions`
+    /// shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` when the underlying store reports an error.
+    async fn list_pending_actions(
+        &self,
+        _status: Option<&str>,
+        _limit: usize,
+    ) -> StoreResult<Vec<crate::models::PendingAction>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "LIST_PENDING_ACTIONS".to_string(),
+        })
+    }
+
+    /// Resolve a knowledge-graph entity by alias (case-sensitive
+    /// match). Closes `db::entity_get_by_alias` (handler reach at
+    /// `kg.rs:468`).
+    ///
+    /// `namespace`, when set, restricts the alias resolution to a
+    /// specific tenant. When `None`, the most-recently-created
+    /// matching entity wins (deterministic disambiguation if the same
+    /// alias was registered in multiple namespaces).
+    ///
+    /// Returns `Ok(None)` if no entity claims this alias; returns the
+    /// full alias set for the resolved entity otherwise.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` when the underlying store reports an error.
+    async fn entity_get_by_alias(
+        &self,
+        _alias: &str,
+        _namespace: Option<&str>,
+    ) -> StoreResult<Option<crate::models::EntityRecord>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ENTITY_GET_BY_ALIAS".to_string(),
+        })
+    }
+
+    /// Deep health check — verifies the underlying store is reachable
+    /// AND the full-text index (or postgres equivalent) is functional.
+    /// Closes `db::health_check` (handler reach at `transport.rs:840`).
+    ///
+    /// Returns `Ok(true)` on success. Implementations SHOULD perform a
+    /// cheap write-side probe (e.g. SQLite FTS integrity-check) so
+    /// degradation surfaces before the next user-facing recall fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` when the underlying store is unreachable or
+    /// the FTS / index probe fails.
+    async fn health_check(&self) -> StoreResult<bool> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "HEALTH_CHECK".to_string(),
+        })
+    }
+
+    /// Aggregate database statistics — total rows, per-tier counts,
+    /// per-namespace counts, expiring-soon count, link count, on-disk
+    /// size, dim violations, HNSW evictions. Closes `db::stats`
+    /// (handler reaches at `transport.rs:876`, `admin.rs:505`).
+    ///
+    /// Adapters SHOULD populate every field they can; missing fields
+    /// (e.g. `db_size_bytes` on Postgres where path-based sizing isn't
+    /// meaningful) default to zero so the response shape stays
+    /// constant across backends.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` when the underlying store reports an error.
+    async fn stats(&self) -> StoreResult<crate::models::Stats> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "STATS".to_string(),
+        })
+    }
 }
 
 /// v0.7.0 Wave-3 Continuation 3 (Phase 20) — action class threaded

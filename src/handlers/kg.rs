@@ -387,15 +387,57 @@ pub async fn entity_get_by_alias(
             .into_response();
     }
 
-    // v0.7.0 Wave-3 Continuation — postgres-backed daemons walk the
-    // namespace's `kind=entity` memories via the SAL `list` method
-    // and match against `metadata.aliases` client-side.
-    #[cfg(feature = "sal")]
+    // v0.7.0 ARCH-2 followup (FX-C2-batch3) — postgres-backed daemons
+    // route through `MemoryStore::entity_get_by_alias` first for an
+    // exact-alias match (the canonical resolution path). When the
+    // dedicated trait method returns `Ok(None)` we fall back to the
+    // legacy SAL `list` walk to preserve the `m.title.eq_ignore_ascii_case`
+    // fallback (alias-or-title match) and `metadata.aliases` array
+    // walk. Visibility filtering applies to the fallback path
+    // identically to pre-fix behaviour.
+    #[cfg(feature = "sal-postgres")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        // QC P1 fix (2026-05-20): use header-resolved caller so the
-        // SAL #910 visibility filter applies to the entity walk.
-        // Pre-fix the hardcoded `for_agent("daemon")` caller mismatched
-        // every entity memory's owner and dropped the entire list.
+        // 1. Trait-method exact-alias match — sqlx-native, single
+        //    indexed lookup against `entity_aliases`.
+        match app.store.entity_get_by_alias(alias, namespace).await {
+            Ok(Some(rec)) => {
+                // Apply the post-fix visibility mask: hide the entity
+                // if the caller cannot see the underlying memory row.
+                let caller = {
+                    let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+                    crate::identity::resolve_http_agent_id(None, header_agent_id)
+                        .unwrap_or_else(|_| format!("anonymous:req-{}", uuid::Uuid::new_v4()))
+                };
+                let caller_is_admin = crate::handlers::admin_role::is_admin_caller(&app, &caller);
+                let ctx_admin =
+                    crate::store::CallerContext::for_admin_checked(caller.clone(), caller_is_admin);
+                let visible = caller_is_admin
+                    || app
+                        .store
+                        .get(&ctx_admin, &rec.entity_id)
+                        .await
+                        .ok()
+                        .as_ref()
+                        .is_none_or(|m| crate::visibility::is_visible_to_caller(m, &caller));
+                if visible {
+                    return Json(json!({
+                        "found": true,
+                        "entity_id": rec.entity_id,
+                        "canonical_name": rec.canonical_name,
+                        "namespace": rec.namespace,
+                        "aliases": rec.aliases,
+                    }))
+                    .into_response();
+                }
+                // Fall through to fallback-walk shape on visibility mask
+                // — emits the `found:false` envelope below.
+            }
+            Ok(None) => { /* fall through to title-fallback walk */ }
+            Err(e) => return store_err_to_response(e),
+        }
+        // 2. Fallback walk: legacy SAL `list` so the title-eq-alias
+        //    branch and `metadata.aliases` array case-insensitive
+        //    match stay functional.
         let ctx = crate::handlers::parity::http_caller_ctx(&headers, None);
         let filter = crate::store::Filter {
             namespace: namespace.map(str::to_string),

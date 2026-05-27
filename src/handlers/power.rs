@@ -389,31 +389,18 @@ pub async fn list_namespaces(
     {
         return resp;
     }
-    // v0.7.0 Wave-3 Continuation — postgres-backed daemons aggregate the
-    // distinct namespaces from `memories` via the SAL `list` method.
+    // v0.7.0 ARCH-2 followup (FX-C2-batch3) — postgres-backed daemons
+    // now route through the dedicated `MemoryStore::list_namespaces`
+    // trait method (sqlx-native `GROUP BY namespace`) instead of
+    // fan-folding through a 1M-limit `list()` scan. The aggregate
+    // shape mirrors the SQLite `db::list_namespaces` result: namespace
+    // identifiers are structural metadata, not user data, so no #910
+    // visibility filter applies — same posture as the SQLite branch.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        // QC P1 follow-up (2026-05-20): namespace identifiers are
-        // structural metadata, not user data — same posture as
-        // `get_namespace_standard_qs` (which is also `for_admin`).
-        // Without bypass the SAL #910 visibility filter would gate
-        // every namespace name behind owner==caller and the list
-        // would only ever return the caller's own namespaces, which
-        // breaks the cert harness `namespaces_round_trip_via_sal`
-        // test and surfaces in production as a fragmented namespace
-        // catalog per-tenant.
-        let ctx = crate::store::CallerContext::for_admin("ai:http-internal");
-        let filter = crate::store::Filter {
-            limit: 1_000_000,
-            ..Default::default()
-        };
-        return match app.store.list(&ctx, &filter).await {
-            Ok(memories) => {
-                let mut ns: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-                for m in memories {
-                    ns.insert(m.namespace);
-                }
-                let v: Vec<String> = ns.into_iter().collect();
+        return match app.store.list_namespaces().await {
+            Ok(rows) => {
+                let v: Vec<String> = rows.into_iter().map(|r| r.namespace).collect();
                 Json(json!({"namespaces": v})).into_response()
             }
             Err(e) => store_err_to_response(e),
@@ -491,15 +478,46 @@ pub async fn get_taxonomy(
         .min(crate::models::MAX_NAMESPACE_DEPTH);
     let limit = p.limit.unwrap_or(1000).clamp(1, 10_000);
 
-    // v0.7.0 Wave-3 Continuation 4 (Bucket E / S44) — full hierarchical
-    // taxonomy walk for postgres-backed daemons. Uses
-    // `taxonomy_namespaces_via_store` to project a single `GROUP BY
-    // namespace` aggregate (so we don't pull every memory row into
-    // memory), then assembles the hierarchical tree with honest
-    // `subtree_count` so the cert oracle can detect dishonest
-    // truncation.
+    // v0.7.0 ARCH-2 followup (FX-C2-batch3) — postgres-backed daemons
+    // now route taxonomy reads through `MemoryStore::get_taxonomy`.
+    // The new trait method shares its tree-folding logic with the
+    // SQLite path via `crate::storage::fold_taxonomy_groups`, so the
+    // wire shape is byte-equal across backends. We keep a
+    // `storage_backend: "postgres"` field on the response so the cert
+    // oracle can still distinguish backend provenance from a single
+    // capture.
     #[cfg(feature = "sal-postgres")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
+        return match app
+            .store
+            .get_taxonomy(prefix_owned.as_deref(), depth, limit)
+            .await
+        {
+            Ok(tax) => Json(json!({
+                "tree": tax.tree,
+                "total_count": tax.total_count,
+                "truncated": tax.truncated,
+                "storage_backend": "postgres",
+            }))
+            .into_response(),
+            Err(e) => store_err_to_response(e),
+        };
+    }
+
+    // Legacy postgres branch (pre-FX-C2-batch3): assembled the tree
+    // in-handler from a `(namespace, count)` pair list returned by
+    // `taxonomy_namespaces_via_store`. Now superseded by the SAL trait
+    // route above; the body is preserved as a debug-only fallback path
+    // (`AI_MEMORY_TAXONOMY_LEGACY_PG=1`) so operators can A/B the two
+    // assemblers if they suspect divergence. Without the env var set
+    // the branch never fires.
+    #[cfg(feature = "sal-postgres")]
+    if matches!(app.storage_backend, StorageBackend::Postgres)
+        && std::env::var("AI_MEMORY_TAXONOMY_LEGACY_PG")
+            .ok()
+            .as_deref()
+            == Some("1")
+    {
         let pairs = match crate::store::postgres::taxonomy_namespaces_via_store(
             &app.store,
             prefix_owned.as_deref(),

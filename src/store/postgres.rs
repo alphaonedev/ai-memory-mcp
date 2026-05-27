@@ -10191,6 +10191,448 @@ impl MemoryStore for PostgresStore {
         }
         Ok(filtered)
     }
+
+    // ----- v0.7.0 ARCH-2 followup (FX-C2-batch3) read-only impls --------
+    //
+    // sqlx-native equivalents of the legacy `db::*` free-functions.
+    // Wire shape pinned byte-for-byte against the SQLite adapter by the
+    // `sqlite_postgres_parity_*` tests in this file (gated on
+    // `AI_MEMORY_TEST_POSTGRES_URL`).
+
+    async fn list_namespaces(&self) -> StoreResult<Vec<crate::models::NamespaceCount>> {
+        let now_dt = Utc::now();
+        let rows = sqlx::query(
+            "SELECT namespace, COUNT(*)::BIGINT AS c FROM memories
+             WHERE expires_at IS NULL OR expires_at > $1
+             GROUP BY namespace
+             ORDER BY c DESC, namespace ASC",
+        )
+        .bind(now_dt)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| to_store_err("list_namespaces", e))?;
+
+        rows.iter()
+            .map(|r| {
+                let namespace: String = r
+                    .try_get::<String, _>("namespace")
+                    .map_err(|e| to_store_err("read namespace", e))?;
+                let c: i64 = r
+                    .try_get::<i64, _>("c")
+                    .map_err(|e| to_store_err("read count", e))?;
+                Ok(crate::models::NamespaceCount {
+                    namespace,
+                    count: usize::try_from(c).unwrap_or(0),
+                })
+            })
+            .collect()
+    }
+
+    async fn get_taxonomy(
+        &self,
+        namespace_prefix: Option<&str>,
+        max_depth: usize,
+        limit: usize,
+    ) -> StoreResult<crate::models::Taxonomy> {
+        // Mirror the SQLite adapter's clamp semantics so callers see the
+        // same `truncated` behavior across backends.
+        const TAXONOMY_MAX_LIMIT: usize = 10_000;
+        let effective_limit = limit.min(TAXONOMY_MAX_LIMIT);
+        let effective_depth = max_depth.min(crate::models::MAX_NAMESPACE_DEPTH);
+        let prefix = namespace_prefix.unwrap_or("");
+        let now_dt = Utc::now();
+
+        // Total count is computed independently of the row-walk so the
+        // caller-observable `total_count` stays honest under truncation.
+        let total_count: i64 = if prefix.is_empty() {
+            sqlx::query_scalar(
+                "SELECT COUNT(*)::BIGINT FROM memories
+                 WHERE expires_at IS NULL OR expires_at > $1",
+            )
+            .bind(now_dt)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| to_store_err("get_taxonomy total", e))?
+        } else {
+            sqlx::query_scalar(
+                "SELECT COUNT(*)::BIGINT FROM memories
+                 WHERE (expires_at IS NULL OR expires_at > $1)
+                   AND (namespace = $2 OR namespace LIKE $2 || '/%')",
+            )
+            .bind(now_dt)
+            .bind(prefix)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| to_store_err("get_taxonomy prefix total", e))?
+        };
+
+        let limit_i64: i64 = i64::try_from(effective_limit).unwrap_or(i64::MAX);
+        let groups: Vec<(String, i64)> = if prefix.is_empty() {
+            sqlx::query_as(
+                "SELECT namespace, COUNT(*)::BIGINT FROM memories
+                 WHERE expires_at IS NULL OR expires_at > $1
+                 GROUP BY namespace
+                 ORDER BY COUNT(*) DESC, namespace ASC
+                 LIMIT $2",
+            )
+            .bind(now_dt)
+            .bind(limit_i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| to_store_err("get_taxonomy groups", e))?
+        } else {
+            sqlx::query_as(
+                "SELECT namespace, COUNT(*)::BIGINT FROM memories
+                 WHERE (expires_at IS NULL OR expires_at > $1)
+                   AND (namespace = $2 OR namespace LIKE $2 || '/%')
+                 GROUP BY namespace
+                 ORDER BY COUNT(*) DESC, namespace ASC
+                 LIMIT $3",
+            )
+            .bind(now_dt)
+            .bind(prefix)
+            .bind(limit_i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| to_store_err("get_taxonomy prefix groups", e))?
+        };
+
+        // Re-use the SQLite adapter's tree-folding logic; it operates
+        // purely on the `(namespace, count)` rows so it's backend-blind.
+        // Truncation flag mirrors SQLite: walked sum < total iff the
+        // LIMIT chopped some rows out.
+        let total_usize = usize::try_from(total_count).unwrap_or(0);
+        let group_rows: Vec<(String, usize)> = groups
+            .into_iter()
+            .map(|(ns, c)| (ns, usize::try_from(c).unwrap_or(0)))
+            .collect();
+        let walked_count: usize = group_rows.iter().map(|(_, c)| *c).sum();
+        let truncated = walked_count < total_usize;
+        // `effective_limit` is referenced here for symmetry with the
+        // SQLite path's clamp; the actual SQL `LIMIT` already enforces
+        // it. Bind to `_` to keep clippy from flagging the unused
+        // local while preserving the doc-binding for future debugging.
+        let _ = effective_limit;
+        Ok(crate::storage::fold_taxonomy_groups(
+            prefix,
+            effective_depth,
+            total_usize,
+            truncated,
+            group_rows,
+        ))
+    }
+
+    async fn list_agents(&self) -> StoreResult<Vec<AgentRegistration>> {
+        use crate::models::AGENTS_NAMESPACE;
+        let now_dt = Utc::now();
+        let rows = sqlx::query(
+            "SELECT metadata FROM memories
+             WHERE namespace = $1
+               AND (expires_at IS NULL OR expires_at > $2)
+             ORDER BY (metadata->>'registered_at') ASC NULLS LAST",
+        )
+        .bind(AGENTS_NAMESPACE)
+        .bind(now_dt)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| to_store_err("list_agents", e))?;
+
+        let mut agents = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let meta: serde_json::Value = r
+                .try_get::<serde_json::Value, _>("metadata")
+                .map_err(|e| to_store_err("read agent metadata", e))?;
+            let agent_id = meta
+                .get("agent_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let agent_type = meta
+                .get("agent_type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let capabilities: Vec<String> = meta
+                .get("capabilities")
+                .and_then(serde_json::Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let registered_at = meta
+                .get("registered_at")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let last_seen_at = meta
+                .get("last_seen_at")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            agents.push(AgentRegistration {
+                agent_id,
+                agent_type,
+                capabilities,
+                registered_at,
+                last_seen_at,
+            });
+        }
+        Ok(agents)
+    }
+
+    async fn list_pending_actions(
+        &self,
+        status: Option<&str>,
+        limit: usize,
+    ) -> StoreResult<Vec<crate::models::PendingAction>> {
+        let limit_i64: i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = sqlx::query(
+            "SELECT id, action_type, memory_id, namespace, payload, requested_by,
+                    requested_at, status, decided_by, decided_at, approvals
+             FROM pending_actions
+             WHERE ($1::TEXT IS NULL OR status = $1)
+             ORDER BY requested_at DESC
+             LIMIT $2",
+        )
+        .bind(status)
+        .bind(limit_i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| to_store_err("list_pending_actions", e))?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let requested_at: DateTime<Utc> = r
+                .try_get("requested_at")
+                .map_err(|e| to_store_err("read requested_at", e))?;
+            let decided_at: Option<DateTime<Utc>> = r
+                .try_get("decided_at")
+                .map_err(|e| to_store_err("read decided_at", e))?;
+            let approvals_v: serde_json::Value = r
+                .try_get("approvals")
+                .unwrap_or(serde_json::Value::Array(vec![]));
+            let approvals: Vec<crate::models::Approval> =
+                serde_json::from_value(approvals_v).unwrap_or_default();
+            out.push(crate::models::PendingAction {
+                id: r
+                    .try_get::<String, _>("id")
+                    .map_err(|e| to_store_err("read id", e))?,
+                action_type: r
+                    .try_get::<String, _>("action_type")
+                    .map_err(|e| to_store_err("read action_type", e))?,
+                memory_id: r.try_get::<Option<String>, _>("memory_id").unwrap_or(None),
+                namespace: r
+                    .try_get::<String, _>("namespace")
+                    .map_err(|e| to_store_err("read namespace", e))?,
+                payload: r
+                    .try_get::<serde_json::Value, _>("payload")
+                    .unwrap_or(serde_json::Value::Null),
+                requested_by: r
+                    .try_get::<String, _>("requested_by")
+                    .map_err(|e| to_store_err("read requested_by", e))?,
+                requested_at: requested_at.to_rfc3339(),
+                status: r
+                    .try_get::<String, _>("status")
+                    .map_err(|e| to_store_err("read status", e))?,
+                decided_by: r.try_get::<Option<String>, _>("decided_by").unwrap_or(None),
+                decided_at: decided_at.map(|d| d.to_rfc3339()),
+                approvals,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn entity_get_by_alias(
+        &self,
+        alias: &str,
+        namespace: Option<&str>,
+    ) -> StoreResult<Option<crate::models::EntityRecord>> {
+        use crate::models::{ENTITY_KIND, EntityRecord};
+        let trimmed = alias.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+
+        let row = if let Some(ns) = namespace {
+            sqlx::query(
+                "SELECT m.id, m.title, m.namespace
+                 FROM entity_aliases ea
+                 JOIN memories m ON m.id = ea.entity_id
+                 WHERE ea.alias = $1
+                   AND m.namespace = $2
+                   AND COALESCE(m.metadata->>'kind', '') = $3
+                 ORDER BY m.created_at DESC
+                 LIMIT 1",
+            )
+            .bind(trimmed)
+            .bind(ns)
+            .bind(ENTITY_KIND)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| to_store_err("entity_get_by_alias ns", e))?
+        } else {
+            sqlx::query(
+                "SELECT m.id, m.title, m.namespace
+                 FROM entity_aliases ea
+                 JOIN memories m ON m.id = ea.entity_id
+                 WHERE ea.alias = $1
+                   AND COALESCE(m.metadata->>'kind', '') = $2
+                 ORDER BY m.created_at DESC
+                 LIMIT 1",
+            )
+            .bind(trimmed)
+            .bind(ENTITY_KIND)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| to_store_err("entity_get_by_alias", e))?
+        };
+
+        let Some(r) = row else {
+            return Ok(None);
+        };
+        let entity_id: String = r
+            .try_get::<String, _>("id")
+            .map_err(|e| to_store_err("read entity id", e))?;
+        let canonical_name: String = r
+            .try_get::<String, _>("title")
+            .map_err(|e| to_store_err("read entity title", e))?;
+        let ns_resolved: String = r
+            .try_get::<String, _>("namespace")
+            .map_err(|e| to_store_err("read entity namespace", e))?;
+
+        let alias_rows =
+            sqlx::query("SELECT alias FROM entity_aliases WHERE entity_id = $1 ORDER BY alias")
+                .bind(&entity_id)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| to_store_err("list aliases for entity", e))?;
+        let aliases: Vec<String> = alias_rows
+            .iter()
+            .filter_map(|r| r.try_get::<String, _>("alias").ok())
+            .collect();
+
+        Ok(Some(EntityRecord {
+            entity_id,
+            canonical_name,
+            namespace: ns_resolved,
+            aliases,
+        }))
+    }
+
+    async fn health_check(&self) -> StoreResult<bool> {
+        // Postgres equivalent of SQLite's FTS integrity probe: a cheap
+        // SELECT against the memories table plus a SELECT 1 round-trip
+        // so connection-pool / network-layer failures surface.
+        let _: i64 = sqlx::query_scalar("SELECT COUNT(*)::BIGINT FROM memories")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| to_store_err("health_check count", e))?;
+        let one: i32 = sqlx::query_scalar("SELECT 1")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| to_store_err("health_check ping", e))?;
+        Ok(one == 1)
+    }
+
+    async fn stats(&self) -> StoreResult<crate::models::Stats> {
+        // Mirrors the SQLite adapter's `db::stats` shape; postgres has
+        // no on-disk file path so `db_size_bytes` reports the size of
+        // the `memories` table via pg_total_relation_size — best-effort
+        // (returns 0 if the function call errors so stats stays callable
+        // for least-privileged Postgres users).
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*)::BIGINT FROM memories")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| to_store_err("stats total", e))?;
+        let total_usize = usize::try_from(total).unwrap_or(0);
+
+        let tier_rows = sqlx::query(
+            "SELECT tier, COUNT(*)::BIGINT AS c FROM memories
+             GROUP BY tier ORDER BY c DESC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| to_store_err("stats by_tier", e))?;
+        let by_tier: Vec<crate::models::TierCount> = tier_rows
+            .iter()
+            .map(|r| {
+                let tier: String = r
+                    .try_get::<String, _>("tier")
+                    .map_err(|e| to_store_err("read tier", e))?;
+                let c: i64 = r
+                    .try_get::<i64, _>("c")
+                    .map_err(|e| to_store_err("read tier count", e))?;
+                Ok(crate::models::TierCount {
+                    tier,
+                    count: usize::try_from(c).unwrap_or(0),
+                })
+            })
+            .collect::<StoreResult<Vec<_>>>()?;
+
+        let ns_rows = sqlx::query(
+            "SELECT namespace, COUNT(*)::BIGINT AS c FROM memories
+             GROUP BY namespace ORDER BY c DESC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| to_store_err("stats by_namespace", e))?;
+        let by_namespace: Vec<crate::models::NamespaceCount> = ns_rows
+            .iter()
+            .map(|r| {
+                let namespace: String = r
+                    .try_get::<String, _>("namespace")
+                    .map_err(|e| to_store_err("read namespace", e))?;
+                let c: i64 = r
+                    .try_get::<i64, _>("c")
+                    .map_err(|e| to_store_err("read namespace count", e))?;
+                Ok(crate::models::NamespaceCount {
+                    namespace,
+                    count: usize::try_from(c).unwrap_or(0),
+                })
+            })
+            .collect::<StoreResult<Vec<_>>>()?;
+
+        let now_dt = Utc::now();
+        let one_hour = now_dt + chrono::Duration::hours(1);
+        let expiring_soon: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::BIGINT FROM memories
+             WHERE expires_at IS NOT NULL AND expires_at > $1 AND expires_at <= $2",
+        )
+        .bind(now_dt)
+        .bind(one_hour)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| to_store_err("stats expiring_soon", e))?;
+
+        let links_count: i64 = sqlx::query_scalar("SELECT COUNT(*)::BIGINT FROM memory_links")
+            .fetch_one(&self.pool)
+            .await
+            .unwrap_or(0);
+
+        // Best-effort table size — least-privileged Postgres users may
+        // lack EXECUTE on pg_total_relation_size; tolerate failure so
+        // the stats endpoint stays callable.
+        let db_size_bytes: i64 =
+            sqlx::query_scalar("SELECT COALESCE(pg_total_relation_size('memories'), 0)::BIGINT")
+                .fetch_one(&self.pool)
+                .await
+                .unwrap_or(0);
+
+        Ok(crate::models::Stats {
+            total: total_usize,
+            by_tier,
+            by_namespace,
+            expiring_soon: usize::try_from(expiring_soon).unwrap_or(0),
+            links_count: usize::try_from(links_count).unwrap_or(0),
+            db_size_bytes: u64::try_from(db_size_bytes).unwrap_or(0),
+            // Dim violations + HNSW evictions are sqlite-only concepts;
+            // postgres uses pgvector indexes which don't expose either.
+            dim_violations: 0,
+            index_evictions_total: 0,
+        })
+    }
 }
 
 /// v0.7.0 Continuation 6 — adapter row-to-`QuotaStatus` projection.
@@ -12843,5 +13285,239 @@ mod tests {
         );
         assert_eq!(row.observed_by.as_deref(), Some("ai:tester@host"));
         assert_eq!(row.attest_level.as_deref(), Some("unsigned"));
+    }
+
+    // ============================================================
+    // FX-C2-batch3 — Postgres live parity for read-only trait
+    // additions (list_namespaces, get_taxonomy, list_agents,
+    // list_pending_actions, entity_get_by_alias, health_check,
+    // stats). Gated on AI_MEMORY_TEST_POSTGRES_URL.
+    // ============================================================
+
+    #[tokio::test]
+    async fn live_list_namespaces_groups_by_count() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns_alpha = format!("fxc2-ns-alpha-{unique}");
+        let ns_beta = format!("fxc2-ns-beta-{unique}");
+        for i in 0..3 {
+            let id = format!("a-{i}-{unique}");
+            let mem = sample_memory(&id, &ns_alpha, &format!("t-{i}"), "body content");
+            store.store(&ctx, &mem).await.expect("store alpha");
+        }
+        let mem = sample_memory(&format!("b-{unique}"), &ns_beta, "tb", "beta body content");
+        store.store(&ctx, &mem).await.expect("store beta");
+        let rows = store.list_namespaces().await.expect("list_namespaces");
+        let alpha = rows
+            .iter()
+            .find(|r| r.namespace == ns_alpha)
+            .expect("alpha namespace");
+        let beta = rows
+            .iter()
+            .find(|r| r.namespace == ns_beta)
+            .expect("beta namespace");
+        assert_eq!(alpha.count, 3);
+        assert_eq!(beta.count, 1);
+    }
+
+    #[tokio::test]
+    async fn live_get_taxonomy_assembles_hierarchical_tree() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let root = format!("fxc2-tax-{unique}");
+        let team = format!("{root}/team");
+        let secrets = format!("{root}/team/secrets");
+        let mem_root = sample_memory(&format!("root-{unique}"), &root, "rt", "root body content");
+        store.store(&ctx, &mem_root).await.expect("store root");
+        for i in 0..2 {
+            let mem = sample_memory(
+                &format!("team-{i}-{unique}"),
+                &team,
+                &format!("t-{i}"),
+                "team body content",
+            );
+            store.store(&ctx, &mem).await.expect("store team");
+        }
+        let mem_sec = sample_memory(
+            &format!("sec-{unique}"),
+            &secrets,
+            "ss",
+            "secrets body content",
+        );
+        store.store(&ctx, &mem_sec).await.expect("store secrets");
+
+        let tax = store
+            .get_taxonomy(Some(&root), 8, 100)
+            .await
+            .expect("get_taxonomy");
+        assert_eq!(tax.total_count, 4, "1 root + 2 team + 1 secrets = 4");
+        assert_eq!(tax.tree.namespace, root);
+        assert_eq!(tax.tree.subtree_count, 4);
+        assert!(!tax.truncated);
+    }
+
+    #[tokio::test]
+    async fn live_list_agents_roundtrip() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("daemon");
+        let unique = uuid::Uuid::new_v4();
+        let agent_id = format!("ai:fxc2-tester-{unique}");
+        let agent = AgentRegistration {
+            agent_id: agent_id.clone(),
+            agent_type: "test".to_string(),
+            capabilities: vec!["recall".to_string()],
+            registered_at: String::new(),
+            last_seen_at: String::new(),
+        };
+        store
+            .register_agent(&ctx, &agent)
+            .await
+            .expect("register_agent");
+        let listed = store.list_agents().await.expect("list_agents");
+        assert!(
+            listed.iter().any(|r| r.agent_id == agent_id),
+            "registered agent must surface in list_agents"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_list_pending_actions_returns_seeded_row() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("fxc2-pa-{unique}");
+        let pid = format!("pa-{unique}");
+        // Seed a single pending row directly into the table.
+        sqlx::query(
+            "INSERT INTO pending_actions
+                 (id, action_type, memory_id, namespace, payload, requested_by,
+                  requested_at, status, approvals)
+             VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7, $8)",
+        )
+        .bind(&pid)
+        .bind("Store")
+        .bind(None::<String>)
+        .bind(&ns)
+        .bind(serde_json::json!({"title":"t","content":"c"}))
+        .bind("alice")
+        .bind("pending")
+        .bind(serde_json::json!([]))
+        .execute(&store.pool)
+        .await
+        .expect("seed pending_actions row");
+
+        let rows =
+            <PostgresStore as MemoryStore>::list_pending_actions(&store, Some("pending"), 100)
+                .await
+                .expect("list_pending_actions");
+        let row = rows
+            .iter()
+            .find(|r| r.id == pid)
+            .expect("seeded pending row must surface");
+        assert_eq!(row.namespace, ns);
+        assert_eq!(row.status, "pending");
+        assert_eq!(row.requested_by, "alice");
+    }
+
+    #[tokio::test]
+    async fn live_entity_get_by_alias_resolves_canonical_record() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("fxc2-ent-{unique}");
+        let entity_id = format!("ent-{unique}");
+        let mut mem = sample_memory(
+            &entity_id,
+            &ns,
+            &format!("alphaone-co-{unique}"),
+            "entity row body",
+        );
+        mem.metadata = serde_json::json!({
+            "kind": "entity",
+            "agent_id": "ai:sal-test",
+        });
+        store.store(&ctx, &mem).await.expect("store entity");
+        let alias = format!("AlphaOne-{unique}");
+        // Postgres `entity_aliases` is (entity_id, alias, created_at);
+        // namespace is resolved via JOIN with `memories`.
+        sqlx::query("INSERT INTO entity_aliases (entity_id, alias) VALUES ($1, $2)")
+            .bind(&entity_id)
+            .bind(&alias)
+            .execute(&store.pool)
+            .await
+            .expect("insert alias");
+
+        let rec = store
+            .entity_get_by_alias(&alias, Some(&ns))
+            .await
+            .expect("entity_get_by_alias");
+        let rec = rec.expect("entity must resolve");
+        assert_eq!(rec.entity_id, entity_id);
+        assert_eq!(rec.namespace, ns);
+        assert!(rec.aliases.iter().any(|a| a == &alias));
+    }
+
+    #[tokio::test]
+    async fn live_health_check_returns_true() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ok = store.health_check().await.expect("health_check");
+        assert!(ok);
+    }
+
+    #[tokio::test]
+    async fn live_stats_projects_full_shape() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("fxc2-stats-{unique}");
+        for i in 0..2 {
+            let mem = sample_memory(
+                &format!("stats-{i}-{unique}"),
+                &ns,
+                &format!("t-{i}"),
+                "stats body content",
+            );
+            store.store(&ctx, &mem).await.expect("store");
+        }
+        let s = store.stats().await.expect("stats");
+        let ns_row = s
+            .by_namespace
+            .iter()
+            .find(|r| r.namespace == ns)
+            .expect("ns must surface in stats");
+        assert_eq!(ns_row.count, 2);
+        assert!(s.total >= 2, "stats.total must include seeded rows");
+        // db_size_bytes is best-effort on postgres; assert non-negative
+        // shape — we already enforce non-negative via u64::try_from.
+        let _ = s.db_size_bytes;
     }
 }
