@@ -261,21 +261,32 @@ pub mod store;
 // ---------------------------------------------------------------------------
 // Router construction
 // ---------------------------------------------------------------------------
-//
-// `build_router` is the single source of truth for the daemon's HTTP route
-// table. It is exposed through the lib crate so the integration test suite
-// can construct an in-process `axum::Router` and exercise endpoints via
-// `Router::oneshot()` instead of spawning a subprocess + curl, which:
-//   1. eliminates the OS-level daemon-spawn overhead per test (~200-500ms),
-//   2. exposes the routes' line coverage to `cargo llvm-cov` (subprocess
-//      coverage attribution requires extra `LLVM_PROFILE_FILE` plumbing
-//      that the test harness doesn't provide), and
-//   3. lets test failures surface assertion-level diagnostics instead of
-//      "curl returned 000" black holes.
-//
-// The function takes the same two state values that `serve()` constructs
-// inline (the API key middleware state and the composite app state) so
-// the production binary and the test harness share a single route map.
+
+/// Build the daemon's HTTP `axum::Router` from the API-key middleware
+/// state and the composite app state.
+///
+/// This is the single source of truth for the daemon's HTTP route
+/// table (87 production routes / 73 unique URL paths at v0.7.0). It is
+/// exposed through the lib crate so the integration test suite can
+/// construct an in-process `axum::Router` and exercise endpoints via
+/// `Router::oneshot()` instead of spawning a subprocess + curl, which:
+///
+/// 1. eliminates the OS-level daemon-spawn overhead per test
+///    (~200-500ms),
+/// 2. exposes the routes' line coverage to `cargo llvm-cov` (subprocess
+///    coverage attribution requires extra `LLVM_PROFILE_FILE` plumbing
+///    that the test harness doesn't provide), and
+/// 3. lets test failures surface assertion-level diagnostics instead
+///    of "curl returned 000" black holes.
+///
+/// The function takes the same two state values that `serve()`
+/// constructs inline so the production binary and the test harness
+/// share a single route map.
+///
+/// DOC-5 (med/low review batch) — promoted from the pre-existing `//`
+/// banner so the doc-comment attaches to the symbol (cargo-doc + IDE
+/// surfaces) and is symmetric with the sibling
+/// [`build_router_with_timeout`].
 pub fn build_router(
     api_key_state: handlers::ApiKeyState,
     app_state: handlers::AppState,
