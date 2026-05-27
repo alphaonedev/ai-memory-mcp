@@ -443,6 +443,60 @@ pub enum Command {
     /// Reconstruct the conversation transcript chain that produced a
     /// memory. CLI parity for `memory_replay`.
     Replay(crate::cli::commands::replay::ReplayArgs),
+    /// v0.7.0 ARCH-3 / FX-C3 (batch2) — `ai-memory reflect`. CLI
+    /// parity for `memory_reflect`. CLI dispatcher uses
+    /// `active_keypair=None` / `embedder=None`; operators who need
+    /// signing or LLM dedup drive the daemon via MCP / HTTP.
+    Reflect(crate::cli::commands::reflect::ReflectArgs),
+    /// v0.7.0 ARCH-3 / FX-C3 (batch2) — `ai-memory subscribe`. CLI
+    /// parity for `memory_subscribe`.
+    Subscribe(crate::cli::commands::subscribe::SubscribeArgs),
+    /// v0.7.0 ARCH-3 / FX-C3 (batch2) — `ai-memory unsubscribe`. CLI
+    /// parity for `memory_unsubscribe`.
+    Unsubscribe(crate::cli::commands::unsubscribe::UnsubscribeArgs),
+    /// v0.7.0 ARCH-3 / FX-C3 (batch2) — `ai-memory list-subscriptions`.
+    /// CLI parity for `memory_list_subscriptions`.
+    ListSubscriptions(crate::cli::commands::list_subscriptions::ListSubscriptionsArgs),
+    /// v0.7.0 ARCH-3 / FX-C3 (batch2) — `ai-memory subscription-replay`.
+    /// CLI parity for `memory_subscription_replay`.
+    SubscriptionReplay(crate::cli::commands::subscription_replay::SubscriptionReplayArgs),
+    /// v0.7.0 ARCH-3 / FX-C3 (batch2) — `ai-memory subscription-dlq-list`.
+    /// CLI parity for `memory_subscription_dlq_list`.
+    SubscriptionDlqList(crate::cli::commands::subscription_dlq_list::SubscriptionDlqListArgs),
+    /// v0.7.0 ARCH-3 / FX-C3 (batch2) — `ai-memory notify`. CLI
+    /// parity for `memory_notify`.
+    Notify(crate::cli::commands::notify::NotifyArgs),
+    /// v0.7.0 ARCH-3 / FX-C3 (batch2) — `ai-memory inbox`. CLI
+    /// parity for `memory_inbox`.
+    Inbox(crate::cli::commands::inbox::InboxArgs),
+    /// v0.7.0 ARCH-3 / FX-C3 (batch2) — `ai-memory ingest-multistep`.
+    /// CLI parity for `memory_ingest_multistep`. CLI dispatcher passes
+    /// `handler=None`; tier-locked advisory returns on every tier
+    /// because the CLI does not own the LLM dispatch.
+    IngestMultistep(crate::cli::commands::ingest_multistep::IngestMultistepArgs),
+    /// v0.7.0 ARCH-3 / FX-C3 (batch2) — `ai-memory kg-invalidate`.
+    /// CLI parity for `memory_kg_invalidate`.
+    KgInvalidate(crate::cli::commands::kg_invalidate::KgInvalidateArgs),
+    /// v0.7.0 ARCH-3 / FX-C3 (batch2) — `ai-memory kg-timeline`. CLI
+    /// parity for `memory_kg_timeline`.
+    KgTimeline(crate::cli::commands::kg_timeline::KgTimelineArgs),
+    /// v0.7.0 ARCH-3 / FX-C3 (batch2) — `ai-memory entity-register`.
+    /// CLI parity for `memory_entity_register`.
+    EntityRegister(crate::cli::commands::entity_register::EntityRegisterArgs),
+    /// v0.7.0 ARCH-3 / FX-C3 (batch2) — `ai-memory entity-get-by-alias`.
+    /// CLI parity for `memory_entity_get_by_alias`.
+    EntityGetByAlias(crate::cli::commands::entity_get_by_alias::EntityGetByAliasArgs),
+    /// v0.7.0 ARCH-3 / FX-C3 (batch2) — `ai-memory dependents-of-invalidated`.
+    /// CLI parity for `memory_dependents_of_invalidated`.
+    DependentsOfInvalidated(
+        crate::cli::commands::dependents_of_invalidated::DependentsOfInvalidatedArgs,
+    ),
+    /// v0.7.0 ARCH-3 / FX-C3 (batch2) — `ai-memory reflection-origin`.
+    /// CLI parity for `memory_reflection_origin`.
+    ReflectionOrigin(crate::cli::commands::reflection_origin::ReflectionOriginArgs),
+    /// v0.7.0 ARCH-3 / FX-C3 (batch2) — `ai-memory quota-status`. CLI
+    /// parity for `memory_quota_status`.
+    QuotaStatus(crate::cli::commands::quota_status::QuotaStatusArgs),
 }
 
 /// `ai-memory governance` parent argument struct.
@@ -1490,6 +1544,142 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::commands::replay::cmd_replay(&db_path, &a, &mut out)
         }
+        // v0.7.0 ARCH-3 / FX-C3 (batch2) — 16 additional CLI parity
+        // dispatch arms. Each wraps the same substrate primitive the
+        // MCP tool consumes; wire envelope is byte-equal across MCP /
+        // HTTP / CLI. See
+        // `docs/v0.7.0/arch-3-mcp-cli-parity-audit.md` §"Added in
+        // fix/arch3-mcp-cli-parity-batch2".
+        Command::Reflect(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::commands::reflect::cmd_reflect(&db_path, &a, &mut out)
+        }
+        Command::Subscribe(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::commands::subscribe::cmd_subscribe(&db_path, &a, &mut out)
+        }
+        Command::Unsubscribe(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::commands::unsubscribe::cmd_unsubscribe(&db_path, &a, &mut out)
+        }
+        Command::ListSubscriptions(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::commands::list_subscriptions::cmd_list_subscriptions(&db_path, &a, &mut out)
+        }
+        Command::SubscriptionReplay(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::commands::subscription_replay::cmd_subscription_replay(&db_path, &a, &mut out)
+        }
+        Command::SubscriptionDlqList(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::commands::subscription_dlq_list::cmd_subscription_dlq_list(&db_path, &a, &mut out)
+        }
+        Command::Notify(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::commands::notify::cmd_notify(&db_path, &a, app_config, &mut out)
+        }
+        Command::Inbox(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::commands::inbox::cmd_inbox(&db_path, &a, &mut out)
+        }
+        Command::IngestMultistep(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::commands::ingest_multistep::cmd_ingest_multistep(&a, app_config, &mut out)
+        }
+        Command::KgInvalidate(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::commands::kg_invalidate::cmd_kg_invalidate(&db_path, &a, &mut out)
+        }
+        Command::KgTimeline(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::commands::kg_timeline::cmd_kg_timeline(&db_path, &a, &mut out)
+        }
+        Command::EntityRegister(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::commands::entity_register::cmd_entity_register(&db_path, &a, &mut out)
+        }
+        Command::EntityGetByAlias(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::commands::entity_get_by_alias::cmd_entity_get_by_alias(&db_path, &a, &mut out)
+        }
+        Command::DependentsOfInvalidated(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::commands::dependents_of_invalidated::cmd_dependents_of_invalidated(
+                &db_path, &a, &mut out,
+            )
+        }
+        Command::ReflectionOrigin(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::commands::reflection_origin::cmd_reflection_origin(&db_path, &a, &mut out)
+        }
+        Command::QuotaStatus(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::commands::quota_status::cmd_quota_status(&db_path, &a, &mut out)
+        }
     };
 
     // WAL checkpoint after write commands to prevent unbounded WAL growth
@@ -1544,6 +1734,19 @@ pub fn is_write_command(cmd: &Command) -> bool {
             // recipient agent's `_shared/<from>→<to>/` namespace, so
             // it must trip the post-run WAL checkpoint.
             | Command::Share(_)
+            // v0.7.0 ARCH-3 / FX-C3 (batch2) — write-class verbs in
+            // the new parity batch. The reads (list-subscriptions /
+            // subscription-replay / subscription-dlq-list / inbox /
+            // kg-timeline / entity-get-by-alias / dependents-of-
+            // invalidated / reflection-origin / quota-status) are
+            // omitted from this list.
+            | Command::Reflect(_)
+            | Command::Subscribe(_)
+            | Command::Unsubscribe(_)
+            | Command::Notify(_)
+            | Command::IngestMultistep(_)
+            | Command::KgInvalidate(_)
+            | Command::EntityRegister(_)
     )
 }
 

@@ -54,10 +54,7 @@ impl McpTool for KgTimelineTool {
     }
 }
 
-pub(super) fn handle_kg_timeline(
-    conn: &rusqlite::Connection,
-    params: &Value,
-) -> Result<Value, String> {
+pub fn handle_kg_timeline(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
     let source_id = params["source_id"]
         .as_str()
         .ok_or("source_id is required")?;
