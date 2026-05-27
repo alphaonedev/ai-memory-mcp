@@ -109,6 +109,19 @@ The substrate enforces that no cognition's account of its own actions is accepte
 
 **Open structural gap (deferred per operator):** the substrate must be able to *verify* that producer and reflector are from decorrelated cognitive families. Today this is policy (the deployment config names which model is producer and which is reflector). At ASI scale this has to be architecture — cryptographic verification of model lineage, training data overlap bounds, RLHF family distance, or some richer family-attestation mechanism that does not yet exist. **The roadmap does not yet name how this becomes structural.** This is the single largest gap surfaced by the moonshot synthesis. Tracked for follow-up discussion before commitment.
 
+#### 2.6.1 Substrate-level invariants pinning §2.6 (FX-9 / ARCH-4)
+
+Pre-FX-9 the §2.6 principle was documentation-only — a load-bearing alignment claim with no mechanical pin. ARCH-4 surfaced this as drift risk: a property held by operator discipline rather than by architecture will erode over time as the substrate evolves. The closeout adds four substrate-level invariants — each a deterministic, mechanical test — that pin the *substrate-side preconditions* for §2.6 to hold in practice. The reflector-side gap (cryptographic family-attestation, §6) remains explicitly deferred.
+
+| # | Invariant | What it pins |
+|---|---|---|
+| 1 | Recall determinism over identical memory set + query | The substrate's "view of itself" must not vary on identical inputs. Without this, there is no stable production for a reflector to reflect, and the producer × reflector composition is meaningless. |
+| 2 | Confidence-source attribution preservation across every `ConfidenceSource` variant | The audit trail must honestly report the provenance of every confidence score. Mis-attribution collapses the §2.6 composition: a reflector cannot tell whose bias a number reflects. |
+| 3 | V-4 cross-row hash chain coverage for substrate-attested writes (link writes) | Bias-displacement audit requires that every substrate claim is cryptographically anchored. The V-4 chain is the substrate's tamper-evidence; a reflector can only meaningfully reflect on actions anchored to an immutable chain it can independently verify. |
+| 4 | **Recall blindness to `AI_MEMORY_LLM_BACKEND`** (HEADLINE) | The substrate itself must be neutral to which cognition operates through it. If recall results varied with vendor, the substrate would have a hidden preference — same-vendor reflection would look more coherent than cross-vendor reflection, and the §2.6 composition would be biased at the substrate layer. The substrate IS vendor-neutral at the recall surface by construction (no LLM env vars are read in the recall code path); this test pins that property mechanically. |
+
+Pin location: [`tests/bias_displacement_invariants_2_6.rs`](../../tests/bias_displacement_invariants_2_6.rs). Verified green via `cargo test --test bias_displacement_invariants_2_6`. Any future change that introduces vendor-dependent behaviour in recall, mis-attributes a `ConfidenceSource`, breaks the V-4 chain on a substrate write, or surfaces non-determinism in recall trips a hard test failure rather than silently degrading the §2.6 property.
+
 ### 2.7 LLM-agnostic at every cognitive boundary
 
 The substrate does not bind to any specific model family at any cognitive layer. Producer, reflector, curator, and persona-synthesizer roles are all configurable. The substrate provides the structural roles; the deployment provides the model instances filling them.
