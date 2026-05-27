@@ -1092,6 +1092,78 @@ impl MemoryStore for SqliteStore {
         db::stats(&conn, &self.path).map_err(box_err)
     }
 
+    /// v0.7.0 SAL-routing batch-4 (FX-C2) — close `db::set_embedding`
+    /// gap by overriding `update_embedding` (default impl is no-op).
+    /// Mirrors the Postgres adapter's path so `app.store.update_embedding`
+    /// is the canonical embedding-update surface across backends.
+    async fn update_embedding(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+        embedding: Option<&[f32]>,
+    ) -> StoreResult<()> {
+        let conn = self.state.lock().await;
+        match embedding {
+            Some(vec) => db::set_embedding(&conn, id, vec).map_err(box_err),
+            None => db::set_embedding(&conn, id, &[]).map_err(box_err),
+        }
+    }
+
+    async fn find_by_title_namespace(
+        &self,
+        title: &str,
+        namespace: &str,
+    ) -> StoreResult<Option<String>> {
+        let conn = self.state.lock().await;
+        db::find_by_title_namespace(&conn, title, namespace).map_err(box_err)
+    }
+
+    async fn next_versioned_title(&self, base_title: &str, namespace: &str) -> StoreResult<String> {
+        let conn = self.state.lock().await;
+        db::next_versioned_title(&conn, base_title, namespace).map_err(box_err)
+    }
+
+    async fn find_contradictions(&self, title: &str, namespace: &str) -> StoreResult<Vec<Memory>> {
+        let conn = self.state.lock().await;
+        db::find_contradictions(&conn, title, namespace).map_err(box_err)
+    }
+
+    async fn invalidate_link(
+        &self,
+        source_id: &str,
+        target_id: &str,
+        relation: &str,
+        valid_until: Option<&str>,
+    ) -> StoreResult<crate::store::KgInvalidateRow> {
+        let conn = self.state.lock().await;
+        match db::invalidate_link(&conn, source_id, target_id, relation, valid_until)
+            .map_err(box_err)?
+        {
+            Some(res) => Ok(crate::store::KgInvalidateRow {
+                found: true,
+                valid_until: res.valid_until,
+                previous_valid_until: res.previous_valid_until,
+            }),
+            None => Ok(crate::store::KgInvalidateRow {
+                found: false,
+                valid_until: String::new(),
+                previous_valid_until: None,
+            }),
+        }
+    }
+
+    async fn check_duplicate_with_text(
+        &self,
+        query_embedding: &[f32],
+        query_text: &str,
+        namespace: Option<&str>,
+        threshold: f32,
+    ) -> StoreResult<crate::models::DuplicateCheck> {
+        let conn = self.state.lock().await;
+        db::check_duplicate_with_text(&conn, query_embedding, query_text, namespace, threshold)
+            .map_err(box_err)
+    }
+
     async fn notify(
         &self,
         ctx: &CallerContext,
@@ -2419,5 +2491,201 @@ mod tests {
         // db_size_bytes is best-effort — fresh DB is non-zero
         // (rusqlite at least writes the page header).
         assert!(s.db_size_bytes > 0, "expected non-zero db file size");
+    }
+
+    // ------------------------------------------------------------------
+    // FX-C2 batch-4 — parity tests for the new trait methods.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn update_embedding_persists_via_set_embedding() {
+        // FX-C2-batch4 — `SqliteStore::update_embedding` overrides the
+        // default no-op and delegates to `db::set_embedding` so the
+        // create.rs:475 embedding write is now SAL-routable.
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice");
+        let mem = test_memory("with-embed", "embedding-fixture body content");
+        let id = store.store(&ctx, &mem).await.expect("store");
+        // Use a 4-d vector to keep the test cheap. The dim-mismatch
+        // check inside `db::set_embedding` is keyed off the namespace's
+        // first established dim, so a fresh store accepts any dim.
+        let vec = vec![0.1_f32, 0.2, 0.3, 0.4];
+        store
+            .update_embedding(&ctx, &id, Some(&vec))
+            .await
+            .expect("update_embedding");
+        // Verify by re-reading the column. We deliberately read via
+        // the lock since the SAL doesn't expose a `get_embedding`
+        // surface yet (recall_hybrid is the consumer).
+        let conn = store.state.lock().await;
+        let blob: Vec<u8> = conn
+            .query_row(
+                "SELECT embedding FROM memories WHERE id = ?1",
+                rusqlite::params![&id],
+                |r| r.get(0),
+            )
+            .expect("read embedding");
+        assert!(!blob.is_empty(), "embedding blob should be populated");
+    }
+
+    #[tokio::test]
+    async fn find_by_title_namespace_resolves_id() {
+        // FX-C2-batch4 — `find_by_title_namespace` returns the live
+        // row's id when `(title, namespace)` matches.
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice");
+        let mem = test_memory("conflict-target", "find_by_title body");
+        let id = store.store(&ctx, &mem).await.expect("store");
+        let found = store
+            .find_by_title_namespace(&mem.title, &mem.namespace)
+            .await
+            .expect("find_by_title_namespace");
+        assert_eq!(found.as_deref(), Some(id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn find_by_title_namespace_returns_none_for_unknown() {
+        let store = fresh_store();
+        let found = store
+            .find_by_title_namespace("never-stored", "alphaone")
+            .await
+            .expect("find_by_title_namespace miss");
+        assert!(found.is_none());
+    }
+
+    #[tokio::test]
+    async fn next_versioned_title_first_use_returns_base() {
+        // FX-C2-batch4 — on a fresh store the base title is free.
+        let store = fresh_store();
+        let picked = store
+            .next_versioned_title("My Title", "alphaone")
+            .await
+            .expect("next_versioned_title");
+        assert_eq!(picked, "My Title");
+    }
+
+    #[tokio::test]
+    async fn next_versioned_title_appends_suffix_on_collision() {
+        // FX-C2-batch4 — when the base title is taken, append `(2)`.
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice");
+        let mut mem = test_memory("dup-title", "versioned body content");
+        mem.namespace = "alphaone".to_string();
+        store.store(&ctx, &mem).await.expect("store");
+        let picked = store
+            .next_versioned_title("dup-title", "alphaone")
+            .await
+            .expect("next_versioned_title");
+        assert_eq!(picked, "dup-title (2)");
+    }
+
+    #[tokio::test]
+    async fn find_contradictions_returns_fts_matches() {
+        // FX-C2-batch4 — `find_contradictions` returns FTS-similar
+        // candidates in the same namespace.
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice");
+        let mut a = test_memory("rust language semantics", "rust language safety guarantees");
+        a.namespace = "alphaone".to_string();
+        let mut b = test_memory(
+            "completely unrelated cookbook",
+            "fish stew recipe and instructions",
+        );
+        b.namespace = "alphaone".to_string();
+        store.store(&ctx, &a).await.expect("store a");
+        store.store(&ctx, &b).await.expect("store b");
+        let hits = store
+            .find_contradictions("rust language", "alphaone")
+            .await
+            .expect("find_contradictions");
+        // The FTS5 match query must surface the "rust language" memory;
+        // the recipe row should NOT trigger an FTS hit.
+        assert!(
+            hits.iter().any(|m| m.title.contains("rust language")),
+            "FTS match should surface the rust-language row"
+        );
+        assert!(
+            !hits.iter().any(|m| m.title.contains("cookbook")),
+            "unrelated row must not appear"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalidate_link_marks_found_with_previous_value() {
+        // FX-C2-batch4 — `invalidate_link` sets `valid_until` on the
+        // matching `(source, target, relation)` triple and surfaces
+        // `previous_valid_until` (None on first invalidation).
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice");
+        let src = test_memory("src-row", "source memory body content");
+        let dst = test_memory("dst-row", "destination memory body content");
+        let src_id = store.store(&ctx, &src).await.expect("store src");
+        let dst_id = store.store(&ctx, &dst).await.expect("store dst");
+        let link = crate::models::MemoryLink {
+            source_id: src_id.clone(),
+            target_id: dst_id.clone(),
+            relation: crate::models::MemoryLinkRelation::RelatedTo,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            signature: None,
+            observed_by: None,
+            valid_from: None,
+            valid_until: None,
+            attest_level: None,
+        };
+        store.link(&ctx, &link).await.expect("create link");
+        let row = store
+            .invalidate_link(&src_id, &dst_id, "related_to", Some("2030-01-01T00:00:00Z"))
+            .await
+            .expect("invalidate_link");
+        assert!(row.found, "link must be marked found");
+        assert_eq!(row.valid_until, "2030-01-01T00:00:00Z");
+        assert!(row.previous_valid_until.is_none(), "no prior invalidation");
+    }
+
+    #[tokio::test]
+    async fn invalidate_link_returns_not_found_for_unknown_triple() {
+        // FX-C2-batch4 — non-existent triple surfaces `found = false`,
+        // not an error.
+        let store = fresh_store();
+        let row = store
+            .invalidate_link("nope-src", "nope-dst", "related_to", None)
+            .await
+            .expect("invalidate_link miss");
+        assert!(!row.found);
+        assert!(row.valid_until.is_empty());
+    }
+
+    #[tokio::test]
+    async fn check_duplicate_with_text_exact_content_hash_short_circuits() {
+        // FX-C2-batch4 — phase 1 SHA-256 short-circuit returns
+        // `similarity=1.0` when `format!("{title} {content}")` is
+        // byte-equal to an existing row's text.
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice");
+        let mut mem = test_memory("dup-test-title", "dup-test body content");
+        mem.namespace = "alphaone".to_string();
+        store.store(&ctx, &mem).await.expect("store");
+        let query_text = format!("{} {}", mem.title, mem.content);
+        // Empty embedding is fine — phase 1 (hash) doesn't need it.
+        let check = store
+            .check_duplicate_with_text(&[], &query_text, Some("alphaone"), 0.8)
+            .await
+            .expect("check_duplicate_with_text");
+        assert!(check.is_duplicate);
+        let n = check.nearest.expect("nearest must be populated on dup");
+        assert!((n.similarity - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn check_duplicate_with_text_no_match_returns_false() {
+        // FX-C2-batch4 — empty candidate pool surfaces non-dup with
+        // candidates_scanned=0.
+        let store = fresh_store();
+        let check = store
+            .check_duplicate_with_text(&[], "no-match text", Some("alphaone"), 0.8)
+            .await
+            .expect("check_duplicate_with_text empty");
+        assert!(!check.is_duplicate);
+        assert_eq!(check.candidates_scanned, 0);
     }
 }

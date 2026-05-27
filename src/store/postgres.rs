@@ -10826,6 +10826,267 @@ impl MemoryStore for PostgresStore {
             index_evictions_total: 0,
         })
     }
+
+    async fn find_by_title_namespace(
+        &self,
+        title: &str,
+        namespace: &str,
+    ) -> StoreResult<Option<String>> {
+        // Mirror SQLite's `db::find_by_title_namespace`: project the id
+        // for the first live row matching `(title, namespace)`. The
+        // SAL contract is "no live row matches" → `Ok(None)`, not an
+        // error — `fetch_optional` is the right primitive.
+        let id: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM memories WHERE title = $1 AND namespace = $2 LIMIT 1",
+        )
+        .bind(title)
+        .bind(namespace)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| to_store_err("find_by_title_namespace", e))?;
+        Ok(id)
+    }
+
+    async fn next_versioned_title(&self, base_title: &str, namespace: &str) -> StoreResult<String> {
+        // Byte-for-byte mirror of `db::next_versioned_title` — try the
+        // base title first, then `(2)`, `(3)`, ... up to the substrate's
+        // hard cap. The cap (1024) prevents pathological infinite loops
+        // and matches SQLite's `MAX_VERSION_SUFFIX` exactly so the wire
+        // shape stays identical across backends.
+        const MAX_VERSION_SUFFIX: u32 = 1024;
+        if self
+            .find_by_title_namespace(base_title, namespace)
+            .await?
+            .is_none()
+        {
+            return Ok(base_title.to_string());
+        }
+        for n in 2..=MAX_VERSION_SUFFIX {
+            let candidate = format!("{base_title} ({n})");
+            if self
+                .find_by_title_namespace(&candidate, namespace)
+                .await?
+                .is_none()
+            {
+                return Ok(candidate);
+            }
+        }
+        // Match SQLite's UniqueConflict envelope; the substrate
+        // exposes it as `StorageError::UniqueConflict` on that side.
+        // At the SAL layer we surface it as `IntegrityFailed` because
+        // `StoreError` doesn't yet carry a `UniqueConflict` variant
+        // (#962 tracks the trait-side typed envelope).
+        Err(StoreError::IntegrityFailed {
+            detail: format!(
+                "could not find a free versioned title for '{base_title}' in namespace '{namespace}' within {MAX_VERSION_SUFFIX} attempts"
+            ),
+        })
+    }
+
+    async fn find_contradictions(&self, title: &str, namespace: &str) -> StoreResult<Vec<Memory>> {
+        // Postgres FTS via `to_tsvector` + `plainto_tsquery` mirroring
+        // the SQLite `memories_fts MATCH` semantics — top 5 candidates
+        // in the same namespace, ranked by relevance.
+        let rows = sqlx::query(
+            "SELECT m.* FROM memories m
+             WHERE m.namespace = $2
+               AND to_tsvector('english', m.title || ' ' || m.content)
+                   @@ plainto_tsquery('english', $1)
+             ORDER BY ts_rank(
+                 to_tsvector('english', m.title || ' ' || m.content),
+                 plainto_tsquery('english', $1)
+             ) DESC
+             LIMIT 5",
+        )
+        .bind(title)
+        .bind(namespace)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| to_store_err("find_contradictions", e))?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            out.push(Self::row_to_memory(r)?);
+        }
+        Ok(out)
+    }
+
+    async fn invalidate_link(
+        &self,
+        source_id: &str,
+        target_id: &str,
+        relation: &str,
+        valid_until: Option<&str>,
+    ) -> StoreResult<KgInvalidateRow> {
+        // Delegate to the inherent `kg_invalidate` method which carries
+        // the AGE↔CTE dual-path fallback discipline. The trait method
+        // is the canonical surface; `kg_invalidate_via_store` (the
+        // pre-trait `as_any_for_postgres` downcast hatch) is preserved
+        // for back-compat but new callers should reach via the trait.
+        self.kg_invalidate(source_id, target_id, relation, valid_until)
+            .await
+    }
+
+    async fn check_duplicate_with_text(
+        &self,
+        query_embedding: &[f32],
+        query_text: &str,
+        namespace: Option<&str>,
+        threshold: f32,
+    ) -> StoreResult<crate::models::DuplicateCheck> {
+        use sha2::{Digest, Sha256};
+        // Phase 1 — SHA-256 exact-match short-circuit (parity with
+        // `db::check_duplicate_with_text`). Hash `format!("{title}
+        // {content}")` for every live, namespace-scoped row and
+        // return similarity=1.0 on byte-equal hits. This sidesteps
+        // the embedding-prefix asymmetry that caps cosine at ~0.92
+        // for legitimately-identical inputs.
+        let effective_threshold = threshold.max(0.5_f32); // mirrors DUPLICATE_THRESHOLD_MIN
+        let now_dt = Utc::now();
+        let rows = if let Some(ns) = namespace {
+            sqlx::query(
+                "SELECT id, title, namespace, content FROM memories
+                 WHERE (expires_at IS NULL OR expires_at > $1)
+                   AND namespace = $2",
+            )
+            .bind(now_dt)
+            .bind(ns)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| to_store_err("check_duplicate_with_text scan", e))?
+        } else {
+            sqlx::query(
+                "SELECT id, title, namespace, content FROM memories
+                 WHERE (expires_at IS NULL OR expires_at > $1)",
+            )
+            .bind(now_dt)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| to_store_err("check_duplicate_with_text scan", e))?
+        };
+
+        let mut query_hasher = Sha256::new();
+        query_hasher.update(query_text.as_bytes());
+        let query_hash = query_hasher.finalize();
+
+        let candidates_scanned = rows.len();
+        for r in &rows {
+            let id: String = r.try_get("id").map_err(|e| to_store_err("read id", e))?;
+            let title: String = r
+                .try_get("title")
+                .map_err(|e| to_store_err("read title", e))?;
+            let ns_v: String = r
+                .try_get("namespace")
+                .map_err(|e| to_store_err("read namespace", e))?;
+            let content: String = r
+                .try_get("content")
+                .map_err(|e| to_store_err("read content", e))?;
+            let row_text = format!("{title} {content}");
+            let mut row_hasher = Sha256::new();
+            row_hasher.update(row_text.as_bytes());
+            let row_hash = row_hasher.finalize();
+            if row_hash == query_hash {
+                return Ok(crate::models::DuplicateCheck {
+                    is_duplicate: true,
+                    threshold: effective_threshold,
+                    nearest: Some(crate::models::DuplicateMatch {
+                        id,
+                        title,
+                        namespace: ns_v,
+                        similarity: 1.0,
+                    }),
+                    candidates_scanned,
+                });
+            }
+        }
+
+        // Phase 2 — fall through to the embedding-based nearest-
+        // neighbor scan via the SAL `recall_hybrid` shape so callers
+        // still get a "closest existing memory" signal on near hits.
+        // Empty-embedding shortcut: if no vector was supplied (caller
+        // is keyword-only), report "no duplicate found".
+        if query_embedding.is_empty() {
+            return Ok(crate::models::DuplicateCheck {
+                is_duplicate: false,
+                threshold: effective_threshold,
+                nearest: None,
+                candidates_scanned,
+            });
+        }
+
+        // Use pgvector cosine distance directly — `1 - distance` gives
+        // similarity in `[0, 1]`. We mirror SQLite's `check_duplicate`
+        // scan shape: live rows in `namespace` (or all live rows when
+        // `namespace=None`) with a non-null embedding, ordered by
+        // cosine ascending (= most similar first), limit 1.
+        let emb_pgvec = pgvector::Vector::from(query_embedding.to_vec());
+        let nearest_row = if let Some(ns) = namespace {
+            sqlx::query(
+                "SELECT id, title, namespace,
+                        1 - (embedding <=> $1) AS sim
+                 FROM memories
+                 WHERE embedding IS NOT NULL
+                   AND namespace = $2
+                   AND (expires_at IS NULL OR expires_at > $3)
+                 ORDER BY embedding <=> $1
+                 LIMIT 1",
+            )
+            .bind(&emb_pgvec)
+            .bind(ns)
+            .bind(now_dt)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| to_store_err("check_duplicate_with_text cosine", e))?
+        } else {
+            sqlx::query(
+                "SELECT id, title, namespace,
+                        1 - (embedding <=> $1) AS sim
+                 FROM memories
+                 WHERE embedding IS NOT NULL
+                   AND (expires_at IS NULL OR expires_at > $2)
+                 ORDER BY embedding <=> $1
+                 LIMIT 1",
+            )
+            .bind(&emb_pgvec)
+            .bind(now_dt)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| to_store_err("check_duplicate_with_text cosine", e))?
+        };
+
+        let nearest = match nearest_row {
+            Some(r) => {
+                let id: String = r.try_get("id").map_err(|e| to_store_err("read id", e))?;
+                let title: String = r
+                    .try_get("title")
+                    .map_err(|e| to_store_err("read title", e))?;
+                let ns_v: String = r
+                    .try_get("namespace")
+                    .map_err(|e| to_store_err("read namespace", e))?;
+                let sim: f64 = r.try_get("sim").map_err(|e| to_store_err("read sim", e))?;
+                #[allow(clippy::cast_possible_truncation)]
+                let sim_f32 = sim as f32;
+                Some(crate::models::DuplicateMatch {
+                    id,
+                    title,
+                    namespace: ns_v,
+                    similarity: sim_f32,
+                })
+            }
+            None => None,
+        };
+
+        let is_duplicate = nearest
+            .as_ref()
+            .is_some_and(|n| n.similarity >= effective_threshold);
+
+        Ok(crate::models::DuplicateCheck {
+            is_duplicate,
+            threshold: effective_threshold,
+            nearest,
+            candidates_scanned,
+        })
+    }
 }
 
 /// v0.7.0 Continuation 6 — adapter row-to-`QuotaStatus` projection.
@@ -13712,5 +13973,253 @@ mod tests {
         // db_size_bytes is best-effort on postgres; assert non-negative
         // shape — we already enforce non-negative via u64::try_from.
         let _ = s.db_size_bytes;
+    }
+
+    // ------------------------------------------------------------------
+    // FX-C2 batch-4 — live-Postgres parity tests for the six new trait
+    // methods (find_by_title_namespace, next_versioned_title,
+    // find_contradictions, invalidate_link, check_duplicate_with_text,
+    // update_embedding). Each test skips cleanly when
+    // AI_MEMORY_TEST_POSTGRES_URL is unset.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn live_find_by_title_namespace_resolves_id() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("fxc2b4-find-{unique}");
+        let mem = sample_memory(
+            &format!("find-{unique}"),
+            &ns,
+            "find-target-title",
+            "find_by_title body",
+        );
+        let id = store.store(&ctx, &mem).await.expect("store");
+        let found = store
+            .find_by_title_namespace("find-target-title", &ns)
+            .await
+            .expect("find_by_title_namespace");
+        assert_eq!(found.as_deref(), Some(id.as_str()));
+        let missing = store
+            .find_by_title_namespace("nonexistent-title", &ns)
+            .await
+            .expect("find_by_title_namespace miss");
+        assert!(missing.is_none());
+    }
+
+    #[tokio::test]
+    async fn live_next_versioned_title_picks_suffix_on_collision() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("fxc2b4-version-{unique}");
+        // First store claims the base title.
+        let mem = sample_memory(
+            &format!("ver-{unique}"),
+            &ns,
+            "version-base",
+            "v1 body content",
+        );
+        store.store(&ctx, &mem).await.expect("store");
+        let picked = store
+            .next_versioned_title("version-base", &ns)
+            .await
+            .expect("next_versioned_title");
+        assert_eq!(picked, "version-base (2)");
+        // Fresh title is returned unchanged.
+        let fresh = store
+            .next_versioned_title("never-used-title", &ns)
+            .await
+            .expect("next_versioned_title fresh");
+        assert_eq!(fresh, "never-used-title");
+    }
+
+    #[tokio::test]
+    async fn live_find_contradictions_surfaces_fts_hits() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("fxc2b4-contradictions-{unique}");
+        let m1 = sample_memory(
+            &format!("c1-{unique}"),
+            &ns,
+            "rust borrow checker semantics",
+            "rust language safety guarantees",
+        );
+        let m2 = sample_memory(
+            &format!("c2-{unique}"),
+            &ns,
+            "completely separate cookbook",
+            "fish stew recipe and instructions",
+        );
+        store.store(&ctx, &m1).await.expect("store m1");
+        store.store(&ctx, &m2).await.expect("store m2");
+        let hits = store
+            .find_contradictions("rust borrow checker", &ns)
+            .await
+            .expect("find_contradictions");
+        assert!(
+            hits.iter().any(|m| m.title.contains("rust borrow")),
+            "must surface rust row"
+        );
+        assert!(
+            !hits.iter().any(|m| m.title.contains("cookbook")),
+            "must not surface unrelated row"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_invalidate_link_marks_found() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("fxc2b4-invalidate-{unique}");
+        let src = sample_memory(
+            &format!("src-{unique}"),
+            &ns,
+            "src-title",
+            "src body content",
+        );
+        let dst = sample_memory(
+            &format!("dst-{unique}"),
+            &ns,
+            "dst-title",
+            "dst body content",
+        );
+        let src_id = store.store(&ctx, &src).await.expect("store src");
+        let dst_id = store.store(&ctx, &dst).await.expect("store dst");
+        let link = crate::models::MemoryLink {
+            source_id: src_id.clone(),
+            target_id: dst_id.clone(),
+            relation: crate::models::MemoryLinkRelation::RelatedTo,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            signature: None,
+            observed_by: None,
+            valid_from: None,
+            valid_until: None,
+            attest_level: None,
+        };
+        store.link(&ctx, &link).await.expect("create link");
+        let row = store
+            .invalidate_link(&src_id, &dst_id, "related_to", Some("2030-01-01T00:00:00Z"))
+            .await
+            .expect("invalidate_link");
+        assert!(row.found, "link must be marked found");
+        // valid_until is normalised on the postgres side; just assert
+        // non-empty + timezone present.
+        assert!(!row.valid_until.is_empty());
+        // Calling again should surface the prior value.
+        let row2 = store
+            .invalidate_link(&src_id, &dst_id, "related_to", Some("2031-02-02T00:00:00Z"))
+            .await
+            .expect("re-invalidate");
+        assert!(row2.found);
+        assert!(row2.previous_valid_until.is_some());
+    }
+
+    #[tokio::test]
+    async fn live_invalidate_link_returns_not_found_for_unknown_triple() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let row = store
+            .invalidate_link("nope-src", "nope-dst", "related_to", None)
+            .await
+            .expect("invalidate_link miss");
+        assert!(!row.found);
+        assert!(row.valid_until.is_empty());
+    }
+
+    #[tokio::test]
+    async fn live_check_duplicate_with_text_hash_short_circuit() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("fxc2b4-dup-{unique}");
+        let mem = sample_memory(
+            &format!("dup-{unique}"),
+            &ns,
+            "dup-test-title",
+            "dup-test body content",
+        );
+        store.store(&ctx, &mem).await.expect("store");
+        let query_text = format!("{} {}", mem.title, mem.content);
+        // Empty embedding — phase 1 hash short-circuit doesn't need
+        // pgvector and must surface similarity=1.0 byte-equal.
+        let check = store
+            .check_duplicate_with_text(&[], &query_text, Some(&ns), 0.8)
+            .await
+            .expect("check_duplicate_with_text");
+        assert!(
+            check.is_duplicate,
+            "byte-equal text must short-circuit as duplicate"
+        );
+        let n = check.nearest.expect("nearest must be populated");
+        assert!((n.similarity - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn live_update_embedding_persists_vector() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("fxc2b4-update-emb-{unique}");
+        let mem = sample_memory(
+            &format!("emb-{unique}"),
+            &ns,
+            "emb-test",
+            "embedding update body",
+        );
+        let id = store.store(&ctx, &mem).await.expect("store");
+        // PostgresStore declares the embedding column as `vector(N)`
+        // where N matches `EMBEDDING_DIM` (the connect-time selection).
+        // To stay backend-agnostic in this test we read the current
+        // column dim and craft a zero vector of that length.
+        let dim = store
+            .current_embedding_dim()
+            .await
+            .expect("current_embedding_dim");
+        let dim_usize = usize::try_from(dim.unwrap_or(384)).unwrap_or(384);
+        let vec = vec![0.0_f32; dim_usize];
+        store
+            .update_embedding(&ctx, &id, Some(&vec))
+            .await
+            .expect("update_embedding");
+        // Re-fetch to verify the vector landed (column is non-NULL).
+        let written: Option<i64> = sqlx::query_scalar(
+            "SELECT 1::BIGINT FROM memories WHERE id = $1 AND embedding IS NOT NULL",
+        )
+        .bind(&id)
+        .fetch_optional(&store.pool)
+        .await
+        .expect("verify embedding");
+        assert!(written.is_some(), "embedding column must be non-NULL");
     }
 }
