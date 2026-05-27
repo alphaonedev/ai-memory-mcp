@@ -27,3 +27,13 @@ pub mod calibrate_confidence;
 // dispatches into the same substrate handler the MCP `tools/call`
 // dispatch uses, so no new business logic lands here.
 pub mod skill;
+// v0.7.0 ARCH-3 / FX-12 — CLI parity build-out for MCP tools without
+// a direct CLI subcommand counterpart. Each new module dispatches into
+// the same substrate primitive the MCP tool consumes, guaranteeing
+// wire envelope parity across MCP / HTTP / CLI. See
+// `docs/v0.7.0/arch-3-mcp-cli-parity-audit.md` for the full audit.
+pub mod check_duplicate;
+pub mod find_paths;
+pub mod kg_query;
+pub mod recall_observations;
+pub mod replay;
