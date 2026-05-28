@@ -32,6 +32,10 @@
 
 #![allow(dead_code)]
 
+// Per-test postgres schema isolation helper (issue #1381).
+// See module-level docs in `postgres_env.rs`.
+pub mod postgres_env;
+
 use std::path::PathBuf;
 use std::sync::Mutex;
 
