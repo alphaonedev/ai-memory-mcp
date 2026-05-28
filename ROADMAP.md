@@ -446,9 +446,22 @@ Six streams (A: hierarchy taxonomy · B: schema v15 with temporal columns + sign
 
 **Strengthens:** §2.3 (stoppable — honest refusal vs silent degrade), §2.5 (attested — honest capabilities envelope), §2.4 (improvable — `budget_tokens` enables context-aware accumulation), §2.1 (endpoint-resident — portability spec).
 
-### 11.3 v0.7.0 — Trust + Bias-Displacement + Federation Substrate — SHIP-BLOCKED on #1389 (was: SHIPPED Q2 2026)
+### 11.3 v0.7.0 — Trust + Bias-Displacement + Federation Substrate + Layered Capture — SHIP-BLOCKED on #1389 (was: SHIPPED Q2 2026)
 
-**Status (2026-05-28):** ship-blocked. The grand-slam scope per §9.7 below is complete, but the 2026-05-28 RCA of issue [#1388](https://github.com/alphaonedev/ai-memory-mcp/issues/1388) (substrate failed to auto-capture a 90-minute operator-agent test-plan dialog after a tmux lockup + session kill; recovered manually from the surviving Claude Code JSONL transcript) surfaced that the substrate's "write what I learn so I can be the same NHI tomorrow" promise has no fail-safe under SIGKILL. Operator decision 2026-05-28: v0.7.0 does not ship until the recover-on-boot mechanism in epic [#1389](https://github.com/alphaonedev/ai-memory-mcp/issues/1389) lands. Scope is single ~1-day CLI subcommand (`ai-memory recover-previous-session`) + SessionStart-hook addendum + regression test, not the originally-overscoped 5-host portfolio; the broader portfolio is deferred to v0.8 per §11.4.H below.
+**Status (2026-05-28):** ship-blocked on #1389 layered-capture architecture. The grand-slam scope per §9.7 below is complete, but the 2026-05-28 RCA of issue [#1388](https://github.com/alphaonedev/ai-memory-mcp/issues/1388) (substrate failed to auto-capture a 90-minute operator-agent test-plan dialog after a tmux lockup + session kill; recovered manually from the surviving Claude Code JSONL transcript) surfaced that the substrate's "write what I learn so I can be the same NHI tomorrow" promise has no fail-safe under SIGKILL. Operator decisions 2026-05-28 (verbatim): *"DO the RIGHT ARCHITECTURE - we only do CORRECT - time is not a factor do it correctly get it right the 1st time - longevity"* and *"AI NHI assess looking 50 years into the future the correct pathway or choice in the design and run with it - approved yes"*.
+
+The first proposal (single recover-on-boot mechanism) was correctly identified as a band-aid that couples the substrate to host-internal transcript formats with no stable API contract. The accepted architecture is the **four-layer defense** below, documented canonically in policy memory `f62cb182-7dd7-4513-80c8-bc215f5c6169` (`global/policies`, long tier, priority 10) and in [#1389](https://github.com/alphaonedev/ai-memory-mcp/issues/1389) comment 4565763039:
+
+| Layer | Surface | Catches | Position |
+|---|---|---|---|
+| **L1 — Agent discipline** | CLAUDE.md HARD-RULE + START-HERE memory + `memory_capture_nag` substrate watcher | The common case (agent forgot to call `memory_store`) | Prompt-level + cheap substrate hook |
+| **L2 — Recover-on-boot** | `ai-memory recover-previous-session` CLI + `memory_recover_previous_session` MCP tool | The narrow case (SIGKILL between sessions on same host) | BACKSTOP only; never positioned as "the fix" |
+| **L3 — Substrate watcher** | Filesystem-notify daemon thread inside the ai-memory daemon | Mid-session crashes + multi-session-on-same-host concurrent capture | Universal scrape backstop while L4 propagates |
+| **L4 — Protocol layer** | New `memory_capture_turn` MCP tool + capabilities advertisement + RFC + per-host adapter shims | Everything L1-L3 catch, cleanly — no host-format coupling | THE FIX; survives 50 years of vendor churn |
+
+L4 is the architecturally clean removal of the entire problem class: hosts volunteer each conversation turn through MCP-protocol flow rather than the substrate scraping their internal formats. The substrate ships the SERVER side + the RFC + the host-adapter shims in v0.7.0; vendor adoption proceeds at vendor pace AFTER v0.7.0 ships. L1-L3 cover hosts that haven't adopted yet.
+
+[#1392](https://github.com/alphaonedev/ai-memory-mcp/issues/1392) (MCP-protocol-extension RFC, was a v0.8 deferral) is closed as superseded by this expanded #1389 scope. L1 + L2 + L3 + L4-server-side ALL ship in v0.7.0; only the multi-vendor L4 adoption work happens post-ship. See §11.4.H below for what remains in v0.8 (SDK shims, IDE plugin coverage, decision-detector).
 
 **Strengthens (all seven properties advance):**
 - §2.1 endpoint-resident: mobile cross-compile gate, iOS/Android artifacts.
@@ -602,16 +615,16 @@ Per §3 scope test: observability of the substrate, not the substrate itself. Us
 
 Per §3 scope test: build/release tooling for the substrate, not the substrate itself. The schema-version registry, codegen, doc-drift checks, codegraph integration — all useful, all belong in `ai-memory-schema-tools` sibling repo, consuming the substrate's schema manifest. Tracked under §13.
 
-##### §11.4.H Auto-capture portfolio expansion — deferred from v0.7.0 #1389 (+~5 sessions)
+##### §11.4.H Auto-capture portfolio — v0.8 follow-ons after v0.7.0 layered-defense ship
 
-**Strengthens §2.2 (coherent across sessions and model generations) + §2.7 (LLM-agnostic at every cognitive boundary).** Background: v0.7.0 issue [#1388](https://github.com/alphaonedev/ai-memory-mcp/issues/1388) (substrate failed to auto-persist a 90-min operator-agent test-plan dialog after a tmux lockup) is closed for v0.7.0 by epic [#1389](https://github.com/alphaonedev/ai-memory-mcp/issues/1389) — a single recover-on-boot mechanism (CLI + MCP tool surface) that catches the failure mode for every host that writes a transcript. The four work items below extend that coverage and were explicitly deferred from #1389 at the 2026-05-28 operator scoping decision so v0.7.0 could ship without further timeline slip. Each gets its own v0.8 sub-issue + PR + pm-v3.2 QC discipline.
+**Strengthens §2.2 (coherent across sessions and model generations) + §2.7 (LLM-agnostic at every cognitive boundary).** Background: v0.7.0 ships the full four-layer capture architecture (L1 agent discipline + L2 recover-on-boot + L3 substrate watcher + L4 `memory_capture_turn` MCP tool + RFC + host-adapter shims) per [#1389](https://github.com/alphaonedev/ai-memory-mcp/issues/1389). The items below are the v0.8 follow-ons that extend coverage to surfaces L1-L4 don't fully reach yet — direct-API users, IDE-plugin surfaces, and quality-refinement classifier passes.
 
-- **§11.4.H.1 Direct-API SDK shims** ([#1390](https://github.com/alphaonedev/ai-memory-mcp/issues/1390), ~1 session). Anthropic + OpenAI Python + TypeScript thin wrappers (~100 LOC each) that proxy `messages.create` / `chat.completions.create` and forward each turn to ai-memory via MCP before returning. Coverage for users who hit LLM APIs directly without a host harness.
-- **§11.4.H.2 IDE plugin coverage** ([#1391](https://github.com/alphaonedev/ai-memory-mcp/issues/1391), ~2 sessions). Per-IDE investigation (Cursor / Continue / Aider / Zed / Cline) for transcript location + hook surface; extend the v0.7.0 `transcript_paths` resolver table. IDEs that already write JSONL transcripts in a known location inherit from #1389 for free.
-- **§11.4.H.3 MCP-protocol extension for host-streamed turns** ([#1392](https://github.com/alphaonedev/ai-memory-mcp/issues/1392), ~1 session for the RFC; reference implementation lands when upstream adopts). The architecturally clean fix: hosts volunteer each conversation turn to subscribed MCP servers as part of normal protocol flow, so the substrate doesn't need to read transcript files. RFC drafted in v0.8; vendor adoption is multi-quarter and obsoletes recover-on-boot only when every major host upgrades.
-- **§11.4.H.4 Decision-detector substrate watcher** ([#1393](https://github.com/alphaonedev/ai-memory-mcp/issues/1393), ~1 session). LLM-classifier-driven re-classification of `recovered-from-transcript` atoms into `plan` / `decision` / `commitment` / `question` / `observation`. Quality refinement over the simpler atomiser fallback that #1389 ships with. Quota-aware + audit-trail per re-classification.
+- **§11.4.H.1 Direct-API SDK shims** ([#1390](https://github.com/alphaonedev/ai-memory-mcp/issues/1390), ~1 session). Anthropic + OpenAI Python + TypeScript thin wrappers (~100 LOC each) that proxy `messages.create` / `chat.completions.create` and forward each turn to ai-memory via MCP before returning. Coverage for users who hit LLM APIs directly without a host harness; complements L4 by giving non-MCP-aware programs a thin shim that does the L4 call.
+- **§11.4.H.2 IDE plugin coverage** ([#1391](https://github.com/alphaonedev/ai-memory-mcp/issues/1391), ~2 sessions). Per-IDE investigation (Cursor / Continue / Aider / Zed / Cline) for transcript location + hook surface; extend the v0.7.0 L2/L3 `transcript_paths` resolver table. IDEs that already write JSONL transcripts in a known location inherit from L2 + L3 for free once their paths are added.
+- **§11.4.H.3 — REMOVED.** Previously tracked MCP-protocol extension for host-streamed turns under [#1392](https://github.com/alphaonedev/ai-memory-mcp/issues/1392). **Promoted into v0.7.0 ship scope as L4 of the layered-capture architecture** per operator directive 2026-05-28 ("we only do CORRECT — time is not a factor — get it right the 1st time — longevity"); #1392 closed as superseded by expanded #1389. Substrate ships the SERVER side + the RFC + the host-adapter shims in v0.7.0; multi-vendor adoption is the post-ship long-tail work and proceeds at vendor pace.
+- **§11.4.H.4 Decision-detector substrate watcher** ([#1393](https://github.com/alphaonedev/ai-memory-mcp/issues/1393), ~1 session). LLM-classifier-driven re-classification of `recovered-from-transcript` / `captured-via-l4` atoms into `plan` / `decision` / `commitment` / `question` / `observation`. Quality refinement over the simpler atomiser fallback that L1-L4 ship with. Quota-aware + audit-trail per re-classification.
 
-**Composes with §11.4.C (vLLM):** §11.4.H.4 runs through the curator LLM; deploying at federation scale uses the same vLLM backend §11.4.C lands. **Composes with §2.5 (attested):** every #1390-#1393 surface inherits the same `signed_events` chain as the rest of the substrate so recovered / re-classified memories are non-repudiable.
+**Composes with §11.4.C (vLLM):** §11.4.H.4 runs through the curator LLM; deploying at federation scale uses the same vLLM backend §11.4.C lands. **Composes with §2.5 (attested):** every L1-L4 capture surface AND every #1390-#1393 surface inherits the same `signed_events` chain as the rest of the substrate so recovered / classified memories are non-repudiable.
 
 #### Hook pipeline expansion — v0.7.0 → v0.8.0
 
@@ -655,9 +668,9 @@ v0.7.0 grand-slam terminal schema is v51 (sqlite + postgres lockstep; v51 added 
 | Documentation + reproducibility scripts | 0 | +1 | 1 |
 | §11.4.H.1 — SDK shims (#1390) | 0 | +1 | 1 |
 | §11.4.H.2 — IDE plugin coverage (#1391) | 0 | +2 | 2 |
-| §11.4.H.3 — MCP-protocol ext RFC (#1392) | 0 | +1 | 1 |
+| §11.4.H.3 — REMOVED (promoted to v0.7.0 as L4; #1392 closed) | 0 | 0 | 0 |
 | §11.4.H.4 — Decision-detector (#1393) | 0 | +1 | 1 |
-| **TOTAL (substrate scope, post §3 cuts)** | **24.5** | **+27.5** | **~52 sessions** |
+| **TOTAL (substrate scope, post §3 cuts)** | **24.5** | **+26.5** | **~51 sessions** |
 | §11.4.F (relocated to sibling) | 0 | 0 | 0 (sibling) |
 | §11.4.G (relocated to sibling) | 0 | 0 | 0 (sibling) |
 
