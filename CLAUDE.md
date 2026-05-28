@@ -258,7 +258,7 @@ The v0.7 SAL trait (under `src/store/`) abstracts sqlite vs. postgres+AGE adapte
 | `federation/` | Quorum sync, peer attestation, mTLS allowlist |
 | `kg/` | Knowledge-graph traversal (recursive-CTE + AGE Cypher) |
 | `subscriptions.rs` | HMAC-signed webhook dispatch (mandatory at v0.7.0 post R3-S1.HMAC; unsigned dispatch DISABLED), DLQ, replay |
-| `signed_events.rs` | Append-only audit chain with V-4 cross-row hash chain. Per-row Ed25519 `sig` population is gated on the resolved daemon `agent_id` having a `*.priv` keypair on disk under the key directory; when `load_daemon_signing_key` returns `None` (`src/main.rs:96-98`), the daemon boots with the stderr "continuing unsigned" line and writes rows with `sig` empty. The cross-row hash chain itself remains tamper-evident in either posture. |
+| `signed_events.rs` | Append-only audit chain with V-4 cross-row hash chain. Per-row Ed25519 `sig` population is gated on the resolved daemon `agent_id` having a `*.priv` keypair on disk under the key directory; when `load_daemon_signing_key` returns `None` (`src/main.rs:116-118`), the daemon boots with the stderr "continuing unsigned" line and writes rows with `sig` empty. The cross-row hash chain itself remains tamper-evident in either posture. |
 | `errors.rs` | ApiError, MemoryError enum, HTTP status mapping |
 | `color.rs` | ANSI color output for CLI |
 

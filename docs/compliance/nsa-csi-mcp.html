@@ -148,7 +148,7 @@ footer a{color:var(--text-muted)}
         <span class="hero-pill good">7/7 recommendations implemented</span>
         <span class="hero-pill good">27 substrate primitives catalogued</span>
         <span class="hero-pill good">47 dedicated tests pinning the #1154 contract</span>
-        <span class="hero-pill">Schema v49 · 73 MCP tools · 87 HTTP routes</span>
+        <span class="hero-pill">Schema v51 · 73 MCP tools · 87 HTTP routes</span>
       </div>
     </div>
   </div>
@@ -736,7 +736,7 @@ git checkout 4add7a8528d4c16d696b391ec6e2890269669a84</pre>
 
     <h3>2. Verify the schema version anchor</h3>
 <pre class="codeblock">grep -n 'CURRENT_SCHEMA_VERSION' src/storage/migrations.rs
-<span class="com"># Expected: line 516: const CURRENT_SCHEMA_VERSION: i64 = 49;</span></pre>
+<span class="com"># Expected: line 532: const CURRENT_SCHEMA_VERSION: i64 = 51;</span></pre>
 
     <h3>3. Verify the MCP tool count anchors</h3>
 <pre class="codeblock">cargo test --lib profile::tests::profile_full_has_seventy_three_tools
