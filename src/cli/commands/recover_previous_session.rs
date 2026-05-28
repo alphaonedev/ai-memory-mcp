@@ -114,7 +114,7 @@ pub struct RecoverPreviousSessionArgs {
 /// under `RecoverReport.errors` so the SessionStart-hook chain
 /// can't be wedged by a single bad transcript line.
 pub fn run(
-    _db_path: &Path,
+    db_path: &Path,
     args: &RecoverPreviousSessionArgs,
     out: &mut CliOutput<'_>,
 ) -> Result<i32> {
@@ -136,7 +136,7 @@ pub fn run(
         agent_id,
     };
 
-    let report = match recover_from_transcript(&opts) {
+    let report = match recover_from_transcript(db_path, &opts) {
         Ok(r) => r,
         Err(e) => {
             // Graceful failure — write the error to stderr and exit 0
