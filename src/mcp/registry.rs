@@ -44,6 +44,9 @@ pub mod tool_names {
     pub const MEMORY_AUTO_TAG: &str = "memory_auto_tag";
     pub const MEMORY_CALIBRATE_CONFIDENCE: &str = "memory_calibrate_confidence";
     pub const MEMORY_CAPABILITIES: &str = "memory_capabilities";
+    /// v0.7.0 #1389 L4 — host-volunteered turn capture per
+    /// RFC-0001. See `src/mcp/tools/capture_turn.rs`.
+    pub const MEMORY_CAPTURE_TURN: &str = "memory_capture_turn";
     pub const MEMORY_CHECK_AGENT_ACTION: &str = "memory_check_agent_action";
     pub const MEMORY_CHECK_DUPLICATE: &str = "memory_check_duplicate";
     pub const MEMORY_CONSOLIDATE: &str = "memory_consolidate";
@@ -131,6 +134,7 @@ pub mod tool_names {
         MEMORY_AUTO_TAG,
         MEMORY_CALIBRATE_CONFIDENCE,
         MEMORY_CAPABILITIES,
+        MEMORY_CAPTURE_TURN,
         MEMORY_CHECK_AGENT_ACTION,
         MEMORY_CHECK_DUPLICATE,
         MEMORY_CONSOLIDATE,
@@ -600,6 +604,8 @@ pub fn registered_tools() -> Vec<RegisteredTool> {
         RegisteredTool::of::<crate::mcp::share::ShareTool>(),
         RegisteredTool::of::<crate::mcp::calibrate_confidence::CalibrateConfidenceTool>(),
         RegisteredTool::of::<crate::mcp::capabilities::CapabilitiesTool>(),
+        // v0.7.0 #1389 L4 — host-volunteered turn capture per RFC-0001.
+        RegisteredTool::of::<crate::mcp::capture_turn::MemoryCaptureTurnTool>(),
         RegisteredTool::of::<crate::mcp::expand_query::ExpandQueryTool>(),
         RegisteredTool::of::<crate::mcp::auto_tag::AutoTagTool>(),
         RegisteredTool::of::<crate::mcp::detect_contradiction::DetectContradictionTool>(),

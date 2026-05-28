@@ -297,6 +297,12 @@ mod archive;
 mod auto_tag;
 #[path = "tools/capabilities.rs"]
 mod capabilities;
+// v0.7.0 #1389 L4 — host-volunteered turn capture per RFC-0001
+// (`docs/rfc/RFC-0001-mcp-turn-capture.md`). Substrate-side handler
+// for the protocol-level fix that closes the #1388 substrate failure
+// mode without coupling to host-internal transcript formats.
+#[path = "tools/capture_turn.rs"]
+mod capture_turn;
 #[path = "tools/check_duplicate.rs"]
 mod check_duplicate;
 #[path = "tools/consolidate.rs"]
@@ -464,6 +470,8 @@ pub(crate) use namespace::handle_namespace_clear_standard;
 pub use namespace::{handle_namespace_get_standard, handle_namespace_set_standard};
 pub use notify::{handle_inbox, handle_notify};
 pub use pending::{handle_pending_approve, handle_pending_reject};
+// v0.7.0 #1389 L4 — host-volunteered turn capture per RFC-0001.
+pub use capture_turn::handle_capture_turn;
 pub use quota_status::handle_quota_status;
 // v0.7.0 (issue #691) — substrate-level agent-action rules engine.
 pub use check_agent_action::handle_check_agent_action;
@@ -1417,6 +1425,11 @@ fn dispatch_memory_quota_status(ctx: &ToolDispatchCtx<'_>) -> Result<Value, Stri
     handle_quota_status(ctx.conn, ctx.arguments)
 }
 
+/// v0.7.0 #1389 L4 — `memory_capture_turn` dispatcher.
+fn dispatch_memory_capture_turn(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_capture_turn(ctx.conn, ctx.arguments)
+}
+
 fn dispatch_memory_check_agent_action(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
     handle_check_agent_action(ctx.conn, ctx.arguments)
 }
@@ -1674,6 +1687,11 @@ pub(crate) static TOOL_DISPATCH_TABLE: &[(&str, DispatchFn)] = {
         register_mcp_tool!(
             tool_names::MEMORY_QUOTA_STATUS,
             dispatch_memory_quota_status
+        ),
+        // v0.7.0 #1389 L4 — host-volunteered turn capture per RFC-0001.
+        register_mcp_tool!(
+            tool_names::MEMORY_CAPTURE_TURN,
+            dispatch_memory_capture_turn
         ),
         register_mcp_tool!(
             tool_names::MEMORY_CHECK_AGENT_ACTION,
