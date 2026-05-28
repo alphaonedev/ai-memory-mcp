@@ -305,6 +305,15 @@ pub mod profile;
 // bytes, links/day) consulted by the store_memory + memory_link write
 // paths; daily counters reset at UTC midnight via a sweep loop.
 pub mod quotas;
+// v0.7.0 (issue #1389) — fail-safe recovery of agent context from
+// host-written transcript files (Claude Code JSONL, Codex CLI,
+// Gemini CLI). Closes the #1388 substrate failure mode where an
+// AI agent session terminated by SIGKILL between conversation
+// turns loses every decision / agreed plan it didn't volunteer-
+// `memory_store`. SessionStart-hook calls the CLI verb; in-session
+// agents call the MCP tool; both route through the canonical
+// `recover_from_transcript` handler in this module.
+pub mod recover;
 pub mod replication;
 pub mod reranker;
 // v0.7.x (issue #1174 follow-up #1192 / #1196) — cross-surface
