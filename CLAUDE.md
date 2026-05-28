@@ -2,6 +2,44 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Hard rule — `memory_store` FIRST on operator multi-step directives (L1 of #1389 layered-capture architecture)
+
+> **This is the substrate's first line of defense against the #1388 failure mode** (operator-agent test-plan dialog lost on tmux lockup + SIGKILL). Read this BEFORE the Required Reading list below; this rule has primacy.
+
+**When the operator gives you a multi-step directive — a numbered list, an enumerated plan, a scope statement, an "approved YES" with conditions, ANY content that establishes how you will work — your FIRST action MUST be:**
+
+```
+mcp__memory__memory_store {
+  title: "<short summary>",
+  content: "<verbatim operator message preserved>",
+  kind: "plan",
+  priority: 8 (or higher when load-bearing for ship gates),
+  namespace: "<resolved campaign / release-gate namespace>",
+  tags: ["operator-directive", "<campaign-tag>", "2026-MM-DD"],
+}
+```
+
+**No tool calls. No reasoning steps. No "I'll get started on…" stalling. `memory_store` FIRST, then everything else.**
+
+The substrate is volunteer-mode about capture — there is no automatic mechanism that catches operator directives until you call `memory_store`. Layers L2 (recover-on-boot), L3 (substrate watcher), and L4 (`memory_capture_turn` MCP tool) are the BACKSTOPS that catch the directive when L1 fails. The full layered-defense architecture is canonical in policy memory `f62cb182-7dd7-4513-80c8-bc215f5c6169` (`global/policies`, long tier, priority 10).
+
+### What counts as a "multi-step directive"
+
+- A numbered list (`1.) ... 2.) ... 3.)`).
+- An enumerated bullet plan, scope statement, or roadmap.
+- An "approved yes" / "do it" / "ship it" / "run with it" / "get it done" decision that commits the agent to a course of action.
+- A correction or scope refinement that supersedes a prior directive.
+- An architectural decision ("DO the RIGHT ARCHITECTURE", "use X not Y").
+- Anything the operator says they want PRESERVED — "document this", "keep this in mind", "do not forget this".
+
+When in doubt, store. The cost of an unused stored directive is ~0; the cost of a lost directive is what #1388 documented.
+
+### Failure mode — `memory_capture_nag` substrate watcher
+
+The substrate enforces this rule via the L1 nag watcher (`src/recover/nag.rs`): when an agent goes N turns without a `memory_store` call after a substantive user prompt, the watcher emits a stderr WARN + a `capture_lag` signed event. Operators see the lag in the audit trail. The default threshold is 5 turns; configurable via `AI_MEMORY_CAPTURE_NAG_THRESHOLD`.
+
+This rule and its enforcement are part of #1389; see also #1388 (RCA) and policy memory `f62cb182`.
+
 ## Required Reading at Session Start (AI agents)
 
 Before proposing any change to this repository, load the following into context:
