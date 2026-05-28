@@ -426,6 +426,13 @@ pub const MIGRATION_LADDER: &[MigrationMeta] = &[
         reversible: true,
         data_loss_risk: DataLossRisk::None,
     },
+    MigrationMeta {
+        version: 52,
+        name: "ADD_TRANSCRIPT_LINE_DEDUP",
+        idempotent: true,
+        reversible: true,
+        data_loss_risk: DataLossRisk::None,
+    },
 ];
 
 /// Look up the metadata for a target schema version.
