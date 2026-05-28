@@ -72,7 +72,7 @@ namespace-inheritance enforcement, real permission system with
 deny-first semantics, A2A maturity). Note: signed-events row `sig`
 population is gated on the resolved daemon `agent_id` having an
 Ed25519 `*.priv` on disk under the key directory
-(`src/main.rs:96-98` — `load_daemon_signing_key` returning `None`
+(`src/main.rs:116-118` — `load_daemon_signing_key` returning `None`
 deliberately swallows the failure with the "continuing unsigned"
 stderr line; the cross-row hash chain itself remains tamper-evident
 in either posture).
@@ -262,7 +262,7 @@ removed in v0.8.0.**
 **HTTP / CLI surface additions.** The `Config` subcommand and the
 `/api/v1/config/*` HTTP routes are new at v0.7.x; the count change is
 captured in [`CLAUDE.md`](../../CLAUDE.md) §Architecture (87 HTTP
-routes, 58 CLI subcommands).
+routes, 79 CLI subcommands in default build / 81 under --features sal).
 
 **Test pins.** Resolver precedence + secret-handling discipline are
 pinned by 19 tests under `src/config::tests::*1146*` +
@@ -426,7 +426,8 @@ Three v0.7.0 postures flip from v0.6.x fail-open behaviour to v0.7.0 fail-CLOSED
 ### CRITICAL — schema bump + audit chain integrity
 
 - **#1025 — archived_memories full v0.7.0 column carry, schema v48 → v49** (commits [`b1b462a77`](https://github.com/alphaonedev/ai-memory-mcp/commit/b1b462a77) + [`bd74c2e2c`](https://github.com/alphaonedev/ai-memory-mcp/commit/bd74c2e2c)). v49 added 14 nullable columns to `archived_memories` on both backends so archive → restore is lossless for the full v0.7.0 Memory shape (reflection_depth / memory_kind / entity_id / persona_version / citations / source_uri / source_span / confidence_source / confidence_signals / confidence_decayed_at / mentioned_entity_id / version / atomised_into / atom_of). Both adapters now at `CURRENT_SCHEMA_VERSION = 49`.
-- **#1156 — per-namespace K8 quota dimension extension, schema v49 → v50**. v50 extends `agent_quotas` PRIMARY KEY from `(agent_id)` to `(agent_id, namespace)` so per-namespace allotments hold even when a single agent operates across many namespaces. Pre-v50 rows backfill to the `_global` sentinel. NSA CSI MCP recommendation (c) — defense-in-depth blast-radius controls. Both adapters now at `CURRENT_SCHEMA_VERSION = 50`.
+- **#1156 — per-namespace K8 quota dimension extension, schema v49 → v50**. v50 extends `agent_quotas` PRIMARY KEY from `(agent_id)` to `(agent_id, namespace)` so per-namespace allotments hold even when a single agent operates across many namespaces. Pre-v50 rows backfill to the `_global` sentinel. NSA CSI MCP recommendation (c) — defense-in-depth blast-radius controls.
+- **#1255 — federation_nonces persistence across daemon restarts, schema v50 → v51** (PR [#1296](https://github.com/alphaonedev/ai-memory-mcp/pull/1296)). v51 added the `federation_nonces` table so peer-replay-prevention nonces survive daemon restarts. Both adapters now at `CURRENT_SCHEMA_VERSION = 51`.
 
 ### HIGH — federation, audit chain, governance
 
@@ -1441,9 +1442,9 @@ folded into the v0.7.0 tag rather than slipping to v0.7.1:
   truth lives at [`docs/internal/v070-feature-inventory.md`](../internal/v070-feature-inventory.md)
   (453 commits ahead of v0.6.4, +233,589/−23,541 lines, 74 MCP tools at
   release HEAD, 30 net-new since v0.6.4, 17 net-new `AI_MEMORY_*` env
-  vars, 73 HTTP routes total, 33 sqlite migrations on disk + the in-
-  process v35-v50 arms that converge sqlite + postgres on the single
-  logical `CURRENT_SCHEMA_VERSION = 50`).
+  vars, 87 production HTTP route registrations (73 unique URL paths), 33+ sqlite migrations on disk + the in-
+  process arms that converge sqlite + postgres on the single
+  logical `CURRENT_SCHEMA_VERSION = 51`).
 
 ## Backward compatibility
 

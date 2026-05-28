@@ -148,7 +148,7 @@ footer a{color:var(--text-muted)}
         <span class="hero-pill good">7/7 recommendations implemented</span>
         <span class="hero-pill good">27 substrate primitives catalogued</span>
         <span class="hero-pill good">47 dedicated tests pinning the #1154 contract</span>
-        <span class="hero-pill">Schema v49 · 74 MCP tools · 87 HTTP routes</span>
+        <span class="hero-pill">Schema v51 · 74 MCP tools · 87 HTTP routes</span>
       </div>
     </div>
   </div>
@@ -301,7 +301,7 @@ footer a{color:var(--text-muted)}
         </tr>
         <tr>
           <td class="col-name">i · Tool parameter injection (real-world)</td>
-          <td>RequestValidator DTO-bundled input-validation surface (87 HTTP routes + 74 MCP tools + 58 CLI subcommands)</td>
+          <td>RequestValidator DTO-bundled input-validation surface (87 HTTP routes + 73 MCP tools + 79 CLI subcommands)</td>
           <td><code>request_validator_input_validation</code>, <code>form_4_fact_provenance</code></td>
           <td><code>src/validate.rs:1027</code> (RequestValidator) · <code>src/validate.rs:784/808/852</code> (free-fn primitives)</td>
           <td><span class="status ok">addressed</span></td>
@@ -559,7 +559,7 @@ footer a{color:var(--text-muted)}
         <div class="meta"><span class="status ok">structurally addressed</span></div>
       </div>
       <p><strong>What the NSA warns:</strong> Attackers embed adversarial parameters in tool-invocation payloads that the MCP server does not adequately validate. The NSA document cites this as a recurring real-world failure class.</p>
-      <p><strong>How ai-memory addresses it:</strong> <code>RequestValidator</code> DTO-bundled validation surface (#966). Every wire-entry layer — 87 HTTP routes, 74 MCP tools, 58 CLI subcommands — routes DTO-bundling validation through <code>RequestValidator::validate_create</code>, <code>validate_update</code>, <code>validate_memory</code>, <code>validate_link_triple</code>, <code>validate_consolidate</code>, <code>validate_id_and_namespace</code>, <code>validate_owner_write</code>, <code>validate_confidence_and_priority</code>. The typed <code>ValidationError { field, reason }</code> carries explicit field attribution while preserving byte-equal wire-side error messages via a <code>Display</code> impl mirroring the legacy <code>bail!</code> shape. Adding a new cross-field invariant is one struct method addition.</p>
+      <p><strong>How ai-memory addresses it:</strong> <code>RequestValidator</code> DTO-bundled validation surface (#966). Every wire-entry layer — 87 HTTP routes, 73 MCP tools, 79 CLI subcommands — routes DTO-bundling validation through <code>RequestValidator::validate_create</code>, <code>validate_update</code>, <code>validate_memory</code>, <code>validate_link_triple</code>, <code>validate_consolidate</code>, <code>validate_id_and_namespace</code>, <code>validate_owner_write</code>, <code>validate_confidence_and_priority</code>. The typed <code>ValidationError { field, reason }</code> carries explicit field attribution while preserving byte-equal wire-side error messages via a <code>Display</code> impl mirroring the legacy <code>bail!</code> shape. Adding a new cross-field invariant is one struct method addition.</p>
       <div class="anchor-list">
         <strong>Code anchors:</strong>
         <ul>
@@ -578,7 +578,7 @@ footer a{color:var(--text-muted)}
       <p><strong>What the NSA warns:</strong> MCP clients mounting multiple servers without a robust resolution policy can suffer tool-name collisions — a malicious or misconfigured second server advertising a tool named <code>memory_recall</code> can shadow the legitimate one.</p>
       <p><strong>How ai-memory addresses it (composite — both halves shipped):</strong></p>
       <p><strong>(1) Client-side identity capture (v0.7.0 baseline):</strong> the substrate captures <code>clientInfo.name</code> from the MCP initialize handshake (<code>src/mcp/mod.rs:1607-1611</code>) and threads it through every downstream operation for per-row provenance attribution. This proves WHICH client made a call and supports forensic reconstruction.</p>
-      <p><strong>(2) Server-side cryptographic identity attestation (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1154">#1154</a>, this PR):</strong> the substrate publishes a daemon-Ed25519-signed <code>ai_memory_identity</code> block on every MCP initialize response (<code>src/mcp/server_identity.rs</code>). Clients implement Trust On First Use (TOFU): capture the signature on first connect; refuse subsequent connects that present a different signature. Canonical-bytes discipline mirrors the existing governance-rule signing pattern at <code>src/governance/rules_store.rs:541</code> — schema_version + daemon_id + public_key + signed_at signed via Ed25519. The implementation is purely additive on the wire (per MCP spec, clients ignore unknown response fields); v0.6.4 / v0.7.0 callers continue to function identically; the block is OMITTED when the daemon has no keypair on disk (preserving the existing "continuing unsigned" posture from <code>src/main.rs:96-98</code>).</p>
+      <p><strong>(2) Server-side cryptographic identity attestation (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1154">#1154</a>, this PR):</strong> the substrate publishes a daemon-Ed25519-signed <code>ai_memory_identity</code> block on every MCP initialize response (<code>src/mcp/server_identity.rs</code>). Clients implement Trust On First Use (TOFU): capture the signature on first connect; refuse subsequent connects that present a different signature. Canonical-bytes discipline mirrors the existing governance-rule signing pattern at <code>src/governance/rules_store.rs:541</code> — schema_version + daemon_id + public_key + signed_at signed via Ed25519. The implementation is purely additive on the wire (per MCP spec, clients ignore unknown response fields); v0.6.4 / v0.7.0 callers continue to function identically; the block is OMITTED when the daemon has no keypair on disk (preserving the existing "continuing unsigned" posture from <code>src/main.rs:116-118</code>).</p>
       <p><strong>Coverage pinned by 47 dedicated tests:</strong> 20 module-level tests in <code>src/mcp/server_identity.rs</code> + 27 integration tests in <code>tests/mcp_initialize_server_signing.rs</code>. Zero regression on existing MCP handshake tests (<code>mcp_initialize_handshake_succeeds</code>, the eight <code>d4_*_initialize_round_trip</code> harness coverage tests).</p>
       <div class="anchor-list">
         <strong>Code anchors:</strong>

@@ -437,7 +437,7 @@ pub struct Memory {
     pub priority: i32,
     /// 0.0-1.0 — how certain is this memory
     pub confidence: f64,
-    /// Who/what created this: "user", "claude", "hook", "api", "import"
+    /// Who/what created this: "user", "nhi", "hook", "api", "import" (v0.7.x DEFAULT_NHI_SOURCE; "claude" retained for back-compat per src/validate.rs::VALID_SOURCES)
     pub source: String,
     pub access_count: i64,
     pub created_at: String,

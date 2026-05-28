@@ -40,7 +40,7 @@ Any future revision of this rationale should engage the §2.6 architectural prop
 
 ## Provenance
 
-- Verification report at `release/v0.7.0` HEAD confirmed the CLI inventory (58 subcommands; no `Reflect(ReflectArgs)` variant on the `Command` enum) and recommended Hold Position.
+- Verification report at `release/v0.7.0` HEAD confirmed the CLI inventory (79 subcommands in the default build / 81 under `--features sal` or `--features sal-postgres`; `Reflect` and 15 other parity variants subsequently landed via the FX-C3 batch2 work) and recommended Hold Position.
 - Operator-led architectural review surfaced the §2.6 composition that the verification report named only structurally.
 - Final decision: hold position. Ship v0.7.0 with the current CLI surface unchanged. Document the rationale here so the question cannot resurface without engaging the architecture.
 - See also: [`docs/strategy/moonshot-synthesis.md`](strategy/moonshot-synthesis.md) §2.6 (bias-displacement through architectural separation-of-powers); [`ROADMAP.md`](../ROADMAP.md) §2.6 (the seven properties that remain load-bearing through ASI).
