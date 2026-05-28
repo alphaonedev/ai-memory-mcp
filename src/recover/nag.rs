@@ -56,6 +56,22 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+/// Env var overriding the primary nag threshold (first WARN).
+pub const NAG_THRESHOLD_ENV: &str = "AI_MEMORY_CAPTURE_NAG_THRESHOLD";
+
+/// Env var overriding the escalation nag threshold (sustained-drift WARN).
+pub const NAG_ESCALATE_THRESHOLD_ENV: &str = "AI_MEMORY_CAPTURE_NAG_ESCALATE_THRESHOLD";
+
+/// Default primary threshold: number of consecutive non-write tool
+/// calls before the first `capture_lag` WARN fires. Overridable via
+/// [`NAG_THRESHOLD_ENV`]; `0` disables.
+pub const DEFAULT_NAG_THRESHOLD: u32 = 5;
+
+/// Default escalation threshold: consecutive non-write tool calls
+/// before the sustained-drift WARN fires. Overridable via
+/// [`NAG_ESCALATE_THRESHOLD_ENV`]; `0` disables.
+pub const DEFAULT_NAG_ESCALATE_THRESHOLD: u32 = 20;
+
 /// Per-`(agent_id, session_id)` non-store-call counter, plus the
 /// "have we already warned this session" flag so each session
 /// gets at most one WARN per threshold (no log spam).
@@ -116,12 +132,14 @@ impl CaptureNagWatcher {
     /// Create a new watcher with thresholds from environment vars
     /// (or defaults if unset / unparseable).
     ///
-    /// Default thresholds: primary `5`, escalation `20`. Set
-    /// either to `0` to disable that threshold.
+    /// Default thresholds: primary [`DEFAULT_NAG_THRESHOLD`],
+    /// escalation [`DEFAULT_NAG_ESCALATE_THRESHOLD`]. Set either to
+    /// `0` to disable that threshold.
     #[must_use]
     pub fn new_from_env() -> Self {
-        let primary = parse_threshold_env("AI_MEMORY_CAPTURE_NAG_THRESHOLD", 5);
-        let escalation = parse_threshold_env("AI_MEMORY_CAPTURE_NAG_ESCALATE_THRESHOLD", 20);
+        let primary = parse_threshold_env(NAG_THRESHOLD_ENV, DEFAULT_NAG_THRESHOLD);
+        let escalation =
+            parse_threshold_env(NAG_ESCALATE_THRESHOLD_ENV, DEFAULT_NAG_ESCALATE_THRESHOLD);
         Self::new(primary, escalation)
     }
 
