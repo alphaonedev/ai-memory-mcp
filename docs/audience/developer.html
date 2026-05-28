@@ -118,7 +118,7 @@ curl -X POST http://127.0.0.1:9077/api/v1/memories \
   -d '{"title":"hello","content":"first HTTP memory","tier":"mid"}'</code></pre>
 
   <h3>CLI &mdash; clap subcommands</h3>
-  <div class="if-tabs"><span class="if-tab cli">57 subcommands at --features sal-postgres (55 default-build), all support --json</span></div>
+  <div class="if-tabs"><span class="if-tab cli">79 subcommands in default build (81 with --features sal or --features sal-postgres), all support --json</span></div>
   <pre><code>ai-memory store --title hello --content "first CLI memory" --tier mid
 ai-memory recall "hello"
 ai-memory stats --json | jq .</code></pre>
