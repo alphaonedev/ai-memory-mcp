@@ -216,7 +216,7 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
     <div class="meta">
       <span>73 MCP tools</span>
       <span>87 HTTP routes (73 unique paths)</span>
-      <span>58 CLI subcommands</span>
+      <span>79 CLI subcommands</span>
       <span>Ed25519 attested</span>
       <span>SQLite&nbsp;+&nbsp;Postgres&#x202F;/&#x202F;AGE</span>
       <span><a href="compliance/nsa-csi-mcp.html" style="color:#6ee7ff">NSA CSI MCP 10/10 · 7/7</a></span>
@@ -506,7 +506,7 @@ api_key_env = "XAI_API_KEY"            # env-var name (inline keys rejected at p
       <a class="int-card" href="CLI_REFERENCE.md">
         <div class="label">CLI</div>
         <h4>Command line</h4>
-        <p>56 subcommands, optional <code>--json</code>. For shell scripts, cron, and humans.</p>
+        <p>79 subcommands (81 with <code>--features sal</code>), optional <code>--json</code>. For shell scripts, cron, and humans.</p>
         <span class="arrow">CLI reference &rarr;</span>
       </a>
     </div>
@@ -525,25 +525,35 @@ api_key_env = "XAI_API_KEY"            # env-var name (inline keys rejected at p
     </p>
 
     <div class="audience-row">
-      <a class="aud cyan" href="install-quickstart.md">
-        <div class="who">End user &middot; non-technical</div>
+      <a class="aud cyan" href="audience/decision-maker.html">
+        <div class="who">Decision maker &middot; procurement</div>
         <h3>I want to talk to my AI and have it remember.</h3>
         <p>Install ai-memory in 60 seconds. Plug it into Claude Code or ChatGPT desktop. Your assistant remembers across sessions. No databases, no servers, no jargon.</p>
-        <span class="cta">Quickstart &rarr;</span>
+        <span class="cta">Decision-maker deep-dive &rarr;</span>
       </a>
-      <a class="aud amber" href="integration-guide.md">
+      <a class="aud amber" href="audience/developer.html">
         <div class="who">Developer &middot; integration</div>
         <h3>I am building with ai-memory.</h3>
         <p>Three interfaces: MCP, HTTP, CLI. Persistent typed memory for your AI app, agent, or harness. Generic MCP works out of the box; Claude Code, Cursor, ChatGPT desktop, others have first-class recipes.</p>
-        <span class="cta">Integration guide &rarr;</span>
+        <span class="cta">Developer deep-dive &rarr;</span>
       </a>
-      <a class="aud violet" href="enterprise-deployment.md">
-        <div class="who">SME engineer / architect</div>
+      <a class="aud violet" href="audience/operator.html">
+        <div class="who">Operator &middot; SME engineer / architect</div>
         <h3>I am deploying across racks, DCs, regions.</h3>
         <p>Postgres + Apache AGE backend, mTLS daemon, federated quorum, governance L1&ndash;L6, Ed25519 attestation, swarm + hive topologies. Reproducible reference architectures T3&ndash;T5.</p>
-        <span class="cta">Enterprise deployment &rarr;</span>
+        <span class="cta">Operator deep-dive &rarr;</span>
       </a>
     </div>
+    <p style="margin-top:1.25rem;font-size:.92rem;color:var(--text-muted)">
+      Working refs: <a href="install-quickstart.md">install-quickstart</a> &middot;
+      <a href="integration-guide.md">integration-guide</a> &middot;
+      <a href="enterprise-deployment.md">enterprise-deployment</a>.
+      AI-NHI design essays:
+      <a href="essays/brass-tacks-1-what.html">What</a> &middot;
+      <a href="essays/brass-tacks-2-how.html">How</a> &middot;
+      <a href="essays/brass-tacks-3-why.html">Why</a>.
+      A2A federation: see <a href="a2a-messaging.html">A2A messaging</a> for the federation peer-to-peer recall walkthrough.
+    </p>
   </div>
 </section>
 
@@ -663,8 +673,8 @@ api_key_env = "XAI_API_KEY"            # env-var name (inline keys rejected at p
       <a class="lk" href="compliance/index.html"><strong>Compliance &amp; Procurement</strong><span class="desc">NSA CSI MCP mapping · honest limitations · Memory Portability Spec v1</span></a>
       <a class="lk" href="USER_GUIDE.md"><strong>User guide</strong><span class="desc">End-to-end MCP tool reference</span></a>
       <a class="lk" href="DEVELOPER_GUIDE.md"><strong>Developer guide</strong><span class="desc">Build from source, extend, add tools</span></a>
-      <a class="lk" href="API_REFERENCE.md"><strong>HTTP API</strong><span class="desc">73 routes at /api/v1/</span></a>
-      <a class="lk" href="CLI_REFERENCE.md"><strong>CLI reference</strong><span class="desc">56 subcommands</span></a>
+      <a class="lk" href="API_REFERENCE.md"><strong>HTTP API</strong><span class="desc">87 routes (73 unique paths)</span></a>
+      <a class="lk" href="CLI_REFERENCE.md"><strong>CLI reference</strong><span class="desc">79 subcommands</span></a>
       <a class="lk" href="GLOSSARY.md"><strong>Glossary</strong><span class="desc">Every concept, one place</span></a>
       <a class="lk" href="knowledge-graph.html"><strong>Knowledge graph</strong><span class="desc">Typed links, temporal validity</span></a>
       <a class="lk" href="agent-identity.html"><strong>Agent identity (NHI)</strong><span class="desc">agent_id semantics</span></a>

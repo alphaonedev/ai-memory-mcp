@@ -446,7 +446,7 @@
         "src/validate.rs:852 (validate_update free fn)"
       ],
       "issue_references": ["#966"],
-      "factual_description": "Every wire-entry layer (HTTP handlers, MCP tools, CLI subcommands) routes DTO-bundling validation through pub struct RequestValidator — the canonical fluent surface. Pre-#966 the same validate_id + validate_namespace + validate_agent_id + ... chains were duplicated across 87 HTTP routes, 73 MCP tools, and 58 CLI subcommands; adding a new cross-field invariant required three audited per-surface edits. Post-#966 a single struct method covers all three surfaces with the typed ValidationError { field, reason } envelope. This is the substrate's primary defense against the NSA-enumerated tool-parameter-injection class.",
+      "factual_description": "Every wire-entry layer (HTTP handlers, MCP tools, CLI subcommands) routes DTO-bundling validation through pub struct RequestValidator — the canonical fluent surface. Pre-#966 the same validate_id + validate_namespace + validate_agent_id + ... chains were duplicated across 87 HTTP routes, 73 MCP tools, and 79 CLI subcommands; adding a new cross-field invariant required three audited per-surface edits. Post-#966 a single struct method covers all three surfaces with the typed ValidationError { field, reason } envelope. This is the substrate's primary defense against the NSA-enumerated tool-parameter-injection class.",
       "verified_in_v0_7_0": true,
       "verified_by_grep": "grep -nE 'pub struct RequestValidator|validate_create|validate_update|validate_memory' src/validate.rs → 11 hits"
     },

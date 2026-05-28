@@ -10,7 +10,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>v0.7.0 architecture &mdash; post-#1174 substrate surface</title>
-<meta name="description" content="ai-memory v0.7.0 architecture: 73 MCP tools / 87 HTTP routes / 58 CLI subcommands, schema v50, RuntimeContext cross-surface, lint-gate enforcement, public consts surface (tool_names::*, DEFAULT_NHI_SOURCE, BACKEND_OLLAMA, KNOWN_EMBEDDING_DIMS), 15-vendor LLM substrate.">
+<meta name="description" content="ai-memory v0.7.0 architecture: 73 MCP tools / 87 HTTP routes / 79 CLI subcommands, schema v51, RuntimeContext cross-surface, lint-gate enforcement, public consts surface (tool_names::*, DEFAULT_NHI_SOURCE, BACKEND_OLLAMA, KNOWN_EMBEDDING_DIMS), 15-vendor LLM substrate.">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/v070-architecture.html">
 <style>
 :root{--bg:#0a0a0a;--panel:#121212;--border:#262626;--border-hi:#3a3a3a;--text:#f5f5f5;--muted:#9a9a9a;--dim:#6b6b6b;--accent:#6ee7ff;--warn:#ffb86b;--good:#7cd992;--p1:#a78bfa;--p2:#6ee7ff;--p3:#7cd992;--code-bg:#161616;--font-sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;--font-mono:"SF Mono","JetBrains Mono","Cascadia Code",Consolas,monospace;--w-mid:880px;--w-wide:1080px}
@@ -93,8 +93,8 @@ footer a{color:var(--muted)}
   <p class="lede">ai-memory v0.7.0 ships three interfaces (MCP stdio, HTTP REST, native CLI) over one SQLite-backed core with optional Postgres+AGE adapter. This page is the canonical architecture snapshot at <code>release/v0.7.0 @ 1cb95bbe7</code> &mdash; post-#1174 pm-v3.1 refactor train, post-#1182 vendor-neutrality sweep, post-#1192/#1196 cross-surface RuntimeContext.</p>
   <div class="meta-row">
     <span>release/v0.7.0 @ <code>1cb95bbe7</code></span>
-    <span>73 MCP / 87 HTTP / 58 CLI</span>
-    <span>schema v50</span>
+    <span>73 MCP / 87 HTTP / 79 CLI</span>
+    <span>schema v51</span>
     <span>15-vendor LLM substrate</span>
     <span>lint-gated CI</span>
   </div>
@@ -116,11 +116,11 @@ footer a{color:var(--muted)}
     </div>
     <div class="surface-card cli">
       <div class="label">CLI &mdash; subcommands</div>
-      <div class="count">58</div>
-      <p class="body">Top-level <code>Command</code> enum variants in <code>src/daemon_runtime.rs</code> with <code>--features sal-postgres</code>; default build ships 56. Postgres-only variants (<code>schema-init</code>, <code>migrate</code>) feature-gated.</p>
+      <div class="count">79</div>
+      <p class="body">Top-level <code>Command</code> enum variants in <code>src/daemon_runtime.rs</code> (default build ships 79; <code>--features sal</code>/<code>sal-postgres</code> unlocks 81 by adding <code>migrate</code> + <code>schema-init</code>, both <code>#[cfg(feature = "sal")]</code> &mdash; not postgres-only).</p>
     </div>
   </div>
-  <p>Each count is asserted by a regression test. The architectural North Star (per CLAUDE.md prime directive): long-term codebase manageability. Surface counts grew from v0.6.4&apos;s 70 MCP / 73 HTTP / 40 CLI via the v0.7.0 attested-cortex feature surface + #1146 sectioned-config + #1156 per-namespace K8 quota.</p>
+  <p>Each count is asserted by a regression test. The architectural North Star (per CLAUDE.md prime directive): long-term codebase manageability. Growth narrative: 70 MCP / 73 HTTP / 40 CLI at v0.6.4 &rarr; 73 / 87 / 79 at v0.7.0 (FX-12/ARCH-3 + FX-C3 batch2 added 16 CLI subcommands closing MCP/CLI parity; v0.7.0 attested-cortex feature surface + #1146 sectioned-config + #1156 per-namespace K8 quota + #1255 federation_nonces persistence drove the HTTP + schema bumps).</p>
 </section>
 
 <section class="wrap-mid">
@@ -159,7 +159,7 @@ footer a{color:var(--muted)}
       <tr><td><code>crate::mcp::tool_names::*</code></td><td>All 73 MCP tool names (e.g. <code>RECALL</code>, <code>STORE</code>, <code>CAPABILITIES</code>). Production code reads these instead of bare string literals.</td></tr>
       <tr><td><code>crate::llm::BACKEND_OLLAMA</code><br><code>crate::llm::BACKEND_OPENAI</code><br><code>crate::llm::BACKEND_XAI</code> &hellip;</td><td>15 vendor-backend identifiers (ollama, openai, xai, anthropic, gemini, deepseek, kimi, qwen, mistral, groq, together, cerebras, openrouter, fireworks, lmstudio) + the generic <code>openai-compatible</code> escape hatch.</td></tr>
       <tr><td><code>crate::llm::KNOWN_EMBEDDING_DIMS</code></td><td>Canonical embedding-model &rarr; vector-dim lookup table (closes #1169 drift surface). <code>canonical_embedding_dim(model)</code> helper threads through <code>ResolvedEmbeddings</code>.</td></tr>
-      <tr><td><code>crate::DEFAULT_NHI_SOURCE</code></td><td>Vendor-neutral default source identifier (<code>"nhi"</code>) for the reflection / curator / synthesis surfaces. Replaces the pre-#1175 hardcoded <code>"claude"</code> at <code>src/mcp/tools/reflect.rs:103</code>.</td></tr>
+      <tr><td><code>crate::DEFAULT_NHI_SOURCE</code></td><td>Vendor-neutral default source identifier (<code>"nhi"</code>) for the reflection / curator / synthesis surfaces. Replaces the pre-#1175 hardcoded <code>"claude"</code> (the hardcode was removed by commit 84ec159c1; current source-stamp site uses <code>DEFAULT_NHI_SOURCE</code> from src/validate.rs:85).</td></tr>
       <tr><td><code>crate::DEFAULT_NAMESPACE</code><br><code>crate::quotas::GLOBAL_NAMESPACE</code></td><td>User-facing default vs quota-sentinel namespaces (disambiguated per PR5 #1190).</td></tr>
       <tr><td><code>crate::SECS_PER_HOUR</code><br><code>crate::SECS_PER_DAY</code><br><code>crate::SECS_PER_WEEK</code></td><td>Time-unit constants. Lint-gated against magic-number <code>Duration::from_secs(3600 | 86400 | 604800)</code>.</td></tr>
       <tr><td><code>crate::HEADER_CONTENT_TYPE</code><br><code>crate::MIME_JSON</code></td><td>HTTP header + MIME constants. Eliminates <code>"application/json"</code> string-literal drift surface.</td></tr>
@@ -194,13 +194,14 @@ footer a{color:var(--muted)}
 </section>
 
 <section class="wrap-mid">
-  <div class="eyebrow-h2">Schema v50 ladder</div>
+  <div class="eyebrow-h2">Schema v51 ladder</div>
   <h2>Single logical version, two adapters.</h2>
-  <p>Both adapters carry <code>CURRENT_SCHEMA_VERSION = 50</code>. SQLite ladder ends at the <code>if version &lt; 50</code> arm in <code>src/storage/migrations.rs</code>; postgres ladder ends at <code>migrate_v50()</code> in <code>src/store/postgres.rs</code>. The two adapters share a single logical schema number even though the on-disk file-name counters differ because the sqlite split numbers per-bump while the postgres ladder is a single greenfield+upgrade pair.</p>
+  <p>Both adapters carry <code>CURRENT_SCHEMA_VERSION = 51</code>. SQLite ladder ends at the <code>if version &lt; 51</code> arm in <code>src/storage/migrations.rs</code>; postgres ladder ends at <code>migrate_v51()</code> in <code>src/store/postgres.rs</code>. The two adapters share a single logical schema number even though the on-disk file-name counters differ because the sqlite split numbers per-bump while the postgres ladder is a single greenfield+upgrade pair.</p>
   <ul>
     <li><strong>v48</strong> (#933 Track D) &mdash; <code>federation_push_dlq</code> table.</li>
     <li><strong>v49</strong> (#1025) &mdash; 14 nullable columns on <code>archived_memories</code> so archive&rarr;restore is lossless for the full v0.7.0 Memory shape on both backends.</li>
     <li><strong>v50</strong> (#1156) &mdash; <code>agent_quotas</code> PRIMARY KEY extended from <code>(agent_id)</code> to <code>(agent_id, namespace)</code>. Per-namespace K8 quota allotments hold even when a single agent operates across many namespaces. Pre-v50 rows backfill to the <code>_global</code> sentinel namespace.</li>
+    <li><strong>v51</strong> (#1255 / PR #1296) &mdash; added the <code>federation_nonces</code> table so peer-replay-prevention nonces persist across daemon restarts.</li>
   </ul>
   <p>Migrations run on first open of the new binary. The migration set is dry-run-tested against the operator&apos;s own DB by <code>scripts/dogfood-rebuild.sh</code> before a release ships.</p>
 </section>
@@ -216,7 +217,7 @@ footer a{color:var(--muted)}
     <a href="v070-changelog.html"><strong>v0.7.0 CHANGELOG synthesis</strong><span class="desc">User-facing impact, not PR sequence</span></a>
     <a href="v0.7.0/heterogeneous-ai-nhi-assessment/"><strong>Heterogeneous AI NHI assessment</strong><span class="desc">Multi-evaluator parallel evaluation</span></a>
     <a href="v0.7.0/test-campaign-2026-05-22-release-gate-final/"><strong>2026-05-22 release-gate-final campaign</strong><span class="desc">SHIP-RECOMMENDED &middot; 7,321 PASS / 0 FAIL</span></a>
-    <a href="feature-matrix.html"><strong>Full feature matrix</strong><span class="desc">73 MCP &times; 87 HTTP &times; 58 CLI cross-reference</span></a>
+    <a href="feature-matrix.html"><strong>Full feature matrix</strong><span class="desc">73 MCP &times; 87 HTTP &times; 79 CLI cross-reference</span></a>
   </div>
 </section>
 

@@ -129,7 +129,7 @@ footer a{color:var(--muted)}
     <div class="risk"><h4>Supply chain</h4><p>Rust, <code>cargo audit</code> required to be clean as a release gate. Binary is statically linkable; reproducible builds are on the v1.0 roadmap.</p></div>
     <div class="risk"><h4>Security posture</h4><p>v0.7.0 secure-default: permissions enforced by default, SSRF gate on webhooks, signed audit chain, HMAC subscriptions, optional sqlcipher for at-rest encryption.</p></div>
     <div class="risk"><h4>Operational risk</h4><p>One process, one DB file. Failure modes are SQLite failure modes (well-understood). Migrations dry-run-tested by the maintainer dogfood loop before every release tag.</p></div>
-    <div class="risk"><h4>Project maturity</h4><p>v0.7.0 is the third major release. 73 MCP entries at <code>--profile full</code>, 87 HTTP routes (73 unique paths), 58 CLI subcommands (with <code>--features sal-postgres</code>; 56 in the default build). CI gates on Linux x64/arm64, macOS x64/arm64, Windows x64, plus iOS + Android cross-compile (Posture 1a, #1068). Test campaigns are reproducible and publicly logged under <code>docs/v0.7.0/test-campaign-*</code>.</p></div>
+    <div class="risk"><h4>Project maturity</h4><p>v0.7.0 is the third major release. 73 MCP entries at <code>--profile full</code>, 87 HTTP routes (73 unique paths), 79 CLI subcommands (81 with <code>--features sal</code> or <code>--features sal-postgres</code>). CI gates on Linux x64/arm64, macOS x64/arm64, Windows x64, plus iOS + Android cross-compile (Posture 1a, #1068). Test campaigns are reproducible and publicly logged under <code>docs/v0.7.0/test-campaign-*</code>.</p></div>
   </div>
 </section>
 

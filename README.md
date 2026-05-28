@@ -68,7 +68,7 @@ v0.7.0 closes the `attested-cortex` epic (69/69 across 11 tracks A–K), folds i
 
 ### Attested cortex epic (Tracks A–K)
 
-- **Attested links (Ed25519).** The dead `signature` column shipped in v0.6.3 is now filled with real per-agent Ed25519 attestation, and `memory_verify(link_id)` returns `{signature_verified, attest_level, signed_by, signed_at}` on demand. Generate a keypair with `ai-memory identity generate`; opt-in via `attest_level = "self_signed"`. Signing is **gated on the resolved daemon `agent_id` having a `*.priv` keypair on disk** under the configured key directory — when `load_daemon_signing_key` returns `None` (`src/main.rs:96-98`), rows still write but `sig` is empty and the daemon emits a "continuing unsigned" line at boot. The cross-row hash chain on `signed_events` remains tamper-evident either way. See the [`attested-cortex` RFC](docs/v0.7/rfc-attested-cortex.md#decision-1--why-ed25519-over-x25519--chacha20).
+- **Attested links (Ed25519).** The dead `signature` column shipped in v0.6.3 is now filled with real per-agent Ed25519 attestation, and `memory_verify(link_id)` returns `{signature_verified, attest_level, signed_by, signed_at}` on demand. Generate a keypair with `ai-memory identity generate`; opt-in via `attest_level = "self_signed"`. Signing is **gated on the resolved daemon `agent_id` having a `*.priv` keypair on disk** under the configured key directory — when `load_daemon_signing_key` returns `None` (`src/main.rs:116-118`), rows still write but `sig` is empty and the daemon emits a "continuing unsigned" line at boot. The cross-row hash chain on `signed_events` remains tamper-evident either way. See the [`attested-cortex` RFC](docs/v0.7/rfc-attested-cortex.md#decision-1--why-ed25519-over-x25519--chacha20).
 - **Signed events V-4 closeout (cross-row hash chain)** (issue [#698](https://github.com/alphaonedev/ai-memory-mcp/issues/698)). Each `signed_events` row carries `prev_hash` + `sequence`; first-row `prev_hash` is zero, subsequent rows chain the SHA-256 of the prior canonical-CBOR payload. `ai-memory verify-signed-events-chain` walks the chain end-to-end. See [`docs/signed-events-v4.md`](docs/signed-events-v4.md).
 - **Hook pipeline (25 lifecycle events).** A programmable extension surface fires on the 20 baseline `pre_/post_store|recall|search|delete|promote|link|consolidate|governance_decision|archive|transcript_store` + `on_index_eviction` events, plus 5 grand-slam additions (`pre_recall_expand` G10 + `pre_reflect`/`post_reflect` recursive-learning Task 6/8 + `pre_compaction`/`on_compaction_rollback` L1-7). Hooks return `Allow` / `Modify` / `Deny` / `AskUser`. Default off; opt in via `~/.config/ai-memory/hooks.toml`. See [`docs/hook-pipeline.md`](docs/hook-pipeline.md).
 - **Sidechain transcripts + replay.** zstd-3 BLOB sidechain stores raw conversation/reasoning trails; `memory_replay(memory_id)` walks `memory_transcript_links` to reconstruct the chain. Opt-in per namespace via `[transcripts."team/*"]`. See [`docs/sidechain-transcripts.md`](docs/sidechain-transcripts.md).
@@ -150,7 +150,7 @@ ai-memory integrates with any AI platform that supports the **Model Context Prot
 | **OpenClaw** | MCP stdio | JSON (`mcp.servers` in config) | Fully supported |
 | **Any MCP client** | MCP stdio or HTTP | Varies | Universal |
 
-MCP is the primary integration layer. For AI platforms that do not yet support MCP natively, the **HTTP API** (87 route registrations / 73 unique URL paths on localhost at v0.7.0) and the **CLI** (58 subcommands at v0.7.0 with `--features sal-postgres`; 56 in the default build) provide universal access -- any AI, script, or automation that can make HTTP calls or run shell commands can use ai-memory.
+MCP is the primary integration layer. For AI platforms that do not yet support MCP natively, the **HTTP API** (87 route registrations / 73 unique URL paths on localhost at v0.7.0) and the **CLI** (81 subcommands at v0.7.0 under `--features sal` OR `--features sal-postgres`; 79 in the default build) provide universal access -- any AI, script, or automation that can make HTTP calls or run shell commands can use ai-memory.
 
 ---
 
@@ -652,7 +652,7 @@ It runs as an MCP (Model Context Protocol) tool server -- a background process t
 
 Memories that keep getting accessed automatically promote from mid to long-term. Each recall extends the TTL. Priority increases with usage. The system is self-curating.
 
-Beyond MCP, ai-memory also exposes a full HTTP REST API (87 route registrations / 73 unique URL paths on port 9077 at v0.7.0) and a complete CLI (58 subcommands at v0.7.0 with `--features sal-postgres`; 56 in the default build) for direct interaction, scripting, and integration with any AI platform or tool.
+Beyond MCP, ai-memory also exposes a full HTTP REST API (87 route registrations / 73 unique URL paths on port 9077 at v0.7.0) and a complete CLI (81 subcommands at v0.7.0 under `--features sal` OR `--features sal-postgres`; 79 in the default build) for direct interaction, scripting, and integration with any AI platform or tool.
 
 ---
 
@@ -684,7 +684,7 @@ Beyond MCP, ai-memory also exposes a full HTTP REST API (87 route registrations 
 
 ### Interfaces
 - **87 HTTP routes (73 unique paths)** -- full REST API on 127.0.0.1:9077 (works with any AI or tool)
-- **58 CLI subcommands at v0.7.0 with `--features sal-postgres`** (56 in the default build) -- complete CLI with identical capabilities
+- **81 CLI subcommands at v0.7.0 under `--features sal` OR `--features sal-postgres`** (79 in the default build) -- complete CLI with identical capabilities
 - **73 MCP tools** at full profile (7 default at v0.7.0; verified against `Profile::full().expected_tool_count()`) -- native integration for any MCP-compatible AI
 - **Interactive REPL shell** -- recall, search, list, get, stats, namespaces, delete with color output
 - **JSON output** -- `--json` flag on all CLI commands
@@ -977,7 +977,7 @@ These 73 tools (full profile at v0.7.0; canonical count via `Profile::full().exp
 
 ## CLI Commands
 
-58 top-level subcommands at v0.7.0 with `--features sal-postgres` (56 in the default build; the 2-variant gap is `Migrate` + `SchemaInit`, both sal-gated; was 40 at v0.6.4). Run `ai-memory <command> --help` for details on any command, or `ai-memory --help` for the full list.
+81 top-level subcommands at v0.7.0 under `--features sal` OR `--features sal-postgres` (79 in the default build; the 2-variant gap is `Migrate` + `SchemaInit`, both gated `#[cfg(feature = "sal")]` per src/daemon_runtime.rs:311,321; was 40 at v0.6.4). Run `ai-memory <command> --help` for details on any command, or `ai-memory --help` for the full list.
 
 | Command | Description |
 |---------|-------------|
@@ -1019,7 +1019,7 @@ The `store` subcommand accepts additional flags:
 
 | Flag | Description |
 |------|-------------|
-| `--source` / `-S` | Who created this memory (user, claude, hook, api, cli, import, consolidation, system). Default: `cli` |
+| `--source` / `-S` | Who created this memory (user, nhi, hook, api, cli, import, consolidation, system). Default: `cli`. "claude" accepted for back-compat per src/validate.rs::VALID_SOURCES |
 | `--expires-at` | RFC3339 expiry timestamp |
 | `--ttl-secs` | TTL in seconds (alternative to `--expires-at`) |
 

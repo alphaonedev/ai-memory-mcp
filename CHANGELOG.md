@@ -95,7 +95,7 @@ Closes [#1174](https://github.com/alphaonedev/ai-memory-mcp/issues/1174) (parent
 
 ### fix(config, #1168) — `memory_capabilities.models.*` drift from the v0.7.x #1146 unified resolver (2026-05-24)
 
-Closes [#1168](https://github.com/alphaonedev/ai-memory-mcp/issues/1168). Pre-fix `handle_capabilities_with_conn` and `handle_capabilities_with_conn_v3` reported `models.embedding`, `models.llm`, and `models.cross_encoder` from the compiled [`TierConfig`] preset rather than from `AppConfig::resolve_llm` / `resolve_embeddings` / `resolve_reranker`. Every other LLM-init surface — boot banner (`src/cli/boot.rs:401`), MCP/HTTP daemon LLM client (`src/daemon_runtime.rs:1775`), curator LLM (`src/cli/curator.rs:98`), `ai-memory doctor` reachability probe — was migrated to the unified resolver in #1146; the capabilities surface was missed.
+Closes [#1168](https://github.com/alphaonedev/ai-memory-mcp/issues/1168). Pre-fix `handle_capabilities_with_conn` and `handle_capabilities_with_conn_v3` reported `models.embedding`, `models.llm`, and `models.cross_encoder` from the compiled [`TierConfig`] preset rather than from `AppConfig::resolve_llm` / `resolve_embeddings` / `resolve_reranker`. Every other LLM-init surface — boot banner (`src/cli/boot.rs`), MCP/HTTP daemon LLM client (`src/daemon_runtime.rs`), curator LLM (`src/cli/curator.rs`), `ai-memory doctor` reachability probe — was migrated to the unified resolver in #1146; the capabilities surface was missed.
 
 **Symptom.** With `[llm] backend = "xai", model = "grok-4.3"` in `~/.config/ai-memory/config.toml`, the boot banner correctly reported `llm: xai:grok-4.3` and the daemon talked to xAI Grok, but `memory_capabilities` returned `"models": { "llm": "gemma4:e4b" }` (the compiled autonomous-tier preset). NHI agents and operator dashboards consulting the capabilities wire got a stale answer that disagreed with the actual LLM client wiring. Runtime correctness was unaffected; the defect was strictly observability.
 
@@ -105,9 +105,9 @@ Closes [#1168](https://github.com/alphaonedev/ai-memory-mcp/issues/1168). Pre-fi
 - **NEW** `ResolvedModels::from_tier_preset(&TierConfig)` back-compat constructor synthesises a resolver triple from the compiled tier preset for tests + the legacy `TierConfig::capabilities()` shim — byte-equal output to the pre-#1168 wire shape on every tier.
 - **NEW** `TierConfig::capabilities_with_resolved(&self, &ResolvedModels)` is the production entry point. Display logic mirrors the boot banner (`src/cli/boot.rs:420-424`): Ollama backend → bare model id; other backends → `backend:model`; embedder/reranker still honour the tier-preset disable flag.
 - **CHANGED** `build_capabilities_overlay`, `handle_capabilities_with_conn`, `handle_capabilities_with_conn_v3` (`src/mcp/tools/capabilities.rs`) gain a required `&ResolvedModels` parameter — no `Option<>`, no silent fall-through. A fn-pointer signature assertion in the new regression test file pins this so a future refactor that drops the parameter fails to compile.
-- **CHANGED** `ToolDispatchCtx::resolved_models` (`src/mcp/mod.rs:911`) + `handle_request` slot 2 + the `dispatch_memory_capabilities` forward.
+- **CHANGED** `ToolDispatchCtx::resolved_models` (`src/mcp/mod.rs::ToolDispatchCtx`) + `handle_request` slot 2 + the `dispatch_memory_capabilities` forward.
 - **CHANGED** `AppState::resolved_models: Arc<ResolvedModels>` (`src/handlers/transport.rs:294`) + `get_capabilities` forward (`src/handlers/system.rs:72,87`).
-- **CHANGED** `run_mcp_server` builds the triple once outside the stdio loop (`src/mcp/mod.rs:2438`); `bootstrap_serve` builds it once into `AppState` (`src/daemon_runtime.rs:3232`).
+- **CHANGED** `run_mcp_server` builds the triple once outside the stdio loop (`src/mcp/mod.rs::run_mcp_server`); `bootstrap_serve` builds it once into `AppState` (`src/daemon_runtime.rs::bootstrap_serve`).
 
 **Live MCP probe verification.** Against the live operator config (`[llm] backend = "xai", model = "grok-4.3"`), `printf JSONRPC | ai-memory mcp --profile full | jq '.models'` returns `{"llm": "xai:grok-4.3", "embedding": "nomic-embed-text-v1.5", "embedding_dim": 384, "cross_encoder": "ms-marco-MiniLM-L-6-v2"}` — matches the boot banner + the actual LLM client wiring.
 
@@ -126,9 +126,9 @@ Closes [#1168](https://github.com/alphaonedev/ai-memory-mcp/issues/1168). Pre-fi
 Closes [#1154](https://github.com/alphaonedev/ai-memory-mcp/issues/1154) (the last remaining partial-coverage edge on the NSA CSI MCP security framework). Substrate-side cryptographic identity attestation at the MCP handshake boundary — the second half of the defense against NSA CSI concern (j) Tool invocation path confusion.
 
 - **New module** `src/mcp/server_identity.rs` (≈360 LOC including doc-comments + 20 unit tests) — declares `DaemonIdentityToSign` struct, `canonical_bytes_for_identity` deterministic JSON canonicaliser, `build_signed_identity` Ed25519 signer, and `verify_signed_identity` round-trip helper. Canonical-bytes discipline mirrors the existing governance-rule signing pattern at `src/governance/rules_store.rs:541`.
-- **MCP initialize arm** (`src/mcp/mod.rs`) now constructs and signs an `ai_memory_identity` block on every initialize response when the daemon has an Ed25519 keypair on disk. The block carries `schema_version` (per the SSOT `CURRENT_SCHEMA_VERSION` constant at `src/storage/migrations.rs:516`), `daemon_id` (the resolved daemon `agent_id`), `public_key` (URL-safe base64 of the Ed25519 verifying key), `signed_at` (RFC3339 handshake timestamp), and `signature` (Ed25519 over the canonical bytes of the four preceding fields).
+- **MCP initialize arm** (`src/mcp/mod.rs`) now constructs and signs an `ai_memory_identity` block on every initialize response when the daemon has an Ed25519 keypair on disk. The block carries `schema_version` (per the SSOT `CURRENT_SCHEMA_VERSION` constant at `src/storage/migrations.rs:532`), `daemon_id` (the resolved daemon `agent_id`), `public_key` (URL-safe base64 of the Ed25519 verifying key), `signed_at` (RFC3339 handshake timestamp), and `signature` (Ed25519 over the canonical bytes of the four preceding fields).
 - **TOFU pin workflow** — clients capture the `signature` on first connect and refuse subsequent connects that present a different signature. Closes the tool-name collision attack surface where a misconfigured or adversarial second memory server advertises the same MCP tool names as the legitimate ai-memory daemon.
-- **Backwards compatibility — purely additive.** Per MCP / JSON-RPC convention clients ignore unknown response fields. v0.6.4 / v0.7.0 clients continue to function identically. When the daemon has NO keypair on disk (`load_daemon_signing_key` returns `None`), the `ai_memory_identity` block is OMITTED — preserving the v0.7.0 "continuing unsigned" posture from `src/main.rs:96-98`.
+- **Backwards compatibility — purely additive.** Per MCP / JSON-RPC convention clients ignore unknown response fields. v0.6.4 / v0.7.0 clients continue to function identically. When the daemon has NO keypair on disk (`load_daemon_signing_key` returns `None`), the `ai_memory_identity` block is OMITTED — preserving the v0.7.0 "continuing unsigned" posture from `src/main.rs:116-118`.
 - **Zero hot-path impact.** Initialize fires ONCE per MCP session, not on the recall hot path. The Ed25519 sign over ~150 bytes of canonical identity costs ~10-50µs on modern hardware — the 50ms recall p95 budget is untouched.
 - **`pub const fn current_schema_version()`** added to `src/storage/migrations.rs` as the production-facing alias of the `_for_tests` SSOT accessor. The new module reads this to publish the schema version in the signed identity block.
 - **Test coverage** — 47 dedicated tests pin the contract: 20 module-level unit tests + 27 integration tests in `tests/mcp_initialize_server_signing.rs`. Coverage breakdown:
@@ -574,17 +574,17 @@ Closes #965: Refactor Wave-2 Tier-B5 was filed under the premise that
 serialises every tool dispatch." Sub-agent H performed the Phase 1
 audit; the premise is **verifiably false** against current `HEAD`:
 
-- `src/mcp/mod.rs:2013` — `run_mcp_server` opens a plain
+- `src/mcp/mod.rs::run_mcp_server` — opens a plain
   `rusqlite::Connection` via `db::open`. There is no `Arc`, no
   `Mutex`.
-- `src/mcp/mod.rs:2263` — The stdio loop is
+- `src/mcp/mod.rs::run_mcp_server` (stdio loop) — The stdio loop is
   `for line in stdin.lock().lines()` — **synchronous and
   single-threaded by JSON-RPC stdio protocol design**. One request
   in, one response out; the next line cannot be read until the
   current one's response is flushed.
-- `src/mcp/mod.rs:1519` — `handle_request` takes a plain
+- `src/mcp/mod.rs::handle_request` — takes a plain
   `&rusqlite::Connection`. No shared-state wrapper.
-- `src/mcp/mod.rs:846` — `ToolDispatchCtx::conn` is
+- `src/mcp/mod.rs::ToolDispatchCtx::conn` — typed as
   `&'a rusqlite::Connection`. No shared-state wrapper.
 - All 56+ `dispatch_memory_*` wrappers take `&ToolDispatchCtx` and
   forward `ctx.conn` as `&Connection`. No tool acquires a lock; no
@@ -639,7 +639,7 @@ Closes #966. Introduces `pub struct RequestValidator` in `src/validate.rs` —
 the canonical fluent surface every wire-entry layer (HTTP handlers, MCP tools,
 CLI subcommands) now routes DTO-bundling validation through. Pre-#966 the
 same `validate_id` + `validate_namespace` + `validate_agent_id` + ... chains
-were duplicated across 87 HTTP routes (73 unique URL paths), 73 MCP tools, and 58 CLI subcommands (56 in the default build, 58 with `--features sal-postgres`);
+were duplicated across 87 HTTP routes (73 unique URL paths), 73 MCP tools, and 81 CLI subcommands (79 in the default build, 81 with `--features sal` or `--features sal-postgres`);
 adding a new cross-field invariant required three audited per-surface edits.
 
 **New surface (zero-cost facade — methods only, no per-call state):**
@@ -1431,7 +1431,7 @@ HTTP/MCP wire formats.
 
 ### Changed
 
-- **`ROADMAP.md` — doc-drift correction blocks on §7.3 and §17** (Item D, issue [#973](https://github.com/alphaonedev/ai-memory-mcp/issues/973)). Both sections were dated 2026-04-29 and 5+ weeks stale. Added explicit doc-drift notes citing live schema v48 on both ladders (in lockstep), 73 MCP tools at `--profile full` per `Profile::full().expected_tool_count()`, 7-level Provenance Gap framework #884-#890 all shipped, Batman Forms 1-6 + Form 7 implemented (with the canonical-bytes signing fix `3cdec59`), recursive learning #655 Tasks 1-8 all shipped, federation push DLQ + replay worker. Authoritative-references discipline: read from `src/storage/migrations.rs` + `src/store/postgres.rs:391` + `Profile::full().expected_tool_count()` + `docs/v0.7.0/release-notes.md` + this CHANGELOG `[Unreleased]` section, not from hardcoded numbers in the body of ROADMAP.md (which go stale).
+- **`ROADMAP.md` — doc-drift correction blocks on §7.3 and §17** (Item D, issue [#973](https://github.com/alphaonedev/ai-memory-mcp/issues/973)). Both sections were dated 2026-04-29 and 5+ weeks stale. Added explicit doc-drift notes citing live schema v48 on both ladders (in lockstep), 73 MCP tools at `--profile full` per `Profile::full().expected_tool_count()`, 7-level Provenance Gap framework #884-#890 all shipped, Batman Forms 1-6 + Form 7 implemented (with the canonical-bytes signing fix `3cdec59`), recursive learning #655 Tasks 1-8 all shipped, federation push DLQ + replay worker. Authoritative-references discipline: read from `src/storage/migrations.rs` + `src/store/postgres.rs:424` + `Profile::full().expected_tool_count()` + `docs/v0.7.0/release-notes.md` + this CHANGELOG `[Unreleased]` section, not from hardcoded numbers in the body of ROADMAP.md (which go stale).
 - **`CLAUDE.md` — `CURRENT_SCHEMA_VERSION` references v47 → v48**. Two stale references in the Key Modules table + Database section updated to reflect the #933 federation_push_dlq schema bump.
 
 
@@ -1521,7 +1521,7 @@ The v0.7.0 surface previously documented a 7-level provenance framework (Identit
 
 #### Changed
 
-- **MCP tool count 71 → 73** (Gap 3 `memory_recall_observations` adds 1; Gap 4 `confidence_tier` arg surfaces another callable). `Profile::full().expected_tool_count()` returns 73; pinned by `src/profile.rs:771 assert_eq!(total, 73)`. CLI subcommand count surface bumped to 55 across README + CLAUDE.md (was `~50` placeholder, now exact per `Command` enum at `src/daemon_runtime.rs:157-440`).
+- **MCP tool count 71 → 73** (Gap 3 `memory_recall_observations` adds 1; Gap 4 `confidence_tier` arg surfaces another callable). `Profile::full().expected_tool_count()` returns 73; pinned by `src/profile.rs::Profile::full().expected_tool_count() assert_eq!(total, 73)`. CLI subcommand count surface bumped to 55 across README + CLAUDE.md (was `~50` placeholder, now exact per `Command` enum at `src/daemon_runtime.rs::Command`).
 
 ## [v0.6.4] — 2026-05-08 — `quiet-tools`
 
