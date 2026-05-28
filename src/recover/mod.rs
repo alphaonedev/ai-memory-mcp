@@ -24,6 +24,7 @@
 //! for the full design + acceptance criteria; see CLAUDE.md
 //! §"Auto-capture" for operator-facing documentation.
 
+pub mod nag;
 pub mod parsers;
 pub mod transcript_paths;
 
