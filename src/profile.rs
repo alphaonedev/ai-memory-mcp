@@ -28,12 +28,12 @@
 //!   `memory_load_family`; v0.7 B2 added `memory_smart_load`).
 //!   Always loaded.
 //! - `graph` — adds the 11 KG/entity/replay/verify/find_paths tools. ~18 tools.
-//! - `admin` — adds lifecycle (5) + governance (8). ~20 tools.
+//! - `admin` — adds lifecycle (6) + governance (8). ~21 tools.
 //! - `power` — adds the 8 LLM-augmented + operator tools (consolidate,
 //!   auto_tag, …, plus the v0.7 K7 subscription-reliability pair).
 //!   ~15 tools.
-//! - `full` — every family. **73 advertised entries at v0.7.0**
-//!   (72 callable "memory tools" + the always-on `memory_capabilities`
+//! - `full` — every family. **74 advertised entries at v0.7.0**
+//!   (73 callable "memory tools" + the always-on `memory_capabilities`
 //!   bootstrap; `Profile::full().expected_tool_count()` is the
 //!   canonical assertion).
 //! - `custom` — comma-separated family list (`core,graph,archive` …).
@@ -153,9 +153,10 @@ impl Family {
             | tn::MEMORY_SEARCH | tn::MEMORY_LOAD_FAMILY | tn::MEMORY_SMART_LOAD => {
                 Some(Self::Core)
             }
-            // lifecycle (5)
+            // lifecycle (6 — v0.7.0 #1389 L4 added memory_capture_turn, the
+            // host-volunteered idempotent turn-capture substrate primitive).
             tn::MEMORY_UPDATE | tn::MEMORY_DELETE | tn::MEMORY_FORGET | tn::MEMORY_GC
-            | tn::MEMORY_PROMOTE => Some(Self::Lifecycle),
+            | tn::MEMORY_PROMOTE | tn::MEMORY_CAPTURE_TURN => Some(Self::Lifecycle),
             // graph (11 — v0.7.0 I4 added memory_replay; v0.7 H4 added memory_verify;
             // v0.7 J7 added memory_find_paths)
             tn::MEMORY_KG_QUERY
@@ -193,8 +194,8 @@ impl Family {
             // `memory_check_agent_action` + `memory_rule_list`; v0.7.0
             // #224/#311 added `memory_share`. All operator/governance,
             // not data-plane. Pinned by `Family::expected_tool_count`
-            // (sibling impl) and the family-counts-sum-to-73 test.
-            // #1274 — corrected from stale `(10 — …)` comment.
+            // (derived from this slice) and the
+            // `family_tool_names_cover_registry_all` test.
             tn::MEMORY_CONSOLIDATE
             | tn::MEMORY_DETECT_CONTRADICTION
             | tn::MEMORY_CHECK_DUPLICATE
@@ -317,54 +318,20 @@ impl Family {
         ]
     }
 
-    /// Expected tool count for this family. v0.6.4-002 will assert
-    /// that the actual `register_<family>` matches this constant.
+    /// Number of MCP tools advertised by this family.
+    ///
+    /// Derived from [`Family::tool_names`] — that slice is the single
+    /// source of truth for both the names AND the count. Adding a tool
+    /// to a family is therefore exactly one edit (append a `tn::*`
+    /// entry to the slice arm); every count that depends on it —
+    /// per-profile expectations, the full-profile total, the registry
+    /// lockstep — recomputes automatically. There are NO hand-maintained
+    /// per-family magic numbers here by design (the historical
+    /// `match self { Core => 7, … }` form drifted whenever a tool landed
+    /// without the matching count bump).
     #[must_use]
     pub const fn expected_tool_count(self) -> usize {
-        match self {
-            // Core: 5 baseline + memory_load_family (v0.7 B1) +
-            // memory_smart_load (v0.7 B2) = 7.
-            Self::Core => 7,
-            Self::Lifecycle => 5,
-            // v0.7.0 Gap 3 (#886) — `memory_recall_observations`
-            // surfaced under Meta as the read-side ledger probe.
-            Self::Meta => 6,
-            // Graph: 8 baseline + memory_replay (v0.7.0 I4) + memory_verify (v0.7 H4) +
-            // memory_find_paths (v0.7 J7) = 11.
-            Self::Graph => 11,
-            Self::Governance => 8,
-            // Power: 6 baseline + 2 (v0.7 K7) + 1 (v0.7 K8 quota_status) +
-            // 1 (v0.7.0 Task 4/8 — memory_reflect substrate primitive) +
-            // 1 (v0.7.0 L2-2 / S6-M1 — memory_reflection_origin) +
-            // 1 (v0.7.0 L2-3 / #668 — memory_dependents_of_invalidated) +
-            // 2 (v0.7.0 issue #691 — memory_check_agent_action +
-            // memory_rule_list, substrate-level agent-action rules) +
-            // 1 (v0.7.0 QW-1 — memory_export_reflection, file-backed
-            // reflection chain export) +
-            // 2 (v0.7.0 QW-3 follow-up — memory_offload + memory_deref,
-            // context-offload substrate primitive surfaced at the
-            // semantic-tier+ Power family) +
-            // 1 (v0.7.0 WT-1-C — memory_atomise, curator-pass
-            // decomposition into 2-10 atomic propositions) +
-            // 2 (v0.7.0 QW-2 — memory_persona + memory_persona_generate,
-            // Persona-as-artifact substrate primitive) +
-            // 1 (v0.7.0 Form 3 / #756 — memory_ingest_multistep,
-            // multi-step ingest orchestrator with deterministic
-            // helpers + prompt-cache reuse) +
-            // 1 (v0.7.0 Form 5 / issue #758 — memory_calibrate_confidence,
-            // shadow-mode-driven per-source baseline sweep) +
-            // 1 (v0.7.0 issues #224 + #311 — memory_share, Phase 3 Memory
-            // Sharing & Sync RFC pulled forward per operator directive
-            // `28860423-d12c-4959-bc8b-8fa9a94a33d9`) = 23.
-            Self::Power => 23,
-            Self::Archive => 4,
-            // v0.7.0 L1-5 — 5 skill tools added to the Other family.
-            // v0.7.0 L2-6 (issue #671) — memory_skill_promote_from_reflection
-            // closes the recursive-learning loop → 8.
-            // v0.7.0 L2-7 (issue #672) — memory_skill_compositional_context
-            // composition declaration → 9.
-            Self::Other => 9,
-        }
+        self.tool_names().len()
     }
 
     /// v0.7.0 A2 — tool names belonging to this family. Forward of the
@@ -376,9 +343,11 @@ impl Family {
     /// LLM-facing preview ("the first three tools loaded") aligns with
     /// the actual `tools/list` output.
     ///
-    /// The slice length must match [`Family::expected_tool_count`]; the
-    /// `family_tool_names_match_expected_count` unit test pins both in
-    /// sync.
+    /// This slice is the single source of truth for the family's tool
+    /// set. [`Family::expected_tool_count`] derives its return value
+    /// from `self.tool_names().len()`, and the
+    /// `family_tool_names_cover_registry_all` unit test pins the union
+    /// of all families against the canonical registry set.
     #[must_use]
     pub const fn tool_names(self) -> &'static [&'static str] {
         // v0.7.x (issue #1174 PR1 — pm-v3.1 MCP tool name sweep) — every
@@ -409,6 +378,10 @@ impl Family {
                 tn::MEMORY_FORGET,
                 tn::MEMORY_GC,
                 tn::MEMORY_PROMOTE,
+                // v0.7.0 #1389 L4 — host-volunteered idempotent turn
+                // capture (RFC-0001). One memory row + one
+                // transcript_line_dedup row per host turn.
+                tn::MEMORY_CAPTURE_TURN,
             ],
             Self::Graph => &[
                 tn::MEMORY_KG_QUERY,
@@ -627,11 +600,11 @@ impl Profile {
         }
     }
 
-    /// `full` — every family. **73 advertised entries at v0.7.0**
-    /// (72 callable "memory tools" + the always-on `memory_capabilities`
-    /// bootstrap). Cross-check with
-    /// `Profile::full().expected_tool_count()` — the canonical
-    /// assertion.
+    /// `full` — every family. The advertised entry count (callable
+    /// "memory tools" + the always-on `memory_capabilities` bootstrap)
+    /// is whatever `Profile::full().expected_tool_count()` returns —
+    /// that accessor, derived from the per-family `tool_names` slices,
+    /// is the canonical SSOT; no literal is restated here.
     #[must_use]
     pub fn full() -> Self {
         Self {
@@ -810,31 +783,21 @@ mod tests {
     }
 
     #[test]
-    fn family_expected_tool_counts_sum_to_73() {
-        let total: usize = Family::all().iter().map(|f| f.expected_tool_count()).sum();
+    fn family_tool_names_cover_registry_all() {
+        // Cross-module SSOT invariant (no magic number): the union of
+        // every family's `tool_names` slice must be exactly the
+        // canonical registry set `tool_names::ALL`. Both sides are
+        // hand-maintained name lists in different modules; pinning
+        // their lengths against each other catches a tool added to one
+        // side but not the other. The aggregate `--profile full` count
+        // is whatever this union holds — it is never asserted as a
+        // literal anywhere.
+        let family_total: usize = Family::all().iter().map(|f| f.tool_names().len()).sum();
         assert_eq!(
-            total, 73,
-            "v0.6.3.1 baseline (43) + v0.7.0 I4 `memory_replay` + v0.7 H4 \
-             `memory_verify` + v0.7 B1 `memory_load_family` + v0.7 B2 \
-             `memory_smart_load` + v0.7 K7 `memory_subscription_replay` \
-             + `memory_subscription_dlq_list` + v0.7 J7 `memory_find_paths` \
-             + v0.7 K8 `memory_quota_status` + v0.7.0 Task 4/8 \
-             `memory_reflect` + v0.7.0 L2-2 `memory_reflection_origin` + \
-             v0.7.0 L2-3 `memory_dependents_of_invalidated` + \
-             v0.7.0 issue #691 `memory_check_agent_action` + \
-             `memory_rule_list` + v0.7.0 L1-5 5×skill tools + \
-             v0.7.0 L2-6 `memory_skill_promote_from_reflection` + \
-             v0.7.0 L2-7 `memory_skill_compositional_context` + \
-             v0.7.0 QW-1 `memory_export_reflection` + \
-             v0.7.0 QW-3 follow-up `memory_offload` + `memory_deref` + \
-             v0.7.0 WT-1-C `memory_atomise` + \
-             v0.7.0 QW-2 `memory_persona` + `memory_persona_generate` + \
-             v0.7.0 Form 3 `memory_ingest_multistep` + \
-             v0.7.0 Form 5 `memory_calibrate_confidence` + \
-             v0.7.0 issues #224 + #311 `memory_share` + \
-             v0.7.0 Gap 3 (#886) `memory_recall_observations` = 73. \
-             If this drifts, update Family::expected_tool_count and the \
-             family map docs together."
+            family_total,
+            crate::mcp::registry::tool_names::ALL.len(),
+            "per-family tool_names slices must cover exactly the registry ALL set; \
+             a tool was added to one side but not the other"
         );
     }
 
@@ -869,12 +832,11 @@ mod tests {
     // ---------- Profile named ----------
 
     #[test]
-    fn profile_core_has_seven_tools() {
+    fn profile_core_loads_only_core_family() {
         let p = Profile::core();
-        // v0.7 B1 — Core ships memory_load_family; v0.7 B2 — Core
-        // ships memory_smart_load. Total 7 (5 baseline + 2 always-on
-        // discovery tools).
-        assert_eq!(p.expected_tool_count(), 7);
+        // Core advertises exactly the Core family's tools — derived
+        // from the SSOT slice, never a literal.
+        assert_eq!(p.expected_tool_count(), Family::Core.tool_names().len());
         assert!(p.includes(Family::Core));
         // meta is NOT in core's family list — `memory_capabilities`
         // is bootstrapped separately as always-on per RFC S27. The
@@ -885,83 +847,61 @@ mod tests {
     }
 
     #[test]
-    fn profile_graph_has_eighteen_tools() {
+    fn profile_graph_loads_core_plus_graph() {
         let p = Profile::graph();
-        // v0.7 J7 — Graph now ships 11 tools (8 baseline + memory_replay
-        // [I4] + memory_verify [H4] + memory_find_paths [J7]); v0.7 B1
-        // added memory_load_family to core; v0.7 B2 added
-        // memory_smart_load to core (7 instead of 5).
-        assert_eq!(p.expected_tool_count(), 7 + 11);
+        // Graph = Core + Graph families; count derived from the SSOT
+        // slices so the v0.7 surface additions can't drift this test.
+        assert_eq!(
+            p.expected_tool_count(),
+            Family::Core.tool_names().len() + Family::Graph.tool_names().len()
+        );
         assert!(p.includes(Family::Graph));
     }
 
     #[test]
-    fn profile_admin_has_twenty_tools() {
+    fn profile_admin_loads_core_lifecycle_governance() {
         let p = Profile::admin();
-        // admin = core (7, with v0.7 B1 memory_load_family + v0.7 B2
-        // memory_smart_load) + lifecycle (5) + governance (8) = 20.
-        // Graph isn't in admin so the v0.7.0 I4 memory_replay addition
-        // doesn't change this count.
-        assert_eq!(p.expected_tool_count(), 7 + 5 + 8);
+        // admin = Core + Lifecycle + Governance families; count derived
+        // from the SSOT slices. Graph isn't in admin, and the #1389 L4
+        // memory_capture_turn addition to Lifecycle flows through
+        // automatically rather than needing a literal bump here.
+        assert_eq!(
+            p.expected_tool_count(),
+            Family::Core.tool_names().len()
+                + Family::Lifecycle.tool_names().len()
+                + Family::Governance.tool_names().len()
+        );
     }
 
     #[test]
-    fn profile_power_has_sixteen_tools() {
+    fn profile_power_loads_core_plus_power() {
         let p = Profile::power();
-        // v0.7 B1 + v0.7 B2 — Core now ships 7 tools (was 5).
-        // v0.7 K7 — Power got the subscription-reliability pair (+2 → 8).
-        // v0.7 K8 — Power got memory_quota_status (+1 → 9).
-        // v0.7.0 Task 4/8 — Power got memory_reflect (+1 → 10).
-        // v0.7.0 L2-2 — Power got memory_reflection_origin (+1 → 11).
-        // v0.7.0 L2-3 — Power got memory_dependents_of_invalidated (+1 → 12).
-        // v0.7.0 issue #691 — Power got memory_check_agent_action +
-        // memory_rule_list (+2 → 14).
-        // v0.7.0 QW-1 — Power got memory_export_reflection (+1 → 15).
-        // v0.7.0 QW-3 follow-up — Power got memory_offload + memory_deref
-        // (context-offload substrate primitive, +2 → 17).
-        // v0.7.0 WT-1-C — Power got memory_atomise (+1 → 18).
-        // v0.7.0 QW-2 — Power got memory_persona + memory_persona_generate
-        // (Persona-as-artifact substrate primitive, +2 → 20).
-        // v0.7.0 Form 3 (#756) — Power got memory_ingest_multistep
-        // (multi-step ingest orchestrator with deterministic helpers
-        // + prompt-cache reuse, +1 → 21).
-        // v0.7.0 Form 5 — Power got memory_calibrate_confidence
-        // (shadow-mode-driven per-source baseline sweep, +1 → 22).
-        // v0.7.0 issues #224 + #311 — Power got memory_share (Phase 3
-        // Memory Sharing & Sync RFC pulled forward per operator directive
-        // `28860423-d12c-4959-bc8b-8fa9a94a33d9`, +1 → 23).
-        assert_eq!(p.expected_tool_count(), 7 + 23);
+        // Power = Core + Power families; count derived from the SSOT
+        // slices so every Power-family addition flows through here
+        // without a literal bump.
+        assert_eq!(
+            p.expected_tool_count(),
+            Family::Core.tool_names().len() + Family::Power.tool_names().len()
+        );
     }
 
     #[test]
-    fn profile_full_has_seventy_three_tools() {
+    fn profile_full_matches_registry_all() {
         let p = Profile::full();
-        // v0.7.0 L2 cascade (L2-3 + L2-6 + L2-7) — full surface =
-        // memory_replay (I4) + memory_verify (H4) + memory_load_family (B1)
-        // + memory_smart_load (B2) + memory_subscription_replay (K7) +
-        // memory_subscription_dlq_list (K7) + memory_find_paths (J7) +
-        // memory_quota_status (K8) + memory_reflect (Task 4/8) +
-        // memory_reflection_origin (L2-2) + memory_dependents_of_invalidated
-        // (L2-3) + memory_check_agent_action + memory_rule_list (#691) +
-        // 5×memory_skill_* (L1-5) + memory_skill_promote_from_reflection
-        // (L2-6, #671) + memory_skill_compositional_context (L2-7, #672) +
-        // memory_export_reflection (QW-1) +
-        // memory_offload + memory_deref (QW-3 follow-up, Family::Power) +
-        // memory_atomise (WT-1-C, Family::Power) +
-        // memory_persona + memory_persona_generate (QW-2, Family::Power) +
-        // memory_ingest_multistep (Form 3 / #756, Family::Power) +
-        // memory_calibrate_confidence (Form 5, Family::Power) +
-        // memory_share (Phase 3 Memory Sharing & Sync RFC pulled forward
-        // per operator directive `28860423-d12c-4959-bc8b-8fa9a94a33d9`,
-        // Family::Power) +
-        // v0.7.0 Gap 3 (#886) memory_recall_observations (Family::Meta) = 73.
-        assert_eq!(p.expected_tool_count(), 73);
+        // `--profile full` advertises every family. Its count is the
+        // canonical registry set `tool_names::ALL` — anchored on the
+        // SSOT, never a literal. This is the test that the #1389 L4
+        // memory_capture_turn addition flows through automatically.
+        assert_eq!(
+            p.expected_tool_count(),
+            crate::mcp::registry::tool_names::ALL.len()
+        );
 
-        // The K7+K8 + Task 4/8 + L2-2 + L2-3 + #691 + QW-1 + QW-3 follow-up
-        // + WT-1-C + QW-2 + Form 3 + Form 5 + #224/#311 memory_share additions
-        // live in Family::Power (operator/governance), so the `power` profile
-        // picks them up too.
-        assert_eq!(Profile::power().expected_tool_count(), 7 + 23);
+        // The `power` profile is Core + Power; same SSOT derivation.
+        assert_eq!(
+            Profile::power().expected_tool_count(),
+            Family::Core.tool_names().len() + Family::Power.tool_names().len()
+        );
     }
 
     // ---------- Profile::parse ----------
@@ -983,15 +923,17 @@ mod tests {
 
     #[test]
     fn parse_custom_comma_list_dedup() {
-        // `core,graph` → core (7, after v0.7 B1 + B2) + graph (11,
-        // after v0.7 J7) = 18 tools. Meta is NOT included —
+        // `core,graph` → Core + Graph families. Meta is NOT included —
         // `memory_capabilities` is always-on bootstrapped outside the
-        // family map (v0.6.4-002).
+        // family map (v0.6.4-002). Count derived from the SSOT slices.
         let p = Profile::parse("core,graph").unwrap();
         assert!(p.includes(Family::Core));
         assert!(!p.includes(Family::Meta));
         assert!(p.includes(Family::Graph));
-        assert_eq!(p.expected_tool_count(), 18);
+        assert_eq!(
+            p.expected_tool_count(),
+            Family::Core.tool_names().len() + Family::Graph.tool_names().len()
+        );
     }
 
     #[test]

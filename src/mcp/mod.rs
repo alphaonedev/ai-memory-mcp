@@ -4,7 +4,7 @@
 //! MCP (Model Context Protocol) server for ai-memory.
 //! Exposes memory operations as tools for any MCP-compatible AI client over stdio JSON-RPC.
 
-// #873 — `handle_request` carries the 72-arm dispatch match (each arm
+// #873 — `handle_request` carries the per-tool dispatch match (each arm
 // is a closure-shaped call into a per-tool handler with that handler's
 // specific argument bundle); tracked for split into a registry table
 // as #867. Allowance is module-scope to cover the dispatch helper as
@@ -931,7 +931,7 @@ fn lookup_namespace_standard(conn: &rusqlite::Connection, namespace: &str) -> Op
 // ---------------------------------------------------------------------------
 // #867 — `tools/call` dispatch as a registry table.
 //
-// The legacy `handle_request` carried a 72-arm `match tool_name { ... }`
+// The legacy `handle_request` carried a per-tool `match tool_name { ... }`
 // block that grew linearly with every new MCP tool (each new tool meant
 // a central-file edit). The dispatch surface is now driven by
 // [`TOOL_DISPATCH_TABLE`], a `&'static [(&str, DispatchFn)]` registry
@@ -1748,7 +1748,7 @@ pub(crate) static TOOL_DISPATCH_TABLE: &[(&str, DispatchFn)] = {
 
 /// v0.7.0 #1105 — O(1) HashMap-based lookup against
 /// [`TOOL_DISPATCH_TABLE`]. Pre-#1105 this was a linear scan over the
-/// 73-entry slice; the MCP stdio transport is single-threaded by
+/// dispatch-table slice; the MCP stdio transport is single-threaded by
 /// protocol design so the per-call overhead is paid serially and
 /// contributes directly to dispatch latency for tools at the
 /// alphabetical end of the table.
@@ -1963,7 +1963,7 @@ fn handle_request(
                 &empty_obj
             };
 
-            // #867 — registry-driven dispatch. The legacy 72-arm match
+            // #867 — registry-driven dispatch. The legacy per-tool match
             // is gone; every tool now resolves through
             // [`TOOL_DISPATCH_TABLE`] which keys on `tool_name` and
             // returns a `DispatchFn` that un-bundles the
@@ -3124,78 +3124,37 @@ mod tests {
     }
 
     #[test]
-    fn tool_definitions_returns_50_tools() {
-        // v0.6.3 adds memory_get_taxonomy (Pillar 1 / Stream A),
-        // memory_check_duplicate (Pillar 2 / Stream D),
-        // memory_entity_register + memory_entity_get_by_alias
-        // (Pillar 2 / Stream B), and memory_kg_timeline +
-        // memory_kg_invalidate + memory_kg_query (Pillar 2 / Stream C)
-        // on top of the 36-tool v0.6.0.0 surface = 43.
-        // v0.7.0 I4 adds memory_replay (Family::Graph) → 44.
-        // v0.7 H4 adds memory_verify (Family::Graph) → 45.
-        // v0.7 B1 adds memory_load_family (Family::Core) → 46.
-        // v0.7 K7 adds memory_subscription_replay +
-        // memory_subscription_dlq_list (Family::Power) → 48.
-        // v0.7 J7 adds memory_find_paths (Family::Graph) → 49.
-        // v0.7 B2 adds memory_smart_load (Family::Core) → 50.
-        // v0.7 K8 adds memory_quota_status (Family::Power) → 51.
-        // v0.7.0 Task 4/8 adds memory_reflect (Family::Power) → 52.
-        // v0.7.0 L2-2 adds memory_reflection_origin (Family::Power) → 53.
-        // v0.7.0 (issue #691) adds memory_check_agent_action +
-        // memory_rule_list (Family::Power) → 55. Mutation tools are
-        // explicitly NOT registered over MCP.
-        // v0.7.0 L1-5 adds 5 memory_skill_* tools (Family::Other) → 60.
-        // v0.7.0 L2-3 (issue #668) adds memory_dependents_of_invalidated
-        // (Family::Power) → 61. Read-side surface for the reflection
-        // invalidation propagation walker.
-        // v0.7.0 L2-6 (issue #671) adds memory_skill_promote_from_reflection
-        // (Family::Other) → 62 — closes the recursive-learning loop:
-        // reflections become skills become reusable knowledge.
-        // v0.7.0 L2-7 (issue #672) adds memory_skill_compositional_context
-        // (Family::Other) → 63 — reflection-skill composition declaration.
-        // v0.7.0 QW-1 adds memory_export_reflection (Family::Power) → 64 —
-        // file-backed reflection chain export companion to the
-        // `ai-memory export-reflections` CLI subcommand.
-        // v0.7.0 QW-3 follow-up adds memory_offload + memory_deref
-        // (Family::Power) → 66 — context-offload substrate primitive
-        // surfaced at the semantic-tier+ Power profile.
-        // v0.7.0 WT-1-C adds memory_atomise (Family::Power) → 67 —
-        // curator-pass decomposition of a memory into 2-10 atomic
-        // propositions; archives the source.
-        // v0.7.0 QW-2 adds memory_persona + memory_persona_generate
-        // (Family::Power) → 69 — Persona-as-artifact substrate.
-        // v0.7.0 Form 3 (#756) adds memory_ingest_multistep
-        // (Family::Power) → 70 — multi-step ingest orchestrator with
-        // deterministic helpers + prompt-cache reuse.
-        // v0.7.0 Form 5 (#758) adds memory_calibrate_confidence
-        // (Family::Power) → 71 — shadow-mode-driven per-source
-        // baseline sweep.
-        // v0.7.0 issues #224 + #311 adds memory_share (Family::Power) → 72
-        // — Phase 3 Memory Sharing & Sync RFC pulled forward per operator
-        // directive `28860423-d12c-4959-bc8b-8fa9a94a33d9`.
-        // v0.7.0 Gap 3 (#886) adds memory_recall_observations
-        // (Family::Meta) → 73 — read-side ledger probe over the new
-        // `recall_observations` table.
+    fn tool_definitions_returns_full_profile_count() {
+        // The live `tool_definitions()` surface must advertise exactly
+        // the full-profile tool set. Anchored on the tool-count SSOT
+        // (`Profile::full().expected_tool_count()`, derived from the
+        // per-Family `tool_names` slices) so adding a tool touches ONE
+        // site (the family slice), never a hardcoded literal here.
         let defs = tool_definitions();
         let tools = defs["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 73);
+        assert_eq!(
+            tools.len(),
+            crate::profile::Profile::full().expected_tool_count()
+        );
     }
 
     /// v0.6.4-002 acceptance gate (RFC §S25/S26): `--profile core`
     /// registers exactly 7 family tools (5 baseline + v0.7 B1
     /// memory_load_family + v0.7 B2 memory_smart_load) + 1 always-on
     /// bootstrap (memory_capabilities) = 8 visible tools. `--profile
-    /// full` registers all 73 (was 51 pre-v0.7.0 W6/W7).
+    /// full` registers the whole SSOT set.
     #[test]
-    fn tool_definitions_for_profile_core_registers_7_plus_capabilities() {
+    fn tool_definitions_for_profile_core_registers_core_family_plus_always_on() {
+        use crate::profile::{ALWAYS_ON_TOOLS, Family};
         let defs = tool_definitions_for_profile(&crate::profile::Profile::core());
         let tools = defs["tools"].as_array().unwrap();
         let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
-        // Exactly the 7 core tools + memory_capabilities bootstrap.
+        // Exactly the Core family tools + the always-on bootstrap set
+        // (memory_capabilities). Counts derived from the SSOT slices.
         assert_eq!(
             tools.len(),
-            8,
-            "core profile should register 7 core tools + memory_capabilities; got {names:?}"
+            Family::Core.tool_names().len() + ALWAYS_ON_TOOLS.len(),
+            "core profile should register the Core family + always-on bootstrap; got {names:?}"
         );
         for required in [
             "memory_store",
@@ -3228,46 +3187,50 @@ mod tests {
     }
 
     #[test]
-    fn tool_definitions_for_profile_full_registers_73() {
+    fn tool_definitions_for_profile_full_registers_expected_count() {
         let defs = tool_definitions_for_profile(&crate::profile::Profile::full());
         let tools = defs["tools"].as_array().unwrap();
         assert_eq!(
             tools.len(),
             crate::profile::Profile::full().expected_tool_count(),
             "full profile registration count must match \
-             `Profile::full().expected_tool_count()` = 73 at v0.7.0 \
-             (issues #224 + #311 pulled memory_share forward; Gap 3 \
-             (#886) added memory_recall_observations under Family::Meta)"
+             `Profile::full().expected_tool_count()` — the SSOT derived \
+             from the per-Family `tool_names` slices; no literal is \
+             restated here so surface additions (e.g. #1389 L4 \
+             memory_capture_turn under Family::Lifecycle) flow through \
+             automatically"
         );
     }
 
     #[test]
-    fn tool_definitions_for_profile_graph_registers_nineteen() {
+    fn tool_definitions_for_profile_graph_registers_core_graph_plus_always_on() {
+        use crate::profile::{ALWAYS_ON_TOOLS, Family};
         let defs = tool_definitions_for_profile(&crate::profile::Profile::graph());
         let tools = defs["tools"].as_array().unwrap();
-        // 7 core (with v0.7 B1 memory_load_family + v0.7 B2
-        // memory_smart_load) + 11 graph (8 baseline + memory_replay +
-        // memory_verify + v0.7 J7 memory_find_paths) + 1 always-on
-        // capabilities = 19.
+        // Core + Graph families + always-on bootstrap; all derived from
+        // the SSOT slices.
         assert_eq!(
             tools.len(),
-            19,
-            "graph profile = core(7, with memory_load_family + memory_smart_load) + \
-             graph(11, with memory_replay+memory_verify+memory_find_paths) + \
-             capabilities-bootstrap(1)"
+            Family::Core.tool_names().len()
+                + Family::Graph.tool_names().len()
+                + ALWAYS_ON_TOOLS.len(),
+            "graph profile = Core + Graph families + always-on bootstrap"
         );
     }
 
     /// RFC §S30: custom comma-list `core,graph` registers union.
     #[test]
     fn tool_definitions_for_profile_custom_core_comma_graph_registers_union() {
+        use crate::profile::{ALWAYS_ON_TOOLS, Family};
         let p = crate::profile::Profile::parse("core,graph").unwrap();
         let defs = tool_definitions_for_profile(&p);
         let tools = defs["tools"].as_array().unwrap();
         assert_eq!(
             tools.len(),
-            19,
-            "core,graph = 7 (B1 memory_load_family + B2 memory_smart_load) + 11 (I4 memory_replay + H4 memory_verify + J7 memory_find_paths) + capabilities = 19"
+            Family::Core.tool_names().len()
+                + Family::Graph.tool_names().len()
+                + ALWAYS_ON_TOOLS.len(),
+            "core,graph = Core + Graph families + always-on bootstrap"
         );
     }
 
@@ -4052,13 +4015,8 @@ mod tests {
             "missing err outcome in: {captured}"
         );
     }
-    /// Parametrized smoke matrix for all 73 MCP tools (Justice of MCP pathway).
-    /// v0.6.3 baseline = 43; v0.7.0 I4 added memory_replay (44);
-    /// v0.7 H4 added memory_verify (45); v0.7 B1 added memory_load_family (46);
-    /// v0.7 K7 added memory_subscription_replay + memory_subscription_dlq_list (48);
-    /// v0.7 J7 added memory_find_paths (49);
-    /// v0.7 B2 added memory_smart_load (50);
-    /// v0.7 K8 added memory_quota_status (51).
+    /// Parametrized smoke matrix over the MCP tool dispatch pathway
+    /// (Justice of MCP). Each `ToolCase` exercises one tool end to end:
     /// Tier 1: happy path with canonical valid args.
     /// Tier 2: required arg validation (missing required arg → error).
     #[test]

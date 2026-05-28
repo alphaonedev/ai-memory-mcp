@@ -115,7 +115,8 @@ pub mod tool_names {
     /// iterating in tests + the audit-tool-call dispatcher's
     /// "known names" guard. Order is alphabetical by const name so
     /// adding a new entry has a stable diff position. The slice
-    /// length is pinned to `73` by [`pin_tests::const_count_is_73`].
+    /// length is pinned against `Profile::full().expected_tool_count()`
+    /// by [`pin_tests::const_count_matches_full_profile`].
     ///
     /// `dead_code` is allowed because the only consumer today is the
     /// `pin_tests` module below; making it `pub` keeps the API
@@ -210,20 +211,22 @@ pub mod tool_names {
         use super::*;
 
         #[test]
-        fn const_count_is_73() {
-            // The v0.7.0 surface advertises 73 MCP tools at
-            // `--profile full` (72 callable + the always-on
-            // `memory_capabilities` bootstrap; both are in `ALL`).
-            // If you added a new tool: bump this to N+1 AND add the
-            // const above AND the slice entry AND a per-name byte-
-            // equal test below AND a `RegisteredTool::of::<…>()`
-            // line in `registered_tools()`. The
-            // `consts_match_registered_tools` test below mechanically
-            // verifies the registry side.
+        fn const_count_matches_full_profile() {
+            // SSOT cross-check (no literal): the canonical name slice
+            // `ALL` must hold exactly as many names as the full profile
+            // advertises. `Profile::full().expected_tool_count()` is the
+            // single source of truth — derived from the per-family
+            // `tool_names` slices in `crate::profile`. Adding a tool is
+            // one append to a family slice + one const here + one slice
+            // entry + one per-name byte-equal test below + one
+            // `RegisteredTool::of::<…>()` line in `registered_tools()`;
+            // this assertion then tracks automatically. The
+            // `consts_match_registered_tools` test verifies the registry
+            // side against the same set.
             assert_eq!(
                 ALL.len(),
-                73,
-                "tool_names::ALL must hold exactly the 73 v0.7.0 MCP tool names"
+                crate::profile::Profile::full().expected_tool_count(),
+                "tool_names::ALL must cover exactly the full-profile tool set"
             );
         }
 
@@ -552,7 +555,7 @@ impl RegisteredTool {
 /// `offload::OffloadTool`, sibling re-exports) appear in multiple
 /// register-call sites. The authoritative tool-count is the count
 /// of **unique `<crate::mcp::*>` paths** under the `RegisteredTool::of`
-/// invocations (73 at v0.7.0), pinned by
+/// invocations, pinned by
 /// [`crate::profile::Profile::full().expected_tool_count()`]. The raw
 /// `grep -c` count is structurally cosmetic; reach for the
 /// `Profile::*().expected_tool_count()` assertion when counting.
@@ -564,8 +567,8 @@ pub fn registered_tools() -> Vec<RegisteredTool> {
     // saw before the migration. Re-ordering is allowed at the wire
     // form (the JSON output) but pinning it here keeps the snapshot
     // regression test (Phase 4) trivial — any future reorder shows up
-    // as a single diff hunk in this file, not as a 73-tool reshuffle
-    // in the wire snapshot.
+    // as a single diff hunk in this file, not as a full-profile
+    // reshuffle in the wire snapshot.
     vec![
         RegisteredTool::of::<crate::mcp::store::StoreTool>(),
         RegisteredTool::of::<crate::mcp::recall::RecallTool>(),
@@ -1224,7 +1227,7 @@ pub fn tool_definitions() -> Value {
     // `OnceLock<Value>`. `registered_tools()` is build-time static,
     // so the full catalog is invariant across the daemon lifetime.
     // Pre-#1077 every MCP `tools/list` request paid the full
-    // schemars expansion across all 73 tools; post-#1077 every call
+    // schemars expansion across every registered tool; post-#1077 every call
     // after boot is a single `Value::clone()` of the cached payload.
     static CACHE: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
     CACHE
