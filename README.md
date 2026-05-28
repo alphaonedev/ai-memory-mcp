@@ -977,7 +977,7 @@ These 74 tools (full profile at v0.7.0; canonical count via `Profile::full().exp
 
 ## CLI Commands
 
-81 top-level subcommands at v0.7.0 under `--features sal` OR `--features sal-postgres` (79 in the default build; the 2-variant gap is `Migrate` + `SchemaInit`, both gated `#[cfg(feature = "sal")]` per src/daemon_runtime.rs:311,321; was 40 at v0.6.4). Run `ai-memory <command> --help` for details on any command, or `ai-memory --help` for the full list.
+81 top-level subcommands at v0.7.0 under `--features sal` OR `--features sal-postgres` (79 in the default build; the 2-variant gap is `Migrate` + `SchemaInit`, both gated `#[cfg(feature = "sal")]` per src/daemon_runtime.rs:311,322; was 40 at v0.6.4). Run `ai-memory <command> --help` for details on any command, or `ai-memory --help` for the full list.
 
 | Command | Description |
 |---------|-------------|
