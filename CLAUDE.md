@@ -605,10 +605,19 @@ Tracking issue: #198.
 **New MCP tool** (post-v0.7.0 #987, the D1.6 split landed):
 
 1. Define `<ToolName>Request` in `src/mcp/tools/<name>.rs` with
-   `#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]` +
-   `#[schemars(deny_unknown_fields)]`. Per-field doc-comments become
-   the JSON-Schema `description`s. For descriptions starting with
-   `#` (markdown heading sigil), use
+   `#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]`.
+   **Do NOT add `#[schemars(deny_unknown_fields)]` or
+   `#[serde(deny_unknown_fields)]`** — per the #1052 (Agent-4 F2)
+   wire-truthfulness decision every tool-request struct stays
+   permissive (the wire schema must not advertise
+   `additionalProperties: false` while the runtime tolerates unknown
+   fields, for wider host compat with newer field sets). The honesty
+   pin is `tests/mcp_input_schema_no_false_strict_1052.rs`;
+   re-introducing the attribute on ANY struct fails that test.
+   Required fields are still enforced by serde (a field with no
+   `#[serde(default)]` errors when missing). Per-field doc-comments
+   become the JSON-Schema `description`s. For descriptions starting
+   with `#` (markdown heading sigil), use
    `#[schemars(description = "...")]` instead of a `///` comment.
 2. Define `pub struct <ToolName>Tool` (zero-sized) and
    `impl McpTool for <ToolName>Tool` — return `name()`,

@@ -73,9 +73,16 @@ use crate::models::{Memory, MemoryKind, Tier};
 /// `description` strings in the MCP `inputSchema`. The schema doubles
 /// as the wire contract for every MCP-aware host that volunteers
 /// turns.
+// Per the #1052 wire-truthfulness decision (Agent-4 F2): no MCP
+// tool-request struct carries `deny_unknown_fields`. The wire schema
+// must not advertise `additionalProperties: false` while the runtime
+// stays permissive. For an L4 multi-host ingest surface this is
+// load-bearing — a host that adds a top-level field must not have its
+// turns rejected wholesale (the #1052 rationale cites exactly "clients
+// with newer field sets"). Unknown extra fields are tolerated and
+// ignored; missing REQUIRED fields still error via serde. Arbitrary
+// host-specific data belongs in `metadata`.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-#[schemars(deny_unknown_fields)]
 #[allow(dead_code)] // Skeleton phase — fields read by the storage
 // transaction landing in the follow-up slice.
 pub struct MemoryCaptureTurnRequest {
@@ -161,9 +168,8 @@ pub struct MemoryCaptureTurnRequest {
 /// Summary of one tool call within an assistant turn. Mirrors the
 /// `crate::recover::parsers::ToolCallSummary` shape so L2/L3 +
 /// L4 capture surfaces produce the same downstream memory shape.
+// Wire-truthful permissive per #1052 (see MemoryCaptureTurnRequest).
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-#[schemars(deny_unknown_fields)]
 #[allow(dead_code)] // Skeleton phase — fields read by the storage
 // transaction landing in the follow-up slice.
 pub struct ToolCallSummary {
@@ -471,7 +477,12 @@ mod handler_tests {
     }
 
     #[test]
-    fn handler_rejects_unknown_fields() {
+    fn handler_tolerates_unknown_fields_at_runtime() {
+        // #1052 wire-truthful contract: the schema does not advertise
+        // `additionalProperties: false`, so the runtime must tolerate
+        // (and ignore) unknown extra fields rather than reject the turn.
+        // Wider host compat — a host with a newer field set must not
+        // have its turns dropped wholesale.
         let conn = fresh_conn();
         let resp = handle_capture_turn(
             &conn,
@@ -480,10 +491,29 @@ mod handler_tests {
                 "host_turn_index": 0,
                 "role": "user",
                 "content": "hello",
-                "rogue_field": "should reject"
+                "an_unknown_extra_field": "tolerated and ignored"
             }),
-        );
-        let err = resp.expect_err("unknown field must error per schemars(deny_unknown_fields)");
+        )
+        .expect("unknown extra fields are tolerated at runtime (post-#1052 wire-truthful contract)");
+        assert_eq!(resp["layer"].as_str(), Some("L4"));
+        assert_eq!(resp["dedup_hit"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn handler_rejects_missing_required_field() {
+        // Permissive on UNKNOWN fields, but REQUIRED fields are still
+        // enforced by serde (no `#[serde(default)]`). A turn missing
+        // `content` must error rather than silently store an empty turn.
+        let conn = fresh_conn();
+        let err = handle_capture_turn(
+            &conn,
+            &json!({
+                "host_session_id": "session-a",
+                "host_turn_index": 0,
+                "role": "user"
+            }),
+        )
+        .expect_err("missing required `content` must error");
         assert!(err.starts_with("INVALID_INPUT"), "got: {err}");
     }
 
