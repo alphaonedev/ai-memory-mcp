@@ -34,6 +34,24 @@
 
 // Per-test postgres schema isolation helper (issue #1381).
 // See module-level docs in `postgres_env.rs`.
+//
+// Gated on `feature = "sal-postgres"` because the helper depends on
+// `sqlx::PgPool` (which is a dev-dependency but still bloats the
+// per-binary compile + link work in the default-features cargo test
+// invocation). Pre-#1381-gating, `tests/common/mod.rs` exposed
+// `postgres_env` to all 74 integration test binaries unconditionally,
+// pulling sqlx into every link unit. The doctest link step (which
+// happens at the END of `cargo test`) then hit a `ld terminated with
+// signal 7 [Bus error]` on ubuntu-latest, deterministically, across
+// 3 consecutive CI runs — the runner image's tmpfs ran out of room
+// for the mmap'd rlib aggregate during doctest link. Gating
+// `postgres_env` to `sal-postgres` is the minimal fix that keeps the
+// helper available to the 3 tests that actually use it
+// (`migrate_links_roundtrip`, `embedding_dim_migration`,
+// `issue_1213_atttypmod_age_schema_scope` — all `#![cfg(feature =
+// "sal-postgres")]`) while dropping the per-binary sqlx pull from
+// the other 71 binaries.
+#[cfg(feature = "sal-postgres")]
 pub mod postgres_env;
 
 use std::path::PathBuf;
