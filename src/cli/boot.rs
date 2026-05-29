@@ -54,9 +54,9 @@ use std::time::Instant;
 pub const MIN_SUPPORTED_SCHEMA: u32 = 16;
 
 /// Upper bound of the DB-schema range this binary supports. Mirrors
-/// `db::CURRENT_SCHEMA_VERSION` (currently 48 at v0.7.0; both sqlite
-/// and postgres ladders land at v48 in lockstep — see
-/// `MIGRATION_LADDER.md` for the per-version column inventory and
+/// `db::CURRENT_SCHEMA_VERSION` (currently 51 at v0.7.0; both sqlite
+/// and postgres ladders land at v51 in lockstep — see
+/// `docs/MIGRATION_v0.7.md` for the per-version column inventory and
 /// `migrations/{sqlite,postgres}/` for the SQL).
 ///
 /// When a DB's `schema_version` exceeds this, the binary is too old
@@ -70,7 +70,7 @@ pub const MIN_SUPPORTED_SCHEMA: u32 = 16;
 /// That enumeration drifted: it pegged the value at "34 in v0.7.0"
 /// when the live constant was already 48. Per the prime directive's
 /// documentation-drift rule the inventory now lives in
-/// `MIGRATION_LADDER.md` (single source of truth) and this comment
+/// `docs/MIGRATION_v0.7.md` (single source of truth) and this comment
 /// only carries the current value + a pointer.
 ///
 /// **#1025 (2026-05-21):** bumped 48 → 49 for `archived_memories` full
