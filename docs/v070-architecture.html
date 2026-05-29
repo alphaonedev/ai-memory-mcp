@@ -10,7 +10,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>v0.7.0 architecture &mdash; post-#1174 substrate surface</title>
-<meta name="description" content="ai-memory v0.7.0 architecture: 73 MCP tools / 87 HTTP routes / 58 CLI subcommands, schema v50, RuntimeContext cross-surface, lint-gate enforcement, public consts surface (tool_names::*, DEFAULT_NHI_SOURCE, BACKEND_OLLAMA, KNOWN_EMBEDDING_DIMS), 15-vendor LLM substrate.">
+<meta name="description" content="ai-memory v0.7.0 architecture: 74 MCP tools / 87 HTTP routes / 58 CLI subcommands, schema v50, RuntimeContext cross-surface, lint-gate enforcement, public consts surface (tool_names::*, DEFAULT_NHI_SOURCE, BACKEND_OLLAMA, KNOWN_EMBEDDING_DIMS), 15-vendor LLM substrate.">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/v070-architecture.html">
 <style>
 :root{--bg:#0a0a0a;--panel:#121212;--border:#262626;--border-hi:#3a3a3a;--text:#f5f5f5;--muted:#9a9a9a;--dim:#6b6b6b;--accent:#6ee7ff;--warn:#ffb86b;--good:#7cd992;--p1:#a78bfa;--p2:#6ee7ff;--p3:#7cd992;--code-bg:#161616;--font-sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;--font-mono:"SF Mono","JetBrains Mono","Cascadia Code",Consolas,monospace;--w-mid:880px;--w-wide:1080px}
@@ -93,7 +93,7 @@ footer a{color:var(--muted)}
   <p class="lede">ai-memory v0.7.0 ships three interfaces (MCP stdio, HTTP REST, native CLI) over one SQLite-backed core with optional Postgres+AGE adapter. This page is the canonical architecture snapshot at <code>release/v0.7.0 @ 1cb95bbe7</code> &mdash; post-#1174 pm-v3.1 refactor train, post-#1182 vendor-neutrality sweep, post-#1192/#1196 cross-surface RuntimeContext.</p>
   <div class="meta-row">
     <span>release/v0.7.0 @ <code>1cb95bbe7</code></span>
-    <span>73 MCP / 87 HTTP / 58 CLI</span>
+    <span>74 MCP / 87 HTTP / 58 CLI</span>
     <span>schema v50</span>
     <span>15-vendor LLM substrate</span>
     <span>lint-gated CI</span>
@@ -130,7 +130,7 @@ footer a{color:var(--muted)}
   <table>
     <thead><tr><th>PR</th><th>Scope</th><th>Outcome</th></tr></thead>
     <tbody>
-      <tr><td><a href="https://github.com/alphaonedev/ai-memory-mcp/pull/1187">#1187</a></td><td>PR1 &mdash; extract 73 MCP tool names</td><td>New <code>crate::mcp::tool_names::*</code> const module. Every tool-name literal at production-code sites reads from here instead of scattered <code>"memory_*"</code> string literals.</td></tr>
+      <tr><td><a href="https://github.com/alphaonedev/ai-memory-mcp/pull/1187">#1187</a></td><td>PR1 &mdash; extract 74 MCP tool names</td><td>New <code>crate::mcp::registry::tool_names::*</code> const module. Every tool-name literal at production-code sites reads from here instead of scattered <code>"memory_*"</code> string literals.</td></tr>
       <tr><td><a href="https://github.com/alphaonedev/ai-memory-mcp/pull/1188">#1188</a></td><td>PR2 &mdash; HTTP MIME constants</td><td><code>HEADER_CONTENT_TYPE</code> / <code>MIME_JSON</code> extracted; eliminates the <code>"application/json"</code> literal-by-grep refactor risk.</td></tr>
       <tr><td><a href="https://github.com/alphaonedev/ai-memory-mcp/pull/1185">#1185</a></td><td>PR3 &mdash; SECS_PER_* constants</td><td><code>SECS_PER_HOUR</code> (3_600), <code>SECS_PER_DAY</code> (86_400), <code>SECS_PER_WEEK</code> (604_800). Lint-gated against <code>Duration::from_secs(3600 | 86400 | 604800 | ...)</code>.</td></tr>
       <tr><td><a href="https://github.com/alphaonedev/ai-memory-mcp/pull/1184">#1184</a></td><td>PR4 &mdash; Ollama backend literal sweep</td><td>Every production-code <code>"ollama"</code> literal reads <code>crate::llm::BACKEND_OLLAMA</code>. Substrate is vendor-neutral by code, not just by docs.</td></tr>
@@ -156,7 +156,7 @@ footer a{color:var(--muted)}
   <table>
     <thead><tr><th>Module path</th><th>What it carries</th></tr></thead>
     <tbody>
-      <tr><td><code>crate::mcp::tool_names::*</code></td><td>All 73 MCP tool names (e.g. <code>RECALL</code>, <code>STORE</code>, <code>CAPABILITIES</code>). Production code reads these instead of bare string literals.</td></tr>
+      <tr><td><code>crate::mcp::registry::tool_names::*</code></td><td>All 74 MCP tool names (e.g. <code>RECALL</code>, <code>STORE</code>, <code>CAPABILITIES</code>). Production code reads these instead of bare string literals.</td></tr>
       <tr><td><code>crate::llm::BACKEND_OLLAMA</code><br><code>crate::llm::BACKEND_OPENAI</code><br><code>crate::llm::BACKEND_XAI</code> &hellip;</td><td>15 vendor-backend identifiers (ollama, openai, xai, anthropic, gemini, deepseek, kimi, qwen, mistral, groq, together, cerebras, openrouter, fireworks, lmstudio) + the generic <code>openai-compatible</code> escape hatch.</td></tr>
       <tr><td><code>crate::llm::KNOWN_EMBEDDING_DIMS</code></td><td>Canonical embedding-model &rarr; vector-dim lookup table (closes #1169 drift surface). <code>canonical_embedding_dim(model)</code> helper threads through <code>ResolvedEmbeddings</code>.</td></tr>
       <tr><td><code>crate::DEFAULT_NHI_SOURCE</code></td><td>Vendor-neutral default source identifier (<code>"nhi"</code>) for the reflection / curator / synthesis surfaces. Replaces the pre-#1175 hardcoded <code>"claude"</code> at <code>src/mcp/tools/reflect.rs:103</code>.</td></tr>
@@ -216,7 +216,7 @@ footer a{color:var(--muted)}
     <a href="v070-changelog.html"><strong>v0.7.0 CHANGELOG synthesis</strong><span class="desc">User-facing impact, not PR sequence</span></a>
     <a href="v0.7.0/heterogeneous-ai-nhi-assessment/"><strong>Heterogeneous AI NHI assessment</strong><span class="desc">Multi-evaluator parallel evaluation</span></a>
     <a href="v0.7.0/test-campaign-2026-05-22-release-gate-final/"><strong>2026-05-22 release-gate-final campaign</strong><span class="desc">SHIP-RECOMMENDED &middot; 7,321 PASS / 0 FAIL</span></a>
-    <a href="feature-matrix.html"><strong>Full feature matrix</strong><span class="desc">73 MCP &times; 87 HTTP &times; 58 CLI cross-reference</span></a>
+    <a href="feature-matrix.html"><strong>Full feature matrix</strong><span class="desc">74 &times; 87 HTTP &times; 58 CLI cross-reference</span></a>
   </div>
 </section>
 

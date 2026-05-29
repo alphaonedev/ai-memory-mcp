@@ -178,7 +178,7 @@ pub enum Command {
         /// `core,graph,archive`). Default `core` (5 tools). Resolution
         /// order: this CLI flag > `AI_MEMORY_PROFILE` env > `[mcp].profile`
         /// in config.toml > `core`. Set `--profile full` to expose
-        /// every family (73 advertised entries at v0.7.0 — 72 callable
+        /// every family (74 advertised entries at v0.7.0 — 72 callable
         /// "memory tools" + the always-on `memory_capabilities` bootstrap;
         /// `Profile::full().expected_tool_count()` returns 73, while
         /// `memory_capabilities` summary reports the 72-memory-tool count

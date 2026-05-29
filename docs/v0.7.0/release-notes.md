@@ -492,7 +492,7 @@ The net change is structural — the wire shape is byte-identical
 modulo the documented allowed-diffs catalog — but the contributor
 recipe and the source-of-truth surface flip:
 
-- **73 of 73 MCP tools** now carry per-tool schemars-derived `McpTool`
+- **73 of 74 MCP tools** now carry per-tool schemars-derived `McpTool`
   impls under `src/mcp/tools/<name>.rs`. Each tool owns its
   `<Tool>Request` DTO (`#[derive(JsonSchema)]`), a zero-sized
   `<Tool>Tool` type, and the matching dispatch handler. The trait
@@ -1181,7 +1181,7 @@ handler. ([commit `fbf093c`](https://github.com/alphaonedev/ai-memory-mcp/commit
   `CURRENT_SCHEMA_VERSION = 34`;
   [`src/store/postgres.rs`](../../src/store/postgres.rs)
   `CURRENT_SCHEMA_VERSION = 33`.)
-- **MCP tool count 60 → 73** (post-grand-slam + Gap 3 recall_observations + Gap 4 confidence_tier surface;
+- **MCP tool count 60 → 74** (post-grand-slam + Gap 3 recall_observations + Gap 4 confidence_tier surface;
   authoritative count from `Profile::full().expected_tool_count()` in
   [`src/profile.rs`](../../src/profile.rs) and verified by
   `grep -oE '"memory_[a-z_]+"' src/mcp/registry.rs | sort -u | wc -l`).
@@ -1439,7 +1439,7 @@ folded into the v0.7.0 tag rather than slipping to v0.7.1:
   [`docs/signed-events-v4.md`](../signed-events-v4.md).
 - **Canonical feature inventory.** The full post-grand-slam feature
   truth lives at [`docs/internal/v070-feature-inventory.md`](../internal/v070-feature-inventory.md)
-  (453 commits ahead of v0.6.4, +233,589/−23,541 lines, 73 MCP tools at
+  (453 commits ahead of v0.6.4, +233,589/−23,541 lines, 74 MCP tools at
   release HEAD, 30 net-new since v0.6.4, 17 net-new `AI_MEMORY_*` env
   vars, 73 HTTP routes total, 33 sqlite migrations on disk + the in-
   process v35-v50 arms that converge sqlite + postgres on the single

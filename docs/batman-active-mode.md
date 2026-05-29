@@ -47,7 +47,7 @@ make them permanent.
 - Ollama running locally with `gemma4:e4b` and `nomic-embed-text-v1.5`
   pulled (or your equivalent autonomous-tier stack)
 - The MCP server launched with `--tier autonomous` and a non-`core`
-  profile (`--profile full` exposes all 73 tools at v0.7.0; `power` is
+  profile (`--profile full` exposes all 74 tools at v0.7.0; `power` is
   the recommended ceiling for normal operators)
 - `~/.config/ai-memory/config.toml` exists (default location; macOS uses
   `~/Library/Application Support/ai-memory/` for keys but `~/.config/`
