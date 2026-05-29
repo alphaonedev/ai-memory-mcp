@@ -212,4 +212,16 @@ Documented so a reader can audit our choice surface:
 
 ---
 
-*Last reviewed: 2026-05-15 (v0.7.0 grand-slam, QW-4).*
+## Relationship to CoALA (Sumers et al. 2024)
+
+The Cognitive Architectures for Language Agents framework (Sumers, Yao, Narasimhan, Griffiths, *TMLR* 02/2024, arXiv:2309.02427) is a conceptual organizing lens for language-agent design, not a competitive product or commercial substrate. It is reference material from the academic literature, included here because readers familiar with the framework may want to know how ai-memory maps to its taxonomy.
+
+**Summary.** ai-memory implements every CoALA primitive (modular memory: working / episodic / semantic / procedural; structured action space: reasoning / retrieval / learning / grounding; generalized decision procedure: planning → execution loop) and extends the framework with six structural-governance properties CoALA does not anticipate (endpoint residency, structural stoppability, cryptographic attestation, bias-displacement through decorrelated priors, LLM-agnostic neutrality at every cognitive boundary, and coherence across model generations).
+
+**Three CoALA-named open directions ship as load-bearing substrate primitives.** CoALA §4.3 flags adaptive context-specific recall as understudied — ai-memory's 6-factor recall scoring, reflection-aware reranker boost (L2-8), and default-on cross-encoder reranker at v0.9 close this. CoALA §4.5 flags modifying/deleting memory ("unlearning") as understudied — ai-memory's `supersedes` and `contradicts` link relations, L2-3 reflection invalidation propagation, and compaction pipeline Stage-6 verify+rollback close this. CoALA §4.5 flags procedural-memory updates as alignment-risky with no current agents solving the problem — ai-memory's depth cap, hook veto, audited refusal, operator-signed governance rules, identical-digest skill promote, and compaction rollback close this structurally.
+
+**Disposition.** CoALA is corroborating prior art on cognitive architectures for language agents. The substrate's properties derive from the moonshot synthesis, not from CoALA. Where the two frame the same primitive differently, the moonshot wins. The full mapping with code anchors and ROADMAP cross-references is documented at [`docs/strategy/coala-mapping.md`](strategy/coala-mapping.md).
+
+---
+
+*Last reviewed: 2026-05-15 (v0.7.0 grand-slam, QW-4). CoALA section added 2026-05-27 (prior-art citation, docs-only).*
