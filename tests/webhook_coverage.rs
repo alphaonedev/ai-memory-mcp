@@ -45,6 +45,12 @@ fn fresh_db() -> (NamedTempFile, PathBuf) {
     // default. These tests use wiremock on 127.0.0.1, so opt in
     // explicitly for the duration of the test process.
     ai_memory::config::set_allow_loopback_webhooks(true);
+    // Pay the one-time reqwest::blocking TLS-connector cold init here,
+    // synchronously in setup, so it lands BEFORE the timed delivery
+    // assertions rather than inside the dispatch worker's ACK_TIMEOUT
+    // retry budget. See
+    // `ai_memory::subscriptions::prewarm_dispatch_tls`.
+    ai_memory::subscriptions::prewarm_dispatch_tls();
     let f = NamedTempFile::new().expect("tempfile");
     let p = f.path().to_path_buf();
     let _ = ai_memory::db::open(&p).expect("db::open");
