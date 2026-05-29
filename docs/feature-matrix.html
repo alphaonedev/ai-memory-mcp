@@ -12,7 +12,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ai-memory · Feature Matrix — every tool, endpoint, command</title>
-<meta name="description" content="Complete surface-area atlas: 74 MCP tools at --profile full (7 at --profile core), 87 HTTP routes (73 unique paths) at /api/v1/, 58 CLI subcommands (56 in the default build; canonical counts on the evidence page). Every operation cross-referenced across the three protocol fronts.">
+<meta name="description" content="Complete surface-area atlas: 74 MCP tools at --profile full (7 at --profile core), 87 HTTP routes (73 unique paths) at /api/v1/, 79 CLI subcommands (default build) / 81 with --features sal; canonical counts on the evidence page). Every operation cross-referenced across the three protocol fronts.">
 <meta name="theme-color" content="#0d1117">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/feature-matrix.html">
 <style>
@@ -242,12 +242,12 @@ footer a{color:var(--text-muted)}
 <section class="hero">
   <h1>The complete surface area.</h1>
   <p class="tagline">
-    Every MCP tool, every HTTP route, every CLI subcommand — categorized, cross-referenced, signed off. <strong>73 + 88 + 58 = 219 operations</strong> exposed across three protocol fronts at v0.7.0. One implementation underneath, three ways to call it.
+    Every MCP tool, every HTTP route, every CLI subcommand — categorized, cross-referenced, signed off. <strong>73 + 87 + 79 = 239 operations</strong> exposed across three protocol fronts at v0.7.0. One implementation underneath, three ways to call it.
   </p>
   <div class="pill-row">
     <span class="pill"><strong>73</strong>MCP tools (<code>--profile full</code>)</span>
-    <span class="pill"><strong>73</strong>HTTP routes</span>
-    <span class="pill"><strong>57</strong>CLI subcommands</span>
+    <span class="pill"><strong>87</strong>HTTP routes (73 unique paths)</span>
+    <span class="pill"><strong>79</strong>CLI subcommands (81 w/ <code>--features sal</code>)</span>
     <span class="pill"><strong>4</strong>operational modes</span>
   </div>
 </section>
@@ -641,7 +641,7 @@ footer a{color:var(--text-muted)}
 <!-- =============== CLI =============== -->
 <section id="cli-commands">
   <div class="container">
-    <span class="eyebrow">58 CLI Subcommands (sal-postgres) · 57 default-build</span>
+    <span class="eyebrow">81 CLI Subcommands (sal/sal-postgres) · 79 default-build</span>
     <h2>For humans, scripts, and CI.</h2>
     <p class="lede">Direct subcommands of the <code>ai-memory</code> binary. No daemon required for read/write commands. Run against any database file via <code>--db &lt;path&gt;</code>.</p>
 

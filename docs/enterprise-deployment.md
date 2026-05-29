@@ -161,7 +161,7 @@ Even a singleton should establish per-agent Ed25519 keypairs on the
 first session: `ai-memory identity generate --agent-id "alice@laptop"`.
 The `signed_events` per-row signature column is filled only when the
 daemon resolves an `agent_id` with a `*.priv` keypair on disk
-(`load_daemon_signing_key`, `src/main.rs:96-98`); without it, the
+(`load_daemon_signing_key`, `src/main.rs:116-118`); without it, the
 daemon boots with the stderr "continuing unsigned" line and rows get
 blank signatures (the cross-row hash chain is still tamper-evident).
 Graduating to T2/T3 is a no-op if keypairs already exist — you just
@@ -1434,7 +1434,7 @@ for the single-instance baseline.
 - [ ] Every agent has its own Ed25519 keypair (`ai-memory identity generate`); private keys mode 0600 under the canonical key directory.
 - [ ] No keypair shared across agents.
 - [ ] Key rotation playbook documented; old keys preserved under `<id>.key.rotated-<timestamp>` for historical signature verification ([`signed-events-v4.md`](signed-events-v4.md)).
-- [ ] Daemon `agent_id` has a keypair on disk; the stderr "continuing unsigned" line at boot is a T3-graduation blocker (`load_daemon_signing_key`, `src/main.rs:96-98`).
+- [ ] Daemon `agent_id` has a keypair on disk; the stderr "continuing unsigned" line at boot is a T3-graduation blocker (`load_daemon_signing_key`, `src/main.rs:116-118`).
 
 ### 14.2 Transport — mTLS + API key (T3+)
 

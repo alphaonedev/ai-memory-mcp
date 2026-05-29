@@ -6,7 +6,7 @@
 
 ## Context
 
-CLAUDE.md §"Architecture" claims `74 MCP tools, 58 CLI subcommands`.
+CLAUDE.md §"Architecture" claims `74 MCP tools, 79 CLI subcommands`.
 The implied three-surface parity (MCP / HTTP / CLI) is incomplete on
 the CLI wire — operator-facing scripting against the CLI cannot reach
 ~15 tool families that the MCP surface advertises. Lane ARCH v2
