@@ -2737,12 +2737,9 @@ mod tests {
         assert_eq!(
             tools.len(),
             crate::profile::Profile::full().expected_tool_count(),
-            "raw_table must include every baseline tool — canonical \
-             count is `Profile::full().expected_tool_count()` = 73 at \
-             v0.7.0 (issues #224 + #311 pulled memory_share forward from \
-             v0.8 Phase 3 RFC per operator directive \
-             `28860423-d12c-4959-bc8b-8fa9a94a33d9`; Gap 3 (#886) added \
-             `memory_recall_observations` under `Family::Meta`)"
+            "raw_table must include every tool — canonical count is the \
+             SSOT `Profile::full().expected_tool_count()` (derived from \
+             the per-Family `tool_names` slices); no literal is restated"
         );
         // memory_store is in core and must be loaded under the default
         // (core) profile.

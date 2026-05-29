@@ -53,49 +53,27 @@ use std::time::Instant;
 /// recall pipeline expects. v0.6.3.1 (PR-9h / issue #487 PR #497 req #72).
 pub const MIN_SUPPORTED_SCHEMA: u32 = 16;
 
-/// Upper bound of the DB-schema range this binary supports. Mirrors
-/// `db::CURRENT_SCHEMA_VERSION` (currently 51 at v0.7.0; both sqlite
-/// and postgres ladders land at v51 in lockstep — see
+/// Upper bound of the DB-schema range this binary supports.
+///
+/// Derived from the schema-version SSOT
+/// [`crate::storage::migrations::current_schema_version()`] — NOT a
+/// hand-maintained literal. A binary supports DBs up to the schema its
+/// own migration ladder produces; the next schema bump therefore moves
+/// this bound automatically with no edit here. Both the sqlite and
+/// postgres ladders land at the same version in lockstep — see
 /// `docs/MIGRATION_v0.7.md` for the per-version column inventory and
-/// `migrations/{sqlite,postgres}/` for the SQL).
+/// `migrations/{sqlite,postgres}/` for the SQL. Current value at v0.7.0
+/// is 51 per the v48 → v51 chain: v48 added `federation_push_dlq`
+/// (#933), v49 added 14 nullable `archived_memories` columns (#1025),
+/// v50 extended `agent_quotas` PK with `namespace` (#1156), v51 added
+/// `federation_nonces` (#1255 / PR #1296).
 ///
 /// When a DB's `schema_version` exceeds this, the binary is too old
 /// for a newer DB and we surface a `warn-schema-unsupported` manifest
 /// header so the user knows to upgrade. v0.6.3.1 (PR-9h / issue #487
 /// PR #497 req #72).
-///
-/// **#903 cleanup (2026-05-20):** the prior version of this comment
-/// enumerated every v21–v44 landing inline (K2's `pending_actions`,
-/// I1's `memory_transcripts`, H2's `memory_links.attest_level`, …).
-/// That enumeration drifted: it pegged the value at "34 in v0.7.0"
-/// when the live constant was already 48. Per the prime directive's
-/// documentation-drift rule the inventory now lives in
-/// `docs/MIGRATION_v0.7.md` (single source of truth) and this comment
-/// only carries the current value + a pointer.
-///
-/// **#1025 (2026-05-21):** bumped 48 → 49 for `archived_memories` full
-/// v0.7.0 column carry migration (reflection_depth, atomised_into,
-/// atom_of, memory_kind, entity_id, persona_version, citations,
-/// source_uri, source_span, confidence_source, confidence_signals,
-/// confidence_decayed_at, mentioned_entity_id, version). Pure additive
-/// ALTER TABLE on both backends.
-///
-/// **#1156 (2026-05-23):** bumped 49 → 50 for the per-namespace K8
-/// quota dimension. Extends `agent_quotas` PRIMARY KEY from
-/// `(agent_id)` to `(agent_id, namespace)` so per-namespace
-/// allotments hold even when a single agent operates across many
-/// namespaces. Pre-v50 rows backfill to the `_global` sentinel
-/// namespace so the historical accounting is preserved verbatim.
-///
-/// **#1255 (2026-05-25):** bumped 50 → 51 for the
-/// `federation_nonce_cache` persistence table. Pre-#1255 the
-/// `FederationNonceCache` LRU lived purely in-process, so a daemon
-/// restart opened a fresh replay window for any captured
-/// `(body, sig, nonce)` tuple. The new table persists every
-/// `(peer_id, fingerprint, last_touch)` triple so the cache can
-/// rehydrate on the next boot. Pure additive `CREATE TABLE IF NOT
-/// EXISTS` + two indexes — fully idempotent.
-pub const MAX_SUPPORTED_SCHEMA: u32 = 51;
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub const MAX_SUPPORTED_SCHEMA: u32 = crate::storage::migrations::current_schema_version() as u32;
 
 /// Pure boundary check: `true` when `v` lies within
 /// `[MIN_SUPPORTED_SCHEMA, MAX_SUPPORTED_SCHEMA]`. Extracted so the
